@@ -7550,19 +7550,29 @@ fn is_path_word_byte(b: u8) -> bool {
 ///   TRAILING side is checked: the match must not be followed by a word byte.
 ///   `foo.key` and `.env.local` match; `.keys()` and `.environment` do not.
 /// - Bare filenames (`id_rsa`) must be a whole token on BOTH sides.
+/// - A key pair's name followed by `.pub` (`id_rsa.pub`) is its PUBLIC half,
+///   which is handed out by design, so that occurrence is not a hit. Every
+///   other occurrence in the same text is still looked at, so naming the
+///   public half next to the private one (`id_rsa.pub id_rsa`,
+///   `id_rsa.pub/../id_rsa`) is still a hit, and so is any spelling that is
+///   not exactly `.pub` (`id_rsa%00.pub`, `id_rsa{.pub,}`).
 fn sensitive_pattern_in(hay: &str, pat: &str) -> bool {
     if pat.contains('/') {
         return hay.contains(pat);
     }
     let hb = hay.as_bytes();
     let dot_anchored = pat.starts_with('.');
+    let key_pair = matches!(pat, "id_rsa" | "id_ed25519" | "id_ecdsa" | "id_dsa");
     let mut from = 0;
     while let Some(rel) = hay[from..].find(pat) {
         let start = from + rel;
         let end = start + pat.len();
         let after_ok = end >= hb.len() || !is_path_word_byte(hb[end]);
         let before_ok = dot_anchored || start == 0 || !is_path_word_byte(hb[start - 1]);
-        if after_ok && before_ok {
+        let public_half = key_pair
+            && hay[end..].starts_with(".pub")
+            && hb.get(end + 4).is_none_or(|&b| !is_path_word_byte(b));
+        if after_ok && before_ok && !public_half {
             return true;
         }
         from = start + 1;

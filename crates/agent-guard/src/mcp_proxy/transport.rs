@@ -60,7 +60,7 @@
 //! that left the group on purpose (`setsid`, a daemon) is not the server and is
 //! not followed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
@@ -218,6 +218,11 @@ const MAX_TOOL_NAME_BYTES: usize = 128;
 #[derive(Debug, Default)]
 struct IdRequestMap {
     entries: HashMap<String, (u64, PendingRequest)>,
+    /// The keys of the waiting `tools/call` requests that supplied a
+    /// credential themselves ([`super::content::supplies_credential`]): their
+    /// answers may issue the session's own token. Always a subset of
+    /// `entries`; a key leaves it whenever its entry is replaced or removed.
+    exchanges: HashSet<String>,
     /// The order entries were added in, to find the oldest.
     next: u64,
     /// The key of the digest a long id is kept as. Random per proxy, so a
@@ -248,6 +253,24 @@ impl IdRequestMap {
         self.entries.get(key).map(|(_, request)| request)
     }
 
+    /// Mark the request waiting under `key` as one that supplied a
+    /// credential. A key with no entry is left unmarked.
+    fn mark_exchange(&mut self, key: &str) {
+        if self.entries.contains_key(key) {
+            self.exchanges.insert(key.to_string());
+        }
+    }
+
+    /// The context of the answer to request `id`: whether that request
+    /// supplied a credential. Unknown ids answer `false`, so the answer is
+    /// screened in full.
+    fn answer_context(&self, id: &Value) -> super::content::AnswerContext {
+        let key = self.key(id);
+        super::content::AnswerContext {
+            credential_exchange: self.entries.contains_key(&key) && self.exchanges.contains(&key),
+        }
+    }
+
     /// Keep `request` under `key`, dropping the oldest entry when the map is
     /// full.
     fn insert(&mut self, key: String, request: PendingRequest) {
@@ -259,13 +282,16 @@ impl IdRequestMap {
                 .map(|(key, _)| key.clone())
             {
                 self.entries.remove(&oldest);
+                self.exchanges.remove(&oldest);
             }
         }
         self.next += 1;
+        self.exchanges.remove(&key);
         self.entries.insert(key, (self.next, request));
     }
 
     fn remove(&mut self, key: &str) -> Option<PendingRequest> {
+        self.exchanges.remove(key);
         self.entries.remove(key).map(|(_, request)| request)
     }
 
@@ -609,7 +635,17 @@ fn record_pending(
     method: &str,
     env: &super::jsonrpc::JsonRpcEnvelope,
 ) {
-    let tool = if method == "tools/call" && !map.contains_key(&key) {
+    let reused = map.contains_key(&key);
+    // A call whose id is already waiting cannot be tied to its answer, so its
+    // answer never counts as a credential exchange.
+    let exchange = method == "tools/call"
+        && !reused
+        && env
+            .params
+            .as_ref()
+            .and_then(|p| p.get("arguments"))
+            .is_some_and(super::content::supplies_credential);
+    let tool = if method == "tools/call" && !reused {
         env.params
             .as_ref()
             .and_then(|p| p.get("name"))
@@ -624,7 +660,10 @@ fn record_pending(
     } else {
         String::new()
     };
-    map.insert(key, PendingRequest { method, tool });
+    map.insert(key.clone(), PendingRequest { method, tool });
+    if exchange {
+        map.mark_exchange(&key);
+    }
 }
 
 /// Take a refused request back out of the map. The proxy answered it and the
@@ -721,7 +760,11 @@ fn classify_server_line_in(
                 .ok()
                 .or_else(|| serde_json::to_value(&env).ok())
                 .unwrap_or(Value::Null);
-            let findings = super::content::scan_message(&message);
+            let context = match (&env.method, &env.id) {
+                (None, Some(id)) => map.answer_context(id),
+                _ => super::content::AnswerContext::default(),
+            };
+            let findings = super::content::scan_answer(&message, context);
             if !findings.is_empty() {
                 if mode.blocks() {
                     super::content::mask_message(&mut message, &findings);
@@ -741,7 +784,11 @@ fn classify_server_line_in(
                 let Some(env) = envelope_of(item) else {
                     continue;
                 };
-                let findings = super::content::scan_message(item);
+                let context = match (&env.method, &env.id) {
+                    (None, Some(id)) => map.answer_context(id),
+                    _ => super::content::AnswerContext::default(),
+                };
+                let findings = super::content::scan_answer(item, context);
                 let secret = (!findings.is_empty()).then(|| findings.alert(mode.blocks()));
                 if secret.is_some() && mode.blocks() {
                     super::content::mask_message(item, &findings);
@@ -3180,6 +3227,68 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// REGRESSION ANCHOR (review: a login's session token reached the client
+    /// as `[REDACTED]`, so every later call of the session failed). The token
+    /// a login answer issues stays in place only in the answer to the call
+    /// that supplied the credential: an answer to a call with no credential,
+    /// an answer whose id was reused while it waited, and an answer to an id
+    /// the proxy never saw all mask it.
+    ///
+    /// FAILS ON REVERT: the first answer carried `token: [REDACTED]`.
+    #[test]
+    fn a_session_token_is_kept_only_in_the_answer_to_the_call_that_supplied_a_credential() {
+        let token = format!("{}{}", "3f9a1c2e7b4d", "0a6e5c11");
+        let answer = |id: u64| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"Login OK\n  token: {token}\n"}}]}}}}"#
+            )
+        };
+        let call = |id: u64, arguments: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"login","arguments":{arguments}}}}}"#
+            )
+        };
+        let mut map = IdRequestMap::new();
+        let mut taint = TaintTracker::new();
+        let mut breaker = crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
+        let config = cfg(ProxyMode::Guard);
+        let mut send = |line: &str, map: &mut IdRequestMap, taint: &mut TaintTracker| {
+            classify_client_line(line, &config, None, map, taint, &mut breaker, 0);
+        };
+        let forwarded = |line: &str, map: &mut IdRequestMap, taint: &mut TaintTracker| {
+            match classify_server_line_in(line, ProxyMode::Guard, None, map, taint) {
+                ServerAction::Forward { raw, .. } => raw,
+                other => panic!("{other:?}"),
+            }
+        };
+
+        send(
+            &call(1, r#"{"username":"guest","password":"guest-pw"}"#),
+            &mut map,
+            &mut taint,
+        );
+        let raw = forwarded(&answer(1), &mut map, &mut taint);
+        assert!(
+            raw.contains(&token),
+            "the login's own token must pass: {raw}"
+        );
+
+        send(&call(2, r#"{"username":"guest"}"#), &mut map, &mut taint);
+        let raw = forwarded(&answer(2), &mut map, &mut taint);
+        assert!(!raw.contains(&token), "no credential was supplied: {raw}");
+
+        send(&call(3, r#"{"password":"guest-pw"}"#), &mut map, &mut taint);
+        send(&call(3, r#"{"password":"guest-pw"}"#), &mut map, &mut taint);
+        let raw = forwarded(&answer(3), &mut map, &mut taint);
+        assert!(
+            !raw.contains(&token),
+            "a reused id cannot be tied to its call: {raw}"
+        );
+
+        let raw = forwarded(&answer(9), &mut map, &mut taint);
+        assert!(!raw.contains(&token), "an id never sent: {raw}");
     }
 
     /// End to end: a 2025-03-26 client that sends a batch gets the server's

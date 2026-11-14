@@ -420,7 +420,9 @@ fn advisory_mode_reports_a_secret_bearing_result_and_forwards_it_unchanged() {
 }
 
 /// REGRESSION ANCHOR: a `resources/read` that climbs out of the resource
-/// root, plainly or percent-encoded, or names a private key store, never
+/// root, plainly or percent-encoded, names a private key store or a tool's
+/// credential store (review 2C-EV-4), or carries a password in its user info
+/// (review 2C-COR-1), never
 /// reaches the server in `guard`; the client gets an error reply keyed to the
 /// request, which is the shape a `resources/read` answer can take.
 ///
@@ -445,6 +447,16 @@ fn guard_mode_refuses_a_resource_read_outside_its_root_or_of_a_key_store() {
                 "resources/read",
                 json!({"uri": "file:///home/dev/.ssh/id_ed25519"}),
             ),
+            request(
+                40,
+                "resources/read",
+                json!({"uri": "file:///home/dev/.kube/config"}),
+            ),
+            request(
+                41,
+                "resources/read",
+                json!({"uri": "https://admin:Pr0dLab2026x@reports.example.com/q1"}),
+            ),
         ],
         ProxyMode::Guard,
     );
@@ -454,7 +466,7 @@ fn guard_mode_refuses_a_resource_read_outside_its_root_or_of_a_key_store() {
         "a refused read reached the server:\n{}",
         seen.out
     );
-    for id in [7, 8, 9] {
+    for id in [7, 8, 9, 40, 41] {
         let answer = seen.answer(id);
         assert!(
             answer.get("error").is_some() && answer.get("result").is_none(),
@@ -518,6 +530,119 @@ fn guard_mode_forwards_ordinary_resources_and_results_untouched() {
     );
     assert_eq!(seen.answer(13)["result"]["content"][0]["text"], code);
     assert_eq!(seen.answer(13)["result"]["content"][1]["data"], png);
+    assert!(
+        !seen.rules().iter().any(|rule| rule == "AG-SECRET-OUT"),
+        "{:?}",
+        seen.rules()
+    );
+}
+
+/// REGRESSION ANCHOR (review 2C-FP-2, lab case: a login tool that issues a
+/// session token the client must pass back to the next call). In `guard` the
+/// token arrived as `[REDACTED]`, the client sent the marker back, and every
+/// later call of the session failed as unauthenticated, with no refusal to
+/// show for it.
+///
+/// A token the server issues under a session key, in answer to a call that
+/// itself supplied a password, is the session's own: the client already holds
+/// the credential it was exchanged for, so seeing the token gives it nothing it
+/// could not do. It is left in place. Everything else in that answer is still
+/// masked, and the same token in any other answer is masked.
+///
+/// FAILS ON REVERT: the login answer carried `token: [REDACTED]`.
+#[test]
+fn guard_mode_keeps_the_session_token_a_login_issues_and_masks_the_rest() {
+    let s = secrets();
+    let admin_jwt = format!(
+        "eyJhbGciOiJIUzI1NiJ9.{}.{}",
+        "eyJyb2xlIjoiYWRtaW4ifQ", "YWRtaW4tc2lnbmF0dXJlLTAy"
+    );
+    let signing_secret = format!("Lab-Signing-{}!", 7731);
+    let login = format!(
+        "Login successful\n  user: guest\n  token: {jwt}\n  admin_token: {admin}\n  signing_secret: {sig}\nUse this token with whoami.",
+        jwt = s.jwt,
+        admin = admin_jwt,
+        sig = signing_secret,
+    );
+    let config = format!("Server config\n  token: {jwt}\n", jwt = s.jwt);
+    let table = json!({
+        "tools/call login": {"result": {
+            "content": [{"type": "text", "text": login}],
+            "structuredContent": {"session_token": s.jwt, "user": "guest"}
+        }},
+        "tools/call get_server_config": {"result": {"content": [{"type": "text", "text": config}]}},
+    });
+    let seen = run(
+        &table,
+        &[
+            request(
+                20,
+                "tools/call",
+                json!({"name": "login", "arguments": {"username": "guest", "password": "guest-lab-pw"}}),
+            ),
+            request(
+                21,
+                "tools/call",
+                json!({"name": "get_server_config", "arguments": {}}),
+            ),
+        ],
+        ProxyMode::Guard,
+    );
+
+    let login = seen.answer(20);
+    let text = login["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text kept");
+    assert!(
+        text.contains(&format!("token: {}", s.jwt)),
+        "the session token the login issued must reach the client:\n{text}"
+    );
+    assert_eq!(login["result"]["structuredContent"]["session_token"], s.jwt);
+    assert!(
+        !text.contains(&admin_jwt),
+        "another token in the same answer is masked:\n{text}"
+    );
+    assert!(
+        !text.contains(&signing_secret),
+        "a secret in the same answer is masked:\n{text}"
+    );
+    let config = seen.answer(21)["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text kept")
+        .to_string();
+    assert!(
+        !config.contains(&s.jwt),
+        "the same token in an answer to a call that supplied no credential is masked:\n{config}"
+    );
+}
+
+/// REGRESSION ANCHOR (review 2C-FP-1, lab case: a files server reading an
+/// ordinary web view). Source code that names a token, a key and a password
+/// arrives byte for byte, so an agent editing the file it read never writes a
+/// mask back into the source.
+///
+/// FAILS ON REVERT: three expressions came back as `[REDACTED]`.
+#[test]
+fn guard_mode_forwards_source_code_that_names_secrets_unchanged() {
+    let view = "from django.conf import settings\n\
+                def login_view(request):\n    \
+                token = request.headers.get(\"Authorization\")\n    \
+                api_key = config.api_key\n    \
+                password=form.cleaned_data[\"password\"]\n    \
+                return token\n";
+    let table = json!({
+        "tools/call read_file": {"result": {"content": [{"type": "text", "text": view}]}},
+    });
+    let seen = run(
+        &table,
+        &[request(
+            30,
+            "tools/call",
+            json!({"name": "read_file", "arguments": {"file_path": "/srv/app/views.py"}}),
+        )],
+        ProxyMode::Guard,
+    );
+    assert_eq!(seen.answer(30)["result"]["content"][0]["text"], view);
     assert!(
         !seen.rules().iter().any(|rule| rule == "AG-SECRET-OUT"),
         "{:?}",
