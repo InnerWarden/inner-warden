@@ -63,9 +63,17 @@ detection:
       description: "Shell metacharacter injection followed by dangerous commands"
 
     # -- Layer 3: Privileged tool name patterns --
+    # FP fix (2026-11-14, InnerWarden): `system_` was taken out of the
+    # prefixes. It is the usual way to name what a tool reports on
+    # (`system_info`, `system_status`, `system_health_check`), so a health
+    # check called with no arguments was refused, and its tools/list entry
+    # flagged. The prefixes left name a privilege, or an entry point not meant
+    # for general use. A `system_` tool that runs a command line
+    # (`system_command`, `system_run`) is judged by what it is handed, by
+    # InnerWarden's built-in AG-EXEC check.
     - field: tool_name
       operator: regex
-      value: "(?i)^(admin_|root_|sudo_|system_|internal_|debug_|maintenance_|privileged_|superuser_|__)"
+      value: "(?i)^(admin_|root_|sudo_|internal_|debug_|maintenance_|privileged_|superuser_|__)"
       description: "Tool names with privileged prefixes indicating unauthorized access"
 
     # -- Layer 4: Tool enumeration and discovery --
@@ -202,6 +210,9 @@ test_cases:
     - tool_name: "list_files"
       expected: not_triggered
       description: "Standard file listing tool with non-privileged name"
+    - tool_name: "system_health_check"
+      expected: not_triggered
+      description: "Health check named for the system it reports on, not a privilege"
     - tool_args: "role=viewer&access_level=readonly"
       expected: not_triggered
       description: "Normal parameter setting with non-privileged role values"
