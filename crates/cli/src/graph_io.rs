@@ -3219,14 +3219,24 @@ mod flag_parse_tests {
 
     #[test]
     fn graph_accepts_its_three_flags() {
-        assert_eq!(parse_graph_flags(&args(&[])).unwrap(), GraphFlags::default());
+        assert_eq!(
+            parse_graph_flags(&args(&[])).unwrap(),
+            GraphFlags::default()
+        );
         assert_eq!(
             parse_graph_flags(&args(&["--clear"])).unwrap(),
-            GraphFlags { clear: true, ..Default::default() }
+            GraphFlags {
+                clear: true,
+                ..Default::default()
+            }
         );
         assert_eq!(
             parse_graph_flags(&args(&["--json", "--stats"])).unwrap(),
-            GraphFlags { json: true, stats: true, ..Default::default() }
+            GraphFlags {
+                json: true,
+                stats: true,
+                ..Default::default()
+            }
         );
     }
 
