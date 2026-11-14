@@ -3524,8 +3524,10 @@ mod tests {
                 }
                 other => panic!("{other:?}"),
             }
+            // Text that is not JSON is unreadable: masked and reported here,
+            // and refused whole by a mode that blocks (`server_output`).
             match classify_server_line_in(&opaque, mode, None, &mut map, &mut taint) {
-                ServerAction::Forward {
+                ServerAction::Unreadable {
                     raw,
                     event: Some(d),
                 } => {
@@ -3536,6 +3538,35 @@ mod tests {
                         .iter()
                         .any(|a| a.rule == crate::mcp_proxy::content::SECRET_OUT_RULE));
                     assert!(!d.verdict.alerts.iter().any(|a| a.detail.contains(&key)));
+                    let (out, events) = server_output(
+                        ServerAction::Unreadable {
+                            raw,
+                            event: Some(d),
+                        },
+                        mode.blocks(),
+                    );
+                    let out = out.expect("a line goes to the client");
+                    assert_eq!(out.contains(&key), !mode.blocks(), "{mode:?}: {out}");
+                    assert!(events
+                        .iter()
+                        .flat_map(|d| d.verdict.alerts.iter())
+                        .any(|a| a.rule == crate::mcp_proxy::content::SECRET_OUT_RULE));
+                }
+                other => panic!("{other:?}"),
+            }
+            // A JSON scalar is forwarded, with the secret masked in `guard`.
+            let scalar = serde_json::to_string(&opaque).expect("a JSON string");
+            match classify_server_line_in(&scalar, mode, None, &mut map, &mut taint) {
+                ServerAction::Forward {
+                    raw,
+                    event: Some(d),
+                } => {
+                    assert_eq!(raw.contains(&key), !mode.blocks(), "{mode:?}: {raw}");
+                    assert!(d
+                        .verdict
+                        .alerts
+                        .iter()
+                        .any(|a| a.rule == crate::mcp_proxy::content::SECRET_OUT_RULE));
                 }
                 other => panic!("{other:?}"),
             }
