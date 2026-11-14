@@ -291,6 +291,10 @@ pub struct TaintTracker {
     /// Not taint: it is kept here because this tracker is the one state the
     /// proxy keeps per connection, and the router reads both.
     declared: HashMap<Box<str>, ToolDeclaration>,
+    /// The resources the server announced this session, which a
+    /// `resources/read` is checked against. Not taint either: kept here for
+    /// the same reason as `declared`.
+    pub(crate) resources: super::content::ResourceCatalog,
 }
 
 impl TaintTracker {

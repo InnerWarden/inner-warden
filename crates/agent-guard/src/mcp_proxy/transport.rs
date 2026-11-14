@@ -18,9 +18,11 @@
 //! forwarded MCP traffic.
 //!
 //! Default mode is **advisory**: a transparent, alerting pipe. `guard` replies
-//! to the client with a denial instead of forwarding a disallowed `tools/call`;
-//! `kill` additionally terminates the child. Server-side findings (poisoned
-//! `tools/list`, injected results) are always alert-only.
+//! to the client with a denial instead of forwarding a disallowed `tools/call`
+//! or `resources/read`; `kill` additionally terminates the child. Server-side
+//! findings (poisoned `tools/list`, injected results) are alert-only, except
+//! secret-shaped values in a server answer, which `guard` and `kill` mask
+//! before the client sees them (see [`classify_server_line_in`]).
 //!
 //! # Lifetime
 //!
@@ -656,12 +658,32 @@ fn tool_call_signature(env: &super::jsonrpc::JsonRpcEnvelope) -> String {
     format!("{name}:{args}")
 }
 
+/// [`classify_server_line_in`] in `advisory`: the server's lines as a mode
+/// that never rewrites one sees them.
+#[cfg(test)]
+fn classify_server_line(
+    line: &str,
+    engine: Option<&RuleEngine>,
+    map: &mut IdRequestMap,
+    taint: &mut TaintTracker,
+) -> ServerAction {
+    classify_server_line_in(line, ProxyMode::Advisory, engine, map, taint)
+}
+
 /// Pure: classify a server→client line. Resolves the responded-to request via
 /// the id→request map (removing the entry). Server-side verdicts never block; a
 /// tool-call result also records its long tokens into the session
 /// [`TaintTracker`] so a later call that reuses them is caught.
-fn classify_server_line(
+///
+/// Secret-shaped values in any server message ([`super::content`]) are
+/// reported in every mode, and masked in `guard` and `kill`: the line
+/// forwarded is then the message re-serialized with each value replaced,
+/// everything else (id, shape, other text) as it came. A secret must not
+/// reach the model, and masking the value, rather than refusing the whole
+/// answer, keeps the session working.
+fn classify_server_line_in(
     line: &str,
+    mode: ProxyMode,
     engine: Option<&RuleEngine>,
     map: &mut IdRequestMap,
     taint: &mut TaintTracker,
@@ -674,25 +696,91 @@ fn classify_server_line(
         // returned: scanned for injection, and remembered so a later call
         // that reuses it is caught.
         ParsedLine::Opaque(raw) | ParsedLine::NotJson(raw) => {
-            let event = inspect_opaque_server_text(&raw, engine, taint);
+            let mut event = inspect_opaque_server_text(&raw, engine, taint);
+            let raw = match super::content::mask_text(&raw) {
+                Some((masked, findings)) => {
+                    let alert = findings.alert(mode.blocks());
+                    event = Some(with_alert(event, alert, None, None));
+                    if mode.blocks() {
+                        masked
+                    } else {
+                        raw
+                    }
+                }
+                None => raw,
+            };
             ServerAction::Forward { raw, event }
         }
-        ParsedLine::Message(env) => ServerAction::Forward {
-            raw: as_inspected(line),
-            event: classify_server_message(&env, engine, map, taint),
-        },
-        ParsedLine::Batch(items) => {
-            let events = items
-                .iter()
-                .filter_map(envelope_of)
-                .filter_map(|env| classify_server_message(&env, engine, map, taint))
-                .collect();
-            ServerAction::ForwardBatch {
-                raw: as_inspected(line),
-                events,
+        ParsedLine::Message(env) => {
+            let mut raw = as_inspected(line);
+            let mut secret = None;
+            // The message as inspected; should the line not read back as a
+            // value, the envelope that was routed stands in, so the screen
+            // never goes unrun on a message that is forwarded.
+            let mut message = parse_value(line)
+                .ok()
+                .or_else(|| serde_json::to_value(&env).ok())
+                .unwrap_or(Value::Null);
+            let findings = super::content::scan_message(&message);
+            if !findings.is_empty() {
+                if mode.blocks() {
+                    super::content::mask_message(&mut message, &findings);
+                    raw = message.to_string();
+                }
+                secret = Some(findings.alert(mode.blocks()));
+            }
+            ServerAction::Forward {
+                raw,
+                event: classify_server_message(&env, engine, map, taint, secret),
             }
         }
+        ParsedLine::Batch(mut items) => {
+            let mut rewritten = false;
+            let mut events = Vec::new();
+            for item in items.iter_mut() {
+                let Some(env) = envelope_of(item) else {
+                    continue;
+                };
+                let findings = super::content::scan_message(item);
+                let secret = (!findings.is_empty()).then(|| findings.alert(mode.blocks()));
+                if secret.is_some() && mode.blocks() {
+                    super::content::mask_message(item, &findings);
+                    rewritten = true;
+                }
+                events.extend(classify_server_message(&env, engine, map, taint, secret));
+            }
+            let raw = if rewritten {
+                Value::Array(items).to_string()
+            } else {
+                as_inspected(line)
+            };
+            ServerAction::ForwardBatch { raw, events }
+        }
     }
+}
+
+/// `event` with `alert` added, or a new server-side decision holding only
+/// `alert` when there was none.
+fn with_alert(
+    event: Option<ProxyDecision>,
+    alert: crate::mcp::VerdictAlert,
+    method: Option<String>,
+    request_id: Option<Value>,
+) -> ProxyDecision {
+    let mut decision = event.unwrap_or_else(|| ProxyDecision {
+        verdict: crate::mcp::Verdict {
+            allowed: true,
+            alerts: Vec::new(),
+        },
+        direction: Direction::ServerToClient.label(),
+        method,
+        tool_name: None,
+        tool_summary: None,
+        request_id,
+        deciding_layer: None,
+    });
+    decision.verdict.alerts.push(alert);
+    decision
 }
 
 /// Server text that is not a message, read as untrusted tool output.
@@ -715,12 +803,15 @@ fn inspect_opaque_server_text(
     })
 }
 
-/// [`classify_server_line`] for one message: the finding it raised, if any.
+/// [`classify_server_line_in`] for one message: the finding it raised, if any.
+/// `secret` is the secret-shaped-value alert for the message, added to what
+/// the router found.
 fn classify_server_message(
     env: &JsonRpcEnvelope,
     engine: Option<&RuleEngine>,
     map: &mut IdRequestMap,
     taint: &mut TaintTracker,
+    secret: Option<crate::mcp::VerdictAlert>,
 ) -> Option<ProxyDecision> {
     let responded = if env.method.is_none() {
         env.id.as_ref().and_then(|id| {
@@ -737,6 +828,23 @@ fn classify_server_message(
         engine,
         Some(taint),
     );
+    let decision = match secret {
+        Some(alert) => {
+            let method = responded
+                .map(|r| r.method)
+                .or_else(|| env.method.clone())
+                .filter(|method| !method.is_empty());
+            let mut decision = with_alert(Some(decision), alert, None, None);
+            if decision.method.is_none() {
+                decision.method = method;
+            }
+            if decision.request_id.is_none() {
+                decision.request_id = env.id.clone();
+            }
+            decision
+        }
+        None => decision,
+    };
     if decision.verdict.alerts.is_empty() {
         None
     } else {
@@ -948,7 +1056,7 @@ where
                     Err(e) => break Err(e),
                     Ok(None) => break Ok(Ended::ServerClosed),
                     Ok(Some(line)) => {
-                        match classify_server_line(&line, engine, &mut map, &mut taint) {
+                        match classify_server_line_in(&line, cfg.mode, engine, &mut map, &mut taint) {
                             ServerAction::Drop => {}
                             ServerAction::Forward { raw, event } => {
                                 if let Err(e) = write_line(&mut client_out, &raw).await {
@@ -3000,6 +3108,78 @@ mod tests {
             map.is_empty(),
             "both answers were matched to their requests"
         );
+    }
+
+    /// A secret-shaped value in a server batch, or in server text that is not
+    /// a message, is masked in `guard` and only reported in `advisory`; the
+    /// clean element of the batch is forwarded as it came.
+    ///
+    /// FAILS ON REVERT: without the server-side masking every line goes out
+    /// as it came, in every mode.
+    #[test]
+    fn a_secret_in_a_server_batch_or_opaque_text_is_masked_in_guard_only() {
+        let key = format!("sk-{}", "lab-batch-key-0c41d09e2b77");
+        let answers = format!(
+            r#"[{{"jsonrpc":"2.0","id":2,"result":{{}}}},{{"jsonrpc":"2.0","id":1,"result":{{"content":[{{"type":"text","text":"key {key}"}}]}}}}]"#
+        );
+        let opaque = format!("debug: loaded {key}");
+        for mode in [ProxyMode::Guard, ProxyMode::Advisory] {
+            let mut map = IdRequestMap::new();
+            let mut taint = TaintTracker::new();
+            match classify_server_line_in(&answers, mode, None, &mut map, &mut taint) {
+                ServerAction::ForwardBatch { raw, events } => {
+                    assert_eq!(raw.contains(&key), !mode.blocks(), "{mode:?}: {raw}");
+                    let parsed: Value = serde_json::from_str(&raw).expect("still a batch");
+                    assert_eq!(parsed[0]["id"], 2);
+                    assert_eq!(parsed[1]["id"], 1);
+                    assert!(events
+                        .iter()
+                        .flat_map(|d| d.verdict.alerts.iter())
+                        .any(|a| a.rule == crate::mcp_proxy::content::SECRET_OUT_RULE));
+                }
+                other => panic!("{other:?}"),
+            }
+            match classify_server_line_in(&opaque, mode, None, &mut map, &mut taint) {
+                ServerAction::Forward {
+                    raw,
+                    event: Some(d),
+                } => {
+                    assert_eq!(raw.contains(&key), !mode.blocks(), "{mode:?}: {raw}");
+                    assert!(d
+                        .verdict
+                        .alerts
+                        .iter()
+                        .any(|a| a.rule == crate::mcp_proxy::content::SECRET_OUT_RULE));
+                    assert!(!d.verdict.alerts.iter().any(|a| a.detail.contains(&key)));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// A masked answer is the message as it came, with each secret replaced:
+    /// its id (even `null`), its method-free shape and its other fields stay.
+    #[test]
+    fn a_masked_server_message_keeps_its_id_and_fields() {
+        let mut map = IdRequestMap::new();
+        let mut taint = TaintTracker::new();
+        let line = format!(
+            r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32000,"message":"login failed for password: {}"}},"x-extra":1}}"#,
+            "Lab-Pass-4471!"
+        );
+        match classify_server_line_in(&line, ProxyMode::Guard, None, &mut map, &mut taint) {
+            ServerAction::Forward { raw, event } => {
+                let parsed: Value = serde_json::from_str(&raw).expect("json");
+                assert!(parsed.get("id").is_some_and(Value::is_null), "{raw}");
+                assert_eq!(parsed["x-extra"], 1);
+                assert_eq!(
+                    parsed["error"]["message"],
+                    "login failed for password: [REDACTED]"
+                );
+                assert!(event.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// End to end: a 2025-03-26 client that sends a batch gets the server's
