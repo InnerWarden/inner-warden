@@ -3031,10 +3031,11 @@ mod tests {
             "an arbitrary *_exec tool is not a shell host: {verdict:?}"
         );
         assert!(!verdict.allowed);
+        assert!(verdict.alerts.iter().any(|a| a.rule == RUNNER_RULE));
         assert!(verdict
             .alerts
             .iter()
-            .all(|a| a.rule == RUNNER_RULE && a.block));
+            .all(|a| (a.rule == RUNNER_RULE || a.rule == "AG-CHAIN") && a.block));
         assert!(shell_command_argument("database_exec", &args).is_none());
         assert!(shell_command_argument("mcp__host__exec", &args).is_some());
         assert!(shell_command_argument("mcp__host__exec_command", &args).is_some());
