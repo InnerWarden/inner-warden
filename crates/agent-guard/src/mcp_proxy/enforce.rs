@@ -12,8 +12,9 @@
 //! Scope of blocking in this version: only a **client→server `tools/call`** can
 //! be blocked (the agent invoking a dangerous tool), because a denial must be a
 //! reply keyed to that request's id. Server→client findings (poisoned
-//! `tools/list`, injection in a tool result) are always alert-only, rewriting
-//! a server response (tool stripping) is a later enhancement.
+//! `tools/list`, injection in a tool result) are alert-only here; the one
+//! rewrite of a server response, withholding a listing description that
+//! carries orders for the model, is done by the transport.
 
 use serde_json::{json, Value};
 
