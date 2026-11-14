@@ -196,15 +196,22 @@ fn route_server_to_client(
                 | "initialize"),
             ),
             Some(result),
-        ) => ProxyDecision {
-            verdict: inspect_listing_result(method, result),
-            direction: dir.label(),
-            method: Some(method.into()),
-            tool_name: None,
-            tool_summary: None,
-            request_id: env.id.clone(),
-            deciding_layer: None,
-        },
+        ) => {
+            // A resource listing is also remembered: a later `resources/read`
+            // is checked against what the server announced.
+            if let (Some(t), "resources/list" | "resources/templates/list") = (taint, method) {
+                t.resources.record_listing(method, result);
+            }
+            ProxyDecision {
+                verdict: inspect_listing_result(method, result),
+                direction: dir.label(),
+                method: Some(method.into()),
+                tool_name: None,
+                tool_summary: None,
+                request_id: env.id.clone(),
+                deciding_layer: None,
+            }
+        }
         (Some("tools/call"), Some(result)) => {
             // ASI07 (Memory Leakage): scrub secrets/PII from the untrusted tool
             // output before it enters the guard pipeline / the agent's context,
@@ -250,12 +257,6 @@ fn route_server_to_client(
                 request_id: env.id.clone(),
                 deciding_layer: None,
             }
-        }
-        (Some(method @ ("resources/list" | "resources/templates/list")), Some(result)) => {
-            if let Some(t) = taint {
-                t.resources.record_listing(method, result);
-            }
-            pass_through(dir)
         }
         _ => pass_through(dir),
     }
