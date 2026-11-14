@@ -406,3 +406,100 @@ fn guard_mode_refuses_a_fast_repeat_and_nothing_else() {
         refused[0].1
     );
 }
+
+/// Which calls reached the (echo) server, and the refusal text of each call
+/// the proxy answered instead, by request id.
+fn outcomes(seen: &str) -> (Vec<u64>, Vec<(u64, String)>) {
+    let mut reached_the_server = Vec::new();
+    let mut refused = Vec::new();
+    for line in seen.lines() {
+        let reply: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        let id = reply["id"].as_u64().expect("every line answers an id");
+        if reply["method"] == "tools/call" {
+            reached_the_server.push(id);
+        } else if reply["result"]["isError"] == true {
+            let text = reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            refused.push((id, text));
+        }
+    }
+    reached_the_server.sort_unstable();
+    refused.sort();
+    (reached_the_server, refused)
+}
+
+/// REGRESSION ANCHOR, from a measured run behind a code-execution MCP server:
+/// in guard mode every call to a tool whose name held `exec` was refused,
+/// whatever it carried, at critical severity: running `sum(range(10))`, and a
+/// plugin dispatcher parsing two CSV column names. Two tool-name conditions
+/// did it: ATR-2026-040 matched `exec` anywhere in a name, and ATR-2026-060's
+/// "deceptive safety suffix" condition matched with no suffix at all. A call
+/// is now judged by what it carries. The same server's attack calls are still
+/// refused by what they carry (a dynamic import that runs a program, a read of
+/// the account database), and so is a tool named for a bare `exec` (it runs
+/// whatever its arguments say) and a code tool with a safety suffix.
+///
+/// FAILS ON REVERT: put `exec|execute` back in ATR-2026-040's tool-name
+/// condition, or make ATR-2026-060's suffix optional again, and the two
+/// ordinary calls never reach the server.
+#[test]
+fn guard_mode_with_the_shipped_rules_judges_a_code_tool_by_its_call_not_its_name() {
+    let engine = Arc::new(RuleEngine::load_embedded());
+    let requests = [
+        fs_call(
+            41,
+            "execute_code",
+            serde_json::json!({"language": "python", "code": "result = sum(range(10))"}),
+        ),
+        fs_call(
+            42,
+            "execute_plugin_tool",
+            serde_json::json!({"plugin": "data-tools", "tool_name": "parse_csv", "params": "id,name"}),
+        ),
+        fs_call(
+            43,
+            "execute_code",
+            serde_json::json!({"language": "python", "code": "result = __import__('os').popen('cat /tmp/lab/flag.txt').read()"}),
+        ),
+        fs_call(
+            44,
+            "execute_code",
+            serde_json::json!({"language": "python", "code": "result = open('/etc/passwd').read()"}),
+        ),
+        fs_call(
+            45,
+            "container_exec",
+            serde_json::json!({"container": "web", "command": "id"}),
+        ),
+        fs_call(46, "run_code_safe", serde_json::json!({"code": "print(1)"})),
+    ];
+    let seen = run_through_proxy_with(&requests, ProxyMode::Guard, Some(engine));
+    let (reached, refused) = outcomes(&seen);
+
+    assert_eq!(
+        reached,
+        [41, 42],
+        "only the ordinary calls go through:\n{seen}"
+    );
+    let refused_ids: Vec<u64> = refused.iter().map(|(id, _)| *id).collect();
+    assert_eq!(refused_ids, [43, 44, 45, 46], "{seen}");
+    for (id, rule) in [
+        (43, "ATR-2026-112"),
+        (44, "ATR-2026-113"),
+        (45, "ATR-2026-040"),
+        (46, "ATR-2026-060"),
+    ] {
+        let text = &refused
+            .iter()
+            .find(|(got, _)| *got == id)
+            .expect("refused")
+            .1;
+        assert!(
+            text.contains(rule),
+            "call {id} must be refused by {rule}: {text}"
+        );
+    }
+}

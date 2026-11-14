@@ -3,7 +3,9 @@
 # - 2026-07-15: the `kubectl exec` and `chmod` conditions were narrowed
 #   (comments at each condition);
 # - 2026-10-06: `write_file` was taken out of the tool-name condition for
-#   destructive file operations (comment at that condition).
+#   destructive file operations (comment at that condition);
+# - 2026-11-14: `exec` and `execute` in the shell tool-name condition count
+#   only where they name no other object (comment at that condition).
 title: "Privilege Escalation and Admin Function Access"
 id: ATR-2026-040
 status: experimental
@@ -51,9 +53,21 @@ agent_source:
 
 detection:
   conditions:
+    # FP fix (2026-11-14): `exec` and `execute` matched anywhere in a name, so
+    # every call to a tool that runs something it names (`execute_code`, a
+    # plugin dispatcher, `execute_query`) was refused at critical severity,
+    # whatever the call carried, a sum of ten numbers included. They now count
+    # only as the last word of the name (`exec`, `container_exec`) or before
+    # `command`: a tool that names nothing after the verb runs whatever its
+    # arguments say, as a shell does. Any other tool with `exec` in its name
+    # is judged by what the call hands it: InnerWarden's built-in AG-EXEC
+    # check refuses a command line, code that can do more than compute, or a
+    # path or option handed to it, the argument conditions below and
+    # ATR-2026-110/111/112/113 still apply, and ATR-2026-099 still records
+    # the call at low severity.
     - field: tool_name
       operator: regex
-      value: "(?i)(?:exec|execute|shell|bash|cmd|terminal|subprocess|os_command|system_call|run_command|powershell)"
+      value: "(?i)(?:shell|bash|cmd|terminal|subprocess|os_command|system_call|run_command|powershell|exec(?:ute)?(?:[-_]?command)?$)"
       description: "System shell or command execution tool invocation"
     - field: tool_name
       operator: regex
@@ -189,6 +203,10 @@ test_cases:
       tool_args: '{"path": "/home/user/project/src/main.rs", "content": "fn main() {}"}'
       expected: not_triggered
       description: "Ordinary file write inside the filesystem server's allowed directories"
+    - tool_name: "execute_code"
+      tool_args: '{"language": "python", "code": "result = sum(range(10))"}'
+      expected: not_triggered
+      description: "Code tool running plain arithmetic (judged by the code, not the tool name)"
     # FP fix (deep-test 2026-07-15): benign developer commands that must NOT fire.
     - tool_name: "shell"
       tool_args: '{"command": "chmod 755 deploy.sh"}'
