@@ -371,12 +371,14 @@ fn reading_a_secrets_file_outside_the_project_blocks_the_agent() {
     assert!(!blocks_for_agent(&alone), "without a directory: {alone:?}");
 }
 
-/// FAILS ON REVERT (everything outside from the home): a session started in
-/// the home, or a hook run from `/` with no directory in its payload, says
-/// nothing about which project is the work. Reads from there keep the verdict
-/// they have without a directory, as before.
+/// FAILS ON REVERT (no project read as no verdict): a session started in
+/// the home, or a hook run from `/`, has no project, so every `.env`-class
+/// read from there is outside one and blocks the agent. Nothing was reported
+/// from there, and a session in the home read the home's `.env` and every
+/// project's unchallenged. The verdict a person sees is the review it was,
+/// and the agent is told where to start instead.
 #[test]
-fn a_read_from_the_home_or_the_root_keeps_its_verdict() {
+fn a_read_from_the_home_or_the_root_has_no_project_and_blocks_the_agent() {
     let at = layout();
     for (cwd, command) in [
         (at.home.clone(), "cat .env"),
@@ -393,12 +395,311 @@ fn a_read_from_the_home_or_the_root_keeps_its_verdict() {
             with.recommendation, without.recommendation,
             "{command} from {cwd}"
         );
-        assert!(!blocks_for_agent(&with), "{command} from {cwd}: {with:?}");
+        assert!(blocks_for_agent(&with), "{command} from {cwd}: {with:?}");
+        let outside = with
+            .signals
+            .iter()
+            .find(|s| s.signal == "credential_read_outside_project")
+            .expect("read outside a project");
         assert!(
-            !signal_names(&with).contains(&"credential_read_outside_project"),
-            "{command} from {cwd}"
+            outside
+                .detail
+                .contains("start it in the project's own folder"),
+            "{command} from {cwd}: {}",
+            outside.detail
         );
     }
+    // Inside a project the detail says nothing about where to start.
+    let pkg = format!("{}/pkg", at.repo);
+    let analysis = in_place_at("cat ~/secret.env", &discovered(&pkg, &at.home));
+    let outside = analysis
+        .signals
+        .iter()
+        .find(|s| s.signal == "credential_read_outside_project")
+        .expect("read outside the project");
+    assert!(!outside.detail.contains("start it"), "{}", outside.detail);
+}
+
+/// FAILS ON REVERT (stored logins reached through the place): a tool's
+/// token file named by a path only the directory makes whole, or read with
+/// the whole hidden folder that holds it, passed the agent hook.
+#[test]
+fn a_stored_login_is_refused_however_the_path_reaches_it() {
+    let at = layout();
+    let app = format!("{}/.hermes", at.home);
+    std::fs::create_dir_all(format!("{app}/work")).expect("app");
+    std::fs::write(format!("{app}/.env"), "K=v\n").expect("app env");
+    std::fs::write(format!("{app}/auth.json"), "{}\n").expect("app auth");
+    std::fs::write(format!("{app}/notes.md"), "x\n").expect("app notes");
+    std::fs::create_dir_all(format!("{}/.config/nvim", at.home)).expect("nvim");
+    // A project in the home, not hidden, with its own `.env`.
+    std::fs::create_dir_all(format!("{}/proj2", at.home)).expect("proj2");
+    std::fs::write(format!("{}/proj2/.env", at.home), "K=v\n").expect("proj2 env");
+    let work = format!("{}/work", at.home);
+    std::fs::create_dir_all(&work).expect("work");
+    let from_work = discovered(&work, &at.home);
+    let from_home = discovered(&at.home, &at.home);
+    for (context, command) in [
+        (&from_work, "cd ~/.codex && cat auth.json"),
+        (&from_work, "cd ~/.aws && cat credentials"),
+        (&from_work, "cd ~/.config/gh && head hosts.yml"),
+        (&from_home, "cat .hermes/auth.json"),
+        (&from_home, "head -c 100 .gemini/oauth_creds.json"),
+        (&from_work, "grep -r xoxb ~/.hermes"),
+        (&from_work, "rg xoxb ~/.hermes/"),
+        (&from_work, "tar czf /tmp/h.tgz ~/.hermes"),
+        (&from_work, "cp -r ~/.hermes /tmp/h"),
+        (&from_work, "cat ~/.hermes/*"),
+        (&from_work, "cat ~/.hermes/.e*"),
+        (&from_work, "cd ~/.hermes && grep -r xoxb ."),
+        (&from_work, "find ~/.hermes -type f -exec cat {} +"),
+        (&from_home, "tar czf /tmp/h.tgz .hermes"),
+    ] {
+        let analysis = in_place_at(command, context);
+        assert_eq!(
+            analysis.recommendation, "deny",
+            "{command} from {}: {analysis:?}",
+            context.cwd
+        );
+    }
+    // Ordinary reads near those folders pass.
+    for command in [
+        "grep -rn theme ~/.config/nvim",
+        "grep -rn theme ~/.config",
+        "grep -rn TODO ~/proj2",
+        "ls -la ~/.hermes",
+        "find ~/.hermes -name '*.json'",
+        "cat ~/.hermes/*.md",
+        "stat ~/.codex/auth.json",
+    ] {
+        let analysis = in_place_at(command, &from_work);
+        assert!(!blocks_for_agent(&analysis), "{command}: {analysis:?}");
+    }
+    // An agent working inside the folder reads it as its project.
+    let inside = discovered(&format!("{app}/work"), &at.home);
+    let analysis = in_place_at("grep -rn TODO ..", &inside);
+    assert!(!blocks_for_agent(&analysis), "{analysis:?}");
+}
+
+/// FAILS ON REVERT (one level down, and the registry logins): a whole read
+/// of `~/.config` took `~/.config/gh/hosts.yml` with it, one folder below
+/// the top level that was looked at, and `~/.docker/config.json` and
+/// `~/.cargo/credentials.toml` were no stored login (found in review of
+/// 1.6.13). Each passed the agent hook.
+#[test]
+fn a_stored_login_one_folder_down_or_a_registry_login_is_refused() {
+    let at = layout();
+    std::fs::create_dir_all(format!("{}/.config/gh", at.home)).expect("gh");
+    std::fs::write(format!("{}/.config/gh/hosts.yml", at.home), "x: y\n").expect("hosts");
+    std::fs::create_dir_all(format!("{}/.docker", at.home)).expect("docker");
+    std::fs::write(format!("{}/.docker/config.json", at.home), "{}\n").expect("docker");
+    std::fs::create_dir_all(format!("{}/.cargo", at.home)).expect("cargo");
+    std::fs::write(format!("{}/.cargo/credentials.toml", at.home), "x\n").expect("cargo");
+    std::fs::create_dir_all(format!("{}/.cache/pip/http", at.home)).expect("cache");
+    std::fs::write(format!("{}/.cache/pip/http/a", at.home), "x\n").expect("cache file");
+    let work = format!("{}/work", at.home);
+    std::fs::create_dir_all(&work).expect("work");
+    let from_work = discovered(&work, &at.home);
+    for command in [
+        "grep -r oauth_token ~/.config",
+        "tar czf /tmp/c.tgz ~/.config",
+        "grep -r auths ~/.docker",
+        "cd ~/.docker && cat config.json",
+        "cd ~/.cargo && cat credentials.toml",
+        "cat ~/.cargo/credentials.toml",
+    ] {
+        let analysis = in_place_at(command, &from_work);
+        assert_eq!(analysis.recommendation, "deny", "{command}: {analysis:?}");
+    }
+    for command in [
+        "grep -r x ~/.cache",
+        "ls ~/.config",
+        "cat ~/.cargo/config.toml",
+    ] {
+        let analysis = in_place_at(command, &from_work);
+        assert!(!blocks_for_agent(&analysis), "{command}: {analysis:?}");
+    }
+}
+
+/// A whole read of the home, or of a folder the home is in, takes the keys
+/// and logins kept in it: refused as a read of one of them, from anywhere,
+/// the agent's own folder climbed out of too. A search that leaves hidden
+/// files out, a listing, and a read of a project in the home are not.
+///
+/// FAILS ON REVERT of the whole-home arm in `stored_secret_read_in_place`
+/// (each read in the first list is allowed or only a review).
+#[test]
+fn a_whole_read_of_the_home_is_a_read_of_its_secrets() {
+    let at = layout();
+    std::fs::create_dir_all(format!("{}/.ssh", at.home)).expect("ssh");
+    std::fs::write(format!("{}/.ssh/id_ed25519", at.home), "k\n").expect("key");
+    std::fs::write(format!("{}/.ssh/id_ed25519.pub", at.home), "p\n").expect("pub");
+    let work = format!("{}/work", at.home);
+    std::fs::create_dir_all(&work).expect("work");
+    let from_work = discovered(&work, &at.home);
+    let from_home = discovered(&at.home, &at.home);
+    for (context, command) in [
+        (&from_work, "grep -r oauth_token ~"),
+        (&from_work, "grep -rn TODO ~/"),
+        (&from_work, "grep -r x $HOME"),
+        (&from_work, "grep -r x .."),
+        (&from_work, "grep -r x /"),
+        (&from_work, "tar czf /tmp/h.tgz ~"),
+        (&from_work, "rg --hidden x ~"),
+        (&from_work, "cp -a ~ /tmp/h"),
+        (&from_work, "find ~ -type f -exec cat {} +"),
+        (&from_home, "grep -rl x ."),
+    ] {
+        let analysis = in_place_at(command, context);
+        assert_eq!(analysis.recommendation, "deny", "{command}: {analysis:?}");
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|s| s.detail.contains(".ssh/id_ed25519")),
+            "{command}: {analysis:?}"
+        );
+    }
+    for command in [
+        "rg x ~",
+        "ls -R ~",
+        "du -sh ~",
+        "find ~ -name '*.py'",
+        "grep -rn TODO ~/work",
+        "cat ~/.ssh/id_ed25519.pub",
+    ] {
+        let analysis = in_place_at(command, &from_work);
+        assert!(!blocks_for_agent(&analysis), "{command}: {analysis:?}");
+    }
+    // A home that keeps no key and no login.
+    let bare = layout();
+    let bare_work = format!("{}/work", bare.home);
+    std::fs::create_dir_all(&bare_work).expect("work");
+    let analysis = in_place_at("grep -rn TODO ~", &discovered(&bare_work, &bare.home));
+    assert!(!blocks_for_agent(&analysis), "{analysis:?}");
+}
+
+/// FAILS ON REVERT (the hunt reads the search text): the projection hides
+/// what `grep` searches for, and the hunt for secrets never saw the word it
+/// hunts, so each of these had no signal at all (measured 2026-11-14). Text
+/// that only prints the same words is still no hunt.
+#[test]
+fn a_search_over_a_broad_root_for_a_secret_is_a_hunt() {
+    let hunts = |command: &str| {
+        analyze_command(command, None)
+            .signals
+            .iter()
+            .any(|s| s.signal == "credential_hunt")
+    };
+    for command in [
+        "grep -r password /",
+        "grep -ri password /home",
+        "grep -r -e id_rsa /etc",
+        "cd /tmp && grep -rl api_key /srv",
+    ] {
+        assert!(hunts(command), "{command}");
+    }
+    // A pattern given by `-e` left the file masked as the pattern, and the
+    // key was printed with no signal.
+    for command in [
+        "grep -e . ~/.ssh/id_rsa",
+        "grep -e x /etc/shadow",
+        "rg -e x ~/.aws/credentials",
+    ] {
+        assert_eq!(
+            analyze_command(command, None).recommendation,
+            "deny",
+            "{command}"
+        );
+    }
+    for command in [
+        "echo \"grep -r password /\"",
+        "grep -r password src/",
+        "grep -r foo /; echo password",
+        "grep -rn TODO /etc",
+        // The broad root is inside the pattern, not the search: what the
+        // scan shows is a search of src/.
+        "grep -r -e \"password /\" src/",
+    ] {
+        assert!(!hunts(command), "{command}");
+    }
+}
+
+/// One read signal, at the always-secret score: a softer read in the same
+/// command is raised to it, and a read already at it keeps its own detail.
+///
+/// FAILS ON REVERT: count the place-level read beside a softer one and the
+/// line carries two read signals and 40 points too many; replace a hard
+/// read's detail and the key it names is lost.
+#[test]
+fn a_stored_login_raises_a_softer_read_and_keeps_a_harder_one() {
+    let at = layout();
+    let work = format!("{}/work", at.home);
+    std::fs::create_dir_all(&work).expect("work");
+    let context = discovered(&work, &at.home);
+    let reads = |analysis: &CommandAnalysis| -> Vec<(u32, String)> {
+        analysis
+            .signals
+            .iter()
+            .filter(|s| s.signal == "sensitive_credential_read")
+            .map(|s| (s.score, s.detail.clone()))
+            .collect()
+    };
+
+    let command = "cd ~/.codex && cat ~/.npmrc auth.json";
+    let alone = analyze_command(command, None);
+    assert_eq!(
+        reads(&alone).iter().map(|r| r.0).collect::<Vec<_>>(),
+        [20],
+        "{alone:?}"
+    );
+    let raised = in_place_at(command, &context);
+    let read = reads(&raised);
+    assert_eq!(read.len(), 1, "{raised:?}");
+    assert_eq!(read[0].0, 60, "{raised:?}");
+    assert!(read[0].1.contains(".codex/auth.json"), "{}", read[0].1);
+    assert_eq!(raised.risk_score, alone.risk_score + 40, "{raised:?}");
+
+    let command = "cat ~/.ssh/id_ed25519 ~/.codex/auth.json";
+    let alone = analyze_command(command, None);
+    let kept = in_place_at(command, &context);
+    let read = reads(&kept);
+    assert_eq!(read.len(), 1, "{kept:?}");
+    assert_eq!(read[0].0, 60, "{kept:?}");
+    assert!(read[0].1.contains(".ssh/"), "{}", read[0].1);
+    assert_eq!(kept.risk_score, alone.risk_score, "{kept:?}");
+}
+
+/// FAILS ON REVERT (a `.git` in the home): the nearest `.git` was the
+/// project whatever it was, so a `.git` entry in the home (a dotfiles
+/// repository, or one an agent made) made every folder below it one
+/// project, and the `.env` of any of them the project's own.
+#[test]
+fn a_git_entry_in_the_home_makes_no_project() {
+    let at = layout();
+    std::fs::create_dir_all(format!("{}/.git", at.home)).expect("home git");
+    std::fs::create_dir_all(format!("{}/work", at.home)).expect("work");
+    std::fs::create_dir_all(format!("{}/app/sub", at.home)).expect("app");
+    let work = format!("{}/work", at.home);
+    let context = discovered(&work, &at.home);
+    assert_eq!(context.project_root, work);
+    for command in ["cat ~/app/.env", "cat ../app/.env", "cat ~/.env"] {
+        let analysis = in_place_at(command, &context);
+        assert!(blocks_for_agent(&analysis), "{command}: {analysis:?}");
+    }
+    // A folder below the home keeps its own `.env` one level up, as with no
+    // `.git` in the home.
+    let sub = format!("{}/app/sub", at.home);
+    let analysis = in_place_at("cat ../.env", &discovered(&sub, &at.home));
+    assert!(!blocks_for_agent(&analysis), "{analysis:?}");
+    // A repository of its own below the home is still its own project.
+    let repo = format!("{}/proj", at.home);
+    std::fs::create_dir_all(format!("{repo}/.git")).expect("proj git");
+    std::fs::create_dir_all(format!("{repo}/pkg")).expect("proj pkg");
+    let context = discovered(&format!("{repo}/pkg"), &at.home);
+    assert_eq!(context.project_root, repo);
+    let analysis = in_place_at("cat ../.env", &context);
+    assert!(!blocks_for_agent(&analysis), "{analysis:?}");
 }
 
 /// FAILS ON REVERT (a project not under git ended at the directory): opened
