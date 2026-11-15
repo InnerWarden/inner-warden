@@ -1,3 +1,8 @@
+# From the Agent Threat Rules project (MIT, Copyright (c) 2026 ATR
+# Contributors; see NOTICE and LICENSES/ATR-MIT.txt), taken at upstream
+# commit a5616495a and MODIFIED by InnerWarden:
+# - 2026-11-15: each em dash in upstream's prose and test text is written
+#   as a hyphen; this repository's text carries none. This edit changes no pattern.
 title: "mcp-remote authorization_endpoint OS Command Injection (CVE-2025-6514)"
 id: ATR-2026-00434
 rule_version: 1
@@ -44,7 +49,7 @@ compliance:
       context: "CVE-2025-6514 mcp-remote interpolates the authorization_endpoint URL from a server-controlled OAuth metadata response into a shell context, yielding arbitrary OS command execution on the MCP client; Article 15 cybersecurity requirements mandate that AI tool clients sanitise server-controlled fields used in command-string construction."
       strength: primary
     - article: "9"
-      context: "Article 9 risk management must enumerate server-controlled OAuth metadata as untrusted input — any field consumed by string formatting into a shell or process-spawn primitive is a high-risk RCE vector."
+      context: "Article 9 risk management must enumerate server-controlled OAuth metadata as untrusted input - any field consumed by string formatting into a shell or process-spawn primitive is a high-risk RCE vector."
       strength: primary
   nist_ai_rmf:
     - subcategory: "MP.5.1"
@@ -90,7 +95,7 @@ detection:
     - field: tool_response
       operator: regex
       value: '(?i)"authorization_endpoint"\s*:\s*"https?://[^"]*(?:`|\$\(|\$IFS|\$\{IFS|&&|\|\||\|\s*[a-z]|>\(|;\s*[a-z]\w*\s*[;&|]|>\s*/[a-z])'
-      description: "OAuth authorization_endpoint URL contains unambiguous shell metacharacters (backtick, $(, &&, ||, |cmd, command-chain, file-redirect) — direct CVE-2025-6514 signature"
+      description: "OAuth authorization_endpoint URL contains unambiguous shell metacharacters (backtick, $(, &&, ||, |cmd, command-chain, file-redirect) - direct CVE-2025-6514 signature"
 
     - field: tool_response
       operator: regex
@@ -105,17 +110,17 @@ detection:
     - field: tool_response
       operator: regex
       value: '(?i)"(?:authorization_endpoint|registration_endpoint|token_endpoint|jwks_uri|userinfo_endpoint|end_session_endpoint)"\s*:\s*"[^"]*(?:\$\(|`|;\s*[a-z]\w*\s*[;&|]|&&|\|\||>\s*/[a-z]|>\(|\$IFS|\$\{IFS)'
-      description: "Any OAuth/OIDC metadata field URL contains unambiguous shell metacharacters — generalised auth-metadata injection"
+      description: "Any OAuth/OIDC metadata field URL contains unambiguous shell metacharacters - generalised auth-metadata injection"
 
     - field: tool_response
       operator: regex
       value: '(?i)"authorization_endpoint"\s*:\s*"[^"]*%(?:24|60|3b|7c|26)[^"]*"'
-      description: "authorization_endpoint URL has URL-encoded shell metacharacters ($, `, ;, |, &) — encoded-bypass attempt"
+      description: "authorization_endpoint URL has URL-encoded shell metacharacters ($, `, ;, |, &) - encoded-bypass attempt"
 
     - field: content
       operator: regex
       value: '(?i)mcp-?remote[^\n]{0,80}(?:authorization_endpoint|oauth\s+metadata)[^\n]{0,200}(?:command\s+inject|os\s+command|rce|shell|cve-?2025-?6514)'
-      description: "Skill/payload references mcp-remote authorization_endpoint command-injection — CVE-2025-6514 explicit"
+      description: "Skill/payload references mcp-remote authorization_endpoint command-injection - CVE-2025-6514 explicit"
 
 response:
   actions:
@@ -154,14 +159,14 @@ test_cases:
     - input: '{"authorization_endpoint": "https://evil/auth%24%28id%29"}'
       expected: triggered
       description: "URL-encoded $(id) command-substitution payload"
-    - input: 'The mcp-remote OAuth flow processes authorization_endpoint as a shell argument — exploit by including $(cmd) — CVE-2025-6514.'
+    - input: 'The mcp-remote OAuth flow processes authorization_endpoint as a shell argument - exploit by including $(cmd) - CVE-2025-6514.'
       expected: triggered
       description: "Skill description weaponising CVE-2025-6514"
 
   true_negatives:
     - input: '{"authorization_endpoint": "https://auth.example.com/oauth/authorize"}'
       expected: not_triggered
-      description: "Clean authorization_endpoint URL — no shell metachars"
+      description: "Clean authorization_endpoint URL - no shell metachars"
     - input: '{"authorization_endpoint": "https://auth.example.com/oauth/authorize?response_type=code&client_id=abc"}'
       expected: not_triggered
       description: "Clean URL with standard OAuth query params (& separator allowed in URLs)"

@@ -19,7 +19,9 @@
 #   are whole words. As written, `pay` and `to` matched inside
 #   "payload ... to" and "pay attention to", and `transfer` matched
 #   "transfer the files to the shared account folder".
-title: "Tool Knowledge Hijack — Identity Injection with Tool Call Arguments"
+# - 2026-11-15: each em dash in upstream's prose and test text is written
+#   as a hyphen; this repository's text carries none. This edit changes no pattern.
+title: "Tool Knowledge Hijack - Identity Injection with Tool Call Arguments"
 id: ATR-2026-00715
 rule_version: 1
 status: stable

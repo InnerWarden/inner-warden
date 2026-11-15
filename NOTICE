@@ -25,7 +25,7 @@ The following rule files were taken from the same project's tree at commit
 a5616495a (2026-11-14), under the same MIT License. A file marked (modified)
 starts with a comment that says what InnerWarden changed and why.
 
-    rules/atr/tool-poisoning/ATR-2026-00434-mcp-remote-authorization-endpoint-command-injection.yaml
+    rules/atr/tool-poisoning/ATR-2026-00434-mcp-remote-authorization-endpoint-command-injection.yaml (modified)
     rules/atr/tool-poisoning/ATR-2026-00714-tool-camouflage-forced-tool-call.yaml (modified)
     rules/atr/tool-poisoning/ATR-2026-00715-tool-knowledge-hijack-identity-injection.yaml (modified)
     rules/atr/tool-poisoning/ATR-2026-01301-tool-description-exclusive-tool-override.yaml (modified)

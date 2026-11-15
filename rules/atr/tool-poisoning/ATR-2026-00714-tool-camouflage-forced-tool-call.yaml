@@ -8,7 +8,9 @@
 #   rules and never runs `llm_io` rules, so as declared this rule would
 #   screen nothing there. On a tool result a match raises an alert and
 #   never refuses anything.
-title: "Tool Camouflage — Forced Specific Tool Invocation via Injected Instruction"
+# - 2026-11-15: each em dash in upstream's prose and test text is written
+#   as a hyphen; this repository's text carries none. This edit changes no pattern.
+title: "Tool Camouflage - Forced Specific Tool Invocation via Injected Instruction"
 id: ATR-2026-00714
 rule_version: 1
 status: stable
