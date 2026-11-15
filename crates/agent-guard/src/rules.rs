@@ -769,7 +769,13 @@ fn parse_field(raw: &str) -> AtrField {
         // any command containing those substrings. See `AtrField::ToolName`.
         "tool_name" | "tool" => AtrField::ToolName,
         "content" => AtrField::Content,
-        // user_input, tool_description, and anything else → UserInput
+        // A tool's own description. `AtrContext::tool_description` is the
+        // only `tool_call` context that carries a user_input value, so a
+        // `tool_call` rule that reads this field runs on the descriptions in a
+        // tools/list answer and never on tools/call arguments. Named here, not
+        // left to the catch-all below, because shipped rules rely on it.
+        "user_input" | "tool_description" => AtrField::UserInput,
+        // Any other field name is read as UserInput as well.
         _ => AtrField::UserInput,
     }
 }
