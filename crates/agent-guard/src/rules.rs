@@ -16,7 +16,7 @@ use tracing::warn;
 ///
 /// The vendored ATR (Agent Threat Rules) corpus, embedded into the binary at
 /// compile time. This is the canonical default ruleset, embedding guarantees
-/// the engine always has the 71 community rules without any deploy/copy step
+/// the engine always has the 79 community rules without any deploy/copy step
 /// (the deploy script only ever shipped `rules/sigma`, so on-disk loading left
 /// the ATR engine empty in prod, see `load_with_overlay`).
 static EMBEDDED_ATR_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../rules/atr");
@@ -588,7 +588,7 @@ impl RuleEngine {
     /// with the same `id` as an embedded rule replace it; new ids are added.
     /// A missing/unreadable dir is fine, the embedded corpus stands alone.
     ///
-    /// This is the production entry point: it guarantees the 62 pattern-tier
+    /// This is the production entry point: it guarantees the 70 pattern-tier
     /// community rules are present even when the deploy step never copied the
     /// ATR tree onto the host, while still honoring operator customization.
     pub fn load_with_overlay(override_dir: &Path) -> Self {
@@ -1455,9 +1455,10 @@ detection:
 
     // ── Embedded ATR corpus (fix: prod-load gap via include_dir) ─────────────
 
-    /// 71 vendored rules; 9 are `detection_tier: semantic` (no executor) and
-    /// are skipped, leaving 62 compilable pattern-tier rules.
-    const EMBEDDED_PATTERN_RULE_COUNT: usize = 62;
+    /// 79 vendored rules (71 from ATR v0.4.0, 8 from upstream a5616495a);
+    /// 9 are `detection_tier: semantic` (no executor) and are skipped,
+    /// leaving 70 compilable pattern-tier rules.
+    const EMBEDDED_PATTERN_RULE_COUNT: usize = 70;
 
     #[test]
     fn embedded_corpus_loads_all_pattern_tier_rules() {

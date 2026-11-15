@@ -24,3 +24,18 @@ LICENSES/ATR-MIT.txt (LICENSE-MIT until 1.6.2) carries the MIT copyright and per
 for that material. It applies to the rule files under `rules/atr/`. Everything
 else in this repository, including the engine that loads them, is Apache-2.0
 under LICENSE.
+
+The ATR rule files listed below were not taken at efad113: they were taken
+from the same project's tree at commit a5616495a (2026-11-14), under the
+same MIT License, and each was modified here. Each starts with a comment
+that says what InnerWarden changed and why, and keeps its upstream `id:`
+and `author:` lines.
+
+    rules/atr/context-exfiltration/ATR-2026-00851-indirect-pi-financial-payment-exfil.yaml (modified)
+    rules/atr/context-exfiltration/ATR-2026-00853-indirect-pi-genetic-data-exfil.yaml (modified)
+    rules/atr/context-exfiltration/ATR-2026-00855-indirect-pi-browsing-history-exfil.yaml (modified)
+    rules/atr/context-exfiltration/ATR-2026-01459-variable-clone-sysprompt-technique.yaml (modified)
+    rules/atr/prompt-injection/ATR-2026-01020-spikee-doc-embedded-base64-payload.yaml (modified)
+    rules/atr/prompt-injection/ATR-2026-01021-spikee-doc-embedded-translation-injection.yaml (modified)
+    rules/atr/prompt-injection/ATR-2026-01026-evasion-unicode-glitch-token-anomaly.yaml (modified)
+    rules/atr/prompt-injection/ATR-2026-01304-indirect-injection-carrier-important-override.yaml (modified)
