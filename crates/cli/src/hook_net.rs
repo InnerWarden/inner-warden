@@ -219,6 +219,22 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
 
+    /// What `agents connect` tells the person about the guard's own deadline
+    /// is this deadline, and both stay well inside the wait it writes for
+    /// Codex and Gemini, so the guard answers (or refuses) before the agent
+    /// gives up on it and runs the tool.
+    ///
+    /// FAILS ON REVERT: change either number alone.
+    #[test]
+    fn the_deadline_connect_states_is_this_one_and_inside_the_agents_wait() {
+        use innerwarden_agent_guard::agent_hooks::{CODEX, GEMINI, GUARD_DEADLINE_SECS};
+        assert_eq!(DEADLINE, Duration::from_secs(GUARD_DEADLINE_SECS));
+        let second_opinion = crate::second_opinion_io::LLM_ANSWER_BOUND;
+        for spec in [&CODEX, &GEMINI] {
+            assert!(DEADLINE + second_opinion < spec.wait(), "{}", spec.agent);
+        }
+    }
+
     /// The default holds unless the environment names a LOWER bound.
     ///
     /// FAILS ON REVERT: take the named value as it comes and a large one
@@ -395,5 +411,28 @@ mod tests {
         // This process never arms (only the children do): nothing to move.
         allow_wait(Duration::from_secs(3));
         assert_eq!(DEADLINE_MS.load(Ordering::SeqCst), 0);
+    }
+
+    /// Codex and Gemini run the tool when their hook does not answer in the
+    /// time they were told to wait. The longest this hook takes to answer is
+    /// its deadline plus the one wait it is allowed on top, the model's
+    /// answer, so the time written into each agent's file is longer than
+    /// that, in the agent's own unit.
+    ///
+    /// FAILS ON REVERT: write 10 for Codex (seconds) or 10000 for Gemini
+    /// (milliseconds) and the agent gives up at the same moment as the
+    /// deadline, before the refusal is out. Write Gemini's 60 in seconds'
+    /// worth of digits and it waits 60 ms.
+    #[test]
+    fn each_agent_waits_longer_for_the_hook_than_the_hook_takes_to_refuse() {
+        use innerwarden_agent_guard::agent_hooks::{CODEX, GEMINI};
+
+        let longest = DEADLINE + crate::second_opinion_io::LLM_ANSWER_BOUND;
+        assert_eq!(longest, Duration::from_secs(30));
+        assert_eq!(CODEX.wait(), Duration::from_secs(60));
+        assert_eq!(GEMINI.wait(), Duration::from_secs(60));
+        for agent in [&CODEX, &GEMINI] {
+            assert!(agent.wait() > longest, "{}", agent.agent);
+        }
     }
 }

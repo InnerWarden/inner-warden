@@ -44,11 +44,13 @@ pub mod signatures;
 // Used by the `innerwarden` binary in this workspace, or by the integration
 // tests, which are external consumers in Rust's eyes. Public because they must
 // be, not because they are a contract.
+pub mod agent_hooks;
 pub mod agents;
 pub mod agents_ops;
 pub mod asi;
 pub mod benchmark;
 pub mod breaker;
+pub mod codex_trust;
 // Widened from the internal group for the conversation surface (`innerwarden
 // observe`), which reads a person's message for a plain-language request the
 // same way the injection scan reads text: invisible characters out, NFKC
@@ -56,10 +58,12 @@ pub mod breaker;
 pub mod deobfuscate;
 pub mod file_tools;
 pub mod file_update;
+pub mod hermes_hook;
 pub mod hook;
 pub mod hook_targets;
 // Contract types and pure decisions for agent identity.
 pub mod identity;
+pub mod interactive;
 pub mod mcp_wire;
 pub mod mcp_wire_toml;
 // Profiles per type of agent: the layer between the general policy and an
@@ -72,6 +76,9 @@ pub mod render;
 // architecture, so they are built and checked the same on every host.
 pub mod seccomp;
 pub mod session;
+// The files a patch names when it is handed to the patch program on a shell
+// line, so the hook judges them as it judges the patch tool's.
+pub mod shell_patch;
 pub mod threats;
 
 // ── 3. INTERNAL ──────────────────────────────────────────────────────────────

@@ -17,6 +17,16 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
 }
 
+/// The suite's PATH less every folder that holds a `codex`. `agents connect`
+/// and a mode switch ask the Codex they find there to trust the hook they
+/// wrote, and a test never starts the real one.
+fn path_without_codex() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept = std::env::split_paths(&path)
+        .filter(|dir| !dir.join("codex").exists() && !dir.join("codex.exe").exists());
+    std::env::join_paths(kept).expect("folders split from PATH join back")
+}
+
 const AGENT_SHELL_MARKERS: [&str; 6] = [
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
@@ -61,6 +71,9 @@ impl Host {
             .env("IW_GRAPH_FILE", self.graph())
             .env("INNERWARDEN_AGENT_URL", "off")
             .env("IW_AD_CLI_DIRS", "")
+            // No real Codex: none on PATH to ask, no other folder to read.
+            .env("PATH", path_without_codex())
+            .env_remove("CODEX_HOME")
             .env_remove("IW_GUARD_SESSION")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -257,6 +270,32 @@ fn an_unreadable_call_is_refused_in_enforce_only() {
     assert_eq!(answer["decision"], "deny");
 }
 
+/// A file tool's path too long to read is answered as a call that cannot be
+/// read: `./` repeated in it puts the guard's own settings past the length
+/// that is read. Refused in enforce, let through in monitor, and said to be
+/// unreadable in both.
+///
+/// FAILS ON REVERT: answer `FileScreen::Unreadable` in the `Screen::Files`
+/// arm of `openclaw_guard_io` as a pass is answered and enforce allows the
+/// write; answer it with a deny whatever the mode and monitor refuses it.
+#[test]
+fn a_file_path_too_long_to_read_is_refused_in_enforce_only() {
+    let host = Host::new();
+    let home = host.home().display().to_string();
+    let padded = format!("{home}/{}.gemini/settings.json", "./".repeat(2100));
+    let write = json!({
+        "tool": "write",
+        "params": {"path": padded, "content": "{}"},
+        "session": SESSION,
+    });
+    let enforce = host.screen("enforce", write.clone());
+    assert_eq!(enforce["decision"], "deny", "{enforce}");
+    assert_eq!(enforce["unreadable"], true, "{enforce}");
+    let monitor = host.screen("monitor", write);
+    assert_eq!(monitor["decision"], "allow", "{monitor}");
+    assert_eq!(monitor["unreadable"], true, "{monitor}");
+}
+
 /// `agents connect openclaw` lays the plugin next to the MCP proxy, in
 /// monitor, and never touches the person's plugin policy; `enforce` turns
 /// it on; `dry-run` back; `disconnect` takes it out.
@@ -315,6 +354,19 @@ fn connect_lays_the_guard_in_monitor_and_enforce_turns_it_on() {
         "{listed}"
     );
 
+    // `status` says the same as `agents list` (NEW-20261024).
+    let status = host.run(&["status"], "");
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.contains("through the innerwarden-guard plugin (monitor)"),
+        "{status}"
+    );
+    assert!(
+        !status.contains("Its built-in tools are not screened"),
+        "{status}"
+    );
+    assert!(!status.contains("No agent is wired"), "{status}");
+
     host.run(&["agents", "disconnect", "openclaw"], "");
     assert!(host.config()["plugins"]["entries"]
         .get("innerwarden-guard")
@@ -335,6 +387,8 @@ fn openclaws_exec_shell_cannot_lower_the_guard() {
         .env("IW_GRAPH_FILE", host.graph())
         .env("INNERWARDEN_AGENT_URL", "off")
         .env("IW_AD_CLI_DIRS", "")
+        .env("PATH", path_without_codex())
+        .env_remove("CODEX_HOME")
         .env("OPENCLAW_SHELL", "exec")
         .stdin(Stdio::null());
     for name in AGENT_SHELL_MARKERS

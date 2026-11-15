@@ -175,6 +175,12 @@ fn cmd_screen(rest: &[String]) -> std::process::ExitCode {
                 crate::FileScreen::Refused { .. } => {
                     answer_line(&guard::answer(Decision::Deny, None, None))
                 }
+                // A path too long to read: answered as any call that cannot
+                // be read is.
+                crate::FileScreen::Unreadable(_) => answer_line(&json!({
+                    "decision": (if monitor { "allow" } else { "deny" }),
+                    "unreadable": true,
+                })),
             }
         }
         Screen::Shell { .. } => screen_command(&call, &screen, &buf, &rest, mode),

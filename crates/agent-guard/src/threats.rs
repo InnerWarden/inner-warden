@@ -703,7 +703,10 @@ pub const CHILD_AGENT_OTHER_FOLDER: &str = "starts Claude Code with CLAUDE_CONFI
 
 /// The variables that move the folder an agent CLI reads its hook from, or
 /// switch its hooks or its user settings off: `HOME`, which holds every
-/// agent's own folder, and Claude Code's `CLAUDE_CONFIG_DIR`,
+/// agent's own folder, Codex's `CODEX_HOME`, Hermes's `HERMES_HOME`,
+/// `HERMES_SAFE_MODE` and `HERMES_IGNORE_USER_CONFIG`, Gemini's
+/// `GEMINI_CLI_HOME`, `GEMINI_CLI_SYSTEM_SETTINGS_PATH` and
+/// `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, and Claude Code's `CLAUDE_CONFIG_DIR`,
 /// `CLAUDE_CODE_SIMPLE`, `CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_RESTRICTED`,
 /// `CLAUDE_CODE_MANAGED_SETTINGS_PATH`, `CLAUDE_CODE_PERSONAL_HOOKS_OFF`,
 /// `CLAUDE_CODE_RESTRICT_PERSONAL_CONFIG` and
@@ -712,6 +715,13 @@ pub const CHILD_AGENT_OTHER_FOLDER: &str = "starts Claude Code with CLAUDE_CONFI
 /// beside it). Lowercase.
 const AGENT_HOOK_VARIABLES: &[&str] = &[
     "home",
+    "codex_home",
+    "hermes_home",
+    "hermes_safe_mode",
+    "hermes_ignore_user_config",
+    "gemini_cli_home",
+    "gemini_cli_system_settings_path",
+    "gemini_cli_trusted_folders_path",
     "claude_config_dir",
     "claude_code_simple",
     "claude_code_safe_mode",
@@ -723,12 +733,16 @@ const AGENT_HOOK_VARIABLES: &[&str] = &[
 ];
 
 /// The agent CLIs whose hook the guard writes, by program name.
-const HOOKED_AGENT_PROGRAMS: &[&str] = &["claude"];
+const HOOKED_AGENT_PROGRAMS: &[&str] = &["codex", "gemini", "hermes", "claude"];
 
 /// The npm packages of [`HOOKED_AGENT_PROGRAMS`], with the program each one
 /// is: what `npx`, `bunx`, `pnpm dlx` or `npm exec` are told to run, and
 /// the folder whose entry file `node` is handed.
-const HOOKED_AGENT_PACKAGES: &[(&str, &str)] = &[("@anthropic-ai/claude-code", "claude")];
+const HOOKED_AGENT_PACKAGES: &[(&str, &str)] = &[
+    ("@openai/codex", "codex"),
+    ("@google/gemini-cli", "gemini"),
+    ("@anthropic-ai/claude-code", "claude"),
+];
 
 /// The events of the user's Claude Code hooks the guard's own hook sits
 /// under: the screening before a tool runs, and the record after it.
@@ -1657,7 +1671,7 @@ fn command_starts_unhooked_agent(command: &Spoken, set: &mut SetBefore, depth: u
     let Some((agent, from)) = hooked_agent_at(words, at) else {
         return 0;
     };
-    // Claude Code reads its flags up to a `--`; the words after it are its
+    // An agent reads its flags up to a `--`; the words after it are its
     // prompt.
     let end = words[from..]
         .iter()
@@ -2339,9 +2353,11 @@ fn flag_value<'a>(
 }
 
 /// Whether `arguments` start agent `program` with no hooks, or without the
-/// user's own settings: Claude Code's `--bare`, `--safe-mode` and
-/// `--restricted`, a `--setting-sources` that leaves out `user`, and
-/// settings (`--settings`, `--managed-settings`) that drop the user's hooks
+/// user's own settings: Codex with `--disable hooks`, or a `-c` / `--config`
+/// override of `hooks` or `features.hooks`; Hermes with `--safe-mode` or
+/// `--ignore-user-config`; Claude Code with `--bare`, `--safe-mode` or
+/// `--restricted`, a `--setting-sources` that leaves out `user`, or settings
+/// (`--settings`, `--managed-settings`) that drop the user's hooks
 /// ([`settings_value_drops_hooks`]). `expansions` holds what the shell still
 /// replaces in each argument, `unshown` the names the line gives a value it
 /// does not show.
@@ -2365,6 +2381,20 @@ fn agent_flags_drop_its_hook(
                 .is_some_and(|rest| rest.starts_with('='))
     };
     (0..arguments.len()).any(|index| match program {
+        "codex" => {
+            value_of(index, "--disable")
+                .is_some_and(|(feature, _)| feature.eq_ignore_ascii_case("hooks"))
+                || ["-c", "--config"].iter().any(|flag| {
+                    value_of(index, flag).is_some_and(|(setting, _)| {
+                        let key = setting.split('=').next().unwrap_or("").trim();
+                        key == "hooks"
+                            || key.starts_with("hooks.")
+                            || key == "features.hooks"
+                            || key.starts_with("features.hooks.")
+                    })
+                })
+        }
+        "hermes" => switch(index, "--safe-mode") || switch(index, "--ignore-user-config"),
         "claude" => {
             switch(index, "--bare")
                 || switch(index, "--safe-mode")
@@ -2585,7 +2615,7 @@ const ASSIGNMENT_ROUNDS: usize = 4;
 /// its own name (`a='$a'; $a`) expands to the same text for ever, and that
 /// recursion ended the hook on a stack overflow, which the agent reads as
 /// "carry on" (found 2026-11-10: twelve bytes in front of any command).
-fn assignment_readings(content: &str) -> (Vec<String>, bool) {
+pub(crate) fn assignment_readings(content: &str) -> (Vec<String>, bool) {
     // Eight times the line and a floor: a path set once and used on every
     // word (`P=/long/path; wc -l $P/a $P/b ...`) stays well inside it.
     let limit = content.len().saturating_mul(8).saturating_add(4096);
@@ -2801,7 +2831,10 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
         ".cursor",
         ".codex",
         ".gemini",
+        ".hermes",
         "claude_desktop_config",
+        // zsh runs it before the hook line Codex starts.
+        ".zshenv",
     ];
     if !mentions_any(content, NEEDLES) && !names_guard_alias(content) {
         // A name assembled by the shell (`${x:-innerwarden}`, `$(echo
@@ -2912,7 +2945,7 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         // Removing or rewriting the hook that carries the screening. Covers the
         // file being deleted, moved aside, or edited to drop the hook array.
         add(
-            r#"(?i)(?:\brm\b|\bmv\b|\bunlink\b|\btruncate\b)[^|;&]*(?:\.claude/settings(?:\.local)?\.json|\.claude\.json|\.codex/config|\.cursor/mcp\.json|\.gemini/settings\.json)"#,
+            r#"(?i)(?:\brm\b|\bmv\b|\bunlink\b|\btruncate\b)[^|;&]*(?:\.claude/settings(?:\.local)?\.json|\.claude\.json|\.codex/(?:config|hooks\.json)|\.cursor/mcp\.json|\.gemini/settings\.json)"#,
             "removes or moves aside the configuration that carries the guard's hook",
             60,
         );
@@ -2949,13 +2982,17 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         // is full of `;`, so a segment-bounded pattern stops before reaching
         // the filename. A WRITE indicator is required so that reading the
         // config, which an agent does for honest reasons, is not a finding.
+        // Codex's hooks file is named with its folder: a bare `hooks.json`
+        // is any project's (webhook settings). This is a text match inside
+        // interpreter code; the firm guard of these files is Pro's file
+        // guard, not a pattern.
         add(
-            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json).{0,400}?(?:["']w["']|\bdump\b|\bwrite\b|\bdel\b|writeFileSync|\bunlink\b)"#,
+            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|\.codex/hooks\.json|\.codex/config\.toml).{0,400}?(?:["']w["']|\bdump\b|\bwrite\b|\bdel\b|writeFileSync|\bunlink\b)"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
         add(
-            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:["']w["']|\bdump\b|writeFileSync).{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:["']w["']|\bdump\b|writeFileSync).{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|\.codex/hooks\.json|\.codex/config\.toml)"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
@@ -6449,7 +6486,10 @@ fn may_name_guard_carrier(content: &str) -> bool {
         || names_guard_alias(content)
         || AGENT_HOMES.iter().any(|home| lower.contains(home))
         || guard_carrier_places().any(|place| {
-            let (Place::File(row) | Place::Tree(row) | Place::Components(row)) = place;
+            let (Place::File(row)
+            | Place::Tree(row)
+            | Place::Components(row)
+            | Place::HomeFile(row)) = place;
             row.split('/')
                 .filter(|part| !part.is_empty())
                 .all(|part| lower.contains(part))
@@ -7002,7 +7042,14 @@ fn names_guard_carrier(target: &str) -> bool {
 
 /// The folders the agents keep their settings in, each of which holds a
 /// place of [`GUARD_SETTINGS`].
-const AGENT_HOMES: &[&str] = &[".claude", ".cursor", ".codex", ".gemini", ".openclaw"];
+const AGENT_HOMES: &[&str] = &[
+    ".claude",
+    ".cursor",
+    ".codex",
+    ".gemini",
+    ".openclaw",
+    ".hermes",
+];
 
 /// Whether a path names an agent's own folder ([`AGENT_HOMES`]), in a home
 /// or in a project. Removing it, moving it aside or locking it takes the
@@ -10489,7 +10536,7 @@ fn variables_of_one_word(token: &str) -> Option<Vec<&str>> {
 /// expands them. The `{` that opens a group, ahead of every word, is no
 /// word. A `{` that stands alone anywhere else is one, as it is to the
 /// program that gets it: `scp { -i key host:/loot` copies the key.
-fn shell_tokens_with_braces(segment: &str) -> Vec<String> {
+pub(crate) fn shell_tokens_with_braces(segment: &str) -> Vec<String> {
     // Two characters no shell text holds stand for the braces while the
     // words are made. Text that does hold them reads as braces: refused.
     const OPEN: char = '\u{e000}';
@@ -14157,9 +14204,13 @@ enum Place {
     Tree(&'static str),
     /// Any path holding these components in a row, wherever it is: a `.ssh`
     /// directory, or `.claude/settings.json`, is the same thing in every home
-    /// and every project. The only kind of place a relative path or a `~/`
-    /// path is held to, since where those start is not known here.
+    /// and every project. The only kind of place a relative path is held to,
+    /// since where it starts is not known here.
     Components(&'static str),
+    /// This file directly in a home: `~/<file>`, `$HOME/<file>`, or under
+    /// `/home/<user>`, `/Users/<user>`, `/root` or `/var/root`. A file of the
+    /// same name anywhere else (a dotfiles repository) is not it.
+    HomeFile(&'static str),
 }
 
 impl Place {
@@ -14178,6 +14229,21 @@ impl Place {
                 (at == 0 || named.path[..at].ends_with('/'))
                     && (rest.is_empty() || rest.starts_with('/'))
             }),
+            Place::HomeFile(file) => {
+                let Some(home) = named.path.strip_suffix(file) else {
+                    return false;
+                };
+                if named.rooted {
+                    let user = |prefix: &str| {
+                        home.strip_prefix(prefix)
+                            .and_then(|rest| rest.strip_suffix('/'))
+                            .is_some_and(|user| !user.is_empty() && !user.contains('/'))
+                    };
+                    user("/home/") || user("/users/") || matches!(home, "/root/" | "/var/root/")
+                } else {
+                    matches!(home, "~/" | "$home/" | "${home}/")
+                }
+            }
         }
     }
 }
@@ -14299,7 +14365,21 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
             Place::Components("claude_desktop_config.json"),
             Place::Components(".cursor/mcp.json"),
             Place::Components(".codex/config.toml"),
+            // Where Codex reads the guard's hook from.
+            Place::Components(".codex/hooks.json"),
             Place::Components(".gemini/settings.json"),
+            // A folder Gemini is told not to trust loads no hook from
+            // settings, the guard's included.
+            Place::Components(".gemini/trustedfolders.json"),
+            // Where Hermes Agent reads the guard's hook from, and the
+            // approval without which Hermes skips it.
+            Place::Components(".hermes/config.yaml"),
+            Place::Components(".hermes/shell-hooks-allowlist.json"),
+            // Codex starts the hook line with the person's login shell
+            // (`$SHELL -lc`), and zsh runs this file first in every shell:
+            // one line in it can end every hook run. Only the one in the
+            // home: a `.zshenv` in a dotfiles repository is not read.
+            Place::HomeFile(".zshenv"),
             Place::Components("openclaw.json"),
             // The OpenClaw message hook and reply plugin `innerwarden observe
             // install` lays down (`HOOK_NAME` and `PLUGIN_ID` in the CLI's
@@ -22440,6 +22520,62 @@ mod round_three_rule_tests {
             );
         }
     }
+
+    /// Codex's hooks file and its config are rewritten through an
+    /// interpreter the way Claude Code's settings are, and refused for it; a
+    /// read of the same files is not.
+    ///
+    /// FAILS ON REVERT: take `hooks\.json|\.codex/config\.toml` out of the
+    /// interpreter pattern that names the file before the write and the two
+    /// `python3` lines lose this reason; out of the one that names the write
+    /// first and the two `node` lines do.
+    #[test]
+    fn codexs_files_rewritten_through_an_interpreter_are_refused() {
+        for cmd in [
+            "python3 -c \"import json;p='/home/u/.codex/hooks.json';d=json.load(open(p));d['hooks']={};json.dump(d,open(p,'w'))\"",
+            "python3 -c \"open('/home/u/.codex/config.toml','w').write('')\"",
+            "node -e \"require('fs').writeFileSync(require('os').homedir()+'/.codex/config.toml','')\"",
+            "node -e \"const fs=require('fs');fs.writeFileSync(process.env.HOME+'/.codex/hooks.json','{}')\"",
+        ] {
+            assert_eq!(
+                guard_self_disable_in(cmd).map(|(what, _)| what),
+                Some("rewrites an agent's configuration through an interpreter"),
+                "{cmd}"
+            );
+            assert!(check_guard_self_disable(cmd).is_some(), "{cmd}");
+        }
+        for cmd in [
+            "python3 -c \"import json;print(json.load(open('/home/u/.codex/hooks.json')))\"",
+            "node -e \"console.log(require('fs').readFileSync(require('os').homedir()+'/.codex/config.toml','utf8'))\"",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "reading Codex's files is not disabling the guard: {cmd}"
+            );
+        }
+    }
+
+    /// The pattern for removing or moving aside the settings that carry the
+    /// hook names Codex's hooks file, and answers before the walk over write
+    /// targets does.
+    ///
+    /// FAILS ON REVERT: take `hooks\.json` out of the `.codex/` part of that
+    /// pattern and these lines are refused by the walk instead, in its
+    /// words, or not at all.
+    #[test]
+    fn removing_codexs_hooks_file_is_refused_by_its_pattern() {
+        for cmd in [
+            "rm -f ~/.codex/hooks.json",
+            "mv ~/.codex/hooks.json /tmp/h.json",
+            "xargs rm <<< ~/.codex/hooks.json",
+        ] {
+            assert_eq!(
+                guard_self_disable_in(cmd).map(|(what, _)| what),
+                Some("removes or moves aside the configuration that carries the guard's hook"),
+                "{cmd}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -24156,11 +24292,28 @@ mod redirect_fallback_tests {
     ///
     /// FAILS ON REVERT: without the call in `guard_self_disable_in` these
     /// pass the engine, and without the agents' folders in `NEEDLES` the
-    /// lines that name only `~/.codex` never reach it.
+    /// lines that name only `~/.codex` never reach it. Take
+    /// `.codex/hooks.json` out of `GUARD_SETTINGS` and the four lines on
+    /// Codex's hooks file pass the walk. Take `.zshenv` out of
+    /// `GUARD_SETTINGS` and the two lines on it pass the walk, or out of
+    /// `NEEDLES` and they never reach the engine; take
+    /// `.gemini/trustedfolders.json` out and the two lines on Gemini's folder
+    /// trust pass the walk.
     #[test]
     fn a_shell_write_to_what_carries_the_guard_is_refused() {
         for line in [
             "rm ~/.codex/config.toml",
+            // Codex reads the guard's hook from this file.
+            "rm ~/.codex/hooks.json",
+            "echo '{}' > ~/.codex/hooks.json",
+            "sed -i 's/a/b/' ~/.codex/hooks.json",
+            "cd ~/.codex && rm hooks.json",
+            // zsh runs this file before the hook line Codex starts.
+            "echo 'exit 0' >> ~/.zshenv",
+            "cd ~ && printf 'exit 0\\n' > .zshenv",
+            // A folder Gemini does not trust loads no hook.
+            "echo '{}' > ~/.gemini/trustedFolders.json",
+            "cp /tmp/t.json ~/.gemini/trustedFolders.json",
             "cp target/release/innerwarden ~/.local/bin/",
             "cd ~/.local/bin && cp /bin/true innerwarden",
             "mv /tmp/x ~/.local/bin/innerwarden",
@@ -24243,6 +24396,26 @@ mod redirect_fallback_tests {
             );
         }
         for line in [
+            "codex --disable hooks exec 'fix it'",
+            "codex --disable=hooks exec 'fix it'",
+            "codex -c features.hooks=false exec 'fix it'",
+            "codex --config 'features.hooks=false' exec 'fix it'",
+            "codex -c hooks.PreToolUse=[] exec 'x'",
+            "CODEX_HOME=/tmp/h codex exec --dangerously-bypass-approvals-and-sandbox 'x'",
+            "export CODEX_HOME=/tmp/h; codex exec 'x'",
+            "env CODEX_HOME=/tmp/h codex exec 'x'",
+            "HOME=/tmp/h codex exec 'x'",
+            "timeout 600 codex --disable hooks exec 'x'",
+            "HERMES_SAFE_MODE=1 hermes chat",
+            "HERMES_HOME=/tmp/h hermes --accept-hooks chat",
+            "HERMES_IGNORE_USER_CONFIG=1 hermes chat",
+            "hermes --safe-mode chat",
+            "hermes --ignore-user-config chat",
+            "GEMINI_CLI_HOME=/tmp/g gemini -p 'x'",
+            "GEMINI_CLI_SYSTEM_SETTINGS_PATH=/tmp/s.json gemini -p 'x'",
+            "CODEX_HOME=/a HERMES_HOME=/b codex exec x",
+            "/usr/local/bin/codex --disable hooks exec x",
+            "C=/tmp/h; CODEX_HOME=$C codex exec x",
             "HOME=/tmp/h claude -p 'x'",
             "/usr/local/bin/claude --bare -p x",
             "'cl'aude --bare -p x",
@@ -24271,6 +24444,17 @@ mod redirect_fallback_tests {
             );
         }
         for line in [
+            "codex exec 'fix the failing test'",
+            "codex -c model=o3 exec 'x'",
+            "codex --enable web_search exec 'x'",
+            "gemini -p 'summarise this'",
+            "hermes chat",
+            "hermes --accept-hooks chat",
+            "echo CODEX_HOME=/tmp/h",
+            "grep -r CODEX_HOME docs/",
+            "npm install -g @openai/codex",
+            // Not an assignment: the shell runs `a-b=1` as the program.
+            "a-b=1 codex --disable hooks exec x",
             "claude -p 'x'",
             "claude",
             "claude --version",
@@ -24296,6 +24480,72 @@ mod redirect_fallback_tests {
             "npm install -g @anthropic-ai/claude-code",
         ] {
             assert_eq!(check_guard_self_disable(line), None, "{line}");
+        }
+        for (name, valid) in [
+            ("CODEX_HOME", true),
+            ("_x", true),
+            ("x1", true),
+            ("a_b", true),
+            ("1x", false),
+            ("a-b", false),
+            ("", false),
+            ("-x", false),
+        ] {
+            assert_eq!(is_shell_name(name), valid, "{name}");
+        }
+    }
+
+    /// Inline interpreter code that writes Codex's hooks file is refused,
+    /// and code that writes any project's `hooks.json` is not: the name is
+    /// matched with its folder.
+    ///
+    /// FAILS ON REVERT of `\.codex/hooks\.json` in the two interpreter
+    /// rewrite patterns (back to a bare `hooks\.json`): the project lines
+    /// are refused as a rewrite of an agent's configuration.
+    #[test]
+    fn interpreter_code_that_writes_a_projects_hooks_json_is_not_a_guard_rewrite() {
+        for line in [
+            "python3 -c \"import os; open(os.path.expanduser('~/.codex/hooks.json'),'w').write('{}')\"",
+            "node -e \"require('fs').writeFileSync(process.env.HOME + '/.codex/hooks.json', '{}')\"",
+        ] {
+            assert!(check_guard_self_disable(line).is_some(), "{line}");
+        }
+        for line in [
+            "python3 -c \"open('hooks.json','w').write('{}')\"",
+            "python3 -c \"import json; json.dump({}, open('.github/hooks.json','w'))\"",
+            "node -e \"require('fs').writeFileSync('config/hooks.json', '{}')\"",
+        ] {
+            assert_eq!(check_guard_self_disable(line), None, "{line}");
+        }
+    }
+
+    /// Only the `.zshenv` zsh reads, the one in the home, carries the guard:
+    /// a dotfiles repository's copy is ordinary work.
+    ///
+    /// FAILS ON REVERT of `Place::HomeFile(".zshenv")` (back to any depth):
+    /// every line of the second list is refused as the guard's own
+    /// configuration.
+    #[test]
+    fn only_the_zshenv_in_the_home_carries_the_guard() {
+        for line in [
+            "echo 'exit 0' >> ~/.zshenv",
+            "echo 'exit 0' >> $HOME/.zshenv",
+            "echo 'exit 0' >> /home/dev/.zshenv",
+            "echo 'exit 0' >> /Users/dev/.zshenv",
+            "echo 'exit 0' >> /root/.zshenv",
+            "cd ~ && printf 'exit 0\\n' > .zshenv",
+        ] {
+            assert!(writes_guard_carrier(line), "walk: {line}");
+        }
+        for line in [
+            "echo 'export X=1' >> dotfiles/.zshenv",
+            "echo 'export X=1' >> ~/dotfiles/zsh/.zshenv",
+            "cp ~/dotfiles/.zshenv ./roles/zsh/files/.zshenv",
+            "echo 'export X=1' >> /home/dev/dotfiles/.zshenv",
+            "echo x >> /home/.zshenv",
+        ] {
+            assert!(!writes_guard_carrier(line), "walk: {line}");
+            assert_eq!(check_guard_self_disable(line), None, "engine: {line}");
         }
     }
 
@@ -25008,6 +25258,35 @@ mod redirect_fallback_tests {
         }
     }
 
+    /// Codex and Gemini CLI are the program also when `npx` and its kin run
+    /// their package, or `node` its entry file, as Claude Code is.
+    ///
+    /// FAILS ON REVERT of the Codex and Gemini rows of
+    /// `HOOKED_AGENT_PACKAGES` (the first lines pass).
+    #[test]
+    fn codex_and_gemini_are_known_by_their_package() {
+        for line in [
+            "npx @openai/codex --disable hooks exec 'x'",
+            "npx -y @openai/codex@latest -c features.hooks=false exec 'x'",
+            "node ./node_modules/@openai/codex/bin/codex.js --disable hooks exec 'x'",
+            "GEMINI_CLI_HOME=/tmp/g npx @google/gemini-cli -p 'x'",
+            "CODEX_HOME=/tmp/h pnpm dlx @openai/codex exec 'x'",
+        ] {
+            assert_eq!(
+                check_guard_self_disable(line),
+                Some((CHILD_AGENT_UNHOOKED, 60)),
+                "{line}"
+            );
+        }
+        for line in [
+            "npx @openai/codex exec 'fix the failing test'",
+            "npx -y @google/gemini-cli -p 'summarise this'",
+            "npm install -g @openai/codex @google/gemini-cli",
+        ] {
+            assert_eq!(check_guard_self_disable(line), None, "{line}");
+        }
+    }
+
     /// Settings handed to Claude Code through a descriptor, standard input
     /// or text the line computes are not read here, so they are refused:
     /// what they hold could switch the hooks off.
@@ -25262,6 +25541,8 @@ mod redirect_fallback_tests {
             "mkdir -p ~/.claude/commands",
             "touch ~/.claude/settings.json",
             "cat ~/.codex/config.toml",
+            "cat ~/.zshenv",
+            "cat ~/.gemini/trustedFolders.json",
             "ls ~/.claude ~/.cursor ~/.codex",
             "grep -rn hooks ~/.claude/settings.json",
             "git config core.hooksPath .githooks",
@@ -25341,7 +25622,7 @@ mod redirect_fallback_tests {
         for place in &places {
             let path = match place {
                 Place::File(row) | Place::Tree(row) => row.to_string(),
-                Place::Components(row) => format!("~/{row}"),
+                Place::Components(row) | Place::HomeFile(row) => format!("~/{row}"),
             };
             let line = format!("rm -rf {path}");
             assert!(writes_guard_carrier(&line), "walk: {line}");

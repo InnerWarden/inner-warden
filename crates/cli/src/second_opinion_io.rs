@@ -69,7 +69,9 @@ pub fn has_key() -> bool {
 }
 
 /// How long the user's endpoint has to answer one classification request.
-const LLM_ANSWER_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+/// The hook's deadline moves by this much for that one wait, so the timeout an
+/// agent is given for the hook has to be longer than the two together.
+pub(crate) const LLM_ANSWER_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// POST the classification request to the user's endpoint. Best-effort: any error
 /// (no key, network, bad status) returns `None` so the caller keeps the `review`.

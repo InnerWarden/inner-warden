@@ -86,13 +86,17 @@ following, and says they are the person's to run, from their own terminal.
 - Starting another agent with the hook that screens it switched off or moved
   away, so the child would run every tool call unscreened: Claude Code
   started with `--bare`, `--safe-mode` or `--restricted`, with setting
-  sources that leave out the user's, with settings that switch hooks off or
-  empty the events the guard's hook sits under, or with a variable it reads
-  that moves the folder its hook is in or switches its hooks off (`HOME`,
-  `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_SIMPLE` and the others it reads). `HOME`
+  sources that leave out the user's, or with settings that switch hooks off
+  or empty the events the guard's hook sits under; Codex CLI with `--disable
+  hooks` or a `-c` override of its hooks; Hermes Agent with `--safe-mode` or
+  `--ignore-user-config`; or any of them, Gemini CLI included, with a
+  variable it reads that moves the folder its hook is in or switches its
+  hooks off (`HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`,
+  `GEMINI_CLI_HOME`, `CLAUDE_CODE_SIMPLE` and the others they read). `HOME`
   set to the home folder the shell itself puts in, and `CLAUDE_CONFIG_DIR` set
   to the folder Claude Code already uses, move nothing and run; another
-  folder is refused in words that say how to install the hook there. A tool
+  folder for Claude Code is refused in words that say how to install the
+  hook there. A tool
   call is judged by every command line it carries (a command string, an argv
   list, `args`, its environment as an object or a list, text typed into a
   terminal or handed to a shell). Each line goes through the person's allows
@@ -182,9 +186,21 @@ it is only when a shell reads it.
 
 An agent's hook lets a call run unless the guard answers with a refusal. A
 guard that takes too long answers with one (ten seconds, thirty with a second
-opinion from a model configured, under an enforcing hook). A guard whose
-program is gone or cannot start answers nothing, and the
-call runs: that is why a write to the guard's program is refused above.
+opinion from a model configured, under an enforcing hook). On Linux and
+macOS an enforcing hook line runs the guard inside a small `/bin/sh` script
+(Hermes Agent: its own `fail_closed: true`), so a guard whose program is gone,
+cannot start or is killed refuses the call too. The call still runs when the
+agent stops the hook at its own timeout, on Windows, where the line is the
+program alone, and under a hook line written before this version until it is
+rewritten: that is why a write to the guard's program is refused above. A
+monitor line refuses nothing: Gemini CLI refuses a call on any hook exit but 0
+and 1, so its monitor line is a script too, which ends every other way with 1.
+
+The same script means a program removed by the package manager (`npm
+uninstall -g`, `apt remove`) before `innerwarden uninstall` leaves every tool
+call of an enforcing agent refused, and the agent cannot mend it. Run
+`innerwarden uninstall` first; the refusal names the settings files to edit
+by hand if it is too late.
 
 Some ordinary lines are refused by the same rules, and the refusal says so: a
 program run from a variable on a line that also names the guard, an agent

@@ -1,6 +1,7 @@
 //! The shared `agents` orchestration: discover the AI agents on this machine and
-//! wire the guard into them (Claude Code hook, or MCP-proxy wrap of an agent's
-//! reviewed agent-specific config). This is the ONE implementation both InnerWarden Community
+//! wire the guard into them (Claude Code hook, the Codex and Gemini hook beside
+//! their MCP proxy, or MCP-proxy wrap of an agent's reviewed agent-specific
+//! config). This is the ONE implementation both InnerWarden Community
 //! (`innerwarden`) and Active Defence (`innerwarden` ctl) drive, so the command
 //! behaves identically in both products. The pure decision logic lives in
 //! `agents` / `mcp_wire` / `hook`; this module is the I/O (the /proc scan, the
@@ -12,12 +13,13 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::agent_hooks::{self, HookSpec, HookState};
 use crate::agents::{
     canonical, connect_targets, summarize_discovered, AgentStatus, ConfigFormat, DiscoveryEvidence,
     GuardMode, KnownDiscovery, ProfileConfig, KNOWN,
 };
 use crate::signatures::SignatureIndex;
-use crate::{detect, hook, mcp_wire, mcp_wire_toml};
+use crate::{detect, hermes_hook, hook, mcp_wire, mcp_wire_toml};
 
 const MAX_GENERIC_MCP_CONFIGS: usize = 256;
 const MAX_GENERIC_DIRECTORY_ENTRIES: usize = 4_096;
@@ -706,17 +708,86 @@ fn write_toml(
     }
 }
 
+/// The hook wiring of an agent that has one beside its MCP proxy (Codex,
+/// Gemini), for a name found through that agent's reviewed MCP config. The
+/// same name over any other config file is not that agent.
+fn hook_spec(
+    name: &str,
+    mcp_json: Option<&str>,
+    mcp_toml: Option<&str>,
+) -> Option<&'static HookSpec> {
+    let spec = agent_hooks::spec_for(name)?;
+    (mcp_json.or(mcp_toml) == Some(spec.mcp_config)).then_some(spec)
+}
+
+fn hook_spec_of(agent: &AgentStatus) -> Option<&'static HookSpec> {
+    hook_spec(
+        &agent.name,
+        agent.mcp_json.as_deref(),
+        agent.mcp_toml.as_deref(),
+    )
+}
+
+fn hook_state_with(
+    home: &Path,
+    agent: &AgentStatus,
+    path_env: Option<&OsStr>,
+) -> Option<(&'static HookSpec, HookState)> {
+    let spec = hook_spec_of(agent)?;
+    Some((spec, agent_hooks::state(home, spec, path_env)))
+}
+
+/// Where the blocking hook of Codex or Gemini stands, with the wiring it was
+/// read against. `None` for every other agent. Shared by `status` and
+/// `agents` so both say the same thing of one hook.
+pub fn hook_state(home: &Path, agent: &AgentStatus) -> Option<(&'static HookSpec, HookState)> {
+    let path_env = std::env::var_os("PATH");
+    hook_state_with(home, agent, path_env.as_deref())
+}
+
+/// Whether every stdio server in an agent's MCP config runs behind a proxy
+/// that is there to start. `None` when the config is missing, cannot be read,
+/// or holds no stdio server: the proxy has nothing to say either way.
+fn mcp_guarded(
+    home: &Path,
+    mcp_json: Option<&str>,
+    mcp_toml: Option<&str>,
+    path_env: Option<&OsStr>,
+) -> Option<bool> {
+    if let Some(rel) = mcp_json {
+        let v = read_json(&home.join(rel))?;
+        return mcp_wire::is_guardable(&v).then(|| {
+            mcp_wire::is_guarded(&v)
+                && !proxy_is_broken(&mcp_wire::guard_wrapper_commands(&v), path_env)
+        });
+    }
+    let d = read_toml(&home.join(mcp_toml?))?;
+    mcp_wire_toml::is_guardable_toml(&d).then(|| {
+        mcp_wire_toml::is_guarded_toml(&d)
+            && !proxy_is_broken(&mcp_wire_toml::guard_wrapper_commands_toml(&d), path_env)
+    })
+}
+
 /// Is the guard wired for this agent? Claude Code = the PreToolUse hook; an MCP
 /// agent = every stdio server in its config (reviewed JSON or Codex's TOML
-/// `[mcp_servers]`) routed through the proxy.
+/// `[mcp_servers]`) routed through the proxy. Codex and Gemini have both: their
+/// MCP servers decide when they have any, and their hook does when they have
+/// none, so the hook never hides a server that still runs outside the proxy.
 fn is_guarded(home: &Path, agent: &str, path_env: Option<&OsStr>) -> bool {
     let Some(k) = canonical(agent) else {
         return false;
     };
+    if k.name == hermes_hook::AGENT {
+        return hermes_hook::state(home, path_env).is_on();
+    }
     if k.hookable {
         return read_json(&home.join(".claude/settings.json"))
             .map(|v| claude_hook_screens(&v, path_env))
             .unwrap_or(false);
+    }
+    if let Some(spec) = hook_spec(k.name, k.mcp_json, k.mcp_toml) {
+        return mcp_guarded(home, k.mcp_json, k.mcp_toml, path_env)
+            .unwrap_or_else(|| agent_hooks::state(home, spec, path_env).is_on());
     }
     if let Some(rel) = k.mcp_json {
         return read_json(&home.join(rel))
@@ -745,10 +816,18 @@ pub fn has_guard_wiring(home: &Path, agent: &str) -> bool {
     // reviewed name here: substring canonicalization is for process aliases and
     // must never redirect a generic MCP row to a known agent's static path.
     if let Some(k) = KNOWN.iter().find(|known| known.name == agent) {
+        if k.name == hermes_hook::AGENT {
+            return hermes_hook::state(home, None).installed();
+        }
         if k.hookable {
             return read_json(&home.join(".claude/settings.json"))
                 .map(|v| hook::has_iwguard_wiring(&v))
                 .unwrap_or(false);
+        }
+        if hook_spec(k.name, k.mcp_json, k.mcp_toml)
+            .is_some_and(|spec| agent_hooks::state(home, spec, None).installed())
+        {
+            return true;
         }
         if let Some(rel) = k.mcp_json {
             return read_json(&home.join(rel))
@@ -784,6 +863,9 @@ pub fn has_guard_wiring(home: &Path, agent: &str) -> bool {
 /// which is NOT the same as "the file has never been touched". See
 /// [`mcp_wire::has_unguarded_stdio_server`].
 pub fn status_has_unguarded_server(home: &Path, agent: &AgentStatus) -> bool {
+    if agent.name == hermes_hook::AGENT {
+        return !hermes_hook::state(home, None).installed();
+    }
     if agent.hookable {
         return !read_json(&home.join(".claude/settings.json"))
             .map(|value| hook::has_iwguard_wiring(&value))
@@ -803,11 +885,24 @@ pub fn status_has_unguarded_server(home: &Path, agent: &AgentStatus) -> bool {
 }
 
 pub fn status_has_guard_wiring(home: &Path, agent: &AgentStatus) -> bool {
+    if agent.name == hermes_hook::AGENT {
+        return hermes_hook::state(home, None).installed();
+    }
     if agent.hookable {
         return read_json(&home.join(".claude/settings.json"))
             .map(|value| hook::has_iwguard_wiring(&value))
             .unwrap_or(false);
     }
+    // A hook of Codex or Gemini that is in the file counts, on or not: a
+    // mode switch has to rewrite its line with the wrappers'.
+    if hook_spec_of(agent).is_some_and(|spec| agent_hooks::state(home, spec, None).installed()) {
+        return true;
+    }
+    mcp_has_guard_wiring(home, agent)
+}
+
+/// Whether any MCP server of this agent runs behind the proxy.
+fn mcp_has_guard_wiring(home: &Path, agent: &AgentStatus) -> bool {
     if let Some(relative) = &agent.mcp_json {
         return read_json(&home.join(relative))
             .map(|value| mcp_wire::has_guard_wiring(&value))
@@ -827,13 +922,20 @@ pub fn status_has_guard_wiring(home: &Path, agent: &AgentStatus) -> bool {
 /// discoverable through [`status_has_guard_wiring`] so automatic reconciliation
 /// can repair it without falsely claiming active shell protection.
 pub fn status_is_effectively_guarded(home: &Path, agent: &AgentStatus) -> bool {
+    if agent.name == hermes_hook::AGENT {
+        let path_env = std::env::var_os("PATH");
+        return hermes_hook::state(home, path_env.as_deref()).is_on();
+    }
     if agent.hookable {
         let path_env = std::env::var_os("PATH");
         return read_json(&home.join(".claude/settings.json"))
             .map(|value| claude_hook_screens(&value, path_env.as_deref()))
             .unwrap_or(false);
     }
-    status_has_guard_wiring(home, agent)
+    // The MCP wiring alone: the dashboard reads the mode of these rows from
+    // their MCP config, so the hook of Codex or Gemini is not counted here.
+    // `status` and `agents` state that hook on a line of its own.
+    mcp_has_guard_wiring(home, agent)
         && !matches!(
             mcp_proxy_program(home, agent),
             Some(hook::HookProgram::Broken { .. })
@@ -910,7 +1012,7 @@ fn rows_from_sources(
     // say "monitor" or "enforce" instead of only "guarded".
     for r in &mut rows {
         if r.guarded {
-            r.mode = read_guard_mode(home, r);
+            r.mode = read_guard_mode(home, r, path_env);
         }
     }
     rows.sort_by(|a, b| a.name.cmp(&b.name));
@@ -943,12 +1045,31 @@ pub fn guard_bin() -> String {
 }
 
 fn mechanism(r: &AgentStatus) -> &'static str {
-    if r.hookable {
+    if r.hookable || r.name == hermes_hook::AGENT {
         "hook"
     } else if r.mcp_json.is_some() || r.mcp_toml.is_some() {
         "MCP proxy"
     } else {
         "manual"
+    }
+}
+
+/// The listing's words for Codex or Gemini, which are screened two ways: the
+/// hook for shell commands and file changes, the proxy for MCP servers.
+///
+/// "✓ guarded" is said only with the hook on and no MCP server left outside
+/// the proxy. One of the two alone is "partly guarded", and names which one,
+/// so a hook the agent skips is never under a check mark.
+fn two_way_label(home: &Path, r: &AgentStatus, state: &HookState) -> String {
+    let mode = |mode: Option<GuardMode>| mode.map_or("mode unreadable", GuardMode::label);
+    match (r.guarded, state.is_on()) {
+        (true, true) if mcp_has_guard_wiring(home, r) => {
+            format!("✓ guarded (hook + proxy, {})", mode(r.mode))
+        }
+        (true, true) => format!("✓ guarded (hook, {})", mode(r.mode)),
+        (true, false) => format!("partly guarded (MCP proxy, {})", mode(r.mode)),
+        (false, true) => format!("partly guarded (hook, {})", mode(hook_guard_mode(state))),
+        (false, false) => "not guarded, connect via hook + proxy".to_string(),
     }
 }
 
@@ -967,11 +1088,18 @@ pub enum ConnectEffect {
 pub struct ConnectResult {
     pub effect: ConnectEffect,
     pub line: String,
+    /// Set by a mode switch that rewrote a hook's line and left a hook the
+    /// agent does not run: one line that names the agent and the step left.
+    pub hook_stopped: Option<String>,
 }
 
 impl ConnectResult {
     fn new(effect: ConnectEffect, line: String) -> Self {
-        Self { effect, line }
+        Self {
+            effect,
+            line,
+            hook_stopped: None,
+        }
     }
 
     pub fn configured(&self) -> bool {
@@ -1009,6 +1137,227 @@ pub fn connect_one_result_automatic(
 }
 
 fn connect_one_result_with_link_policy(
+    home: &Path,
+    r: &AgentStatus,
+    guard_bin: &str,
+    strict: bool,
+    monitor: bool,
+    reject_symlinks: bool,
+) -> ConnectResult {
+    // Hermes's hook goes in on a connect a person ran, never by automatic
+    // setup: it records an approval in Hermes's allowlist, which is the
+    // person's to give.
+    if r.name == hermes_hook::AGENT {
+        return if reject_symlinks {
+            ConnectResult::new(
+                ConnectEffect::Skipped,
+                format!(
+                    "  {} - its hook is wired only by `innerwarden agents connect {}`",
+                    r.name, r.name
+                ),
+            )
+        } else {
+            connect_hermes(home, &r.name, guard_bin, strict, monitor)
+        };
+    }
+    // Codex and Gemini get their blocking hook with the proxy, on a connect a
+    // person ran. Automatic setup never writes that hook: what it changes and
+    // prints for these two agents is what it was.
+    match hook_spec_of(r) {
+        Some(spec) if !reject_symlinks => {
+            connect_hook_and_proxy(home, r, spec, guard_bin, strict, monitor, false)
+        }
+        _ => connect_by_one_mechanism(home, r, guard_bin, strict, monitor, reject_symlinks),
+    }
+}
+
+/// Switch ONE agent that is already wired to the mode `monitor` names.
+///
+/// The hook of Codex or Gemini is rewritten only when it is already in the
+/// agent's file. A switch never installs one, and never asks Codex to trust
+/// one, for an agent that only has its MCP servers behind the proxy: a new
+/// hook comes from `agents connect` and setup, which the person runs for it.
+///
+/// A switch that leaves a Codex hook Codex does not run is a failure, and
+/// [`ConnectResult::hook_stopped`] holds the line that says so: whether this
+/// run rewrote the line or found it already in the mode asked for, the mode
+/// is not in force for that agent.
+pub fn switch_mode_one_result(
+    home: &Path,
+    r: &AgentStatus,
+    guard_bin: &str,
+    strict: bool,
+    monitor: bool,
+) -> ConnectResult {
+    if r.name == hermes_hook::AGENT {
+        return if hermes_hook::state(home, None).installed() {
+            connect_hermes(home, &r.name, guard_bin, strict, monitor)
+        } else {
+            ConnectResult::new(
+                ConnectEffect::Skipped,
+                format!("  {} - not connected; nothing to switch", r.name),
+            )
+        };
+    }
+    match hook_spec_of(r) {
+        Some(spec) if agent_hooks::state(home, spec, None).installed() => {
+            connect_hook_and_proxy(home, r, spec, guard_bin, strict, monitor, true)
+        }
+        _ => connect_by_one_mechanism(home, r, guard_bin, strict, monitor, false),
+    }
+}
+
+/// Wire Hermes Agent's hook ([`hermes_hook`]) in the mode asked for, and say
+/// where it stands after: on only when Hermes runs it, with what it screens
+/// and what it does not.
+fn connect_hermes(
+    home: &Path,
+    name: &str,
+    guard_bin: &str,
+    strict: bool,
+    monitor: bool,
+) -> ConnectResult {
+    let changed = match hermes_hook::install(home, Path::new(guard_bin), strict, monitor) {
+        Ok(changed) => changed,
+        Err(error) => {
+            return ConnectResult::new(ConnectEffect::Failed, format!("  {name} - failed: {error}"))
+        }
+    };
+    let path_env = std::env::var_os("PATH");
+    let state = hermes_hook::state(home, path_env.as_deref());
+    let mut lines = vec![format!("  {name} - {}", hermes_hook::state_line(&state))];
+    let effect = match (&state, changed) {
+        (hermes_hook::State::On { .. }, true) => ConnectEffect::Connected,
+        (hermes_hook::State::On { .. }, false) => ConnectEffect::Unchanged,
+        _ => ConnectEffect::Failed,
+    };
+    if state.is_on() {
+        lines.extend(
+            hermes_hook::coverage()
+                .into_iter()
+                .map(|line| format!("      {line}")),
+        );
+    }
+    ConnectResult::new(effect, lines.join("\n"))
+}
+
+/// Wire the blocking hook and the MCP proxy of Codex or Gemini in one go.
+///
+/// The hook goes first and the proxy second, in series: Gemini keeps both in
+/// one file, so the proxy step reads that file with the hook already in it and
+/// neither write drops the other. For Codex the proxy step reads the config
+/// after Codex has written its trust for the hook into it.
+///
+/// The result holds one line for the hook, one for the proxy, then what is
+/// screened and what is not. A hook the agent would skip adds nothing to the
+/// effect: it is installed, and it screens nothing yet.
+///
+/// `mode_switch` is true when the caller is `enforce` or `dry-run` and the
+/// hook was already in the file. Then a Codex hook that Codex does not run
+/// afterwards is a failure, whether this run rewrote its line (Codex trusted
+/// the old line and skips the new one without a word) or found it already in
+/// that mode: the switch is not in force for that agent, with or without
+/// MCP servers behind the proxy.
+fn connect_hook_and_proxy(
+    home: &Path,
+    r: &AgentStatus,
+    spec: &HookSpec,
+    guard_bin: &str,
+    strict: bool,
+    monitor: bool,
+    mode_switch: bool,
+) -> ConnectResult {
+    let codex = agent_hooks::codex_to_ask(home);
+    let hooked = agent_hooks::connect_noting_write(
+        home,
+        spec,
+        Path::new(guard_bin),
+        strict,
+        monitor,
+        codex.as_deref(),
+    );
+    let proxy = connect_by_one_mechanism(home, r, guard_bin, strict, monitor, false);
+
+    let mut lines = Vec::new();
+    let mut hook_stopped = None;
+    let hook_effect = match &hooked {
+        Ok(connected) => {
+            lines.push(agent_hooks::connect_line(
+                &r.name,
+                spec,
+                &connected.outcome,
+                strict,
+                monitor,
+            ));
+            // What the write did beside the hook itself: a hook of the
+            // person's that moved, a yes from Codex that status cannot read.
+            lines.extend(
+                connected
+                    .notes(spec)
+                    .into_iter()
+                    .map(|note| format!("      {note}")),
+            );
+            match &connected.outcome {
+                agent_hooks::Outcome::Active { changed: true } => ConnectEffect::Connected,
+                agent_hooks::Outcome::Active { changed: false } => ConnectEffect::Unchanged,
+                agent_hooks::Outcome::NotActive { step, .. }
+                    if mode_switch && spec.host == agent_hooks::Host::Codex =>
+                {
+                    hook_stopped = Some(format!(
+                        "{} - its {} hook is not active after this switch. {step}",
+                        r.name, spec.event
+                    ));
+                    ConnectEffect::Failed
+                }
+                agent_hooks::Outcome::NotActive { .. } => ConnectEffect::Skipped,
+            }
+        }
+        Err(error) => {
+            lines.push(format!("  {} - failed: {error}", r.name));
+            ConnectEffect::Failed
+        }
+    };
+    // On a connect a person ran, the proxy step is skipped for one reason
+    // only: the agent has no stdio server to wrap. Its own words for that end
+    // in "nothing to guard", which is not true beside a hook.
+    lines.push(if proxy.effect == ConnectEffect::Skipped {
+        format!(
+            "  {} - no local MCP servers to route through the guard proxy",
+            r.name
+        )
+    } else {
+        proxy.line
+    });
+    if let Ok(connected) = &hooked {
+        lines.extend(
+            agent_hooks::connect_notes(spec, &connected.outcome)
+                .into_iter()
+                .map(|note| format!("      {note}")),
+        );
+    }
+    ConnectResult {
+        hook_stopped,
+        ..ConnectResult::new(both_effects(hook_effect, proxy.effect), lines.join("\n"))
+    }
+}
+
+/// The effect of two wiring steps on one agent: a failure in either is a
+/// failure, then a change in either is a change, then wiring that was already
+/// there counts, and only two skips are a skip.
+fn both_effects(first: ConnectEffect, second: ConnectEffect) -> ConnectEffect {
+    [
+        ConnectEffect::Failed,
+        ConnectEffect::Connected,
+        ConnectEffect::Unchanged,
+    ]
+    .into_iter()
+    .find(|effect| first == *effect || second == *effect)
+    .unwrap_or(ConnectEffect::Skipped)
+}
+
+/// Wire an agent by the one mechanism its row names: Claude Code's hook, or
+/// the MCP proxy over the row's own config.
+fn connect_by_one_mechanism(
     home: &Path,
     r: &AgentStatus,
     guard_bin: &str,
@@ -1258,6 +1607,43 @@ pub fn connect_one(
 }
 
 fn disconnect_one(home: &Path, r: &AgentStatus) -> String {
+    if r.name == hermes_hook::AGENT {
+        return match hermes_hook::uninstall(home) {
+            Ok(0) => format!("  {}, was not connected", r.name),
+            Ok(_) => format!("  {}, disconnected", r.name),
+            Err(e) => format!("  {}, failed: {e}", r.name),
+        };
+    }
+    // Codex and Gemini: the hook comes out first, then the wrappers. Gemini
+    // keeps both in one file, so the second step reads what the first wrote.
+    let Some(spec) = hook_spec_of(r) else {
+        return disconnect_by_one_mechanism(home, r);
+    };
+    let unhooked = agent_hooks::uninstall_noting_moved(home, spec);
+    let proxy = disconnect_by_one_mechanism(home, r);
+    let (removed, moved) = match unhooked {
+        Ok(done) => done,
+        // The wrappers were handled whatever the hook's file did, so their
+        // line stays above the failure. `failed:` is what the caller reads.
+        Err(error) => return format!("{proxy}\n  {}, failed: {error}", r.name),
+    };
+    // The wrappers had nothing to say and the hook was taken out: that is a
+    // disconnect. A failure on the proxy side is still the line to read.
+    let line = if removed > 0 && proxy.ends_with("was not connected") {
+        format!("  {}, disconnected", r.name)
+    } else {
+        proxy
+    };
+    // Taking our hook out moves the person's later hooks up one place, and
+    // Codex trusts a hook by its place.
+    match agent_hooks::moved_note(spec, &moved) {
+        Some(note) => format!("{line}\n      {note}"),
+        None => line,
+    }
+}
+
+/// Unwire an agent from the one mechanism its row names.
+fn disconnect_by_one_mechanism(home: &Path, r: &AgentStatus) -> String {
     if r.hookable {
         return match hook::uninstall_hook(home, &r.name, None) {
             Ok((_, n)) if n > 0 => format!("  {}, disconnected", r.name),
@@ -1325,8 +1711,12 @@ fn nothing_detected_lines() -> Vec<String> {
 }
 
 fn list_lines(home: &Path) -> Vec<String> {
+    list_lines_of(home, &rows(home))
+}
+
+/// The listing of `rows`, with each row's wiring read back from `home`.
+fn list_lines_of(home: &Path, rows: &[AgentStatus]) -> Vec<String> {
     let mut out = Vec::new();
-    let rows = rows(home);
     if rows.is_empty() {
         out.extend(nothing_detected_lines());
     } else {
@@ -1338,8 +1728,22 @@ fn list_lines(home: &Path) -> Vec<String> {
         // the row itself already reading "guarded" before and after. Someone who
         // had just wired three of four agents was still being told to wire them,
         // with no way to tell from the output that anything had happened.
-        let pending = rows.iter().filter(|r| r.guardable() && !r.guarded).count();
-        let guarded = rows.iter().filter(|r| r.guarded).count();
+        //
+        // Codex and Gemini have work left while their hook is not on, even
+        // with every MCP server behind the proxy: their shell commands and
+        // file changes run unscreened until it is.
+        let hooks: Vec<_> = rows.iter().map(|r| hook_state(home, r)).collect();
+        let hook_off = |row: usize| hooks[row].as_ref().is_some_and(|(_, state)| !state.is_on());
+        let pending = rows
+            .iter()
+            .enumerate()
+            .filter(|(row, r)| r.guardable() && (!r.guarded || hook_off(*row)))
+            .count();
+        let guarded = rows
+            .iter()
+            .enumerate()
+            .filter(|(row, r)| r.guarded && !hook_off(*row))
+            .count();
         out.push(match pending {
             0 if guarded > 0 => format!(
                 "innerwarden agents, all {guarded} guardable agent(s) are wired. Nothing to connect."
@@ -1349,7 +1753,7 @@ fn list_lines(home: &Path) -> Vec<String> {
             // wired and still screens nothing.
             n => format!("innerwarden agents, found ({n} not guarded yet):"),
         });
-        for r in &rows {
+        for (r, hooked) in rows.iter().zip(&hooks) {
             // A hook whose program is gone is wiring that screens nothing. It
             // used to read "✓ guarded" here, as it did in `status` and on the
             // dashboard, because a hook was judged by its text alone.
@@ -1369,6 +1773,8 @@ fn list_lines(home: &Path) -> Vec<String> {
                 "✗ wired, but its hook cannot run".to_string()
             } else if proxy_broken.is_some() {
                 "✗ wired, but its MCP proxy cannot run".to_string()
+            } else if let Some((_, state)) = hooked {
+                two_way_label(home, r, state)
             } else if r.guarded {
                 // Name the MODE, not just the mechanism. "guarded (hook)" was the
                 // same string whether the hook records or blocks.
@@ -1402,12 +1808,37 @@ fn list_lines(home: &Path) -> Vec<String> {
                     hook_repair_command(home, r)
                 ));
             }
+            let proxy_cannot_run = proxy_broken.is_some();
             if let Some(problem) = proxy_broken {
                 out.push(format!(
                     "  {:<13} {problem}, so its MCP servers cannot start. Fix: {}",
                     "",
                     proxy_repair_command(home, r)
                 ));
+            }
+            // Codex and Gemini are screened two ways. Under a row that has one
+            // of the two only, say which is missing and the one step that adds
+            // it. A row with neither, and no hook in the file, already says
+            // "connect".
+            if r.name == hermes_hook::AGENT {
+                let state = hermes_hook::state(home, std::env::var_os("PATH").as_deref());
+                if state.installed() && !state.is_on() {
+                    out.push(format!("  {:<13} {}", "", hermes_hook::state_line(&state)));
+                }
+            }
+            if let Some((spec, state)) = hooked {
+                if !state.is_on() && (r.guarded || *state != HookState::Absent) {
+                    out.push(format!(
+                        "  {:<13} {}",
+                        "",
+                        agent_hooks::state_line(spec, state)
+                    ));
+                } else if state.is_on() && !r.guarded && !proxy_cannot_run {
+                    out.push(format!(
+                        "  {:<13} MCP servers: not all behind the guard proxy. Run: innerwarden agents connect {}",
+                        "", spec.agent
+                    ));
+                }
             }
         }
         // Only offer the action when there is something to act on.
@@ -1618,7 +2049,18 @@ pub fn run(home: &Path, args: &[String]) -> Vec<String> {
 /// file's text for the words `"advisory"`, `"warn"`, `"guard"` and `"kill"`
 /// anywhere, so `--mode=advisory` (no quote before the word) beside any other
 /// `"guard"` in the file read as enforce while every call was let through.
-fn read_guard_mode(home: &Path, row: &AgentStatus) -> Option<GuardMode> {
+///
+/// Codex and Gemini have a hook beside their wrappers. A hook that is on has a
+/// mode of its own, and one that records beside wrappers that block is
+/// neither mode: it reads `MIXED`, never the stricter of the two.
+fn read_guard_mode(home: &Path, row: &AgentStatus, path_env: Option<&OsStr>) -> Option<GuardMode> {
+    if row.name == hermes_hook::AGENT {
+        return match hermes_hook::state(home, path_env) {
+            hermes_hook::State::On { monitor: true, .. } => Some(GuardMode::Monitor),
+            hermes_hook::State::On { monitor: false, .. } => Some(GuardMode::Enforce),
+            _ => None,
+        };
+    }
     if row.hookable {
         return read_json(&home.join(".claude/settings.json"))
             .and_then(|v| hook::effective_iwguard_hook_mode(&v))
@@ -1628,6 +2070,27 @@ fn read_guard_mode(home: &Path, row: &AgentStatus) -> Option<GuardMode> {
                 hook::EffectiveHookMode::Mixed => GuardMode::Mixed,
             });
     }
+    let wrappers = mcp_guard_mode(home, row);
+    let hooked =
+        hook_state_with(home, row, path_env).and_then(|(_, state)| hook_guard_mode(&state));
+    match (hooked, wrappers) {
+        (Some(hooked), Some(wrappers)) if hooked != wrappers => Some(GuardMode::Mixed),
+        (hooked, wrappers) => hooked.or(wrappers),
+    }
+}
+
+/// The mode of a hook that is on. `None` for any other state: a hook the agent
+/// does not run has no mode to report.
+fn hook_guard_mode(state: &HookState) -> Option<GuardMode> {
+    match state {
+        HookState::On { monitor: true, .. } => Some(GuardMode::Monitor),
+        HookState::On { monitor: false, .. } => Some(GuardMode::Enforce),
+        _ => None,
+    }
+}
+
+/// The mode the row's MCP wrappers run in, read from the row's own config.
+fn mcp_guard_mode(home: &Path, row: &AgentStatus) -> Option<GuardMode> {
     if let Some(rel) = &row.mcp_json {
         return read_json(&home.join(rel))
             .and_then(|config| mcp_wire::guarded_mode(&config))
@@ -1826,13 +2289,13 @@ mod tests {
                 "{name} evidence"
             );
         }
-        // Hermes has no reviewed MCP surface, so it stays manual. OpenClaw
-        // became guardable on 2026-08-05 once `mcp_wire` could locate a nested
-        // `mcp.servers` table; the point of THIS test is that a config file
-        // alone is evidence of configuration and not of an installed CLI, which
-        // holds for both regardless.
+        // Hermes is wired through its own fail-closed hook (`hermes_hook`).
+        // OpenClaw became guardable on 2026-08-05 once `mcp_wire` could locate
+        // a nested `mcp.servers` table; the point of THIS test is that a
+        // config file alone is evidence of configuration and not of an
+        // installed CLI, which holds for both regardless.
         let hermes = rows.iter().find(|row| row.name == "hermes").unwrap();
-        assert!(!hermes.guardable(), "hermes must remain manual");
+        assert!(hermes.guardable(), "hermes is wired through its hook");
     }
 
     #[cfg(unix)]
@@ -1865,8 +2328,15 @@ mod tests {
         );
     }
 
+    /// A running Hermes is found by its process. Its hook is written only on
+    /// a connect a person runs: automatic setup records no approval in
+    /// Hermes's allowlist, which is the person's to give.
+    ///
+    /// FAILS ON REVERT: drop the `reject_symlinks` arm of the Hermes branch
+    /// in `connect_one_result_with_link_policy` and automatic setup writes the
+    /// hook and its approval.
     #[test]
-    fn process_evidence_detects_hermes_without_granting_guardability() {
+    fn process_evidence_detects_hermes_and_automatic_setup_never_wires_it() {
         let home = tempfile::TempDir::new().unwrap();
         let running = [("Hermes Agent".to_string(), 91)];
 
@@ -1876,7 +2346,128 @@ mod tests {
         assert_eq!(hermes.pids, vec![91]);
         assert_eq!(hermes.evidence, vec![DiscoveryEvidence::Process]);
         assert!(!hermes.installed);
-        assert!(!hermes.guardable());
+        assert!(hermes.guardable());
+        let automatic =
+            connect_one_result_automatic(home.path(), hermes, "/abs/innerwarden", false, false);
+        assert_eq!(
+            automatic.effect,
+            ConnectEffect::Skipped,
+            "{}",
+            automatic.line
+        );
+        assert!(!home.path().join(".hermes").exists());
+    }
+
+    /// The listing and the repair checks read Hermes from its hook: a hook
+    /// Hermes skips is said under the row with its step, a hook that is on
+    /// is not, and an agent with no hook has guarding work left while one
+    /// with the hook in its file has wiring to switch.
+    ///
+    /// FAILS ON REVERT: turn `installed() && !is_on()` under the Hermes row
+    /// in `list_lines_of` into `||`, or the Hermes test in
+    /// `status_has_unguarded_server` into `!=`.
+    #[cfg(unix)]
+    #[test]
+    fn the_listing_says_when_hermes_skips_its_hook() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".hermes")).unwrap();
+        std::fs::write(home.path().join(".hermes/config.yaml"), "model: test\n").unwrap();
+        let bin = format!("{}innerwarden", installed_guard_dir(home.path()));
+        let row = |home: &Path| {
+            let (rows, _) = rows_from_sources(home, &[], None);
+            rows.into_iter().find(|row| row.name == "hermes").unwrap()
+        };
+        let skipped = "pre_tool_call hook: installed, but Hermes skips it";
+        let hermes = row(home.path());
+        assert!(status_has_unguarded_server(home.path(), &hermes));
+        assert!(!status_has_guard_wiring(home.path(), &hermes));
+        // No hook yet: the row's own words say connect, through its hook,
+        // and no hook line.
+        let listed = list_lines_of(home.path(), std::slice::from_ref(&hermes)).join("\n");
+        assert!(!listed.contains("pre_tool_call hook:"), "{listed}");
+        assert!(listed.contains("not guarded, connect via hook"), "{listed}");
+
+        connect_one_result(home.path(), &hermes, &bin, false, false);
+        let hermes = row(home.path());
+        assert!(!status_has_unguarded_server(home.path(), &hermes));
+        assert!(status_has_guard_wiring(home.path(), &hermes));
+        let listed = list_lines_of(home.path(), std::slice::from_ref(&hermes)).join("\n");
+        assert!(!listed.contains("pre_tool_call hook:"), "{listed}");
+
+        std::fs::remove_file(home.path().join(hermes_hook::ALLOWLIST)).unwrap();
+        let hermes = row(home.path());
+        let listed = list_lines_of(home.path(), std::slice::from_ref(&hermes)).join("\n");
+        assert!(listed.contains(skipped), "{listed}");
+        assert!(status_has_guard_wiring(home.path(), &hermes));
+        // The line is Hermes's alone: another agent's row does not carry it.
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::write(home.path().join(".cursor/mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+        let cursor: Vec<AgentStatus> = rows.into_iter().filter(|r| r.name == "cursor").collect();
+        assert_eq!(cursor.len(), 1);
+        let listed = list_lines_of(home.path(), &cursor).join("\n");
+        assert!(!listed.contains("pre_tool_call hook:"), "{listed}");
+    }
+
+    /// `agents connect hermes` writes the fail-closed entry and its approval,
+    /// says the hook is on with what it screens, `agents` lists it as
+    /// guarded by the hook in enforce mode, and `disconnect` takes it out.
+    ///
+    /// FAILS ON REVERT: drop the Hermes branch of
+    /// `connect_one_result_with_link_policy` and the row is connected by no
+    /// mechanism.
+    #[cfg(unix)]
+    #[test]
+    fn connect_hermes_wires_its_hook_and_disconnect_takes_it_out() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".hermes")).unwrap();
+        std::fs::write(
+            home.path().join(".hermes/config.yaml"),
+            "model: test
+",
+        )
+        .unwrap();
+        let bin = format!("{}innerwarden", installed_guard_dir(home.path()));
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+        let hermes = rows.iter().find(|row| row.name == "hermes").unwrap();
+
+        let result = connect_one_result(home.path(), hermes, &bin, false, false);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+        assert!(
+            result
+                .line
+                .starts_with("  hermes - pre_tool_call hook: on (enforce)"),
+            "{}",
+            result.line
+        );
+        let config = std::fs::read_to_string(home.path().join(".hermes/config.yaml")).unwrap();
+        assert!(config.contains("fail_closed: true"), "{config}");
+        let again = connect_one_result(home.path(), hermes, &bin, false, false);
+        assert_eq!(again.effect, ConnectEffect::Unchanged, "{}", again.line);
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+        let hermes = rows.iter().find(|row| row.name == "hermes").unwrap();
+        assert!(hermes.guarded);
+        assert_eq!(hermes.mode, Some(GuardMode::Enforce));
+
+        assert_eq!(
+            disconnect_one(home.path(), hermes),
+            "  hermes, disconnected"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".hermes/config.yaml")).unwrap(),
+            "model: test\n"
+        );
+        assert_eq!(
+            disconnect_one(home.path(), hermes),
+            "  hermes, was not connected"
+        );
+
+        // Monitor is read back as monitor.
+        let watched = connect_one_result(home.path(), hermes, &bin, false, true);
+        assert_eq!(watched.effect, ConnectEffect::Connected, "{}", watched.line);
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+        let hermes = rows.iter().find(|row| row.name == "hermes").unwrap();
+        assert_eq!(hermes.mode, Some(GuardMode::Monitor));
     }
 
     #[test]
@@ -2934,5 +3525,798 @@ mod tests {
             program_fact("innerwarden", None),
             hook::ProgramFact::Missing
         );
+    }
+
+    /// Gemini settings a person wrote: a setting, a hook of their own and one
+    /// local MCP server.
+    const GEMINI_SETTINGS: &str = r#"{"theme":"dark","hooks":{"BeforeTool":[{"matcher":"write_file","hooks":[{"type":"command","command":"/usr/local/bin/mine"}]}]},"mcpServers":{"fs":{"command":"npx","args":["fs"]}}}"#;
+
+    /// What `agents connect` says of a Codex hook with nobody to ask and no
+    /// trust on file, and the note it prints under the agent's lines.
+    const CODEX_NOT_ACTIVE: &str = "  codex - its PreToolUse hook is installed, but it is NOT active: Codex skips it: it is not trusted yet. Run `/hooks` inside Codex and trust the innerwarden hook";
+    const CODEX_UNSCREENED: &str = "      Until the hook is active, only calls to MCP servers behind the proxy are screened. Codex's shell commands and file changes run unscreened.";
+
+    const NOTHING_TO_CONNECT: &str =
+        "innerwarden agents, all 1 guardable agent(s) are wired. Nothing to connect.";
+    const ONE_NOT_GUARDED: &str = "innerwarden agents, found (1 not guarded yet):";
+    const CONNECT_FOOTER: &str = "\n  connect one:  innerwarden agents connect <name>     all:  innerwarden agents connect --all";
+    const BY_ITS_CONFIG: &str = "recognized configuration; CLI not confirmed";
+
+    fn write_gemini_settings(home: &Path) -> std::path::PathBuf {
+        let path = home.join(".gemini/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, GEMINI_SETTINGS).unwrap();
+        path
+    }
+
+    fn json_at(path: &Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    /// The notes `agents connect` prints under an agent's lines, as they sit
+    /// in its result.
+    fn indented(notes: Vec<String>) -> String {
+        notes.iter().map(|note| format!("\n      {note}")).collect()
+    }
+
+    /// One row of the listing, and a line under it.
+    fn listed(name: &str, guard: &str, found: &str) -> String {
+        format!("  {name:<13} {guard:<34} {found}")
+    }
+
+    fn under_row(text: &str) -> String {
+        format!("  {:<13} {text}", "")
+    }
+
+    /// Codex's config with the first hook in `home`'s `hooks.json` trusted for
+    /// `command`.
+    #[cfg(unix)]
+    fn codex_trusting(home: &Path, command: &str) -> String {
+        format!(
+            "[hooks.state.'{}:pre_tool_use:0:0']\ntrusted_hash = \"{}\"\n",
+            agent_hooks::CODEX.path(home).display(),
+            crate::codex_trust::hook_hash(command, 60)
+        )
+    }
+
+    /// A hook that is on reports its own mode: monitor as monitor, enforce
+    /// and block-review as enforce. A hook in any other state has none.
+    ///
+    /// FAILS ON REVERT: drop the `monitor: false` arm of `hook_guard_mode`
+    /// and an enforcing hook has no mode to report.
+    #[test]
+    fn a_hook_that_is_on_reports_its_own_mode() {
+        for (state, mode) in [
+            (
+                HookState::On {
+                    monitor: true,
+                    block_review: false,
+                },
+                Some(GuardMode::Monitor),
+            ),
+            (
+                HookState::On {
+                    monitor: false,
+                    block_review: false,
+                },
+                Some(GuardMode::Enforce),
+            ),
+            (
+                HookState::On {
+                    monitor: false,
+                    block_review: true,
+                },
+                Some(GuardMode::Enforce),
+            ),
+            (HookState::Absent, None),
+            (HookState::Unreadable, None),
+        ] {
+            assert_eq!(hook_guard_mode(&state), mode, "{state:?}");
+        }
+    }
+
+    /// One connect wires Gemini's hook and its MCP proxy, in the one file
+    /// Gemini keeps both in, and leaves the person's own hook and settings
+    /// where they were. A second connect has nothing to write.
+    ///
+    /// FAILS ON REVERT: send Gemini's row down `connect_by_one_mechanism`
+    /// alone, and the file has no hook of ours and the result has one line.
+    #[cfg(unix)]
+    #[test]
+    fn connect_gemini_wires_its_hook_and_its_proxy_and_keeps_the_rest() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = format!("{}innerwarden", installed_guard_dir(home.path()));
+        let path = write_gemini_settings(home.path());
+        let row = known_row(home.path(), "gemini");
+        assert!(!row.guarded);
+
+        let first = connect_one_result(home.path(), &row, &bin, false, true);
+        assert_eq!(first.effect, ConnectEffect::Connected, "{}", first.line);
+        assert_eq!(
+            first.line,
+            format!(
+                "  gemini - connected (BeforeTool hook, monitor (records, never blocks))\n  gemini - connected (1 MCP server routed through the guard proxy, monitor){}",
+                indented(agent_hooks::GEMINI.coverage())
+            )
+        );
+        assert_eq!(
+            json_at(&path),
+            serde_json::json!({
+                "theme": "dark",
+                "hooks": {"BeforeTool": [
+                    {
+                        "matcher": "write_file",
+                        "hooks": [{"type": "command", "command": "/usr/local/bin/mine"}]
+                    },
+                    {"hooks": [{
+                        "type": "command",
+                        "name": "innerwarden",
+                        "command": agent_hooks::GEMINI.command(std::path::Path::new(&bin), false, true),
+                        "timeout": 60000
+                    }]}
+                ]},
+                "mcpServers": {"fs": {
+                    "command": bin,
+                    "args": [
+                        "proxy", "--label", "gemini", "--agent", "gemini", "--mode", "advisory",
+                        "--", "npx", "fs"
+                    ]
+                }}
+            })
+        );
+        let written = std::fs::read(&path).unwrap();
+
+        let row = known_row(home.path(), "gemini");
+        assert!(row.guarded);
+        assert_eq!(row.mode, Some(GuardMode::Monitor));
+        assert_eq!(
+            list_lines_of(home.path(), std::slice::from_ref(&row)),
+            [
+                NOTHING_TO_CONNECT.to_string(),
+                listed("gemini", "✓ guarded (hook + proxy, monitor)", BY_ITS_CONFIG),
+            ]
+        );
+        // An agent that cannot be wired is not counted among the wired ones
+        // (FAILS ON REVERT: read `&&` as `||` in the count of the guarded in
+        // `list_lines_of` and Aider is one of "all 2").
+        std::fs::write(home.path().join(".aider.conf.yml"), "model: gpt\n").unwrap();
+        let aider = known_row(home.path(), "aider");
+        assert!(!aider.guardable());
+        assert_eq!(
+            list_lines_of(home.path(), &[row.clone(), aider])[0],
+            NOTHING_TO_CONNECT
+        );
+
+        let again = connect_one_result(home.path(), &row, &bin, false, true);
+        assert_eq!(again.effect, ConnectEffect::Unchanged, "{}", again.line);
+        assert_eq!(
+            again.line,
+            format!(
+                "  gemini - already guarded (BeforeTool hook, monitor)\n  gemini - already guarded (MCP proxy, monitor){}",
+                indented(agent_hooks::GEMINI.coverage())
+            )
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), written);
+    }
+
+    /// Disconnect takes Gemini's hook and its wrappers out together and leaves
+    /// the settings the person had.
+    ///
+    /// FAILS ON REVERT: unwire by `disconnect_by_one_mechanism` alone, and the
+    /// hook stays in the file.
+    #[test]
+    fn disconnect_gemini_removes_its_hook_and_its_proxy_and_keeps_the_rest() {
+        let home = tempfile::TempDir::new().unwrap();
+        let path = write_gemini_settings(home.path());
+        let before = json_at(&path);
+        let row = known_row(home.path(), "gemini");
+        let connected = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert_eq!(
+            connected.effect,
+            ConnectEffect::Connected,
+            "{}",
+            connected.line
+        );
+        assert!(has_guard_wiring(home.path(), "gemini"));
+        assert_ne!(json_at(&path), before);
+
+        assert_eq!(disconnect_one(home.path(), &row), "  gemini, disconnected");
+        assert_eq!(json_at(&path), before);
+        assert!(!has_guard_wiring(home.path(), "gemini"));
+        assert_eq!(
+            disconnect_one(home.path(), &row),
+            "  gemini, was not connected"
+        );
+    }
+
+    /// Codex runs a hook only once it trusts it. With nobody to ask and no
+    /// trust on file, connect says the hook is NOT active and names the one
+    /// step, while the MCP servers still go behind the proxy.
+    ///
+    /// FAILS ON REVERT: report the hook by the file it was written to (active
+    /// whenever the install succeeded), and the first line reads "connected
+    /// (PreToolUse hook)".
+    #[test]
+    fn connect_codex_never_says_connected_for_a_hook_codex_would_skip() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "[mcp_servers.icm]\ncommand = \"icm\"\n",
+        )
+        .unwrap();
+        let row = known_row(home.path(), "codex");
+
+        let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+        assert_eq!(
+            result.line,
+            format!(
+                "{CODEX_NOT_ACTIVE}\n  codex - connected (1 MCP server routed through the guard proxy, enforce)\n{CODEX_UNSCREENED}"
+            )
+        );
+        assert_eq!(
+            json_at(&home.path().join(".codex/hooks.json")),
+            serde_json::json!({"hooks": {"PreToolUse": [{"hooks": [{
+                "type": "command",
+                "command": agent_hooks::CODEX.command(Path::new("/abs/innerwarden"), false, false),
+                "timeout": 60
+            }]}]}})
+        );
+    }
+
+    /// A hook Codex has not trusted, on an agent with no MCP server, wires
+    /// nothing that screens: the result is not a configured agent, and the
+    /// listing says installed and skipped, never guarded, with the step.
+    ///
+    /// FAILS ON REVERT: count a hook that is in the file as guarding
+    /// (`installed()` where `is_guarded` asks `is_on()`), and the row reads
+    /// "✓ guarded".
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_hook_codex_would_skip_is_never_listed_as_guarded() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = format!("{}innerwarden", installed_guard_dir(home.path()));
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let row = known_row(home.path(), "codex");
+        let line = format!(
+            "{CODEX_NOT_ACTIVE}\n  codex - no local MCP servers to route through the guard proxy\n{CODEX_UNSCREENED}"
+        );
+
+        let result = connect_one_result(home.path(), &row, &bin, false, false);
+        assert_eq!(result.effect, ConnectEffect::Skipped, "{}", result.line);
+        assert!(!result.configured());
+        assert_eq!(result.line, line);
+        let outcome = run_with_guard_bin_outcome(
+            home.path(),
+            &["connect".to_string(), "codex".to_string()],
+            &bin,
+        );
+        assert_eq!(outcome.configured, 0);
+        assert_eq!(outcome.lines, [line]);
+
+        let row = known_row(home.path(), "codex");
+        assert!(!row.guarded);
+        assert!(!is_guarded(home.path(), "codex", None));
+        assert!(has_guard_wiring(home.path(), "codex"));
+        assert!(status_has_guard_wiring(home.path(), &row));
+        assert!(!status_is_effectively_guarded(home.path(), &row));
+        assert_eq!(
+            list_lines_of(home.path(), std::slice::from_ref(&row)),
+            [
+                ONE_NOT_GUARDED.to_string(),
+                listed(
+                    "codex",
+                    "not guarded, connect via hook + proxy",
+                    "possible leftover; installation not confirmed"
+                ),
+                under_row(
+                    "PreToolUse hook: installed, but Codex skips it: it is not trusted yet. Run: innerwarden agents connect codex"
+                ),
+                CONNECT_FOOTER.to_string(),
+            ]
+        );
+    }
+
+    /// Codex with a hook it trusts and no MCP server is guarded by the hook
+    /// alone, in the hook's mode. The dashboard's predicate stays on the MCP
+    /// wiring it reads the mode from.
+    ///
+    /// FAILS ON REVERT: leave `is_guarded` on the MCP config alone, and a
+    /// Codex with a trusted hook and no server reads "not guarded".
+    #[cfg(unix)]
+    #[test]
+    fn a_codex_hook_that_is_on_guards_an_agent_with_no_servers() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = format!("{}innerwarden", installed_guard_dir(home.path()));
+        let command = agent_hooks::CODEX.command(Path::new(&bin), false, true);
+        let config = codex_trusting(home.path(), &command);
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(home.path().join(".codex/config.toml"), &config).unwrap();
+        let row = known_row(home.path(), "codex");
+        assert!(!row.guarded);
+        assert!(!status_has_guard_wiring(home.path(), &row));
+
+        let result = connect_one_result(home.path(), &row, &bin, false, true);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+        assert!(result.configured());
+        assert_eq!(
+            result.line,
+            format!(
+                "  codex - connected (PreToolUse hook, monitor (records, never blocks))\n  codex - no local MCP servers to route through the guard proxy{}",
+                indented(agent_hooks::CODEX.coverage())
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.path().join(".codex/config.toml")).unwrap(),
+            config
+        );
+
+        let row = known_row(home.path(), "codex");
+        assert!(row.guarded);
+        assert_eq!(row.mode, Some(GuardMode::Monitor));
+        assert!(status_has_guard_wiring(home.path(), &row));
+        assert!(!status_is_effectively_guarded(home.path(), &row));
+        assert_eq!(
+            list_lines_of(home.path(), std::slice::from_ref(&row)),
+            [
+                NOTHING_TO_CONNECT.to_string(),
+                listed("codex", "✓ guarded (hook, monitor)", BY_ITS_CONFIG),
+            ]
+        );
+    }
+
+    /// `enforce` and `dry-run` rewrite the wiring that is there. An agent that
+    /// only has its MCP servers behind the proxy gets no hook from them: a new
+    /// hook, and the trust Codex is asked for it, come from `agents connect`
+    /// and setup, which the person runs for that.
+    ///
+    /// FAILS ON REVERT: drop the `installed()` guard in
+    /// `switch_mode_one_result` (take the hook branch for every row that has a
+    /// hook spec), and `.codex/hooks.json` is there after the switch and
+    /// Gemini's `BeforeTool` holds two groups.
+    #[test]
+    fn a_mode_switch_installs_no_hook_an_agent_did_not_have() {
+        const BIN: &str = "/abs/innerwarden";
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "[mcp_servers.icm]\ncommand = \"icm\"\n",
+        )
+        .unwrap();
+        let gemini = write_gemini_settings(home.path());
+
+        for name in ["codex", "gemini"] {
+            let row = known_row(home.path(), name);
+            // Automatic setup wires the proxy and never the hook.
+            let wired = connect_one_result_automatic(home.path(), &row, BIN, false, true);
+            assert_eq!(wired.effect, ConnectEffect::Connected, "{}", wired.line);
+
+            let row = known_row(home.path(), name);
+            assert!(status_has_guard_wiring(home.path(), &row), "{name}");
+            let switched = switch_mode_one_result(home.path(), &row, BIN, false, false);
+            assert_eq!(
+                switched.line,
+                format!(
+                    "  {name} - connected (1 MCP server routed through the guard proxy, enforce)"
+                )
+            );
+            assert_eq!(switched.effect, ConnectEffect::Connected);
+            assert_eq!(switched.hook_stopped, None);
+        }
+
+        assert!(!home.path().join(".codex/hooks.json").exists());
+        assert_eq!(
+            json_at(&gemini)["hooks"],
+            serde_json::json!({"BeforeTool": [{
+                "matcher": "write_file",
+                "hooks": [{"type": "command", "command": "/usr/local/bin/mine"}]
+            }]})
+        );
+    }
+
+    /// A mode switch rewrites Codex's hook line, and Codex runs a hook only
+    /// while it trusts the line it has. When nobody is there to trust the new
+    /// one, the hook that recorded every call before the switch runs for none
+    /// after it. That is a failed switch, and the result names the agent and
+    /// the one step, for the summary under the agents' lines.
+    ///
+    /// A second switch to the same mode rewrites nothing, and the mode is
+    /// still not in force for Codex: it fails the same way. `agents connect`
+    /// on a hook Codex does not trust is not a failure:
+    /// `a_codex_hook_codex_would_skip_is_never_listed_as_guarded` holds that
+    /// one at `Skipped`.
+    ///
+    /// FAILS ON REVERT: drop the `NotActive` arm guarded by `mode_switch` in
+    /// `connect_hook_and_proxy`, and the first switch is `Skipped` with no
+    /// line in `hook_stopped`; guard it on this run having written the line
+    /// as well, and the second switch is `Skipped`.
+    #[cfg(unix)]
+    #[test]
+    fn a_mode_switch_that_stops_codexs_hook_is_a_failure() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = format!("{}innerwarden", installed_guard_dir(home.path()));
+        let monitor_line = agent_hooks::CODEX.command(Path::new(&bin), false, true);
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            codex_trusting(home.path(), &monitor_line),
+        )
+        .unwrap();
+        let row = known_row(home.path(), "codex");
+        let connected = connect_one_result(home.path(), &row, &bin, false, true);
+        assert_eq!(
+            connected.effect,
+            ConnectEffect::Connected,
+            "{}",
+            connected.line
+        );
+        assert_eq!(connected.hook_stopped, None);
+
+        let row = known_row(home.path(), "codex");
+        assert!(row.guarded);
+        let switched = switch_mode_one_result(home.path(), &row, &bin, false, false);
+        assert_eq!(switched.effect, ConnectEffect::Failed, "{}", switched.line);
+        assert!(!switched.configured());
+        assert_eq!(
+            switched.hook_stopped.as_deref(),
+            Some(
+                "codex - its PreToolUse hook is not active after this switch. Run `/hooks` inside Codex and trust the innerwarden hook"
+            )
+        );
+        assert!(
+            switched
+                .line
+                .starts_with("  codex - its PreToolUse hook is installed, but it is NOT active: "),
+            "{}",
+            switched.line
+        );
+        assert!(
+            switched.line.ends_with(CODEX_UNSCREENED),
+            "{}",
+            switched.line
+        );
+        assert!(!known_row(home.path(), "codex").guarded);
+
+        let row = known_row(home.path(), "codex");
+        let again = switch_mode_one_result(home.path(), &row, &bin, false, false);
+        assert_eq!(again.effect, ConnectEffect::Failed, "{}", again.line);
+        assert!(!again.configured());
+        assert_eq!(again.hook_stopped, switched.hook_stopped);
+    }
+
+    /// With MCP servers behind the proxy the wrappers switch, and the hook
+    /// Codex skips still makes the switch fail for Codex: the summary never
+    /// counts it among the agents the mode is configured on.
+    ///
+    /// FAILS ON REVERT: let the `NotActive` arm guarded by `mode_switch` in
+    /// `connect_hook_and_proxy` answer `Skipped`, and the wrappers' effect
+    /// makes each switch `Connected` or `Unchanged`, counted as configured.
+    #[cfg(unix)]
+    #[test]
+    fn a_switch_that_leaves_codexs_hook_skipped_fails_beside_its_mcp_servers() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = format!("{}innerwarden", installed_guard_dir(home.path()));
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "[mcp_servers.icm]\ncommand = \"icm\"\n",
+        )
+        .unwrap();
+        let row = known_row(home.path(), "codex");
+        let connected = connect_one_result(home.path(), &row, &bin, false, false);
+        assert!(
+            home.path().join(".codex/hooks.json").is_file(),
+            "{}",
+            connected.line
+        );
+        assert_eq!(connected.hook_stopped, None);
+
+        for _ in 0..2 {
+            let row = known_row(home.path(), "codex");
+            let switched = switch_mode_one_result(home.path(), &row, &bin, false, false);
+            assert_eq!(switched.effect, ConnectEffect::Failed, "{}", switched.line);
+            assert!(!switched.configured());
+            assert!(
+                switched.hook_stopped.as_deref().is_some_and(|line| line
+                    .starts_with("codex - its PreToolUse hook is not active after this switch.")),
+                "{:?}",
+                switched.hook_stopped
+            );
+        }
+    }
+
+    /// Wrappers alone are half of what Codex is screened by. The listing says
+    /// "partly guarded", states the hook and the one step under the row, and
+    /// still counts the agent as work left.
+    ///
+    /// FAILS ON REVERT: label the row by `r.guarded` alone, and it reads
+    /// "✓ guarded (MCP proxy, enforce)" under "Nothing to connect".
+    #[test]
+    fn the_listing_says_partly_guarded_while_the_hook_is_not_installed() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = format!("{}innerwarden", installed_guard_dir(home.path()));
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            format!(
+                "[mcp_servers.icm]\ncommand = \"{bin}\"\nargs = [\"proxy\", \"--label\", \"codex\", \"--agent\", \"codex\", \"--mode\", \"guard\", \"--\", \"icm\"]\n"
+            ),
+        )
+        .unwrap();
+        let row = known_row(home.path(), "codex");
+        assert!(row.guarded);
+        assert_eq!(row.mode, Some(GuardMode::Enforce));
+        assert!(status_is_effectively_guarded(home.path(), &row));
+
+        assert_eq!(
+            list_lines_of(home.path(), std::slice::from_ref(&row)),
+            [
+                ONE_NOT_GUARDED.to_string(),
+                listed(
+                    "codex",
+                    "partly guarded (MCP proxy, enforce)",
+                    BY_ITS_CONFIG
+                ),
+                under_row("PreToolUse hook: not installed. Run: innerwarden agents connect codex"),
+                CONNECT_FOOTER.to_string(),
+            ]
+        );
+    }
+
+    /// A hook that is on does not hide an MCP server that still runs outside
+    /// the proxy: the row is not guarded, and the listing says which half is
+    /// missing.
+    ///
+    /// FAILS ON REVERT: let a hook that is on decide `is_guarded` ahead of
+    /// the MCP servers, and the row reads "✓ guarded".
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_that_is_on_does_not_hide_a_server_outside_the_proxy() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = format!("{}innerwarden", installed_guard_dir(home.path()));
+        let path = write_gemini_settings(home.path());
+        let row = known_row(home.path(), "gemini");
+        assert!(connect_one_result(home.path(), &row, &bin, false, true).configured());
+        assert!(known_row(home.path(), "gemini").guarded);
+
+        // A server the person adds after the connect.
+        let mut settings = json_at(&path);
+        settings["mcpServers"]["later"] = serde_json::json!({"command": "node"});
+        std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        let row = known_row(home.path(), "gemini");
+        assert!(!row.guarded);
+        assert_eq!(row.mode, None);
+        assert_eq!(
+            list_lines_of(home.path(), std::slice::from_ref(&row)),
+            [
+                ONE_NOT_GUARDED.to_string(),
+                listed("gemini", "partly guarded (hook, monitor)", BY_ITS_CONFIG),
+                under_row(
+                    "MCP servers: not all behind the guard proxy. Run: innerwarden agents connect gemini"
+                ),
+                CONNECT_FOOTER.to_string(),
+            ]
+        );
+    }
+
+    /// A hook that records beside wrappers that block is neither mode.
+    ///
+    /// FAILS ON REVERT: read the mode from the wrappers alone, and the row
+    /// says "enforce" while the hook lets every shell command through.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_and_wrappers_in_two_modes_read_as_mixed() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = format!("{}innerwarden", installed_guard_dir(home.path()));
+        write_gemini_settings(home.path());
+        let row = known_row(home.path(), "gemini");
+        assert!(connect_one_result(home.path(), &row, &bin, false, true).configured());
+        assert_eq!(
+            known_row(home.path(), "gemini").mode,
+            Some(GuardMode::Monitor)
+        );
+
+        // The wrappers alone move to enforce; the hook line stays in monitor.
+        let proxy = connect_by_one_mechanism(home.path(), &row, &bin, false, false, false);
+        assert_eq!(proxy.effect, ConnectEffect::Connected, "{}", proxy.line);
+        let row = known_row(home.path(), "gemini");
+        assert!(row.guarded);
+        assert_eq!(row.mode, Some(GuardMode::Mixed));
+        assert_eq!(
+            list_lines_of(home.path(), std::slice::from_ref(&row)),
+            [
+                NOTHING_TO_CONNECT.to_string(),
+                listed("gemini", "✓ guarded (hook + proxy, MIXED)", BY_ITS_CONFIG),
+            ]
+        );
+    }
+
+    /// Automatic setup never writes the hook of Codex or Gemini: what it does
+    /// and prints for them is the proxy step alone.
+    ///
+    /// FAILS ON REVERT: wire the hook whatever the link policy, and background
+    /// setup adds a hook nobody asked for.
+    #[test]
+    fn automatic_setup_wires_the_proxy_of_gemini_and_never_its_hook() {
+        let home = tempfile::TempDir::new().unwrap();
+        let path = write_gemini_settings(home.path());
+        let before = json_at(&path);
+        let row = known_row(home.path(), "gemini");
+
+        let result =
+            connect_one_result_automatic(home.path(), &row, "/abs/innerwarden", false, true);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+        assert_eq!(
+            result.line,
+            "  gemini - connected (1 MCP server routed through the guard proxy, monitor)"
+        );
+        let after = json_at(&path);
+        assert_eq!(after["hooks"], before["hooks"]);
+        assert_eq!(after["mcpServers"]["fs"]["command"], "/abs/innerwarden");
+        assert_eq!(
+            hook_state(home.path(), &row).map(|(_, state)| state),
+            Some(HookState::Absent)
+        );
+    }
+
+    /// Disconnect takes the hook of Codex out when there is no wrapper to
+    /// unwrap, and says so. A second run has nothing to remove.
+    ///
+    /// FAILS ON REVERT: print the proxy step's line whatever the hook step
+    /// removed, and the first disconnect reads "was not connected".
+    #[test]
+    fn disconnect_codex_with_only_a_hook_removes_it() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let row = known_row(home.path(), "codex");
+        connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert!(has_guard_wiring(home.path(), "codex"));
+
+        assert_eq!(disconnect_one(home.path(), &row), "  codex, disconnected");
+        assert_eq!(
+            json_at(&home.path().join(".codex/hooks.json")),
+            serde_json::json!({"hooks": {"PreToolUse": []}})
+        );
+        assert!(!has_guard_wiring(home.path(), "codex"));
+        assert_eq!(
+            disconnect_one(home.path(), &row),
+            "  codex - was not connected"
+        );
+    }
+
+    /// Codex trusts a hook by its place in the file. Taking our hook out moves
+    /// a hook of the person's that sat behind it, and the disconnect names it
+    /// with the step that makes Codex run it again.
+    ///
+    /// FAILS ON REVERT: end `disconnect_one` with `line` in place of the
+    /// `match` on `agent_hooks::moved_note`, and the person reads
+    /// "disconnected" and nothing about the hook Codex now skips.
+    #[test]
+    fn disconnect_codex_names_the_persons_hook_it_moved() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let row = known_row(home.path(), "codex");
+        connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        let theirs = serde_json::json!({
+            "hooks": [{"type": "command", "command": "/opt/audit/before"}]
+        });
+        let path = home.path().join(".codex/hooks.json");
+        let mut settings = json_at(&path);
+        settings["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .expect("the connect wrote a list of groups")
+            .push(theirs.clone());
+        std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        assert_eq!(
+            disconnect_one(home.path(), &row),
+            "  codex, disconnected\n      A PreToolUse hook of your own moved to a new place in ~/.codex/hooks.json: `/opt/audit/before`. Codex trusts a hook by its place and skips it until it is trusted there. Run `/hooks` inside Codex and trust it again."
+        );
+        assert_eq!(
+            json_at(&path),
+            serde_json::json!({"hooks": {"PreToolUse": [theirs]}})
+        );
+    }
+
+    /// A connect that finds our hook inside a group of the person's takes it
+    /// out of that group, which moves the person's hook behind it. The connect
+    /// names that hook under the line for ours.
+    ///
+    /// FAILS ON REVERT: drop the `lines.extend` over `connected.notes(spec)`
+    /// in `connect_hook_and_proxy`, and the hook Codex now skips is not named.
+    #[test]
+    fn connect_codex_names_the_persons_hook_it_moved() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let row = known_row(home.path(), "codex");
+        connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        // The person adds a hook of their own behind ours, in the same group.
+        let path = home.path().join(".codex/hooks.json");
+        let mut settings = json_at(&path);
+        settings["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array_mut()
+            .expect("the connect wrote a group with a list of hooks")
+            .push(serde_json::json!({"type": "command", "command": "/opt/audit/before"}));
+        std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
+
+        let again = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert!(
+            again.line.contains(
+                "\n      A PreToolUse hook of your own moved to a new place in ~/.codex/hooks.json: `/opt/audit/before`. Codex trusts a hook by its place and skips it until it is trusted there. Run `/hooks` inside Codex and trust it again."
+            ),
+            "{}",
+            again.line
+        );
+    }
+
+    /// The wrappers come off whatever the hook's file holds. When that file
+    /// cannot be read, the disconnect still says what happened to the
+    /// wrappers, above the failure the exit code is read from.
+    ///
+    /// FAILS ON REVERT: take `{proxy}\n` out of the `Err` arm of
+    /// `disconnect_one`, and the line starts with the failure: the person is
+    /// not told the MCP servers no longer run behind the proxy.
+    #[test]
+    fn disconnect_says_what_the_wrappers_did_when_the_hook_file_is_broken() {
+        const BIN: &str = "/abs/innerwarden";
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        let config = home.path().join(".codex/config.toml");
+        std::fs::write(&config, "[mcp_servers.icm]\ncommand = \"icm\"\n").unwrap();
+        let row = known_row(home.path(), "codex");
+        let wired = connect_one_result_automatic(home.path(), &row, BIN, false, true);
+        assert_eq!(wired.effect, ConnectEffect::Connected, "{}", wired.line);
+        assert!(std::fs::read_to_string(&config).unwrap().contains(BIN));
+        std::fs::write(home.path().join(".codex/hooks.json"), "{\"hooks\": ").unwrap();
+
+        let row = known_row(home.path(), "codex");
+        let line = disconnect_one(home.path(), &row);
+        assert!(
+            line.starts_with("  codex, disconnected\n  codex, failed: "),
+            "{line}"
+        );
+        assert!(line.contains("hooks.json is not valid JSON"), "{line}");
+        assert!(!std::fs::read_to_string(&config).unwrap().contains(BIN));
+    }
+
+    /// The effect of a hook step and a proxy step on one agent.
+    #[test]
+    fn two_wiring_steps_report_a_failure_then_a_change_then_what_was_there() {
+        use ConnectEffect::{Connected, Failed, Skipped, Unchanged};
+        for (first, second, both) in [
+            (Failed, Connected, Failed),
+            (Connected, Failed, Failed),
+            (Skipped, Failed, Failed),
+            (Connected, Unchanged, Connected),
+            (Skipped, Connected, Connected),
+            (Unchanged, Skipped, Unchanged),
+            (Skipped, Unchanged, Unchanged),
+            (Unchanged, Unchanged, Unchanged),
+            (Skipped, Skipped, Skipped),
+        ] {
+            assert_eq!(both_effects(first, second), both, "{first:?} + {second:?}");
+        }
+    }
+
+    /// Only Codex and Gemini, found through their own reviewed MCP config,
+    /// have a hook beside the proxy. The same name over another file does not.
+    #[test]
+    fn the_hook_beside_the_proxy_is_for_codex_and_gemini_by_their_own_config() {
+        assert_eq!(
+            hook_spec("codex", None, Some(".codex/config.toml")),
+            Some(&agent_hooks::CODEX)
+        );
+        assert_eq!(
+            hook_spec("gemini", Some(".gemini/settings.json"), None),
+            Some(&agent_hooks::GEMINI)
+        );
+        assert_eq!(hook_spec("codex", Some(".codex/mcp.json"), None), None);
+        assert_eq!(hook_spec("gemini", Some(".gemini/mcp.json"), None), None);
+        assert_eq!(hook_spec("codex", None, None), None);
+        assert_eq!(hook_spec("cursor", Some(".cursor/mcp.json"), None), None);
+        assert_eq!(hook_spec("claude-code", None, None), None);
     }
 }

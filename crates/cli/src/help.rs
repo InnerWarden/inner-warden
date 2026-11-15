@@ -151,12 +151,16 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
             "{p} hook [--block-review] [--monitor]\n  \
              The PreToolUse adapter: reads the agent's tool call as JSON on stdin and\n  \
              screens the shell command inside it. A file tool (Write, Edit, MultiEdit,\n  \
-             NotebookEdit) is judged on the file it changes: a privileged one (agent\n  \
-             settings, the guard's configuration, shell startup files, credentials) is\n  \
-             refused, any other passes at once. A read tool (Read, Grep, Glob) is judged\n  \
+             NotebookEdit; Gemini's write_file and replace; Codex's apply_patch;\n  \
+             Hermes's write_file and patch) is judged on the file it changes: a\n  \
+             privileged one (agent settings, the guard's configuration, shell startup\n  \
+             files, credentials) is refused, any other passes at once. A read tool\n  \
+             (Read, Grep, Glob; Gemini's and Hermes's read_file and searches) is judged\n  \
              as the shell read of the same files: a private key or a stored login is\n  \
-             refused. Exit 2 blocks the call, exit 0 allows it. Any other tool call\n  \
-             always allows, so it is never wedged.\n\
+             refused. Hermes's execute_code is judged as `python3 -c`, and text its\n  \
+             process_manage types into a running process as a shell line. Exit 2\n  \
+             blocks the call, exit 0 allows it. Any other tool call always allows, so it\n  \
+             is never wedged.\n\
              \n  \
              --block-review   block `review` verdicts too (default: deny only)\n  \
              --monitor        record every command and never block"
@@ -442,6 +446,21 @@ mod tests {
         }
     }
 
+    /// The hook's usage names every agent's file tools it judges, Hermes's
+    /// included, and the Hermes tools that run code.
+    /// FAILS ON REVERT of the Hermes words in the `hook` usage.
+    #[test]
+    fn the_hook_help_names_every_agents_file_tools() {
+        let text = usage("hook", &[]).expect("hook has a usage");
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        for words in [
+            "Gemini's write_file and replace; Codex's apply_patch; Hermes's write_file and patch",
+            "Hermes's execute_code is judged as `python3 -c`",
+        ] {
+            assert!(flat.contains(words), "{words}: {text}");
+        }
+    }
+
     /// The hook's usage names every class of tool it judges: the read tools
     /// are judged since 1.6.13, and "any other tool call always allows" was
     /// said over them.
@@ -450,13 +469,13 @@ mod tests {
     fn the_hook_help_names_the_read_tools() {
         let text = usage("hook", &[]).expect("hook has a usage");
         let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(
-            flat.contains(
-                "A read tool (Read, Grep, Glob) is judged as the shell read of the same files: \
-                 a private key or a stored login is refused."
-            ),
-            "{text}"
-        );
+        for words in [
+            "A read tool (Read, Grep, Glob;",
+            "is judged as the shell read of the same files: a private key or a stored login is \
+             refused.",
+        ] {
+            assert!(flat.contains(words), "{words}: {text}");
+        }
     }
 
     /// THE CARVE-OUT, and the reason a blanket intercept was rejected.
