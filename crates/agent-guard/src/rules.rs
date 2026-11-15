@@ -117,7 +117,7 @@ struct PendingCondition {
 /// corpus has close to 600 conditions, and its bounded repetitions
 /// (`.{0,200}`, `[^)]{0,300}`) over Unicode classes compile to large automata,
 /// built once forwards and once in reverse: about 34 MB of heap for the whole
-/// corpus, before any search warms a cache. Measured on Linux x86_64 release,
+/// corpus of ATR v0.4.0 (71 files), before any search warms a cache. Measured on Linux x86_64 release,
 /// that put each `innerwarden proxy` at about 41 MB of private anonymous
 /// memory before it had screened anything. An MCP client keeps one proxy per
 /// wrapped server open for its whole session, so a user with five servers in
@@ -129,6 +129,13 @@ struct PendingCondition {
 /// one of them out before a regex is consulted. So a rule now compiles when a
 /// context it applies to first reaches it, and a rule no inspected surface
 /// selects is never compiled at all.
+///
+/// What the proxy's surfaces do compile is held to a budget by
+/// `tests/proxy_rule_heap.rs`: the live heap the `tool_call` and
+/// `mcp_exchange` rules leave behind after one `tools/list`, one `tools/call`
+/// and one ordinary tool result, counted by allocator (21.9 MiB with the 77
+/// shipped files, 14.1 MiB before upstream batch 1). Re-declaring an `llm_io`
+/// rule for a proxy surface moves its whole cost onto every proxy.
 ///
 /// Detection is unchanged by construction: a rule is compiled before its first
 /// evaluation completes, through the same compiler as before, so its first
