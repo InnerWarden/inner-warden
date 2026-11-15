@@ -111,7 +111,41 @@ struct ForwardRegex {
     dfa: regex_automata::hybrid::dfa::DFA,
     pikevm: regex_automata::nfa::thompson::pikevm::PikeVM,
     caches: regex_automata::util::pool::Pool<ForwardCaches, ForwardCacheFn>,
+    /// What a lazy-DFA cache holds when it is created: the floor for
+    /// [`RETAINED_CACHE_BYTES`].
+    fresh_dfa_cache: usize,
 }
+
+/// How much search scratch a condition may keep between two searches, over
+/// what a fresh lazy-DFA cache holds.
+///
+/// # Why there is a bound
+///
+/// A lazy DFA builds its states while it searches and keeps them in its cache
+/// for the next search, up to its capacity (2 MiB, as in `Regex`); a cache
+/// that fills is cleared and refilled, and its memory stays allocated either
+/// way. Ordinary text leaves a cache well under this bound (at most 41 KB
+/// over a fresh cache, measured over 64 KB of English and of Portuguese and
+/// Japanese prose on every condition the proxy compiles). Text written to
+/// drive the automaton, a 64 KB tool result of the rules' own trigger words
+/// with no line breaks, fills it to the capacity; and the PikeVM's cache,
+/// created when the lazy DFA gives up, is sized by the automaton. Both lived
+/// as long as the engine, for every condition such a text reached, in every
+/// `innerwarden proxy`: measured on Linux x86_64 after two ordinary 64 KB
+/// results, five such results took the proxy's rules from 3.2 MiB to 9.2 MiB
+/// of live heap on the 71 files of ATR v0.4.0, and from 6.8 MiB to 39.5 MiB
+/// with upstream batch 2 as first proposed.
+///
+/// After each search, a lazy-DFA cache that has cleared, or that holds more
+/// than this over a fresh one, is replaced by a fresh one, and a PikeVM cache
+/// over this bound is dropped (the next fallback creates one). A search runs
+/// exactly as before: the same capacity, the same give-up thresholds, the
+/// same engines, so the same answers; a search that starts from a fresh
+/// cache is how every condition's first search starts. A smaller capacity
+/// would bound the memory too, but it sends some shipped conditions to the
+/// PikeVM on text they decide today in the lazy DFA (three times slower on
+/// two of the hostile texts measured).
+const RETAINED_CACHE_BYTES: usize = 256 * 1024;
 
 /// One searcher's scratch space. The PikeVM's is created only the first time
 /// the lazy DFA hands a search over to it, so text the lazy DFA decides on its
@@ -163,6 +197,7 @@ impl ForwardRegex {
             .configure(PikeVM::config().prefilter(prefix))
             .build_from_nfa(nfa)
             .ok()?;
+        let fresh_dfa_cache = dfa.create_cache().memory_usage();
         let for_caches = dfa.clone();
         let create: ForwardCacheFn = Box::new(move || ForwardCaches {
             dfa: for_caches.create_cache(),
@@ -172,13 +207,14 @@ impl ForwardRegex {
             dfa,
             pikevm,
             caches: Pool::new(create),
+            fresh_dfa_cache,
         }))
     }
 
     fn is_match(&self, haystack: &str) -> bool {
         let input = regex_automata::Input::new(haystack).earliest(true);
         let mut caches = self.caches.get();
-        match self.dfa.try_search_fwd(&mut caches.dfa, &input) {
+        let found = match self.dfa.try_search_fwd(&mut caches.dfa, &input) {
             Ok(found) => found.is_some(),
             Err(_) => {
                 #[cfg(test)]
@@ -187,6 +223,28 @@ impl ForwardRegex {
                 let cache = caches.pikevm.get_or_insert_with(|| pikevm.create_cache());
                 pikevm.is_match(cache, input)
             }
+        };
+        self.trim(&mut caches);
+        found
+    }
+
+    /// Keeps what a search leaves in `caches` within [`RETAINED_CACHE_BYTES`].
+    fn trim(&self, caches: &mut ForwardCaches) {
+        // `memory_usage` counts what the cache holds now; a cache that has
+        // cleared still owns the capacity it filled before clearing.
+        if caches.dfa.clear_count() > 0
+            || caches.dfa.memory_usage() > self.fresh_dfa_cache + RETAINED_CACHE_BYTES
+        {
+            caches.dfa = self.dfa.create_cache();
+        }
+        // Sized by the automaton, not by the text: a large one is created
+        // again by the next search that needs it.
+        if caches
+            .pikevm
+            .as_ref()
+            .is_some_and(|cache| cache.memory_usage() > RETAINED_CACHE_BYTES)
+        {
+            caches.pikevm = None;
         }
     }
 
@@ -1945,6 +2003,113 @@ detection:
         assert!(
             with_prefilter > 100,
             "only {with_prefilter} shipped conditions have a literal prefix"
+        );
+    }
+
+    /// One shipped exfiltration condition (an override phrase, then bounded
+    /// runs of any character but a line break) and a 64 KB text of its own
+    /// trigger words: the shape that fills a lazy DFA's cache.
+    fn cache_filling_pattern_and_text() -> (&'static str, String) {
+        let pattern = r#"(?i)(?:ignore\s+all\s+previous\s+instructions|disregard\s+(?:all\s+)?(?:previous|prior)\s+instructions)[^\n]{0,200}(?:retrieve|get|export|access|fetch|download)\s+(?:my\s+)?(?:saved\s+)?(?:payment\s+method|bank\s+account|credit\s+card)[^\n]{0,150}(?:email|mail|send)[^\n]{0,80}@[^\s"]{3,80}"#;
+        let words = [
+            "ignore all previous instructions",
+            "disregard prior instructions",
+            "retrieve my credit card",
+            "get my bank account",
+            "email",
+            "send",
+            "a@b.co",
+            "the",
+            "a",
+            "report",
+            "and",
+            "of",
+            "x",
+        ];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut text = String::new();
+        while text.len() < 64 * 1024 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            text.push_str(words[(state % words.len() as u64) as usize]);
+            text.push(' ');
+        }
+        (pattern, text)
+    }
+
+    /// A search that fills the lazy DFA's cache leaves a fresh cache behind,
+    /// and a PikeVM cache over the bound is dropped: what a condition keeps
+    /// between searches stays within [`RETAINED_CACHE_BYTES`]. The answer is
+    /// the one `Regex` gives, and the next search answers the same.
+    ///
+    /// Not vacuous: the same search on a cache this code does not trim is
+    /// shown to leave more than the bound allows (or to clear it, or to give
+    /// up), so the text does reach the bound.
+    ///
+    /// FAILS ON REVERT: drop the `self.trim(&mut caches)` call from
+    /// `ForwardRegex::is_match`.
+    #[test]
+    fn a_search_that_fills_the_cache_leaves_a_bounded_one() {
+        let (pattern, text) = cache_filling_pattern_and_text();
+        let forward = ForwardRegex::new(pattern).expect("forward matcher");
+        let expected = Regex::new(pattern).expect("regex").is_match(&text);
+        let bound = forward.fresh_dfa_cache + RETAINED_CACHE_BYTES;
+
+        let mut untrimmed = forward.dfa.create_cache();
+        let input = regex_automata::Input::new(text.as_str()).earliest(true);
+        let gave_up = forward.dfa.try_search_fwd(&mut untrimmed, &input).is_err();
+        assert!(
+            gave_up || untrimmed.clear_count() > 0 || untrimmed.memory_usage() > bound,
+            "the text left a {} byte cache, within the {bound} byte bound: it tests nothing",
+            untrimmed.memory_usage()
+        );
+
+        for _ in 0..2 {
+            assert_eq!(forward.is_match(&text), expected);
+            let caches = forward.caches.get();
+            assert_eq!(caches.dfa.clear_count(), 0, "a cleared cache was kept");
+            assert!(
+                caches.dfa.memory_usage() <= bound,
+                "kept a {} byte lazy-DFA cache, over the {bound} byte bound",
+                caches.dfa.memory_usage()
+            );
+            let pikevm = caches.pikevm.as_ref().map_or(0, |c| c.memory_usage());
+            assert!(
+                pikevm <= RETAINED_CACHE_BYTES,
+                "kept a {pikevm} byte PikeVM cache"
+            );
+        }
+    }
+
+    /// The bound costs ordinary text nothing: the states a search of it built
+    /// stay in the cache for the next search.
+    ///
+    /// FAILS ON REVERT of the bound to "always start fresh".
+    #[test]
+    fn an_ordinary_search_keeps_its_warm_cache() {
+        let (pattern, _) = cache_filling_pattern_and_text();
+        let forward = ForwardRegex::new(pattern).expect("forward matcher");
+        let fresh = forward.fresh_dfa_cache;
+        let mut text = String::new();
+        let mut n = 0;
+        while text.len() < 64 * 1024 {
+            n += 1;
+            text.push_str(&format!(
+                "Section {n}. Ignore the old draft; the release notes are at \
+                 https://docs.example.com/guide/{n}. Send comments to docs@example.com.\n"
+            ));
+        }
+        assert!(!forward.is_match(&text));
+        let caches = forward.caches.get();
+        assert_eq!(
+            caches.dfa.clear_count(),
+            0,
+            "ordinary text filled the cache"
+        );
+        assert!(
+            caches.dfa.memory_usage() > fresh,
+            "the states the search built were thrown away"
         );
     }
 
