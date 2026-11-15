@@ -31,15 +31,12 @@ use serde_json::{json, Value};
 /// The rule files taken at upstream commit a5616495a, relative to
 /// `rules/atr`. NOTICE names each of them.
 const IMPORTED: &[&str] = &[
-    "prompt-injection/ATR-2026-00511-mcp-web-context-poisoning.yaml",
     "tool-poisoning/ATR-2026-00434-mcp-remote-authorization-endpoint-command-injection.yaml",
     "tool-poisoning/ATR-2026-00714-tool-camouflage-forced-tool-call.yaml",
     "tool-poisoning/ATR-2026-00715-tool-knowledge-hijack-identity-injection.yaml",
     "tool-poisoning/ATR-2026-01301-tool-description-exclusive-tool-override.yaml",
     "tool-poisoning/ATR-2026-01302-fake-tool-result-instruction-injection.yaml",
-    "tool-poisoning/ATR-2026-01306-mcp-oauth-command-injection.yaml",
     "tool-poisoning/ATR-2026-01307-mcp-dns-rebinding-attack.yaml",
-    "tool-poisoning/ATR-2026-01310-mcp-tool-description-compliance-history-exfil.yaml",
 ];
 
 /// Keys of a test case that describe it rather than carry its input.

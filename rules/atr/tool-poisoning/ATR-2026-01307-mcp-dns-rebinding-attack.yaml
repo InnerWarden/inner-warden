@@ -6,6 +6,11 @@
 #   dialect InnerWarden compiles, `\w` is Unicode, and with `(?i)` the
 #   pattern went over the regex size limit, so it did not compile and the
 #   condition was skipped.
+# - 2026-11-15: upstream's fourth condition (a loopback dev port, then one
+#   of the words rebind, 1time, forever or rbndr within 200 characters) is
+#   left out. No upstream true positive relies on it, and it matched
+#   ordinary terminal output: a port-in-use error that says to rebind, a
+#   dev server that runs forever, process-manager logs.
 title: "MCP DNS Rebinding Attack — Hostname Time-Based IP Switching"
 id: ATR-2026-01307
 rule_version: 1
@@ -99,11 +104,8 @@ detection:
       value: "(?i)<\\s*script[^>]{0,80}>\\s*(?:window\\.location|document\\.location|location\\.href)\\s*=\\s*['\"]?https?://[a-zA-Z0-9.-]{10,200}(?:rebind|rbndr|1time|forever)[a-zA-Z0-9.-]*:[0-9]{2,5}"
       description: "Script tag with window.location redirect to DNS rebinding hostname — MCPSecBench exact pattern"
 
-    # Pattern 4: Loopback MCP port targeted after internal IP rebinding
-    - field: content
-      operator: regex
-      value: '(?i)(?:127\.0\.0\.1|localhost|::1)\s*:\s*(?:900[0-9]|8[0-9]{3}|3[0-9]{3})\b[^"]{0,200}(?:rebind|1time|forever|rbndr)'
-      description: "Loopback address with common MCP server port referenced alongside rebinding terminology"
+    # InnerWarden: upstream's Pattern 4 (loopback port + rebinding word) is
+    # left out here; see the header.
 
 response:
   actions:

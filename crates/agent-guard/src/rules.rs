@@ -16,7 +16,7 @@ use tracing::warn;
 ///
 /// The vendored ATR (Agent Threat Rules) corpus, embedded into the binary at
 /// compile time. This is the canonical default ruleset, embedding guarantees
-/// the engine always has the 80 community rules without any deploy/copy step
+/// the engine always has the 77 community rules without any deploy/copy step
 /// (the deploy script only ever shipped `rules/sigma`, so on-disk loading left
 /// the ATR engine empty in prod, see `load_with_overlay`).
 static EMBEDDED_ATR_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../rules/atr");
@@ -382,7 +382,7 @@ impl RuleEngine {
     /// with the same `id` as an embedded rule replace it; new ids are added.
     /// A missing/unreadable dir is fine, the embedded corpus stands alone.
     ///
-    /// This is the production entry point: it guarantees the 71 pattern-tier
+    /// This is the production entry point: it guarantees the 68 pattern-tier
     /// community rules are present even when the deploy step never copied the
     /// ATR tree onto the host, while still honoring operator customization.
     pub fn load_with_overlay(override_dir: &Path) -> Self {
@@ -568,7 +568,7 @@ impl RuleEngine {
 ///
 /// # Why the shell surface matches nothing today
 ///
-/// The corpus declares 29 rules as `tool_call`, 30 as `llm_io`, and NONE as
+/// The corpus declares 28 rules as `tool_call`, 30 as `llm_io`, and NONE as
 /// `shell_command` or `any`. So screening a shell command matches nothing: every
 /// rule is filtered out here before a regex runs, and `innerwarden check` reports
 /// zero ATR matches whatever it is given. The rules are live on the MCP and LLM
@@ -1225,10 +1225,10 @@ detection:
 
     // ── Embedded ATR corpus (fix: prod-load gap via include_dir) ─────────────
 
-    /// 80 vendored rules (71 from ATR v0.4.0, 9 from upstream a5616495a);
+    /// 77 vendored rules (71 from ATR v0.4.0, 6 from upstream a5616495a);
     /// 9 are `detection_tier: semantic` (no executor) and are skipped,
-    /// leaving 71 compilable pattern-tier rules.
-    const EMBEDDED_PATTERN_RULE_COUNT: usize = 71;
+    /// leaving 68 compilable pattern-tier rules.
+    const EMBEDDED_PATTERN_RULE_COUNT: usize = 68;
 
     #[test]
     fn embedded_corpus_loads_all_pattern_tier_rules() {
