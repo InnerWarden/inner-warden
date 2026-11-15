@@ -905,6 +905,7 @@ dependencies = [
  "innerwarden-safe-io",
  "libc",
  "regex",
+ "regex-automata",
  "serde",
  "serde_json",
  "serde_yaml",
