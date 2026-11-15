@@ -928,24 +928,42 @@ mod tests {
     /// Orders are read from each verb, and a verb can sit inside a long
     /// token. A target read to the end of the token from each one was
     /// quadratic; bounded, the scan stays linear. No order to disclose is
-    /// there, so every verb is tried. FAILS ON REVERT (to unbounded path
-    /// tails): the first token took over 10 s.
+    /// there, so every verb is tried. The check is a ratio, not a wall
+    /// time, so a slow runner or coverage instrumentation cannot fail it:
+    /// four times the text costs about four times the time when linear and
+    /// sixteen times when quadratic. FAILS ON REVERT (to unbounded path
+    /// tails): the larger text does not finish within the 120 s ceiling.
     #[test]
     fn a_long_token_full_of_verbs_is_screened_in_linear_time() {
+        use std::time::{Duration, Instant};
+        fn fastest_of_two(text: &str) -> Duration {
+            (0..2)
+                .map(|_| {
+                    let started = Instant::now();
+                    let _ = find(text).is_some();
+                    started.elapsed()
+                })
+                .min()
+                .unwrap_or_default()
+        }
         for unit in [
             "get/home/",
             "get-a-",
             "send.x@",
             "<!--x-->get the password ",
         ] {
-            let text = unit.repeat(100_000);
+            let (small, large) = (unit.repeat(10_000), unit.repeat(40_000));
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let _ = tx.send(find(&text).is_some());
+                let _ = tx.send((fastest_of_two(&small), fastest_of_two(&large)));
             });
-            if rx.recv_timeout(std::time::Duration::from_secs(10)).is_err() {
-                panic!("screening a long token of {unit:?} took over 10 s");
-            }
+            let Ok((small, large)) = rx.recv_timeout(Duration::from_secs(120)) else {
+                panic!("screening a long token of {unit:?} took over 120 s");
+            };
+            assert!(
+                large < small * 10 + Duration::from_millis(50),
+                "four times a long token of {unit:?} took {large:?} against {small:?}: not linear"
+            );
         }
     }
 
