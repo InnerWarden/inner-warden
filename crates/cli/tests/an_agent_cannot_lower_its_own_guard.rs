@@ -41,12 +41,25 @@ fn enforced_home() -> tempfile::TempDir {
     home
 }
 
+/// The suite's PATH less every folder that holds a `codex`. `agents connect`
+/// and a mode switch ask the Codex they find there to trust the hook they
+/// wrote, and a test never starts the real one.
+fn path_without_codex() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept = std::env::split_paths(&path)
+        .filter(|dir| !dir.join("codex").exists() && !dir.join("codex.exe").exists());
+    std::env::join_paths(kept).expect("folders split from PATH join back")
+}
+
 fn run(home: &Path, args: &[&str], marker: Option<&str>) -> Output {
     let mut command = Command::new(bin());
     command
         .env("HOME", home)
         .env("IW_GRAPH_FILE", home.join("graph.json"))
         .env("INNERWARDEN_AGENT_URL", "off")
+        // No real Codex: none on PATH to ask, no other folder for it to read.
+        .env("PATH", path_without_codex())
+        .env_remove("CODEX_HOME")
         .stdin(Stdio::null());
     for name in AGENT_SHELL_MARKERS {
         command.env_remove(name);

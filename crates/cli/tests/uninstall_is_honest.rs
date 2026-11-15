@@ -104,15 +104,34 @@ fn seed_home(home: &Path) {
     .expect("seed a key");
 }
 
+/// The suite's PATH less every folder that holds a `codex`. `agents connect`
+/// and a mode switch ask the Codex they find there to trust the hook they
+/// wrote, and a test never starts the real one.
+fn path_without_codex() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept = std::env::split_paths(&path)
+        .filter(|dir| !dir.join("codex").exists() && !dir.join("codex.exe").exists());
+    std::env::join_paths(kept).expect("folders split from PATH join back")
+}
+
 fn run_uninstall(exe: &Path, home: &Path, extra: &[&str]) -> Output {
+    let mut args = vec!["uninstall"];
+    args.extend_from_slice(extra);
+    run_cli(exe, home, &args)
+}
+
+/// The copy at `exe` with `args`, over a disposable home, as the person.
+fn run_cli(exe: &Path, home: &Path, args: &[&str]) -> Output {
     let mut cmd = Command::new(exe);
-    cmd.arg("uninstall");
-    cmd.args(extra);
+    cmd.args(args);
     cmd.env("HOME", home);
     // Windows reads the home directory from here, not from HOME.
     cmd.env("USERPROFILE", home);
     // Keep the run offline and non-interactive whatever the environment holds.
     cmd.env_remove("INNERWARDEN_CONFIG_DIR");
+    // No real Codex: none on PATH to ask, no other folder for it to read.
+    cmd.env("PATH", path_without_codex());
+    cmd.env_remove("CODEX_HOME");
     // Run as the person, not from inside an AI agent's shell (the suite may
     // itself run under one): uninstall is refused there.
     for marker in [
@@ -131,7 +150,7 @@ fn run_uninstall(exe: &Path, home: &Path, extra: &[&str]) -> Output {
     // another test's copy. See `fork_safe` for why the fork needs covering.
     spawn_without_racing_a_copy(&mut cmd)
         .wait_with_output()
-        .expect("run uninstall")
+        .expect("run the copy")
 }
 
 fn text(out: &Output) -> String {
@@ -235,6 +254,251 @@ fn a_writable_direct_install_is_removed_and_exits_clean() {
         !exe.exists(),
         "a writable direct install must actually be gone:\n{said}"
     );
+}
+
+/// Gemini's settings with nothing in them, so the agent is there to connect.
+#[cfg(unix)]
+fn an_empty_gemini(home: &Path) -> PathBuf {
+    let settings = home.join(".gemini/settings.json");
+    std::fs::create_dir_all(settings.parent().expect("a directory")).expect("gemini dir");
+    std::fs::write(&settings, "{}\n").expect("gemini settings");
+    settings
+}
+
+/// Codex and Gemini each hold a hook that runs this binary by its absolute
+/// path. `uninstall` takes both out before the binary goes: Gemini refuses
+/// every tool call while its hook names a program that is gone.
+///
+/// FAILS ON REVERT: drop the disconnect call from `cmd_uninstall_self` and
+/// both files keep their hook.
+#[cfg(unix)]
+#[test]
+fn the_codex_and_gemini_hooks_go_before_the_binary() {
+    let home = tempfile::tempdir().expect("home");
+    seed_home(home.path());
+    let exe = in_the_installers_directory(home.path());
+    std::fs::create_dir_all(home.path().join(".codex")).expect("codex dir");
+    let gemini = an_empty_gemini(home.path());
+    let hooks = [
+        ("codex", home.path().join(".codex/hooks.json")),
+        ("gemini", gemini),
+    ];
+    for (agent, file) in &hooks {
+        let connected = text(&run_cli(
+            &exe,
+            home.path(),
+            &["agents", "connect", *agent, "--monitor"],
+        ));
+        let held = std::fs::read_to_string(file).unwrap_or_default();
+        assert!(
+            held.contains(&format!("hook --monitor --agent {agent}")),
+            "the connect wrote no hook into {}, so the rest of this test proves \
+             nothing:\n{connected}",
+            file.display()
+        );
+    }
+
+    let out = run_uninstall(&exe, home.path(), &[]);
+    let said = text(&out);
+
+    assert_eq!(out.status.code(), Some(0), "{said}");
+    assert!(!exe.exists(), "the binary must be gone:\n{said}");
+    for (agent, file) in &hooks {
+        let held = std::fs::read_to_string(file).unwrap_or_default();
+        assert!(
+            !held.contains("innerwarden"),
+            "{agent} still holds a hook that names a binary that is gone:\n{held}"
+        );
+    }
+}
+
+/// A hook the disconnect could not take out still runs this binary, and
+/// Gemini refuses every tool call while its hook names a program that is
+/// gone. `uninstall` stops with the binary and the configuration in place and
+/// names the file. Here Gemini's settings were cut short after the hook was
+/// written: the disconnect cannot read them, and the line is still in them for
+/// the day the file is mended.
+///
+/// FAILS ON REVERT: take the `if !left.is_empty()` block out of
+/// `cmd_uninstall_self` and the run removes the binary under the hook.
+#[cfg(unix)]
+#[test]
+fn a_hook_the_disconnect_left_behind_stops_the_uninstall() {
+    let home = tempfile::tempdir().expect("home");
+    seed_home(home.path());
+    let exe = in_the_installers_directory(home.path());
+    let settings = an_empty_gemini(home.path());
+    let connected = text(&run_cli(
+        &exe,
+        home.path(),
+        &["agents", "connect", "gemini", "--monitor"],
+    ));
+    let whole = std::fs::read_to_string(&settings).expect("read the settings");
+    assert!(
+        whole.contains("hook --monitor --agent gemini"),
+        "the connect wrote no hook, so the rest of this test proves nothing:\n{connected}"
+    );
+    let cut = whole
+        .trim_end()
+        .strip_suffix('}')
+        .expect("the settings end in a brace");
+    std::fs::write(&settings, cut).expect("cut the settings short");
+
+    let out = run_uninstall(&exe, home.path(), &[]);
+    let said = text(&out);
+
+    assert_eq!(out.status.code(), Some(1), "{said}");
+    assert!(
+        exe.exists(),
+        "the binary a hook still runs was removed:\n{said}"
+    );
+    assert!(
+        home.path().join(".config/innerwarden/llm-key").exists(),
+        "the configuration went while the hook stayed:\n{said}"
+    );
+    assert!(
+        said.contains(
+            "~/.gemini/settings.json could not be read, and a BeforeTool hook in it may \
+             still run this binary."
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains(
+            "Gemini would start a hook whose program is gone before every tool call: in \
+             enforce mode it refuses every call, in monitor mode it runs them unscreened on \
+             Linux and macOS and refuses them on Windows."
+        ),
+        "{said}"
+    );
+    assert!(!said.contains("binary  : removed"), "{said}");
+}
+
+/// Make `dir` read-only (or writable again), as a person's locked-down
+/// settings folder is: nothing in it can be replaced.
+#[cfg(unix)]
+fn lock(dir: &Path, locked: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if locked { 0o555 } else { 0o755 };
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// Claude Code's enforcing hook is the fail-closed script: with its program
+/// gone, Claude Code refuses every tool call, the one that would mend the
+/// file included. When the hook cannot be taken out (here `~/.claude` is
+/// read-only), `uninstall` stops with the binary and the configuration in
+/// place and names the file. Before, it said "removed", exited 0, and left
+/// every call refused (reproduced on the build box with `~/.claude` at 555).
+///
+/// FAILS ON REVERT of the `claude_code_hook_still_runs` stop in
+/// `cmd_uninstall_self`: exit 0, and the binary is gone under the hook.
+#[cfg(unix)]
+#[test]
+fn a_claude_code_hook_that_cannot_be_removed_stops_the_uninstall() {
+    let home = tempfile::tempdir().expect("home");
+    seed_home(home.path());
+    let exe = in_the_installers_directory(home.path());
+    let claude = home.path().join(".claude");
+    std::fs::create_dir_all(&claude).expect("claude dir");
+    let installed = text(&run_cli(&exe, home.path(), &["install", "claude-code"]));
+    let settings = std::fs::read_to_string(claude.join("settings.json")).unwrap_or_default();
+    assert!(
+        settings.contains("/bin/sh -c") && settings.contains("hook --agent claude-code"),
+        "the install wrote no enforcing hook, so the rest of this test proves \
+         nothing:\n{installed}\n{settings}"
+    );
+    if !geteuid_is_root() {
+        lock(&claude, true);
+    }
+    let out = run_uninstall(&exe, home.path(), &[]);
+    lock(&claude, false);
+    let said = text(&out);
+    if geteuid_is_root() {
+        // Root writes through a read-only folder: nothing to stop for.
+        return;
+    }
+
+    assert_eq!(out.status.code(), Some(1), "{said}");
+    assert!(
+        exe.exists(),
+        "the binary a hook still runs was removed:\n{said}"
+    );
+    assert!(
+        home.path().join(".config/innerwarden/llm-key").exists(),
+        "the configuration went while the hook stayed:\n{said}"
+    );
+    assert!(
+        said.contains(
+            "~/.claude/settings.json still holds a PreToolUse hook that runs this binary."
+        ),
+        "{said}"
+    );
+    assert!(!said.contains("binary  : removed"), "{said}");
+    assert!(!said.contains("Community removed"), "{said}");
+}
+
+/// Hermes's enforcing entry carries `fail_closed: true`: with its program
+/// gone, Hermes refuses every tool call. When the disconnect cannot take it
+/// out (here `~/.hermes` is read-only), `uninstall` stops with the binary
+/// and the configuration in place and names the file.
+///
+/// FAILS ON REVERT of the `hermes_hook::still_runs` look in
+/// `cmd_uninstall_self` (answer `None`): exit 0, and the binary is gone
+/// under the entry.
+#[cfg(unix)]
+#[test]
+fn a_hermes_hook_the_disconnect_left_behind_stops_the_uninstall() {
+    let home = tempfile::tempdir().expect("home");
+    seed_home(home.path());
+    let exe = in_the_installers_directory(home.path());
+    let hermes = home.path().join(".hermes");
+    std::fs::create_dir_all(&hermes).expect("hermes dir");
+    std::fs::write(hermes.join("config.yaml"), "model: x\n").expect("hermes config");
+    let connected = text(&run_cli(
+        &exe,
+        home.path(),
+        &["agents", "connect", "hermes"],
+    ));
+    let config = std::fs::read_to_string(hermes.join("config.yaml")).unwrap_or_default();
+    assert!(
+        config.contains("hook --agent hermes") && config.contains("fail_closed: true"),
+        "the connect wrote no enforcing entry, so the rest of this test proves \
+         nothing:\n{connected}\n{config}"
+    );
+    if geteuid_is_root() {
+        return;
+    }
+    lock(&hermes, true);
+    let out = run_uninstall(&exe, home.path(), &[]);
+    lock(&hermes, false);
+    let said = text(&out);
+
+    assert_eq!(out.status.code(), Some(1), "{said}");
+    assert!(
+        exe.exists(),
+        "the binary a hook still runs was removed:\n{said}"
+    );
+    assert!(
+        home.path().join(".config/innerwarden/llm-key").exists(),
+        "the configuration went while the hook stayed:\n{said}"
+    );
+    for line in [
+        "~/.hermes/config.yaml still holds a pre_tool_call hook that runs this binary.",
+        "Hermes refuses every tool call while a fail-closed hook names a program that is gone.",
+    ] {
+        assert!(said.contains(line), "{line}\n{said}");
+    }
+    assert!(!said.contains("binary  : removed"), "{said}");
+}
+
+/// Whether the tests run as root, who writes through a read-only folder.
+#[cfg(unix)]
+fn geteuid_is_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+        .unwrap_or(false)
 }
 
 /// REGRESSION ANCHOR. A copy the installer did not lay down was deleted by

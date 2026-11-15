@@ -91,6 +91,12 @@ With Rust / cargo (any platform):
 cargo install --git https://github.com/InnerWarden/inner-warden innerwarden
 ```
 
+To remove it, run `innerwarden uninstall` first, then remove the package
+(`npm uninstall -g innerwarden`, `apt remove`, `dnf remove`, Scoop). An
+enforcing hook refuses every tool call once its program is gone (see "The
+hook line fails closed" below), and `innerwarden uninstall` takes the hooks
+out before the program goes.
+
 No account. The guard itself sends nothing off the machine. The `curl | sh`
 installer sends one anonymous, opt-out install ping (version + OS + CPU arch
 only: no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
@@ -182,6 +188,47 @@ Whatever agent you run, there is a mechanism and a command for it:
   rules a shell read is: a `Read` of a private key, a tool's stored login or
   a `.env` outside the project gets the verdict `cat` of the same file gets.
   The text a `Grep` searches for is not judged.
+- **Codex CLI, Gemini CLI** - their own pre-tool hooks (Codex `PreToolUse`
+  in `~/.codex/hooks.json`, Gemini `BeforeTool` in `~/.gemini/settings.json`)
+  judge their shell commands and their file changes (`apply_patch`;
+  `write_file` and `replace`), and Gemini's reads (`read_file`,
+  `read_many_files`, `glob`, `grep_search`) by the same secret rules as
+  Claude Code's, and the MCP proxy carries their MCP servers:
+  `innerwarden agents connect codex` or `gemini`. Codex runs the hook only
+  once it trusts it, and connect asks Codex to. Needs Codex CLI 0.166.0 or
+  newer (older ones send the session's folder, not the command's) and Gemini
+  CLI 0.26.0 or newer (older ones run no hook unless switched on); measured
+  on macOS with Codex 0.167.2 and Gemini 0.68.0.
+- **Hermes Agent** - its own shell hook, under `hooks.pre_tool_call` in
+  `~/.hermes/config.yaml`, judges its `terminal` commands (in the `workdir`
+  they name), its file changes through `write_file` and `patch`, and its
+  reads through `read_file` and `search_files`:
+  `innerwarden agents connect hermes`, which also records the hook's
+  approval in `~/.hermes/shell-hooks-allowlist.json` (Hermes skips a hook
+  nobody approved). In enforce mode the entry carries `fail_closed: true`, so
+  a guard that is missing, killed or out of time refuses the call. The
+  Python `execute_code` runs is judged as `python3 -c`, and text
+  `process_manage` types into a running process as a shell line; in enforce
+  mode a `terminal` command that only starts a shell or a language, waiting
+  for input, is refused. Not screened: its other tools (the browser, its MCP
+  servers).
+  Hermes keeps the folder a command `cd`s into for its next command but
+  sends the folder it was started in, so a later relative path is judged
+  there. Needs Hermes Agent v0.22.5 or newer; read in its v0.23.1 source,
+  not yet measured on a running Hermes. Reversible with `agents disconnect
+  hermes`.
+- **The hook line fails closed.** On Linux and macOS an enforcing hook line
+  (Claude Code, Codex, Gemini) runs the guard inside a small `/bin/sh`
+  script: if the innerwarden program is missing, cannot start, is killed or
+  ends without its answer, the call is refused with that reason. The guard
+  refuses on its own when it has not answered in 10 seconds (longer while a
+  second opinion you turned on waits). A monitor line never refuses: it is
+  the program alone, or for Gemini, which refuses a call on most other exits,
+  a script that ends every other way with 1. Not closed: an agent that stops
+  the hook at its own timeout (60 s as written) runs the call, and on Windows
+  the line is the program alone. Because the line fails closed, removing the
+  program without `innerwarden uninstall` leaves every tool call refused:
+  put it back, or take the hook out of the agent's settings by hand.
 - **OpenClaw** - its own tools (`exec`, `process`, `write`, `edit`,
   `apply_patch`) are asked about through its `before_tool_call` plugin hook,
   which needs OpenClaw 2026.9.7 or newer: `innerwarden agents connect
@@ -190,9 +237,9 @@ Whatever agent you run, there is a mechanism and a command for it:
   `innerwarden enforce` a deny is refused (the model is told only "Refused by
   InnerWarden.") and a review asks you to allow it once or deny it.
   Reversible with `agents disconnect openclaw`.
-- **Cursor, Codex CLI, Gemini CLI** - no pre-execution hook exists, so
-  the guard wires their MCP configuration to run through its proxy:
-  `innerwarden agents connect <agent>`. Reversible with `agents disconnect`.
+- **Cursor** - no pre-execution hook exists, so the guard wires its MCP
+  configuration to run through its proxy: `innerwarden agents connect
+  cursor`. Reversible with `agents disconnect`.
   OpenClaw has one more surface, and it observes rather than enforces: its
   message hooks see the inbound prompt and the reply, so
   `innerwarden observe install` records a dangerous ask even when the model,

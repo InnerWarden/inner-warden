@@ -515,12 +515,111 @@ pub fn hook_command(iw_guard: &Path, block_review: bool, monitor: bool) -> Strin
 /// [`hook_command`], naming the agent the hook serves (`--agent <id>`), so
 /// every decision it records says which agent asked. The id is written only
 /// when it is a plain agent id; anything else is left out rather than quoted.
+///
+/// This is Claude Code's line. On Linux and macOS an enforcing one ends in
+/// [`FAIL_CLOSED`]; Codex CLI and Gemini CLI get [`hook_command_shaped`].
 pub fn hook_command_for(
     iw_guard: &Path,
     block_review: bool,
     monitor: bool,
     agent: Option<&str>,
 ) -> String {
+    let words = hook_words(block_review, monitor, agent);
+    // A hook that refuses closes when it cannot run: see [`FAIL_CLOSED`].
+    let closed = if !monitor && cfg!(unix) {
+        FAIL_CLOSED
+    } else {
+        ""
+    };
+    format!("\"{}\" hook{words}{closed}", iw_guard.display())
+}
+
+/// The shell that runs the fail-closed hook line. Named by its full path: the
+/// line must not depend on the agent's `PATH`, and every Linux and macOS
+/// system has it.
+const FAIL_CLOSED_SHELL: &str = "/bin/sh";
+
+/// How the fail-closed line names the guard inside its script: the shell's
+/// `$0`, which is the guard's path, handed to the shell as its own argument.
+/// The path is then quoted once, by the agent's shell, exactly as in the plain
+/// line, and never inside the script.
+const FAIL_CLOSED_PROGRAM: &str = "\"$0\"";
+
+/// What the fail-closed line runs after the guard. The guard answers 0 (run
+/// it) or 2 (refuse it) in enforce. Any other end means it did not answer: the
+/// shell could not find or start it (127, 126), it died on a signal (128 and
+/// up, `SIGKILL` included, which no process can answer), or it failed some
+/// other way. Every agent this line is written for refuses on 2 with a reason
+/// on stderr, and runs the tool on most of the rest, so the rest becomes 2
+/// with a reason. There is no `'` and no `\` in it, so it reads the same in
+/// every shell an agent may start the line with (`sh`, `bash`, `zsh`, `fish`).
+///
+/// The refusal names the way out, because the agent cannot take it: every
+/// call it would make to mend the hook is refused too. A person who removed
+/// the program without `innerwarden uninstall` puts it back, or takes the
+/// hook out of the agent's settings by hand.
+const FAIL_CLOSED_TAIL: &str = "; s=$?; case $s in 0|2) exit $s;; esac; echo \"InnerWarden \
+hook: the innerwarden program ended without an answer (exit $s); refusing this tool call rather \
+than letting it run unscreened. To stop this, put the innerwarden program back, or remove the \
+innerwarden hook from the agent settings by hand (~/.claude/settings.json, ~/.codex/hooks.json \
+or ~/.gemini/settings.json).\" >&2; exit 2";
+
+/// What the Gemini monitor line runs after the guard ([`FAIL_CLOSED_TAIL`]
+/// turned the other way): every end but 0 becomes 1, with a note. Gemini CLI
+/// 0.30.0 and later refuse a tool call on any exit but 0 and 1, so a plain
+/// monitor line whose program is gone (127), cannot start (126) or is killed
+/// held every call up: a mode that never refuses refused everything. 1 is
+/// Gemini's "warn, run the tool". No `'` and no `\`, as in the other tail.
+const FAIL_OPEN_TAIL: &str = "; s=$?; case $s in 0) exit 0;; esac; echo \"InnerWarden \
+hook: the innerwarden program ended without an answer (exit $s); this tool call was NOT \
+screened (monitor mode never blocks).\" >&2; exit 1";
+
+/// The agent whose monitor line is the fail-open script: the one agent that
+/// refuses a call on an exit a plain monitor line can end with.
+const FAIL_OPEN_AGENT: &str = "gemini";
+
+/// PURE: the hook line for Codex CLI, Gemini CLI and Hermes Agent, with its
+/// shape chosen by the caller. Codex starts a hook line with the person's
+/// login shell (`$SHELL -lc`), which may be one that cannot read the
+/// [`FAIL_CLOSED`] tail (fish), and a line that shell cannot parse runs no
+/// guard at all; so these lines name `/bin/sh` themselves.
+///
+/// `fail_closed` wraps an enforcing line in a small shell script that turns
+/// every end of the guard other than its own answer into a refusal
+/// ([`FAIL_CLOSED_TAIL`]). Without it the line is the guard alone, and a guard
+/// that is missing, cannot start or is killed lets the call run on Claude Code
+/// and Codex: they treat an exit other than 2 as "carry on". A monitor line
+/// never refuses anything, whatever happens to the guard: it stays plain,
+/// except Gemini's, which the same flag wraps in the script that turns every
+/// end other than 0 into 1 ([`FAIL_OPEN_TAIL`]), because Gemini refuses on
+/// the others. On Windows the line stays plain, because the agents start it
+/// with `cmd` or PowerShell, where there is no `/bin/sh`.
+pub fn hook_command_shaped(
+    iw_guard: &Path,
+    block_review: bool,
+    monitor: bool,
+    agent: Option<&str>,
+    fail_closed: bool,
+) -> String {
+    let words = hook_words(block_review, monitor, agent);
+    let tail = match (monitor, agent) {
+        (false, _) => FAIL_CLOSED_TAIL,
+        (true, Some(FAIL_OPEN_AGENT)) => FAIL_OPEN_TAIL,
+        (true, _) => "",
+    };
+    if fail_closed && !tail.is_empty() {
+        format!(
+            "{FAIL_CLOSED_SHELL} -c '{FAIL_CLOSED_PROGRAM} hook{words}{tail}' \"{}\"",
+            iw_guard.display()
+        )
+    } else {
+        format!("\"{}\" hook{words}", iw_guard.display())
+    }
+}
+
+/// The words after `hook` in a line of ours: the mode flag, then
+/// `--agent <id>`.
+fn hook_words(block_review: bool, monitor: bool, agent: Option<&str>) -> String {
     // `monitor` wins: it records every command but never blocks, so a dev gets the
     // live graph without the guardrail denying day-to-day work.
     let flag = if monitor {
@@ -534,13 +633,7 @@ pub fn hook_command_for(
         .filter(|agent| is_agent_id(agent))
         .map(|agent| format!(" --agent {agent}"))
         .unwrap_or_default();
-    // A hook that refuses closes when it cannot run: see [`FAIL_CLOSED`].
-    let closed = if !monitor && cfg!(unix) {
-        FAIL_CLOSED
-    } else {
-        ""
-    };
-    format!("\"{}\" hook{flag}{agent}{closed}", iw_guard.display())
+    format!("{flag}{agent}")
 }
 
 /// Written after a hook that refuses (enforce, `--block-review`), never after
@@ -908,6 +1001,50 @@ fn plain_hook_command_words(command: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+/// How a line of ours runs the guard ([`hook_command_shaped`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineShape {
+    /// The guard alone.
+    Plain,
+    /// Inside the script that refuses when the guard does not answer.
+    FailClosed,
+    /// Inside the script that lets the call run, with a note, when the guard
+    /// does not answer (Gemini's monitor line).
+    FailOpen,
+}
+
+/// The guard's own words in a hook line, the program first: the line split by
+/// [`hook_command_words`], or, for the scripted lines [`hook_command_shaped`]
+/// writes, the words its script hands the guard, with the program its `$0`
+/// names. The second value says which shape it was.
+///
+/// A scripted line is read by its exact shape and nothing wider: the shell by
+/// its full path, `-c`, a script that starts with the guard as `$0` and ends
+/// with [`FAIL_CLOSED_TAIL`] or [`FAIL_OPEN_TAIL`] to the letter, and the
+/// program as the one word after it. Uninstall and repair find this line by
+/// it, and a script of the person's own that merely runs the guard must stay
+/// theirs.
+fn guard_words(command: &str) -> Option<(Vec<String>, LineShape)> {
+    let words = hook_command_words(command)?;
+    let [shell, dash_c, script, program] = words.as_slice() else {
+        return Some((words, LineShape::Plain));
+    };
+    if shell != FAIL_CLOSED_SHELL || dash_c != "-c" {
+        return Some((words, LineShape::Plain));
+    }
+    let guard = script.strip_prefix(FAIL_CLOSED_PROGRAM)?;
+    let (guard, shape) = match guard.strip_suffix(FAIL_CLOSED_TAIL) {
+        Some(guard) => (guard, LineShape::FailClosed),
+        None => (guard.strip_suffix(FAIL_OPEN_TAIL)?, LineShape::FailOpen),
+    };
+    if !guard.starts_with(' ') {
+        return None;
+    }
+    let mut inner = vec![program.clone()];
+    inner.extend(hook_command_words(guard)?);
+    Some((inner, shape))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum HookProtection {
     Monitor,
@@ -977,19 +1114,37 @@ fn iwguard_hook_mode(hook: &Value) -> Option<HookProtection> {
 ///
 /// The grammar is the one [`hook_command_for`] writes and nothing wider:
 /// `<innerwarden> hook`, then at most one mode flag, then at most one
-/// `--agent <id>`. A repeated flag, an unknown word or an agent id that is not
+/// `--agent <id>`, alone or inside the fail-closed script ([`guard_words`]). A repeated flag, an unknown word or an agent id that is not
 /// a plain id means the line is not ours, exactly as before `--agent` existed:
 /// uninstall and repair must never claim an operator's own command.
 fn iwguard_hook_parts(hook: &Value) -> Option<(HookProtection, Option<String>)> {
-    let words = hook
-        .get("command")
-        .and_then(Value::as_str)
-        .and_then(hook_command_words)?;
-    hook_parts_of_words(&words)
+    let line = parse_guard_line(hook.get("command").and_then(Value::as_str)?)?;
+    Some((line.mode, line.agent))
+}
+
+/// One line of ours, read apart by [`parse_guard_line`].
+struct GuardLine {
+    program: String,
+    mode: HookProtection,
+    agent: Option<String>,
+    shape: LineShape,
+}
+
+/// PURE: read a hook command as a line of ours, plain or fail-closed
+/// ([`guard_words`]), by the grammar [`iwguard_hook_parts`] states.
+fn parse_guard_line(command: &str) -> Option<GuardLine> {
+    let (words, shape) = guard_words(command)?;
+    parse_guard_words(&words, shape)
 }
 
 /// [`iwguard_hook_parts`] once the command is split into words.
+#[cfg(test)]
 fn hook_parts_of_words(words: &[String]) -> Option<(HookProtection, Option<String>)> {
+    parse_guard_words(words, LineShape::Plain).map(|line| (line.mode, line.agent))
+}
+
+/// [`parse_guard_line`] once the command is split into words.
+fn parse_guard_words(words: &[String], shape: LineShape) -> Option<GuardLine> {
     let (executable, rest) = words.split_first()?;
     let (subcommand, flags) = rest.split_first()?;
     if !is_innerwarden_executable(executable) || subcommand != "hook" {
@@ -1004,17 +1159,67 @@ fn hook_parts_of_words(words: &[String]) -> Option<(HookProtection, Option<Strin
         Some("--monitor") => HookProtection::Monitor,
         Some(_) => HookProtection::BlockReview,
     };
-    match agent_flags {
-        [] => Some((mode, None)),
-        [flag, agent] if flag == "--agent" && is_agent_id(agent) => {
-            Some((mode, Some(agent.clone())))
-        }
-        _ => None,
+    let agent = match agent_flags {
+        [] => None,
+        [flag, agent] if flag == "--agent" && is_agent_id(agent) => Some(agent.clone()),
+        _ => return None,
+    };
+    // Each script belongs to its mode: a monitor line that refuses, or an
+    // enforcing one that lets a call through, is no line this module writes.
+    let monitor = mode == HookProtection::Monitor;
+    match shape {
+        LineShape::FailClosed if monitor => return None,
+        LineShape::FailOpen if !monitor => return None,
+        _ => {}
     }
+    Some(GuardLine {
+        program: executable.clone(),
+        mode,
+        agent,
+        shape,
+    })
 }
 
 fn is_iwguard_hook(hook: &Value) -> bool {
     iwguard_hook_mode(hook).is_some()
+}
+
+/// One hook command this module calls its own, read apart.
+///
+/// For the agents whose hook lives outside Claude Code's settings
+/// ([`crate::agent_hooks`]): they recognise, judge and remove their entry by
+/// the same grammar, so a line is "ours" in one place only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookLine {
+    /// The program the hook runs, quotes removed.
+    pub program: String,
+    /// `--monitor`: records, never blocks.
+    pub monitor: bool,
+    /// `--block-review`: also blocks `review`.
+    pub block_review: bool,
+    /// The agent the line names with `--agent`, when it names one.
+    pub agent: Option<String>,
+    /// The line is the fail-closed script ([`hook_command_shaped`]): a guard
+    /// that does not answer refuses the call.
+    pub fail_closed: bool,
+    /// The line is the fail-open script (Gemini's monitor line): a guard
+    /// that does not answer ends the line with 1, and the call runs.
+    pub fail_open: bool,
+}
+
+/// Read one hook object as an InnerWarden hook line, `None` when its command
+/// is not one [`hook_command_for`] writes.
+pub fn read_hook_line(hook: &Value) -> Option<HookLine> {
+    let line = parse_guard_line(hook.get("command").and_then(Value::as_str)?)?;
+    let (block_review, monitor) = line.mode.flags();
+    Some(HookLine {
+        program: line.program,
+        monitor,
+        block_review,
+        agent: line.agent,
+        fail_closed: line.shape == LineShape::FailClosed,
+        fail_open: line.shape == LineShape::FailOpen,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1415,10 +1620,9 @@ pub fn effective_iwguard_hook_programs(settings: &Value) -> Vec<String> {
         .filter(|entry| bash_matcher_coverage(entry) == BashMatcherCoverage::Includes)
         .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
         .flatten()
-        .filter(|hook| is_iwguard_hook(hook))
         .filter_map(|hook| hook.get("command").and_then(Value::as_str))
-        .filter_map(hook_command_words)
-        .filter_map(|words| words.into_iter().next())
+        .filter_map(parse_guard_line)
+        .map(|line| line.program)
         .collect()
 }
 
@@ -1660,10 +1864,18 @@ pub fn needs_iwguard_hook_reconciliation(
 /// Remove every innerwarden PreToolUse Bash hook entry from a settings object,
 /// preserving all other keys, hook types, and unrelated PreToolUse entries.
 /// Returns `(new_settings, removed_count)`. Idempotent: a second call removes 0.
-pub fn remove_iwguard_pretooluse_hook(mut settings: Value) -> (Value, usize) {
+pub fn remove_iwguard_pretooluse_hook(settings: Value) -> (Value, usize) {
+    remove_iwguard_hooks_for_event(settings, "PreToolUse")
+}
+
+/// Remove every InnerWarden hook under one event (`PreToolUse`, `PostToolUse`,
+/// Gemini's `BeforeTool`), preserving every other hook, entry and key. An
+/// entry whose hook list becomes empty goes with it. Returns the new settings
+/// and how many hooks were removed. Idempotent: a second call removes 0.
+pub fn remove_iwguard_hooks_for_event(mut settings: Value, event: &str) -> (Value, usize) {
     let Some(pre) = settings
         .get_mut("hooks")
-        .and_then(|h| h.get_mut("PreToolUse"))
+        .and_then(|h| h.get_mut(event))
         .and_then(|p| p.as_array_mut())
     else {
         return (settings, 0);
@@ -1682,9 +1894,69 @@ pub fn remove_iwguard_pretooluse_hook(mut settings: Value) -> (Value, usize) {
 }
 
 /// Core uninstaller with the home directory injected (unit-testable). Reads the
-/// settings, strips innerwarden's PreToolUse hook, and writes back only if something
-/// changed. A missing/empty settings file means nothing to remove (0), not an
-/// error, so `uninstall` is always safe to run.
+/// settings, strips innerwarden's PreToolUse hooks and the PostToolUse hook
+/// installed with them, and writes back only if something changed. A
+/// missing/empty settings file means nothing to remove (0), not an error, so
+/// `uninstall` is always safe to run.
+/// Whether Claude Code's settings under `home` still hold a PreToolUse hook
+/// of ours whose program is `binary`: `Some(true)` when they do,
+/// `Some(false)` when the file cannot be read or parsed and its text holds
+/// a hook line of ours (which copy it runs cannot be told), `None` when
+/// there is none. Asked by `uninstall` before the binary goes: an enforcing
+/// line is the fail-closed script, and with its program gone Claude Code
+/// refuses every tool call, the one that would mend the file included.
+pub fn claude_code_hook_still_runs(home: &Path, binary: &Path) -> Option<bool> {
+    let path = home.join(".claude/settings.json");
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(false),
+    };
+    let text = String::from_utf8_lossy(&bytes);
+    let Ok(settings) = serde_json::from_slice::<Value>(&bytes) else {
+        let lower = text.to_ascii_lowercase();
+        return (lower.contains("innerwarden") && lower.contains("hook")).then_some(false);
+    };
+    let runs = settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(read_hook_line)
+        .any(|line| {
+            let program = Path::new(&line.program);
+            program == binary
+                || matches!(
+                    (program.canonicalize(), binary.canonicalize()),
+                    (Ok(program), Ok(binary)) if program == binary
+                )
+        });
+    runs.then_some(true)
+}
+
+/// What `uninstall` says when it stops for [`claude_code_hook_still_runs`].
+pub fn claude_code_left_behind_lines(seen: bool) -> Vec<String> {
+    vec![
+        if seen {
+            "~/.claude/settings.json still holds a PreToolUse hook that runs this binary."
+                .to_string()
+        } else {
+            "~/.claude/settings.json could not be read, and a PreToolUse hook in it may still \
+             run this binary."
+                .to_string()
+        },
+        "Claude Code would start a hook whose program is gone before every tool call: in \
+         enforce mode it refuses every call, the one that would fix the file included."
+            .to_string(),
+        "Make ~/.claude and its settings.json writable and run `innerwarden uninstall` \
+         again, or take the innerwarden entries out of `hooks.PreToolUse` in that file."
+            .to_string(),
+    ]
+}
+
 pub fn uninstall_hook(
     home: &Path,
     agent: &str,
@@ -1716,6 +1988,11 @@ pub fn uninstall_hook(
         }
     };
     let (cleaned, removed) = remove_iwguard_pretooluse_hook(existing);
+    // The observation half goes with the screening half. Left behind, it kept
+    // running the guard's binary after every tool call of an agent the person
+    // had disconnected, and failed on each one once the binary was removed.
+    let (cleaned, observed) = remove_iwguard_hooks_for_event(cleaned, "PostToolUse");
+    let removed = removed + observed;
     if removed > 0 {
         let body = serde_json::to_string_pretty(&cleaned).map_err(|e| e.to_string())? + "\n";
         crate::file_update::replace_if_unchanged(&settings_path, Some(&source), body.as_bytes())?;
@@ -2012,12 +2289,18 @@ mod tests {
             let entries = read_entry(&settings);
             assert_eq!(entries.len(), 1, "{settings}");
             assert_eq!(entries[0]["hooks"].as_array().unwrap().len(), 1);
-            assert_eq!(
-                entries[0]["hooks"][0]["command"],
-                json!(report.hook_command)
-            );
+            // The line the Bash entry holds: in enforce, the fail-closed
+            // script; in monitor, the program alone.
+            let bash_line = settings["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["matcher"] == "Bash")
+                .map(|entry| entry["hooks"][0]["command"].clone())
+                .unwrap();
+            assert_eq!(entries[0]["hooks"][0]["command"], bash_line);
             // The Bash and file merges, run again, leave it as it is.
-            let cmd = report.hook_command.as_str();
+            let cmd = bash_line.as_str().unwrap();
             assert_eq!(
                 merge_pretooluse_file_hook(merge_pretooluse_bash_hook(settings.clone(), cmd), cmd),
                 settings
@@ -2053,6 +2336,8 @@ mod tests {
         let new: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         let entries = read_entry(&new);
         assert_eq!(entries.len(), 1, "{new}");
+        // Brought up in enforce, so as the fail-closed line, as the Bash and
+        // file entries are repaired to it.
         assert_eq!(
             entries[0]["hooks"][0]["command"],
             format!("\"/opt/innerwarden\" hook --agent claude-code{CLOSED}")
@@ -2706,6 +2991,10 @@ mod tests {
         assert_eq!(c3, "\"/x/innerwarden\" hook --monitor");
         let c4 = hook_command(Path::new("/x/innerwarden"), false, true);
         assert_eq!(c4, "\"/x/innerwarden\" hook --monitor");
+        assert_eq!(
+            hook_command(Path::new("/x/innerwarden"), true, false),
+            hook_command_shaped(Path::new("/x/innerwarden"), true, false, None, cfg!(unix))
+        );
     }
 
     #[test]
@@ -2767,6 +3056,10 @@ mod tests {
         assert_eq!(
             hook_command_for(Path::new("/x/innerwarden"), false, false, Some("x; rm")),
             format!("\"/x/innerwarden\" hook{CLOSED}")
+        );
+        assert_eq!(
+            hook_command_for(Path::new("/x/innerwarden"), false, false, Some("x; rm")),
+            hook_command_for(Path::new("/x/innerwarden"), false, false, None)
         );
     }
 
@@ -3490,11 +3783,12 @@ mod tests {
         let (path, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
         assert_eq!(path, settings);
         assert_eq!(
-            removed, 3,
-            "the Bash hook, the file-tools hook and the read-tools hook"
+            removed, 4,
+            "the Bash hook, the file-tools hook, the read-tools hook and the PostToolUse hook"
         );
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 0);
+        assert_eq!(v["hooks"]["PostToolUse"].as_array().unwrap().len(), 0);
 
         // running uninstall again removes nothing and does not error.
         let (_, removed2) = uninstall_hook(home.path(), "claude-code", None).unwrap();
@@ -3523,9 +3817,558 @@ mod tests {
             3,
             "reinstall must not stack a second hook (Bash, file-tools and read-tools entries)"
         );
-        // uninstall finds and removes all three.
+        // uninstall finds and removes all four: Bash, file tools, read tools,
+        // PostToolUse.
         let (_, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
-        assert_eq!(removed, 3);
+        assert_eq!(removed, 4);
+    }
+
+    /// Uninstall takes out the PostToolUse hook it installed and nothing else
+    /// under that event: the person's own hook there stays as it was.
+    #[test]
+    fn uninstall_removes_its_posttooluse_hook_and_keeps_the_persons() {
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let theirs = json!({
+            "matcher": "Bash",
+            "hooks": [{"type": "command", "command": "/opt/audit/log-result"}]
+        });
+        std::fs::write(
+            &settings,
+            serde_json::to_string(&json!({"hooks": {"PostToolUse": [theirs.clone()]}})).unwrap(),
+        )
+        .unwrap();
+        install_hook(
+            home.path(),
+            "claude-code",
+            None,
+            Path::new("/opt/innerwarden"),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let (_, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
+        assert_eq!(removed, 4);
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["hooks"]["PostToolUse"], json!([theirs]));
+        assert_eq!(v["hooks"]["PreToolUse"], json!([]));
+    }
+
+    #[test]
+    fn a_hook_line_is_read_apart_and_a_foreign_one_is_not_ours() {
+        let line = |command: &str| read_hook_line(&json!({"type": "command", "command": command}));
+        assert_eq!(
+            line("\"/opt/iw/innerwarden\" hook --monitor --agent codex"),
+            Some(HookLine {
+                program: "/opt/iw/innerwarden".to_string(),
+                monitor: true,
+                block_review: false,
+                agent: Some("codex".to_string()),
+                fail_closed: false,
+                fail_open: false,
+            })
+        );
+        assert_eq!(
+            line("innerwarden hook --block-review"),
+            Some(HookLine {
+                program: "innerwarden".to_string(),
+                monitor: false,
+                block_review: true,
+                agent: None,
+                fail_closed: false,
+                fail_open: false,
+            })
+        );
+        assert_eq!(line("/opt/audit/innerwarden-helper hook"), None);
+        assert_eq!(line("innerwarden hook; rm -rf x"), None);
+    }
+
+    const GUARD: &str = "/opt/iw/innerwarden";
+
+    /// An enforcing line is the fail-closed script, and it reads back as the
+    /// same program, mode and agent: uninstall, repair and `status` find it as
+    /// they find the plain one. A monitor line stays plain whatever is asked.
+    ///
+    /// FAILS ON REVERT: make `hook_command_shaped` ignore `fail_closed` and
+    /// the enforcing lines are plain, so they start with the quoted program.
+    #[test]
+    fn an_enforcing_line_is_the_fail_closed_script_and_reads_back_as_ours() {
+        for (block_review, agent) in [
+            (false, Some("codex")),
+            (true, Some("gemini")),
+            (false, None),
+        ] {
+            let command = hook_command_shaped(Path::new(GUARD), block_review, false, agent, true);
+            assert!(command.starts_with("/bin/sh -c '\"$0\" hook"), "{command}");
+            assert!(
+                command.ends_with("exit 2' \"/opt/iw/innerwarden\""),
+                "{command}"
+            );
+            assert_eq!(
+                read_hook_line(&json!({"type": "command", "command": command})),
+                Some(HookLine {
+                    program: GUARD.to_string(),
+                    monitor: false,
+                    block_review,
+                    agent: agent.map(str::to_string),
+                    fail_closed: true,
+                    fail_open: false,
+                }),
+                "{command}"
+            );
+        }
+        let monitor = hook_command_shaped(Path::new(GUARD), false, true, Some("codex"), true);
+        assert_eq!(
+            monitor,
+            "\"/opt/iw/innerwarden\" hook --monitor --agent codex"
+        );
+        let plain = hook_command_shaped(Path::new(GUARD), false, false, Some("codex"), false);
+        assert_eq!(plain, "\"/opt/iw/innerwarden\" hook --agent codex");
+        assert_eq!(
+            hook_command_for(Path::new(GUARD), false, false, Some("codex")),
+            hook_command_shaped(Path::new(GUARD), false, false, Some("codex"), cfg!(unix))
+        );
+    }
+
+    /// Gemini's monitor line is the fail-open script, and it reads back as
+    /// ours, in monitor mode, neither fail-closed nor plain. Every other
+    /// monitor line stays plain. A script whose tail does not belong to its
+    /// mode is not ours.
+    ///
+    /// FAILS ON REVERT of the `FAIL_OPEN_AGENT` arm in `hook_command_shaped`
+    /// (Gemini's monitor line is plain), or of the `FAIL_OPEN_TAIL` arm in
+    /// `guard_words` (the line is not read back as ours).
+    #[test]
+    fn geminis_monitor_line_is_the_fail_open_script_and_reads_back_as_ours() {
+        let command = hook_command_shaped(Path::new(GUARD), false, true, Some("gemini"), true);
+        assert!(
+            command.starts_with("/bin/sh -c '\"$0\" hook --monitor --agent gemini"),
+            "{command}"
+        );
+        assert!(
+            command.ends_with("exit 1' \"/opt/iw/innerwarden\""),
+            "{command}"
+        );
+        assert_eq!(
+            read_hook_line(&json!({"type": "command", "command": command})),
+            Some(HookLine {
+                program: GUARD.to_string(),
+                monitor: true,
+                block_review: false,
+                agent: Some("gemini".to_string()),
+                fail_closed: false,
+                fail_open: true,
+            })
+        );
+        for agent in [Some("codex"), Some("claude-code"), None] {
+            let plain = hook_command_shaped(Path::new(GUARD), false, true, agent, true);
+            assert!(
+                plain.starts_with("\"/opt/iw/innerwarden\" hook --monitor"),
+                "{plain}"
+            );
+        }
+        let plain = hook_command_shaped(Path::new(GUARD), false, true, Some("gemini"), false);
+        assert_eq!(
+            plain,
+            "\"/opt/iw/innerwarden\" hook --monitor --agent gemini"
+        );
+        // A tail that is not its mode's: an enforcing line that lets the call
+        // run, a monitor line that refuses.
+        let enforce = hook_command_shaped(Path::new(GUARD), false, false, Some("gemini"), true);
+        let line = |command: &str| read_hook_line(&json!({"type": "command", "command": command}));
+        assert!(line(&enforce).is_some());
+        assert_eq!(
+            line(&enforce.replacen(FAIL_CLOSED_TAIL, FAIL_OPEN_TAIL, 1)),
+            None
+        );
+        assert_eq!(
+            line(&command.replacen(FAIL_OPEN_TAIL, FAIL_CLOSED_TAIL, 1)),
+            None
+        );
+    }
+
+    /// Run the way Gemini runs it, the fail-open monitor line ends with 1
+    /// and a note on stderr when the guard is missing, cannot start or is
+    /// killed (Gemini 0.30.0 and later refuse on any exit but 0 and 1), and
+    /// passes the guard's own 0 through.
+    ///
+    /// FAILS ON REVERT of `FAIL_OPEN_TAIL` in `hook_command_shaped`: the
+    /// missing guard's 127 comes back, which Gemini reads as a refusal.
+    #[cfg(unix)]
+    #[test]
+    fn geminis_monitor_line_lets_the_call_run_when_the_guard_does_not_answer() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let monitor = |guard: &Path| hook_command_shaped(guard, false, true, Some("gemini"), true);
+        let runs = |(code, stderr): (Option<i32>, String)| {
+            assert_eq!(code, Some(1), "{stderr}");
+            assert!(stderr.contains("NOT screened"), "{stderr}");
+        };
+        runs(run_line(
+            &monitor(&dir.path().join("gone/innerwarden")),
+            "{}",
+        ));
+        let guard = stand_in(dir.path(), "exit 0");
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o644)).unwrap();
+        runs(run_line(&monitor(&guard), "{}"));
+        let killed = stand_in(dir.path(), "kill -9 $$");
+        runs(run_line(&monitor(&killed), "{}"));
+        let answers = stand_in(dir.path(), "cat >/dev/null; exit 0");
+        let (code, stderr) = run_line(&monitor(&answers), "{}");
+        assert_eq!(code, Some(0), "{stderr}");
+        assert!(stderr.is_empty(), "{stderr}");
+    }
+
+    /// Whether Claude Code's settings still run this binary, read apart:
+    /// a hook of ours naming this program, another program, no file, a file
+    /// that is no settings with or without a hook line in it, and a path
+    /// that cannot be read. And the words uninstall says when it stops.
+    ///
+    /// FAILS ON REVERT of any test in `claude_code_hook_still_runs`, or of
+    /// the lines in `claude_code_left_behind_lines`.
+    #[test]
+    fn a_claude_code_hook_that_runs_this_binary_is_found() {
+        let home = tempfile::TempDir::new().unwrap();
+        let gone = Path::new("/opt/iw-not-here/innerwarden");
+        assert_eq!(claude_code_hook_still_runs(home.path(), gone), None);
+        let settings = home.path().join(".claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let wired = json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": hook_command_for(gone, false, false, Some("claude-code"))}
+        ]}]}});
+        fs::write(&settings, wired.to_string()).unwrap();
+        assert_eq!(claude_code_hook_still_runs(home.path(), gone), Some(true));
+        assert_eq!(
+            claude_code_hook_still_runs(home.path(), Path::new("/usr/bin/innerwarden")),
+            None
+        );
+        fs::write(
+            &settings,
+            "{\"hooks\": {\"PreToolUse\": [\"innerwarden\" hook",
+        )
+        .unwrap();
+        assert_eq!(claude_code_hook_still_runs(home.path(), gone), Some(false));
+        fs::write(&settings, "not json").unwrap();
+        assert_eq!(claude_code_hook_still_runs(home.path(), gone), None);
+        fs::write(&settings, "{\"note\": \"innerwarden\"").unwrap();
+        assert_eq!(claude_code_hook_still_runs(home.path(), gone), None);
+        // A link to the binary runs it.
+        let real = home.path().join("bin/innerwarden");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            let link = home.path().join("link/innerwarden");
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let linked = json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": hook_command_for(&link, false, false, Some("claude-code"))}
+            ]}]}});
+            fs::write(&settings, linked.to_string()).unwrap();
+            assert_eq!(claude_code_hook_still_runs(home.path(), &real), Some(true));
+        }
+        fs::remove_file(&settings).unwrap();
+        fs::create_dir_all(&settings).unwrap();
+        assert_eq!(claude_code_hook_still_runs(home.path(), gone), Some(false));
+        assert_eq!(
+            claude_code_left_behind_lines(true)[0],
+            "~/.claude/settings.json still holds a PreToolUse hook that runs this binary."
+        );
+        assert_eq!(
+            claude_code_left_behind_lines(false)[0],
+            "~/.claude/settings.json could not be read, and a PreToolUse hook in it may still \
+             run this binary."
+        );
+        assert_eq!(claude_code_left_behind_lines(true).len(), 3);
+        assert!(claude_code_left_behind_lines(true)[1].contains("refuses every call"));
+        assert!(claude_code_left_behind_lines(true)[2].contains("innerwarden uninstall"));
+    }
+
+    /// The Read|Grep|Glob entry is written with the same line as the shell
+    /// entry: in enforce, the fail-closed script, so a guard that is gone
+    /// refuses a read of a secret rather than letting it run; in monitor,
+    /// plain. An install from before reads were judged is brought up to it.
+    ///
+    /// FAILS ON REVERT of the read merge in `install_hook_with_link_policy`
+    /// or in `needs_iwguard_hook_reconciliation` (no read entry), or with the
+    /// read entry written with the plain line.
+    #[cfg(unix)]
+    #[test]
+    fn the_read_entry_is_fail_closed_in_enforce() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = Path::new("/opt/iw/innerwarden");
+        install_hook(home.path(), "claude-code", None, bin, false, false).unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let read_entry = |v: &Value| {
+            v["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["matcher"] == crate::file_tools::READ_TOOLS_MATCHER)
+                .map(|entry| entry["hooks"][0]["command"].as_str().unwrap().to_string())
+        };
+        let enforcing = read_entry(&v).expect("a read entry");
+        assert_eq!(
+            enforcing,
+            hook_command_for(bin, false, false, Some("claude-code"))
+        );
+        assert!(
+            enforcing.starts_with("/bin/sh -c '\"$0\" hook"),
+            "{enforcing}"
+        );
+        // An install from before the read entry is brought up to it, fail-closed.
+        let old = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command",
+                "command": hook_command_for(bin, false, false, Some("claude-code"))}]},
+            {"matcher": crate::file_tools::FILE_TOOLS_MATCHER, "hooks": [{"type": "command",
+                "command": hook_command_for(bin, false, false, Some("claude-code"))}]}
+        ]}});
+        assert!(needs_iwguard_hook_reconciliation(&old, bin, false, false));
+        std::fs::write(&settings, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+        install_hook(home.path(), "claude-code", None, bin, false, false).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(read_entry(&v), Some(enforcing));
+        // Monitor never refuses: the read entry is plain there.
+        let home = tempfile::TempDir::new().unwrap();
+        install_hook(home.path(), "claude-code", None, bin, false, true).unwrap();
+        let v: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_entry(&v).as_deref(),
+            Some("\"/opt/iw/innerwarden\" hook --monitor --agent claude-code")
+        );
+    }
+
+    /// A script is ours only to the letter: another shell, another tail,
+    /// another first word, a program that is not the guard, or one word more
+    /// is the person's own command, and uninstall leaves it alone.
+    ///
+    /// FAILS ON REVERT: read the script by `contains("hook")` instead of its
+    /// exact prefix and tail and the altered scripts are claimed.
+    #[test]
+    fn a_script_that_is_not_ours_to_the_letter_is_left_alone() {
+        let ours = hook_command_shaped(Path::new(GUARD), false, false, Some("codex"), true);
+        let line = |command: &str| read_hook_line(&json!({"type": "command", "command": command}));
+        assert!(line(&ours).is_some());
+        let altered = [
+            ours.replacen("/bin/sh", "/usr/bin/sh", 1),
+            ours.replacen("/bin/sh", "bash", 1),
+            ours.replacen(" -c ", " -ec ", 1),
+            ours.replacen("exit 2'", "exit 1'", 1),
+            ours.replacen("0|2)", "0|1|2)", 1),
+            ours.replacen("'\"$0\" hook", "'$0 hook", 1),
+            ours.replacen("'\"$0\" hook", "'\"$0\" hook; rm -rf ~;", 1),
+            ours.replacen("\"/opt/iw/innerwarden\"", "\"/opt/audit/check\"", 1),
+            format!("{ours} extra"),
+            ours.replacen("--agent codex", "--agent codex --monitor", 1),
+        ];
+        for command in &altered {
+            assert_eq!(line(command), None, "{command}");
+        }
+    }
+
+    /// Run `line` the way an agent runs a hook, `sh -c <line>`, with
+    /// `payload` on stdin: the exit code and stderr.
+    #[cfg(unix)]
+    fn run_line(line: &str, payload: &str) -> (Option<i32>, String) {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(line)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the agent's shell");
+        // A shell that cannot find the guard ends before it reads, and the
+        // pipe is closed first; the agent reads the answer all the same.
+        match child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(payload.as_bytes())
+        {
+            Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => {
+                panic!("write the payload: {error}")
+            }
+            _ => {}
+        }
+        let out = child.wait_with_output().expect("wait for the hook");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// A stand-in guard at `dir/innerwarden` that runs `body` as a script.
+    #[cfg(unix)]
+    fn stand_in(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("innerwarden");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The row's proof: run the way an agent runs it, the fail-closed line
+    /// refuses with a reason on stderr when the guard is missing, cannot be
+    /// started, dies on a signal (`SIGKILL` included) or ends any way but its
+    /// own answer, and passes the guard's own 0 and 2 through untouched, with
+    /// the payload on its stdin. The plain line, and the monitor line, let
+    /// the missing guard's 127 through, which Claude Code and Codex read as
+    /// "run the tool".
+    ///
+    /// FAILS ON REVERT: make `hook_command_shaped` ignore `fail_closed` and
+    /// every refusal below is 127, 126, 137, 139 or 1.
+    #[cfg(unix)]
+    #[test]
+    fn the_fail_closed_line_refuses_whenever_the_guard_does_not_answer() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let enforce = |guard: &Path| hook_command_shaped(guard, false, false, Some("codex"), true);
+        let refused = |(code, stderr): (Option<i32>, String)| {
+            assert_eq!(code, Some(2), "{stderr}");
+            assert!(
+                stderr
+                    .contains("InnerWarden hook: the innerwarden program ended without an answer"),
+                "a refusal must say why: {stderr}"
+            );
+            // The agent cannot mend the hook (each call it makes is refused),
+            // so the refusal names the way out for the person.
+            assert!(
+                stderr.contains(
+                    "To stop this, put the innerwarden program back, or remove the innerwarden \
+                     hook from the agent settings by hand (~/.claude/settings.json, \
+                     ~/.codex/hooks.json or ~/.gemini/settings.json)."
+                ),
+                "a refusal must name the way out: {stderr}"
+            );
+        };
+
+        let missing = dir.path().join("gone/innerwarden");
+        refused(run_line(&enforce(&missing), "{}"));
+        let (code, _) = run_line(
+            &hook_command_shaped(&missing, false, false, Some("codex"), false),
+            "{}",
+        );
+        assert_eq!(
+            code,
+            Some(127),
+            "the plain line lets a missing guard through"
+        );
+        let (code, _) = run_line(
+            &hook_command_shaped(&missing, false, true, Some("codex"), true),
+            "{}",
+        );
+        assert_eq!(code, Some(127), "monitor never acts, so it is not wrapped");
+
+        let guard = stand_in(dir.path(), "exit 0");
+        std::fs::set_permissions(&guard, std::fs::Permissions::from_mode(0o644)).unwrap();
+        refused(run_line(&enforce(&guard), "{}"));
+
+        let killed = stand_in(dir.path(), "kill -9 $$");
+        refused(run_line(&enforce(&killed), "{}"));
+        let crashed = stand_in(dir.path(), "kill -SEGV $$");
+        refused(run_line(&enforce(&crashed), "{}"));
+        let failed = stand_in(dir.path(), "exit 1");
+        refused(run_line(&enforce(&failed), "{}"));
+
+        let seen = dir.path().join("seen");
+        let allows = stand_in(dir.path(), &format!("cat > '{}'; exit 0", seen.display()));
+        assert_eq!(
+            run_line(&enforce(&allows), "{\"tool_name\":\"Bash\"}"),
+            (Some(0), String::new())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            "{\"tool_name\":\"Bash\"}",
+            "the guard reads the agent's payload through the script"
+        );
+        let denies = stand_in(
+            dir.path(),
+            "echo 'InnerWarden blocked this command' >&2; exit 2",
+        );
+        assert_eq!(
+            run_line(&enforce(&denies), "{}"),
+            (Some(2), "InnerWarden blocked this command\n".to_string()),
+            "the guard's own refusal and reason pass through as they are"
+        );
+    }
+
+    /// A Claude Code hook written before the fail-closed line is repaired to
+    /// it: the plain enforcing line lets every call through when its program
+    /// goes, so it is drift, as a moved program is. Its PostToolUse half stays
+    /// plain (the tool has run; there is nothing to refuse), and a monitor
+    /// hook is left as it is.
+    ///
+    /// FAILS ON REVERT: write the plain line in `hook_command_for` and the old
+    /// hook reads as no drift.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_enforcing_claude_hook_is_drift_and_is_repaired_to_the_fail_closed_line() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = Path::new(GUARD);
+        let plain = hook_command_shaped(bin, false, false, Some("claude-code"), false);
+        let old = merge_posttooluse_hook(
+            merge_pretooluse_file_hook(merge_pretooluse_bash_hook(json!({}), &plain), &plain),
+            &plain,
+        );
+        assert!(needs_iwguard_hook_reconciliation(&old, bin, false, false));
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::write(&settings, serde_json::to_string(&old).unwrap()).unwrap();
+        install_hook(home.path(), "claude-code", None, bin, false, false).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let wrapped = hook_command_for(bin, false, false, Some("claude-code"));
+        for entry in v["hooks"]["PreToolUse"].as_array().unwrap() {
+            assert_eq!(entry["hooks"][0]["command"], json!(wrapped));
+        }
+        assert_eq!(
+            v["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+            json!(plain)
+        );
+        assert!(!needs_iwguard_hook_reconciliation(&v, bin, false, false));
+        assert_eq!(effective_iwguard_hook_programs(&v), vec![GUARD.to_string()]);
+        let (_, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
+        assert_eq!(removed, 4, "uninstall finds the fail-closed lines");
+
+        let monitor = hook_command_for(bin, false, true, Some("claude-code"));
+        let watched = merge_pretooluse_read_hook(
+            merge_pretooluse_file_hook(merge_pretooluse_bash_hook(json!({}), &monitor), &monitor),
+            &monitor,
+        );
+        assert!(!needs_iwguard_hook_reconciliation(
+            &watched, bin, false, true
+        ));
+    }
+
+    #[test]
+    fn removal_by_event_touches_that_event_only() {
+        let ours = json!({"type": "command", "command": "innerwarden hook --agent gemini"});
+        let theirs = json!({"type": "command", "command": "/opt/audit/before"});
+        let settings = json!({
+            "hooks": {
+                "BeforeTool": [{"hooks": [theirs.clone(), ours.clone()]}, {"hooks": [ours.clone()]}],
+                "AfterTool": [{"hooks": [ours.clone()]}]
+            }
+        });
+        let (out, removed) = remove_iwguard_hooks_for_event(settings, "BeforeTool");
+        assert_eq!(removed, 2);
+        assert_eq!(
+            out,
+            json!({
+                "hooks": {
+                    "BeforeTool": [{"hooks": [theirs]}],
+                    "AfterTool": [{"hooks": [ours]}]
+                }
+            })
+        );
     }
 
     #[test]

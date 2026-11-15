@@ -45,6 +45,7 @@ Full detail + copy-paste commands: <https://innerwarden.com/docs/installation>.
 - **Windows:** `irm https://innerwarden.com/free.ps1 | iex` or Scoop
 - **ubi / eget / mise:** read the release directly
 - **From source:** `cargo install --git https://github.com/InnerWarden/inner-warden innerwarden` (crates.io + `cargo binstall` are pending)
+- **Uninstall (every channel):** run `innerwarden uninstall` before removing the package (`npm uninstall -g innerwarden`, `apt remove innerwarden`, `dnf remove innerwarden`, `scoop uninstall innerwarden`). The packages carry no remove script that unwires the agents, and an enforcing hook line fails closed: with its program gone, Claude Code, Codex and Gemini refuse every tool call until the hook is taken out of their settings by hand.
 
 ---
 

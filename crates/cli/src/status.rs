@@ -133,6 +133,47 @@ pub enum ToolClasses {
     },
     /// Wired through the MCP proxy: calls to its wrapped servers.
     Proxy { agent: String },
+    /// Codex or Gemini with its hook on beside the MCP proxy. `screened` is
+    /// what the two judge between them and `gaps` is every measured thing
+    /// the hook leaves out, both in the wiring's own words.
+    HookAndProxy {
+        agent: String,
+        screened: String,
+        gaps: Vec<String>,
+    },
+    /// Codex or Gemini with a hook that is not on: its shell commands and
+    /// file changes are not judged. `what` says where the hook stands, `next`
+    /// is the one step that turns it on, and `effect` is what that leaves of
+    /// the agent's calls.
+    HookNotOn {
+        agent: String,
+        what: String,
+        next: String,
+        effect: NotOn,
+    },
+    /// OpenClaw with the innerwarden-guard plugin screening its own tools
+    /// in `mode`, beside the MCP proxy when it has servers there (`proxy`).
+    OpenClawPlugin {
+        agent: String,
+        mode: &'static str,
+        proxy: bool,
+    },
+}
+
+/// What a hook of Codex or Gemini that is not on leaves of the agent's calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotOn {
+    /// The proxy judges the calls to its MCP servers, and nothing else is
+    /// judged.
+    ProxyOnly,
+    /// The agent is not wired through the proxy either: nothing is judged.
+    Unjudged,
+    /// The hook's program is not there, and the agent refuses every tool
+    /// call until it is.
+    Refused,
+    /// The hook's program could not be looked at, and the agent refuses
+    /// every tool call if it does not start.
+    MayRefuse,
 }
 
 /// How long one wired agent waits for its InnerWarden hook.
@@ -221,7 +262,56 @@ fn hook_shell_only_words() -> String {
 const PROXY_WORDS: &str =
     "calls to its MCP servers. Its built-in tools are not screened by InnerWarden Community.";
 
-/// PURE: the line `status` prints for what one agent's wiring judges.
+/// What the innerwarden-guard plugin judges for OpenClaw, in the words
+/// `status` prints after "judged before they run: ".
+fn openclaw_plugin_words(mode: &str, proxy: bool) -> String {
+    let also = if proxy {
+        ", and calls to its MCP servers"
+    } else {
+        ""
+    };
+    format!(
+        "its own shell commands and file changes, through the innerwarden-guard \
+         plugin ({mode}){also}."
+    )
+}
+
+/// The mode OpenClaw's own tools are screened in by the innerwarden-guard
+/// plugin; `None` when the plugin screens nothing (not installed, no entry
+/// in OpenClaw's config, or turned off there).
+pub fn openclaw_plugin_mode(
+    home: &std::path::Path,
+) -> Option<innerwarden_agent_guard::agents::GuardMode> {
+    use innerwarden_agent_guard::agents::GuardMode;
+    let state = crate::openclaw_guard_io::state(home);
+    if !state.files || state.turned_off {
+        return None;
+    }
+    Some(match state.mode? {
+        crate::openclaw_guard::Mode::Monitor => GuardMode::Monitor,
+        crate::openclaw_guard::Mode::Enforce => GuardMode::Enforce,
+    })
+}
+
+/// What Codex or Gemini leaves unjudged while its hook is not on, in the
+/// words `status` prints after the agent's name. `what` says where the hook
+/// stands. A hook whose program is gone does not leave Gemini unscreened: it
+/// leaves it refusing every call, and the line says that instead.
+fn hook_not_on_words(effect: NotOn, what: &str) -> String {
+    let left = match effect {
+        NotOn::ProxyOnly => {
+            "only calls to its MCP servers are judged, so its shell commands and file \
+             changes run unchecked"
+        }
+        NotOn::Unjudged => "its shell commands and file changes run unchecked",
+        NotOn::Refused => "it refuses every tool call until the hook program is fixed",
+        NotOn::MayRefuse => "it refuses every tool call if the hook program does not start",
+    };
+    format!("{left}. Its {what}.")
+}
+
+/// PURE: the line `status` prints for what one agent's wiring judges. For a
+/// hook beside the proxy, every gap follows on a line of its own.
 pub fn tool_classes_finding(classes: &ToolClasses) -> Finding {
     match classes {
         ToolClasses::Hook {
@@ -254,6 +344,31 @@ pub fn tool_classes_finding(classes: &ToolClasses) -> Finding {
         ToolClasses::Proxy { agent } => {
             Finding::Working(format!("{agent}: judged before they run: {PROXY_WORDS}"))
         }
+        ToolClasses::HookAndProxy {
+            agent,
+            screened,
+            gaps,
+        } => {
+            let mut text = format!("{agent}: judged before they run: {screened}");
+            for gap in gaps {
+                text.push_str("\n            ");
+                text.push_str(gap);
+            }
+            Finding::Working(text)
+        }
+        ToolClasses::HookNotOn {
+            agent,
+            what,
+            next,
+            effect,
+        } => Finding::NotWorking {
+            what: format!("{agent}: {}", hook_not_on_words(*effect, what)),
+            next: next.clone(),
+        },
+        ToolClasses::OpenClawPlugin { agent, mode, proxy } => Finding::Working(format!(
+            "{agent}: judged before they run: {}",
+            openclaw_plugin_words(mode, *proxy)
+        )),
     }
 }
 
@@ -261,7 +376,8 @@ pub fn tool_classes_finding(classes: &ToolClasses) -> Finding {
 /// `status` prints for it without the agent's name, so the dashboard and
 /// `status` say one thing. The keys: `shell_and_privileged_files` (with or
 /// without the reads, which the sentence says), `shell_only` and
-/// `mcp_server_calls`.
+/// `mcp_server_calls`. A hook beside the proxy has no key of its own: on, it
+/// is the first; not on, the proxy is all that judges, which is the last.
 pub fn judges(classes: &ToolClasses) -> (&'static str, String) {
     let sentence = |words: &str| {
         let mut chars = words.chars();
@@ -293,21 +409,74 @@ pub fn judges(classes: &ToolClasses) -> (&'static str, String) {
             file_tools: false, ..
         } => ("shell_only", sentence(&hook_shell_only_words())),
         ToolClasses::Proxy { .. } => ("mcp_server_calls", sentence(PROXY_WORDS)),
+        ToolClasses::HookAndProxy { screened, .. } => {
+            ("shell_and_privileged_files", sentence(screened))
+        }
+        ToolClasses::HookNotOn { what, effect, .. } => (
+            "mcp_server_calls",
+            sentence(&hook_not_on_words(*effect, what)),
+        ),
+        ToolClasses::OpenClawPlugin { mode, proxy, .. } => (
+            "shell_and_privileged_files",
+            sentence(&openclaw_plugin_words(mode, *proxy)),
+        ),
     }
 }
 
 /// What each of `rows` judges before a call runs: a hook agent's settings
 /// say whether its hook covers the agent's own file tools, which wiring
 /// written by an earlier version does not; an MCP agent is judged through
-/// the proxy. A hook agent whose settings cannot be read or parsed is left
-/// out: what it judges is not known. The caller passes the rows it counts
-/// as wired.
+/// the proxy. Codex and Gemini have a hook beside the proxy, read back from
+/// their own files: on, the two judge together; in any other state the proxy
+/// judges alone, and the entry says where the hook stands. A hook agent
+/// whose settings cannot be read or parsed is left out: what it judges is
+/// not known. The caller passes the rows [`reports_what_is_judged`] keeps.
 pub fn tool_classes_for<'a>(
     home: &std::path::Path,
     rows: impl IntoIterator<Item = &'a innerwarden_agent_guard::agents::AgentStatus>,
 ) -> Vec<ToolClasses> {
     rows.into_iter()
         .filter_map(|r| {
+            if r.name == innerwarden_agent_guard::hermes_hook::AGENT {
+                return hermes_classes(home, r);
+            }
+            if let Some((spec, state)) = innerwarden_agent_guard::agents_ops::hook_state(home, r) {
+                let agent = r.name.clone();
+                return Some(
+                    match innerwarden_agent_guard::agent_hooks::not_on(spec, &state) {
+                        None => ToolClasses::HookAndProxy {
+                            agent,
+                            screened: spec.screened(),
+                            gaps: spec.gaps(),
+                        },
+                        Some((what, next)) => ToolClasses::HookNotOn {
+                            agent,
+                            what,
+                            next,
+                            effect: match innerwarden_agent_guard::agent_hooks::stall(spec, &state)
+                            {
+                                Some(innerwarden_agent_guard::agent_hooks::Stall::Refuses) => {
+                                    NotOn::Refused
+                                }
+                                Some(innerwarden_agent_guard::agent_hooks::Stall::MayRefuse) => {
+                                    NotOn::MayRefuse
+                                }
+                                None if r.guarded => NotOn::ProxyOnly,
+                                None => NotOn::Unjudged,
+                            },
+                        },
+                    },
+                );
+            }
+            if r.name == crate::openclaw_guard::AGENT {
+                if let Some(mode) = openclaw_plugin_mode(home) {
+                    return Some(ToolClasses::OpenClawPlugin {
+                        agent: r.name.clone(),
+                        mode: mode_word(mode),
+                        proxy: r.guarded,
+                    });
+                }
+            }
             if !r.hookable {
                 return Some(ToolClasses::Proxy {
                     agent: r.name.clone(),
@@ -324,6 +493,64 @@ pub fn tool_classes_for<'a>(
             })
         })
         .collect()
+}
+
+/// What Hermes Agent's hook judges, read back from its own files: on, the
+/// hook and every gap it leaves; installed and not on, where it stands;
+/// absent, nothing to say.
+fn hermes_classes(
+    home: &std::path::Path,
+    r: &innerwarden_agent_guard::agents::AgentStatus,
+) -> Option<ToolClasses> {
+    use innerwarden_agent_guard::hermes_hook::{self, Off, State};
+    let path_env = std::env::var_os("PATH");
+    let state = hermes_hook::state(home, path_env.as_deref());
+    let agent = r.name.clone();
+    match &state {
+        State::On { .. } => Some(ToolClasses::HookAndProxy {
+            agent,
+            screened: hermes_hook::screened(),
+            gaps: hermes_hook::gaps(),
+        }),
+        State::Absent => None,
+        _ => Some(ToolClasses::HookNotOn {
+            agent,
+            what: hermes_hook::not_on(&state)?,
+            next: format!("innerwarden agents connect {}", hermes_hook::AGENT),
+            effect: match state {
+                State::Off(Off::Broken { refuses: true, .. }) => NotOn::Refused,
+                State::Off(Off::Unchecked { refuses: true, .. }) => NotOn::MayRefuse,
+                _ => NotOn::Unjudged,
+            },
+        }),
+    }
+}
+
+/// The word for a mode the plugin can be in.
+fn mode_word(mode: innerwarden_agent_guard::agents::GuardMode) -> &'static str {
+    match mode {
+        innerwarden_agent_guard::agents::GuardMode::Enforce => "enforce",
+        innerwarden_agent_guard::agents::GuardMode::Monitor => "monitor",
+        innerwarden_agent_guard::agents::GuardMode::Mixed => "mixed",
+    }
+}
+
+/// Whether `status` says what is judged for this row: an agent counted as
+/// wired, or a Codex or Gemini whose hook is in its file and is not on. The
+/// second is not wired and is never counted as wired. It is reported all the
+/// same: with no MCP server behind the proxy, the hook is all that agent has,
+/// and a hook the agent skips screens nothing.
+pub fn reports_what_is_judged(
+    home: &std::path::Path,
+    row: &innerwarden_agent_guard::agents::AgentStatus,
+    wired: &[String],
+) -> bool {
+    wired.contains(&row.name)
+        || innerwarden_agent_guard::agents_ops::hook_state(home, row)
+            .is_some_and(|(_, state)| state.installed() && !state.is_on())
+        || (row.name == crate::openclaw_guard::AGENT && openclaw_plugin_mode(home).is_some())
+        || (row.name == innerwarden_agent_guard::hermes_hook::AGENT
+            && innerwarden_agent_guard::hermes_hook::state(home, None).installed())
 }
 
 /// PURE: a duration a person reads at a glance, in its largest whole unit.
@@ -462,7 +689,8 @@ pub struct Facts {
     pub unread_hook_lines: Vec<UnreadHookLine>,
     /// What each wired agent's wiring judges before a call runs, in the order
     /// of `wired_agents`. An agent whose settings could not be read back is
-    /// left out: "could not tell" is never "off".
+    /// left out: "could not tell" is never "off". A Codex or Gemini that is
+    /// not wired is here too when its hook is in its file and is not on.
     pub tool_classes: Vec<ToolClasses>,
     /// How long each wired hook agent waits for its InnerWarden hook, read
     /// from its settings. An agent whose settings could not be read is left
@@ -755,9 +983,15 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
             facts.wired_agents.len(),
             named.join(", ")
         )));
-        out.extend(facts.tool_classes.iter().map(tool_classes_finding));
         out.extend(facts.hook_timeouts.iter().map(hook_timeout_finding));
-    } else if facts.hook_trouble.is_empty() {
+    }
+    // Printed with no wired agent too: a hook that is in the file of an agent
+    // with no MCP servers, and is not on, is the only line that agent gets.
+    out.extend(facts.tool_classes.iter().map(tool_classes_finding));
+    if facts.wired_agents.is_empty()
+        && facts.hook_trouble.is_empty()
+        && facts.tool_classes.is_empty()
+    {
         out.push(nothing_wired_finding(facts.any_agent_seen));
     }
 
@@ -1238,7 +1472,15 @@ mod tests {
             "not json",
         ] {
             std::fs::write(home.path().join(".claude/settings.json"), settings).unwrap();
-            let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
+            // Codex and Gemini are read by their hook too, which the inline
+            // block never did. A host with one of them installed lists it
+            // here, so those rows are left to their own test.
+            let rows: Vec<_> = innerwarden_agent_guard::agents_ops::rows(home.path())
+                .into_iter()
+                .filter(|r| {
+                    innerwarden_agent_guard::agents_ops::hook_state(home.path(), r).is_none()
+                })
+                .collect();
             assert!(rows.iter().any(|r| r.hookable), "a hook agent row");
             assert!(rows.iter().any(|r| !r.hookable), "an MCP agent row");
             let classes = tool_classes_for(home.path(), &rows);
@@ -1291,6 +1533,23 @@ mod tests {
                 },
                 "mcp_server_calls",
             ),
+            (
+                ToolClasses::HookAndProxy {
+                    agent: "codex".into(),
+                    screened: "shell commands.".into(),
+                    gaps: Vec::new(),
+                },
+                "shell_and_privileged_files",
+            ),
+            (
+                ToolClasses::HookNotOn {
+                    agent: "codex".into(),
+                    what: "PreToolUse hook is not installed".into(),
+                    next: String::new(),
+                    effect: NotOn::ProxyOnly,
+                },
+                "mcp_server_calls",
+            ),
         ] {
             let (found, line) = judges(&classes);
             assert_eq!(found, key);
@@ -1305,6 +1564,422 @@ mod tests {
             );
             assert!(line.starts_with(char::is_uppercase), "{line}");
         }
+    }
+
+    /// Codex and Gemini: `status` prints what the hook and the proxy judge
+    /// between them with every gap on a line under it, and a hook that is not
+    /// on as a fault with the one step. The dashboard gets the first sentence
+    /// under a key it already knows.
+    ///
+    /// FAILS ON REVERT: print these two agents with the proxy's sentence, and
+    /// neither the gaps nor a hook that is off reaches the report.
+    #[test]
+    fn status_states_what_a_hook_beside_the_proxy_judges_and_what_it_leaves_out() {
+        let on = ToolClasses::HookAndProxy {
+            agent: "codex".into(),
+            screened: "shell commands and calls to MCP servers.".into(),
+            gaps: vec!["Not screened: one tool.".into(), "Measured once.".into()],
+        };
+        assert_eq!(
+            tool_classes_finding(&on).to_string(),
+            "  [on]      codex: judged before they run: shell commands and calls to MCP servers.\n            Not screened: one tool.\n            Measured once."
+        );
+        assert_eq!(
+            judges(&on),
+            (
+                "shell_and_privileged_files",
+                "Shell commands and calls to MCP servers.".to_string()
+            )
+        );
+
+        let off = ToolClasses::HookNotOn {
+            agent: "codex".into(),
+            what: "PreToolUse hook is not installed".into(),
+            next: "innerwarden agents connect codex".into(),
+            effect: NotOn::ProxyOnly,
+        };
+        assert_eq!(
+            tool_classes_finding(&off).to_string(),
+            "  [off]     codex: only calls to its MCP servers are judged, so its shell commands and file changes run unchecked. Its PreToolUse hook is not installed.\n            try: innerwarden agents connect codex"
+        );
+        assert_eq!(
+            judges(&off),
+            (
+                "mcp_server_calls",
+                "Only calls to its MCP servers are judged, so its shell commands and file changes run unchecked. Its PreToolUse hook is not installed."
+                    .to_string()
+            )
+        );
+
+        // A hook that is on leaves a healthy install healthy. One that is not
+        // on is a fault, and the headline says so.
+        let mut facts = healthy();
+        facts.tool_classes = vec![on];
+        assert_eq!(
+            headline(&assess(&facts)),
+            "InnerWarden is on and screening."
+        );
+        facts.tool_classes = vec![off.clone()];
+        let findings = assess(&facts);
+        assert!(
+            findings.contains(&tool_classes_finding(&off)),
+            "{findings:?}"
+        );
+        assert_eq!(
+            headline(&findings),
+            "InnerWarden is installed but NOT fully protecting this machine."
+        );
+    }
+
+    /// A program that is there to run, for a hook `status` reads back.
+    #[cfg(unix)]
+    fn a_guard_that_is_there(home: &std::path::Path) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = home.join("guard-bin/innerwarden");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin.display().to_string()
+    }
+
+    /// `status` reads the hook of Codex and Gemini back from their own files.
+    /// A Gemini connected by one command is judged by hook and proxy, in the
+    /// wiring's own words. A Codex with wrappers alone, and one whose hook
+    /// Codex has not trusted, are judged by the proxy only, and the entry
+    /// says where the hook stands.
+    ///
+    /// FAILS ON REVERT: answer `Proxy` for every row that is not Claude Code,
+    /// and all three read "calls to its MCP servers" with nothing about the
+    /// hook.
+    #[cfg(unix)]
+    #[test]
+    fn status_reads_the_hook_of_codex_and_gemini_beside_their_proxy() {
+        use innerwarden_agent_guard::{agent_hooks, agents_ops};
+        let home = tempfile::tempdir().unwrap();
+        let bin = a_guard_that_is_there(home.path());
+        let connect = |agent: &str| {
+            let args = ["connect".to_string(), agent.to_string()];
+            let outcome = agents_ops::run_with_guard_bin_outcome(home.path(), &args, &bin);
+            assert_eq!(outcome.configured, 1, "{:?}", outcome.lines);
+        };
+        let classes = |agent: &str| {
+            let rows = agents_ops::rows(home.path());
+            let row = rows.iter().find(|r| r.name == agent).unwrap();
+            assert!(row.guarded, "{agent}");
+            tool_classes_for(home.path(), [row])
+        };
+
+        std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
+        std::fs::write(
+            home.path().join(".gemini/settings.json"),
+            r#"{"mcpServers":{"fs":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        connect("gemini");
+        assert_eq!(
+            classes("gemini"),
+            [ToolClasses::HookAndProxy {
+                agent: "gemini".into(),
+                screened: agent_hooks::GEMINI.screened(),
+                gaps: agent_hooks::GEMINI.gaps(),
+            }]
+        );
+
+        // Codex with its servers behind the proxy and no hook in its file.
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            format!(
+                "[mcp_servers.icm]\ncommand = \"{bin}\"\nargs = [\"proxy\", \"--label\", \"codex\", \"--agent\", \"codex\", \"--mode\", \"guard\", \"--\", \"icm\"]\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            classes("codex"),
+            [ToolClasses::HookNotOn {
+                agent: "codex".into(),
+                what: "PreToolUse hook is not installed".into(),
+                next: "innerwarden agents connect codex".into(),
+                effect: NotOn::ProxyOnly,
+            }]
+        );
+
+        // The hook is written, and no Codex was asked to trust it.
+        connect("codex");
+        assert_eq!(
+            classes("codex"),
+            [ToolClasses::HookNotOn {
+                agent: "codex".into(),
+                what: "PreToolUse hook is installed, but Codex skips it: it is not trusted yet"
+                    .into(),
+                next: "innerwarden agents connect codex".into(),
+                effect: NotOn::ProxyOnly,
+            }]
+        );
+    }
+
+    /// A Codex with no MCP servers, its hook in its file and no trust record.
+    /// It is not wired and is never counted as wired, and `status` still says
+    /// where its hook stands, alone and beside a wired agent.
+    ///
+    /// FAILS ON REVERT: take `|| ...hook_state(home, row)...` out of
+    /// `reports_what_is_judged` and the row is not reported. Put the
+    /// `tool_classes` lines of `assess` back under "some agent is wired" and
+    /// the line is not printed when Codex is the only agent.
+    #[cfg(unix)]
+    #[test]
+    fn status_names_a_hook_that_is_not_on_for_an_agent_with_no_mcp_servers() {
+        use innerwarden_agent_guard::{agent_hooks, agents_ops};
+        let home = tempfile::tempdir().unwrap();
+        let bin = a_guard_that_is_there(home.path());
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        agent_hooks::install(
+            home.path(),
+            &agent_hooks::CODEX,
+            std::path::Path::new(&bin),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let rows = agents_ops::rows(home.path());
+        let row = rows.iter().find(|r| r.name == "codex").unwrap();
+        assert!(!row.guarded, "a hook Codex skips is not wiring");
+        let wired: Vec<String> = Vec::new();
+        assert!(reports_what_is_judged(home.path(), row, &wired));
+        let classes = tool_classes_for(
+            home.path(),
+            rows.iter()
+                .filter(|r| reports_what_is_judged(home.path(), r, &wired)),
+        );
+        assert_eq!(
+            classes,
+            [ToolClasses::HookNotOn {
+                agent: "codex".into(),
+                what: "PreToolUse hook is installed, but Codex skips it: it is not trusted yet"
+                    .into(),
+                next: "innerwarden agents connect codex".into(),
+                effect: NotOn::Unjudged,
+            }]
+        );
+        let line = Finding::NotWorking {
+            what: "codex: its shell commands and file changes run unchecked. Its PreToolUse \
+                   hook is installed, but Codex skips it: it is not trusted yet."
+                .into(),
+            next: "innerwarden agents connect codex".into(),
+        };
+
+        // Codex is the only agent: its line, and no "Wired into".
+        let mut alone = healthy();
+        alone.wired_agents.clear();
+        alone.mode = None;
+        alone.tool_classes = classes.clone();
+        let findings = assess(&alone);
+        assert!(findings.contains(&line), "{findings:?}");
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, Finding::Working(text) if text.starts_with("Wired into"))),
+            "{findings:?}"
+        );
+
+        // Beside a wired Claude Code: Codex is not in the count, and the
+        // headline no longer says all is screened.
+        let mut beside = healthy();
+        beside.tool_classes = classes;
+        let findings = assess(&beside);
+        assert!(
+            findings.contains(&Finding::Working("Wired into 1: claude-code.".into())),
+            "{findings:?}"
+        );
+        assert!(findings.contains(&line), "{findings:?}");
+        assert_eq!(
+            headline(&findings),
+            "InnerWarden is installed but NOT fully protecting this machine."
+        );
+
+        // A file with no hook of ours is not a hook that is not on.
+        agent_hooks::uninstall(home.path(), &agent_hooks::CODEX).unwrap();
+        let rows = agents_ops::rows(home.path());
+        let row = rows.iter().find(|r| r.name == "codex").unwrap();
+        assert!(!reports_what_is_judged(home.path(), row, &wired));
+    }
+
+    /// FAILS ON REVERT (NEW-20261024): OpenClaw with its plugin was said to
+    /// have its built-in tools unscreened, beside its MCP servers or alone.
+    #[test]
+    fn openclaw_with_its_plugin_is_said_to_screen_its_own_tools() {
+        for proxy in [true, false] {
+            let classes = ToolClasses::OpenClawPlugin {
+                agent: "openclaw".into(),
+                mode: "enforce",
+                proxy,
+            };
+            let Finding::Working(text) = tool_classes_finding(&classes) else {
+                panic!("a plugin that screens is working");
+            };
+            assert!(
+                text.contains("its own shell commands and file changes"),
+                "{text}"
+            );
+            assert!(text.contains("(enforce)"), "{text}");
+            assert_eq!(text.contains("MCP servers"), proxy, "{text}");
+            assert!(!text.contains("not screened"), "{text}");
+            assert_eq!(judges(&classes).0, "shell_and_privileged_files");
+        }
+    }
+
+    /// OpenClaw's guard plugin screens its own tools only while its entry is
+    /// on: with the plugin's files in place and the entry turned off in
+    /// OpenClaw's config, `status` says nothing of its own tools being
+    /// judged, and an OpenClaw wired through the proxy gets the proxy's
+    /// sentence.
+    ///
+    /// FAILS ON REVERT of `|| state.turned_off` in `openclaw_plugin_mode`:
+    /// the turned-off plugin is said to judge OpenClaw's own tools.
+    #[test]
+    fn openclaw_with_its_plugin_turned_off_is_not_said_to_screen_its_own_tools() {
+        let home = tempfile::tempdir().unwrap();
+        let plugin = home
+            .path()
+            .join(".openclaw/extensions")
+            .join(crate::openclaw_guard::PLUGIN_ID);
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("index.js"), "export default {}\n").unwrap();
+        let config = |enabled: bool| {
+            let mut entries = serde_json::Map::new();
+            entries.insert(
+                crate::openclaw_guard::PLUGIN_ID.to_string(),
+                serde_json::json!({"enabled": enabled, "config": {"mode": "enforce"}}),
+            );
+            std::fs::write(
+                home.path().join(".openclaw/openclaw.json"),
+                serde_json::json!({"plugins": {"entries": entries}}).to_string(),
+            )
+            .unwrap();
+        };
+        config(true);
+        assert_eq!(
+            openclaw_plugin_mode(home.path()),
+            Some(innerwarden_agent_guard::agents::GuardMode::Enforce),
+            "the rest of this test proves nothing if the plugin on is not read"
+        );
+        config(false);
+        assert_eq!(openclaw_plugin_mode(home.path()), None);
+        let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
+        if let Some(row) = rows.iter().find(|r| r.name == crate::openclaw_guard::AGENT) {
+            for classes in tool_classes_for(home.path(), [row]) {
+                assert!(
+                    !matches!(classes, ToolClasses::OpenClawPlugin { .. }),
+                    "{classes:?}"
+                );
+                if let Finding::Working(text) = tool_classes_finding(&classes) {
+                    assert!(!text.contains("its own shell commands"), "{text}");
+                }
+            }
+        }
+    }
+
+    /// Hermes's hook is read back from its own files: on, `status` says what
+    /// it screens and every gap; with its approval gone, that Hermes skips
+    /// it and nothing of its calls is judged.
+    ///
+    /// FAILS ON REVERT: drop the Hermes branch at the top of
+    /// `tool_classes_for` and Hermes reads as judged through an MCP proxy it
+    /// is not wired to.
+    #[cfg(unix)]
+    #[test]
+    fn status_says_what_the_hermes_hook_judges() {
+        use innerwarden_agent_guard::{agents_ops, hermes_hook};
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".hermes")).unwrap();
+        std::fs::write(home.path().join(".hermes/config.yaml"), "model: x\n").unwrap();
+        let bin = home.path().join("innerwarden");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        hermes_hook::install(home.path(), &bin, false, false).unwrap();
+        let rows = agents_ops::rows(home.path());
+        let hermes: Vec<_> = rows.iter().filter(|r| r.name == "hermes").collect();
+        assert_eq!(
+            tool_classes_for(home.path(), hermes.clone()),
+            vec![ToolClasses::HookAndProxy {
+                agent: "hermes".into(),
+                screened: hermes_hook::screened(),
+                gaps: hermes_hook::gaps(),
+            }]
+        );
+        std::fs::remove_file(home.path().join(hermes_hook::ALLOWLIST)).unwrap();
+        assert_eq!(
+            tool_classes_for(home.path(), hermes.clone()),
+            vec![ToolClasses::HookNotOn {
+                agent: "hermes".into(),
+                what: "pre_tool_call hook is installed, but Hermes skips it: it is not approved \
+                       in ~/.hermes/shell-hooks-allowlist.json"
+                    .into(),
+                next: "innerwarden agents connect hermes".into(),
+                effect: NotOn::Unjudged,
+            }]
+        );
+        assert!(reports_what_is_judged(home.path(), hermes[0], &[]));
+    }
+
+    /// A Gemini hook whose program is gone does not leave Gemini unscreened:
+    /// Gemini refuses every tool call, and the line says so.
+    ///
+    /// FAILS ON REVERT: give `NotOn::Refused` the words of `NotOn::ProxyOnly`
+    /// in `hook_not_on_words` and a wedged Gemini reads "run unchecked".
+    #[test]
+    fn status_says_a_gemini_hook_with_no_program_refuses_every_call() {
+        let line = |effect: NotOn| {
+            tool_classes_finding(&ToolClasses::HookNotOn {
+                agent: "gemini".into(),
+                what: "BeforeTool hook is installed, but its hook runs /x, which does not exist"
+                    .into(),
+                next: "innerwarden agents connect gemini".into(),
+                effect,
+            })
+            .to_string()
+        };
+        assert_eq!(
+            line(NotOn::Refused),
+            "  [off]     gemini: it refuses every tool call until the hook program is fixed. Its BeforeTool hook is installed, but its hook runs /x, which does not exist.\n            try: innerwarden agents connect gemini"
+        );
+        assert_eq!(
+            line(NotOn::MayRefuse),
+            "  [off]     gemini: it refuses every tool call if the hook program does not start. Its BeforeTool hook is installed, but its hook runs /x, which does not exist.\n            try: innerwarden agents connect gemini"
+        );
+    }
+
+    /// The effect is read from the hook's own state: a Gemini hook whose
+    /// program is gone refuses, with or without servers behind the proxy.
+    ///
+    /// FAILS ON REVERT: drop the `Stall::Refuses` arm in `tool_classes_for`
+    /// and this Gemini reads `NotOn::Unjudged`.
+    #[cfg(unix)]
+    #[test]
+    fn status_reads_a_gemini_hook_with_no_program_as_refusing() {
+        use innerwarden_agent_guard::{agent_hooks, agents_ops};
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
+        let gone = home.path().join("gone/innerwarden");
+        agent_hooks::install(home.path(), &agent_hooks::GEMINI, &gone, false, false).unwrap();
+        let rows = agents_ops::rows(home.path());
+        let row = rows.iter().find(|r| r.name == "gemini").unwrap();
+        let wired: Vec<String> = Vec::new();
+        assert!(reports_what_is_judged(home.path(), row, &wired));
+        assert_eq!(
+            tool_classes_for(home.path(), [row]),
+            [ToolClasses::HookNotOn {
+                agent: "gemini".into(),
+                what: format!(
+                    "BeforeTool hook is installed, but its hook runs {}, which does not exist",
+                    gone.display()
+                ),
+                next: "innerwarden agents connect gemini".into(),
+                effect: NotOn::Refused,
+            }]
+        );
     }
 
     /// The short-circuit must not swallow a real problem: once anything IS
