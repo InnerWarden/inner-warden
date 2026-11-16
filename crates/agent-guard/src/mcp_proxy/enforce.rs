@@ -14,8 +14,9 @@
 //! not), because a denial must be a reply keyed to that request's id. The
 //! router raises a blocking verdict on a `tools/call` and a `resources/read`.
 //! Server→client findings (poisoned `tools/list`, injection in a tool result)
-//! are alert-only; the one rewrite of a server answer, masking secret-shaped
-//! values, is the transport's.
+//! are alert-only here; the rewrites of what a server sends (masking
+//! secret-shaped values, withholding listing text that carries orders for the
+//! model, refusing a line the proxy cannot read) are done by the transport.
 
 use serde_json::{json, Value};
 
