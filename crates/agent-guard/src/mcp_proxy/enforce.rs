@@ -9,11 +9,13 @@
 //! alert, never blocked, so enabling the proxy at its default mode changes no
 //! observable behavior. Blocking (`guard` / `kill`) is opt-in.
 //!
-//! Scope of blocking in this version: only a **client→server `tools/call`** can
-//! be blocked (the agent invoking a dangerous tool), because a denial must be a
-//! reply keyed to that request's id. Server→client findings (poisoned
-//! `tools/list`, injection in a tool result) are always alert-only, rewriting
-//! a server response (tool stripping) is a later enhancement.
+//! Scope of blocking in this version: only a **client→server request** can be
+//! blocked (the agent invoking a dangerous tool, or reading a resource it must
+//! not), because a denial must be a reply keyed to that request's id. The
+//! router raises a blocking verdict on a `tools/call` and a `resources/read`.
+//! Server→client findings (poisoned `tools/list`, injection in a tool result)
+//! are alert-only; the one rewrite of a server answer, masking secret-shaped
+//! values, is the transport's.
 
 use serde_json::{json, Value};
 
@@ -230,6 +232,10 @@ fn apply_profile(
 /// The original request id is echoed **verbatim** (as a raw [`Value`]) so the
 /// client correlates the reply; a blocked request is never silently dropped.
 pub fn synthesize_denial(d: &ProxyDecision, as_protocol_error: bool) -> String {
+    // A tool-execution error (`isError`) is an answer only a `tools/call` can
+    // take; any other refused request gets a JSON-RPC error, the one shape
+    // its client can read as a refusal.
+    let as_protocol_error = as_protocol_error || d.method.as_deref() != Some("tools/call");
     let id = d.request_id.clone();
     let reason = d
         .verdict

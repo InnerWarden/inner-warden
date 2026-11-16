@@ -6,7 +6,7 @@ that screens what an AI agent tries to do **before it runs** and tags every
 verdict with its OWASP Agentic Top 10 id. Two surfaces, two bodies of signal:
 shell commands are screened on command behaviour (download-and-execute, reverse
 shells, credential access, obfuscation), while MCP and tool calls additionally
-match the 79-rule ATR corpus, which covers tool poisoning and prompt injection
+match the 85-rule ATR corpus, which covers tool poisoning and prompt injection
 in LLM I/O and tool exchanges. End-user installs use the canonical `innerwarden` command (or the short
 alias `iw`).
 
