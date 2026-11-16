@@ -76,6 +76,21 @@ impl Word {
     }
 }
 
+/// What ends the command in front of a command, and so starts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Joint {
+    /// Nothing: the first command of the line.
+    #[default]
+    Start,
+    /// A line break, a lone `&` or a closing parenthesis: also how prose
+    /// and documents break a line, join two words or close an aside. No
+    /// command starts right after a `)` but in a `case` pattern.
+    Loose,
+    /// `;`, `&&`, `||`, `|`, `|&`, an opening parenthesis or a brace
+    /// group's brace: operators prose has little use for.
+    Tight,
+}
+
 /// One simple command: its words, and what it does with its input and output.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Command {
@@ -87,6 +102,11 @@ pub(crate) struct Command {
     /// Text it reads on its input from the line itself: a here-document's
     /// body, a here-string's word.
     pub(crate) inputs: Vec<String>,
+    /// The files it reads on its input: the targets of `<` and `<>`.
+    pub(crate) reads: Vec<Word>,
+    /// What ends the command in front of it. Two operators with no command
+    /// between them (`a &&` and a line break) count as the tighter one.
+    pub(crate) after: Joint,
     redirected: bool,
 }
 
@@ -114,6 +134,7 @@ pub(crate) fn read_line(text: &str) -> Line {
         word: None,
         braces: 0,
         heredocs: Vec::new(),
+        joint: Joint::Start,
     };
     lexer.run();
     lexer.line
@@ -167,6 +188,8 @@ struct Lexer {
     braces: usize,
     /// Here-documents whose body starts at the next newline.
     heredocs: Vec<Heredoc>,
+    /// What ended the last command: what starts the next one.
+    joint: Joint,
 }
 
 impl Lexer {
@@ -185,12 +208,16 @@ impl Lexer {
         self.braces = 0;
     }
 
-    fn end_command(&mut self, piped: bool) {
+    fn end_command(&mut self, piped: bool, next: Joint) {
         self.end_word();
         let mut command = std::mem::take(&mut self.command);
         if !command.words.is_empty() || command.redirected || !command.inputs.is_empty() {
             command.piped = piped;
+            command.after = self.joint;
             self.line.commands.push(command);
+            self.joint = next;
+        } else {
+            self.joint = self.joint.max(next);
         }
     }
 
@@ -202,12 +229,12 @@ impl Lexer {
                     self.at += 1;
                 }
                 '\n' => {
-                    self.end_command(false);
+                    self.end_command(false, Joint::Loose);
                     self.at += 1;
                     self.read_heredocs();
                 }
                 ';' => {
-                    self.end_command(false);
+                    self.end_command(false, Joint::Tight);
                     self.at += 1;
                 }
                 '&' if self.peek(1) == Some('>') => {
@@ -215,21 +242,27 @@ impl Lexer {
                     self.redirection();
                 }
                 '&' => {
-                    self.end_command(false);
-                    self.at += if self.peek(1) == Some('&') { 2 } else { 1 };
+                    if self.peek(1) == Some('&') {
+                        self.end_command(false, Joint::Tight);
+                        self.at += 2;
+                    } else {
+                        self.end_command(false, Joint::Loose);
+                        self.at += 1;
+                    }
                 }
                 '|' => {
                     if self.peek(1) == Some('|') {
-                        self.end_command(false);
+                        self.end_command(false, Joint::Tight);
                         self.at += 2;
                     } else {
-                        self.end_command(true);
+                        self.end_command(true, Joint::Tight);
                         self.at += if self.peek(1) == Some('&') { 2 } else { 1 };
                     }
                 }
                 '(' if self.word.as_ref().is_some_and(is_array_name) => self.array(),
                 '(' | ')' => {
-                    self.end_command(false);
+                    let next = if c == '(' { Joint::Tight } else { Joint::Loose };
+                    self.end_command(false, next);
                     self.at += 1;
                 }
                 '<' | '>' if self.peek(1) == Some('(') => self.process_substitution(),
@@ -238,7 +271,7 @@ impl Lexer {
                     self.redirection();
                 }
                 '{' | '}' if self.word.is_none() && self.reserved_brace(c) => {
-                    self.end_command(false);
+                    self.end_command(false, Joint::Tight);
                     self.at += 1;
                 }
                 // A `#` where a word starts opens a comment to the end of
@@ -255,7 +288,7 @@ impl Lexer {
                 _ => self.word_unit(),
             }
         }
-        self.end_command(false);
+        self.end_command(false, Joint::Start);
     }
 
     /// A `{` or `}` standing alone where a word starts: a brace group's.
@@ -546,7 +579,12 @@ impl Lexer {
                 expands: !target.quoted,
             }),
             "<<<" => self.command.inputs.push(target.text),
-            ">" | ">>" | ">|" | "&>" | "&>>" | "<>" => self.command.writes_file |= to_a_file,
+            "<" => self.command.reads.push(target),
+            "<>" => {
+                self.command.writes_file |= to_a_file;
+                self.command.reads.push(target);
+            }
+            ">" | ">>" | ">|" | "&>" | "&>>" => self.command.writes_file |= to_a_file,
             ">&" => {
                 let descriptor =
                     target.text == "-" || target.text.chars().all(|c| c.is_ascii_digit());
@@ -1128,5 +1166,47 @@ mod tests {
         assert_eq!(line.arrays, ["x y"]);
         assert_eq!(line.commands[0].words[2].substitutions, ["d e"]);
         assert_eq!(read_line("diff <(a) b").nested, ["a"]);
+    }
+
+    /// Each command knows the operator in front of it; two with no command
+    /// between them count as the tighter one. Input redirections name the
+    /// files a command reads.
+    #[test]
+    fn the_operator_before_a_command_and_the_files_it_reads_are_kept() {
+        let line = read_line("(a) b");
+        let after: Vec<Joint> = line.commands.iter().map(|command| command.after).collect();
+        assert_eq!(after, [Joint::Tight, Joint::Loose]);
+        let line = read_line("a; b && c || d | e\nf & g &&\nh");
+        let after: Vec<Joint> = line.commands.iter().map(|command| command.after).collect();
+        assert_eq!(
+            after,
+            [
+                Joint::Start,
+                Joint::Tight,
+                Joint::Tight,
+                Joint::Tight,
+                Joint::Tight,
+                Joint::Loose,
+                Joint::Loose,
+                Joint::Tight
+            ]
+        );
+        let line = read_line("read l < /a; b <> c; d << E\ne\nE\nf <<< g; h 0</dev/null");
+        let reads: Vec<Vec<&str>> = line
+            .commands
+            .iter()
+            .map(|command| {
+                command
+                    .reads
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            reads,
+            [vec!["/a"], vec!["c"], vec![], vec![], vec!["/dev/null"]]
+        );
+        assert!(line.commands[1].writes_file);
     }
 }
