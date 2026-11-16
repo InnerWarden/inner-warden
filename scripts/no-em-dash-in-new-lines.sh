@@ -75,7 +75,11 @@ fi
 # first version used it, I fed it a deliberate em dash to check, and it
 # reported clean. A guard that cannot see uncommitted work is useless as a
 # local pre-push check and fires only after the fact.
-added="$(git diff -U0 "${base}" -- '*.rs' '*.sh' '*.ts' '*.tsx' '*.md' '*.toml' \
+#
+# YAML is scanned too. The vendored ATR rules under `rules/atr/` are YAML, and
+# a batch of imported upstream rules once added 59 em dashes there through a
+# green run of this gate, because `*.yaml` was not in the list below.
+added="$(git diff -U0 "${base}" -- '*.rs' '*.sh' '*.ts' '*.tsx' '*.md' '*.toml' '*.yaml' '*.yml' \
   | grep -E '^\+' | grep -v '^+++' || true)"
 
 offenders="$(printf '%s\n' "${added}" | grep -F "${dash}" || true)"

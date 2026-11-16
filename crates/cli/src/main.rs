@@ -4,7 +4,7 @@
 //! It wraps InnerWarden's `check-command` engine (`crates/agent-guard`) so a
 //! developer's AI coding agent (Claude Code, Cursor, Codex, ...) can screen a
 //! shell command for danger BEFORE it runs - prompt-injection, download-and-exec,
-//! reverse shells, credential access, tool-poisoning (71 ATR rules) - with the
+//! reverse shells, credential access, tool-poisoning (85 ATR rules) - with the
 //! OWASP Agentic Top 10 ids on every verdict. No sensor, no kernel, no install:
 //! just the guardrail, wherever the developer works. The heavy host-EDR
 //! (eBPF/sensor/exec-gate) stays Linux-only; this is the portable guardrail half.

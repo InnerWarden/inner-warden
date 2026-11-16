@@ -97,7 +97,7 @@ detection:
     # -- Layer 7: Sensitive file access --
     - field: tool_args
       operator: regex
-      value: "(?i)([\\/\\\\](etc[\\/\\\\](passwd|shadow|sudoers|ssh[\\/\\\\]|ssl[\\/\\\\])|proc[\\/\\\\](self[\\/\\\\]|\\d+[\\/\\\\])(environ|cmdline|maps|fd)|root[\\/\\\\]\\.(bash_history|ssh)|\\.env|\\.git[\\/\\\\]config|\\.aws[\\/\\\\]credentials|\\.ssh[\\/\\\\](id_rsa|authorized_keys)|wp-config\\.php|\\.htpasswd|\\.netrc|\\.pgpass))"
+      value: "(?i)([\\/\\\\](etc[\\/\\\\](passwd|shadow|sudoers|ssh[\\/\\\\]|ssl[\\/\\\\])|proc[\\/\\\\](self[\\/\\\\]|\\d+[\\/\\\\])(environ|cmdline|maps|fd)|root[\\/\\\\]\\.(bash_history|ssh)|\\.env(?!\\.(?:example|sample|template|dist|defaults)\\b)|\\.git[\\/\\\\]config|\\.aws[\\/\\\\]credentials|\\.ssh[\\/\\\\](id_rsa|authorized_keys)|wp-config\\.php|\\.htpasswd|\\.netrc|\\.pgpass))"
       description: "Access to known sensitive files (credentials, config, keys)"
 
     # -- Layer 8: Template injection --
@@ -188,6 +188,12 @@ test_cases:
     - tool_args: "O:8:\"Malicious\":1:{s:4:\"exec\";s:6:\"whoami\";}"
       expected: triggered
       description: "PHP serialized object injection"
+    - tool_args: "/srv/app/.env"
+      expected: triggered
+      description: "Read of an env file that holds the live secrets"
+    - tool_args: "/srv/app/.env.example /srv/app/.env"
+      expected: triggered
+      description: "A template named next to the live env file does not hide it"
   true_negatives:
     - tool_name: "search_knowledge_base"
       expected: not_triggered
@@ -201,6 +207,9 @@ test_cases:
     - tool_args: "/home/user/documents/report.pdf"
       expected: not_triggered
       description: "Normal file path without traversal"
+    - tool_args: "/srv/app/.env.example"
+      expected: not_triggered
+      description: "A committed env template holds placeholders, not secrets"
     - tool_args: "search_query=machine learning algorithms"
       expected: not_triggered
       description: "Normal search query parameter"
