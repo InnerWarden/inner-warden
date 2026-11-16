@@ -69,7 +69,7 @@ fn patterns() -> &'static [Pattern] {
 
 const MASK: &str = "[REDACTED]";
 
-fn sensitive_key(key: &str) -> bool {
+pub(crate) fn sensitive_key(key: &str) -> bool {
     let normalized: String = key
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
