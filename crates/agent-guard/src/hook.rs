@@ -165,10 +165,11 @@ pub fn merge_pretooluse_bash_hook(mut settings: Value, hook_command: &str) -> Va
     let replacing_innerwarden = is_iwguard_hook(&replacement_hook);
     let mut installed = false;
     arr.retain_mut(|entry| {
-        // The file-tools entry is the other half of the same wiring, kept by
-        // `merge_pretooluse_file_hook`; collapsing its hook as a duplicate
+        // The file-tools and read-tools entries are the other halves of the
+        // same wiring, kept by `merge_pretooluse_file_hook` and
+        // `merge_pretooluse_read_hook`; collapsing their hook as a duplicate
         // would make every reinstall rewrite the file.
-        if is_file_tools_entry(entry) {
+        if is_file_tools_entry(entry) || is_read_tools_entry(entry) {
             return true;
         }
         let is_bash_entry = bash_matcher_coverage(entry) == BashMatcherCoverage::Includes;
@@ -221,7 +222,36 @@ pub fn merge_pretooluse_bash_hook(mut settings: Value, hook_command: &str) -> Va
 /// survives) and duplicates there are collapsed. When an InnerWarden hook
 /// with this same command already runs for every file tool (under `*`, say),
 /// nothing is added: the agent would run the same check twice.
-pub fn merge_pretooluse_file_hook(mut settings: Value, hook_command: &str) -> Value {
+pub fn merge_pretooluse_file_hook(settings: Value, hook_command: &str) -> Value {
+    merge_pretooluse_tools_hook(
+        settings,
+        hook_command,
+        crate::file_tools::FILE_TOOLS_MATCHER,
+        crate::file_tools::FILE_TOOLS,
+    )
+}
+
+/// Idempotently install the hook on the agent's own read tools
+/// (`Read|Grep|Glob`, see [`crate::file_tools::file_read_call`]), as
+/// [`merge_pretooluse_file_hook`] does for the file-changing ones: its own
+/// entry, an exact matcher, the same command and mode.
+pub fn merge_pretooluse_read_hook(settings: Value, hook_command: &str) -> Value {
+    merge_pretooluse_tools_hook(
+        settings,
+        hook_command,
+        crate::file_tools::READ_TOOLS_MATCHER,
+        crate::file_tools::READ_TOOLS,
+    )
+}
+
+/// [`merge_pretooluse_file_hook`] and [`merge_pretooluse_read_hook`]: the
+/// entry whose matcher is exactly `matcher`, for `tools`.
+fn merge_pretooluse_tools_hook(
+    mut settings: Value,
+    hook_command: &str,
+    matcher: &str,
+    tools: &[&str],
+) -> Value {
     if !settings.is_object() {
         settings = json!({});
     }
@@ -243,7 +273,7 @@ pub fn merge_pretooluse_file_hook(mut settings: Value, hook_command: &str) -> Va
     let replacing_innerwarden = is_iwguard_hook(&replacement_hook);
     let mut installed = false;
     arr.retain_mut(|entry| {
-        if !is_file_tools_entry(entry) {
+        if entry.get("matcher").and_then(Value::as_str) != Some(matcher) {
             return true;
         }
         let Some(hooks) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
@@ -270,7 +300,7 @@ pub fn merge_pretooluse_file_hook(mut settings: Value, hook_command: &str) -> Va
         was_empty || !hooks.is_empty()
     });
     let covered_elsewhere = arr.iter().any(|entry| {
-        covers_every_file_tool(entry)
+        covers_every_tool(entry, tools)
             && entry
                 .get("hooks")
                 .and_then(Value::as_array)
@@ -282,7 +312,7 @@ pub fn merge_pretooluse_file_hook(mut settings: Value, hook_command: &str) -> Va
     });
     if !installed && !covered_elsewhere {
         arr.push(json!({
-            "matcher": crate::file_tools::FILE_TOOLS_MATCHER,
+            "matcher": matcher,
             "hooks": [replacement_hook],
         }));
     }
@@ -295,9 +325,16 @@ fn is_file_tools_entry(entry: &Value) -> bool {
     entry.get("matcher").and_then(Value::as_str) == Some(crate::file_tools::FILE_TOOLS_MATCHER)
 }
 
-/// Whether an entry's matcher certainly sends every file tool to its hooks.
-fn covers_every_file_tool(entry: &Value) -> bool {
-    crate::file_tools::FILE_TOOLS
+/// The entry [`merge_pretooluse_read_hook`] owns: its matcher is exactly
+/// [`crate::file_tools::READ_TOOLS_MATCHER`].
+fn is_read_tools_entry(entry: &Value) -> bool {
+    entry.get("matcher").and_then(Value::as_str) == Some(crate::file_tools::READ_TOOLS_MATCHER)
+}
+
+/// Whether an entry's matcher certainly sends every one of `tools` to its
+/// hooks.
+fn covers_every_tool(entry: &Value, tools: &[&str]) -> bool {
+    tools
         .iter()
         .all(|tool| tool_matcher_coverage(entry, tool) == BashMatcherCoverage::Includes)
 }
@@ -309,18 +346,31 @@ fn covers_every_file_tool(entry: &Value) -> bool {
 /// that only records (`--monitor`) beside a shell hook that refuses: there
 /// the file changes are not judged the way the shell commands are.
 pub fn iwguard_judges_file_tools(settings: &Value) -> bool {
-    let file_mode = settings
+    iwguard_judges_tools(settings, crate::file_tools::FILE_TOOLS)
+}
+
+/// [`iwguard_judges_file_tools`] for the agent's read tools (`Read`,
+/// `Grep`, `Glob`), so a read of a secret is judged before it happens.
+/// False on wiring written before reads were judged.
+pub fn iwguard_judges_read_tools(settings: &Value) -> bool {
+    iwguard_judges_tools(settings, crate::file_tools::READ_TOOLS)
+}
+
+/// Whether a recognised InnerWarden hook runs for every one of `tools`, in
+/// a mode as strong as the shell hook's ([`iwguard_judges_file_tools`]).
+fn iwguard_judges_tools(settings: &Value, tools: &[&str]) -> bool {
+    let mode = settings
         .get("hooks")
         .and_then(|hooks| hooks.get("PreToolUse"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter(|entry| covers_every_file_tool(entry))
+        .filter(|entry| covers_every_tool(entry, tools))
         .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
         .flatten()
         .filter_map(iwguard_hook_mode)
         .max();
-    match (file_mode, strongest_effective_iwguard_hook_mode(settings)) {
+    match (mode, strongest_effective_iwguard_hook_mode(settings)) {
         (None, _) => false,
         (Some(HookProtection::Monitor), Some(shell)) => shell == HookProtection::Monitor,
         (Some(_), _) => true,
@@ -603,6 +653,9 @@ fn install_hook_with_link_policy(
     // The file-tools half: the same binary and mode, on the agent's own
     // `Write`/`Edit` tools, which never pass through the shell.
     let merged = merge_pretooluse_file_hook(merged, &cmd);
+    // The read half: `Read`, `Grep` and `Glob`, judged by the secret rules
+    // of the shell, with the same binary and mode.
+    let merged = merge_pretooluse_read_hook(merged, &cmd);
     // The observation half. Written with the SAME binary and the same mode
     // flags, because a PostToolUse hook that points at a different build is a
     // seam that drifts silently: it would keep feeding a store the screening
@@ -1095,10 +1148,14 @@ pub fn needs_iwguard_hook_reconciliation(
     // `--agent` is correct wiring, never drift to repair.
     let agent = existing_agent_flag(settings).flatten();
     let command = hook_command_for(iw_guard, block_review, monitor, agent.as_deref());
-    // The file-tools hook is part of the wiring: an install from before it
-    // existed is brought up to it, in the mode it already has.
-    merge_pretooluse_file_hook(
-        merge_pretooluse_bash_hook(settings.clone(), &command),
+    // The file-tools and read-tools hooks are part of the wiring: an install
+    // from before they existed is brought up to them, in the mode it already
+    // has.
+    merge_pretooluse_read_hook(
+        merge_pretooluse_file_hook(
+            merge_pretooluse_bash_hook(settings.clone(), &command),
+            &command,
+        ),
         &command,
     ) != *settings
 }
@@ -1334,6 +1391,38 @@ mod tests {
         assert!(iwguard_judges_file_tools(&wiring(" --monitor", "")));
     }
 
+    /// The read half is reported on its own: wiring with the shell and file
+    /// entries and no read entry does not judge reads, and a record-only
+    /// read entry beside an enforcing shell hook does not either.
+    ///
+    /// FAILS ON REVERT: answer `iwguard_judges_read_tools` with the file
+    /// tools' list and the first wiring reads as judging reads.
+    #[test]
+    fn the_read_half_is_judged_only_where_its_entry_is() {
+        let entry = |matcher: &str, flags: &str| {
+            json!({ "matcher": matcher, "hooks": [
+                { "type": "command", "command": format!("\"/opt/innerwarden\" hook{flags}") }
+            ]})
+        };
+        let without_reads = json!({"hooks": {"PreToolUse": [
+            entry("Bash", ""),
+            entry(crate::file_tools::FILE_TOOLS_MATCHER, ""),
+        ]}});
+        assert!(iwguard_judges_file_tools(&without_reads));
+        assert!(!iwguard_judges_read_tools(&without_reads));
+        let with_reads = json!({"hooks": {"PreToolUse": [
+            entry("Bash", ""),
+            entry(crate::file_tools::FILE_TOOLS_MATCHER, ""),
+            entry(crate::file_tools::READ_TOOLS_MATCHER, ""),
+        ]}});
+        assert!(iwguard_judges_read_tools(&with_reads));
+        let record_only = json!({"hooks": {"PreToolUse": [
+            entry("Bash", ""),
+            entry(crate::file_tools::READ_TOOLS_MATCHER, " --monitor"),
+        ]}});
+        assert!(!iwguard_judges_read_tools(&record_only));
+    }
+
     /// Uninstall takes the file-tools half away with the rest.
     #[test]
     fn uninstall_removes_the_file_tools_hook_too() {
@@ -1353,6 +1442,90 @@ mod tests {
                 .unwrap();
         assert!(!iwguard_judges_file_tools(&settings));
         assert!(!has_iwguard_wiring(&settings));
+    }
+
+    /// The read-tools half: its own entry, exact matcher, the same command
+    /// and mode as the shell hook; the Bash and file merges leave it alone;
+    /// an install from before it is brought up to it in its own mode; and
+    /// uninstall takes it away.
+    ///
+    /// FAILS ON REVERT: leave `merge_pretooluse_read_hook` out of
+    /// `install_hook_with_link_policy` or out of `needs_iwguard_hook_reconciliation`, or
+    /// let the Bash merge collapse its hook, and an assertion here fails.
+    #[test]
+    fn the_read_tools_are_wired_with_the_same_command_and_mode() {
+        let iw = Path::new("/opt/innerwarden");
+        let read_entry = |settings: &Value| {
+            settings["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["matcher"] == crate::file_tools::READ_TOOLS_MATCHER)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for (block_review, monitor) in [(false, false), (true, false), (false, true)] {
+            let home = tempfile::TempDir::new().unwrap();
+            let report =
+                install_hook(home.path(), "claude-code", None, iw, block_review, monitor).unwrap();
+            let settings: Value =
+                serde_json::from_slice(&fs::read(&report.settings_path).unwrap()).unwrap();
+            let entries = read_entry(&settings);
+            assert_eq!(entries.len(), 1, "{settings}");
+            assert_eq!(entries[0]["hooks"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                entries[0]["hooks"][0]["command"],
+                json!(report.hook_command)
+            );
+            // The Bash and file merges, run again, leave it as it is.
+            let cmd = report.hook_command.as_str();
+            assert_eq!(
+                merge_pretooluse_file_hook(merge_pretooluse_bash_hook(settings.clone(), cmd), cmd),
+                settings
+            );
+            assert_eq!(merge_pretooluse_read_hook(settings.clone(), cmd), settings);
+            uninstall_hook(home.path(), "claude-code", None).unwrap();
+            let after: Value = serde_json::from_slice(
+                &fs::read(home.path().join(".claude/settings.json")).unwrap(),
+            )
+            .unwrap();
+            assert!(read_entry(&after).is_empty(), "{after}");
+            assert!(!has_iwguard_wiring(&after), "{after}");
+        }
+
+        // Wiring from before the read tools: the Bash and file halves only.
+        let old = json!({"hooks": {"PreToolUse": [
+            { "matcher": "Bash", "hooks": [
+                { "type": "command", "command": "\"/opt/innerwarden\" hook --agent claude-code" }
+            ]},
+            { "matcher": crate::file_tools::FILE_TOOLS_MATCHER, "hooks": [
+                { "type": "command", "command": "\"/opt/innerwarden\" hook --agent claude-code" }
+            ]}
+        ]}});
+        assert!(needs_iwguard_hook_reconciliation(&old, iw, false, true));
+        let home = tempfile::TempDir::new().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+        // Background setup asks for monitor; the enforce hook keeps enforce.
+        let result =
+            install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+        assert!(matches!(result, AutomaticHookInstall::Installed(_)));
+        let new: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let entries = read_entry(&new);
+        assert_eq!(entries.len(), 1, "{new}");
+        assert_eq!(
+            entries[0]["hooks"][0]["command"],
+            "\"/opt/innerwarden\" hook --agent claude-code"
+        );
+        assert!(!needs_iwguard_hook_reconciliation(&new, iw, false, true));
+
+        // A hook already run for every tool (`*`) reads them too: nothing added.
+        let cmd = "\"/opt/innerwarden\" hook";
+        let star = json!({"hooks": {"PreToolUse": [
+            { "matcher": "*", "hooks": [ { "type": "command", "command": cmd } ] }
+        ]}});
+        assert_eq!(merge_pretooluse_read_hook(star.clone(), cmd), star);
     }
 
     #[test]
@@ -1801,22 +1974,27 @@ mod tests {
             let settings = json!({"hooks": {"PreToolUse": [
                 {"matcher": "Bash", "hooks": [{"type": "command", "command": command}]},
                 {"matcher": crate::file_tools::FILE_TOOLS_MATCHER,
+                 "hooks": [{"type": "command", "command": command}]},
+                {"matcher": crate::file_tools::READ_TOOLS_MATCHER,
                  "hooks": [{"type": "command", "command": command}]}
             ]}});
             assert!(
                 !needs_iwguard_hook_reconciliation(&settings, iw, false, true),
                 "{command}"
             );
-            // Without the file-tools half it needs work, and the work adds
-            // that half without renaming the Bash hook.
+            // Without the file-tools and read-tools halves it needs work, and
+            // the work adds them without renaming the Bash hook.
             let bash_only = json!({"hooks": {"PreToolUse": [
                 {"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}
             ]}});
             assert!(needs_iwguard_hook_reconciliation(
                 &bash_only, iw, false, true
             ));
-            let repaired = merge_pretooluse_file_hook(
-                merge_pretooluse_bash_hook(bash_only.clone(), command),
+            let repaired = merge_pretooluse_read_hook(
+                merge_pretooluse_file_hook(
+                    merge_pretooluse_bash_hook(bash_only.clone(), command),
+                    command,
+                ),
                 command,
             );
             assert_eq!(
@@ -1836,7 +2014,7 @@ mod tests {
 
     #[test]
     fn a_hand_run_install_names_an_unnamed_hook_and_background_setup_does_not() {
-        let unnamed = r#"{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]},{"matcher":"Write|Edit|MultiEdit|NotebookEdit","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]}]}}"#;
+        let unnamed = r#"{"hooks":{"PostToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]}],"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]},{"matcher":"Write|Edit|MultiEdit|NotebookEdit","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]},{"matcher":"Read|Grep|Glob","hooks":[{"type":"command","command":"\"/opt/innerwarden\" hook --monitor"}]}]}}"#;
         // By hand: the name is added, in the mode asked for.
         let home = tempfile::TempDir::new().unwrap();
         let settings = home.path().join(".claude/settings.json");
@@ -1944,10 +2122,11 @@ mod tests {
             "\"/opt/innerwarden\" hook --block-review --agent claude-code"
         );
 
-        // Idempotent: the Bash hook and the file-tools hook, once each.
+        // Idempotent: the Bash hook, the file-tools hook and the read-tools
+        // hook, once each.
         install_hook(home.path(), "claude-code", None, iw, true, false).unwrap();
         let v2: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
-        assert_eq!(v2["hooks"]["PreToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(v2["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
     }
 
     #[test]
@@ -2159,6 +2338,12 @@ mod tests {
                 "type":"command",
                 "command":"\"/current/innerwarden\" hook --monitor"
             }]
+        }, {
+            "matcher": crate::file_tools::READ_TOOLS_MATCHER,
+            "hooks":[{
+                "type":"command",
+                "command":"\"/current/innerwarden\" hook --monitor"
+            }]
         }]}});
         assert!(has_iwguard_wiring(&canonical));
         assert!(has_iwguard_hook(&canonical));
@@ -2219,11 +2404,13 @@ mod tests {
         let repaired: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         let entries = repaired["hooks"]["PreToolUse"].as_array().unwrap();
-        // One Bash hook, plus the file-tools half beside it.
+        // One Bash hook, plus the file-tools and read-tools halves beside it.
         assert_eq!(
             entries
                 .iter()
-                .filter(|entry| is_iwguard_hook_entry(entry) && !is_file_tools_entry(entry))
+                .filter(|entry| is_iwguard_hook_entry(entry)
+                    && !is_file_tools_entry(entry)
+                    && !is_read_tools_entry(entry))
                 .count(),
             1
         );
@@ -2391,7 +2578,10 @@ mod tests {
 
         let (path, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
         assert_eq!(path, settings);
-        assert_eq!(removed, 2, "the Bash hook and the file-tools hook");
+        assert_eq!(
+            removed, 3,
+            "the Bash hook, the file-tools hook and the read-tools hook"
+        );
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 0);
 
@@ -2419,12 +2609,12 @@ mod tests {
         let v2: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(
             v2["hooks"]["PreToolUse"].as_array().unwrap().len(),
-            2,
-            "reinstall must not stack a second hook (Bash entry + file-tools entry)"
+            3,
+            "reinstall must not stack a second hook (Bash, file-tools and read-tools entries)"
         );
-        // uninstall finds and removes both.
+        // uninstall finds and removes all three.
         let (_, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
     }
 
     #[test]

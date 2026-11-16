@@ -1,6 +1,6 @@
 {
   "schema": "innerwarden.dashboard.bundle.v1",
-  "source_digest": "sha256:faef94eaec708186d229aef6c45f0cbee6bbef823c2909580d39ffa8361ed65d",
+  "source_digest": "sha256:cc2d57f56bf978f1db16b92dc967d39320ba339e0e4139b1b5969aff5610fac0",
   "entrypoint": "index.html",
   "assets": [
     {

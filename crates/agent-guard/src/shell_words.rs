@@ -39,6 +39,11 @@ pub(crate) struct Word {
     /// What the substitutions in it put in its place: the command line of a
     /// command substitution, the default of a `${name:-default}`.
     pub(crate) substitutions: Vec<String>,
+    /// Where a `~` stands unquoted and unescaped, as indices into the
+    /// characters of `text`. The shell puts the home folder in place of one
+    /// that starts a word or the value of an assignment; a quoted or escaped
+    /// `~` is a letter.
+    pub(crate) open_tildes: Vec<usize>,
 }
 
 impl Word {
@@ -369,7 +374,11 @@ impl Lexer {
                 self.at += 2;
             }
             _ => {
-                self.word().push(c, Mark::Plain);
+                let word = self.word();
+                if c == '~' {
+                    word.open_tildes.push(word.marks.len());
+                }
+                word.push(c, Mark::Plain);
                 self.at += 1;
             }
         }
@@ -1079,6 +1088,35 @@ mod tests {
             assert_eq!(words(&line), [["a", "b"]], "{text}");
             assert_eq!(line.commands[0].writes_file, writes, "{text}");
         }
+    }
+
+    /// A `~` is recorded where it stands unquoted and unescaped, the one the
+    /// shell may put the home folder in place of; quoted, escaped or in an
+    /// ANSI-C string it is a letter, and not recorded.
+    ///
+    /// FAILS ON REVERT of the `open_tildes` record in `word_unit`.
+    #[test]
+    fn an_unquoted_tilde_is_recorded_where_it_stands() {
+        let line = read_line("a ~ X=~/c ~x \"~\" '~' \\~ $'~' x~");
+        let tildes: Vec<Vec<usize>> = line.commands[0]
+            .words
+            .iter()
+            .map(|word| word.open_tildes.clone())
+            .collect();
+        assert_eq!(
+            tildes,
+            [
+                vec![],
+                vec![0],
+                vec![2],
+                vec![0],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![1]
+            ]
+        );
     }
 
     /// What the shell would still change is marked: expansions, globs and

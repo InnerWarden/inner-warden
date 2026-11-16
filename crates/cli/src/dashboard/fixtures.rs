@@ -509,6 +509,7 @@ pub(super) fn agents_payload(rows: &[FixtureAgent], host_mode: &str) -> Value {
             crate::status::ToolClasses::Hook {
                 agent: row.id.into(),
                 file_tools: true,
+                reads: true,
                 next: String::new(),
             }
         } else {

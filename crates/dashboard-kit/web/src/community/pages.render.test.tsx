@@ -944,7 +944,8 @@ describe("Protection, Agents and Tokens", () => {
     expect(text).toContain("Automatic setup is on: a new agent joins in monitor, checked every 60 s.");
     expect(text.match(/Monitor is a dry run/g)?.length).toBe(1);
     expect(html).toContain('id="agent-claude-code"');
-    expect(text).toContain("Judges before it runs: Shell commands, and file changes");
+    expect(text).toContain("Judges before it runs: Shell commands, file changes");
+    expect(text).toContain("and reads (Read, Grep, Glob) of secrets");
     expect(text).toContain("2 of 3 local servers wrapped.");
     expect(text).toContain("Last screened");
     expect(commandBoxes(html).map((box) => box.text)).toContain("innerwarden agents connect codex --monitor");
