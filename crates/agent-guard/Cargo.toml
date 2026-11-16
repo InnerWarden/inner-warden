@@ -22,6 +22,10 @@ toml = "1.1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 regex = "1"
+# The engines `regex` is built from, used directly so an ATR condition compiles
+# only the forward automaton `is_match` needs (see `ForwardRegex` in
+# src/rules.rs). Already in the tree through `regex`; same version.
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "perf", "unicode", "hybrid", "nfa-pikevm", "meta"] }
 fancy-regex = "0.19"
 fs4 = { version = "1.1", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
