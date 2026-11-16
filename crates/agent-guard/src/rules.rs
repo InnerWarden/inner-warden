@@ -16,7 +16,7 @@ use tracing::warn;
 ///
 /// The vendored ATR (Agent Threat Rules) corpus, embedded into the binary at
 /// compile time. This is the canonical default ruleset, embedding guarantees
-/// the engine always has the 71 community rules without any deploy/copy step
+/// the engine always has the 77 community rules without any deploy/copy step
 /// (the deploy script only ever shipped `rules/sigma`, so on-disk loading left
 /// the ATR engine empty in prod, see `load_with_overlay`).
 static EMBEDDED_ATR_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../rules/atr");
@@ -117,7 +117,7 @@ struct PendingCondition {
 /// corpus has close to 600 conditions, and its bounded repetitions
 /// (`.{0,200}`, `[^)]{0,300}`) over Unicode classes compile to large automata,
 /// built once forwards and once in reverse: about 34 MB of heap for the whole
-/// corpus, before any search warms a cache. Measured on Linux x86_64 release,
+/// corpus of ATR v0.4.0 (71 files), before any search warms a cache. Measured on Linux x86_64 release,
 /// that put each `innerwarden proxy` at about 41 MB of private anonymous
 /// memory before it had screened anything. An MCP client keeps one proxy per
 /// wrapped server open for its whole session, so a user with five servers in
@@ -129,6 +129,13 @@ struct PendingCondition {
 /// one of them out before a regex is consulted. So a rule now compiles when a
 /// context it applies to first reaches it, and a rule no inspected surface
 /// selects is never compiled at all.
+///
+/// What the proxy's surfaces do compile is held to a budget by
+/// `tests/proxy_rule_heap.rs`: the live heap the `tool_call` and
+/// `mcp_exchange` rules leave behind after one `tools/list`, one `tools/call`
+/// and one ordinary tool result, counted by allocator (21.9 MiB with the 77
+/// shipped files, 14.1 MiB before upstream batch 1). Re-declaring an `llm_io`
+/// rule for a proxy surface moves its whole cost onto every proxy.
 ///
 /// Detection is unchanged by construction: a rule is compiled before its first
 /// evaluation completes, through the same compiler as before, so its first
@@ -382,7 +389,7 @@ impl RuleEngine {
     /// with the same `id` as an embedded rule replace it; new ids are added.
     /// A missing/unreadable dir is fine, the embedded corpus stands alone.
     ///
-    /// This is the production entry point: it guarantees the 62 pattern-tier
+    /// This is the production entry point: it guarantees the 68 pattern-tier
     /// community rules are present even when the deploy step never copied the
     /// ATR tree onto the host, while still honoring operator customization.
     pub fn load_with_overlay(override_dir: &Path) -> Self {
@@ -568,7 +575,7 @@ impl RuleEngine {
 ///
 /// # Why the shell surface matches nothing today
 ///
-/// The corpus declares 27 rules as `tool_call`, 30 as `llm_io`, and NONE as
+/// The corpus declares 28 rules as `tool_call`, 30 as `llm_io`, and NONE as
 /// `shell_command` or `any`. So screening a shell command matches nothing: every
 /// rule is filtered out here before a regex runs, and `innerwarden check` reports
 /// zero ATR matches whatever it is given. The rules are live on the MCP and LLM
@@ -769,7 +776,13 @@ fn parse_field(raw: &str) -> AtrField {
         // any command containing those substrings. See `AtrField::ToolName`.
         "tool_name" | "tool" => AtrField::ToolName,
         "content" => AtrField::Content,
-        // user_input, tool_description, and anything else → UserInput
+        // A tool's own description. `AtrContext::tool_description` is the
+        // only `tool_call` context that carries a user_input value, so a
+        // `tool_call` rule that reads this field runs on the descriptions in a
+        // tools/list answer and never on tools/call arguments. Named here, not
+        // left to the catch-all below, because shipped rules rely on it.
+        "user_input" | "tool_description" => AtrField::UserInput,
+        // Any other field name is read as UserInput as well.
         _ => AtrField::UserInput,
     }
 }
@@ -1219,9 +1232,10 @@ detection:
 
     // ── Embedded ATR corpus (fix: prod-load gap via include_dir) ─────────────
 
-    /// 71 vendored rules; 9 are `detection_tier: semantic` (no executor) and
-    /// are skipped, leaving 62 compilable pattern-tier rules.
-    const EMBEDDED_PATTERN_RULE_COUNT: usize = 62;
+    /// 77 vendored rules (71 from ATR v0.4.0, 6 from upstream a5616495a);
+    /// 9 are `detection_tier: semantic` (no executor) and are skipped,
+    /// leaving 68 compilable pattern-tier rules.
+    const EMBEDDED_PATTERN_RULE_COUNT: usize = 68;
 
     #[test]
     fn embedded_corpus_loads_all_pattern_tier_rules() {

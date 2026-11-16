@@ -16,9 +16,21 @@ Rules project:
     Copyright (c) 2026 ATR Contributors
     MIT License (see LICENSES/ATR-MIT.txt)
 
-They were taken from that project's tree at commit efad113 (2026-03-26,
+All but the files listed below were taken from that project's tree at
+commit efad113 (2026-03-26,
 "v0.4.0 — 71 rules"), and some have since been modified here. Each rule file
 carries its original `author:` line.
+
+The following rule files were taken from the same project's tree at commit
+a5616495a (2026-11-14), under the same MIT License. A file marked (modified)
+starts with a comment that says what InnerWarden changed and why.
+
+    rules/atr/tool-poisoning/ATR-2026-00434-mcp-remote-authorization-endpoint-command-injection.yaml (modified)
+    rules/atr/tool-poisoning/ATR-2026-00714-tool-camouflage-forced-tool-call.yaml (modified)
+    rules/atr/tool-poisoning/ATR-2026-00715-tool-knowledge-hijack-identity-injection.yaml (modified)
+    rules/atr/tool-poisoning/ATR-2026-01301-tool-description-exclusive-tool-override.yaml (modified)
+    rules/atr/tool-poisoning/ATR-2026-01302-fake-tool-result-instruction-injection.yaml (modified)
+    rules/atr/tool-poisoning/ATR-2026-01307-mcp-dns-rebinding-attack.yaml (modified)
 
 LICENSES/ATR-MIT.txt (LICENSE-MIT until 1.6.2) carries the MIT copyright and permission notice
 for that material. It applies to the rule files under `rules/atr/`. Everything

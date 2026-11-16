@@ -404,11 +404,29 @@ fn proxy_advisory_records_all_calls_without_recording_responses_or_clean_alerts(
         "advisory must forward deny recommendations"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    let alerts: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("[innerwarden]"))
+        .collect();
     assert_eq!(
-        stderr.matches("[innerwarden]").count(),
+        alerts
+            .iter()
+            .filter(|line| line.contains("client->server"))
+            .count(),
         1,
         "only the finding should be an alert; clean activity is telemetry: {stderr}"
     );
+    // `cat` sends the denied call back as server traffic, secret and all:
+    // that echo is a secret in what a server sent, reported as one, never a
+    // second alert for the clean call.
+    assert!(
+        alerts
+            .iter()
+            .filter(|line| line.contains("server->client"))
+            .all(|line| line.ends_with(r#"rules=["AG-SECRET-OUT"]"#)),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(&secret), "{stderr}");
 
     let body = std::fs::read_to_string(&graph_path).expect("MCP graph written");
     assert!(
