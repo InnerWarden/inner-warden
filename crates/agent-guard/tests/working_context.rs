@@ -521,6 +521,35 @@ fn a_stored_login_one_folder_down_or_a_registry_login_is_refused() {
     }
 }
 
+/// A public SSH file is public under every name the system gives it: with
+/// the home reached through a link (on macOS a home under `/var` is, since
+/// `/var` leads to `/private/var`), `cat ~/.ssh/id_ed25519.pub` is still the
+/// public key. A public name that leads to the private key is still the key.
+///
+/// FAILS ON REVERT of the public-file test in `secret_behind` (the public key
+/// under its second name was read as a key).
+#[cfg(unix)]
+#[test]
+fn a_public_ssh_file_under_a_linked_home_is_public() {
+    let at = layout();
+    let real = format!("{}/real-home", at.root);
+    std::fs::create_dir_all(format!("{real}/.ssh")).expect("ssh");
+    std::fs::create_dir_all(format!("{real}/work")).expect("work");
+    std::fs::write(format!("{real}/.ssh/id_ed25519"), "k\n").expect("key");
+    std::fs::write(format!("{real}/.ssh/id_ed25519.pub"), "p\n").expect("pub");
+    std::fs::write(format!("{real}/.ssh/authorized_keys"), "p\n").expect("keys");
+    std::os::unix::fs::symlink("id_ed25519", format!("{real}/.ssh/leak.pub")).expect("link");
+    let home = format!("{}/linked-home", at.root);
+    std::os::unix::fs::symlink(&real, &home).expect("linked home");
+    let context = discovered(&format!("{home}/work"), &home);
+    for command in ["cat ~/.ssh/id_ed25519.pub", "cat ~/.ssh/authorized_keys"] {
+        let analysis = in_place_at(command, &context);
+        assert!(!blocks_for_agent(&analysis), "{command}: {analysis:?}");
+    }
+    let analysis = in_place_at("cat ~/.ssh/leak.pub", &context);
+    assert!(blocks_for_agent(&analysis), "{analysis:?}");
+}
+
 /// A whole read of the home, or of a folder the home is in, takes the keys
 /// and logins kept in it: refused as a read of one of them, from anywhere,
 /// the agent's own folder climbed out of too. A search that leaves hidden

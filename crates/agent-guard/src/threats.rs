@@ -7798,15 +7798,38 @@ pub fn check_container_escape(content: &str) -> Option<(&'static str, u32)> {
 /// `check_kubernetes_escalation`; then each with its mount sources spelled
 /// plainly.
 fn container_escape_as_read(content: &str) -> Option<&'static str> {
+    container_escape_as_read_with(content, &|path: &str| {
+        std::fs::read_link(path)
+            .ok()
+            .map(|target| target.to_string_lossy().into_owned())
+    })
+}
+
+/// [`container_escape_as_read`] with the host's links read by `read_link`.
+fn container_escape_as_read_with(
+    content: &str,
+    read_link: &dyn Fn(&str) -> Option<String>,
+) -> Option<&'static str> {
     let normalized = normalize_command(content);
     let mut forms = vec![content.to_string()];
     if normalized != content {
         forms.push(normalized);
     }
+    // Every link a socket source passes through is a form of its own: the
+    // path a link leads to may be a link itself, as Docker Desktop's
+    // `/var/run/docker.sock` is (it leads into the home), and the path on the
+    // way is the one the rules know.
     for form in forms.clone() {
-        let plain = mount_sources_spelled_plainly(&form);
-        if plain != form {
-            forms.push(plain);
+        let mut before = form.clone();
+        for hops in 0..=MOUNT_LINK_STEPS {
+            let plain = mount_sources_spelled_plainly(&form, hops, read_link);
+            if hops > 0 && plain == before {
+                break;
+            }
+            if plain != form && !forms.contains(&plain) {
+                forms.push(plain.clone());
+            }
+            before = plain;
         }
     }
     // Each source also as where its links lead on this host: a link made
@@ -7849,10 +7872,14 @@ const MOUNT_LINK_STEPS: usize = 8;
 /// `text` with each mount source (`-v`, `--volume`, `--mount source=`)
 /// written as the path it names: `.` and empty parts dropped and `..` taken
 /// back ([`plain_absolute_path`]), and a source that ends in `.sock` followed
-/// through its links on this host, so a link to the runtime socket is read
-/// as the socket. A relative source, or one an expansion still names, is
-/// left as written.
-fn mount_sources_spelled_plainly(text: &str) -> String {
+/// through at most `hops` of its links (`read_link`), so a link to the
+/// runtime socket is read as the socket. A relative source, or one an
+/// expansion still names, is left as written.
+fn mount_sources_spelled_plainly(
+    text: &str,
+    hops: usize,
+    read_link: &dyn Fn(&str) -> Option<String>,
+) -> String {
     static SOURCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let source = SOURCE.get_or_init(|| {
         regex::Regex::new(concat!(
@@ -7867,11 +7894,10 @@ fn mount_sources_spelled_plainly(text: &str) -> String {
             let written = &found[2];
             let mut path = plain_absolute_path(written);
             if path.ends_with(".sock") {
-                for _ in 0..MOUNT_LINK_STEPS {
-                    let Ok(target) = std::fs::read_link(&path) else {
+                for _ in 0..hops {
+                    let Some(target) = read_link(&path) else {
                         break;
                     };
-                    let target = target.to_string_lossy().into_owned();
                     path = if target.starts_with('/') {
                         plain_absolute_path(&target)
                     } else {
@@ -11737,7 +11763,13 @@ fn secret_behind(path: &str, home: Option<&str>) -> Option<String> {
         .into_iter()
         .map(|name| name.to_string_lossy().into_owned())
         .find(|name| {
+            // A public SSH file is public under every name. Where its links
+            // lead keeps its name unless a link names another file, and a hard
+            // link to a key is found as the key by its identity. On macOS
+            // `/var` leads to `/private/var`, so a home under it gives every
+            // file there a second name.
             name != path
+                && !is_public_ssh_file(name)
                 && (hard_path_in(name).is_some()
                     || credential_directory(name).is_some_and(is_hard_sensitive_path)
                     || is_stored_credential(name, home))
@@ -22190,6 +22222,36 @@ mod round_three_rule_tests {
         assert_eq!(
             secret_in_hidden_folder_within(&tool, &home, None, 5),
             Some(format!("{tool}/b/.env"))
+        );
+    }
+
+    /// A socket source is read at every link it passes through: on Docker
+    /// Desktop `/var/run/docker.sock` is itself a link into the home, and the
+    /// path the rules know is the one on the way, also after a link to it.
+    /// FAILS ON REVERT of the form per link in `container_escape_as_read_with`
+    /// (only where the links end was read).
+    #[test]
+    fn a_socket_source_is_read_at_every_link_on_its_way() {
+        let links = |path: &str| match path {
+            "/tmp/d.sock" => Some("/var/run/docker.sock".to_string()),
+            "/var/run/docker.sock" => Some("/Users/dev/.docker/run/docker.sock".to_string()),
+            _ => None,
+        };
+        for cmd in [
+            "docker run -v //var/run/docker.sock:/s alpine sh",
+            "docker run -v /var/run/./docker.sock:/s alpine sh",
+            "docker run -v /tmp/d.sock:/s alpine sh",
+            "docker run --mount type=bind,source=/tmp//d.sock,target=/s alpine sh",
+        ] {
+            assert_eq!(
+                container_escape_as_read_with(cmd, &links),
+                Some(ESCAPE_SOCKET_MOUNT),
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            container_escape_as_read_with("docker run -v /tmp/app.sock:/s alpine sh", &links),
+            None
         );
     }
 

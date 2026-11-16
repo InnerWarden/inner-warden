@@ -1110,8 +1110,10 @@ mod tests {
             ),
             (
                 "glob",
-                json!({"pattern": "**/id_rsa", "dir_path": "/home"}),
-                "find /home -path '**/id_rsa'",
+                // A broad root that is no link on any runner: `/home` is one
+                // on macOS (it leads to `/System/Volumes/Data/home`).
+                json!({"pattern": "**/id_rsa", "dir_path": "/srv"}),
+                "find /srv -path '**/id_rsa'",
             ),
             (
                 "grep_search",

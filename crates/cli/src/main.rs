@@ -3636,11 +3636,13 @@ mod install_target_tests {
         // A Read tool call carries no command: it is screened as the shell
         // read of the same file. FAILS ON REVERT of the read-tool arm of
         // `classify_hook_input` (it was `NotAShellCall`, nothing screened).
+        // A path that names no file on any runner: an existing one is also
+        // read as where it leads, and `/etc` leads to `/private/etc` on macOS.
         assert_eq!(
             classify_hook_input(
-                r#"{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/etc/hosts"}}"#
+                r#"{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{"file_path":"/home/dev/proj/notes.md"}}"#
             ),
-            HookInput::FileRead("cat /etc/hosts".into())
+            HookInput::FileRead("cat /home/dev/proj/notes.md".into())
         );
         assert_eq!(
             classify_hook_input(r#"{"tool_name":"Read","tool_input":{"limit":5}}"#),
