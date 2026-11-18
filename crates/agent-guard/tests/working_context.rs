@@ -569,7 +569,8 @@ fn a_whole_read_of_the_home_is_a_read_of_its_secrets() {
     let from_home = discovered(&at.home, &at.home);
     for (context, command) in [
         (&from_work, "grep -r oauth_token ~"),
-        (&from_work, "grep -rn TODO ~/"),
+        (&from_work, "grep -rn '' ~/"),
+        (&from_work, "grep -rv TODO ~/"),
         (&from_work, "grep -r x $HOME"),
         (&from_work, "grep -r x .."),
         (&from_work, "grep -r x /"),
@@ -599,6 +600,20 @@ fn a_whole_read_of_the_home_is_a_read_of_its_secrets() {
     ] {
         let analysis = in_place_at(command, &from_work);
         assert!(!blocks_for_agent(&analysis), "{command}: {analysis:?}");
+    }
+    // A grep of the whole home for a narrow text opens the key too, but
+    // prints from it only a line holding that text: a person's call
+    // (`review`), still named by the key, not a hard refusal (T-009 item 4).
+    for command in ["grep -rn TODO ~/", "grep -rl 'fn main' ~"] {
+        let analysis = in_place_at(command, &from_work);
+        assert_eq!(analysis.recommendation, "review", "{command}: {analysis:?}");
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|s| s.detail.contains(".ssh/id_ed25519")),
+            "{command}: {analysis:?}"
+        );
     }
     // A home that keeps no key and no login.
     let bare = layout();

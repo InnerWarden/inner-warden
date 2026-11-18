@@ -3325,10 +3325,34 @@ fn analyze_command_as_read(
         // A stored credential reached through the directory, or inside a
         // whole hidden folder the command reads: the always-secret read the
         // text alone could not see. One read signal, at the hard score.
-        if let Some((path, folder)) =
-            threats::stored_secret_read_in_place(scan_cmd, &place.cwd, place.home.as_deref())
-        {
-            let detail = if folder {
+        // A grep of the whole home for a narrow text opens the key and
+        // prints from it only a line holding that text: a person decides
+        // (`review`), the agent is not blocked outright.
+        // The pattern is judged on the line as written: the scanned reading
+        // has it blanked as data.
+        let found =
+            threats::stored_secret_read_in_place(scan_cmd, &place.cwd, place.home.as_deref());
+        let searched = matches!(found, Some((_, threats::SecretReach::Folder)))
+            && threats::searches_home_for_narrow_text(cmd, &place.cwd, place.home.as_deref());
+        if let Some((path, _)) = found.as_ref().filter(|_| searched) {
+            if !signals
+                .iter()
+                .any(|s| s.signal == "sensitive_credential_read")
+            {
+                signals.push(AnalysisSignal {
+                    signal: "sensitive_credential_read".into(),
+                    score: 30,
+                    detail: format!(
+                        "searches the whole home, which holds `{path}`: grep opens it and \
+                         prints any line of it that holds the text searched for (search the \
+                         folder the work needs instead)"
+                    ),
+                });
+                score += 30;
+            }
+        }
+        if let Some((path, reach)) = found.filter(|_| !searched) {
+            let detail = if reach == threats::SecretReach::Folder {
                 format!(
                     "reads sensitive credential path: `{path}` (inside a whole folder the \
                      command reads: name the file or subfolder the work needs instead)"
