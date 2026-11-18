@@ -289,6 +289,16 @@ fn a_decision_without_the_person_at_a_terminal_changes_nothing() {
         "schema_version = 1\n[profile.strict]\ndeny_categories = [\"bare_ip_fetch\"]\n[agent.claude-code]\nprofile = \"strict\"\n",
     )
     .unwrap();
+    // The product refuses a profiles file its group can write. `fs::write`
+    // creates it at 0666 minus the umask, so under `umask 002` (a stock
+    // Ubuntu user) the fixture was group-writable and refused for that, not
+    // for the reason under test. Fix the mode the product writes: 0600.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(host.profiles_path(), std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+    }
     let before = std::fs::read(host.profiles_path()).unwrap();
     let back = host.agents("profile claude-code general --yes");
     assert_eq!(back.code, Some(2), "{}", back.stderr);

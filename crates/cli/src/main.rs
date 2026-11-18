@@ -2998,6 +2998,30 @@ mod status_wiring_tests {
                     .as_deref(),
                 Some(w.partly_unscreened[0].sentence.as_str())
             );
+            // And through the row the dashboard serves: its guarded gate
+            // (`status_is_effectively_guarded` in `agents_json_with_status`)
+            // keeps the agent connected, and `agent_unscreened` says the
+            // words `status` prints.
+            let payload: serde_json::Value =
+                serde_json::from_str(&dashboard::agents_json(home.path(), &rows)).unwrap();
+            let row = payload["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == "claude-code")
+                .expect("claude-code row");
+            assert_ne!(
+                row["guardrail"]["mode"], "not_configured",
+                "monitor={monitor}: {row}"
+            );
+            assert!(row["guardrail"]["mode"].is_string(), "{row}");
+            assert_eq!(
+                row["unscreened"]["line"],
+                status::partly_unscreened_words("claude-code", &w.partly_unscreened[0].sentence)
+                    .as_str(),
+                "monitor={monitor}: {row}"
+            );
+            assert!(row.get("judges").is_none(), "{row}");
 
             // Whole again: no caveat, and the tool classes say what it judges.
             runnable(&home.path().join("gone/innerwarden"));
