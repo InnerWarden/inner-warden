@@ -25,6 +25,12 @@ pub(super) fn unread_beside_guard_word(content: &str) -> bool {
     rules::judge(content.as_bytes(), true).is_some()
 }
 
+/// Whether `code`, handed to an interpreter that runs it in its own
+/// language, holds a way to start a program ([`rules::code_starts_a_program`]).
+pub(super) fn code_starts_a_program(code: &str) -> bool {
+    rules::code_starts_a_program(code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{check_guard_self_disable, guard_verb_loosens, GUARD_VERB_HEADS};

@@ -7197,6 +7197,137 @@ fn heredoc_start_is_quoted(redirect: tree_sitter::Node<'_>, source: &[u8]) -> bo
     quoted
 }
 
+/// Interpreters that run, in their own language, a program they read from
+/// their input (`python3 -`, `node`, `perl -`), with no shell between.
+const CODE_INTERPRETERS: [&str; 6] = ["python", "perl", "ruby", "node", "php", "lua"];
+
+/// The command line with the body of each here-document that is a program
+/// for one of [`CODE_INTERPRETERS`], and that starts no program in that
+/// language, blanked: the text the guard's own words are looked for in.
+/// `None` when no body is blanked.
+///
+/// `python3 - <<'EOF'` hands the interpreter its program. With the
+/// delimiter quoted the shell expands nothing in the body, so the body is
+/// Python, not shell: a guard name or verb in one of its strings is text the
+/// program works on (a file it edits), and is a command only if the program
+/// starts one ([`crate::threats::interpreter_code_starts_a_program`]). Read
+/// as shell, every edit of a file that quotes a guard command was refused as
+/// that command.
+///
+/// Only the shape whose whole effect is the program is blanked: one command,
+/// its name an interpreter and its only word `-` or none, the quoted
+/// here-document its one redirection, with nothing that runs what it prints
+/// (a pipe, a substitution) or what it may write (a later command, a loop,
+/// a function, a trap). Anything else is read as before, as shell.
+pub(crate) fn interpreter_input_as_data(source: &str) -> Option<String> {
+    let rewritten = text_as_the_shell_reads(source);
+    let text = rewritten.as_deref().unwrap_or(source);
+    let tree = parse_bash(text)?;
+    let root = tree.root_node();
+    if root.has_error() || ast_exceeds_projection_budget(root) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    if node_contains_kind(root, "function_definition", 0) {
+        return None;
+    }
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    if commands.iter().any(|command| {
+        command_name(*command, bytes).is_some_and(|name| normalized_command_name(&name) == "trap")
+    }) {
+        return None;
+    }
+    let mut bodies = Vec::new();
+    collect_nodes_of_kind(root, "heredoc_body", &mut bodies, 0);
+    let blanked: Vec<Range<usize>> = bodies
+        .into_iter()
+        .filter(|body| body.kind() == "heredoc_body")
+        .filter_map(|body| inert_interpreter_program(body, bytes, &commands))
+        .collect();
+    if blanked.is_empty() {
+        return None;
+    }
+    let mut out = bytes.to_vec();
+    for range in blanked {
+        for byte in &mut out[range] {
+            if *byte != b'\n' && *byte != b'\r' {
+                *byte = b' ';
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// The range of `body` when it is a program [`interpreter_input_as_data`]
+/// blanks.
+fn inert_interpreter_program(
+    body: tree_sitter::Node<'_>,
+    source: &[u8],
+    commands: &[tree_sitter::Node<'_>],
+) -> Option<Range<usize>> {
+    let redirect = body.parent().filter(|n| n.kind() == "heredoc_redirect")?;
+    // Quoted, and nothing nested in the redirect (a pipeline into `sh`).
+    if !heredoc_start_is_quoted(redirect, source) {
+        return None;
+    }
+    let statement = redirect
+        .parent()
+        .filter(|n| n.kind() == "redirected_statement")?;
+    let mut body_node = None;
+    let mut cursor = statement.walk();
+    for child in statement.children(&mut cursor) {
+        match child.kind() {
+            "command" | "list" if body_node.is_none() => body_node = Some(child),
+            "heredoc_redirect" if child == redirect => {}
+            // Another redirection: its input or output is not vouched for.
+            _ => return None,
+        }
+    }
+    // `cd app && python3 - <<'EOF'`: the grammar hangs the here-document on
+    // the whole list, the shell hands it to the list's last command. What
+    // runs before that command is read as shell, as it always was.
+    let command = match body_node? {
+        list if list.kind() == "list" => {
+            let last =
+                list.named_child(list.named_child_count().checked_sub(1)?.try_into().ok()?)?;
+            (last.kind() == "command").then_some(last)?
+        }
+        command => command,
+    };
+    // The words before the redirection: the interpreter, then `-` or nothing
+    // (a script, `-c` or `-e` code, an assignment in front: not this shape).
+    let head =
+        std::str::from_utf8(source.get(command.start_byte()..redirect.start_byte())?).ok()?;
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let (first, rest) = words.split_first()?;
+    let name = normalized_command_name(first);
+    if command_name(command, source).map(|n| normalized_command_name(&n)) != Some(name.clone())
+        || !CODE_INTERPRETERS.contains(&versionless_interpreter_name(&name))
+        || !(rest.is_empty() || rest == ["-"])
+    {
+        return None;
+    }
+    // Where it stands: on the line itself, not in a pipeline, a
+    // substitution, a loop or under another redirection.
+    let mut ancestor = statement.parent();
+    while let Some(node) = ancestor {
+        if !matches!(node.kind(), "program" | "list") {
+            return None;
+        }
+        ancestor = node.parent();
+    }
+    // The last command of the line: none runs after it what it wrote.
+    if commands
+        .iter()
+        .any(|other| other.start_byte() >= statement.end_byte())
+    {
+        return None;
+    }
+    let code = std::str::from_utf8(source.get(body.byte_range())?).ok()?;
+    (!crate::threats::interpreter_code_starts_a_program(code)).then(|| body.byte_range())
+}
+
 // `collect_kinds` lived here. It re-exposed EVERY substitution inside a masked
 // data argument, and `collect_executable_substitutions` replaced its only caller
 // with a version that keeps the inert ones masked. Nothing else used it.

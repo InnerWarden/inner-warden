@@ -676,6 +676,13 @@ fn guard_readings(content: &str) -> (Vec<String>, bool) {
     (readings, settled)
 }
 
+/// Whether code an interpreter runs in its own language (Python, Perl,
+/// Ruby, Node and the like) holds a way to start a program: a guard word in
+/// code that starts none is text the code works on, not a command it runs.
+pub(crate) fn interpreter_code_starts_a_program(code: &str) -> bool {
+    guard_doubt::code_starts_a_program(code)
+}
+
 /// [`child_agent_without_its_hook`] on every reading of a line
 /// ([`guard_readings`]). The rule reads a line's words itself, as the shell
 /// hands them to its programs, so it is asked of the line as written: a

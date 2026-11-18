@@ -99,7 +99,11 @@ const RUN_MARKERS: &[&str] = &[
     "child_process",
     "`",
     "qx",
-    "open(",
+    // `open(` is no marker of its own: in Python it reads or writes a file,
+    // and where it starts a program (Perl's `open(F, "cmd |")`, Ruby's and
+    // Tcl's `open("|cmd")`) the pipe stands in a quoted string beside it,
+    // which the markers below catch. PHP's `proc_open` is named here.
+    "proc_open",
     "getline",
     "| \"",
     "|\"",
@@ -139,6 +143,12 @@ fn names_guard_raw(text: &str) -> bool {
             left && right
         })
     })
+}
+
+/// Whether code for one of [`INTERPRETERS`] holds a way to start a program.
+pub(super) fn code_starts_a_program(code: &str) -> bool {
+    let low = code.to_ascii_lowercase();
+    RUN_MARKERS.iter().any(|m| low.contains(m))
 }
 
 /// Code for an interpreter that names a guard CLI and starts a program.
