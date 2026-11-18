@@ -2941,7 +2941,9 @@ pub(crate) fn check_code_rewrites_guard_carrier(content: &str) -> Option<(&'stat
     {
         return Some((*what, *score));
     }
-    if interpreter_code_puts_file_onto_settings(content) {
+    if interpreter_code_puts_file_onto_settings(content)
+        || interpreter_code_writes_settings_another_way(content)
+    {
         return Some((SETTINGS_REWRITTEN_BY_INTERPRETER, 60));
     }
     if code_names_and_writes_guard_config(&content.to_ascii_lowercase()) {
@@ -2982,7 +2984,9 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
     if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
         return Some((*what, *score));
     }
-    if interpreter_code_puts_file_onto_settings(content) {
+    if interpreter_code_puts_file_onto_settings(content)
+        || interpreter_code_writes_settings_another_way(content)
+    {
         return Some((SETTINGS_REWRITTEN_BY_INTERPRETER, 60));
     }
     guard_self_disable_after_patterns(content)
@@ -3044,6 +3048,127 @@ fn interpreter_code_puts_file_onto_settings(content: &str) -> bool {
         .captures_iter(&lower)
         .filter_map(|c| c.get(1))
         .any(|m| names.contains(&m.as_str()))
+}
+
+/// Whether inline interpreter code writes an agent's settings in a way the
+/// patterns of [`guard_self_disable_patterns`] do not spell out:
+///
+/// - a Node `fs` call reached through a name or a callback
+///   (`require('fs').writeFile(..)`, `fsp.writeFile(..)`,
+///   `require('fs/promises').rm(..)`); a copy or a link is left to
+///   [`interpreter_code_puts_file_onto_settings`], which tells a copy onto
+///   the settings from a backup of them;
+/// - `.replace(` or `.rename(` of a `Path` held in a name or built as a
+///   chain (`p = Path.home()/'.claude'/'settings.json'; p.replace(..)`);
+/// - a file opened with a mode or flags that are not a literal read-only
+///   one (`m = 'wb'; open(settings, m)`, `os.open(settings, os.O_TRUNC)`);
+/// - the name split across names (`a = 'settings'; b = '.json'`) beside
+///   `.claude` and a write.
+///
+/// Each only where the code names the settings, whole or in pieces.
+fn interpreter_code_writes_settings_another_way(content: &str) -> bool {
+    use std::sync::OnceLock;
+    static INTERPRETER: OnceLock<regex::Regex> = OnceLock::new();
+    static SETTINGS: OnceLock<regex::Regex> = OnceLock::new();
+    static PIECE: OnceLock<regex::Regex> = OnceLock::new();
+    static NODE_CALL: OnceLock<regex::Regex> = OnceLock::new();
+    static PATH_NAME: OnceLock<regex::Regex> = OnceLock::new();
+    static PATH_CHAIN: OnceLock<regex::Regex> = OnceLock::new();
+    static MODE_NAME: OnceLock<regex::Regex> = OnceLock::new();
+    static OS_OPEN: OnceLock<regex::Regex> = OnceLock::new();
+    static WRITE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = |cell: &'static OnceLock<regex::Regex>, pattern: &str| -> &'static regex::Regex {
+        cell.get_or_init(|| regex::Regex::new(pattern).expect("static settings write regex"))
+    };
+    let lower = content.to_ascii_lowercase();
+    if !(lower.contains("settings") || lower.contains(".claude.json") || lower.contains("mcp.json"))
+    {
+        return false;
+    }
+    if !re(
+        &INTERPRETER,
+        r#"(?s)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b"#,
+    )
+    .is_match(&lower)
+    {
+        return false;
+    }
+    let whole = re(
+        &SETTINGS,
+        r#"settings(?:\.local)?\.json|\.claude\.json|mcp\.json"#,
+    )
+    .is_match(&lower);
+    // `'settings'` as a quoted piece of a name built beside `.claude`.
+    let in_pieces =
+        !whole && lower.contains(".claude") && re(&PIECE, r#"['"]settings"#).is_match(&lower);
+    if !(whole || in_pieces) {
+        return false;
+    }
+    if re(
+        &NODE_CALL,
+        r#"\.(?:writefile|appendfile|rm|unlink|rename|truncate)(?:sync)?\s*\("#,
+    )
+    .is_match(&lower)
+    {
+        return true;
+    }
+    // A name given a `Path` built with the settings (not its text read),
+    // then replaced or renamed.
+    let path_names: Vec<&str> = re(
+        &PATH_NAME,
+        r#"\b([a-z_]\w*)\s*=\s*([^;\n]*\bpath\b[^;\n]*)"#,
+    )
+    .captures_iter(&lower)
+    .filter(|c| {
+        c.get(2).is_some_and(|value| {
+            let value = value.as_str();
+            (value.contains("settings") || value.contains(".claude")) && !value.contains("read")
+        })
+    })
+    .filter_map(|c| c.get(1).map(|m| m.as_str()))
+    .collect();
+    if path_names.iter().any(|name| {
+        lower.contains(&format!("{name}.replace(")) || lower.contains(&format!("{name}.rename("))
+    }) {
+        return true;
+    }
+    if lower.contains("path")
+        && re(
+            &PATH_CHAIN,
+            r#"(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)['"]\s*\)\s*\.(?:replace|rename)\s*\("#,
+        )
+        .is_match(&lower)
+    {
+        return true;
+    }
+    // A second argument of `open` that is a name, not a quoted mode.
+    if re(
+        &MODE_NAME,
+        r#"\bopen(?:sync)?\s*\((?:[^(),]|\([^()]*\))+,\s*([a-z_][\w.]*)\s*[,)]"#,
+    )
+    .captures_iter(&lower)
+    .any(|c| c.get(1).is_some_and(|mode| mode.as_str() != "os.o_rdonly"))
+    {
+        return true;
+    }
+    // `os.open` with any flags but `os.O_RDONLY` alone.
+    if re(
+        &OS_OPEN,
+        r#"\bos\.open\s*\((?:[^(),]|\([^()]*\))+,\s*([^)]*)\)"#,
+    )
+    .captures_iter(&lower)
+    .any(|c| {
+        c.get(1)
+            .is_some_and(|flags| flags.as_str().trim() != "os.o_rdonly")
+    }) {
+        return true;
+    }
+    in_pieces
+        && re(
+            &WRITE,
+            r#"["'](?:[bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2})["']|\bwrite|\bdump\b|\bunlink|\bremove\(|\brename\(|\bos\.replace\(|\bshutil\.move\(|\btruncate|file_put_contents|\bdel\b"#,
+        )
+        .is_match(&lower)
 }
 
 /// The patterns [`guard_self_disable_in`] asks first, each with what it

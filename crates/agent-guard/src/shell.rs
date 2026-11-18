@@ -7210,7 +7210,8 @@ const CODE_INTERPRETERS: [&str; 6] = ["python", "perl", "ruby", "node", "php", "
 /// delimiter quoted the shell expands nothing in the body, so the body is
 /// Python, not shell: a guard name or verb in one of its strings is text the
 /// program works on (a file it edits), and is a command only if the program
-/// starts one ([`crate::threats::interpreter_code_starts_a_program`]). Read
+/// could start one ([`crate::threats::interpreter_code_starts_a_program`],
+/// [`program_may_reach_a_program`]: anything that could, read as shell). Read
 /// as shell, every edit of a file that quotes a guard command was refused as
 /// that command.
 ///
@@ -7406,7 +7407,112 @@ fn inert_interpreter_program(
     {
         return None;
     }
-    (!crate::threats::interpreter_code_starts_a_program(code)).then(|| body.byte_range())
+    (!crate::threats::interpreter_code_starts_a_program(code) && !program_may_reach_a_program(code))
+        .then(|| body.byte_range())
+}
+
+/// Words that start a program in one of [`CODE_INTERPRETERS`], or reach
+/// one: loading code, finding a function or a module by a name built at run
+/// time, building text from character codes. Lowercase; each counts only
+/// where no letter, digit or `_` stands right before it.
+const REACHES_A_PROGRAM: &[&str] = &[
+    "import",
+    "require",
+    "use",
+    "load",
+    "include",
+    "dofile",
+    "loadstring",
+    "os.",
+    "subprocess",
+    "system",
+    "popen",
+    "spawn",
+    "exec",
+    "eval",
+    "open3",
+    "passthru",
+    "proc_open",
+    "shell_exec",
+    "pcntl",
+    "syscall",
+    "qx",
+    "%x",
+    "getattr",
+    "attrgetter",
+    "methodcaller",
+    "__import__",
+    "globals",
+    "locals",
+    "vars(",
+    "compile(",
+    "__builtins__",
+    "builtins",
+    "__dict__",
+    "__class__",
+    "__subclasses__",
+    "__globals__",
+    "send(",
+    "__send__",
+    "public_send",
+    "method(",
+    "const_get",
+    "instance_variable_get",
+    "constructor",
+    "process",
+    "chr(",
+    "fromcharcode",
+    "fromcodepoint",
+    "atob",
+    "unescape",
+    "decode",
+    "bytes.fromhex",
+    "fromhex",
+    "codecs",
+    "base64",
+    "pack(",
+    "child_process",
+];
+
+/// Whether a here-document program could start a program, as far as a
+/// reading of its words can rule out: the opposite of a list of ways to
+/// run one, so a way no list names keeps the body read as shell, as it was
+/// before here-documents were read as programs. A body is blanked only when
+/// it holds none of [`REACHES_A_PROGRAM`], no `Function(`, no backquote,
+/// no string that opens a pipe (`"|cmd"`, `'-|'`), and no escape that
+/// writes a character by its code (`\x`, `\u`, `\N{`, `\0` to `\9`).
+///
+/// Editing a file with `s = open(p).read(); s = s.replace(...)` holds
+/// none of them and stays blanked.
+fn program_may_reach_a_program(code: &str) -> bool {
+    if code.contains("Function(") || code.contains('`') {
+        return true;
+    }
+    let low = code.to_ascii_lowercase();
+    if ["\"|", "'|", "-|", "|-"]
+        .iter()
+        .any(|pipe| low.contains(pipe))
+    {
+        return true;
+    }
+    let bytes = low.as_bytes();
+    if bytes.windows(2).any(|pair| {
+        pair[0] == b'\\' && (matches!(pair[1], b'x' | b'u') || pair[1].is_ascii_digit())
+    }) || low.contains("\\n{")
+        || low.contains("\\o{")
+    {
+        return true;
+    }
+    let word_char = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    REACHES_A_PROGRAM.iter().any(|word| {
+        // A short word counts whole (`use`, not `user`); the rest also
+        // as the start of a longer one (`execute`, `importlib`).
+        let whole = matches!(*word, "use" | "load" | "qx");
+        low.match_indices(word).any(|(at, _)| {
+            !low[..at].chars().next_back().is_some_and(word_char)
+                && !(whole && low[at + word.len()..].chars().next().is_some_and(word_char))
+        })
+    })
 }
 
 /// The delimiter word of a here-document, its quotes taken off.

@@ -1,7 +1,7 @@
 //! Lines the review of the here-document and argv reading found let through
 //! that were refused before it. Each must stay refused.
 
-use innerwarden_agent_guard::mcp::analyze_command;
+use innerwarden_agent_guard::mcp::{analyze_command, inspect_tool_call};
 use innerwarden_agent_guard::rules::{AtrSource, RuleEngine};
 
 fn verdict(command: &str) -> (String, String) {
@@ -112,6 +112,74 @@ fn reading_settings_and_editing_text_about_the_guard_stay_allowed() {
         "node -e \"console.log(require('fs').readFileSync('/home/u/.claude/settings.json','utf8'))\"",
         "php -r \"echo file_get_contents(getenv('HOME').'/.claude/settings.json');\"",
         "lua -e \"print(io.open(os.getenv('HOME')..'/.claude/settings.json'):read('a'))\"",
+        "python3 - <<'EOF'\np = 'docs/guard.md'\ns = open(p).read()\ns = s.replace('innerwarden allow x', 'innerwarden allow y')\nopen(p, 'w').write(s)\nEOF",
+    ]);
+}
+
+/// Writes of an agent's settings the patterns did not spell out: a Node
+/// `fs` call through a name or a callback, a `Path` replaced through a name
+/// or a chain, a mode or flags that are not a literal read, and the name
+/// split across names.
+#[test]
+fn settings_written_through_a_name_or_a_callback_are_refused() {
+    assert_denied(&[
+        "node -e \"require('fs').writeFile('/home/u/.claude/settings.json','{}',()=>{})\"",
+        "node -e \"const fsp=require('fs').promises; fsp.writeFile('/home/u/.claude/settings.json','{}')\"",
+        "node -e \"require('fs/promises').rm('/home/u/.claude/settings.json')\"",
+        "node -e \"const f=require('fs'); f.appendFile('/home/u/.claude/settings.json','x',()=>{})\"",
+        "python3 -c \"from pathlib import Path; p=Path.home()/'.claude'/'settings.json'; Path('/tmp/x').replace(p)\"",
+        "python3 -c \"from pathlib import Path; p=Path.home()/'.claude'/'settings.json'; p.replace('/tmp/x')\"",
+        "python3 -c \"m='wb'; open('/home/u/.claude/settings.json',m).close()\"",
+        "python3 -c \"import os; os.open('/home/u/.claude/settings.json', os.O_TRUNC|os.O_WRONLY)\"",
+        "python3 -c \"import os; a='settings'; b='.json'; p=os.path.expanduser('~/.claude/')+a+b; open(p,'w').write('{}')\"",
+        "python3 - <<'EOF'\nimport os\na='settings'; b='.json'\np=os.path.expanduser('~/.claude/')+a+b\nopen(p,'w').write('{}')\nEOF",
+    ]);
+    assert_allowed(&[
+        "node -e \"require('fs').readFile('/home/u/.claude/settings.json','utf8',(e,d)=>console.log(d))\"",
+        "python3 -c \"open('/home/u/.claude/settings.json','r').close()\"",
+        "python3 -c \"import sys, os; os.close(os.open('/home/u/.claude/settings.json', os.O_RDONLY))\"",
+        "python3 -c \"from pathlib import Path; p=Path.home()/'.claude'/'settings.json'; print(p.read_text().replace('a','b'))\"",
+        "python3 -c \"a='settings'; print(open('/home/u/.claude/'+a+'.json').read())\"",
+    ]);
+}
+
+/// A here-document program is read as shell, as before, unless it holds
+/// nothing that could start a program: no import, no run or eval call, no
+/// lookup by a built name, no character built from its code. Each of these
+/// reached a program through a way the earlier list of run calls missed.
+#[test]
+fn a_heredoc_program_that_could_start_one_is_read_as_shell() {
+    assert_denied(&[
+        "ruby - <<'EOF'\n%x!innerwarden allow x!\nEOF",
+        "ruby - <<'EOF'\n%x\"innerwarden allow x\"\nEOF",
+        "ruby - <<'EOF'\n%x|innerwarden allow x|\nEOF",
+        "node <<'EOF'\nconst k = String.fromCharCode(101, 120, 101, 99);\nconsole.log(k, 'innerwarden allow x');\nEOF",
+        r"node <<'EOF'
+const k = '\x65xecSync';
+console.log(k, 'innerwarden allow x');
+EOF",
+        r"python3 - <<'EOF'
+import operator, os
+operator.attrgetter('\x73ystem')(os)('innerwarden allow x')
+EOF",
+        r"python3 - <<'EOF'
+f = '\163ystem'
+print(f, 'innerwarden allow x')
+EOF",
         "python3 - <<'EOF'\nfrom pathlib import Path\np = Path('docs/guard.md')\np.write_text(p.read_text().replace('innerwarden allow x', 'innerwarden allow y'))\nEOF",
     ]);
+}
+
+/// The environment a proxied shell tool call carries is read as variables
+/// exported before its command, not as an inert key: `BASH_ENV` and
+/// `LD_PRELOAD` there are refused as they are on the line.
+#[test]
+fn a_preload_variable_in_a_tool_call_environment_is_refused() {
+    for name in ["BASH_ENV", "LD_PRELOAD"] {
+        let args = serde_json::json!({"command": "bash -c ls", "env": {name: "/tmp/x"}});
+        let proxied = inspect_tool_call("run_command", &args, None);
+        assert!(!proxied.allowed, "{name}: {proxied:?}");
+        let (recommendation, why) = verdict(&format!("{name}=/tmp/x bash -c ls"));
+        assert_eq!(recommendation, "deny", "{name}: {why}");
+    }
 }
