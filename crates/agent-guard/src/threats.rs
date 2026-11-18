@@ -14954,6 +14954,15 @@ fn command_target_execution(
             TargetExecution::None
         };
     }
+    if base == "go" {
+        return if go_run_sources(effective).iter().any(|source| {
+            resolve_command_target(source, effective_cwd.as_deref(), variables) == target
+        }) {
+            TargetExecution::Interpreted
+        } else {
+            TargetExecution::None
+        };
+    }
     if !EXECUTORS.contains(&base) {
         return TargetExecution::None;
     }
@@ -15169,6 +15178,67 @@ fn wrapper_directory(
         index += 1;
     }
     None
+}
+
+/// The Go source files `go run` builds and runs (`go run [build flags]
+/// a.go b.go [arguments]`): the `.go` words that follow its flags, up to the
+/// first word that is not one, which starts the program's own arguments.
+/// Empty for any other `go` verb. A `.go` file fetched and then run this way
+/// is code from elsewhere run as surely as `sh x.sh` (measured 2026-11-18:
+/// `curl -so m.go URL && go run m.go` was allowed).
+fn go_run_sources(words: &[String]) -> Vec<&str> {
+    // Build flags that take their value as the next word.
+    const VALUE_FLAGS: &[&str] = &[
+        "-C",
+        "-o",
+        "-p",
+        "-tags",
+        "-ldflags",
+        "-gcflags",
+        "-asmflags",
+        "-gccgoflags",
+        "-mod",
+        "-modfile",
+        "-overlay",
+        "-pkgdir",
+        "-exec",
+        "-toolexec",
+        "-covermode",
+        "-coverpkg",
+        "-compiler",
+        "-installsuffix",
+        "-buildmode",
+        "-pgo",
+    ];
+    let mut words = words
+        .iter()
+        .skip(1)
+        .map(|word| word.trim_matches(['\'', '"']));
+    if words.next() != Some("run") {
+        return Vec::new();
+    }
+    let mut sources = Vec::new();
+    let mut takes_value = false;
+    for word in words {
+        if takes_value {
+            takes_value = false;
+            continue;
+        }
+        if word.starts_with('-') && sources.is_empty() {
+            let flag = word.split('=').next().unwrap_or(word);
+            let flag = flag
+                .strip_prefix('-')
+                .filter(|f| f.starts_with('-'))
+                .unwrap_or(flag);
+            takes_value = !word.contains('=') && VALUE_FLAGS.contains(&flag);
+            continue;
+        }
+        if !word.ends_with(".go") {
+            break;
+        }
+        sources.push(word);
+    }
+    sources
 }
 
 fn interpreter_executes_target(

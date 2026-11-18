@@ -31,6 +31,8 @@ pub(crate) fn project(source: &str) -> ShellProjection {
     // command as written is scanned, as before.
     let rewritten = text_as_the_shell_reads(source);
     let text = rewritten.as_deref().unwrap_or(source);
+    let evaluated = with_evaluated_subscripts_run(text);
+    let text = evaluated.as_deref().unwrap_or(text);
     let Some(tree) = parse_bash(text) else {
         return ShellProjection {
             scan: source.to_owned(),
@@ -436,6 +438,25 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
                 at += 1;
                 changed = true;
             }
+            // `{sh,-c,"$(curl ...)"}` is the words `sh`, `-c` and the
+            // substitution to bash: a whole word that is a brace list is
+            // expanded before the command is found. The grammar read it as
+            // one broken word, so the line was scanned as plain text and the
+            // shell, the `-c` and the download it runs were never seen
+            // (measured 2026-11-18 on 1.6.13). The list is written out as
+            // the words it makes, each with its quotes as written.
+            '{' if !word_started
+                && !parens.in_arithmetic()
+                && whole_word_brace_list(&chars, at).is_some() =>
+            {
+                if let Some((items, end)) = whole_word_brace_list(&chars, at) {
+                    out.push_str(&items.join(" "));
+                    at = end;
+                    changed = true;
+                    word_started = true;
+                    command_start = false;
+                }
+            }
             ' ' | '\t' | ';' | '&' | '|' | '<' | '>' => {
                 out.push(c);
                 at += 1;
@@ -456,6 +477,262 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
         }
     }
     changed.then_some(out)
+}
+
+/// Where on a line bash may read a quoted value as a variable name or as
+/// arithmetic, and so expand the subscript in it: arithmetic (`$((`, `((`,
+/// `$[`, `let`, a `[[` comparison), a substring or indirect expansion
+/// (`${Z:Y}`, `${!X}`), an integer declaration and the builtins that take a
+/// variable name (`declare`, `printf -v`, `read`, `unset`, `test -v`...).
+const NAME_EVALUATING_SPELLINGS: [&str; 16] = [
+    "((", "$[", "let ", "[[", "${", "declare", "typeset", "local ", "readonly", "export ",
+    "printf ", "read ", "unset ", "test ", "[ ", "mapfile",
+];
+
+/// The line with the substitutions bash runs out of a quoted subscript
+/// written after it, each on a line of its own; `None` when it has none.
+///
+/// `X='a[$(cmd)]'; echo $((X))` runs `cmd`: a value read as arithmetic or as
+/// a name is expanded again, and the subscript of an indexed array with it,
+/// substitutions included. The grammar reads the single-quoted value as
+/// data, so the projection showed no command at all (measured 2026-11-18 on
+/// 1.6.13: `curl ... | sh` hidden this way was allowed, in `$((X))`,
+/// `${Z:Y}`, `${!X}`, `let`, `[[ -eq ]]` and `declare -i`). The subscript
+/// substitution is copied as written, so every check reads the command it
+/// runs, and nothing else changes. Only a quoted value shaped as a subscript
+/// (`name[...$(...)...]`) on a line that evaluates names counts: printing or
+/// searching for such text (`grep 'a[$(x)]' f`) is left as it was.
+fn with_evaluated_subscripts_run(text: &str) -> Option<String> {
+    if !(text.contains("$(") || text.contains('`'))
+        || !NAME_EVALUATING_SPELLINGS
+            .iter()
+            .any(|spelling| text.contains(spelling))
+    {
+        return None;
+    }
+    let tree = parse_bash(text)?;
+    let mut quoted = Vec::new();
+    collect_nodes_of_kind(tree.root_node(), "raw_string", &mut quoted, 0);
+    collect_nodes_of_kind(tree.root_node(), "ansi_c_string", &mut quoted, 0);
+    let mut runs = Vec::new();
+    let bytes = text.as_bytes();
+    for node in quoted {
+        let written = node_text(node, bytes);
+        // `$(( a['$(cmd)'] ))`: the quotes stand inside the subscript.
+        let start = node.start_byte();
+        let inside_subscript = start >= 2
+            && bytes[start - 1] == b'['
+            && (bytes[start - 2].is_ascii_alphanumeric() || bytes[start - 2] == b'_');
+        let written = if inside_subscript {
+            format!("x[{written}]")
+        } else {
+            written
+        };
+        runs.extend(
+            subscript_substitutions(&written)
+                .iter()
+                .map(|substitution| substitution_command(substitution)),
+        );
+    }
+    if runs.is_empty() {
+        return None;
+    }
+    let mut out = text.to_owned();
+    for run in runs {
+        out.push('\n');
+        out.push_str(&run);
+    }
+    Some(out)
+}
+
+/// The command line a substitution as written (`$(cmd)`, `` `cmd` ``) runs.
+fn substitution_command(substitution: &str) -> String {
+    substitution
+        .strip_prefix("$(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .or_else(|| {
+            substitution
+                .strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+        })
+        .unwrap_or(substitution)
+        .to_owned()
+}
+
+/// The command substitutions (`$(...)`, backticks) inside the subscripts
+/// (`name[...]`) of `text`, as written.
+fn subscript_substitutions(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let opens_subscript = chars[at] == '['
+            && at > 0
+            && (chars[at - 1].is_ascii_alphanumeric() || chars[at - 1] == '_');
+        if !opens_subscript {
+            at += 1;
+            continue;
+        }
+        let mut depth = 1usize;
+        let mut j = at + 1;
+        while j < chars.len() && depth > 0 {
+            match chars[j] {
+                '[' => {
+                    depth += 1;
+                    j += 1;
+                }
+                ']' => {
+                    depth -= 1;
+                    j += 1;
+                }
+                '$' if chars.get(j + 1) == Some(&'(') => {
+                    let end = quoted_construct_end(&chars, j, 0).unwrap_or(chars.len());
+                    found.push(chars[j..end].iter().collect());
+                    j = end;
+                }
+                '`' => {
+                    let end = quoted_construct_end(&chars, j, 0).unwrap_or(chars.len());
+                    found.push(chars[j..end].iter().collect());
+                    j = end;
+                }
+                _ => j += 1,
+            }
+        }
+        at = j.max(at + 1);
+    }
+    found
+}
+
+/// The most words one brace list is written out as. A longer list is left as
+/// written, which is how every line was read before.
+const BRACE_LIST_WORDS: usize = 64;
+
+/// The words a whole word that is one brace list (`{a,b,c}`, opening at
+/// `open`) makes to bash, each as written with its quotes, and where the word
+/// ends. `None` when the `{` opens no such word: a brace group (`{ cmd; }`),
+/// a list with text glued before or after it (`file{,.bak}`, read as written
+/// as before), one without a `,` at its own level (`{1..5}`, `{}`), one cut by
+/// a blank, an operator or the end of the line, or one past
+/// [`BRACE_LIST_WORDS`]. An empty item makes no word.
+fn whole_word_brace_list(chars: &[char], open: usize) -> Option<(Vec<String>, usize)> {
+    let first = *chars.get(open + 1)?;
+    if first.is_whitespace() || first == '}' {
+        return None;
+    }
+    let mut items: Vec<String> = Vec::new();
+    let mut item_start = open + 1;
+    let mut depth = 1usize;
+    let mut at = open + 1;
+    let close = loop {
+        let c = *chars.get(at)?;
+        match c {
+            '\\' | '\'' | '"' | '`' => at = quoted_construct_end(chars, at, 0)?,
+            '$' if matches!(chars.get(at + 1), Some('(' | '{')) => {
+                at = quoted_construct_end(chars, at, 0)?;
+            }
+            '{' => {
+                depth += 1;
+                at += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break at;
+                }
+                at += 1;
+            }
+            ',' if depth == 1 => {
+                items.push(chars[item_start..at].iter().collect());
+                at += 1;
+                item_start = at;
+            }
+            c if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')') => {
+                return None;
+            }
+            _ => at += 1,
+        }
+    };
+    if items.is_empty() {
+        return None;
+    }
+    items.push(chars[item_start..close].iter().collect());
+    let ends_word = chars
+        .get(close + 1)
+        .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | ')'));
+    items.retain(|item| !item.is_empty());
+    (ends_word && !items.is_empty() && items.len() <= BRACE_LIST_WORDS)
+        .then_some((items, close + 1))
+}
+
+/// Where the quote, escape, `$(...)` or `${...}` that starts at `at` ends
+/// (the index just past it), reading the quotes and substitutions nested in
+/// it. `None` when it does not close before the line ends.
+fn quoted_construct_end(chars: &[char], at: usize, depth: u8) -> Option<usize> {
+    if depth > 32 {
+        return None;
+    }
+    match *chars.get(at)? {
+        '\\' => Some((at + 2).min(chars.len())),
+        '\'' => chars[at + 1..]
+            .iter()
+            .position(|c| *c == '\'')
+            .map(|found| at + 1 + found + 1),
+        '`' => {
+            let mut j = at + 1;
+            loop {
+                match *chars.get(j)? {
+                    '\\' => j += 2,
+                    '`' => return Some(j + 1),
+                    _ => j += 1,
+                }
+            }
+        }
+        '"' => {
+            let mut j = at + 1;
+            loop {
+                match *chars.get(j)? {
+                    '\\' => j += 2,
+                    '"' => return Some(j + 1),
+                    '`' => j = quoted_construct_end(chars, j, depth + 1)?,
+                    '$' if matches!(chars.get(j + 1), Some('(' | '{')) => {
+                        j = quoted_construct_end(chars, j, depth + 1)?;
+                    }
+                    _ => j += 1,
+                }
+            }
+        }
+        '$' => {
+            let (open, close) = match chars.get(at + 1)? {
+                '(' => ('(', ')'),
+                '{' => ('{', '}'),
+                _ => return Some(at + 1),
+            };
+            let mut nested = 1usize;
+            let mut j = at + 2;
+            loop {
+                let c = *chars.get(j)?;
+                match c {
+                    '\\' | '\'' | '"' | '`' => j = quoted_construct_end(chars, j, depth + 1)?,
+                    '$' if matches!(chars.get(j + 1), Some('(' | '{')) => {
+                        j = quoted_construct_end(chars, j, depth + 1)?;
+                    }
+                    c if c == open => {
+                        nested += 1;
+                        j += 1;
+                    }
+                    c if c == close => {
+                        nested -= 1;
+                        j += 1;
+                        if nested == 0 {
+                            return Some(j);
+                        }
+                    }
+                    _ => j += 1,
+                }
+            }
+        }
+        _ => Some(at + 1),
+    }
 }
 
 /// Why a line is held as an executable data flow.
@@ -606,7 +883,19 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
                             None => {}
                         }
                     }
-                    if substituted {
+                    // `X="$(curl ...)"; "$X" run` names the program by what
+                    // was fetched, as `"$(curl ...)" run` does: the
+                    // variable only moves the fetch to an earlier command
+                    // (measured 2026-11-18: the direct form was refused,
+                    // this one allowed). A variable set from a local
+                    // command (`"$(command -v python3)"`) is not fetched.
+                    if substituted
+                        || variable_code_argument_is_download_tainted(
+                            command,
+                            &shell_word(&effective[0]),
+                            source.as_bytes(),
+                        )
+                    {
                         unknown_program = true;
                     }
                     return false;
@@ -6865,7 +7154,8 @@ fn effective_command_words(words: &[String], depth: u8) -> Option<&[String]> {
         "nohup" | "setsid" | "busybox" | "toybox" => unwrap_simple_wrapper(args),
         "nice" => unwrap_options_with_values(args, &["-n", "--adjustment"]),
         "timeout" => unwrap_timeout(args),
-        "stdbuf" => unwrap_options_with_values(args, &["-i", "-o", "-e"]),
+        "stdbuf" => unwrap_options_with_values(args, &STDBUF_OPTIONS),
+        "time" => unwrap_time(args),
         "chrt" | "ionice" => unwrap_scheduler_wrapper(args),
         "exec" => unwrap_simple_wrapper(args),
         _ => return Some(words),
@@ -7544,7 +7834,8 @@ fn classify_command_words(words: &[String], depth: u8) -> PipelineCommand {
         "nohup" | "setsid" => unwrap_simple_wrapper(args),
         "nice" => unwrap_options_with_values(args, &["-n", "--adjustment"]),
         "timeout" => unwrap_timeout(args),
-        "stdbuf" => unwrap_options_with_values(args, &["-i", "-o", "-e"]),
+        "stdbuf" => unwrap_options_with_values(args, &STDBUF_OPTIONS),
+        "time" => unwrap_time(args),
         "chrt" | "ionice" => unwrap_scheduler_wrapper(args),
         "busybox" | "toybox" => unwrap_simple_wrapper(args),
         _ => return PipelineCommand::Unknown,
@@ -7657,6 +7948,9 @@ fn unwrap_simple_wrapper(args: &[String]) -> WrapperTarget {
     }
 }
 
+/// The options of `stdbuf`, each of which takes a mode.
+const STDBUF_OPTIONS: [&str; 6] = ["-i", "-o", "-e", "--input", "--output", "--error"];
+
 fn unwrap_options_with_values(args: &[String], options: &[&str]) -> WrapperTarget {
     let mut index = 0;
     while let Some(arg) = args.get(index).map(|arg| shell_word(arg)) {
@@ -7671,10 +7965,17 @@ fn unwrap_options_with_values(args: &[String], options: &[&str]) -> WrapperTarge
             index += 2;
             continue;
         }
-        if options
-            .iter()
-            .any(|option| arg.starts_with(&format!("{option}=")))
-        {
+        // `--output=L`, and a short option with its value glued on (`-oL`,
+        // `-o0`, `-n5`): the way `stdbuf` is usually written. Read as an
+        // unknown option, it left the command after it unread
+        // (`stdbuf -o0 sh -c "$(curl ...)"`, measured 2026-11-18).
+        if options.iter().any(|option| {
+            arg.starts_with(&format!("{option}="))
+                || (option.len() == 2
+                    && !option.starts_with("--")
+                    && arg.len() > 2
+                    && arg.starts_with(option))
+        }) {
             index += 1;
             continue;
         }
@@ -7684,6 +7985,34 @@ fn unwrap_options_with_values(args: &[String], options: &[&str]) -> WrapperTarge
         return WrapperTarget::Command(index);
     }
     WrapperTarget::Unknown
+}
+
+/// The program `time` runs: bash's keyword (`time -p`) and GNU `time`
+/// (`-f FORMAT`, `-o FILE`, `-a`, `-v`, `-q` and their long names) both run
+/// the words after their options as a command.
+fn unwrap_time(args: &[String]) -> WrapperTarget {
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(|arg| shell_word(arg)) {
+        match arg.as_str() {
+            "--" => return command_at(args, index + 1),
+            "-p" | "-a" | "-v" | "-q" | "--portability" | "--append" | "--verbose" | "--quiet" => {
+                index += 1
+            }
+            "-f" | "-o" | "--format" | "--output" => {
+                if index + 1 >= args.len() {
+                    return WrapperTarget::Unknown;
+                }
+                index += 2;
+            }
+            value if value.starts_with("--format=") || value.starts_with("--output=") => {
+                index += 1;
+            }
+            value if value.starts_with('-') => return WrapperTarget::Unknown,
+            _ => return WrapperTarget::Command(index),
+        }
+    }
+    // A bare `time` times nothing.
+    WrapperTarget::DataOnly
 }
 
 fn unwrap_timeout(args: &[String]) -> WrapperTarget {
