@@ -469,14 +469,69 @@ pub fn moved_note(spec: &HookSpec, moved: &[String]) -> Option<String> {
     ))
 }
 
+/// A group with no hook in it. Codex counts it when it numbers the groups
+/// (measured on Codex CLI 0.167.2: behind `{"hooks": []}` the next hook is
+/// listed at group 1), and runs nothing for it. It holds a place that a hook
+/// of ours left, so the person's hooks behind it keep theirs.
+fn empty_group() -> Value {
+    json!({"hooks": []})
+}
+
+/// Take the empty groups ([`empty_group`]) off the end of the list. Nothing
+/// sits behind them, so no hook changes its place.
+fn trim_empty_groups(groups: &mut Vec<Value>) {
+    while groups.last() == Some(&empty_group()) {
+        groups.pop();
+    }
+}
+
+/// PURE: take every hook of ours out of Codex's file, leaving the person's
+/// hooks at the places Codex trusts them by. A group that held only hooks of
+/// ours becomes an empty group ([`empty_group`]) instead of going, so the
+/// groups behind it are not renumbered. Returns the settings and how many
+/// hooks came out.
+///
+/// A hook of ours that shares a group with the person's still moves the
+/// person's hooks behind it inside that group: a group cannot hold an empty
+/// hook. [`moved`] names those.
+fn vacate(mut settings: Value, event: &str) -> (Value, usize) {
+    let Some(groups) = settings
+        .get_mut("hooks")
+        .and_then(|hooks| hooks.get_mut(event))
+        .and_then(Value::as_array_mut)
+    else {
+        return (settings, 0);
+    };
+    let mut removed = 0usize;
+    for group in groups.iter_mut() {
+        let Some(list) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let before = list.len();
+        list.retain(|hook| hook::read_hook_line(hook).is_none());
+        let gone = before - list.len();
+        removed += gone;
+        if gone > 0 && list.is_empty() {
+            *group = empty_group();
+        }
+    }
+    if removed > 0 {
+        trim_empty_groups(groups);
+    }
+    (settings, removed)
+}
+
 /// PURE: put the hook into the agent's settings, leaving one entry of ours.
 ///
 /// A group that holds only our hook is replaced where it sits, so a re-run
 /// moves nothing: Codex keys its trust by position, the person's hooks
 /// included. Our hook inside a group it shares with another is taken out of
 /// that group, because the group's matcher is the person's and ours has none.
-/// With no group to replace the entry goes at the end, behind every hook that
-/// is already there. Every other key, group and hook stays as it was.
+/// In Codex's file a second group of ours becomes an empty group, and with no
+/// group of ours to replace the entry takes the first empty group a
+/// disconnect left ([`vacate`]): either way no hook of the person's changes
+/// its place. Otherwise the entry goes at the end, behind every hook that is
+/// already there. Every other key, group and hook stays as it was.
 pub fn merge(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, String> {
     let mut settings = match settings {
         Value::Null => json!({}),
@@ -496,6 +551,7 @@ pub fn merge(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, S
         .as_array_mut()
         .ok_or_else(|| format!("`hooks.{}` is not a list", spec.event))?;
     let entry = spec.entry(command);
+    let keep_places = spec.host == Host::Codex;
     let mut placed = false;
     groups.retain_mut(|group| {
         let (any, all) = ours_in(group);
@@ -507,6 +563,10 @@ pub fn merge(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, S
             placed = true;
             return true;
         }
+        if all && keep_places {
+            *group = empty_group();
+            return true;
+        }
         match group.get_mut("hooks").and_then(Value::as_array_mut) {
             Some(list) => {
                 list.retain(|hook| hook::read_hook_line(hook).is_none());
@@ -515,8 +575,17 @@ pub fn merge(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, S
             None => true,
         }
     });
+    if !placed && keep_places {
+        if let Some(empty) = groups.iter_mut().find(|group| **group == empty_group()) {
+            *empty = entry.clone();
+            placed = true;
+        }
+    }
     if !placed {
         groups.push(entry);
+    }
+    if keep_places {
+        trim_empty_groups(groups);
     }
     Ok(settings)
 }
@@ -594,7 +663,11 @@ pub fn uninstall_noting_moved(
     let before = file_update::read_config(&path)?;
     let settings = parse(&path, before.as_deref())?;
     let ours = found(&settings, spec);
-    let (cleaned, removed) = hook::remove_iwguard_hooks_for_event(settings.clone(), spec.event);
+    // Codex trusts a hook by its place, so its file keeps the places.
+    let (cleaned, removed) = match spec.host {
+        Host::Codex => vacate(settings.clone(), spec.event),
+        Host::Gemini => hook::remove_iwguard_hooks_for_event(settings.clone(), spec.event),
+    };
     if removed == 0 {
         return Ok((0, Vec::new()));
     }
@@ -1172,42 +1245,23 @@ pub struct Connected {
     pub outcome: Outcome,
     /// The hooks of the person's that the write moved ([`moved`]).
     pub moved: Vec<String>,
-    /// Codex said it trusts the hook, and the files read here do not show it
-    /// ([`trust_unread`]).
-    pub trust_unread: bool,
 }
 
 impl Connected {
     /// What `agents connect` says under the hook's line, beside the coverage:
-    /// hooks of the person's that moved, and trust that `status` cannot read.
+    /// hooks of the person's that moved.
     pub fn notes(&self, spec: &HookSpec) -> Vec<String> {
-        let mut notes: Vec<String> = moved_note(spec, &self.moved).into_iter().collect();
-        if self.trust_unread {
-            notes.push(format!(
-                "{} confirms the hook is trusted, but `innerwarden status` cannot read this \
-                 {} version's record of trust and will report the hook as not trusted \
-                 (measured on {}).",
-                spec.product, spec.product, spec.measured
-            ));
-        }
-        notes
+        moved_note(spec, &self.moved).into_iter().collect()
     }
 }
 
-/// PURE: Codex said it trusts the hook, and the trust recomputed from its
-/// files says otherwise. [`settle`] takes Codex's word. `status` and the
-/// listing read the files only and keep saying the hook is not trusted, so the
-/// person is told which of the two to believe.
-fn trust_unread(asked: Option<Result<(), GrantError>>, state: &HookState) -> bool {
-    asked == Some(Ok(()))
-        && matches!(
-            state,
-            HookState::Off(Reason::Codex(Skip::NotTrusted | Skip::Changed))
-        )
-}
+/// Why a hook is not active when the program asked said it trusts the hook
+/// and Codex's config holds no record of that trust for this line.
+const YES_NOT_IN_CONFIG: &str = "the `codex` program answered that it trusts the hook, but \
+     ~/.codex/config.toml holds no record of that trust for this hook line";
 
-/// [`connect`], which also says what the run did to the agent's file and
-/// whether Codex's word and its files agree ([`Connected`]).
+/// [`connect`], which also says what the run did to the agent's file
+/// ([`Connected`]).
 pub fn connect_noting_write(
     home: &Path,
     spec: &HookSpec,
@@ -1231,18 +1285,14 @@ pub fn connect_noting_write(
         )),
         _ => None,
     };
-    let now = state_with(home, spec, there);
-    // Codex's own yes names the folder it serves. Without it, the folder
-    // `CODEX_HOME` names decides, as it does for `status`.
-    let now = if asked == Some(Ok(())) {
-        now
-    } else {
-        where_codex_reads(home, spec, now)
-    };
+    // What the program asked says is not the proof: it is the first `codex`
+    // on the PATH, and any program placed in front of the real one answers in
+    // its place. The proof is the record in Codex's own config and the folder
+    // `CODEX_HOME` names, read here as `status` reads them.
+    let now = where_codex_reads(home, spec, state_with(home, spec, there));
     Ok(Connected {
         outcome: settle(spec, wrote || !was_on, asked, &now),
         moved,
-        trust_unread: trust_unread(asked, &now),
     })
 }
 
@@ -1279,10 +1329,12 @@ fn grant_step(spec: &HookSpec, error: GrantError, state: &HookState) -> String {
 /// PURE: the outcome of a connect, from what Codex answered (when it was
 /// asked) and what the files say afterwards.
 ///
-/// Codex's own "no" stands whatever the files say. Its "yes" outranks the
-/// hash recomputed here, which a later Codex may compute another way. When
-/// Codex could not be asked, the files decide, and a hook they do not show as
-/// trusted is not active.
+/// Codex's own "no" stands whatever the files say. A "yes" never outranks
+/// them: the program asked is whichever `codex` comes first on the PATH, and
+/// a hook reported active that Codex skips costs every tool call it was meant
+/// to screen. A later Codex that records trust another way makes this "not
+/// active" for a hook that runs, never the reverse. When Codex could not be
+/// asked, the files decide too.
 fn settle(
     spec: &HookSpec,
     changed: bool,
@@ -1302,7 +1354,10 @@ fn settle(
         HookState::Off(Reason::Codex(Skip::NotTrusted | Skip::Changed))
             if asked == Some(Ok(())) =>
         {
-            Outcome::Active { changed }
+            Outcome::NotActive {
+                why: YES_NOT_IN_CONFIG.to_string(),
+                step: TRUST_STEP.to_string(),
+            }
         }
         // Not trusted, and connect is the command that was just run: the step
         // left is the one inside Codex.
@@ -1629,12 +1684,15 @@ mod tests {
     }
 
     /// An install that takes our hook out of a group it shares moves the
-    /// person's hook listed behind it in that group, and one that drops a
-    /// second group of ours moves every group behind it. Both are named, and
-    /// a run that writes nothing names nothing.
+    /// person's hook listed behind it in that group, and it is named. A
+    /// second group of ours becomes an empty group, so the groups behind it
+    /// keep their places and nothing is named. A run that writes nothing
+    /// names nothing.
     ///
     /// FAILS ON REVERT: end `install_noting_moved` with
     /// `Ok((true, Vec::new()))` in place of its last line and no hook is named.
+    /// Take the `all && keep_places` arm out of `merge` and the second group
+    /// of ours is dropped, which moves `/opt/audit/last`.
     #[test]
     fn an_install_names_the_hooks_it_moved_inside_a_group_and_behind_one() {
         let home = tempfile::TempDir::new().unwrap();
@@ -1660,13 +1718,105 @@ mod tests {
         let twice = json!({"hooks": {"PreToolUse": [
             {"hooks": [ours.clone()]},
             {"hooks": [ours]},
-            last
+            last.clone()
         ]}});
         write(home.path(), CODEX.file, &twice.to_string());
         assert_eq!(
             install_noting_moved(home.path(), &CODEX, bin, false, false),
-            Ok((true, vec!["`/opt/audit/last`".to_string()]))
+            Ok((true, Vec::new()))
         );
+        assert_eq!(
+            read(home.path(), CODEX.file),
+            json!({"hooks": {"PreToolUse": [codex_entry(&CODEX_LINE), {"hooks": []}, last]}})
+        );
+    }
+
+    /// A disconnect leaves an empty group where our hook was, so the person's
+    /// hooks behind it keep their places. The next connect writes our hook
+    /// back into that group, and still moves nothing. Gemini keeps no trust
+    /// by place: its file keeps no empty group.
+    ///
+    /// FAILS ON REVERT: take the `find` over empty groups out of `merge`
+    /// and the reconnect leaves the empty group and puts ours at the end.
+    /// Uninstall Codex's hook with `remove_iwguard_hooks_for_event` and
+    /// `/opt/audit/before` moves up to group 0.
+    #[test]
+    fn our_place_is_kept_empty_and_taken_again_in_codexs_file() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = Path::new(BIN);
+        write(
+            home.path(),
+            CODEX.file,
+            &json!({"hooks": {"PreToolUse": [codex_entry(&CODEX_LINE), theirs()]}}).to_string(),
+        );
+        assert_eq!(
+            uninstall_noting_moved(home.path(), &CODEX),
+            Ok((1, Vec::new()))
+        );
+        assert_eq!(
+            read(home.path(), CODEX.file),
+            json!({"hooks": {"PreToolUse": [{"hooks": []}, theirs()]}})
+        );
+        assert_eq!(
+            install_noting_moved(home.path(), &CODEX, bin, false, false),
+            Ok((true, Vec::new()))
+        );
+        assert_eq!(
+            read(home.path(), CODEX.file),
+            json!({"hooks": {"PreToolUse": [codex_entry(&CODEX_LINE), theirs()]}})
+        );
+        // Ours last: nothing sits behind it, and no empty group is left.
+        write(
+            home.path(),
+            CODEX.file,
+            &json!({"hooks": {"PreToolUse": [theirs(), codex_entry(&CODEX_LINE)]}}).to_string(),
+        );
+        assert_eq!(
+            uninstall_noting_moved(home.path(), &CODEX),
+            Ok((1, Vec::new()))
+        );
+        assert_eq!(
+            read(home.path(), CODEX.file),
+            json!({"hooks": {"PreToolUse": [theirs()]}})
+        );
+
+        write(
+            home.path(),
+            GEMINI.file,
+            &json!({"hooks": {"BeforeTool": [gemini_entry(&GEMINI_LINE), theirs()]}}).to_string(),
+        );
+        assert_eq!(uninstall(home.path(), &GEMINI), Ok(1));
+        assert_eq!(
+            read(home.path(), GEMINI.file),
+            json!({"hooks": {"BeforeTool": [theirs()]}})
+        );
+    }
+
+    /// PURE: only hooks of ours come out, a group that held only ours stays
+    /// as an empty group while something sits behind it, and empty groups at
+    /// the end go.
+    #[test]
+    fn vacate_keeps_every_place_in_front_of_the_last_hook_of_the_persons() {
+        let behind = json!({"hooks": [{"type": "command", "command": "/opt/audit/behind"}]});
+        let ours = json!({"type": "command", "command": CODEX_LINE.as_str()});
+        let settings = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [ours.clone()]},
+            theirs(),
+            {"hooks": [ours.clone()]},
+            behind.clone(),
+            {"hooks": [ours]}
+        ]}});
+        let (after, removed) = vacate(settings.clone(), CODEX.event);
+        assert_eq!(removed, 3);
+        assert_eq!(
+            after,
+            json!({"hooks": {"PreToolUse": [{"hooks": []}, theirs(), {"hooks": []}, behind]}})
+        );
+        assert_eq!(moved(&settings, &after, &CODEX), Vec::<String>::new());
+        // Nothing of ours: nothing changes, an empty group of the person's
+        // at the end included.
+        let none = json!({"hooks": {"PreToolUse": [theirs(), {"hooks": []}]}});
+        assert_eq!(vacate(none.clone(), CODEX.event), (none, 0));
     }
 
     /// Gemini keeps no trust by place, so a hook of the person's that moved
@@ -1895,16 +2045,16 @@ mod tests {
         );
     }
 
-    /// Taking our hook out of Codex's file moves the person's hook listed
-    /// behind it, and the removal says which. The record of trust Codex holds
-    /// for that hook stays as it was, under the old place: trust is the
-    /// person's to give.
+    /// Taking our hook out of Codex's file leaves the person's hook listed
+    /// behind it at its place, so the record of trust Codex holds for it,
+    /// which this leaves alone, still names it. Nothing moved and nothing is
+    /// named.
     ///
-    /// FAILS ON REVERT: end `uninstall_noting_moved` with
-    /// `Ok((removed, Vec::new()))` in place of its last line and the hook
-    /// that moved is not named.
+    /// FAILS ON REVERT: uninstall Codex's hook with
+    /// `remove_iwguard_hooks_for_event` again and `/opt/audit/before` moves
+    /// to group 0, away from its record.
     #[test]
-    fn uninstall_names_the_persons_hook_it_moved_and_leaves_its_record() {
+    fn uninstall_keeps_the_persons_hook_at_the_place_of_its_record() {
         let home = tempfile::TempDir::new().unwrap();
         let file = home.path().join(CODEX.file);
         write(
@@ -1924,11 +2074,11 @@ mod tests {
 
         assert_eq!(
             uninstall_noting_moved(home.path(), &CODEX),
-            Ok((1, vec!["`/opt/audit/before`".to_string()]))
+            Ok((1, Vec::new()))
         );
         assert_eq!(
             read(home.path(), CODEX.file),
-            json!({"hooks": {"PreToolUse": [theirs()]}})
+            json!({"hooks": {"PreToolUse": [{"hooks": []}, theirs()]}})
         );
         let config = config(&std::fs::read_to_string(home.path().join(CODEX_CONFIG)).unwrap());
         let held = config["hooks"]["state"]
@@ -2590,51 +2740,21 @@ mod tests {
         );
     }
 
-    /// Codex said yes and the trust recomputed from its files says no:
-    /// connect reports the hook as active and says that `status` will not.
-    /// With the files in agreement, or with no answer from Codex, nothing is
-    /// added.
-    ///
-    /// FAILS ON REVERT: take the `if self.trust_unread` block out of
-    /// `Connected::notes` and connect says nothing of the disagreement.
+    /// The notes under the hook's line name the hooks of the person's that
+    /// moved, and nothing else: there is no "yes" from Codex to report beside
+    /// the files any more.
     #[test]
-    fn a_yes_the_files_do_not_show_is_said_under_the_hooks_line() {
-        let untrusted = HookState::Off(Reason::Codex(Skip::NotTrusted));
-        let changed = HookState::Off(Reason::Codex(Skip::Changed));
-        assert!(trust_unread(Some(Ok(())), &untrusted));
-        assert!(trust_unread(Some(Ok(())), &changed));
-        assert!(!trust_unread(Some(Ok(())), &ON));
-        assert!(!trust_unread(None, &untrusted));
-        assert!(!trust_unread(Some(Err(GrantError::NotTrusted)), &untrusted));
-        assert!(!trust_unread(
-            Some(Ok(())),
-            &HookState::Off(Reason::Codex(Skip::HooksOff))
-        ));
-
-        let connected = |trust_unread: bool, moved: Vec<String>| Connected {
+    fn the_notes_are_the_hooks_that_moved() {
+        let connected = |moved: Vec<String>| Connected {
             outcome: Outcome::Active { changed: true },
             moved,
-            trust_unread,
         };
-        assert_eq!(
-            connected(false, Vec::new()).notes(&CODEX),
-            Vec::<String>::new()
-        );
-        assert_eq!(
-            connected(true, Vec::new()).notes(&CODEX),
-            vec![
-                "Codex confirms the hook is trusted, but `innerwarden status` cannot read this \
-                 Codex version's record of trust and will report the hook as not trusted \
-                 (measured on Codex CLI 0.167.2)."
-                    .to_string()
-            ]
-        );
-        // A hook of the person's that moved is said first.
-        let both = connected(true, vec!["`/opt/audit/before`".to_string()]).notes(&CODEX);
-        assert_eq!(both.len(), 2);
+        assert_eq!(connected(Vec::new()).notes(&CODEX), Vec::<String>::new());
+        let one = connected(vec!["`/opt/audit/before`".to_string()]).notes(&CODEX);
+        assert_eq!(one.len(), 1);
         assert!(
-            both[0].starts_with("A PreToolUse hook of your own moved"),
-            "{both:?}"
+            one[0].starts_with("A PreToolUse hook of your own moved"),
+            "{one:?}"
         );
     }
 
@@ -2669,11 +2789,17 @@ mod tests {
         );
     }
 
-    /// Codex says it trusts and runs the hook. The hash recomputed here may
-    /// be the one a later Codex no longer uses, so it does not overrule that.
-    /// A switch Codex's answer does not cover still does.
+    /// The program asked says it trusts and runs the hook, and Codex's config
+    /// holds no record of that trust for this line: the hook is not active.
+    /// The program asked is the first `codex` on the PATH, and another one
+    /// placed in front of Codex answers in its place. A switch its answer does
+    /// not cover still decides too.
+    ///
+    /// FAILS ON REVERT: answer `Outcome::Active { changed }` again in the
+    /// `asked == Some(Ok(()))` arm of `settle`, and a yes from any program
+    /// called `codex` reports a hook Codex skips as active.
     #[test]
-    fn a_yes_from_codex_outranks_the_recomputed_hash_and_no_other_switch() {
+    fn a_yes_from_the_program_asked_never_outranks_codexs_config() {
         for skip in [Skip::NotTrusted, Skip::Changed] {
             assert_eq!(
                 settle(
@@ -2682,10 +2808,14 @@ mod tests {
                     Some(Ok(())),
                     &HookState::Off(Reason::Codex(skip))
                 ),
-                Outcome::Active { changed: true },
+                not_active(YES_NOT_IN_CONFIG, TRUST_STEP),
                 "{skip:?}"
             );
         }
+        assert_eq!(
+            settle(&CODEX, true, Some(Ok(())), &ON),
+            Outcome::Active { changed: true }
+        );
         assert_eq!(
             settle(
                 &CODEX,
@@ -2862,8 +2992,8 @@ mod tests {
         }
 
         /// Codex is asked about the line `connect` has just written, in the
-        /// file it wrote it in, under the home it was given. Its yes makes the
-        /// hook active while the files read here show no trust yet.
+        /// file it wrote it in, under the home it was given, and writes its
+        /// record of trust into its config: the hook is active.
         ///
         /// FAILS ON REVERT: swap `home` and `&spec.path(home)` in the
         /// `codex_trust::grant` call of `connect_noting_write` (Codex is asked
@@ -2874,6 +3004,11 @@ mod tests {
         fn connect_has_codex_trust_the_line_and_the_file_it_wrote() {
             let home = tempfile::TempDir::new().unwrap();
             let fake = stand_in(home.path(), &["untrusted", "trusted"]);
+            std::fs::write(
+                fake.path().join("config"),
+                trusting(&CODEX.path(home.path()), 0, CODEX_MONITOR),
+            )
+            .unwrap();
             assert_eq!(
                 connect(
                     home.path(),
@@ -2895,6 +3030,50 @@ mod tests {
                     "hooks.state.\"{}\".trusted_hash",
                     key(home.path())
                 )))
+            );
+        }
+
+        /// A program called `codex` in front of the real one answers that it
+        /// trusts the hook and writes nothing. Codex's config holds no record
+        /// for the line, Codex skips the hook, and connect says it is not
+        /// active (measured on the binary before this check: "connected").
+        ///
+        /// FAILS ON REVERT: settle on the state read before the exchange is
+        /// trusted, or answer `Active` for a yes in `settle`, and the hook
+        /// is reported active.
+        #[test]
+        fn a_yes_that_leaves_no_record_in_codexs_config_is_not_active() {
+            let home = tempfile::TempDir::new().unwrap();
+            let fake = stand_in(home.path(), &["trusted"]);
+            assert_eq!(
+                connect(
+                    home.path(),
+                    &CODEX,
+                    Path::new(BIN),
+                    false,
+                    true,
+                    Some(&codex(&fake))
+                ),
+                Ok(not_active(YES_NOT_IN_CONFIG, TRUST_STEP))
+            );
+            assert!(!home.path().join(CODEX_CONFIG).exists());
+            // A record for another line is not this one's trust either.
+            write(
+                home.path(),
+                CODEX_CONFIG,
+                &trusting(&CODEX.path(home.path()), 0, &CODEX_LINE),
+            );
+            let fake = stand_in(home.path(), &["trusted"]);
+            assert_eq!(
+                connect(
+                    home.path(),
+                    &CODEX,
+                    Path::new(BIN),
+                    false,
+                    true,
+                    Some(&codex(&fake))
+                ),
+                Ok(not_active(YES_NOT_IN_CONFIG, TRUST_STEP))
             );
         }
 
