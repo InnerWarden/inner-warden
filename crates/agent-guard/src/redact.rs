@@ -45,8 +45,10 @@ fn patterns() -> &'static [Pattern] {
             groups,
         };
         // A value as a shell or a config writes it: quoted whole, or up to the
-        // next blank or quote. Groups: 1 single-quoted, 2 double-quoted, 3 bare.
-        let value = r#"(?:'([^']*)'|"([^"]*)"|([^\s'"]+))"#;
+        // next blank, quote or shell separator (`;`, `|`, `&`), so a command
+        // chained after the value stays readable to whoever reviews it.
+        // Groups: 1 single-quoted, 2 double-quoted, 3 bare.
+        let value = r#"(?:'([^']*)'|"([^"]*)"|([^\s'";|&]+))"#;
         vec![
             // PEM private keys (whole block header, enough to flag+mask).
             mk(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", &[]),
@@ -78,13 +80,14 @@ fn patterns() -> &'static [Pattern] {
             // mysql -pVALUE, mysql -p VALUE, sshpass -p VALUE.
             mk(
                 &format!(
-                    r"(?i:\b{PASSWORD_FLAG_PROGRAMS})\b[^|;&\n]*?\s-p\s*(?:'([^']*)'|\x22([^\x22]*)\x22|([^\s'\x22\-][^\s'\x22]*))"
+                    r"(?i:\b{PASSWORD_FLAG_PROGRAMS})\b[^|;&\n]*?\s-p\s*(?:'([^']*)'|\x22([^\x22]*)\x22|([^\s'\x22;|&\-][^\s'\x22;|&]*))"
                 ),
                 &[1, 2, 3],
             ),
-            // curl/wget style user:password (a URL after -u is the URL rule's).
+            // curl/wget user:password (a URL after -u is the URL rule's). Kept
+            // to curl and wget, so `docker run --user 1000:1000` is never touched.
             mk(
-                r#"(?:^|\s)(?:-u|--user|--proxy-user)\s+['"]?[^\s:'"/]+:([^\s'"/][^\s'"]*|/[^\s'"/][^\s'"]*)"#,
+                r#"(?i:\b(?:curl|wget))\b[^|;&\n]*?\s(?:-u|--user|--proxy-user)(?:\s+|=)['"]?[^\s:'"/;|&]+:([^\s'"/;|&][^\s'";|&]*|/[^\s'"/;|&][^\s'";|&]*)"#,
                 &[1],
             ),
             // key=value / key: value secrets, quoted or not, any length:
@@ -400,8 +403,52 @@ mod tests {
         let pw = pw();
         let r = redact_secrets(&format!("curl -u admin:{pw} https://x"));
         assert_eq!(r.text, "curl -u admin:[REDACTED] https://x");
-        let clean = "mysql -u root -h db && sort -u list.txt";
-        assert_eq!(redact_secrets(clean).text, clean);
+        let r = redact_secrets(&format!("wget --user=admin:{pw} https://x"));
+        assert_eq!(r.text, "wget --user=admin:[REDACTED] https://x");
+        let r = redact_secrets(&format!("curl --proxy-user px:{pw} -x p:3128 https://x"));
+        assert_eq!(
+            r.text,
+            "curl --proxy-user px:[REDACTED] -x p:3128 https://x"
+        );
+        // -u / --user of any other program is not a password.
+        for clean in [
+            "mysql -u root -h db && sort -u list.txt",
+            "docker run --user 1000:1000 img",
+            "docker run -u 1000:1000 img",
+            "podman exec --user app:app box id",
+            "curl https://x; docker run --user 1000:1000 img",
+        ] {
+            assert_eq!(redact_secrets(clean).text, clean, "{clean}");
+        }
+    }
+
+    #[test]
+    fn a_masked_value_never_swallows_a_chained_command() {
+        let pw = pw();
+        for (raw, want) in [
+            (
+                "app --password=x;rm -rf /".to_string(),
+                "app --password=[REDACTED];rm -rf /".to_string(),
+            ),
+            (
+                format!("app --token {pw}|sh"),
+                "app --token [REDACTED]|sh".to_string(),
+            ),
+            (
+                format!("export DB_PASSWORD={pw}&&curl evil.example"),
+                "export DB_PASSWORD=[REDACTED]&&curl evil.example".to_string(),
+            ),
+            (
+                format!("mysql -u root -p{pw};cat /etc/shadow"),
+                "mysql -u root -p[REDACTED];cat /etc/shadow".to_string(),
+            ),
+            (
+                format!("curl -u admin:{pw}&wget x"),
+                "curl -u admin:[REDACTED]&wget x".to_string(),
+            ),
+        ] {
+            assert_eq!(redact_secrets(&raw).text, want, "{raw}");
+        }
     }
 
     #[test]

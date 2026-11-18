@@ -2014,11 +2014,11 @@ mod tests {
     }
 
     /// The full command fills the 12 MiB store far sooner than labels did.
-    /// What a record costs at the cap, and what it leaves on disk, is measured
-    /// here on a store already full of long reviews.
+    /// On a store already full of long reviews, every record leaves the file
+    /// under its cap, and only a few of them have to prune to do it.
     #[test]
     #[cfg_attr(miri, ignore)]
-    fn a_store_full_of_long_reviews_stays_under_its_cap_at_a_bounded_cost() {
+    fn a_store_full_of_long_reviews_stays_under_its_cap_and_prunes_rarely() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("graph.json");
         let long = |i: usize| {
@@ -2041,7 +2041,6 @@ mod tests {
 
         let calls = 30;
         let mut pruned_calls = 0;
-        let started = std::time::Instant::now();
         for _ in 0..calls {
             let before = std::fs::metadata(&path).unwrap().len();
             record_at_with_options(
@@ -2066,11 +2065,6 @@ mod tests {
                 pruned_calls += 1;
             }
         }
-        let per_call = started.elapsed() / calls as u32;
-        eprintln!(
-            "graph cap: {calls} long reviews on a full store, {per_call:?} per call, \
-             {pruned_calls} of them pruned"
-        );
         // Each prune sheds a margin beyond what the new record needs, so the
         // calls after it write without pruning: the first call prunes the
         // seed's overflow, then one in many.
