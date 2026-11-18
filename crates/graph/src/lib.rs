@@ -538,15 +538,60 @@ impl Graph {
     /// dangling edge would make a reader render a relationship to a node it
     /// cannot resolve.
     pub fn prune(&mut self) -> usize {
+        self.prune_to_json().0
+    }
+
+    /// What a prune sheds beyond the overflow, so the writes after it fit
+    /// without pruning again. About 47 commands kept whole at
+    /// [`MAX_FULL_COMMAND_CHARS`], many more short ones.
+    pub const PRUNE_MARGIN_BYTES: usize = Self::MAX_BYTES / 32;
+
+    /// [`Self::prune`], returning the nodes dropped and the JSON of what is
+    /// left, which is what the store writes.
+    ///
+    /// The graph is serialised once when it is under budget and twice when it
+    /// had to shed: once to learn the overflow, once for what is written. What
+    /// is shed is sized node by node from the oldest end, only as far as the
+    /// overflow plus [`Self::PRUNE_MARGIN_BYTES`] reaches, so the work is
+    /// proportional to what came in, not to the store. It used to serialise the
+    /// whole store on every pass of a loop that dropped a tenth of the nodes at
+    /// a time, on a clone, and once more to write.
+    pub fn prune_to_json(&mut self) -> (usize, String) {
         let mut dropped = self.drop_oldest(self.nodes.len().saturating_sub(Self::MAX_NODES));
         // A node cap alone does not bound the file. Nodes carry commands, and at
         // 20k nodes a real graph measured 15.6 MB, close enough to any reader's
         // limit that one long command could put it over and wedge every later
         // write. The byte budget is what actually keeps the store loadable.
-        while self.nodes.len() > 1 && self.to_json().len() > Self::MAX_BYTES {
-            dropped += self.drop_oldest((self.nodes.len() / 10).max(1));
+        let mut json = self.to_json();
+        while self.nodes.len() > 1 && json.len() > Self::MAX_BYTES {
+            let shed = json.len() - Self::MAX_BYTES + Self::PRUNE_MARGIN_BYTES;
+            let count = self.oldest_covering(shed);
+            let now = self.drop_oldest(count);
+            if now == 0 {
+                // Only session anchors are left to drop, and those are kept.
+                break;
+            }
+            dropped += now;
+            json = self.to_json();
         }
-        dropped
+        (dropped, json)
+    }
+
+    /// How many of the oldest nodes to drop so the ones that go (session
+    /// anchors stay, see [`Self::drop_oldest`]) add up to at least `bytes` of
+    /// JSON. Each node is sized as it is written, plus its separating comma; the
+    /// edges that go with them only make the store smaller still.
+    fn oldest_covering(&self, bytes: usize) -> usize {
+        let mut freed = 0usize;
+        for (index, node) in self.nodes.iter().enumerate() {
+            if node.kind != "session" {
+                freed += serde_json::to_string(node).map_or(0, |s| s.len()) + 1;
+            }
+            if freed >= bytes {
+                return index + 1;
+            }
+        }
+        self.nodes.len()
     }
 
     /// Drop the `count` oldest nodes and every edge that then dangles.
@@ -736,6 +781,8 @@ impl Graph {
         // decision and for tuning rules. Only when the label had to be cut, so
         // a short command is not stored twice. Allowed commands keep only the
         // label: they are the bulk of the record and nobody reviews them.
+        // For an MCP call `command` is the router's tool summary, already cut
+        // at 240 characters, so that summary is all "whole" means there.
         let label = short(command, 120);
         if matches!(rec.as_str(), "deny" | "review") && label != command.trim() {
             attrs.insert(
@@ -2795,9 +2842,9 @@ mod prune_tests {
     /// Skipped under miri, and the reason is worth writing down because it cost
     /// a week of nightly runs. This test has to build ~14 MB (20k nodes with
     /// 700-byte labels) to reproduce "inside the node cap, over the byte
-    /// budget", and `prune` then serialises the whole graph on each pass of its
-    /// shrink loop. Native that is a moment; under an interpreter it does not
-    /// finish, so the nightly `miri` job ran to the 6-hour platform cap and was
+    /// budget", and `prune` then serialises the whole graph (it used to on each
+    /// pass of its shrink loop, now twice). Native that is a moment; under an
+    /// interpreter it did not finish, so the nightly `miri` job ran to the 6-hour platform cap and was
     /// killed every night from 2026-08-06 to 2026-08-12. The run showed as
     /// "cancelled", which reads as harmless, so nothing was checked for UB the
     /// whole time.
@@ -2829,6 +2876,17 @@ mod prune_tests {
         assert!(
             g.to_json().len() <= Graph::MAX_BYTES,
             "the store must come back under its own budget, or every later write fails"
+        );
+        assert!(
+            g.to_json().len() <= Graph::MAX_BYTES - Graph::PRUNE_MARGIN_BYTES,
+            "a prune sheds a margin too, so the next writes fit without another"
+        );
+        let (again, json) = g.prune_to_json();
+        assert_eq!(again, 0, "under budget, nothing more goes");
+        assert_eq!(
+            json,
+            g.to_json(),
+            "the JSON a prune hands back is the store's"
         );
         assert!(
             g.nodes
