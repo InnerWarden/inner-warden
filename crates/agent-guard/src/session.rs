@@ -575,3 +575,7 @@ mod pruning_tests {
         assert!(t.read_files.contains_key("/fresh/path"));
     }
 }
+
+#[cfg(test)]
+#[path = "mutant_kills/session_s1.rs"]
+mod mutant_kills_s1;

@@ -944,7 +944,8 @@ describe("Protection, Agents and Tokens", () => {
     expect(text).toContain("Automatic setup is on: a new agent joins in monitor, checked every 60 s.");
     expect(text.match(/Monitor is a dry run/g)?.length).toBe(1);
     expect(html).toContain('id="agent-claude-code"');
-    expect(text).toContain("Judges before it runs: Shell commands, and file changes");
+    expect(text).toContain("Judges before it runs: Shell commands, file changes");
+    expect(text).toContain("and reads (Read, Grep, Glob) of secrets");
     expect(text).toContain("2 of 3 local servers wrapped.");
     expect(text).toContain("Last screened");
     expect(commandBoxes(html).map((box) => box.text)).toContain("innerwarden agents connect codex --monitor");
@@ -953,6 +954,28 @@ describe("Protection, Agents and Tokens", () => {
     expect(text).toContain("If Gemini CLI is running, restart it after this step. Quit Gemini CLI and start it again.");
     expect(links(html)).toEqual([]);
     expect(html).not.toContain("data-offer");
+  });
+
+  it("says which tools a gone hook leaves unscreened, in status's words with its fix, on Agents and on Protection", () => {
+    const line =
+      "claude-code is wired and its shell commands are screened, but Write/Edit/MultiEdit/NotebookEdit not screened: its hook runs /gone/innerwarden, which does not exist.";
+    answers.set("agents", {
+      ...agentsFixture,
+      agents: agentsFixture.agents.map((agent) =>
+        agent.id === "claude-code"
+          ? { ...agent, judges: undefined, judges_line: undefined, unscreened: { line, command: "innerwarden install claude-code" } }
+          : agent,
+      ),
+    });
+    for (const html of [render(<CommunityAgents />), protectionHtml()]) {
+      const text = textOf(html);
+      const block = html.slice(html.indexOf("data-unscreened"));
+      expect(html.match(/data-unscreened/g)?.length, text).toBe(1);
+      expect(textOf(block)).toContain(line);
+      expect(commandBoxes(block)[0]?.text).toBe("innerwarden install claude-code");
+      // Its hooks' text alone would say the file changes are judged.
+      expect(text).not.toContain("Judges before it runs: Shell commands, file changes");
+    }
   });
 
   it("says running as not read on macOS in the technical view, never not running", () => {

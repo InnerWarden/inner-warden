@@ -61,10 +61,12 @@ pub enum Mechanism {
 
 #[derive(Debug, Clone, Copy)]
 pub struct HookTarget {
-    /// Value accepted by `install`. Kebab-case, stable.
+    /// Canonical `install` id. Kebab-case, stable.
     pub id: &'static str,
     /// Display name, matching `signatures::KNOWN`.
     pub display: &'static str,
+    /// Additional names accepted by `install`, matched case-insensitively.
+    pub aliases: &'static [&'static str],
     pub mechanism: Mechanism,
     /// Home-relative paths whose existence proves the agent has run here.
     /// Config directories, not binaries: a binary on PATH can be a leftover.
@@ -81,6 +83,7 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "claude-code",
         display: "Claude Code",
+        aliases: &["claude"],
         mechanism: Mechanism::SettingsHook {
             settings_rel: ".claude/settings.json",
         },
@@ -89,6 +92,7 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "openclaw",
         display: "OpenClaw",
+        aliases: &[],
         // Established against the shipped build (OpenClaw 2026.9.7), not
         // assumed. Its internal hook events (command/session/agent/gateway/
         // message) never see a proposed shell command, and they cannot refuse
@@ -122,6 +126,7 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "codex-cli",
         display: "Codex CLI",
+        aliases: &["codex", "openai-codex"],
         mechanism: Mechanism::McpProxy {
             why: "its `notify` hook fires AFTER a command runs, so it cannot block one",
             connect: "codex",
@@ -131,6 +136,7 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "gemini-cli",
         display: "Gemini CLI",
+        aliases: &["gemini"],
         mechanism: Mechanism::McpProxy {
             why: "no pre-execution command hook is exposed",
             connect: "gemini",
@@ -140,6 +146,7 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "aider",
         display: "Aider",
+        aliases: &[],
         mechanism: Mechanism::Contain {
             why: "no pre-execution hook and no MCP surface",
         },
@@ -148,6 +155,7 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "goose",
         display: "Goose",
+        aliases: &[],
         mechanism: Mechanism::NotYetWirable {
             why: "no pre-execution hook, and its MCP configuration has no lossless editor yet",
         },
@@ -156,6 +164,7 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "cursor",
         display: "Cursor",
+        aliases: &[],
         mechanism: Mechanism::McpProxy {
             why: "commands run inside the editor process; there is no host-side hook",
             connect: "cursor",
@@ -165,6 +174,7 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "windsurf",
         display: "Windsurf",
+        aliases: &[],
         // Advertised a connect command that has no target: `agents::KNOWN` has
         // no Windsurf row, so `agents connect windsurf` answers "no guardable
         // agent found". Wiring it needs its MCP config path CONFIRMED, not
@@ -178,6 +188,7 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "cline",
         display: "Cline",
+        aliases: &[],
         // Same as Windsurf: no `agents::KNOWN` row, so a connect command would
         // be a false promise.
         mechanism: Mechanism::NotYetWirable {
@@ -188,6 +199,7 @@ pub static TARGETS: &[HookTarget] = &[
     HookTarget {
         id: "openhands",
         display: "OpenHands",
+        aliases: &[],
         mechanism: Mechanism::Contain {
             why: "no pre-execution hook and no stable MCP surface",
         },
@@ -195,12 +207,16 @@ pub static TARGETS: &[HookTarget] = &[
     },
 ];
 
-/// Look a target up by `install` id, or by the display name `agents` prints.
+/// Look a target up by `install` id, display name, or an explicit alias.
 pub fn by_id(value: &str) -> Option<&'static HookTarget> {
     let needle = value.trim();
-    TARGETS
-        .iter()
-        .find(|t| t.id.eq_ignore_ascii_case(needle) || t.display.eq_ignore_ascii_case(needle))
+    TARGETS.iter().find(|t| {
+        t.id.eq_ignore_ascii_case(needle)
+            || t.display.eq_ignore_ascii_case(needle)
+            || t.aliases
+                .iter()
+                .any(|alias| alias.eq_ignore_ascii_case(needle))
+    })
 }
 
 /// Every agent with a marker under `home`, in table order.
@@ -293,6 +309,31 @@ mod tests {
         assert_eq!(by_id("OpenClaw").unwrap().id, "openclaw");
         assert_eq!(by_id("  Claude Code ").unwrap().id, "claude-code");
         assert!(by_id("nope").is_none());
+    }
+
+    #[test]
+    fn lookup_accepts_short_agent_names() {
+        for (alias, id) in [
+            ("claude", "claude-code"),
+            ("codex", "codex-cli"),
+            ("openai-codex", "codex-cli"),
+            ("gemini", "gemini-cli"),
+        ] {
+            let target = by_id(alias).expect("agent alias resolves");
+            assert!(std::ptr::eq(target, by_id(id).unwrap()));
+            assert_eq!(guidance(target), guidance(by_id(id).unwrap()));
+            assert!(std::ptr::eq(
+                target,
+                by_id(&format!("  {} \t", alias.to_ascii_uppercase())).unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn lookup_rejects_partial_agent_names() {
+        for value in ["", "claud", "claude-helper", "my-codex", "gemini-cli-extra"] {
+            assert!(by_id(value).is_none(), "must not match {value:?}");
+        }
     }
 
     /// REGRESSION ANCHOR. An agent with no hook must be pointed at the mechanism

@@ -39,6 +39,11 @@ pub(crate) struct Word {
     /// What the substitutions in it put in its place: the command line of a
     /// command substitution, the default of a `${name:-default}`.
     pub(crate) substitutions: Vec<String>,
+    /// Where a `~` stands unquoted and unescaped, as indices into the
+    /// characters of `text`. The shell puts the home folder in place of one
+    /// that starts a word or the value of an assignment; a quoted or escaped
+    /// `~` is a letter.
+    pub(crate) open_tildes: Vec<usize>,
 }
 
 impl Word {
@@ -76,6 +81,21 @@ impl Word {
     }
 }
 
+/// What ends the command in front of a command, and so starts it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Joint {
+    /// Nothing: the first command of the line.
+    #[default]
+    Start,
+    /// A line break, a lone `&` or a closing parenthesis: also how prose
+    /// and documents break a line, join two words or close an aside. No
+    /// command starts right after a `)` but in a `case` pattern.
+    Loose,
+    /// `;`, `&&`, `||`, `|`, `|&`, an opening parenthesis or a brace
+    /// group's brace: operators prose has little use for.
+    Tight,
+}
+
 /// One simple command: its words, and what it does with its input and output.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Command {
@@ -87,6 +107,11 @@ pub(crate) struct Command {
     /// Text it reads on its input from the line itself: a here-document's
     /// body, a here-string's word.
     pub(crate) inputs: Vec<String>,
+    /// The files it reads on its input: the targets of `<` and `<>`.
+    pub(crate) reads: Vec<Word>,
+    /// What ends the command in front of it. Two operators with no command
+    /// between them (`a &&` and a line break) count as the tighter one.
+    pub(crate) after: Joint,
     redirected: bool,
 }
 
@@ -114,6 +139,7 @@ pub(crate) fn read_line(text: &str) -> Line {
         word: None,
         braces: 0,
         heredocs: Vec::new(),
+        joint: Joint::Start,
     };
     lexer.run();
     lexer.line
@@ -167,6 +193,8 @@ struct Lexer {
     braces: usize,
     /// Here-documents whose body starts at the next newline.
     heredocs: Vec<Heredoc>,
+    /// What ended the last command: what starts the next one.
+    joint: Joint,
 }
 
 impl Lexer {
@@ -185,12 +213,16 @@ impl Lexer {
         self.braces = 0;
     }
 
-    fn end_command(&mut self, piped: bool) {
+    fn end_command(&mut self, piped: bool, next: Joint) {
         self.end_word();
         let mut command = std::mem::take(&mut self.command);
         if !command.words.is_empty() || command.redirected || !command.inputs.is_empty() {
             command.piped = piped;
+            command.after = self.joint;
             self.line.commands.push(command);
+            self.joint = next;
+        } else {
+            self.joint = self.joint.max(next);
         }
     }
 
@@ -202,12 +234,12 @@ impl Lexer {
                     self.at += 1;
                 }
                 '\n' => {
-                    self.end_command(false);
+                    self.end_command(false, Joint::Loose);
                     self.at += 1;
                     self.read_heredocs();
                 }
                 ';' => {
-                    self.end_command(false);
+                    self.end_command(false, Joint::Tight);
                     self.at += 1;
                 }
                 '&' if self.peek(1) == Some('>') => {
@@ -215,21 +247,27 @@ impl Lexer {
                     self.redirection();
                 }
                 '&' => {
-                    self.end_command(false);
-                    self.at += if self.peek(1) == Some('&') { 2 } else { 1 };
+                    if self.peek(1) == Some('&') {
+                        self.end_command(false, Joint::Tight);
+                        self.at += 2;
+                    } else {
+                        self.end_command(false, Joint::Loose);
+                        self.at += 1;
+                    }
                 }
                 '|' => {
                     if self.peek(1) == Some('|') {
-                        self.end_command(false);
+                        self.end_command(false, Joint::Tight);
                         self.at += 2;
                     } else {
-                        self.end_command(true);
+                        self.end_command(true, Joint::Tight);
                         self.at += if self.peek(1) == Some('&') { 2 } else { 1 };
                     }
                 }
                 '(' if self.word.as_ref().is_some_and(is_array_name) => self.array(),
                 '(' | ')' => {
-                    self.end_command(false);
+                    let next = if c == '(' { Joint::Tight } else { Joint::Loose };
+                    self.end_command(false, next);
                     self.at += 1;
                 }
                 '<' | '>' if self.peek(1) == Some('(') => self.process_substitution(),
@@ -238,13 +276,24 @@ impl Lexer {
                     self.redirection();
                 }
                 '{' | '}' if self.word.is_none() && self.reserved_brace(c) => {
-                    self.end_command(false);
+                    self.end_command(false, Joint::Tight);
                     self.at += 1;
+                }
+                // A `#` where a word starts opens a comment to the end of
+                // the line: a quote inside it opens nothing. Read as a word,
+                // `done #'` opened a quote that hid every later line from
+                // the reading (measured 2026-11-09). A `#` inside a word
+                // (`a#b`, a line continuation before it included) is a
+                // character, as it is to the shell.
+                '#' if self.word.is_none() => {
+                    while self.peek(0).is_some_and(|c| c != '\n') {
+                        self.at += 1;
+                    }
                 }
                 _ => self.word_unit(),
             }
         }
-        self.end_command(false);
+        self.end_command(false, Joint::Start);
     }
 
     /// A `{` or `}` standing alone where a word starts: a brace group's.
@@ -325,7 +374,11 @@ impl Lexer {
                 self.at += 2;
             }
             _ => {
-                self.word().push(c, Mark::Plain);
+                let word = self.word();
+                if c == '~' {
+                    word.open_tildes.push(word.marks.len());
+                }
+                word.push(c, Mark::Plain);
                 self.at += 1;
             }
         }
@@ -535,7 +588,12 @@ impl Lexer {
                 expands: !target.quoted,
             }),
             "<<<" => self.command.inputs.push(target.text),
-            ">" | ">>" | ">|" | "&>" | "&>>" | "<>" => self.command.writes_file |= to_a_file,
+            "<" => self.command.reads.push(target),
+            "<>" => {
+                self.command.writes_file |= to_a_file;
+                self.command.reads.push(target);
+            }
+            ">" | ">>" | ">|" | "&>" | "&>>" => self.command.writes_file |= to_a_file,
             ">&" => {
                 let descriptor =
                     target.text == "-" || target.text.chars().all(|c| c.is_ascii_digit());
@@ -743,10 +801,132 @@ fn matching_close(chars: &[char], start: usize, open: char, close: char) -> Opti
     None
 }
 
+/// What an unquoted `(` opened, for the byte-at-a-time readers of a line
+/// (`threats::shell_command_segments`, `threats::shell_tokens`, the
+/// projection's `shell::text_as_the_shell_reads`), which need to know what
+/// its `)` does to the word around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParenKind {
+    /// A `(` where a word starts: a subshell, or the outer `(` of an
+    /// arithmetic command `((`. Its `)` is an operator, so a word starts
+    /// after it and a `#` there opens a comment (`(true)#x` runs `true`
+    /// alone, in sh, bash and dash).
+    Operator,
+    /// A `(` glued to the word before it (`$(`, `a=(`, `@(`) or to a
+    /// redirection operator (`<(`, `>(`): its `)` is a character of that
+    /// word, which goes on. `a=$(date)#;innerwarden allow x` holds no
+    /// comment to the shell, and the lowering after the `;` runs (measured
+    /// 2026-11-09 in sh, bash and dash; `<(` in bash).
+    InWord,
+    /// The second `(` of `$((` or `((`, and a `(` that groups inside one:
+    /// arithmetic, where `<<` is a shift and opens no here-document, and
+    /// `case` is a variable's name.
+    Arithmetic,
+    /// Not a `(`: a `case` read and its `esac` not yet, so a `)` with no
+    /// `(` open since is a pattern's end, an operator (`a)# note` holds a
+    /// comment), and does not close the `$(` the `case` is in.
+    Case,
+}
+
+/// The `(` still open while a line is read, innermost last. One entry per
+/// unquoted `(` read and not yet closed, and per `case` not yet ended, so it
+/// holds no more than the line is long.
+#[derive(Debug, Default)]
+pub(crate) struct OpenParens {
+    open: Vec<ParenKind>,
+    arithmetic: usize,
+}
+
+impl OpenParens {
+    /// An unquoted `(` is read. `glued` when it follows a character of a
+    /// word or a redirection operator, `after_paren` when the character right
+    /// before it is an unquoted `(`, `after_dollar` when it is an unquoted
+    /// `$`. Inside arithmetic only `$(` opens a substitution: any other `(`
+    /// groups (`$(( (1+2)*3 ))`, `$((1<(2)))`).
+    pub(crate) fn open(&mut self, glued: bool, after_paren: bool, after_dollar: bool) {
+        let grouping = self.open.last() == Some(&ParenKind::Arithmetic) && !after_dollar;
+        let kind = if after_paren || grouping {
+            ParenKind::Arithmetic
+        } else if glued {
+            ParenKind::InWord
+        } else {
+            ParenKind::Operator
+        };
+        self.arithmetic += usize::from(kind == ParenKind::Arithmetic);
+        self.open.push(kind);
+    }
+
+    /// An unquoted `)` is read: whether the word it is in goes on after it.
+    /// A `)` with no `(` open and no `case` (a `(` this reading missed) is
+    /// taken to go on: a `#` right after it is then a character, which reads
+    /// more of the line, never less, than taking it for a comment.
+    pub(crate) fn close_continues_word(&mut self) -> bool {
+        let Some(&kind) = self.open.last() else {
+            return true;
+        };
+        if kind == ParenKind::Case {
+            return false;
+        }
+        self.open.pop();
+        match kind {
+            ParenKind::Operator | ParenKind::Case => false,
+            ParenKind::Arithmetic => {
+                self.arithmetic -= 1;
+                true
+            }
+            ParenKind::InWord => true,
+        }
+    }
+
+    /// An unquoted word starts where a command does, with `rest` (the line
+    /// from its first character; five are read): `case` opens a case, whose
+    /// pattern `)`s are operators, and `esac` ends the innermost one when
+    /// nothing opened after it is still open. Read only where a command
+    /// starts, as the shell reads them: `$(echo case x)#` is one word. A
+    /// `case` after a word this reading does not take for a command's start
+    /// (`then case`, `{ case`) is missed, and its pattern `)` is then read
+    /// as going on, which reads more of the line, never less. In arithmetic
+    /// `case` is a variable: `a=$((case +1))#;innerwarden allow x` holds no
+    /// case and no comment, and the lowering runs (review of c0d10d7,
+    /// 2026-11-09).
+    pub(crate) fn command_word_starts(&mut self, rest: impl Iterator<Item = char>) {
+        let head: Vec<char> = rest.take(5).collect();
+        let ends_word = |c: Option<&char>| {
+            c.is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+        };
+        if head.starts_with(&['c', 'a', 's', 'e']) && head.get(4).is_some_and(|c| c.is_whitespace())
+        {
+            if self.open.last() != Some(&ParenKind::Arithmetic) {
+                self.open.push(ParenKind::Case);
+            }
+        } else if head.starts_with(&['e', 's', 'a', 'c'])
+            && ends_word(head.get(4))
+            && self.open.last() == Some(&ParenKind::Case)
+        {
+            self.open.pop();
+        }
+    }
+
+    /// Inside `$((...))` or `((...))`, where `<<` is a shift.
+    pub(crate) fn in_arithmetic(&self) -> bool {
+        self.arithmetic > 0
+    }
+
+    /// The innermost thing open is a `case`: after a `)` a command starts
+    /// (the `)` ended a pattern, `x)` or `(x)`), so an `esac` there ends the
+    /// case. Missed, `a=$(case x in (x) esac)#;innerwarden allow x` kept the
+    /// case open, its `$(` never closed, and the `#` hid the lowering (review
+    /// of c0d10d7, 2026-11-09).
+    pub(crate) fn in_case(&self) -> bool {
+        self.open.last() == Some(&ParenKind::Case)
+    }
+}
+
 /// One escape of a `$'...'` string, `chars` starting after its backslash:
 /// the character it stands for (none for `\c` at the end) and how many
-/// characters it used.
-fn ansi_c_escape(chars: &[char]) -> (Option<char>, usize) {
+/// characters it used. Shared with the guard's own word reading
+/// (`threats::shell_tokens`), so both decode `$'\151nnerwarden'` alike.
+pub(crate) fn ansi_c_escape(chars: &[char]) -> (Option<char>, usize) {
     let Some(&first) = chars.first() else {
         return (Some('\\'), 0);
     };
@@ -788,6 +968,48 @@ fn ansi_c_escape(chars: &[char]) -> (Option<char>, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a `)` does to the word around it, as sh, bash and dash read it
+    /// (measured 2026-11-09): a substitution's or an array's leaves it going
+    /// on, a subshell's and a `case` pattern's end it, and in `$((`/`((` a
+    /// `<<` is a shift.
+    #[test]
+    fn a_closing_paren_ends_the_word_as_the_shell_ends_it() {
+        let mut parens = OpenParens::default();
+        parens.open(true, false, true);
+        parens.open(false, true, false);
+        assert!(parens.in_arithmetic(), "$((");
+        parens.command_word_starts("case +1".chars());
+        assert!(!parens.in_case(), "`case` is a variable in arithmetic");
+        parens.open(false, false, false);
+        parens.command_word_starts("case +1".chars());
+        assert!(parens.close_continues_word(), "a `(` there groups");
+        assert!(parens.in_arithmetic());
+        parens.open(true, false, true);
+        parens.command_word_starts("case x in".chars());
+        assert!(parens.in_case(), "a `$(` there holds commands");
+        assert!(!parens.close_continues_word(), "whose pattern ends");
+        parens.command_word_starts("esac".chars());
+        assert!(parens.close_continues_word(), "and it closes");
+        assert!(parens.in_arithmetic(), "back in the arithmetic");
+        assert!(parens.close_continues_word());
+        assert!(!parens.in_arithmetic());
+        assert!(parens.close_continues_word(), "the `)` of `$(` goes on");
+        parens.open(false, false, false);
+        assert!(!parens.close_continues_word(), "a subshell's `)` ends it");
+        parens.command_word_starts("case x in".chars());
+        assert!(!parens.close_continues_word(), "a pattern's `)` ends it");
+        assert!(!parens.close_continues_word(), "and keeps the case open");
+        assert!(parens.in_case(), "so a command starts after it");
+        parens.open(false, false, false);
+        assert!(!parens.close_continues_word(), "`(x)` is a pattern too");
+        assert!(parens.in_case());
+        parens.command_word_starts("esac;".chars());
+        assert!(parens.close_continues_word(), "a stray `)` reads on");
+        parens.command_word_starts("cases".chars());
+        parens.command_word_starts("esac".chars());
+        assert!(parens.close_continues_word(), "`cases` opens no case");
+    }
 
     fn words(line: &Line) -> Vec<Vec<String>> {
         line.commands
@@ -866,6 +1088,35 @@ mod tests {
             assert_eq!(words(&line), [["a", "b"]], "{text}");
             assert_eq!(line.commands[0].writes_file, writes, "{text}");
         }
+    }
+
+    /// A `~` is recorded where it stands unquoted and unescaped, the one the
+    /// shell may put the home folder in place of; quoted, escaped or in an
+    /// ANSI-C string it is a letter, and not recorded.
+    ///
+    /// FAILS ON REVERT of the `open_tildes` record in `word_unit`.
+    #[test]
+    fn an_unquoted_tilde_is_recorded_where_it_stands() {
+        let line = read_line("a ~ X=~/c ~x \"~\" '~' \\~ $'~' x~");
+        let tildes: Vec<Vec<usize>> = line.commands[0]
+            .words
+            .iter()
+            .map(|word| word.open_tildes.clone())
+            .collect();
+        assert_eq!(
+            tildes,
+            [
+                vec![],
+                vec![0],
+                vec![2],
+                vec![0],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![1]
+            ]
+        );
     }
 
     /// What the shell would still change is marked: expansions, globs and
@@ -953,5 +1204,47 @@ mod tests {
         assert_eq!(line.arrays, ["x y"]);
         assert_eq!(line.commands[0].words[2].substitutions, ["d e"]);
         assert_eq!(read_line("diff <(a) b").nested, ["a"]);
+    }
+
+    /// Each command knows the operator in front of it; two with no command
+    /// between them count as the tighter one. Input redirections name the
+    /// files a command reads.
+    #[test]
+    fn the_operator_before_a_command_and_the_files_it_reads_are_kept() {
+        let line = read_line("(a) b");
+        let after: Vec<Joint> = line.commands.iter().map(|command| command.after).collect();
+        assert_eq!(after, [Joint::Tight, Joint::Loose]);
+        let line = read_line("a; b && c || d | e\nf & g &&\nh");
+        let after: Vec<Joint> = line.commands.iter().map(|command| command.after).collect();
+        assert_eq!(
+            after,
+            [
+                Joint::Start,
+                Joint::Tight,
+                Joint::Tight,
+                Joint::Tight,
+                Joint::Tight,
+                Joint::Loose,
+                Joint::Loose,
+                Joint::Tight
+            ]
+        );
+        let line = read_line("read l < /a; b <> c; d << E\ne\nE\nf <<< g; h 0</dev/null");
+        let reads: Vec<Vec<&str>> = line
+            .commands
+            .iter()
+            .map(|command| {
+                command
+                    .reads
+                    .iter()
+                    .map(|word| word.text.as_str())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            reads,
+            [vec!["/a"], vec!["c"], vec![], vec![], vec!["/dev/null"]]
+        );
+        assert!(line.commands[1].writes_file);
     }
 }

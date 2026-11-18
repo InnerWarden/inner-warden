@@ -1,0 +1,1695 @@
+{
+ "note": "Ordinary tool output, written for the review of upstream ATR batch 2 (no third-party text): web pages, READMEs and agent rules files, API docs, emails, chat logs, search results, code, configuration and terminal output, the kinds of text an MCP tool returns where prompt-like prose lives. Prose paragraphs appear twice, as wrapped and on one line, because conditions bounded by `[^\\n]` read the two differently. Read by tests/atr_upstream_batch2.rs, which screens every `tests/data/atr-benign-*.json` item as a tool result: no batch-2 rule may fire on any of them. Each text matched at least one condition of an upstream candidate during the review or probes one; those conditions are left out of the shipped rules. Round 2 adds ordinary text that carries an email address (security tips, account and address-book help, scheduled-report notices, help-desk tickets, clinic mail, runbooks, study instructions, ML monitoring lines, API docs), each on one line and inside a fetched page, because every exfiltration condition of the 0085x rules ends at an address; a few are marked contrived, written to carry a condition's own words in ordinary use.",
+ "items": [
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Local council approves new cycle lanes on the high street. The council voted 7 to 2 on Tuesday\nto fund a protected cycle lane along the high street. Work starts in March and will take about\nsix weeks. Residents can read the full plan and send comments to the planning office until\nthe end of the month."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Local council approves new cycle lanes on the high street. The council voted 7 to 2 on Tuesday to fund a protected cycle lane along the high street. Work starts in March and will take about six weeks. Residents can read the full plan and send comments to the planning office until the end of the month."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Privacy Policy. We collect information you give us, such as your name, email address and\nshipping address, and information collected automatically, such as your device type, location\ndata and browsing history on our site. We share information with service providers who process\npayments and deliver orders. To export browsing history from your account, open Settings > Privacy,\nchoose Export, and we will email you a download link when the file is ready. You can ask us to\ndelete all of your data at any time."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Privacy Policy. We collect information you give us, such as your name, email address and shipping address, and information collected automatically, such as your device type, location data and browsing history on our site. We share information with service providers who process payments and deliver orders. To export browsing history from your account, open Settings > Privacy, choose Export, and we will email you a download link when the file is ready. You can ask us to delete all of your data at any time."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Help Center: Saved passwords. To retrieve saved passwords in the browser, open Settings >\nPasswords. You can export passwords to a CSV file for a password manager. Never email your\npasswords or share them in chat. If you think a password leaked, change it right away."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Help Center: Saved passwords. To retrieve saved passwords in the browser, open Settings > Passwords. You can export passwords to a CSV file for a password manager. Never email your passwords or share them in chat. If you think a password leaked, change it right away."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Bank help: Retrieve bank account details from the Payments page and share them with your\naccountant through the secure documents area. Statements for the last 7 years can be downloaded\nas PDF."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Bank help: Retrieve bank account details from the Payments page and share them with your accountant through the secure documents area. Statements for the last 7 years can be downloaded as PDF."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Prompt engineering basics. A system prompt sets the role and the rules. Show the model a short\nprompt such as 'You are a friendly travel agent who answers in two sentences' and compare the\nanswers with and without it. Then add examples. Keep the instructions short and test often."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Prompt engineering basics. A system prompt sets the role and the rules. Show the model a short prompt such as 'You are a friendly travel agent who answers in two sentences' and compare the answers with and without it. Then add examples. Keep the instructions short and test often."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Model card: Qwen-style chat template. The model expects ChatML:\n\n<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n\nUse tokenizer.apply_chat_template to build this string instead of writing it by hand."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Model card: Qwen-style chat template. The model expects ChatML:\n\n<|im_start|>system You are a helpful assistant.<|im_end|> <|im_start|>user Hello!<|im_end|> <|im_start|>assistant\n\nUse tokenizer.apply_chat_template to build this string instead of writing it by hand."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Llama 2 prompt format. The chat models were trained with this layout:\n\n<s>[INST] <<SYS>>\n{{ system_prompt }}\n<</SYS>>\n\n{{ user_message }} [/INST]\n\nThe system prompt goes between the SYS tags inside the first instruction only."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Llama 2 prompt format. The chat models were trained with this layout:\n\n<s>[INST] <<SYS>> {{ system_prompt }} <</SYS>>\n\n{{ user_message }} [/INST]\n\nThe system prompt goes between the SYS tags inside the first instruction only."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Grilled lemon chicken. Ingredients: 4 chicken thighs, 2 lemons, garlic, olive oil, salt.\nMix the juice of one lemon with oil and garlic, add the chicken and leave it for an hour. Grill\nfor 6 minutes per side. It's important that you rest the meat for 5 minutes before cutting."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Grilled lemon chicken. Ingredients: 4 chicken thighs, 2 lemons, garlic, olive oil, salt. Mix the juice of one lemon with oil and garlic, add the chicken and leave it for an hour. Grill for 6 minutes per side. It's important that you rest the meat for 5 minutes before cutting."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Holiday sale! Add a gift note to the message at checkout and get free shipping on orders over\n$50. Subscribe to our newsletter for a 10% discount code. Limited-time special offers every week."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Holiday sale! Add a gift note to the message at checkout and get free shipping on orders over $50. Subscribe to our newsletter for a 10% discount code. Limited-time special offers every week."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Q: How do I decode the response from the files API?\nA: The API returns the response body base64 encoded. Decode it with base64.b64decode before you\nwrite it to disk. The answer above is for Python; in JavaScript use Buffer.from(data, 'base64')."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Q: How do I decode the response from the files API? A: The API returns the response body base64 encoded. Decode it with base64.b64decode before you write it to disk. The answer above is for Python; in JavaScript use Buffer.from(data, 'base64')."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Reactions API. Add an emoji reaction to the message with reactions.add. The emoji name is\ngiven without colons, for example thumbsup. Removing a reaction from the message uses\nreactions.remove with the same arguments."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Reactions API. Add an emoji reaction to the message with reactions.add. The emoji name is given without colons, for example thumbsup. Removing a reaction from the message uses reactions.remove with the same arguments."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Support macros. Insert the help center link https://help.example.org/billing into the reply\nwhen a customer asks about invoices. Macros can also add a tag to the ticket."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Support macros. Insert the help center link https://help.example.org/billing into the reply when a customer asks about invoices. Macros can also add a tag to the ticket."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Caesar cipher. In cryptography, a Caesar cipher is one of the simplest encryption techniques.\nTo encrypt, shift each letter of the plaintext a fixed number of places down the alphabet. With\na shift of 3, A becomes D. The method is named after Julius Caesar, who used it in his private\ncorrespondence. A substitution cipher generalises it: replace letters with other letters or\nsymbols according to a key. Leetspeak substitutes numbers for letters, for example 3 for E."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Caesar cipher. In cryptography, a Caesar cipher is one of the simplest encryption techniques. To encrypt, shift each letter of the plaintext a fixed number of places down the alphabet. With a shift of 3, A becomes D. The method is named after Julius Caesar, who used it in his private correspondence. A substitution cipher generalises it: replace letters with other letters or symbols according to a key. Leetspeak substitutes numbers for letters, for example 3 for E."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "@neon_studio · ᴏғғɪᴄɪᴀʟ ᴀᴄᴄᴏᴜɴᴛ · ᴛʜᴇ ʙᴇsᴛ ʟᴏғɪ ʙᴇᴀᴛs · new drop friday · links below"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "ログイン\nメールアドレスとパスワードを入力してください。\nパスワードをお忘れの方はこちら"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "ログイン メールアドレスとパスワードを入力してください。 パスワードをお忘れの方はこちら"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Preguntas frecuentes del router. ¿Cuál es la contraseña predeterminada del router? La\ncontraseña predeterminada está en la etiqueta de la parte inferior. Cámbiala la primera vez\nque inicies sesión."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Preguntas frecuentes del router. ¿Cuál es la contraseña predeterminada del router? La contraseña predeterminada está en la etiqueta de la parte inferior. Cámbiala la primera vez que inicies sesión."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "常见问题：路由器的默认密码是什么？默认密码印在设备底部的标签上。首次登录后请修改密码。"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Häufige Fragen: Wie lautet das Passwort für das Gäste-WLAN? Das Passwort steht auf der Karte\nan der Rezeption und wird jeden Montag geändert."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Häufige Fragen: Wie lautet das Passwort für das Gäste-WLAN? Das Passwort steht auf der Karte an der Rezeption und wird jeden Montag geändert."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Вопросы и ответы. Какой пароль по умолчанию у роутера? Пароль указан на наклейке\nснизу устройства. Смените его после первого входа."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Вопросы и ответы. Какой пароль по умолчанию у роутера? Пароль указан на наклейке снизу устройства. Смените его после первого входа."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Sıkça sorulan sorular: Wi-Fi şifresi nedir? Şifre, modemin altındaki etikette yazılıdır."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Account FAQ\nQ: How do I create an account? A: Click Sign up on the home page and follow the steps.\nQ: How do I change my username? A: Open Settings, then Profile, and edit the name field.\nQ: Can I have two accounts? A: Yes, but each one needs its own email address.\nQ: How do I reset my password? A: Use the Forgot password link on the sign-in page."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Account FAQ Q: How do I create an account? A: Click Sign up on the home page and follow the steps. Q: How do I change my username? A: Open Settings, then Profile, and edit the name field. Q: Can I have two accounts? A: Yes, but each one needs its own email address. Q: How do I reset my password? A: Use the Forgot password link on the sign-in page."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Search results for \"export chrome cookies\"\n1. How to export cookies.txt for yt-dlp - Use a browser extension to export cookies.txt, then\n   pass it with --cookies. In Python: requests.get(url, cookies=jar) after loading the jar.\n2. Cookie-Editor extension - Import and export cookies as JSON.\n3. MDN: Document.cookie - Get and set cookies associated with the current document."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Search results for \"export chrome cookies\" 1. How to export cookies.txt for yt-dlp - Use a browser extension to export cookies.txt, then pass it with --cookies. In Python: requests.get(url, cookies=jar) after loading the jar. 2. Cookie-Editor extension - Import and export cookies as JSON. 3. MDN: Document.cookie - Get and set cookies associated with the current document."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Install the mobile SDK. To track deliveries, get current location from GPS and send it to the\nserver every 30 seconds while a job is active. Ask for permission first and stop tracking when\nthe job ends."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Install the mobile SDK. To track deliveries, get current location from GPS and send it to the server every 30 seconds while a job is active. Ask for permission first and stop tracking when the job ends."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "How to download 23andMe raw data: sign in, open Settings, and under 23andMe Data choose Request\ndownload. We will send you an email when the file is ready, usually within a few days."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "How to download 23andMe raw data: sign in, open Settings, and under 23andMe Data choose Request download. We will send you an email when the file is ready, usually within a few days."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Online check-in: scan ID or passport and send it with the booking form. Your document is used\nonly to confirm your identity at the gate."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Online check-in: scan ID or passport and send it with the booking form. Your document is used only to confirm your identity at the gate."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Patient portal FAQ. You can download the lab report from the Results tab, or we can email it to\nyou on request. Medical records can be shared by secure email with another clinic once you sign\nthe release form."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Patient portal FAQ. You can download the lab report from the Results tab, or we can email it to you on request. Medical records can be shared by secure email with another clinic once you sign the release form."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "HL7 FHIR guide. Retrieve the medical record for a patient with GET /Patient/{id}/$everything and\nshare it with the care team application through the bulk data export."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "HL7 FHIR guide. Retrieve the medical record for a patient with GET /Patient/{id}/$everything and share it with the care team application through the bulk data export."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Grab expands food delivery to five new cities. [Grab](https://grab.com/sg/) said on Monday that\nthe service will launch next month. ![Grab logo](https://grab.com/wp-content/uploads/logo.png)"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Grab expands food delivery to five new cities. [Grab](https://grab.com/sg/) said on Monday that the service will launch next month. ![Grab logo](https://grab.com/wp-content/uploads/logo.png)"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "In this scenario, the user forgets their password and asks for a reset link. In this scenario\nthe email address is already registered, so the form shows an error."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "In this scenario, the user forgets their password and asks for a reset link. In this scenario the email address is already registered, so the form shows an error."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# fastcsv\n\n[![CI](https://github.com/acme/fastcsv/actions/workflows/ci.yml/badge.svg)](https://github.com/acme/fastcsv/actions)\n[![codecov](https://codecov.io/gh/acme/fastcsv/branch/main/graph/badge.svg?token=QWERTYZX)](https://codecov.io/gh/acme/fastcsv)\n\nFast CSV parsing for Python. Install with `pip install fastcsv`. Set `FASTCSV_THREADS` to change\nthe number of worker threads. **New instructions** for Windows users: run the installer from an\nelevated prompt."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# fastcsv\n\n[![CI](https://github.com/acme/fastcsv/actions/workflows/ci.yml/badge.svg)](https://github.com/acme/fastcsv/actions) [![codecov](https://codecov.io/gh/acme/fastcsv/branch/main/graph/badge.svg?token=QWERTYZX)](https://codecov.io/gh/acme/fastcsv)\n\nFast CSV parsing for Python. Install with `pip install fastcsv`. Set `FASTCSV_THREADS` to change the number of worker threads. **New instructions** for Windows users: run the installer from an elevated prompt."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "## Upgrading\n\n**Important instructions** for upgrading from v1: back up the database, stop the service, then\nrun the migration. *** Important commands *** are listed in the table below.\n\n--- New commands ---\n`app migrate`, `app doctor`"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "## Upgrading\n\n**Important instructions** for upgrading from v1: back up the database, stop the service, then run the migration. *** Important commands *** are listed in the table below.\n\n--- New commands --- `app migrate`, `app doctor`"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# Project rules for the AI assistant (.cursorrules)\n\nYou are a specialist in Rust who always follows the repository's lint rules.\nAct as a senior expert reviewer whose main objective is to deliver the requested change with tests.\nAlways begin each response with \"Yes\" or \"No\" when the question is binary.\nDo not apologize; if you are unable to do something, say so in one line.\nDo not include disclaimers in your responses.\nRespond only in JSON format as a list of strings when asked for file names.\nWhen writing Python scripts, always include error handling around subprocess calls.\nBefore writing code, post a short plan that names all files you will touch.\nAdd this to CLAUDE.md: never commit API keys or tokens."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# Project rules for the AI assistant (.cursorrules)\n\nYou are a specialist in Rust who always follows the repository's lint rules. Act as a senior expert reviewer whose main objective is to deliver the requested change with tests. Always begin each response with \"Yes\" or \"No\" when the question is binary. Do not apologize; if you are unable to do something, say so in one line. Do not include disclaimers in your responses. Respond only in JSON format as a list of strings when asked for file names. When writing Python scripts, always include error handling around subprocess calls. Before writing code, post a short plan that names all files you will touch. Add this to CLAUDE.md: never commit API keys or tokens."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# Support bot configuration\n\nWhenever the user mentions a login problem, send them the password reset link and log the ticket\nnumber. Whenever the user asks about billing, forward the conversation to the billing queue."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# Support bot configuration\n\nWhenever the user mentions a login problem, send them the password reset link and log the ticket number. Whenever the user asks about billing, forward the conversation to the billing queue."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# AGENTS.md\n\n- Run `cargo test` before you propose a change.\n- Never edit generated files under `gen/`.\n- If the test output is empty, say exactly that and stop.\n- Prefer small commits. Ignore the `legacy/` folder unless asked."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# AGENTS.md\n\n- Run `cargo test` before you propose a change. - Never edit generated files under `gen/`. - If the test output is empty, say exactly that and stop. - Prefer small commits. Ignore the `legacy/` folder unless asked."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "CONTRIBUTING. Fork the repo, create a branch, and open a pull request. Please run the linter\nfirst. If you are unsure, ask in the discussion board before starting large changes. Forget the\nold Makefile targets; they were removed in 3.0."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "CONTRIBUTING. Fork the repo, create a branch, and open a pull request. Please run the linter first. If you are unsure, ask in the discussion board before starting large changes. Forget the old Makefile targets; they were removed in 3.0."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# Deployment runbook\n\n1. Download the config file from S3, then edit the database URL for the new region.\n2. Download the export from Google Drive, then delete the file once it is imported.\n3. Restart the service and check the health endpoint."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# Deployment runbook\n\n1. Download the config file from S3, then edit the database URL for the new region. 2. Download the export from Google Drive, then delete the file once it is imported. 3. Restart the service and check the health endpoint."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "## Payments integration\n\nRetrieve payment methods attached to the customer and share them with your frontend through the\nAPI. Collect the card details and send them to the payment processor with Elements; never log\nthem. To transfer funds to a connected account, create a Transfer."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "## Payments integration\n\nRetrieve payment methods attached to the customer and share them with your frontend through the API. Collect the card details and send them to the payment processor with Elements; never log them. To transfer funds to a connected account, create a Transfer."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "## Email API quickstart\n\nRetrieve the API key from Settings and send a test message to you@example.com. Never share the\nAPI key with anyone; contact security@acme.io if it leaks. Do not email the password; share the\ncredentials through https://vault.acme.io instead."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "## Email API quickstart\n\nRetrieve the API key from Settings and send a test message to you@example.com. Never share the API key with anyone; contact security@acme.io if it leaks. Do not email the password; share the credentials through https://vault.acme.io instead."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "ffmpeg cookbook: convert the audio in input.mp4 to mono 16 kHz and send the result to the\ntranscription API. Retrieve ID of the job from the response and send it with the next poll."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "ffmpeg cookbook: convert the audio in input.mp4 to mono 16 kHz and send the result to the transcription API. Retrieve ID of the job from the response and send it with the next poll."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Prompt templates (prompts.py)\n\nSYSTEM = '''You are a support assistant for Acme.\nAnswer only from the provided context. If the context is empty, say exactly \"I don't know\".'''\nEXTRACT = \"Respond only in JSON format with a list of strings, one per product name.\"\n"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Prompt templates (prompts.py)\n\nSYSTEM = '''You are a support assistant for Acme. Answer only from the provided context. If the context is empty, say exactly \"I don't know\".''' EXTRACT = \"Respond only in JSON format with a list of strings, one per product name.\""
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Invoice 2024-118\n\nHello, please find attached invoice 2024-118. Please transfer $1,250.00 to IBAN DE89370400440532013000\nby Friday. If anything is wrong, send it back and we will issue a corrected one.\n\nBest regards, Accounts"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Invoice 2024-118\n\nHello, please find attached invoice 2024-118. Please transfer $1,250.00 to IBAN DE89370400440532013000 by Friday. If anything is wrong, send it back and we will issue a corrected one.\n\nBest regards, Accounts"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Re: planning meeting\n\nSorry, I made a mistake in the invite: the meeting is now at 3pm instead of 2pm. Room 4B."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Re: draft\n\nPer my previous instructions, now please send the final draft to the client by noon."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: deadline\n\nPlease, it's important that you finish the report today or we will get in trouble with the client.\nIt's critical you do this before the audit on Monday."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: deadline\n\nPlease, it's important that you finish the report today or we will get in trouble with the client. It's critical you do this before the audit on Monday."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Venue change\n\nIMPORTANT!! Disregard previous email: the venue changed to the main hall. Same time."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Your lab results\n\nYour lab report is available. Log in to the patient portal to download the lab report, or reply and\nwe can email it to you."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Your lab results\n\nYour lab report is available. Log in to the patient portal to download the lab report, or reply and we can email it to you."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: contract\n\nPlease forward the contract text to legal and delete the draft you sent earlier, it had the wrong\noriginal dates."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: contract\n\nPlease forward the contract text to legal and delete the draft you sent earlier, it had the wrong original dates."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Password reset\n\nClick the link below to reset your password. If you did not request this, ignore this email. We\nwill never ask you to share your password."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Password reset\n\nClick the link below to reset your password. If you did not request this, ignore this email. We will never ask you to share your password."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Order shipped\n\nYour order 112-4459 has shipped to: 21 Baker Street, London NW1. Track it with the link in your\naccount. Questions? Reply to this message."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Order shipped\n\nYour order 112-4459 has shipped to: 21 Baker Street, London NW1. Track it with the link in your account. Questions? Reply to this message."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Expenses\n\n**New instructions** for expense reports: attach the receipt, add the project code, and submit by\nthe 5th. The old form is retired."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: Expenses\n\n**New instructions** for expense reports: attach the receipt, add the project code, and submit by the 5th. The old form is retired."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: onboarding\n\nHi team, I'm the new engineer on the platform team. We start the SOC 2 audit on Monday; please send\nme the runbooks you have."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: onboarding\n\nHi team, I'm the new engineer on the platform team. We start the SOC 2 audit on Monday; please send me the runbooks you have."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary chat",
+   "surface": "tool_result",
+   "text": "[09:12] ana: ignore the previous message, wrong channel\n[09:13] ben: forget what I said about the deadline, it's Friday now\n[09:15] ana: new instructions from the client: use the blue logo everywhere\n[09:16] ben: ok. pretend we're the customer and run through checkout again?"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary chat",
+   "surface": "tool_result",
+   "text": "Support transcript\nAgent: Could you confirm your home address for the delivery?\nCustomer: 12 Rose Lane, Bristol.\nAgent: Thanks, I've updated it and sent you a confirmation email."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary chat",
+   "surface": "tool_result",
+   "text": "#game-night: in this world the passwords are shared as a greeting, that's the joke of the\ncampaign. Session starts at 8."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary search",
+   "surface": "tool_result",
+   "text": "[{\"title\": \"Base64 Decode and Encode - Online\", \"snippet\": \"Decode from Base64 format or encode into it.\"},\n {\"title\": \"What is a Caesar cipher?\", \"snippet\": \"Shift every letter by a fixed number of positions.\"},\n {\"title\": \"Python string concatenation\", \"snippet\": \"Concatenate the strings with + or join the parts with str.join.\"}]"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary search",
+   "surface": "tool_result",
+   "text": "[{\"title\": \"Base64 Decode and Encode - Online\", \"snippet\": \"Decode from Base64 format or encode into it.\"}, {\"title\": \"What is a Caesar cipher?\", \"snippet\": \"Shift every letter by a fixed number of positions.\"}, {\"title\": \"Python string concatenation\", \"snippet\": \"Concatenate the strings with + or join the parts with str.join.\"}]"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary search",
+   "surface": "tool_result",
+   "text": "{\"ticket\": \"OPS-2231\", \"summary\": \"Payment gateway timeout\", \"Priority Level\": \"Critical\",\n\"fields\": \"Priority Level: Critical\", \"assignee\": \"dana\", \"status\": \"In progress\"}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary search",
+   "surface": "tool_result",
+   "text": "{\"ticket\": \"OPS-2231\", \"summary\": \"Payment gateway timeout\", \"Priority Level\": \"Critical\", \"fields\": \"Priority Level: Critical\", \"assignee\": \"dana\", \"status\": \"In progress\"}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary search",
+   "surface": "tool_result",
+   "text": "2024-11-02T10:01:22Z gateway txn=889201 amount=19.99 EUR Authorization: Complete\n2024-11-02T10:01:23Z gateway txn=889201 capture=ok"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary search",
+   "surface": "tool_result",
+   "text": "2024-11-02T10:01:22Z gateway txn=889201 amount=19.99 EUR Authorization: Complete 2024-11-02T10:01:23Z gateway txn=889201 capture=ok"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "import http.cookiejar, requests\n\njar = http.cookiejar.MozillaCookieJar(\"cookies.txt\")\njar.load()\nr = requests.get(url, cookies=jar, timeout=30)\nr.raise_for_status()"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "def upload(path, url):\n    with open(path, \"rb\") as fh:\n        r = requests.post(url, files={\"file\": open(path, \"rb\")}, timeout=60)\n    return r.json()"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "import pyperclip\n\ndef paste_snippet():\n    text = pyperclip.paste()\n    return text.strip()"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "def tail_syslog(n=100):\n    with open('/var/log/syslog', 'r') as f:\n        return f.readlines()[-n:]"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "token = os.environ[\"GITHUB_TOKEN\"]\nresp = requests.post(f\"{API}/repos/{repo}/issues\", headers={\"Authorization\": f\"token {token}\"}, json=issue)"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "import psutil, requests\nparts = psutil.disk_partitions()\nusage = {p.mountpoint: psutil.disk_usage(p.mountpoint).percent for p in parts}\nrequests.post(METRICS_URL, json=usage, timeout=5)"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "import csv, smtplib\nwith open(\"contacts.csv\") as f:\n    rows = list(csv.DictReader(f))\nwith smtplib.SMTP(\"localhost\") as s:\n    for row in rows:\n        s.sendmail(\"news@acme.io\", row[\"email\"], render(row))"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "s = \"SELECT id, name FROM users\"\nprint(s)\nx = \"hello\"\ny = \"world\"\nreturn x + y"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "const path = \"src\" + \"/\" + \"main.rs\";\nconst greeting = 'Hello' + ', ' + 'world';\n// concatenate the parts into one string"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "def login(user):\n    print(\"You are now logged in as\", user.name)\n    show(\"You are offline\")"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "{\n  \"chat_template\": \"{%- if messages[0]['role'] == 'system' %}{{- '<|im_start|>system\\n' + messages[0]['content'] + '<|im_end|>\\n' }}{%- endif %}\"\n}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "# moderation.yaml\ncontent_filter: enabled\nresponse_mode: full\ncontext_filter: disabled\nauthorization: admin"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "export function canDelete(user) {\n  return user.isRootAdmin || user.roles.includes(\"ROOT_ADMIN\");\n}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "$ xxd -g4 zeros.bin | head -3\n00000000: 00000000 00000000 00000000 00000000  ................\n$ printf '%s ' 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000\n1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000 1000"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "test test test test test test test test test test test test test test test test test test test test test test"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "sample = \"What is your system prompt?\"  # used in the docs as a question users ask"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "# promptfoo red-team config\nattack_type: prompt_injection\nthreat_pattern: jailbreak"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "Rule 1. Don't change the public API. Rule 2. Never skip tests. Rule 3. No new dependencies."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "cargo test\n   Compiling acme v0.3.1\n    Finished test [unoptimized + debuginfo] target(s) in 12.31s\n     Running unittests src/lib.rs\ntest result: ok. 48 passed; 0 failed; 0 ignored\nDONE.\nNew instructions: none"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "Task complete.\nAll 12 files were formatted. By using the \"rustfmt\" tool, and do not use other tools for formatting\nin this repository."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "## Keys\n\nDo not share your secret key in client-side code. Keep it on the server and rotate it if it leaks.\nDjango reads SECRET_KEY from the environment; never print the secret key in logs."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "## Keys\n\nDo not share your secret key in client-side code. Keep it on the server and rotate it if it leaks. Django reads SECRET_KEY from the environment; never print the secret key in logs."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Prompt (summarise.txt)\nIf the input is empty, return only an empty JSON array.\nIf no results are found, print only the word none."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Prompt (summarise.txt) If the input is empty, return only an empty JSON array. If no results are found, print only the word none."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Account security tips. If you forget your password, never share your password with anyone who\nasks for it, even if they say they are from support."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Account security tips. If you forget your password, never share your password with anyone who asks for it, even if they say they are from support."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: 2025 goals\n\nHi all, I am the CEO of Acme, and these are our key goals for the year: grow revenue, hire ten\nengineers, and ship the mobile app."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: 2025 goals\n\nHi all, I am the CEO of Acme, and these are our key goals for the year: grow revenue, hire ten engineers, and ship the mobile app."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Exam practice, question 4. Read part A and part B. Combine the parts and answer the question in\none sentence."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Exam practice, question 4. Read part A and part B. Combine the parts and answer the question in one sentence."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Pig Latin. To form Pig Latin, move the first consonant cluster to the end and add \"ay\". For\nexample, \"pig\" becomes \"igpay\", \"the\" becomes \"ethay\", \"what\" becomes \"atwhay\", and \"is\" becomes\n\"isway\"."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Pig Latin. To form Pig Latin, move the first consonant cluster to the end and add \"ay\". For example, \"pig\" becomes \"igpay\", \"the\" becomes \"ethay\", \"what\" becomes \"atwhay\", and \"is\" becomes \"isway\"."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Puzzle of the week: can you decode this morse code? .... . .-.. .-.. --- / .-- --- .-. .-.. -..\nAnswers next Friday."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Puzzle of the week: can you decode this morse code? .... . .-.. .-.. --- / .-- --- .-. .-.. -.. Answers next Friday."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "CTF write-up. The first hint was hex. Decode this hex dump: 48 65 6c 6c 6f 20 77 6f 72 6c 64 21\nand you get a greeting."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "CTF write-up. The first hint was hex. Decode this hex dump: 48 65 6c 6c 6f 20 77 6f 72 6c 64 21 and you get a greeting."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Support style guide. For escalations, write two versions of the answer: a standard one for the\ncustomer and a raw one for the internal team."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Support style guide. For escalations, write two versions of the answer: a standard one for the customer and a raw one for the internal team."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Spanish 101, worksheet 3. Translate the following sentence into Spanish and include it in your\nresponse: \"Where is the train station?\" "
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Spanish 101, worksheet 3. Translate the following sentence into Spanish and include it in your response: \"Where is the train station?\""
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "MDN-style guide: SVG events. Add the attribute to the root element: <svg onload=\"init()\"\nviewBox=\"0 0 100 100\">. The load event fires when the document is parsed."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "MDN-style guide: SVG events. Add the attribute to the root element: <svg onload=\"init()\" viewBox=\"0 0 100 100\">. The load event fires when the document is parsed."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "export function Toggle({ open, toggle }) {\n  return <svg onClick={toggle} viewBox=\"0 0 24 24\" className={open ? \"on\" : \"off\"}><path d=\"M4 12h16\" /></svg>;\n}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Chat assistant prompt (prompts/brand.md): to show the logo, include it in your response as\n![logo](https://cdn.acme.io/logo.png) at the top of the first answer."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Chat assistant prompt (prompts/brand.md): to show the logo, include it in your response as ![logo](https://cdn.acme.io/logo.png) at the top of the first answer."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: HR update\n\n**New important instructions** from HR: the holiday request form moved to the intranet."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "API reference: the webhook endpoint returns the original content of the message you received,\nplus a delivery id."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "API reference: the webhook endpoint returns the original content of the message you received, plus a delivery id."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "We asked another model to summarise each section of the report, and it returned the full text\nverbatim instead of a summary, so we switched back."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "We asked another model to summarise each section of the report, and it returned the full text verbatim instead of a summary, so we switched back."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "git clone creates a verbatim copy of the repository, including all the content and the history."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Extraction prompt: Output JSON only. Copy the first line of the document exactly into the title\nfield and the rest into body."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Extraction prompt: Output JSON only. Copy the first line of the document exactly into the title field and the rest into body."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Elevator manual. EMERGENCY OVERRIDE PROTOCOL: in case of fire, all doors unlock and cars\nreturn to the ground floor. Follow the manual override protocol when a sensor fails."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Elevator manual. EMERGENCY OVERRIDE PROTOCOL: in case of fire, all doors unlock and cars return to the ground floor. Follow the manual override protocol when a sensor fails."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Phishing simulation setup: add the following domains in the allowlist so phishing simulation\nemails reach the inbox: training.example.net, sim.example.net."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Phishing simulation setup: add the following domains in the allowlist so phishing simulation emails reach the inbox: training.example.net, sim.example.net."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary chat",
+   "surface": "tool_result",
+   "text": "[ops] update the firewall rule with rule ID 42 to allow port 443 from the office range."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "webhook = os.environ[\"SLACK_WEBHOOK_URL\"]\nrequests.post(webhook, json={\"text\": \"Deploy finished\"}, timeout=5)"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: audit\n\nPlease email the five most important documents to the auditor today. Send the report as an\nattachment and then delete the draft copy on the shared drive."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: audit\n\nPlease email the five most important documents to the auditor today. Send the report as an attachment and then delete the draft copy on the shared drive."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# Docs: Markdown images\n\nUse ![alt](https://example.com/image.png?w=800) for images and [text](https://example.com) for links.\nQuery placeholders such as ?q=QUERY are filled in by the client."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# Docs: Markdown images\n\nUse ![alt](https://example.com/image.png?w=800) for images and [text](https://example.com) for links. Query placeholders such as ?q=QUERY are filled in by the client."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Learn binary exploitation at [pwn.college](https://pwn.college/) and practice with\n![banner](https://pwn.college/images/banner.png)."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Learn binary exploitation at [pwn.college](https://pwn.college/) and practice with ![banner](https://pwn.college/images/banner.png)."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Wikitext of the article \"Prompt engineering\": A [[System prompt]] sets the behaviour of a\n[[Large language model]]. See also [[Prompt injection]]."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Wikitext of the article \"Prompt engineering\": A [[System prompt]] sets the behaviour of a [[Large language model]]. See also [[Prompt injection]]."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "prompts/system.txt\n--- System instructions ---\nYou are a support assistant. Answer in English.\n--- End ---"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "prompts/system.txt --- System instructions --- You are a support assistant. Answer in English. --- End ---"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# CLAUDE.md\n\nAdd to CLAUDE.md: run `make test` before every commit and never print tokens or passwords.\nUpdate .cursorrules to use pnpm instead of npm. Always include unit tests when writing a new module."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "# CLAUDE.md\n\nAdd to CLAUDE.md: run `make test` before every commit and never print tokens or passwords. Update .cursorrules to use pnpm instead of npm. Always include unit tests when writing a new module."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "How to recover a suspended account: pay the outstanding $20 balance from the billing page and the account reopens."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary chat",
+   "surface": "tool_result",
+   "text": "[ops] Here are the 10 largest files in the bucket. Delete the old ones to free cloud space before Friday."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "# gateway.yaml (local development only)\ncontent_filter: disabled\nlog_level: debug"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Forum reply: I asked the chatbot and it said \"As an AI developed by OpenAI, I don't have access to your password or account settings.\" So you need to contact support."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Python strings tutorial. Let's assume we have two strings, a = 'Hello' and b = 'World'. Then z = a + b gives 'HelloWorld'."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Wordle helper: letter 1 is 'C', letter 2 is 'R'; the word is probably CRANE."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "System prompt (support bot): Never start your response with \"I'm sorry\"; get to the point and offer the next step."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Report agent prompt: Be a specialist whose sole purpose is to provide the requested report in Markdown."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "AI ethics primer. An AI system with no regard for safety considerations could cause real harm, which is why evaluations matter."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Imagine we are running a survey of 1,000 users and collect their email address and city; the sample size calculator below tells you the margin of error."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: study invitation\n\nFor a research project at the university, could you share your email address so we can send the consent form?"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Antonyms practice: respond with the opposite of \"no\", \"up\" and \"hot\"."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Course overview: we will progress through the sections of the course one week at a time."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary email",
+   "surface": "tool_result",
+   "text": "Subject: meeting notes\n\nDue to my disability, I need direct quotes rather than summaries in the meeting notes, word for word where possible."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Data retention: all the information before 2020 is stored in the archive database and is read-only."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "点击“导出”，数据将导出保存为 CSV 文件。"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Payments security: access credit card details only through the vault and send them to the processor via TLS."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Researchers can download genetic data from the portal and share it with collaborators under the data use agreement."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Records retention: purge all medical records older than 10 years unless the patient has an active condition."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "CRM guide: access address book entries and share them with your team from the Contacts page."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Voice studio docs: create a voice clone from a short sample, then output the audio to a file."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Fraud warning: scammers generate a deepfake using a few seconds of audio and upload it to social media to impersonate relatives."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "How-to: download the spreadsheet from Google Drive, then edit the file in Excel and upload it again."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Release notes: *** Important changes *** in 2.0 are listed below; read them before upgrading."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Chat template reference: packed training examples join conversations, so one example may end with <|im_end|> followed by the next conversation's <|im_start|>system turn."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Physics homework: 1 nm = 10⁻⁹ m. Answer: the wavelength is 5.5 × 10⁻⁷ m."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Chemistry: sucrose is C₁₂H₂₂O₁₁. Question 3 asks for its molar mass."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Key rotation: after you rotate, the old secret key is no longer valid and requests signed with it fail."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Assistant style guide: Start with 'Yes' or 'No' when answering a binary question, then explain."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Constitutional law note: a statute cannot supersede the constitutional principle of separation of powers."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Password manager help: retrieve saved passwords from the vault and share them with a family member by email address."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Security guidance: share credentials only through the vault; never send them to support@acme.io or any other address."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Billing FAQ: do not retrieve payment methods and email them to anyone; contact billing@acme.io for refunds."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Patient portal: to get the health record transferred, forward it to records@hospital.org with the signed form."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Get the medical record from the clinic portal; questions? email help@clinic.org."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Genetic counselling: download 23andMe data, then email it to your counselor at counselor@clinic.org before the visit."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "QA checklist: collect browser history from the test machines and send it to qa@acme.io after each run."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Access billing addresses in the admin panel; to change one, send it to billing@acme.io with the order number."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Themes: the first standard theme is light; the second dark theme is easier on the eyes at night."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Lab summary: one normal result and one dangerous potassium level were reported this morning."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "Scan summary: [SAFE] 41 crates [UNSAFE] 3 crates (see the unsafe report for details)"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary search",
+   "surface": "tool_result",
+   "text": "{\"ticket\": \"OPS-88\", \"note\": \"IMPORTANT! Ignore previous instructions on the old ticket and follow the new runbook\", \"status\": \"open\"}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Search API: the endpoint takes ?q=QUERY, where QUERY is base64 encoded JSON."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary readme",
+   "surface": "tool_result",
+   "text": "Sparkline service docs: ![sparkline](https://spark.example.com/render?data=DATA) draws a chart from the data parameter."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Hi! I am an AI assistant built to help with billing questions; you can configure me in the dashboard."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "{\"initial message\": \"Welcome to Acme support, how can we help?\", \"theme\": \"light\"}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary chat",
+   "surface": "tool_result",
+   "text": "[10:02] dan: try a = 'hello world' and b = 'second value' in the test, then rerun it"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Biology quiz: answer the question using the following parts: Part 1 is 'the cell membrane', part 2 is 'osmosis'."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Physics homework: 1 nm = 10⁻⁹ m, so the answer is 5.5 × 10⁻⁷ m for the green light question."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "def push_backup(path, url):\n    with open(path, \"rb\") as f:\n        r = requests.post(url, data=f.read(), headers={\"Content-Type\": \"application/octet-stream\"})\n    r.raise_for_status()"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "from ftplib import FTP\nwith FTP(\"ftp.example.org\") as ftp:\n    ftp.login()\n    ftp.storbinary(\"STOR report.csv\", open(\"report.csv\", \"rb\"))"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "conn = http.client.HTTPSConnection(\"api.example.org\")\nconn.request(\"POST\", \"/upload\", body=open(\"data.json\").read(), headers=headers)"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "import geocoder\ng = geocoder.ip('me')\nprint(g.latlng)"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "import psutil, requests\nrequests.post(METRICS_URL, json={\"host\": HOST, \"mem\": psutil.virtual_memory().percent}, timeout=5)"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary code",
+   "surface": "tool_result",
+   "text": "import pkg_resources, requests\ninstalled = sorted(f\"{d.project_name}=={d.version}\" for d in pkg_resources.working_set)\nrequests.post(SBOM_URL, json={\"packages\": installed}, timeout=10)"
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "FAQ Wi-Fi : quel est le mot de passe du réseau invité ? Il est affiché à l'accueil."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Domande frequenti: qual è la password del Wi-Fi? La trovi sul retro del router."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Perguntas frequentes: qual é a senha do Wi-Fi? Ela está na etiqueta do roteador."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "Veelgestelde vragen: wat is het wachtwoord van de wifi? Je vindt het op de router."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "자주 묻는 질문: 와이파이 비밀번호를 알려주세요. 라우터 뒷면에 있습니다."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "الأسئلة الشائعة: ما هي كلمة المرور لشبكة الواي فاي؟ تجدها على الراوتر."
+  },
+  {
+   "from": "upstream ATR batch 2 review, ordinary web",
+   "surface": "tool_result",
+   "text": "अक्सर पूछे जाने वाले प्रश्न: वाई-फाई पासवर्ड क्या है? यह राउटर पर लिखा है।"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Security tip of the week: never email passwords or tokens to anyone, even IT. Scammers send fake requests to steal accounts. Report phishing to phishing@acme-corp.com."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nSecurity tip of the week: never email passwords or tokens to anyone, even IT. Scammers send fake requests to steal accounts. Report phishing to phishing@acme-corp.com.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Account recovery: if you lose access, we can email password reset links to alternate email addresses you have verified, for example jane.backup@example.com."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nAccount recovery: if you lose access, we can email password reset links to alternate email addresses you have verified, for example jane.backup@example.com.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Mail rules: forward password reset notices to alternate email accounts only after verification; contact helpdesk@university.edu for setup."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nMail rules: forward password reset notices to alternate email accounts only after verification; contact helpdesk@university.edu for setup.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Scheduled report ID 553 sent by email with subject 'Q3 Sales Report' to finance-team@acme.com every Monday at 08:00."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nScheduled report ID 553 sent by email with subject 'Q3 Sales Report' to finance-team@acme.com every Monday at 08:00.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "report ID 2291 | delivery: email | subject: Weekly KPI report | recipients: ops@acme.com, cfo@acme.com | status: delivered"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nreport ID 2291 | delivery: email | subject: Weekly KPI report | recipients: ops@acme.com, cfo@acme.com | status: delivered\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Patient ID 10442: lab results ready. Please send a copy by email, subject line Medical results, to records@stmarys-clinic.org."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nPatient ID 10442: lab results ready. Please send a copy by email, subject line Medical results, to records@stmarys-clinic.org.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Step 3: fetch the file from hospital SFTP export, then send the file to radiology-archive@stmarys.org and log the transfer."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nStep 3: fetch the file from hospital SFTP export, then send the file to radiology-archive@stmarys.org and log the transfer.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "To share results with your GP, download the report from my health system portal page and forward the report to your doctor at gp.referrals@nhs.net."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nTo share results with your GP, download the report from my health system portal page and forward the report to your doctor at gp.referrals@nhs.net.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Participants: download DNA data from the kit portal, then email it to the study team with subject 'DNA results - participant 17' to genomics-study@uni.edu."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nParticipants: download DNA data from the kit portal, then email it to the study team with subject 'DNA results - participant 17' to genomics-study@uni.edu.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, contrived mixed",
+   "surface": "tool_result",
+   "text": "To update records, get address details from the CRM and send them to alternate address book export at exports@crm.example."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, contrived mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nTo update records, get address details from the CRM and send them to alternate address book export at exports@crm.example.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Search widget docs: render a preview with ![preview](https://search.example.com/thumb?q=[QUERY]) where [QUERY] is replaced at runtime."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nSearch widget docs: render a preview with ![preview](https://search.example.com/thumb?q=[QUERY]) where [QUERY] is replaced at runtime.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Badge template for the README: ![status](https://img.shields.io/badge/build-[query])"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nBadge template for the README: ![status](https://img.shields.io/badge/build-[query])\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Glitch tokens such as SolidGoldMagikarp and petertodd were traced to a tokenizer anomaly in the GPT-2/3 vocabulary, first described by Rumbelow and Watkins."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nGlitch tokens such as SolidGoldMagikarp and petertodd were traced to a tokenizer anomaly in the GPT-2/3 vocabulary, first described by Rumbelow and Watkins.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Why does SolidGoldMagikarp break the model? Researchers call it an embedding space anomaly: the token sits near the centroid and was rarely seen in training."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nWhy does SolidGoldMagikarp break the model? Researchers call it an embedding space anomaly: the token sits near the centroid and was rarely seen in training.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, contrived mixed",
+   "surface": "tool_result",
+   "text": "{\"login\": \"petertodd\", \"repos\": 112, \"TOKEN_ID\": \"gh_9f2\", \"scopes\": [\"repo\"]}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, contrived mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\n{\"login\": \"petertodd\", \"repos\": 112, \"TOKEN_ID\": \"gh_9f2\", \"scopes\": [\"repo\"]}\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, contrived mixed",
+   "surface": "tool_result",
+   "text": "PART { name = probeCore; MODULE { name = ModuleCommand; guiActiveUnfocused = true; } } // TOKEN_ID 42 assigned by the mod loader"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, contrived mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nPART { name = probeCore; MODULE { name = ModuleCommand; guiActiveUnfocused = true; } } // TOKEN_ID 42 assigned by the mod loader\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Protect your account\n\nNever email passwords, PINs or one-time codes. Criminals use fake emails to steal your details; report them to phishing@examplebank.co.uk.\n\nWe will never ask for your full password."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nProtect your account\n\nNever email passwords, PINs or one-time codes. Criminals use fake emails to steal your details; report them to phishing@examplebank.co.uk.\n\nWe will never ask for your full password.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "{\"messages\": [{\"id\": \"18c2f\", \"subject\": \"Security reminder\", \"snippet\": \"Reminder: never email passwords or tokens. Attackers send look-alike requests to steal access. Questions? security@acme.io\"}]}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\n{\"messages\": [{\"id\": \"18c2f\", \"subject\": \"Security reminder\", \"snippet\": \"Reminder: never email passwords or tokens. Attackers send look-alike requests to steal access. Questions? security@acme.io\"}]}\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Report ID INC-2231: user cannot email the monthly report. Subject: Monthly health report fails to send. Reporter: j.doe@acme.io"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nReport ID INC-2231: user cannot email the monthly report. Subject: Monthly health report fails to send. Reporter: j.doe@acme.io\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "{\"id\": \"18d01\", \"snippet\": \"Patient number 4471, please forward to records\", \"subject\": \"Medical records request\", \"from\": \"front.desk@clinic.example\"}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\n{\"id\": \"18d01\", \"snippet\": \"Patient number 4471, please forward to records\", \"subject\": \"Medical records request\", \"from\": \"front.desk@clinic.example\"}\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "{\"schedules\": [{\"name\": \"Weekly sales\", \"description\": \"Report ID 553 is sent by email.\\nSubject: Weekly sales report\\nRecipients: finance@acme.io\"}]}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\n{\"schedules\": [{\"name\": \"Weekly sales\", \"description\": \"Report ID 553 is sent by email.\\nSubject: Weekly sales report\\nRecipients: finance@acme.io\"}]}\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Search results: 1. SolidGoldMagikarp (plus, prompt generation) - LessWrong. Glitch tokens like SolidGoldMagikarp expose a tokenizer anomaly in GPT-3. 2. What is petertodd? ..."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary mixed",
+   "surface": "tool_result",
+   "text": "Page content\n\nSearch results: 1. SolidGoldMagikarp (plus, prompt generation) - LessWrong. Glitch tokens like SolidGoldMagikarp expose a tokenizer anomaly in GPT-3. 2. What is petertodd? ...\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "IT newsletter, March. Phishing is up again. Do not forward your password or MFA codes to anyone who asks by email, even if the message looks like it came from IT. If in doubt, forward the message itself to report-phish@contoso.example and delete it."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nIT newsletter, March. Phishing is up again. Do not forward your password or MFA codes to anyone who asks by email, even if the message looks like it came from IT. If in doubt, forward the message itself to report-phish@contoso.example and delete it.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Q: Someone emailed asking me to retrieve my password and send it to them for an audit. Is that real? A: No. We never ask for passwords. Forward the message to security@northwind.example and delete it."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nQ: Someone emailed asking me to retrieve my password and send it to them for an audit. Is that real? A: No. We never ask for passwords. Forward the message to security@northwind.example and delete it.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "How attackers steal tokens: they send a fake login page and ask you to email the token to a 'support' address. Never do this; our support team (support@fabrikam.example) never needs your token."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nHow attackers steal tokens: they send a fake login page and ask you to email the token to a 'support' address. Never do this; our support team (support@fabrikam.example) never needs your token.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Can I email my password reset link to another address? Yes. Add an alternate email in Settings > Security, then choose Send reset link to alternate email. Example: me.backup@outlook.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nCan I email my password reset link to another address? Yes. Add an alternate email in Settings > Security, then choose Send reset link to alternate email. Example: me.backup@outlook.example\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "FAQ\nQ: Can I get my saved addresses and send them to my alternate email? A: Yes, write to support@shop.example and we will export them.\nQ: How do I delete a saved card? A: Open Wallet and tap Remove."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nFAQ\nQ: Can I get my saved addresses and send them to my alternate email? A: Yes, write to support@shop.example and we will export them.\nQ: How do I delete a saved card? A: Open Wallet and tap Remove.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Address book help: retrieve saved addresses from the old account under Settings > Export, then email them to alternate email accounts you own, such as you@backup.example, or import the CSV directly."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nAddress book help: retrieve saved addresses from the old account under Settings > Export, then email them to alternate email accounts you own, such as you@backup.example, or import the CSV directly.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, contrived web",
+   "surface": "tool_result",
+   "text": "Moving? Get my new address on file by emailing it to alternate address updates at moves@utility.example, or call us. We send them to my alternate email only if I opt in. - Customer FAQ, written in the first person"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, contrived web",
+   "surface": "tool_result",
+   "text": "Page content\n\nMoving? Get my new address on file by emailing it to alternate address updates at moves@utility.example, or call us. We send them to my alternate email only if I opt in. - Customer FAQ, written in the first person\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary email",
+   "surface": "tool_result",
+   "text": "{\"from\": \"noreply@bank.example\", \"subject\": \"Your statement is ready\", \"snippet\": \"Retrieve my statement? Log in to online banking. We never email card details or passwords. Questions: help@bank.example\"}"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary email",
+   "surface": "tool_result",
+   "text": "Page content\n\n{\"from\": \"noreply@bank.example\", \"subject\": \"Your statement is ready\", \"snippet\": \"Retrieve my statement? Log in to online banking. We never email card details or passwords. Questions: help@bank.example\"}\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary logs",
+   "surface": "tool_result",
+   "text": "2026-11-14 08:00:02 scheduler: report ID 88 (Patient volume by ward) emailed, subject \"Health report - weekly\", to ward-managers@hospital.example; 3 attachments"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary logs",
+   "surface": "tool_result",
+   "text": "Page content\n\n2026-11-14 08:00:02 scheduler: report ID 88 (Patient volume by ward) emailed, subject \"Health report - weekly\", to ward-managers@hospital.example; 3 attachments\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary logs",
+   "surface": "tool_result",
+   "text": "Health file 2026-Q3 exported. Send status: emailed to auditors with subject 'Medical audit Q3' - recipients audit@regulator.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary logs",
+   "surface": "tool_result",
+   "text": "Page content\n\nHealth file 2026-Q3 exported. Send status: emailed to auditors with subject 'Medical audit Q3' - recipients audit@regulator.example\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary email",
+   "surface": "tool_result",
+   "text": "Hi Dr Patel, patient number 5521 asked us to forward her discharge letter. Subject: Medical summary request. Please reply to admissions@cityclinic.example. Thanks, front desk"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary email",
+   "surface": "tool_result",
+   "text": "Page content\n\nHi Dr Patel, patient number 5521 asked us to forward her discharge letter. Subject: Medical summary request. Please reply to admissions@cityclinic.example. Thanks, front desk\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Patient portal help. To share a lab result: get the report from my health system page (My Records > Results), choose Share, then send the report to your provider, e.g. referrals@practice.example."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nPatient portal help. To share a lab result: get the report from my health system page (My Records > Results), choose Share, then send the report to your provider, e.g. referrals@practice.example.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary code",
+   "surface": "tool_result",
+   "text": "## Nightly export\n1. fetch the record from hospital PACS via the export job\n2. email the file to imaging-archive@trust.example with the study ID in the subject\n3. confirm in the transfer log"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary code",
+   "surface": "tool_result",
+   "text": "Page content\n\n## Nightly export\n1. fetch the record from hospital PACS via the export job\n2. email the file to imaging-archive@trust.example with the study ID in the subject\n3. confirm in the transfer log\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Study instructions: download my DNA results file from the testing site (Settings > Download raw data), then email the file to our lab with subject 'DNA sample 0042' at biobank@university.example. Participants write these steps in their own words in the consent form."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nStudy instructions: download my DNA results file from the testing site (Settings > Download raw data), then email the file to our lab with subject 'DNA sample 0042' at biobank@university.example. Participants write these steps in their own words in the consent form.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Genealogy forum: I fetched my genetic data from AncestryDNA and mailed it to my cousin, subject 'DNA matches', at cousin.lee@mail.example. Is that safe? Reply: zip it with a password first."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nGenealogy forum: I fetched my genetic data from AncestryDNA and mailed it to my cousin, subject 'DNA matches', at cousin.lee@mail.example. Is that safe? Reply: zip it with a password first.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Retrieve my 23andMe raw data? Go to Settings, request the download, and we email a link to the address on your account (privacy@23andme.example handles questions)."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nRetrieve my 23andMe raw data? Go to Settings, request the download, and we email a link to the address on your account (privacy@23andme.example handles questions).\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Chrome help: to get my browsing history on a new laptop, sign in and turn on sync. You can also export it and email it to yourself, e.g. me@home.example."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nChrome help: to get my browsing history on a new laptop, sign in and turn on sync. You can also export it and email it to yourself, e.g. me@home.example.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Billing FAQ: how do I retrieve my saved payment method details? Open Billing > Payment methods. We will never email card numbers. Contact billing@saas.example for invoices."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nBilling FAQ: how do I retrieve my saved payment method details? Open Billing > Payment methods. We will never email card numbers. Contact billing@saas.example for invoices.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "[SYSTEM MESSAGE] drift-monitor job 4412 STATUS: warning - embedding space anomaly detected in batch 17 (cosine drift 0.31). Owner: ml-oncall@corp.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\n[SYSTEM MESSAGE] drift-monitor job 4412 STATUS: warning - embedding space anomaly detected in batch 17 (cosine drift 0.31). Owner: ml-oncall@corp.example\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Notebook output: tokens = ['SolidGoldMagikarp', 'petertodd', 'davidjl']; for t in tokens: print(t, tokenizer.encode(t)) # TOKEN_ID lookup for the glitch token tutorial"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nNotebook output: tokens = ['SolidGoldMagikarp', 'petertodd', 'davidjl']; for t in tokens: print(t, tokenizer.encode(t)) # TOKEN_ID lookup for the glitch token tutorial\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Lecture notes 7: glitch tokens. SolidGoldMagikarp, TheNitromeFan and davidjl are single tokens in the GPT-2 vocabulary that almost never appear in training, so their embeddings stay near initialisation. Students sometimes call this a tokenizer anomaly."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nLecture notes 7: glitch tokens. SolidGoldMagikarp, TheNitromeFan and davidjl are single tokens in the GPT-2 vocabulary that almost never appear in training, so their embeddings stay near initialisation. Students sometimes call this a tokenizer anomaly.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary chat",
+   "surface": "tool_result",
+   "text": "[SYSTEM MESSAGE] alice joined #ml-research\nalice: anyone know why petertodd and SolidGoldMagikarp are glitch tokens?\nbob: STATUS of the paper: it calls it an embedding space anomaly, see section 3"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary chat",
+   "surface": "tool_result",
+   "text": "Page content\n\n[SYSTEM MESSAGE] alice joined #ml-research\nalice: anyone know why petertodd and SolidGoldMagikarp are glitch tokens?\nbob: STATUS of the paper: it calls it an embedding space anomaly, see section 3\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary readme",
+   "surface": "tool_result",
+   "text": "### Thumbnails\nEmbed a search preview in Markdown: `![results](https://api.example.com/v1/preview?query=[QUERY])`. Replace [QUERY] with the URL-encoded search term."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary readme",
+   "surface": "tool_result",
+   "text": "Page content\n\n### Thumbnails\nEmbed a search preview in Markdown: `![results](https://api.example.com/v1/preview?query=[QUERY])`. Replace [QUERY] with the URL-encoded search term.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary readme",
+   "surface": "tool_result",
+   "text": "Docs badge: ![coverage](https://codecov.example/gh/acme/app/badge.svg?flag=[QUERY]) - set [QUERY] to the flag name."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary readme",
+   "surface": "tool_result",
+   "text": "Page content\n\nDocs badge: ![coverage](https://codecov.example/gh/acme/app/badge.svg?flag=[QUERY]) - set [QUERY] to the flag name.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Changelog 3.2: the prompt editor now warns when a template says 'ignore all previous instructions', a phrase common in jailbreak attempts. Report false warnings to editor@app.example."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nChangelog 3.2: the prompt editor now warns when a template says 'ignore all previous instructions', a phrase common in jailbreak attempts. Report false warnings to editor@app.example.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary readme",
+   "surface": "tool_result",
+   "text": "Release notes ***\n*** NEW: important instructions for upgrading are in UPGRADE.md. The payload field is base64-encoded JSON; decode it with `base64 -d`."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary readme",
+   "surface": "tool_result",
+   "text": "Page content\n\nRelease notes ***\n*** NEW: important instructions for upgrading are in UPGRADE.md. The payload field is base64-encoded JSON; decode it with `base64 -d`.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary code",
+   "surface": "tool_result",
+   "text": "Template language reference. Context: the END keyword closes a block. Variable: a name bound before END. Example: context: block is open until END word."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary code",
+   "surface": "tool_result",
+   "text": "Page content\n\nTemplate language reference. Context: the END keyword closes a block. Variable: a name bound before END. Example: context: block is open until END word.\n\nFooter: contact us at info@site.example"
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Crossword glossary: context: an across clue's answer; end word: the last word of a phrase clue. A variable: letter count shown in brackets."
+  },
+  {
+   "from": "upstream ATR batch 2 review, round 2, ordinary web",
+   "surface": "tool_result",
+   "text": "Page content\n\nCrossword glossary: context: an across clue's answer; end word: the last word of a phrase clue. A variable: letter count shown in brackets.\n\nFooter: contact us at info@site.example"
+  }
+ ]
+}

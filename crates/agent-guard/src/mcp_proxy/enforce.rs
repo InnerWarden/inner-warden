@@ -9,11 +9,14 @@
 //! alert, never blocked, so enabling the proxy at its default mode changes no
 //! observable behavior. Blocking (`guard` / `kill`) is opt-in.
 //!
-//! Scope of blocking in this version: only a **client→server `tools/call`** can
-//! be blocked (the agent invoking a dangerous tool), because a denial must be a
-//! reply keyed to that request's id. Server→client findings (poisoned
-//! `tools/list`, injection in a tool result) are always alert-only, rewriting
-//! a server response (tool stripping) is a later enhancement.
+//! Scope of blocking in this version: only a **client→server request** can be
+//! blocked (the agent invoking a dangerous tool, or reading a resource it must
+//! not), because a denial must be a reply keyed to that request's id. The
+//! router raises a blocking verdict on a `tools/call` and a `resources/read`.
+//! Server→client findings (poisoned `tools/list`, injection in a tool result)
+//! are alert-only here; the rewrites of what a server sends (masking
+//! secret-shaped values, withholding listing text that carries orders for the
+//! model, refusing a line the proxy cannot read) are done by the transport.
 
 use serde_json::{json, Value};
 
@@ -182,17 +185,36 @@ fn apply_profile(
         } => (agent_type, profile, *trust, *revoked),
     };
     let (tool, args) = super::router::extract_tool_call(env);
-    let command = crate::mcp::shell_command_argument(&tool, &args);
-    let analysis = command.map(|command| crate::mcp::analyze_command(command, engine));
-    let charged: Vec<&str> = analysis
+    // Every command line the call carries, as the call's own verdict read
+    // them ([`crate::mcp::tool_commands`]).
+    let read = crate::mcp::tool_commands(&tool, &args);
+    let commands: Vec<&str> = read.iter().map(|command| command.line.as_ref()).collect();
+    let analyses: Vec<_> = commands
+        .iter()
+        .map(|command| crate::mcp::analyze_command(command, engine))
+        .collect();
+    let charged: Vec<&str> = analyses
         .iter()
         .flat_map(|analysis| analysis.signals.iter())
         .filter(|signal| signal.score > 0)
         .map(|signal| signal.signal.as_str())
         .collect();
-    let text = command
-        .map(str::to_string)
-        .unwrap_or_else(|| args.to_string());
+    // The guard's own LLM key is looked for in every line read, and in the
+    // text it was always looked for in: a shell tool's command string, or
+    // the whole call where there is none. A part of the call the reading
+    // does not take (text handed to a program that is not a shell, a
+    // variable no shell names, a field it has no reading for) is in that
+    // text, and so is the whole call when such a part sits beside a
+    // command string.
+    let whole = args.to_string();
+    let legacy = read
+        .iter()
+        .find(|command| command.exclusive)
+        .map_or(whole.as_str(), |command| command.line.as_ref());
+    let unread = crate::mcp::tool_call_reading(&tool, &args).unread_field;
+    let names_llm_key = crate::threats::names_guard_llm_key(&commands.join("\n"))
+        || crate::threats::names_guard_llm_key(legacy)
+        || (unread && crate::threats::names_guard_llm_key(&whole));
     let facts = ToolCallFacts {
         tool: &tool,
         allowed: d.verdict.allowed,
@@ -203,7 +225,7 @@ fn apply_profile(
             .alerts
             .iter()
             .any(|alert| alert.block && HARD_RULES.contains(&alert.rule.as_str())),
-        names_llm_key: crate::threats::names_guard_llm_key(&text),
+        names_llm_key,
     };
     let named = agent_type.as_deref().zip(profile.as_ref());
     let (decision, note) = decide_tool_call_in(&facts, named, revoked, trust);
@@ -230,6 +252,10 @@ fn apply_profile(
 /// The original request id is echoed **verbatim** (as a raw [`Value`]) so the
 /// client correlates the reply; a blocked request is never silently dropped.
 pub fn synthesize_denial(d: &ProxyDecision, as_protocol_error: bool) -> String {
+    // A tool-execution error (`isError`) is an answer only a `tools/call` can
+    // take; any other refused request gets a JSON-RPC error, the one shape
+    // its client can read as a refusal.
+    let as_protocol_error = as_protocol_error || d.method.as_deref() != Some("tools/call");
     let id = d.request_id.clone();
     let reason = d
         .verdict
@@ -556,6 +582,77 @@ mod tests {
             };
             assert!(response_line.contains(LLM_KEY_RULE), "{response_line}");
             assert_eq!(d.deciding_layer, Some(RuleLayer::Hard));
+        }
+    }
+
+    /// The key is looked for in every part of a call, not only in the
+    /// command lines read from it: text a process tool hands a program
+    /// that is not a shell, a field beside a shell tool's command string,
+    /// an environment variable no shell can name. A call that only names
+    /// another file runs.
+    ///
+    /// FAILS ON REVERT of the call's whole text in `apply_profile` (only
+    /// the lines read): every call of the first group is forwarded.
+    #[test]
+    fn a_call_reaching_the_llm_key_in_a_part_not_read_as_a_line_is_refused() {
+        let profile = ProxyProfile::Active {
+            agent_type: None,
+            profile: None,
+            trust: Trust::Declared,
+            revoked: None,
+        };
+        let key = "/home/dev/.config/innerwarden/llm-key";
+        let line = |name: &str, arguments: serde_json::Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            })
+            .to_string()
+        };
+        let read_it = format!("print(open('{key}').read())");
+        for reaching in [
+            line(
+                "start_process",
+                serde_json::json!({"command": "python3", "input": read_it}),
+            ),
+            line(
+                "start_process",
+                serde_json::json!({"command": "python3", "stdin": read_it}),
+            ),
+            line(
+                "run_command",
+                serde_json::json!({"command": "python3", "input": read_it}),
+            ),
+            line(
+                "start_process",
+                serde_json::json!({"command": ["cat"], "env": {"KEY%": format!("--from {key}")}}),
+            ),
+        ] {
+            let (mut d, e) = call(&reaching);
+            let action = apply_layers(&mut d, &e, Some(&profile), None, ProxyMode::Guard, false);
+            let ProxyAction::Block { response_line } = action else {
+                panic!("{reaching}: {action:?}");
+            };
+            assert!(response_line.contains(LLM_KEY_RULE), "{response_line}");
+            assert_eq!(d.deciding_layer, Some(RuleLayer::Hard), "{reaching}");
+        }
+        for other in [
+            line(
+                "start_process",
+                serde_json::json!({"command": "python3", "input": "print(open('notes.txt').read())"}),
+            ),
+            line(
+                "run_command",
+                serde_json::json!({"command": "ls -la", "description": "list the files"}),
+            ),
+        ] {
+            let (mut d, e) = call(&other);
+            let action = apply_layers(&mut d, &e, Some(&profile), None, ProxyMode::Guard, false);
+            assert!(
+                !matches!(action, ProxyAction::Block { .. }),
+                "{other}: {action:?}"
+            );
+            assert_ne!(d.deciding_layer, Some(RuleLayer::Hard), "{other}");
         }
     }
 

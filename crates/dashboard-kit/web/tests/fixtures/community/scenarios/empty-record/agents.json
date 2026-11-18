@@ -16,7 +16,7 @@
       "id": "claude-code",
       "installed": true,
       "judges": "shell_and_privileged_files",
-      "judges_line": "Shell commands, and file changes (Write, Edit, MultiEdit, NotebookEdit) to privileged files such as its settings, the guard's configuration and your shell startup files. Its other tools are recorded after they run.",
+      "judges_line": "Shell commands, file changes (Write, Edit, MultiEdit, NotebookEdit) to privileged files such as its settings, the guard's configuration and your shell startup files, and reads (Read, Grep, Glob) of secrets such as private keys and stored logins. Its other tools are recorded after they run.",
       "mode_steps": {
         "enforce": {
           "command": "innerwarden agents connect claude-code",

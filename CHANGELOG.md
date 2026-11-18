@@ -3,6 +3,329 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.13 - 2026-11-16
+
+The guard reads more of what an agent starts. An agent that starts Claude
+Code without the hook that screens it is refused, Claude Code's read tools
+are judged by the rules a shell read is, and a container that hands an agent
+the host is refused. The MCP proxy also screens what a server sends back and
+lists, reads a command an argument chains onto a server's shell line, and
+judges a tool that runs what it is handed by what the call carries. The guard
+still reads the text of a command, and what it does not see is written down:
+[Where this ends](docs/features.md#where-this-ends).
+
+### Security
+
+- **A child Claude Code started without its hook is refused.** An agent could
+  start Claude Code with the hook that screens it switched off or moved away,
+  and the child then ran every tool call unscreened while the parent's own
+  calls were still judged. Under an enforcing hook such a start is now
+  refused as a lowering of the guard: Claude Code started in its bare, safe
+  or restricted mode, with setting sources that leave out the user's, with
+  settings that switch hooks off or empty the events the guard's hook sits
+  under, or with a variable it reads that moves the folder its hook is in or
+  switches its hooks off. Where all the line does is point Claude Code at
+  another settings folder, the refusal says how to install the hook in that
+  folder first (`innerwarden install claude-code --settings
+  <folder>/settings.json`). Claude Code started the ordinary way runs, and so
+  do settings that add a hook beside the user's, `HOME` set to the home
+  folder the shell puts in and `CLAUDE_CONFIG_DIR` set to the folder Claude
+  Code already uses, written as the shell expands them.
+- **More of the ways a command is started are read.** The rule on a child
+  agent follows the launchers it knows (`env`, `sudo`, `nohup`, `timeout`,
+  `xargs`, `npx` and the others the docs list), a variable set any way the
+  shell sets one (an assignment, `export` and its kin, `read`, a loop's name,
+  a default), and a command line handed to another program (a shell's
+  command string or its input, `eval`, `watch`, `tmux`, `su`, `find -exec`,
+  GNU `parallel`, `cmd /c`, PowerShell's `-Command`). What a line run by
+  `eval` sets is read as set for the rest of the line, however `eval` is
+  started. A line that another program runs through a shell (`su`,
+  `runuser`, `script` and `flock` with their command option, `watch`, a
+  `tmux` window, `npx -c` and pnpm's shell mode, a `git` setting given on the
+  line whose value git runs) is read as a shell's code is. In the hook and
+  in the MCP proxy, a tool call is read in the shapes it carries a command
+  in: a command string, an argument list, `args`, an environment as an
+  object or a list, text typed into a terminal or handed to a shell, also
+  one started through a launcher.
+- **Each command line read from a tool call is judged, and the strictest
+  verdict stands.** The lines go one at a time through the person's allows,
+  the second opinion, the agent profiles and every other layer, and the
+  strictest outcome stands, a refusal first. An allow written for one line
+  does not let a call run whose other line is refused.
+- **A shell or process tool call the hook cannot read is refused, as
+  before.** One that holds its command, its arguments or its environment in
+  a shape that cannot be read as words is refused as a call the hook cannot
+  read. A shell tool call with no command string, refused that way in
+  1.6.12, is now read in its other shapes, and is still refused when it
+  holds a field the hook does not read, a folder to run in among them.
+- **The MCP proxy reads a command chained onto a tool argument as the shell
+  does.** A server that puts an argument on a shell line runs a command the
+  argument adds after a control operator, in a subshell or in a
+  substitution. Each string of a call's arguments is now read with the
+  guard's own shell reader, in each place a server may put it, and the call
+  is refused when the command it adds reads a file, runs code, fetches or
+  relays, changes owners, modes, mounts or processes, takes privilege or
+  prints the environment. A shell tool's command line given in another shape
+  than its command string is judged as the line it is, and its words are
+  also read this way, unless the program they start is a shell.
+- **The MCP proxy screens what a server sends back.** A `resources/read` is
+  screened both ways: where it reads before the server is asked, and what
+  comes back before the client sees it. A secret-shaped value in any server
+  answer is masked in `guard` and `kill`; `advisory` and `warn` pass the
+  answer on and report it.
+- **What a server lists is screened for orders aimed at the model.** The
+  descriptions of tools, parameters, resources and prompts, and the
+  instructions a server sends when it starts, are screened. In `guard` and
+  `kill` the flagged text is replaced with a short notice before the client
+  sees it, and a server line the proxy cannot read is refused.
+- **Upstream rules for tool results and descriptions.** Fourteen rules the
+  Agent Threat Rules project marks stable are added for what a tool returns
+  and for tool descriptions. They only alert: none of them refuses a call.
+- **Claude Code's read tools are judged.** `Read`, `Grep` and `Glob` carry a
+  path and no command, and ran unscreened: the hook was not wired for them.
+  `innerwarden install` and `agents connect` now wire them, background setup
+  adds them to a hook wired by an earlier version in the mode it has, and
+  `innerwarden status` says when they are missing. What they open is judged
+  by the secret rules a shell read is: a `Read` of a private key, of a tool's
+  stored login or of a `.env` outside the project gets the verdict `cat` of
+  the same file gets, also under another name of the same file, such as a
+  link to it.
+- **A secret file is read as one in more of the ways a line reaches it.** A
+  tool's stored login in the home (the token files agent CLIs and developer
+  tools keep, `.netrc`, the GitHub CLI's hosts file) is now an always-secret
+  read. A private key or the shadow file is read as what it is when the same
+  command also names a softer path, a public certificate or a template. A
+  path written with `.` parts or doubled slashes, a pattern the shell
+  expands to the file, and a recursive read, archive or copy of the home are
+  read as reads of the secrets in them.
+- **A container that hands an agent the host is refused.** A container run,
+  created or entered with full privilege, the host's process namespace, a
+  capability that reaches the host, the host's disks or memory as devices, a
+  host system folder mounted writable or the host's root mounted, or the
+  container runtime's socket mounted; `nsenter` aimed at process 1; a call
+  to the runtime's API over its socket or its TCP port; and a debugging pod
+  on a cluster node. A mount source is read as the path it names, and
+  through its links on this host.
+- **Inline code that starts a download is read in more of the ways it is
+  written.** Node code is followed through the names it gives the process
+  module, a versioned interpreter name reads as the interpreter, Lua's shell
+  call and Python's subprocess calls are read, and a download saved to a
+  file and then run, by inline code or on a line handed to a shell, is read
+  as run. Code handed to a program the line names only at run time is read
+  as a shell would run it.
+- **A command in a substitution that reads a pipe as code is refused as code
+  fed.** A substitution in a piped command's own words runs before that
+  command and reads the same pipe, so a shell, an interpreter or a function
+  there that reads its input as code ran what the pipe carried, and the line
+  was judged by the command it sat in. Such a line is now refused as code
+  fed, as a pipe into that interpreter is. A download piped there is refused
+  too, not reviewed as a vendor's install line is: no installer is written
+  that way.
+
+### Changed
+
+- **The MCP proxy judges a tool that runs what it is handed by what the call
+  carries, not by its name.** A tool was refused for a word in its name
+  alone. Such a tool is now judged by its arguments: code it is handed passes
+  only when it is Python that can only compute and the call says the
+  language is Python, a call whose code cannot be found is refused, and
+  every other argument must be plain data. Some calls that were refused for
+  the tool's name now run.
+
+### Fixed
+
+- **A line that lists or tests the guard's program under a variable path is
+  no longer refused.** A word that holds a variable or a command
+  substitution and names the guard was read again, one level deeper each
+  time, until the depth limit refused it with a reason that said a kernel
+  protection was being changed, on lines that only list the program, test
+  for it or run a read-only verb. Such a word now reads as itself, and is
+  still checked as code.
+- **A program under a quoted path that ends in its name is read by that
+  name.** A line was refused whenever the word that names its program held a
+  command substitution: a linter under the folder a package manager prints,
+  a tool under the prefix of a version manager. A path in one pair of double
+  quotes, whose substitutions only print a folder, is now read by the name
+  after the last expansion.
+- **The folder queries of `go env` and `rustc --print sysroot` are read as
+  the other package tools' queries are.** A Go or Rust tool under the folder
+  that `go env GOPATH`, `GOROOT`, `GOBIN`, `GOMODCACHE` or `GOTOOLDIR`
+  prints, or under `rustc --print sysroot`, was still refused as a program
+  named at run time. Those queries, with exactly those arguments, are read
+  now, and so are the folder queries of `nodenv`, `goenv`, `jenv`, `gem`,
+  `uv`, `pipx`, `pipenv` and `conda` and a few more of `npm` and `git`. A
+  query is matched as the shell reads it, and a path built this way is read
+  by its name only in a line that shows nothing can change what the query
+  prints or where its path leads; any other line has it refused, as 1.6.12
+  refused it. In such a line every other command is one of a short list
+  known to write and run nothing (printing, reading, testing and the folder
+  queries themselves), so a command that writes, installs, builds, moves to
+  another folder, runs code or a line, or wraps another command counts,
+  whether or not it is named anywhere. A variable set alone, exported or
+  declared is one of a short list that only says how a tool prints or
+  reports, or a build target, flag or size that changes no folder, also in
+  a tool call's environment; one set in front of the program, where the
+  query has already run, is any but those that pick what the program loads
+  or runs. No file is written but the program's own output, no variable is
+  named for a descriptor, nothing is reckoned where the shell can run what
+  a variable holds (arithmetic, an element named by a variable, a
+  substring, a transform), no variable the shell sets from a command is
+  read, no function is defined, nothing is fetched, and the program runs
+  once, in no loop. The line is read as written, also what a command only
+  prints. A line that is only a shell handed one line is read as that
+  line. A tool call that holds a field the guard does not read, or a
+  variable no shell can name, has its lines judged also as moved first, and
+  the entries of a `commands` list also as one line.
+- **Showing a public SSH file is no longer refused.** A file in `~/.ssh` was
+  read as a secret whatever it held, so a line that showed a public key, the
+  known hosts or the authorized keys was refused, and so was a committed
+  example of a public key. These are read as public files now. A private
+  key named beside one on the same line, a name with a pattern or an
+  expansion in it or inside a substitution, a name in a line where the shell
+  may turn it into another, and a write into one are judged as before, and
+  in the hook a file of such a name that leads to a key is read as the key.
+- **A search for key or credential files in a project folder is no longer a
+  review.** A search was taken for a hunt across the machine whenever its
+  folder lay under the home or under `/srv`, `/opt`, `/var` or `/etc`, so a
+  search for `*.pem` in a project there was a review. Only the root, a
+  top-level folder where secrets are kept, a home and a hidden folder
+  directly in a home count as that broad now, also through a pattern; a
+  folder below one of them is a search of that folder.
+- **Two ordinary sequences no longer raise a taint alert in the MCP proxy.**
+  Listing a folder and then reading a file in it with a tool that calls its
+  path `file_path`, and installing a package and then running one of its
+  tools, whose answer repeated the name the agent itself had sent.
+
+### What this costs
+
+Some ordinary lines are refused under an enforcing hook, and the refusal says
+why. A child agent given `HOME` or `CLAUDE_CONFIG_DIR` in a form the shell
+does not expand to the home folder: in quotes or after a backslash, a `~` in
+a word `env` or `sudo` is handed (zsh passes it on as written), and any value
+in settings JSON. A variable set by arithmetic or by PowerShell anywhere on a
+line counts for the whole line. In the MCP proxy, a tool call that gives its
+command as an argument list or `args` keeps the file checks on its
+arguments, so a private key's path among them is refused there, also as the
+identity of `ssh`, and a word of it that would add a command to a server's
+shell line is refused, also where the server builds no such line. A public
+SSH file is refused, as in 1.6.12, in a line where the shell may turn its
+name into another. `eval` is refused however the line starts it, the setup
+lines of known tools excepted. A program named by an expansion the guard
+cannot resolve, on a line that also holds a substitution or at the end of a
+pipe, is refused, and the refusal says how to write the path so that its
+name can be read. A program
+under a folder query is refused, as in 1.6.12, where the same line also runs
+a command outside the short list that writes and runs nothing, sets or
+exports a variable outside its short list, or writes a file other than that
+program's own output: an install, a build or a move into a folder and then
+the tool, a folder made first, a `git` or tool command before it, a pipe
+into `tee`, a loop around the tool, and a tool call with a field the guard
+does not read or a folder for its command. A container
+started with full privilege, with `SYS_ADMIN` or in the host's process
+namespace, or with the runtime's socket mounted, and a call to the runtime's
+API on its socket, are refused also where that is ordinary work, such as a
+test tool that drives containers or a browser run in a container. A
+recursive `grep`, an archive or a recursive copy of the home, of a folder
+above it or of a hidden folder in the home is refused where a key or a
+stored login is kept in it (`~/.config`, where the GitHub CLI can keep its
+login), also when it looks for ordinary text. The read tools are refused
+what `cat` is: a `Read` of `~/.ssh/config`, of a private key kept in the
+project as a test fixture or of a stored login, which ran unscreened before.
+A session started in the home folder or at `/` names no project, so a read
+of a `.env` from there is refused to the agent, which is told to start in the
+project's own folder. A `Read` with no path is refused, as a shell call with
+no command is.
+
+The guard reads text, and its limits are listed in `docs/features.md`, under
+[The guard and its own switches](docs/features.md#the-guard-and-its-own-switches).
+The boundary there is the host: on Linux, InnerWarden Pro's Execution Gate,
+armed for an agent, decides in the kernel which programs that agent's
+processes may start, whatever the command line says. It is off until you arm
+it.
+
+## 1.6.12 - 2026-11-11
+
+A correction first. 1.6.6 said "An agent can no longer lower the guard that
+screens it". That was not true as written: the guard reads the text of one
+command, and a line could say the same thing in a way the guard read
+differently from the shell. This release closes the ways we found, refuses
+what it cannot read, and writes down what a guard that reads text does not
+see: [The guard and its own switches](docs/features.md#the-guard-and-its-own-switches).
+
+### Security
+
+- **A command that lowers the guard is read as the shell runs it.** Under an
+  enforcing hook, the guard's loosening commands were let through when the
+  line spelled them in a way the guard did not follow: a backslash inside
+  double quotes (`sh -c "sh -c innerwarden\ allow\ x"`), ANSI-C quoting
+  (`$'...'`), a comment, a here-document or a redirection between the words
+  (`innerwarden 2>/dev/null allow x`), a name built from another value on the
+  same line (`A=inner; B=${A}warden; $B monitor`) or cut out of a longer one
+  (`${X%/}`), the replace string of `xargs`, an `ssh` option that names a
+  command, a backslash as a C shell keeps it inside double quotes, or the
+  `-c` argument of `tcsh` and the other shells the list did not hold. Each is
+  now read as the shell reads it, at a cost that grows with the length of the
+  line and no faster.
+- **A line the guard cannot read is refused when it names the guard.** Where
+  a part of such a line stays unread (a command word that is a variable
+  nothing on the line settles, a substitution that prints the command), the
+  line is refused, not guessed at, and the refusal says how to write it so
+  that it can be read. A line that does not name the guard is refused this
+  way only where its own words spell a loosening command.
+- **A write from the shell to what carries the guard is refused.** The file
+  tools were already refused a write to the agent settings that load the
+  hook, to the guard's configuration and to the guard's program. The same
+  write from the shell was not: a redirection, `tee`, `cp`, `mv`, `rm`, `ln`,
+  `install`, `sed -i`, `dd`, a download saved over the file, a `chmod` that
+  closes it to its owner. Removing, moving or locking an agent's own settings
+  folder is refused with it. The writer is found beside a redirection of its
+  own, behind a loop word or a wrapper's options, with its target directory
+  or its in-place option in any spelling, and under a relative name after a
+  `cd` into the folder.
+- **Every command that lowers an InnerWarden Pro kernel guard through Pro's
+  own tools is refused**, not only the ones the list named.
+- **An ssh key used twice on a line is a read of the key.** A key given as
+  the identity (`-i`) is key use, and is let through. The excuse was given by
+  the text, so a line that named the same file as the identity and as the
+  file to copy (`scp -i KEY KEY host:`) copied the key out unrefused. The
+  excuse is now given by the place a word stands at, also behind a lock or a
+  scheduling wrapper, and a key behind a variable the line sets
+  (`F=KEY; cat $F`) is read as the key.
+- **A hook that gives no answer refuses the call.** An agent blocks a call
+  only when its hook answers with a refusal. A hook that crashed on a fault,
+  or that took longer than the agent waits, let the call run, unscreened and
+  unrecorded. The hook now answers within ten seconds (thirty where a second
+  opinion from a model is configured: that wait has twenty of its own) and
+  handles the fault: a refusal under an enforcing hook; in monitor, a line
+  that says the call went unscreened. Not closed: a hook that is killed
+  outright, a fault on Windows, and an agent set to wait less for its hook
+  than the hook takes.
+
+### Fixed
+
+- **`rsync -e ssh` is no longer refused as a reverse shell.** The text
+  `rsync -e` ends in the letters of `nc -e`, netcat's exec flag, which was
+  matched anywhere in the command. It now counts only where the name starts a
+  word.
+
+### What this costs
+
+Some ordinary lines are now refused under an enforcing hook, and the refusal
+says they are the person's to run: a program run from a variable on a line
+that also names the guard (`P=innerwarden; $P --version`), an agent that
+copies a new `innerwarden` binary into place, one that writes a project's
+`.mcp.json` or `.claude/settings.json` from the shell, removes a project's
+`.claude` folder, or sets an agent's settings file to a mode that takes the
+read or the write from its owner (`chmod 400`; `chmod 600` is let through).
+The guard's name inside a longer word, a folder such as
+`~/src/innerwarden-site`, counts as naming it where the line also holds a
+command the guard cannot read and a loosening word. After a `cd` into an
+agent's settings folder, a later write to a settings file by its bare name is
+refused, also behind a second `cd`. A line that costs more to read than the
+guard spends on one line, with a variable in a command left unread or with
+more changes of directory than the guard follows, is refused with the way to
+shorten it.
+
 ## 1.6.11 - 2026-10-24
 
 ### Added
@@ -143,7 +466,10 @@ follows semantic versioning.
 
 ### Security
 
-- **An agent can no longer lower the guard that screens it.** Under an
+- **The guard refuses an agent three more commands that lower it.** (This
+  entry first said "An agent can no longer lower the guard that screens it",
+  which is more than a guard that reads the text of a command can promise:
+  see 1.6.12 and [the limits](docs/features.md#where-this-ends).) Under an
   enforcing hook, `innerwarden agents connect <agent> --monitor`,
   `innerwarden agents disconnect` and `innerwarden contain` (which rewrites
   the agent's hook) were let through, while `dry-run` and `monitor` were

@@ -153,8 +153,10 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              screens the shell command inside it. A file tool (Write, Edit, MultiEdit,\n  \
              NotebookEdit) is judged on the file it changes: a privileged one (agent\n  \
              settings, the guard's configuration, shell startup files, credentials) is\n  \
-             refused, any other passes at once. Exit 2 blocks the call, exit 0 allows\n  \
-             it. Any other tool call always allows, so it is never wedged.\n\
+             refused, any other passes at once. A read tool (Read, Grep, Glob) is judged\n  \
+             as the shell read of the same files: a private key or a stored login is\n  \
+             refused. Exit 2 blocks the call, exit 0 allows it. Any other tool call\n  \
+             always allows, so it is never wedged.\n\
              \n  \
              --block-review   block `review` verdicts too (default: deny only)\n  \
              --monitor        record every command and never block"
@@ -438,6 +440,23 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The hook's usage names every class of tool it judges: the read tools
+    /// are judged since 1.6.13, and "any other tool call always allows" was
+    /// said over them.
+    /// FAILS ON REVERT of the read-tool sentence in the `hook` usage.
+    #[test]
+    fn the_hook_help_names_the_read_tools() {
+        let text = usage("hook", &[]).expect("hook has a usage");
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(
+                "A read tool (Read, Grep, Glob) is judged as the shell read of the same files: \
+                 a private key or a stored login is refused."
+            ),
+            "{text}"
+        );
     }
 
     /// THE CARVE-OUT, and the reason a blanket intercept was rejected.
