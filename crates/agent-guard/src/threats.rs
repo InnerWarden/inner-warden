@@ -9618,12 +9618,16 @@ const EVAL_AFTER_OPENER: &str = r"(?:^|[;&|(`\s])(?:(?:then|do|else|elif)\s+|[{!
 
 /// The byte spans of `content` inside single quotes, as the shell reads
 /// them: a quote opens a span only outside double quotes and not after a
-/// backslash.
+/// backslash. `$'...'` (ANSI-C quoting) is a quote of its own: inside it a
+/// backslash escapes the next character, so `\'` does not close it, and
+/// its text, whose escapes the shell expands, opens no span.
 fn single_quoted_spans(content: &str) -> Vec<std::ops::Range<usize>> {
     let mut spans = Vec::new();
     let mut in_double = false;
     let mut open: Option<usize> = None;
+    let mut in_ansi_c = false;
     let mut escaped = false;
+    let mut after_dollar = false;
     for (at, character) in content.char_indices() {
         if let Some(start) = open {
             if character == '\'' {
@@ -9632,6 +9636,17 @@ fn single_quoted_spans(content: &str) -> Vec<std::ops::Range<usize>> {
             }
             continue;
         }
+        if in_ansi_c {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '\'' {
+                in_ansi_c = false;
+            }
+            continue;
+        }
+        let dollar_before = std::mem::replace(&mut after_dollar, false);
         if escaped {
             escaped = false;
             continue;
@@ -9639,6 +9654,8 @@ fn single_quoted_spans(content: &str) -> Vec<std::ops::Range<usize>> {
         match character {
             '\\' => escaped = true,
             '"' => in_double = !in_double,
+            '$' if !in_double => after_dollar = true,
+            '\'' if !in_double && dollar_before => in_ansi_c = true,
             '\'' if !in_double => open = Some(at + 1),
             _ => {}
         }
@@ -25779,6 +25796,31 @@ mod redirect_fallback_tests {
     /// with it. A line handed to a new shell sets nothing for the line that
     /// handed it.
     ///
+    /// FAILS ON REVERT of the `$'...'` arm in `single_quoted_spans`: the
+    /// tracker closed `$'\''` at its `\'`, read the rest of the line as
+    /// quoted and exempted the `eval` after `then`. The exemption itself
+    /// must refuse, not only the structural reader.
+    #[test]
+    fn an_ansi_c_quote_does_not_hide_an_eval_from_the_exemption() {
+        for probe in [
+            "echo $'\\'' ; if true; then eval \"$X\"; fi ; echo 'x'",
+            "$'a\\'b' ; eval \"$X\"",
+            "$'a\\'b' ; if true; then eval \"$X\"; fi ; echo 'x'",
+        ] {
+            assert!(!eval_only_after_opener_in_single_quotes(probe), "{probe}");
+            assert_eq!(
+                dangerous_command_in(probe),
+                Some(("shell eval (dynamic command execution)", true)),
+                "{probe}"
+            );
+        }
+        assert_eq!(single_quoted_spans("$'a\\'b' 'c'"), vec![9..10]);
+        assert_eq!(single_quoted_spans("\\$'a' $$"), vec![3..4]);
+        assert!(eval_only_after_opener_in_single_quotes(
+            "bash -c 'if false; then eval \"$(cat)\"; fi'"
+        ));
+    }
+
     /// FAILS ON REVERT of the `eval` arm in `command_starts_unhooked_agent`
     /// (what the line set is lost: the first two lists pass).
     #[test]

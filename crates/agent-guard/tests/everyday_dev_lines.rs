@@ -393,8 +393,9 @@ fn a_search_path_set_before_the_repository_top_is_refused() {
 /// `then`, `do`, `else`, `{` or `!` was allowed, on main as well
 /// (measured 2026-11-18). In single quotes the text is a line handed to a
 /// program and read on its own, where a branch that never runs is known
-/// (corpus case bn-062). A `$'\''` before the `eval` (the quote tracker
-/// closes the quote at its `\'`) is refused by the shell reader.
+/// (corpus case bn-062). A `$'\''` before the `eval` is its own quote,
+/// where `\'` does not close it, and is refused by the exemption as well
+/// as by the shell reader.
 #[test]
 fn eval_after_a_body_opener_a_group_or_a_negation_is_refused() {
     assert_verdict(
@@ -407,6 +408,8 @@ fn eval_after_a_body_opener_a_group_or_a_negation_is_refused() {
             "{ eval \"$X\"; }",
             "! eval \"$X\"",
             "echo $'\\'' ; if true; then eval \"$X\"; fi ; echo 'x'",
+            "$'a\\'b' ; eval \"$X\"",
+            "$'a\\'b' ; if true; then eval \"$X\"; fi ; echo 'x'",
         ],
         "deny",
     );
