@@ -461,6 +461,10 @@ pub fn hook_command_for(
 /// exactly those three into 2 and leaves every other code as it was: 0 still
 /// allows, 2 still refuses.
 ///
+/// A hook that times out is not covered: Claude Code may end the shell that
+/// runs this line when its hook timeout fires, and then the tail never runs.
+/// Only the three failures of the binary above are closed.
+///
 /// Unix only: on Windows the line may not reach a POSIX shell, and a line the
 /// shell cannot parse would leave every call unscreened, which is worse.
 /// Recognition ([`hook_command_words`]) accepts this exact text on every
@@ -671,13 +675,30 @@ fn install_hook_with_link_policy(
              replacing it"
         ));
     }
+    // Background setup keeps the mode of EVERY half it rewrites, not only the
+    // Bash one: an enforcing `Write|Edit` or `Read|Grep|Glob` hook with no
+    // enforcing Bash hook beside it was rewritten to the Bash half's mode,
+    // monitor, and a monitor half beside an enforcing Bash hook was raised.
+    // A half that is not there yet takes the Bash half's mode, as before.
+    let half_command = |matcher: &str| -> String {
+        match exact_matcher_iwguard_mode(&existing, matcher).filter(|_| reject_symlinks) {
+            Some(mode) => {
+                let mode = mode.max(requested_mode);
+                let (block_review, monitor) = mode.flags();
+                hook_command_for(iw_guard, block_review, monitor, agent_flag.as_deref())
+            }
+            None => cmd.clone(),
+        }
+    };
     let merged = merge_pretooluse_bash_hook(existing.clone(), &cmd);
-    // The file-tools half: the same binary and mode, on the agent's own
+    // The file-tools half: the same binary, on the agent's own
     // `Write`/`Edit` tools, which never pass through the shell.
-    let merged = merge_pretooluse_file_hook(merged, &cmd);
+    let merged =
+        merge_pretooluse_file_hook(merged, &half_command(crate::file_tools::FILE_TOOLS_MATCHER));
     // The read half: `Read`, `Grep` and `Glob`, judged by the secret rules
-    // of the shell, with the same binary and mode.
-    let merged = merge_pretooluse_read_hook(merged, &cmd);
+    // of the shell, with the same binary.
+    let merged =
+        merge_pretooluse_read_hook(merged, &half_command(crate::file_tools::READ_TOOLS_MATCHER));
     // The observation half. Written with the SAME binary and the same mode
     // flags, because a PostToolUse hook that points at a different build is a
     // seam that drifts silently: it would keep feeding a store the screening
@@ -723,7 +744,17 @@ fn hook_command_words(command: &str) -> Option<Vec<String>> {
     // The one piece of shell the grammar knows: the exact [`FAIL_CLOSED`]
     // tail [`hook_command_for`] writes. Any other composition stays refused.
     let command = command.trim();
-    let command = command.strip_suffix(FAIL_CLOSED).unwrap_or(command);
+    plain_hook_command_words(command.strip_suffix(FAIL_CLOSED).unwrap_or(command))
+}
+
+/// The grammar of every release before [`FAIL_CLOSED`]: no shell at all.
+///
+/// Kept apart because it is the rollback limit. A binary from before the
+/// tail reads a line that carries it as an operator's command, not as its
+/// own: going back to it, `install` adds a second hook beside this one and
+/// `uninstall` leaves this one in place, still refusing. Remove the hooks
+/// with this binary (`innerwarden uninstall`) before installing an older one.
+fn plain_hook_command_words(command: &str) -> Option<Vec<String>> {
     let mut chars = command.trim().chars().peekable();
     let mut words = Vec::new();
 
@@ -840,6 +871,11 @@ fn iwguard_hook_parts(hook: &Value) -> Option<(HookProtection, Option<String>)> 
         .get("command")
         .and_then(Value::as_str)
         .and_then(hook_command_words)?;
+    hook_parts_of_words(&words)
+}
+
+/// [`iwguard_hook_parts`] once the command is split into words.
+fn hook_parts_of_words(words: &[String]) -> Option<(HookProtection, Option<String>)> {
     let (executable, rest) = words.split_first()?;
     let (subcommand, flags) = rest.split_first()?;
     if !is_innerwarden_executable(executable) || subcommand != "hook" {
@@ -932,6 +968,23 @@ fn strongest_effective_iwguard_hook_mode(settings: &Value) -> Option<HookProtect
         .into_iter()
         .flatten()
         .filter(|entry| bash_matcher_coverage(entry) == BashMatcherCoverage::Includes)
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(iwguard_hook_mode)
+        .max()
+}
+
+/// Strongest recognised InnerWarden mode in the `PreToolUse` entries whose
+/// matcher is exactly `matcher`: the entries [`merge_pretooluse_tools_hook`]
+/// rewrites in place.
+fn exact_matcher_iwguard_mode(settings: &Value, matcher: &str) -> Option<HookProtection> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("matcher").and_then(Value::as_str) == Some(matcher))
         .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
         .flatten()
         .filter_map(iwguard_hook_mode)
@@ -1382,6 +1435,10 @@ pub fn uninstall_hook(
 mod tests {
     use super::*;
 
+    /// The tail [`hook_command_for`] writes after a refusing hook on this
+    /// platform: [`FAIL_CLOSED`] on unix, nothing elsewhere.
+    const CLOSED: &str = if cfg!(unix) { FAIL_CLOSED } else { "" };
+
     #[test]
     fn merge_into_empty_adds_bash_hook() {
         let out = merge_pretooluse_bash_hook(json!({}), "\"/p/innerwarden\" hook");
@@ -1668,7 +1725,7 @@ mod tests {
         assert_eq!(entries.len(), 1, "{new}");
         assert_eq!(
             entries[0]["hooks"][0]["command"],
-            format!("\"/opt/innerwarden\" hook --agent claude-code{FAIL_CLOSED}")
+            format!("\"/opt/innerwarden\" hook --agent claude-code{CLOSED}")
         );
         assert!(!needs_iwguard_hook_reconciliation(&new, iw, false, true));
 
@@ -2164,17 +2221,98 @@ mod tests {
         assert_eq!(remove_iwguard_pretooluse_hook(wrapped).1, 1);
     }
 
+    /// The rollback limit: the grammar of every release before the tail does
+    /// not read a line that carries it as ours, so an older binary neither
+    /// replaces nor removes it. Documented in the README ("Rolling back").
+    #[test]
+    fn a_binary_from_before_the_tail_does_not_know_the_line() {
+        let plain = "\"/x/innerwarden\" hook --agent claude-code";
+        // What a release before the tail recognised: the plain grammar, then
+        // the same reading of the words.
+        let before_the_tail = |command: &str| {
+            plain_hook_command_words(command).and_then(|words| hook_parts_of_words(&words))
+        };
+        let wrapped = format!("{plain}{FAIL_CLOSED}");
+        assert!(before_the_tail(plain).is_some());
+        assert_eq!(
+            before_the_tail(&wrapped),
+            None,
+            "an older binary reads it as foreign"
+        );
+        assert!(iwguard_hook_mode(&json!({ "command": wrapped })).is_some());
+    }
+
+    /// Background setup keeps the mode of each half it rewrites: an enforcing
+    /// file or read hook with no enforcing Bash hook stays enforcing, and a
+    /// monitor half beside an enforcing Bash hook stays monitor.
+    #[test]
+    fn automatic_setup_keeps_the_mode_of_every_half() {
+        let iw = Path::new("/opt/innerwarden");
+        let enforce = format!("\"/opt/innerwarden\" hook --agent claude-code{CLOSED}");
+        let monitor = "\"/opt/innerwarden\" hook --monitor --agent claude-code".to_string();
+        let entry = |matcher: &str, command: &str| json!({"matcher": matcher, "hooks": [{"type": "command", "command": command}]});
+        let commands = |v: &Value, matcher: &str| -> Vec<String> {
+            v["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["matcher"] == matcher)
+                .flat_map(|e| e["hooks"].as_array().unwrap().clone())
+                .map(|h| h["command"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let file = crate::file_tools::FILE_TOOLS_MATCHER;
+        let read = crate::file_tools::READ_TOOLS_MATCHER;
+        for (wired, want_bash, want_file, want_read) in [
+            // Write|Edit in enforce, no Bash line: the file half stays enforce,
+            // the new halves take the monitor automatic setup asks for.
+            (
+                json!({"hooks": {"PreToolUse": [entry(file, &enforce)]}}),
+                &monitor,
+                &enforce,
+                &monitor,
+            ),
+            // Write|Edit and Read in enforce, Bash in monitor.
+            (
+                json!({"hooks": {"PreToolUse": [
+                    entry("Bash", &monitor), entry(file, &enforce), entry(read, &enforce)]}}),
+                &monitor,
+                &enforce,
+                &enforce,
+            ),
+            // The other way: a monitor read half beside an enforcing Bash hook.
+            (
+                json!({"hooks": {"PreToolUse": [
+                    entry("Bash", &enforce), entry(file, &enforce), entry(read, &monitor)]}}),
+                &enforce,
+                &enforce,
+                &monitor,
+            ),
+        ] {
+            let home = tempfile::TempDir::new().unwrap();
+            let path = home.path().join(".claude/settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, serde_json::to_vec_pretty(&wired).unwrap()).unwrap();
+            install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+            let now: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(commands(&now, "Bash"), vec![want_bash.clone()], "{wired}");
+            assert_eq!(commands(&now, file), vec![want_file.clone()], "{wired}");
+            assert_eq!(commands(&now, read), vec![want_read.clone()], "{wired}");
+            // And a second pass changes nothing.
+            let body = fs::read(&path).unwrap();
+            install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), body, "{wired}");
+        }
+    }
+
     #[test]
     fn hook_command_quotes_path_and_wires_block_review() {
         let c = hook_command(Path::new("/usr/local/bin/innerwarden"), false, false);
-        assert_eq!(
-            c,
-            format!("\"/usr/local/bin/innerwarden\" hook{FAIL_CLOSED}")
-        );
+        assert_eq!(c, format!("\"/usr/local/bin/innerwarden\" hook{CLOSED}"));
         let c2 = hook_command(Path::new("/x/innerwarden"), true, false);
         assert_eq!(
             c2,
-            format!("\"/x/innerwarden\" hook --block-review{FAIL_CLOSED}")
+            format!("\"/x/innerwarden\" hook --block-review{CLOSED}")
         );
         // monitor wins over block_review (records, never blocks).
         let c3 = hook_command(Path::new("/x/innerwarden"), true, true);
@@ -2241,7 +2379,7 @@ mod tests {
         // An id that is not a plain id is left out, never quoted in.
         assert_eq!(
             hook_command_for(Path::new("/x/innerwarden"), false, false, Some("x; rm")),
-            format!("\"/x/innerwarden\" hook{FAIL_CLOSED}")
+            format!("\"/x/innerwarden\" hook{CLOSED}")
         );
     }
 
@@ -2360,7 +2498,7 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            format!("\"/opt/innerwarden\" hook --agent claude-code{FAIL_CLOSED}"),
+            format!("\"/opt/innerwarden\" hook --agent claude-code{CLOSED}"),
             "switching mode rewrites the mode and keeps the name"
         );
     }
@@ -2403,7 +2541,7 @@ mod tests {
         // A new connection names the agent it serves.
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            format!("\"/opt/innerwarden\" hook --block-review --agent claude-code{FAIL_CLOSED}")
+            format!("\"/opt/innerwarden\" hook --block-review --agent claude-code{CLOSED}")
         );
 
         // Idempotent: the Bash hook, the file-tools hook and the read-tools
@@ -2706,7 +2844,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             installed["command"],
-            format!("\"/current/target/release/innerwarden\" hook --block-review{FAIL_CLOSED}")
+            format!("\"/current/target/release/innerwarden\" hook --block-review{CLOSED}")
         );
         assert_eq!(installed["timeout"], 21);
         assert_eq!(installed["operator_note"], "keep");

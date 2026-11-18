@@ -90,6 +90,9 @@ pub struct ReconcileReport {
     /// What this pass did to each agent it considered, for the watcher's log
     /// gate ([`lines_to_log`]). The one-shot CLI prints `notices` instead.
     pub outcomes: BTreeMap<String, AgentTick>,
+    /// A rewire that [`refuse_rewire_to`] stopped before it touched anything:
+    /// the wiring is left as it was, which the caller has to say.
+    pub refused: bool,
 }
 
 /// What one reconcile pass did to one agent.
@@ -796,9 +799,12 @@ pub fn rewire_existing_within(
     guard_bin: &str,
     wait: std::time::Duration,
 ) -> ReconcileReport {
+    let named = wired_name_of(home, guard_bin);
+    let guard_bin = named.as_str();
     if let Some(why) = refuse_rewire_to(home, guard_bin) {
         return ReconcileReport {
             notices: vec![why],
+            refused: true,
             ..ReconcileReport::default()
         };
     }
@@ -835,7 +841,13 @@ pub fn rewire_existing_within(
 ///   replaces with whatever the tree holds then;
 /// - a program other than the one the hooks already run.
 pub fn refuse_rewire_to(home: &Path, guard_bin: &str) -> Option<String> {
-    if is_cargo_build_output(Path::new(guard_bin)) {
+    // The path as written and the file it resolves to: a link such as
+    // `~/.local/bin/innerwarden -> target/debug/innerwarden` reads as an
+    // installed binary by its name alone.
+    let resolved = std::fs::canonicalize(guard_bin).ok();
+    if is_cargo_build_output(Path::new(guard_bin))
+        || resolved.as_deref().is_some_and(is_cargo_build_output)
+    {
         return Some(format!(
             "Not rewired: {guard_bin} is a cargo build output, not an installed binary."
         ));
@@ -852,6 +864,18 @@ pub fn refuse_rewire_to(home: &Path, guard_bin: &str) -> Option<String> {
         ));
     }
     None
+}
+
+/// The path the hooks already use for `guard_bin`: a wired program that is
+/// the same file (a link the person runs, where the upgrade knows only the
+/// file it resolves to) keeps its name, so a rewire never turns a hook that
+/// names a link into one that names whatever the link points at today.
+/// `guard_bin` itself when no wired program is the same file.
+pub fn wired_name_of(home: &Path, guard_bin: &str) -> String {
+    claude_hook_programs(home)
+        .into_iter()
+        .find(|program| same_program(program, guard_bin))
+        .unwrap_or_else(|| guard_bin.to_string())
 }
 
 /// The programs the InnerWarden Bash hooks in Claude Code's settings run.
@@ -1266,6 +1290,65 @@ mod tests {
         let report = rewire_existing(home.path(), "/other/innerwarden");
         assert_eq!(report.connected, 0);
         assert_eq!(read_json(&path), wired, "nothing rewritten");
+    }
+
+    /// Item of the same incident: a link with an installed-looking name that
+    /// resolves into a cargo build is a build too. And a rewire run by the
+    /// file a link resolves to (the macOS upgrade) keeps the link the hooks
+    /// name instead of writing the file behind it.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewire_reads_links_both_ways() {
+        let root = tempfile::TempDir::new().unwrap();
+        let wire = |home: &Path, program: &Path| {
+            let path = home.join(".claude/settings.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let wired = serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash",
+                "hooks": [{"type": "command",
+                           "command": format!("\"{}\" hook --agent claude-code", program.display())}]}]}});
+            std::fs::write(&path, serde_json::to_vec_pretty(&wired).unwrap()).unwrap();
+            path
+        };
+
+        // ~/.local/bin/innerwarden -> target/debug/innerwarden
+        let build = root.path().join("src/target/debug/innerwarden");
+        std::fs::create_dir_all(build.parent().unwrap()).unwrap();
+        std::fs::write(&build, "").unwrap();
+        let link = root.path().join("local/bin/innerwarden");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&build, &link).unwrap();
+        let home = root.path().join("home-a");
+        let settings = wire(&home, &link);
+        let before = read_json(&settings);
+        let link_s = link.display().to_string();
+        assert!(
+            !is_cargo_build_output(&link),
+            "the name alone reads as installed"
+        );
+        assert!(refuse_rewire_to(&home, &link_s).is_some());
+        let report = rewire_existing(&home, &link_s);
+        assert!(report.refused && report.connected == 0, "{report:?}");
+        assert_eq!(read_json(&settings), before, "nothing rewritten");
+
+        // /usr/local/bin/innerwarden -> /opt/innerwarden/innerwarden, run as the file.
+        let file = root.path().join("opt/innerwarden/innerwarden");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+        let named = root.path().join("usr/bin/innerwarden");
+        std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&file, &named).unwrap();
+        let home = root.path().join("home-b");
+        let settings = wire(&home, &named);
+        let file_s = file.display().to_string();
+        assert_eq!(wired_name_of(&home, &file_s), named.display().to_string());
+        let report = rewire_existing(&home, &file_s);
+        assert!(!report.refused, "{report:?}");
+        let body = std::fs::read_to_string(&settings).unwrap();
+        assert!(body.contains(&named.display().to_string()), "{body}");
+        assert!(
+            !body.contains(&file_s),
+            "the hook must keep the link: {body}"
+        );
     }
 
     fn read_json(path: &Path) -> serde_json::Value {

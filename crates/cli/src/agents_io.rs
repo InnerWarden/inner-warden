@@ -53,6 +53,10 @@ fn cmd_rewire() -> std::process::ExitCode {
     }
     if report.failed > 0 {
         std::process::ExitCode::from(1)
+    } else if report.refused {
+        // Not a failure of the command, but the wiring was left as it was:
+        // the upgrade reads this code to say so and how to rewire.
+        std::process::ExitCode::from(3)
     } else {
         std::process::ExitCode::SUCCESS
     }
@@ -74,6 +78,7 @@ pub(crate) fn rewire_once_per_version() {
     let (Ok(home), Some(bin)) = (hook::home_dir(), invoked_as()) else {
         return;
     };
+    let bin = agent_policy::wired_name_of(&home, &bin);
     let stamp = agent_policy::config_path(&home).with_file_name("rewired");
     let want = format!("{} {bin}\n", env!("CARGO_PKG_VERSION"));
     if std::fs::read_to_string(&stamp).is_ok_and(|have| have == want) {

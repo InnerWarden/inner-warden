@@ -546,7 +546,16 @@ fn still_running(dashboard_bind: &str, serve_bind: &str) -> StillRunning {
 /// on disk and refusing here would leave the operator believing the upgrade
 /// did not happen.
 fn rewire_agents_after_upgrade(target: &Path) -> Vec<String> {
-    let ran = std::process::Command::new(target)
+    // Run it by the path the hooks name when that is this same file: on macOS
+    // `target` is the file every link resolves to, and the new binary rewires
+    // to the path it was started by, so a hook that names the link the person
+    // uses would come out naming the file behind it.
+    let program = innerwarden_agent_guard::hook::home_dir()
+        .ok()
+        .map(|home| crate::agent_policy::wired_name_of(&home, &target.display().to_string()))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| target.to_path_buf());
+    let ran = std::process::Command::new(&program)
         .args(["agents", "rewire"])
         .stdin(std::process::Stdio::null())
         .output()
@@ -582,7 +591,7 @@ fn rewire_report(ran: Option<&RefreshRun>) -> Vec<String> {
                 );
             }
             lines.extend([
-                "The connected agents may still run the previous version's hooks.".into(),
+                "The hooks were not rewired: the connected agents keep the previous wiring.".into(),
                 "To bring them up to this version:  innerwarden agents rewire".into(),
                 "then restart them. `innerwarden status` says what each one screens.".into(),
             ]);
@@ -1442,6 +1451,27 @@ mod closing_advice_tests {
         assert!(rewire_report(Some(&ran(1, "", "lock busy")))
             .iter()
             .any(|l| l == "lock busy"));
+        // A refused rewire (exit 3) changed nothing: the upgrade says so, with
+        // the refusal and the step by hand, instead of ending silently.
+        let refused = rewire_report(Some(&ran(
+            3,
+            "Not rewired: the hooks run /a/innerwarden, not /b/innerwarden.\n",
+            "",
+        )));
+        assert!(
+            refused.iter().any(|l| l.starts_with("Not rewired")),
+            "{refused:?}"
+        );
+        assert!(
+            refused.iter().any(|l| l.contains("previous wiring")),
+            "{refused:?}"
+        );
+        assert!(
+            refused
+                .iter()
+                .any(|l| l.contains("innerwarden agents rewire")),
+            "{refused:?}"
+        );
     }
 
     /// A new binary that could not be run, or does not know the command
