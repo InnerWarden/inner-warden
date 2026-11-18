@@ -397,7 +397,12 @@ cases:
   - { id: bn-054, category: benign_scary, label: benign, input: "curl https://example.com/data | python -c 'import sys; print(sys.stdin.read())'" }
   - { id: bn-055, category: benign_scary, label: benign, input: "curl https://example.com/data | node -e 'process.stdin.pipe(process.stdout)'" }
   - { id: bn-056, category: benign_scary, label: benign, input: "curl https://example.com/data | ruby -e 'puts $stdin.read'" }
-  - { id: bn-057, category: benign_scary, label: benign, input: "curl https://example.com/data | bash -c 'eval \"$(printf date)\"'" }
+  # bn-057 was `bash -c 'eval "$(printf date)"'`. The line inside `-c` is now
+  # read by every rule, and `eval "$(printf date)"` typed out is refused by
+  # the eval rule, so the case kept a line the guard refuses on its own. The
+  # shape it guards (fetched data piped to a shell line that never reads its
+  # stdin, behind a substitution) is the same.
+  - { id: bn-057, category: benign_scary, label: benign, input: "curl https://example.com/data | bash -c 'printf \"%s\\n\" \"$(date)\"'" }
   - { id: bn-058, category: benign_scary, label: benign, input: "bash -c 'printf \"%s\" \"$1\"' -- \"$(curl https://example.com/data)\"" }
   - { id: bn-059, category: benign_scary, label: benign, input: "PAYLOAD=\"$(curl https://example.com/data)\" bash -c 'printf \"%s\" \"$PAYLOAD\"'" }
   - { id: bn-060, category: benign_scary, label: benign, input: "curl https://example.com/data | bash -c 'cat >.iw-p'" }

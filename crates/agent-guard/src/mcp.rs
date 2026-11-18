@@ -3117,13 +3117,28 @@ fn analyze_command_as_read(
     // escapes of the code apart. Its charged signals are added once each,
     // but for a download it runs: the code's own reading of the data flow
     // above is that observation, charged once.
+    // A line handed to a shell to run (`bash -c '...'`, `su -c`, a debugger's
+    // `shell`, behind `sudo`, `xargs` or `find -exec`) is the same: the
+    // download rules read it already, the rest of the rules read it here.
+    // Measured 2026-11-18: `bash -c 'rm -rf /'` was allowed.
     if depth < STARTUP_PAYLOAD_DEPTH {
-        let mut lines = crate::shell::inline_process_lines(raw_scan);
         // A line handed over again says nothing new: each is judged once,
         // where it is first handed over.
         let mut seen = std::collections::HashSet::new();
-        lines.retain(|line| seen.insert(line.clone()));
-        if !lines.is_empty() {
+        for (mut lines, handed_by) in [
+            (
+                crate::shell::inline_process_lines(raw_scan),
+                "in a line inline code hands to a process",
+            ),
+            (
+                crate::shell::handed_shell_lines(raw_scan),
+                "in a line handed to a shell to run",
+            ),
+        ] {
+            lines.retain(|line| seen.insert(line.clone()));
+            if lines.is_empty() {
+                continue;
+            }
             let inner = analyze_command_at(
                 &lines.join("\n"),
                 rule_engine,
@@ -3142,10 +3157,7 @@ fn analyze_command_as_read(
                 }
                 score += handed.score;
                 signals.push(AnalysisSignal {
-                    detail: format!(
-                        "in a line inline code hands to a process: {}",
-                        handed.detail
-                    ),
+                    detail: format!("{handed_by}: {}", handed.detail),
                     ..handed
                 });
             }

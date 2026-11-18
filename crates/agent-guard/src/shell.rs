@@ -2751,6 +2751,179 @@ pub(crate) fn inline_process_lines(source: &str) -> Vec<String> {
     lines
 }
 
+/// The lines the shell line `source` hands to a shell to run: the `-c`
+/// line of `sh`, `bash`, `zsh`, `dash`, `ksh` or `fish` (also `-lc`), the
+/// line a runner takes ([`runner_shell_line`]: `su -c`, `script -c`, a
+/// git setting, ...), and the line a program with no reader of its own is
+/// handed with a debugger's `shell` or `!` ([`unlisted_runner_code`]).
+/// Behind `env`, `sudo`, `nohup`, `timeout` and the other wrappers, and as
+/// the command `xargs` or `find -exec` runs. What a shell is handed is a
+/// shell line, and the caller judges it as one: measured 2026-11-18,
+/// `bash -c 'rm -rf /'` was allowed while `rm -rf /` was refused.
+pub(crate) fn handed_shell_lines(source: &str) -> Vec<String> {
+    let Some((tree, _doubt)) = parse_line(source) else {
+        return Vec::new();
+    };
+    let bytes = source.as_bytes();
+    let mut lines = Vec::new();
+    let mut commands = Vec::new();
+    collect_all_commands(tree.root_node(), &mut commands, 0);
+    for command in commands {
+        if node_is_in_literal_unreachable_branch(command, bytes) {
+            continue;
+        }
+        if let Some(words) = command_words(command, bytes) {
+            handed_lines_of(&words, 0, &mut lines);
+        }
+    }
+    lines.retain(|line| !line.trim().is_empty());
+    lines
+}
+
+/// [`handed_shell_lines`] for one command's words.
+fn handed_lines_of(words: &[String], depth: u8, lines: &mut Vec<String>) {
+    if depth > 4 {
+        return;
+    }
+    let Some(effective) = effective_command_words(words, 0) else {
+        return;
+    };
+    let name = normalized_command_name(&effective[0]);
+    match name.as_str() {
+        "xargs" => {
+            if let Some(at) = xargs_command_start(effective) {
+                handed_lines_of(&effective[at..], depth + 1, lines);
+            }
+        }
+        "find" => {
+            for invoked in find_exec_commands(effective) {
+                handed_lines_of(invoked, depth + 1, lines);
+            }
+        }
+        _ if is_shell_name(&name) => {
+            let args: Vec<String> = effective[1..]
+                .iter()
+                .map(|argument| shell_literal_word(argument))
+                .collect();
+            if let Some(line) = runner_shell_line(&name, &args).or_else(|| shell_c_line(&args)) {
+                lines.push(line);
+            }
+        }
+        // Code in another language is read by [`inline_process_lines`];
+        // `source` and `.` are handed a file, not a line.
+        _ if is_stdin_code_executor(&name) => {}
+        _ => {
+            if let CodeInput::Argument(line) = command_code_input(effective) {
+                lines.push(line);
+            }
+        }
+    }
+}
+
+fn is_shell_name(name: &str) -> bool {
+    matches!(
+        versionless_interpreter_name(name),
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
+    )
+}
+
+/// The `-c` line of a shell's arguments (already unquoted): the word after
+/// `-c`, `--command` or a group of short flags holding `c` (`-lc`), among
+/// the options before the first operand. A shell given a script file, or
+/// `-n` (read, never run), has none.
+fn shell_c_line(args: &[String]) -> Option<String> {
+    let mut index = 0;
+    let mut wants_line = false;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" || !(argument.starts_with('-') || argument.starts_with('+')) {
+            break;
+        }
+        if matches!(
+            argument.as_str(),
+            "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file"
+        ) {
+            index += 2;
+            continue;
+        }
+        if argument == "--command" {
+            wants_line = true;
+        } else if argument == "--noexec" {
+            return None;
+        } else if let Some(flags) = argument.strip_prefix('-').filter(|f| !f.starts_with('-')) {
+            if flags.contains('n') {
+                return None;
+            }
+            wants_line |= flags.contains('c');
+        }
+        index += 1;
+    }
+    // With `-c`, the line is the first operand.
+    wants_line.then(|| args.get(index).cloned()).flatten()
+}
+
+/// Where the command `xargs` runs starts in its words, past its options.
+fn xargs_command_start(words: &[String]) -> Option<usize> {
+    let mut index = 1;
+    while let Some(argument) = words.get(index).map(|argument| shell_word(argument)) {
+        if argument == "--" {
+            index += 1;
+            break;
+        }
+        if matches!(
+            argument.as_str(),
+            "-I" | "-E"
+                | "-L"
+                | "-n"
+                | "-P"
+                | "-s"
+                | "-a"
+                | "-d"
+                | "--eof"
+                | "--max-lines"
+                | "--max-args"
+                | "--max-procs"
+                | "--max-chars"
+                | "--arg-file"
+                | "--delimiter"
+        ) {
+            index += 2;
+            continue;
+        }
+        if argument.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    (index < words.len()).then_some(index)
+}
+
+/// The commands `find` runs with `-exec`, `-execdir`, `-ok` or `-okdir`.
+fn find_exec_commands(words: &[String]) -> Vec<&[String]> {
+    let mut commands = Vec::new();
+    let mut index = 1;
+    while index < words.len() {
+        if matches!(
+            shell_word(&words[index]).as_str(),
+            "-exec" | "-execdir" | "-ok" | "-okdir"
+        ) {
+            let start = index + 1;
+            let end = words[start..]
+                .iter()
+                .position(|word| matches!(shell_word(word).as_str(), ";" | "+" | "\\;"))
+                .map(|offset| start + offset)
+                .unwrap_or(words.len());
+            if start < end {
+                commands.push(&words[start..end]);
+            }
+            index = end.saturating_add(1);
+            continue;
+        }
+        index += 1;
+    }
+    commands
+}
+
 /// The command a here-document's body or a here-string is stdin of.
 fn stdin_code_owner(body: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     if body.kind() == "herestring_redirect" {
