@@ -77,6 +77,18 @@ pub struct HookTrouble {
     pub via_proxy: bool,
 }
 
+/// A wired agent whose shell commands are screened while some of its other
+/// tool calls are not, because the hook wired for them cannot start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartlyUnscreened {
+    pub agent: String,
+    /// Which tools go unscreened and why, from
+    /// `hook::unscreened_hooks_sentence`.
+    pub sentence: String,
+    /// The command that rewrites every hook to a binary that is there.
+    pub next: String,
+}
+
 /// Which tool calls of a wired agent are judged before they run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolClasses {
@@ -371,6 +383,10 @@ pub struct Facts {
     /// (or could not be checked). Never also in `wired_agents`: a hook that
     /// cannot start screens nothing, whatever its text says.
     pub hook_trouble: Vec<HookTrouble>,
+    /// Wired agents whose Bash hook runs, but where another InnerWarden hook
+    /// (file tools, read tools, tool results) runs a program that is not
+    /// there, so those calls go unscreened. Still in `wired_agents`.
+    pub partly_unscreened: Vec<PartlyUnscreened>,
     /// What each wired agent's wiring judges before a call runs, in the order
     /// of `wired_agents`. An agent whose settings could not be read back is
     /// left out: "could not tell" is never "off".
@@ -498,6 +514,19 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
             }),
             HookProgram::Runs => {}
         }
+    }
+    // Claude Code runs a hook whose program is gone as a non-blocking error,
+    // for a file write or a tool result just as for a shell command. A Bash
+    // hook that runs said nothing about the others, so `[on]` stood while
+    // every Write and Edit went through unscreened.
+    for partly in &facts.partly_unscreened {
+        out.push(Finding::NotWorking {
+            what: format!(
+                "{} is wired and its shell commands are screened, but {}.",
+                partly.agent, partly.sentence
+            ),
+            next: partly.next.clone(),
+        });
     }
     if !facts.wired_agents.is_empty() {
         out.push(Finding::Working(format!(
@@ -919,6 +948,7 @@ mod tests {
             mode: Some("enforce".into()),
             wired_agents: vec!["claude-code".into()],
             hook_trouble: vec![],
+            partly_unscreened: vec![],
             tool_classes: vec![],
             any_agent_seen: Some(true),
             decisions_recorded: Some(42),
@@ -1123,6 +1153,7 @@ mod tests {
             mode: None,
             wired_agents: vec![],
             hook_trouble: vec![],
+            partly_unscreened: vec![],
             tool_classes: vec![],
             any_agent_seen: None,
             decisions_recorded: None,
@@ -1548,5 +1579,46 @@ mod tests {
         let unknown_report = render(&Facts::default());
         assert!(unknown_report.contains("  [unknown] "), "{unknown_report}");
         assert!(unknown_report.contains("never means off"));
+    }
+
+    /// FAILS ON REVERT: an agent whose Bash hook runs while its file-tool and
+    /// result hooks point at a program that is gone read `[on]` throughout,
+    /// and every Write and Edit went through unscreened.
+    #[test]
+    fn a_hook_gone_beside_a_bash_hook_that_runs_is_off() {
+        let mut f = healthy();
+        f.partly_unscreened = vec![PartlyUnscreened {
+            agent: "claude-code".into(),
+            sentence: "Write/Edit not screened: its hook runs /gone/innerwarden, which does \
+                       not exist"
+                .into(),
+            next: "innerwarden install claude-code".into(),
+        }];
+        let findings = assess(&f);
+        assert!(
+            findings.iter().any(|x| matches!(
+                x,
+                Finding::NotWorking { what, next }
+                    if what.contains("claude-code is wired and its shell commands are screened")
+                        && what.contains("Write/Edit not screened")
+                        && next == "innerwarden install claude-code"
+            )),
+            "{findings:?}"
+        );
+        assert_eq!(
+            headline(&findings),
+            "InnerWarden is installed but NOT fully protecting this machine."
+        );
+        let report = render(&f);
+        assert!(
+            report.contains("  [off]     claude-code is wired and its shell commands"),
+            "{report}"
+        );
+        assert!(
+            report.contains("try: innerwarden install claude-code"),
+            "{report}"
+        );
+        // The rest of the report still stands: shell commands ARE screened.
+        assert!(report.contains("Wired into 1: claude-code."), "{report}");
     }
 }

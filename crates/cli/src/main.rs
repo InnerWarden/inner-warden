@@ -144,6 +144,27 @@ fn status_io_cmd() -> std::process::ExitCode {
         })
         .unwrap_or_default();
 
+    // Wired agents whose Bash hook runs while another hook of ours (file
+    // tools, read tools, tool results) runs a program that is gone. The same
+    // shared function `agents` uses.
+    let partly_unscreened: Vec<status::PartlyUnscreened> = home
+        .as_deref()
+        .map(|home| {
+            use innerwarden_agent_guard::{agents_ops, hook};
+            rows.iter()
+                .filter(|r| r.guarded && !hook_trouble.iter().any(|t| t.agent == r.name))
+                .filter_map(|r| {
+                    let groups = agents_ops::unscreened_hooks(home, r);
+                    Some(status::PartlyUnscreened {
+                        agent: r.name.clone(),
+                        sentence: hook::unscreened_hooks_sentence(&groups)?,
+                        next: agents_ops::hook_repair_command(home, r),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let wired_agents: Vec<String> = rows
         .iter()
         .filter(|r| r.guarded && !hook_trouble.iter().any(|t| t.agent == r.name))
@@ -156,7 +177,16 @@ fn status_io_cmd() -> std::process::ExitCode {
     let tool_classes: Vec<status::ToolClasses> = home
         .as_deref()
         .map(|home| {
-            status::tool_classes_for(home, rows.iter().filter(|r| wired_agents.contains(&r.name)))
+            // An agent with a hook that cannot start is described by its
+            // [off] line; this one judges the hooks by their text alone and
+            // would say its file changes are judged.
+            status::tool_classes_for(
+                home,
+                rows.iter().filter(|r| {
+                    wired_agents.contains(&r.name)
+                        && !partly_unscreened.iter().any(|p| p.agent == r.name)
+                }),
+            )
         })
         .unwrap_or_default();
 
@@ -214,6 +244,7 @@ fn status_io_cmd() -> std::process::ExitCode {
         mode,
         wired_agents,
         hook_trouble,
+        partly_unscreened,
         tool_classes,
         any_agent_seen,
         decisions_recorded,
