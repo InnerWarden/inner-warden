@@ -64,9 +64,11 @@ pub(crate) fn project(source: &str) -> ShellProjection {
     let mut executable_inside_mask = Vec::new();
     let mut unreachable = Vec::new();
     collect_literal_unreachable_ranges(tree.root_node(), text.as_bytes(), &mut unreachable, 0);
+    let taint = LineTaint::default();
     collect_ranges(
         tree.root_node(),
         text.as_bytes(),
+        &taint,
         &mut masked,
         &mut executable_inside_mask,
         0,
@@ -753,6 +755,55 @@ fn argument_is_a_name(
     }
 }
 
+/// Whether a declaration evaluates the subscripts of the names it takes:
+/// `declare`, `local` and `typeset` do; `export` and `readonly` refuse
+/// such a name as not a valid identifier (measured on bash 5.1.8,
+/// 2026-11-18).
+fn declaration_evaluates_subscripts(declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    declaration.child(0).is_some_and(|keyword| {
+        matches!(
+            node_text(keyword, source).as_str(),
+            "declare" | "local" | "typeset"
+        )
+    })
+}
+
+/// The variables written in the subscript of a name (`b[X]` reads `X`).
+/// Where a builtin takes the name, bash evaluates that subscript as
+/// arithmetic, and so reads each of them.
+fn name_subscript_identifiers(word: &str) -> Vec<String> {
+    let Some((name, rest)) = word.split_once('[') else {
+        return Vec::new();
+    };
+    if name.is_empty() || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return Vec::new();
+    }
+    identifiers(rest.rfind(']').map_or(rest, |end| &rest[..end]))
+}
+
+/// Whether `node` stands in the offset of a substring expansion
+/// (`${Z:'a[$(cmd)]'}`), which bash reads as arithmetic.
+fn stands_in_substring_offset(
+    expansion: tree_sitter::Node<'_>,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    let text = node_text(expansion, source);
+    let Some(inner) = text.strip_prefix("${") else {
+        return false;
+    };
+    let name_end = inner
+        .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+        .unwrap_or(inner.len());
+    if name_end == 0 || !inner[name_end..].starts_with(':') {
+        return false;
+    }
+    if inner[name_end + 1..].starts_with(['-', '=', '?', '+']) {
+        return false;
+    }
+    node.start_byte() > expansion.start_byte() + 2 + name_end
+}
+
 /// Whether a declaration (`declare -i`, `local -ai`...) makes its names
 /// integers, so the values given them are read as arithmetic.
 fn declares_integers(declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
@@ -797,7 +848,10 @@ fn value_is_evaluated(
                     .is_some_and(|value| value.start_byte() <= node.start_byte());
                 if !in_value {
                     // `declare 'a[$(cmd)]'=1`: in the name, a subscript.
-                    return true;
+                    return parent.parent().is_none_or(|owner| {
+                        owner.kind() != "declaration_command"
+                            || declaration_evaluates_subscripts(owner, source)
+                    });
                 }
                 if parent.parent().is_some_and(|owner| {
                     owner.kind() == "declaration_command" && declares_integers(owner, source)
@@ -810,9 +864,22 @@ fn value_is_evaluated(
             }
             "declaration_command" => {
                 // A word a declaration names: a name, whose subscript is
-                // evaluated (`declare 'a[$(cmd)]'`).
+                // evaluated (`declare 'a[$(cmd)]'`), by the builtins that
+                // take such a name.
+                return declaration_evaluates_subscripts(parent, source)
+                    && (current.kind() != "word" || !node_text(current, source).starts_with('-'));
+            }
+            // `unset 'a[$(cmd)]'`: a name, whose subscript is evaluated.
+            "unset_command" => {
                 return current.kind() != "word" || !node_text(current, source).starts_with('-');
             }
+            // `[[ -v 'a[$(cmd)]' ]]`: the name tested is evaluated.
+            "unary_expression" => {
+                return parent
+                    .child(0)
+                    .is_some_and(|operator| node_text(operator, source) == "-v");
+            }
+            "expansion" if stands_in_substring_offset(parent, node, source) => return true,
             "command" => {
                 if command_name(parent, source)
                     .is_some_and(|name| normalized_command_name(&name) == "let")
@@ -919,8 +986,71 @@ fn evaluated_name_reads(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(usiz
             }
         }
     }
+    // The grammar reads `unset` apart from other commands.
+    collect_nodes_of_kind(root, "unset_command", &mut places, 0);
+    for place in places.drain(..) {
+        // `unset b[X]` unquoted comes as `b` and `[X]` side by side: the
+        // pieces with no blank between them make one word.
+        let mut words: Vec<String> = Vec::new();
+        let mut end = None;
+        let mut cursor = place.walk();
+        for child in place.named_children(&mut cursor) {
+            let text = node_text(child, source);
+            match words.last_mut() {
+                Some(word) if end == Some(child.start_byte()) => word.push_str(&text),
+                _ => words.push(text),
+            }
+            end = Some(child.end_byte());
+        }
+        for written in words {
+            let word = shell_word(&written);
+            if word.starts_with('-') {
+                continue;
+            }
+            if let Some(name) = shell_variable_name(&word) {
+                reads.push((place.start_byte(), name.to_owned()));
+            }
+            for name in name_subscript_identifiers(&word) {
+                reads.push((place.start_byte(), name));
+            }
+        }
+    }
+    collect_nodes_of_kind(root, "unary_expression", &mut places, 0);
+    for place in places.drain(..) {
+        if place
+            .child(0)
+            .is_some_and(|operator| node_text(operator, source) == "-v")
+        {
+            if let Some(operand) = place.child(1) {
+                let word = shell_word(&node_text(operand, source));
+                for name in name_subscript_identifiers(&word) {
+                    reads.push((place.start_byte(), name));
+                }
+            }
+        }
+    }
     collect_nodes_of_kind(root, "declaration_command", &mut places, 0);
     for place in places.drain(..) {
+        if declaration_evaluates_subscripts(place, source) {
+            let mut cursor = place.walk();
+            for child in place.named_children(&mut cursor) {
+                let name = match child.kind() {
+                    "variable_assignment" => child
+                        .child_by_field_name("name")
+                        .map(|name| node_text(name, source)),
+                    _ => Some(node_text(child, source)),
+                };
+                let Some(word) = name.map(|name| shell_word(&name)) else {
+                    continue;
+                };
+                if word.starts_with('-') {
+                    continue;
+                }
+                for name in name_subscript_identifiers(&word) {
+                    reads.push((place.start_byte(), name));
+                }
+            }
+        }
         if !declares_integers(place, source) {
             continue;
         }
@@ -942,8 +1072,13 @@ fn evaluated_name_reads(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(usiz
             if is_let {
                 add(&mut reads, command.start_byte(), &text);
             } else if argument_is_a_name(command, argument, source) {
-                if let Some(name) = shell_variable_name(&shell_word(&text)) {
+                let word = shell_word(&text);
+                if let Some(name) = shell_variable_name(&word) {
                     reads.push((command.start_byte(), name.to_owned()));
+                }
+                // `unset 'b[X]'`: the subscript of the name reads `X`.
+                for name in name_subscript_identifiers(&word) {
+                    reads.push((command.start_byte(), name));
                 }
             }
         }
@@ -954,20 +1089,23 @@ fn evaluated_name_reads(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(usiz
 /// Whether an argument of `command` reads a fetched value as arithmetic or
 /// as a name (`echo $((X))` after `X=$(curl ..)`). Its arguments are then
 /// not text to print but code bash runs, so they are never masked.
-fn command_evaluates_fetched_value(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+fn command_evaluates_fetched_value(
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+    taint: &LineTaint,
+) -> bool {
     if !node_contains_kind(command, "arithmetic_expansion", 0)
         && !node_contains_kind(command, "expansion", 0)
     {
         return false;
     }
-    let root = root_node(command);
-    let timeline = download_taint_timeline(root, source);
+    let timeline = taint.timeline(command, source);
     if timeline.is_empty() {
         return false;
     }
     evaluated_name_reads(command, source)
         .into_iter()
-        .any(|(start, name)| tainted_names_at(&timeline, start).contains(&name))
+        .any(|(start, name)| tainted_names_at(timeline, start).contains(&name))
 }
 
 /// Whether a value fetched from the network reaches a place where bash reads
@@ -3801,7 +3939,11 @@ fn stdin_redirect_expands_download_value(
 /// shell variable. Used by the projection so `echo "$f" > r.sh` is never
 /// masked as literal output: the argument is not text the operator typed, it
 /// is the fetched payload on its way to disk.
-fn command_writes_download_tainted_value(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+fn command_writes_download_tainted_value(
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+    taint: &LineTaint,
+) -> bool {
     if !node_contains_kind(command, "simple_expansion", 0)
         && !node_contains_kind(command, "expansion", 0)
         && redirect_owner(command).is_none_or(|redirected| {
@@ -3815,8 +3957,7 @@ fn command_writes_download_tainted_value(command: tree_sitter::Node<'_>, source:
     if targets.is_empty() {
         return false;
     }
-    let timeline = download_taint_timeline(root_node(command), source);
-    let tainted = tainted_names_at(&timeline, command.start_byte());
+    let tainted = tainted_names_at(taint.timeline(command, source), command.start_byte());
     node_expands_tainted_variable(scope, source, &tainted)
 }
 
@@ -6964,9 +7105,25 @@ fn ast_exceeds_projection_budget(root: tree_sitter::Node<'_>) -> bool {
     false
 }
 
+/// The download taint timeline of the line the masking walk reads, built the
+/// first time a command asks for it and then shared by every command of the
+/// line, instead of one walk of the whole tree per command.
+#[derive(Default)]
+struct LineTaint {
+    timeline: std::cell::OnceCell<Vec<(usize, String, bool)>>,
+}
+
+impl LineTaint {
+    fn timeline(&self, node: tree_sitter::Node<'_>, source: &[u8]) -> &[(usize, String, bool)] {
+        self.timeline
+            .get_or_init(|| download_taint_timeline(root_node(node), source))
+    }
+}
+
 fn collect_ranges(
     node: tree_sitter::Node<'_>,
     source: &[u8],
+    taint: &LineTaint,
     masked: &mut Vec<Range<usize>>,
     executable_inside_mask: &mut Vec<Range<usize>>,
     depth: u8,
@@ -6976,7 +7133,9 @@ fn collect_ranges(
     }
     match node.kind() {
         "comment" if comment_opens_a_word(node, source) => masked.push(node.byte_range()),
-        "command" => mask_literal_command_args(node, source, masked, executable_inside_mask),
+        "command" => {
+            mask_literal_command_args(node, source, taint, masked, executable_inside_mask);
+        }
         "heredoc_body" => mask_data_heredoc(node, source, masked, executable_inside_mask),
         _ => {}
     }
@@ -6987,6 +7146,7 @@ fn collect_ranges(
             collect_ranges(
                 cursor.node(),
                 source,
+                taint,
                 masked,
                 executable_inside_mask,
                 depth + 1,
@@ -7016,6 +7176,7 @@ fn comment_opens_a_word(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
 fn mask_literal_command_args(
     command: tree_sitter::Node<'_>,
     source: &[u8],
+    taint: &LineTaint,
     masked: &mut Vec<Range<usize>>,
     executable_inside_mask: &mut Vec<Range<usize>>,
 ) {
@@ -7032,8 +7193,8 @@ fn mask_literal_command_args(
         || writes_security_or_execution_sink(command, source)
         || writes_payload_executed_later(command, source)
         || pipeline_payload_executed_later(command, source)
-        || command_writes_download_tainted_value(command, source)
-        || command_evaluates_fetched_value(command, source)
+        || command_writes_download_tainted_value(command, source, taint)
+        || command_evaluates_fetched_value(command, source, taint)
     {
         return;
     }
