@@ -4464,15 +4464,11 @@ mod tests {
         );
     }
 
-    /// Codex trusts a hook by its place in the file. Taking our hook out moves
-    /// a hook of the person's that sat behind it, and the disconnect names it
-    /// with the step that makes Codex run it again.
-    ///
-    /// FAILS ON REVERT: end `disconnect_one` with `line` in place of the
-    /// `match` on `agent_hooks::moved_note`, and the person reads
-    /// "disconnected" and nothing about the hook Codex now skips.
+    /// Codex trusts a hook by its place in the file. Taking our hook out
+    /// leaves an empty group where it was, so a hook of the person's that sat
+    /// behind it keeps its place and its trust, and there is nothing to name.
     #[test]
-    fn disconnect_codex_names_the_persons_hook_it_moved() {
+    fn disconnect_codex_keeps_the_persons_hook_in_its_place() {
         let home = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(home.path().join(".codex")).unwrap();
         let row = known_row(home.path(), "codex");
@@ -4488,13 +4484,10 @@ mod tests {
             .push(theirs.clone());
         std::fs::write(&path, serde_json::to_vec(&settings).unwrap()).unwrap();
 
-        assert_eq!(
-            disconnect_one(home.path(), &row),
-            "  codex, disconnected\n      A PreToolUse hook of your own moved to a new place in ~/.codex/hooks.json: `/opt/audit/before`. Codex trusts a hook by its place and skips it until it is trusted there. Run `/hooks` inside Codex and trust it again."
-        );
+        assert_eq!(disconnect_one(home.path(), &row), "  codex, disconnected");
         assert_eq!(
             json_at(&path),
-            serde_json::json!({"hooks": {"PreToolUse": [theirs]}})
+            serde_json::json!({"hooks": {"PreToolUse": [{"hooks": []}, theirs]}})
         );
     }
 

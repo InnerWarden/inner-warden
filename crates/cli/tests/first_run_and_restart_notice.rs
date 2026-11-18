@@ -243,9 +243,10 @@ fn a_mode_switch_that_stops_codexs_hook_exits_1_and_names_the_step() {
     }
 }
 
-/// Taking the hook out moves a hook of the person's behind it, and the note
-/// that says so names its program only. Its command says `failed:`, and the
-/// disconnect did not fail.
+/// Taking the hook out of a group it shares with a hook of the person's
+/// moves that hook inside the group (a group cannot hold an empty hook), and
+/// the note that says so names its program only. Its command says
+/// `failed:`, and the disconnect did not fail.
 ///
 /// FAILS ON REVERT: name a moved hook by its whole command in
 /// `agent_hooks::theirs_at` and the note holds `failed:`, which `agents
@@ -261,12 +262,10 @@ fn a_moved_hook_whose_command_says_failed_does_not_fail_the_disconnect() {
             .unwrap_or_else(|_| panic!("the connect wrote no Codex hook:\n{connected}")),
     )
     .expect("the hooks file is JSON");
-    settings["hooks"]["PreToolUse"]
+    settings["hooks"]["PreToolUse"][0]["hooks"]
         .as_array_mut()
-        .expect("the hook's event is a list")
-        .push(serde_json::json!({
-            "hooks": [{"type": "command", "command": "echo \"audit failed: x\""}]
-        }));
+        .expect("the connect wrote one group with our hook")
+        .push(serde_json::json!({"type": "command", "command": "echo \"audit failed: x\""}));
     std::fs::write(&file, settings.to_string()).unwrap();
 
     let out = cli(home.path())
