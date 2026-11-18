@@ -13,11 +13,13 @@ import {
   main,
   versionsIn,
   wellFormed,
-  WAIVERS,
 } from "./npm-audit.mjs";
 
 const self = fileURLToPath(new URL("./npm-audit.mjs", import.meta.url));
 const PICO = "GHSA-fc5q-39xc-vjpf";
+// The waiver the tests run with: a fixture, so the real list in npm-audit.mjs
+// can be empty without the tests losing the waived cases.
+const WAIVERS = { [PICO]: { package: "picomatch", lastAffected: "4.0.7" } };
 
 const advisory = (name, id, severity) => ({
   name,
@@ -50,7 +52,7 @@ const fakeNpm = ({
 const runMain = (io) => {
   const out = [];
   const err = [];
-  const code = main(io, (l) => out.push(l), (l) => err.push(l));
+  const code = main(io, (l) => out.push(l), (l) => err.push(l), WAIVERS);
   return { code, out, err };
 };
 
