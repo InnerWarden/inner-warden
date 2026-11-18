@@ -729,6 +729,12 @@ fn names_a_script_file(
     let Ok(whole) = std::str::from_utf8(source) else {
         return false;
     };
+    // A search path the line sets (`PATH=/tmp/x:$PATH bash "$(git ...)/x.sh"`)
+    // decides which `git` the substitution runs, so what it prints is no
+    // longer the repository's top.
+    if line_sets_search_path(whole) {
+        return false;
+    }
     command_arguments(command).into_iter().any(|word| {
         if word.kind() != "string" || shell_literal_word(&node_text(word, source)) != argument {
             return false;
@@ -739,6 +745,18 @@ fn names_a_script_file(
             .iter()
             .all(|inner| !substitution_runs_untrusted_code(&node_text(*inner, source), whole))
     })
+}
+
+/// Whether a line assigns the search path anywhere (`PATH=...`,
+/// `export PATH=...`, `env PATH=...`, `PATH+=...`, a quoted name), which
+/// moves every program the line names by name.
+fn line_sets_search_path(line: &str) -> bool {
+    static SETS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    SETS.get_or_init(|| {
+        regex::Regex::new(r#"(?:^|[^A-Za-z0-9_])["']?PATH["']?\+?="#)
+            .expect("static search path assignment regex")
+    })
+    .is_match(line)
 }
 
 /// Whether `argument` is a word of `command` written whole in single

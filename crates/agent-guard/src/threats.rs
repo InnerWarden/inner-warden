@@ -134,7 +134,12 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
         block: true,
     },
     CommandPattern {
-        pattern: r"(?:^|[;&|(`]\s*)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)",
+        // A command starts after a separator or an opening, and also after
+        // the words that open a body (`if a; then eval x; fi`, `while a; do
+        // eval x; done`), a group (`{ eval x; }`) and a negation
+        // (`! eval x`); those last are read outside single quotes only
+        // ([`EVAL_AFTER_OPENER`]).
+        pattern: r"(?:^|[;&|(`]\s*|(?:^|[;&|(`\s])(?:(?:then|do|else|elif)\s+|[{!]\s+))(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)",
         description: "shell eval (dynamic command execution)",
         block: true,
     },
@@ -6781,9 +6786,9 @@ fn writes_guard_carrier(content: &str) -> bool {
 ///   into the folder, and `tee` into it;
 /// * `rm -rf` of the folder;
 /// * a command run with `HOME` set to the folder, after the last write
-///   into it (what it does in its home cannot be followed by a write here),
-///   when that command is not a shell, `eval`, `env` or another program
-///   that runs a line of its own (its line is not read here).
+///   into it (what it does in its home cannot be followed by a write here);
+///   that command itself is kept in the line and read as written, whatever
+///   program it runs.
 ///
 /// A `cd`, a link, a copy, an archive, an alias of the variable, a function
 /// or anything else that names the folder leaves the line read whole.
@@ -6874,37 +6879,13 @@ fn without_fresh_dir_writes(content: &str) -> Option<String> {
             if rest.iter().any(|w| mention.is_match(w)) {
                 return None;
             }
-            // A shell, an evaluator or a wrapper run in the folder's home
-            // runs a line of its own (`HOME=$H sh -c 'ln -s ...'`) that can
-            // plant a link there: the line is read whole.
-            let runs_a_line = rest.first().is_some_and(|w| {
-                matches!(
-                    token_basename(w.trim_matches(|c| c == '"' || c == '\'')),
-                    "sh" | "bash"
-                        | "zsh"
-                        | "dash"
-                        | "ksh"
-                        | "fish"
-                        | "busybox"
-                        | "env"
-                        | "eval"
-                        | "exec"
-                        | "source"
-                        | "."
-                        | "command"
-                        | "builtin"
-                        | "nohup"
-                        | "xargs"
-                        | "sudo"
-                        | "doas"
-                        | "su"
-                        | "timeout"
-                        | "nice"
-                )
-            });
-            if runs_a_line {
-                return None;
-            }
+            // What the program does in the folder's home is not followed
+            // here, and any program can run a line of its own there
+            // (`HOME=$H $SHELL -c 'ln -s ...'`, `python3 -c` with
+            // `os.symlink`, a `git -c alias.x='!ln -s ...'`): no list of
+            // such programs is whole, so the segment is always kept and
+            // read as written.
+            kept.push(segment);
             home_runs = true;
             continue;
         }
@@ -9623,6 +9604,74 @@ pub fn check_command(content: &str) -> Option<(&'static str, bool)> {
 
 /// The first [`DANGEROUS_COMMANDS`] pattern one spelling of a command
 /// matches, its exemptions applied.
+/// The shell eval rule as it read before the body openers were added:
+/// `eval` after a separator or an opening.
+const EVAL_AFTER_SEPARATOR: &str =
+    r"(?:^|[;&|(`]\s*)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)";
+
+/// `eval` where a command starts after `then`, `do`, `else`, `elif`, `{`
+/// or `!`. Text in single quotes is a line handed to a program
+/// (`bash -c 'if false; then eval "$(cat)"; fi'`), read on its own by the
+/// shell reader, which knows a branch that never runs: a match there is
+/// not taken from the outer line.
+const EVAL_AFTER_OPENER: &str = r"(?:^|[;&|(`\s])(?:(?:then|do|else|elif)\s+|[{!]\s+)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)";
+
+/// The byte spans of `content` inside single quotes, as the shell reads
+/// them: a quote opens a span only outside double quotes and not after a
+/// backslash.
+fn single_quoted_spans(content: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut in_double = false;
+    let mut open: Option<usize> = None;
+    let mut escaped = false;
+    for (at, character) in content.char_indices() {
+        if let Some(start) = open {
+            if character == '\'' {
+                spans.push(start..at);
+                open = None;
+            }
+            continue;
+        }
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => in_double = !in_double,
+            '\'' if !in_double => open = Some(at + 1),
+            _ => {}
+        }
+    }
+    if let Some(start) = open {
+        spans.push(start..content.len());
+    }
+    spans
+}
+
+/// Whether the shell eval rule matched `content` only through a body
+/// opener (`then`, `do`, `{`, `!`, ...) inside single quotes: no `eval`
+/// follows a separator anywhere, and each one after an opener is in a
+/// line handed to a program, which the shell reader reads on its own.
+fn eval_only_after_opener_in_single_quotes(content: &str) -> bool {
+    static READINGS: std::sync::OnceLock<(regex::Regex, regex::Regex)> = std::sync::OnceLock::new();
+    let (separator, opener) = READINGS.get_or_init(|| {
+        (
+            regex::Regex::new(EVAL_AFTER_SEPARATOR).expect("static eval separator regex"),
+            regex::Regex::new(EVAL_AFTER_OPENER).expect("static eval opener regex"),
+        )
+    });
+    if separator.is_match(content) {
+        return false;
+    }
+    let quoted = single_quoted_spans(content);
+    opener.find_iter(content).all(|found| {
+        quoted
+            .iter()
+            .any(|span| span.start <= found.start() && found.end() <= span.end)
+    })
+}
+
 fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
     for (re, description, block) in dangerous_command_regexes() {
         if re.is_match(content) {
@@ -9643,6 +9692,11 @@ fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
             }
             if *description == "shell eval (dynamic command execution)"
                 && (is_local_tool_eval_idiom(content) || eval_only_in_grep_patterns(re, content))
+            {
+                continue;
+            }
+            if *description == "shell eval (dynamic command execution)"
+                && eval_only_after_opener_in_single_quotes(content)
             {
                 continue;
             }

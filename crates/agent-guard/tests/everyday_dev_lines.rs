@@ -336,16 +336,71 @@ fn everyday_developer_lines_are_allowed() {
 /// the `--exclude-dir` search was a `review`, the double-quoted `eval`
 /// lines `allow`, and the shell run in the fresh home already `deny`).
 ///
-/// A program run with `HOME` set to the fresh folder is followed only when
-/// it runs no line of its own: a shell there can plant a link.
+/// A program run with `HOME` set to the fresh folder is always read as
+/// written: any program can run a line of its own there and plant a link,
+/// and no list of such programs is whole (a shell named by a variable, an
+/// interpreter's `-c`, a git alias, a wrapper the list did not name).
 #[test]
-fn a_shell_run_in_the_fresh_home_is_read_whole() {
+fn a_program_run_in_the_fresh_home_is_read_whole() {
     assert_verdict(
         &[
             "H=$(mktemp -d); HOME=$H sh -c 'ln -s /home/u/.claude \"$HOME/.claude\"; echo \"{}\" > \"$HOME/.claude/settings.json\"'",
             "H=$(mktemp -d); mkdir -p \"$H/.claude\"; echo '{}' > \"$H/.claude/settings.json\"; HOME=$H bash -c 'ln -sf /home/u/.claude/settings.json \"$HOME/.claude/settings.json\"'",
+            "H=$(mktemp -d); mkdir -p \"$H/.claude\"; echo '{}' > \"$H/.claude/settings.json\"; HOME=$H $SHELL -c 'ln -sf /home/u/.claude/settings.json \"$HOME/.claude/settings.json\"'",
+            "H=$(mktemp -d); mkdir -p \"$H/.claude\"; echo '{}' > \"$H/.claude/settings.json\"; HOME=$H python3 -c \"import os; os.remove(os.path.expanduser('~/.claude/settings.json')); os.symlink('/home/u/.claude/settings.json', os.path.expanduser('~/.claude/settings.json'))\"",
+            "H=$(mktemp -d); mkdir -p \"$H/.claude\"; echo '{}' > \"$H/.claude/settings.json\"; HOME=$H git -c alias.x='!ln -sf /home/u/.claude/settings.json \"$HOME/.claude/settings.json\"' x",
+            "H=$(mktemp -d); HOME=$H stdbuf -o0 sh -c 'ln -s /home/u/.claude \"$HOME/.claude\"; echo \"{}\" > \"$HOME/.claude/settings.json\"'",
+            "H=$(mktemp -d); HOME=$H nice -n 5 sh -c 'ln -s /home/u/.claude \"$HOME/.claude\"; echo \"{}\" > \"$HOME/.claude/settings.json\"'",
         ],
         "deny",
+    );
+}
+
+/// A search path the line sets decides which `git` the substitution runs,
+/// so `"$(git rev-parse --show-toplevel)/x.sh"` is no longer the
+/// repository's script. Measured 2026-11-18: denied on main, allowed on
+/// this branch before `line_sets_search_path` (shell.rs).
+#[test]
+fn a_search_path_set_before_the_repository_top_is_refused() {
+    assert_verdict(
+        &[
+            "PATH=/tmp/fake:$PATH bash \"$(git rev-parse --show-toplevel)/x.sh\"",
+            "PATH=/tmp/fake:$PATH; bash \"$(git rev-parse --show-toplevel)/x.sh\"",
+            "export PATH=/tmp/fake:$PATH; bash \"$(git rev-parse --show-toplevel)/x.sh\"",
+            "env PATH=/tmp/fake:$PATH bash \"$(git rev-parse --show-toplevel)/x.sh\"",
+        ],
+        "deny",
+    );
+    assert_verdict(&["bash \"$(git rev-parse --show-toplevel)/x.sh\""], "allow");
+}
+
+/// FAILS ON REVERT of `EVAL_AFTER_OPENER` (threats.rs): an `eval` after
+/// `then`, `do`, `else`, `{` or `!` was allowed, on main as well
+/// (measured 2026-11-18). In single quotes the text is a line handed to a
+/// program and read on its own, where a branch that never runs is known
+/// (corpus case bn-062).
+#[test]
+fn eval_after_a_body_opener_a_group_or_a_negation_is_refused() {
+    assert_verdict(
+        &[
+            "if true; then eval \"$X\"; fi",
+            "if [ -f x ]; then echo ok; else eval \"$X\"; fi",
+            "if a; then :; elif b; then eval \"$X\"; fi",
+            "while true; do eval \"$X\"; done",
+            "for i in 1; do eval \"$X\"; done",
+            "{ eval \"$X\"; }",
+            "! eval \"$X\"",
+        ],
+        "deny",
+    );
+    assert_verdict(
+        &[
+            "grep -rn 'then eval' src/",
+            "echo done",
+            "git log --grep='do eval'",
+            "bash -c 'if false; then eval \"$(cat)\"; fi'",
+        ],
+        "allow",
     );
 }
 
