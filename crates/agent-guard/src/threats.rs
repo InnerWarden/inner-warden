@@ -9497,8 +9497,18 @@ fn dd_noop_sink(hay: &str) -> bool {
 /// of anything fetched, decoded, or read from a variable stays exactly as
 /// dangerous as it was, which `eval_of_network_data_is_still_denied` pins.
 fn is_local_tool_eval_idiom(content: &str) -> bool {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
+    static AT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static IDIOM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // Every `eval` the line runs: where a command starts (the start of a
+    // line, after `;` `&` `|`, inside `{ }`, `( )`, `$( )` or backquotes, and
+    // after a keyword that opens a body).
+    let at = AT.get_or_init(|| {
+        regex::Regex::new(
+            r"(?m)(?:^|[;&|({!`\n]|\$\(|\b(?:then|do|else|elif|if|while|until|time)\b)\s*(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*(eval)(?:\s|$)",
+        )
+        .expect("static eval position regex")
+    });
+    let idiom = IDIOM.get_or_init(|| {
         // The command reaching this point may be RAW (`eval "$(kubectl
         // completion bash)"`) or STRUCTURALLY PROJECTED, which unwraps the
         // command substitution. Both forms have to match or the exemption only
@@ -9507,43 +9517,34 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
         // question.
         regex::Regex::new(
             r#"(?ix)
-            ^\s* (?: (?:command|builtin) \s+ (?:-p\s+)? (?:--\s+)? )* eval\s+ ["']? (?:\$\( | `)? \s*
+            ^eval\s+ ["']? (?:\$\( | `)? \s*
             (?:
-                  [\w.-]+ \s+ (?:completion|completions) (?:\s+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
+                  [\w.-]+ \s+ (?:completion|completions) (?:[\t\x20]+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
                 | (?:direnv|starship|zoxide|mise|rbenv|pyenv|nodenv|jenv|fnm|atuin|navi|keychain)
-                    \s+ (?:hook|init|env|activate|init-file) (?:\s+[\w.-]+)?   # direnv hook bash
-                | ssh-agent (?:\s+-s)?                                     # ssh-agent -s
-                | gpg-agent [^)`'"]*
+                    \s+ (?:hook|init|env|activate|init-file) (?:[\t\x20]+[\w.-]+)?   # direnv hook bash
+                | ssh-agent (?:[\t\x20]+-s)?                                  # ssh-agent -s
+                | gpg-agent [^)`'";&|\n]*
                 | brew \s+ shellenv
-                | dircolors [^)`'"]*
+                | dircolors [^)`'";&|\n]*
                 | opam \s+ env
                 | luarocks \s+ path
             )
-            \s* (?:\) | `)? ["']? \s*
-            (?: (?:&&|;) .* )? $
+            [\t\x20]* (?:\) | `)? ["']? [\t\x20]*
+            (?: $ | && | \|\| | ; | \n | \} | \) )
             "#,
         )
         .expect("static local-tool eval idiom regex")
     });
     let c = content.trim();
-    // The tail after `&&` is screened on its own merits by every other rule;
-    // this exemption only ever removes the `eval` finding.
-    if re.is_match(c) {
-        return true;
-    }
-    // A line of several commands, one to a line or in a `{ ... }` group:
-    // every line that runs `eval` must be one of these idioms.
-    let mut evals = c
-        .lines()
-        .map(|line| line.trim().trim_start_matches(['{', '(', ' ', '\t']))
-        .filter(|line| {
-            line.split([';', '&', '|']).any(|part| {
-                let part = part.trim_start_matches(['{', '(', ' ', '\t']);
-                part == "eval" || part.starts_with("eval ") || part.starts_with("eval\t")
-            })
-        })
+    // Each `eval` of the line must be one of these idioms: the exemption only
+    // ever removes the `eval` finding, and only when no other `eval` runs
+    // (`eval "$(direnv hook bash)"; eval "$(curl ...)"` keeps it).
+    let mut evals = at
+        .captures_iter(c)
+        .filter_map(|found| found.get(1))
+        .map(|eval| &c[eval.start()..])
         .peekable();
-    evals.peek().is_some() && evals.all(|line| re.is_match(line))
+    evals.peek().is_some() && evals.all(|from| idiom.is_match(from))
 }
 
 /// `shred` of a short-lived secret in a runtime or temporary directory.

@@ -24,6 +24,9 @@ pub(crate) struct ShellProjection {
     /// What `scan` leaves out may still run: the command can give a name
     /// another meaning or runs text the masks did not see.
     pub(crate) masks_in_doubt: bool,
+    /// The line calls more functions defined on it than the guard writes
+    /// out ([`FUNCTION_CALLS_WRITTEN_OUT`]): what they run is unread.
+    pub(crate) names_over_budget: bool,
 }
 
 pub(crate) fn project(source: &str) -> ShellProjection {
@@ -32,7 +35,8 @@ pub(crate) fn project(source: &str) -> ShellProjection {
     let rewritten = text_as_the_shell_reads(source);
     let text = rewritten.as_deref().unwrap_or(source);
     let resolved = with_names_resolved(text);
-    let text = resolved.as_deref().unwrap_or(text);
+    let names_over_budget = resolved.over_budget;
+    let text = resolved.text.as_deref().unwrap_or(text);
     let evaluated = with_evaluated_subscripts_run(text);
     let text = evaluated.as_deref().unwrap_or(text);
     let exported = exported_function_bodies(text);
@@ -43,6 +47,7 @@ pub(crate) fn project(source: &str) -> ShellProjection {
             scan: source.to_owned(),
             parsed: false,
             masks_in_doubt: false,
+            names_over_budget,
         };
     };
     if tree.root_node().has_error() {
@@ -52,6 +57,7 @@ pub(crate) fn project(source: &str) -> ShellProjection {
             scan: source.to_owned(),
             parsed: false,
             masks_in_doubt: false,
+            names_over_budget,
         };
     }
     if ast_exceeds_projection_budget(tree.root_node()) {
@@ -62,6 +68,7 @@ pub(crate) fn project(source: &str) -> ShellProjection {
             scan: source.to_owned(),
             parsed: false,
             masks_in_doubt: false,
+            names_over_budget,
         };
     }
 
@@ -125,6 +132,7 @@ pub(crate) fn project(source: &str) -> ShellProjection {
         scan: String::from_utf8(bytes).unwrap_or_else(|_| source.to_owned()),
         parsed: true,
         masks_in_doubt: masks_are_in_doubt(tree.root_node(), text),
+        names_over_budget,
     }
 }
 
@@ -1172,7 +1180,7 @@ fn fetched_value_is_evaluated(root: tree_sitter::Node<'_>, source: &[u8]) -> boo
 }
 
 /// The most calls of functions defined on the line that are written out with
-/// their bodies. A line with more is left as it was read before.
+/// their bodies. A line with more is refused: what its calls run is unread.
 const FUNCTION_CALLS_WRITTEN_OUT: usize = 64;
 
 /// The line with the names bash resolves on it written out as what they run,
@@ -1195,30 +1203,40 @@ const FUNCTION_CALLS_WRITTEN_OUT: usize = 64;
 ///   they are.
 ///
 /// `None` when nothing is resolved.
-fn with_names_resolved(text: &str) -> Option<String> {
+fn with_names_resolved(text: &str) -> NamesResolved {
+    let unresolved = NamesResolved {
+        text: None,
+        over_budget: false,
+    };
     if !(text.contains("alias")
         || text.contains("command")
         || text.contains("builtin")
         || text.contains("()"))
     {
-        return None;
+        return unresolved;
     }
-    let tree = parse_bash(text)?;
+    let Some(tree) = parse_bash(text) else {
+        return unresolved;
+    };
     let root = tree.root_node();
     if root.has_error() {
-        return None;
+        return unresolved;
     }
     let source = text.as_bytes();
     let mut commands = Vec::new();
     collect_all_commands(root, &mut commands, 0);
 
-    // Aliases defined on the line, each with where its definition ends.
+    // Aliases defined on the line, each with where its definition ends;
+    // `command alias` and `builtin alias` define one too.
     let mut aliases: Vec<(String, String, usize)> = Vec::new();
     for command in &commands {
-        if command_name(*command, source).as_deref() != Some("alias") {
+        let Some((name, _, arguments)) = command_run_name(*command, source) else {
+            continue;
+        };
+        if name != "alias" {
             continue;
         }
-        for argument in command_arguments(*command) {
+        for argument in arguments {
             let word = shell_literal_word(&node_text(argument, source));
             if let Some((name, value)) = word.split_once('=') {
                 let plain_name = !name.is_empty()
@@ -1245,10 +1263,9 @@ fn with_names_resolved(text: &str) -> Option<String> {
             // definition, which every check already sees whole.
             let mut inner = Vec::new();
             collect_all_commands(body, &mut inner, 0);
-            if inner
-                .iter()
-                .any(|command| command_name(*command, source).as_deref() == Some(name.as_str()))
-            {
+            if inner.iter().any(|command| {
+                command_run_name(*command, source).is_some_and(|(called, _, _)| called == name)
+            }) {
                 return None;
             }
             Some((name, node_text(body, source)))
@@ -1261,40 +1278,54 @@ fn with_names_resolved(text: &str) -> Option<String> {
         let Some(name_node) = command.child_by_field_name("name") else {
             continue;
         };
-        let name = node_text(name_node, source);
-        if matches!(name.as_str(), "command" | "builtin") {
-            let next = command_arguments(*command)
-                .first()
-                .map(|argument| node_text(*argument, source));
-            if next.is_some_and(|next| !next.starts_with('-')) {
-                edits.push((name_node.byte_range(), " ".repeat(name.len())));
-            }
+        let Some((name, run_node, arguments)) = command_run_name(*command, source) else {
             continue;
-        }
+        };
         if let Some((_, value, _)) = aliases
             .iter()
             .rev()
-            .find(|(alias, _, defined)| *alias == name && *defined <= name_node.start_byte())
+            .find(|(alias, _, defined)| *alias == name && *defined <= run_node.start_byte())
         {
-            edits.push((name_node.byte_range(), value.clone()));
+            // The alias as it expands and the command as written, both read:
+            // without `expand_aliases` (bash reading a script) the name runs as
+            // itself, so `alias rm=true; rm -rf /` is still `rm -rf /`.
+            let range = command.byte_range();
+            edits.push((
+                range.clone(),
+                format!(
+                    "{{ {}{value}{}\n{}\n}}",
+                    &text[range.start..name_node.start_byte()],
+                    &text[run_node.end_byte()..range.end],
+                    &text[range.clone()],
+                ),
+            ));
             continue;
         }
         let inside_a_definition = ancestor_of_kind(*command, "function_definition").is_some();
-        if inside_a_definition {
-            continue;
-        }
-        let Some((_, body)) = functions
-            .iter()
-            .rev()
-            .find(|(function, _)| *function == name)
-        else {
+        let function = (!inside_a_definition)
+            .then(|| {
+                functions
+                    .iter()
+                    .rev()
+                    .find(|(function, _)| *function == name)
+            })
+            .flatten();
+        let Some((_, body)) = function else {
+            // `command` and `builtin` in front of a name run that name.
+            if run_node.start_byte() > name_node.start_byte() {
+                let blank = name_node.start_byte()..run_node.start_byte();
+                edits.push((blank.clone(), " ".repeat(blank.len())));
+            }
             continue;
         };
         calls += 1;
         if calls > FUNCTION_CALLS_WRITTEN_OUT {
-            return None;
+            return NamesResolved {
+                text: None,
+                over_budget: true,
+            };
         }
-        let arguments: Vec<String> = command_arguments(*command)
+        let arguments: Vec<String> = arguments
             .into_iter()
             .map(|argument| node_text(argument, source))
             .collect();
@@ -1312,7 +1343,7 @@ fn with_names_resolved(text: &str) -> Option<String> {
         ));
     }
     if edits.is_empty() {
-        return None;
+        return unresolved;
     }
     // Commands do not overlap except by nesting; keep the outermost edit.
     edits.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
@@ -1327,7 +1358,60 @@ fn with_names_resolved(text: &str) -> Option<String> {
         at = range.end;
     }
     out.push_str(&text[at..]);
-    Some(out)
+    NamesResolved {
+        text: Some(out),
+        over_budget: false,
+    }
+}
+
+/// What [`with_names_resolved`] reads of a line.
+struct NamesResolved {
+    /// The line with its names written out, or `None` when nothing is.
+    text: Option<String>,
+    /// More calls of functions defined on the line than are written out: the
+    /// line is not read past its names, and the caller refuses it.
+    over_budget: bool,
+}
+
+/// The name a command runs, the word that holds it and the words after it:
+/// past `command` and `builtin` (and `command -p`, `--`), with its quotes and
+/// backslashes taken out as bash looks the name up (`"f"` and `\f` call a
+/// function `f`). `None` for `command -v name` and the other option forms,
+/// which run nothing.
+fn command_run_name<'tree>(
+    command: tree_sitter::Node<'tree>,
+    source: &[u8],
+) -> Option<(
+    String,
+    tree_sitter::Node<'tree>,
+    Vec<tree_sitter::Node<'tree>>,
+)> {
+    let mut run = command.child_by_field_name("name")?;
+    let mut rest = command_arguments(command).into_iter();
+    loop {
+        let name = unquoted_name(&node_text(run, source));
+        if !matches!(name.as_str(), "command" | "builtin") {
+            return Some((name, run, rest.collect()));
+        }
+        let mut next = rest.next()?;
+        loop {
+            match unquoted_name(&node_text(next, source)).as_str() {
+                "-p" if name == "command" => next = rest.next()?,
+                "--" => next = rest.next()?,
+                word if word.starts_with('-') => return None,
+                _ => break,
+            }
+        }
+        run = next;
+    }
+}
+
+/// A command name with its quotes and backslashes taken out.
+fn unquoted_name(word: &str) -> String {
+    word.trim()
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect()
 }
 
 /// `body` with its positional parameters (`$1`, `${2}`, `$@`, `$*`, each
@@ -1896,6 +1980,14 @@ fn code_argument_flow(
         && !names_a_script_file(command, interpreter, argument, source.as_bytes())
     {
         return executable_data_flow(argument);
+    }
+    // The lines read out of a code flag's value ([`unlisted_runner_code`])
+    // can together be longer than the line they came from; each is shorter.
+    if as_shell {
+        return argument
+            .lines()
+            .filter(|line| line.len() < source.len())
+            .find_map(executable_data_flow);
     }
     None
 }
@@ -7165,46 +7257,95 @@ fn runner_shell_line(name: &str, args: &[String]) -> Option<String> {
 
 /// The flags by which programs take code to run on the line: a shell's
 /// `-c`, an interpreter's `-e` or `--eval`, PowerShell's `-Command`, a
-/// debugger's `-ex` and `--eval-command`.
+/// debugger's `-ex`, `-iex`, `--eval-command` and `--init-eval-command`.
 const INLINE_CODE_FLAGS: &[&str] = &[
     "-c",
     "-e",
     "-ex",
+    "-iex",
     "-command",
     "-Command",
     "--command",
     "-eval",
     "--eval",
+    "-eval-command",
     "--eval-command",
+    "-init-eval-command",
+    "--init-eval-command",
     "-execute",
     "--execute",
 ];
 
+/// The most words of a code flag's value read as the start of a line.
+const CODE_VALUE_WORDS_READ: usize = 32;
+
 /// The code a program with no reader of its own is handed on the line, read
-/// from its arguments and not its name: a value of an inline code flag that
-/// is a fetch substitution (`pwsh -c "$(curl ...)"`, `yaegi -e "$(curl
-/// ...)"`), or one that asks for a shell line (`-ex 'shell cmd'`, `-ex
-/// '!cmd'`, the way debuggers run one). Measured 2026-11-18: each was
-/// allowed while `python3 -c "$(curl ...)"` was refused. A value that is
-/// plain text, or a substitution of a local command, is not read as code.
+/// from its arguments and not its name. The value of an inline code flag is
+/// code in a language the guard does not read, and any part of it may be a
+/// shell line the program runs (`gdb -iex 'shell cmd'`, `osascript -e 'do
+/// shell script "cmd"'`, `psql -c '\! cmd'`): the value is read as it stands,
+/// every quoted string in it, and the rest of it after each of its words.
+/// Measured 2026-11-18: each was allowed while `python3 -c "$(curl ...)"`
+/// was refused. A value of one plain word (`gdb -ex run`, `grep -e foo`)
+/// holds no line to run.
 fn unlisted_runner_code(args: &[String]) -> Option<String> {
-    args.iter().enumerate().find_map(|(at, argument)| {
+    let mut lines = Vec::new();
+    for (at, argument) in args.iter().enumerate() {
         let value = match argument.split_once('=') {
-            Some((flag, value)) if flag.starts_with("--") && INLINE_CODE_FLAGS.contains(&flag) => {
+            Some((flag, value)) if flag.starts_with('-') && INLINE_CODE_FLAGS.contains(&flag) => {
                 shell_literal_word(value)
             }
-            _ if INLINE_CODE_FLAGS.contains(&argument.as_str()) => args.get(at + 1)?.clone(),
-            _ => return None,
+            _ if INLINE_CODE_FLAGS.contains(&argument.as_str()) => match args.get(at + 1) {
+                Some(value) => value.clone(),
+                None => continue,
+            },
+            _ => continue,
         };
-        let trimmed = value.trim_start();
-        if let Some(line) = trimmed
-            .strip_prefix("shell ")
-            .or_else(|| trimmed.strip_prefix('!'))
-        {
-            return Some(line.trim().to_owned());
+        lines.extend(code_value_lines(&value));
+    }
+    lines.retain(|line| !line.trim().is_empty());
+    let mut seen = std::collections::HashSet::new();
+    lines.retain(|line| seen.insert(line.clone()));
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// [`unlisted_runner_code`] for one value: the value, each quoted string in
+/// it, and the rest after each of its first [`CODE_VALUE_WORDS_READ`] words,
+/// with a leading `!` or `\!` (a shell escape in many programs) taken off.
+/// A value of a single word gives nothing.
+fn code_value_lines(value: &str) -> Vec<String> {
+    let trimmed = value.trim();
+    if trimmed.split_whitespace().nth(1).is_none() && !trimmed.contains(['$', '`', '|', ';']) {
+        return Vec::new();
+    }
+    let unescaped = |line: &str| {
+        line.trim_start()
+            .trim_start_matches('\\')
+            .trim_start_matches('!')
+            .trim()
+            .to_owned()
+    };
+    let mut lines = vec![unescaped(trimmed)];
+    let mut rest = trimmed;
+    for _ in 0..CODE_VALUE_WORDS_READ {
+        let Some(split) = rest.find(char::is_whitespace) else {
+            break;
+        };
+        rest = rest[split..].trim_start();
+        if rest.is_empty() {
+            break;
         }
-        (dynamic_code_argument(&value) && text_fetches(&value)).then_some(value)
-    })
+        lines.push(unescaped(rest));
+    }
+    for quote in ['"', '\''] {
+        let mut parts = trimmed.split(quote);
+        parts.next();
+        while let Some(inside) = parts.next() {
+            lines.push(unescaped(&inside.replace("\\\"", "\"")));
+            parts.next();
+        }
+    }
+    lines
 }
 
 fn shell_code_input(args: &[String]) -> CodeInput {
