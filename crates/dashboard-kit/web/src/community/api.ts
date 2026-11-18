@@ -789,6 +789,20 @@ export function readProfilesFile(value: unknown): { sentence: string } | undefin
 /** The one command the CLI says fixes an agent, printed as sent. */
 export type AgentNextStep = { label: string; command: string; line: string };
 
+/**
+ * A connected hook agent whose shell commands are screened while another of
+ * its hooks runs a program that is gone: the sentence `innerwarden status`
+ * prints for it and the command that fixes it, as the CLI built them.
+ */
+export type AgentUnscreened = { line: string; command: string };
+
+export function readAgentUnscreened(value: unknown): AgentUnscreened | undefined {
+  const item = record(value);
+  const line = plain(item?.line, 600);
+  const command = plain(item?.command, 200);
+  return line === undefined || command === undefined ? undefined : { line, command };
+}
+
 export function readAgentNextStep(value: unknown): AgentNextStep | undefined {
   const item = record(value);
   const label = plain(item?.label, 120);
@@ -1139,6 +1153,8 @@ export type AgentFacts = {
   configChangedAt?: string;
   judges?: Judges;
   judgesLine?: string;
+  /** Some of its tool calls go unscreened because a hook's program is gone; `judges` is then absent. */
+  unscreened?: AgentUnscreened;
   restart?: RestartWords;
   modeSteps?: ModeSteps;
   mcp?: McpCounts;
@@ -1235,6 +1251,7 @@ export function readAgentFacts(value: unknown): AgentFacts | undefined {
     configChangedAt: time(guardrail?.config_changed_at),
     judges,
     judgesLine: plain(item.judges_line, 400),
+    unscreened: readAgentUnscreened(item.unscreened),
     restart: readRestart(item.restart),
     modeSteps: readModeSteps(item.mode_steps),
     mcp: mechanism === "mcp" ? readMcp(item.mcp) : undefined,

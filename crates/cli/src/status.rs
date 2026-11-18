@@ -89,6 +89,12 @@ pub struct PartlyUnscreened {
     pub next: String,
 }
 
+/// PURE: the sentence for a [`PartlyUnscreened`] agent, the one `status`
+/// prints and the dashboard serves, so the two say one thing.
+pub fn partly_unscreened_words(agent: &str, sentence: &str) -> String {
+    format!("{agent} is wired and its shell commands are screened, but {sentence}.")
+}
+
 /// Which tool calls of a wired agent are judged before they run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolClasses {
@@ -521,10 +527,7 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     // every Write and Edit went through unscreened.
     for partly in &facts.partly_unscreened {
         out.push(Finding::NotWorking {
-            what: format!(
-                "{} is wired and its shell commands are screened, but {}.",
-                partly.agent, partly.sentence
-            ),
+            what: partly_unscreened_words(&partly.agent, &partly.sentence),
             next: partly.next.clone(),
         });
     }
