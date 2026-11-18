@@ -251,9 +251,39 @@ impl VerbSearch {
         })
     }
 
+    /// How strongly an end says the protection may change: a verb of its
+    /// own never, the words ending only when words are added, a word not
+    /// shown always.
+    fn strength(end: u16) -> u8 {
+        match end {
+            Self::VERB => 0,
+            Self::ENDS => 1,
+            Self::ENDS_AFTER_AGENT => 2,
+            _ => 3,
+        }
+    }
+
+    /// The stronger of two ends ([`VerbSearch::strength`]).
+    fn stronger(one: u16, other: u16) -> u16 {
+        if Self::strength(other) > Self::strength(one) {
+            other
+        } else {
+            one
+        }
+    }
+
     /// How the search ends from `word` on, for each state, given how it
-    /// ends from the word after it (`next`).
-    fn from(word: &Word, next: u16) -> u16 {
+    /// ends from the word after it (`next`). `rest_not_a_read`: a word
+    /// after this one is not a read ([`KERNEL_PROTECTION_READS`]).
+    ///
+    /// A word not shown that the shell hands over as one word
+    /// ([`Word::one_word`]: `"$N"`, `"ls $(date)"`) is one of the words it
+    /// could be, and the search goes on from there: `agent`, `host`, an
+    /// option or its value, `--`, `kernel` after `agent`, or a verb of its
+    /// own. The strongest of those ends is the end. One word cannot be
+    /// `agent kernel off`; unquoted, it may be any number of words, and
+    /// ends the search where it stands.
+    fn from(word: &Word, next: u16, rest_not_a_read: bool) -> u16 {
         let plain = word.is_plain();
         let text = word.text.as_str();
         let option = text.len() > 1 && text.starts_with('-');
@@ -264,7 +294,32 @@ impl VerbSearch {
             let options_end = state & Self::OPTIONS_END != 0;
             let after_agent = state & Self::AFTER_AGENT != 0;
             let no_value = state & !Self::MAYBE_A_VALUE;
-            let end = if !plain {
+            let end = if !plain && word.one_word {
+                let mut end = Self::VERB;
+                if !options_end {
+                    end = Self::stronger(end, after(no_value | Self::OPTIONS_END));
+                    end = Self::stronger(end, after(state | Self::MAYBE_A_VALUE));
+                    end = Self::stronger(end, after(no_value));
+                }
+                if !after_agent {
+                    end = Self::stronger(end, after(no_value | Self::AFTER_AGENT));
+                }
+                // `host`, or the value of the option before it.
+                end = Self::stronger(end, after(no_value));
+                if after_agent {
+                    // `kernel`: a change unless nothing after it, or only
+                    // reads, follow.
+                    end = Self::stronger(
+                        end,
+                        if rest_not_a_read {
+                            Self::UNSHOWN
+                        } else {
+                            Self::ENDS_AFTER_AGENT
+                        },
+                    );
+                }
+                end
+            } else if !plain {
                 Self::UNSHOWN
             } else if !options_end && text == "--" {
                 after(no_value | Self::OPTIONS_END)
@@ -384,7 +439,7 @@ impl WordsAfter {
                         } else {
                             place
                         },
-                        verb_search: VerbSearch::from(word, next.verb_search),
+                        verb_search: VerbSearch::from(word, next.verb_search, next.not_a_read),
                     };
                 }
                 for (place, word) in words.iter().enumerate() {

@@ -44,6 +44,13 @@ pub(crate) struct Word {
     /// that starts a word or the value of an assignment; a quoted or escaped
     /// `~` is a letter.
     pub(crate) open_tildes: Vec<usize>,
+    /// The shell hands the program exactly one word for it, whatever its
+    /// expansions hold: each stands in double quotes and none is `$@` or an
+    /// array's every member, and it holds no pattern and no quote left open.
+    /// Set by [`read_line`]; a word built elsewhere is not vouched for.
+    pub(crate) one_word: bool,
+    /// While it is read: an expansion stood where the shell splits it.
+    pub(crate) may_split: bool,
 }
 
 impl Word {
@@ -140,6 +147,7 @@ pub(crate) fn read_line(text: &str) -> Line {
         braces: 0,
         heredocs: Vec::new(),
         joint: Joint::Start,
+        in_double: false,
     };
     lexer.run();
     lexer.line
@@ -195,6 +203,8 @@ struct Lexer {
     heredocs: Vec<Heredoc>,
     /// What ended the last command: what starts the next one.
     joint: Joint,
+    /// The reading is inside a double quote.
+    in_double: bool,
 }
 
 impl Lexer {
@@ -207,7 +217,8 @@ impl Lexer {
     }
 
     fn end_word(&mut self) {
-        if let Some(word) = self.word.take() {
+        if let Some(mut word) = self.word.take() {
+            word.one_word = !word.may_split && !word.has(Mark::Pattern);
             self.command.words.push(word);
         }
         self.braces = 0;
@@ -397,15 +408,24 @@ impl Lexer {
             word.push(c, Mark::Plain);
         }
         never_closed(word, start, '\'');
+        word.may_split = true;
     }
 
     /// The inside of a double quote, its opening quote already read.
     fn double_quoted(&mut self) {
+        let was_in_double = std::mem::replace(&mut self.in_double, true);
+        self.double_quoted_body();
+        self.in_double = was_in_double;
+    }
+
+    /// [`Lexer::double_quoted`], with `in_double` set.
+    fn double_quoted_body(&mut self) {
         let start = self.word().marks.len();
         loop {
             let Some(c) = self.peek(0) else {
                 let word = self.word();
                 never_closed(word, start, '"');
+                word.may_split = true;
                 return;
             };
             match c {
@@ -489,7 +509,12 @@ impl Lexer {
     fn expansion_to(&mut self, end: usize) {
         let raw: String = self.chars[self.at..end].iter().collect();
         self.at = end;
-        self.word().push_str(&raw, Mark::Expansion);
+        // Unquoted, the shell splits what it puts in place; quoted, `$@`
+        // and `${name[@]}` are still a word for each member.
+        let splits = !self.in_double || raw.contains('@');
+        let word = self.word();
+        word.may_split |= splits;
+        word.push_str(&raw, Mark::Expansion);
     }
 
     /// `$'...'`: the shell decodes its escapes, and the program gets the
@@ -514,6 +539,7 @@ impl Lexer {
             }
         }
         never_closed(word, start, '\'');
+        word.may_split = true;
     }
 
     fn backtick(&mut self) {
