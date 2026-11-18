@@ -19,8 +19,12 @@
 //!   trusted" for a hook that is, never the reverse.
 //! - [`grant`] asks Codex itself, through its app-server, to trust the hook.
 //!   `agents connect` runs it: the person ran that command to turn the hook
-//!   on. Codex names the hash it stores, so nothing here can leave a record
-//!   Codex does not accept and call it trusted.
+//!   on. Codex names the hash it stores, so nothing here writes a record
+//!   Codex does not accept. Its answer is not the proof that the hook runs:
+//!   the program started is the first `codex` on the PATH, and another
+//!   program placed in front of it can answer "trusted" and write nothing.
+//!   `agents connect` reads the record with [`offline`] afterwards and
+//!   only that decides.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -466,7 +470,8 @@ impl Talk {
 /// It answers `initialize` with the home in `home`, the n-th `hooks/list`
 /// with `list<n>` (an error when there is no such file), and a write with the
 /// status in `write` ("ok" when there is no such file), keeping the request in
-/// `asked`. One notification goes out first, as the real server sends one.
+/// `asked` and copying the file `config`, when there is one, to `config.toml`
+/// in the home it serves, as Codex writes its record there. One notification goes out first, as the real server sends one.
 #[cfg(all(test, unix))]
 pub(crate) const FAKE_APP_SERVER: &str = r##"dir="$1"
 q='"'
@@ -489,6 +494,7 @@ while IFS= read -r line; do
       ;;
     *'"method":"config/batchWrite"'*)
       printf '%s\n' "$line" > "$dir/asked"
+      if [ -f "$dir/config" ]; then cp "$dir/config" "$(cat "$dir/home")/config.toml"; fi
       if [ -f "$dir/write" ]; then
         printf '{"id":%s,"result":{"status":"%s"}}\n' "$id" "$(cat "$dir/write")"
       else
