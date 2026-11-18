@@ -18,6 +18,14 @@ ignore = [
   # is tracked as its own change; drop this entry when it lands. Only this ID
   # is waived: a vulnerability advisory against either crate still fails here.
   "RUSTSEC-2024-0449",
+  # RUSTSEC-2026-0543: `chrono` is UNMAINTAINED (announced in
+  # chronotope/chrono#1768), an informational advisory, not a known
+  # vulnerability, and every version is affected, so there is no upgrade to
+  # take. It is the time type across this workspace and of the timestamps
+  # other builds read from the kit, so it cannot be swapped in a patch.
+  # The advisory names `jiff` and `time` as the replacements. Move off chrono
+  # and drop this entry.
+  "RUSTSEC-2026-0543",
 ]
 
 [licenses]

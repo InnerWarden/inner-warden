@@ -328,8 +328,60 @@ fn status_names_the_tool_classes_an_agent_hook_judges() {
     run(home.path(), &["install", "claude-code"]);
     let after = run(home.path(), &["status"]);
     assert!(
-        after.contains("claude-code: judged before they run: shell commands, and file changes"),
+        after.contains("claude-code: judged before they run: shell commands, file changes"),
+        "{after}"
+    );
+    assert!(
+        after.contains("and reads (Read, Grep, Glob) of secrets"),
         "{after}"
     );
     assert!(!after.contains("only shell commands are judged"), "{after}");
+}
+
+/// Wiring with the shell and file entries but no read entry (written by
+/// 1.6.12) is said to leave the read tools unjudged, with the step that adds
+/// them; after it, reads are named among what is judged.
+///
+/// FAILS ON REVERT of the `reads` field in `tool_classes_for` (always true):
+/// the first status says the reads are judged.
+#[test]
+fn status_names_the_read_tools_a_hook_wired_before_them_leaves_out() {
+    let home = tempfile::TempDir::new().expect("temp home");
+    let command = format!("\"{}\" hook --agent claude-code", bin());
+    std::fs::create_dir_all(home.path().join(".claude")).expect("agent config dir");
+    let entry = |matcher: &str| {
+        serde_json::json!({
+            "matcher": matcher,
+            "hooks": [{"type": "command", "command": command}]
+        })
+    };
+    std::fs::write(
+        home.path().join(".claude/settings.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({"hooks": {"PreToolUse": [
+            entry("Bash"),
+            entry("Write|Edit|MultiEdit|NotebookEdit"),
+        ]}}))
+        .expect("settings json"),
+    )
+    .expect("write settings");
+
+    let before = run(home.path(), &["status"]);
+    assert!(
+        before.contains(
+            "claude-code: shell commands and file changes are judged, but its read tools"
+        ),
+        "{before}"
+    );
+    assert!(
+        before.contains("try: innerwarden install claude-code"),
+        "{before}"
+    );
+
+    run(home.path(), &["install", "claude-code"]);
+    let after = run(home.path(), &["status"]);
+    assert!(
+        after.contains("and reads (Read, Grep, Glob) of secrets"),
+        "{after}"
+    );
+    assert!(!after.contains("but its read tools"), "{after}");
 }

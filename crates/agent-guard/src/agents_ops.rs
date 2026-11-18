@@ -154,6 +154,26 @@ pub fn hook_program(home: &Path, agent: &AgentStatus) -> Option<hook::HookProgra
     })
 }
 
+/// The tools a wired agent's hooks leave unscreened while its Bash hook runs:
+/// a file-tool, read-tool or result hook whose program is gone. Empty when the
+/// Bash hook itself does not run (that is [`hook_program`]'s answer, and the
+/// whole agent is off) or for an agent guarded some other way. Shared by
+/// `status` and `agents` so the two give the same answer.
+pub fn unscreened_hooks(home: &Path, agent: &AgentStatus) -> Vec<hook::UnscreenedHooks> {
+    if !agent.hookable {
+        return Vec::new();
+    }
+    let Some(settings) = read_json(&home.join(".claude/settings.json")) else {
+        return Vec::new();
+    };
+    let path_env = std::env::var_os("PATH");
+    let fact = |program: &str| program_fact(program, path_env.as_deref());
+    match hook::judge_iwguard_hooks(&settings, fact) {
+        Some(hook::HookProgram::Runs) => hook::unscreened_iwguard_hooks(&settings, fact),
+        _ => Vec::new(),
+    }
+}
+
 /// PURE: judge one MCP proxy wrapper's program from what the caller found
 /// when it looked. The same facts and the same rule as a hook's program
 /// ([`hook::judge_hook_program`]), worded for what goes wrong: an MCP client
@@ -1363,10 +1383,19 @@ fn list_lines(home: &Path) -> Vec<String> {
                 (false, Some(hook::HookProgram::Broken { problem, .. })) => Some(problem),
                 _ => None,
             };
+            // Bash screened, but a file-tool, read-tool or result hook points
+            // at a program that is gone: those calls go through unscreened.
+            let partly = if r.guarded {
+                hook::unscreened_hooks_sentence(&unscreened_hooks(home, r))
+            } else {
+                None
+            };
             let guard = if !r.guardable() {
                 "detected (guard manually)".to_string()
             } else if broken.is_some() {
                 "✗ wired, but its hook cannot run".to_string()
+            } else if partly.is_some() {
+                "✗ wired, part of its hook cannot run".to_string()
             } else if proxy_broken.is_some() {
                 "✗ wired, but its MCP proxy cannot run".to_string()
             } else if r.guarded {
@@ -1398,6 +1427,13 @@ fn list_lines(home: &Path) -> Vec<String> {
             if let Some(problem) = broken {
                 out.push(format!(
                     "  {:<13} {problem}, so nothing is screened. Fix: {}",
+                    "",
+                    hook_repair_command(home, r)
+                ));
+            }
+            if let Some(sentence) = partly {
+                out.push(format!(
+                    "  {:<13} {sentence}. Fix: {}",
                     "",
                     hook_repair_command(home, r)
                 ));

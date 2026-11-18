@@ -370,9 +370,11 @@ jobs:
       # public repo for weeks after the patched release. This fails a pull
       # request on a known advisory in this npm tree the way `cargo deny check`
       # does for crates. Dev dependencies count: the test runner and the build
-      # tools run here and on every contributor's machine.
+      # tools run here and on every contributor's machine. An advisory with no
+      # patched release can only be waived by ID, with its reason, in
+      # scripts/npm-audit.mjs; the waiver fails once a newer release ships.
       - name: No known advisory in the npm tree
-        run: npm audit --audit-level=moderate
+        run: npm run audit
 
       - name: Typecheck
         run: npx tsc -b

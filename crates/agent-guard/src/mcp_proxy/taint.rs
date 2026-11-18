@@ -118,9 +118,39 @@
 //! raise `AG-TAINT` exactly as before. Reading a listed file inside the
 //! server's roots discloses nothing to a third party, and what it returns is
 //! itself recorded as content, so a later call that carries it is still caught.
+//!
+//! # A value the agent sent
+//!
+//! Servers repeat what they were asked for: a directory listing names the
+//! directory, an install names the package, an error names the file. Recorded
+//! as the server's, the agent's own value tainted the next call that used it,
+//! so installing a package and then running one of its tools was refused.
+//!
+//! So the answer to a call does not record an argument value that call sent
+//! ([`TaintTracker::note_call`], [`TaintTracker::record_answer`]). Only the
+//! answer to that same request id is affected, and only when:
+//!
+//! * the value is a whole argument value, one token long (a directory, a
+//!   package name). A word inside a longer argument, a command line or a
+//!   sentence, is recorded as before: a server that runs or reads that
+//!   argument hands the word back as part of its own output;
+//! * the call carried no recorded token (a call that may have been steered
+//!   has nothing of its own to repeat);
+//! * the token is not kept already. A value another result brought in stays
+//!   tainted when the agent sends it on and the server repeats it.
+//!
+//! A value one call sent and the answer to another call names is recorded as
+//! before. What a call sent is kept until its answer arrives, for at most
+//! [`MAX_SENT_CALLS`] calls of [`SENT_CALL_COST`] each; past either, or for a
+//! request id longer than [`MAX_SENT_ID_BYTES`], the answer is recorded whole.
+//!
+//! What this gives up: a value that reached the agent through a channel this
+//! tracker does not record (a tool description, a resource) and that the
+//! agent sent in a call is not caught when it is used again after the server
+//! repeats it. The first use was not caught either.
 
 use std::collections::hash_map::RandomState;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 
 use serde_json::Value;
@@ -180,6 +210,18 @@ const MAX_DECLARED_TOOLS: usize = 1024;
 /// The longest tool name whose declaration is kept.
 const MAX_DECLARED_NAME_BYTES: usize = 128;
 
+/// The most calls whose sent values are kept while their answers are awaited
+/// (see "A value the agent sent"). An MCP client has a handful of calls in
+/// flight; past this, the oldest call's answer is recorded whole.
+const MAX_SENT_CALLS: usize = 16;
+/// What the values one call sent may cost, counted as the store counts
+/// ([`cost_of`]). Past it, the rest of that call's values are not kept, and
+/// the answer records them, the cautious side.
+const SENT_CALL_COST: usize = 16 * 1024;
+/// The longest request id a call's sent values are kept under. A call with a
+/// longer id is not remembered, and its answer is recorded whole.
+const MAX_SENT_ID_BYTES: usize = 128;
+
 /// The tools of the reference MCP filesystem server whose successful result is
 /// a list of names (entries, matches, allowed directories) rather than file
 /// contents.
@@ -193,10 +235,11 @@ const LISTING_TOOLS: &[&str] = &[
 
 /// The arguments of those read-only tools that name a path or a path pattern:
 /// `path`, `paths` (an array), and the glob filters of `search_files` and
-/// `directory_tree`, which only narrow which local names come back. Any other
-/// argument (a `head` count, an unknown extra key, a nested value) is not a
-/// path, and a listing token found there still raises the alert.
-const PATH_ARGS: &[&str] = &["path", "paths", "pattern", "excludePatterns"];
+/// `directory_tree`, which only narrow which local names come back, plus
+/// `file_path`, the name other servers give the path their `read_file` reads.
+/// Any other argument (a `head` count, an unknown extra key, a nested value)
+/// is not a path, and a listing token found there still raises the alert.
+const PATH_ARGS: &[&str] = &["path", "paths", "pattern", "excludePatterns", "file_path"];
 
 /// The orders `list_directory_with_sizes` takes in `sortBy`: the one string
 /// argument outside [`PATH_ARGS`] a read-only reference tool accepts.
@@ -291,6 +334,14 @@ pub struct TaintTracker {
     /// Not taint: it is kept here because this tracker is the one state the
     /// proxy keeps per connection, and the router reads both.
     declared: HashMap<Box<str>, ToolDeclaration>,
+    /// The resources the server announced this session, which a
+    /// `resources/read` is checked against. Not taint either: kept here for
+    /// the same reason as `declared`.
+    pub(crate) resources: super::content::ResourceCatalog,
+    /// The argument values each recent call sent, by request id, oldest
+    /// first, until the answer to it is recorded (see "A value the agent
+    /// sent").
+    sent: VecDeque<(Box<str>, HashSet<Box<str>>)>,
 }
 
 impl TaintTracker {
@@ -337,14 +388,75 @@ impl TaintTracker {
     /// result's `provenance`, then make room if the store is over its budget
     /// (see "What is kept" in the module docs).
     pub fn record_result(&mut self, text: &str, provenance: Provenance) {
+        self.record(text, provenance, None);
+    }
+
+    /// Remember the argument values a `tools/call` sent whole, each one token
+    /// long, under its request `id`, so that the answer to it does not record
+    /// them as the server's (see "A value the agent sent"). `reuses_result` is whether the call carries a
+    /// recorded token: such a call may have been steered, so nothing it sent
+    /// is remembered, and an earlier call under the same id is forgotten too.
+    /// A call with no id, or one longer than [`MAX_SENT_ID_BYTES`], is not
+    /// remembered.
+    pub fn note_call(&mut self, id: Option<&Value>, args: &Value, reuses_result: bool) {
+        let Some(key) = id
+            .map(Value::to_string)
+            .filter(|key| key.len() <= MAX_SENT_ID_BYTES)
+        else {
+            return;
+        };
+        self.sent.retain(|(kept, _)| **kept != *key);
+        if reuses_result {
+            return;
+        }
+        let mut values: HashSet<Box<str>> = HashSet::new();
+        let mut cost = 0;
+        walk_strings(args, &mut |value| {
+            // Only a whole value that is one token: a word inside a longer
+            // argument is not kept.
+            if value.len() < MIN_TOKEN_LEN
+                || value.len() > MAX_KEPT_TOKEN_BYTES
+                || value.contains(char::is_whitespace)
+                || values.contains(value)
+                || cost + cost_of(value) > SENT_CALL_COST
+            {
+                return;
+            }
+            cost += cost_of(value);
+            values.insert(value.into());
+        });
+        if values.is_empty() {
+            return;
+        }
+        if self.sent.len() >= MAX_SENT_CALLS {
+            self.sent.pop_front();
+        }
+        self.sent.push_back((key.into(), values));
+    }
+
+    /// [`TaintTracker::record_result`] for the answer to request `id`: a
+    /// value the call sent ([`TaintTracker::note_call`]) is not recorded
+    /// anew. A token another result already recorded is handled as before,
+    /// so a value the server brought in stays tainted when it is repeated.
+    pub fn record_answer(&mut self, id: Option<&Value>, text: &str, provenance: Provenance) {
+        let sent = id.map(Value::to_string).and_then(|key| {
+            let at = self.sent.iter().position(|(kept, _)| **kept == *key)?;
+            self.sent.remove(at).map(|(_, values)| values)
+        });
+        self.record(text, provenance, sent.as_ref());
+    }
+
+    /// Record one result's tokens, leaving out a token not yet kept that is
+    /// one of `sent` (what the call it answers sent).
+    fn record(&mut self, text: &str, provenance: Provenance, sent: Option<&HashSet<Box<str>>>) {
         self.results += 1;
         let newest = self.results;
         // Tokens an earlier result holds, and what this result costs with
         // them.
         let mut seen_again: Vec<usize> = Vec::new();
         let mut whole_cost = 0;
-        for tok in tokenize(text) {
-            let tok = kept_part(tok, provenance);
+        for raw in tokenize(text) {
+            let tok = kept_part(raw, provenance);
             match self.find(tok) {
                 Some(slot) => {
                     // Never downgrades: a token also seen as content stays
@@ -358,6 +470,11 @@ impl TaintTracker {
                     }
                 }
                 None => {
+                    // The call itself sent it: the agent's value, not one
+                    // the server brought in.
+                    if sent.is_some_and(|sent| sent.contains(raw)) {
+                        continue;
+                    }
                     whole_cost += cost_of(tok);
                     self.insert(tok, provenance);
                 }
@@ -1889,5 +2006,86 @@ mod tests {
             Provenance::Content,
             "a result whose request is unknown"
         );
+    }
+
+    /// The answer to a call leaves out what that call sent, and nothing else:
+    /// the answer to another id, a word inside a longer argument, the answer
+    /// to a call that reused a recorded token, a call under an id too long to
+    /// keep, the oldest of more calls than are kept, and a second answer
+    /// under one id all record the value as before.
+    #[test]
+    fn what_a_call_sent_is_left_out_of_its_own_answer_only() {
+        let args = json!({"name": "corp-analytics"});
+        let answer = "installed corp-analytics";
+        let tainted = |t: &TaintTracker| {
+            t.arg_taint_alert("run_tool", &json!({"package": "corp-analytics"}))
+                .is_some()
+        };
+
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(1)), &args, false);
+        t.record_answer(Some(&json!(1)), answer, Provenance::Content);
+        assert!(!tainted(&t), "the answer to the call that sent it");
+
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(1)), &args, false);
+        t.record_answer(Some(&json!(2)), answer, Provenance::Content);
+        assert!(tainted(&t), "the answer to another call");
+
+        let mut t = TaintTracker::new();
+        t.note_call(
+            Some(&json!(1)),
+            &json!({"query": "install corp-analytics"}),
+            false,
+        );
+        t.record_answer(Some(&json!(1)), answer, Provenance::Content);
+        assert!(tainted(&t), "a word inside a longer argument");
+
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(1)), &args, false);
+        t.note_call(Some(&json!(1)), &args, true);
+        t.record_answer(Some(&json!(1)), answer, Provenance::Content);
+        assert!(tainted(&t), "a call that reused a recorded token");
+
+        let long = json!("x".repeat(MAX_SENT_ID_BYTES + 1));
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&long), &args, false);
+        t.record_answer(Some(&long), answer, Provenance::Content);
+        assert!(tainted(&t), "an id too long to keep");
+
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(0)), &args, false);
+        for id in 1..=MAX_SENT_CALLS {
+            t.note_call(
+                Some(&json!(id)),
+                &json!({"q": format!("another-value-{id:04}")}),
+                false,
+            );
+        }
+        assert_eq!(t.sent.len(), MAX_SENT_CALLS);
+        t.record_answer(Some(&json!(0)), answer, Provenance::Content);
+        assert!(tainted(&t), "the oldest of more calls than are kept");
+
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(1)), &args, false);
+        t.record_answer(Some(&json!(1)), "done", Provenance::Content);
+        t.record_answer(Some(&json!(1)), answer, Provenance::Content);
+        assert!(tainted(&t), "a second answer under one id");
+    }
+
+    /// What one call sent is kept within [`SENT_CALL_COST`]: the values past
+    /// it are recorded from the answer like any other token.
+    #[test]
+    fn what_one_call_sent_is_kept_within_its_budget() {
+        let names: Vec<String> = (0..400).map(|i| format!("package-name-{i:04}")).collect();
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(1)), &json!({"names": names}), false);
+        let kept = &t.sent.front().expect("the call is kept").1;
+        assert!(kept.len() > 1 && kept.len() < names.len(), "{}", kept.len());
+        assert!(kept.iter().map(|v| cost_of(v)).sum::<usize>() <= SENT_CALL_COST);
+
+        t.record_answer(Some(&json!(1)), &names.join(" "), Provenance::Content);
+        assert!(t.arg_taint_alert("x", &json!({"n": names[0]})).is_none());
+        assert!(t.arg_taint_alert("x", &json!({"n": names[399]})).is_some());
     }
 }
