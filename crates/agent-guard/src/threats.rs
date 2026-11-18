@@ -2897,11 +2897,66 @@ const GUARD_LOOSENING_VERB: &str =
      installs it in monitor, uninstalls it, or starts a jail, which only the person \
      supervising the agent may run, from their own terminal";
 
+/// What [`guard_self_disable_in`] says of a line that rewrites, removes or
+/// moves aside the configuration an agent loads the guard from, or the
+/// guard's hook script: the refusals [`check_code_rewrites_guard_carrier`]
+/// keeps.
+const CARRIER_REWRITES: &[&str] = &[
+    "removes or moves aside the configuration that carries the guard's hook",
+    "edits an agent's configuration to remove the guard's hook",
+    "points an MCP client at a server staged in a temporary directory",
+    "edits an agent's configuration in place to remove the guard",
+    "rewrites an agent's configuration through an interpreter",
+    "deletes the guard's hook script",
+    "removes or moves aside the plugin or hook that carries the guard in OpenClaw",
+];
+
+/// What [`guard_self_disable_in`] says of a write into the guard's own
+/// configuration.
+const GUARD_CONFIG_WRITTEN: &str =
+    "writes into the guard's own configuration, which holds its allow and mute rules";
+
+/// The refusals of [`check_guard_self_disable`] that are about what a line
+/// writes, asked of a line that hands an interpreter its code inline
+/// (`python3 -c '...'`): an agent's settings that load the guard rewritten,
+/// removed or moved aside, the guard's hook script deleted, the guard's own
+/// configuration named and written by the code, what carries the guard
+/// written ([`writes_guard_carrier`]).
+///
+/// Asked of the inline form of a program an interpreter reads from a
+/// here-document ([`crate::shell::interpreter_input_as_inline_code`]): the
+/// same code refused under `-c` is refused fed on standard input. The
+/// readings of the guard's own words are left out: a guard command quoted in
+/// code that starts no program is text the code works on.
+pub(crate) fn check_code_rewrites_guard_carrier(content: &str) -> Option<(&'static str, u32)> {
+    if let Some((_, what, score)) = guard_self_disable_patterns()
+        .iter()
+        .filter(|(_, what, _)| CARRIER_REWRITES.contains(what))
+        .find(|(re, _, _)| re.is_match(content))
+    {
+        return Some((*what, *score));
+    }
+    if code_names_and_writes_guard_config(&content.to_ascii_lowercase()) {
+        return Some((GUARD_CONFIG_WRITTEN, 60));
+    }
+    writes_guard_carrier(content).then_some((GUARD_CARRIER_WRITTEN, 60))
+}
+
 /// [`check_guard_self_disable`] on one spelling of the command.
 fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
+    let res = guard_self_disable_patterns();
+    if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
+        return Some((*what, *score));
+    }
+    guard_self_disable_after_patterns(content)
+}
+
+/// The patterns [`guard_self_disable_in`] asks first, each with what it
+/// says and its score.
+fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)] {
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str, u32)>> =
         std::sync::OnceLock::new();
-    let res = RES.get_or_init(|| {
+    RES.get_or_init(|| {
         let mut v: Vec<(regex::Regex, &'static str, u32)> = Vec::new();
         let mut add = |p: &str, what: &'static str, score: u32| {
             if let Ok(re) = regex::Regex::new(p) {
@@ -3022,10 +3077,12 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
             60,
         );
         v
-    });
-    if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
-        return Some((*what, *score));
-    }
+    })
+}
+
+/// [`guard_self_disable_in`] past its patterns
+/// ([`guard_self_disable_patterns`]).
+fn guard_self_disable_after_patterns(content: &str) -> Option<(&'static str, u32)> {
     // The same two refusals on the words the shell hands the program: a
     // guard program named by a glob, a bracket expression or a value the
     // line assigned (`/usr/local/sbin/inner*-ctl exec-gate disarm`).
@@ -3051,10 +3108,7 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         ));
     }
     if writes_guard_config(content, 0) {
-        return Some((
-            "writes into the guard's own configuration, which holds its allow and mute rules",
-            60,
-        ));
+        return Some((GUARD_CONFIG_WRITTEN, 60));
     }
     carrier()
 }
@@ -7169,6 +7223,12 @@ fn interpreter_code_writes_guard_config(interpreter: &str, arguments: &[String])
     if !code.contains("innerwarden") {
         return false;
     }
+    code_names_and_writes_guard_config(&code) || code_text_runs_guard_verb(&code)
+}
+
+/// Whether interpreter code (lowercase) names the guard's configuration
+/// directory and writes.
+fn code_names_and_writes_guard_config(code: &str) -> bool {
     static NAMES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
@@ -7181,7 +7241,7 @@ fn interpreter_code_writes_guard_config(interpreter: &str, arguments: &[String])
         )
         .expect("static interpreter write regex")
     });
-    (names.is_match(&code) && writes.is_match(&code)) || code_text_runs_guard_verb(&code)
+    names.is_match(code) && writes.is_match(code)
 }
 
 /// Cheap literal gate in front of a regex family.
@@ -12990,31 +13050,92 @@ fn check_disable_verb_reaches_target(lower: &str) -> Option<&'static str> {
     if INSPECTION_VERBS.iter().any(|v| lower.contains(v)) {
         return None;
     }
+    let ends = command_ends(lower);
     for target in PROTECTED_TARGETS {
-        let Some(target_at) = lower.find(target) else {
-            continue;
-        };
-        for verb in DISABLE_VERBS {
-            let mut from = 0usize;
-            while let Some(rel) = lower[from..].find(verb) {
-                let verb_at = from + rel;
-                // Verb must precede the target and sit close to it, so an
-                // unrelated "remove" elsewhere in a long pipeline does not pair
-                // with an incidental mention of the target.
-                if verb_at < target_at && target_at - verb_at <= 40 {
-                    return Some(match *target {
-                        "innerwarden" => "disable InnerWarden (flags between verb and target)",
-                        _ => "disable a host security monitor",
-                    });
-                }
-                from = verb_at + verb.len();
-                if from >= lower.len() {
-                    break;
-                }
+        for (target_at, _) in lower.match_indices(target) {
+            if let Some(hit) = disable_verb_before(lower, target, target_at, &ends) {
+                return Some(hit);
             }
         }
     }
     None
+}
+
+/// The finding of [`check_disable_verb_reaches_target`] for one mention of
+/// `target` at `target_at`: a disable verb before it, close, in the same
+/// command (no end of a command, [`command_ends`], between the two).
+fn disable_verb_before(
+    lower: &str,
+    target: &str,
+    target_at: usize,
+    ends: &[usize],
+) -> Option<&'static str> {
+    for verb in DISABLE_VERBS {
+        let mut from = 0usize;
+        while let Some(rel) = lower[from..].find(verb) {
+            let verb_at = from + rel;
+            // Verb must precede the target and sit close to it, so an
+            // unrelated "remove" elsewhere in a long pipeline does not pair
+            // with an incidental mention of the target. And in the same
+            // command: `pkill -f x; cd ~/innerwarden/wt` kills `x`, then
+            // enters a folder whose name holds the guard's.
+            if verb_at < target_at
+                && target_at - verb_at <= 40
+                && !ends.iter().any(|end| (verb_at..target_at).contains(end))
+            {
+                return Some(match target {
+                    "innerwarden" => "disable InnerWarden (flags between verb and target)",
+                    _ => "disable a host security monitor",
+                });
+            }
+            from = verb_at + verb.len();
+            if from >= lower.len() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Where each command of a line ends: the byte offset of every `;`, `&`,
+/// `|` and newline outside quotes and outside parentheses, so a command
+/// substitution is one command with the one it stands in
+/// (`kill $(pgrep -f x | grep the-target)`). Read loosely: a quote left
+/// open runs to the end of the line, and a backslash outside single quotes
+/// escapes the next character.
+fn command_ends(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let mut ends = Vec::new();
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'\\' => at += 1,
+            b'\'' => {
+                at += 1;
+                while bytes.get(at).is_some_and(|&b| b != b'\'') {
+                    at += 1;
+                }
+            }
+            b'"' => {
+                at += 1;
+                while let Some(&b) = bytes.get(at) {
+                    if b == b'\\' {
+                        at += 1;
+                    } else if b == b'"' {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b';' | b'&' | b'|' | b'\n' if depth == 0 => ends.push(at),
+            _ => {}
+        }
+        at += 1;
+    }
+    ends
 }
 
 /// Tearing down the host firewall. Nothing covered this: both `ufw disable` and

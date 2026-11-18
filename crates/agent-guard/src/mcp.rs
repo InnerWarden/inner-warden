@@ -2809,7 +2809,16 @@ fn analyze_command_as_read(
     let self_disable = match crate::shell::interpreter_input_as_data(cmd) {
         Some(line) => guard_self_disable_on(&line, &crate::shell::project(&line)),
         None => guard_self_disable_on(cmd, &projection),
-    };
+    }
+    // The same program fed to the interpreter as a here-document is read as
+    // the same code given inline (`python3 -c`), so a rewrite of an agent's
+    // settings or of the guard's configuration is refused either way. Only
+    // those writes: a guard command quoted in the code is still text.
+    .or_else(|| {
+        crate::shell::interpreter_input_as_inline_code(cmd)
+            .iter()
+            .find_map(|line| threats::check_code_rewrites_guard_carrier(line))
+    });
     if let Some((what, s)) = self_disable {
         signals.push(AnalysisSignal {
             signal: "guard_self_disable".into(),
