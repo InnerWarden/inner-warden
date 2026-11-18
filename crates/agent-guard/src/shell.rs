@@ -31,8 +31,13 @@ pub(crate) fn project(source: &str) -> ShellProjection {
     // command as written is scanned, as before.
     let rewritten = text_as_the_shell_reads(source);
     let text = rewritten.as_deref().unwrap_or(source);
+    let resolved = with_names_resolved(text);
+    let text = resolved.as_deref().unwrap_or(text);
     let evaluated = with_evaluated_subscripts_run(text);
     let text = evaluated.as_deref().unwrap_or(text);
+    let exported = exported_function_bodies(text);
+    let with_exported = (!exported.is_empty()).then(|| format!("{text}\n{}", exported.join("\n")));
+    let text = with_exported.as_deref().unwrap_or(text);
     let Some(tree) = parse_bash(text) else {
         return ShellProjection {
             scan: source.to_owned(),
@@ -551,6 +556,50 @@ fn with_evaluated_subscripts_run(text: &str) -> Option<String> {
     collect_nodes_of_kind(tree.root_node(), "ansi_c_string", &mut quoted, 0);
     collect_nodes_of_kind(tree.root_node(), "string", &mut quoted, 0);
     let mut runs = Vec::new();
+    // A here-document a shell reads as its script is a line of its own: the
+    // quoted subscripts in it are evaluated the same way. A body whose
+    // delimiter is not quoted is expanded first, so its escapes are taken
+    // out the way the outer shell takes them out.
+    let mut bodies = Vec::new();
+    collect_nodes_of_kind(tree.root_node(), "heredoc_body", &mut bodies, 0);
+    for body in bodies {
+        let read_by_a_shell = ancestor_of_kind(body, "redirected_statement")
+            .and_then(|statement| statement.child_by_field_name("body"))
+            .and_then(|command| command_name(command, bytes))
+            .is_some_and(|name| {
+                matches!(
+                    versionless_interpreter_name(&normalized_command_name(&name)),
+                    "sh" | "bash" | "zsh" | "dash" | "ksh"
+                )
+            });
+        if !read_by_a_shell {
+            continue;
+        }
+        let written = node_text(body, bytes);
+        let quoted_delimiter = body
+            .parent()
+            .and_then(|redirect| first_descendant_of_kind(redirect, "heredoc_start", 0))
+            .is_some_and(|start| node_text(start, bytes).contains(['\'', '"', '\\']));
+        let script = if quoted_delimiter {
+            written
+        } else {
+            written
+                .replace("\\\\", "\u{0}")
+                .replace("\\$", "$")
+                .replace("\\`", "`")
+                .replace('\u{0}', "\\")
+        };
+        if let Some(evaluated) = with_evaluated_subscripts_run(&script) {
+            if let Some(added) = evaluated.get(script.len()..) {
+                runs.extend(
+                    added
+                        .lines()
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+        }
+    }
     for node in quoted {
         let Some(value) = quoted_value(node, bytes) else {
             continue;
@@ -1120,6 +1169,292 @@ fn fetched_value_is_evaluated(root: tree_sitter::Node<'_>, source: &[u8]) -> boo
     evaluated_name_reads(root, source)
         .into_iter()
         .any(|(start, name)| tainted_names_at(&timeline, start).contains(&name))
+}
+
+/// The most calls of functions defined on the line that are written out with
+/// their bodies. A line with more is left as it was read before.
+const FUNCTION_CALLS_WRITTEN_OUT: usize = 64;
+
+/// The line with the names bash resolves on it written out as what they run,
+/// so every check reads the command that runs and not the name it hides
+/// behind (measured 2026-11-18 on the 1.6.13 candidate, each allowed while
+/// the plain form was refused):
+///
+/// - An alias defined on the line (`alias r=sh`) is the words it stands for
+///   wherever it is the command word after its definition: `curl ... | r`
+///   is `curl ... | sh`. With `shopt -s expand_aliases` bash expands it in
+///   a script too; the guard cannot know which shell reads the line, so it
+///   reads the alias as expanded.
+/// - A call of a function defined on the line runs its body with the
+///   call's arguments as `$1`, `$@`: `f() { eval "$1"; }; f "$(curl ...)"`
+///   runs `eval "$(curl ...)"`, and `curl ... | f` with `f() { sh; }` pipes
+///   into `sh`. The call is written as `{ body; call; }`, so its pipe and
+///   redirects reach the body and the call as written is still read.
+/// - `command` and `builtin` in front of a name run that name: `builtin .
+///   file` is `. file`. Their option forms (`command -v x`) are left as
+///   they are.
+///
+/// `None` when nothing is resolved.
+fn with_names_resolved(text: &str) -> Option<String> {
+    if !(text.contains("alias")
+        || text.contains("command")
+        || text.contains("builtin")
+        || text.contains("()"))
+    {
+        return None;
+    }
+    let tree = parse_bash(text)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let source = text.as_bytes();
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+
+    // Aliases defined on the line, each with where its definition ends.
+    let mut aliases: Vec<(String, String, usize)> = Vec::new();
+    for command in &commands {
+        if command_name(*command, source).as_deref() != Some("alias") {
+            continue;
+        }
+        for argument in command_arguments(*command) {
+            let word = shell_literal_word(&node_text(argument, source));
+            if let Some((name, value)) = word.split_once('=') {
+                let plain_name = !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+                if plain_name && !value.trim().is_empty() {
+                    aliases.push((name.to_owned(), value.to_owned(), command.end_byte()));
+                }
+            }
+        }
+    }
+
+    // Functions defined on the line: name and body as written, braces or
+    // parentheses included.
+    let mut definitions = Vec::new();
+    collect_nodes_of_kind(root, "function_definition", &mut definitions, 0);
+    let functions: Vec<(String, String)> = definitions
+        .iter()
+        .filter_map(|definition| {
+            let name = function_definition_name(*definition, source)?;
+            let body = definition.child_by_field_name("body")?;
+            // A function that calls itself (`:(){ :|:& };:`) is read by its
+            // definition, which every check already sees whole.
+            let mut inner = Vec::new();
+            collect_all_commands(body, &mut inner, 0);
+            if inner
+                .iter()
+                .any(|command| command_name(*command, source).as_deref() == Some(name.as_str()))
+            {
+                return None;
+            }
+            Some((name, node_text(body, source)))
+        })
+        .collect();
+
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut calls = 0usize;
+    for command in &commands {
+        let Some(name_node) = command.child_by_field_name("name") else {
+            continue;
+        };
+        let name = node_text(name_node, source);
+        if matches!(name.as_str(), "command" | "builtin") {
+            let next = command_arguments(*command)
+                .first()
+                .map(|argument| node_text(*argument, source));
+            if next.is_some_and(|next| !next.starts_with('-')) {
+                edits.push((name_node.byte_range(), " ".repeat(name.len())));
+            }
+            continue;
+        }
+        if let Some((_, value, _)) = aliases
+            .iter()
+            .rev()
+            .find(|(alias, _, defined)| *alias == name && *defined <= name_node.start_byte())
+        {
+            edits.push((name_node.byte_range(), value.clone()));
+            continue;
+        }
+        let inside_a_definition = ancestor_of_kind(*command, "function_definition").is_some();
+        if inside_a_definition {
+            continue;
+        }
+        let Some((_, body)) = functions
+            .iter()
+            .rev()
+            .find(|(function, _)| *function == name)
+        else {
+            continue;
+        };
+        calls += 1;
+        if calls > FUNCTION_CALLS_WRITTEN_OUT {
+            return None;
+        }
+        let arguments: Vec<String> = command_arguments(*command)
+            .into_iter()
+            .map(|argument| node_text(argument, source))
+            .collect();
+        let call = node_text(*command, source);
+        let inner = body
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+            .map_or_else(|| body.clone(), str::to_owned);
+        edits.push((
+            command.byte_range(),
+            format!(
+                "{{ {}\n{call}\n}}",
+                with_positional_parameters(&inner, &arguments)
+            ),
+        ));
+    }
+    if edits.is_empty() {
+        return None;
+    }
+    // Commands do not overlap except by nesting; keep the outermost edit.
+    edits.sort_by_key(|(range, _)| (range.start, std::cmp::Reverse(range.end)));
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0usize;
+    for (range, replacement) in edits {
+        if range.start < at {
+            continue;
+        }
+        out.push_str(&text[at..range.start]);
+        out.push_str(&replacement);
+        at = range.end;
+    }
+    out.push_str(&text[at..]);
+    Some(out)
+}
+
+/// `body` with its positional parameters (`$1`, `${2}`, `$@`, `$*`, each
+/// also inside double quotes of its own) replaced by the call's arguments as
+/// written. Text in single quotes is left alone; a parameter the call does
+/// not give is empty.
+fn with_positional_parameters(body: &str, arguments: &[String]) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let all = arguments.join(" ");
+    // The parameter at `at` (just after its `$`), and the characters it took.
+    let parameter = |at: usize| -> Option<(String, usize)> {
+        match chars.get(at)? {
+            '@' | '*' => Some((all.clone(), 1)),
+            c @ '1'..='9' => {
+                let index = c.to_digit(10)? as usize;
+                Some((arguments.get(index - 1).cloned().unwrap_or_default(), 1))
+            }
+            '{' => {
+                let close = chars[at..].iter().position(|c| *c == '}')? + at;
+                let inside: String = chars[at + 1..close].iter().collect();
+                match inside.as_str() {
+                    "@" | "*" => Some((all.clone(), close - at + 1)),
+                    _ => {
+                        let index: usize = inside.parse().ok().filter(|n| *n > 0)?;
+                        Some((
+                            arguments.get(index - 1).cloned().unwrap_or_default(),
+                            close - at + 1,
+                        ))
+                    }
+                }
+            }
+            _ => None,
+        }
+    };
+    let mut out = String::with_capacity(body.len());
+    let mut at = 0usize;
+    while let Some(&c) = chars.get(at) {
+        match c {
+            '\'' => {
+                let end = chars[at + 1..]
+                    .iter()
+                    .position(|c| *c == '\'')
+                    .map_or(chars.len(), |found| at + 2 + found);
+                out.extend(&chars[at..end]);
+                at = end;
+            }
+            '\\' => {
+                out.extend(chars.get(at..(at + 2).min(chars.len())).unwrap_or_default());
+                at += 2;
+            }
+            // `"$1"` alone in its quotes: the argument as written.
+            '"' if chars.get(at + 1) == Some(&'$') => match parameter(at + 2) {
+                Some((value, taken)) if chars.get(at + 2 + taken) == Some(&'"') => {
+                    if value.is_empty() {
+                        out.push_str("\"\"");
+                    } else {
+                        out.push_str(&value);
+                    }
+                    at += 3 + taken;
+                }
+                _ => {
+                    out.push('"');
+                    at += 1;
+                }
+            },
+            '$' => match parameter(at + 1) {
+                Some((value, taken)) => {
+                    out.push_str(&value);
+                    at += 1 + taken;
+                }
+                None => {
+                    out.push('$');
+                    at += 1;
+                }
+            },
+            _ => {
+                out.push(c);
+                at += 1;
+            }
+        }
+    }
+    out
+}
+
+/// The bodies of the functions a line hands bash in its environment
+/// (`env 'BASH_FUNC_ls%%=() { cmd; }' bash -c ls`): bash defines a function
+/// from each such variable when it starts, and `bash -c ls` then runs the
+/// body. The grammar read the definition as a quoted word, so the body was
+/// never read (measured 2026-11-18: `rm -rf ~` hidden this way was allowed).
+fn exported_function_bodies(text: &str) -> Vec<String> {
+    const MARK: &str = "BASH_FUNC_";
+    let mut bodies = Vec::new();
+    let mut from = 0usize;
+    while let Some(found) = text[from..].find(MARK) {
+        let start = from + found;
+        from = start + MARK.len();
+        let rest = &text[from..];
+        let Some(equals) = rest.find('=') else {
+            break;
+        };
+        let after = &rest[equals + 1..];
+        // The quote the value stands in: opened just before the name, or
+        // just after the `=`.
+        let quote = text[..start]
+            .chars()
+            .next_back()
+            .filter(|c| matches!(c, '\'' | '"'))
+            .or_else(|| after.chars().next().filter(|c| matches!(c, '\'' | '"')));
+        let value = after.trim_start_matches(['\'', '"']);
+        let value = match quote {
+            Some(quote) => value.split(quote).next().unwrap_or(value),
+            None => value.split([' ', '\t', '\n', ';']).next().unwrap_or(value),
+        };
+        let Some(open) = value.trim_start().strip_prefix("()") else {
+            continue;
+        };
+        let Some(open) = open.trim_start().strip_prefix('{') else {
+            continue;
+        };
+        if let Some(close) = open.rfind('}') {
+            let body = open[..close].trim();
+            if !body.is_empty() {
+                bodies.push(body.to_owned());
+            }
+        }
+    }
+    bodies
 }
 
 /// The command line a substitution as written (`$(cmd)`, `` `cmd` ``) runs.
@@ -6683,6 +7018,11 @@ fn command_code_input(words: &[String]) -> CodeInput {
     if let Some(line) = runner_shell_line(&name, &args) {
         return CodeInput::Argument(line);
     }
+    if !is_stdin_code_executor(&name) {
+        if let Some(code) = unlisted_runner_code(&args) {
+            return CodeInput::Argument(code);
+        }
+    }
     if !is_stdin_code_executor(&name) || command_is_noexec_shell(words) {
         return CodeInput::None;
     }
@@ -6821,6 +7161,50 @@ fn runner_shell_line(name: &str, args: &[String]) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// The flags by which programs take code to run on the line: a shell's
+/// `-c`, an interpreter's `-e` or `--eval`, PowerShell's `-Command`, a
+/// debugger's `-ex` and `--eval-command`.
+const INLINE_CODE_FLAGS: &[&str] = &[
+    "-c",
+    "-e",
+    "-ex",
+    "-command",
+    "-Command",
+    "--command",
+    "-eval",
+    "--eval",
+    "--eval-command",
+    "-execute",
+    "--execute",
+];
+
+/// The code a program with no reader of its own is handed on the line, read
+/// from its arguments and not its name: a value of an inline code flag that
+/// is a fetch substitution (`pwsh -c "$(curl ...)"`, `yaegi -e "$(curl
+/// ...)"`), or one that asks for a shell line (`-ex 'shell cmd'`, `-ex
+/// '!cmd'`, the way debuggers run one). Measured 2026-11-18: each was
+/// allowed while `python3 -c "$(curl ...)"` was refused. A value that is
+/// plain text, or a substitution of a local command, is not read as code.
+fn unlisted_runner_code(args: &[String]) -> Option<String> {
+    args.iter().enumerate().find_map(|(at, argument)| {
+        let value = match argument.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") && INLINE_CODE_FLAGS.contains(&flag) => {
+                shell_literal_word(value)
+            }
+            _ if INLINE_CODE_FLAGS.contains(&argument.as_str()) => args.get(at + 1)?.clone(),
+            _ => return None,
+        };
+        let trimmed = value.trim_start();
+        if let Some(line) = trimmed
+            .strip_prefix("shell ")
+            .or_else(|| trimmed.strip_prefix('!'))
+        {
+            return Some(line.trim().to_owned());
+        }
+        (dynamic_code_argument(&value) && text_fetches(&value)).then_some(value)
+    })
 }
 
 fn shell_code_input(args: &[String]) -> CodeInput {
@@ -7895,7 +8279,7 @@ fn effective_command_words(words: &[String], depth: u8) -> Option<&[String]> {
         "command" => unwrap_command(args),
         "sudo" | "doas" => unwrap_privilege_wrapper(args),
         "nohup" | "setsid" | "busybox" | "toybox" => unwrap_simple_wrapper(args),
-        "nice" => unwrap_options_with_values(args, &["-n", "--adjustment"]),
+        "nice" => unwrap_nice(args),
         "timeout" => unwrap_timeout(args),
         "stdbuf" => unwrap_options_with_values(args, &STDBUF_OPTIONS),
         "time" => unwrap_time(args),
@@ -8690,7 +9074,7 @@ fn classify_command_words(words: &[String], depth: u8) -> PipelineCommand {
         "command" => unwrap_command(args),
         "sudo" | "doas" => unwrap_privilege_wrapper(args),
         "nohup" | "setsid" => unwrap_simple_wrapper(args),
-        "nice" => unwrap_options_with_values(args, &["-n", "--adjustment"]),
+        "nice" => unwrap_nice(args),
         "timeout" => unwrap_timeout(args),
         "stdbuf" => unwrap_options_with_values(args, &STDBUF_OPTIONS),
         "time" => unwrap_time(args),
@@ -8808,6 +9192,29 @@ fn unwrap_simple_wrapper(args: &[String]) -> WrapperTarget {
 
 /// The options of `stdbuf`, each of which takes a mode.
 const STDBUF_OPTIONS: [&str; 6] = ["-i", "-o", "-e", "--input", "--output", "--error"];
+
+/// The program `nice` runs. Besides `-n N` and `--adjustment=N` it takes the
+/// old form, the number as the option (`nice -5`, `nice --10`), which was
+/// read as an unknown option and left the command after it unread
+/// (measured 2026-11-18: `nice -5 sh -c "$(curl ...)"` was allowed).
+fn unwrap_nice(args: &[String]) -> WrapperTarget {
+    let old_form = args.first().is_some_and(|first| {
+        let word = shell_word(first);
+        let number = word
+            .strip_prefix("--")
+            .or_else(|| word.strip_prefix("-+"))
+            .or_else(|| word.strip_prefix('-'))
+            .unwrap_or("");
+        !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+    });
+    if !old_form {
+        return unwrap_options_with_values(args, &["-n", "--adjustment"]);
+    }
+    match unwrap_options_with_values(&args[1..], &["-n", "--adjustment"]) {
+        WrapperTarget::Command(index) => WrapperTarget::Command(index + 1),
+        other => other,
+    }
+}
 
 fn unwrap_options_with_values(args: &[String], options: &[&str]) -> WrapperTarget {
     let mut index = 0;

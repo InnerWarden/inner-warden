@@ -9528,7 +9528,22 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
     let c = content.trim();
     // The tail after `&&` is screened on its own merits by every other rule;
     // this exemption only ever removes the `eval` finding.
-    re.is_match(c)
+    if re.is_match(c) {
+        return true;
+    }
+    // A line of several commands, one to a line or in a `{ ... }` group:
+    // every line that runs `eval` must be one of these idioms.
+    let mut evals = c
+        .lines()
+        .map(|line| line.trim().trim_start_matches(['{', '(', ' ', '\t']))
+        .filter(|line| {
+            line.split([';', '&', '|']).any(|part| {
+                let part = part.trim_start_matches(['{', '(', ' ', '\t']);
+                part == "eval" || part.starts_with("eval ") || part.starts_with("eval\t")
+            })
+        })
+        .peekable();
+    evals.peek().is_some() && evals.all(|line| re.is_match(line))
 }
 
 /// `shred` of a short-lived secret in a runtime or temporary directory.
@@ -13508,17 +13523,33 @@ pub fn check_tmp_execution(content: &str) -> Option<(&'static str, u32)> {
     let temp = r#"(?:/(?:tmp|var/tmp|dev/shm|run/shm)|/private/tmp)/[^\s\"'|;&)]+"#;
     let direct = DIRECT.get_or_init(|| {
         regex::Regex::new(&format!(
-            r#"(?i)(?:^|[;&|]\s*|\$\(\s*|`\s*)(?:(?:sudo|command|nohup)\s+|env(?:\s+\w+=\S+)*\s+)*[\"']?{temp}"#
+            r#"(?im)(?:^\s*|[;&|{{(]\s*|\$\(\s*|`\s*)(?:(?:sudo|command|builtin|nohup)\s+|env(?:\s+\w+=\S+)*\s+)*[\"']?{temp}"#
         ))
         .expect("static direct temp execution regex")
     });
     let interpreted = INTERPRETED.get_or_init(|| {
         regex::Regex::new(&format!(
-            r#"(?i)(?:^|[;&|]\s*|\$\(\s*|`\s*)(?:source|\.|ba?sh|zsh|dash|ksh|python\d*(?:\.\d+)?|perl|ruby|node\d*)\s+(?:-[^\s]+\s+)*[\"']?{temp}"#
+            r#"(?im)(?:^\s*|[;&|{{(]\s*|\$\(\s*|`\s*)(?:(?:command|builtin)\s+)*(?:source|\.|ba?sh|zsh|dash|ksh|python\d*(?:\.\d+)?|perl|ruby|node\d*)\s+(?:-[^\s]+\s+)*[\"']?{temp}"#
         ))
         .expect("static interpreted temp execution regex")
     });
-    if direct.is_match(&lower) || interpreted.is_match(&lower) {
+    // `bash -n file` only reads the file for its syntax: it runs nothing.
+    let runs_the_file = |found: regex::Match<'_>| {
+        let words: Vec<&str> = found.as_str().split_whitespace().collect();
+        let shell = words.iter().position(|word| {
+            matches!(
+                word.trim_start_matches([';', '&', '|', '{', '(']),
+                "sh" | "bash" | "zsh" | "dash" | "ksh"
+            )
+        });
+        !shell.is_some_and(|at| {
+            words[at + 1..]
+                .iter()
+                .take_while(|word| word.starts_with('-'))
+                .any(|flag| !flag.starts_with("--") && flag.contains('n'))
+        })
+    };
+    if direct.is_match(&lower) || interpreted.find_iter(&lower).any(runs_the_file) {
         TMP_EXECUTION_DIRS
             .iter()
             .find(|dir| lower.contains(*dir))
