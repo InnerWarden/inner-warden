@@ -189,7 +189,7 @@ function ScreeningItem({ row, unnamed }: { row: ScreeningRow; unnamed: { hook?: 
             {mcpLines(agent.mcp).map((line) => <span key={line} data-mcp className="block">{line}</span>)}
           </dd>
         </div>
-        {agent.judgesLine === undefined ? (
+        {agent.unscreened !== undefined ? null : agent.judgesLine === undefined ? (
           <TechnicalOnly>
             <div className="min-w-0">
               <dt className={CELL_LABEL}>Judges before it runs</dt>
@@ -207,6 +207,11 @@ function ScreeningItem({ row, unnamed }: { row: ScreeningRow; unnamed: { hook?: 
           <dd><SeenCell agent={agent} unnamed={unnamed} /></dd>
         </div>
       </dl>
+      {agent.unscreened === undefined ? null : (
+        <div data-unscreened className="max-w-xl">
+          <StepBlock step={{ label: agent.unscreened.line, command: agent.unscreened.command }} restarts={[{ agent: agent.name, words: row.restart }]} />
+        </div>
+      )}
       {row.step === undefined ? null : (
         <div className="max-w-xl">
           <StepBlock step={row.step} restarts={[{ agent: agent.name, words: row.restart }]} />

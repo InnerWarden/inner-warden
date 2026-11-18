@@ -166,6 +166,13 @@ struct AgentView {
     judges: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     judges_line: Option<String>,
+    /// A connected hook agent whose shell commands are screened while a
+    /// file-tool, read-tool or result hook runs a program that is gone: the
+    /// sentence `status` prints for it and the command that fixes it. While
+    /// present, `judges` is absent: it reads the hooks' text alone and would
+    /// say the file changes are judged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unscreened: Option<AgentUnscreened>,
     /// How to restart this agent after a step that changes its config, and
     /// why. The person restarts it; the page never says it was.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,6 +185,28 @@ struct AgentView {
     /// through the proxy whose config could be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     mcp: Option<innerwarden_agent_guard::mcp_wire::ServerCounts>,
+}
+
+/// The tools a connected agent's hooks leave unscreened, as `status` says it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct AgentUnscreened {
+    line: String,
+    command: String,
+}
+
+/// What `status` says of an agent whose Bash hook runs while another hook
+/// of ours runs a program that is gone, from the same shared judgement.
+/// `None` when every hook it has can start, or for an MCP agent.
+fn agent_unscreened(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+) -> Option<AgentUnscreened> {
+    use innerwarden_agent_guard::{agents_ops, hook};
+    let sentence = hook::unscreened_hooks_sentence(&agents_ops::unscreened_hooks(home, agent))?;
+    Some(AgentUnscreened {
+        line: crate::status::partly_unscreened_words(&agent.name, &sentence),
+        command: agents_ops::hook_repair_command(home, agent),
+    })
 }
 
 /// The steps that switch one agent's mode and leave the others as they are.
@@ -597,7 +626,16 @@ fn agents_json_with_status(
                 &host_mode,
                 mode == "partial" && agent_wired_monitor(home, agent),
             );
-            let judges = agent_judges(home, agent, &mode);
+            let unscreened = if effectively_guarded {
+                agent_unscreened(home, agent)
+            } else {
+                None
+            };
+            let judges = if unscreened.is_none() {
+                agent_judges(home, agent, &mode)
+            } else {
+                None
+            };
             let config_changed_at = if effectively_guarded {
                 agent_config_changed_ms(home, agent).map(crate::dashboard_community::rfc3339)
             } else {
@@ -626,6 +664,7 @@ fn agents_json_with_status(
                 },
                 judges: judges.as_ref().map(|(key, _)| *key),
                 judges_line: judges.map(|(_, line)| line),
+                unscreened,
                 restart,
                 auto_connect_eligible: policy_available
                     .then(|| crate::agent_policy::is_auto_connect_candidate(home, agent, &policy)),
@@ -2501,6 +2540,60 @@ mod tests {
         assert_eq!(row_of(&payload, "cursor")["judges"], "mcp_server_calls");
     }
 
+    /// FAILS ON REVERT: a Bash hook that runs beside file-tool and result
+    /// hooks pointing at a program that is gone. The row says what `status`
+    /// says, word for word, with the fix, and does not claim the file changes
+    /// are judged.
+    #[cfg(unix)]
+    #[test]
+    fn agents_row_names_the_tools_a_gone_hook_leaves_unscreened() {
+        let (home, bin) = home_with_cli();
+        let gone = home.path().join("gone/innerwarden").display().to_string();
+        let hook = |program: &str| {
+            serde_json::json!([{"type": "command",
+                "command": format!("{} hook --agent claude-code",
+                    serde_json::to_string(program).unwrap())}])
+        };
+        let settings = serde_json::json!({"hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": hook(&bin)},
+                {"matcher": "Write|Edit|MultiEdit|NotebookEdit", "hooks": hook(&gone)}
+            ],
+            "PostToolUse": [{"matcher": "*", "hooks": hook(&gone)}]
+        }});
+        write_in(home.path(), ".claude/settings.json", &settings.to_string());
+        let row = row_of(&payload_for(home.path(), &bin), "claude-code");
+
+        let sentence = format!(
+            "Write/Edit/MultiEdit/NotebookEdit not screened, PostToolUse (every tool) not \
+             screened: its hook runs {gone}, which does not exist"
+        );
+        assert_eq!(
+            row["unscreened"]["line"],
+            crate::status::partly_unscreened_words("claude-code", &sentence).as_str(),
+            "{row}"
+        );
+        let status_row = innerwarden_agent_guard::agents_ops::rows(home.path())
+            .into_iter()
+            .find(|r| r.name == "claude-code")
+            .unwrap();
+        assert_eq!(
+            row["unscreened"]["command"],
+            innerwarden_agent_guard::agents_ops::hook_repair_command(home.path(), &status_row)
+                .as_str(),
+            "{row}"
+        );
+        assert!(row.get("judges").is_none(), "{row}");
+        assert!(row.get("judges_line").is_none(), "{row}");
+
+        // Every hook running again: no line, and the judges come back.
+        let healthy = settings.to_string().replace(&gone, &bin);
+        std::fs::write(home.path().join(".claude/settings.json"), healthy).unwrap();
+        let row = row_of(&payload_for(home.path(), &bin), "claude-code");
+        assert!(row.get("unscreened").is_none(), "{row}");
+        assert!(row.get("judges").is_some(), "{row}");
+    }
+
     /// Settings that cannot be parsed say nothing about what is judged:
     /// the field is absent, never a guess.
     #[test]
@@ -2965,6 +3058,9 @@ mod tests {
             // without the identity features.
             "judges",
             "judges_line",
+            // A hook of ours whose program is gone beside a Bash hook that
+            // runs: read from the agent's own settings, like `judges`.
+            "unscreened",
             "restart",
             "mode_steps",
             "mcp",
@@ -3072,6 +3168,7 @@ mod tests {
             more_instances: None,
             judges: None,
             judges_line: None,
+            unscreened: None,
             restart: None,
             mode_steps: None,
             mcp: None,

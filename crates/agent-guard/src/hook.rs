@@ -1103,6 +1103,132 @@ pub fn judge_iwguard_hooks(
         .cloned()
 }
 
+/// One group of InnerWarden hooks (an event and a matcher) whose program
+/// cannot start, so the tools it is wired for go unscreened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnscreenedHooks {
+    /// The tools that go unscreened, for a sentence: `Write/Edit` for a
+    /// `PreToolUse` matcher, `PostToolUse (every tool)` for a result hook.
+    pub tools: String,
+    /// A clause naming the program, as in [`HookProgram::Broken`].
+    pub problem: String,
+}
+
+/// The tool names a matcher lists, for a sentence. `None` for an entry that
+/// covers every tool.
+fn matcher_label(entry: &Value) -> String {
+    match entry.get("matcher").and_then(Value::as_str) {
+        None | Some("" | "*") => "every tool".to_string(),
+        Some(matcher) => matcher.split('|').collect::<Vec<_>>().join("/"),
+    }
+}
+
+/// PURE: the groups of InnerWarden hooks, beyond the one that screens Bash,
+/// whose program cannot start: `Write|Edit|MultiEdit|NotebookEdit`,
+/// `Read|Grep|Glob`, `PostToolUse`, or any other event and matcher.
+///
+/// [`judge_iwguard_hooks`] only asks whether Bash is screened, so a Bash hook
+/// that runs beside a file-tool or result hook pointing at a deleted binary
+/// read as fully guarded, while Claude Code ran those hooks as non-blocking
+/// errors and let the calls through.
+///
+/// The rule per group is the one [`judge_iwguard_hooks`] uses: one hook in
+/// the group that runs is enough, and one that could not be checked keeps the
+/// group out of this list ("could not tell" is never "off"). A group is also
+/// left out when a hook of ours that runs, in the same event, covers every
+/// tool. Operator hooks are never judged.
+pub fn unscreened_iwguard_hooks(
+    settings: &Value,
+    fact: impl Fn(&str) -> ProgramFact,
+) -> Vec<UnscreenedHooks> {
+    let Some(events) = settings.get("hooks").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out: Vec<UnscreenedHooks> = Vec::new();
+    // `PreToolUse` first: a call that is never judged before it runs is the
+    // larger gap, so it leads the sentence.
+    let mut ordered: Vec<(&String, &Value)> = events.iter().collect();
+    ordered.sort_by_key(|(event, _)| event.as_str() != "PreToolUse");
+    for (event, entries) in ordered {
+        let Some(entries) = entries.as_array() else {
+            continue;
+        };
+        // (label, verdicts) per matcher, in file order.
+        let mut groups: Vec<(String, Vec<HookProgram>)> = Vec::new();
+        let mut every_tool_runs = false;
+        for entry in entries {
+            let label = matcher_label(entry);
+            let verdicts: Vec<HookProgram> = entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|hook| is_iwguard_hook(hook))
+                .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+                .filter_map(hook_command_words)
+                .filter_map(|words| words.into_iter().next())
+                .map(|program| judge_hook_program(&program, fact(&program)))
+                .collect();
+            if verdicts.is_empty() {
+                continue;
+            }
+            if label == "every tool" && verdicts.contains(&HookProgram::Runs) {
+                every_tool_runs = true;
+            }
+            match groups.iter_mut().find(|(l, _)| *l == label) {
+                Some((_, all)) => all.extend(verdicts),
+                None => groups.push((label, verdicts)),
+            }
+        }
+        if every_tool_runs {
+            continue;
+        }
+        for (label, verdicts) in groups {
+            if verdicts
+                .iter()
+                .any(|v| !matches!(v, HookProgram::Broken { .. }))
+            {
+                continue;
+            }
+            // The Bash group is judged by `judge_iwguard_hooks`; a broken one
+            // already makes the whole agent off, said elsewhere.
+            if event == "PreToolUse" && label == "Bash" {
+                continue;
+            }
+            let Some(HookProgram::Broken { problem, .. }) = verdicts.into_iter().next() else {
+                continue;
+            };
+            let tools = if event == "PreToolUse" {
+                label
+            } else {
+                format!("{event} ({label})")
+            };
+            out.push(UnscreenedHooks { tools, problem });
+        }
+    }
+    out
+}
+
+/// PURE: one sentence for [`unscreened_iwguard_hooks`], `None` when it is
+/// empty: `Write/Edit not screened, PostToolUse (every tool) not screened:
+/// its hook runs /x/innerwarden, which does not exist`.
+pub fn unscreened_hooks_sentence(groups: &[UnscreenedHooks]) -> Option<String> {
+    if groups.is_empty() {
+        return None;
+    }
+    let mut problems: Vec<&str> = Vec::new();
+    for g in groups {
+        if !problems.contains(&g.problem.as_str()) {
+            problems.push(&g.problem);
+        }
+    }
+    let tools: Vec<String> = groups
+        .iter()
+        .map(|g| format!("{} not screened", g.tools))
+        .collect();
+    Some(format!("{}: {}", tools.join(", "), problems.join("; ")))
+}
+
 /// PURE: the `(block_review, monitor)` flags of the mode these hooks already
 /// have (the strongest, as [`install_mode_flag`] keeps it), `None` where no
 /// hook of ours screens Bash. A rewrite that asked for no mode keeps this one,
@@ -2939,5 +3065,185 @@ mod automatic_write_tests {
         );
         assert_eq!(kept_hook_flags(&json!({})), None);
         assert_eq!(kept_hook_flags(&with("their-own-audit.sh")), None);
+    }
+}
+
+/// Every InnerWarden hook a wired agent has is judged, not only the one that
+/// screens Bash. Measured 2026-11-18 on a lab host: three hooks (Bash, the
+/// file tools, `PostToolUse`) pointed at a build directory that was gone, and
+/// Claude Code ran each as a non-blocking error. With only the file-tool and
+/// result hooks gone, `status` said `[on]`.
+#[cfg(test)]
+mod unscreened_hook_tests {
+    use super::*;
+
+    /// An absolute program path on this platform: `/x` is not absolute on
+    /// Windows, where this suite also runs.
+    fn abs(dir: &str) -> String {
+        if cfg!(windows) {
+            format!(r"C:\{dir}\innerwarden.exe")
+        } else {
+            format!("/{dir}/innerwarden")
+        }
+    }
+
+    fn cmd(program: &str) -> String {
+        format!(
+            "{} hook --agent claude-code",
+            serde_json::to_string(program).unwrap()
+        )
+    }
+
+    /// The settings the installer writes, each hook with its own program.
+    fn wired(bash: &str, files: &str, reads: &str, post: &str) -> Value {
+        json!({"hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": bash}]},
+                {"matcher": "Write|Edit|MultiEdit|NotebookEdit",
+                 "hooks": [{"type": "command", "command": files}]},
+                {"matcher": "Read|Grep|Glob", "hooks": [{"type": "command", "command": reads}]}
+            ],
+            "PostToolUse": [
+                {"matcher": "*", "hooks": [{"type": "command", "command": post}]}
+            ]
+        }})
+    }
+
+    /// Only the `ok` directory holds a program; everything else is missing.
+    fn fact(program: &str) -> ProgramFact {
+        if program == abs("ok") {
+            ProgramFact::Executable
+        } else {
+            ProgramFact::Missing
+        }
+    }
+
+    fn tools(settings: &Value) -> Vec<String> {
+        unscreened_iwguard_hooks(settings, fact)
+            .into_iter()
+            .map(|g| g.tools)
+            .collect()
+    }
+
+    /// FAILS ON REVERT of #190: every hook gone is the whole agent off.
+    #[test]
+    fn every_hook_gone_is_off() {
+        let dead = cmd(&abs("gone"));
+        let settings = wired(&dead, &dead, &dead, &dead);
+        assert!(matches!(
+            judge_iwguard_hooks(&settings, fact),
+            Some(HookProgram::Broken { .. })
+        ));
+    }
+
+    #[test]
+    fn every_hook_that_runs_is_on_with_nothing_unscreened() {
+        let ok = cmd(&abs("ok"));
+        let settings = wired(&ok, &ok, &ok, &ok);
+        assert_eq!(
+            judge_iwguard_hooks(&settings, fact),
+            Some(HookProgram::Runs)
+        );
+        assert!(tools(&settings).is_empty());
+    }
+
+    /// FAILS ON REVERT: without this judgement Bash alone decided, and the
+    /// file tools went unscreened under `[on]`.
+    #[test]
+    fn bash_runs_but_the_file_tools_hook_is_gone() {
+        let (ok, dead) = (cmd(&abs("ok")), cmd(&abs("gone")));
+        let settings = wired(&ok, &dead, &ok, &ok);
+        assert_eq!(
+            judge_iwguard_hooks(&settings, fact),
+            Some(HookProgram::Runs)
+        );
+        let groups = unscreened_iwguard_hooks(&settings, fact);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert_eq!(groups[0].tools, "Write/Edit/MultiEdit/NotebookEdit");
+        assert!(groups[0].problem.contains(&abs("gone")), "{groups:?}");
+        assert!(groups[0].problem.contains("does not exist"), "{groups:?}");
+    }
+
+    #[test]
+    fn only_the_result_hook_is_gone() {
+        let (ok, dead) = (cmd(&abs("ok")), cmd(&abs("gone")));
+        assert_eq!(
+            tools(&wired(&ok, &ok, &ok, &dead)),
+            vec!["PostToolUse (every tool)"]
+        );
+    }
+
+    #[test]
+    fn the_read_tools_hook_is_gone() {
+        let (ok, dead) = (cmd(&abs("ok")), cmd(&abs("gone")));
+        assert_eq!(tools(&wired(&ok, &ok, &dead, &ok)), vec!["Read/Grep/Glob"]);
+    }
+
+    /// The order the sentence reads: before-the-call gaps first.
+    #[test]
+    fn the_file_tools_and_the_result_hook_gone_are_both_named() {
+        let (ok, dead) = (cmd(&abs("ok")), cmd(&abs("gone")));
+        let groups = unscreened_iwguard_hooks(&wired(&ok, &dead, &ok, &dead), fact);
+        let sentence = unscreened_hooks_sentence(&groups).unwrap();
+        assert_eq!(
+            sentence,
+            format!(
+                "Write/Edit/MultiEdit/NotebookEdit not screened, PostToolUse (every tool) \
+                 not screened: its hook runs {}, which does not exist",
+                abs("gone")
+            )
+        );
+        assert_eq!(unscreened_hooks_sentence(&[]), None);
+    }
+
+    /// A quoted path, spaces and all, is read whole; so is one without quotes.
+    #[test]
+    fn a_quoted_path_is_read_whole() {
+        let ok = cmd(&abs("ok"));
+        let spaced = abs("dir with space");
+        let quoted = format!("\"{spaced}\" hook --agent claude-code");
+        let groups = unscreened_iwguard_hooks(&wired(&ok, &quoted, &ok, &ok), fact);
+        assert_eq!(groups.len(), 1, "{groups:?}");
+        assert!(
+            groups[0].problem.contains(&format!("runs {spaced},")),
+            "{groups:?}"
+        );
+        let bare = format!("{} hook --agent claude-code", abs("gone"));
+        assert_eq!(
+            tools(&wired(&ok, &bare, &ok, &ok)),
+            vec!["Write/Edit/MultiEdit/NotebookEdit"]
+        );
+    }
+
+    /// An operator's own hook is never judged, gone or not.
+    #[test]
+    fn another_tools_hook_is_ignored() {
+        let ok = cmd(&abs("ok"));
+        let theirs = format!(
+            "{} check",
+            serde_json::to_string(&abs("gone").replace("innerwarden", "their-audit")).unwrap()
+        );
+        assert!(tools(&wired(&ok, &theirs, &theirs, &theirs)).is_empty());
+    }
+
+    /// "Could not tell" is never "off": a path relative to wherever the
+    /// agent starts cannot be checked from here.
+    #[test]
+    fn a_hook_that_could_not_be_checked_is_not_reported() {
+        let ok = cmd(&abs("ok"));
+        let relative = "target/release/innerwarden hook --agent claude-code";
+        assert!(tools(&wired(&ok, relative, &ok, relative)).is_empty());
+    }
+
+    /// One hook of ours that runs for every tool screens the file tools too.
+    #[test]
+    fn a_running_hook_for_every_tool_covers_a_gone_one() {
+        let (ok, dead) = (cmd(&abs("ok")), cmd(&abs("gone")));
+        let mut settings = wired(&ok, &dead, &ok, &ok);
+        settings["hooks"]["PreToolUse"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"matcher": "*", "hooks": [{"type": "command", "command": ok}]}));
+        assert!(tools(&settings).is_empty());
     }
 }

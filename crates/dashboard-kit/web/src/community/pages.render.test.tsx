@@ -956,6 +956,28 @@ describe("Protection, Agents and Tokens", () => {
     expect(html).not.toContain("data-offer");
   });
 
+  it("says which tools a gone hook leaves unscreened, in status's words with its fix, on Agents and on Protection", () => {
+    const line =
+      "claude-code is wired and its shell commands are screened, but Write/Edit/MultiEdit/NotebookEdit not screened: its hook runs /gone/innerwarden, which does not exist.";
+    answers.set("agents", {
+      ...agentsFixture,
+      agents: agentsFixture.agents.map((agent) =>
+        agent.id === "claude-code"
+          ? { ...agent, judges: undefined, judges_line: undefined, unscreened: { line, command: "innerwarden install claude-code" } }
+          : agent,
+      ),
+    });
+    for (const html of [render(<CommunityAgents />), protectionHtml()]) {
+      const text = textOf(html);
+      const block = html.slice(html.indexOf("data-unscreened"));
+      expect(html.match(/data-unscreened/g)?.length, text).toBe(1);
+      expect(textOf(block)).toContain(line);
+      expect(commandBoxes(block)[0]?.text).toBe("innerwarden install claude-code");
+      // Its hooks' text alone would say the file changes are judged.
+      expect(text).not.toContain("Judges before it runs: Shell commands, file changes");
+    }
+  });
+
   it("says running as not read on macOS in the technical view, never not running", () => {
     answers.set("protection", readProtection(protectionFixture));
     setTechnicalDetail(true);

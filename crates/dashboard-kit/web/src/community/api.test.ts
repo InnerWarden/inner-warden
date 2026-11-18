@@ -33,6 +33,8 @@ import {
   readProtection,
   readRecordHealth,
   UnreadableAnswer,
+  UNSCREENED_CUT_NOTICE,
+  UNSCREENED_LINE_MAX,
 } from "./api";
 
 describe("the Community routes, read strictly", () => {
@@ -203,6 +205,45 @@ describe("the fields and routes v2 reads (A1 to E2): present, absent, malformed"
     expect(agent.modeSteps).toBeUndefined();
     expect(agent.mcp).toBeUndefined();
     expect(() => readAgentsFacts({ agents: "none" })).toThrow(UnreadableAnswer);
+  });
+
+  it("reads the tools a gone hook leaves unscreened as the CLI sent them, and drops a malformed one", () => {
+    const line =
+      "claude-code is wired and its shell commands are screened, but Write/Edit/MultiEdit/NotebookEdit not screened: its hook runs /gone/innerwarden, which does not exist.";
+    const row = (unscreened: unknown) => ({
+      id: "claude-code",
+      display_name: "Claude Code",
+      installed: true,
+      running: true,
+      detected_by: [],
+      guardrail: { mode: "enforce", mechanism: "pretooluse_hook", setup_support: "automatic" },
+      unscreened,
+    });
+    const [agent] = readAgentsFacts({ agents: [row({ line, command: "innerwarden install claude-code" })] }).agents;
+    expect(agent.unscreened).toEqual({ line, command: "innerwarden install claude-code" });
+    expect(agent.judges).toBeUndefined();
+    for (const malformed of [undefined, { line }, { command: "innerwarden install claude-code" }, { line: 7, command: "x" }]) {
+      const [other] = readAgentsFacts({ agents: [row(malformed)] }).agents;
+      expect(other.id).toBe("claude-code");
+      expect(other.unscreened).toBeUndefined();
+    }
+  });
+
+  it("cuts a long unscreened line with a notice instead of dropping the card", () => {
+    const long = `claude-code is wired, but Read/Grep/Glob not screened: its hook runs /${"deep/".repeat(200)}innerwarden, which does not exist.`;
+    expect(long.length).toBeGreaterThan(UNSCREENED_LINE_MAX);
+    const [agent] = readAgentsFacts({
+      agents: [{
+        id: "claude-code",
+        display_name: "Claude Code",
+        guardrail: { mode: "enforce", mechanism: "pretooluse_hook" },
+        unscreened: { line: long, command: "innerwarden install claude-code" },
+      }],
+    }).agents;
+    expect(agent.unscreened?.command).toBe("innerwarden install claude-code");
+    expect(agent.unscreened?.line.length).toBeLessThanOrEqual(UNSCREENED_LINE_MAX);
+    expect(agent.unscreened?.line.startsWith("claude-code is wired, but Read/Grep/Glob not screened")).toBe(true);
+    expect(agent.unscreened?.line.endsWith(UNSCREENED_CUT_NOTICE)).toBe(true);
   });
 
   it("reads a guardrail nobody has seen working at the mode it was set to, never a better one", () => {
