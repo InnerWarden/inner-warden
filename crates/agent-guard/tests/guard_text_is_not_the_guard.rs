@@ -207,6 +207,22 @@ fn paths_and_text_that_name_the_guard_stay_allowed() {
     ]);
 }
 
+/// A word not shown right after the guard's own name is still one of its
+/// verbs: reading `"$X"` as one word must not loosen the guard's verbs.
+/// The same word after the name given to ANOTHER program stays allowed.
+#[test]
+fn a_quoted_expansion_after_the_guard_name_stays_refused() {
+    assert_denied(&[
+        "innerwarden \"$X\"",
+        "innerwarden \"$X\" monitor",
+        "innerwarden allow \"$X\"",
+        "innerwarden \"$(echo dry-run)\"",
+        "iw \"$X\"",
+        "innerwarden-ctl \"$X\"",
+    ]);
+    assert_allowed(&["iwt read test001 innerwarden \"$N\""]);
+}
+
 /// What the readings above must not let through: the guard run by path, by
 /// a variable or by words the shell builds, its services stopped, its
 /// kernel protection changed, and here-documents a shell runs.
