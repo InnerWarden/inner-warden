@@ -570,7 +570,7 @@ fn agent_mechanism(agent: &innerwarden_agent_guard::agents::AgentStatus) -> Opti
 }
 
 #[cfg(test)]
-fn agents_json(
+pub(crate) fn agents_json(
     home: &std::path::Path,
     rows: &[innerwarden_agent_guard::agents::AgentStatus],
 ) -> String {
