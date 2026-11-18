@@ -2781,6 +2781,9 @@ fn analyze_command_as_read(
                     "shell data is structurally fed into a code interpreter".into()
                 }
                 crate::shell::DataFlow::RuntimeProgram => PROGRAM_NAMED_AT_RUN_TIME.into(),
+                crate::shell::DataFlow::EvaluatedFetch => {
+                    "a value fetched from the network is read as arithmetic or as a variable name, where the shell runs the commands in its array subscripts".into()
+                }
             },
         });
         score += 40;

@@ -31,6 +31,8 @@ pub(crate) fn project(source: &str) -> ShellProjection {
     // command as written is scanned, as before.
     let rewritten = text_as_the_shell_reads(source);
     let text = rewritten.as_deref().unwrap_or(source);
+    let evaluated = with_evaluated_subscripts_run(text);
+    let text = evaluated.as_deref().unwrap_or(text);
     let Some(tree) = parse_bash(text) else {
         return ShellProjection {
             scan: source.to_owned(),
@@ -62,9 +64,11 @@ pub(crate) fn project(source: &str) -> ShellProjection {
     let mut executable_inside_mask = Vec::new();
     let mut unreachable = Vec::new();
     collect_literal_unreachable_ranges(tree.root_node(), text.as_bytes(), &mut unreachable, 0);
+    let taint = LineTaint::default();
     collect_ranges(
         tree.root_node(),
         text.as_bytes(),
+        &taint,
         &mut masked,
         &mut executable_inside_mask,
         0,
@@ -436,6 +440,25 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
                 at += 1;
                 changed = true;
             }
+            // `{sh,-c,"$(curl ...)"}` is the words `sh`, `-c` and the
+            // substitution to bash: a whole word that is a brace list is
+            // expanded before the command is found. The grammar read it as
+            // one broken word, so the line was scanned as plain text and the
+            // shell, the `-c` and the download it runs were never seen
+            // (measured 2026-11-18 on 1.6.13). The list is written out as
+            // the words it makes, each with its quotes as written.
+            '{' if !word_started
+                && !parens.in_arithmetic()
+                && whole_word_brace_list(&chars, at).is_some() =>
+            {
+                if let Some((items, end)) = whole_word_brace_list(&chars, at) {
+                    out.push_str(&items.join(" "));
+                    at = end;
+                    changed = true;
+                    word_started = true;
+                    command_start = false;
+                }
+            }
             ' ' | '\t' | ';' | '&' | '|' | '<' | '>' => {
                 out.push(c);
                 at += 1;
@@ -458,6 +481,868 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
     changed.then_some(out)
 }
 
+/// Spellings without which no part of a line reads a value as a variable
+/// name or as arithmetic: arithmetic (`$((`, `((`, `$[`, `let`, a `[[`
+/// comparison), a subscript (`a[X]=`, `${a[X]}`), a substring or indirect
+/// expansion (`${Z:Y}`, `${!X}`), an integer declaration and the builtins
+/// that take a variable name (`declare`, `printf -v`, `read`, `unset`,
+/// `test -v`...). Only a cheap gate: where the value stands decides.
+const NAME_EVALUATING_SPELLINGS: [&str; 18] = [
+    "((",
+    "$[",
+    "let ",
+    "[[",
+    "${",
+    "declare",
+    "typeset",
+    "local ",
+    "readonly",
+    "export ",
+    "printf ",
+    "read ",
+    "unset ",
+    "test ",
+    "[ ",
+    "mapfile",
+    "readarray",
+    "]",
+];
+
+/// The line with the substitutions bash runs out of a quoted subscript
+/// written after it, each on a line of its own; `None` when it has none.
+///
+/// `X='a[$(cmd)]'; echo $((X))` runs `cmd`: a value read as arithmetic or as
+/// a name is expanded again, and the subscript of an indexed array with it,
+/// substitutions included. The grammar reads the quoted value as data, so
+/// the projection showed no command at all (measured 2026-11-18 on 1.6.13:
+/// `curl ... | sh` hidden this way was allowed, in `$((X))`, `${Z:Y}`,
+/// `${!X}`, `let`, `[[ -eq ]]` and `declare -i`). The subscript substitution
+/// is copied as written, so every check reads the command it runs, and
+/// nothing else changes.
+///
+/// A value counts in any quoting bash decodes to it (`'...'`, `"a[\$(..)]"`,
+/// `$'a[\x24(..)]'`, an unquoted word with its `$` escaped) and only where
+/// bash evaluates it: in arithmetic or a subscript, as a name a builtin takes,
+/// as an integer declaration's value, or assigned to a variable that one of
+/// those places reads (`a[X]=1`, `$((X))`, `${!X}`). Printing, exporting or
+/// searching for such text (`printf '%s' 'a[$(x)]'`, `export X='a[$(x)]'`,
+/// `grep 'a[$(x)]' f`) is left as it was.
+fn with_evaluated_subscripts_run(text: &str) -> Option<String> {
+    let maybe_substitution = ["$(", "`", "\\x24", "\\044", "\\u0024", "\\U00000024"]
+        .iter()
+        .any(|spelling| text.contains(spelling));
+    if !maybe_substitution
+        || !NAME_EVALUATING_SPELLINGS
+            .iter()
+            .any(|spelling| text.contains(spelling))
+    {
+        return None;
+    }
+    let quoted_words = with_escaped_words_quoted(text);
+    let read_text = quoted_words.as_deref().unwrap_or(text);
+    let tree = parse_bash(read_text)?;
+    let bytes = read_text.as_bytes();
+    let read: std::collections::HashSet<String> = evaluated_name_reads(tree.root_node(), bytes)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    let mut quoted = Vec::new();
+    collect_nodes_of_kind(tree.root_node(), "raw_string", &mut quoted, 0);
+    collect_nodes_of_kind(tree.root_node(), "ansi_c_string", &mut quoted, 0);
+    collect_nodes_of_kind(tree.root_node(), "string", &mut quoted, 0);
+    let mut runs = Vec::new();
+    for node in quoted {
+        let Some(value) = quoted_value(node, bytes) else {
+            continue;
+        };
+        // `$(( a['$(cmd)'] ))`: the quotes stand inside the subscript.
+        let start = node.start_byte();
+        let inside_subscript = start >= 2
+            && bytes[start - 1] == b'['
+            && (bytes[start - 2].is_ascii_alphanumeric() || bytes[start - 2] == b'_');
+        let value = if inside_subscript {
+            format!("x[{value}]")
+        } else {
+            value
+        };
+        let substitutions = subscript_substitutions(&value);
+        if substitutions.is_empty() || !value_is_evaluated(node, bytes, &read) {
+            continue;
+        }
+        runs.extend(
+            substitutions
+                .iter()
+                .map(|substitution| substitution_command(substitution)),
+        );
+    }
+    if runs.is_empty() {
+        return None;
+    }
+    let mut out = text.to_owned();
+    for run in runs {
+        out.push('\n');
+        out.push_str(&run);
+    }
+    Some(out)
+}
+
+/// The value a quoted word stands for once bash has taken its quotes off:
+/// a `'...'` as written, a `$'...'` with its escapes decoded, a `"..."`
+/// with `\$`, `\``, `\"` and `\\` read as the character. `None` for any
+/// other node.
+fn quoted_value(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let written = node_text(node, source);
+    match node.kind() {
+        "raw_string" => Some(
+            written
+                .strip_prefix('\'')
+                .and_then(|inner| inner.strip_suffix('\''))
+                .unwrap_or(&written)
+                .to_owned(),
+        ),
+        "ansi_c_string" => {
+            let inner = written
+                .strip_prefix("$'")
+                .and_then(|inner| inner.strip_suffix('\''))?;
+            let chars: Vec<char> = inner.chars().collect();
+            let mut value = String::new();
+            let mut at = 0;
+            while at < chars.len() {
+                if chars[at] == '\\' {
+                    let (decoded, used) = crate::shell_words::ansi_c_escape(&chars[at + 1..]);
+                    value.extend(decoded);
+                    at += 1 + used.max(usize::from(at + 1 == chars.len()));
+                } else {
+                    value.push(chars[at]);
+                    at += 1;
+                }
+            }
+            Some(value)
+        }
+        "string" => {
+            let inner = written
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))?;
+            let mut value = String::new();
+            let mut chars = inner.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\\' && matches!(chars.peek(), Some('$' | '`' | '"' | '\\')) {
+                    value.extend(chars.next());
+                } else {
+                    value.push(c);
+                }
+            }
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+/// The line with each unquoted word that escapes a `$` or a backtick
+/// (`X=a[\$\(cmd\)]`) written as the single-quoted word bash makes of it
+/// (`X='a[$(cmd)]'`), so its value is read like any quoted one. A word with
+/// a quote, an expansion or a `'` in its value is left as written. `None`
+/// when no word changed.
+fn with_escaped_words_quoted(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let separates =
+        |c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')');
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut at = 0;
+    while at < chars.len() {
+        if separates(chars[at]) {
+            out.push(chars[at]);
+            at += 1;
+            continue;
+        }
+        let start = at;
+        let mut plain = true;
+        let mut escapes_expansion = false;
+        while at < chars.len() && !separates(chars[at]) {
+            match chars[at] {
+                '\\' => {
+                    escapes_expansion |= matches!(chars.get(at + 1), Some('$' | '`'));
+                    at += 2;
+                }
+                '\'' | '"' | '`' | '$' => {
+                    plain = false;
+                    at = quoted_construct_end(&chars, at, 0).unwrap_or(chars.len());
+                }
+                _ => at += 1,
+            }
+        }
+        let at_end = at.min(chars.len());
+        let word: String = chars[start..at_end].iter().collect();
+        at = at_end;
+        if !(plain && escapes_expansion) {
+            out.push_str(&word);
+            continue;
+        }
+        // `NAME=` or `NAME+=` stays outside the quotes, or the word would
+        // no longer be an assignment.
+        let name_end = word
+            .find('=')
+            .filter(|end| {
+                let name = word[..*end].strip_suffix('+').unwrap_or(&word[..*end]);
+                !name.is_empty()
+                    && !name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            })
+            .map_or(0, |end| end + 1);
+        let mut value = String::new();
+        let mut rest = word[name_end..].chars();
+        while let Some(c) = rest.next() {
+            if c == '\\' {
+                value.extend(rest.next());
+            } else {
+                value.push(c);
+            }
+        }
+        if value.contains('\'') {
+            out.push_str(&word);
+            continue;
+        }
+        out.push_str(&word[..name_end]);
+        out.push('\'');
+        out.push_str(&value);
+        out.push('\'');
+        changed = true;
+    }
+    changed.then_some(out)
+}
+
+/// The comparisons of `[[ ]]` that read both sides as arithmetic.
+const ARITHMETIC_TESTS: [&str; 6] = ["-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
+
+/// The builtins that take a variable name as an argument, and evaluate the
+/// subscript in it.
+fn takes_names(command: &str) -> bool {
+    matches!(command, "read" | "unset" | "mapfile" | "readarray")
+}
+
+/// Options of `read`, `mapfile` and `readarray` whose value is not a name.
+const NAME_BUILTIN_VALUE_OPTIONS: [&str; 10] =
+    ["-p", "-d", "-t", "-n", "-N", "-u", "-i", "-C", "-c", "-O"];
+
+/// Whether `argument` of `command` stands where its builtin takes a
+/// variable name: after `printf -v` or `test -v`, or as a name `read`,
+/// `unset`, `mapfile` or a declaration takes.
+fn argument_is_a_name(
+    command: tree_sitter::Node<'_>,
+    argument: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    let Some(name) = command_name(command, source).map(|name| normalized_command_name(&name))
+    else {
+        return false;
+    };
+    let arguments = command_arguments(command);
+    let Some(position) = arguments.iter().position(|node| node.id() == argument.id()) else {
+        return false;
+    };
+    let before = position
+        .checked_sub(1)
+        .map(|previous| shell_word(&node_text(arguments[previous], source)));
+    match name.as_str() {
+        "printf" | "test" | "[" => before.as_deref() == Some("-v"),
+        name if takes_names(name) => {
+            let word = shell_word(&node_text(argument, source));
+            !word.starts_with('-')
+                && !before.is_some_and(|flag| NAME_BUILTIN_VALUE_OPTIONS.contains(&flag.as_str()))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a declaration evaluates the subscripts of the names it takes:
+/// `declare`, `local` and `typeset` do; `export` and `readonly` refuse
+/// such a name as not a valid identifier (measured on bash 5.1.8,
+/// 2026-11-18).
+fn declaration_evaluates_subscripts(declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    declaration.child(0).is_some_and(|keyword| {
+        matches!(
+            node_text(keyword, source).as_str(),
+            "declare" | "local" | "typeset"
+        )
+    })
+}
+
+/// The variables written in the subscript of a name (`b[X]` reads `X`).
+/// Where a builtin takes the name, bash evaluates that subscript as
+/// arithmetic, and so reads each of them.
+fn name_subscript_identifiers(word: &str) -> Vec<String> {
+    let Some((name, rest)) = word.split_once('[') else {
+        return Vec::new();
+    };
+    if name.is_empty() || !name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+        return Vec::new();
+    }
+    identifiers(rest.rfind(']').map_or(rest, |end| &rest[..end]))
+}
+
+/// Whether `node` stands in the offset of a substring expansion
+/// (`${Z:'a[$(cmd)]'}`), which bash reads as arithmetic.
+fn stands_in_substring_offset(
+    expansion: tree_sitter::Node<'_>,
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    let text = node_text(expansion, source);
+    let Some(inner) = text.strip_prefix("${") else {
+        return false;
+    };
+    let name_end = inner
+        .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+        .unwrap_or(inner.len());
+    if name_end == 0 || !inner[name_end..].starts_with(':') {
+        return false;
+    }
+    if inner[name_end + 1..].starts_with(['-', '=', '?', '+']) {
+        return false;
+    }
+    node.start_byte() > expansion.start_byte() + 2 + name_end
+}
+
+/// Whether a declaration (`declare -i`, `local -ai`...) makes its names
+/// integers, so the values given them are read as arithmetic.
+fn declares_integers(declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = declaration.walk();
+    let found = declaration.named_children(&mut cursor).any(|child| {
+        child.kind() == "word" && {
+            let flag = node_text(child, source);
+            flag.starts_with('-') && !flag.starts_with("--") && flag.contains('i')
+        }
+    });
+    found
+}
+
+/// Whether bash evaluates the quoted value at `node` as arithmetic or as a
+/// name: it stands in arithmetic, a subscript or an arithmetic `[[`
+/// comparison, as an argument of `let`, as a name a builtin takes, as the
+/// value of an integer declaration, or as the value of an assignment whose
+/// name is in `read` (the names read in those places).
+fn value_is_evaluated(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    read: &std::collections::HashSet<String>,
+) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "arithmetic_expansion" | "subscript" => return true,
+            "compound_statement" if node_text(parent, source).starts_with("((") => return true,
+            "binary_expression" => {
+                if parent
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| {
+                        ARITHMETIC_TESTS.contains(&node_text(operator, source).as_str())
+                    })
+                {
+                    return true;
+                }
+            }
+            "variable_assignment" => {
+                let in_value = parent
+                    .child_by_field_name("value")
+                    .is_some_and(|value| value.start_byte() <= node.start_byte());
+                if !in_value {
+                    // `declare 'a[$(cmd)]'=1`: in the name, a subscript.
+                    return parent.parent().is_none_or(|owner| {
+                        owner.kind() != "declaration_command"
+                            || declaration_evaluates_subscripts(owner, source)
+                    });
+                }
+                if parent.parent().is_some_and(|owner| {
+                    owner.kind() == "declaration_command" && declares_integers(owner, source)
+                }) {
+                    return true;
+                }
+                return parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| read.contains(&node_text(name, source)));
+            }
+            "declaration_command" => {
+                // A word a declaration names: a name, whose subscript is
+                // evaluated (`declare 'a[$(cmd)]'`), by the builtins that
+                // take such a name.
+                return declaration_evaluates_subscripts(parent, source)
+                    && (current.kind() != "word" || !node_text(current, source).starts_with('-'));
+            }
+            // `unset 'a[$(cmd)]'`: a name, whose subscript is evaluated.
+            "unset_command" => {
+                return current.kind() != "word" || !node_text(current, source).starts_with('-');
+            }
+            // `[[ -v 'a[$(cmd)]' ]]`: the name tested is evaluated.
+            "unary_expression" => {
+                return parent
+                    .child(0)
+                    .is_some_and(|operator| node_text(operator, source) == "-v");
+            }
+            "expansion" if stands_in_substring_offset(parent, node, source) => return true,
+            "command" => {
+                if command_name(parent, source)
+                    .is_some_and(|name| normalized_command_name(&name) == "let")
+                {
+                    return true;
+                }
+                return argument_is_a_name(parent, current, source);
+            }
+            "concatenation" | "string" | "expansion" => {}
+            _ => return false,
+        }
+        current = parent;
+    }
+    false
+}
+
+/// The variable names written in `text` (`X`, `$X`, `${X}`), as
+/// arithmetic reads them.
+fn identifiers(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut current = String::new();
+    let mut after_digit = false;
+    for c in text.chars() {
+        if c == '_' || c.is_ascii_alphanumeric() {
+            if current.is_empty() && c.is_ascii_digit() {
+                after_digit = true;
+            }
+            if !after_digit {
+                current.push(c);
+            }
+        } else {
+            if !current.is_empty() {
+                found.push(std::mem::take(&mut current));
+            }
+            after_digit = false;
+        }
+    }
+    if !current.is_empty() {
+        found.push(current);
+    }
+    found
+}
+
+/// Each variable bash reads as arithmetic or as a name on the line, with
+/// where the reading place starts: names in arithmetic (`$((X))`, `((X))`,
+/// `let n=X`, an arithmetic `[[` comparison, an integer declaration's
+/// value), in a subscript (`a[X]=1`, `${a[X]}`), in a substring offset
+/// (`${Z:X}`), an indirect name (`${!X}`), and a variable expanded where a
+/// builtin takes a name (`printf -v "$X"`, `read "$X"`). A value read in one
+/// of these places runs the substitutions in the subscripts it holds.
+fn evaluated_name_reads(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(usize, String)> {
+    let mut reads = Vec::new();
+    let add = |reads: &mut Vec<(usize, String)>, start: usize, text: &str| {
+        reads.extend(identifiers(text).into_iter().map(|name| (start, name)));
+    };
+    let mut places = Vec::new();
+    collect_nodes_of_kind(root, "arithmetic_expansion", &mut places, 0);
+    for place in places.drain(..) {
+        add(&mut reads, place.start_byte(), &node_text(place, source));
+    }
+    collect_nodes_of_kind(root, "compound_statement", &mut places, 0);
+    for place in places.drain(..) {
+        let text = node_text(place, source);
+        if text.starts_with("((") {
+            add(&mut reads, place.start_byte(), &text);
+        }
+    }
+    collect_nodes_of_kind(root, "subscript", &mut places, 0);
+    for place in places.drain(..) {
+        if let Some(index) = place.child_by_field_name("index") {
+            add(&mut reads, place.start_byte(), &node_text(index, source));
+        }
+    }
+    collect_nodes_of_kind(root, "binary_expression", &mut places, 0);
+    for place in places.drain(..) {
+        if place
+            .child_by_field_name("operator")
+            .is_some_and(|operator| {
+                ARITHMETIC_TESTS.contains(&node_text(operator, source).as_str())
+            })
+        {
+            add(&mut reads, place.start_byte(), &node_text(place, source));
+        }
+    }
+    collect_nodes_of_kind(root, "expansion", &mut places, 0);
+    for place in places.drain(..) {
+        let text = node_text(place, source);
+        let Some(inner) = text
+            .strip_prefix("${")
+            .and_then(|inner| inner.strip_suffix('}'))
+        else {
+            continue;
+        };
+        if let Some(indirect) = inner.strip_prefix('!') {
+            add(&mut reads, place.start_byte(), indirect);
+            continue;
+        }
+        let name_end = inner
+            .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+            .unwrap_or(inner.len());
+        if let Some(offset) = inner[name_end..].strip_prefix(':') {
+            if !offset.starts_with(['-', '=', '?', '+']) {
+                add(&mut reads, place.start_byte(), offset);
+            }
+        }
+    }
+    // The grammar reads `unset` apart from other commands.
+    collect_nodes_of_kind(root, "unset_command", &mut places, 0);
+    for place in places.drain(..) {
+        // `unset b[X]` unquoted comes as `b` and `[X]` side by side: the
+        // pieces with no blank between them make one word.
+        let mut words: Vec<String> = Vec::new();
+        let mut end = None;
+        let mut cursor = place.walk();
+        for child in place.named_children(&mut cursor) {
+            let text = node_text(child, source);
+            match words.last_mut() {
+                Some(word) if end == Some(child.start_byte()) => word.push_str(&text),
+                _ => words.push(text),
+            }
+            end = Some(child.end_byte());
+        }
+        for written in words {
+            let word = shell_word(&written);
+            if word.starts_with('-') {
+                continue;
+            }
+            if let Some(name) = shell_variable_name(&word) {
+                reads.push((place.start_byte(), name.to_owned()));
+            }
+            for name in name_subscript_identifiers(&word) {
+                reads.push((place.start_byte(), name));
+            }
+        }
+    }
+    collect_nodes_of_kind(root, "unary_expression", &mut places, 0);
+    for place in places.drain(..) {
+        if place
+            .child(0)
+            .is_some_and(|operator| node_text(operator, source) == "-v")
+        {
+            if let Some(operand) = place.child(1) {
+                let word = shell_word(&node_text(operand, source));
+                for name in name_subscript_identifiers(&word) {
+                    reads.push((place.start_byte(), name));
+                }
+            }
+        }
+    }
+    collect_nodes_of_kind(root, "declaration_command", &mut places, 0);
+    for place in places.drain(..) {
+        if declaration_evaluates_subscripts(place, source) {
+            let mut cursor = place.walk();
+            for child in place.named_children(&mut cursor) {
+                let name = match child.kind() {
+                    "variable_assignment" => child
+                        .child_by_field_name("name")
+                        .map(|name| node_text(name, source)),
+                    _ => Some(node_text(child, source)),
+                };
+                let Some(word) = name.map(|name| shell_word(&name)) else {
+                    continue;
+                };
+                if word.starts_with('-') {
+                    continue;
+                }
+                for name in name_subscript_identifiers(&word) {
+                    reads.push((place.start_byte(), name));
+                }
+            }
+        }
+        if !declares_integers(place, source) {
+            continue;
+        }
+        let mut assignments = Vec::new();
+        collect_nodes_of_kind(place, "variable_assignment", &mut assignments, 0);
+        for assignment in assignments {
+            if let Some(value) = assignment.child_by_field_name("value") {
+                add(&mut reads, place.start_byte(), &node_text(value, source));
+            }
+        }
+    }
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    for command in commands {
+        let is_let = command_name(command, source)
+            .is_some_and(|name| normalized_command_name(&name) == "let");
+        for argument in command_arguments(command) {
+            let text = node_text(argument, source);
+            if is_let {
+                add(&mut reads, command.start_byte(), &text);
+            } else if argument_is_a_name(command, argument, source) {
+                let word = shell_word(&text);
+                if let Some(name) = shell_variable_name(&word) {
+                    reads.push((command.start_byte(), name.to_owned()));
+                }
+                // `unset 'b[X]'`: the subscript of the name reads `X`.
+                for name in name_subscript_identifiers(&word) {
+                    reads.push((command.start_byte(), name));
+                }
+            }
+        }
+    }
+    reads
+}
+
+/// Whether an argument of `command` reads a fetched value as arithmetic or
+/// as a name (`echo $((X))` after `X=$(curl ..)`). Its arguments are then
+/// not text to print but code bash runs, so they are never masked.
+fn command_evaluates_fetched_value(
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+    taint: &LineTaint,
+) -> bool {
+    if !node_contains_kind(command, "arithmetic_expansion", 0)
+        && !node_contains_kind(command, "expansion", 0)
+    {
+        return false;
+    }
+    let timeline = taint.timeline(command, source);
+    if timeline.is_empty() {
+        return false;
+    }
+    evaluated_name_reads(command, source)
+        .into_iter()
+        .any(|(start, name)| tainted_names_at(timeline, start).contains(&name))
+}
+
+/// Whether a value fetched from the network reaches a place where bash reads
+/// it as arithmetic or as a name (`X=$(curl ..); echo $((X))`): bash then
+/// runs the substitutions in any subscript the server put in it, so the
+/// fetched text is run (found in review, 2026-11-18).
+fn fetched_value_is_evaluated(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let timeline = download_taint_timeline(root, source);
+    if timeline.is_empty() {
+        return false;
+    }
+    evaluated_name_reads(root, source)
+        .into_iter()
+        .any(|(start, name)| tainted_names_at(&timeline, start).contains(&name))
+}
+
+/// The command line a substitution as written (`$(cmd)`, `` `cmd` ``) runs.
+fn substitution_command(substitution: &str) -> String {
+    substitution
+        .strip_prefix("$(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .or_else(|| {
+            substitution
+                .strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+        })
+        .unwrap_or(substitution)
+        .to_owned()
+}
+
+/// The command substitutions (`$(...)`, backticks) inside the subscripts
+/// (`name[...]`) of `text`, as written.
+fn subscript_substitutions(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let opens_subscript = chars[at] == '['
+            && at > 0
+            && (chars[at - 1].is_ascii_alphanumeric() || chars[at - 1] == '_');
+        if !opens_subscript {
+            at += 1;
+            continue;
+        }
+        let mut depth = 1usize;
+        let mut j = at + 1;
+        while j < chars.len() && depth > 0 {
+            match chars[j] {
+                '[' => {
+                    depth += 1;
+                    j += 1;
+                }
+                ']' => {
+                    depth -= 1;
+                    j += 1;
+                }
+                '$' if chars.get(j + 1) == Some(&'(') => {
+                    let end = quoted_construct_end(&chars, j, 0).unwrap_or(chars.len());
+                    found.push(chars[j..end].iter().collect());
+                    j = end;
+                }
+                '`' => {
+                    let end = quoted_construct_end(&chars, j, 0).unwrap_or(chars.len());
+                    found.push(chars[j..end].iter().collect());
+                    j = end;
+                }
+                _ => j += 1,
+            }
+        }
+        at = j.max(at + 1);
+    }
+    found
+}
+
+/// The most words one brace list is written out as. A longer list is left as
+/// written, which is how every line was read before.
+const BRACE_LIST_WORDS: usize = 64;
+
+/// The words a whole word that is one brace list (`{a,b,c}`, opening at
+/// `open`) makes to bash, each as written with its quotes, and where the word
+/// ends. `None` when the `{` opens no such word: a brace group (`{ cmd; }`),
+/// a list with text glued before or after it (`file{,.bak}`, read as written
+/// as before), one without a `,` at its own level (`{1..5}`, `{}`), one cut by
+/// a blank, an operator or the end of the line, or one past
+/// [`BRACE_LIST_WORDS`]. An empty item makes no word.
+fn whole_word_brace_list(chars: &[char], open: usize) -> Option<(Vec<String>, usize)> {
+    let first = *chars.get(open + 1)?;
+    if first.is_whitespace() || first == '}' {
+        return None;
+    }
+    let mut items: Vec<String> = Vec::new();
+    let mut item_start = open + 1;
+    let mut depth = 1usize;
+    let mut at = open + 1;
+    let close = loop {
+        let c = *chars.get(at)?;
+        match c {
+            '\\' | '\'' | '"' | '`' => at = quoted_construct_end(chars, at, 0)?,
+            '$' if matches!(chars.get(at + 1), Some('(' | '{')) => {
+                at = quoted_construct_end(chars, at, 0)?;
+            }
+            '{' => {
+                depth += 1;
+                at += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    break at;
+                }
+                at += 1;
+            }
+            ',' if depth == 1 => {
+                items.push(chars[item_start..at].iter().collect());
+                at += 1;
+                item_start = at;
+            }
+            c if c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')') => {
+                return None;
+            }
+            _ => at += 1,
+        }
+    };
+    if items.is_empty() {
+        return None;
+    }
+    items.push(chars[item_start..close].iter().collect());
+    let ends_word = chars
+        .get(close + 1)
+        .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | ')'));
+    if !ends_word {
+        return None;
+    }
+    // `{{bash,-c},"$(...)"}`: an item that is itself a whole brace list is
+    // the words it makes, as bash expands it (found in review, 2026-11-18).
+    let mut words = Vec::new();
+    for item in items {
+        brace_item_words(item, 0, &mut words);
+        if words.len() > BRACE_LIST_WORDS {
+            return None;
+        }
+    }
+    (!words.is_empty()).then_some((words, close + 1))
+}
+
+/// The words one item of a brace list makes: the words of the brace list it
+/// is, when it is one whole, read to a depth of eight lists, or else itself.
+/// An empty item makes none.
+fn brace_item_words(item: String, depth: u8, words: &mut Vec<String>) {
+    if item.is_empty() {
+        return;
+    }
+    if depth < 8 && item.starts_with('{') {
+        let chars: Vec<char> = item.chars().collect();
+        if let Some((inner, end)) = whole_word_brace_list(&chars, 0) {
+            if end == chars.len() {
+                for word in inner {
+                    brace_item_words(word, depth + 1, words);
+                }
+                return;
+            }
+        }
+    }
+    words.push(item);
+}
+
+/// Where the quote, escape, `$(...)` or `${...}` that starts at `at` ends
+/// (the index just past it), reading the quotes and substitutions nested in
+/// it. `None` when it does not close before the line ends.
+fn quoted_construct_end(chars: &[char], at: usize, depth: u8) -> Option<usize> {
+    if depth > 32 {
+        return None;
+    }
+    match *chars.get(at)? {
+        '\\' => Some((at + 2).min(chars.len())),
+        '\'' => chars[at + 1..]
+            .iter()
+            .position(|c| *c == '\'')
+            .map(|found| at + 1 + found + 1),
+        '`' => {
+            let mut j = at + 1;
+            loop {
+                match *chars.get(j)? {
+                    '\\' => j += 2,
+                    '`' => return Some(j + 1),
+                    _ => j += 1,
+                }
+            }
+        }
+        '"' => {
+            let mut j = at + 1;
+            loop {
+                match *chars.get(j)? {
+                    '\\' => j += 2,
+                    '"' => return Some(j + 1),
+                    '`' => j = quoted_construct_end(chars, j, depth + 1)?,
+                    '$' if matches!(chars.get(j + 1), Some('(' | '{')) => {
+                        j = quoted_construct_end(chars, j, depth + 1)?;
+                    }
+                    _ => j += 1,
+                }
+            }
+        }
+        '$' => {
+            let (open, close) = match chars.get(at + 1)? {
+                '(' => ('(', ')'),
+                '{' => ('{', '}'),
+                _ => return Some(at + 1),
+            };
+            let mut nested = 1usize;
+            let mut j = at + 2;
+            loop {
+                let c = *chars.get(j)?;
+                match c {
+                    '\\' | '\'' | '"' | '`' => j = quoted_construct_end(chars, j, depth + 1)?,
+                    '$' if matches!(chars.get(j + 1), Some('(' | '{')) => {
+                        j = quoted_construct_end(chars, j, depth + 1)?;
+                    }
+                    c if c == open => {
+                        nested += 1;
+                        j += 1;
+                    }
+                    c if c == close => {
+                        nested -= 1;
+                        j += 1;
+                        if nested == 0 {
+                            return Some(j);
+                        }
+                    }
+                    _ => j += 1,
+                }
+            }
+        }
+        _ => Some(at + 1),
+    }
+}
+
 /// Why a line is held as an executable data flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DataFlow {
@@ -466,6 +1351,9 @@ pub(crate) enum DataFlow {
     /// The line holds a substitution and the program it runs is only named
     /// when the line runs, so nothing shows the program is not an interpreter.
     RuntimeProgram,
+    /// A value fetched from the network is read as arithmetic or as a name,
+    /// where bash runs the substitutions in the subscripts it holds.
+    EvaluatedFetch,
 }
 
 /// The yes-or-no reading of [`executable_data_flow`], for the tests that ask
@@ -493,6 +1381,7 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
     // A pipeline whose only reader of code is a program named at run time
     // is refused for that name, and says how to write it.
     let mut unknown_program = false;
+    let mut evaluated_fetch = false;
     for pipeline in pipelines {
         if node_is_in_literal_unreachable_branch(pipeline, source.as_bytes())
             || !pipeline_has_stdin_executor(pipeline, source.as_bytes(), false)
@@ -564,6 +1453,7 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
                 match code_argument_flow(command, &name, &argument, source) {
                     Some(DataFlow::Fed) => return true,
                     Some(DataFlow::RuntimeProgram) => unknown_program = true,
+                    Some(DataFlow::EvaluatedFetch) => evaluated_fetch = true,
                     None => {}
                 }
                 false
@@ -603,10 +1493,23 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
                             }
                             Some(DataFlow::Fed) => return true,
                             Some(DataFlow::RuntimeProgram) => unknown_program = true,
+                            Some(DataFlow::EvaluatedFetch) => evaluated_fetch = true,
                             None => {}
                         }
                     }
-                    if substituted {
+                    // `X="$(curl ...)"; "$X" run` names the program by what
+                    // was fetched, as `"$(curl ...)" run` does: the
+                    // variable only moves the fetch to an earlier command
+                    // (measured 2026-11-18: the direct form was refused,
+                    // this one allowed). A variable set from a local
+                    // command (`"$(command -v python3)"`) is not fetched.
+                    if substituted
+                        || variable_code_argument_is_download_tainted(
+                            command,
+                            &shell_word(&effective[0]),
+                            source.as_bytes(),
+                        )
+                    {
                         unknown_program = true;
                     }
                     return false;
@@ -619,7 +1522,11 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
     if fed {
         return Some(DataFlow::Fed);
     }
-    unknown_program.then_some(DataFlow::RuntimeProgram)
+    if unknown_program {
+        return Some(DataFlow::RuntimeProgram);
+    }
+    (evaluated_fetch || fetched_value_is_evaluated(tree.root_node(), source.as_bytes()))
+        .then_some(DataFlow::EvaluatedFetch)
 }
 
 /// What the code a program is handed in an argument does when the program
@@ -2308,13 +3215,20 @@ fn variable_code_argument_is_download_tainted(
         0,
     );
     assignments.sort_by_key(|assignment| assignment.start_byte());
-    let mut tainted = std::collections::HashSet::<String>::new();
+    // `read X < <(curl ..)`, `mapfile -t A < <(curl ..)`, `printf -v X
+    // "$(curl ..)"` fill a name with fetched bytes too.
+    let timeline = download_taint_timeline(root_node(command), source);
+    let mut tainted = tainted_names_at(&timeline, command.start_byte());
     for assignment in assignments {
-        if assignment.end_byte() > command.start_byte()
-            || assignment_has_control_flow_ancestor(assignment)
-        {
+        if assignment.end_byte() > command.start_byte() {
             continue;
         }
+        // An assignment that runs only on some paths (a branch, a loop, a
+        // function, a subshell) may run: it taints on any path, and a clean
+        // one there does not clear what an earlier one fetched (found in
+        // review, 2026-11-18: `if true; then X="$(curl ..)"; fi; "$X" run`
+        // was allowed).
+        let on_some_paths = assignment_has_control_flow_ancestor(assignment);
         let text = node_text(assignment, source);
         let (name, value) = if let Some((name, value)) = text.split_once("+=") {
             (name, value)
@@ -2330,7 +3244,7 @@ fn variable_code_argument_is_download_tainted(
             || value_variable.is_some_and(|name| tainted.contains(name));
         if value_tainted {
             tainted.insert(name.to_owned());
-        } else {
+        } else if !on_some_paths {
             tainted.remove(name);
         }
     }
@@ -2898,7 +3812,9 @@ fn download_taint_timeline(
     readers.retain(|command| {
         command_name(*command, source)
             .map(|name| normalized_command_name(&name))
-            .is_some_and(|name| matches!(name.as_str(), "read" | "mapfile" | "readarray"))
+            .is_some_and(|name| {
+                matches!(name.as_str(), "read" | "mapfile" | "readarray" | "printf")
+            })
     });
     // Assignments sort before the command that carries them as a prefix,
     // which over-taints `f=$(curl ..) cmd "$f"` (the shell would not expand
@@ -2926,6 +3842,25 @@ fn download_taint_timeline(
                 _ => node,
             };
             if !node_contains_download_substitution(unit, source) {
+                continue;
+            }
+            // `printf -v X "$(curl ..)"` fills only the name after `-v`.
+            if command_name(node, source)
+                .is_some_and(|name| normalized_command_name(&name) == "printf")
+            {
+                let words: Vec<String> = command_arguments(node)
+                    .into_iter()
+                    .map(|argument| shell_word(&node_text(argument, source)))
+                    .collect();
+                for name in words
+                    .iter()
+                    .zip(words.iter().skip(1))
+                    .filter(|(flag, _)| *flag == "-v")
+                    .map(|(_, name)| name.split('[').next().unwrap_or(name).to_owned())
+                {
+                    running.insert(name.clone());
+                    timeline.push((start, name, true));
+                }
                 continue;
             }
             // Every non-option word is taken as a name: tainting a prompt
@@ -3004,7 +3939,11 @@ fn stdin_redirect_expands_download_value(
 /// shell variable. Used by the projection so `echo "$f" > r.sh` is never
 /// masked as literal output: the argument is not text the operator typed, it
 /// is the fetched payload on its way to disk.
-fn command_writes_download_tainted_value(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+fn command_writes_download_tainted_value(
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+    taint: &LineTaint,
+) -> bool {
     if !node_contains_kind(command, "simple_expansion", 0)
         && !node_contains_kind(command, "expansion", 0)
         && redirect_owner(command).is_none_or(|redirected| {
@@ -3018,8 +3957,7 @@ fn command_writes_download_tainted_value(command: tree_sitter::Node<'_>, source:
     if targets.is_empty() {
         return false;
     }
-    let timeline = download_taint_timeline(root_node(command), source);
-    let tainted = tainted_names_at(&timeline, command.start_byte());
+    let tainted = tainted_names_at(taint.timeline(command, source), command.start_byte());
     node_expands_tainted_variable(scope, source, &tainted)
 }
 
@@ -3342,6 +4280,8 @@ fn shell_variable_name(word: &str) -> Option<&str> {
     let name = word
         .strip_prefix("${")
         .and_then(|value| value.strip_suffix('}'))
+        // `${A[0]}`, `${A[@]}`: an element of the array `A`.
+        .map(|value| value.split_once('[').map_or(value, |(name, _)| name))
         .or_else(|| word.strip_prefix('$'))?;
     (!name.is_empty()
         && name
@@ -6165,9 +7105,25 @@ fn ast_exceeds_projection_budget(root: tree_sitter::Node<'_>) -> bool {
     false
 }
 
+/// The download taint timeline of the line the masking walk reads, built the
+/// first time a command asks for it and then shared by every command of the
+/// line, instead of one walk of the whole tree per command.
+#[derive(Default)]
+struct LineTaint {
+    timeline: std::cell::OnceCell<Vec<(usize, String, bool)>>,
+}
+
+impl LineTaint {
+    fn timeline(&self, node: tree_sitter::Node<'_>, source: &[u8]) -> &[(usize, String, bool)] {
+        self.timeline
+            .get_or_init(|| download_taint_timeline(root_node(node), source))
+    }
+}
+
 fn collect_ranges(
     node: tree_sitter::Node<'_>,
     source: &[u8],
+    taint: &LineTaint,
     masked: &mut Vec<Range<usize>>,
     executable_inside_mask: &mut Vec<Range<usize>>,
     depth: u8,
@@ -6177,7 +7133,9 @@ fn collect_ranges(
     }
     match node.kind() {
         "comment" if comment_opens_a_word(node, source) => masked.push(node.byte_range()),
-        "command" => mask_literal_command_args(node, source, masked, executable_inside_mask),
+        "command" => {
+            mask_literal_command_args(node, source, taint, masked, executable_inside_mask);
+        }
         "heredoc_body" => mask_data_heredoc(node, source, masked, executable_inside_mask),
         _ => {}
     }
@@ -6188,6 +7146,7 @@ fn collect_ranges(
             collect_ranges(
                 cursor.node(),
                 source,
+                taint,
                 masked,
                 executable_inside_mask,
                 depth + 1,
@@ -6217,6 +7176,7 @@ fn comment_opens_a_word(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
 fn mask_literal_command_args(
     command: tree_sitter::Node<'_>,
     source: &[u8],
+    taint: &LineTaint,
     masked: &mut Vec<Range<usize>>,
     executable_inside_mask: &mut Vec<Range<usize>>,
 ) {
@@ -6233,7 +7193,8 @@ fn mask_literal_command_args(
         || writes_security_or_execution_sink(command, source)
         || writes_payload_executed_later(command, source)
         || pipeline_payload_executed_later(command, source)
-        || command_writes_download_tainted_value(command, source)
+        || command_writes_download_tainted_value(command, source, taint)
+        || command_evaluates_fetched_value(command, source, taint)
     {
         return;
     }
@@ -6865,7 +7826,8 @@ fn effective_command_words(words: &[String], depth: u8) -> Option<&[String]> {
         "nohup" | "setsid" | "busybox" | "toybox" => unwrap_simple_wrapper(args),
         "nice" => unwrap_options_with_values(args, &["-n", "--adjustment"]),
         "timeout" => unwrap_timeout(args),
-        "stdbuf" => unwrap_options_with_values(args, &["-i", "-o", "-e"]),
+        "stdbuf" => unwrap_options_with_values(args, &STDBUF_OPTIONS),
+        "time" => unwrap_time(args),
         "chrt" | "ionice" => unwrap_scheduler_wrapper(args),
         "exec" => unwrap_simple_wrapper(args),
         _ => return Some(words),
@@ -7619,7 +8581,8 @@ fn classify_command_words(words: &[String], depth: u8) -> PipelineCommand {
         "nohup" | "setsid" => unwrap_simple_wrapper(args),
         "nice" => unwrap_options_with_values(args, &["-n", "--adjustment"]),
         "timeout" => unwrap_timeout(args),
-        "stdbuf" => unwrap_options_with_values(args, &["-i", "-o", "-e"]),
+        "stdbuf" => unwrap_options_with_values(args, &STDBUF_OPTIONS),
+        "time" => unwrap_time(args),
         "chrt" | "ionice" => unwrap_scheduler_wrapper(args),
         "busybox" | "toybox" => unwrap_simple_wrapper(args),
         _ => return PipelineCommand::Unknown,
@@ -7732,25 +8695,43 @@ fn unwrap_simple_wrapper(args: &[String]) -> WrapperTarget {
     }
 }
 
+/// The options of `stdbuf`, each of which takes a mode.
+const STDBUF_OPTIONS: [&str; 6] = ["-i", "-o", "-e", "--input", "--output", "--error"];
+
 fn unwrap_options_with_values(args: &[String], options: &[&str]) -> WrapperTarget {
     let mut index = 0;
     while let Some(arg) = args.get(index).map(|arg| shell_word(arg)) {
         if arg == "--" {
             return command_at(args, index + 1);
         }
-        if let Some(option) = options.iter().find(|option| arg == **option) {
-            let _ = option;
+        if options.contains(&arg.as_str()) {
             if index + 1 >= args.len() {
                 return WrapperTarget::Unknown;
             }
             index += 2;
             continue;
         }
-        if options
-            .iter()
-            .any(|option| arg.starts_with(&format!("{option}=")))
-        {
+        // `--output=L`, and a short option with its value glued on (`-oL`,
+        // `-o0`, `-n5`): the way `stdbuf` is usually written. Read as an
+        // unknown option, it left the command after it unread
+        // (`stdbuf -o0 sh -c "$(curl ...)"`, measured 2026-11-18).
+        if options.iter().any(|option| {
+            arg.starts_with(&format!("{option}="))
+                || (option.len() == 2
+                    && !option.starts_with("--")
+                    && arg.len() > 2
+                    && arg.starts_with(option))
+        }) {
             index += 1;
+            continue;
+        }
+        // `--out=L`, `--adj 5`: GNU tools take any prefix of a long option
+        // that names only one of them.
+        if let Some((_, glued)) = long_option_prefix(&arg, options) {
+            index += if glued { 1 } else { 2 };
+            if index > args.len() {
+                return WrapperTarget::Unknown;
+            }
             continue;
         }
         if arg.starts_with('-') {
@@ -7759,6 +8740,79 @@ fn unwrap_options_with_values(args: &[String], options: &[&str]) -> WrapperTarge
         return WrapperTarget::Command(index);
     }
     WrapperTarget::Unknown
+}
+
+/// The one long option of `options` that `arg` (`--out`, `--out=L`) is a
+/// prefix of, as getopt_long reads it, and whether its value is glued on
+/// with `=`. `None` when it names none of them or more than one.
+fn long_option_prefix<'a>(arg: &str, options: &[&'a str]) -> Option<(&'a str, bool)> {
+    let written = arg.strip_prefix("--").filter(|rest| !rest.is_empty())?;
+    let (name, glued) = match written.split_once('=') {
+        Some((name, _)) => (name, true),
+        None => (written, false),
+    };
+    let mut matching = options.iter().filter(|option| {
+        option
+            .strip_prefix("--")
+            .is_some_and(|long| long.starts_with(name))
+    });
+    let found = matching.next()?;
+    matching.next().is_none().then_some((*found, glued))
+}
+
+/// The program `time` runs: bash's keyword (`time -p`) and GNU `time`
+/// (`-f FORMAT`, `-o FILE`, `-a`, `-v`, `-q` and their long names) both run
+/// the words after their options as a command. Short options may be grouped
+/// and a value glued on (`-f%e`, `-o/dev/null`, `-ao t`), and a long option
+/// may be cut to a prefix that names only one (`--form=%e`, `--out f`).
+fn unwrap_time(args: &[String]) -> WrapperTarget {
+    const LONG_WITH_VALUE: [&str; 2] = ["--format", "--output"];
+    const LONG: [&str; 8] = [
+        "--format",
+        "--output",
+        "--portability",
+        "--append",
+        "--verbose",
+        "--quiet",
+        "--help",
+        "--version",
+    ];
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(|arg| shell_word(arg)) {
+        if arg == "--" {
+            return command_at(args, index + 1);
+        }
+        if arg.starts_with("--") {
+            match long_option_prefix(&arg, &LONG) {
+                Some((option, false)) if LONG_WITH_VALUE.contains(&option) => index += 2,
+                Some(("--help" | "--version", _)) | None => return WrapperTarget::Unknown,
+                Some(_) => index += 1,
+            }
+            continue;
+        }
+        if let Some(cluster) = arg.strip_prefix('-').filter(|rest| !rest.is_empty()) {
+            let mut takes_next = false;
+            for (at, option) in cluster.char_indices() {
+                match option {
+                    'p' | 'a' | 'v' | 'q' => {}
+                    'f' | 'o' => {
+                        takes_next = at + 1 == cluster.len();
+                        break;
+                    }
+                    _ => return WrapperTarget::Unknown,
+                }
+            }
+            index += if takes_next { 2 } else { 1 };
+            continue;
+        }
+        return WrapperTarget::Command(index);
+    }
+    // A bare `time` times nothing; one whose last option wants a value it
+    // does not have runs nothing either, but is read as unknown.
+    if index > args.len() {
+        return WrapperTarget::Unknown;
+    }
+    WrapperTarget::DataOnly
 }
 
 fn unwrap_timeout(args: &[String]) -> WrapperTarget {
