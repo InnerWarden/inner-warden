@@ -2269,6 +2269,7 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "security_tooling_tamper",
     "sensitive_credential_read",
     "sensitive_file_overwrite",
+    "shell_line_not_literal",
     "shell_reading_over_budget",
     "tls_verification_disabled",
     "tmp_execution",
@@ -3121,6 +3122,34 @@ fn analyze_command_as_read(
     // `shell`, behind `sudo`, `xargs` or `find -exec`) is the same: the
     // download rules read it already, the rest of the rules read it here.
     // Measured 2026-11-18: `bash -c 'rm -rf /'` was allowed.
+    let handed_to_shell = crate::shell::handed_shell_lines(raw_scan);
+    // What the reading of handed lines could not read is said, not left as
+    // read: a line handed through more levels than are read (`xargs` or
+    // `find` past four, a shell's line past [`STARTUP_PAYLOAD_DEPTH`] shells
+    // with one more still pending) is refused; a `-c` line not written out
+    // (`sh -c "$C"`) is reviewed.
+    if handed_to_shell.over_budget
+        || (depth >= STARTUP_PAYLOAD_DEPTH && !handed_to_shell.lines.is_empty())
+    {
+        push_unique_signal(
+            &mut signals,
+            AnalysisSignal {
+                signal: "shell_reading_over_budget".into(),
+                score: 40,
+                detail: "hands a line to run through more levels of shells, xargs or find than the guard reads".into(),
+            },
+        );
+        score += 40;
+    }
+    if handed_to_shell.not_literal && !signals.iter().any(|s| s.signal == "shell_line_not_literal")
+    {
+        signals.push(AnalysisSignal {
+            signal: "shell_line_not_literal".into(),
+            score: 20,
+            detail: "hands a shell a line built at run time (a variable or a substitution), which the guard cannot read".into(),
+        });
+        score += 20;
+    }
     if depth < STARTUP_PAYLOAD_DEPTH {
         // A line handed over again says nothing new: each is judged once,
         // where it is first handed over.
@@ -3130,10 +3159,7 @@ fn analyze_command_as_read(
                 crate::shell::inline_process_lines(raw_scan),
                 "in a line inline code hands to a process",
             ),
-            (
-                crate::shell::handed_shell_lines(raw_scan),
-                "in a line handed to a shell to run",
-            ),
+            (handed_to_shell.lines, "in a line handed to a shell to run"),
         ] {
             lines.retain(|line| seen.insert(line.clone()));
             if lines.is_empty() {
@@ -3152,14 +3178,20 @@ fn analyze_command_as_read(
                     || handed.signal.starts_with("fetch_exec_")
                     || (handed.signal == "dangerous_command"
                         && handed.detail.contains("pipe to shell"));
-                if fetch_exec || signals.iter().any(|s| s.signal == handed.signal) {
+                // The same finding is charged once; another finding under
+                // the same name is its own (`chmod -R 777 build; sh -c 'rm
+                // -rf /'` holds two).
+                let detail = format!("{handed_by}: {}", handed.detail);
+                if fetch_exec
+                    || signals.iter().any(|s| {
+                        s.signal == handed.signal
+                            && (s.detail == handed.detail || s.detail == detail)
+                    })
+                {
                     continue;
                 }
                 score += handed.score;
-                signals.push(AnalysisSignal {
-                    detail: format!("{handed_by}: {}", handed.detail),
-                    ..handed
-                });
+                signals.push(AnalysisSignal { detail, ..handed });
             }
         }
     }

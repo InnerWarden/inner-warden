@@ -167,3 +167,105 @@ fn everyday_shell_lines_stay_allowed() {
         "git commit -m \"guard: read sh -c 'rm -rf /' as the line\"",
     ]);
 }
+
+// Review of the reading above (2026-11-18): each refused line below was
+// allowed by it.
+
+fn refused(lines: &[&str]) {
+    let missed: Vec<(&str, String)> = lines
+        .iter()
+        .map(|line| (*line, verdict(line)))
+        .filter(|(_, verdict)| verdict != "deny")
+        .collect();
+    assert!(missed.is_empty(), "not refused: {missed:#?}");
+}
+
+/// A third shell is not read: at the last level read, a line still handed
+/// on is refused rather than passed unread.
+#[test]
+fn a_line_handed_past_the_shells_read_is_refused() {
+    refused(&[
+        "sh -c \"sh -c \\\"sh -c 'rm -rf /'\\\"\"",
+        "sh -c \"sh -c \\\"sh -c 'echo hi'\\\"\"",
+    ]);
+    assert_allowed(&["sh -c \"sh -c 'echo hi'\""]);
+}
+
+/// A `-c` line that is a variable set on the line, or a positional
+/// parameter, is the text it stands for; any other line built at run time
+/// is not passed as read.
+#[test]
+fn a_c_line_built_at_run_time_is_read_or_reviewed() {
+    refused(&[
+        "C='rm -rf ~'; sh -c \"$C\"",
+        "bash -c \"$1\" _ 'rm -rf /'",
+        "sh -c \"$(printf 'rm -rf /')\"",
+    ]);
+    for line in ["sh -c \"$C\"", "sh -c \"$C\" _ x"] {
+        assert_eq!(verdict(line), "review", "{line}");
+    }
+    assert_allowed(&["C='make test'; sh -c \"$C\"", "bash -c \"cd $DIR && make\""]);
+}
+
+/// Past four levels of `xargs` or `find -exec` the line is refused; and a
+/// finding inside the handed line is charged even when the line outside
+/// holds another finding under the same name.
+#[test]
+fn deep_runners_are_refused_and_findings_count_by_detail() {
+    refused(&[
+        "echo / | xargs xargs xargs xargs xargs xargs rm -rf",
+        "find / -exec find {} -exec find {} -exec find {} -exec find {} -exec rm -rf {} \\; \\; \\; \\; \\;",
+        "chmod -R 777 build; sh -c 'rm -rf /'",
+    ]);
+    // Both findings stay in view: the permissions outside and the removal
+    // handed to the shell.
+    let analysis = analyze_command("chmod -R 777 build; sh -c 'rm -rf /'", None);
+    for (signal, handed) in [
+        ("insecure_permissions", false),
+        ("destructive_command", true),
+    ] {
+        assert!(
+            analysis.signals.iter().any(|s| s.signal == signal
+                && s.detail.starts_with("in a line handed to a shell to run") == handed),
+            "{signal}: {analysis:?}"
+        );
+    }
+    assert_allowed(&[
+        "xargs -n1 echo < list.txt",
+        "find . -name '*.o' -exec rm -f {} +",
+    ]);
+}
+
+/// The ways a line reaches a shell's standard input are refused.
+#[test]
+fn a_line_on_a_shells_input_is_refused() {
+    refused(&[
+        "coproc sh -c 'rm -rf /'",
+        "sh <<< 'rm -rf /'",
+        "sh <<'EOF'\nrm -rf /\nEOF",
+        "printf 'rm -rf /' | sh",
+        "echo 'rm -rf /' | sh -s",
+        ". /dev/stdin <<< 'rm -rf /'",
+    ]);
+    assert_allowed(&["bash <<< 'echo hi'"]);
+}
+
+/// A shell named by a variable is a shell: `$SHELL`, `$BASH`,
+/// `${SHELL:-sh}`, `$(command -v bash)`. And an `eval` in quotes inside a
+/// handed line is an `eval` (BI NEW-20261118-guard-shell-named-by-variable-unread).
+#[test]
+fn a_shell_named_by_a_variable_is_a_shell() {
+    refused(&[
+        "$SHELL -c 'echo \"{}\" > ~/.claude/settings.json'",
+        "$BASH -c 'rm -rf /'",
+        "\"$SHELL\" -c 'rm -rf ~'",
+        "${SHELL:-sh} -c 'rm -rf /'",
+        "${BASH:-bash} -c 'rm -rf /'",
+        "$(command -v bash) -c 'rm -rf /'",
+        "bash -c 'eval \"$X\"'",
+    ]);
+    assert_allowed(&[
+        "$SHELL -c 'echo hi'",
+        "bash -c 'cargo test' && sh -c 'make'",
+    ]);
+}
