@@ -99,7 +99,6 @@ fn a_script_path_built_in_double_quotes_was_refused() {
             "sh \"$(git rev-parse --show-toplevel)/scripts/check.sh\" --fast",
             "bash -x \"$(git rev-parse --show-toplevel)/scripts/x.sh\"",
             "python3 \"$(git rev-parse --show-toplevel)/tools/gen.py\"",
-            "bash \"$PWD/scripts/x.sh\"",
         ],
         "allow",
     );
@@ -330,4 +329,93 @@ fn everyday_developer_lines_are_allowed() {
         ],
         "allow",
     );
+}
+
+/// From the review of this change: four of its readings let a dangerous
+/// neighbour through (measured 2026-11-18 on the branch before this fix:
+/// the `--exclude-dir` search was a `review`, the double-quoted `eval`
+/// lines `allow`, and the shell run in the fresh home already `deny`).
+///
+/// A program run with `HOME` set to the fresh folder is followed only when
+/// it runs no line of its own: a shell there can plant a link.
+#[test]
+fn a_shell_run_in_the_fresh_home_is_read_whole() {
+    assert_verdict(
+        &[
+            "H=$(mktemp -d); HOME=$H sh -c 'ln -s /home/u/.claude \"$HOME/.claude\"; echo \"{}\" > \"$HOME/.claude/settings.json\"'",
+            "H=$(mktemp -d); mkdir -p \"$H/.claude\"; echo '{}' > \"$H/.claude/settings.json\"; HOME=$H bash -c 'ln -sf /home/u/.claude/settings.json \"$HOME/.claude/settings.json\"'",
+        ],
+        "deny",
+    );
+}
+
+/// The value of a long grep option given in the next word is not the
+/// pattern, and a long option whose value is not known keeps the refusal.
+#[test]
+fn a_long_grep_option_value_is_not_taken_for_the_pattern() {
+    let (base, context) = home_with_a_key();
+    for command in [
+        "grep -r --exclude-dir node_modules '' ~",
+        "grep -rn --exclude x '.*' ~",
+        "grep -r --include x . ~",
+        "grep -r --exclude-from x '' ~",
+        "grep -r --color always '' ~",
+    ] {
+        let analysis = analyze_command_in(command, None, Some(&context));
+        assert_eq!(analysis.recommendation, "deny", "{command}: {analysis:?}");
+    }
+    for command in [
+        "grep -r --exclude-dir node_modules TODO ~",
+        "grep -r --color=auto TODO ~",
+    ] {
+        let analysis = analyze_command_in(command, None, Some(&context));
+        assert_eq!(analysis.recommendation, "review", "{command}: {analysis:?}");
+    }
+    // A search for a known key prefix is never allowed.
+    for command in ["grep -r AKIA ~", "grep -r ghp_ ~"] {
+        let got = analyze_command_in(command, None, Some(&context)).recommendation;
+        assert!(got == "deny" || got == "review", "{command}: {got}");
+    }
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// An `eval` in a grep pattern is exempt only in single quotes: in double
+/// quotes a substitution runs it. An `eval` that opens a substitution or a
+/// subshell is a command start: on main as well, `echo "$(eval id)"` was
+/// allowed (measured 2026-11-18).
+#[test]
+fn eval_in_a_substitution_or_a_double_quoted_grep_pattern_is_refused() {
+    assert_verdict(
+        &[
+            "grep \"$(eval id)\" out.txt",
+            "grep \"$(eval \"$(cat /tmp/p)\")\" out.txt",
+            "grep -E \"a|$(eval id)\" out.txt",
+            "echo \"$(eval id)\"",
+            "echo $(eval id)",
+            "x=`eval id`",
+            "(eval id)",
+        ],
+        "deny",
+    );
+    assert_verdict(
+        &[
+            "grep -E '(eval x)' f",
+            "grep 'foo(eval' f",
+            "git log --grep='(eval'",
+        ],
+        "allow",
+    );
+}
+
+/// Inline code that builds the guard's name or runs a file kept out of the
+/// line is never allowed.
+#[test]
+fn inline_code_that_hides_what_it_runs_is_never_allowed() {
+    for line in [
+        "python3 -c \"import os; os.system('inner'+'warden allow x')\"",
+        "python3 -c \"import os; exec(open('/tmp/p.py').read())\"",
+    ] {
+        let got = verdict(line);
+        assert!(got == "deny" || got == "review", "{line}: {got}");
+    }
 }

@@ -134,7 +134,7 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
         block: true,
     },
     CommandPattern {
-        pattern: r"(?:^|[;&|]\s*)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)",
+        pattern: r"(?:^|[;&|(`]\s*)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)",
         description: "shell eval (dynamic command execution)",
         block: true,
     },
@@ -6781,7 +6781,9 @@ fn writes_guard_carrier(content: &str) -> bool {
 ///   into the folder, and `tee` into it;
 /// * `rm -rf` of the folder;
 /// * a command run with `HOME` set to the folder, after the last write
-///   into it (what it does in its home cannot be followed by a write here).
+///   into it (what it does in its home cannot be followed by a write here),
+///   when that command is not a shell, `eval`, `env` or another program
+///   that runs a line of its own (its line is not read here).
 ///
 /// A `cd`, a link, a copy, an archive, an alias of the variable, a function
 /// or anything else that names the folder leaves the line read whole.
@@ -6870,6 +6872,37 @@ fn without_fresh_dir_writes(content: &str) -> Option<String> {
                 .skip_while(|w| w.contains('=') || **w == "env")
                 .collect();
             if rest.iter().any(|w| mention.is_match(w)) {
+                return None;
+            }
+            // A shell, an evaluator or a wrapper run in the folder's home
+            // runs a line of its own (`HOME=$H sh -c 'ln -s ...'`) that can
+            // plant a link there: the line is read whole.
+            let runs_a_line = rest.first().is_some_and(|w| {
+                matches!(
+                    token_basename(w.trim_matches(|c| c == '"' || c == '\'')),
+                    "sh" | "bash"
+                        | "zsh"
+                        | "dash"
+                        | "ksh"
+                        | "fish"
+                        | "busybox"
+                        | "env"
+                        | "eval"
+                        | "exec"
+                        | "source"
+                        | "."
+                        | "command"
+                        | "builtin"
+                        | "nohup"
+                        | "xargs"
+                        | "sudo"
+                        | "doas"
+                        | "su"
+                        | "timeout"
+                        | "nice"
+                )
+            });
+            if runs_a_line {
                 return None;
             }
             home_runs = true;
@@ -9629,9 +9662,19 @@ fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
 /// `|` before it is the pattern's alternation, and nothing runs `eval`.
 /// Measured 2026-11-18: denied as a shell eval. A real `eval` anywhere on
 /// the line, a pattern given unquoted, and a line that does not parse keep
-/// the refusal.
+/// the refusal, and so does a pattern in double quotes, where a
+/// substitution runs.
 fn eval_only_in_grep_patterns(re: &regex::Regex, content: &str) -> bool {
-    let patterns = crate::shell::grep_pattern_ranges(content);
+    // Only a pattern in single quotes: in double quotes a `$(...)` runs, and
+    // an `eval` inside it is a command (`grep "$(eval id)" out.txt`).
+    let patterns: Vec<_> = crate::shell::grep_pattern_ranges(content)
+        .into_iter()
+        .filter(|range| {
+            content
+                .get(range.clone())
+                .is_some_and(|p| p.starts_with('\''))
+        })
+        .collect();
     !patterns.is_empty()
         && re.find_iter(content).all(|found| {
             patterns
@@ -12187,7 +12230,9 @@ pub enum SecretReach {
 /// narrow text: every pattern at least three characters, two of them
 /// letters or digits, the rest of a short set that a regular expression
 /// does not widen (`.` only under `-F` or `fgrep`), and none a word a hunt
-/// for secrets looks for ([`credential_hunt_token`]). Refused: `-v` (prints
+/// for secrets looks for ([`credential_hunt_token`]). A long option this
+/// does not know is refused, since its value could be taken for the
+/// pattern. Refused: `-v` (prints
 /// the lines that do not match, so the whole key), `-z` (a whole file is
 /// one line), a pattern from a file (`-f`), and an empty or wide pattern.
 ///
@@ -12233,12 +12278,43 @@ fn searches_for_narrow_text(segment: &str) -> bool {
                     }
                 }
                 "after-context" | "before-context" | "context" | "max-count" | "devices"
-                | "directories" | "label" | "binary-files"
+                | "directories" | "label" | "binary-files" | "exclude-dir" | "include"
+                | "exclude" | "exclude-from" | "include-dir" | "group-separator"
                     if value.is_none() =>
                 {
                     rest.next();
                 }
-                _ => {}
+                // Options that take no value, or whose value is given here.
+                _ if value.is_some() => {}
+                "recursive"
+                | "dereference-recursive"
+                | "line-number"
+                | "files-with-matches"
+                | "files-without-match"
+                | "count"
+                | "ignore-case"
+                | "no-ignore-case"
+                | "word-regexp"
+                | "line-regexp"
+                | "extended-regexp"
+                | "basic-regexp"
+                | "perl-regexp"
+                | "only-matching"
+                | "quiet"
+                | "silent"
+                | "no-messages"
+                | "with-filename"
+                | "no-filename"
+                | "null"
+                | "text"
+                | "byte-offset"
+                | "initial-tab"
+                | "line-buffered"
+                | "no-group-separator" => {}
+                // Any other long option: which word it takes, if any, is not
+                // known here, and a value read as the pattern (`--exclude-dir
+                // node_modules '' ~`) would make a wide search narrow.
+                _ => return false,
             }
             continue;
         }

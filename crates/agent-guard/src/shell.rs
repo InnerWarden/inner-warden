@@ -664,7 +664,8 @@ fn code_argument_flow(
 /// operand (`bash x.sh`, `python3 tool.py`) and not code given inline: a
 /// word of its own whose word before it is the program or an option that
 /// hands over no code (`-c`, `-e`, `--eval` and the like, alone or among
-/// other letters, do).
+/// other letters, do). A path built by an expansion counts only as
+/// `"$(git rev-parse --show-toplevel)/<literal path>"`.
 fn names_a_script_file(
     command: tree_sitter::Node<'_>,
     interpreter: &str,
@@ -707,9 +708,23 @@ fn names_a_script_file(
     if !argument.contains(['$', '`']) {
         return true;
     }
-    // A path built by an expansion is one path only in double quotes
-    // (unquoted, the shell splits what it gives into words), and its
-    // substitutions must run nothing fetched or built by the line: the
+    // A path built by an expansion is taken as a script file in one shape
+    // only: the top of the repository the line runs in, in double quotes
+    // (unquoted, the shell splits what it gives into words), followed by a
+    // literal path below it. A variable (`"$f"`, `"$TMPDIR/x.sh"`, a
+    // `"$PWD/x.sh"` after a `cd`) names whatever the line or the
+    // environment set it to, and is read as code.
+    const TOP: &str = "$(git rev-parse --show-toplevel)/";
+    let Some(tail) = argument.strip_prefix(TOP) else {
+        return false;
+    };
+    if tail.is_empty()
+        || tail.contains(['$', '`', '\\', '"', '\''])
+        || tail.split('/').any(|part| part == "..")
+    {
+        return false;
+    }
+    // The substitution must run nothing fetched or built by the line: the
     // script a download names is not a file the person wrote.
     let Ok(whole) = std::str::from_utf8(source) else {
         return false;
