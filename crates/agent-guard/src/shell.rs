@@ -479,14 +479,31 @@ fn text_as_the_shell_reads(source: &str) -> Option<String> {
     changed.then_some(out)
 }
 
-/// Where on a line bash may read a quoted value as a variable name or as
-/// arithmetic, and so expand the subscript in it: arithmetic (`$((`, `((`,
-/// `$[`, `let`, a `[[` comparison), a substring or indirect expansion
-/// (`${Z:Y}`, `${!X}`), an integer declaration and the builtins that take a
-/// variable name (`declare`, `printf -v`, `read`, `unset`, `test -v`...).
-const NAME_EVALUATING_SPELLINGS: [&str; 16] = [
-    "((", "$[", "let ", "[[", "${", "declare", "typeset", "local ", "readonly", "export ",
-    "printf ", "read ", "unset ", "test ", "[ ", "mapfile",
+/// Spellings without which no part of a line reads a value as a variable
+/// name or as arithmetic: arithmetic (`$((`, `((`, `$[`, `let`, a `[[`
+/// comparison), a subscript (`a[X]=`, `${a[X]}`), a substring or indirect
+/// expansion (`${Z:Y}`, `${!X}`), an integer declaration and the builtins
+/// that take a variable name (`declare`, `printf -v`, `read`, `unset`,
+/// `test -v`...). Only a cheap gate: where the value stands decides.
+const NAME_EVALUATING_SPELLINGS: [&str; 18] = [
+    "((",
+    "$[",
+    "let ",
+    "[[",
+    "${",
+    "declare",
+    "typeset",
+    "local ",
+    "readonly",
+    "export ",
+    "printf ",
+    "read ",
+    "unset ",
+    "test ",
+    "[ ",
+    "mapfile",
+    "readarray",
+    "]",
 ];
 
 /// The line with the substitutions bash runs out of a quoted subscript
@@ -494,42 +511,64 @@ const NAME_EVALUATING_SPELLINGS: [&str; 16] = [
 ///
 /// `X='a[$(cmd)]'; echo $((X))` runs `cmd`: a value read as arithmetic or as
 /// a name is expanded again, and the subscript of an indexed array with it,
-/// substitutions included. The grammar reads the single-quoted value as
-/// data, so the projection showed no command at all (measured 2026-11-18 on
-/// 1.6.13: `curl ... | sh` hidden this way was allowed, in `$((X))`,
-/// `${Z:Y}`, `${!X}`, `let`, `[[ -eq ]]` and `declare -i`). The subscript
-/// substitution is copied as written, so every check reads the command it
-/// runs, and nothing else changes. Only a quoted value shaped as a subscript
-/// (`name[...$(...)...]`) on a line that evaluates names counts: printing or
-/// searching for such text (`grep 'a[$(x)]' f`) is left as it was.
+/// substitutions included. The grammar reads the quoted value as data, so
+/// the projection showed no command at all (measured 2026-11-18 on 1.6.13:
+/// `curl ... | sh` hidden this way was allowed, in `$((X))`, `${Z:Y}`,
+/// `${!X}`, `let`, `[[ -eq ]]` and `declare -i`). The subscript substitution
+/// is copied as written, so every check reads the command it runs, and
+/// nothing else changes.
+///
+/// A value counts in any quoting bash decodes to it (`'...'`, `"a[\$(..)]"`,
+/// `$'a[\x24(..)]'`, an unquoted word with its `$` escaped) and only where
+/// bash evaluates it: in arithmetic or a subscript, as a name a builtin takes,
+/// as an integer declaration's value, or assigned to a variable that one of
+/// those places reads (`a[X]=1`, `$((X))`, `${!X}`). Printing, exporting or
+/// searching for such text (`printf '%s' 'a[$(x)]'`, `export X='a[$(x)]'`,
+/// `grep 'a[$(x)]' f`) is left as it was.
 fn with_evaluated_subscripts_run(text: &str) -> Option<String> {
-    if !(text.contains("$(") || text.contains('`'))
+    let maybe_substitution = ["$(", "`", "\\x24", "\\044", "\\u0024", "\\U00000024"]
+        .iter()
+        .any(|spelling| text.contains(spelling));
+    if !maybe_substitution
         || !NAME_EVALUATING_SPELLINGS
             .iter()
             .any(|spelling| text.contains(spelling))
     {
         return None;
     }
-    let tree = parse_bash(text)?;
+    let quoted_words = with_escaped_words_quoted(text);
+    let read_text = quoted_words.as_deref().unwrap_or(text);
+    let tree = parse_bash(read_text)?;
+    let bytes = read_text.as_bytes();
+    let read: std::collections::HashSet<String> = evaluated_name_reads(tree.root_node(), bytes)
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
     let mut quoted = Vec::new();
     collect_nodes_of_kind(tree.root_node(), "raw_string", &mut quoted, 0);
     collect_nodes_of_kind(tree.root_node(), "ansi_c_string", &mut quoted, 0);
+    collect_nodes_of_kind(tree.root_node(), "string", &mut quoted, 0);
     let mut runs = Vec::new();
-    let bytes = text.as_bytes();
     for node in quoted {
-        let written = node_text(node, bytes);
+        let Some(value) = quoted_value(node, bytes) else {
+            continue;
+        };
         // `$(( a['$(cmd)'] ))`: the quotes stand inside the subscript.
         let start = node.start_byte();
         let inside_subscript = start >= 2
             && bytes[start - 1] == b'['
             && (bytes[start - 2].is_ascii_alphanumeric() || bytes[start - 2] == b'_');
-        let written = if inside_subscript {
-            format!("x[{written}]")
+        let value = if inside_subscript {
+            format!("x[{value}]")
         } else {
-            written
+            value
         };
+        let substitutions = subscript_substitutions(&value);
+        if substitutions.is_empty() || !value_is_evaluated(node, bytes, &read) {
+            continue;
+        }
         runs.extend(
-            subscript_substitutions(&written)
+            substitutions
                 .iter()
                 .map(|substitution| substitution_command(substitution)),
         );
@@ -543,6 +582,406 @@ fn with_evaluated_subscripts_run(text: &str) -> Option<String> {
         out.push_str(&run);
     }
     Some(out)
+}
+
+/// The value a quoted word stands for once bash has taken its quotes off:
+/// a `'...'` as written, a `$'...'` with its escapes decoded, a `"..."`
+/// with `\$`, `\``, `\"` and `\\` read as the character. `None` for any
+/// other node.
+fn quoted_value(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let written = node_text(node, source);
+    match node.kind() {
+        "raw_string" => Some(
+            written
+                .strip_prefix('\'')
+                .and_then(|inner| inner.strip_suffix('\''))
+                .unwrap_or(&written)
+                .to_owned(),
+        ),
+        "ansi_c_string" => {
+            let inner = written
+                .strip_prefix("$'")
+                .and_then(|inner| inner.strip_suffix('\''))?;
+            let chars: Vec<char> = inner.chars().collect();
+            let mut value = String::new();
+            let mut at = 0;
+            while at < chars.len() {
+                if chars[at] == '\\' {
+                    let (decoded, used) = crate::shell_words::ansi_c_escape(&chars[at + 1..]);
+                    value.extend(decoded);
+                    at += 1 + used.max(usize::from(at + 1 == chars.len()));
+                } else {
+                    value.push(chars[at]);
+                    at += 1;
+                }
+            }
+            Some(value)
+        }
+        "string" => {
+            let inner = written
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))?;
+            let mut value = String::new();
+            let mut chars = inner.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c == '\\' && matches!(chars.peek(), Some('$' | '`' | '"' | '\\')) {
+                    value.extend(chars.next());
+                } else {
+                    value.push(c);
+                }
+            }
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+/// The line with each unquoted word that escapes a `$` or a backtick
+/// (`X=a[\$\(cmd\)]`) written as the single-quoted word bash makes of it
+/// (`X='a[$(cmd)]'`), so its value is read like any quoted one. A word with
+/// a quote, an expansion or a `'` in its value is left as written. `None`
+/// when no word changed.
+fn with_escaped_words_quoted(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let separates =
+        |c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | '(' | ')');
+    let mut out = String::with_capacity(text.len());
+    let mut changed = false;
+    let mut at = 0;
+    while at < chars.len() {
+        if separates(chars[at]) {
+            out.push(chars[at]);
+            at += 1;
+            continue;
+        }
+        let start = at;
+        let mut plain = true;
+        let mut escapes_expansion = false;
+        while at < chars.len() && !separates(chars[at]) {
+            match chars[at] {
+                '\\' => {
+                    escapes_expansion |= matches!(chars.get(at + 1), Some('$' | '`'));
+                    at += 2;
+                }
+                '\'' | '"' | '`' | '$' => {
+                    plain = false;
+                    at = quoted_construct_end(&chars, at, 0).unwrap_or(chars.len());
+                }
+                _ => at += 1,
+            }
+        }
+        let at_end = at.min(chars.len());
+        let word: String = chars[start..at_end].iter().collect();
+        at = at_end;
+        if !(plain && escapes_expansion) {
+            out.push_str(&word);
+            continue;
+        }
+        // `NAME=` or `NAME+=` stays outside the quotes, or the word would
+        // no longer be an assignment.
+        let name_end = word
+            .find('=')
+            .filter(|end| {
+                let name = word[..*end].strip_suffix('+').unwrap_or(&word[..*end]);
+                !name.is_empty()
+                    && !name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+            })
+            .map_or(0, |end| end + 1);
+        let mut value = String::new();
+        let mut rest = word[name_end..].chars();
+        while let Some(c) = rest.next() {
+            if c == '\\' {
+                value.extend(rest.next());
+            } else {
+                value.push(c);
+            }
+        }
+        if value.contains('\'') {
+            out.push_str(&word);
+            continue;
+        }
+        out.push_str(&word[..name_end]);
+        out.push('\'');
+        out.push_str(&value);
+        out.push('\'');
+        changed = true;
+    }
+    changed.then_some(out)
+}
+
+/// The comparisons of `[[ ]]` that read both sides as arithmetic.
+const ARITHMETIC_TESTS: [&str; 6] = ["-eq", "-ne", "-lt", "-le", "-gt", "-ge"];
+
+/// The builtins that take a variable name as an argument, and evaluate the
+/// subscript in it.
+fn takes_names(command: &str) -> bool {
+    matches!(command, "read" | "unset" | "mapfile" | "readarray")
+}
+
+/// Options of `read`, `mapfile` and `readarray` whose value is not a name.
+const NAME_BUILTIN_VALUE_OPTIONS: [&str; 10] =
+    ["-p", "-d", "-t", "-n", "-N", "-u", "-i", "-C", "-c", "-O"];
+
+/// Whether `argument` of `command` stands where its builtin takes a
+/// variable name: after `printf -v` or `test -v`, or as a name `read`,
+/// `unset`, `mapfile` or a declaration takes.
+fn argument_is_a_name(
+    command: tree_sitter::Node<'_>,
+    argument: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    let Some(name) = command_name(command, source).map(|name| normalized_command_name(&name))
+    else {
+        return false;
+    };
+    let arguments = command_arguments(command);
+    let Some(position) = arguments.iter().position(|node| node.id() == argument.id()) else {
+        return false;
+    };
+    let before = position
+        .checked_sub(1)
+        .map(|previous| shell_word(&node_text(arguments[previous], source)));
+    match name.as_str() {
+        "printf" | "test" | "[" => before.as_deref() == Some("-v"),
+        name if takes_names(name) => {
+            let word = shell_word(&node_text(argument, source));
+            !word.starts_with('-')
+                && !before.is_some_and(|flag| NAME_BUILTIN_VALUE_OPTIONS.contains(&flag.as_str()))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a declaration (`declare -i`, `local -ai`...) makes its names
+/// integers, so the values given them are read as arithmetic.
+fn declares_integers(declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = declaration.walk();
+    let found = declaration.named_children(&mut cursor).any(|child| {
+        child.kind() == "word" && {
+            let flag = node_text(child, source);
+            flag.starts_with('-') && !flag.starts_with("--") && flag.contains('i')
+        }
+    });
+    found
+}
+
+/// Whether bash evaluates the quoted value at `node` as arithmetic or as a
+/// name: it stands in arithmetic, a subscript or an arithmetic `[[`
+/// comparison, as an argument of `let`, as a name a builtin takes, as the
+/// value of an integer declaration, or as the value of an assignment whose
+/// name is in `read` (the names read in those places).
+fn value_is_evaluated(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    read: &std::collections::HashSet<String>,
+) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "arithmetic_expansion" | "subscript" => return true,
+            "compound_statement" if node_text(parent, source).starts_with("((") => return true,
+            "binary_expression" => {
+                if parent
+                    .child_by_field_name("operator")
+                    .is_some_and(|operator| {
+                        ARITHMETIC_TESTS.contains(&node_text(operator, source).as_str())
+                    })
+                {
+                    return true;
+                }
+            }
+            "variable_assignment" => {
+                let in_value = parent
+                    .child_by_field_name("value")
+                    .is_some_and(|value| value.start_byte() <= node.start_byte());
+                if !in_value {
+                    // `declare 'a[$(cmd)]'=1`: in the name, a subscript.
+                    return true;
+                }
+                if parent.parent().is_some_and(|owner| {
+                    owner.kind() == "declaration_command" && declares_integers(owner, source)
+                }) {
+                    return true;
+                }
+                return parent
+                    .child_by_field_name("name")
+                    .is_some_and(|name| read.contains(&node_text(name, source)));
+            }
+            "declaration_command" => {
+                // A word a declaration names: a name, whose subscript is
+                // evaluated (`declare 'a[$(cmd)]'`).
+                return current.kind() != "word" || !node_text(current, source).starts_with('-');
+            }
+            "command" => {
+                if command_name(parent, source)
+                    .is_some_and(|name| normalized_command_name(&name) == "let")
+                {
+                    return true;
+                }
+                return argument_is_a_name(parent, current, source);
+            }
+            "concatenation" | "string" | "expansion" => {}
+            _ => return false,
+        }
+        current = parent;
+    }
+    false
+}
+
+/// The variable names written in `text` (`X`, `$X`, `${X}`), as
+/// arithmetic reads them.
+fn identifiers(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut current = String::new();
+    let mut after_digit = false;
+    for c in text.chars() {
+        if c == '_' || c.is_ascii_alphanumeric() {
+            if current.is_empty() && c.is_ascii_digit() {
+                after_digit = true;
+            }
+            if !after_digit {
+                current.push(c);
+            }
+        } else {
+            if !current.is_empty() {
+                found.push(std::mem::take(&mut current));
+            }
+            after_digit = false;
+        }
+    }
+    if !current.is_empty() {
+        found.push(current);
+    }
+    found
+}
+
+/// Each variable bash reads as arithmetic or as a name on the line, with
+/// where the reading place starts: names in arithmetic (`$((X))`, `((X))`,
+/// `let n=X`, an arithmetic `[[` comparison, an integer declaration's
+/// value), in a subscript (`a[X]=1`, `${a[X]}`), in a substring offset
+/// (`${Z:X}`), an indirect name (`${!X}`), and a variable expanded where a
+/// builtin takes a name (`printf -v "$X"`, `read "$X"`). A value read in one
+/// of these places runs the substitutions in the subscripts it holds.
+fn evaluated_name_reads(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(usize, String)> {
+    let mut reads = Vec::new();
+    let add = |reads: &mut Vec<(usize, String)>, start: usize, text: &str| {
+        reads.extend(identifiers(text).into_iter().map(|name| (start, name)));
+    };
+    let mut places = Vec::new();
+    collect_nodes_of_kind(root, "arithmetic_expansion", &mut places, 0);
+    for place in places.drain(..) {
+        add(&mut reads, place.start_byte(), &node_text(place, source));
+    }
+    collect_nodes_of_kind(root, "compound_statement", &mut places, 0);
+    for place in places.drain(..) {
+        let text = node_text(place, source);
+        if text.starts_with("((") {
+            add(&mut reads, place.start_byte(), &text);
+        }
+    }
+    collect_nodes_of_kind(root, "subscript", &mut places, 0);
+    for place in places.drain(..) {
+        if let Some(index) = place.child_by_field_name("index") {
+            add(&mut reads, place.start_byte(), &node_text(index, source));
+        }
+    }
+    collect_nodes_of_kind(root, "binary_expression", &mut places, 0);
+    for place in places.drain(..) {
+        if place
+            .child_by_field_name("operator")
+            .is_some_and(|operator| {
+                ARITHMETIC_TESTS.contains(&node_text(operator, source).as_str())
+            })
+        {
+            add(&mut reads, place.start_byte(), &node_text(place, source));
+        }
+    }
+    collect_nodes_of_kind(root, "expansion", &mut places, 0);
+    for place in places.drain(..) {
+        let text = node_text(place, source);
+        let Some(inner) = text
+            .strip_prefix("${")
+            .and_then(|inner| inner.strip_suffix('}'))
+        else {
+            continue;
+        };
+        if let Some(indirect) = inner.strip_prefix('!') {
+            add(&mut reads, place.start_byte(), indirect);
+            continue;
+        }
+        let name_end = inner
+            .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+            .unwrap_or(inner.len());
+        if let Some(offset) = inner[name_end..].strip_prefix(':') {
+            if !offset.starts_with(['-', '=', '?', '+']) {
+                add(&mut reads, place.start_byte(), offset);
+            }
+        }
+    }
+    collect_nodes_of_kind(root, "declaration_command", &mut places, 0);
+    for place in places.drain(..) {
+        if !declares_integers(place, source) {
+            continue;
+        }
+        let mut assignments = Vec::new();
+        collect_nodes_of_kind(place, "variable_assignment", &mut assignments, 0);
+        for assignment in assignments {
+            if let Some(value) = assignment.child_by_field_name("value") {
+                add(&mut reads, place.start_byte(), &node_text(value, source));
+            }
+        }
+    }
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    for command in commands {
+        let is_let = command_name(command, source)
+            .is_some_and(|name| normalized_command_name(&name) == "let");
+        for argument in command_arguments(command) {
+            let text = node_text(argument, source);
+            if is_let {
+                add(&mut reads, command.start_byte(), &text);
+            } else if argument_is_a_name(command, argument, source) {
+                if let Some(name) = shell_variable_name(&shell_word(&text)) {
+                    reads.push((command.start_byte(), name.to_owned()));
+                }
+            }
+        }
+    }
+    reads
+}
+
+/// Whether an argument of `command` reads a fetched value as arithmetic or
+/// as a name (`echo $((X))` after `X=$(curl ..)`). Its arguments are then
+/// not text to print but code bash runs, so they are never masked.
+fn command_evaluates_fetched_value(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if !node_contains_kind(command, "arithmetic_expansion", 0)
+        && !node_contains_kind(command, "expansion", 0)
+    {
+        return false;
+    }
+    let root = root_node(command);
+    let timeline = download_taint_timeline(root, source);
+    if timeline.is_empty() {
+        return false;
+    }
+    evaluated_name_reads(command, source)
+        .into_iter()
+        .any(|(start, name)| tainted_names_at(&timeline, start).contains(&name))
+}
+
+/// Whether a value fetched from the network reaches a place where bash reads
+/// it as arithmetic or as a name (`X=$(curl ..); echo $((X))`): bash then
+/// runs the substitutions in any subscript the server put in it, so the
+/// fetched text is run (found in review, 2026-11-18).
+fn fetched_value_is_evaluated(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let timeline = download_taint_timeline(root, source);
+    if timeline.is_empty() {
+        return false;
+    }
+    evaluated_name_reads(root, source)
+        .into_iter()
+        .any(|(start, name)| tainted_names_at(&timeline, start).contains(&name))
 }
 
 /// The command line a substitution as written (`$(cmd)`, `` `cmd` ``) runs.
@@ -659,9 +1098,40 @@ fn whole_word_brace_list(chars: &[char], open: usize) -> Option<(Vec<String>, us
     let ends_word = chars
         .get(close + 1)
         .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '<' | '>' | ')'));
-    items.retain(|item| !item.is_empty());
-    (ends_word && !items.is_empty() && items.len() <= BRACE_LIST_WORDS)
-        .then_some((items, close + 1))
+    if !ends_word {
+        return None;
+    }
+    // `{{bash,-c},"$(...)"}`: an item that is itself a whole brace list is
+    // the words it makes, as bash expands it (found in review, 2026-11-18).
+    let mut words = Vec::new();
+    for item in items {
+        brace_item_words(item, 0, &mut words);
+        if words.len() > BRACE_LIST_WORDS {
+            return None;
+        }
+    }
+    (!words.is_empty()).then_some((words, close + 1))
+}
+
+/// The words one item of a brace list makes: the words of the brace list it
+/// is, when it is one whole, read to a depth of eight lists, or else itself.
+/// An empty item makes none.
+fn brace_item_words(item: String, depth: u8, words: &mut Vec<String>) {
+    if item.is_empty() {
+        return;
+    }
+    if depth < 8 && item.starts_with('{') {
+        let chars: Vec<char> = item.chars().collect();
+        if let Some((inner, end)) = whole_word_brace_list(&chars, 0) {
+            if end == chars.len() {
+                for word in inner {
+                    brace_item_words(word, depth + 1, words);
+                }
+                return;
+            }
+        }
+    }
+    words.push(item);
 }
 
 /// Where the quote, escape, `$(...)` or `${...}` that starts at `at` ends
@@ -743,6 +1213,9 @@ pub(crate) enum DataFlow {
     /// The line holds a substitution and the program it runs is only named
     /// when the line runs, so nothing shows the program is not an interpreter.
     RuntimeProgram,
+    /// A value fetched from the network is read as arithmetic or as a name,
+    /// where bash runs the substitutions in the subscripts it holds.
+    EvaluatedFetch,
 }
 
 /// The yes-or-no reading of [`executable_data_flow`], for the tests that ask
@@ -770,6 +1243,7 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
     // A pipeline whose only reader of code is a program named at run time
     // is refused for that name, and says how to write it.
     let mut unknown_program = false;
+    let mut evaluated_fetch = false;
     for pipeline in pipelines {
         if node_is_in_literal_unreachable_branch(pipeline, source.as_bytes())
             || !pipeline_has_stdin_executor(pipeline, source.as_bytes(), false)
@@ -841,6 +1315,7 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
                 match code_argument_flow(command, &name, &argument, source) {
                     Some(DataFlow::Fed) => return true,
                     Some(DataFlow::RuntimeProgram) => unknown_program = true,
+                    Some(DataFlow::EvaluatedFetch) => evaluated_fetch = true,
                     None => {}
                 }
                 false
@@ -880,6 +1355,7 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
                             }
                             Some(DataFlow::Fed) => return true,
                             Some(DataFlow::RuntimeProgram) => unknown_program = true,
+                            Some(DataFlow::EvaluatedFetch) => evaluated_fetch = true,
                             None => {}
                         }
                     }
@@ -908,7 +1384,11 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
     if fed {
         return Some(DataFlow::Fed);
     }
-    unknown_program.then_some(DataFlow::RuntimeProgram)
+    if unknown_program {
+        return Some(DataFlow::RuntimeProgram);
+    }
+    (evaluated_fetch || fetched_value_is_evaluated(tree.root_node(), source.as_bytes()))
+        .then_some(DataFlow::EvaluatedFetch)
 }
 
 /// What the code a program is handed in an argument does when the program
@@ -2597,13 +3077,20 @@ fn variable_code_argument_is_download_tainted(
         0,
     );
     assignments.sort_by_key(|assignment| assignment.start_byte());
-    let mut tainted = std::collections::HashSet::<String>::new();
+    // `read X < <(curl ..)`, `mapfile -t A < <(curl ..)`, `printf -v X
+    // "$(curl ..)"` fill a name with fetched bytes too.
+    let timeline = download_taint_timeline(root_node(command), source);
+    let mut tainted = tainted_names_at(&timeline, command.start_byte());
     for assignment in assignments {
-        if assignment.end_byte() > command.start_byte()
-            || assignment_has_control_flow_ancestor(assignment)
-        {
+        if assignment.end_byte() > command.start_byte() {
             continue;
         }
+        // An assignment that runs only on some paths (a branch, a loop, a
+        // function, a subshell) may run: it taints on any path, and a clean
+        // one there does not clear what an earlier one fetched (found in
+        // review, 2026-11-18: `if true; then X="$(curl ..)"; fi; "$X" run`
+        // was allowed).
+        let on_some_paths = assignment_has_control_flow_ancestor(assignment);
         let text = node_text(assignment, source);
         let (name, value) = if let Some((name, value)) = text.split_once("+=") {
             (name, value)
@@ -2619,7 +3106,7 @@ fn variable_code_argument_is_download_tainted(
             || value_variable.is_some_and(|name| tainted.contains(name));
         if value_tainted {
             tainted.insert(name.to_owned());
-        } else {
+        } else if !on_some_paths {
             tainted.remove(name);
         }
     }
@@ -3187,7 +3674,9 @@ fn download_taint_timeline(
     readers.retain(|command| {
         command_name(*command, source)
             .map(|name| normalized_command_name(&name))
-            .is_some_and(|name| matches!(name.as_str(), "read" | "mapfile" | "readarray"))
+            .is_some_and(|name| {
+                matches!(name.as_str(), "read" | "mapfile" | "readarray" | "printf")
+            })
     });
     // Assignments sort before the command that carries them as a prefix,
     // which over-taints `f=$(curl ..) cmd "$f"` (the shell would not expand
@@ -3215,6 +3704,25 @@ fn download_taint_timeline(
                 _ => node,
             };
             if !node_contains_download_substitution(unit, source) {
+                continue;
+            }
+            // `printf -v X "$(curl ..)"` fills only the name after `-v`.
+            if command_name(node, source)
+                .is_some_and(|name| normalized_command_name(&name) == "printf")
+            {
+                let words: Vec<String> = command_arguments(node)
+                    .into_iter()
+                    .map(|argument| shell_word(&node_text(argument, source)))
+                    .collect();
+                for name in words
+                    .iter()
+                    .zip(words.iter().skip(1))
+                    .filter(|(flag, _)| *flag == "-v")
+                    .map(|(_, name)| name.split('[').next().unwrap_or(name).to_owned())
+                {
+                    running.insert(name.clone());
+                    timeline.push((start, name, true));
+                }
                 continue;
             }
             // Every non-option word is taken as a name: tainting a prompt
@@ -3631,6 +4139,8 @@ fn shell_variable_name(word: &str) -> Option<&str> {
     let name = word
         .strip_prefix("${")
         .and_then(|value| value.strip_suffix('}'))
+        // `${A[0]}`, `${A[@]}`: an element of the array `A`.
+        .map(|value| value.split_once('[').map_or(value, |(name, _)| name))
         .or_else(|| word.strip_prefix('$'))?;
     (!name.is_empty()
         && name
@@ -6523,6 +7033,7 @@ fn mask_literal_command_args(
         || writes_payload_executed_later(command, source)
         || pipeline_payload_executed_later(command, source)
         || command_writes_download_tainted_value(command, source)
+        || command_evaluates_fetched_value(command, source)
     {
         return;
     }
@@ -7957,8 +8468,7 @@ fn unwrap_options_with_values(args: &[String], options: &[&str]) -> WrapperTarge
         if arg == "--" {
             return command_at(args, index + 1);
         }
-        if let Some(option) = options.iter().find(|option| arg == **option) {
-            let _ = option;
+        if options.contains(&arg.as_str()) {
             if index + 1 >= args.len() {
                 return WrapperTarget::Unknown;
             }
@@ -7979,6 +8489,15 @@ fn unwrap_options_with_values(args: &[String], options: &[&str]) -> WrapperTarge
             index += 1;
             continue;
         }
+        // `--out=L`, `--adj 5`: GNU tools take any prefix of a long option
+        // that names only one of them.
+        if let Some((_, glued)) = long_option_prefix(&arg, options) {
+            index += if glued { 1 } else { 2 };
+            if index > args.len() {
+                return WrapperTarget::Unknown;
+            }
+            continue;
+        }
         if arg.starts_with('-') {
             return WrapperTarget::Unknown;
         }
@@ -7987,31 +8506,76 @@ fn unwrap_options_with_values(args: &[String], options: &[&str]) -> WrapperTarge
     WrapperTarget::Unknown
 }
 
+/// The one long option of `options` that `arg` (`--out`, `--out=L`) is a
+/// prefix of, as getopt_long reads it, and whether its value is glued on
+/// with `=`. `None` when it names none of them or more than one.
+fn long_option_prefix<'a>(arg: &str, options: &[&'a str]) -> Option<(&'a str, bool)> {
+    let written = arg.strip_prefix("--").filter(|rest| !rest.is_empty())?;
+    let (name, glued) = match written.split_once('=') {
+        Some((name, _)) => (name, true),
+        None => (written, false),
+    };
+    let mut matching = options.iter().filter(|option| {
+        option
+            .strip_prefix("--")
+            .is_some_and(|long| long.starts_with(name))
+    });
+    let found = matching.next()?;
+    matching.next().is_none().then_some((*found, glued))
+}
+
 /// The program `time` runs: bash's keyword (`time -p`) and GNU `time`
 /// (`-f FORMAT`, `-o FILE`, `-a`, `-v`, `-q` and their long names) both run
-/// the words after their options as a command.
+/// the words after their options as a command. Short options may be grouped
+/// and a value glued on (`-f%e`, `-o/dev/null`, `-ao t`), and a long option
+/// may be cut to a prefix that names only one (`--form=%e`, `--out f`).
 fn unwrap_time(args: &[String]) -> WrapperTarget {
+    const LONG_WITH_VALUE: [&str; 2] = ["--format", "--output"];
+    const LONG: [&str; 8] = [
+        "--format",
+        "--output",
+        "--portability",
+        "--append",
+        "--verbose",
+        "--quiet",
+        "--help",
+        "--version",
+    ];
     let mut index = 0;
     while let Some(arg) = args.get(index).map(|arg| shell_word(arg)) {
-        match arg.as_str() {
-            "--" => return command_at(args, index + 1),
-            "-p" | "-a" | "-v" | "-q" | "--portability" | "--append" | "--verbose" | "--quiet" => {
-                index += 1
-            }
-            "-f" | "-o" | "--format" | "--output" => {
-                if index + 1 >= args.len() {
-                    return WrapperTarget::Unknown;
-                }
-                index += 2;
-            }
-            value if value.starts_with("--format=") || value.starts_with("--output=") => {
-                index += 1;
-            }
-            value if value.starts_with('-') => return WrapperTarget::Unknown,
-            _ => return WrapperTarget::Command(index),
+        if arg == "--" {
+            return command_at(args, index + 1);
         }
+        if arg.starts_with("--") {
+            match long_option_prefix(&arg, &LONG) {
+                Some((option, false)) if LONG_WITH_VALUE.contains(&option) => index += 2,
+                Some(("--help" | "--version", _)) | None => return WrapperTarget::Unknown,
+                Some(_) => index += 1,
+            }
+            continue;
+        }
+        if let Some(cluster) = arg.strip_prefix('-').filter(|rest| !rest.is_empty()) {
+            let mut takes_next = false;
+            for (at, option) in cluster.char_indices() {
+                match option {
+                    'p' | 'a' | 'v' | 'q' => {}
+                    'f' | 'o' => {
+                        takes_next = at + 1 == cluster.len();
+                        break;
+                    }
+                    _ => return WrapperTarget::Unknown,
+                }
+            }
+            index += if takes_next { 2 } else { 1 };
+            continue;
+        }
+        return WrapperTarget::Command(index);
     }
-    // A bare `time` times nothing.
+    // A bare `time` times nothing; one whose last option wants a value it
+    // does not have runs nothing either, but is read as unknown.
+    if index > args.len() {
+        return WrapperTarget::Unknown;
+    }
     WrapperTarget::DataOnly
 }
 
