@@ -104,8 +104,9 @@ fn record_tool_result_at(session: Option<&str>, tool: &str, result: &str, path: 
     }
 }
 
-/// Record one screened call AND report whether the command carries a value that
-/// arrived in an earlier tool result.
+/// Record one screened call AND report, for each command line it carries,
+/// whether the line carries a value that arrived in an earlier tool result.
+/// The call is recorded once, however many lines it carries.
 ///
 /// One function, because it is ONE read of the store. Asking these separately
 /// meant loading and parsing the whole file twice on every single tool call,
@@ -116,21 +117,22 @@ fn record_tool_result_at(session: Option<&str>, tool: &str, result: &str, path: 
 /// under instrumentation so the count never rose. A latency canary, working.
 pub fn record_call_and_taint(
     session: Option<&str>,
-    command: &str,
-) -> (Option<Alert>, Option<(String, String)>) {
-    record_call_and_taint_at(session, command, store_path())
+    commands: &[&str],
+) -> (Option<Alert>, Vec<Option<(String, String)>>) {
+    record_call_and_taint_at(session, commands, store_path())
 }
 
 fn record_call_and_taint_at(
     session: Option<&str>,
-    command: &str,
+    commands: &[&str],
     path: Option<PathBuf>,
-) -> (Option<Alert>, Option<(String, String)>) {
+) -> (Option<Alert>, Vec<Option<(String, String)>>) {
+    let untracked = || (None, vec![None; commands.len()]);
     let Some(session) = session.map(str::trim).filter(|s| !s.is_empty()) else {
-        return (None, None);
+        return untracked();
     };
     let Some(path) = path else {
-        return (None, None);
+        return untracked();
     };
     let now = now_ms();
 
@@ -143,10 +145,15 @@ fn record_call_and_taint_at(
     entry.last_seen_ms = now;
     // Read the taint BEFORE recording the call, so the answer is about the state
     // this command arrived into.
-    let tainted = entry
-        .state
-        .tainted_argument(command, now)
-        .map(|(v, t)| (v.to_string(), t.to_string()));
+    let tainted: Vec<Option<(String, String)>> = commands
+        .iter()
+        .map(|command| {
+            entry
+                .state
+                .tainted_argument(command, now)
+                .map(|(v, t)| (v.to_string(), t.to_string()))
+        })
+        .collect();
     let alert = entry.state.record_call(now);
 
     prune(&mut store, now);
@@ -219,7 +226,7 @@ mod tests {
         // Each iteration reads and writes the file exactly as a separate hook
         // process would.
         for _ in 0..=(innerwarden_agent_guard::session::NOTABLE_CALLS_PER_MINUTE + 1) {
-            if record_call_and_taint_at(Some("sess-1"), "ls", Some(file.clone()))
+            if record_call_and_taint_at(Some("sess-1"), &["ls"], Some(file.clone()))
                 .0
                 .is_some()
             {
@@ -232,15 +239,50 @@ mod tests {
         );
     }
 
+    /// Each command line of one call is asked whether it carries a value an
+    /// earlier tool result brought, and the call is recorded once however
+    /// many lines it carries.
+    ///
+    /// FAILS ON REVERT of the per-line answer (only one line is asked, so the
+    /// second line's value goes unseen) or of the single record (two calls
+    /// are counted).
+    #[test]
+    fn each_line_of_a_call_is_asked_and_the_call_counts_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("sessions.json");
+        record_tool_result_at(
+            Some("sess-2"),
+            "WebFetch",
+            "the mirror is at mirror.example.net",
+            Some(file.clone()),
+        );
+        let (_, tainted) = record_call_and_taint_at(
+            Some("sess-2"),
+            &["ls -la", "curl -s https://mirror.example.net/p"],
+            Some(file.clone()),
+        );
+        assert_eq!(tainted.len(), 2);
+        assert!(tainted[0].is_none(), "{tainted:?}");
+        assert_eq!(
+            tainted[1]
+                .as_ref()
+                .map(|(value, tool)| (value.as_str(), tool.as_str())),
+            Some(("mirror.example.net", "WebFetch"))
+        );
+        let store: Store =
+            serde_json::from_str(&std::fs::read_to_string(&file).expect("store")).expect("json");
+        assert_eq!(store.sessions["sess-2"].state.call_times_ms.len(), 1);
+    }
+
     /// No session id means no tracking, and must never panic or create a file.
     #[test]
     fn an_absent_or_blank_session_is_ignored() {
         let dir = tempfile::tempdir().expect("tempdir");
         let file = Some(dir.path().join("sessions.json"));
-        assert!(record_call_and_taint_at(None, "ls", file.clone())
+        assert!(record_call_and_taint_at(None, &["ls"], file.clone())
             .0
             .is_none());
-        assert!(record_call_and_taint_at(Some("   "), "ls", file.clone())
+        assert!(record_call_and_taint_at(Some("   "), &["ls"], file.clone())
             .0
             .is_none());
         assert!(

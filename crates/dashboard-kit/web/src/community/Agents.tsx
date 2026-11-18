@@ -200,6 +200,11 @@ function AgentCard({
             {agent.judgesLine}
           </p>
         )}
+        {agent.unscreened === undefined ? null : (
+          <div data-unscreened className="max-w-xl">
+            <StepBlock step={{ label: agent.unscreened.line, command: agent.unscreened.command }} restarts={[restartOf(agent)]} />
+          </div>
+        )}
         {mcpLines(agent.mcp).map((line) => (
           <p key={line} data-mcp className={`${SMALL_TEXT} text-(--iw-ink-2)`}>{line}</p>
         ))}
@@ -317,7 +322,7 @@ function AgentTechnical({ agent, os, connected = false }: { agent: AgentFacts; o
     `Setup: ${agent.setupSupport ?? "not sent"}`,
     `Found by: ${(agent.detectedBy ?? []).join(", ") || "not sent"}`,
   ];
-  if (connected && agent.judgesLine === undefined) lines.push("Judges before it runs: Not read");
+  if (connected && agent.judgesLine === undefined && agent.unscreened === undefined) lines.push("Judges before it runs: Not read");
   if (agent.configChangedAt !== undefined) lines.push(`Settings changed: ${formatAbsolute(agent.configChangedAt) ?? agent.configChangedAt}`);
   if (agent.lastObservedAt !== undefined) lines.push(`Last screened: ${formatAbsolute(agent.lastObservedAt) ?? agent.lastObservedAt}`);
   return (

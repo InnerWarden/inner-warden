@@ -509,6 +509,7 @@ pub(super) fn agents_payload(rows: &[FixtureAgent], host_mode: &str) -> Value {
             crate::status::ToolClasses::Hook {
                 agent: row.id.into(),
                 file_tools: true,
+                reads: true,
                 next: String::new(),
             }
         } else {
@@ -557,6 +558,7 @@ pub(super) fn agents_payload(rows: &[FixtureAgent], host_mode: &str) -> Value {
             more_instances: None,
             judges: judges.as_ref().map(|(key, _)| *key),
             judges_line: judges.map(|(_, line)| line),
+            unscreened: None,
             mode_steps: agent_mode_steps(&status, row.mode, "automatic"),
             mcp: row.mcp,
         }
@@ -1344,6 +1346,7 @@ fn identity_fixtures() -> Vec<(&'static str, Value)> {
             more_instances: None,
             judges: None,
             judges_line: None,
+            unscreened: None,
             restart: None,
             mode_steps: None,
             mcp: None,

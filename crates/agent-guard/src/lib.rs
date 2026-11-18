@@ -77,6 +77,8 @@ pub mod threats;
 // ── 3. INTERNAL ──────────────────────────────────────────────────────────────
 // No consumer outside this crate. Kept private so a future caller has to make a
 // deliberate decision to widen the surface, rather than finding it already open.
+mod arg_chain;
+mod description_poison;
 mod shell;
 mod shell_words;
 mod typosquat;

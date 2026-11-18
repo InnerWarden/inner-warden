@@ -96,6 +96,25 @@ installer sends one anonymous, opt-out install ping (version + OS + CPU arch
 only: no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
 `cargo install` or from-source build sends nothing at all.
 
+## First commands
+
+Check the guard's status and screen a command without running it:
+
+```sh
+innerwarden status
+innerwarden check "git status"
+```
+
+Connect the agent you use:
+
+```sh
+innerwarden install claude-code       # Claude Code's PreToolUse hook
+innerwarden agents connect cursor    # or: codex, gemini, openclaw
+```
+
+For command options, JSON output and exit codes, see the
+[CLI reference](crates/cli/README.md).
+
 ## What it does
 
 - **Screens** shell commands and MCP/tool calls and returns a verdict
@@ -143,6 +162,10 @@ Whatever agent you run, there is a mechanism and a command for it:
   `Edit`, `MultiEdit`, `NotebookEdit`) make to a privileged file: its settings,
   the guard's configuration, shell startup files, SSH keys, scheduled jobs and
   services, and stored credentials. Ordinary project edits are not judged.
+  What its read tools (`Read`, `Grep`, `Glob`) open is judged by the secret
+  rules a shell read is: a `Read` of a private key, a tool's stored login or
+  a `.env` outside the project gets the verdict `cat` of the same file gets.
+  The text a `Grep` searches for is not judged.
 - **OpenClaw** - its own tools (`exec`, `process`, `write`, `edit`,
   `apply_patch`) are asked about through its `before_tool_call` plugin hook,
   which needs OpenClaw 2026.9.7 or newer: `innerwarden agents connect

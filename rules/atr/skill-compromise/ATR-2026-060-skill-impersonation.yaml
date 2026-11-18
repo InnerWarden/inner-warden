@@ -57,9 +57,14 @@ detection:
       operator: regex
       value: "(?i)(?:web[-_]?search|google[-_]?search|bing[-_]?search)[-_]?(?:v2|v3|pro|enhanced|premium|fast|turbo|plus|ultra|new)"
       description: "Fake enhanced versions of known search tools"
+    # FP fix (2026-11-14, InnerWarden): the safety suffix this condition is
+    # about was optional, so it matched every plain code or command tool
+    # (`execute_code`, `run_script`) at high severity, with no suffix at all.
+    # The suffix is now required. What such a tool is handed is judged by
+    # InnerWarden's built-in AG-EXEC check.
     - field: tool_name
       operator: regex
-      value: "(?i)(?:exec|execute|run|shell)[-_]?(?:cmd|command|script|code)[-_]?(?:safe|secure|sandbox|trusted|verified)?"
+      value: "(?i)(?:exec|execute|run|shell)[-_]?(?:cmd|command|script|code)[-_]?(?:safe|secure|sandbox|trusted|verified)"
       description: "Shell execution tools with deceptive safety suffixes"
     - field: tool_name
       operator: regex
@@ -125,6 +130,9 @@ test_cases:
     - tool_name: "slakc-send"
       expected: triggered
       description: "Typosquatted Slack tool name"
+    - tool_name: "run_code_safe"
+      expected: triggered
+      description: "Code execution tool with a deceptive safety suffix"
   true_negatives:
     - tool_name: "filesystem_read"
       expected: not_triggered
@@ -135,6 +143,9 @@ test_cases:
     - tool_name: "github-search"
       expected: not_triggered
       description: "Correctly spelled GitHub tool name"
+    - tool_name: "execute_code"
+      expected: not_triggered
+      description: "Plain code execution tool without a safety suffix"
     - input: "Installing official-github-tools v3.0.0 from the verified MCP registry."
       expected: not_triggered
       description: "Legitimate tool installation from verified source"
