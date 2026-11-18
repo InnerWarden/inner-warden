@@ -99,10 +99,9 @@ const RUN_MARKERS: &[&str] = &[
     "child_process",
     "`",
     "qx",
-    // `open(` is no marker of its own: in Python it reads or writes a file,
-    // and where it starts a program (Perl's `open(F, "cmd |")`, Ruby's and
-    // Tcl's `open("|cmd")`) the pipe stands in a quoted string beside it,
-    // which the markers below catch. PHP's `proc_open` is named here.
+    // Perl's `open(F, "cmd |")`, Ruby's and Tcl's `open("|cmd")`, PHP's
+    // `proc_open`.
+    "open(",
     "proc_open",
     "getline",
     // Ruby's `%x(...)` and `Open3`, PHP's `passthru`.

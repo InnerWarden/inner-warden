@@ -112,8 +112,75 @@ fn reading_settings_and_editing_text_about_the_guard_stay_allowed() {
         "node -e \"console.log(require('fs').readFileSync('/home/u/.claude/settings.json','utf8'))\"",
         "php -r \"echo file_get_contents(getenv('HOME').'/.claude/settings.json');\"",
         "lua -e \"print(io.open(os.getenv('HOME')..'/.claude/settings.json'):read('a'))\"",
-        "python3 - <<'EOF'\np = 'docs/guard.md'\ns = open(p).read()\ns = s.replace('innerwarden allow x', 'innerwarden allow y')\nopen(p, 'w').write(s)\nEOF",
+        "python3 - <<'EOF'\np = 'docs/guard.md'\ns = open(p).read()\ns = s.replace('old text', 'new text')\nopen(p, 'w').write(s)\nEOF",
     ]);
+}
+
+/// The same code as a quoted here-document fed to the interpreter and as
+/// its inline form (`-c`, `-e`, `-r`).
+fn heredoc_and_inline(interpreter: &str, code: &str) -> [String; 2] {
+    let flag = match interpreter {
+        "python3" => "-c",
+        "php" => "-r",
+        _ => "-e",
+    };
+    [
+        format!("{interpreter} - <<'EOF'\n{code}\nEOF"),
+        format!("{interpreter} {flag} '{}'", code.replace('\'', r"'\''")),
+    ]
+}
+
+/// The guard's words in interpreter code are read as shell, here-document
+/// and `-c` alike, as they were before here-documents were read as
+/// programs. Each of these reached a program through a name built at run
+/// time, past every list of run calls the reviews tried.
+///
+/// FAILS ON REVERT of reading the guard's words on the line as written in
+/// `analyze_command_as_read` (mcp.rs): a body blanked as "starts no
+/// program" let these through.
+#[test]
+fn guard_words_in_interpreter_code_are_read_as_shell() {
+    let cases = [
+        ("php", "<?php $f='sy'; $f.='stem'; $f('innerwarden allow x');"),
+        ("perl", "my $f='sy'; $f.='stem'; &$f('innerwarden allow x');"),
+        ("lua", "local f='exe'..'cute'; _G['os'][f]('innerwarden allow x')"),
+        (
+            "node",
+            "const k=Buffer.from('70726f63657373','hex').toString(); global[k].mainModule.require('child_'+'process').execSync('innerwarden allow x')",
+        ),
+        ("ruby", "Kernel.method(\"sys\" \"tem\").call('innerwarden allow x')"),
+        ("python3", "f = 'sy' 'stem'; print(f, 'innerwarden allow x')"),
+        ("python3", "print('innerwarden allow x')"),
+        ("node", "console.log('innerwarden dry-run')"),
+    ];
+    let lines: Vec<String> = cases
+        .iter()
+        .flat_map(|(interpreter, code)| heredoc_and_inline(interpreter, code))
+        .collect();
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    assert_denied(&lines);
+}
+
+/// The false refusal this keeps, pinned: an edit of source that quotes a
+/// guard command, through a here-document or `-c`, is refused. Make that
+/// edit with the agent's file edit tool or a script saved to a file.
+#[test]
+fn editing_source_that_quotes_a_guard_command_inline_stays_refused() {
+    let code = "p = 'docs/guard.md'; s = open(p).read(); open(p, 'w').write(s.replace('innerwarden allow x', 'innerwarden allow y'))";
+    let lines = heredoc_and_inline("python3", code);
+    assert_denied(&[lines[0].as_str(), lines[1].as_str()]);
+}
+
+/// Code that edits a file and holds no guard word runs, either way.
+#[test]
+fn editing_source_without_a_guard_word_runs_either_way() {
+    for code in [
+        "p = 'src/a.rs'; s = open(p).read(); s = s.replace('a', 'b'); open(p, 'w').write(s)",
+        "s=open('src/a.rs').read(); s=s.replace('a','b'); open('src/a.rs','w').write(s)",
+    ] {
+        let lines = heredoc_and_inline("python3", code);
+        assert_allowed(&[lines[0].as_str(), lines[1].as_str()]);
+    }
 }
 
 /// Writes of an agent's settings the patterns did not spell out: a Node
@@ -133,6 +200,11 @@ fn settings_written_through_a_name_or_a_callback_are_refused() {
         "python3 -c \"import os; os.open('/home/u/.claude/settings.json', os.O_TRUNC|os.O_WRONLY)\"",
         "python3 -c \"import os; a='settings'; b='.json'; p=os.path.expanduser('~/.claude/')+a+b; open(p,'w').write('{}')\"",
         "python3 - <<'EOF'\nimport os\na='settings'; b='.json'\np=os.path.expanduser('~/.claude/')+a+b\nopen(p,'w').write('{}')\nEOF",
+        // A `Path` built from a name that holds the settings path.
+        "python3 -c \"from pathlib import Path; x='/home/u/.claude/settings.json'; p=Path(x); p.replace('/tmp/s')\"",
+        // `.claude` built from pieces as well.
+        "python3 -c \"import os; d='.cla'+'ude'; a='settings'; p=os.path.join(os.environ['HOME'], d, a+'.json'); open(p,'w').write('{}')\"",
+        "python3 -c \"import os; d='.cl'; e='aude'; a='settings'; p=os.path.expanduser('~/'+d+e+'/'+a+'.json'); open(p,'w').write('{}')\"",
     ]);
     assert_allowed(&[
         "node -e \"require('fs').readFile('/home/u/.claude/settings.json','utf8',(e,d)=>console.log(d))\"",
@@ -140,6 +212,9 @@ fn settings_written_through_a_name_or_a_callback_are_refused() {
         "python3 -c \"import sys, os; os.close(os.open('/home/u/.claude/settings.json', os.O_RDONLY))\"",
         "python3 -c \"from pathlib import Path; p=Path.home()/'.claude'/'settings.json'; print(p.read_text().replace('a','b'))\"",
         "python3 -c \"a='settings'; print(open('/home/u/.claude/'+a+'.json').read())\"",
+        "python3 -c \"x='notes/settings.txt'; open(x,'w').write('a')\"",
+        "python3 -c \"open('app/settings.py','w').write('DEBUG = False')\"",
+        "python3 -c \"from pathlib import Path; x='/home/u/.claude/settings.json'; p=Path(x); print(p.exists())\"",
     ]);
 }
 

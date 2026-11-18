@@ -2812,23 +2812,26 @@ fn analyze_command_as_read(
     // route here is a deliberate act against the control boundary, and the
     // operator keeps all of them from their own terminal
     // ([`guard_self_disable_on`]).
-    // A here-document that is an interpreter's program and starts no program
-    // is that language's text, not shell ([`crate::shell::interpreter_input_as_data`]):
-    // the guard's words in it are looked for with it blanked, every other
-    // check below still reads it.
-    let self_disable = match crate::shell::interpreter_input_as_data(cmd) {
-        Some(line) => guard_self_disable_on(&line, &crate::shell::project(&line)),
-        None => guard_self_disable_on(cmd, &projection),
-    }
-    // The same program fed to the interpreter as a here-document is read as
-    // the same code given inline (`python3 -c`), so a rewrite of an agent's
-    // settings or of the guard's configuration is refused either way. Only
-    // those writes: a guard command quoted in the code is still text.
-    .or_else(|| {
-        crate::shell::interpreter_input_as_inline_code(cmd)
-            .iter()
-            .find_map(|line| threats::check_code_rewrites_guard_carrier(line))
-    });
+    //
+    // The guard's own words (its name, a verb that loosens it) are looked for
+    // in the whole line, the body of a here-document handed to an interpreter
+    // and `-c`/`-e` code included, as plain shell. Reading such a body as
+    // the interpreter's language, and passing a guard command quoted in code
+    // that "starts no program", was tried and dropped: every list of ways to
+    // start a program had a way around it (a function name built at run time
+    // in PHP, Perl, Lua, Node and Ruby). The price is a false refusal when an
+    // agent edits source that quotes a guard command through an inline
+    // interpreter; the way to make that edit is the agent's file edit tool or
+    // a script saved to a file, not a here-document or `-c`.
+    let self_disable = guard_self_disable_on(cmd, &projection)
+        // The same program fed to the interpreter as a here-document is read as
+        // the same code given inline (`python3 -c`), so a rewrite of an agent's
+        // settings or of the guard's configuration is refused either way.
+        .or_else(|| {
+            crate::shell::interpreter_input_as_inline_code(cmd)
+                .iter()
+                .find_map(|line| threats::check_code_rewrites_guard_carrier(line))
+        });
     if let Some((what, s)) = self_disable {
         signals.push(AnalysisSignal {
             signal: "guard_self_disable".into(),
@@ -7322,23 +7325,30 @@ mod interpreter_input_and_argv_calls {
         analyze_command(line, None).recommendation == "deny"
     }
 
-    /// Editing source code that quotes the guard's commands, with Python fed
-    /// its program in a quoted here-document: the strings are text the
-    /// program works on. Refused as the guard's own loosening command (with
-    /// `allow`), and as a guard word beside code that starts a program (with
-    /// `open(`) before.
-    ///
-    /// FAILS ON REVERT of the call to `interpreter_input_as_data` in
-    /// `analyze_command_with` (the first and third lines are refused), and of
-    /// `open(` taken out of `RUN_MARKERS` (the second and fourth are).
+    /// Editing source code that quotes a command that loosens the guard,
+    /// with an interpreter fed its program in a quoted here-document, is
+    /// refused: the body is read as shell for the guard's words. Reading it
+    /// as the interpreter's language let a run call built at run time
+    /// through. This false refusal is the price; the edit is made with the
+    /// agent's file edit tool or a script saved to a file.
     #[test]
-    fn a_quoted_here_document_that_is_a_program_is_read_as_that_program() {
+    fn a_heredoc_program_quoting_a_guard_loosening_is_refused() {
         for line in [
             "python3 - <<'EOF'\np = 'crates/agent-guard/src/hook.rs'\ns = open(p).read()\ns = s.replace('innerwarden allow x', 'innerwarden allow --list')\nopen(p, 'w').write(s)\nEOF",
-            "python3 - <<'EOF'\np = 'docs/cli.md'\ns = open(p).read()\ns = s.replace('innerwarden status', 'innerwarden doctor')\nopen(p, 'w').write(s)\nEOF",
             "cd app && python3 - <<'EOF'\np = 'a.rs'\ns = open(p).read().replace('iw dry-run', 'iw status')\nopen(p, 'w').write(s)\nEOF",
-            "python3 <<\"EOF\"\nfor line in open('notes.md'):\n    print(line.replace('innerwarden', 'InnerWarden'))\nEOF",
             "node - <<'EOF'\nconsole.log('run innerwarden allow x from your own terminal')\nEOF",
+        ] {
+            assert!(refused(line), "{line}");
+        }
+    }
+
+    /// A here-document program that edits a file and holds no guard word
+    /// runs.
+    #[test]
+    fn a_heredoc_program_editing_source_without_a_guard_word_runs() {
+        for line in [
+            "python3 - <<'EOF'\np = 'src/a.rs'\ns = open(p).read()\ns = s.replace('a', 'b')\nopen(p, 'w').write(s)\nEOF",
+            "cd app && python3 - <<'EOF'\ns = open('a.rs').read()\nopen('a.rs', 'w').write(s.replace('old', 'new'))\nEOF",
         ] {
             assert!(!refused(line), "{line}");
         }
@@ -7349,9 +7359,6 @@ mod interpreter_input_and_argv_calls {
     /// the program prints run by a shell, what it writes run after it, and a
     /// download run by a shell fed a quoted here-document.
     ///
-    /// FAILS ON REVERT of the quoting test, the pipeline and position tests
-    /// or the `interpreter_code_starts_a_program` test in
-    /// `inert_interpreter_program` (one line each is let through).
     #[test]
     fn a_here_document_that_runs_the_guard_or_a_download_is_still_refused() {
         for line in [

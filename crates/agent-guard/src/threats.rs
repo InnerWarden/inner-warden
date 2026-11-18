@@ -676,13 +676,6 @@ fn guard_readings(content: &str) -> (Vec<String>, bool) {
     (readings, settled)
 }
 
-/// Whether code an interpreter runs in its own language (Python, Perl,
-/// Ruby, Node and the like) holds a way to start a program: a guard word in
-/// code that starts none is text the code works on, not a command it runs.
-pub(crate) fn interpreter_code_starts_a_program(code: &str) -> bool {
-    guard_doubt::code_starts_a_program(code)
-}
-
 /// [`child_agent_without_its_hook`] on every reading of a line
 /// ([`guard_readings`]). The rule reads a line's words itself, as the shell
 /// hands them to its programs, so it is asked of the line as written: a
@@ -2809,6 +2802,10 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
         ".codex",
         ".gemini",
         "claude_desktop_config",
+        // The settings name as a quoted piece of a path built at run time,
+        // `.claude` built from pieces too.
+        "'settings'",
+        "\"settings\"",
     ];
     if !mentions_any(content, NEEDLES) && !names_guard_alias(content) {
         // A name assembled by the shell (`${x:-innerwarden}`, `$(echo
@@ -3071,6 +3068,8 @@ fn interpreter_code_writes_settings_another_way(content: &str) -> bool {
     static INTERPRETER: OnceLock<regex::Regex> = OnceLock::new();
     static SETTINGS: OnceLock<regex::Regex> = OnceLock::new();
     static PIECE: OnceLock<regex::Regex> = OnceLock::new();
+    static BARE_PIECE: OnceLock<regex::Regex> = OnceLock::new();
+    static SETTINGS_NAME: OnceLock<regex::Regex> = OnceLock::new();
     static NODE_CALL: OnceLock<regex::Regex> = OnceLock::new();
     static PATH_NAME: OnceLock<regex::Regex> = OnceLock::new();
     static PATH_CHAIN: OnceLock<regex::Regex> = OnceLock::new();
@@ -3098,9 +3097,14 @@ fn interpreter_code_writes_settings_another_way(content: &str) -> bool {
         r#"settings(?:\.local)?\.json|\.claude\.json|mcp\.json"#,
     )
     .is_match(&lower);
-    // `'settings'` as a quoted piece of a name built beside `.claude`.
-    let in_pieces =
-        !whole && lower.contains(".claude") && re(&PIECE, r#"['"]settings"#).is_match(&lower);
+    // `'settings'` as a quoted piece of a name built beside `.claude`, or
+    // the whole piece `'settings'` beside `.json` with `.claude` built
+    // from pieces too (`d='.cla'+'ude'`). A file such as `'settings.py'`
+    // is no piece.
+    let in_pieces = !whole
+        && ((lower.contains(".claude") && re(&PIECE, r#"['"]settings"#).is_match(&lower))
+            || (lower.contains(".json")
+                && re(&BARE_PIECE, r#"['"]settings(?:\.local)?['"]"#).is_match(&lower)));
     if !(whole || in_pieces) {
         return false;
     }
@@ -3112,8 +3116,26 @@ fn interpreter_code_writes_settings_another_way(content: &str) -> bool {
     {
         return true;
     }
-    // A name given a `Path` built with the settings (not its text read),
-    // then replaced or renamed.
+    // Names assigned the settings path as text (`x = '~/.claude/settings.json'`),
+    // so a `Path` built from one of them is a `Path` of the settings.
+    let settings_names: Vec<&str> = re(
+        &SETTINGS_NAME,
+        r#"\b([a-z_]\w*)\s*=\s*[^;\n=]*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+    )
+    .captures_iter(&lower)
+    .filter_map(|c| c.get(1).map(|m| m.as_str()))
+    .collect();
+    let names_a_settings_name = |value: &str| {
+        settings_names.iter().any(|name| {
+            value.match_indices(name).any(|(at, _)| {
+                let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                !value[..at].chars().next_back().is_some_and(word)
+                    && !value[at + name.len()..].chars().next().is_some_and(word)
+            })
+        })
+    };
+    // A name given a `Path` built with the settings, or with a name that
+    // holds them (not their text read), then replaced or renamed.
     let path_names: Vec<&str> = re(
         &PATH_NAME,
         r#"\b([a-z_]\w*)\s*=\s*([^;\n]*\bpath\b[^;\n]*)"#,
@@ -3122,7 +3144,10 @@ fn interpreter_code_writes_settings_another_way(content: &str) -> bool {
     .filter(|c| {
         c.get(2).is_some_and(|value| {
             let value = value.as_str();
-            (value.contains("settings") || value.contains(".claude")) && !value.contains("read")
+            (value.contains("settings")
+                || value.contains(".claude")
+                || names_a_settings_name(value))
+                && !value.contains("read")
         })
     })
     .filter_map(|c| c.get(1).map(|m| m.as_str()))
