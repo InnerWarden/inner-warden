@@ -7111,7 +7111,7 @@ fn command_code_input(words: &[String]) -> CodeInput {
         return CodeInput::Argument(line);
     }
     if !is_stdin_code_executor(&name) {
-        if let Some(code) = unlisted_runner_code(&args) {
+        if let Some(code) = unlisted_runner_code(&name, &args) {
             return CodeInput::Argument(code);
         }
     }
@@ -7288,7 +7288,15 @@ const CODE_VALUE_WORDS_READ: usize = 32;
 /// Measured 2026-11-18: each was allowed while `python3 -c "$(curl ...)"`
 /// was refused. A value of one plain word (`gdb -ex run`, `grep -e foo`)
 /// holds no line to run.
-fn unlisted_runner_code(args: &[String]) -> Option<String> {
+///
+/// Only a program that takes code in that flag ([`CODE_FLAG_PROGRAMS`]) has
+/// the whole value read: for any other program `-e` and `-c` usually hand
+/// over data (`grep -e PATTERN`, `rg -e PATTERN`, `docker run -e VAR`), so
+/// only a part written as a shell escape (`shell cmd`, `!cmd`, `\!cmd`) is
+/// read there. Measured 2026-11-18: `grep -e "curl -s URL | sh" docs/` was
+/// refused when every value was read as a line.
+fn unlisted_runner_code(name: &str, args: &[String]) -> Option<String> {
+    let takes_code = CODE_FLAG_PROGRAMS.contains(&name);
     let mut lines = Vec::new();
     for (at, argument) in args.iter().enumerate() {
         let value = match argument.split_once('=') {
@@ -7301,12 +7309,98 @@ fn unlisted_runner_code(args: &[String]) -> Option<String> {
             },
             _ => continue,
         };
-        lines.extend(code_value_lines(&value));
+        if takes_code {
+            lines.extend(code_value_lines(&value));
+        } else {
+            lines.extend(shell_escape_lines(&value));
+        }
     }
     lines.retain(|line| !line.trim().is_empty());
     let mut seen = std::collections::HashSet::new();
     lines.retain(|line| seen.insert(line.clone()));
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// Programs whose inline code flag takes code that can run a shell line:
+/// debuggers, AppleScript, database shells, editors and interpreters the
+/// guard has no reader of its own for. Names as [`node_program_name`] gives
+/// them, trailing digits taken off (`sqlite3` is `sqlite`).
+const CODE_FLAG_PROGRAMS: &[&str] = &[
+    "gdb",
+    "rust-gdb",
+    "gdb-multiarch",
+    "cgdb",
+    "lldb",
+    "rust-lldb",
+    "osascript",
+    "psql",
+    "mysql",
+    "mariadb",
+    "sqlite",
+    "duckdb",
+    "clickhouse-client",
+    "pwsh",
+    "powershell",
+    "yaegi",
+    "vim",
+    "nvim",
+    "vi",
+    "ex",
+    "emacs",
+    "jshell",
+    "julia",
+    "rscript",
+    "r",
+    "erl",
+    "elixir",
+    "iex",
+    "groovy",
+    "scala",
+    "tclsh",
+    "wish",
+    "octave",
+    "guile",
+    "racket",
+    "sbcl",
+    "clisp",
+    "ghci",
+    "ghc",
+    "runghc",
+    "swift",
+    "dotnet-script",
+    "kotlin",
+    "awk",
+    "gawk",
+    "mawk",
+    "nawk",
+];
+
+/// The parts of a data flag's value written as a shell escape: the value or
+/// a quoted string in it that starts with `!`, `\!` or the word `shell`,
+/// with that escape taken off.
+fn shell_escape_lines(value: &str) -> Vec<String> {
+    let mut candidates = vec![value.trim().to_owned()];
+    for quote in ['"', '\''] {
+        let mut parts = value.split(quote);
+        parts.next();
+        while let Some(inside) = parts.next() {
+            candidates.push(inside.replace("\\\"", "\""));
+            parts.next();
+        }
+    }
+    candidates
+        .iter()
+        .filter_map(|candidate| {
+            let line = candidate.trim_start();
+            if let Some(rest) = line.strip_prefix("\\!").or_else(|| line.strip_prefix('!')) {
+                return Some(rest.trim().to_owned());
+            }
+            let (word, rest) = line.split_once(char::is_whitespace)?;
+            word.eq_ignore_ascii_case("shell")
+                .then(|| rest.trim().to_owned())
+        })
+        .filter(|line| !line.is_empty())
+        .collect()
 }
 
 /// [`unlisted_runner_code`] for one value: the value, each quoted string in
