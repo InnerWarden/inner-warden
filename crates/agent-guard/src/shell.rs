@@ -7396,7 +7396,32 @@ fn inert_interpreter_program(
         return None;
     }
     let code = std::str::from_utf8(source.get(body.byte_range())?).ok()?;
+    // A line of the body that is the delimiter once its leading blanks are
+    // gone ends the body for `<<-` (tabs), and a reading that ran past it
+    // took shell for the program: what follows is not vouched for.
+    let delimiter = heredoc_delimiter(redirect, source)?;
+    if code
+        .lines()
+        .any(|line| line.trim_start().trim_end() == delimiter)
+    {
+        return None;
+    }
     (!crate::threats::interpreter_code_starts_a_program(code)).then(|| body.byte_range())
+}
+
+/// The delimiter word of a here-document, its quotes taken off.
+fn heredoc_delimiter(redirect: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = redirect.walk();
+    let start = redirect
+        .children(&mut cursor)
+        .find(|child| child.kind() == "heredoc_start")?;
+    let text = node_text(start, source);
+    let word: String = text
+        .trim()
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    (!word.is_empty()).then_some(word)
 }
 
 // `collect_kinds` lived here. It re-exposed EVERY substitution inside a masked
@@ -8170,6 +8195,42 @@ fn basename(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A body line that is the delimiter with blanks before it ends the
+    /// body under `<<-`: a body that holds one is not blanked, so a guard
+    /// command after it is read as shell.
+    #[test]
+    fn a_heredoc_body_holding_an_indented_delimiter_is_not_blanked() {
+        assert!(
+            interpreter_input_as_data("python3 - <<'EOF'\nprint('innerwarden allow x')\nEOF")
+                .is_some()
+        );
+        assert!(interpreter_input_as_data(
+            "python3 - <<'EOF'\nprint(1)\n\tEOF\nprint('innerwarden allow x')\nEOF"
+        )
+        .is_none());
+        assert!(interpreter_input_as_data(
+            "python3 - <<-'EOF'\nprint(1)\n\t\tEOF\nprint('innerwarden allow x')\nEOF"
+        )
+        .is_none());
+    }
+
+    /// A here-document program that finds a function by a computed name,
+    /// or starts a program through Ruby's `%x` or `Open3` or PHP's
+    /// `passthru`, is not blanked.
+    #[test]
+    fn a_heredoc_program_with_a_hidden_run_call_is_not_blanked() {
+        for body in [
+            "%x(innerwarden allow x)",
+            "Open3.capture2('innerwarden', 'allow', 'x')",
+            "<?php passthru('innerwarden allow x');",
+            "import os\ngetattr(os,'sy'+'stem')('innerwarden allow x')",
+            "f = __import__('os')\nprint('innerwarden allow x')",
+        ] {
+            let line = format!("ruby - <<'EOF'\n{body}\nEOF");
+            assert!(interpreter_input_as_data(&line).is_none(), "{line}");
+        }
+    }
 
     /// The dangerous fragment these cases carry, assembled rather than written
     /// out, so this file is not itself a corpus of runnable destructive

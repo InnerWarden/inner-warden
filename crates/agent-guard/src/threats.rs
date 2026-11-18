@@ -2929,6 +2929,11 @@ const GUARD_CONFIG_WRITTEN: &str =
 /// readings of the guard's own words are left out: a guard command quoted in
 /// code that starts no program is text the code works on.
 pub(crate) fn check_code_rewrites_guard_carrier(content: &str) -> Option<(&'static str, u32)> {
+    if let Some(joined) = quoted_pieces_joined(content) {
+        if let Some(hit) = check_code_rewrites_guard_carrier(&joined) {
+            return Some(hit);
+        }
+    }
     if let Some((_, what, score)) = guard_self_disable_patterns()
         .iter()
         .filter(|(_, what, _)| CARRIER_REWRITES.contains(what))
@@ -2950,8 +2955,29 @@ pub(crate) fn check_code_rewrites_guard_carrier(content: &str) -> Option<(&'stat
 const SETTINGS_REWRITTEN_BY_INTERPRETER: &str =
     "rewrites an agent's configuration through an interpreter";
 
-/// [`check_guard_self_disable`] on one spelling of the command.
+/// `content` with each pair of quoted pieces code joins into one string
+/// (`'set' + 'tings.json'`, PHP's `'a'.'b'`, Lua's `'a'..'b'`) written
+/// as that string, so a path built from pieces is read as the path. `None`
+/// when nothing is joined.
+fn quoted_pieces_joined(content: &str) -> Option<String> {
+    static JOIN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let join = JOIN.get_or_init(|| {
+        regex::Regex::new(r#"['"]\s*(?:\+|\.\.|\.)\s*['"]"#).expect("static join regex")
+    });
+    match join.replace_all(content, "") {
+        std::borrow::Cow::Owned(joined) => Some(joined),
+        std::borrow::Cow::Borrowed(_) => None,
+    }
+}
+
+/// [`check_guard_self_disable`] on one spelling of the command, and on the
+/// same spelling with its quoted pieces joined ([`quoted_pieces_joined`]).
 fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
+    if let Some(joined) = quoted_pieces_joined(content) {
+        if let Some(hit) = guard_self_disable_in(&joined) {
+            return Some(hit);
+        }
+    }
     let res = guard_self_disable_patterns();
     if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
         return Some((*what, *score));
@@ -2984,8 +3010,10 @@ fn interpreter_code_puts_file_onto_settings(content: &str) -> bool {
     // (`os.path.expanduser('~/x')`), then the destination.
     const CALL: &str = r#"\b(?:copy\w*|symlink(?:sync)?)\s*\(\s*[^,()]*(?:\([^()]*\)[^,()]*)*,\s*"#;
     let interpreter = INTERPRETER.get_or_init(|| {
-        regex::Regex::new(r#"(?s)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b"#)
-            .expect("static interpreter regex")
+        regex::Regex::new(
+            r#"(?s)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b"#,
+        )
+        .expect("static interpreter regex")
     });
     if !interpreter.is_match(&lower) {
         return false;
@@ -3082,12 +3110,19 @@ fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)]
         // `os` and `shutil` remove and move, node's `fs` does each of those.
         // A rename, replace or move counts with the settings on either side.
         add(
-            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json).{0,400}?(?:["']w["']|\bdump\b|\bwrite\b|\bdel\b|writeFileSync|\bunlink\b|\.write_(?:text|bytes)\(|\bos\.(?:remove|rename|replace)\(|\bshutil\.(?:move|rmtree)\(|\.rename\(|\.symlink_to\(|\b(?:unlink|rm|rename|appendFile|truncate)Sync\(|\bfs\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\()"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json).*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\(|\bwrite\b|\bwritelines\b|\bdel\b|\bunlink\b|\.truncate\(|\.write_(?:text|bytes)\(|\.rename\(|\.symlink_to\()"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
         add(
-            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:["']w["']|\bdump\b|writeFileSync|\bos\.(?:remove|rename|replace|unlink)\(|\bshutil\.move\(|\b(?:unlink|rm|rename|appendFile|truncate)Sync\(|\bfs\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\().{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\().*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+            "rewrites an agent's configuration through an interpreter",
+            60,
+        );
+        // Opened in a mode that writes, the mode right after the settings
+        // path in the same call: `open(p, 'wb')`, `'w+'`, `'a'`, `'r+'`.
+        add(
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)["']?\)*\s*,\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
@@ -13172,7 +13207,9 @@ fn disable_verb_before(
 /// substitution is one command with the one it stands in
 /// (`kill $(pgrep -f x | grep the-target)`). Read loosely: a quote left
 /// open runs to the end of the line, and a backslash outside single quotes
-/// escapes the next character.
+/// escapes the next character. The body of a backquoted substitution is
+/// read as one of `$(...)`, and `$'...'` closes only at a quote no
+/// backslash escapes: a `;` in either is no end of a command.
 fn command_ends(line: &str) -> Vec<usize> {
     let bytes = line.as_bytes();
     let mut ends = Vec::new();
@@ -13181,6 +13218,28 @@ fn command_ends(line: &str) -> Vec<usize> {
     while let Some(&byte) = bytes.get(at) {
         match byte {
             b'\\' => at += 1,
+            b'$' if bytes.get(at + 1) == Some(&b'\'') => {
+                at += 2;
+                while let Some(&b) = bytes.get(at) {
+                    if b == b'\\' {
+                        at += 1;
+                    } else if b == b'\'' {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            b'`' => {
+                at += 1;
+                while let Some(&b) = bytes.get(at) {
+                    if b == b'\\' {
+                        at += 1;
+                    } else if b == b'`' {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
             b'\'' => {
                 at += 1;
                 while bytes.get(at).is_some_and(|&b| b != b'\'') {
@@ -17574,6 +17633,27 @@ fn normalize_command_target(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `;` inside backquotes or inside `$'...'` (after an escaped quote)
+    /// is part of a word, not the end of a command: a stop verb and its
+    /// target around it stay one command.
+    #[test]
+    fn command_ends_skips_backquotes_and_ansi_c_quoting() {
+        assert!(command_ends("systemctl stop `echo x;` innerwarden-agent").is_empty());
+        assert!(command_ends("systemctl stop $'x\\';' innerwarden-agent").is_empty());
+        assert_eq!(command_ends("a `b`; c"), vec![5]);
+        assert_eq!(command_ends("a $'b\\'c'; d"), vec![9]);
+        assert!(
+            check_disable_verb_reaches_target("systemctl stop `echo x;` innerwarden-agent")
+                .is_some()
+        );
+        assert!(
+            check_disable_verb_reaches_target("systemctl stop $'x\\';' innerwarden-agent")
+                .is_some()
+        );
+        // A real end still splits: the guard's folder entered after a stop.
+        assert!(check_disable_verb_reaches_target("pkill -f x; cd ~/innerwarden/wt").is_none());
+    }
 
     /// Each was `allow` while its curl/wget twin was a staged fetch-and-run:
     /// the correlation only knew curl, wget and fetch as the producer of a file.

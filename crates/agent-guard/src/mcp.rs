@@ -259,8 +259,18 @@ pub(crate) fn inspect_declared_tool_call(
     // ["-la"]}` was refused for the tool's name while `{"command": "ls -la"}`
     // ran. The argument conditions still read the whole call.
     // A rule that needs every condition is never matched by the name alone,
-    // so it keeps the name.
-    let lines_read = shell_tool && !commands.is_empty();
+    // so it keeps the name. A field the reading did not take that is more
+    // than a folder, an environment or a note (`stdin`, text handed to the
+    // program) is read by nothing but the name: with one, the name stays.
+    let only_inert_unread = unread.as_object().is_none_or(|object| {
+        object.keys().all(|key| {
+            let key = canonical_key(key);
+            [INERT_KEYS, WORKING_FOLDER_KEYS, ENV_KEYS]
+                .iter()
+                .any(|keys| keys.contains(&key.as_str()))
+        })
+    });
+    let lines_read = shell_tool && !commands.is_empty() && only_inert_unread;
     if let Some(engine) = rule_engine {
         let context = AtrContext::tool_call(tool_name, &args_str);
         let without_name = lines_read.then(|| {
@@ -7386,6 +7396,30 @@ mod interpreter_input_and_argv_calls {
         ] {
             let verdict = inspect_tool_call(tool, &args, Some(&engine));
             assert!(verdict.allowed, "{tool} {args}: {:?}", verdict.alerts);
+        }
+    }
+
+    /// A field no reading takes (`stdin`) is judged by the shell tool's name
+    /// as before: `bash -s` fed `rm -rf /` on standard input is refused.
+    /// A folder, an environment or a note leave the name out.
+    ///
+    /// FAILS ON REVERT of `only_inert_unread` in `lines_read`.
+    #[test]
+    fn a_field_no_reading_takes_keeps_the_shell_tools_name() {
+        let engine = RuleEngine::load_embedded();
+        for args in [
+            json!({"command": "bash", "args": ["-s"], "stdin": "rm -rf /"}),
+            json!({"command": "ls", "args": ["-la"], "stdin": "rm -rf /"}),
+        ] {
+            let verdict = inspect_tool_call("run_shell", &args, Some(&engine));
+            assert!(!verdict.allowed, "{args}: {:?}", verdict.alerts);
+        }
+        for args in [
+            json!({"command": "ls", "args": ["-la"], "description": "list"}),
+            json!({"command": "ls", "args": ["-la"], "cwd": "/home/u/app", "timeout": 5}),
+        ] {
+            let verdict = inspect_tool_call("run_shell", &args, Some(&engine));
+            assert!(verdict.allowed, "{args}: {:?}", verdict.alerts);
         }
     }
 
