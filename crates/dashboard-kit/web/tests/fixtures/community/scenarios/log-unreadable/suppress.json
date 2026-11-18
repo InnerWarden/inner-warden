@@ -1,0 +1,106 @@
+{
+  "allow": [
+    {
+      "hidden_characters": false,
+      "pattern": "npm run * --silent",
+      "redacted": false,
+      "remove": {
+        "command": "innerwarden allow --remove 'npm run * --silent'",
+        "label": "To remove it:",
+        "line": "Commands it matches are judged by the rules again."
+      },
+      "warning": null
+    },
+    {
+      "hidden_characters": false,
+      "pattern": "make release",
+      "redacted": false,
+      "remove": {
+        "command": "innerwarden allow --remove 'make release'",
+        "label": "To remove it:",
+        "line": "Commands it matches are judged by the rules again."
+      },
+      "warning": null
+    },
+    {
+      "hidden_characters": false,
+      "pattern": "* --dry-run",
+      "redacted": false,
+      "remove": {
+        "command": "innerwarden allow --remove '* --dry-run'",
+        "label": "To remove it:",
+        "line": "Commands it matches are judged by the rules again."
+      },
+      "warning": "unanchored"
+    },
+    {
+      "hidden_characters": false,
+      "pattern": "deploy-cli --token=[REDACTED]",
+      "redacted": true,
+      "warning": null
+    },
+    {
+      "hidden_characters": true,
+      "pattern": "git status\\u{200B}",
+      "redacted": false,
+      "warning": null
+    }
+  ],
+  "changes": {
+    "count": null,
+    "last_at": null,
+    "since": null
+  },
+  "counts": {
+    "allow": 5,
+    "mute_categories": 1,
+    "mute_rules": 1
+  },
+  "dropped": [
+    {
+      "pattern": "*",
+      "why": "universal"
+    }
+  ],
+  "generated_at_ms": 1790690700000,
+  "list_steps": {
+    "allow": {
+      "command": "innerwarden allow --list",
+      "label": "To see every allow pattern:",
+      "line": "Prints the whole list in your terminal."
+    },
+    "mute": {
+      "command": "innerwarden mute --list",
+      "label": "To see every muted rule and category:",
+      "line": "Prints the whole list in your terminal."
+    }
+  },
+  "more": {
+    "allow": 0,
+    "mute_categories": 0,
+    "mute_rules": 0
+  },
+  "mute_categories": [
+    {
+      "id": "data-poisoning",
+      "remove": {
+        "command": "innerwarden mute --remove data-poisoning",
+        "label": "To remove it:",
+        "line": "The category counts against a command again."
+      }
+    }
+  ],
+  "mute_rules": [
+    {
+      "id": "ATR-2026-030",
+      "remove": {
+        "command": "innerwarden mute --remove ATR-2026-030",
+        "label": "To remove it:",
+        "line": "The rule counts against a command again."
+      },
+      "title": "cross-agent attack detection"
+    }
+  ],
+  "schema_version": 1,
+  "withheld": null
+}

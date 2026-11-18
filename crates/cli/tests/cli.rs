@@ -37,6 +37,19 @@ fn cli() -> Command {
     // a developer running the suite on a host with an agent never gets the
     // suite's fake attacks as cases; the one test of the report turns it on.
     command.env("INNERWARDEN_AGENT_URL", "off");
+    // The person's shell, even when the suite runs under an AI agent's: a
+    // jail and the wiring that lowers a guard are refused inside one. A test
+    // about an agent's shell sets its marker again; the later value wins.
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+        "GEMINI_CLI",
+        "OPENCLAW_SHELL",
+    ] {
+        command.env_remove(marker);
+    }
     command
 }
 
@@ -391,11 +404,29 @@ fn proxy_advisory_records_all_calls_without_recording_responses_or_clean_alerts(
         "advisory must forward deny recommendations"
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
+    let alerts: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.starts_with("[innerwarden]"))
+        .collect();
     assert_eq!(
-        stderr.matches("[innerwarden]").count(),
+        alerts
+            .iter()
+            .filter(|line| line.contains("client->server"))
+            .count(),
         1,
         "only the finding should be an alert; clean activity is telemetry: {stderr}"
     );
+    // `cat` sends the denied call back as server traffic, secret and all:
+    // that echo is a secret in what a server sent, reported as one, never a
+    // second alert for the clean call.
+    assert!(
+        alerts
+            .iter()
+            .filter(|line| line.contains("server->client"))
+            .all(|line| line.ends_with(r#"rules=["AG-SECRET-OUT"]"#)),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(&secret), "{stderr}");
 
     let body = std::fs::read_to_string(&graph_path).expect("MCP graph written");
     assert!(
@@ -1157,13 +1188,24 @@ fn graph_records_checks_and_narrates() {
         "narrative counts the deny verdict: {narrative}"
     );
 
-    // `graph --clear` resets it.
+    // `graph --clear` resets it, as the person's: here an operator's script
+    // (no terminal, `--operator`, outside an AI agent's shell).
     let out = cli()
-        .args(["graph", "--clear"])
+        .args(["graph", "--clear", "--operator"])
         .env("IW_GRAPH_FILE", gp)
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_ENTRYPOINT")
+        .env_remove("CODEX_SANDBOX")
+        .env_remove("CODEX_SANDBOX_NETWORK_DISABLED")
+        .env_remove("GEMINI_CLI")
+        .env_remove("OPENCLAW_SHELL")
         .output()
         .expect("run graph clear");
-    assert!(out.status.success());
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(!graph.exists(), "clear removed the file");
 }
 

@@ -41,9 +41,9 @@ function messageId(opening: string): string {
 const MESSAGE = messageId("Ignore your rules");
 
 const PAGES: [string, string, string][] = [
-  ...COMMUNITY_TABS.map(([label, path]) => [label, path, PAGE_READY[label]] as [string, string, string]),
-  ["A case", `/?view=activity&decision=${encodeURIComponent(CASE.domainFetch)}`, `section[data-case="${CASE.domainFetch}"]`],
-  ["A message", `/?view=activity&lane=agent_messages&decision=${MESSAGE}`, `section[data-case="${MESSAGE}"]`],
+  ...COMMUNITY_TABS.map(([label, path, titled]) => [titled, path, PAGE_READY[label]] as [string, string, string]),
+  ["A case", `/?view=activity&decision=${encodeURIComponent(CASE.domainFetch)}`, `section[data-decision="${CASE.domainFetch}"]`],
+  ["A message", `/?view=activity&lane=agent_messages&decision=${MESSAGE}`, `section[data-decision="${MESSAGE}"]`],
 ];
 
 for (const [name, path, drawn] of PAGES) {
@@ -72,7 +72,7 @@ test("the five tabs wrap inside the screen, and the header stays under a third o
   expect(height).toBeLessThan(640 / 3);
 
   // The mode is said in words at this width too, not a bare mark.
-  await expect(page.locator("header [data-meta-status]")).toHaveText(/Partly connected/);
+  await expect(page.locator("header [data-meta-status]")).toHaveText(/Needs you/);
 
   const toggle = page.getByRole("checkbox", { name: "Show technical detail" });
   await expect(toggle).toBeHidden();
@@ -84,17 +84,40 @@ test("the five tabs wrap inside the screen, and the header stays under a third o
   await expect(page.getByRole("button", { name: "Open the product tour" })).toBeVisible();
 });
 
-/** FAILS ON REVERT: at 390 the tabs wrapped, "Tokens" alone on a second row. */
-for (const width of [320, 390]) {
-  test(`the five tabs share one row at ${width} px`, async ({ page }) => {
+/**
+ * Below 400 px five tabs in one row clip "Protection" and "Decisions" under
+ * their neighbours (54 px for a 71 px word at 320): two rows of three
+ * columns, every word whole, never "Tokens" alone on a row of its own.
+ * FAILS ON REVERT of the Community nav rule: the labels overflow.
+ */
+for (const width of [320, 360, 390]) {
+  test(`every tab's word fits, in at most two even rows, at ${width} px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 });
     await page.goto("/");
     const tabs = page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button");
     await expect(tabs).toHaveCount(COMMUNITY_TABS.length);
-    const tops = await tabs.evaluateAll((buttons) => buttons.map((button) => Math.round(button.getBoundingClientRect().top)));
-    expect(new Set(tops).size).toBe(1);
+    const boxes = await tabs.evaluateAll((buttons) =>
+      buttons.map((button) => ({
+        top: Math.round(button.getBoundingClientRect().top),
+        overflow: button.scrollWidth - button.clientWidth,
+        right: button.getBoundingClientRect().right,
+      })),
+    );
+    for (const box of boxes) expect(box.overflow).toBeLessThanOrEqual(0);
+    const rows = [...new Set(boxes.map((box) => box.top))];
+    expect(rows.length).toBeLessThanOrEqual(2);
+    expect(boxes.filter((box) => box.top === rows[0])).toHaveLength(3);
+    for (const box of boxes) expect(box.right).toBeLessThanOrEqual(width);
   });
 }
+
+test("the five tabs share one row from 640 px", async ({ page }) => {
+  await page.setViewportSize({ width: 640, height: 800 });
+  await page.goto("/");
+  const tabs = page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button");
+  const tops = await tabs.evaluateAll((buttons) => buttons.map((button) => Math.round(button.getBoundingClientRect().top)));
+  expect(new Set(tops).size).toBe(1);
+});
 
 /**
  * A case's neighbours say their outcome in words for a screen reader at
@@ -145,7 +168,7 @@ test("the menu closes on Escape, on a press outside it, and on going to another 
   await expect(menu).toHaveAttribute("aria-expanded", "true");
   await toggle.click();
 
-  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Cases" }).click();
+  await page.getByRole("navigation", { name: "Dashboard views" }).getByRole("button", { name: "Decisions" }).click();
   await expect(menu).toHaveAttribute("aria-expanded", "false");
   await expect(toggle).toBeHidden();
 });
@@ -185,9 +208,9 @@ test.describe("the header at a desk", () => {
         await page.goto("/");
         await expect(page.locator("header [data-meta-status]")).toHaveAttribute("data-meta-status", "ready");
         if (technical) await page.getByRole("checkbox", { name: "Show technical detail" }).check();
-        await expect(page.locator("header [data-chip]")).toHaveCount(1);
+        await expect(page.locator("header [data-pill]")).toHaveCount(1);
         const nav = await page.getByRole("navigation", { name: "Dashboard views" }).boundingBox();
-        const chip = await page.locator("header [data-chip]").boundingBox();
+        const chip = await page.locator("header [data-pill]").boundingBox();
         expect(Math.abs((chip!.y + chip!.height / 2) - (nav!.y + nav!.height / 2))).toBeLessThan(12);
       });
     }

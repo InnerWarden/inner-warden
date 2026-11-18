@@ -3,16 +3,37 @@
 Thanks for helping build a better guardrail for AI agents. This guide covers how
 to build, test, and submit changes.
 
+## Where to start
+
+- **Good first issues.** Issues labelled
+  [good first issue](https://github.com/InnerWarden/inner-warden/issues?q=is%3Aopen+label%3A%22good+first+issue%22)
+  are small and scoped: each names the files to touch and the command that
+  proves the change. Say in the issue that you are taking it, so two people
+  do not do the same work.
+- **A wrong verdict.** A command the guard should catch and does not, or one
+  it flags and should not, is the most useful report there is: open a
+  "Wrong verdict" issue with the exact command and the output of
+  `innerwarden check --json "<command>"`. A working bypass of the guard is a
+  vulnerability: send it to security@innerwarden.com (see
+  [SECURITY.md](SECURITY.md)), never in a public issue.
+- **Your first build.** `cargo test --workspace` on a fresh clone is the
+  first step; if it fails on your machine, that is worth an issue too.
+
+The crates and what each one does are listed in the README
+([Project layout](README.md#project-layout)). To run one crate's tests while
+you work, name it: `cargo test -p innerwarden-agent-guard` for the engine,
+`cargo test -p innerwarden` for the CLI.
+
 ## Build and test
 
-InnerWarden is a Rust workspace. A stable Rust toolchain is all you
-need.
+InnerWarden is a Rust workspace. Rust is all you need: `rustup` installs
+the toolchain the repo pins (`rust-toolchain.toml`) on the first build.
 
 ```sh
 cargo build --release          # build the workspace
 cargo test --workspace         # run all tests
 cargo fmt --all --check        # confirm formatting
-cargo clippy --workspace -- -D warnings   # lint, warnings are errors
+cargo clippy --workspace --all-targets -- -D warnings   # lint, warnings are errors, as CI runs it
 ```
 
 Run all four locally and confirm they pass before you open a pull request.
@@ -70,3 +91,5 @@ commit, amend it with `git commit -s --amend`.
 2. Make your change, with tests, and sign off each commit (`git commit -s`).
 3. Run the build, test, fmt, and clippy commands above until they pass.
 4. Open a pull request describing the change and its motivation.
+
+Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).

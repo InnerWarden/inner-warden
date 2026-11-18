@@ -18,6 +18,7 @@ fn run(config: &std::path::Path, args: &[&str]) -> Output {
         .env_remove("CODEX_SANDBOX")
         .env_remove("CODEX_SANDBOX_NETWORK_DISABLED")
         .env_remove("GEMINI_CLI")
+        .env_remove("OPENCLAW_SHELL")
         .output()
         .expect("run innerwarden")
 }

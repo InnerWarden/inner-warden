@@ -62,12 +62,94 @@ pub struct DecisionOrigin {
     pub project: Option<String>,
     /// The ids of the rules behind the verdict, primary first.
     pub rules: Vec<String>,
+    /// The instance id a launcher gave the jail this command ran in. A LABEL:
+    /// it says which launch the hook believes it belongs to, and proves
+    /// nothing by itself.
+    pub instance_id: Option<String>,
+    /// The session id the agent put in its own payload. Untrusted: the agent
+    /// chooses it.
+    pub session_id: Option<String>,
+    /// How the hook came to know the instance: `declared`, `observed` or
+    /// `confined`. Only a known word is kept.
+    pub trust: Option<String>,
+    /// Why the hook gave that level (a short snake_case word).
+    pub trust_reason: Option<String>,
+    /// The rule layer that made the decision (`hard`, `general`,
+    /// `agent_type`, `instance`). Written only where per-agent profiles are
+    /// in force; only a known word is kept.
+    pub deciding_layer: Option<String>,
+    /// The profile in force for the caller's agent type when the decision
+    /// was made, by name. Written only beside a deciding layer.
+    pub profile: Option<String>,
+    /// The profile or the instance's exception would have allowed this, the
+    /// instance did not run confined, and the general rules decided. Written
+    /// only beside a deciding layer, and only when true.
+    pub relaxation_withheld: bool,
+    /// Who was asked about the rules for this decision: `host` when the hook
+    /// asked the Active Defence agent on its host and got the contract's
+    /// answer (`jail` is the hook's own reading). A LABEL the hook wrote.
+    /// Written only beside a known trust; only a known word is kept.
+    pub trust_source: Option<String>,
+    /// The host's id for its decision (32 lowercase hex characters), from
+    /// its answer. Written only beside a known trust.
+    pub host_decision: Option<String>,
+    /// The host's word for not relaxing, as it came (1 to 48 of `[a-z_]`),
+    /// or `host_answer_invalid` when its answer was not the contract's.
+    /// Written only beside a known trust.
+    pub host_withheld: Option<String>,
 }
 
 const MAX_AGENT_CHARS: usize = 64;
 const MAX_PROJECT_CHARS: usize = 120;
 const MAX_RULES: usize = 16;
 const MAX_RULE_CHARS: usize = 64;
+const INSTANCE_ID_CHARS: usize = 32;
+const MAX_SESSION_CHARS: usize = 120;
+const MAX_REASON_CHARS: usize = 64;
+
+/// The words a trust label may hold.
+const TRUST_WORDS: [&str; 3] = ["declared", "observed", "confined"];
+
+/// The words a deciding layer may hold.
+const LAYER_WORDS: [&str; 4] = ["hard", "general", "agent_type", "instance"];
+
+/// The words a trust source may hold.
+const TRUST_SOURCE_WORDS: [&str; 2] = ["jail", "host"];
+
+/// A host decision id: 32 lowercase hex characters.
+fn valid_host_decision(id: &str) -> bool {
+    valid_instance(id)
+}
+
+/// A host's word for not relaxing, kept without being read: 1 to 48 of
+/// `[a-z_]`.
+fn valid_host_withheld(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= 48
+        && word.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+}
+
+/// An instance id is 32 lowercase hex characters (the launcher's 16 random
+/// bytes), the same shape `agent_guard::identity::is_instance_id` accepts.
+fn valid_instance(id: &str) -> bool {
+    id.len() == INSTANCE_ID_CHARS
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn valid_session(session: &str) -> bool {
+    let count = session.chars().count();
+    count > 0 && count <= MAX_SESSION_CHARS && !session.chars().any(char::is_control)
+}
+
+fn valid_reason(reason: &str) -> bool {
+    !reason.is_empty()
+        && reason.len() <= MAX_REASON_CHARS
+        && reason
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
 
 fn valid_agent(agent: &str) -> bool {
     !agent.is_empty()
@@ -96,6 +178,25 @@ fn valid_rule(rule: &str) -> bool {
 }
 
 impl DecisionOrigin {
+    /// The instance id, if it has the shape of one.
+    pub fn instance_label(&self) -> Option<&str> {
+        self.instance_id.as_deref().filter(|id| valid_instance(id))
+    }
+
+    /// The trust word, if it is one of the known three.
+    pub fn trust_label(&self) -> Option<&str> {
+        self.trust
+            .as_deref()
+            .filter(|word| TRUST_WORDS.contains(word))
+    }
+
+    /// The deciding layer, if it is one of the known four.
+    pub fn layer_label(&self) -> Option<&str> {
+        self.deciding_layer
+            .as_deref()
+            .filter(|word| LAYER_WORDS.contains(word))
+    }
+
     /// Write the fields this origin carries onto a command node's attributes.
     /// A field that fails its shape check is dropped, never repaired: a record
     /// with no agent is honest, one with a guessed agent is not.
@@ -127,7 +228,141 @@ impl DecisionOrigin {
         if !rules.is_empty() {
             attrs.insert("rules".into(), rules.join(","));
         }
+        if let Some(instance) = self.instance_label() {
+            attrs.insert("instance_id".into(), instance.into());
+        }
+        if let Some(session) = self
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|session| valid_session(session))
+        {
+            attrs.insert("session_id".into(), session.into());
+        }
+        if let Some(trust) = self.trust_label() {
+            attrs.insert("trust".into(), trust.into());
+            if let Some(reason) = self.trust_reason.as_deref().filter(|r| valid_reason(r)) {
+                attrs.insert("trust_reason".into(), reason.into());
+            }
+            if let Some(source) = self
+                .trust_source
+                .as_deref()
+                .filter(|word| TRUST_SOURCE_WORDS.contains(word))
+            {
+                attrs.insert("trust_source".into(), source.into());
+            }
+            if let Some(id) = self
+                .host_decision
+                .as_deref()
+                .filter(|id| valid_host_decision(id))
+            {
+                attrs.insert("host_decision".into(), id.into());
+            }
+            if let Some(word) = self
+                .host_withheld
+                .as_deref()
+                .filter(|word| valid_host_withheld(word))
+            {
+                attrs.insert("host_withheld".into(), word.into());
+            }
+        }
+        if let Some(layer) = self.layer_label() {
+            attrs.insert("deciding_layer".into(), layer.into());
+            if let Some(profile) = self.profile.as_deref().filter(|p| valid_agent(p)) {
+                attrs.insert("profile".into(), profile.into());
+            }
+            if self.relaxation_withheld {
+                attrs.insert("relaxation_withheld".into(), "true".into());
+            }
+        }
     }
+}
+
+/// Which instance asked and which layer decided, as a command node recorded
+/// it: every field re-checked on the way out, the way it was on the way in.
+/// The instance, session and trust are LABELS the hook wrote; they prove
+/// nothing by themselves.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct DecisionIdentity {
+    pub instance_id: Option<String>,
+    pub session_id: Option<String>,
+    /// `declared`, `observed` or `confined`.
+    pub trust: Option<String>,
+    pub trust_reason: Option<String>,
+    pub deciding_layer: Option<String>,
+    pub profile: Option<String>,
+    pub relaxation_withheld: bool,
+    /// `jail` or `host`, beside a trust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trust_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_decision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_withheld: Option<String>,
+}
+
+/// The identity labels of one command node, or `None` when it holds none
+/// (every node written without a jail and without profiles).
+fn identity_of(node: &Node) -> Option<DecisionIdentity> {
+    let trust = attr(node, "trust").filter(|word| TRUST_WORDS.contains(word));
+    let layer = attr(node, "deciding_layer").filter(|word| LAYER_WORDS.contains(word));
+    let beside_trust = |key: &str, valid: fn(&str) -> bool| {
+        trust
+            .and(attr(node, key))
+            .filter(|value| valid(value))
+            .map(str::to_string)
+    };
+    let identity = DecisionIdentity {
+        instance_id: attr(node, "instance_id")
+            .filter(|id| valid_instance(id))
+            .map(str::to_string),
+        session_id: attr(node, "session_id")
+            .filter(|session| valid_session(session))
+            .map(str::to_string),
+        trust: trust.map(str::to_string),
+        trust_reason: trust
+            .and(attr(node, "trust_reason"))
+            .filter(|reason| valid_reason(reason))
+            .map(str::to_string),
+        deciding_layer: layer.map(str::to_string),
+        profile: layer
+            .and(attr(node, "profile"))
+            .filter(|profile| valid_agent(profile))
+            .map(str::to_string),
+        relaxation_withheld: layer.is_some() && attr(node, "relaxation_withheld") == Some("true"),
+        trust_source: beside_trust("trust_source", |word| TRUST_SOURCE_WORDS.contains(&word)),
+        host_decision: beside_trust("host_decision", valid_host_decision),
+        host_withheld: beside_trust("host_withheld", valid_host_withheld),
+    };
+    (identity.instance_id.is_some()
+        || identity.session_id.is_some()
+        || identity.trust.is_some()
+        || identity.deciding_layer.is_some())
+    .then_some(identity)
+}
+
+/// One session an instance's hook named, as its commands recorded it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct InstanceSession {
+    /// The session id the agent put in its own payload. A label.
+    pub session_id: String,
+    pub first_at_ms: Option<u64>,
+    pub last_at_ms: Option<u64>,
+    /// The newest decision of this session the guard flagged, by id.
+    pub case_id: Option<String>,
+}
+
+/// What the record holds about one instance id: the hook's newest label
+/// and the sessions it named. Every value is a label the hook wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceActivity {
+    /// The trust word of the newest command that carried one.
+    pub trust: Option<String>,
+    pub trust_reason: Option<String>,
+    /// The newest command recorded for the instance.
+    pub last_at_ms: Option<u64>,
+    /// Newest first.
+    pub sessions: Vec<InstanceSession>,
 }
 
 /// What finally happened to a decision, as one key. The same keys the lane
@@ -405,6 +640,10 @@ pub struct DecisionRecord {
     pub asi: Vec<String>,
     pub explanation: String,
     pub flagged: bool,
+    /// Which instance asked and which layer decided, where the node holds
+    /// it. Absent on every record written without a jail or profiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<DecisionIdentity>,
 }
 
 /// A neighbour of a case in its session, for "Around it".
@@ -441,6 +680,10 @@ pub struct RecordSpan {
     pub checked: usize,
     pub oldest_at_ms: Option<u64>,
     pub newest_at_ms: Option<u64>,
+    /// The record holds as many nodes as it keeps ([`Graph::MAX_NODES`]), so
+    /// the oldest are dropped as new ones arrive: the span is the newest part
+    /// of what was screened, not all of it.
+    pub capped: bool,
 }
 
 /// One reason, counted per DECISION: a decision counts once, under its
@@ -452,6 +695,27 @@ pub struct ReasonCount {
     /// The rule ids of the newest decision under this key.
     pub rules: Vec<String>,
     pub count: usize,
+    /// The decisions under this key by outcome key, non-zero keys only. Adds
+    /// up to `count`.
+    pub by_outcome: BTreeMap<&'static str, usize>,
+    /// The newest decision's whole explanation, as stored, at most
+    /// [`MAX_REASON_EXPLANATION_CHARS`] characters: `words` is only its first
+    /// clause, and a reader may need a later one to say what it was.
+    pub explanation: String,
+}
+
+/// The most characters of an explanation a reason carries. The record keeps
+/// no more than this per decision.
+pub const MAX_REASON_EXPLANATION_CHARS: usize = 300;
+
+/// One session that has decisions in the record: what [`SessionFacts`] says
+/// about it, and its decisions by outcome key (non-zero keys only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionSummary {
+    /// The session, as a decision's `session` names it.
+    pub id: String,
+    pub facts: SessionFacts,
+    pub by_outcome: BTreeMap<&'static str, usize>,
 }
 
 /// What a page asks for. Every filter narrows; none widens.
@@ -631,7 +895,80 @@ impl Graph {
             asi: linked("asi"),
             explanation: explanation_of(node).to_string(),
             flagged: is_flagged(node),
+            identity: identity_of(node),
         }
+    }
+
+    /// What the record holds about each instance id its commands named: the
+    /// hook's newest trust label, the newest command, and up to
+    /// `max_sessions` sessions, newest first. Only an id of the right shape
+    /// is a key; nothing here is proof of anything.
+    pub fn instance_activity(&self, max_sessions: usize) -> BTreeMap<String, InstanceActivity> {
+        struct Seen<'a> {
+            activity: InstanceActivity,
+            trust_key: Option<OrderKey>,
+            sessions: BTreeMap<&'a str, (InstanceSession, Option<OrderKey>)>,
+        }
+        let mut seen: BTreeMap<String, Seen<'_>> = BTreeMap::new();
+        for row in self.command_rows() {
+            let Some(id) = attr(row.node, "instance_id").filter(|id| valid_instance(id)) else {
+                continue;
+            };
+            let entry = seen.entry(id.to_string()).or_insert_with(|| Seen {
+                activity: InstanceActivity::default(),
+                trust_key: None,
+                sessions: BTreeMap::new(),
+            });
+            let ms = recorded_at_ms(row.node);
+            if let Some(ms) = ms {
+                entry.activity.last_at_ms =
+                    Some(entry.activity.last_at_ms.map_or(ms, |last| last.max(ms)));
+            }
+            if let Some(trust) = attr(row.node, "trust").filter(|word| TRUST_WORDS.contains(word)) {
+                if entry.trust_key.as_ref().is_none_or(|key| row.key > *key) {
+                    entry.trust_key = Some(row.key.clone());
+                    entry.activity.trust = Some(trust.to_string());
+                    entry.activity.trust_reason = attr(row.node, "trust_reason")
+                        .filter(|reason| valid_reason(reason))
+                        .map(str::to_string);
+                }
+            }
+            let Some(session) = attr(row.node, "session_id").filter(|s| valid_session(s)) else {
+                continue;
+            };
+            let (facts, case_key) = entry.sessions.entry(session).or_insert_with(|| {
+                (
+                    InstanceSession {
+                        session_id: session.to_string(),
+                        ..InstanceSession::default()
+                    },
+                    None,
+                )
+            });
+            if let Some(ms) = ms {
+                facts.first_at_ms = Some(facts.first_at_ms.map_or(ms, |first| first.min(ms)));
+                facts.last_at_ms = Some(facts.last_at_ms.map_or(ms, |last| last.max(ms)));
+            }
+            if is_flagged_agent_action(row.node) && case_key.as_ref().is_none_or(|k| row.key > *k) {
+                *case_key = Some(row.key.clone());
+                facts.case_id = Some(row.node.id.clone());
+            }
+        }
+        seen.into_iter()
+            .map(|(id, seen)| {
+                let mut activity = seen.activity;
+                let mut sessions: Vec<InstanceSession> =
+                    seen.sessions.into_values().map(|(s, _)| s).collect();
+                sessions.sort_by(|a, b| {
+                    b.last_at_ms
+                        .cmp(&a.last_at_ms)
+                        .then_with(|| a.session_id.cmp(&b.session_id))
+                });
+                sessions.truncate(max_sessions);
+                activity.sessions = sessions;
+                (id, activity)
+            })
+            .collect()
     }
 
     /// Out-edges to categories and OWASP ids, by command id. Built once per
@@ -813,7 +1150,47 @@ impl Graph {
                 span.newest_at_ms = Some(span.newest_at_ms.map_or(ms, |newest| newest.max(ms)));
             }
         }
+        // Every node counts toward the cap, not only commands: `prune` drops
+        // the oldest of all of them once the store holds this many.
+        span.capped = self.nodes.len() >= Graph::MAX_NODES;
         span
+    }
+
+    /// The sessions with decisions in the record, newest last decision first
+    /// (a session with no recorded time last), at most `limit` of them.
+    ///
+    /// Built from the decisions themselves, the same derivation as the
+    /// `sessions` of a page, so a session anchor that outlived its commands is
+    /// never listed, and neither is `session:host`, the container of host
+    /// observations that holds no agent session.
+    pub fn recent_sessions(&self, limit: usize) -> Vec<SessionSummary> {
+        let rows = self.command_rows();
+        let mut by_outcome: HashMap<&str, BTreeMap<&'static str, usize>> = HashMap::new();
+        for row in &rows {
+            *by_outcome
+                .entry(row.session)
+                .or_default()
+                .entry(row.outcome)
+                .or_insert(0) += 1;
+        }
+        let mut sessions: Vec<SessionSummary> = self
+            .session_facts(&rows)
+            .into_iter()
+            .filter(|(id, _)| !id.is_empty() && id != "host")
+            .map(|(id, facts)| SessionSummary {
+                by_outcome: by_outcome.remove(id.as_str()).unwrap_or_default(),
+                id,
+                facts,
+            })
+            .collect();
+        sessions.sort_by(|a, b| {
+            b.facts
+                .last_at_ms
+                .cmp(&a.facts.last_at_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        sessions.truncate(limit);
+        sessions
     }
 
     /// The agent's commands recorded at or after `from_ms`, split by outcome.
@@ -902,6 +1279,7 @@ impl Graph {
 
         let mut by_outcome: BTreeMap<&'static str, usize> = BTreeMap::new();
         let mut reasons: HashMap<&str, (usize, &OrderKey, &Node)> = HashMap::new();
+        let mut reason_outcomes: HashMap<&str, BTreeMap<&'static str, usize>> = HashMap::new();
         let mut matching: Vec<&Row<'_>> = Vec::new();
         let mut flagged_total = 0usize;
         for row in &rows {
@@ -923,6 +1301,11 @@ impl Graph {
                     entry.1 = &row.key;
                     entry.2 = row.node;
                 }
+                *reason_outcomes
+                    .entry(row.reason.as_str())
+                    .or_default()
+                    .entry(row.outcome)
+                    .or_insert(0) += 1;
             }
             if outcome_ok(row) && reason_ok(row) {
                 matching.push(row);
@@ -958,6 +1341,11 @@ impl Graph {
                 words: reason_words(node),
                 rules: rules_of(node),
                 count,
+                by_outcome: reason_outcomes.remove(key).unwrap_or_default(),
+                explanation: explanation_of(node)
+                    .chars()
+                    .take(MAX_REASON_EXPLANATION_CHARS)
+                    .collect(),
             })
             .collect();
         reason_list.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.key.cmp(&b.key)));
@@ -1030,6 +1418,76 @@ impl Graph {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn identity_labels_are_kept_only_in_their_own_shape() {
+        use super::DecisionOrigin;
+        let good = DecisionOrigin {
+            instance_id: Some("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59".into()),
+            trust: Some("confined".into()),
+            ..DecisionOrigin::default()
+        };
+        assert_eq!(
+            good.instance_label(),
+            Some("7f3a9c1e42b84d0e9a6c5f1b2d3e4a59")
+        );
+        assert_eq!(good.trust_label(), Some("confined"));
+        // The launcher's shape only: 32 lowercase hex. FAILS ON REVERT of the
+        // strict check: the dashed, short and non-hex ids are kept.
+        for bad in [
+            "",
+            "A",
+            "a/b",
+            "a b",
+            &"a".repeat(65),
+            "7f3a9c1e-42",
+            &"a".repeat(31),
+            &"z".repeat(32),
+            "7f3a9c1e-2b84d0e9a6c5f1b2d3e4a59",
+        ] {
+            let o = DecisionOrigin {
+                instance_id: Some(bad.into()),
+                ..DecisionOrigin::default()
+            };
+            assert_eq!(o.instance_label(), None, "{bad:?}");
+        }
+        for bad in ["", "root", "Confined", "host_verified", "authenticated"] {
+            let o = DecisionOrigin {
+                trust: Some(bad.into()),
+                ..DecisionOrigin::default()
+            };
+            assert_eq!(o.trust_label(), None, "{bad:?}");
+        }
+    }
+
+    /// A deciding layer is one of four words; anything else is dropped, and
+    /// with none the attribute is not written at all.
+    #[test]
+    fn a_deciding_layer_is_written_only_as_a_known_word() {
+        use super::DecisionOrigin;
+        use std::collections::BTreeMap;
+        for word in ["hard", "general", "agent_type", "instance"] {
+            let mut attrs = BTreeMap::new();
+            DecisionOrigin {
+                deciding_layer: Some(word.into()),
+                ..DecisionOrigin::default()
+            }
+            .write_attrs(&mut attrs);
+            assert_eq!(attrs.get("deciding_layer").map(String::as_str), Some(word));
+        }
+        for bad in ["", "Hard", "profile", "agent-type", "general "] {
+            let mut attrs = BTreeMap::new();
+            DecisionOrigin {
+                deciding_layer: Some(bad.into()),
+                ..DecisionOrigin::default()
+            }
+            .write_attrs(&mut attrs);
+            assert!(!attrs.contains_key("deciding_layer"), "{bad:?}");
+        }
+        let mut attrs = BTreeMap::new();
+        DecisionOrigin::default().write_attrs(&mut attrs);
+        assert!(attrs.is_empty());
+    }
+
     use super::*;
     use crate::{DecisionContext, DecisionMode, DecisionOutcome};
     use serde_json::{json, Value};
@@ -1052,6 +1510,7 @@ mod tests {
             agent: Some("claude-code".into()),
             project: Some("my-app".into()),
             rules: rules.iter().map(|rule| rule.to_string()).collect(),
+            ..DecisionOrigin::default()
         }
     }
 
@@ -1163,6 +1622,252 @@ mod tests {
         g
     }
 
+    /// The profile and the withheld relaxation are written only beside a
+    /// deciding layer, the profile only in the shape of a name, and the
+    /// withheld flag only when true.
+    ///
+    /// FAILS ON REVERT: write `profile` outside the `layer_label` branch and
+    /// the origin with no layer carries it.
+    #[test]
+    fn the_profile_and_a_withheld_relaxation_ride_only_with_a_layer() {
+        let mut with = BTreeMap::new();
+        DecisionOrigin {
+            deciding_layer: Some("general".into()),
+            profile: Some("claude-code".into()),
+            relaxation_withheld: true,
+            ..DecisionOrigin::default()
+        }
+        .write_attrs(&mut with);
+        assert_eq!(with["profile"], "claude-code");
+        assert_eq!(with["relaxation_withheld"], "true");
+        let mut without_layer = BTreeMap::new();
+        DecisionOrigin {
+            profile: Some("claude-code".into()),
+            relaxation_withheld: true,
+            ..DecisionOrigin::default()
+        }
+        .write_attrs(&mut without_layer);
+        assert!(without_layer.is_empty(), "{without_layer:?}");
+        let mut not_withheld = BTreeMap::new();
+        DecisionOrigin {
+            deciding_layer: Some("agent_type".into()),
+            profile: Some("Bad Name".into()),
+            ..DecisionOrigin::default()
+        }
+        .write_attrs(&mut not_withheld);
+        assert!(!not_withheld.contains_key("profile"));
+        assert!(!not_withheld.contains_key("relaxation_withheld"));
+    }
+
+    fn labelled(
+        g: &mut Graph,
+        session: &str,
+        seq: usize,
+        rec: &str,
+        origin: &DecisionOrigin,
+        ms: u64,
+    ) {
+        let outcome = if rec == "allow" {
+            DecisionOutcome::Allowed
+        } else {
+            DecisionOutcome::Blocked
+        };
+        g.ingest_verdict_with_origin(
+            session,
+            seq,
+            &format!("cmd {seq}"),
+            &verdict(rec, "why"),
+            context(DecisionMode::Enforce, outcome, ms),
+            origin,
+        );
+    }
+
+    /// A decision serves the labels its node holds, re-checked; a decision
+    /// written with none serves no identity at all, and its JSON has no key.
+    ///
+    /// FAILS ON REVERT: make `identity_of` return `Some` unconditionally and
+    /// the plain decision serialises an `identity` key.
+    #[test]
+    fn a_decision_serves_its_identity_labels_and_none_without_them() {
+        let mut g = Graph::new();
+        let id = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+        labelled(
+            &mut g,
+            "contain",
+            0,
+            "deny",
+            &DecisionOrigin {
+                instance_id: Some(id.into()),
+                session_id: Some("a1b2c3d4-session".into()),
+                trust: Some("confined".into()),
+                trust_reason: Some("confined_by_namespace".into()),
+                deciding_layer: Some("general".into()),
+                profile: Some("claude-code".into()),
+                relaxation_withheld: true,
+                ..origin(&[])
+            },
+            10,
+        );
+        labelled(&mut g, "s2", 0, "deny", &origin(&[]), 20);
+        let page = g.decisions_page(&DecisionQuery::default());
+        let labelled = page
+            .items
+            .iter()
+            .find(|item| item.session == "contain")
+            .unwrap();
+        assert_eq!(
+            labelled.identity,
+            Some(DecisionIdentity {
+                instance_id: Some(id.into()),
+                session_id: Some("a1b2c3d4-session".into()),
+                trust: Some("confined".into()),
+                trust_reason: Some("confined_by_namespace".into()),
+                deciding_layer: Some("general".into()),
+                profile: Some("claude-code".into()),
+                relaxation_withheld: true,
+                ..DecisionIdentity::default()
+            })
+        );
+        let plain = page.items.iter().find(|item| item.session == "s2").unwrap();
+        assert_eq!(plain.identity, None);
+        let json = serde_json::to_value(plain).unwrap();
+        assert!(json.get("identity").is_none(), "{json}");
+        // A decision the host was not asked about serves no host key.
+        let json = serde_json::to_value(labelled).unwrap();
+        for key in ["trust_source", "host_decision", "host_withheld"] {
+            assert!(json["identity"].get(key).is_none(), "{key}: {json}");
+        }
+    }
+
+    /// What the host answered rides only beside a trust, each value in its
+    /// shape, and is read back the same way.
+    ///
+    /// FAILS ON REVERT: write `trust_source` outside the trust branch and the
+    /// origin with no trust carries it; drop a shape filter and its bad value
+    /// is written.
+    #[test]
+    fn the_host_labels_ride_only_beside_a_trust_and_in_their_shape() {
+        let host = DecisionOrigin {
+            trust: Some("observed".into()),
+            trust_reason: Some("host_decided".into()),
+            trust_source: Some("host".into()),
+            host_decision: Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0".into()),
+            host_withheld: Some("a_word_never_heard".into()),
+            deciding_layer: Some("agent_type".into()),
+            ..DecisionOrigin::default()
+        };
+        let mut attrs = BTreeMap::new();
+        host.write_attrs(&mut attrs);
+        assert_eq!(attrs["trust_source"], "host");
+        assert_eq!(attrs["host_decision"], "0f1e2d3c4b5a69788796a5b4c3d2e1f0");
+        assert_eq!(attrs["host_withheld"], "a_word_never_heard");
+        assert_eq!(attrs["trust_reason"], "host_decided");
+
+        let mut without_trust = BTreeMap::new();
+        DecisionOrigin {
+            trust: None,
+            ..host.clone()
+        }
+        .write_attrs(&mut without_trust);
+        for key in ["trust_source", "host_decision", "host_withheld"] {
+            assert!(!without_trust.contains_key(key), "{key}");
+        }
+
+        let mut bad = BTreeMap::new();
+        DecisionOrigin {
+            trust_source: Some("kernel".into()),
+            host_decision: Some("0F1E2D3C4B5A69788796A5B4C3D2E1F0".into()),
+            host_withheld: Some("Kept, because".into()),
+            ..host.clone()
+        }
+        .write_attrs(&mut bad);
+        for key in ["trust_source", "host_decision", "host_withheld"] {
+            assert!(!bad.contains_key(key), "{key}: {bad:?}");
+        }
+
+        let mut g = Graph::new();
+        labelled(&mut g, "contain", 0, "allow", &host, 10);
+        let page = g.decisions_page(&DecisionQuery {
+            flagged_only: false,
+            ..DecisionQuery::default()
+        });
+        let read = page.items[0].identity.clone().expect("identity");
+        assert_eq!(read.trust_source.as_deref(), Some("host"));
+        assert_eq!(
+            read.host_decision.as_deref(),
+            Some("0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+        );
+        assert_eq!(read.host_withheld.as_deref(), Some("a_word_never_heard"));
+    }
+
+    /// Per instance: the newest trust label wins, sessions are newest first
+    /// and capped, and a session's case is its newest flagged decision. A
+    /// node with no instance id, or one of the wrong shape, adds nothing.
+    ///
+    /// FAILS ON REVERT: drop the `row.key > *key` check and the older label
+    /// (observed) overwrites the newer one when it is read later.
+    #[test]
+    fn instance_activity_keeps_the_newest_label_and_the_sessions() {
+        let mut g = Graph::new();
+        let id = "3f9a0c1e5b7d42a8c6e1f0b2d4a69c87";
+        let with = |session: &str, trust: &str, reason: &str| DecisionOrigin {
+            instance_id: Some(id.into()),
+            session_id: Some(session.into()),
+            trust: Some(trust.into()),
+            trust_reason: Some(reason.into()),
+            ..origin(&[])
+        };
+        labelled(
+            &mut g,
+            "contain",
+            2,
+            "allow",
+            &with("sess-b", "confined", "confined_by_namespace"),
+            300,
+        );
+        labelled(
+            &mut g,
+            "contain",
+            0,
+            "deny",
+            &with("sess-a", "observed", "launcher_not_trusted"),
+            100,
+        );
+        labelled(
+            &mut g,
+            "contain",
+            1,
+            "allow",
+            &with("sess-a", "observed", "launcher_not_trusted"),
+            200,
+        );
+        labelled(&mut g, "s9", 0, "deny", &origin(&[]), 400);
+        labelled(
+            &mut g,
+            "s8",
+            0,
+            "deny",
+            &DecisionOrigin {
+                instance_id: Some("Not/An/Id".into()),
+                ..origin(&[])
+            },
+            500,
+        );
+        let activity = g.instance_activity(5);
+        assert_eq!(activity.len(), 1, "{activity:?}");
+        let one = &activity[id];
+        assert_eq!(one.trust.as_deref(), Some("confined"));
+        assert_eq!(one.trust_reason.as_deref(), Some("confined_by_namespace"));
+        assert_eq!(one.last_at_ms, Some(300));
+        let ids: Vec<&str> = one.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert_eq!(ids, ["sess-b", "sess-a"]);
+        assert_eq!(one.sessions[1].first_at_ms, Some(100));
+        assert_eq!(one.sessions[1].last_at_ms, Some(200));
+        assert_eq!(one.sessions[1].case_id.as_deref(), Some("cmd:contain:0"));
+        assert_eq!(one.sessions[0].case_id, None);
+        assert_eq!(g.instance_activity(1)[id].sessions.len(), 1);
+    }
+
     #[test]
     fn origin_attrs_are_written_and_old_nodes_read_as_unknown() {
         let mut g = Graph::new();
@@ -1180,6 +1885,7 @@ mod tests {
                     "sensitive_credential_read".into(),
                     "sensitive_credential_read".into(),
                 ],
+                ..DecisionOrigin::default()
             },
         );
         let node = g.nodes.iter().find(|n| n.kind == "command").unwrap();
@@ -1220,6 +1926,7 @@ mod tests {
             agent: Some("Claude Code".into()),
             project: Some("/Users/someone/my-app".into()),
             rules: vec!["ok_rule".into(), "not a rule".into()],
+            ..DecisionOrigin::default()
         }
         .write_attrs(&mut attrs);
         assert!(!attrs.contains_key("agent"));
@@ -1589,6 +2296,266 @@ mod tests {
         assert_eq!(span.oldest_at_ms, Some(1_000));
         assert_eq!(span.newest_at_ms, Some(7_000));
         assert_eq!(Graph::new().record_span(), RecordSpan::default());
+    }
+
+    fn plain_node(at: usize) -> Node {
+        Node {
+            id: format!("n{at:06}"),
+            kind: "category".into(),
+            label: String::new(),
+            attrs: BTreeMap::new(),
+        }
+    }
+
+    /// `capped` says the record holds as many nodes as it keeps, and only
+    /// then. FAILS ON REVERT: with the line gone the full record reads as
+    /// one that still keeps everything.
+    #[test]
+    fn record_span_capped_is_true_only_at_max_nodes() {
+        assert!(!record().record_span().capped);
+        let mut g = record();
+        let room = Graph::MAX_NODES - g.nodes.len();
+        g.nodes.extend((0..room - 1).map(plain_node));
+        assert_eq!(g.nodes.len(), Graph::MAX_NODES - 1);
+        assert!(!g.record_span().capped, "one short of the cap");
+        g.nodes.push(plain_node(room));
+        let span = g.record_span();
+        assert!(span.capped, "at the cap the oldest are being dropped");
+        assert_eq!(span.decisions, 7, "the cap changes no count");
+    }
+
+    /// Each reason's outcomes add up to its count, name only outcomes that
+    /// happened, and follow the outcome filter like the count does.
+    #[test]
+    fn reasons_by_outcome_add_up_to_the_reason_count() {
+        let page = record().decisions_page(&DecisionQuery::default());
+        assert!(!page.reasons.is_empty());
+        for reason in &page.reasons {
+            assert_eq!(
+                reason.by_outcome.values().sum::<usize>(),
+                reason.count,
+                "{}",
+                reason.key
+            );
+            assert!(reason.by_outcome.values().all(|count| *count > 0));
+        }
+        let tmp = page
+            .reasons
+            .iter()
+            .find(|reason| reason.key == "rule:tmp_execution")
+            .expect("the world-writable reason");
+        assert_eq!(tmp.by_outcome, BTreeMap::from([("flagged_ran", 2usize)]));
+        let filtered = record().decisions_page(&DecisionQuery {
+            outcome: Some("refused_before_run".into()),
+            ..DecisionQuery::default()
+        });
+        assert_eq!(filtered.reasons.len(), 1);
+        assert_eq!(
+            filtered.reasons[0].by_outcome,
+            BTreeMap::from([("refused_before_run", 1usize)])
+        );
+    }
+
+    /// A reason carries the whole explanation of its NEWEST decision, never
+    /// more than the record keeps.
+    #[test]
+    fn reasons_explanation_is_the_newest_decisions() {
+        let mut g = record();
+        g.ingest_verdict_with_origin(
+            "s2",
+            0,
+            "bash /tmp/third.sh",
+            &verdict(
+                "review",
+                "references world-writable directory: /tmp/third; dangerous command: bash",
+            ),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 50_000),
+            &origin(&["tmp_execution"]),
+        );
+        let long = format!(
+            "references world-writable directory: /tmp/{}",
+            "x".repeat(400)
+        );
+        g.ingest_verdict_with_origin(
+            "s2",
+            1,
+            "bash /tmp/long.sh",
+            &verdict("review", &long),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 40_000),
+            &origin(&["tmp_execution"]),
+        );
+        let page = g.decisions_page(&DecisionQuery::default());
+        let tmp = page
+            .reasons
+            .iter()
+            .find(|reason| reason.key == "rule:tmp_execution")
+            .expect("the world-writable reason");
+        assert_eq!(tmp.count, 4);
+        assert_eq!(
+            tmp.explanation,
+            "references world-writable directory: /tmp/third; dangerous command: bash"
+        );
+        assert_eq!(tmp.words, "references world-writable directory: /tmp/third");
+        let mut only_long = record();
+        only_long.ingest_verdict_with_origin(
+            "s2",
+            1,
+            "bash /tmp/long.sh",
+            &verdict("review", &long),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 40_000),
+            &origin(&["tmp_execution"]),
+        );
+        let page = only_long.decisions_page(&DecisionQuery::default());
+        let tmp = page
+            .reasons
+            .iter()
+            .find(|reason| reason.key == "rule:tmp_execution")
+            .expect("the world-writable reason");
+        assert!(tmp.explanation.chars().count() <= MAX_REASON_EXPLANATION_CHARS);
+        assert!(tmp
+            .explanation
+            .starts_with("references world-writable directory: /tmp/xxx"));
+    }
+
+    /// The grouping key of a fixed node is pinned: a saved `reason=` link
+    /// keeps opening the same group after this change.
+    #[test]
+    fn reason_keys_are_unchanged_by_v2() {
+        let mut g = record();
+        g.ingest_verdict_with_origin(
+            "s3",
+            0,
+            "curl http://203.0.113.9/",
+            &verdict(
+                "review",
+                "no rule matched (absence of a match is not a safety judgement); \
+                 argument `203.0.113.9` did not come from you: it arrived in a result \
+                 from Read earlier in this session",
+            ),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 60_000),
+            &origin(&[]),
+        );
+        let page = g.decisions_page(&DecisionQuery {
+            limit: 50,
+            ..DecisionQuery::default()
+        });
+        let key_of = |command: &str| {
+            page.items
+                .iter()
+                .find(|item| item.command == command)
+                .map(|item| item.reason_key.clone())
+                .expect(command)
+        };
+        assert_eq!(key_of("bash /tmp/run.sh"), "rule:tmp_execution");
+        assert_eq!(key_of("rm -rf /"), "rule:destructive_command");
+        assert_eq!(
+            key_of("MCP · fs · {\"path\":\"/etc/passwd\"}"),
+            "text:653fec6848b9e3b9"
+        );
+        assert_eq!(key_of("curl http://203.0.113.9/"), "text:2c1ddeb4188a2616");
+        let keys: Vec<&str> = page.reasons.iter().map(|r| r.key.as_str()).collect();
+        assert!(keys.contains(&"text:2c1ddeb4188a2616"));
+        assert!(keys.contains(&"rule:sensitive_credential_read"));
+    }
+
+    /// Every session the list knows, counted the way a page filtered to it
+    /// counts it.
+    #[test]
+    fn recent_sessions_counts_match_decisions_page() {
+        let g = record();
+        let sessions = g.recent_sessions(50);
+        assert_eq!(sessions.len(), 2);
+        for summary in &sessions {
+            let all = g.decisions_page(&DecisionQuery {
+                flagged_only: false,
+                session: Some(summary.id.clone()),
+                ..DecisionQuery::default()
+            });
+            assert_eq!(all.total, summary.facts.decisions, "{}", summary.id);
+            assert_eq!(all.by_outcome, summary.by_outcome, "{}", summary.id);
+            assert_eq!(
+                all.sessions.get(&summary.id),
+                Some(&summary.facts),
+                "{}",
+                summary.id
+            );
+            let flagged = g.decisions_page(&DecisionQuery {
+                session: Some(format!("session:{}", summary.id)),
+                ..DecisionQuery::default()
+            });
+            assert_eq!(flagged.total, summary.facts.flagged, "{}", summary.id);
+        }
+        let s1 = sessions.iter().find(|s| s.id == "s1").expect("s1");
+        assert_eq!(s1.facts.decisions, 6);
+        assert_eq!(s1.facts.flagged, 4, "a check by hand is not flagged");
+        assert_eq!(s1.facts.agent.as_deref(), Some("claude-code"));
+        assert_eq!(s1.facts.project.as_deref(), Some("my-app"));
+        assert_eq!(s1.by_outcome.get("checked_only"), Some(&1));
+    }
+
+    /// An anchor whose commands were pruned, and `session:host`, are not
+    /// sessions anybody worked in.
+    #[test]
+    fn recent_sessions_leave_out_anchors_and_the_host_session() {
+        let mut g = record();
+        for id in ["session:host", "session:s7"] {
+            g.upsert_node(Node {
+                id: id.into(),
+                kind: "session".into(),
+                label: id.trim_start_matches("session:").into(),
+                attrs: BTreeMap::new(),
+            });
+        }
+        g.ingest_verdict_with_context(
+            "host",
+            0,
+            "observed on the host",
+            &verdict("allow", ""),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 90_000),
+        );
+        let ids: Vec<String> = g.recent_sessions(50).into_iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["mcp:innerwarden".to_string(), "s1".to_string()]);
+    }
+
+    /// Newest last decision first, a session with no recorded time last,
+    /// and never more than asked for.
+    #[test]
+    fn recent_sessions_are_newest_first_and_bounded() {
+        let mut g = record();
+        g.ingest_verdict_with_context(
+            "old",
+            0,
+            "ls",
+            &verdict("allow", ""),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 500),
+        );
+        g.ingest_verdict_with_context(
+            "newest",
+            0,
+            "ls",
+            &verdict("allow", ""),
+            context(DecisionMode::Monitor, DecisionOutcome::Allowed, 80_000),
+        );
+        g.ingest_verdict_with_context(
+            "untimed",
+            0,
+            "ls",
+            &verdict("allow", ""),
+            DecisionContext {
+                mode: DecisionMode::Monitor,
+                outcome: DecisionOutcome::Allowed,
+                recorded_at_ms: None,
+            },
+        );
+        let ids: Vec<String> = g.recent_sessions(50).into_iter().map(|s| s.id).collect();
+        assert_eq!(
+            ids,
+            ["newest", "mcp:innerwarden", "s1", "old", "untimed"].map(String::from)
+        );
+        let two: Vec<String> = g.recent_sessions(2).into_iter().map(|s| s.id).collect();
+        assert_eq!(two, ["newest", "mcp:innerwarden"].map(String::from));
+        assert!(g.recent_sessions(0).is_empty());
+        assert!(Graph::new().recent_sessions(20).is_empty());
     }
 
     #[test]

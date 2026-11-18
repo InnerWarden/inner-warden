@@ -113,6 +113,18 @@ fn run_uninstall(exe: &Path, home: &Path, extra: &[&str]) -> Output {
     cmd.env("USERPROFILE", home);
     // Keep the run offline and non-interactive whatever the environment holds.
     cmd.env_remove("INNERWARDEN_CONFIG_DIR");
+    // Run as the person, not from inside an AI agent's shell (the suite may
+    // itself run under one): uninstall is refused there.
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+        "GEMINI_CLI",
+        "OPENCLAW_SHELL",
+    ] {
+        cmd.env_remove(marker);
+    }
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // The guard is dropped before the wait, so a slow child never blocks

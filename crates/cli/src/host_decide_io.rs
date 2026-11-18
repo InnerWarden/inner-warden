@@ -1,0 +1,1272 @@
+//! The one request the hook makes to the Active Defence agent on its host
+//! (see `host_decide`): a POST over TLS to this host's loopback, bounded as a
+//! whole, held to the key the agent publishes.
+//!
+//! The connection is believed only when the certificate the server presents
+//! carries the public key whose SHA-256 is in the key file, and the server
+//! proves it holds that key in the handshake. No certificate authority is
+//! consulted. Outside a jail the key file is [`AGENT_TLS_SPKI_PATH`], a file
+//! of root's that no other account can write; inside one it is only the copy
+//! the launcher read from there with the host's real owners and handed in
+//! read-only ([`JAIL_SPKI_PIN_PATH`]). With no key, or one that cannot be
+//! believed, nothing is sent. Against another account on the host that takes
+//! the port while the agent is down, this is the defence; the agent inside
+//! the jail controls what the hook reads, and a key it sees proves nothing
+//! about it.
+//!
+//! [`AGENT_TLS_SPKI_PATH`]: innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH
+//! [`JAIL_SPKI_PIN_PATH`]: innerwarden_agent_guard::identity::JAIL_SPKI_PIN_PATH
+//!
+//! A failure of any kind (no key, no connection, a key that does not match,
+//! a slow server, a broken answer) returns `None`, and the hook decides as it
+//! did before it asked.
+
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use innerwarden_agent_guard::identity::{
+    parse_spki_pin, InstanceDecideRequest, MAX_INSTANCE_ANSWER_BYTES, MAX_SPKI_PIN_BYTES,
+};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, SignatureScheme};
+use sha2::{Digest, Sha256};
+
+/// The most bytes of a response head read.
+const MAX_HEAD_BYTES: usize = 8 * 1024;
+
+/// Ask the host about one command: the key from `key` at `path`, then
+/// [`ask`]. `None` with no key: no request is made.
+pub fn consult(
+    url: &str,
+    request: &InstanceDecideRequest,
+    key: crate::host_decide::KeyFile,
+    path: &Path,
+    timeout: Duration,
+) -> Option<(u16, Vec<u8>)> {
+    let pin = match key {
+        crate::host_decide::KeyFile::Jail => read_jail_pin(path),
+        crate::host_decide::KeyFile::Host => read_pin(path),
+    }?;
+    let body = serde_json::to_vec(request).ok()?;
+    ask(url, &body, timeout, &pin)
+}
+
+/// POST `body` as JSON to `url` (`https://127.0.0.1:<port><path>` only),
+/// within `timeout` from connect to the end of the answer, believing only a
+/// server whose key hashes to `pin`. The status and up to
+/// [`MAX_INSTANCE_ANSWER_BYTES`] + 1 bytes of the body (more than the most an
+/// answer may be, so a longer one is seen to be longer), or `None`.
+///
+/// The bound is on the request as a whole. A timeout on each socket call is
+/// not one: the TLS library reads the handshake and each record in a loop of
+/// its own, and a server that sends one byte at a time, each inside the
+/// timeout, would hold that loop for as long as it liked. So the exchange
+/// runs on a thread of its own and is waited for until the deadline only;
+/// past it the hook goes on without an answer, and the thread, still held to
+/// its socket timeouts, ends with the process (the hook runs once per call).
+pub fn ask(url: &str, body: &[u8], timeout: Duration, pin: &[u8; 32]) -> Option<(u16, Vec<u8>)> {
+    post(
+        url,
+        body,
+        timeout,
+        pin,
+        Wanted {
+            status: 200,
+            cap: MAX_INSTANCE_ANSWER_BYTES + 1,
+        },
+    )
+    .ok()
+}
+
+/// Why [`post`] got no answer, said so a person can act on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoAnswer {
+    /// The address is not `https://127.0.0.1:<port><path>`.
+    NotLoopback,
+    /// Nothing listens there: the agent is not running, or restarting.
+    Refused,
+    /// The connection could not be made for another reason.
+    Unreachable,
+    /// A server answered there with a key that is not the host's.
+    WrongKey,
+    /// The connection was made and then failed.
+    Failed,
+    /// No whole answer before the deadline.
+    TimedOut,
+    /// What came back is not an HTTP answer.
+    Broken,
+}
+
+impl std::fmt::Display for NoAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            NoAnswer::NotLoopback => "the agent's address is not this host's loopback",
+            NoAnswer::Refused => {
+                "nothing listens at the agent's address: InnerWarden Pro is not running"
+            }
+            NoAnswer::Unreachable => "the agent's address cannot be reached",
+            NoAnswer::WrongKey => "the server at the agent's address does not hold the host's key",
+            NoAnswer::Failed => "the connection to the agent failed",
+            NoAnswer::TimedOut => "the agent did not answer in time",
+            NoAnswer::Broken => "the agent's answer could not be read",
+        })
+    }
+}
+
+/// What a failed socket call says of the exchange: a TLS refusal of the
+/// server's key, a deadline, or another failure.
+fn no_answer(error: &std::io::Error) -> NoAnswer {
+    let tls = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>());
+    match (tls, error.kind()) {
+        (Some(rustls::Error::InvalidCertificate(_)), _) => NoAnswer::WrongKey,
+        (_, std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => NoAnswer::TimedOut,
+        _ => NoAnswer::Failed,
+    }
+}
+
+/// The answer the launcher reads of its request for a system scope: the
+/// body of a `202`, up to one byte more than an answer may hold.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn system_scope_wanted() -> Wanted {
+    Wanted {
+        status: innerwarden_agent_guard::identity::SYSTEM_SCOPE_TAKEN,
+        cap: innerwarden_agent_guard::identity::MAX_SYSTEM_SCOPE_ANSWER_BYTES + 1,
+    }
+}
+
+/// Which answer's body a request reads: the one of `status`, up to `cap`
+/// bytes. Any other status is done once its head is read, with no body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wanted {
+    pub status: u16,
+    pub cap: usize,
+}
+
+/// [`ask`] for any route of the agent: POST `body` as JSON to `url`
+/// (`https://127.0.0.1:<port><path>` only) within `timeout`, believing only
+/// a server whose key hashes to `pin`, and read the body of the answer
+/// `wanted` names. The launcher asks for a system scope with it.
+pub fn post(
+    url: &str,
+    body: &[u8],
+    timeout: Duration,
+    pin: &[u8; 32],
+    wanted: Wanted,
+) -> Result<(u16, Vec<u8>), NoAnswer> {
+    let deadline = Instant::now() + timeout;
+    let (url, body, pin) = (url.to_string(), body.to_vec(), *pin);
+    let (answered, answer) = std::sync::mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("host-decide".into())
+        .spawn(move || {
+            let _ = answered.send(exchange(&url, &body, deadline, &pin, wanted));
+        })
+        .map_err(|_| NoAnswer::Failed)?;
+    answer
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .map_err(|_| NoAnswer::TimedOut)?
+}
+
+/// The request itself, each socket call held to what is left before
+/// `deadline`. [`ask`] holds the whole of it to the deadline.
+fn exchange(
+    url: &str,
+    body: &[u8],
+    deadline: Instant,
+    pin: &[u8; 32],
+    wanted: Wanted,
+) -> Result<(u16, Vec<u8>), NoAnswer> {
+    let remaining = || {
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or(NoAnswer::TimedOut)
+    };
+    let (addr, path) = loopback_target(url).ok_or(NoAnswer::NotLoopback)?;
+    let tcp = TcpStream::connect_timeout(&addr, remaining()?).map_err(|e| match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => NoAnswer::Refused,
+        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => NoAnswer::TimedOut,
+        _ => NoAnswer::Unreachable,
+    })?;
+    let _ = tcp.set_nodelay(true);
+    let connection = rustls::ClientConnection::new(
+        Arc::new(client_config(*pin).ok_or(NoAnswer::Failed)?),
+        ServerName::IpAddress(addr.ip().into()),
+    )
+    .map_err(|_| NoAnswer::Failed)?;
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Accept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let failed = |e: std::io::Error| no_answer(&e);
+    stream
+        .sock
+        .set_write_timeout(Some(remaining()?))
+        .map_err(failed)?;
+    stream
+        .sock
+        .set_read_timeout(Some(remaining()?))
+        .map_err(failed)?;
+    stream.write_all(head.as_bytes()).map_err(failed)?;
+    stream.write_all(body).map_err(failed)?;
+    stream.flush().map_err(failed)?;
+    let mut seen = Vec::new();
+    let mut chunk = [0u8; 2048];
+    let done = |seen: &[u8]| match parse_response(seen, true, wanted) {
+        Parsed::Done(status, body) => Ok((status, body)),
+        _ => Err(NoAnswer::Broken),
+    };
+    loop {
+        if let Parsed::Done(status, body) = parse_response(&seen, false, wanted) {
+            return Ok((status, body));
+        }
+        stream
+            .sock
+            .set_read_timeout(Some(remaining()?))
+            .map_err(failed)?;
+        let eof = match stream.read(&mut chunk) {
+            Ok(0) => true,
+            Ok(n) => {
+                seen.extend_from_slice(&chunk[..n]);
+                false
+            }
+            // A server that closes without saying so still ended its answer.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => true,
+            Err(e) => return Err(no_answer(&e)),
+        };
+        if eof || seen.len() > MAX_HEAD_BYTES + wanted.cap + 64 {
+            return done(&seen);
+        }
+    }
+}
+
+/// Whether [`post`] can reach `url`: `https://127.0.0.1:<port><path>`.
+// Its caller, `contain --identity`, is Linux-only; the test runs everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn pinnable(url: &str) -> bool {
+    loopback_target(url).is_some()
+}
+
+/// `https://127.0.0.1:<port><path>` and nothing else: the address and the
+/// path, or `None`.
+fn loopback_target(url: &str) -> Option<(SocketAddr, String)> {
+    let rest = url.strip_prefix("https://127.0.0.1:")?;
+    let split = rest.find('/')?;
+    let port: u16 = rest[..split].parse().ok()?;
+    let path = &rest[split..];
+    if path.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    Some((
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+        path.to_string(),
+    ))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Parsed {
+    /// More bytes are needed.
+    Incomplete,
+    /// Not an HTTP response.
+    Broken,
+    /// The status and the body.
+    Done(u16, Vec<u8>),
+}
+
+/// PURE. Read an HTTP/1.1 response from `seen` (`eof`: nothing more will
+/// come). Any status but the one `wanted` names is done as soon as the head
+/// is read, with no body. That one's body is read by its `Content-Length`,
+/// its chunks, or to the end, and kept up to `wanted.cap` bytes (one more
+/// than an answer may hold, so a longer one is seen to be longer).
+fn parse_response(seen: &[u8], eof: bool, wanted: Wanted) -> Parsed {
+    let cap = wanted.cap;
+    let Some(head_end) = find(seen, b"\r\n\r\n") else {
+        return if eof || seen.len() > MAX_HEAD_BYTES {
+            Parsed::Broken
+        } else {
+            Parsed::Incomplete
+        };
+    };
+    if head_end > MAX_HEAD_BYTES {
+        return Parsed::Broken;
+    }
+    let Ok(head) = std::str::from_utf8(&seen[..head_end]) else {
+        return Parsed::Broken;
+    };
+    let mut lines = head.split("\r\n");
+    let status = lines.next().and_then(|line| {
+        let mut parts = line.splitn(3, ' ');
+        let version = parts.next()?;
+        let code = parts.next()?;
+        (version.starts_with("HTTP/1.") && code.len() == 3)
+            .then(|| code.parse::<u16>().ok())
+            .flatten()
+    });
+    let Some(status) = status else {
+        return Parsed::Broken;
+    };
+    if status != wanted.status {
+        return Parsed::Done(status, Vec::new());
+    }
+    let mut length: Option<usize> = None;
+    let mut chunked = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (name, value) = (name.trim(), value.trim());
+        if name.eq_ignore_ascii_case("content-length") {
+            match value.parse::<usize>() {
+                Ok(n) => length = Some(n),
+                Err(_) => return Parsed::Broken,
+            }
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value.to_ascii_lowercase().contains("chunked");
+        }
+    }
+    let body = &seen[head_end + 4..];
+    if chunked {
+        return match dechunk(body, cap) {
+            Some((decoded, true)) => Parsed::Done(status, decoded),
+            Some((decoded, false)) if eof || decoded.len() >= cap => {
+                let mut decoded = decoded;
+                decoded.truncate(cap);
+                Parsed::Done(status, decoded)
+            }
+            Some(_) => Parsed::Incomplete,
+            None => Parsed::Broken,
+        };
+    }
+    let wanted_len = length.map_or(cap, |n| n.min(cap));
+    if body.len() >= wanted_len {
+        return Parsed::Done(status, body[..wanted_len].to_vec());
+    }
+    if eof {
+        return Parsed::Done(status, body.to_vec());
+    }
+    Parsed::Incomplete
+}
+
+/// The bytes of a chunked body read so far (at most `cap`), and whether its
+/// last chunk was read. `None` when it is not a chunked body.
+fn dechunk(mut body: &[u8], cap: usize) -> Option<(Vec<u8>, bool)> {
+    let mut out = Vec::new();
+    loop {
+        let Some(line_end) = find(body, b"\r\n") else {
+            return Some((out, false));
+        };
+        let size_text = std::str::from_utf8(&body[..line_end]).ok()?;
+        let size_text = size_text.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_text, 16).ok()?;
+        let data = &body[line_end + 2..];
+        if size == 0 {
+            return Some((out, true));
+        }
+        // The size and its line end: a size near the top of `usize` is not a
+        // body this reads, and is never added to unchecked.
+        let whole = size.checked_add(2)?;
+        if data.len() < whole {
+            out.extend_from_slice(&data[..data.len().min(size)]);
+            out.truncate(cap);
+            return Some((out, false));
+        }
+        out.extend_from_slice(&data[..size]);
+        if out.len() >= cap {
+            out.truncate(cap);
+            return Some((out, false));
+        }
+        body = &data[whole..];
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// PURE. Whether a certificate carries the key `pin` names: the SHA-256 of
+/// its DER `SubjectPublicKeyInfo`.
+pub fn spki_matches(certificate: &[u8], pin: &[u8; 32]) -> bool {
+    let der = CertificateDer::from(certificate);
+    let Ok(cert) = webpki::EndEntityCert::try_from(&der) else {
+        return false;
+    };
+    let spki = cert.subject_public_key_info();
+    Sha256::digest(spki.as_ref()).as_slice() == pin.as_slice()
+}
+
+/// Believes the one server whose key `pin` names, and checks the handshake's
+/// signatures the way rustls does, so the server must hold that key.
+#[derive(Debug)]
+struct PinnedKey {
+    pin: [u8; 32],
+    provider: Arc<CryptoProvider>,
+}
+
+impl ServerCertVerifier for PinnedKey {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        if spki_matches(end_entity.as_ref(), &self.pin) {
+            Ok(ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+fn client_config(pin: [u8; 32]) -> Option<rustls::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = Arc::new(PinnedKey {
+        pin,
+        provider: provider.clone(),
+    });
+    Some(
+        rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .ok()?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth(),
+    )
+}
+
+/// The key in `path`, when the file is root's (uid 0, as the host's real
+/// owners are seen outside a jail) and neither it nor a directory above it
+/// can be written by another account (the rule `contain` holds its sandbox
+/// backend to, without the execute bit). The launcher reads the key with this
+/// before it hands it into a jail.
+#[cfg(unix)]
+pub fn read_pin(path: &Path) -> Option<[u8; 32]> {
+    use std::os::unix::fs::MetadataExt;
+    let root = |uid: u32| uid == 0;
+    let facts = crate::contain_io::backend_facts(path)?;
+    if !crate::contain_io::root_file_trusted(&facts, &root) {
+        return None;
+    }
+    let file = innerwarden_safe_io::open_no_follow(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !innerwarden_safe_io::is_regular_file(&meta)
+        || !root(meta.uid())
+        || meta.mode() & 0o022 != 0
+        || meta.len() > MAX_SPKI_PIN_BYTES as u64
+    {
+        return None;
+    }
+    read_key_bytes(file)
+}
+
+#[cfg(not(unix))]
+pub fn read_pin(_path: &Path) -> Option<[u8; 32]> {
+    None
+}
+
+/// The key the launcher handed into the jail at `path`: one open, no link
+/// followed, no wait on a FIFO, a regular file, no more than a key's bytes.
+/// No owner is judged: inside the jail it is the launcher's word, as the
+/// record beside it is, and the host's answer is still held to it in the
+/// handshake.
+pub fn read_jail_pin(path: &Path) -> Option<[u8; 32]> {
+    let file = innerwarden_safe_io::open_no_follow(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !innerwarden_safe_io::is_regular_file(&meta) || meta.len() > MAX_SPKI_PIN_BYTES as u64 {
+        return None;
+    }
+    read_key_bytes(file)
+}
+
+/// At most one byte more than a key, from an open file, as a key.
+fn read_key_bytes(file: std::fs::File) -> Option<[u8; 32]> {
+    let mut bytes = Vec::new();
+    file.take(MAX_SPKI_PIN_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    parse_spki_pin(&bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::PublicKeyData;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread::JoinHandle;
+
+    const ID: &str = "7f3a9c1e42b84d0e9a6c5f1b2d3e4a59";
+
+    /// What the hook's request reads: a 200's body, to one byte more than an
+    /// answer may hold.
+    const HOOK: Wanted = Wanted {
+        status: 200,
+        cap: MAX_INSTANCE_ANSWER_BYTES + 1,
+    };
+
+    /// [`super::parse_response`] for the hook's request.
+    fn parse_response(seen: &[u8], eof: bool) -> Parsed {
+        super::parse_response(seen, eof, HOOK)
+    }
+
+    /// A certificate for 127.0.0.1 and its key, made for the test.
+    fn certificate() -> (CertificateDer<'static>, PrivateKeyDer<'static>, [u8; 32]) {
+        let made = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert = made.cert.der().clone();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(made.signing_key.serialize_der()));
+        let pin: [u8; 32] = Sha256::digest(made.signing_key.subject_public_key_info()).into();
+        (cert, key, pin)
+    }
+
+    /// A request read to the end its `content-length` names.
+    fn whole_request(seen: &[u8]) -> bool {
+        let Some(end) = find(seen, b"\r\n\r\n") else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&seen[..end]);
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        seen.len() >= end + 4 + length
+    }
+
+    /// A TLS server on an ephemeral loopback port that reads ONE request in
+    /// full, waits `delay`, and answers `response`. Its URL, the pin of its
+    /// key, and the request it read (`None` when no handshake completed).
+    fn server(
+        response: Vec<u8>,
+        delay: Duration,
+    ) -> (String, [u8; 32], JoinHandle<Option<Vec<u8>>>) {
+        let (cert, key, pin) = certificate();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().ok()?;
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+            let connection = rustls::ServerConnection::new(Arc::new(config)).ok()?;
+            let mut stream = rustls::StreamOwned::new(connection, tcp);
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !whole_request(&seen) {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return (!seen.is_empty()).then_some(seen),
+                    Ok(n) => seen.extend_from_slice(&buf[..n]),
+                }
+            }
+            std::thread::sleep(delay);
+            let _ = stream.write_all(&response);
+            let _ = stream.flush();
+            stream.conn.send_close_notify();
+            let _ = stream.flush();
+            Some(seen)
+        });
+        (
+            format!("https://127.0.0.1:{port}/api/agent/instance-decide"),
+            pin,
+            handle,
+        )
+    }
+
+    fn ok_json(body: &serde_json::Value) -> Vec<u8> {
+        let body = serde_json::to_vec(body).unwrap();
+        let mut out = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn answer_for(instance: &str) -> serde_json::Value {
+        serde_json::json!({
+            "v": 1, "instance_id": instance, "agent_type": "claude-code", "trust": "confined",
+            "trust_source": "host", "verdict": "allow", "deciding_layer": "agent_type",
+            "profile": "claude-code", "decision_id": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+            "withheld": null, "signals_mismatch": false, "conflict": false, "incident_id": null,
+        })
+    }
+
+    fn request() -> InstanceDecideRequest {
+        innerwarden_agent_guard::identity::instance_decide_request(
+            ID,
+            Some("claude-code"),
+            Some("s-1"),
+            "curl http://203.0.113.9/x",
+            &["bare_ip_fetch"],
+            false,
+        )
+        .unwrap()
+    }
+
+    /// The request is posted whole to the route, as JSON, and the
+    /// contract's answer for this instance is read.
+    #[test]
+    fn the_request_is_posted_to_the_route_and_the_answer_is_read() {
+        let (url, pin, server) = server(ok_json(&answer_for(ID)), Duration::ZERO);
+        let body = serde_json::to_vec(&request()).unwrap();
+        let reply = ask(&url, &body, Duration::from_secs(5), &pin);
+        let seen = server.join().unwrap().expect("a request");
+        let text = String::from_utf8_lossy(&seen);
+        assert!(
+            text.starts_with("POST /api/agent/instance-decide HTTP/1.1\r\n"),
+            "{text}"
+        );
+        assert!(
+            text.to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "{text}"
+        );
+        let sent: InstanceDecideRequest =
+            serde_json::from_slice(&seen[find(&seen, b"\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(sent, request());
+        let reply = crate::host_decide::read_reply(reply, Some(ID));
+        assert!(
+            matches!(reply, crate::host_decide::HostReply::Answer(_)),
+            "{reply:?}"
+        );
+    }
+
+    /// Under a profile that asks about every command, the request about an
+    /// allow goes whole as version 2, and the host's refusal comes back in an
+    /// answer of the same shape as ever.
+    #[test]
+    fn an_allow_asked_about_goes_as_version_2_and_a_refusal_reads() {
+        let mut refusal = answer_for(ID);
+        refusal["verdict"] = serde_json::json!("deny");
+        refusal["deciding_layer"] = serde_json::json!("general");
+        refusal["profile"] = serde_json::Value::Null;
+        refusal["withheld"] = serde_json::json!("a_word_never_heard");
+        let (url, pin, server) = server(ok_json(&refusal), Duration::ZERO);
+        let request = innerwarden_agent_guard::identity::instance_decide_request_v2(
+            ID,
+            Some("claude-code"),
+            Some("s-1"),
+            "curl https://example.com",
+            &[],
+            false,
+            innerwarden_agent_guard::identity::Verdict::Allow,
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&request).unwrap();
+        let reply = ask(&url, &body, Duration::from_secs(5), &pin);
+        let seen = server.join().unwrap().expect("a request");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&seen[find(&seen, b"\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(sent["v"], 2);
+        assert_eq!(sent["hook_verdict"], "allow");
+        assert_eq!(
+            serde_json::from_value::<InstanceDecideRequest>(sent).unwrap(),
+            request
+        );
+        let crate::host_decide::HostReply::Answer(answer) =
+            crate::host_decide::read_reply(reply, Some(ID))
+        else {
+            panic!("the contract's answer");
+        };
+        assert_eq!(answer.v, 1, "the answer keeps its version");
+        assert_eq!(
+            answer.verdict,
+            innerwarden_agent_guard::identity::Verdict::Deny
+        );
+        assert_eq!(answer.withheld.as_deref(), Some("a_word_never_heard"));
+    }
+
+    /// A server of the agent's own that holds the right key would still have
+    /// to answer for this instance: an allow for another is not taken.
+    #[test]
+    fn a_forged_allow_for_another_instance_is_recorded_as_invalid() {
+        let (url, pin, server) = server(
+            ok_json(&answer_for("fedcba9876543210fedcba9876543210")),
+            Duration::ZERO,
+        );
+        let reply = ask(&url, br#"{}"#, Duration::from_secs(5), &pin);
+        server.join().unwrap();
+        assert_eq!(
+            crate::host_decide::read_reply(reply, Some(ID)),
+            crate::host_decide::HostReply::Invalid
+        );
+    }
+
+    /// The launcher's request for a system scope, over the same connection
+    /// held to the host's key: the 202's body is read to its bound and says
+    /// the admission; a server holding another key gets nothing through, so
+    /// nothing is admitted.
+    ///
+    /// FAILS ON REVERT: read the body of a 200 only (the hook's `Wanted`) and
+    /// the admission is never read.
+    #[test]
+    fn the_answer_of_a_scope_request_is_read_from_its_202_over_the_key() {
+        use innerwarden_agent_guard::identity::{
+            system_scope_request, SystemScopeAdmission, MAX_SYSTEM_SCOPE_ANSWER_BYTES,
+            SYSTEM_SCOPE_TAKEN,
+        };
+        let body = br#"{"placed":true,"unit":"u","admitted":true,"note":"Kernel protection is on for this session."}"#;
+        let mut answer = format!(
+            "HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        answer.extend_from_slice(body);
+        let wanted = Wanted {
+            status: SYSTEM_SCOPE_TAKEN,
+            cap: MAX_SYSTEM_SCOPE_ANSWER_BYTES + 1,
+        };
+        // What the launcher asks for is this.
+        assert_eq!(system_scope_wanted(), wanted);
+        let request = serde_json::to_vec(&system_scope_request(ID).unwrap()).unwrap();
+        let (url, pin, taken) = server(answer.clone(), Duration::ZERO);
+        let (status, read) = post(&url, &request, Duration::from_secs(5), &pin, wanted).unwrap();
+        let seen = taken.join().unwrap().expect("a request");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&seen[find(&seen, b"\r\n\r\n").unwrap() + 4..]).unwrap();
+        assert_eq!(
+            sent,
+            serde_json::json!({ "instance": ID }),
+            "the request is unchanged"
+        );
+        assert_eq!(status, 202);
+        let admission = SystemScopeAdmission::read(&read);
+        assert!(admission.admitted);
+        assert_eq!(
+            admission.note.as_deref(),
+            Some("Kernel protection is on for this session.")
+        );
+        // Another key: no request goes through and nothing is read.
+        let (url, _pin, refused) = server(answer, Duration::ZERO);
+        let (_, _, other) = certificate();
+        assert_eq!(
+            post(&url, &request, Duration::from_secs(5), &other, wanted),
+            Err(NoAnswer::WrongKey)
+        );
+        let _ = refused.join();
+        assert!(pinnable("https://127.0.0.1:8787/api/agent/contain-scope"));
+        assert!(!pinnable("https://localhost:8787/api/agent/contain-scope"));
+    }
+
+    /// A request that gets no answer says why, in words a person can act
+    /// on: nothing listening (the agent is down or restarting), a server
+    /// with another key, no answer in time, an answer that is not HTTP, an
+    /// address that is not the loopback. The launcher prints it, and the
+    /// launch admits nothing.
+    ///
+    /// FAILS ON REVERT: map every failure to one kind in `exchange` (the
+    /// one sentence the launcher printed before) and the lines below that
+    /// say otherwise fail.
+    #[test]
+    fn a_request_that_gets_no_answer_says_why() {
+        let wanted = system_scope_wanted();
+        let request = br#"{"instance":"x"}"#;
+        let free = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let (_, _, pin) = certificate();
+        assert_eq!(
+            post(
+                &format!("https://127.0.0.1:{free}/api/agent/contain-scope"),
+                request,
+                Duration::from_secs(5),
+                &pin,
+                wanted
+            ),
+            Err(NoAnswer::Refused)
+        );
+        assert_eq!(
+            post(
+                "https://localhost:8787/x",
+                request,
+                Duration::from_secs(5),
+                &pin,
+                wanted
+            ),
+            Err(NoAnswer::NotLoopback)
+        );
+        let (url, pin, slow) = server(
+            b"HTTP/1.1 202 Accepted\r\n\r\n".to_vec(),
+            Duration::from_secs(1),
+        );
+        assert_eq!(
+            post(&url, request, Duration::from_millis(300), &pin, wanted),
+            Err(NoAnswer::TimedOut)
+        );
+        let _ = slow.join();
+        let (url, pin, broken) = server(b"not http at all".to_vec(), Duration::ZERO);
+        assert_eq!(
+            post(&url, request, Duration::from_secs(5), &pin, wanted),
+            Err(NoAnswer::Broken)
+        );
+        let _ = broken.join();
+        for (why, said) in [
+            (NoAnswer::Refused, "InnerWarden Pro is not running"),
+            (NoAnswer::WrongKey, "does not hold the host's key"),
+            (NoAnswer::TimedOut, "did not answer in time"),
+        ] {
+            assert!(why.to_string().contains(said), "{why:?}");
+        }
+    }
+
+    /// A server whose key is not the published one gets no request through
+    /// and gives no answer: the decision is today's, with no label.
+    ///
+    /// FAILS ON REVERT: believe any certificate in `PinnedKey` and the
+    /// server's allow is read.
+    #[test]
+    fn a_certificate_the_key_file_does_not_name_gives_no_answer() {
+        let (url, _pin, server) = server(ok_json(&answer_for(ID)), Duration::ZERO);
+        let (_, _, other) = certificate();
+        let reply = ask(&url, br#"{}"#, Duration::from_secs(5), &other);
+        assert_eq!(reply, None);
+        assert_eq!(
+            server.join().unwrap(),
+            None,
+            "no request reached the server"
+        );
+        assert_eq!(
+            crate::host_decide::read_reply(reply, Some(ID)),
+            crate::host_decide::HostReply::None
+        );
+    }
+
+    /// A host that answers late is not waited for past the bound.
+    #[test]
+    fn a_slow_host_is_withheld_within_the_bound() {
+        let (url, pin, server) = server(ok_json(&answer_for(ID)), Duration::from_millis(1_500));
+        let started = Instant::now();
+        let reply = ask(&url, br#"{}"#, Duration::from_millis(400), &pin);
+        let took = started.elapsed();
+        assert_eq!(reply, None);
+        assert!(took < Duration::from_millis(1_000), "{took:?}");
+        let _ = server.join();
+    }
+
+    /// How long a dripping server keeps a connection going, and its pace:
+    /// each byte comes well inside the bound, the whole far outside it.
+    const DRIP_EVERY: Duration = Duration::from_millis(100);
+    const DRIP_FOR: Duration = Duration::from_millis(3_000);
+
+    /// Send `bytes` one at a time at [`DRIP_EVERY`], for [`DRIP_FOR`] at most.
+    fn drip(tcp: &mut std::net::TcpStream, bytes: impl IntoIterator<Item = u8>) {
+        let started = Instant::now();
+        for byte in bytes {
+            if started.elapsed() > DRIP_FOR || tcp.write_all(&[byte]).is_err() {
+                return;
+            }
+            let _ = tcp.flush();
+            std::thread::sleep(DRIP_EVERY);
+        }
+    }
+
+    /// A process of the host that took the port, without the key, answers
+    /// the client's hello with a record header and then one byte at a time,
+    /// each inside the bound: the hook gives no answer within the bound, as
+    /// a whole, before any certificate is even seen.
+    ///
+    /// FAILS ON REVERT: bound each socket call instead of the request, and
+    /// the handshake is held for as long as the server drips.
+    #[test]
+    fn a_server_that_drips_its_hello_is_withheld_within_the_bound() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().ok()?;
+            let mut hello = [0u8; 4096];
+            let _ = tcp.read(&mut hello).ok()?;
+            // A handshake record that says 16 KiB follow, then its body.
+            drip(
+                &mut tcp,
+                [0x16, 0x03, 0x03, 0x40, 0x00]
+                    .into_iter()
+                    .chain(std::iter::repeat(0)),
+            );
+            Some(())
+        });
+        let (_, _, pin) = certificate();
+        let url = format!("https://127.0.0.1:{port}/api/agent/instance-decide");
+        let started = Instant::now();
+        let reply = ask(&url, br#"{}"#, Duration::from_millis(400), &pin);
+        let took = started.elapsed();
+        assert_eq!(reply, None);
+        assert!(took < Duration::from_millis(1_000), "{took:?}");
+    }
+
+    /// The server with the published key drips its answer, one encrypted
+    /// byte at a time, each inside the bound: the answer is not waited for
+    /// past the bound.
+    ///
+    /// FAILS ON REVERT: bound each socket call instead of the request.
+    #[test]
+    fn a_server_that_drips_its_answer_is_withheld_within_the_bound() {
+        let (cert, key, pin) = certificate();
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let response = ok_json(&answer_for(ID));
+        std::thread::spawn(move || {
+            let (mut tcp, _) = listener.accept().ok()?;
+            tcp.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+            let mut connection = rustls::ServerConnection::new(config).ok()?;
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 4096];
+            {
+                let mut stream = rustls::Stream::new(&mut connection, &mut tcp);
+                while !whole_request(&seen) {
+                    let n = stream.read(&mut buf).ok()?;
+                    if n == 0 {
+                        return None;
+                    }
+                    seen.extend_from_slice(&buf[..n]);
+                }
+            }
+            connection.writer().write_all(&response).ok()?;
+            let mut sealed = Vec::new();
+            while connection.wants_write() {
+                connection.write_tls(&mut sealed).ok()?;
+            }
+            drip(&mut tcp, sealed);
+            Some(())
+        });
+        let url = format!("https://127.0.0.1:{port}/api/agent/instance-decide");
+        let started = Instant::now();
+        let reply = ask(&url, br#"{}"#, Duration::from_millis(400), &pin);
+        let took = started.elapsed();
+        assert_eq!(reply, None);
+        assert!(took < Duration::from_millis(1_000), "{took:?}");
+    }
+
+    /// A `serve` of Community, or an older Active Defence, has no such route:
+    /// its 404 is a status, and no answer.
+    #[test]
+    fn a_404_is_no_answer() {
+        let (url, pin, server) = server(
+            b"HTTP/1.1 404 Not Found\r\ncontent-length: 9\r\n\r\nnot found".to_vec(),
+            Duration::ZERO,
+        );
+        let reply = ask(&url, br#"{}"#, Duration::from_secs(5), &pin);
+        server.join().unwrap();
+        assert_eq!(reply, Some((404, Vec::new())));
+        assert_eq!(
+            crate::host_decide::read_reply(reply, Some(ID)),
+            crate::host_decide::HostReply::None
+        );
+    }
+
+    /// With no key file, nothing is sent: not even a connection is opened.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_key_file_sends_nothing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        for key in [
+            crate::host_decide::KeyFile::Jail,
+            crate::host_decide::KeyFile::Host,
+        ] {
+            let reply = consult(
+                &format!("https://127.0.0.1:{port}/api/agent/instance-decide"),
+                &request(),
+                key,
+                &dir.path().join("agent-tls.spki"),
+                Duration::from_millis(400),
+            );
+            assert_eq!(reply, None);
+        }
+        let accepted = AtomicUsize::new(0);
+        if listener.accept().is_ok() {
+            accepted.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "a connection was opened"
+        );
+    }
+
+    /// A key file that is the user's own (anything of theirs could write it)
+    /// is no key.
+    #[cfg(unix)]
+    #[test]
+    fn a_key_file_of_the_users_own_is_no_key() {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let path = dir.join("agent-tls.spki");
+        std::fs::write(
+            &path,
+            innerwarden_agent_guard::identity::spki_pin_line(&[7u8; 32]),
+        )
+        .unwrap();
+        assert_eq!(read_pin(&path), None);
+    }
+
+    /// Inside the jail the launcher's copy is read with the record's rules:
+    /// one open, no link, a regular file, bounded, and no owner judged (in
+    /// the jail's user namespace an owner says nothing). The host's rule
+    /// still refuses the same file.
+    ///
+    /// FAILS ON REVERT: hold the jail's copy to the host's owner rule, and
+    /// a jail on a host whose bwrap is not setuid never asks.
+    #[cfg(unix)]
+    #[test]
+    fn the_jails_copy_of_the_key_is_read_as_the_record_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let pin = [7u8; 32];
+        let path = dir.join("agent-tls.spki");
+        std::fs::write(
+            &path,
+            innerwarden_agent_guard::identity::spki_pin_line(&pin),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        assert_eq!(read_jail_pin(&path), Some(pin));
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            assert_eq!(read_pin(&path), None, "the host's file must be root's");
+        }
+
+        let link = dir.join("link.spki");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert_eq!(read_jail_pin(&link), None, "a link is not followed");
+        let fifo = dir.join("fifo.spki");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid C string and a mode.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_jail_pin(&fifo), None, "a FIFO is not waited on");
+        let long = dir.join("long.spki");
+        std::fs::write(&long, "a".repeat(MAX_SPKI_PIN_BYTES + 1)).unwrap();
+        assert_eq!(read_jail_pin(&long), None);
+        let garbage = dir.join("garbage.spki");
+        std::fs::write(&garbage, "not a key\n").unwrap();
+        assert_eq!(read_jail_pin(&garbage), None);
+        assert_eq!(read_jail_pin(&dir.join("absent.spki")), None);
+        assert_eq!(read_jail_pin(&dir), None, "a folder is no key");
+    }
+
+    #[test]
+    fn the_target_is_this_hosts_loopback_over_tls_only() {
+        assert_eq!(
+            loopback_target("https://127.0.0.1:8787/api/agent/instance-decide"),
+            Some((
+                "127.0.0.1:8787".parse().unwrap(),
+                "/api/agent/instance-decide".to_string()
+            ))
+        );
+        for other in [
+            "http://127.0.0.1:8787/api/agent/instance-decide",
+            "https://localhost:8787/api/agent/instance-decide",
+            "https://10.0.0.5:8787/x",
+            "https://127.0.0.1.evil.example:8787/x",
+            "https://127.0.0.1:8787",
+            "https://127.0.0.1:99999/x",
+            "https://127.0.0.1:8787/x y",
+        ] {
+            assert_eq!(loopback_target(other), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_response_is_read_by_its_length_its_chunks_or_its_end() {
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\n", false),
+            Parsed::Incomplete
+        );
+        assert_eq!(parse_response(b"garbage\r\n\r\n", false), Parsed::Broken);
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}", false),
+            Parsed::Done(200, b"{}".to_vec())
+        );
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n{}", false),
+            Parsed::Incomplete
+        );
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n{}", true),
+            Parsed::Done(200, b"{}".to_vec())
+        );
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n{\r\n1\r\n}\r\n0\r\n\r\n", false),
+            Parsed::Done(200, b"{}".to_vec())
+        );
+        assert_eq!(
+            parse_response(b"HTTP/1.1 200 OK\r\n\r\n{}", true),
+            Parsed::Done(200, b"{}".to_vec())
+        );
+        assert_eq!(
+            parse_response(b"HTTP/1.1 503 Busy\r\n\r\n", false),
+            Parsed::Done(503, Vec::new())
+        );
+        let mut long = b"HTTP/1.1 200 OK\r\nContent-Length: 9000\r\n\r\n".to_vec();
+        long.extend(std::iter::repeat_n(b'a', 5000));
+        match parse_response(&long, false) {
+            Parsed::Done(200, body) => assert_eq!(body.len(), MAX_INSTANCE_ANSWER_BYTES + 1),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Another route reads the body of the status it names, to its own cap,
+    /// and no other: the launcher's request for a system scope reads a
+    /// 202's body, and a 200 there is no answer of that route.
+    #[test]
+    fn another_route_reads_the_body_of_its_own_status_only() {
+        let taken = Wanted {
+            status: 202,
+            cap: 8,
+        };
+        assert_eq!(
+            super::parse_response(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}",
+                false,
+                taken
+            ),
+            Parsed::Done(202, b"{}".to_vec())
+        );
+        assert_eq!(
+            super::parse_response(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}",
+                false,
+                taken
+            ),
+            Parsed::Done(200, Vec::new())
+        );
+        match super::parse_response(
+            b"HTTP/1.1 202 Accepted\r\nContent-Length: 20\r\n\r\n0123456789abcdefghij",
+            false,
+            taken,
+        ) {
+            Parsed::Done(202, body) => assert_eq!(body, b"01234567"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            super::parse_response(
+                b"HTTP/1.1 202 Accepted\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+                false,
+                taken
+            ),
+            Parsed::Done(202, b"{}".to_vec())
+        );
+        // The hook's request is what it was: a 202 there has no body.
+        assert_eq!(
+            parse_response(
+                b"HTTP/1.1 202 Accepted\r\nContent-Length: 2\r\n\r\n{}",
+                false
+            ),
+            Parsed::Done(202, Vec::new())
+        );
+    }
+
+    /// A chunk size near the top of `usize` is not added to: the body is
+    /// broken or read to the cap, and the hook never aborts on it.
+    ///
+    /// FAILS ON REVERT: add 2 to the size unchecked, and the size overflows
+    /// (a panic here; in a release build, an abort of the hook).
+    #[test]
+    fn a_chunk_size_at_the_top_of_usize_is_no_answer_and_no_abort() {
+        let head = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for size in ["ffffffffffffffff", "fffffffffffffffe"] {
+            let mut seen = head.to_vec();
+            seen.extend_from_slice(format!("{size}\r\nx").as_bytes());
+            for eof in [false, true] {
+                assert_eq!(parse_response(&seen, eof), Parsed::Broken, "{size} {eof}");
+            }
+        }
+        // Larger than an answer may be and still addable: read to the cap,
+        // and an answer that long is no answer.
+        let mut seen = head.to_vec();
+        seen.extend_from_slice(b"fffffffffffffffd\r\n");
+        seen.extend(std::iter::repeat_n(b'a', MAX_INSTANCE_ANSWER_BYTES + 10));
+        match parse_response(&seen, false) {
+            Parsed::Done(200, body) => assert_eq!(body.len(), MAX_INSTANCE_ANSWER_BYTES + 1),
+            other => panic!("{other:?}"),
+        }
+        // More digits than a size can hold is not a size.
+        let mut seen = head.to_vec();
+        seen.extend_from_slice(b"1ffffffffffffffff\r\nx");
+        assert_eq!(parse_response(&seen, true), Parsed::Broken);
+    }
+
+    #[test]
+    fn the_key_matches_only_its_own_certificate() {
+        let (cert, _, pin) = certificate();
+        assert!(spki_matches(cert.as_ref(), &pin));
+        let (_, _, other) = certificate();
+        assert!(!spki_matches(cert.as_ref(), &other));
+        assert!(!spki_matches(b"not a certificate", &pin));
+    }
+}

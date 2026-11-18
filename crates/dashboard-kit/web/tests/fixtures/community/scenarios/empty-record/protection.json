@@ -1,0 +1,37 @@
+{
+  "alerts": {
+    "channels": 0
+  },
+  "flagged": {
+    "credential_read": 0,
+    "domain_fetch": 0,
+    "ran": 0
+  },
+  "generated_at_ms": 1790690700000,
+  "jail": {
+    "advice": [],
+    "available": true,
+    "backend": "sandbox-exec",
+    "checked_at": "2026-09-29T14:01:00Z",
+    "checks_pass": true
+  },
+  "observe": {
+    "available": true,
+    "installed": true
+  },
+  "platform": {
+    "os": "macos"
+  },
+  "record": {
+    "recording": true
+  },
+  "schema_version": 1,
+  "second_opinion": {
+    "configured": false
+  },
+  "suppress": {
+    "allow": 5,
+    "mute_categories": 1,
+    "mute_rules": 1
+  }
+}

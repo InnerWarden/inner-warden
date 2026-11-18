@@ -1773,30 +1773,51 @@
   "next_cursor": "1790506800000-636d643a37653061353566312d64656d6f2d343030302d383030302d3030303030303030303030323a38",
   "reasons": [
     {
+      "by_outcome": {
+        "flagged_ran": 15
+      },
       "count": 15,
+      "detail": "/tmp/",
       "key": "rule:tmp_execution",
       "short": "world-writable folder",
       "words": "references world-writable directory: /tmp/"
     },
     {
+      "by_outcome": {
+        "unsafe_may_have_run": 1,
+        "would_have_refused": 3
+      },
       "count": 4,
+      "detail": "download piped to shell…",
       "key": "rule:download_and_execute",
       "short": "download run by a shell",
       "words": "dangerous pipeline: download piped to shell interpreter"
     },
     {
+      "by_outcome": {
+        "refused_before_run": 2,
+        "would_have_refused": 1
+      },
       "count": 3,
+      "detail": ".ssh/",
       "key": "rule:sensitive_credential_read",
       "short": "credential path",
       "words": "reads sensitive credential path: `.ssh/`"
     },
     {
+      "by_outcome": {
+        "flagged_ran": 2
+      },
       "count": 2,
+      "detail": "bidi override",
       "key": "rule:obfuscated_command",
       "short": "obfuscated command",
       "words": "obfuscation pattern: bidi override"
     },
     {
+      "by_outcome": {
+        "flagged_ran": 1
+      },
       "count": 1,
       "key": "rule:ATR-2026-099",
       "mute": "innerwarden mute ATR-2026-099",
@@ -1804,18 +1825,28 @@
       "words": "[ATR-2026-099] high-risk tool called without a confirmation step"
     },
     {
+      "by_outcome": {
+        "flagged_ran": 1
+      },
       "count": 1,
       "key": "rule:credential_hunt",
       "short": "search for credentials",
       "words": "searches the filesystem for credentials (`grep -r password`) rather than naming one"
     },
     {
+      "by_outcome": {
+        "flagged_ran": 1
+      },
       "count": 1,
+      "detail": "force push rewrites…",
       "key": "rule:dangerous_command",
       "short": "dangerous command",
       "words": "dangerous command: force push rewrites shared history"
     },
     {
+      "by_outcome": {
+        "refused_before_run": 1
+      },
       "count": 1,
       "key": "rule:destructive_command",
       "short": "destructive command",
@@ -1824,6 +1855,7 @@
   ],
   "reasons_distinct": 10,
   "record": {
+    "capped": false,
     "checked": 1,
     "decisions": 96,
     "flagged": 30,
@@ -1860,8 +1892,8 @@
     }
   },
   "suppress": {
-    "allow": 2,
-    "mute_categories": 0,
+    "allow": 5,
+    "mute_categories": 1,
     "mute_rules": 1
   },
   "total": 30

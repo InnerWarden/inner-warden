@@ -1806,12 +1806,12 @@ export const ACTIVE_DEFENCE_COPY = {
   offer: {
     badge: "Host protection",
     title: "Extend protection from agent intent to the host.",
-    body: "Community screens supported agent actions before execution. On supported Linux hosts, Active Defence adds independent host telemetry, incident triage and evidence-backed response, including eBPF enforcement and the kernel Execution Gate. macOS and Windows host protection is planned, not implied by this dashboard.",
+    body: "Community screens supported agent actions before execution. On supported Linux hosts, InnerWarden Pro adds independent host telemetry, incident triage and evidence-backed response, including eBPF enforcement and the kernel Execution Gate. macOS and Windows host protection is planned, not implied by this dashboard.",
   },
   installed: {
     badge: "Installed on this host",
-    title: "Active Defence is installed on this host.",
-    body: "This page covers the agent layer only. Host telemetry, incident triage and the kernel Execution Gate belong to Active Defence, and this dashboard runs unprivileged, so it cannot read kernel state and does not report here what is running or what is turned on. Ask the host itself:",
+    title: "InnerWarden Pro is installed on this host.",
+    body: "This page covers the agent layer only. Host telemetry, incident triage and the kernel Execution Gate belong to InnerWarden Pro, and this dashboard runs unprivileged, so it cannot read kernel state and does not report here what is running or what is turned on. Ask the host itself:",
     /**
      * Verified against a real installation before being written down: on
      * `iw-challenge`, `innerwarden get status` exits 0 and lists the host
@@ -1842,7 +1842,7 @@ function ActiveDefenceCard({ installed }: { installed: boolean }) {
         aria-labelledby="active-defence-title"
       >
         <div className="flex flex-wrap items-center gap-2">
-          <p className={EYEBROW_SLATE}>InnerWarden Active Defence</p>
+          <p className={EYEBROW_SLATE}>InnerWarden Pro</p>
           <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600">{copy.badge}</span>
         </div>
         <h2 id="active-defence-title" className="mt-2 text-lg font-semibold text-slate-950">{copy.title}</h2>
@@ -1856,7 +1856,7 @@ function ActiveDefenceCard({ installed }: { installed: boolean }) {
       <div className="flex flex-col gap-4 sm:flex-row sm:items-center">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <p className={EYEBROW_SLATE}>InnerWarden Active Defence</p>
+            <p className={EYEBROW_SLATE}>InnerWarden Pro</p>
             <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600">{ACTIVE_DEFENCE_COPY.offer.badge}</span>
           </div>
           <h2 id="active-defence-title" className="mt-2 text-lg font-semibold text-slate-950">{ACTIVE_DEFENCE_COPY.offer.title}</h2>
@@ -1868,7 +1868,7 @@ function ActiveDefenceCard({ installed }: { installed: boolean }) {
           rel="noreferrer"
           className="inline-flex shrink-0 items-center justify-center rounded-lg border border-slate-300 bg-white px-4 py-2 text-sm font-semibold text-slate-800 shadow-sm hover:border-slate-400 hover:bg-slate-50"
         >
-          Explore Active Defence <span className="ml-1" aria-hidden="true">↗</span>
+          Explore InnerWarden Pro <span className="ml-1" aria-hidden="true">↗</span>
         </a>
       </div>
     </aside>

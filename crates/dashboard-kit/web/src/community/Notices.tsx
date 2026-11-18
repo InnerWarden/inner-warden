@@ -2,11 +2,9 @@ import type { DashboardMeta } from "../api";
 import { TechnicalOnly } from "../components/TechnicalDetail";
 import { When } from "../components/When";
 import { formatCount } from "../presentation";
-import { fetchRecordHealth, type RecordHealth } from "./api";
-import { usePolled } from "./poll";
-
-/** How often every page re-asks whether decisions are being recorded. */
-export const RECORD_HEALTH_POLL_MS = 30_000;
+import type { RecordHealth } from "./api";
+import { useSource } from "./store";
+import { onPlainClick } from "./ui/blocks";
 
 /**
  * The notices at the top of every Community page, in both views, in order of
@@ -14,9 +12,28 @@ export const RECORD_HEALTH_POLL_MS = 30_000;
  * is true right now), decisions are not being recorded (amber: a person has
  * to fix it), a newer InnerWarden is installed (slate: nothing is wrong).
  */
-export function Notices({ meta, health }: { meta?: DashboardMeta; health?: RecordHealth }) {
-  const exposed = meta?.exposed === true;
-  const outage = health !== undefined && !health.recording;
+export function Notices({
+  meta,
+  health,
+  inBand = false,
+  onOverview,
+}: {
+  meta?: DashboardMeta;
+  health?: RecordHealth;
+  /**
+   * The page's verdict band already says the dashboard is open to the
+   * network (row 1), or that decisions are not recorded (row 2): what the
+   * band says is not said twice. The band says one thing: open to the
+   * network wins, so "not recording" is still said here when both are true.
+   * The update line is always said.
+   */
+  inBand?: boolean;
+  /** Open the Overview, where the band says the step: a plain click stays in the page. */
+  onOverview?: () => void;
+}) {
+  const exposedNow = meta?.exposed === true;
+  const exposed = !inBand && exposedNow;
+  const outage = health !== undefined && !health.recording && !(inBand && !exposedNow);
   const update = meta?.update_pending === true && typeof meta.update_note === "string" && meta.update_note.trim().length > 0;
   if (!exposed && !outage && !update) return null;
   return (
@@ -25,8 +42,9 @@ export function Notices({ meta, health }: { meta?: DashboardMeta; health?: Recor
         <div role="alert" data-exposed="" className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm leading-6 text-rose-900">
           <p className="font-semibold">This dashboard is open to the network with no sign-in.</p>
           <p>
-            Anyone who can reach this machine can read your agents' commands. Restart it without{" "}
-            <code className="font-mono">--bind</code> to keep it on this machine.
+            Anyone who can reach this machine can read your agents' commands. Stop the dashboard and start it again with{" "}
+            <code className="font-mono">innerwarden dashboard</code>: without <code className="font-mono">--expose</code> it answers on this machine only.{" "}
+            <a href="?view=overview" onClick={onPlainClick(onOverview)} className="font-semibold underline underline-offset-2">Open the Overview</a>
           </p>
         </div>
       ) : null}
@@ -63,8 +81,11 @@ export function Notices({ meta, health }: { meta?: DashboardMeta; health?: Recor
   );
 }
 
-/** The notices, with the record's health polled for them. */
-export function PageNotices({ meta }: { meta?: DashboardMeta }) {
-  const health = usePolled(fetchRecordHealth, RECORD_HEALTH_POLL_MS, "record-health");
-  return <Notices meta={meta} health={health.data} />;
+/** The pages whose verdict band carries the exposed and not-recording facts. */
+export const BAND_ROUTES: readonly string[] = ["overview"];
+
+/** The notices, with the record's health read from the source the header shares. */
+export function PageNotices({ meta, route, onOverview }: { meta?: DashboardMeta; route?: string; onOverview?: () => void }) {
+  const health = useSource("record-health");
+  return <Notices meta={meta} health={health.data} inBand={route !== undefined && BAND_ROUTES.includes(route)} onOverview={onOverview} />;
 }

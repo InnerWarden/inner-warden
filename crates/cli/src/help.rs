@@ -153,8 +153,10 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              screens the shell command inside it. A file tool (Write, Edit, MultiEdit,\n  \
              NotebookEdit) is judged on the file it changes: a privileged one (agent\n  \
              settings, the guard's configuration, shell startup files, credentials) is\n  \
-             refused, any other passes at once. Exit 2 blocks the call, exit 0 allows\n  \
-             it. Any other tool call always allows, so it is never wedged.\n\
+             refused, any other passes at once. A read tool (Read, Grep, Glob) is judged\n  \
+             as the shell read of the same files: a private key or a stored login is\n  \
+             refused. Exit 2 blocks the call, exit 0 allows it. Any other tool call\n  \
+             always allows, so it is never wedged.\n\
              \n  \
              --block-review   block `review` verdicts too (default: deny only)\n  \
              --monitor        record every command and never block"
@@ -214,7 +216,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         }
         "contain" => format!(
             "{p} contain [--monitor|--enforce|--block-review] [--project DIR]\n  \
-             \x20              [--deny-read GLOB] [--dry-run] [--setup] -- <command...>\n  \
+             \x20              [--deny-read GLOB] [--dry-run] [--setup] [--identity]\n  \
+             \x20              -- <command...>\n  \
              Run <command> inside a filesystem/namespace JAIL with the guard hook armed\n  \
              INSIDE it (Linux bwrap, macOS sandbox-exec). Your API key and the project's\n  \
              secrets stay outside what the jailed command can read.\n\
@@ -222,7 +225,98 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              --project DIR     the directory the jailed command may write (default: cwd)\n  \
              --deny-read GLOB  one more path the jail must not expose\n  \
              --dry-run         print the jail that would be built and run nothing\n  \
-             --setup           arm the in-jail hook only\n\
+             --setup           arm the in-jail hook only\n  \
+             --identity        (Linux) record the run as an identified instance\n\
+             \n  \
+             With --identity the hook inside the jail tells this instance apart from\n  \
+             the agent's other runs. Read from inside the jail, the instance is at most\n  \
+             `observed`: confined needs a witness outside the jail. On Linux, where\n  \
+             InnerWarden Pro runs on the same host, the hook asks it about a shell\n  \
+             command sent to review and the host decides whether a profile rule that\n  \
+             relaxes your general rules applies; the stricter verdict wins. Without it\n  \
+             the relaxation is recorded and not applied. MCP tools and file edits keep\n  \
+             your general rules. A profile of the system file (schema 2) can say\n  \
+             ask_host = \"every_command\": the hook then asks the host about every\n  \
+             shell command it does not refuse itself, one your general rules allow\n  \
+             too, and only a refusal of the host's own makes an allowed command\n  \
+             stricter. A command the hook refuses is never asked about.\n\
+             \n  \
+             A profile of schema 2, in either file, can say when its jail starts and\n  \
+             what of the home it hides. start = \"only_when_admitted\": the agent\n  \
+             starts only once InnerWarden Pro on the host admitted the jail; otherwise\n  \
+             contain says what to check and exits 2, having started nothing (a launcher\n  \
+             stopped while it waits starts nothing either). hide_home: home paths the\n  \
+             jail covers with an empty mount, or denies on macOS; a path that leads\n  \
+             outside the home, or over the project, the guard or the agent's\n  \
+             settings, stops the launch, and a read-only path under one is left out\n  \
+             and said (the hidden path wins). A note\n  \
+             from the host about the jail is printed as `innerwarden contain: <note>`.\n  \
+             A Linux jail shows the host's resolver file read-only, so names resolve as\n  \
+             on the host. Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws or a\n  \
+             link inside one, a --deny-read path, InnerWarden's own folder) is a link,\n  \
+             the place it leads to is hidden too, wherever the jail shows it (on macOS\n  \
+             also outside your home), and the folders above it are pinned, so the\n  \
+             agent cannot rename it away. On macOS the project, ~/.config and each\n  \
+             folder the jail may write above a place it hides (a folder between the\n  \
+             project and a --deny-read path among them) cannot be renamed, removed or\n  \
+             replaced from inside the jail (it still writes in them and sets their\n  \
+             mode and times), and contain makes each first where it is missing, and\n  \
+             says so. A link never hides\n  \
+             what the jail needs (the guard, the agent's settings, the project, and\n  \
+             for a --deny-read path a read-only path), and a --deny-read link never\n  \
+             hides what the jail runs on: contain leaves such a place, says so, and\n  \
+             the jail still starts. A\n  \
+             hidden dotdir, InnerWarden's folder or, with --identity on Linux, the\n  \
+             launcher's records folder or a profile's hidden home path, whose way goes\n  \
+             through a link in a folder the jail writes stops the launch (replace that\n  \
+             link with what it leads to).\n  \
+             On Linux, InnerWarden's own folder kept as a link stops the launch\n  \
+             (replace it with the folder it leads to), and a project path over where\n  \
+             it leads is refused. A profile's read-only path (extra_ro) is read-only\n  \
+             where it leads, and shows nothing the jail would not show otherwise:\n  \
+             contain follows a link in a folder a jail writes only to a place the\n  \
+             jail shows already (and says the link itself is not held), and a path\n  \
+             that would show more, or that lies in a place the jail hides, is left\n  \
+             out, said on one line, and the jail still starts. On macOS it is denied\n  \
+             writing as named and where it leads. A Linux jail binds it, and each\n  \
+             folder it pins, from a descriptor opened just before bwrap starts; a\n  \
+             bwrap that cannot (no --ro-bind-fd: before 0.10.0, or without its\n  \
+             distribution's security update) leaves out one in a folder a jail\n  \
+             writes, and says so, and a profile with start = \"only_when_admitted\"\n  \
+             then does not start. A linked worktree's git folders are shown only\n  \
+             where git made them for this project (they name the project back, in a\n  \
+             git repository of yours, with every folder on the way there and no\n  \
+             link on it, never your home, a folder above it, a place the jail hides\n  \
+             or a hidden folder of your home that the jail does not show on Linux\n  \
+             and lets no program write on macOS, such as ~/.kube); otherwise, or\n  \
+             where one lies over where InnerWarden's folder or a hidden dotdir\n  \
+             leads, contain says why, the jail starts, and git in it sees no\n  \
+             repository there on Linux, and cannot commit there on macOS (it may\n  \
+             still read it). A worktree of a repository in the project or in a\n  \
+             folder every jail writes (~/.config, ~/.local) is shown by that\n  \
+             folder, with no bind of its own unless a read-only path holds it. A\n  \
+             Linux jail binds the others from\n  \
+             descriptors too where bwrap can (an older bwrap binds them by name).\n  \
+             A repository made with --separate-git-dir is not shown, unless the jail\n  \
+             shows its folder anyway. On Linux, with --identity, Claude\n  \
+             Code's settings file is kept in ~/.claude/.claude.json\n  \
+             between launches (your own ~/.claude.json is not shown), and each jail has\n  \
+             an empty ~/.claude/sessions and ~/.claude/backups of its own, so two jails\n  \
+             at once do not write the same session file. That is for Claude Code's\n  \
+             folder at ~/.claude; where a jail cannot have them of its own, contain\n  \
+             says so.\n\
+             \n  \
+             On Linux, where the host takes it, every jail starts its programs under\n  \
+             a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
+             TIOCLINUX, the terminal commands that push input into your terminal,\n  \
+             and new btrfs or bcachefs subvolumes or snapshots, which would show the\n  \
+             files the jail hides; contain says so when the host does not take it.\n  \
+             A snapshot made before the jail started, in a folder the jail shows,\n  \
+             still holds the files it hides: only new ones are refused.\n  \
+             With --identity it also refuses new user namespaces and joining other\n  \
+             namespaces, ends a 32-bit program, and drops every capability: turn the\n  \
+             agent's own sandbox off inside the jail. The jail shares the host's\n  \
+             network, so an X server's abstract socket stays reachable from it.\n\
              \n  \
              Everything after `--` is the jailed command line, including its own\n  \
              `--help`."
@@ -292,6 +386,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              --clear   delete the local record"
         ),
         "observe" => crate::observe_io::help_text(),
+        "openclaw" => crate::openclaw_guard_io::help_text(),
         "llm" => format!(
             "{p} llm [status]\n\
              {p} llm set --url <chat-completions-URL> --model <name> [--provider azure]\n\
@@ -306,8 +401,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         ),
         "host" => format!(
             "{p} host <command> [args...]\n  \
-             Run a command in the Active Defence host layer, even when this binary has\n  \
-             a verb by the same name. Without Active Defence installed it says so\n  \
+             Run a command in the InnerWarden Pro host layer, even when this binary has\n  \
+             a verb by the same name. Without InnerWarden Pro installed it says so\n  \
              rather than guessing."
         ),
         _ => return None,
@@ -347,6 +442,23 @@ mod tests {
         }
     }
 
+    /// The hook's usage names every class of tool it judges: the read tools
+    /// are judged since 1.6.13, and "any other tool call always allows" was
+    /// said over them.
+    /// FAILS ON REVERT of the read-tool sentence in the `hook` usage.
+    #[test]
+    fn the_hook_help_names_the_read_tools() {
+        let text = usage("hook", &[]).expect("hook has a usage");
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(
+                "A read tool (Read, Grep, Glob) is judged as the shell read of the same files: \
+                 a private key or a stored login is refused."
+            ),
+            "{text}"
+        );
+    }
+
     /// THE CARVE-OUT, and the reason a blanket intercept was rejected.
     ///
     /// `check`'s argument is the command being screened. `check rm -rf /
@@ -374,6 +486,447 @@ mod tests {
         }
         // Nothing at all reads from stdin, which is not a help request either.
         assert!(!is_help_request("check", &[]));
+    }
+
+    /// The public words for the jail's seccomp filter say what it covers and
+    /// where it stops, in `contain --help` and in the README alike: the two
+    /// terminal commands by name and the refusal of new btrfs and bcachefs
+    /// subvolumes and snapshots in every jail, only where the host takes
+    /// it, the identified jail's capability drop and its end of 32-bit
+    /// programs, the plain jail's rules on those programs, what a jail that
+    /// falls back says, that a snapshot made before the jail started still
+    /// holds the files it hides, the X server left reachable, and the kernels
+    /// before 4.8.
+    ///
+    /// FAILS ON REVERT: say again that every jail refuses injecting
+    /// keystrokes, or that a plain jail gets only the keystroke rule or only
+    /// the terminal rule, put the subvolume refusal back under `--identity`
+    /// alone, drop the bcachefs words or what a fallback says, or drop the
+    /// limit on snapshots made before the jail started.
+    #[test]
+    fn the_contain_help_and_the_readme_say_what_the_filter_covers() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "where the host takes it",
+            "every jail starts its programs under a seccomp filter in the style of Flatpak that refuses TIOCSTI and TIOCLINUX, the terminal commands that push input into your terminal, and new btrfs or bcachefs subvolumes or snapshots, which would show the files the jail hides;",
+            "contain says so when the host does not take it",
+            "A snapshot made before the jail started, in a folder the jail shows, still holds the files it hides: only new ones are refused.",
+            "ends a 32-bit program, and drops every capability",
+            "With --identity it also refuses new user namespaces and joining other namespaces,",
+            "The jail shares the host's network, so an X server's abstract socket stays reachable",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        // The README and the two pages its detail moved to: the user docs.
+        let readme = flat(
+            &[
+                include_str!("../../../README.md"),
+                include_str!("../../../docs/features.md"),
+                include_str!("../../../docs/agent-identity.md"),
+            ]
+            .join("\n"),
+        );
+        for said in [
+            "On Linux, where the host takes it, every jail starts its programs under a seccomp filter that refuses `TIOCSTI` and `TIOCLINUX`, the terminal commands that push input into your terminal, and new btrfs or bcachefs subvolumes and snapshots.",
+            "Its programs run with no capability, also when `contain` itself runs as root.",
+            "in the style of Flatpak: no new user namespaces, no joining other namespaces, no new btrfs or bcachefs subvolumes or snapshots,",
+            "is ended at its first call in an identified jail",
+            "gets only the terminal rule and the subvolume rule, and applies them to 32-bit programs too",
+            "Every jail refuses new subvolumes and snapshots because a snapshot of the project would show the files the jail hides in it",
+            "a build for an architecture other than x86_64 or aarch64",
+            "naming the keystrokes and the snapshots its programs can then make",
+            "`contain` says user namespaces stay open, joining other namespaces too, and that a 32-bit program runs in it; the terminal rule and the subvolume rule still hold.",
+            "Limits: the filter covers those commands only.",
+            "It refuses only new subvolumes and snapshots: a snapshot made before the jail started, in a folder the jail shows, still holds the files the jail hides (`.env`, `secrets/`, each `--deny-read` path), and a program in the jail can read them there.",
+            "a desktop's X server among them",
+            "On a kernel older than 4.8",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        for text in [&help, &readme] {
+            assert!(!text.contains("refuses injecting keystrokes"));
+            assert!(!text.contains("gets only the keystroke rule"));
+            assert!(!text.contains("gets only the terminal rule,"));
+            assert!(!text.contains("joining other namespaces, and new btrfs"));
+            assert!(!text.contains("covers those terminal commands only"));
+        }
+    }
+
+    /// The contain help and the README say what `ask_host = "every_command"`
+    /// asks, what may make an allowed command stricter, and that the host
+    /// reads the system file too.
+    ///
+    /// FAILS ON REVERT: drop the `ask_host` sentence from the contain help,
+    /// or put back the README's "your suppressions ... still win" and its
+    /// warning about an older `innerwarden` alone.
+    #[test]
+    fn the_contain_help_and_the_readme_say_what_every_command_asks() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "A profile of the system file (schema 2) can say ask_host = \"every_command\"",
+            "asks the host about every shell command it does not refuse itself, one your general rules allow too",
+            "only a refusal of the host's own makes an allowed command stricter",
+            "A command the hook refuses is never asked about.",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        // The README and the two pages its detail moved to: the user docs.
+        let readme = flat(
+            &[
+                include_str!("../../../README.md"),
+                include_str!("../../../docs/features.md"),
+                include_str!("../../../docs/agent-identity.md"),
+            ]
+            .join("\n"),
+        );
+        for said in [
+            "A review the hook would block on its line is still asked about, because the host may relax it",
+            "your suppressions included, is made stricter only by a refusal of the host's own",
+            "and so does an older InnerWarden Pro on the host, which reads the same file",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        assert!(!readme.contains("your suppressions and your own profiles file still win"));
+    }
+
+    /// The contain help and the README say what a jail profile of schema 2
+    /// adds: when the jail starts (and the exit 2 with nothing started),
+    /// what of the home it hides, the host's note, and the resolver file
+    /// every Linux jail shows, with its limit.
+    ///
+    /// FAILS ON REVERT: drop any of these from the contain help or the
+    /// README and the line that names it fails.
+    #[test]
+    fn the_contain_help_and_the_readme_say_when_a_jail_starts_and_what_it_hides() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "start = \"only_when_admitted\": the agent starts only once InnerWarden Pro on the host admitted the jail",
+            "contain says what to check and exits 2, having started nothing",
+            "hide_home: home paths the jail covers with an empty mount, or denies on macOS",
+            "is printed as `innerwarden contain: <note>`",
+            "A Linux jail shows the host's resolver file read-only",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        // The README and the two pages its detail moved to: the user docs.
+        let readme = flat(
+            &[
+                include_str!("../../../README.md"),
+                include_str!("../../../docs/features.md"),
+                include_str!("../../../docs/agent-identity.md"),
+            ]
+            .join("\n"),
+        );
+        for said in [
+            "`start = \"only_when_admitted\"`: `contain --identity` starts the agent only once InnerWarden Pro on the host has admitted the jail",
+            "and exits 2 with nothing started",
+            "`hide_home = [\".cache/git/credential\"]`: home paths the jail covers",
+            "it prints it as `innerwarden contain: <note>`",
+            "a jail keeps the resolver file it started with until the agent is restarted",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+    }
+
+    /// The contain help and the README say where an identified jail keeps
+    /// Claude Code's own state, and only what the launcher makes true: on
+    /// Linux only, the person's own settings file not shown, nor its copies
+    /// in `~/.claude/backups`, each jail with its own sessions and backups,
+    /// only for Claude Code's folder at `~/.claude`, the cases it shares,
+    /// the limit of two jails sharing the one file, that what any jail
+    /// writes to the kept file is what the next identified launch loads,
+    /// and that a jail without `--identity` still loses the file. The
+    /// CHANGELOG says the same cases the README does (M30CW-C6).
+    ///
+    /// FAILS ON REVERT: drop the sentence from the contain help or its
+    /// "On Linux", or a sentence of the README's paragraphs or its limit, or
+    /// put back the CHANGELOG's "not shown" with no case where it is.
+    #[test]
+    fn the_contain_help_and_the_readme_say_where_claude_codes_state_is_kept() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "On Linux, with --identity, Claude Code's settings file is kept in ~/.claude/.claude.json between launches (your own ~/.claude.json is not shown)",
+            "each jail has an empty ~/.claude/sessions and ~/.claude/backups of its own, so two jails at once do not write the same session file.",
+            "That is for Claude Code's folder at ~/.claude; where a jail cannot have them of its own, contain says so.",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        assert!(!help.contains("stays outside"), "{help}");
+        // The README and the two pages its detail moved to: the user docs.
+        let readme = flat(
+            &[
+                include_str!("../../../README.md"),
+                include_str!("../../../docs/features.md"),
+                include_str!("../../../docs/agent-identity.md"),
+            ]
+            .join("\n"),
+        );
+        for said in [
+            "An identified Linux jail keeps Claude Code's own state in the `~/.claude` it already shares with you.",
+            "In the jail it now leads to `~/.claude/.claude.json`",
+            "Your own `~/.claude.json` is not shown in the jail, and the jail's Claude Code never uses it. Nor are the copies Claude Code keeps of it in `~/.claude/backups`: each identified jail has an empty `~/.claude/backups` of its own",
+            "Where your own `~/.claude.json` is a link, or a hard link, to a file in `~/.claude`, that file is shared with the jail like the rest of the folder, and the jail makes no link to it.",
+            "each identified jail also has an empty `~/.claude/sessions` of its own: two jails at once do not write the same session file",
+            "Both folders are covered at every place the jail shows them",
+            "All of this is for Claude Code's own folder at `~/.claude`, where it is unless `CLAUDE_CONFIG_DIR` names another",
+            "where a read-only path of the profile shows it, `~/.claude` or `~/.claude.json`",
+            "or where your own `~/.claude.json` is that file or leads into `~/.claude` or to nothing.",
+            "Where one of the two folders cannot be the jail's own (a link is there, the project is inside it, or it could not be made), the jail shows the host's, and `innerwarden contain` says so.",
+            "Limit: two jails at once share the one settings file, and Claude Code's lock on it is each jail's own",
+            "Every jail, with `--identity` or without, shares `~/.claude` with you, so what a program in any jail writes to `~/.claude/.claude.json` is what the next identified Claude Code loads, as with `~/.claude/settings.json`: an MCP server listed there starts with it, outside `innerwarden proxy` unless the entry runs through it",
+            "A jail started without `--identity` is unchanged: Claude Code's settings file is still gone at every launch there, and two such jails at once still share `~/.claude/sessions` and see the host's.",
+            "On macOS the jail lets Claude Code use your own `~/.claude.json`, as before.",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        for unsaid in [
+            "stays outside the jail",
+            "never write the same session file",
+        ] {
+            assert!(!readme.contains(unsaid), "README still says {unsaid:?}");
+        }
+        let changelog = flat(include_str!("../../../CHANGELOG.md"));
+        for said in [
+            "Where your own `~/.claude.json` is a link, or a hard link, to a file in `~/.claude`, that file is shared with the jail like the rest of the folder, and where `~/.claude/backups` is a link of yours the jail shows the host's copies (`innerwarden contain` says so).",
+            "or where your own `~/.claude.json` is that file or leads into `~/.claude` or to nothing:",
+            "what a program in any jail writes to `~/.claude/.claude.json` is what the next identified Claude Code loads, as with `~/.claude/settings.json`",
+        ] {
+            assert!(changelog.contains(said), "CHANGELOG lacks {said:?}");
+        }
+        assert!(
+            !changelog.contains(
+                "or where your own `~/.claude.json` is that file or leads into `~/.claude`: "
+            ),
+            "the CHANGELOG leaves out the link to nothing"
+        );
+    }
+
+    /// The contain help, the README and the CHANGELOG say what the jail does
+    /// with a place it hides that is a link (M30-CW-link), only what the
+    /// launcher makes true: hidden where it leads, wherever the jail shows
+    /// it (on macOS also out of the home); left and said where it leads onto
+    /// what the jail needs, or where a link a program in the jail can change
+    /// leads onto what the jail runs on; a stop only for InnerWarden's own
+    /// folder kept as a link on Linux and for a path over a place it hides
+    /// (M30-R5, M30L-DOC-4); a place not there yet made only for a dotdir
+    /// (M30L-DOC-5); and the CHANGELOG says what changed on Linux for a
+    /// `--deny-read` link out of the home (M30L-DOC-1). And, since the
+    /// critic's M30C pass: the links inside a hidden dotdir are hidden too
+    /// (M30C-3), the folders above a cover are pinned (M30C-2), a way
+    /// through a link the jail can change stops the launch, the records
+    /// folder's included, which no longer starts (M30C-1, M30C-4), and the
+    /// LLM and notification config are read from nothing (M30C-5).
+    ///
+    /// FAILS ON REVERT: drop the sentence from the help, the README or the
+    /// CHANGELOG and the line that names it fails.
+    #[test]
+    fn the_contain_help_and_the_readme_say_what_a_hidden_link_leads_to() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "Where a place the jail hides (~/.ssh, ~/.gnupg, ~/.aws or a link inside one, a --deny-read path, InnerWarden's own folder) is a link, the place it leads to is hidden too, wherever the jail shows it (on macOS also outside your home), and the folders above it are pinned, so the agent cannot rename it away.",
+            "On macOS the project, ~/.config and each folder the jail may write above a place it hides (a folder between the project and a --deny-read path among them) cannot be renamed, removed or replaced from inside the jail (it still writes in them and sets their mode and times), and contain makes each first where it is missing, and says so.",
+            "A link never hides what the jail needs (the guard, the agent's settings, the project, and for a --deny-read path a read-only path), and a --deny-read link never hides what the jail runs on: contain leaves such a place, says so, and the jail still starts.",
+            "A hidden dotdir, InnerWarden's folder or, with --identity on Linux, the launcher's records folder or a profile's hidden home path, whose way goes through a link in a folder the jail writes stops the launch (replace that link with what it leads to).",
+            "On Linux, InnerWarden's own folder kept as a link stops the launch (replace it with the folder it leads to), and a project path over where it leads is refused.",
+            // CWNF: a read-only path is read-only where it leads, and a link
+            // a jail can change never shows more.
+            "A profile's read-only path (extra_ro) is read-only where it leads, and shows nothing the jail would not show otherwise: contain follows a link in a folder a jail writes only to a place the jail shows already (and says the link itself is not held), and a path that would show more, or that lies in a place the jail hides, is left out, said on one line, and the jail still starts.",
+            "A Linux jail binds it, and each folder it pins, from a descriptor opened just before bwrap starts;",
+            // CRIT-2: a bwrap that binds from no descriptor, and a strict
+            // profile there. CRIT-3: a separate git folder.
+            "a bwrap that cannot (no --ro-bind-fd: before 0.10.0, or without its distribution's security update) leaves out one in a folder a jail writes, and says so, and a profile with start = \"only_when_admitted\" then does not start.",
+            // CWWT-SEC-1, BRK-1, BRK-2, DOC-2: every folder on the way
+            // there, the hidden folders a jail shows anyway, what git sees
+            // on each OS, and an older bwrap.
+            // CWWT-C1, C2, C3: the hidden folders per OS, the worktree over
+            // a place only the plan finds hidden, and one the jail shows
+            // anyway.
+            "A linked worktree's git folders are shown only where git made them for this project (they name the project back, in a git repository of yours, with every folder on the way there and no link on it, never your home, a folder above it, a place the jail hides or a hidden folder of your home that the jail does not show on Linux and lets no program write on macOS, such as ~/.kube); otherwise, or where one lies over where InnerWarden's folder or a hidden dotdir leads, contain says why, the jail starts, and git in it sees no repository there on Linux, and cannot commit there on macOS (it may still read it). A worktree of a repository in the project or in a folder every jail writes (~/.config, ~/.local) is shown by that folder, with no bind of its own unless a read-only path holds it. A Linux jail binds the others from descriptors too where bwrap can (an older bwrap binds them by name). A repository made with --separate-git-dir is not shown, unless the jail shows its folder anyway.",
+            // CWNF-BRK-2: a read-only path under a hidden home path no
+            // longer stops the launch.
+            "a path that leads outside the home, or over the project, the guard or the agent's settings, stops the launch, and a read-only path under one is left out and said (the hidden path wins).",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        // The README and the two pages its detail moved to: the user docs.
+        let readme = flat(
+            &[
+                include_str!("../../../README.md"),
+                include_str!("../../../docs/features.md"),
+                include_str!("../../../docs/agent-identity.md"),
+            ]
+            .join("\n"),
+        );
+        for said in [
+            "Where a place the jail hides is a link, the jail hides the place it leads to:",
+            "On Linux that place is covered wherever a folder the jail shows holds it, and each folder the jail writes between the cover and your home is a mount point of its own, so a program in the jail can neither read the place nor rename it away from the name your link uses; a dotdir's place that is not there yet is made first, empty and 0700, so nothing the agent writes there reaches it (a `--deny-read` path that is not there is not hidden). On macOS it is denied, read and write, also outside your home, and each folder above it that the jail may write, the project included, is closed to renaming and removal (the jail still writes in it).",
+            "a link inside one of them (`~/.ssh/config` a link into `~/.config/dotfiles`, as GNU stow and chezmoi make one per file)",
+            "The launcher looks for the links inside those dotdirs as far as 100000 entries and 32 folders deep, and says where it stops short.",
+            "A link never moves a mask or a deny onto what the jail needs: the guard, the agent's settings or a file in them, the project, the system's folders, and for a `--deny-read` path a read-only path of the profile (a hidden dotdir or InnerWarden's own folder is hidden where it leads even there).",
+            "Nor does a `--deny-read` link in the project, which the agent can change, move one onto what the jail runs on: on Linux a place outside your home, on macOS a place of the system outside the project.",
+            "A dotdir that leads into the project is hidden there, and said.",
+            "A link stops the launch only here: a hidden dotdir, a link inside one, InnerWarden's own folder or, in an identified Linux jail, the launcher's records folder or a profile's hidden home path (above), whose way goes through a link in a folder the jail writes (`~/.aws` a link to `~/.cache/aws-link`, itself a link) is refused, since no mount or deny pins a link and a program in the jail could replace it on the host (replace that link with what it leads to); on Linux, InnerWarden's own folder kept as a link is refused for the same reason (replace it with the folder it leads to), and so is a link inside a hidden dotdir that leads to nothing yet where the jail shows that place (make it, or remove the link); and a project path over the place InnerWarden's folder leads to is refused (a worktree's folder there, or over the place a hidden dotdir leads to, is left out, above).",
+            "Each folder the jail writes between such a path and your home is pinned as below, so no program in the jail renames it away from the path's cover.",
+            "On macOS every jail keeps in place the folders above what it hides: the project, `~/.config` (which holds InnerWarden's own folder) and each folder between the project and a `--deny-read` path cannot be renamed, removed or replaced by a link from inside the jail, so nothing it hides is shown at another name.",
+            "So is every other folder the jail may write above a place it hides: `~/.cache` or `/tmp` above a project there that holds a `--deny-read` path, or a folder above where a hidden dotdir or a profile's hidden home path leads, or above a profile's read-only path.",
+            "The jail still writes in them, finds them writable and sets their mode and times (`rsync -a` or `cp -a` into the project works); only renaming, removing or replacing the folder itself is refused.",
+            "Where such a folder is not there yet (`~/.config` on an account that has none), `innerwarden contain` makes it first, empty and 0700, and says so; a dry run makes nothing and names each folder a real run would make.",
+            "A profile's `hide_home` path keeps its own rule, above: one that leads outside the home stops the launch.",
+            "On Linux a path whose way goes through a link in a folder the jail writes (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh` link) stops the launch: a program in the jail could replace that link with a folder of its own, which your programs would then read and write at that name, so replace the link with the folder it leads to.",
+            // JP-2 completeness: macOS keeps every link on the way in place.
+            "On macOS the jail starts, and keeps each such link in place instead, also one further down a chain (`~/.local/a`, where `~/.cache/git` leads to `~/.local/a/git` and `~/.local/a` is a link too): no program in the jail can remove, rename or replace it.",
+            // A profile's read-only path on macOS, wherever it is.
+            "A profile's read-only path (`extra_ro`) is read-only in every jail, wherever it is, and wherever a link on its way leads (below). On Linux one inside a folder the jail may write (the project, `~/.local`) is kept read-only only where bubblewrap binds a folder from a descriptor (below): bubblewrap 0.10.0 or later, or a package whose security update added `--ro-bind-fd` (the current packages of Debian 12, Ubuntu 22.04 and 24.04, and RHEL 9 have it). On macOS the sandbox denies writing it also inside a folder the jail may write",
+            // CRIT-2: what an older bubblewrap leaves, and a strict profile.
+            "the jail shows it, and its programs can write it, where before this release the jail laid it read-only by name. A profile with `start = \"only_when_admitted\"` asked for every defence in effect, so there it does not start: the launch stops with a line that names each such path and what to do (update bubblewrap, or take the path out of `extra_ro`).",
+            // CRIT-3: a separate git folder is not shown, and what to do.
+            "A repository made with `--separate-git-dir` (`git init` or `git clone`, the layout of dotfile managers such as yadm and vcsh) keeps nothing that names the project back, so it cannot be told apart from such a file: it is not shown either, where before git in the jail worked there (one in a folder the jail shows anyway, such as `~/.local/share`, still works). Move its git folder into the project in place of the `.git` file, or work in a linked worktree (`git worktree add`); the start line says so.",
+            // CWNF: where a link leads, what is said, and what is held.
+            "Where a profile's read-only path is a link, or goes through one, the jail keeps it read-only where it leads, and shows nothing it would not show otherwise.",
+            "Your own links, in folders no jail writes (`~/code` a link to another disk), are followed as before.",
+            "The real Linux run binds each read-only path, and each folder it pins above one, from a descriptor it opens just before bwrap starts, one folder at a time with no link a program in a jail can change followed",
+            "A read-only path never keeps a hidden dotdir from being hidden where a link leads it: that place is hidden, and the read-only path in it left out.",
+            "A linked git worktree's folders are shown, read-write, only where git made them for this project:",
+            // CW-worktree-gitdir: what makes a worktree one, what is said,
+            // and the descriptors; and a tool that reads the command line.
+            "the repository is a git folder (`HEAD`, `objects`, `refs`); both belong to you; no link is on the way to either (git writes these paths with none); and neither is your home, a folder above it, a place the jail hides, or in a hidden folder of your home that the jail does not show on Linux and lets no program write on macOS (`~/.kube`, `~/.docker`, `~/.password-store`, `~/.dotfiles`).",
+            // CWWT-SEC-1, BRK-1, BRK-2.
+            "Every folder on the way is there, as the kernel takes the path: one named through a folder that is not there and back (`nx/../L`) is none.",
+            "A hidden folder of your home that every jail shows writable (`~/.config`, `~/.local`, `~/.cache`) is fine: a worktree of a repository kept there (an editor's configuration in `~/.config/nvim`) works as before.",
+            // CWWT-C2, C3.
+            "The jail shows such a repository through that folder, as it shows one in the project, so it binds nothing more for it (unless a profile's read-only path holds it: the worktree's write wins there, as before), and says nothing of a `.git` file that names a folder there.",
+            "A worktree whose folder lies over the place InnerWarden's own folder, a hidden dotdir or a link inside one leads to is left out the same way, where the launch stopped before.",
+            "git in a Linux jail then sees no repository there, and git in a macOS jail cannot commit there (it may still read it).",
+            "Such a file is left alone now, the start says why on one line, and the jail starts;",
+            // CWWT-DOC-2: only where bwrap binds from a descriptor.
+            "Where bwrap binds a place from a descriptor (bubblewrap 0.10.0 or later, or a package with the security update that added it), the real Linux run binds a worktree's folders from descriptors it opens just before bwrap starts, as it binds a profile's read-only paths, so a folder on the way swapped for a link after the launcher looked stops the launch. An older bwrap binds them by name, as 1.5.5 did, and the start says nothing of it: a program in a jail of a project that holds the repository (its main worktree, or a folder above it) could swap a folder on the way for a link while this jail starts.",
+            "A tool that reads the command line of a running jail's bubblewrap (from `/proc`) finds an identified jail's filter first: that command line starts with `--seccomp <fd>`.",
+            "the real run of any jail binds the folders it pins, a profile's read-only paths and a worktree's git folders with `--bind-fd` and `--ro-bind-fd`",
+            // CWNF-BRK-2: the hidden home path's own bullet agrees.
+            "a profile's read-only path under it is left out (the hidden path wins, so nothing of it is shown or written), said, and the jail starts.",
+        ] {
+            assert!(readme.contains(said), "README lacks {said:?}");
+        }
+        let changelog = flat(include_str!("../../../CHANGELOG.md"));
+        for said in [
+            "Each is now hidden where it really is, at every place the jail shows it, in every jail; on macOS it is denied where it leads, also outside your home.",
+            "A link never moves a mask or a deny onto what the jail needs (the guard, the agent's settings or a file in them, such as the one that carries the hook, the project, and for a `--deny-read` path a read-only path of the profile; a hidden dotdir is hidden even there), and a link that a program in the jail can change (a `--deny-read` link in the project) never moves one onto what the jail runs on: on Linux a place outside your home, on macOS a place of the system.",
+            "On Linux, InnerWarden's own folder kept as a link stops `innerwarden contain`.",
+            "On Linux a `--deny-read` path that a link in the project leads out of your home is not hidden there.",
+            "A suppression planted in the jail no longer lifts the hook's verdict.",
+            "An LLM or notification config planted in the jail is no longer read.",
+            "A jail can no longer move a hidden place away from the name the host reads it by.",
+            "On macOS a jail can no longer move a folder above what it hides.",
+            "It still writes in them, finds them writable and sets their mode and times; only the folder itself keeps its name.",
+            "On Linux a hidden place inside a project kept in a folder the jail writes stays where the host reads it.",
+            "A dotdir, InnerWarden's folder or the launcher's records behind a link the jail can change is refused.",
+            "A hidden dotdir behind a link the jail can change stops `innerwarden contain`.",
+            "On macOS such a place is denied where it leads, unless it is a place of the system outside the project.",
+            "So does, on Linux, a profile's `hide_home` path whose way goes through such a link (`~/.cache/git` a link, or a dotfiles manager's `~/.config/gh` link): replace that link with the folder it leads to.",
+            "On Linux the same holds for a profile's hidden home path: the host's programs read the jail's folder at that name, and wrote into it what the path was hidden for (a credential cache's socket, a token).",
+            "the launcher looks for such links as far as 100000 entries and 32 folders deep, and says where it stops short.",
+            // The upgrade notes name what no longer moves on Linux, and
+            // what a macOS read-only path now refuses.
+            "On Linux a program in `innerwarden contain` can no longer rename or remove a folder it writes that sits above a place the jail covers.",
+            "fails with \"Device or resource busy\"",
+            "On macOS a profile's read-only path (`extra_ro`) is now read-only wherever it is.",
+            "On macOS the sandbox keeps each link on the way to a profile's hidden home path in place instead, also one further down a chain",
+            // CWNF: a read-only path through a link, the descriptor binds,
+            // the worktree and the hidden dotdir.
+            "A profile's read-only path never shows where a link a jail can change leads.",
+            "A profile's read-only path (`extra_ro`) through a link stays read-only where it leads.",
+            "A program in `innerwarden contain` can no longer have the next jail show a folder of your home writable.",
+            "A profile's read-only path never keeps a hidden dotdir from being hidden.",
+            "A project whose `.git` file names a folder that does not name the project back is no worktree in `innerwarden contain`.",
+            // CW-worktree-gitdir.
+            "the repository is a git folder (`HEAD`, `objects`, `refs`); both belong to you; no link is on the way to either; and neither is your home, a folder above it, a place the jail hides, or in a hidden folder of your home that the jail does not show on Linux and lets no program write on macOS (`~/.kube`, `~/.docker`, `~/.password-store`, `~/.dotfiles`).",
+            // CWWT-SEC-1, BRK-1, BRK-2, DOC-2.
+            "Every folder on the way is there: a path through a folder that is not there and back (`nx/../L`) names none.",
+            "git in a Linux jail sees no repository there, while git in a macOS jail cannot commit there (it may still read it).",
+            "A worktree whose repository you keep in a hidden folder of your home that the jail does not show on Linux and lets no program write on macOS (`~/.dotfiles`; `~/.config`, `~/.local` and the other folders every jail shows writable are fine: the jail shows a repository there through that folder, and binds nothing more for it), or reach through a link, is not shown either",
+            // CWWT-C3.
+            "A worktree whose folder lies over the place InnerWarden's own folder, a hidden dotdir or a link inside one leads to is left out the same way, with one line, and the jail starts.",
+            "every path found with every folder on the way there and no link on it, and where bwrap binds a place from a descriptor the real Linux run binds it from one it opens just before bwrap starts, so a folder on the way swapped for a link since the launcher looked stops the launch. An older bwrap binds it by name, as before; a repository in the project or in a folder every jail writes (`~/.config`, `~/.local`) is not bound at all, since the jail shows it there.",
+            "A worktree over the place a hidden dotdir leads to, and a read-only path of a profile there, are left out of the jail, and said.",
+            "The command line of a running jail's bubblewrap changed.",
+            "An identified jail's (`--identity`) now starts with its seccomp filter (`--seccomp <fd>`), before every other option.",
+            "the real run of any jail binds the folders it pins, a profile's read-only paths and a worktree's git folders with `--bind-fd <fd> <place>` and `--ro-bind-fd <fd> <place>` instead of `--bind` and `--ro-bind-try` by name;",
+            "a project in a folder named `worktrees` whose `.git` named the project itself made the folder two above it (`~/code`, with every repository in it) the repository.",
+            // CRIT-2 and CRIT-3.
+            "the jail shows it and its programs can write it, where 1.5.5 laid it read-only by name. Update bubblewrap to keep it. A profile with `start = \"only_when_admitted\"` does not start there: the launch stops, names each such path and says what to do.",
+            "A repository made with `--separate-git-dir` (`git init` or `git clone`, the layout of dotfile managers such as yadm and vcsh) keeps nothing that names the project back, so it is not shown either, where 1.5.5 showed it (one in a folder the jail shows anyway, such as `~/.local/share`, still works): move its git folder into the project in place of the `.git` file, or work in a linked worktree (`git worktree add`).",
+        ] {
+            assert!(changelog.contains(said), "CHANGELOG lacks {said:?}");
+        }
+        // CWWT-DOC-2 and CWWT-BRK-2: no unqualified descriptor promise for
+        // a worktree, and no "sees no repository" said of every OS.
+        assert!(
+            !help.contains("A Linux jail binds them from descriptors too. A repository"),
+            "{help}"
+        );
+        assert!(
+            !readme.contains("The real Linux run binds a worktree's folders"),
+            "the README still says every Linux run binds a worktree from descriptors"
+        );
+        assert!(
+            !changelog.contains("every path found with no link on the way, and the real Linux run"),
+            "the CHANGELOG still says every Linux run binds a worktree from descriptors"
+        );
+        for text in [&help, &readme, &changelog] {
+            assert!(
+                !text.contains("and git in the jail sees no repository there"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("and git in it sees no repository."),
+                "{text}"
+            );
+            // CWWT-C1: the macOS sandbox shows `~/.kube` (read-only), so no
+            // text says of every OS that the jail does not show it; and
+            // CWWT-C3: no worktree over a hidden place stops the launch.
+            assert!(
+                !text.contains("a hidden folder of your home the jail does not show"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("a hidden folder of your home that the jail does not show ("),
+                "{text}"
+            );
+            assert!(
+                !text.contains("worktree path over the place a hidden dotdir leads to"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("so is a worktree path over where a hidden dotdir leads"),
+                "{text}"
+            );
+            assert!(
+                !text.contains("A worktree over the place a hidden dotdir leads to is refused"),
+                "{text}"
+            );
+        }
+        // M30C-4: such a jail is refused now, never started.
+        assert!(
+            !changelog.contains(
+                "An identified jail starts where the launcher's records folder is behind a link."
+            ),
+            "the CHANGELOG still says the records-link jail starts"
+        );
+        // M30C-1: through a link the jail can change, a dotdir is refused,
+        // never left and said.
+        assert!(
+            !help.contains("one a program in the jail can change never hides"),
+            "{help}"
+        );
+        assert!(
+            !readme.contains("Nor does a link that a program in the jail can change (every"),
+            "the README still says a dotdir behind such a link is left"
+        );
     }
 
     /// A wrapped child's flags are not ours. `contain -- claude --help` must run
@@ -485,6 +1038,67 @@ mod tests {
         }
     }
 
+    /// The commands the dashboard prints with no per-agent argument
+    /// (`FIXED_COMMANDS` in the Community pages' `words.ts`), read out of the
+    /// list one quoted command per line.
+    fn dashboard_fixed_commands() -> Vec<String> {
+        let words = include_str!("../../dashboard-kit/web/src/community/words.ts");
+        let start = words
+            .find("export const FIXED_COMMANDS = [")
+            .expect("words.ts names FIXED_COMMANDS");
+        let body = &words[start..];
+        let end = body.find("] as const;").expect("FIXED_COMMANDS ends");
+        body[..end]
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let line = line.trim().trim_end_matches(',');
+                line.strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Every fixed command a dashboard page tells a person to type is one this
+    /// binary answers: its verb is dispatched natively, and every subcommand
+    /// and flag it carries is in that verb's own usage. A `<placeholder>` and
+    /// the `--` before a wrapped command are the person's to fill in.
+    ///
+    /// FAILS ON REVERT: a misspelt verb or flag in `words.ts`
+    /// (`innerwarden enforce --all`, `innerwarden agent connect`) has no usage
+    /// that holds it.
+    #[test]
+    fn dashboard_fixed_commands_are_real_cli_verbs() {
+        let commands = dashboard_fixed_commands();
+        assert!(
+            commands.len() >= 10,
+            "the list was read, not skipped: {commands:?}"
+        );
+        for command in &commands {
+            let mut words = command.split_whitespace();
+            assert_eq!(words.next(), Some("innerwarden"), "{command}");
+            let verb = words.next().unwrap_or_else(|| panic!("{command}: no verb"));
+            assert!(
+                NATIVE_VERBS.contains(&verb),
+                "{command}: `{verb}` is not a verb this binary dispatches"
+            );
+            let rest: Vec<String> = words.clone().map(str::to_string).collect();
+            let text = usage(verb, &rest)
+                .unwrap_or_else(|| panic!("{command}: `{verb}` has no usage of its own"));
+            for word in words {
+                if word == "--" || (word.starts_with('<') && word.ends_with('>')) {
+                    continue;
+                }
+                assert!(
+                    text.split(|c: char| c.is_whitespace() || "[]|".contains(c))
+                        .any(|token| token == word),
+                    "{command}: `{word}` is not in the usage of `{verb}`:\n{text}"
+                );
+            }
+        }
+    }
+
     /// Every verb `main` dispatches natively. Kept beside the usage table so the
     /// synopsis rule above is checked against all of them.
     const NATIVE_VERBS: &[&str] = &[
@@ -509,6 +1123,7 @@ mod tests {
         "mute",
         "notify",
         "observe",
+        "openclaw",
         "graph",
         "llm",
         "host",

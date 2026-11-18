@@ -235,11 +235,15 @@ reproducible and a rollback possible:
 
 ```sh
 # install an exact cut
-IW_GUARD_TAG=guard-v1.3.7 curl -fsSL https://innerwarden.com/free | sh
+curl -fsSL https://innerwarden.com/free | IW_GUARD_TAG=guard-v1.6.10 sh
 
 # roll a host back to the last known-good one
-IW_GUARD_TAG=guard-v1.3.6 curl -fsSL https://innerwarden.com/free | sh
+curl -fsSL https://innerwarden.com/free | IW_GUARD_TAG=guard-v1.6.9 sh
 ```
+
+The variable goes on the `sh` side of the pipe: the installer reads it
+(`RELEASE_TAG="${IW_GUARD_TAG:-iw-guard}"`). Written before `curl`, it reaches
+only `curl`, and the installer silently installs the newest build.
 
 Rolling back the DEFAULT install (what `https://innerwarden.com/free` serves
 with no variable set) means re-running `release-guard.yml` from the older
@@ -293,5 +297,14 @@ run, not an asset copy, because the rolling tag must keep matching a real cut.
   skip isolation, so `release-guard.yml` installs bubblewrap and relaxes the
   Ubuntu 24.04 AppArmor userns restriction. Do not "fix" a jail-test failure by
   skipping the test.
+- **The jail tests require the sandbox filter.** The Community test step of
+  `release-guard.yml` (and CI's Linux test steps) set `IW_REQUIRE_SECCOMP=1`:
+  the runner's bubblewrap must start a jail under the seccomp filter
+  (`--seccomp`), or the jail tests fail with `IW_REQUIRE_SECCOMP=1: this host
+  must start a jail under a seccomp filter`. Without the variable the tests
+  accept a host that does not take the filter and check only the jail without
+  it, which proves nothing about the filter. So the runner needs a kernel with
+  seccomp filters, a native (not emulated) build, and the bubblewrap and userns
+  settings above. Fix the runner; do not unset the variable to get green.
 - **Keep this file current.** If you add a channel, change a workflow, or change
   the signing scheme, update this doc in the same PR.

@@ -79,7 +79,7 @@ fn find_ad_cli() -> Option<std::path::PathBuf> {
 /// still reads exactly one line.
 pub fn version_host_hint(ad_installed: bool) -> Option<&'static str> {
     ad_installed.then_some(
-        "Active Defence is installed here; its host stack has its own release: innerwarden-ctl --version",
+        "InnerWarden Pro is installed here; its host stack has its own release: innerwarden-ctl --version",
     )
 }
 
@@ -129,7 +129,7 @@ pub fn shared_verb_hint(verb: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "  Active Defence has its own `{verb}` for the host layer:  innerwarden host {verb}"
+        "  InnerWarden Pro has its own `{verb}` for the host layer:  innerwarden host {verb}"
     ))
 }
 
@@ -142,7 +142,7 @@ pub fn try_delegate(command: &str, args: &[String]) -> Option<ExitCode> {
     Some(match status {
         Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(0, 255) as u8),
         Err(e) => {
-            eprintln!("innerwarden: could not run Active Defence CLI: {e}");
+            eprintln!("innerwarden: could not run InnerWarden Pro CLI: {e}");
             ExitCode::from(1)
         }
     })
@@ -183,7 +183,7 @@ pub fn cmd_host(rest: &[String]) -> ExitCode {
     let asked_for_help = rest.first().is_some_and(|a| a == "help");
     let Some(verb) = rest.first().filter(|_| !asked_for_help) else {
         eprintln!("innerwarden host <command> [args]");
-        eprintln!("  Runs a command in the Active Defence host layer.");
+        eprintln!("  Runs a command in the InnerWarden Pro host layer.");
         eprintln!("  Use it to reach a host command whose name this binary also has:");
         eprintln!("    {}", SHARED_VERBS.join(", "));
         return if asked_for_help {
@@ -194,14 +194,14 @@ pub fn cmd_host(rest: &[String]) -> ExitCode {
     };
     if find_ad_cli().is_none() {
         eprintln!(
-            "innerwarden host: Active Defence is not installed on this machine, so there is no \
+            "innerwarden host: InnerWarden Pro is not installed on this machine, so there is no \
              host layer to run `{verb}` in."
         );
-        eprintln!("  → https://innerwarden.com/defend");
+        eprintln!("  → https://innerwarden.com/pricing");
         return ExitCode::from(1);
     }
     try_delegate(verb, &rest[1..]).unwrap_or_else(|| {
-        eprintln!("innerwarden host: could not run the Active Defence CLI");
+        eprintln!("innerwarden host: could not run the InnerWarden Pro CLI");
         ExitCode::from(1)
     })
 }
@@ -344,7 +344,7 @@ mod active_defence_detection_tests {
         assert_eq!(
             find_ad_cli_in([dir.path().to_path_buf()]),
             Some(expected),
-            "a directory containing {AD_CLI_NAME} means Active Defence is installed"
+            "a directory containing {AD_CLI_NAME} means InnerWarden Pro is installed"
         );
     }
 

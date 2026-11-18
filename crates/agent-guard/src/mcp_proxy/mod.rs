@@ -17,6 +17,7 @@
 //! which is the only way to guarantee byte-fidelity; the typed envelope here
 //! exists purely to route and inspect a message.
 
+pub mod content;
 pub mod enforce;
 pub mod jsonrpc;
 pub mod router;

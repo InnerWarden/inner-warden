@@ -319,3 +319,15 @@ describe("the evidence badge", () => {
     expect(() => parseUnifiedCase(payload)).toThrow();
   });
 });
+
+describe("case identity confidence 'observed'", () => {
+  it("reads observed and still refuses an unknown word", () => {
+    const withConfidence = (confidence: string) => {
+      const payload = JSON.parse(JSON.stringify(caseAgentHost));
+      payload.identity.confidence = confidence;
+      return payload;
+    };
+    expect(parseUnifiedCase(withConfidence("observed")).identity.confidence).toBe("observed");
+    expect(() => parseUnifiedCase(withConfidence("trusted"))).toThrow(/confidence/);
+  });
+});
