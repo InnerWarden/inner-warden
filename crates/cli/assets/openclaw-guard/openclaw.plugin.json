@@ -1,0 +1,13 @@
+{
+  "id": "innerwarden-guard",
+  "name": "InnerWarden guard",
+  "description": "Screens OpenClaw's own exec, process, write, edit and apply_patch calls with InnerWarden before they run. Monitor records only; enforce refuses a deny and asks you about a review.",
+  "activation": { "onStartup": true },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "mode": { "type": "string", "enum": ["monitor", "enforce"], "default": "monitor" }
+    }
+  }
+}

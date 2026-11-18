@@ -289,3 +289,18 @@ fn the_umask_pattern_matches_the_installer_line() {
         assert!(!matches(line), "{line:?} must not pass the release step");
     }
 }
+
+/// A build folder never reaches the public repository. A cross build put
+/// into `target-linux` (its `CARGO_TARGET_DIR`) was committed once: 2880
+/// files, about 840 MiB, with the builder's local paths in them. Only
+/// `target` was ignored.
+///
+/// FAILS ON REVERT: drop `/target-*/` from `.gitignore`.
+#[test]
+fn every_build_folder_is_kept_out_of_the_repository() {
+    let ignore = include_str!("../../../.gitignore");
+    assert!(
+        ignore.lines().any(|line| line.trim() == "/target-*/"),
+        "a build folder named target-<something> is not ignored"
+    );
+}

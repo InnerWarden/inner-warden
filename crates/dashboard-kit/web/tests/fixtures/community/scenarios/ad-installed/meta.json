@@ -1,0 +1,10 @@
+{
+  "version": "1.5.0-fixture",
+  "exposed": false,
+  "edition": "community",
+  "guardrail": {
+    "mode": "partial",
+    "guarded_agents": 3
+  },
+  "active_defence_installed": true
+}

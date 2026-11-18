@@ -1,8 +1,10 @@
 import {
   DASHBOARD_ACCESS,
   DASHBOARD_SCHEMA_VERSION,
+  PLAN_STATES,
   type AgentCapabilityState,
   type AgentInventory,
+  type AgentKernel,
   type AgentLayerReport,
   type AgentSessionRef,
   type AgentSubject,
@@ -18,6 +20,9 @@ import {
   type LocalModelReport,
   type MeasuredValue,
   type Metric,
+  type PlanNotice,
+  PLAN_LINE_MAX,
+  PLAN_STEP_MAX,
   type ProtectionLayer,
   type ScopeRef,
   type SourceRef,
@@ -319,6 +324,48 @@ export function auditTrailViewOf(value: unknown): string | undefined {
   return typeof value === "string" && /^[a-z][a-z0-9_-]{0,63}$/.test(value) ? value : undefined;
 }
 
+/**
+ * One line of the host's words: trimmed, 1 to `maximum` characters, and no
+ * line break, control or format character (the bidi overrides among them,
+ * as `hasControlCharacters` refuses them).
+ */
+function planLine(value: unknown, maximum: number): string | undefined {
+  const line = typeof value === "string" ? value.trim() : "";
+  return line !== "" && line.length <= maximum && !/[\p{Cc}\p{Cf}\u2028\u2029]/u.test(line) ? line : undefined;
+}
+
+/** An RFC 3339 date-time, or `undefined`. */
+function planTime(value: unknown): string | undefined {
+  return typeof value === "string" && /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/.test(value) && !isNaN(Date.parse(value))
+    ? value
+    : undefined;
+}
+
+/**
+ * `plan_notice`, read leniently like `dashboard_access`: it never refuses the
+ * bootstrap. A known state is kept whatever its line: a line that is not
+ * usable is dropped alone, so free mode is never lost because of its words.
+ * A state this bundle does not know is `unknown` when there is a line to
+ * print, and is never read as `active`; no object, or neither a known state
+ * nor a line, is read as not sent. A step or time that is not well formed is
+ * dropped alone.
+ */
+export function planNoticeOf(value: unknown): PlanNotice | undefined {
+  const item = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  const line = planLine(item.line, PLAN_LINE_MAX);
+  const state = PLAN_STATES.find((candidate) => candidate === item.state) ?? (line === undefined ? undefined : "unknown");
+  if (state === undefined) return undefined;
+  const notice: PlanNotice = { state };
+  if (line !== undefined) notice.line = line;
+  const step = planLine(item.step, PLAN_STEP_MAX);
+  const since = planTime(item.since);
+  const until = planTime(item.until);
+  if (step !== undefined) notice.step = step;
+  if (since !== undefined) notice.since = since;
+  if (until !== undefined) notice.until = until;
+  return notice;
+}
+
 export function parseDashboardBootstrap(value: unknown): DashboardBootstrap {
   const item = record(value, "bootstrap");
   if (item.schema_version !== DASHBOARD_SCHEMA_VERSION) throw new Error("bootstrap.schema_version: unsupported contract version");
@@ -327,11 +374,13 @@ export function parseDashboardBootstrap(value: unknown): DashboardBootstrap {
   const privacy = record(item.privacy, "bootstrap.privacy");
   const access = dashboardAccessOf(item.dashboard_access);
   const auditTrail = auditTrailViewOf(item.audit_trail_view);
+  const plan = planNoticeOf(item.plan_notice);
   return {
     // Only when sent and known: an older server's bootstrap has no such key,
     // and the parsed value must not grow one either.
     ...(access === undefined ? {} : { dashboard_access: access }),
     ...(auditTrail === undefined ? {} : { audit_trail_view: auditTrail }),
+    ...(plan === undefined ? {} : { plan_notice: plan }),
     schema_version: DASHBOARD_SCHEMA_VERSION, generated_at: text(item.generated_at, "bootstrap.generated_at"),
     edition: oneOf(item.edition, ["community", "enterprise"] as const, "bootstrap.edition"), product_version: text(item.product_version, "bootstrap.product_version"),
     community_contract: versionRef(item.community_contract, "bootstrap.community_contract"),
@@ -491,7 +540,7 @@ function agentSession(value: unknown, path: string): AgentSessionRef {
     session_id: text(item.session_id, `${path}.session_id`),
     started_at: item.started_at === undefined ? undefined : nullableText(item.started_at, `${path}.started_at`),
     ended_at: item.ended_at === undefined ? undefined : nullableText(item.ended_at, `${path}.ended_at`),
-    identity_confidence: oneOf(item.identity_confidence, ["host_verified", "configured", "declared", "conflicting", "unattributed"] as const, `${path}.identity_confidence`),
+    identity_confidence: oneOf(item.identity_confidence, ["host_verified", "observed", "configured", "declared", "conflicting", "unattributed"] as const, `${path}.identity_confidence`),
     evidence: array(item.evidence, `${path}.evidence`, evidence),
   };
 }
@@ -517,6 +566,74 @@ function agentCapability(value: unknown, path: string): AgentCapabilityState {
   return parsed;
 }
 
+const KERNEL_MODES = ["off", "observe", "enforce"] as const;
+const KERNEL_KEY = /^[a-z][a-z0-9_]{0,31}$/;
+const KERNEL_WORDS_MAX = 200;
+const KERNEL_LIST_MAX = 16;
+
+function kernelKey(value: unknown, path: string): string {
+  const key = text(value, path);
+  if (!KERNEL_KEY.test(key)) throw new Error(`${path}: expected a key of [a-z0-9_], at most 32`);
+  return key;
+}
+
+function kernelWords(value: unknown, path: string): string {
+  const words = text(value, path);
+  if (words.length === 0 || words.length > KERNEL_WORDS_MAX) throw new Error(`${path}: expected 1 to ${KERNEL_WORDS_MAX} characters`);
+  return words;
+}
+
+function bounded<T>(value: unknown, path: string, parse: (item: unknown, path: string) => T): T[] {
+  const items = array(value, path, parse);
+  if (items.length > KERNEL_LIST_MAX) throw new Error(`${path}: more than ${KERNEL_LIST_MAX}`);
+  return items;
+}
+
+/**
+ * The host's kernel protection over one type of agent, checked for its
+ * shape only: the part keys are the host's. Throws on anything else; the
+ * caller drops the field, never the subject.
+ */
+function agentKernel(value: unknown, path: string): AgentKernel {
+  const item = record(value, path);
+  const watch = record(item.watch, `${path}.watch`);
+  const parsed: AgentKernel = {
+    mode: oneOf(item.mode, KERNEL_MODES, `${path}.mode`),
+    strict: bool(item.strict, `${path}.strict`),
+    parts: bounded(item.parts, `${path}.parts`, (part, at) => {
+      const entry = record(part, at);
+      return {
+        key: kernelKey(entry.key, `${at}.key`),
+        effective: oneOf(entry.effective, KERNEL_MODES, `${at}.effective`),
+        ...(entry.why === undefined ? {} : { why: kernelWords(entry.why, `${at}.why`) }),
+      };
+    }),
+    watch: {
+      since: nullableText(watch.since, `${path}.watch.since`),
+      sessions: integer(watch.sessions, `${path}.watch.sessions`),
+      agent_starts: integer(watch.agent_starts, `${path}.watch.agent_starts`),
+      would_refuse: bounded(watch.would_refuse, `${path}.watch.would_refuse`, (entry, at) => {
+        const refusal = record(entry, at);
+        return { key: kernelKey(refusal.key, `${at}.key`), n: integer(refusal.n, `${at}.n`) };
+      }),
+    },
+    ready: bool(item.ready, `${path}.ready`),
+    blockers: bounded(item.blockers, `${path}.blockers`, kernelWords),
+    ...(item.checked_at === undefined ? {} : { checked_at: nullableText(item.checked_at, `${path}.checked_at`) }),
+  };
+  return parsed;
+}
+
+/** `kernel` when it is there and holds its shape; nothing otherwise. */
+function agentKernelOf(value: unknown, path: string): Pick<AgentSubject, "kernel"> {
+  if (value === undefined) return {};
+  try {
+    return { kernel: agentKernel(value, path) };
+  } catch {
+    return {};
+  }
+}
+
 function agentSubject(value: unknown, path: string): AgentSubject {
   const item = record(value, path);
   const parsed: AgentSubject = {
@@ -527,7 +644,7 @@ function agentSubject(value: unknown, path: string): AgentSubject {
     agent_class: oneOf(item.agent_class, ["coding", "autonomous", "mcp_based", "custom", "unknown"] as const, `${path}.agent_class`),
     runtime: nullableText(item.runtime, `${path}.runtime`),
     model: nullableText(item.model, `${path}.model`),
-    identity_confidence: oneOf(item.identity_confidence, ["host_verified", "configured", "declared", "conflicting", "unattributed"] as const, `${path}.identity_confidence`),
+    identity_confidence: oneOf(item.identity_confidence, ["host_verified", "observed", "configured", "declared", "conflicting", "unattributed"] as const, `${path}.identity_confidence`),
     identity_evidence: array(item.identity_evidence, `${path}.identity_evidence`, evidence),
     sessions: array(item.sessions, `${path}.sessions`, agentSession),
     capabilities: array(item.capabilities, `${path}.capabilities`, agentCapability),
@@ -538,6 +655,7 @@ function agentSubject(value: unknown, path: string): AgentSubject {
     guardrail_configured_at: item.guardrail_configured_at === undefined ? null : nullableText(item.guardrail_configured_at, `${path}.guardrail_configured_at`),
     guardrail_recorded_activity: item.guardrail_recorded_activity === undefined ? null : nullableInteger(item.guardrail_recorded_activity, `${path}.guardrail_recorded_activity`),
     guardrail_last_observed_at: item.guardrail_last_observed_at === undefined ? null : nullableText(item.guardrail_last_observed_at, `${path}.guardrail_last_observed_at`),
+    ...agentKernelOf(item.kernel, `${path}.kernel`),
   };
   if (parsed.identity_confidence === "host_verified"
     && !parsed.identity_evidence.some((entry) => entry.integrity === "verified")) {

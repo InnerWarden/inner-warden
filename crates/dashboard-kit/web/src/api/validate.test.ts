@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { parseDashboardBootstrap, parseDashboardPosture } from "./validate";
+import { parseAgentInventory, parseDashboardBootstrap, parseDashboardPosture, planNoticeOf } from "./validate";
+import { PLAN_LINE_MAX } from "./v1";
 
 function bootstrapWithSourceKind(kind: unknown): unknown {
   const stage = { state: "unknown", evidence: [], reason_code: "not_observed" };
@@ -422,5 +423,197 @@ describe("the agent's command tally survives validation", () => {
       expect(parsed.agent_commands, JSON.stringify(bad)).toBeUndefined();
       expect(parsed.layers).toHaveLength(1);
     }
+  });
+});
+
+describe("agent identity confidence 'observed'", () => {
+  const subject = (confidence: string) => ({
+    agent_id: "claude-code",
+    principal: null,
+    product: "Claude Code",
+    provider: null,
+    agent_class: "coding",
+    runtime: null,
+    model: null,
+    identity_confidence: confidence,
+    identity_evidence: [],
+    sessions: [{ session_id: "s1", identity_confidence: confidence, evidence: [] }],
+    capabilities: [],
+  });
+  const inventory = (confidence: string) => ({
+    schema_version: "innerwarden.dashboard.v1",
+    generated_at: "2026-10-16T09:00:00Z",
+    availability: "available",
+    discovery_limited: false,
+    subjects: [subject(confidence)],
+  });
+
+  /**
+   * A producer that starts to send `observed` must not take the whole Agents
+   * screen down: the validator throws on a value it does not know.
+   */
+  it("reads observed on a subject and on a session without evidence", () => {
+    const parsed = parseAgentInventory(inventory("observed"));
+    expect(parsed.subjects[0].identity_confidence).toBe("observed");
+    expect(parsed.subjects[0].sessions[0].identity_confidence).toBe("observed");
+  });
+
+  it("still refuses a word it does not know, and host verified without verified evidence", () => {
+    expect(() => parseAgentInventory(inventory("trusted"))).toThrow(/identity_confidence/);
+    expect(() => parseAgentInventory(inventory("host_verified"))).toThrow(/verified evidence/);
+  });
+});
+
+describe("the host's kernel protection on an agent subject", () => {
+  const subject = (extra: Record<string, unknown> = {}) => ({
+    agent_id: "claude-code",
+    principal: null,
+    product: "Claude Code",
+    provider: null,
+    agent_class: "coding",
+    runtime: null,
+    model: null,
+    identity_confidence: "observed",
+    identity_evidence: [],
+    sessions: [],
+    capabilities: [],
+    ...extra,
+  });
+  const inventory = (extra: Record<string, unknown> = {}) => ({
+    schema_version: "innerwarden.dashboard.v1",
+    generated_at: "2026-10-18T09:00:00Z",
+    availability: "available",
+    discovery_limited: false,
+    subjects: [subject(extra)],
+  });
+  const kernel = {
+    mode: "observe",
+    strict: false,
+    parts: [
+      { key: "programs", effective: "observe" },
+      { key: "a_part_this_kit_never_heard_of", effective: "off", why: "This host cannot do it." },
+    ],
+    watch: { since: "2026-10-18T08:00:00Z", sessions: 2, agent_starts: 14, would_refuse: [{ key: "programs", n: 3 }] },
+    ready: false,
+    blockers: ["One session in which the agent itself started."],
+    checked_at: null,
+  };
+
+  /**
+   * A producer that predates the field sends none, and the subject is
+   * exactly what it was: the key is not even there.
+   */
+  it("is absent where the producer sends none", () => {
+    const parsed = parseAgentInventory(inventory());
+    expect("kernel" in parsed.subjects[0]).toBe(false);
+  });
+
+  /** Opaque: parts the kit never heard of are kept as the host sent them. */
+  it("keeps what the host sent, keys it does not know included", () => {
+    const parsed = parseAgentInventory(inventory({ kernel }));
+    expect(parsed.subjects[0].kernel).toEqual(kernel);
+    const { checked_at: _dropped, ...without } = kernel;
+    expect(parseAgentInventory(inventory({ kernel: without })).subjects[0].kernel).toEqual(without);
+  });
+
+  /**
+   * A field that does not hold its shape is dropped whole, never in part,
+   * and never takes the subject or the screen down with it.
+   *
+   * FAILS ON REVERT: parse `kernel` with the throwing parser directly and
+   * the whole inventory is refused; keep it unchecked and these are kept.
+   */
+  it("drops a field that does not hold its shape, and keeps the subject", () => {
+    for (const bad of [
+      null,
+      "on",
+      { ...kernel, mode: "protected" },
+      { ...kernel, strict: "yes" },
+      { ...kernel, parts: [{ key: "Programs", effective: "observe" }] },
+      { ...kernel, parts: [{ key: "programs", effective: "on" }] },
+      { ...kernel, parts: [{ key: "programs", effective: "observe", why: "" }] },
+      { ...kernel, parts: [{ key: "programs", effective: "observe", why: "x".repeat(201) }] },
+      { ...kernel, parts: Array.from({ length: 17 }, () => ({ key: "p", effective: "off" })) },
+      { ...kernel, watch: { ...kernel.watch, sessions: -1 } },
+      { ...kernel, watch: { ...kernel.watch, would_refuse: [{ key: "programs", n: 1.5 }] } },
+      { ...kernel, blockers: [7] },
+      { ...kernel, ready: undefined },
+      { ...kernel, checked_at: 5 },
+    ]) {
+      const parsed = parseAgentInventory(inventory({ kernel: bad }));
+      expect(parsed.subjects[0].kernel, JSON.stringify(bad)).toBeUndefined();
+      expect(parsed.subjects[0].agent_id).toBe("claude-code");
+    }
+  });
+});
+
+describe("the plan notice is read leniently and never costs the bootstrap", () => {
+  const withPlan = (plan_notice: unknown) => ({ ...(bootstrapWithSourceKind("runtime_probe") as object), plan_notice });
+
+  it("keeps a well formed notice, trimmed", () => {
+    const parsed = parseDashboardBootstrap(withPlan({
+      state: "free_mode", line: "  The host sentence.  ", step: "fixture-licence renew",
+      since: "2026-07-30T09:00:00Z", until: "2026-11-06T00:00:00+01:00",
+    }));
+    expect(parsed.plan_notice).toEqual({
+      state: "free_mode", line: "The host sentence.", step: "fixture-licence renew",
+      since: "2026-07-30T09:00:00Z", until: "2026-11-06T00:00:00+01:00",
+    });
+  });
+
+  it("grows no plan_notice key when none was sent", () => {
+    expect("plan_notice" in parseDashboardBootstrap(bootstrapWithSourceKind("runtime_probe"))).toBe(false);
+  });
+
+  it("keeps the bootstrap and drops the notice when it has neither a known state nor a line", () => {
+    for (const bad of [
+      null, "free_mode", 7, [], {}, { line: "" }, { state: "renewed" }, { state: "FREE_MODE", line: "two\nlines" },
+      { state: 3, line: 12 },
+    ]) {
+      const parsed = parseDashboardBootstrap(withPlan(bad));
+      expect(parsed.edition).toBe("community");
+      expect("plan_notice" in parsed, JSON.stringify(bad)).toBe(false);
+    }
+  });
+
+  /**
+   * A known state is never lost because of its words: free mode with a line
+   * that is too long, empty, multi-line or carries a bidi override keeps its
+   * state and drops only the line. FAILS ON REVERT of the line-first read.
+   */
+  it("keeps a known state when its line is not usable, and drops the line alone", () => {
+    for (const line of [undefined, "", "   ", "x".repeat(PLAN_LINE_MAX + 1), "two\nlines", "bidi \u202e trick", 12]) {
+      const parsed = parseDashboardBootstrap(withPlan({ state: "free_mode", line, since: "2026-07-30T09:00:00Z" }));
+      expect(parsed.plan_notice, JSON.stringify(line)).toEqual({ state: "free_mode", since: "2026-07-30T09:00:00Z" });
+    }
+  });
+
+  it("reads a free mode sentence of 558 characters whole, and a line of 1,000", () => {
+    const sentence = `The licence ended, so the host runs its paid functions in free mode. ${"w".repeat(489)}`;
+    expect(sentence.length).toBe(558);
+    expect(planNoticeOf({ state: "free_mode", line: sentence })).toEqual({ state: "free_mode", line: sentence });
+    const notice = planNoticeOf({ state: "active", line: "x".repeat(PLAN_LINE_MAX), step: "s".repeat(200) });
+    expect(notice?.line?.length).toBe(1_000);
+    expect(notice?.step?.length).toBe(200);
+  });
+
+  it("reads a valid licence that does not cover every paid function as its own state", () => {
+    expect(planNoticeOf({ state: "partly_covered", line: "Sent." })).toEqual({ state: "partly_covered", line: "Sent." });
+  });
+
+  it("reads a state it does not know as unknown, never as active", () => {
+    expect(planNoticeOf({ state: "renewed", line: "Sent." })?.state).toBe("unknown");
+    expect(planNoticeOf({ line: "Sent." })?.state).toBe("unknown");
+    expect(planNoticeOf({ state: "ACTIVE", line: "Sent." })?.state).toBe("unknown");
+  });
+
+  it("drops a bad step or time alone and keeps the rest", () => {
+    expect(planNoticeOf({
+      state: "ending_soon", line: "Sent.", step: "x".repeat(201), since: "yesterday", until: "2026-13-40T99:00:00Z",
+    })).toEqual({ state: "ending_soon", line: "Sent." });
+    expect(planNoticeOf({ state: "ending_soon", line: "Sent.", step: "a\nb", until: "2026-11-06T00:00:00Z" }))
+      .toEqual({ state: "ending_soon", line: "Sent.", until: "2026-11-06T00:00:00Z" });
+    expect(planNoticeOf({ state: "ending_soon", line: "Sent.", step: "", since: 1_700_000_000 }))
+      .toEqual({ state: "ending_soon", line: "Sent." });
   });
 });

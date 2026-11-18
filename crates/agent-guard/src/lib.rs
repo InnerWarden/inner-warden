@@ -58,17 +58,29 @@ pub mod file_tools;
 pub mod file_update;
 pub mod hook;
 pub mod hook_targets;
+// Contract types and pure decisions for agent identity.
+pub mod identity;
 pub mod mcp_wire;
 pub mod mcp_wire_toml;
+// Profiles per type of agent: the layer between the general policy and an
+// instance. Read only where a profiles file exists.
+pub mod profiles;
 pub mod redact;
 pub mod render;
+// The seccomp filter a Linux jail of `innerwarden contain` starts under, in
+// the style of Flatpak. Pure, and the one definition of its bytes for each
+// architecture, so they are built and checked the same on every host.
+pub mod seccomp;
 pub mod session;
 pub mod threats;
 
 // ── 3. INTERNAL ──────────────────────────────────────────────────────────────
 // No consumer outside this crate. Kept private so a future caller has to make a
 // deliberate decision to widen the surface, rather than finding it already open.
+mod arg_chain;
+mod description_poison;
 mod shell;
+mod shell_words;
 mod typosquat;
 mod unparsed;
 

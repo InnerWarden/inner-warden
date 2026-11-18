@@ -410,6 +410,7 @@
     }
   ],
   "record": {
+    "capped": false,
     "checked": 1,
     "decisions": 96,
     "flagged": 30,

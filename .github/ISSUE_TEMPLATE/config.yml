@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/InnerWarden/inner-warden/blob/main/SECURITY.md
+    about: Please report vulnerabilities privately by email (security@innerwarden.com), never in a public issue.
+  - name: Documentation
+    url: https://www.innerwarden.com/docs/installation
+    about: Install, setup and how each agent is wired.

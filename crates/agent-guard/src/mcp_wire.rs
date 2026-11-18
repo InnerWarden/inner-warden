@@ -457,6 +457,44 @@ fn for_each_server(root: &mut Value, mut f: impl FnMut(&mut Value) -> bool) -> u
     n
 }
 
+/// How many MCP servers a configuration names, by how the proxy can reach
+/// them: `stdio` servers run a local command and can be wrapped, `wrapped`
+/// of those already run through the proxy, and `remote` is every other
+/// server entry: it has no local command to wrap, so the proxy never sees
+/// its calls, whatever key names its address (`url`, Gemini CLI's `httpUrl`,
+/// `serverUrl`, a `type` of http or sse, or none at all).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ServerCounts {
+    pub stdio: usize,
+    pub wrapped: usize,
+    pub remote: usize,
+}
+
+/// A server entry with no local command: one the proxy cannot wrap, so its
+/// calls are never screened. Counted whatever names its address, so no
+/// unscreened server is left uncounted (a Gemini CLI `httpUrl` server was).
+fn is_remote_server(server: &Value) -> bool {
+    server.is_object() && !is_stdio_server(server)
+}
+
+/// The servers of a configuration, counted across every table this module
+/// wires, the same tables and the same tests [`wrap`] uses, so the counts
+/// say what a wrap would and did reach. Pure.
+pub fn server_counts(root: &Value) -> ServerCounts {
+    let (stdio, wrapped) = counts(root);
+    let remote = SERVER_TABLE_PATHS
+        .iter()
+        .filter_map(|path| table_at(root, path))
+        .flat_map(|map| map.values())
+        .filter(|server| is_remote_server(server))
+        .count();
+    ServerCounts {
+        stdio,
+        wrapped,
+        remote,
+    }
+}
+
 /// Count (stdio servers, of those already wrapped) across both schema keys.
 fn counts(root: &Value) -> (usize, usize) {
     let mut stdio = 0;
@@ -684,6 +722,79 @@ mod tests {
                 "remote": { "url": "https://example.com/sse" }
             }
         })
+    }
+
+    /// A remote server is counted apart and never as a local one, before
+    /// and after a wrap, in every table the module wires. FAILS ON REVERT of
+    /// the `url` test: the remote server is not counted at all.
+    #[test]
+    fn server_counts_counts_remote_servers_apart() {
+        assert_eq!(
+            server_counts(&cfg()),
+            ServerCounts {
+                stdio: 2,
+                wrapped: 0,
+                remote: 1
+            }
+        );
+        let (wrapped, _) = wrap(cfg(), "/abs/innerwarden", true, "cursor");
+        assert_eq!(
+            server_counts(&wrapped),
+            ServerCounts {
+                stdio: 2,
+                wrapped: 2,
+                remote: 1
+            }
+        );
+        let nested = json!({
+            "mcp": {"servers": {"a": {"url": "https://x/mcp"}, "b": {"command": "node"}}},
+            "servers": {"c": {"url": " "}, "d": {"command": "", "url": "https://y"}, "e": "not a server"}
+        });
+        assert_eq!(
+            server_counts(&nested),
+            ServerCounts {
+                stdio: 1,
+                wrapped: 0,
+                remote: 3
+            },
+            "every entry with no local command is counted unscreened; a value that is not an entry is not"
+        );
+        assert_eq!(server_counts(&json!({})), ServerCounts::default());
+    }
+
+    /// Gemini CLI declares a streamable HTTP server with `httpUrl`, others
+    /// with `serverUrl` or a `type`: none runs a local command, so none is
+    /// screened, and each is counted remote. FAILS ON REVERT of the `url`
+    /// only test: they were counted as nothing, and the page said "No MCP
+    /// server to screen" while their calls ran unscreened.
+    #[test]
+    fn server_counts_counts_every_remote_form_as_remote() {
+        let gemini = json!({
+            "mcpServers": {
+                "local": {"command": "npx", "args": ["-y", "server"]},
+                "http": {"httpUrl": "https://api.example.com/mcp"},
+                "sse": {"serverUrl": "https://sse.example.com"},
+                "typed": {"type": "streamable-http", "endpoint": "https://t.example.com"}
+            }
+        });
+        assert_eq!(
+            server_counts(&gemini),
+            ServerCounts {
+                stdio: 1,
+                wrapped: 0,
+                remote: 3
+            }
+        );
+        let only_http = json!({"mcpServers": {"http": {"httpUrl": "https://api.example.com/mcp"}}});
+        assert_eq!(
+            server_counts(&only_http),
+            ServerCounts {
+                stdio: 0,
+                wrapped: 0,
+                remote: 1
+            },
+            "a configuration of remote servers only is never \"no server\""
+        );
     }
 
     #[test]

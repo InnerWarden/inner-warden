@@ -18,6 +18,12 @@ const PRESENTATIONS: Record<string, Omit<StatusPresentation, "label"> & { label?
   active: { tone: "positive", symbol: "✓" },
   healthy: { tone: "positive", symbol: "✓" },
   host_verified: { tone: "positive", symbol: "✓", label: "Host verified" },
+  // Seen to start, but not inside a boundary it cannot leave: informational,
+  // never emerald (emerald is a read back that was confirmed).
+  observed: { tone: "informational", symbol: "i", label: "Seen by the kernel" },
+  // The lifecycle axis. Amber only for the one state that waits on a person.
+  discovered: { tone: "attention", symbol: "!", label: "Waits for your approval" },
+  revoked: { tone: "neutral", symbol: "–", label: "Revoked" },
   allowed: { tone: "positive", symbol: "✓" },
   // A case's outcomes, in the outcome palette every screen draws them in
   // (`outcomeTone`): a stop is the accent, a failure rose, anything only

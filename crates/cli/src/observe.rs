@@ -75,7 +75,9 @@ pub enum Decider {
     ModelRefused,
     /// The InnerWarden guard refused a screened command or tool call.
     GuardDenied,
-    /// The kernel refused the execution (Active Defence execution gate).
+    /// The kernel refused the execution: InnerWarden Pro's Execution Gate, in
+    /// enforce for this agent, refused a program during a call of this
+    /// conversation, as Pro recorded it ([`Basis::KernelRefusalInWindow`]).
     KernelDenied,
     /// Observed, outcome not established. Never presented as either of the two
     /// above.
@@ -114,11 +116,11 @@ impl Decider {
 /// reader to assume the product proved more than it saw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Basis {
-    /// A reply was delivered and no guard block was recorded in the window, so
-    /// nothing the guard screens ran. A tool the guard does not screen (an
-    /// OpenClaw agent's own exec) leaves nothing in its record, and the
-    /// reply's words are not read, so this says the agent answered, not that
-    /// it declined.
+    /// A reply was delivered and no guard block was recorded in the window.
+    /// A call the guard let run leaves no line in the sink, a tool it does
+    /// not see leaves nothing at all (OpenClaw's own tools are screened only
+    /// where the `innerwarden-guard` plugin runs), and the reply's words are
+    /// not read, so this says the agent answered, not that it declined.
     NoScreenedExecution,
     /// The agent's turn that answered the ask ended with a reply and called
     /// no tool (the reply plugin read the turn). It ran nothing; whether its
@@ -126,6 +128,10 @@ pub enum Basis {
     ReplyWithoutToolCall,
     /// The guard recorded a block in the same window as the ask.
     GuardBlockInWindow,
+    /// InnerWarden Pro's Execution Gate refused a program in this agent's
+    /// scope, in enforce, during a call of this conversation in the ask's
+    /// window, and Pro's own record says so when the ask is recorded.
+    KernelRefusalInWindow,
     /// Monitor mode let an action the guard flagged run in the same window as
     /// the ask (`outcome: would_block`). Nothing was refused, so neither the
     /// model nor the guard can be named as having stopped anything.
@@ -162,6 +168,7 @@ impl Basis {
             Self::NoScreenedExecution => "no_screened_execution_recorded_in_window",
             Self::ReplyWithoutToolCall => "replied_without_tool_call",
             Self::GuardBlockInWindow => "guard_block_recorded_in_window",
+            Self::KernelRefusalInWindow => "kernel_refusal_recorded_in_window",
             Self::FlaggedActionRanInWindow => "flagged_action_ran_in_window",
             Self::NoReplyWithinTtl => "no_reply_observed_within_ttl",
             Self::NextMessageBeforeReply => "next_message_before_reply",
@@ -441,6 +448,43 @@ pub struct GuardWindow {
     /// The guard refused an action on a line nothing ties to this ask: the
     /// line names no agent, or another session, or the ask names no agent.
     pub refused_unattributed: bool,
+    /// InnerWarden Pro's Execution Gate refused a program during a call of
+    /// this conversation, and Pro's own record confirmed it
+    /// ([`kernel_claims`] names the refusals; `observe_io` asks Pro).
+    pub kernel_refused_this_session: bool,
+}
+
+/// One refusal of the kernel the guard plugin recorded against a chat: when
+/// Pro says it refused, as the plugin's report carried it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelClaim {
+    pub refused_at: u64,
+}
+
+/// PURE. The kernel refusals the sink attributes to this agent and session
+/// in the window (`guard.kernel_refused`, written by `openclaw ran`). The
+/// sink is a file the agent's own account can append to, so these are only
+/// claims: `observe_io` keeps the ones Pro's record confirms.
+pub fn kernel_claims(
+    sink_tail: &str,
+    agent: &str,
+    session: &str,
+    from: u64,
+    until: u64,
+) -> Vec<KernelClaim> {
+    if agent.is_empty() || session.is_empty() {
+        return Vec::new();
+    }
+    sink_tail
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value.get("kind").and_then(Value::as_str) == Some("guard.kernel_refused"))
+        .filter(|value| value.get("agent").and_then(Value::as_str) == Some(agent))
+        .filter(|value| value.get("session").and_then(Value::as_str) == Some(session))
+        .filter_map(|value| value.get("refused_at").and_then(Value::as_u64))
+        .filter(|at| *at >= from && *at <= until)
+        .map(|refused_at| KernelClaim { refused_at })
+        .collect()
 }
 
 /// How an ask that left the pending state is recorded. PURE: what the guard
@@ -479,6 +523,12 @@ pub struct GuardWindow {
 /// An expired ask is not correlated at all, because its window can be hours
 /// wide by the time a later hook call flushes it.
 ///
+/// The kernel is named (`kernel_denied`) only where InnerWarden Pro's
+/// Execution Gate, in enforce for this agent, refused a program during a call
+/// of this conversation, Pro's own record confirming it when the ask is
+/// recorded (`observe_io`), for an ask whose reply was observed: the sink
+/// line that names the chat is only the attribution.
+///
 /// A turn that ended is a reply only when it called no tool and said
 /// something. One that called a tool acted: a native tool the guard does not
 /// screen leaves no line in the sink, so "nothing screened ran" would be true
@@ -500,6 +550,12 @@ pub fn outcome(leaving: Leaving, window: GuardWindow, recorded_at: u64) -> Attem
             (Decider::GuardDenied, Basis::GuardBlockInWindow)
         }
         _ if refused => (Decider::Undetermined, Basis::GuardBlockInWindow),
+        _ if replied && window.kernel_refused_this_session => {
+            (Decider::KernelDenied, Basis::KernelRefusalInWindow)
+        }
+        _ if window.kernel_refused_this_session => {
+            (Decider::Undetermined, Basis::KernelRefusalInWindow)
+        }
         Departure::Replied { declared: None } => {
             (Decider::Undetermined, Basis::NoScreenedExecution)
         }
@@ -2347,6 +2403,7 @@ mod tests {
         flagged_ran: false,
         refused_this_session: false,
         refused_unattributed: false,
+        kernel_refused_this_session: false,
     };
     const REFUSED_THIS_SESSION: GuardWindow = GuardWindow {
         refused_this_session: true,
@@ -2367,6 +2424,75 @@ mod tests {
         NoReply::PendingLimit,
         NoReply::StateUnavailable,
     ];
+
+    /// A refusal of InnerWarden Pro's Execution Gate during a call of this
+    /// chat, confirmed by Pro's own record, makes `kernel_denied` for an ask
+    /// whose reply was seen, and only for it: an ask nothing answered stays
+    /// undetermined, and a refusal of the guard's own in the same turn names
+    /// the guard.
+    ///
+    /// FAILS ON REVERT: drop the kernel arm and the replied ask reads
+    /// `no_screened_execution_recorded_in_window`.
+    #[test]
+    fn a_confirmed_kernel_refusal_names_the_kernel_for_an_answered_ask() {
+        let kernel = GuardWindow {
+            kernel_refused_this_session: true,
+            ..NOTHING
+        };
+        let replied = || Leaving {
+            ask: pending("s1", 100),
+            departure: Departure::Replied { declared: None },
+        };
+        let attempt = outcome(replied(), kernel, 150);
+        assert_eq!(attempt.decider, Decider::KernelDenied);
+        assert_eq!(attempt.basis, Basis::KernelRefusalInWindow);
+        let line = attempt_line(&attempt);
+        assert_eq!(line["decider"], "kernel_denied");
+        assert_eq!(line["decider_basis"], "kernel_refusal_recorded_in_window");
+        assert_eq!(line["enforced"], true);
+
+        let unanswered = outcome(
+            Leaving {
+                ask: pending("s1", 100),
+                departure: Departure::Unanswered(NoReply::ChannelReportsNone),
+            },
+            kernel,
+            150,
+        );
+        assert_eq!(unanswered.decider, Decider::Undetermined);
+        assert_eq!(unanswered.basis, Basis::KernelRefusalInWindow);
+
+        let both = GuardWindow {
+            refused_this_session: true,
+            kernel_refused_this_session: true,
+            ..NOTHING
+        };
+        assert_eq!(outcome(replied(), both, 150).decider, Decider::GuardDenied);
+    }
+
+    /// The sink's kernel lines are claims of this agent and chat in the
+    /// window, and nothing else is read as one.
+    #[test]
+    fn kernel_claims_are_read_for_this_agent_and_chat_only() {
+        let line = |agent: &str, session: &str, at: u64| {
+            json!({"kind": "guard.kernel_refused", "ts": at, "refused_at": at, "agent": agent, "session": session, "program": "/tmp/x"})
+                .to_string()
+        };
+        let tail = [
+            line("openclaw", "s1", 120),
+            line("openclaw", "s2", 121),
+            line("claude-code", "s1", 122),
+            line("openclaw", "s1", 99),
+            json!({"kind": "guard.blocked", "ts": 123, "refused_at": 123, "agent": "openclaw", "session": "s1"}).to_string(),
+        ]
+        .join("\n");
+        assert_eq!(
+            kernel_claims(&tail, "openclaw", "s1", 100, 200),
+            vec![KernelClaim { refused_at: 120 }]
+        );
+        assert!(kernel_claims(&tail, "", "s1", 100, 200).is_empty());
+        assert!(kernel_claims(&tail, "openclaw", "", 100, 200).is_empty());
+    }
 
     /// An ask that leaves without an observed reply is never recorded as the
     /// model declining, whatever the reason it left.

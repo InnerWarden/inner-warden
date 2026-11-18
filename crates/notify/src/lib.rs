@@ -249,8 +249,15 @@ pub fn telegram_request(token: &str, chat: &str, text: &str) -> Request {
     }
 }
 
-/// Slack incoming webhook, `{ "text": ... }`.
+/// Slack incoming webhook, `{ "text": ... }`. `&`, `<` and `>` are escaped,
+/// as Slack asks: the text carries a command an agent chose, and unescaped,
+/// a `<!channel>` in it pings the whole channel and `<url|label>` is a link
+/// that names another place than it goes.
 pub fn slack_request(webhook: &str, text: &str) -> Request {
+    let text = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
     Request {
         url: webhook.to_string(),
         body: json!({ "text": text }).to_string(),
@@ -258,11 +265,13 @@ pub fn slack_request(webhook: &str, text: &str) -> Request {
     }
 }
 
-/// Discord webhook, `{ "content": ... }`.
+/// Discord webhook, `{ "content": ... }`, with no mention parsed: the text
+/// carries a command an agent chose, and an `@everyone` in it would ping the
+/// whole server.
 pub fn discord_request(webhook: &str, text: &str) -> Request {
     Request {
         url: webhook.to_string(),
-        body: json!({ "content": text }).to_string(),
+        body: json!({ "content": text, "allowed_mentions": { "parse": [] } }).to_string(),
         json: true,
     }
 }
@@ -532,6 +541,27 @@ mod tests {
         );
         let w = webhook_request("https://w", json!({"a":1}));
         assert_eq!(serde_json::from_str::<Value>(&w.body).unwrap()["a"], 1);
+    }
+
+    /// A command an agent chose, in a chat alert, pings nobody and links
+    /// nowhere: Discord parses no mention, Slack's `& < >` are escaped. A
+    /// backtick in the command closes the alert's code span, so the text
+    /// is live otherwise. FAILS ON REVERT of either.
+    #[test]
+    fn a_chat_alert_pings_nobody_and_links_nowhere() {
+        let text = format_verdict(
+            "echo `x` @everyone <!channel> <https://evil.example|docs> & done",
+            &json!({"recommendation": "deny"}),
+        );
+        let discord: Value =
+            serde_json::from_str(&discord_request("https://d", &text).body).unwrap();
+        assert_eq!(discord["allowed_mentions"]["parse"], json!([]));
+        assert_eq!(discord["content"], text.as_str());
+        let slack: Value = serde_json::from_str(&slack_request("https://s", &text).body).unwrap();
+        let said = slack["text"].as_str().unwrap();
+        assert!(!said.contains('<') && !said.contains('>'), "{said}");
+        assert!(said.contains("&lt;!channel&gt;"), "{said}");
+        assert!(said.contains("&amp; done"), "{said}");
     }
 
     #[test]

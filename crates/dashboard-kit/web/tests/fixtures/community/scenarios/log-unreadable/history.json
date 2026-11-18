@@ -1,0 +1,16 @@
+{
+  "generated_at_ms": 1790690700000,
+  "messages": {
+    "last_7d": 0,
+    "recorded": 0
+  },
+  "readable": false,
+  "refusals": {
+    "blocked": 0,
+    "weeks": [],
+    "would_block": 0
+  },
+  "schema_version": 1,
+  "suppression_changes": 0,
+  "unparsable_lines": 0
+}

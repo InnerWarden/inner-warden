@@ -22,3 +22,6 @@
 # the paid tier's install behaviour, and where it currently falls short. They
 graphify-out/
 PRODUTO.md
+# Every other build folder (a cross build's CARGO_TARGET_DIR, such as
+# target-linux): megabytes of output that embed local paths, never public.
+/target-*/

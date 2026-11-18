@@ -399,7 +399,7 @@ const OUTCOMES = ["observed_only", "allowed", "blocked_before_execution", "would
 const MODES = ["disabled", "learning", "observe", "rehearse", "enforce", "mixed", "unknown"] as const;
 const EVENT_TYPES = ["agent_intent", "host_observation", "signal", "incident", "recommendation", "policy_decision", "enforcement_attempt", "verification", "operator_action", "feedback", "evidence_gap"] as const;
 const RELATIONSHIPS = ["causal", "strongly_supported", "contextual", "unknown"] as const;
-const IDENTITY_CONFIDENCE = ["host_verified", "configured", "declared", "conflicting", "unattributed"] as const;
+const IDENTITY_CONFIDENCE = ["host_verified", "observed", "configured", "declared", "conflicting", "unattributed"] as const;
 
 function object(value: unknown, path: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error(`${path}: expected object`);

@@ -1,14 +1,32 @@
-import { getJson } from "../api";
+import { getJson, type AgentsResponse } from "../api";
+import { DASHBOARD_FETCH_TIMEOUT_MS, requestDeadline } from "../api/client";
+import type { RestartWords } from "./restart";
 import { hasControlCharacters } from "../presentation";
 import {
   asChannel,
+  asDecisionAction,
+  asLaunchMode,
+  asLayer,
+  asLifecycle,
   asPlatform,
+  asTrustSource,
+  asVerdict,
+  effectiveTrust,
   isDecisionOutcome,
   isMessageOutcome,
+  TRUSTS,
+  worseTrust,
+  type AgentDecisionAction,
   type Channel,
   type DecisionOutcomeKey,
+  type LaunchMode,
+  type Layer,
+  type Lifecycle,
   type MessageOutcomeKey,
   type PlatformOs,
+  type Trust,
+  type TrustSource,
+  type Verdict,
 } from "./words";
 
 /**
@@ -140,6 +158,8 @@ export type Decision = {
   did: string;
   next: NextStep[];
   allowedByYou: boolean;
+  /** Which instance asked and which layer decided; absent where the record holds none. */
+  identity?: DecisionIdentity;
 };
 
 export type SessionFacts = {
@@ -152,7 +172,17 @@ export type SessionFacts = {
   lastAt?: string;
 };
 
-export type Reason = { key: string; words: string; short: string; count: number; mute?: string };
+export type Reason = {
+  key: string;
+  words: string;
+  short: string;
+  count: number;
+  mute?: string;
+  /** What the reason quoted, cut short by the CLI, for a muted line under `short`. */
+  detail?: string;
+  /** The reason's decisions by outcome, only the outcomes it has; absent from an older CLI. */
+  byOutcome?: Partial<Record<DecisionOutcomeKey, number>>;
+};
 
 export type RecordSpan = {
   decisions: number;
@@ -162,6 +192,11 @@ export type RecordSpan = {
   checked: number;
   oldestAt?: string;
   newestAt?: string;
+  /**
+   * The record is full: the oldest decisions are dropped as new ones arrive.
+   * Absent from an older CLI, and then nothing is said about it.
+   */
+  capped?: boolean;
 };
 
 export type SuppressCounts = { allow: number; muteRules: number; muteCategories: number };
@@ -270,6 +305,7 @@ export function readDecision(value: unknown): Decision | undefined {
     did,
     next: readNext(item.next),
     allowedByYou: bool(item.allowed_by_you) ?? false,
+    identity: readDecisionIdentity(item.identity),
   });
 }
 
@@ -294,7 +330,14 @@ function readRecordSpan(value: unknown): RecordSpan | undefined {
   const decisions = count(item?.decisions);
   const flagged = count(item?.flagged);
   if (item === undefined || decisions === undefined || flagged === undefined) return undefined;
-  return defined({ decisions, flagged, checked: count(item.checked) ?? 0, oldestAt: time(item.oldest_at), newestAt: time(item.newest_at) });
+  return defined({
+    decisions,
+    flagged,
+    checked: count(item.checked) ?? 0,
+    oldestAt: time(item.oldest_at),
+    newestAt: time(item.newest_at),
+    capped: bool(item.capped),
+  });
 }
 
 function readSuppress(value: unknown): SuppressCounts {
@@ -304,6 +347,22 @@ function readSuppress(value: unknown): SuppressCounts {
     muteRules: count(item?.mute_rules) ?? 0,
     muteCategories: count(item?.mute_categories) ?? 0,
   };
+}
+
+/**
+ * Counts by outcome (`by_outcome`), only the keys this page has words for;
+ * `undefined` when the field is not an object, so an absent count is never
+ * read as an empty one.
+ */
+function readOutcomeCounts(value: unknown): Partial<Record<DecisionOutcomeKey, number>> | undefined {
+  const outcomes = record(value);
+  if (outcomes === undefined) return undefined;
+  const counts: Partial<Record<DecisionOutcomeKey, number>> = {};
+  for (const [key, raw] of Object.entries(outcomes)) {
+    const read = count(raw);
+    if (isDecisionOutcome(key) && read !== undefined) counts[key] = read;
+  }
+  return counts;
 }
 
 export class UnreadableAnswer extends Error {
@@ -322,12 +381,7 @@ export function readDecisionsPage(value: unknown): DecisionsPage {
   if (page === undefined || !Array.isArray(page.items) || total === undefined || flaggedTotal === undefined || span === undefined) {
     throw new UnreadableAnswer("guard/decisions");
   }
-  const byOutcome: Partial<Record<DecisionOutcomeKey, number>> = {};
-  const outcomes = record(page.by_outcome) ?? {};
-  for (const [key, raw] of Object.entries(outcomes)) {
-    const value = count(raw);
-    if (isDecisionOutcome(key) && value !== undefined) byOutcome[key] = value;
-  }
+  const byOutcome = readOutcomeCounts(page.by_outcome) ?? {};
   const reasons = Array.isArray(page.reasons)
     ? page.reasons.flatMap((entry) => {
         const item = record(entry);
@@ -335,9 +389,16 @@ export function readDecisionsPage(value: unknown): DecisionsPage {
         const words = evidence(item?.words, 600)?.text;
         const reasonCount = count(item?.count);
         if (item === undefined || key === undefined || words === undefined || reasonCount === undefined) return [];
-        const mute = plain(item.mute, 200);
-        const reason: Reason = { key, words, short: plain(item.short, 80) ?? words, count: reasonCount };
-        return mute === undefined ? [reason] : [{ ...reason, mute }];
+        const reason: Reason = defined({
+          key,
+          words,
+          short: plain(item.short, 80) ?? words,
+          count: reasonCount,
+          mute: plain(item.mute, 200),
+          detail: evidence(item.detail, 120)?.text,
+          byOutcome: readOutcomeCounts(item.by_outcome),
+        });
+        return [reason];
       })
     : [];
   const sessions: Record<string, SessionFacts> = {};
@@ -398,6 +459,8 @@ export function readDecisionDetail(value: unknown): DecisionDetail {
 }
 
 export type DecisionsQuery = {
+  /** What the rules said (`deny`, `review`, `allow`): the Overview's newest denies. */
+  verdict?: "deny" | "review" | "allow";
   outcome?: string;
   reason?: string;
   /** A reason the reader hid from the list: a view only, the guard keeps flagging it. */
@@ -411,7 +474,7 @@ export type DecisionsQuery = {
 export function decisionsPath(query: DecisionsQuery): string {
   const params = new URLSearchParams();
   params.set("flagged", "1");
-  for (const name of ["outcome", "reason", "session", "q", "cursor"] as const) {
+  for (const name of ["verdict", "outcome", "reason", "session", "q", "cursor"] as const) {
     const value = query[name];
     if (value !== undefined && value.length > 0) params.set(name, value);
   }
@@ -451,13 +514,28 @@ export type RefusalWeek = {
   partial: boolean;
 };
 
+/** One UTC day of the guard's log. */
+export type RefusalDay = {
+  date: string;
+  blocked: number;
+  wouldBlock: number;
+  /** Today: the day is still under way, so its bar is drawn as "so far". */
+  partial: boolean;
+};
+
 export type History = {
   readable: boolean;
   since?: string;
   unparsableLines: number;
-  refusals: { blocked: number; wouldBlock: number; weeks: RefusalWeek[] };
+  /**
+   * `days`: the last 14 UTC days, oldest first. Absent from an older CLI,
+   * and then a page counts from the decision record instead, never zero.
+   */
+  refusals: { blocked: number; wouldBlock: number; weeks: RefusalWeek[]; days?: RefusalDay[] };
   messages: { recorded: number; last7d: number; latest?: { at: string; detail: string } };
   suppressionChanges: number;
+  /** What people decided about agents, most recent first; absent where the log holds none. */
+  agentDecisions?: AgentDecisionLine[];
 };
 
 export function readHistory(value: unknown): History {
@@ -480,6 +558,18 @@ export function readHistory(value: unknown): History {
         return start === undefined || b === undefined || w === undefined ? [] : [{ start, blocked: b, wouldBlock: w, partial: week?.partial === true }];
       })
     : [];
+  const days = Array.isArray(refusals?.days)
+    ? refusals.days.slice(-14).flatMap((entry): RefusalDay[] => {
+        const day = record(entry);
+        const date = typeof day?.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(day.date) ? day.date : undefined;
+        const b = count(day?.blocked);
+        const w = count(day?.would_block);
+        return date === undefined || b === undefined || w === undefined ? [] : [{ date, blocked: b, wouldBlock: w, partial: day?.partial === true }];
+      })
+    : undefined;
+  // No day that could be read is no days at all: the page then counts from
+  // the record, and never sums nothing into a zero.
+  const readDays = days === undefined || days.length === 0 ? undefined : days;
   const latestRecord = record(messages?.latest);
   const latestAt = time(latestRecord?.at);
   const latestDetail = evidence(latestRecord?.detail, 400)?.text;
@@ -487,13 +577,14 @@ export function readHistory(value: unknown): History {
     readable,
     since: time(body.since),
     unparsableLines: count(body.unparsable_lines) ?? 0,
-    refusals: { blocked, wouldBlock, weeks },
+    refusals: defined({ blocked, wouldBlock, weeks, days: readDays }),
     messages: defined({
       recorded,
       last7d: count(messages?.last_7d) ?? 0,
       latest: latestAt !== undefined && latestDetail !== undefined ? { at: latestAt, detail: latestDetail } : undefined,
     }),
     suppressionChanges: count(body.suppression_changes) ?? 0,
+    agentDecisions: readAgentDecisions(body.agent_decisions),
   });
 }
 
@@ -580,14 +671,23 @@ export type FlaggedConcerns = { ran: number; credentialRead: number; domainFetch
 export type Protection = {
   os: PlatformOs;
   record: { recording: boolean; since?: string; lostActions?: number };
-  jail: { available: boolean; backend?: string };
+  /**
+   * `checksPass`: whether the checks a jail needs pass on this machine. Absent
+   * (an older CLI) and `null` (not checked yet) both read "Not checked here
+   * yet": only `true` is ready. `advice` is the CLI's own words when not.
+   */
+  jail: { available: boolean; backend?: string; checksPass?: boolean; advice: string[]; checkedAt?: string };
   /** `available`: an OpenClaw config is here, so `observe install` can work. */
   observe: { installed: boolean; available: boolean };
-  alerts: { channels: number };
+  /** `channels`: how many are set up; absent when the CLI did not say, which is "not read", never zero. */
+  alerts: { channels?: number };
   secondOpinion: { configured: boolean; provider?: string };
   suppress: SuppressCounts;
   flagged?: FlaggedConcerns;
 };
+
+/** The longest line of jail advice the CLI serves. */
+export const JAIL_ADVICE_MAX = 400;
 
 export function readProtection(value: unknown): Protection {
   const body = record(value);
@@ -605,10 +705,23 @@ export function readProtection(value: unknown): Protection {
   return defined({
     os: asPlatform(record(body.platform)?.os),
     record: defined({ recording, since: time(recordFacts?.since), lostActions: count(recordFacts?.lost_actions) }),
-    jail: defined({ available: jailAvailable, backend: plain(jail?.backend, 32) }),
+    jail: defined({
+      available: jailAvailable,
+      backend: plain(jail?.backend, 32),
+      checksPass: bool(jail?.checks_pass),
+      // The same bound the CLI cuts a line of advice to (400 characters), so
+      // no line it serves is dropped here.
+      advice: Array.isArray(jail?.advice)
+        ? jail.advice.slice(0, 6).flatMap((line) => {
+            const read = plain(line, JAIL_ADVICE_MAX);
+            return read === undefined ? [] : [read];
+          })
+        : [],
+      checkedAt: time(jail?.checked_at),
+    }),
     // An older CLI sends no `available`: then only an installed hook says yes.
     observe: { installed, available: bool(record(body.observe)?.available) ?? installed },
-    alerts: { channels: count(record(body.alerts)?.channels) ?? 0 },
+    alerts: defined({ channels: count(record(body.alerts)?.channels) }),
     secondOpinion: defined({ configured: bool(second?.configured) ?? false, provider: plain(second?.provider, 32) }),
     suppress: readSuppress(body.suppress),
     flagged: ran === undefined || credentialRead === undefined || domainFetch === undefined
@@ -662,8 +775,44 @@ export function readUnnamedByChannel(value: unknown): { hook?: string; mcp?: str
   return item === undefined ? undefined : defined({ hook: time(item.hook), mcp: time(item.mcp) });
 }
 
+/**
+ * The CLI's sentence about a profiles file that is there and cannot be used
+ * (`profiles_file`), or `undefined` when there is none, which is every
+ * payload of a host without one.
+ */
+export function readProfilesFile(value: unknown): { sentence: string } | undefined {
+  const item = record(record(value)?.profiles_file);
+  const sentence = plain(item?.sentence, 1_024);
+  return item?.state === "invalid" && sentence !== undefined ? { sentence } : undefined;
+}
+
 /** The one command the CLI says fixes an agent, printed as sent. */
 export type AgentNextStep = { label: string; command: string; line: string };
+
+/**
+ * A connected hook agent whose shell commands are screened while another of
+ * its hooks runs a program that is gone: the sentence `innerwarden status`
+ * prints for it and the command that fixes it, as the CLI built them.
+ */
+export type AgentUnscreened = { line: string; command: string };
+
+/** Where a long unscreened line is cut, and what is said in its place. */
+export const UNSCREENED_LINE_MAX = 600;
+export const UNSCREENED_CUT_NOTICE = " [cut: innerwarden status prints the whole line]";
+
+export function readAgentUnscreened(value: unknown): AgentUnscreened | undefined {
+  const item = record(value);
+  // A long line (a deep binary path, several groups) is cut with a notice,
+  // never dropped: dropping it took the whole card away, and with it the one
+  // place the page said these tools are not screened.
+  const whole = plain(item?.line, 16_384);
+  const line =
+    whole === undefined || whole.length <= UNSCREENED_LINE_MAX
+      ? whole
+      : whole.slice(0, UNSCREENED_LINE_MAX - UNSCREENED_CUT_NOTICE.length).trimEnd() + UNSCREENED_CUT_NOTICE;
+  const command = plain(item?.command, 200);
+  return line === undefined || command === undefined ? undefined : { line, command };
+}
 
 export function readAgentNextStep(value: unknown): AgentNextStep | undefined {
   const item = record(value);
@@ -671,6 +820,299 @@ export function readAgentNextStep(value: unknown): AgentNextStep | undefined {
   const command = plain(item?.command, 200);
   const line = plain(item?.line, 300);
   return label === undefined || command === undefined || line === undefined ? undefined : { label, command, line };
+}
+
+// ---------------------------------------------------------------------------
+// Agent identity, as the CLI sends it (only where it exists)
+// ---------------------------------------------------------------------------
+
+const INSTANCE_ID = /^[0-9a-f]{32}$/;
+/** Most instances one agent row lists; the CLI counts the rest in `more_instances`. */
+export const MAX_INSTANCES = 20;
+const MAX_SESSIONS = 5;
+const MAX_AGENT_DECISIONS = 50;
+
+export type AgentProfile = {
+  /** `undefined` is the general rules. */
+  name?: string;
+  label: string;
+  source?: "builtin" | "system" | "user";
+  confined: number;
+  other: number;
+  appliesFrom: "now" | "next_start";
+};
+
+export type InstanceSession = { session: string; firstAt?: string; lastAt?: string; caseId?: string };
+
+export type LocalInstance = {
+  instanceId: string;
+  trust: Trust;
+  trustReason: string;
+  /** Who the label says decided its rules: the jail's own reading, or the host. */
+  trustSource?: TrustSource;
+  user?: string;
+  uid?: number;
+  project?: string;
+  mode?: LaunchMode;
+  startedAt?: string;
+  lastActivityAt?: string;
+  /** `false` is "ended"; absent is "not said", never "ended". */
+  live?: boolean;
+  sessions: InstanceSession[];
+  technical: {
+    jailPid?: number;
+    jailStartTicks?: number;
+    pidNs?: number;
+    scopeUnit?: string;
+    launcherPath?: string;
+    launcherRootOwned?: boolean;
+    /** `true` when the jail was started with user namespaces closed; absent is "not said". */
+    usernsClosed?: boolean;
+  };
+};
+
+/**
+ * What the CLI says about who an agent is and what was decided about it. Every
+ * field is optional: a CLI without the identity flag sends none of them, and
+ * `readAgentIdentity` then returns `undefined`, so the row is what it was.
+ */
+export type AgentIdentity = {
+  trust?: Trust;
+  trustReason?: string;
+  lifecycle?: Lifecycle;
+  lifecycleBy?: string;
+  lifecycleAt?: string;
+  owner?: string;
+  profile?: AgentProfile;
+  confine?: AgentNextStep;
+  decisionSteps: AgentNextStep[];
+  instances: LocalInstance[];
+  moreInstances: number;
+};
+
+function readTrust(value: unknown): Trust | undefined {
+  return typeof value === "string" && (TRUSTS as readonly string[]).includes(value) ? (value as Trust) : undefined;
+}
+
+function readProfile(value: unknown): AgentProfile | undefined {
+  const item = record(value);
+  const label = plain(item?.label, 80);
+  if (item === undefined || label === undefined) return undefined;
+  const source: AgentProfile["source"] = item.source === "builtin" || item.source === "system" || item.source === "user" ? item.source : undefined;
+  return defined({
+    name: plain(item.name, 64),
+    label,
+    source,
+    confined: count(item.confined_instances) ?? 0,
+    other: count(item.other_instances) ?? 0,
+    appliesFrom: item.applies_from === "next_start" ? ("next_start" as const) : ("now" as const),
+  });
+}
+
+function readInstance(value: unknown): LocalInstance | undefined {
+  const item = record(value);
+  const id = plain(item?.instance_id, 64);
+  if (item === undefined || id === undefined || !INSTANCE_ID.test(id)) return undefined;
+  const reason = plain(item.trust_reason, 64) ?? "";
+  // The reason is the ceiling: a trust above what it supports is never shown,
+  // and an instance whose label names another source is not a jail's word.
+  const source = item.trust_source === undefined ? "jail" : asTrustSource(item.trust_source);
+  const claimed = source !== undefined ? (readTrust(item.trust) ?? "declared") : "declared";
+  const sessions = Array.isArray(item.sessions)
+    ? item.sessions.slice(0, MAX_SESSIONS).flatMap((entry): InstanceSession[] => {
+        const session = record(entry);
+        const label = plain(session?.session, 64);
+        return session === undefined || label === undefined
+          ? []
+          : [defined({ session: label, firstAt: time(session.first_at), lastAt: time(session.last_at), caseId: plain(session.case_id, 256) })];
+      })
+    : [];
+  const technical = record(item.technical);
+  return defined({
+    instanceId: id,
+    trust: effectiveTrust(claimed, reason),
+    trustReason: reason,
+    trustSource: source,
+    user: plain(item.user, 64),
+    uid: count(item.uid),
+    project: plain(item.project, 120),
+    mode: asLaunchMode(item.mode),
+    startedAt: time(item.started_at),
+    lastActivityAt: time(item.last_activity_at),
+    live: bool(item.live),
+    sessions,
+    technical: defined({
+      jailPid: count(technical?.jail_pid),
+      jailStartTicks: count(technical?.jail_start_ticks),
+      pidNs: count(technical?.pid_ns),
+      scopeUnit: plain(technical?.scope_unit, 200),
+      launcherPath: plain(technical?.launcher_path, 300),
+      launcherRootOwned: bool(technical?.launcher_root_owned),
+      usernsClosed: technical?.userns_closed === true ? true : undefined,
+    }),
+  });
+}
+
+/** Worst trust of the live instances, or of all of them where none says it is live. */
+export function worstTrust(instances: readonly LocalInstance[]): Trust | undefined {
+  const live = instances.filter((instance) => instance.live !== false);
+  const pool = live.length > 0 ? live : instances;
+  return pool.length === 0 ? undefined : pool.map((instance) => instance.trust).reduce(worseTrust);
+}
+
+/**
+ * The identity fields of one `guard/agents` row, or `undefined` when the row
+ * carries none of them (which is the whole payload of a CLI without them).
+ */
+export function readAgentIdentity(agent: unknown): AgentIdentity | undefined {
+  const item = record(agent);
+  if (item === undefined) return undefined;
+  const instances = Array.isArray(item.instances)
+    ? item.instances.slice(0, MAX_INSTANCES).flatMap((entry) => {
+        const read = readInstance(entry);
+        return read === undefined ? [] : [read];
+      })
+    : [];
+  const lifecycle = asLifecycle(item.lifecycle);
+  const profile = readProfile(item.profile);
+  const confine = readAgentNextStep(item.confine_step);
+  const decisionSteps = Array.isArray(item.decision_steps)
+    ? item.decision_steps.flatMap((step) => {
+        const read = readAgentNextStep(step);
+        return read === undefined ? [] : [read];
+      })
+    : [];
+  const claimed = readTrust(item.trust);
+  const reason = plain(item.trust_reason, 64);
+  if (
+    lifecycle === undefined
+    && profile === undefined
+    && confine === undefined
+    && decisionSteps.length === 0
+    && instances.length === 0
+    && claimed === undefined
+  ) {
+    return undefined;
+  }
+  // The row's trust is its own label when it sent one, never above what its
+  // reason supports and never above its worst live instance; the reason shown
+  // is the one that belongs to the trust shown.
+  const own = claimed === undefined ? undefined : effectiveTrust(claimed, reason ?? "");
+  const worst = worstTrust(instances);
+  let trust = own;
+  let trustReason = own === undefined ? undefined : (reason ?? "");
+  if (worst !== undefined && (own === undefined || TRUSTS.indexOf(worst) < TRUSTS.indexOf(own))) {
+    trust = worst;
+    trustReason = instances.find((instance) => instance.trust === worst && instance.live !== false)?.trustReason
+      ?? instances.find((instance) => instance.trust === worst)?.trustReason;
+  }
+  return defined({
+    trust,
+    trustReason,
+    lifecycle,
+    lifecycleBy: plain(item.lifecycle_by, 64),
+    lifecycleAt: time(item.lifecycle_at),
+    owner: plain(item.owner, 64),
+    profile,
+    confine,
+    decisionSteps,
+    instances,
+    moreInstances: count(item.more_instances) ?? 0,
+  });
+}
+
+/** Which instance asked, and which layer decided (`guard/decision`'s `identity`). */
+export type DecisionIdentity = {
+  instanceId?: string;
+  sessionId?: string;
+  trust: Trust;
+  trustReason: string;
+  layer?: Layer;
+  profile?: string;
+  relaxationWithheld: boolean;
+  /** `host` when the hook asked Active Defence on its host and recorded its answer. */
+  trustSource?: TrustSource;
+  /** The host's id for its decision, as the hook recorded it. */
+  hostDecision?: string;
+  /** The host's word for not relaxing, kept without being read. */
+  hostWithheld?: string;
+};
+
+export function readDecisionIdentity(value: unknown): DecisionIdentity | undefined {
+  const item = record(value);
+  if (item === undefined) return undefined;
+  const reason = plain(item.trust_reason, 64) ?? "";
+  const id = plain(item.instance_id, 64);
+  return defined({
+    instanceId: id !== undefined && INSTANCE_ID.test(id) ? id : undefined,
+    sessionId: plain(item.session_id, 256),
+    trust: effectiveTrust(readTrust(item.trust) ?? "declared", reason),
+    trustReason: reason,
+    layer: asLayer(item.deciding_layer),
+    profile: plain(item.profile, 64),
+    relaxationWithheld: item.relaxation_withheld === true,
+    trustSource: asTrustSource(item.trust_source),
+    hostDecision: typeof item.host_decision === "string" && DECISION_ID.test(item.host_decision) ? item.host_decision : undefined,
+    hostWithheld: typeof item.host_withheld === "string" && WITHHELD_WORD.test(item.host_withheld) ? item.host_withheld : undefined,
+  });
+}
+
+/** A host decision id as the hook records it: 32 lowercase hex characters. */
+const DECISION_ID = /^[0-9a-f]{32}$/;
+/** A host's word for not relaxing: 1 to 48 of `[a-z_]`. */
+const WITHHELD_WORD = /^[a-z_]{1,48}$/;
+
+/** The verdict a decision's recommendation names, for the layer's words. */
+export function decisionVerdict(recommendation: string): Verdict | undefined {
+  return asVerdict(recommendation);
+}
+
+/** One line of what people decided about agents (`guard.agent_decision`). */
+export type AgentDecisionLine = {
+  at: string;
+  action: AgentDecisionAction;
+  agent: string;
+  instanceId?: string;
+  by: string;
+  owner?: string;
+  rule?: string;
+  profileBefore?: string;
+  profileAfter?: string;
+  confined?: number;
+  result: string;
+};
+
+function readAgentDecisions(value: unknown): AgentDecisionLine[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const lines = value.slice(0, MAX_AGENT_DECISIONS).flatMap((entry): AgentDecisionLine[] => {
+    const item = record(entry);
+    const at = time(item?.ts);
+    const action = asDecisionAction(typeof item?.action === "string" ? item.action.replace(/^agent_/, "") : undefined);
+    const agent = plain(item?.agent, 64);
+    const by = plain(item?.by, 64);
+    const result = plain(item?.result, 120);
+    if (item === undefined || at === undefined || action === undefined || agent === undefined || by === undefined || result === undefined) return [];
+    const rule = record(item.rule);
+    const id = plain(item.instance_id, 64);
+    return [
+      defined({
+        at,
+        action,
+        agent,
+        instanceId: id !== undefined && INSTANCE_ID.test(id) ? id : undefined,
+        by,
+        owner: plain(item.owner, 64),
+        // `{ kind, value }`, as the verbs write it and the CLI serves it
+        // (spec 104 5b.1); any other shape names no rule.
+        rule: rule !== undefined && (rule.kind === "category" || rule.kind === "mcp_tool") ? plain(rule.value, 120) : undefined,
+        profileBefore: plain(item.profile_before, 80),
+        profileAfter: plain(item.profile_after, 80),
+        confined: count(item.confined_instances),
+        result,
+      }),
+    ];
+  });
+  return lines.length === 0 ? undefined : lines;
 }
 
 /** A lane card's own command, sent beside a `no_source` lane. */
@@ -684,4 +1126,367 @@ export function readLaneNextStep(lanes: unknown, lane: string): { command: strin
 /** The decision record's span, as `guard/overview` sends it in `record`. */
 export function readOverviewRecord(value: unknown): RecordSpan | undefined {
   return readRecordSpan(value);
+}
+
+// ---------------------------------------------------------------------------
+// What the CLI says about each agent (`guard/agents`): how it is connected,
+// what it judges, how to change and restart it. Every field is optional: a
+// CLI that does not send one leaves it absent, and each page says the
+// fallback its section names, never a zero and never "off".
+// ---------------------------------------------------------------------------
+
+/** What an agent's connection judges before a call runs (`judges`). */
+export const JUDGES = ["shell_and_privileged_files", "shell_only", "mcp_server_calls"] as const;
+export type Judges = (typeof JUDGES)[number];
+
+/** An agent's own mode, as one word a page can branch on. */
+export type AgentMode = "enforce" | "monitor" | "mixed" | "partial" | "not_configured" | "unknown";
+
+/** A proxy agent's MCP servers: how many run locally, how many are wrapped, how many are remote. */
+export type McpCounts = { stdio: number; wrapped: number; remote: number };
+
+/** A step for THIS agent only (`mode_steps`), served only where the switch is proven. */
+export type ModeSteps = { enforce?: AgentNextStep; monitor?: AgentNextStep };
+
+export type AgentFacts = {
+  id: string;
+  name: string;
+  mode: AgentMode;
+  mechanism?: "hook" | "mcp";
+  /** `false` only when the CLI says the agent cannot be wired (`setup_support: "unsupported"`). */
+  supported: boolean;
+  /** Installed, or found running or on the PATH: not only a configuration left behind. */
+  present: boolean;
+  installed: boolean;
+  /** `null` where the platform does not check (macOS): never "not running". */
+  running: boolean | null;
+  lastObservedAt?: string;
+  configChangedAt?: string;
+  judges?: Judges;
+  judgesLine?: string;
+  /** Some of its tool calls go unscreened because a hook's program is gone; `judges` is then absent. */
+  unscreened?: AgentUnscreened;
+  restart?: RestartWords;
+  modeSteps?: ModeSteps;
+  mcp?: McpCounts;
+  nextStep?: AgentNextStep;
+  /** OpenClaw only: its own tools, the guard plugin that screens them, what Pro says about this host and the suggestion. */
+  ownTools?: OwnTools;
+  /** The technical view's evidence, as sent: how the agent was found, and the raw ids. */
+  detectedBy?: string[];
+  setupSupport?: string;
+  mechanismId?: string;
+  modeId?: string;
+};
+
+/**
+ * OpenClaw's own tools (`exec`, `process`, `write`, `edit`, `apply_patch`),
+ * as the CLI serves them on its card: screened by the guard plugin or not,
+ * in which mode, the paid edition's line where it is installed, and the one
+ * suggestion line, only on a measured fact.
+ */
+export type OwnTools = {
+  screened: boolean;
+  mode?: "monitor" | "enforce";
+  turnedOff: boolean;
+  proLine?: string;
+  suggestion?: string;
+};
+
+export function readOwnTools(value: unknown): OwnTools | undefined {
+  const item = record(value);
+  if (item === undefined || typeof item.screened !== "boolean") return undefined;
+  const mode: OwnTools["mode"] = item.mode === "monitor" ? "monitor" : item.mode === "enforce" ? "enforce" : undefined;
+  return defined({
+    screened: item.screened,
+    mode,
+    turnedOff: item.turned_off === true,
+    proLine: plain(item.pro_line, 300),
+    suggestion: plain(item.suggestion, 300),
+  });
+}
+
+function agentMode(guardrail: Json | undefined): AgentMode {
+  const raw = guardrail?.mode;
+  // A policy row nobody has seen working says so, and its intent is the mode
+  // it was set to; nothing about it is taken as seen.
+  const mode = raw === "configured_not_observed" ? guardrail?.configured_mode : raw;
+  if (mode === "dry-run") return "monitor";
+  if (mode === "enforcing") return "enforce";
+  return mode === "enforce" || mode === "monitor" || mode === "mixed" || mode === "partial" || mode === "not_configured" ? mode : "unknown";
+}
+
+function readRestart(value: unknown): RestartWords | undefined {
+  const item = record(value);
+  const how = plain(item?.how, 200);
+  const why = plain(item?.why, 200);
+  return how === undefined || why === undefined ? undefined : { how, why };
+}
+
+function readModeSteps(value: unknown): ModeSteps | undefined {
+  const item = record(value);
+  if (item === undefined) return undefined;
+  const steps = defined({ enforce: readAgentNextStep(item.enforce), monitor: readAgentNextStep(item.monitor) });
+  return steps.enforce === undefined && steps.monitor === undefined ? undefined : steps;
+}
+
+function readMcp(value: unknown): McpCounts | undefined {
+  const item = record(value);
+  const stdio = count(item?.stdio);
+  const wrapped = count(item?.wrapped);
+  const remote = count(item?.remote);
+  return stdio === undefined || wrapped === undefined || remote === undefined ? undefined : { stdio, wrapped, remote };
+}
+
+/** One `guard/agents` row, or `undefined` when it carries no id or name. */
+export function readAgentFacts(value: unknown): AgentFacts | undefined {
+  const item = record(value);
+  const id = plain(item?.id, 64);
+  const name = plain(item?.display_name, 64);
+  if (item === undefined || id === undefined || name === undefined) return undefined;
+  const guardrail = record(item.guardrail);
+  const mechanism: AgentFacts["mechanism"] = guardrail?.mechanism === "pretooluse_hook" ? "hook" : guardrail?.mechanism === "mcp_proxy" ? "mcp" : undefined;
+  const detectedBy = Array.isArray(item.detected_by) ? item.detected_by : [];
+  const installed = item.installed === true;
+  const judges = (JUDGES as readonly unknown[]).includes(item.judges) ? (item.judges as Judges) : undefined;
+  return defined({
+    id,
+    name,
+    mode: agentMode(guardrail),
+    mechanism,
+    supported: guardrail?.setup_support !== "unsupported",
+    present: installed || detectedBy.some((evidence) => evidence === "process" || evidence === "executable_on_path"),
+    installed,
+    running: typeof item.running === "boolean" ? item.running : null,
+    lastObservedAt: time(guardrail?.last_observed_at),
+    configChangedAt: time(guardrail?.config_changed_at),
+    judges,
+    judgesLine: plain(item.judges_line, 400),
+    unscreened: readAgentUnscreened(item.unscreened),
+    restart: readRestart(item.restart),
+    modeSteps: readModeSteps(item.mode_steps),
+    mcp: mechanism === "mcp" ? readMcp(item.mcp) : undefined,
+    nextStep: readAgentNextStep(item.next_step),
+    ownTools: id === "openclaw" ? readOwnTools(item.own_tools) : undefined,
+    detectedBy: strings(item.detected_by, 64),
+    setupSupport: plain(guardrail?.setup_support, 32),
+    mechanismId: plain(guardrail?.mechanism, 32),
+    modeId: plain(guardrail?.mode, 32),
+  });
+}
+
+export type AgentsFacts = {
+  agents: AgentFacts[];
+  /** The newest decision each channel screened, named or not. */
+  screened: { hook?: string; mcp?: string };
+  /** The newest decision each channel screened that names no agent; `undefined` when the CLI did not say. */
+  unnamed?: { hook?: string; mcp?: string };
+  autoConnect?: { enabled: boolean; mode?: string; everySeconds?: number };
+  /** Discovery stopped at its local safety limit: an agent may be missing from the list. */
+  discoveryLimited: boolean;
+};
+
+/** The whole `guard/agents` answer, or an error: a list that could not be read is never "no agent". */
+export function readAgentsFacts(value: AgentsResponse | unknown): AgentsFacts {
+  const body = record(value);
+  if (body === undefined || !Array.isArray(body.agents)) throw new UnreadableAnswer("guard/agents");
+  const auto = record(body.auto_connect);
+  const enabled = bool(auto?.enabled);
+  return defined({
+    agents: body.agents.flatMap((entry) => {
+      const read = readAgentFacts(entry);
+      return read === undefined ? [] : [read];
+    }),
+    screened: readScreenedByChannel(body),
+    unnamed: readUnnamedByChannel(body),
+    autoConnect: enabled === undefined
+      ? undefined
+      : defined({ enabled, mode: plain(auto?.mode, 32), everySeconds: count(auto?.refresh_interval_secs) }),
+    discoveryLimited: body.discovery_limited === true,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Routes an older CLI does not serve. A 404 is "this InnerWarden does not
+// serve it", which a page says in words; it is never read as an empty list.
+// ---------------------------------------------------------------------------
+
+export type Served<T> = { supported: true; value: T } | { supported: false };
+
+/** The answer to a route a CLI may not serve: unsupported on a 404, an error on any other failure. */
+export async function getServed(path: string): Promise<Served<unknown>> {
+  const deadline = requestDeadline(undefined, DASHBOARD_FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(path, { cache: "no-store", signal: deadline.signal });
+    if (response.status === 404) return { supported: false };
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => undefined)) as { error?: unknown } | undefined;
+      throw new Error(typeof payload?.error === "string" ? payload.error : `${path}: ${response.status}`);
+    }
+    return { supported: true, value: await response.json() };
+  } catch (error) {
+    if (deadline.timedOut()) throw new Error(`${path}: no answer in time`);
+    throw error;
+  } finally {
+    deadline.done();
+  }
+}
+
+/** One session that still has decisions in the record (`guard/sessions`). */
+export type SessionSummary = {
+  id: string;
+  agent?: string;
+  agentId?: string;
+  channel: Channel;
+  project?: string;
+  firstAt?: string;
+  lastAt?: string;
+  decisions: number;
+  flagged: number;
+  byOutcome: Partial<Record<DecisionOutcomeKey, number>>;
+};
+
+export type SessionsPage = { items: SessionSummary[]; record?: RecordSpan };
+
+/** At most this many sessions are asked for, as the route bounds it. */
+export const MAX_SESSIONS_LIMIT = 50;
+
+export function readSessionsPage(value: unknown): SessionsPage {
+  const body = record(value);
+  if (body === undefined || !Array.isArray(body.items)) throw new UnreadableAnswer("guard/sessions");
+  return defined({
+    items: body.items.slice(0, MAX_SESSIONS_LIMIT).flatMap((entry): SessionSummary[] => {
+      const item = record(entry);
+      const id = plain(item?.id, 256);
+      const decisions = count(item?.decisions);
+      const flagged = count(item?.flagged);
+      if (item === undefined || id === undefined || decisions === undefined || flagged === undefined) return [];
+      return [
+        defined({
+          id,
+          agent: plain(item.agent, 64),
+          agentId: plain(item.agent_id, 64),
+          channel: asChannel(item.channel),
+          project: plain(item.project, 120),
+          firstAt: time(item.first_at),
+          lastAt: time(item.last_at),
+          decisions,
+          flagged,
+          byOutcome: readOutcomeCounts(item.by_outcome) ?? {},
+        }),
+      ];
+    }),
+    record: readRecordSpan(body.record),
+  });
+}
+
+export async function fetchSessions(limit = 20): Promise<Served<SessionsPage>> {
+  const bounded = Math.min(MAX_SESSIONS_LIMIT, Math.max(1, Math.floor(limit)));
+  const answer = await getServed(`api/guard/sessions?limit=${bounded}`);
+  return answer.supported ? { supported: true, value: readSessionsPage(answer.value) } : answer;
+}
+
+/** One allow pattern (`guard/suppress`). */
+export type AllowEntry = {
+  pattern: string;
+  /** It matches more than one command: no anchor holds it to one. */
+  unanchored: boolean;
+  /** It held a secret, which the CLI replaced before serving it. */
+  redacted: boolean;
+  hiddenCharacters: boolean;
+  /**
+   * Too long to serve whole: `pattern` is its first part. The text shown is
+   * not the pattern in force, so it has no remove step here.
+   */
+  shortened: boolean;
+  /** Never present for a redacted, shortened or hidden-character pattern: the step would not remove it. */
+  remove?: AgentNextStep;
+};
+
+export type SuppressList = {
+  /** The lists are hidden because this dashboard is open to the network; the counts still show. */
+  withheld: boolean;
+  counts: SuppressCounts;
+  allow: AllowEntry[];
+  /** Patterns the guard ignores because they match every command. */
+  dropped: string[];
+  muteRules: { id: string; title?: string; remove?: AgentNextStep }[];
+  muteCategories: { id: string; remove?: AgentNextStep }[];
+  /** How many more each list holds than it shows. */
+  more: SuppressCounts;
+  /** Entries the CLI served that this page could not read: counted, never dropped silently. */
+  unshown: number;
+  /**
+   * How many times the lists changed, counted from the guard's log: never a
+   * pattern from it. `count` is absent when the log could not be read, which
+   * is said as not read, never as no change.
+   */
+  changes: { count?: number; since?: string; lastAt?: string };
+  listSteps: { allow?: AgentNextStep; mute?: AgentNextStep };
+};
+
+/** Most entries one list carries, as the route bounds it. */
+export const MAX_SUPPRESS_ENTRIES = 200;
+/**
+ * The bound an entry of these lists is read with. The CLI serves at most 400
+ * characters of one (a longer one is cut and marked), which is at most 800
+ * UTF-16 units here.
+ */
+export const SUPPRESS_ENTRY_MAX = 1_024;
+
+export function readSuppressList(value: unknown): SuppressList {
+  const body = record(value);
+  const counts = record(body?.counts);
+  if (body === undefined || counts === undefined || !Array.isArray(body.allow)) throw new UnreadableAnswer("guard/suppress");
+  const withheld = body.withheld === "exposed";
+  const list = (entries: unknown) => (withheld || !Array.isArray(entries) ? [] : entries.slice(0, MAX_SUPPRESS_ENTRIES));
+  const changes = record(body.changes);
+  const steps = record(body.list_steps);
+  let unshown = 0;
+  const skip = (): [] => {
+    unshown += 1;
+    return [];
+  };
+  return {
+    withheld,
+    counts: readSuppress(counts),
+    allow: list(body.allow).flatMap((entry): AllowEntry[] => {
+      const item = record(entry);
+      const pattern = evidence(item?.pattern, SUPPRESS_ENTRY_MAX);
+      if (item === undefined || pattern === undefined) return skip();
+      const redacted = item.redacted === true;
+      const hiddenCharacters = pattern.hidden || item.hidden_characters === true;
+      const shortened = item.shortened === true;
+      const remove = redacted || hiddenCharacters || shortened ? undefined : readAgentNextStep(item.remove);
+      return [defined({ pattern: pattern.text, unanchored: item.warning === "unanchored", redacted, hiddenCharacters, shortened, remove })];
+    }),
+    dropped: list(body.dropped).flatMap((entry) => {
+      const pattern = evidence(record(entry)?.pattern, SUPPRESS_ENTRY_MAX);
+      return pattern === undefined ? skip() : [pattern.text];
+    }),
+    // A mute is read with the bound the CLI serves it at (it may be any
+    // length, and the file can be edited by hand), as evidence: a hidden
+    // character is shown written out, never a reason to drop the row.
+    muteRules: list(body.mute_rules).flatMap((entry) => {
+      const item = record(entry);
+      const id = evidence(item?.id, SUPPRESS_ENTRY_MAX)?.text.trim();
+      return item === undefined || id === undefined || id === ""
+        ? skip()
+        : [defined({ id, title: plain(item.title, 120), remove: readAgentNextStep(item.remove) })];
+    }),
+    muteCategories: list(body.mute_categories).flatMap((entry) => {
+      const item = record(entry);
+      const id = evidence(item?.id, SUPPRESS_ENTRY_MAX)?.text.trim();
+      return item === undefined || id === undefined || id === "" ? skip() : [defined({ id, remove: readAgentNextStep(item.remove) })];
+    }),
+    more: readSuppress(body.more),
+    unshown,
+    changes: defined({ count: count(changes?.count), since: time(changes?.since), lastAt: time(changes?.last_at) }),
+    listSteps: defined({ allow: readAgentNextStep(steps?.allow), mute: readAgentNextStep(steps?.mute) }),
+  };
+}
+
+export async function fetchSuppress(): Promise<Served<SuppressList>> {
+  const answer = await getServed("api/guard/suppress");
+  return answer.supported ? { supported: true, value: readSuppressList(answer.value) } : answer;
 }

@@ -263,28 +263,28 @@ async function expectNoUnsupportedProtectionClaim(page: Page) {
 
 /**
  * The Community Overview's own pages (the kit entry point mounts them): the
- * lanes say what this machine's records hold, and the card for attacks on
- * this machine says plainly that Community does not watch it, with the one
- * offer beside it. Regenerated deliberately when the Community pages
- * replaced the posture hero; the prohibitions below did not change.
+ * band says whether the agents are connected and what to do next, and every
+ * count says where it comes from. Regenerated deliberately when the Overview
+ * became one verdict, two counts and the decisions that need a look; the
+ * prohibitions below did not change.
  */
 test("Community language states its useful agent boundary without implying host protection", async ({ page }) => {
   await page.goto(communityUrl);
 
-  const lanes = page.locator("section[aria-labelledby='lanes-title']");
-  const hostBoundary = page.locator("[data-lane='server_attacks']");
-  await expect(hostBoundary.locator("[data-ad-state='offer']")).toBeVisible();
+  const band = page.locator("[data-verdict-row]");
+  await expect(band.getByRole("heading", { level: 1 })).toBeVisible();
   const language = {
     edition: await normalizedText(page.getByText("Community", { exact: true }).first()),
-    title: await normalizedText(lanes.locator("#lanes-title")),
-    description: await normalizedText(lanes.locator("#lanes-title + p")),
-    hostBoundaryTitle: await normalizedText(hostBoundary.locator("#lane-server_attacks-title")),
-    hostBoundary: await normalizedText(hostBoundary.getByText("It does not watch this machine itself.", { exact: false })),
-    hostBoundaryOffer: await normalizedText(hostBoundary.locator("[data-ad-state='offer'] [data-offer-words]")),
+    title: await normalizedText(band.getByRole("heading", { level: 1 })),
+    verdict: await normalizedText(band.locator("p").first()),
+    refusedTitle: await normalizedText(page.locator("#refused-title")),
+    refusedSource: await normalizedText(page.locator("#refused [data-source]")),
+    recordSource: await normalizedText(page.locator("#needs-a-look [data-source]").first()),
   };
 
   expect(language).toEqual(claimLanguageSnapshots.community);
   await expectNoUnsupportedProtectionClaim(page);
+  await expect(page.locator("[data-ad-state]")).toHaveCount(0);
 });
 
 test("Observe language is visibility-only", async ({ page }) => {

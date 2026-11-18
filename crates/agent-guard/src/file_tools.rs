@@ -101,6 +101,399 @@ pub fn file_tool_call(payload: &Value) -> FileToolCall {
     }
 }
 
+/// Claude Code's tools that read a file or search files, by name. They
+/// never pass through the shell either, so a hook wired to `Bash` and the
+/// file-changing tools let `Read` of a private key, or `Grep` over a folder
+/// of tokens, run with no screening at all (measured 2026-11-12, 5 of 5).
+pub const READ_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
+
+/// The same reads under the names other agents give them, each read in that
+/// agent's own source: Gemini CLI's `read_file` (`file_path`),
+/// `read_many_files` (`include`), `glob` and `grep_search` (`dir_path`;
+/// `search_file_content` before it was renamed), and Hermes Agent's
+/// `read_file` (`path`) and `search_files` (`target` `files` or `content`).
+/// Their hooks carry no matcher, so these calls reach the guard already.
+pub const OTHER_READ_TOOLS: &[&str] = &[
+    "read_file",
+    "read_many_files",
+    "glob",
+    "grep_search",
+    "search_file_content",
+    "search_files",
+];
+
+/// The PreToolUse matcher that sends [`READ_TOOLS`] to the hook: a plain
+/// `|` list, as [`FILE_TOOLS_MATCHER`] is.
+pub const READ_TOOLS_MATCHER: &str = "Read|Grep|Glob";
+
+/// Where a read tool names the folder it searches.
+const FOLDER_KEYS: &[&str] = &["path", "dir_path"];
+
+/// One tool call, read for what it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileReadCall {
+    /// Not one of [`READ_TOOLS`] or [`OTHER_READ_TOOLS`]: none of this
+    /// module's business.
+    NotARead,
+    /// One of them, as the shell line that reads the same files
+    /// ([`file_read_call`]): screened by the rules a shell read is.
+    Reads(String),
+    /// One of them with no target that can be read. The hook is registered
+    /// for these tools, so this is a schema change or a broken agent.
+    Unreadable(&'static str),
+}
+
+/// What a read tool does, whatever the agent calls it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadKind {
+    /// Opens the files it names.
+    Files,
+    /// Searches the text of every file under a folder.
+    Search,
+    /// Lists the files under a folder whose names match a pattern.
+    Find,
+}
+
+fn read_kind(tool: &str, input: Option<&Value>) -> Option<ReadKind> {
+    Some(match tool {
+        "Read" | "read_file" | "read_many_files" => ReadKind::Files,
+        "Grep" | "grep_search" | "search_file_content" => ReadKind::Search,
+        "Glob" | "glob" => ReadKind::Find,
+        "search_files" => {
+            match input
+                .and_then(|input| input.get("target"))
+                .and_then(Value::as_str)
+            {
+                Some("files") => ReadKind::Find,
+                _ => ReadKind::Search,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// [`file_read_call_in`] with the home from the environment (else the
+/// account database) and the working directory the payload names.
+pub fn file_read_call(payload: &Value) -> FileReadCall {
+    let home = home_from(std::env::var_os("HOME"));
+    let cwd = payload
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| cwd.starts_with('/'))
+        .map(PathBuf::from);
+    let context = WriteContext {
+        cwd: cwd.as_deref(),
+        home: home.as_deref(),
+        guard_program: None,
+    };
+    file_read_call_in(payload, &context)
+}
+
+/// The home a read is judged in: `HOME` when it is set and not empty,
+/// else the one the account database names.
+fn home_from(variable: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match variable {
+        Some(home) if !home.is_empty() => Some(PathBuf::from(home)),
+        _ => home_of_this_account(),
+    }
+}
+
+/// Read a hook payload as a call of one of [`READ_TOOLS`] or
+/// [`OTHER_READ_TOOLS`], and say it as the shell line that reads what it
+/// reads:
+///
+/// * a file read is `cat <file>`, every path the call names;
+/// * a search over a path is `grep -r '' <path>`, the path the call names,
+///   else the folder it runs in (`cwd`), else `.`;
+/// * a file search is `find <path> -path <pattern>`, with the same folder.
+///
+/// What is judged is the files, by the secret rules of the shell: a private
+/// key, a tool's stored login, a `.env` outside the project, a hidden folder
+/// in the home that holds one. Not the text a search looks for: the pattern
+/// is no file, and every text rule of the shell on a search string would
+/// refuse a search for the words of a dangerous command. One part of it is
+/// kept: the word that makes a search over a broad root a hunt for secrets
+/// (`password`, `id_rsa`, see [`crate::threats::credential_hunt_token`]),
+/// as `-e <word>`, which the credential hunt reads and the rest of the rules
+/// do not. A search limited by `glob` or `type` is judged as a read of the
+/// whole path.
+///
+/// Each path is judged as written and as what it is ([`other_names_of`]): a
+/// link to a secret, a hard link to one, and on macOS a spelling in another
+/// case are judged as the secret, because the tool opens the secret.
+///
+/// The empty pattern is grep's first operand, the plainest spelling of the
+/// read, so the path is the word the shell rules see as the file.
+pub fn file_read_call_in(payload: &Value, context: &WriteContext<'_>) -> FileReadCall {
+    let tool = payload
+        .get("tool_name")
+        .or_else(|| payload.get("tool"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !READ_TOOLS.contains(&tool) && !OTHER_READ_TOOLS.contains(&tool) {
+        return FileReadCall::NotARead;
+    }
+    let input = payload.get("tool_input");
+    let Some(kind) = read_kind(tool, input) else {
+        return FileReadCall::NotARead;
+    };
+    let text = |key: &str| {
+        input
+            .and_then(|input| input.get(key))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    // The folder a search with no path runs in.
+    let folder = || {
+        FOLDER_KEYS
+            .iter()
+            .find_map(|key| text(key))
+            .or_else(|| {
+                payload
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|cwd| cwd.starts_with('/'))
+            })
+            .unwrap_or(".")
+    };
+    // A path as words of the line: as written, then what it also is.
+    let words_of = |path: &str| {
+        let mut words = vec![shell_path_word(path)];
+        words.extend(
+            other_names_of(path, context)
+                .iter()
+                .map(|name| shell_path_word(name)),
+        );
+        words.join(" ")
+    };
+    match kind {
+        ReadKind::Files => {
+            let mut paths: Vec<&str> = Vec::new();
+            let listed = input
+                .and_then(|input| input.get("include"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|path| !path.is_empty());
+            for path in PATH_KEYS
+                .iter()
+                .chain(&["absolute_path"])
+                .filter_map(|key| text(key))
+                .chain(listed)
+            {
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+            }
+            if paths.is_empty() {
+                return FileReadCall::Unreadable("a file read call with no file path");
+            }
+            let words: Vec<String> = paths.into_iter().map(words_of).collect();
+            FileReadCall::Reads(format!("cat {}", words.join(" ")))
+        }
+        ReadKind::Search => {
+            let hunted = text("pattern")
+                .and_then(crate::threats::credential_hunt_token)
+                .map(|word| format!("-e {word} "))
+                .unwrap_or_else(|| "'' ".to_string());
+            FileReadCall::Reads(format!("grep -r {hunted}{}", words_of(folder())))
+        }
+        ReadKind::Find => {
+            let Some(pattern) = text("pattern") else {
+                return FileReadCall::Unreadable("a file search call with no pattern");
+            };
+            FileReadCall::Reads(format!(
+                "find {} -path {}",
+                words_of(folder()),
+                shell_path_word(pattern)
+            ))
+        }
+    }
+}
+
+/// The always-secret files in a home, relative to it, that a read is
+/// compared with by identity ([`other_names_of`]), beside every file in
+/// `~/.ssh`.
+pub(crate) const HOME_SECRETS: &[&str] = &[
+    ".aws/credentials",
+    ".git-credentials",
+    ".netrc",
+    ".config/gh/hosts.yml",
+    ".docker/config.json",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".codex/auth.json",
+    ".gemini/oauth_creds.json",
+    ".claude/.credentials.json",
+    ".hermes/auth.json",
+    ".config/gcloud/application_default_credentials.json",
+    ".kube/config",
+    ".vault-token",
+];
+
+/// How many entries of `~/.ssh` a read is compared with.
+#[cfg(unix)]
+const SSH_ENTRIES: usize = 256;
+
+/// The other names a read tool's `path` has, for the rules that judge a path
+/// by its text: the real path once its links are followed, the always-secret
+/// file in the home that is the same file (a hard link, or the file a link
+/// or another spelling reaches), and on macOS the home-relative path in
+/// lowercase when it is in a hidden folder. Only what differs from the path
+/// as written is given, and only what exists is compared. A read opens the
+/// file a link leads to, the file a hard link is, and on a file system that
+/// ignores case the file another spelling names, so each is judged as that
+/// file.
+pub fn other_names_of(path: &str, context: &WriteContext<'_>) -> Vec<String> {
+    // An empty path names no file (`absolute_path` would make it the
+    // working directory). A path longer than any the system opens needs no
+    // test of its own: following it and asking what it is both fail.
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let Some(absolute) = absolute_path(trimmed, context) else {
+        return Vec::new();
+    };
+    let written = lexical(&absolute);
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |name: PathBuf| {
+        let name = name.to_string_lossy().into_owned();
+        if name != written.to_string_lossy() && !names.contains(&name) {
+            names.push(name);
+        }
+    };
+    if let Ok(real) = std::fs::canonicalize(&absolute) {
+        add(real);
+    }
+    for secret in same_secret_in_home(&absolute, context) {
+        add(secret);
+    }
+    if cfg!(target_os = "macos") {
+        if let Some(lower) = context
+            .home
+            .and_then(|home| lowercase_hidden_spelling(&written, home))
+        {
+            add(lower);
+        }
+    }
+    names
+}
+
+/// What the file at `path` also is, for the shell's reads: where its links
+/// lead, and the always-secret files in `home` it is the same file as
+/// ([`same_secrets`]). A path that names no file has no other name.
+pub(crate) fn names_of_the_file(path: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut names: Vec<PathBuf> = std::fs::canonicalize(path).into_iter().collect();
+    for secret in same_secrets(path, home) {
+        if !names.contains(&secret) {
+            names.push(secret);
+        }
+    }
+    names
+}
+
+/// The always-secret files in the home that `path` is the same file as, by
+/// device and inode: every file in `~/.ssh` and the [`HOME_SECRETS`]. None
+/// off Unix, where identity is no device and inode pair.
+fn same_secret_in_home(path: &Path, context: &WriteContext<'_>) -> Vec<PathBuf> {
+    same_secrets(path, context.home)
+}
+
+/// [`same_secret_in_home`] with the home given.
+fn same_secrets(path: &Path, home: Option<&Path>) -> Vec<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let identity = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+        let (Some(home), Some(target)) = (home, identity(path)) else {
+            return Vec::new();
+        };
+        let ssh = std::fs::read_dir(home.join(".ssh"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .take(SSH_ENTRIES)
+            .map(|entry| entry.path());
+        ssh.chain(HOME_SECRETS.iter().map(|relative| home.join(relative)))
+            .filter(|secret| identity(secret) == Some(target))
+            .collect()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, home);
+        Vec::new()
+    }
+}
+
+/// `path` with its part below `home` in lowercase, when that part is in a
+/// hidden folder and is spelled with an upper-case letter: on a file system
+/// that ignores case, `~/.SSH/id_ed25519` and `~/.Codex/AUTH.json` open
+/// `~/.ssh/id_ed25519` and `~/.codex/auth.json`, and the rules know only
+/// the lowercase names.
+fn lowercase_hidden_spelling(path: &Path, home: &Path) -> Option<PathBuf> {
+    let parts = |path: &Path| -> Vec<String> {
+        path.components()
+            .map(|part| part.as_os_str().to_string_lossy().into_owned())
+            .collect()
+    };
+    let (path_parts, home_parts) = (parts(path), parts(&lexical(home)));
+    let rest = path_parts.get(home_parts.len()..)?;
+    let same_home = path_parts
+        .iter()
+        .zip(&home_parts)
+        .all(|(a, b)| a.to_lowercase() == b.to_lowercase());
+    if !same_home || !rest.first()?.starts_with('.') {
+        return None;
+    }
+    let lower: Vec<String> = rest.iter().map(|part| part.to_lowercase()).collect();
+    if lower == rest {
+        return None;
+    }
+    let mut out = home.to_path_buf();
+    out.extend(lower);
+    Some(out)
+}
+
+/// One path as a word of a shell line, so the line names that path and no
+/// more: written out when every character is a plain path character, else
+/// in single quotes. A leading `~/` stays outside the quotes, where the
+/// shell, and the guard, read it as the home; a leading `-` is made a path
+/// (`./-x`) so it is no option.
+fn shell_path_word(path: &str) -> String {
+    let plain = |text: &str| {
+        !text.is_empty()
+            && text
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-./:=@%+,".contains(c))
+    };
+    let quoted = |text: &str| {
+        if plain(text) {
+            text.to_string()
+        } else {
+            format!("'{}'", text.replace('\'', r"'\''"))
+        }
+    };
+    if path == "~" {
+        return "~".into();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return if rest.is_empty() {
+            "~/".into()
+        } else {
+            format!("~/{}", quoted(rest))
+        };
+    }
+    if path.starts_with('-') {
+        return quoted(&format!("./{path}"));
+    }
+    quoted(path)
+}
+
 /// Where the call runs, as far as the hook knows it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WriteContext<'a> {
@@ -246,8 +639,18 @@ const HOME_GUARD_FILES: &[&str] = &[
 ];
 
 /// Privileged directories in the account's home outside [`HOME_PLACES`].
+/// OpenClaw's plugin and hook folders hold the guard that screens its own
+/// tools (`innerwarden-guard`) and the hook that records its chats: code the
+/// gateway loads, so an agent that could change them could take its own
+/// guard off or plant a plugin that rewrites the calls the guard screened.
 #[cfg(unix)]
-const HOME_GUARD_TREES: &[&str] = &[".config/innerwarden", ".ssh", ".gnupg"];
+const HOME_GUARD_TREES: &[&str] = &[
+    ".config/innerwarden",
+    ".ssh",
+    ".gnupg",
+    ".openclaw/extensions",
+    ".openclaw/hooks",
+];
 
 /// The account's home from the account database, for a hook run without
 /// `HOME`.
@@ -570,6 +973,431 @@ mod tests {
             FILE_TOOLS_MATCHER.split('|').collect::<Vec<_>>(),
             FILE_TOOLS
         );
+        assert_eq!(
+            READ_TOOLS_MATCHER.split('|').collect::<Vec<_>>(),
+            READ_TOOLS
+        );
+    }
+
+    /// Each read tool is said as the shell line that reads the same files,
+    /// and nothing else is read as one.
+    ///
+    /// FAILS ON REVERT of `file_read_call` (every call is `NotARead`, as the
+    /// hook took a call with no command before).
+    #[test]
+    fn a_read_tool_is_said_as_the_shell_read_of_the_same_files() {
+        let read = |tool: &str, input: Value| {
+            file_read_call(
+                &json!({"tool_name": tool, "cwd": "/home/dev/proj", "tool_input": input}),
+            )
+        };
+        for (tool, input, line) in [
+            (
+                "Read",
+                json!({"file_path": "/home/dev/.ssh/id_ed25519"}),
+                "cat /home/dev/.ssh/id_ed25519",
+            ),
+            (
+                "Read",
+                json!({"file_path": "/home/dev/proj/src/main.rs", "offset": 10, "limit": 40}),
+                "cat /home/dev/proj/src/main.rs",
+            ),
+            (
+                "Read",
+                json!({"file_path": "~/.codex/auth.json"}),
+                "cat ~/.codex/auth.json",
+            ),
+            (
+                "Read",
+                json!({"file_path": "/home/dev/My Notes/a.md", "path": "/etc/shadow"}),
+                "cat '/home/dev/My Notes/a.md' /etc/shadow",
+            ),
+            (
+                "Read",
+                json!({"notebook_path": "/home/dev/proj/a.ipynb"}),
+                "cat /home/dev/proj/a.ipynb",
+            ),
+            (
+                "Grep",
+                json!({"pattern": "xoxb-", "path": "/home/dev/.hermes", "output_mode": "content"}),
+                "grep -r '' /home/dev/.hermes",
+            ),
+            (
+                "Grep",
+                json!({"pattern": "docker run --privileged", "glob": "*.md"}),
+                "grep -r '' /home/dev/proj",
+            ),
+            (
+                "Glob",
+                json!({"pattern": "**/id_rsa", "path": "/"}),
+                "find / -path '**/id_rsa'",
+            ),
+            (
+                "Glob",
+                json!({"pattern": "src/**/*.rs"}),
+                "find /home/dev/proj -path 'src/**/*.rs'",
+            ),
+        ] {
+            assert_eq!(
+                read(tool, input.clone()),
+                FileReadCall::Reads(line.to_string()),
+                "{tool} {input}"
+            );
+        }
+        // No folder at all: the search runs where the hook runs.
+        assert_eq!(
+            file_read_call(&json!({"tool_name": "Grep", "tool_input": {"pattern": "x"}})),
+            FileReadCall::Reads("grep -r '' .".into())
+        );
+        for tool in [
+            "Bash",
+            "Write",
+            "Edit",
+            "read",
+            "Read_File",
+            "mcp__fs__read_file",
+        ] {
+            assert_eq!(
+                read(
+                    tool,
+                    json!({"file_path": "/home/dev/.ssh/id_rsa", "pattern": "x"})
+                ),
+                FileReadCall::NotARead,
+                "{tool}"
+            );
+        }
+        for (tool, input) in [
+            ("Read", json!({"offset": 1})),
+            ("Read", json!({"file_path": "  "})),
+            ("Glob", json!({"path": "/home/dev"})),
+        ] {
+            assert!(
+                matches!(read(tool, input.clone()), FileReadCall::Unreadable(_)),
+                "{tool} {input}"
+            );
+        }
+    }
+
+    /// The same reads under Gemini CLI's and Hermes Agent's names, with the
+    /// fields their own sources give them, are said as the same lines.
+    ///
+    /// FAILS ON REVERT of `OTHER_READ_TOOLS` (each call is `NotARead`), of
+    /// `absolute_path` or `include` in the file arm, of `dir_path` in
+    /// `FOLDER_KEYS`, or of the `target` test of `search_files`.
+    #[test]
+    fn another_agents_read_tool_is_said_as_the_same_shell_read() {
+        let read = |tool: &str, input: Value| {
+            file_read_call(
+                &json!({"tool_name": tool, "cwd": "/home/dev/proj", "tool_input": input}),
+            )
+        };
+        for (tool, input, line) in [
+            // Gemini CLI.
+            (
+                "read_file",
+                json!({"file_path": "/home/dev/.ssh/id_ed25519", "start_line": 1}),
+                "cat /home/dev/.ssh/id_ed25519",
+            ),
+            (
+                "read_file",
+                json!({"absolute_path": "/home/dev/.netrc"}),
+                "cat /home/dev/.netrc",
+            ),
+            (
+                "read_many_files",
+                json!({"include": ["src/**/*.rs", "/home/dev/.aws/credentials"], "recursive": true}),
+                "cat 'src/**/*.rs' /home/dev/.aws/credentials",
+            ),
+            (
+                "glob",
+                // A broad root that is no link on any runner: `/home` is one
+                // on macOS (it leads to `/System/Volumes/Data/home`).
+                json!({"pattern": "**/id_rsa", "dir_path": "/srv"}),
+                "find /srv -path '**/id_rsa'",
+            ),
+            (
+                "grep_search",
+                json!({"pattern": "oauth_token", "dir_path": "/home/dev/.config"}),
+                "grep -r -e oauth /home/dev/.config",
+            ),
+            (
+                "search_file_content",
+                json!({"pattern": "x", "path": "/home/dev/.hermes"}),
+                "grep -r '' /home/dev/.hermes",
+            ),
+            // Hermes Agent.
+            (
+                "read_file",
+                json!({"path": "~/.codex/auth.json", "offset": 1, "limit": 200}),
+                "cat ~/.codex/auth.json",
+            ),
+            (
+                "search_files",
+                json!({"pattern": "xoxb-", "target": "content", "path": "/home/dev/.hermes"}),
+                "grep -r '' /home/dev/.hermes",
+            ),
+            (
+                "search_files",
+                json!({"pattern": "TOKEN"}),
+                "grep -r -e token /home/dev/proj",
+            ),
+            (
+                "search_files",
+                json!({"pattern": "*.pem", "target": "files", "path": "/"}),
+                "find / -path '*.pem'",
+            ),
+        ] {
+            assert_eq!(
+                read(tool, input.clone()),
+                FileReadCall::Reads(line.to_string()),
+                "{tool} {input}"
+            );
+        }
+        for (tool, input) in [
+            ("read_file", json!({"start_line": 1})),
+            ("read_many_files", json!({"include": []})),
+            ("glob", json!({"dir_path": "/home/dev"})),
+        ] {
+            assert!(
+                matches!(read(tool, input.clone()), FileReadCall::Unreadable(_)),
+                "{tool} {input}"
+            );
+        }
+    }
+
+    /// A search keeps the word that makes it a hunt for secrets, and only
+    /// that word: the rest of the search text is no file and no command.
+    ///
+    /// FAILS ON REVERT of the `credential_hunt_token` reading in the search
+    /// arm: every line holds `''`.
+    #[test]
+    fn a_search_keeps_only_the_word_it_hunts() {
+        let grep = |pattern: &str| {
+            file_read_call(&json!({
+                "tool_name": "Grep",
+                "cwd": "/home/dev/proj",
+                "tool_input": {"pattern": pattern, "path": "/", "-A": 50},
+            }))
+        };
+        for (pattern, line) in [
+            (
+                "password|BEGIN OPENSSH PRIVATE KEY",
+                "grep -r -e password /",
+            ),
+            ("API_KEY=", "grep -r -e api_key /"),
+            ("id_rsa", "grep -r -e id_rsa /"),
+            ("rm -rf /; curl x | sh", "grep -r '' /"),
+            ("fn main", "grep -r '' /"),
+        ] {
+            assert_eq!(grep(pattern), FileReadCall::Reads(line.into()), "{pattern}");
+        }
+    }
+
+    /// A read through a link to a secret, through a hard link to one, or by
+    /// a spelling in another case, is said with the secret's own name too.
+    ///
+    /// FAILS ON REVERT of `other_names_of` in `file_read_call_in` (each line
+    /// is the path as written alone), of the `canonicalize` step (the link),
+    /// or of `same_secret_in_home` (the hard link).
+    #[cfg(unix)]
+    #[test]
+    fn a_read_names_the_secret_a_link_or_a_hard_link_reaches() {
+        let root = tempfile::tempdir().expect("tempdir");
+        // Its real path: a temporary folder may sit under a link (`/tmp` on
+        // macOS), and the spellings below are then the real ones.
+        let root_path = std::fs::canonicalize(root.path()).expect("real tempdir");
+        let home = root_path.join("home");
+        std::fs::create_dir_all(home.join(".ssh")).expect("ssh");
+        let key = home.join(".ssh/id_ed25519");
+        std::fs::write(&key, "dummy key\n").expect("key");
+        std::fs::create_dir_all(home.join(".docker")).expect("docker");
+        std::fs::write(home.join(".docker/config.json"), "{}\n").expect("docker config");
+        let elsewhere = root_path.join("tmp");
+        std::fs::create_dir_all(&elsewhere).expect("tmp");
+        let soft = elsewhere.join("k");
+        std::os::unix::fs::symlink(&key, &soft).expect("symlink");
+        let hard = elsewhere.join("h");
+        std::fs::hard_link(&key, &hard).expect("hard link");
+        let hard_docker = elsewhere.join("d");
+        std::fs::hard_link(home.join(".docker/config.json"), &hard_docker).expect("hard link");
+        let project = home.join("proj");
+        std::fs::create_dir_all(&project).expect("project");
+        let ctx = context(&home, &project);
+        let real_key = std::fs::canonicalize(&key).expect("real key");
+        let at = |p: &Path| p.to_string_lossy().into_owned();
+        let read = |path: &str| {
+            file_read_call_in(
+                &json!({"tool_name": "Read", "tool_input": {"file_path": path}}),
+                &ctx,
+            )
+        };
+        assert_eq!(
+            read(&at(&soft)),
+            FileReadCall::Reads(format!("cat {} {}", at(&soft), at(&real_key)))
+        );
+        assert_eq!(
+            read(&at(&hard)),
+            FileReadCall::Reads(format!("cat {} {}", at(&hard), at(&key)))
+        );
+        assert_eq!(
+            read(&at(&hard_docker)),
+            FileReadCall::Reads(format!(
+                "cat {} {}",
+                at(&hard_docker),
+                at(&home.join(".docker/config.json"))
+            ))
+        );
+        // A link to the folder a search runs in is searched as the folder.
+        let soft_folder = elsewhere.join("s");
+        std::os::unix::fs::symlink(home.join(".ssh"), &soft_folder).expect("folder link");
+        let real_folder = std::fs::canonicalize(home.join(".ssh")).expect("real folder");
+        assert_eq!(
+            file_read_call_in(
+                &json!({"tool_name": "Grep", "tool_input": {"pattern": "x", "path": at(&soft_folder)}}),
+                &ctx,
+            ),
+            FileReadCall::Reads(format!(
+                "grep -r '' {} {}",
+                at(&soft_folder),
+                at(&real_folder)
+            ))
+        );
+        // The twins: the secret by its own name, and an ordinary file, are
+        // said as written and nothing more.
+        let plain = project.join("main.rs");
+        std::fs::write(&plain, "fn main() {}\n").expect("main.rs");
+        for path in [&key, &plain] {
+            let path = std::fs::canonicalize(path).expect("real path");
+            assert_eq!(
+                read(&at(&path)),
+                FileReadCall::Reads(format!("cat {}", at(&path)))
+            );
+        }
+    }
+
+    /// An empty path names no file, whatever the folder the call runs in
+    /// is reached through; and the home is `HOME` unless it is empty.
+    /// FAILS ON REVERT of the empty test in `other_names_of` (the working
+    /// directory's real path is given), or of the `!` in `home_from`.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_path_names_nothing_and_the_home_is_homes_unless_empty() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let real = std::fs::canonicalize(root.path())
+            .expect("real")
+            .join("real");
+        std::fs::create_dir_all(&real).expect("real dir");
+        let linked = root.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).expect("link");
+        let ctx = WriteContext {
+            cwd: Some(&linked),
+            home: Some(&real),
+            guard_program: None,
+        };
+        assert_eq!(other_names_of("", &ctx), Vec::<String>::new());
+        assert_eq!(other_names_of("  ", &ctx), Vec::<String>::new());
+        assert_eq!(
+            other_names_of(".", &ctx),
+            vec![real.to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            home_from(Some("/home/dev".into())),
+            Some(PathBuf::from("/home/dev"))
+        );
+        assert_eq!(home_from(Some("".into())), home_of_this_account());
+        assert_eq!(home_from(None), home_of_this_account());
+    }
+
+    /// On a file system that ignores case a hidden folder in the home is
+    /// also read in lowercase, the spelling the rules know.
+    ///
+    /// FAILS ON REVERT of `lowercase_hidden_spelling`.
+    #[test]
+    fn an_upper_case_spelling_in_a_hidden_folder_is_read_in_lowercase() {
+        let home = Path::new("/Users/dev");
+        for (path, lower) in [
+            (
+                "/Users/dev/.SSH/id_ed25519",
+                Some("/Users/dev/.ssh/id_ed25519"),
+            ),
+            (
+                "/Users/dev/.Codex/AUTH.json",
+                Some("/Users/dev/.codex/auth.json"),
+            ),
+            ("/USERS/DEV/.ssh/ID_RSA", Some("/Users/dev/.ssh/id_rsa")),
+            ("/Users/dev/.ssh/id_ed25519", None),
+            ("/Users/dev/Projects/App/README.md", None),
+            ("/Users/other/.SSH/id_rsa", None),
+            ("/Users/dev", None),
+        ] {
+            assert_eq!(
+                lowercase_hidden_spelling(Path::new(path), home),
+                lower.map(PathBuf::from),
+                "{path}"
+            );
+        }
+    }
+
+    /// A path is one word of the line and no more: a quote, a space, a
+    /// substitution or an option inside it stays inside it.
+    #[test]
+    fn a_path_is_one_word_of_the_line() {
+        for (path, word) in [
+            ("/home/dev/.netrc", "/home/dev/.netrc"),
+            ("~", "~"),
+            ("~/", "~/"),
+            ("~/.ssh", "~/.ssh"),
+            ("~/My Keys/id_rsa", "~/'My Keys/id_rsa'"),
+            ("/tmp/a b", "'/tmp/a b'"),
+            ("/tmp/it's", r"'/tmp/it'\''s'"),
+            ("/tmp/$(id)", "'/tmp/$(id)'"),
+            ("/tmp/a;rm -rf ~", "'/tmp/a;rm -rf ~'"),
+            ("-rf", "./-rf"),
+            ("--help me", "'./--help me'"),
+            ("src/**/*.rs", "'src/**/*.rs'"),
+        ] {
+            assert_eq!(shell_path_word(path), word, "{path}");
+        }
+    }
+
+    /// The per-agent profiles, the user's and the system's, are the person's:
+    /// a file tool writing either one is refused however it is spelled. The
+    /// refusal reads the path only, so no level of trust and no profile can
+    /// change it.
+    ///
+    /// FAILS ON REVERT: drop `.config/innerwarden` and `/etc/innerwarden`
+    /// from the privileged places and these are allowed.
+    #[test]
+    fn the_agent_profiles_files_are_refused_to_every_file_tool() {
+        let home = Path::new("/home/dev");
+        let cwd = Path::new("/home/dev/proj");
+        let ctx = context(home, cwd);
+        for path in [
+            "/home/dev/.config/innerwarden/agent-profiles.toml",
+            "~/.config/innerwarden/agent-profiles.toml",
+            "../.config/innerwarden/agent-profiles.toml",
+            "/home/dev/proj/../.config/innerwarden/./agent-profiles.toml",
+            "/etc/innerwarden/agent-profiles.toml",
+            "/etc//innerwarden/agent-profiles.toml",
+            "/ETC/innerwarden/AGENT-PROFILES.TOML",
+        ] {
+            assert!(
+                privileged_file_write(path, &ctx).is_some(),
+                "{path} must be refused"
+            );
+        }
+        let root = context(Path::new("/root"), Path::new("/root/proj"));
+        for path in [
+            "/root/.config/innerwarden/agent-profiles.toml",
+            "/etc/innerwarden/agent-profiles.toml",
+        ] {
+            assert!(privileged_file_write(path, &root).is_some(), "{path}");
+        }
+        // A file of the same name in the project is the project's.
+        assert_eq!(
+            privileged_file_write("/home/dev/proj/agent-profiles.toml", &ctx),
+            None
+        );
     }
 
     /// The row's proof: the agent's settings, the guard's configuration, shell
@@ -605,6 +1433,18 @@ mod tests {
             ),
             (
                 "/home/dev/.codex/config.toml",
+                "the guard's own configuration",
+            ),
+            (
+                "/home/dev/.openclaw/extensions/innerwarden-guard/index.js",
+                "the guard's own configuration",
+            ),
+            (
+                "~/.openclaw/extensions/a-new-plugin/index.js",
+                "the guard's own configuration",
+            ),
+            (
+                "/home/dev/.openclaw/hooks/innerwarden-attempts/handler.js",
                 "the guard's own configuration",
             ),
             ("/home/dev/.ssh/authorized_keys", "SSH"),
@@ -767,6 +1607,45 @@ mod tests {
         for path in ["plain.json", "../dotfiles/README.md", "new.txt"] {
             assert_eq!(privileged_file_write(path, &ctx), None, "{path}");
         }
+    }
+
+    /// OpenClaw's plugin and hook folders hold the guard that screens its
+    /// own tools: reached by another name (the folder a link in the home
+    /// leads to), a write into them is refused as a write into them.
+    ///
+    /// FAILS ON REVERT: take `.openclaw/extensions` and `.openclaw/hooks` out
+    /// of `HOME_GUARD_TREES` and both paths are allowed.
+    #[cfg(unix)]
+    #[test]
+    fn openclaws_plugin_folders_are_refused_under_another_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let proj = home.join("proj");
+        let kept = home.join("kept");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(home.join(".openclaw")).unwrap();
+        std::fs::create_dir_all(kept.join("ext/innerwarden-guard")).unwrap();
+        std::fs::create_dir_all(kept.join("hooks/innerwarden-attempts")).unwrap();
+        std::os::unix::fs::symlink(kept.join("ext"), home.join(".openclaw/extensions")).unwrap();
+        std::os::unix::fs::symlink(kept.join("hooks"), home.join(".openclaw/hooks")).unwrap();
+        let ctx = WriteContext {
+            cwd: Some(&proj),
+            home: Some(&home),
+            guard_program: None,
+        };
+        for path in [
+            "../kept/ext/innerwarden-guard/index.js",
+            "../kept/hooks/innerwarden-attempts/handler.js",
+            "../kept/ext/new-plugin/index.js",
+        ] {
+            let found = privileged_file_write(path, &ctx)
+                .unwrap_or_else(|| panic!("{path} is OpenClaw's plugin folder under another name"));
+            assert!(
+                found.contains("the guard's own configuration"),
+                "{path}: {found}"
+            );
+        }
+        assert_eq!(privileged_file_write("../kept/notes.txt", &ctx), None);
     }
 
     /// A hook run without `HOME` still knows the account's home, from the

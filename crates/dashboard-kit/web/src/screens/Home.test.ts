@@ -113,7 +113,7 @@ describe("decisionRecordCta", () => {
  * proving the denial -- it invited the operator to go and acquire what was
  * already running underneath the page, beneath a header reading "Setup needed".
  */
-describe("the Active Defence card", () => {
+describe("the InnerWarden Pro card", () => {
   it("stops offering the product on a host that already has it", () => {
     // FAILS ON REVERT: make the state unconditional and this trips.
     expect(activeDefenceCardState(true)).toBe("installed");
@@ -152,7 +152,7 @@ describe("the Active Defence card", () => {
   it("does not send an installed host to the acquisition page", () => {
     const shown = Object.values(ACTIVE_DEFENCE_COPY.installed).join(" ");
     expect(shown).not.toContain("innerwarden.com/enterprise");
-    expect(shown).not.toContain("Explore Active Defence");
+    expect(shown).not.toContain("Explore InnerWarden Pro");
   });
 });
 

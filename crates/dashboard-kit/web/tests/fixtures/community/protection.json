@@ -10,8 +10,11 @@
   },
   "generated_at_ms": 1790690700000,
   "jail": {
+    "advice": [],
     "available": true,
-    "backend": "sandbox-exec"
+    "backend": "sandbox-exec",
+    "checked_at": "2026-09-29T14:01:00Z",
+    "checks_pass": true
   },
   "observe": {
     "available": true,
@@ -28,8 +31,8 @@
     "configured": false
   },
   "suppress": {
-    "allow": 2,
-    "mute_categories": 0,
+    "allow": 5,
+    "mute_categories": 1,
     "mute_rules": 1
   }
 }

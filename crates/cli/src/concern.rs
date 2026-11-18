@@ -67,6 +67,7 @@ const SHORT_WORDS: &[(&str, &str)] = &[
     ("anti_forensics", "erasing records"),
     ("bare_ip_fetch", "fetch from a bare IP address"),
     ("cloud_control_plane", "cloud control plane"),
+    ("container_escape", "container escape"),
     ("credential_exposure", "a secret in the command"),
     ("credential_hunt", "search for credentials"),
     (
@@ -130,6 +131,10 @@ const WORDING: &[(&str, &str)] = &[
     ),
     (
         "shell data is structurally fed into a code interpreter",
+        "dynamic_code_execution",
+    ),
+    (
+        "the program this line runs is named by an expansion",
         "dynamic_code_execution",
     ),
     ("reverse shell indicator: ", "reverse_shell"),

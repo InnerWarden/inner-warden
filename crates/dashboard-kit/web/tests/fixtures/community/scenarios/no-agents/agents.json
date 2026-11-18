@@ -1,0 +1,88 @@
+{
+  "agents": [
+    {
+      "auto_connect_eligible": false,
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Cursor",
+      "guardrail": {
+        "last_observed_at": "2026-09-29T12:05:00Z",
+        "mechanism": "mcp_proxy",
+        "mode": "not_configured",
+        "setup_support": "automatic"
+      },
+      "id": "cursor",
+      "installed": true,
+      "mcp": {
+        "remote": 0,
+        "stdio": 2,
+        "wrapped": 0
+      },
+      "next_step": {
+        "command": "innerwarden agents connect cursor --monitor",
+        "label": "To put the guard in front of it:",
+        "line": "It starts in monitor mode: every command is recorded and nothing is refused."
+      },
+      "restart": {
+        "how": "Quit Cursor and start it again.",
+        "why": "An agent reads its hook or MCP config only when it starts."
+      },
+      "running": null
+    },
+    {
+      "auto_connect_eligible": false,
+      "detected_by": [
+        "executable_on_path",
+        "configuration_file"
+      ],
+      "display_name": "Gemini CLI",
+      "guardrail": {
+        "mechanism": "mcp_proxy",
+        "mode": "not_configured",
+        "setup_support": "automatic"
+      },
+      "id": "gemini",
+      "installed": true,
+      "mcp": {
+        "remote": 0,
+        "stdio": 1,
+        "wrapped": 0
+      },
+      "next_step": {
+        "command": "innerwarden agents connect gemini --monitor",
+        "label": "To put the guard in front of it:",
+        "line": "It starts in monitor mode: every command is recorded and nothing is refused."
+      },
+      "restart": {
+        "how": "Quit Gemini CLI and start it again.",
+        "why": "An agent reads its hook or MCP config only when it starts."
+      },
+      "running": null
+    }
+  ],
+  "auto_connect": {
+    "enabled": true,
+    "mode": "monitor",
+    "refresh_interval_secs": 60,
+    "status": "available",
+    "watcher": {
+      "effective_policy_mode": null,
+      "last_reconcile_at_ms": null,
+      "lifecycle": "unavailable",
+      "policy_available": false,
+      "policy_enabled": null,
+      "reason_code": "watcher_unavailable"
+    }
+  },
+  "availability": "available",
+  "discovery_limited": false,
+  "generated_at_ms": 1790690700000,
+  "schema_version": 2,
+  "screened_by_channel": {
+    "hook": "2026-09-29T14:03:00Z",
+    "mcp": "2026-09-29T12:05:00Z"
+  },
+  "unnamed_by_channel": {}
+}

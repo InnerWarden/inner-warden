@@ -97,6 +97,7 @@ const VERBS: &[&str] = &[
     "mute",
     "notify",
     "observe",
+    "openclaw",
     "graph",
     "llm",
     "host",
@@ -371,6 +372,6 @@ fn a_host_verb_is_not_answered_by_the_community_binary() {
     assert_ne!(
         out.status.code(),
         Some(0),
-        "without Active Defence installed, a host verb does not succeed quietly"
+        "without InnerWarden Pro installed, a host verb does not succeed quietly"
     );
 }

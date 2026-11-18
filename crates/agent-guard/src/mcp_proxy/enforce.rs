@@ -9,11 +9,14 @@
 //! alert, never blocked, so enabling the proxy at its default mode changes no
 //! observable behavior. Blocking (`guard` / `kill`) is opt-in.
 //!
-//! Scope of blocking in this version: only a **client→server `tools/call`** can
-//! be blocked (the agent invoking a dangerous tool), because a denial must be a
-//! reply keyed to that request's id. Server→client findings (poisoned
-//! `tools/list`, injection in a tool result) are always alert-only, rewriting
-//! a server response (tool stripping) is a later enhancement.
+//! Scope of blocking in this version: only a **client→server request** can be
+//! blocked (the agent invoking a dangerous tool, or reading a resource it must
+//! not), because a denial must be a reply keyed to that request's id. The
+//! router raises a blocking verdict on a `tools/call` and a `resources/read`.
+//! Server→client findings (poisoned `tools/list`, injection in a tool result)
+//! are alert-only here; the rewrites of what a server sends (masking
+//! secret-shaped values, withholding listing text that carries orders for the
+//! model, refusing a line the proxy cannot read) are done by the transport.
 
 use serde_json::{json, Value};
 
@@ -104,11 +107,155 @@ pub fn apply_mode(d: &ProxyDecision, mode: ProxyMode, as_protocol_error: bool) -
     }
 }
 
+/// The rules whose refusal of a tool call is a hard rule's: a change to a
+/// privileged file, and (when it blocks) a read of a secret store.
+const HARD_RULES: &[&str] = &["AG-PRIV-WRITE", "AG-FILE"];
+
+/// The rule a profile's refusal of a tool call is reported under.
+pub const PROFILE_DENY_RULE: &str = "AG-PROFILE-DENY";
+
+/// The rule the hard layer's refusal of a call reaching the guard's LLM key
+/// is reported under.
+pub const LLM_KEY_RULE: &str = "AG-HARD-LLM-KEY";
+
+/// The rule every tool call is refused under while the profiles file cannot
+/// be used.
+pub const PROFILES_INVALID_RULE: &str = "AG-PROFILES-INVALID";
+
+/// The rule every tool call of a revoked agent or instance is refused under.
+pub const REVOKED_RULE: &str = "AG-HARD-REVOKED";
+
+/// Apply the per-agent profile layers to one inspected client `tools/call`,
+/// then [`apply_mode`].
+///
+/// With no profile (`None`: no profiles file on this host) this IS
+/// [`apply_mode`]: nothing is read, added or changed. With one, the layers
+/// are combined by [`crate::identity::decide`] (see [`crate::profiles`]); a
+/// refusal they add is an alert that blocks, and the layer that decided is
+/// put on the decision. The mode still decides what a refusal does, so
+/// `advisory` and `warn`, and any label that is not a mode, forward it.
+/// Nothing but a client `tools/call` is touched.
+pub fn apply_layers(
+    d: &mut ProxyDecision,
+    env: &super::jsonrpc::JsonRpcEnvelope,
+    profile: Option<&crate::profiles::ProxyProfile>,
+    engine: Option<&crate::rules::RuleEngine>,
+    mode: ProxyMode,
+    as_protocol_error: bool,
+) -> ProxyAction {
+    if let Some(profile) = profile {
+        apply_profile(d, env, profile, engine);
+    }
+    apply_mode(d, mode, as_protocol_error)
+}
+
+fn apply_profile(
+    d: &mut ProxyDecision,
+    env: &super::jsonrpc::JsonRpcEnvelope,
+    profile: &crate::profiles::ProxyProfile,
+    engine: Option<&crate::rules::RuleEngine>,
+) {
+    use crate::identity::{RuleLayer, Verdict};
+    use crate::mcp::VerdictAlert;
+    use crate::profiles::{decide_tool_call_in, ProxyProfile, ToolCallFacts};
+
+    if d.direction != super::router::Direction::ClientToServer.label()
+        || d.method.as_deref() != Some("tools/call")
+    {
+        return;
+    }
+    let (agent_type, profile, trust, revoked) = match profile {
+        ProxyProfile::Invalid { why } => {
+            d.verdict.allowed = false;
+            d.verdict.alerts.push(VerdictAlert::builtin(
+                PROFILES_INVALID_RULE,
+                format!(
+                    "the agent profiles file cannot be used, so no tool call is screened \
+                     against it: {why}"
+                ),
+                true,
+            ));
+            return;
+        }
+        ProxyProfile::Active {
+            agent_type,
+            profile,
+            trust,
+            revoked,
+        } => (agent_type, profile, *trust, *revoked),
+    };
+    let (tool, args) = super::router::extract_tool_call(env);
+    // Every command line the call carries, as the call's own verdict read
+    // them ([`crate::mcp::tool_commands`]).
+    let read = crate::mcp::tool_commands(&tool, &args);
+    let commands: Vec<&str> = read.iter().map(|command| command.line.as_ref()).collect();
+    let analyses: Vec<_> = commands
+        .iter()
+        .map(|command| crate::mcp::analyze_command(command, engine))
+        .collect();
+    let charged: Vec<&str> = analyses
+        .iter()
+        .flat_map(|analysis| analysis.signals.iter())
+        .filter(|signal| signal.score > 0)
+        .map(|signal| signal.signal.as_str())
+        .collect();
+    // The guard's own LLM key is looked for in every line read, and in the
+    // text it was always looked for in: a shell tool's command string, or
+    // the whole call where there is none. A part of the call the reading
+    // does not take (text handed to a program that is not a shell, a
+    // variable no shell names, a field it has no reading for) is in that
+    // text, and so is the whole call when such a part sits beside a
+    // command string.
+    let whole = args.to_string();
+    let legacy = read
+        .iter()
+        .find(|command| command.exclusive)
+        .map_or(whole.as_str(), |command| command.line.as_ref());
+    let unread = crate::mcp::tool_call_reading(&tool, &args).unread_field;
+    let names_llm_key = crate::threats::names_guard_llm_key(&commands.join("\n"))
+        || crate::threats::names_guard_llm_key(legacy)
+        || (unread && crate::threats::names_guard_llm_key(&whole));
+    let facts = ToolCallFacts {
+        tool: &tool,
+        allowed: d.verdict.allowed,
+        has_alerts: !d.verdict.alerts.is_empty(),
+        charged: &charged,
+        hard_alert: d
+            .verdict
+            .alerts
+            .iter()
+            .any(|alert| alert.block && HARD_RULES.contains(&alert.rule.as_str())),
+        names_llm_key,
+    };
+    let named = agent_type.as_deref().zip(profile.as_ref());
+    let (decision, note) = decide_tool_call_in(&facts, named, revoked, trust);
+    if decision.verdict == Verdict::Deny && d.verdict.allowed {
+        let rule = if decision.deciding_layer == RuleLayer::Hard && revoked.is_some() {
+            REVOKED_RULE
+        } else if decision.deciding_layer == RuleLayer::Hard {
+            LLM_KEY_RULE
+        } else {
+            PROFILE_DENY_RULE
+        };
+        d.verdict.allowed = false;
+        d.verdict.alerts.push(VerdictAlert::builtin(
+            rule,
+            note.unwrap_or_else(|| "refused by the agent profile".to_string()),
+            true,
+        ));
+    }
+    d.deciding_layer = Some(decision.deciding_layer);
+}
+
 /// Build the denial line sent back to the client for a blocked `tools/call`.
 ///
 /// The original request id is echoed **verbatim** (as a raw [`Value`]) so the
 /// client correlates the reply; a blocked request is never silently dropped.
 pub fn synthesize_denial(d: &ProxyDecision, as_protocol_error: bool) -> String {
+    // A tool-execution error (`isError`) is an answer only a `tools/call` can
+    // take; any other refused request gets a JSON-RPC error, the one shape
+    // its client can read as a refusal.
+    let as_protocol_error = as_protocol_error || d.method.as_deref() != Some("tools/call");
     let id = d.request_id.clone();
     let reason = d
         .verdict
@@ -300,6 +447,286 @@ mod tests {
             response_line.contains(big),
             "big-int id must round-trip in the denial: {response_line}"
         );
+    }
+
+    // -- the per-agent profile layers ---------------------------------------
+
+    use crate::identity::{RuleLayer, Trust};
+    use crate::profiles::{AgentProfile, ProxyProfile};
+
+    const ALL_TRUST: [Trust; 3] = [Trust::Declared, Trust::Observed, Trust::Confined];
+    const ALL_MODES: [ProxyMode; 4] = [
+        ProxyMode::Advisory,
+        ProxyMode::Warn,
+        ProxyMode::Guard,
+        ProxyMode::Kill,
+    ];
+
+    fn call(line: &str) -> (ProxyDecision, crate::mcp_proxy::jsonrpc::JsonRpcEnvelope) {
+        let e = env(line);
+        let d = route_message(&e, Direction::ClientToServer, None, None, None);
+        (d, e)
+    }
+
+    const WEATHER: &str = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"weather","arguments":{"location":"NYC"}}}"#;
+    const SAVE_KEY: &str = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"save","arguments":{"token":"sk-ant-aaaaaaaaaaaaaaaaaaaaaaaa"}}}"#;
+    const READ_LLM_KEY: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/home/dev/.config/innerwarden/llm-key"}}}"#;
+
+    fn active(profile: AgentProfile, trust: Trust) -> ProxyProfile {
+        ProxyProfile::Active {
+            agent_type: Some("claude-code".into()),
+            profile: Some(profile),
+            trust,
+            revoked: None,
+        }
+    }
+
+    fn denying(tool: &str) -> AgentProfile {
+        AgentProfile {
+            mcp_tools_deny: vec![tool.into()],
+            ..AgentProfile::default()
+        }
+    }
+
+    /// No profiles file: the proxy is exactly what it was. Same action, and
+    /// the decision is not touched (no layer, no alert).
+    #[test]
+    fn with_no_profile_the_layers_are_apply_mode() {
+        for line in [WEATHER, SAVE_KEY, READ_LLM_KEY] {
+            for mode in ALL_MODES {
+                let (before, e) = call(line);
+                let mut d = before.clone();
+                assert_eq!(
+                    apply_layers(&mut d, &e, None, None, mode, false),
+                    apply_mode(&before, mode, false)
+                );
+                assert_eq!(d.deciding_layer, None);
+                assert_eq!(d.verdict.alerts.len(), before.verdict.alerts.len());
+                assert_eq!(d.verdict.allowed, before.verdict.allowed);
+            }
+        }
+    }
+
+    /// A profile's refusal blocks only in a mode that blocks: `advisory`,
+    /// `warn` and a label that is no mode forward it with the alert.
+    ///
+    /// FAILS ON REVERT: skip the profile in `apply_layers` and `guard`
+    /// forwards the denied tool.
+    #[test]
+    fn a_profile_deny_blocks_in_guard_and_is_only_an_alert_in_advisory() {
+        for trust in ALL_TRUST {
+            let profile = active(denying("weather"), trust);
+            let (mut d, e) = call(WEATHER);
+            let action = apply_layers(&mut d, &e, Some(&profile), None, ProxyMode::Guard, false);
+            let ProxyAction::Block { response_line } = action else {
+                panic!("guard must block a tool the profile denies: {action:?}");
+            };
+            assert!(response_line.contains(PROFILE_DENY_RULE), "{response_line}");
+            assert_eq!(d.deciding_layer, Some(RuleLayer::AgentType));
+            for mode in [
+                ProxyMode::Advisory,
+                ProxyMode::Warn,
+                ProxyMode::from_label("nonsense"),
+            ] {
+                let (mut d, e) = call(WEATHER);
+                assert_eq!(
+                    apply_layers(&mut d, &e, Some(&profile), None, mode, false),
+                    ProxyAction::ForwardWithAlert,
+                    "{mode:?}"
+                );
+                assert!(!d.verdict.allowed, "the record still says it was refused");
+            }
+        }
+    }
+
+    /// An allow of the tool lifts nothing: the call the inspectors refused
+    /// stays refused, confined or not.
+    #[test]
+    fn a_profile_allow_never_lifts_a_refusal_in_the_proxy() {
+        let permissive = AgentProfile {
+            mcp_tools_allow: vec!["save".into()],
+            ..AgentProfile::default()
+        };
+        for trust in ALL_TRUST {
+            let (mut d, e) = call(SAVE_KEY);
+            let action = apply_layers(
+                &mut d,
+                &e,
+                Some(&active(permissive.clone(), trust)),
+                None,
+                ProxyMode::Guard,
+                false,
+            );
+            assert!(matches!(action, ProxyAction::Block { .. }), "{trust:?}");
+            assert_eq!(d.deciding_layer, Some(RuleLayer::General));
+        }
+    }
+
+    /// The guard's LLM key is the hard layer's, with or without a profile for
+    /// the type.
+    #[test]
+    fn a_call_reaching_the_llm_key_is_refused_by_the_hard_layer() {
+        for profile in [
+            active(AgentProfile::default(), Trust::Confined),
+            ProxyProfile::Active {
+                agent_type: None,
+                profile: None,
+                trust: Trust::Declared,
+                revoked: None,
+            },
+        ] {
+            let (mut d, e) = call(READ_LLM_KEY);
+            let action = apply_layers(&mut d, &e, Some(&profile), None, ProxyMode::Guard, false);
+            let ProxyAction::Block { response_line } = action else {
+                panic!("{action:?}");
+            };
+            assert!(response_line.contains(LLM_KEY_RULE), "{response_line}");
+            assert_eq!(d.deciding_layer, Some(RuleLayer::Hard));
+        }
+    }
+
+    /// The key is looked for in every part of a call, not only in the
+    /// command lines read from it: text a process tool hands a program
+    /// that is not a shell, a field beside a shell tool's command string,
+    /// an environment variable no shell can name. A call that only names
+    /// another file runs.
+    ///
+    /// FAILS ON REVERT of the call's whole text in `apply_profile` (only
+    /// the lines read): every call of the first group is forwarded.
+    #[test]
+    fn a_call_reaching_the_llm_key_in_a_part_not_read_as_a_line_is_refused() {
+        let profile = ProxyProfile::Active {
+            agent_type: None,
+            profile: None,
+            trust: Trust::Declared,
+            revoked: None,
+        };
+        let key = "/home/dev/.config/innerwarden/llm-key";
+        let line = |name: &str, arguments: serde_json::Value| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            })
+            .to_string()
+        };
+        let read_it = format!("print(open('{key}').read())");
+        for reaching in [
+            line(
+                "start_process",
+                serde_json::json!({"command": "python3", "input": read_it}),
+            ),
+            line(
+                "start_process",
+                serde_json::json!({"command": "python3", "stdin": read_it}),
+            ),
+            line(
+                "run_command",
+                serde_json::json!({"command": "python3", "input": read_it}),
+            ),
+            line(
+                "start_process",
+                serde_json::json!({"command": ["cat"], "env": {"KEY%": format!("--from {key}")}}),
+            ),
+        ] {
+            let (mut d, e) = call(&reaching);
+            let action = apply_layers(&mut d, &e, Some(&profile), None, ProxyMode::Guard, false);
+            let ProxyAction::Block { response_line } = action else {
+                panic!("{reaching}: {action:?}");
+            };
+            assert!(response_line.contains(LLM_KEY_RULE), "{response_line}");
+            assert_eq!(d.deciding_layer, Some(RuleLayer::Hard), "{reaching}");
+        }
+        for other in [
+            line(
+                "start_process",
+                serde_json::json!({"command": "python3", "input": "print(open('notes.txt').read())"}),
+            ),
+            line(
+                "run_command",
+                serde_json::json!({"command": "ls -la", "description": "list the files"}),
+            ),
+        ] {
+            let (mut d, e) = call(&other);
+            let action = apply_layers(&mut d, &e, Some(&profile), None, ProxyMode::Guard, false);
+            assert!(
+                !matches!(action, ProxyAction::Block { .. }),
+                "{other}: {action:?}"
+            );
+            assert_ne!(d.deciding_layer, Some(RuleLayer::Hard), "{other}");
+        }
+    }
+
+    /// A revoked agent's tool calls are refused by the hard layer under their
+    /// own rule; the mode still decides what a refusal does, so an advisory
+    /// proxy forwards it and says why.
+    ///
+    /// FAILS ON REVERT: pass `None` for `revoked` to `decide_tool_call_in`
+    /// and the call is forwarded in guard.
+    #[test]
+    fn a_revoked_agent_is_refused_by_the_hard_layer() {
+        let revoked = ProxyProfile::Active {
+            agent_type: Some("claude-code".into()),
+            profile: None,
+            trust: Trust::Confined,
+            revoked: Some(crate::profiles::Revocation::AgentType),
+        };
+        let (mut d, e) = call(WEATHER);
+        let action = apply_layers(&mut d, &e, Some(&revoked), None, ProxyMode::Guard, false);
+        let ProxyAction::Block { response_line } = action else {
+            panic!("{action:?}");
+        };
+        assert!(response_line.contains(REVOKED_RULE), "{response_line}");
+        assert!(
+            response_line.contains("this agent was revoked"),
+            "{response_line}"
+        );
+        assert_eq!(d.deciding_layer, Some(RuleLayer::Hard));
+        let (mut d, e) = call(WEATHER);
+        let action = apply_layers(&mut d, &e, Some(&revoked), None, ProxyMode::Advisory, false);
+        assert!(!matches!(action, ProxyAction::Block { .. }), "{action:?}");
+    }
+
+    /// A file that cannot be used refuses every tool call, which the mode
+    /// then applies: an advisory proxy forwards and says why.
+    #[test]
+    fn a_profiles_file_that_cannot_be_used_refuses_every_call_in_guard() {
+        let invalid = ProxyProfile::Invalid {
+            why: "profile `x`: deny_categories: `nope` is not a signal name".into(),
+        };
+        let (mut d, e) = call(WEATHER);
+        assert!(matches!(
+            apply_layers(&mut d, &e, Some(&invalid), None, ProxyMode::Guard, false),
+            ProxyAction::Block { .. }
+        ));
+        assert!(d
+            .verdict
+            .alerts
+            .iter()
+            .any(|a| a.rule == PROFILES_INVALID_RULE
+                && a.detail.contains("`nope` is not a signal name")));
+        let (mut d, e) = call(WEATHER);
+        assert_eq!(
+            apply_layers(&mut d, &e, Some(&invalid), None, ProxyMode::Advisory, false),
+            ProxyAction::ForwardWithAlert
+        );
+    }
+
+    /// A server's answer is not a call: no profile touches it.
+    #[test]
+    fn the_layers_touch_only_a_client_tool_call() {
+        let mut d = server_alert_decision();
+        let e = env(r#"{"jsonrpc":"2.0","id":2,"result":{"content":[]}}"#);
+        let before = d.clone();
+        let _ = apply_layers(
+            &mut d,
+            &e,
+            Some(&active(denying("weather"), Trust::Confined)),
+            None,
+            ProxyMode::Guard,
+            false,
+        );
+        assert_eq!(d.deciding_layer, None);
+        assert_eq!(d.verdict.alerts.len(), before.verdict.alerts.len());
     }
 
     #[test]

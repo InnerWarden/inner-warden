@@ -1,0 +1,36 @@
+{
+  "allow": [],
+  "changes": {
+    "count": 3,
+    "last_at": "2026-09-10T00:26:40Z",
+    "since": "2026-07-30T00:00:00Z"
+  },
+  "counts": {
+    "allow": 5,
+    "mute_categories": 1,
+    "mute_rules": 1
+  },
+  "dropped": [],
+  "generated_at_ms": 1790690700000,
+  "list_steps": {
+    "allow": {
+      "command": "innerwarden allow --list",
+      "label": "To see every allow pattern:",
+      "line": "Prints the whole list in your terminal."
+    },
+    "mute": {
+      "command": "innerwarden mute --list",
+      "label": "To see every muted rule and category:",
+      "line": "Prints the whole list in your terminal."
+    }
+  },
+  "more": {
+    "allow": 5,
+    "mute_categories": 1,
+    "mute_rules": 1
+  },
+  "mute_categories": [],
+  "mute_rules": [],
+  "schema_version": 1,
+  "withheld": "exposed"
+}

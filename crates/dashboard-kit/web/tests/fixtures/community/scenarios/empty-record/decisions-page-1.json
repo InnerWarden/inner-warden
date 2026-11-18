@@ -1,0 +1,22 @@
+{
+  "by_outcome": {},
+  "flagged_total": 0,
+  "generated_at_ms": 1790690700000,
+  "items": [],
+  "reasons": [],
+  "reasons_distinct": 0,
+  "record": {
+    "capped": false,
+    "checked": 0,
+    "decisions": 0,
+    "flagged": 0
+  },
+  "schema_version": 1,
+  "sessions": {},
+  "suppress": {
+    "allow": 5,
+    "mute_categories": 1,
+    "mute_rules": 1
+  },
+  "total": 0
+}

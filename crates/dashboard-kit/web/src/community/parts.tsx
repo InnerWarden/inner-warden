@@ -6,7 +6,7 @@ import { formatTimestamp, isoInstant, timeTitle } from "../presentation";
 
 /**
  * The small pieces every Community page is built from, in the paid redesign's
- * vocabulary: one card shell, one eyebrow, one chip, one command box.
+ * vocabulary: one card shell, one eyebrow, one command box.
  *
  * Colour has a job and only that job (spec M5): amber appears only inside an
  * element marked `data-needs-you`, rose only on an outcome that happened
@@ -48,49 +48,11 @@ export function PageHeader({
     <div className="flex flex-wrap items-end justify-between gap-x-4 gap-y-3" data-tour={tour}>
       <div className="min-w-0">
         <p className={EYEBROW}>{eyebrow}</p>
-        <h1 id={titleId} className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">{title}</h1>
+        <h1 id={titleId} tabIndex={-1} className="mt-1 text-2xl font-semibold tracking-tight text-slate-950">{title}</h1>
         {description === undefined ? null : <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">{description}</p>}
       </div>
       {aside === undefined ? null : <div className="flex flex-wrap items-center gap-2">{aside}</div>}
     </div>
-  );
-}
-
-export type ChipTone = "accent" | "watch" | "needs" | "exposed" | "off";
-
-const CHIP_CLASS: Record<ChipTone, string> = {
-  accent: "border-cyan-200 bg-cyan-50 text-cyan-900",
-  watch: "border-slate-200 bg-slate-50 text-slate-700",
-  needs: "border-amber-200 bg-amber-50 text-amber-900",
-  exposed: "border-rose-200 bg-rose-50 text-rose-800",
-  off: "border-slate-200 bg-white text-slate-500",
-};
-
-const CHIP_SYMBOL: Record<ChipTone, string> = {
-  accent: "i",
-  watch: "i",
-  needs: "!",
-  exposed: "×",
-  off: "-",
-};
-
-/**
- * A state in words, with a symbol so the colour is never the only signal:
- * "i" for a state that is so, "!" for one that needs a person, "×" for a
- * dashboard open to the network, "-" for off.
- */
-export function Chip({ tone, label, title, className = "" }: { tone: ChipTone; label: string; title?: string; className?: string }) {
-  const marks = tone === "needs" ? { "data-needs-you": "" } : tone === "exposed" ? { "data-exposed": "" } : {};
-  return (
-    <span
-      {...marks}
-      data-chip={tone}
-      title={title}
-      className={`inline-flex w-fit max-w-full items-start gap-1.5 rounded-md border px-2.5 py-1 text-xs font-semibold leading-4 ${CHIP_CLASS[tone]} ${className}`}
-    >
-      <span className="shrink-0 font-bold" aria-hidden="true">{CHIP_SYMBOL[tone]}</span>
-      <span className="min-w-0 break-words">{label}</span>
-    </span>
   );
 }
 
@@ -204,12 +166,15 @@ export function CopyCommand({
         <button
           type="button"
           onClick={onCopy}
-          aria-label={`Copy the command ${command}`}
-          className="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-100"
+          aria-label={`Copy command: ${command}`}
+          className="shrink-0 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-semibold text-slate-700 hover:bg-slate-100 pointer-coarse:min-h-11 pointer-coarse:px-3"
         >
           {copied ? "Copied" : "Copy"}
         </button>
       ) : null}
+      {/* The button's name stays "Copy command": a screen reader hears that it
+          worked here, once, politely. */}
+      {canCopy ? <span data-copied-status className="sr-only" aria-live="polite">{copied ? `Copied: ${command}` : ""}</span> : null}
     </div>
   );
 }

@@ -125,6 +125,22 @@ pub(crate) fn current() -> SuppressConfig {
     load()
 }
 
+/// [`current`], and the allow patterns the file holds that the load ignores
+/// because they match every command, so the dashboard can say they do
+/// nothing. Read from the same file, once.
+pub(crate) fn current_with_ignored() -> (SuppressConfig, Vec<String>) {
+    let Some(text) = config_path().and_then(|p| std::fs::read_to_string(p).ok()) else {
+        return (SuppressConfig::default(), Vec::new());
+    };
+    let ignored = toml::from_str::<SuppressConfig>(&text)
+        .unwrap_or_default()
+        .allow
+        .into_iter()
+        .filter(|pattern| is_universal_pattern(pattern))
+        .collect();
+    (SuppressConfig::load(&text).0, ignored)
+}
+
 /// Apply user suppression to a rules verdict (best-effort). Returns an overriding
 /// verdict when the command is allowed/muted, else `None`.
 ///
@@ -143,17 +159,20 @@ pub fn consider_reporting(command: &str, verdict: &Value) -> Option<Value> {
 
 /// Environment variables an AI coding agent sets in the shell it runs
 /// commands in. Any of them set (non-empty) means the caller is, or was
-/// started by, such an agent.
-const AGENT_SHELL_MARKERS: &[&str] = &[
+/// started by, such an agent. OpenClaw sets `OPENCLAW_SHELL=exec` in every
+/// command its `exec` tool runs, a PTY and a sandbox included (OpenClaw
+/// 2026.9.7, `docs/tools/exec.md`).
+pub(crate) const AGENT_SHELL_MARKERS: &[&str] = &[
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "GEMINI_CLI",
+    "OPENCLAW_SHELL",
 ];
 
 /// Whether this process runs in an AI agent's shell, by its markers.
-fn in_agent_shell() -> bool {
+pub(crate) fn in_agent_shell() -> bool {
     AGENT_SHELL_MARKERS
         .iter()
         .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()))
@@ -168,7 +187,7 @@ fn in_agent_shell() -> bool {
 /// see the call (a renamed copy of the binary, a script the agent wrote). A
 /// same-user agent can still allocate a terminal or unset its markers, so
 /// this raises the cost, it does not close the route.
-fn may_widen(operator_flag: bool) -> bool {
+pub(crate) fn may_widen(operator_flag: bool) -> bool {
     std::io::IsTerminal::is_terminal(&std::io::stdin()) || (operator_flag && !in_agent_shell())
 }
 
@@ -184,7 +203,7 @@ fn refuse_without_terminal(verb: &str) -> std::process::ExitCode {
 }
 
 /// The arguments with the operator flag taken out, and whether it was there.
-fn split_operator_flag(rest: &[String]) -> (Vec<String>, bool) {
+pub(crate) fn split_operator_flag(rest: &[String]) -> (Vec<String>, bool) {
     let operator = rest.iter().any(|a| a == GUARD_OPERATOR_FLAG);
     let args = rest
         .iter()
