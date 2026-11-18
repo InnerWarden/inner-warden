@@ -107,11 +107,40 @@ fn status_io_cmd() -> std::process::ExitCode {
         .map(innerwarden_agent_guard::agents_ops::rows)
         .unwrap_or_default();
 
+    let StatusWiring {
+        hook_trouble,
+        partly_unscreened,
+        wired_agents,
+        tool_classes,
+    } = status_wiring(home.as_deref(), &rows);
+    status_io_cmd_rest(
+        home,
+        rows,
+        hook_trouble,
+        partly_unscreened,
+        wired_agents,
+        tool_classes,
+    )
+}
+
+/// What `status` says about each agent's wiring, from the rows it read.
+struct StatusWiring {
+    hook_trouble: Vec<status::HookTrouble>,
+    partly_unscreened: Vec<status::PartlyUnscreened>,
+    wired_agents: Vec<String>,
+    tool_classes: Vec<status::ToolClasses>,
+}
+
+/// The wiring half of `status`, out of the command so a test can run it on a
+/// home of its own. `None` home: nothing could be looked at.
+fn status_wiring(
+    home: Option<&std::path::Path>,
+    rows: &[innerwarden_agent_guard::agents::AgentStatus],
+) -> StatusWiring {
     // Wired agents whose hook is not known to run: its program is gone, is not
     // executable, or could not be checked. Judged by the same shared function
     // `agents` and the dashboard use, so the three cannot disagree.
     let hook_trouble: Vec<status::HookTrouble> = home
-        .as_deref()
         .map(|home| {
             use innerwarden_agent_guard::{agents_ops, hook::HookProgram};
             rows.iter()
@@ -148,7 +177,6 @@ fn status_io_cmd() -> std::process::ExitCode {
     // tools, read tools, tool results) runs a program that is gone. The same
     // shared function `agents` uses.
     let partly_unscreened: Vec<status::PartlyUnscreened> = home
-        .as_deref()
         .map(|home| {
             use innerwarden_agent_guard::{agents_ops, hook};
             rows.iter()
@@ -175,7 +203,6 @@ fn status_io_cmd() -> std::process::ExitCode {
     // whether it covers the agent's own file tools, which wiring written by an
     // earlier version does not.
     let tool_classes: Vec<status::ToolClasses> = home
-        .as_deref()
         .map(|home| {
             // An agent with a hook that cannot start is described by its
             // [off] line; this one judges the hooks by their text alone and
@@ -189,7 +216,22 @@ fn status_io_cmd() -> std::process::ExitCode {
             )
         })
         .unwrap_or_default();
+    StatusWiring {
+        hook_trouble,
+        partly_unscreened,
+        wired_agents,
+        tool_classes,
+    }
+}
 
+fn status_io_cmd_rest(
+    home: Option<std::path::PathBuf>,
+    rows: Vec<innerwarden_agent_guard::agents::AgentStatus>,
+    hook_trouble: Vec<status::HookTrouble>,
+    partly_unscreened: Vec<status::PartlyUnscreened>,
+    wired_agents: Vec<String>,
+    tool_classes: Vec<status::ToolClasses>,
+) -> std::process::ExitCode {
     // Seen at all, wired or not. `None` when we could not look, which the
     // report renders as unknown rather than as "no agent".
     let any_agent_seen = home.as_ref().map(|_| !rows.is_empty());
@@ -2861,6 +2903,121 @@ mod unknown_command_tests {
         let said = unknown_command_lines("innerwarden", "--verison").join("\n");
         assert!(said.contains("--version"), "{said}");
         assert!(!said.contains("list of commands"), "{said}");
+    }
+}
+
+#[cfg(test)]
+mod status_wiring_tests {
+    use super::*;
+    use innerwarden_agent_guard::{agents_ops, file_tools, hook};
+
+    fn runnable(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// Claude Code wired with the Bash hook on `bash_bin` and the file and
+    /// read hooks on `rest_bin`, in monitor or enforce.
+    fn wire(
+        home: &std::path::Path,
+        bash_bin: &std::path::Path,
+        rest_bin: &std::path::Path,
+        monitor: bool,
+    ) {
+        let bash = hook::hook_command_for(bash_bin, false, monitor, Some("claude-code"));
+        let rest = hook::hook_command_for(rest_bin, false, monitor, Some("claude-code"));
+        let settings = serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": bash}]},
+            {"matcher": file_tools::FILE_TOOLS_MATCHER, "hooks": [{"type": "command", "command": rest}]},
+            {"matcher": file_tools::READ_TOOLS_MATCHER, "hooks": [{"type": "command", "command": rest}]}
+        ]}});
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            serde_json::to_vec_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// FAILS ON REVERT of the collection in `status`: an agent whose Bash hook
+    /// runs while its file and read hooks name a program that is gone is in
+    /// `partly_unscreened`, still wired, and left out of the tool classes
+    /// (which judge the hooks by their text and would call it whole). The
+    /// dashboard answers the same for the same file, in monitor and enforce:
+    /// guarded (`status_is_effectively_guarded`, what `r.guarded` says to
+    /// status), with the same tools named unscreened.
+    #[test]
+    fn status_and_dashboard_agree_on_a_partly_screened_agent_in_every_mode() {
+        for monitor in [true, false] {
+            let home = tempfile::TempDir::new().unwrap();
+            let bin = home.path().join("bin/innerwarden");
+            runnable(&bin);
+            wire(
+                home.path(),
+                &bin,
+                &home.path().join("gone/innerwarden"),
+                monitor,
+            );
+            let rows = agents_ops::rows(home.path());
+            let claude = rows
+                .iter()
+                .find(|r| r.name == "claude-code")
+                .expect("claude row");
+
+            let w = status_wiring(Some(home.path()), &rows);
+            assert!(w.hook_trouble.is_empty(), "monitor={monitor}");
+            assert_eq!(
+                w.wired_agents,
+                vec!["claude-code".to_string()],
+                "monitor={monitor}"
+            );
+            assert_eq!(w.partly_unscreened.len(), 1, "monitor={monitor}");
+            assert!(w.partly_unscreened[0].sentence.contains("not screened"));
+            assert!(
+                !w.tool_classes.iter().any(|c| matches!(c, status::ToolClasses::Hook { agent, .. } if agent == "claude-code")),
+                "a partly screened agent gets no tool-classes line: {:?}",
+                w.tool_classes
+            );
+
+            // The dashboard, on the same file.
+            assert_eq!(
+                claude.guarded,
+                agents_ops::status_is_effectively_guarded(home.path(), claude)
+            );
+            assert!(agents_ops::status_is_effectively_guarded(
+                home.path(),
+                claude
+            ));
+            assert_eq!(
+                hook::unscreened_hooks_sentence(&agents_ops::unscreened_hooks(home.path(), claude))
+                    .as_deref(),
+                Some(w.partly_unscreened[0].sentence.as_str())
+            );
+
+            // Whole again: no caveat, and the tool classes say what it judges.
+            runnable(&home.path().join("gone/innerwarden"));
+            let rows = agents_ops::rows(home.path());
+            let w = status_wiring(Some(home.path()), &rows);
+            assert!(w.partly_unscreened.is_empty(), "monitor={monitor}");
+            assert!(
+                w.tool_classes.iter().any(|c| matches!(c, status::ToolClasses::Hook { agent, file_tools: true, reads: true, .. } if agent == "claude-code")),
+                "{:?}",
+                w.tool_classes
+            );
+        }
+    }
+
+    /// No home: nothing is claimed either way.
+    #[test]
+    fn status_wiring_without_a_home_claims_nothing() {
+        let w = status_wiring(None, &[]);
+        assert!(w.hook_trouble.is_empty() && w.partly_unscreened.is_empty());
+        assert!(w.wired_agents.is_empty() && w.tool_classes.is_empty());
     }
 }
 

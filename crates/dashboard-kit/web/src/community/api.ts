@@ -796,9 +796,20 @@ export type AgentNextStep = { label: string; command: string; line: string };
  */
 export type AgentUnscreened = { line: string; command: string };
 
+/** Where a long unscreened line is cut, and what is said in its place. */
+export const UNSCREENED_LINE_MAX = 600;
+export const UNSCREENED_CUT_NOTICE = " [cut: innerwarden status prints the whole line]";
+
 export function readAgentUnscreened(value: unknown): AgentUnscreened | undefined {
   const item = record(value);
-  const line = plain(item?.line, 600);
+  // A long line (a deep binary path, several groups) is cut with a notice,
+  // never dropped: dropping it took the whole card away, and with it the one
+  // place the page said these tools are not screened.
+  const whole = plain(item?.line, 16_384);
+  const line =
+    whole === undefined || whole.length <= UNSCREENED_LINE_MAX
+      ? whole
+      : whole.slice(0, UNSCREENED_LINE_MAX - UNSCREENED_CUT_NOTICE.length).trimEnd() + UNSCREENED_CUT_NOTICE;
   const command = plain(item?.command, 200);
   return line === undefined || command === undefined ? undefined : { line, command };
 }

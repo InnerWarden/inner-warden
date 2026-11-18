@@ -416,6 +416,9 @@ pub struct Facts {
     pub dashboard_reachable: Option<bool>,
 }
 
+/// The caveat on an agent in `Wired into` whose other hooks do not run.
+pub const PARTLY_SCREENED: &str = "partly: some of its tools are not screened, see above";
+
 /// PURE: turn observed facts into findings a beginner can act on.
 pub fn assess(facts: &Facts) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -532,10 +535,24 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
         });
     }
     if !facts.wired_agents.is_empty() {
+        // An agent with some of its tools unscreened is named with that
+        // caveat: the same agent read `[off] ... not screened` above and then
+        // `[on] Wired into 1: claude-code` here, as if it were whole.
+        let named: Vec<String> = facts
+            .wired_agents
+            .iter()
+            .map(|agent| {
+                if facts.partly_unscreened.iter().any(|p| &p.agent == agent) {
+                    format!("{agent} ({PARTLY_SCREENED})")
+                } else {
+                    agent.clone()
+                }
+            })
+            .collect();
         out.push(Finding::Working(format!(
             "Wired into {}: {}.",
             facts.wired_agents.len(),
-            facts.wired_agents.join(", ")
+            named.join(", ")
         )));
         out.extend(facts.tool_classes.iter().map(tool_classes_finding));
     } else if facts.hook_trouble.is_empty() {
@@ -1621,7 +1638,12 @@ mod tests {
             report.contains("try: innerwarden install claude-code"),
             "{report}"
         );
-        // The rest of the report still stands: shell commands ARE screened.
-        assert!(report.contains("Wired into 1: claude-code."), "{report}");
+        // Still wired, shell commands ARE screened, but never named as whole:
+        // the same agent read [off] above and plain [on] here.
+        assert!(
+            report.contains(&format!("Wired into 1: claude-code ({PARTLY_SCREENED}).")),
+            "{report}"
+        );
+        assert!(!report.contains("Wired into 1: claude-code."), "{report}");
     }
 }
