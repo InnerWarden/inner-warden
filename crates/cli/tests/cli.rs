@@ -1243,6 +1243,82 @@ fn graph_never_persists_a_secret_in_a_screened_command() {
     );
 }
 
+/// The one command node `graph --json` prints for a fresh record.
+fn only_command_in(gp: &str) -> serde_json::Value {
+    let out = cli()
+        .args(["graph", "--json"])
+        .env("IW_GRAPH_FILE", gp)
+        .output()
+        .expect("run graph");
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let commands: Vec<_> = printed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "command")
+        .cloned()
+        .collect();
+    assert_eq!(commands.len(), 1, "{printed}");
+    commands.into_iter().next().unwrap()
+}
+
+#[test]
+fn a_long_review_comes_out_whole_in_graph_json() {
+    // The label is cut for the screen; the person reviewing the decision, and
+    // the rules tuned on it, need the line as it was screened.
+    let dir = tempfile::TempDir::new().unwrap();
+    let graph = dir.path().join("graph.json");
+    let gp = graph.to_str().unwrap();
+    let cmd = format!(
+        "chmod 777 build/out {}",
+        "build/generated/asset.bin ".repeat(20)
+    );
+    let cmd = cmd.trim();
+    let out = cli()
+        .args(["check", cmd, "--json"])
+        .env("IW_GRAPH_FILE", gp)
+        .env("IW_GUARD_SESSION", "long-review")
+        .output()
+        .expect("run check");
+    let verdict: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(verdict["recommendation"], "review", "{verdict}");
+
+    let node = only_command_in(gp);
+    assert!(node["label"].as_str().unwrap().chars().count() <= 120);
+    assert_eq!(node["attrs"]["command_full"], cmd, "{node}");
+}
+
+#[test]
+fn a_long_command_keeps_its_token_masked_in_the_full_text() {
+    // Assembled at runtime so no contiguous token literal lives in the source.
+    let secret = format!("sk-proj{}", "-FAKEfake1111fake2222fake3333value789");
+    let dir = tempfile::TempDir::new().unwrap();
+    let graph = dir.path().join("graph.json");
+    let gp = graph.to_str().unwrap();
+    let cmd = format!(
+        "chmod 777 build/out && OPENAI_API_KEY={secret} make {}",
+        "target ".repeat(40)
+    );
+    let cmd = cmd.trim();
+    cli()
+        .args(["check", cmd, "--json"])
+        .env("IW_GRAPH_FILE", gp)
+        .env("IW_GUARD_SESSION", "long-secret")
+        .output()
+        .expect("run check");
+
+    let node = only_command_in(gp);
+    let full = node["attrs"]["command_full"].as_str().expect("kept whole");
+    assert!(!full.contains(&secret), "secret leaked: {full}");
+    assert!(full.contains("[REDACTED]"), "{full}");
+    assert!(
+        full.ends_with("target"),
+        "the rest of the line is there: {full}"
+    );
+    let body = std::fs::read_to_string(&graph).unwrap();
+    assert!(!body.contains(&secret), "secret leaked into the file");
+}
+
 #[test]
 fn llm_set_key_stores_owner_only_and_config_keeps_only_the_path() {
     // The wizard / `llm set-key` must store the API key in an owner-only file and
