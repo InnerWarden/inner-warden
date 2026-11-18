@@ -34,14 +34,9 @@ const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
  * release the advisory covers, and why it is accepted.
  */
 export const WAIVERS = {
-  // picomatch ReDoS through single-branch repeated extglobs. GitHub withdrew
-  // this advisory on 2026-11-18, but the npm registry still serves it, so
-  // `npm audit` still lists every picomatch release through 4.0.7, the latest
-  // published, with no upgrade to take. picomatch only runs in the build and
-  // test tools here (vite, vitest, tinyglobby, fdir), on globs this repo
-  // writes. This entry goes when `npm audit` stops listing it: the stale
-  // check below then fails until it is removed.
-  "GHSA-fc5q-39xc-vjpf": { package: "picomatch", lastAffected: "4.0.7" },
+  // None today. The picomatch entry (GHSA-fc5q-39xc-vjpf) went on 2026-11-18:
+  // GitHub withdrew the advisory and the npm registry stopped serving it, and
+  // the stale check failed as designed.
 };
 
 const SEVERITY = { info: 0, low: 1, moderate: 2, high: 3, critical: 4 };
