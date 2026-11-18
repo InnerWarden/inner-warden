@@ -463,12 +463,11 @@ pub const OBFUSCATION_INDICATORS: &[&str] = &[
     "echo -e \"\\x",
     "echo -ne '\\x",
     "$'\\x",
-    "python -c \"import os",
-    "python3 -c \"import os",
-    "python -c 'import os",
-    "python3 -c 'import os",
-    "python -c \"import subprocess",
-    "python3 -c \"import subprocess",
+    // `python3 -c "import os` is not here: importing a module hides nothing,
+    // and the same code fed on standard input was never a sign. What the
+    // code does with it (`os.system`, `subprocess.run` of a line, a write of
+    // agent settings) is read by the rules that read inline code, the same
+    // way in `-c` and in a here-document.
     "perl -e 'system",
     "perl -e 'exec",
     "ruby -e 'system",
@@ -6747,13 +6746,180 @@ const GUARD_CARRIER_WRITTEN: &str =
 /// URL, `git checkout` of one, a change of owner, and a write made by
 /// interpreter code other than the rewrites [`guard_self_disable_in`] names.
 fn writes_guard_carrier(content: &str) -> bool {
-    may_name_guard_carrier(content)
-        && writes_place(
-            content,
-            0,
-            |target, taken| names_guard_carrier(target) || (taken && names_agent_home(target)),
-            false,
+    if !may_name_guard_carrier(content) {
+        return false;
+    }
+    // The rest holds no assignment of a fresh folder, so this is asked once.
+    if let Some(rest) = without_fresh_dir_writes(content) {
+        return writes_guard_carrier(&rest);
+    }
+    writes_place(
+        content,
+        0,
+        |target, taken| names_guard_carrier(target) || (taken && names_agent_home(target)),
+        false,
+    )
+}
+
+/// `content` with the commands that only make and fill a folder the same
+/// line has just created with `mktemp -d` taken out, when that is provably
+/// all they do: a test fixture written into a throwaway home
+/// (`H=$(mktemp -d); mkdir -p "$H/.claude"; echo '{}' >
+/// "$H/.claude/settings.json"; HOME="$H" tool`). `None` when the line is not
+/// in that shape, and it is then read whole.
+///
+/// The folder is new: no agent was started in it or with it as its home, so
+/// no agent loads settings from it. What would make a write into it reach
+/// the real settings is a link planted inside it, so every command that
+/// names the folder must be one that cannot plant one:
+///
+/// * the one assignment of the variable, `NAME=$(mktemp -d ...)`, without
+///   `-u` (which names a folder and makes none), and no other word that sets
+///   the name (`for`, `read`, `export`, another assignment);
+/// * `mkdir`;
+/// * `echo`, `printf`, `cat`, `true` or `:` whose output goes by `>` or `>>`
+///   into the folder, and `tee` into it;
+/// * `rm -rf` of the folder;
+/// * a command run with `HOME` set to the folder, after the last write
+///   into it (what it does in its home cannot be followed by a write here).
+///
+/// A `cd`, a link, a copy, an archive, an alias of the variable, a function
+/// or anything else that names the folder leaves the line read whole.
+fn without_fresh_dir_writes(content: &str) -> Option<String> {
+    static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let assign = ASSIGN.get_or_init(|| {
+        // `NAME=$(mktemp -d)`, quoted or not, and the same with the
+        // substitution opened, as the guard's other reading of the line has
+        // it (`NAME= mktemp -d`): there `NAME` is empty, and the folder the
+        // line writes in is under `/`, not a home either.
+        regex::Regex::new(
+            r#"^([A-Za-z_][A-Za-z0-9_]*)=(?:"\$\(mktemp(\s+[^$`;&|()<>"'\\]*)?\)"|\$\(mktemp(\s+[^$`;&|()<>"'\\]*)?\)|"?\s+mktemp(\s+[^$`;&|()<>"'\\]*)?"?)$"#,
         )
+        .expect("static fresh folder assignment regex")
+    });
+    // A here-document's body is not read for commands here, and a function
+    // runs its body where it is called: neither shape is followed.
+    if content.contains('`') || content.contains("<<") || content.contains("()") {
+        return None;
+    }
+    let segments = shell_command_segments(content);
+    let mut name = None;
+    for segment in &segments {
+        if let Some(found) = assign.captures(segment.trim()) {
+            let flags = found
+                .get(2)
+                .or_else(|| found.get(3))
+                .or_else(|| found.get(4))
+                .map_or("", |m| m.as_str());
+            let words: Vec<&str> = flags.split_whitespace().collect();
+            let makes_folder = words.iter().any(|word| {
+                *word == "--directory"
+                    || word
+                        .strip_prefix('-')
+                        .is_some_and(|f| !f.starts_with('-') && f.contains('d'))
+            });
+            let dry = words.iter().any(|word| {
+                *word == "--dry-run"
+                    || word
+                        .strip_prefix('-')
+                        .is_some_and(|f| !f.starts_with('-') && f.contains('u'))
+            });
+            if !makes_folder || dry || name.is_some() {
+                return None;
+            }
+            name = Some(found.get(1)?.as_str().to_string());
+        }
+    }
+    let name = name?;
+    // The name stands bare only in its one assignment.
+    let bare = regex::Regex::new(&format!(r"(?:^|[^$A-Za-z0-9_{{]){name}\b")).ok()?;
+    if bare.find_iter(content).count() != 1 {
+        return None;
+    }
+    let mention = regex::Regex::new(&format!(r"\$(?:\{{{name}\}}|{name}\b)")).ok()?;
+    // In the folder: the folder itself or a path below it with no `..`.
+    let in_folder = |word: &str| {
+        let word = word.trim_matches('"');
+        !word.split('/').any(|part| part == "..")
+            && [format!("${name}"), format!("${{{name}}}")]
+                .iter()
+                .any(|head| word == head || word.starts_with(&format!("{head}/")))
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut home_runs = false;
+    for segment in &segments {
+        let trimmed = segment.trim();
+        if assign.is_match(trimmed) {
+            continue;
+        }
+        if !mention.is_match(trimmed) {
+            kept.push(segment);
+            continue;
+        }
+        let words = shell_tokens(trimmed);
+        let raw: Vec<&str> = trimmed.split_whitespace().collect();
+        let program = words.first().map(|w| token_basename(w)).unwrap_or_default();
+        // `HOME=$H tool` or `env HOME=$H tool`: the folder is the tool's home.
+        let home_set = raw
+            .iter()
+            .take_while(|w| w.contains('=') || **w == "env")
+            .any(|w| w.strip_prefix("HOME=").is_some_and(in_folder));
+        if home_set {
+            let rest: Vec<&&str> = raw
+                .iter()
+                .skip_while(|w| w.contains('=') || **w == "env")
+                .collect();
+            if rest.iter().any(|w| mention.is_match(w)) {
+                return None;
+            }
+            home_runs = true;
+            continue;
+        }
+        let writes_in_folder = match program {
+            "mkdir" => raw[1..].iter().all(|w| w.starts_with('-') || in_folder(w)),
+            "rm" => {
+                raw.len() == 3
+                    && matches!(raw[1], "-rf" | "-fr" | "-r" | "-Rf" | "-fR")
+                    && in_folder(raw[2])
+                    && raw[2]
+                        .trim_matches('"')
+                        .trim_end_matches('/')
+                        .ends_with(&name)
+            }
+            "tee" => raw[1..]
+                .iter()
+                .all(|w| matches!(*w, "-a" | "--append") || in_folder(w)),
+            "echo" | "printf" | "cat" | "true" | ":" => {
+                // Every mention is the target of `>` or `>>`.
+                let mut ok = false;
+                let mut targets = 0;
+                let mut iter = raw.iter().peekable();
+                while let Some(word) = iter.next() {
+                    if let Some(target) = word.strip_prefix(">>").or_else(|| word.strip_prefix('>'))
+                    {
+                        let target = if target.is_empty() {
+                            iter.next().copied().unwrap_or("")
+                        } else {
+                            target
+                        };
+                        if !in_folder(target) {
+                            return None;
+                        }
+                        targets += 1;
+                        ok = true;
+                    } else if mention.is_match(word) {
+                        return None;
+                    }
+                }
+                ok && targets == 1
+            }
+            _ => false,
+        };
+        if !writes_in_folder || (home_runs && program != "rm") {
+            return None;
+        }
+    }
+    Some(kept.join("\n"))
 }
 
 /// A cheap test ahead of the walk [`writes_guard_carrier`] makes: a line
@@ -9443,7 +9609,7 @@ fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
                 continue;
             }
             if *description == "shell eval (dynamic command execution)"
-                && is_local_tool_eval_idiom(content)
+                && (is_local_tool_eval_idiom(content) || eval_only_in_grep_patterns(re, content))
             {
                 continue;
             }
@@ -9455,6 +9621,23 @@ fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
         }
     }
     None
+}
+
+/// Whether every place `eval` reads as a command start in `content` is
+/// inside a quoted pattern handed to grep ([`crate::shell::grep_pattern_ranges`]):
+/// `cargo test 2>&1 | grep -E '^===|eval ->'` searches for the word, the
+/// `|` before it is the pattern's alternation, and nothing runs `eval`.
+/// Measured 2026-11-18: denied as a shell eval. A real `eval` anywhere on
+/// the line, a pattern given unquoted, and a line that does not parse keep
+/// the refusal.
+fn eval_only_in_grep_patterns(re: &regex::Regex, content: &str) -> bool {
+    let patterns = crate::shell::grep_pattern_ranges(content);
+    !patterns.is_empty()
+        && re.find_iter(content).all(|found| {
+            patterns
+                .iter()
+                .any(|range| range.start < found.start() && found.end() < range.end)
+        })
 }
 
 /// PURE. `text` with the assignments that stand in front of a command
@@ -11907,7 +12090,7 @@ fn secret_in_hidden_folder_within(
 /// `cwd`. The text alone names none of these: `cat auth.json` after `cd
 /// ~/.codex`, `cat .hermes/auth.json` run in the home, `cat credentials` in
 /// `~/.aws`, `grep -r <token> ~/.app`. Measured 2026-11-12 on the agent hook:
-/// every one of them passed. The bool is whether it was a folder read.
+/// every one of them passed. The second part says how it was reached.
 ///
 /// Paths are resolved as [`env_read_outside_project`] resolves them, and a
 /// path the text cannot resolve is not reported.
@@ -11915,9 +12098,35 @@ pub fn stored_secret_read_in_place(
     content: &str,
     cwd: &str,
     home: Option<&str>,
-) -> Option<(String, bool)> {
+) -> Option<(String, SecretReach)> {
+    stored_secret_reach(content, cwd, home, false)
+}
+
+/// Whether the one stored secret `content`, as written, reaches is the
+/// home's, by a `grep` of the whole home for a narrow text
+/// ([`SecretReach::HomeSearched`]). Asked of the line as written: the
+/// reading the other rules scan has the search pattern blanked as data, and
+/// a blank pattern is no narrow text.
+pub fn searches_home_for_narrow_text(content: &str, cwd: &str, home: Option<&str>) -> bool {
+    matches!(
+        stored_secret_reach(content, cwd, home, true),
+        Some((_, SecretReach::HomeSearched))
+    )
+}
+
+/// [`stored_secret_read_in_place`], with a whole-home `grep` for a narrow
+/// text told apart when `patterns` is set.
+fn stored_secret_reach(
+    content: &str,
+    cwd: &str,
+    home: Option<&str>,
+    patterns: bool,
+) -> Option<(String, SecretReach)> {
     let content = strip_inert_heredoc_bodies(content);
     let mut place = CommandPlace::new(cwd, home);
+    // A search of the whole home for a narrow text: kept, and answered only
+    // when nothing on the line reaches a secret harder.
+    let mut searched: Option<String> = None;
     for segment in shell_command_segments(&content) {
         let Some(words) = place.step(segment) else {
             continue;
@@ -11934,26 +12143,157 @@ pub fn stored_secret_read_in_place(
                     continue;
                 };
                 if is_stored_credential(&path, home) {
-                    return Some((path, false));
+                    return Some((path, SecretReach::Named));
                 }
                 if let Some(secret) = secret_behind(&path, home) {
-                    return Some((secret, false));
+                    return Some((secret, SecretReach::Named));
                 }
                 if let Some(secret) = home
                     .filter(|home| holds_the_folder(&path, home) && reads_folders_whole(segment))
                     .and_then(secret_kept_in_home)
                 {
-                    return Some((secret, true));
+                    if patterns && searches_for_narrow_text(segment) {
+                        searched.get_or_insert(secret);
+                        continue;
+                    }
+                    return Some((secret, SecretReach::Folder));
                 }
                 if let Some(file) =
                     home.and_then(|home| secret_in_hidden_folder(&path, home, Some(cwd)))
                 {
-                    return Some((file, true));
+                    return Some((file, SecretReach::Folder));
                 }
             }
         }
     }
-    None
+    searched.map(|secret| (secret, SecretReach::HomeSearched))
+}
+
+/// How [`stored_secret_read_in_place`] found a command reaching a stored
+/// secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretReach {
+    /// The path names the secret, or a link or a directory makes it.
+    Named,
+    /// A whole folder that holds it is read.
+    Folder,
+    /// The whole home that holds it is searched with grep for a narrow text
+    /// ([`searches_for_narrow_text`]): the key is opened, and only a line
+    /// of it that holds that text would be printed.
+    HomeSearched,
+}
+
+/// Whether `segment` is a `grep` that prints only the lines holding a
+/// narrow text: every pattern at least three characters, two of them
+/// letters or digits, the rest of a short set that a regular expression
+/// does not widen (`.` only under `-F` or `fgrep`), and none a word a hunt
+/// for secrets looks for ([`credential_hunt_token`]). Refused: `-v` (prints
+/// the lines that do not match, so the whole key), `-z` (a whole file is
+/// one line), a pattern from a file (`-f`), and an empty or wide pattern.
+///
+/// `grep -r TODO ~` over a home that holds `~/.ssh/id_ed25519` opens the
+/// key, and prints from it only a line holding `TODO`. That is a person's
+/// call to make (`review`), not the hard refusal a read of the key is:
+/// measured 2026-11-18, every recursive search of a home that held a key
+/// was denied, whatever it looked for.
+fn searches_for_narrow_text(segment: &str) -> bool {
+    let words = shell_tokens(segment);
+    let Some(at) = effective_command_index(&words) else {
+        return false;
+    };
+    let program = token_basename(&words[at]).to_ascii_lowercase();
+    if !matches!(program.as_str(), "grep" | "egrep" | "fgrep") {
+        return false;
+    }
+    let mut fixed = program == "fgrep";
+    let mut patterns: Vec<&str> = Vec::new();
+    let mut given_by_option = false;
+    let mut positional: Option<&str> = None;
+    let mut rest = words[at + 1..].iter();
+    while let Some(word) = rest.next() {
+        let word = word.as_str();
+        if word == "--" {
+            if positional.is_none() && !given_by_option {
+                positional = rest.next().map(String::as_str);
+            }
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            match name {
+                "invert-match" | "null-data" | "file" => return false,
+                "fixed-strings" => fixed = true,
+                "regexp" => {
+                    given_by_option = true;
+                    match value.or_else(|| rest.next().map(String::as_str)) {
+                        Some(pattern) => patterns.push(pattern),
+                        None => return false,
+                    }
+                }
+                "after-context" | "before-context" | "context" | "max-count" | "devices"
+                | "directories" | "label" | "binary-files"
+                    if value.is_none() =>
+                {
+                    rest.next();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if let Some(flags) = word.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            for (index, flag) in flags.char_indices() {
+                let attached = &flags[index + flag.len_utf8()..];
+                match flag {
+                    'v' | 'z' | 'f' => return false,
+                    'F' => fixed = true,
+                    'e' => {
+                        given_by_option = true;
+                        let pattern = if attached.is_empty() {
+                            rest.next().map(String::as_str)
+                        } else {
+                            Some(attached)
+                        };
+                        match pattern {
+                            Some(pattern) => patterns.push(pattern),
+                            None => return false,
+                        }
+                        break;
+                    }
+                    'A' | 'B' | 'C' | 'm' | 'd' | 'D' => {
+                        if attached.is_empty() {
+                            rest.next();
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if positional.is_none() && !given_by_option {
+            positional = Some(word);
+        }
+    }
+    if !given_by_option {
+        patterns.extend(positional);
+    }
+    !patterns.is_empty()
+        && patterns.iter().all(|pattern| {
+            let narrow_char = |c: char| {
+                c.is_ascii_alphanumeric()
+                    || matches!(
+                        c,
+                        ' ' | '_' | '-' | ':' | '#' | '@' | '/' | '<' | '>' | ',' | '='
+                    )
+                    || (fixed && c == '.')
+            };
+            pattern.chars().count() >= 3
+                && pattern.chars().filter(char::is_ascii_alphanumeric).count() >= 2
+                && pattern.chars().all(narrow_char)
+                && credential_hunt_token(pattern).is_none()
+        })
 }
 
 /// Whether `path` is `home` or a folder `home` is in (`/home`, `/`): a
