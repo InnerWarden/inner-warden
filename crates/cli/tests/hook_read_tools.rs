@@ -8,8 +8,12 @@
 //! files in that scratch home.
 
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Instant;
+
+mod fork_safe;
+use fork_safe::{copy_the_binary, spawn_without_racing_a_copy};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
@@ -50,19 +54,24 @@ impl Host {
 
     /// Run the hook once with `payload`; the exit code and stderr.
     fn hook(&self, flags: &[&str], payload: &str) -> (Option<i32>, String) {
-        let mut child = Command::new(bin())
-            .arg("hook")
-            .args(flags)
-            .env("HOME", self.home())
-            .env("USERPROFILE", self.home())
-            .env("IW_GRAPH_FILE", self.dir.path().join("graph.json"))
-            .env("IW_SESSION_FILE", self.dir.path().join("sessions.json"))
-            .current_dir(self.project())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("run innerwarden hook");
+        self.hook_as(Path::new(bin()), flags, payload)
+    }
+
+    /// [`Host::hook`] with `program` as the guard binary.
+    fn hook_as(&self, program: &Path, flags: &[&str], payload: &str) -> (Option<i32>, String) {
+        let mut child = spawn_without_racing_a_copy(
+            Command::new(program)
+                .arg("hook")
+                .args(flags)
+                .env("HOME", self.home())
+                .env("USERPROFILE", self.home())
+                .env("IW_GRAPH_FILE", self.dir.path().join("graph.json"))
+                .env("IW_SESSION_FILE", self.dir.path().join("sessions.json"))
+                .current_dir(self.project())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
         child
             .stdin
             .as_mut()
@@ -114,15 +123,19 @@ fn record(host: &Host) -> String {
 #[test]
 fn an_installed_hook_refuses_the_five_reads_that_passed_on_1_6_12() {
     let host = Host::new();
-    let install = Command::new(bin())
-        .args(["install", "claude-code"])
-        .env("HOME", host.home())
-        .env("USERPROFILE", host.home())
-        .env("IW_GRAPH_FILE", host.dir.path().join("graph.json"))
-        .env("IW_SESSION_FILE", host.dir.path().join("sessions.json"))
-        .stdin(Stdio::null())
-        .output()
-        .expect("run innerwarden install");
+    let install = spawn_without_racing_a_copy(
+        Command::new(bin())
+            .args(["install", "claude-code"])
+            .env("HOME", host.home())
+            .env("USERPROFILE", host.home())
+            .env("IW_GRAPH_FILE", host.dir.path().join("graph.json"))
+            .env("IW_SESSION_FILE", host.dir.path().join("sessions.json"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .wait_with_output()
+    .expect("run innerwarden install");
     assert!(
         install.status.success(),
         "{}",
@@ -148,17 +161,17 @@ fn an_installed_hook_refuses_the_five_reads_that_passed_on_1_6_12() {
     };
     assert!(!line_for("Glob").is_empty());
     let run = |line: &str, payload: &str| -> (Option<i32>, String) {
-        let mut child = Command::new("sh")
-            .args(["-c", line])
-            .env("HOME", host.home())
-            .env("IW_GRAPH_FILE", host.dir.path().join("graph.json"))
-            .env("IW_SESSION_FILE", host.dir.path().join("sessions.json"))
-            .current_dir(host.project())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("sh");
+        let mut child = spawn_without_racing_a_copy(
+            Command::new("sh")
+                .args(["-c", line])
+                .env("HOME", host.home())
+                .env("IW_GRAPH_FILE", host.dir.path().join("graph.json"))
+                .env("IW_SESSION_FILE", host.dir.path().join("sessions.json"))
+                .current_dir(host.project())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
         child
             .stdin
             .as_mut()
@@ -189,10 +202,18 @@ fn an_installed_hook_refuses_the_five_reads_that_passed_on_1_6_12() {
 /// version's, in the mode it had, once: the next call changes nothing.
 /// `agents rewire`, what the upgrade now runs with the new binary, is a no-op
 /// after that.
+///
+/// The binary runs from a copy outside the cargo build directory, the way an
+/// installed one does: a cargo build never rewires anything
+/// (`rewire_never_to_a_build.rs`).
 #[test]
 fn the_first_hook_of_a_new_version_wires_the_read_tools() {
     let host = Host::new();
-    let old = format!("\"{}\" hook --agent claude-code", bin());
+    let installed_dir = host.dir.path().join("bin");
+    std::fs::create_dir_all(&installed_dir).unwrap();
+    let installed = installed_dir.join(Path::new(bin()).file_name().unwrap());
+    copy_the_binary(Path::new(bin()), &installed);
+    let old = format!("\"{}\" hook --agent claude-code", installed.display());
     let wired_by_1_6_12 = serde_json::json!({"hooks": {"PreToolUse": [
         {"matcher": "Bash", "hooks": [{"type": "command", "command": old}]},
         {"matcher": "Write|Edit|MultiEdit|NotebookEdit",
@@ -213,7 +234,7 @@ fn the_first_hook_of_a_new_version_wires_the_read_tools() {
     assert!(!read_tools_wired());
 
     let harmless = host.call("Bash", serde_json::json!({ "command": "ls" }));
-    let (code, stderr) = host.hook(&["--agent", "claude-code"], &harmless);
+    let (code, stderr) = host.hook_as(&installed, &["--agent", "claude-code"], &harmless);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(
         read_tools_wired(),
@@ -226,17 +247,21 @@ fn the_first_hook_of_a_new_version_wires_the_read_tools() {
         "enforce stays enforce"
     );
 
-    let (code, _) = host.hook(&["--agent", "claude-code"], &harmless);
+    let (code, _) = host.hook_as(&installed, &["--agent", "claude-code"], &harmless);
     assert_eq!(code, Some(0));
     assert_eq!(std::fs::read(&path).unwrap(), body, "once per version");
 
-    let rewire = Command::new(bin())
-        .args(["agents", "rewire"])
-        .env("HOME", host.home())
-        .env("USERPROFILE", host.home())
-        .stdin(Stdio::null())
-        .output()
-        .expect("agents rewire");
+    let rewire = spawn_without_racing_a_copy(
+        Command::new(&installed)
+            .args(["agents", "rewire"])
+            .env("HOME", host.home())
+            .env("USERPROFILE", host.home())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .wait_with_output()
+    .expect("agents rewire");
     assert!(
         rewire.status.success(),
         "{}",

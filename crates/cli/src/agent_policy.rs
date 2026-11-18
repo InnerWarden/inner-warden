@@ -796,6 +796,12 @@ pub fn rewire_existing_within(
     guard_bin: &str,
     wait: std::time::Duration,
 ) -> ReconcileReport {
+    if let Some(why) = refuse_rewire_to(home, guard_bin) {
+        return ReconcileReport {
+            notices: vec![why],
+            ..ReconcileReport::default()
+        };
+    }
     let run = with_lock_within(home, wait, || {
         let policy = load(home)?;
         let mut report = ReconcileReport::default();
@@ -814,6 +820,80 @@ pub fn rewire_existing_within(
         Ok(report)
     });
     run.unwrap_or_else(ReconcileReport::lock_failure)
+}
+
+/// Why a rewire must not point the wiring at `guard_bin`, or `None` when it
+/// may (NEW-20261118-dev-build-rewired-real-claude-hooks).
+///
+/// A rewire brings the wiring up to the binary that is already wired, never
+/// to another one: the upgrade replaces the binary at the path the hooks name
+/// and then runs it there. Two cases it refused nothing for, and a test of the
+/// workspace that ran `target/debug/innerwarden hook` against the real home
+/// turned every guard hook of that machine into the debug build:
+///
+/// - a program inside a cargo build directory, which the next `cargo build`
+///   replaces with whatever the tree holds then;
+/// - a program other than the one the hooks already run.
+pub fn refuse_rewire_to(home: &Path, guard_bin: &str) -> Option<String> {
+    if is_cargo_build_output(Path::new(guard_bin)) {
+        return Some(format!(
+            "Not rewired: {guard_bin} is a cargo build output, not an installed binary."
+        ));
+    }
+    let wired = claude_hook_programs(home);
+    if wired
+        .iter()
+        .any(|program| !same_program(program, guard_bin))
+    {
+        return Some(format!(
+            "Not rewired: the hooks run {}, not {guard_bin}. Connect this binary explicitly \
+             with `innerwarden agents connect` if it is the one to use.",
+            wired.join(", ")
+        ));
+    }
+    None
+}
+
+/// The programs the InnerWarden Bash hooks in Claude Code's settings run.
+fn claude_hook_programs(home: &Path) -> Vec<String> {
+    let path = home.join(".claude/settings.json");
+    innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &path)
+        .ok()
+        .flatten()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .map(|settings| innerwarden_agent_guard::hook::effective_iwguard_hook_programs(&settings))
+        .unwrap_or_default()
+}
+
+fn same_program(a: &str, b: &str) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// PURE but for reading two marker files: whether `program` sits in a cargo
+/// target directory. Cargo marks the root of every target directory, the
+/// default `target/` and any `CARGO_TARGET_DIR`, with `CACHEDIR.TAG` and
+/// `.rustc_info.json`; a path through `target/{debug,release}` counts too,
+/// so a tree that was cleaned still reads as one.
+pub fn is_cargo_build_output(program: &Path) -> bool {
+    let words: Vec<_> = program
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let through_target = words
+        .windows(2)
+        .any(|pair| pair[0] == "target" && matches!(pair[1].as_str(), "debug" | "release"))
+        || words
+            .windows(3)
+            .any(|w| w[0] == "target" && matches!(w[2].as_str(), "debug" | "release"));
+    through_target
+        || program
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir.join("CACHEDIR.TAG").is_file() && dir.join(".rustc_info.json").is_file())
 }
 
 fn reconcile_current(
@@ -1141,6 +1221,55 @@ mod tests {
         .unwrap();
         assert_eq!(rewire_existing(home.path(), guard_bin).connected, 0);
         assert_eq!(read(), wired_by_1_6_12);
+    }
+
+    /// NEW-20261118-dev-build-rewired-real-claude-hooks: a rewire never points
+    /// the wiring at a cargo build, nor at a binary the hooks do not run.
+    #[test]
+    fn a_rewire_never_points_at_a_build_or_another_binary() {
+        for build in [
+            "/home/dev/innerwarden/target/debug/innerwarden",
+            "/home/dev/innerwarden/target/release/innerwarden",
+            "/w/target/x86_64-unknown-linux-gnu/release/innerwarden",
+        ] {
+            assert!(is_cargo_build_output(Path::new(build)), "{build}");
+        }
+        for installed in [
+            "/home/dev/.local/bin/innerwarden",
+            "/usr/local/bin/innerwarden",
+            "/opt/target/innerwarden",
+        ] {
+            assert!(!is_cargo_build_output(Path::new(installed)), "{installed}");
+        }
+        // A CARGO_TARGET_DIR with any name: cargo's marker files say so.
+        let custom = tempfile::TempDir::new().unwrap();
+        std::fs::write(custom.path().join("CACHEDIR.TAG"), "Signature").unwrap();
+        std::fs::write(custom.path().join(".rustc_info.json"), "{}").unwrap();
+        assert!(is_cargo_build_output(
+            &custom.path().join("debug/innerwarden")
+        ));
+
+        let home = tempfile::TempDir::new().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let wired = serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash",
+            "hooks": [{"type": "command",
+                       "command": "\"/abs/innerwarden\" hook --agent claude-code"}]}]}});
+        std::fs::write(&path, serde_json::to_vec_pretty(&wired).unwrap()).unwrap();
+        assert_eq!(refuse_rewire_to(home.path(), "/abs/innerwarden"), None);
+        assert!(refuse_rewire_to(home.path(), "/other/innerwarden").is_some());
+        assert!(refuse_rewire_to(
+            home.path(),
+            "/home/dev/innerwarden/target/debug/innerwarden"
+        )
+        .is_some());
+        let report = rewire_existing(home.path(), "/other/innerwarden");
+        assert_eq!(report.connected, 0);
+        assert_eq!(read_json(&path), wired, "nothing rewritten");
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
     fn pass(ticks: &[(&str, AgentTick)]) -> BTreeMap<String, AgentTick> {

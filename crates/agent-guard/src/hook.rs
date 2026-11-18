@@ -2043,19 +2043,39 @@ mod tests {
     /// gone, cannot run or dies refuses (2) in enforce; in monitor the same
     /// failure stays a non-blocking error, because monitor never acts. Every
     /// code the binary itself returns passes through unchanged.
+    ///
+    /// Run under `sh` and, where it exists, `bash`: macOS `/bin/sh` is bash,
+    /// which execs a lone command in place of itself, so a monitor line whose
+    /// binary is killed takes the shell down with the same signal instead of
+    /// returning 128 + n. Both read as the same failure here.
     #[cfg(unix)]
     #[test]
     fn a_refusing_hook_that_cannot_run_refuses_and_monitor_never_acts() {
+        use std::os::unix::process::ExitStatusExt;
+        let shells: Vec<&str> = ["sh", "/bin/bash"]
+            .into_iter()
+            .filter(|s| *s == "sh" || Path::new(s).exists())
+            .collect();
+        for shell in shells {
+            refusing_hook_cases(shell, |status: std::process::ExitStatus| {
+                status.code().or(status.signal().map(|n| 128 + n))
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    fn refusing_hook_cases(shell: &str, code: impl Fn(std::process::ExitStatus) -> Option<i32>) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::TempDir::new().unwrap();
         let bin = dir.path().join("innerwarden");
         let run = |line: &str| {
-            std::process::Command::new("sh")
-                .args(["-c", line])
-                .stdin(std::process::Stdio::null())
-                .status()
-                .unwrap()
-                .code()
+            code(
+                std::process::Command::new(shell)
+                    .args(["-c", line])
+                    .stdin(std::process::Stdio::null())
+                    .status()
+                    .unwrap(),
+            )
         };
         let script = |body: &str, mode: u32| {
             fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();

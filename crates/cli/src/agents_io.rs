@@ -79,6 +79,11 @@ pub(crate) fn rewire_once_per_version() {
     if std::fs::read_to_string(&stamp).is_ok_and(|have| have == want) {
         return;
     }
+    // A cargo build, or a binary the hooks do not run: leave the home
+    // exactly as it is, stamp included.
+    if agent_policy::refuse_rewire_to(&home, &bin).is_some() {
+        return;
+    }
     // Nothing of ours to bring up to date: write nothing, not even the
     // stamp, so a hook on a home with no wiring leaves no file behind.
     if !agent_policy::claude_wiring_needs_rewire(&home, &bin) {
