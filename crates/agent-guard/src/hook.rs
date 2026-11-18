@@ -442,8 +442,30 @@ pub fn hook_command_for(
         .filter(|agent| is_agent_id(agent))
         .map(|agent| format!(" --agent {agent}"))
         .unwrap_or_default();
-    format!("\"{}\" hook{flag}{agent}", iw_guard.display())
+    // A hook that refuses closes when it cannot run: see [`FAIL_CLOSED`].
+    let closed = if !monitor && cfg!(unix) {
+        FAIL_CLOSED
+    } else {
+        ""
+    };
+    format!("\"{}\" hook{flag}{agent}{closed}", iw_guard.display())
 }
+
+/// Written after a hook that refuses (enforce, `--block-review`), never after
+/// one in monitor, which never acts.
+///
+/// Claude Code refuses a call only on exit 2; any other failure of the hook is
+/// "non-blocking" and the call runs. So a hook whose binary is gone (127),
+/// cannot be executed (126) or was killed (128 + signal) let every call run
+/// unscreened, silently. The shell Claude Code runs the hook line in turns
+/// exactly those three into 2 and leaves every other code as it was: 0 still
+/// allows, 2 still refuses.
+///
+/// Unix only: on Windows the line may not reach a POSIX shell, and a line the
+/// shell cannot parse would leave every call unscreened, which is worse.
+/// Recognition ([`hook_command_words`]) accepts this exact text on every
+/// platform, so uninstall and repair keep finding the line.
+pub const FAIL_CLOSED: &str = " || { s=$?; [ $s -ge 126 ] && exit 2; exit $s; }";
 
 /// A plain agent id (`claude-code`): lowercase letters, digits, `-` and `_`.
 pub fn is_agent_id(value: &str) -> bool {
@@ -698,6 +720,10 @@ fn install_hook_with_link_policy(
 /// unknown flags is intentional: detection is also used by uninstall, so a
 /// command that merely mentions InnerWarden must remain operator-owned.
 fn hook_command_words(command: &str) -> Option<Vec<String>> {
+    // The one piece of shell the grammar knows: the exact [`FAIL_CLOSED`]
+    // tail [`hook_command_for`] writes. Any other composition stays refused.
+    let command = command.trim();
+    let command = command.strip_suffix(FAIL_CLOSED).unwrap_or(command);
     let mut chars = command.trim().chars().peekable();
     let mut words = Vec::new();
 
@@ -1642,7 +1668,7 @@ mod tests {
         assert_eq!(entries.len(), 1, "{new}");
         assert_eq!(
             entries[0]["hooks"][0]["command"],
-            "\"/opt/innerwarden\" hook --agent claude-code"
+            format!("\"/opt/innerwarden\" hook --agent claude-code{FAIL_CLOSED}")
         );
         assert!(!needs_iwguard_hook_reconciliation(&new, iw, false, true));
 
@@ -2012,12 +2038,124 @@ mod tests {
         }
     }
 
+    /// NEW-20261112-hook-missing-binary-fails-open. The line an enforcing hook
+    /// runs in, run by `sh -c` the way Claude Code runs it: a binary that is
+    /// gone, cannot run or dies refuses (2) in enforce; in monitor the same
+    /// failure stays a non-blocking error, because monitor never acts. Every
+    /// code the binary itself returns passes through unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusing_hook_that_cannot_run_refuses_and_monitor_never_acts() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("innerwarden");
+        let run = |line: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", line])
+                .stdin(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .code()
+        };
+        let script = |body: &str, mode: u32| {
+            fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let enforce = hook_command_for(&bin, false, false, Some("claude-code"));
+        let review = hook_command_for(&bin, true, false, Some("claude-code"));
+        let monitor = hook_command_for(&bin, false, true, Some("claude-code"));
+        assert!(!monitor.contains(FAIL_CLOSED), "{monitor}");
+
+        // Gone: 127 from the shell. Before this, Claude Code ran the call.
+        assert_eq!(run(&enforce), Some(2));
+        assert_eq!(run(&review), Some(2));
+        assert_eq!(run(&monitor), Some(127));
+        // Not executable: 126.
+        script("exit 0", 0o644);
+        assert_eq!(run(&enforce), Some(2));
+        assert_eq!(run(&monitor), Some(126));
+        // Killed by a signal: 128 + n.
+        script("kill -KILL $$", 0o755);
+        assert_eq!(run(&enforce), Some(2));
+        assert_eq!(run(&monitor), Some(137));
+        // The binary's own answers are untouched.
+        for code in [0, 1, 2] {
+            script(&format!("exit {code}"), 0o755);
+            assert_eq!(run(&enforce), Some(code));
+            assert_eq!(run(&monitor), Some(code));
+        }
+    }
+
+    /// The wrapped line stays ours, so uninstall and repair find it; anything
+    /// else after it, or a tail that is not exactly ours, is not.
+    #[test]
+    fn the_fail_closed_tail_is_recognised_and_nothing_wider_is() {
+        for (command, mode) in [
+            (
+                format!("\"/x/innerwarden\" hook --agent claude-code{FAIL_CLOSED}"),
+                HookProtection::Enforce,
+            ),
+            (
+                format!("\"/x/innerwarden\" hook --block-review{FAIL_CLOSED}"),
+                HookProtection::BlockReview,
+            ),
+            // Never written, but still ours: repair rewrites it to plain monitor.
+            (
+                format!("\"/x/innerwarden\" hook --monitor{FAIL_CLOSED}"),
+                HookProtection::Monitor,
+            ),
+        ] {
+            assert_eq!(
+                iwguard_hook_mode(&json!({ "command": command })),
+                Some(mode),
+                "{command}"
+            );
+        }
+        for command in [
+            format!("\"/x/innerwarden\" hook{FAIL_CLOSED}; rm -rf /"),
+            format!("\"/x/innerwarden\" hook{FAIL_CLOSED}{FAIL_CLOSED}"),
+            "\"/x/innerwarden\" hook || exit 2".to_string(),
+            "\"/x/innerwarden\" hook || { s=$?; [ $s -ge 1 ] && exit 2; exit $s; }".to_string(),
+        ] {
+            assert_eq!(
+                iwguard_hook_mode(&json!({ "command": command })),
+                None,
+                "{command}"
+            );
+        }
+        // An enforce hook written before the tail is drift: repair adds it.
+        let plain = "\"/x/innerwarden\" hook --agent claude-code";
+        let settings = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": plain}]},
+            {"matcher": crate::file_tools::FILE_TOOLS_MATCHER,
+             "hooks": [{"type": "command", "command": plain}]},
+            {"matcher": crate::file_tools::READ_TOOLS_MATCHER,
+             "hooks": [{"type": "command", "command": plain}]}
+        ]}});
+        assert_eq!(
+            needs_iwguard_hook_reconciliation(&settings, Path::new("/x/innerwarden"), false, true),
+            cfg!(unix)
+        );
+        // And the wrapped one is removed by uninstall like any other.
+        let wrapped = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command",
+              "command": format!("{plain}{FAIL_CLOSED}")}]}
+        ]}});
+        assert_eq!(remove_iwguard_pretooluse_hook(wrapped).1, 1);
+    }
+
     #[test]
     fn hook_command_quotes_path_and_wires_block_review() {
         let c = hook_command(Path::new("/usr/local/bin/innerwarden"), false, false);
-        assert_eq!(c, "\"/usr/local/bin/innerwarden\" hook");
+        assert_eq!(
+            c,
+            format!("\"/usr/local/bin/innerwarden\" hook{FAIL_CLOSED}")
+        );
         let c2 = hook_command(Path::new("/x/innerwarden"), true, false);
-        assert_eq!(c2, "\"/x/innerwarden\" hook --block-review");
+        assert_eq!(
+            c2,
+            format!("\"/x/innerwarden\" hook --block-review{FAIL_CLOSED}")
+        );
         // monitor wins over block_review (records, never blocks).
         let c3 = hook_command(Path::new("/x/innerwarden"), true, true);
         assert_eq!(c3, "\"/x/innerwarden\" hook --monitor");
@@ -2083,7 +2221,7 @@ mod tests {
         // An id that is not a plain id is left out, never quoted in.
         assert_eq!(
             hook_command_for(Path::new("/x/innerwarden"), false, false, Some("x; rm")),
-            "\"/x/innerwarden\" hook"
+            format!("\"/x/innerwarden\" hook{FAIL_CLOSED}")
         );
     }
 
@@ -2202,7 +2340,7 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            "\"/opt/innerwarden\" hook --agent claude-code",
+            format!("\"/opt/innerwarden\" hook --agent claude-code{FAIL_CLOSED}"),
             "switching mode rewrites the mode and keeps the name"
         );
     }
@@ -2245,7 +2383,7 @@ mod tests {
         // A new connection names the agent it serves.
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            "\"/opt/innerwarden\" hook --block-review --agent claude-code"
+            format!("\"/opt/innerwarden\" hook --block-review --agent claude-code{FAIL_CLOSED}")
         );
 
         // Idempotent: the Bash hook, the file-tools hook and the read-tools
@@ -2265,7 +2403,7 @@ mod tests {
             let alias_home = tempfile::TempDir::new().unwrap();
             let report = install_hook(alias_home.path(), alias, None, iw, false, false).unwrap();
             assert_eq!(std::fs::read(&report.settings_path).unwrap(), expected);
-            assert!(report.hook_command.ends_with(" --agent claude-code"));
+            assert!(report.hook_command.contains(" --agent claude-code"));
 
             install_hook(alias_home.path(), "claude-code", None, iw, false, false).unwrap();
             assert_eq!(std::fs::read(&report.settings_path).unwrap(), expected);
@@ -2548,7 +2686,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             installed["command"],
-            "\"/current/target/release/innerwarden\" hook --block-review"
+            format!("\"/current/target/release/innerwarden\" hook --block-review{FAIL_CLOSED}")
         );
         assert_eq!(installed["timeout"], 21);
         assert_eq!(installed["operator_note"], "keep");

@@ -1068,6 +1068,9 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     if let Err(why) = hook_net::arm(monitor) {
         return hook_unreadable(why, monitor);
     }
+    // A host upgraded by an older binary still runs that binary's wiring:
+    // the first hook of this version brings it up to this one's.
+    agents_io::rewire_once_per_version();
 
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {

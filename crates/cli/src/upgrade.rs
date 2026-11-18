@@ -360,7 +360,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             println!("Signature verified against this build's pinned release key.");
             println!();
             println!("Upgrade complete. Confirm with:  innerwarden --version");
-            for line in rewire_agents_after_upgrade() {
+            for line in rewire_agents_after_upgrade(&target) {
                 println!("{line}");
             }
             for line in closing_advice(
@@ -534,37 +534,61 @@ fn still_running(dashboard_bind: &str, serve_bind: &str) -> StillRunning {
 /// "anything that only reaches fresh installs leaves every existing customer on
 /// the broken seam forever."
 ///
-/// Reconcile is idempotent and repairs in place, so on a host that needs
-/// nothing this is silent. Failure is reported and never fails the upgrade: the
-/// new binary is already on disk and refusing here would leave the operator
-/// believing the upgrade did not happen.
-fn rewire_agents_after_upgrade() -> Vec<String> {
-    let Some(home) = dirs_home() else {
-        return Vec::new();
-    };
-    let guard_bin = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "innerwarden".to_string());
-    let report = crate::agent_policy::reconcile(
-        &home,
-        &guard_bin,
-        &crate::agent_policy::AgentPolicy::default(),
-    );
-    if report.connected == 0 {
-        return Vec::new();
-    }
-    vec![
-        String::new(),
-        format!(
-            "Re-wired {} connected agent(s) so this version's hooks are the ones they run.",
-            report.connected
-        ),
-        "Restart them to pick it up: a hook is read at agent startup.".into(),
-    ]
+/// The rewiring is done by the NEW binary (`agents rewire`), never by this
+/// process. This process is the previous version and only knows its own
+/// wiring: 1.6.12 rewired after installing 1.6.13 and wrote 1.6.12's, so Read,
+/// Grep and Glob stayed unscreened
+/// (NEW-20261116-upgrade-leaves-read-tools-unwired). It also waited for
+/// auto-connect, which is off by default, so most hosts were not rewired at all.
+///
+/// Rewiring is idempotent, so on a host that needs nothing this is silent.
+/// Failure is reported and never fails the upgrade: the new binary is already
+/// on disk and refusing here would leave the operator believing the upgrade
+/// did not happen.
+fn rewire_agents_after_upgrade(target: &Path) -> Vec<String> {
+    let ran = std::process::Command::new(target)
+        .args(["agents", "rewire"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()
+        .map(|out| RefreshRun {
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    rewire_report(ran.as_ref())
 }
 
-fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+/// What the upgrade prints for the rewiring. PURE. Its own words when it ran;
+/// when it could not run, or failed, the step by hand, because a hook left at
+/// the previous version's wiring says nothing on its own.
+fn rewire_report(ran: Option<&RefreshRun>) -> Vec<String> {
+    match ran {
+        Some(run) if run.code == Some(0) => {
+            let mut lines: Vec<String> = run.stdout.lines().map(str::to_string).collect();
+            if !lines.is_empty() {
+                lines.insert(0, String::new());
+            }
+            lines
+        }
+        _ => {
+            let mut lines = vec![String::new()];
+            if let Some(run) = ran {
+                lines.extend(
+                    run.stdout
+                        .lines()
+                        .chain(run.stderr.lines())
+                        .map(str::to_string),
+                );
+            }
+            lines.extend([
+                "The connected agents may still run the previous version's hooks.".into(),
+                "To bring them up to this version:  innerwarden agents rewire".into(),
+                "then restart them. `innerwarden status` says what each one screens.".into(),
+            ]);
+            lines
+        }
+    }
 }
 
 /// What to print after a successful replace.
@@ -1342,7 +1366,7 @@ mod installed_binary_tests {
 mod closing_advice_tests {
     use super::{
         closing_advice, community_dashboard_version, is_community_serve, refresh_report,
-        RefreshRun, StillRunning,
+        rewire_report, RefreshRun, StillRunning,
     };
 
     fn ran(code: i32, stdout: &str, stderr: &str) -> RefreshRun {
@@ -1387,6 +1411,37 @@ mod closing_advice_tests {
             failed[1],
             "OpenClaw's message hook could not be updated (x)."
         );
+    }
+
+    /// NEW-20261116-upgrade-leaves-read-tools-unwired: the rewiring is the
+    /// NEW binary's `agents rewire`, and the upgrade prints what it said. One
+    /// that could not run, or failed, gives the step by hand.
+    #[test]
+    fn the_new_binarys_rewire_is_what_the_upgrade_prints() {
+        let rewired = ran(
+            0,
+            "  claude-code - connected (PreToolUse hook, enforce)\nRe-wired 1 connected agent(s) so this version's hooks are the ones they run.\n",
+            "",
+        );
+        let lines = rewire_report(Some(&rewired));
+        assert_eq!(lines[0], "");
+        assert_eq!(
+            lines[1],
+            "  claude-code - connected (PreToolUse hook, enforce)"
+        );
+        assert!(rewire_report(Some(&ran(0, "", ""))).is_empty());
+        for run in [None, Some(ran(1, "", "lock busy")), Some(ran(2, "", ""))] {
+            let lines = rewire_report(run.as_ref());
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains("innerwarden agents rewire")),
+                "{lines:?}"
+            );
+        }
+        assert!(rewire_report(Some(&ran(1, "", "lock busy")))
+            .iter()
+            .any(|l| l == "lock busy"));
     }
 
     /// A new binary that could not be run, or does not know the command

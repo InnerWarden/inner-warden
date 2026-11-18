@@ -672,9 +672,13 @@ fn hook_needs_automatic_reconciliation(
     agent: &innerwarden_agent_guard::agents::AgentStatus,
     guard_bin: &str,
 ) -> bool {
-    if !agent.hookable {
-        return false;
-    }
+    agent.hookable && claude_wiring_needs_rewire(home, guard_bin)
+}
+
+/// Whether Claude Code's settings carry InnerWarden wiring that this binary
+/// would rewrite. Reads one file and writes nothing, so the hook can ask it
+/// before deciding to take the policy lock at all.
+pub fn claude_wiring_needs_rewire(home: &Path, guard_bin: &str) -> bool {
     let path = home.join(".claude/settings.json");
     innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &path)
         .ok()
@@ -730,33 +734,86 @@ fn reconcile_unlocked(home: &Path, guard_bin: &str, policy: &AgentPolicy) -> Rec
             report.skipped += 1;
             continue;
         }
-        report.attempted += 1;
-        let result = innerwarden_agent_guard::agents_ops::connect_one_result_automatic(
-            home, &agent, guard_bin, false,
-            true, // Hard invariant: automatic wiring is always monitor-only.
-        );
-        match result.effect {
-            innerwarden_agent_guard::agents_ops::ConnectEffect::Connected => {
-                report.connected += 1;
-                report
-                    .outcomes
-                    .insert(agent.name.clone(), AgentTick::Wrote(result.line.clone()));
-                report.notices.push(result.line);
-            }
-            innerwarden_agent_guard::agents_ops::ConnectEffect::Unchanged
-            | innerwarden_agent_guard::agents_ops::ConnectEffect::Skipped => {
-                report.skipped += 1;
-            }
-            innerwarden_agent_guard::agents_ops::ConnectEffect::Failed => {
-                report.failed += 1;
-                report
-                    .outcomes
-                    .insert(agent.name.clone(), AgentTick::Failed(result.line.clone()));
-                report.notices.push(result.line);
-            }
-        }
+        connect_automatically(home, &agent, guard_bin, &mut report);
     }
     report
+}
+
+/// One automatic connection, counted into `report`.
+fn connect_automatically(
+    home: &Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+    guard_bin: &str,
+    report: &mut ReconcileReport,
+) {
+    report.attempted += 1;
+    let result = innerwarden_agent_guard::agents_ops::connect_one_result_automatic(
+        home, agent, guard_bin, false,
+        true, // Hard invariant: automatic wiring is always monitor-only.
+    );
+    match result.effect {
+        innerwarden_agent_guard::agents_ops::ConnectEffect::Connected => {
+            report.connected += 1;
+            report
+                .outcomes
+                .insert(agent.name.clone(), AgentTick::Wrote(result.line.clone()));
+            report.notices.push(result.line);
+        }
+        innerwarden_agent_guard::agents_ops::ConnectEffect::Unchanged
+        | innerwarden_agent_guard::agents_ops::ConnectEffect::Skipped => {
+            report.skipped += 1;
+        }
+        innerwarden_agent_guard::agents_ops::ConnectEffect::Failed => {
+            report.failed += 1;
+            report
+                .outcomes
+                .insert(agent.name.clone(), AgentTick::Failed(result.line.clone()));
+            report.notices.push(result.line);
+        }
+    }
+}
+
+/// Bring the hook wiring that is ALREADY there up to this binary's: the
+/// halves it judges with (file tools, read tools, tool results) and the line
+/// it writes, in the mode the wiring already has, never weaker.
+///
+/// Run by the NEW binary after an upgrade. The previous binary only knows
+/// the wiring of its own version, so when it rewired after replacing itself
+/// it wrote that, and a 1.6.12 upgraded to 1.6.13 kept Read, Grep and Glob
+/// unscreened (NEW-20261116-upgrade-leaves-read-tools-unwired).
+///
+/// Unlike [`reconcile`], this does not wait for `auto_connect`: it connects
+/// nothing new, it only completes wiring the person already chose. A
+/// disconnect or exclusion still wins.
+pub fn rewire_existing(home: &Path, guard_bin: &str) -> ReconcileReport {
+    rewire_existing_within(home, guard_bin, POLICY_LOCK_WAIT)
+}
+
+/// [`rewire_existing`], waiting at most `wait` for the policy lock: the hook
+/// path cannot wait long, and gives up to try again on its next call.
+pub fn rewire_existing_within(
+    home: &Path,
+    guard_bin: &str,
+    wait: std::time::Duration,
+) -> ReconcileReport {
+    let run = with_lock_within(home, wait, || {
+        let policy = load(home)?;
+        let mut report = ReconcileReport::default();
+        for agent in innerwarden_agent_guard::agents_ops::detected_guardable(home) {
+            report.detected += 1;
+            report.outcomes.insert(agent.name.clone(), AgentTick::Quiet);
+            if !is_reviewed_integration(&agent)
+                || is_excluded(&policy, &agent.name)
+                || !hook_needs_automatic_reconciliation(home, &agent, guard_bin)
+            {
+                report.skipped += 1;
+                continue;
+            }
+            connect_automatically(home, &agent, guard_bin, &mut report);
+        }
+        Ok(report)
+    });
+    run.unwrap_or_else(ReconcileReport::lock_failure)
 }
 
 fn reconcile_current(
@@ -1022,6 +1079,68 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// NEW-20261116-upgrade-leaves-read-tools-unwired. A host wired in
+    /// enforce by 1.6.12 (Bash and file tools, no read tools), with
+    /// auto-connect never turned on, which is the default. What the upgrade
+    /// ran before ([`reconcile`]) changed nothing there; [`rewire_existing`]
+    /// adds the read half in the mode the wiring already has, keeps the rest,
+    /// and is a no-op on the next run. A disconnected agent is left alone.
+    #[test]
+    fn rewire_completes_existing_wiring_without_auto_connect() {
+        let guard_bin = "/abs/innerwarden";
+        let old = "\"/abs/innerwarden\" hook --agent claude-code";
+        let wired_by_1_6_12 = serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": old}]},
+            {"matcher": "Write|Edit|MultiEdit|NotebookEdit",
+             "hooks": [{"type": "command", "command": old}]}
+        ]}});
+        let home = tempfile::TempDir::new().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&wired_by_1_6_12).unwrap()).unwrap();
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+
+        // What the upgrade did before: nothing, auto-connect is off.
+        let before = reconcile(home.path(), guard_bin, &AgentPolicy::default());
+        assert_eq!(before.connected, 0);
+        assert!(!innerwarden_agent_guard::hook::iwguard_judges_read_tools(
+            &read()
+        ));
+
+        let report = rewire_existing(home.path(), guard_bin);
+        assert_eq!(report.connected, 1, "{:?}", report.notices);
+        let now = read();
+        assert!(innerwarden_agent_guard::hook::iwguard_judges_read_tools(
+            &now
+        ));
+        assert!(innerwarden_agent_guard::hook::iwguard_judges_file_tools(
+            &now
+        ));
+        // Still enforce, never lowered to the monitor automatic setup asks for.
+        for entry in now["hooks"]["PreToolUse"].as_array().unwrap() {
+            let command = entry["hooks"][0]["command"].as_str().unwrap();
+            assert!(!command.contains("--monitor"), "{command}");
+        }
+        let body = std::fs::read(&path).unwrap();
+        assert_eq!(rewire_existing(home.path(), guard_bin).connected, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), body, "second run is a no-op");
+
+        // A disconnected agent stays as the person left it.
+        std::fs::write(&path, serde_json::to_vec_pretty(&wired_by_1_6_12).unwrap()).unwrap();
+        save(
+            home.path(),
+            &AgentPolicy {
+                excluded: vec!["claude-code".into()],
+                ..AgentPolicy::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rewire_existing(home.path(), guard_bin).connected, 0);
+        assert_eq!(read(), wired_by_1_6_12);
     }
 
     fn pass(ticks: &[(&str, AgentTick)]) -> BTreeMap<String, AgentTick> {
