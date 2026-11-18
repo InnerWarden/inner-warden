@@ -7197,6 +7197,81 @@ fn heredoc_start_is_quoted(redirect: tree_sitter::Node<'_>, source: &[u8]) -> bo
     quoted
 }
 
+/// Interpreters that run, in their own language, a program they read from
+/// their input (`python3 -`, `node`, `perl -`), with no shell between.
+const CODE_INTERPRETERS: [&str; 6] = ["python", "perl", "ruby", "node", "php", "lua"];
+
+/// Each here-document handed to one of [`CODE_INTERPRETERS`] as its program
+/// (`python3 - <<'EOF'`, `node <<EOF`), written as the same interpreter
+/// given the same code inline (`python3 -c '...'`, `node -e '...'`), so the
+/// rules that read inline code read it too. Empty when the line hands no
+/// interpreter a here-document.
+///
+/// The code is the same program either way: a rewrite of an agent's
+/// settings or of the guard's configuration refused as `-c` code is refused
+/// fed on standard input. These lines are only asked for more refusals
+/// beside the line itself, never instead of it, so the shape is read
+/// loosely: wherever the command stands, quoted delimiter or not, with any
+/// other redirection.
+pub(crate) fn interpreter_input_as_inline_code(source: &str) -> Vec<String> {
+    if !source.contains("<<") {
+        return Vec::new();
+    }
+    let rewritten = text_as_the_shell_reads(source);
+    let text = rewritten.as_deref().unwrap_or(source);
+    let Some(tree) = parse_bash(text) else {
+        return Vec::new();
+    };
+    let root = tree.root_node();
+    if ast_exceeds_projection_budget(root) {
+        return Vec::new();
+    }
+    let bytes = text.as_bytes();
+    let mut bodies = Vec::new();
+    collect_nodes_of_kind(root, "heredoc_body", &mut bodies, 0);
+    bodies
+        .into_iter()
+        .filter(|body| body.kind() == "heredoc_body")
+        .filter_map(|body| interpreter_of_heredoc(body, bytes))
+        .collect()
+}
+
+/// The interpreter `body` is handed to as its program, with the code given
+/// inline ([`interpreter_input_as_inline_code`]).
+fn interpreter_of_heredoc(body: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let redirect = body.parent().filter(|n| n.kind() == "heredoc_redirect")?;
+    let statement = redirect
+        .parent()
+        .filter(|n| n.kind() == "redirected_statement")?;
+    let mut cursor = statement.walk();
+    let body_node = statement
+        .children(&mut cursor)
+        .find(|child| matches!(child.kind(), "command" | "list"))?;
+    let command = match body_node {
+        list if list.kind() == "list" => {
+            let last =
+                list.named_child(list.named_child_count().checked_sub(1)?.try_into().ok()?)?;
+            (last.kind() == "command").then_some(last)?
+        }
+        command => command,
+    };
+    let head = std::str::from_utf8(source.get(command.byte_range())?).ok()?;
+    let words: Vec<&str> = head.split_whitespace().collect();
+    let (first, rest) = words.split_first()?;
+    let name = normalized_command_name(first);
+    let interpreter = versionless_interpreter_name(&name);
+    if !CODE_INTERPRETERS.contains(&interpreter) || !(rest.is_empty() || rest == ["-"]) {
+        return None;
+    }
+    let flag = match interpreter {
+        "python" => "-c",
+        "php" => "-r",
+        _ => "-e",
+    };
+    let code = std::str::from_utf8(source.get(body.byte_range())?).ok()?;
+    Some(format!("{name} {flag} '{}'", code.replace('\'', r"'\''")))
+}
+
 // `collect_kinds` lived here. It re-exposed EVERY substitution inside a masked
 // data argument, and `collect_executable_substitutions` replaced its only caller
 // with a version that keeps the inert ones masked. Nothing else used it.
