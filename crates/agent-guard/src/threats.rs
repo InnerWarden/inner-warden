@@ -134,12 +134,12 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
         block: true,
     },
     CommandPattern {
-        // A command starts after a separator or an opening, and also after
-        // the words that open a body (`if a; then eval x; fi`, `while a; do
-        // eval x; done`), a group (`{ eval x; }`) and a negation
-        // (`! eval x`); those last are read outside single quotes only
-        // ([`EVAL_AFTER_OPENER`]).
-        pattern: r"(?:^|[;&|(`]\s*|(?:^|[;&|(`\s])(?:(?:then|do|else|elif)\s+|[{!]\s+))(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)",
+        // A command starts after a separator (a new line is one) or an
+        // opening, and also after the words that open a body (`if a; then
+        // eval x; fi`, `while a; do eval x; done`), a group (`{ eval x; }`)
+        // and a negation (`! eval x`); those last are read outside single
+        // quotes only ([`EVAL_AFTER_OPENER`]).
+        pattern: r"(?:^|[;&|(`\n]\s*|(?:^|[;&|(`\s])(?:(?:then|do|else|elif)\s+|[{!]\s+))(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)",
         description: "shell eval (dynamic command execution)",
         block: true,
     },
@@ -9607,7 +9607,7 @@ pub fn check_command(content: &str) -> Option<(&'static str, bool)> {
 /// The shell eval rule as it read before the body openers were added:
 /// `eval` after a separator or an opening.
 const EVAL_AFTER_SEPARATOR: &str =
-    r"(?:^|[;&|(`]\s*)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)";
+    r"(?:^|[;&|(`\n]\s*)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)";
 
 /// `eval` where a command starts after `then`, `do`, `else`, `elif`, `{`
 /// or `!`. Text in single quotes is a line handed to a program

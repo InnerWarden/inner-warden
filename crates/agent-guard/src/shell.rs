@@ -647,10 +647,8 @@ fn code_argument_flow(
     {
         return Some(DataFlow::Fed);
     }
-    // A script file the program is handed (`bash "$(git rev-parse
-    // --show-toplevel)/scripts/x.sh"`) is a path, not a line: its
-    // substitutions are commands of the line, read with it, and the path
-    // is not read again as a command whose name is an expansion.
+    // A script file the program is handed by a literal path (`bash
+    // scripts/x.sh`) is a path, not a line.
     if as_shell
         && argument.len() < source.len()
         && !names_a_script_file(command, interpreter, argument, source.as_bytes())
@@ -664,8 +662,7 @@ fn code_argument_flow(
 /// operand (`bash x.sh`, `python3 tool.py`) and not code given inline: a
 /// word of its own whose word before it is the program or an option that
 /// hands over no code (`-c`, `-e`, `--eval` and the like, alone or among
-/// other letters, do). A path built by an expansion counts only as
-/// `"$(git rev-parse --show-toplevel)/<literal path>"`.
+/// other letters, do). A path built by an expansion never counts.
 fn names_a_script_file(
     command: tree_sitter::Node<'_>,
     interpreter: &str,
@@ -705,58 +702,12 @@ fn names_a_script_file(
     if !after_no_code {
         return false;
     }
-    if !argument.contains(['$', '`']) {
-        return true;
-    }
-    // A path built by an expansion is taken as a script file in one shape
-    // only: the top of the repository the line runs in, in double quotes
-    // (unquoted, the shell splits what it gives into words), followed by a
-    // literal path below it. A variable (`"$f"`, `"$TMPDIR/x.sh"`, a
-    // `"$PWD/x.sh"` after a `cd`) names whatever the line or the
-    // environment set it to, and is read as code.
-    const TOP: &str = "$(git rev-parse --show-toplevel)/";
-    let Some(tail) = argument.strip_prefix(TOP) else {
-        return false;
-    };
-    if tail.is_empty()
-        || tail.contains(['$', '`', '\\', '"', '\''])
-        || tail.split('/').any(|part| part == "..")
-    {
-        return false;
-    }
-    // The substitution must run nothing fetched or built by the line: the
-    // script a download names is not a file the person wrote.
-    let Ok(whole) = std::str::from_utf8(source) else {
-        return false;
-    };
-    // A search path the line sets (`PATH=/tmp/x:$PATH bash "$(git ...)/x.sh"`)
-    // decides which `git` the substitution runs, so what it prints is no
-    // longer the repository's top.
-    if line_sets_search_path(whole) {
-        return false;
-    }
-    command_arguments(command).into_iter().any(|word| {
-        if word.kind() != "string" || shell_literal_word(&node_text(word, source)) != argument {
-            return false;
-        }
-        let mut substitutions = Vec::new();
-        collect_nodes_of_kind(word, "command_substitution", &mut substitutions, 0);
-        substitutions
-            .iter()
-            .all(|inner| !substitution_runs_untrusted_code(&node_text(*inner, source), whole))
-    })
-}
-
-/// Whether a line assigns the search path anywhere (`PATH=...`,
-/// `export PATH=...`, `env PATH=...`, `PATH+=...`, a quoted name), which
-/// moves every program the line names by name.
-fn line_sets_search_path(line: &str) -> bool {
-    static SETS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    SETS.get_or_init(|| {
-        regex::Regex::new(r#"(?:^|[^A-Za-z0-9_])["']?PATH["']?\+?="#)
-            .expect("static search path assignment regex")
-    })
-    .is_match(line)
+    // A path built by an expansion is read as code, as on main: what the
+    // substitution prints depends on the line and the environment (a
+    // function or a search path can stand in for `git`), so
+    // `bash "$(git rev-parse --show-toplevel)/x.sh"` is refused and
+    // `bash scripts/x.sh` from the top of the repository is the way.
+    !argument.contains(['$', '`'])
 }
 
 /// Whether `argument` is a word of `command` written whole in single
