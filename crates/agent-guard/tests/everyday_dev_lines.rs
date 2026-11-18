@@ -371,10 +371,80 @@ fn a_long_grep_option_value_is_not_taken_for_the_pattern() {
         let analysis = analyze_command_in(command, None, Some(&context));
         assert_eq!(analysis.recommendation, "review", "{command}: {analysis:?}");
     }
-    // A search for a known key prefix is never allowed.
-    for command in ["grep -r AKIA ~", "grep -r ghp_ ~"] {
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// FAILS ON REVERT of `names_credential_marker` in
+/// `searches_for_narrow_text` (threats.rs): the prefixes without a hunt
+/// word (`AKIA`, `ghp_`, `sk-`, ...) drop to `review`, which the agent
+/// hook lets through.
+///
+/// A recursive search of the home or the root for a credential prefix or a
+/// key marker is a hunt for keys: `deny`, as on main before the narrow text
+/// reading. A search for an everyday word stays a `review`.
+#[test]
+fn a_home_search_for_a_credential_prefix_stays_denied() {
+    let (base, context) = home_with_a_key();
+    let patterns = [
+        "AKIA",
+        "ASIA",
+        "akia",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "github_pat_",
+        "glpat-",
+        "sk-",
+        "sk-proj",
+        "sk_live_",
+        "xoxb-",
+        "xoxa-",
+        "xoxp-",
+        "AIza",
+        "'-----BEGIN'",
+        "'BEGIN .*PRIVATE'",
+        "'BEGIN RSA PRIVATE KEY'",
+        "'PRIVATE KEY'",
+        "ssh-rsa",
+        "ssh-ed25519",
+        "ecdsa-sha2",
+        "password",
+        "PASSWORD",
+        "passwd",
+        "secret",
+        "client_secret",
+        "token",
+        "GITHUB_TOKEN",
+        "api_key",
+        "api-key",
+        "apikey",
+        "AWS_SECRET",
+        "aws_access_key_id",
+        "Bearer",
+        "Authorization",
+        "credentials",
+    ];
+    let mut wrong = Vec::new();
+    for pattern in patterns {
+        for line in [
+            format!("grep -r {pattern} ~"),
+            format!("grep -rn {pattern} ~/"),
+            format!("grep -rl {pattern} $HOME"),
+            format!("grep -rF {pattern} ~"),
+            format!("grep -r -e {pattern} ~"),
+            format!("grep -r -- {pattern} ~"),
+            format!("grep -r {pattern} /"),
+        ] {
+            let got = analyze_command_in(&line, None, Some(&context)).recommendation;
+            if got != "deny" {
+                wrong.push((line, got));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "expected deny: {wrong:#?}");
+    for command in ["grep -rn TODO ~/", "grep -r TODO ~", "grep -r 'fn main' ~"] {
         let got = analyze_command_in(command, None, Some(&context)).recommendation;
-        assert!(got == "deny" || got == "review", "{command}: {got}");
+        assert_eq!(got, "review", "{command}");
     }
     std::fs::remove_dir_all(&base).ok();
 }

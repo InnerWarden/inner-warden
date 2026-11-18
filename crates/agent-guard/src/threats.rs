@@ -12369,7 +12369,27 @@ fn searches_for_narrow_text(segment: &str) -> bool {
                 && pattern.chars().filter(char::is_ascii_alphanumeric).count() >= 2
                 && pattern.chars().all(narrow_char)
                 && credential_hunt_token(pattern).is_none()
+                && !names_credential_marker(pattern)
         })
+}
+
+/// A known credential prefix or key marker in a grep pattern (`AKIA`,
+/// `ghp_`, `github_pat_`, `sk-`, `xoxb-`, `AIza`, `-----BEGIN`,
+/// `PRIVATE`, `ssh-ed25519`, ...), at the start of the pattern or after a
+/// character that is not a letter or digit. A recursive search of a home or
+/// a wide root for one of these is a hunt for keys, never a narrow text: it
+/// keeps the hard refusal (`grep -r AKIA ~` is `deny`, as before
+/// `searches_home_for_narrow_text`).
+fn names_credential_marker(pattern: &str) -> bool {
+    static MARKER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    MARKER
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)(^|[^a-z0-9])(akia|asia|aroa|aida|gh[pousr]_|github_pat_|glpat-|sk-|sk_(live|test)_|rk_live_|xox[abposr]-|aiza|ya29.|npm_[a-z0-9]|pypi-|hf_[a-z0-9]|-{3,}|begin|private|ssh-(rsa|ed25519|dss)|ecdsa-sha2|bearer|auth|cred|passw|pwd|pass|key|jwt|eyj)",
+            )
+            .expect("static credential marker regex")
+        })
+        .is_match(pattern)
 }
 
 /// Whether `path` is `home` or a folder `home` is in (`/home`, `/`): a
