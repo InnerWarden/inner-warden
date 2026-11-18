@@ -2936,11 +2936,19 @@ pub(crate) fn check_code_rewrites_guard_carrier(content: &str) -> Option<(&'stat
     {
         return Some((*what, *score));
     }
+    if interpreter_code_puts_file_onto_settings(content) {
+        return Some((SETTINGS_REWRITTEN_BY_INTERPRETER, 60));
+    }
     if code_names_and_writes_guard_config(&content.to_ascii_lowercase()) {
         return Some((GUARD_CONFIG_WRITTEN, 60));
     }
     writes_guard_carrier(content).then_some((GUARD_CARRIER_WRITTEN, 60))
 }
+
+/// What [`guard_self_disable_patterns`] says of interpreter code that
+/// rewrites an agent's settings.
+const SETTINGS_REWRITTEN_BY_INTERPRETER: &str =
+    "rewrites an agent's configuration through an interpreter";
 
 /// [`check_guard_self_disable`] on one spelling of the command.
 fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
@@ -2948,7 +2956,66 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
     if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
         return Some((*what, *score));
     }
+    if interpreter_code_puts_file_onto_settings(content) {
+        return Some((SETTINGS_REWRITTEN_BY_INTERPRETER, 60));
+    }
     guard_self_disable_after_patterns(content)
+}
+
+/// Whether inline interpreter code copies or links a file ONTO an agent's
+/// settings: `shutil.copy*`, `os.symlink`, `copyFileSync`, `symlinkSync`
+/// with the settings, or a variable assigned them, as the destination.
+/// A copy FROM the settings is a backup, a read, and stays out.
+fn interpreter_code_puts_file_onto_settings(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if !(lower.contains("copy") || lower.contains("symlink"))
+        || !(lower.contains("settings")
+            || lower.contains(".claude.json")
+            || lower.contains("mcp.json"))
+    {
+        return false;
+    }
+    static INTERPRETER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ONTO: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ASSIGNED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ONTO_NAME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    const SETTINGS: &str = r#"(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#;
+    // The first argument, with one level of calls inside it
+    // (`os.path.expanduser('~/x')`), then the destination.
+    const CALL: &str = r#"\b(?:copy\w*|symlink(?:sync)?)\s*\(\s*[^,()]*(?:\([^()]*\)[^,()]*)*,\s*"#;
+    let interpreter = INTERPRETER.get_or_init(|| {
+        regex::Regex::new(r#"(?s)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b"#)
+            .expect("static interpreter regex")
+    });
+    if !interpreter.is_match(&lower) {
+        return false;
+    }
+    let onto = ONTO.get_or_init(|| {
+        regex::Regex::new(&format!(r#"(?s){CALL}[^,)]*?{SETTINGS}"#))
+            .expect("static copy onto settings regex")
+    });
+    if onto.is_match(&lower) {
+        return true;
+    }
+    let assigned = ASSIGNED.get_or_init(|| {
+        regex::Regex::new(&format!(r#"\b([a-z_]\w*)\s*=\s*[^;\n=]*?{SETTINGS}"#))
+            .expect("static settings assignment regex")
+    });
+    let names: Vec<&str> = assigned
+        .captures_iter(&lower)
+        .filter_map(|c| c.get(1).map(|m| m.as_str()))
+        .collect();
+    if names.is_empty() {
+        return false;
+    }
+    let onto_name = ONTO_NAME.get_or_init(|| {
+        regex::Regex::new(&format!(r#"(?s){CALL}([a-z_]\w*)\s*[,)]"#))
+            .expect("static copy onto name regex")
+    });
+    onto_name
+        .captures_iter(&lower)
+        .filter_map(|c| c.get(1))
+        .any(|m| names.contains(&m.as_str()))
 }
 
 /// The patterns [`guard_self_disable_in`] asks first, each with what it
@@ -3011,13 +3078,16 @@ fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)]
         // is full of `;`, so a segment-bounded pattern stops before reaching
         // the filename. A WRITE indicator is required so that reading the
         // config, which an agent does for honest reasons, is not a finding.
+        // Writing is more than `open(..., 'w')`: pathlib writes and unlinks,
+        // `os` and `shutil` remove and move, node's `fs` does each of those.
+        // A rename, replace or move counts with the settings on either side.
         add(
-            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json).{0,400}?(?:["']w["']|\bdump\b|\bwrite\b|\bdel\b|writeFileSync|\bunlink\b)"#,
+            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json).{0,400}?(?:["']w["']|\bdump\b|\bwrite\b|\bdel\b|writeFileSync|\bunlink\b|\.write_(?:text|bytes)\(|\bos\.(?:remove|rename|replace)\(|\bshutil\.(?:move|rmtree)\(|\.rename\(|\.symlink_to\(|\b(?:unlink|rm|rename|appendFile|truncate)Sync\(|\bfs\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\()"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
         add(
-            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:["']w["']|\bdump\b|writeFileSync).{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:["']w["']|\bdump\b|writeFileSync|\bos\.(?:remove|rename|replace|unlink)\(|\bshutil\.move\(|\b(?:unlink|rm|rename|appendFile|truncate)Sync\(|\bfs\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\().{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );

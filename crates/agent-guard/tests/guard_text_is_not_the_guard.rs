@@ -78,6 +78,90 @@ fn a_heredoc_program_that_edits_source_is_allowed_as_its_inline_form() {
     }
 }
 
+/// The same node program, given inline and fed as a quoted here-document.
+fn node_both_ways(code: &str) -> [String; 2] {
+    [
+        format!("node -e \"{code}\""),
+        format!("node - <<'EOF'\n{}\nEOF", code.replace("; ", ";\n")),
+    ]
+}
+
+/// FAILS ON REVERT of the write, remove, move and link calls added to the
+/// interpreter settings rules in `guard_self_disable_patterns` and of
+/// `interpreter_code_puts_file_onto_settings` (threats.rs): each was allowed
+/// in both forms, because the rules read `open(..., 'w')` and little else.
+#[test]
+fn interpreter_code_that_writes_removes_moves_or_links_settings_is_refused() {
+    let python = [
+        "from pathlib import Path; Path.home().joinpath('.claude/settings.json').write_text('{}')",
+        "from pathlib import Path; Path('/home/u/.claude/settings.local.json').write_bytes(b'{}')",
+        "import os; os.remove('/home/u/.claude/settings.json')",
+        "import os; p=os.path.expanduser('~/.claude/settings.json'); os.remove(p)",
+        "from pathlib import Path; Path.home().joinpath('.claude/settings.json').unlink()",
+        "import os; os.rename('/home/u/.claude/settings.json', '/home/u/.claude/off.json')",
+        "import os; os.replace('/tmp/e.json', '/home/u/.claude/settings.json')",
+        "import shutil; shutil.move('/home/u/.claude/settings.json', '/tmp/s')",
+        "import shutil; shutil.copy('/tmp/e.json', '/home/u/.claude/settings.json')",
+        "import shutil,os; p=os.path.expanduser('~/.claude/settings.json'); shutil.copyfile('/tmp/e.json', p)",
+        "import os; os.symlink('/tmp/e.json', '/home/u/.claude/settings.json')",
+        "from pathlib import Path; Path('/home/u/.claude/settings.json').symlink_to('/tmp/e.json')",
+        "import os; os.remove(os.path.expanduser('~/.config/innerwarden/allow.toml'))",
+        "from pathlib import Path; Path.home().joinpath('.config/innerwarden/suppress.toml').write_text('x')",
+    ];
+    for code in python {
+        for line in both_ways(code) {
+            assert_denied(&[line.as_str()]);
+        }
+    }
+    let node = [
+        "require('fs').unlinkSync(process.env.HOME + '/.claude/settings.json')",
+        "require('fs').rmSync(process.env.HOME + '/.claude/settings.json')",
+        "require('fs').renameSync(process.env.HOME + '/.claude/settings.json', '/tmp/s')",
+        "require('fs').copyFileSync('/tmp/e.json', process.env.HOME + '/.claude/settings.json')",
+        "require('fs').symlinkSync('/tmp/e.json', process.env.HOME + '/.claude/settings.json')",
+    ];
+    for code in node {
+        for line in node_both_ways(code) {
+            assert_denied(&[line.as_str()]);
+        }
+    }
+}
+
+/// The other direction: the same calls on project files, a copy of the
+/// settings taken as a backup, and a read of them stay allowed.
+#[test]
+fn the_same_calls_on_project_files_or_reading_settings_stay_allowed() {
+    let python = [
+        "from pathlib import Path; Path('src/a.rs').write_text('x')",
+        "from pathlib import Path; Path('out.bin').write_bytes(b'x')",
+        "import os; os.remove('build/out.txt')",
+        "import os; os.rename('a.txt', 'b.txt')",
+        "import shutil; shutil.copy('/home/u/.claude/settings.json', 'settings-backup.json')",
+        "import os; p=os.path.expanduser('~/.claude/settings.json'); print(open(p).read().replace('a','b'))",
+        "import os; print(os.path.exists('/home/u/.claude/settings.json'))",
+    ];
+    for code in python {
+        let [inline, heredoc] = both_ways(code);
+        assert_allowed(&[heredoc.as_str()]);
+        if code.starts_with("import os") {
+            // `python3 -c "import os` is an obfuscation indicator of its own
+            // (review), before and after this change; it must not become deny.
+            let (recommendation, why) = verdict(&inline);
+            assert_ne!(recommendation, "deny", "{inline:?}: {why}");
+        } else {
+            assert_allowed(&[inline.as_str()]);
+        }
+    }
+    for code in [
+        "require('fs').unlinkSync('dist/a.js')",
+        "require('fs').copyFileSync(process.env.HOME + '/.claude/settings.json', 'backup.json')",
+    ] {
+        for line in node_both_ways(code) {
+            assert_allowed(&[line.as_str()]);
+        }
+    }
+}
+
 /// FAILS ON REVERT of `Word::one_word` in the kernel verb search
 /// (threats/words_after.rs): each was refused as a change of the kernel
 /// protection.
