@@ -9010,7 +9010,7 @@ const ESCAPE_HOST_DIRECTORY: &str =
     "mounts a host system directory into a container writable, which is a container escape";
 const ESCAPE_SOCKET_MOUNT: &str =
     "mounts the container runtime's socket into a container, which hands the container the host";
-const ESCAPE_SOCKET_UNREAD: &str = "hands a raw socket client a socket named by a value the line does not set, which may be the container runtime's; the guard cannot tell without running the line";
+const ESCAPE_SOCKET_UNREAD: &str = "points a socket client or the container runtime's CLI at a socket named by a value the line does not set, which may be the container runtime's; the guard cannot tell without running the line";
 const ESCAPE_TARGET_UNREAD: &str = "enters the namespaces of a process named by a value the line does not set, which may be PID 1; the guard cannot tell without running the line";
 
 /// A container started so that it is the host, the host entered from inside
@@ -9122,15 +9122,18 @@ pub fn check_container_escape(content: &str) -> Option<(&'static str, u32)> {
         .map(|what| (what, 25))
 }
 
-/// A raw socket client or `nsenter` pointed by a value the line does not
-/// set: a variable from outside the line, or a command substitution. What it
+/// A raw socket client, the runtime's own CLI (`DOCKER_HOST=`,
+/// `CONTAINER_HOST=`, `docker -H`, `podman --url`) or `nsenter` pointed by
+/// a value the line does not set: a variable from outside the line, or a
+/// command substitution. `$HOME` and `$XDG_RUNTIME_DIR` are not such a
+/// value: the path after them is on the line and read by the rules above. What it
 /// names is known only once the line runs, so it is left to a person
 /// (`review`), not refused. A target that is a container's own PID read
 /// from the runtime (`nsenter -t "$(docker inspect -f '{{.State.Pid}}' web)"`)
 /// is a container's, never PID 1, and is not flagged.
 fn container_reach_unread(text: &str) -> Option<&'static str> {
-    static RES: std::sync::OnceLock<[regex::Regex; 4]> = std::sync::OnceLock::new();
-    let [socket, target, target_from_runtime, namespace] = RES.get_or_init(|| {
+    static RES: std::sync::OnceLock<[regex::Regex; 5]> = std::sync::OnceLock::new();
+    let [socket, setting, target, target_from_runtime, namespace] = RES.get_or_init(|| {
         // The socket after curl's socket options, `nc -U` and socat's
         // `UNIX-*:` addresses, when it starts with an expansion.
         const SOCKET_FROM_VALUE: &str = concat!(
@@ -9139,18 +9142,30 @@ fn container_reach_unread(text: &str) -> Option<&'static str> {
             r#"|(?i:\b(?:nc|ncat|netcat)\b)[^|;&\n]*\s-[a-zA-Z]*U\s*["']?(?:\$|`)"#,
             r#"|(?i:\bsocat\b)[^|;&\n]*\bUNIX(?:-CONNECT|-CLIENT|-SENDTO)?:["']?(?:\$|`)"#,
         );
+        // Where the runtime's CLI is pointed, by its settings or its flags,
+        // when the value starts with an expansion; the expansion is captured.
+        const SETTING_FROM_VALUE: &str = concat!(
+            r#"(?:(?:^|[\s;&|(])(?:export\s+)?(?:DOCKER_HOST|CONTAINER_HOST)="#,
+            r#"|(?i:\b(?:docker|podman|nerdctl)\b)[^|;&\n]*\s(?:-H|--host|--url)(?:\s*=\s*|\s+))"#,
+            r#"["']?(?:(?:unix|tcp|ssh|npipe)://)?["']?(\$\{?\w*|`)"#,
+        );
         const TARGET_FROM_VALUE: &str = r#"\bnsenter\b[\s\S]*?(?:\s-[a-zA-Z]*t\s*|\s--target(?:\s*=\s*|\s+))["']?(?:\$|`)"#;
         const TARGET_FROM_RUNTIME: &str = r#"\bnsenter\b[\s\S]*?(?:\s-[a-zA-Z]*t\s*|\s--target(?:\s*=\s*|\s+))["']?\$\(\s*(?:sudo\s+)?(?:docker|podman|nerdctl|crictl)\s+(?:container\s+)?inspect\b"#;
         const NAMESPACE_FROM_VALUE: &str = r#"\bnsenter\b[\s\S]*?\s--(?:mount|uts|ipc|net|pid|user|cgroup|time)=["']?(?:/proc/)?(?:\$|`)"#;
         [
             SOCKET_FROM_VALUE,
+            SETTING_FROM_VALUE,
             TARGET_FROM_VALUE,
             TARGET_FROM_RUNTIME,
             NAMESPACE_FROM_VALUE,
         ]
         .map(|p| regex::Regex::new(p).expect("static container reach regex"))
     });
-    if socket.is_match(text) {
+    let unset = |found: regex::Captures<'_>| {
+        let name = found[1].trim_start_matches(['$', '{']);
+        !matches!(name, "HOME" | "XDG_RUNTIME_DIR")
+    };
+    if socket.is_match(text) || setting.captures_iter(text).any(unset) {
         return Some(ESCAPE_SOCKET_UNREAD);
     }
     if (target.is_match(text) && !target_from_runtime.is_match(text)) || namespace.is_match(text) {
@@ -25081,6 +25096,18 @@ mod round_three_rule_tests {
         assert_eq!(
             check_container_escape("nsenter -t \"$P\" -m sh"),
             Some((ESCAPE_TARGET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("DOCKER_HOST=unix://$S docker ps"),
+            Some((ESCAPE_SOCKET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("podman --url \"$U\" ps"),
+            Some((ESCAPE_SOCKET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock"),
+            None
         );
         assert_eq!(
             check_container_escape("P=1; nsenter -t $P -m sh"),
