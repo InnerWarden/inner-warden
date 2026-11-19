@@ -145,23 +145,29 @@ fn exported_credentials_stay_out_of_the_jail_unless_passed_by_name() {
         .expect("run Linux AI Jail");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "AI Jail failed: {stderr}");
-    for secret in ["cjc-openai", "cjc-aws", "cjc-gh"] {
-        assert!(
-            !stdout.contains(secret),
-            "{secret} reached the jail: {stdout}"
-        );
+    // The messages name the variable, never the jail's output: the output
+    // holds the environment, and a failing run must not echo it.
+    assert!(output.status.success(), "AI Jail failed");
+    for (name, value) in [
+        ("OPENAI_API_KEY", "cjc-openai"),
+        ("AWS_SECRET_ACCESS_KEY", "cjc-aws"),
+        ("GITHUB_TOKEN", "cjc-gh"),
+    ] {
+        assert!(!stdout.contains(value), "{name} reached the jail");
     }
     assert!(
         stdout.contains("ANTHROPIC_API_KEY=cjc-anthropic"),
-        "{stdout}"
+        "ANTHROPIC_API_KEY, passed by name, did not reach the jail"
     );
-    assert!(stdout.contains("CJC_ORDINARY=cjc-ordinary"), "{stdout}");
+    assert!(
+        stdout.contains("CJC_ORDINARY=cjc-ordinary"),
+        "an ordinary variable did not reach the jail"
+    );
     assert!(
         stderr.contains("credential variables kept out of the jail's environment:")
             && stderr.contains("OPENAI_API_KEY")
             && !stderr.contains("cjc-"),
-        "{stderr}"
+        "the jail's notice does not name the variables kept out, or shows a value"
     );
 }
 
