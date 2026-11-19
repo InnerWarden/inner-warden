@@ -807,4 +807,26 @@ mod tests {
         assert!(text.contains("All 4 calls were refused before they could run."));
         assert!(text.contains("Nothing was run"));
     }
+
+    /// Nothing wired on a system whose process scan cannot look (macOS,
+    /// Windows: no /proc), the case the CI macOS runner is: the demo sends
+    /// nothing, says it could not tell whether an agent runs (never "none
+    /// running"), and still names the command that connects one. Built from
+    /// the scan's own answer, so it runs on any platform.
+    #[test]
+    fn nothing_wired_where_the_scan_cannot_look_says_so_and_how_to_connect() {
+        let running = innerwarden_agent_guard::agents_ops::any_agent_running_with(&[], false);
+        assert_eq!(running, None);
+        let none = crate::status::nothing_wired_finding(running);
+        let text = render(&[], Some(&none), 4);
+        assert!(text.contains("no call was sent"), "{text}");
+        assert!(text.contains("[unknown]"), "{text}");
+        assert!(!text.contains("none of the agents"), "{text}");
+        assert!(
+            text.contains("innerwarden agents connect --all --monitor"),
+            "{text}"
+        );
+        let json = to_json(&[], Some(&none));
+        assert_eq!(json["result"], "nothing_connected", "{json}");
+    }
 }

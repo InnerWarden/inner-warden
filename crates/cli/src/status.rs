@@ -77,6 +77,19 @@ pub struct HookTrouble {
     pub via_proxy: bool,
 }
 
+/// A hook line that names the guard but is not the guard's own line (see
+/// [`innerwarden_agent_guard::hook::WrappedHook`]). Listed so it never
+/// vanishes from the report: `Unknown` with the line, or `Broken` when the
+/// binary it names is certainly gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadHookLine {
+    pub agent: String,
+    /// `Broken` or `Unknown`, never `Runs`.
+    pub program: HookProgram,
+    /// The command that writes the guard's own line.
+    pub next: String,
+}
+
 /// A wired agent whose shell commands are screened while some of its other
 /// tool calls are not, because the hook wired for them cannot start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +406,9 @@ pub struct Facts {
     /// (file tools, read tools, tool results) runs a program that is not
     /// there, so those calls go unscreened. Still in `wired_agents`.
     pub partly_unscreened: Vec<PartlyUnscreened>,
+    /// Hook lines that name the guard without being its own line, beyond the
+    /// one (if any) already judged in `hook_trouble`.
+    pub unread_hook_lines: Vec<UnreadHookLine>,
     /// What each wired agent's wiring judges before a call runs, in the order
     /// of `wired_agents`. An agent whose settings could not be read back is
     /// left out: "could not tell" is never "off".
@@ -564,6 +580,15 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
             next: partly.next.clone(),
         });
     }
+    // A hook line written by hand (`env X=1 ... hook`, `sh -c '...'`, a path
+    // with a space and no quotes) was skipped in silence: it is not the
+    // guard's own line, so nothing judged it. It is named here, with the line.
+    out.extend(
+        facts
+            .unread_hook_lines
+            .iter()
+            .filter_map(unread_line_finding),
+    );
     if !facts.wired_agents.is_empty() {
         // An agent with some of its tools unscreened is named with that
         // caveat: the same agent read `[off] ... not screened` above and then
@@ -711,6 +736,27 @@ pub fn trouble_finding(trouble: &HookTrouble) -> Option<Finding> {
     }
 }
 
+/// The line for a hook line that names the guard but is not its own line.
+pub fn unread_line_finding(line: &UnreadHookLine) -> Option<Finding> {
+    match &line.program {
+        HookProgram::Broken { problem, .. } => Some(Finding::NotWorking {
+            what: format!(
+                "{} has a hook line that cannot start: {problem}, so that line screens nothing.",
+                line.agent
+            ),
+            next: line.next.clone(),
+        }),
+        HookProgram::Unknown { why, .. } => Some(Finding::Unknown {
+            what: format!(
+                "{} has a hook line I could not read as the guard's own.",
+                line.agent
+            ),
+            why: format!("{why}. `{}` writes the guard's own line.", line.next),
+        }),
+        HookProgram::Runs => None,
+    }
+}
+
 /// The line when no agent is wired and no wiring is in trouble, from whether
 /// any agent was seen (`None`: could not look). Shared with `demo`.
 pub fn nothing_wired_finding(any_agent_seen: Option<bool>) -> Finding {
@@ -727,10 +773,15 @@ pub fn nothing_wired_finding(any_agent_seen: Option<bool>) -> Finding {
                 .into(),
             next: "start your agent, then: innerwarden agents connect --all --monitor".into(),
         },
+        // Unknown, never "none running": on macOS and Windows the process
+        // scan has nothing to read (it reads /proc), and a failed look is not
+        // an empty one. The step that connects the agents installed here is
+        // still named, because it does not depend on the answer.
         None => Finding::Unknown {
             what: "Could not tell whether any agent is running.".into(),
-            why: "Process inspection failed. An agent may well be running; I \
-                  simply could not look."
+            why: "I could not look at the running processes here. An agent may \
+                  well be running. To connect the agents installed here: \
+                  innerwarden agents connect --all --monitor"
                 .into(),
         },
     }
@@ -1045,6 +1096,7 @@ mod tests {
             wired_agents: vec!["claude-code".into()],
             hook_trouble: vec![],
             partly_unscreened: vec![],
+            unread_hook_lines: vec![],
             tool_classes: vec![],
             any_agent_seen: Some(true),
             decisions_recorded: Some(42),
@@ -1355,6 +1407,7 @@ mod tests {
             wired_agents: vec![],
             hook_trouble: vec![],
             partly_unscreened: vec![],
+            unread_hook_lines: vec![],
             tool_classes: vec![],
             any_agent_seen: None,
             decisions_recorded: None,
@@ -1369,6 +1422,25 @@ mod tests {
                 !matches!(finding, Finding::NotWorking { .. }),
                 "nothing was established, so nothing may be reported as off: {finding:?}"
             );
+        }
+    }
+
+    /// Where the process scan cannot look (macOS, Windows), nothing wired is
+    /// "could not tell", never "no agent", and the line still names the
+    /// command that connects one: `demo` prints this line as its whole
+    /// answer when nothing is wired.
+    #[test]
+    fn nothing_wired_and_no_scan_is_unknown_and_names_how_to_connect() {
+        match nothing_wired_finding(None) {
+            Finding::Unknown { what, why } => {
+                assert!(what.contains("Could not tell"), "{what}");
+                assert!(
+                    why.contains("innerwarden agents connect --all --monitor"),
+                    "{why}"
+                );
+                assert!(!why.contains("none of the agents"), "{why}");
+            }
+            other => panic!("a scan that could not look is not an answer: {other:?}"),
         }
     }
 
@@ -1628,6 +1700,36 @@ mod tests {
             "{findings:?}"
         );
         assert!(headline(&findings).contains("NOT fully protecting"));
+    }
+
+    /// A bare name FOUND here is resolved on the agent's PATH, not this one:
+    /// status says it could not tell, never an OK that could be false.
+    #[test]
+    fn a_wired_hook_whose_bare_program_is_found_here_could_not_be_told() {
+        {
+            let fact = ProgramFact::Executable;
+            let f = wired_to("innerwarden", fact, "innerwarden install claude-code");
+            let findings = assess(&f);
+            assert!(
+                findings.iter().any(|x| matches!(
+                    x,
+                    Finding::Unknown { why, .. }
+                        if why.contains("could not tell: bare name, resolved on the agent's PATH")
+                )),
+                "{fact:?}: {findings:?}"
+            );
+            assert!(
+                !findings
+                    .iter()
+                    .any(|x| matches!(x, Finding::Working(what) if what.starts_with("Wired into"))),
+                "{fact:?}: {findings:?}"
+            );
+            assert_eq!(
+                headline(&findings),
+                "InnerWarden is on, but some things could not be verified.",
+                "{fact:?}"
+            );
+        }
     }
 
     /// A hook that could not be checked is unknown, never off, and never on.

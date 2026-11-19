@@ -112,6 +112,7 @@ fn status_io_cmd() -> std::process::ExitCode {
     let StatusWiring {
         hook_trouble,
         partly_unscreened,
+        unread_hook_lines,
         wired_agents,
         tool_classes,
     } = status_wiring(home.as_deref(), &rows);
@@ -120,6 +121,7 @@ fn status_io_cmd() -> std::process::ExitCode {
         rows,
         hook_trouble,
         partly_unscreened,
+        unread_hook_lines,
         wired_agents,
         tool_classes,
     )
@@ -129,6 +131,7 @@ fn status_io_cmd() -> std::process::ExitCode {
 struct StatusWiring {
     hook_trouble: Vec<status::HookTrouble>,
     partly_unscreened: Vec<status::PartlyUnscreened>,
+    unread_hook_lines: Vec<status::UnreadHookLine>,
     wired_agents: Vec<String>,
     tool_classes: Vec<status::ToolClasses>,
 }
@@ -157,6 +160,17 @@ fn status_wiring(
                                 via_proxy: false,
                             }),
                         };
+                    }
+                    // No line of the guard's own screens Bash, but one written
+                    // by hand names it (`env X=1 .../innerwarden hook`,
+                    // `sh -c '...'`): judged as the agent's hook, never skipped.
+                    if let Some(program) = wrapped_bash_verdict(home, r) {
+                        return Some(status::HookTrouble {
+                            agent: r.name.clone(),
+                            program,
+                            next: agents_ops::hook_repair_command(home, r),
+                            via_proxy: false,
+                        });
                     }
                     // An MCP agent whose proxy wrapper's binary is gone. Only
                     // a known-broken one is trouble: an unknown one stays wired
@@ -195,6 +209,33 @@ fn status_wiring(
         })
         .unwrap_or_default();
 
+    // Every other hook line that names the guard without being its own line:
+    // the one judged above as the agent's hook is not said twice.
+    let unread_hook_lines: Vec<status::UnreadHookLine> = home
+        .map(|home| {
+            use innerwarden_agent_guard::agents_ops;
+            rows.iter()
+                .flat_map(|r| {
+                    let judged = hook_trouble
+                        .iter()
+                        .find(|t| t.agent == r.name && !t.via_proxy)
+                        .map(|t| t.program.clone());
+                    let next = agents_ops::hook_repair_command(home, r);
+                    agents_ops::wrapped_hooks(home, r)
+                        .into_iter()
+                        .map(|(_, program)| program)
+                        .filter(move |program| Some(program) != judged.as_ref())
+                        .map(move |program| status::UnreadHookLine {
+                            agent: r.name.clone(),
+                            program,
+                            next: next.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let wired_agents: Vec<String> = rows
         .iter()
         .filter(|r| r.guarded && !hook_trouble.iter().any(|t| t.agent == r.name))
@@ -221,9 +262,41 @@ fn status_wiring(
     StatusWiring {
         hook_trouble,
         partly_unscreened,
+        unread_hook_lines,
         wired_agents,
         tool_classes,
     }
+}
+
+/// What `status` says about whether an agent is running: the process scan's
+/// pids, never a row alone (a row is made for an agent only installed).
+/// `None` with no home or where the scan cannot look.
+fn status_any_agent_seen(
+    home: Option<&std::path::Path>,
+    rows: &[innerwarden_agent_guard::agents::AgentStatus],
+) -> Option<bool> {
+    home.and_then(|_| innerwarden_agent_guard::agents_ops::any_agent_running(rows))
+}
+
+/// The verdict on the hand-written lines that name the guard under a matcher
+/// that covers Bash, for an agent with no line of the guard's own there:
+/// "could not tell" before "off", as for the guard's own lines. `None` when
+/// there is no such line.
+fn wrapped_bash_verdict(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+) -> Option<innerwarden_agent_guard::hook::HookProgram> {
+    use innerwarden_agent_guard::{agents_ops, hook::HookProgram};
+    let verdicts: Vec<HookProgram> = agents_ops::wrapped_hooks(home, agent)
+        .into_iter()
+        .filter(|(wrapped, _)| wrapped.screens_bash)
+        .map(|(_, program)| program)
+        .collect();
+    verdicts
+        .iter()
+        .find(|verdict| matches!(verdict, HookProgram::Unknown { .. }))
+        .or_else(|| verdicts.first())
+        .cloned()
 }
 
 fn status_io_cmd_rest(
@@ -231,12 +304,15 @@ fn status_io_cmd_rest(
     rows: Vec<innerwarden_agent_guard::agents::AgentStatus>,
     hook_trouble: Vec<status::HookTrouble>,
     partly_unscreened: Vec<status::PartlyUnscreened>,
+    unread_hook_lines: Vec<status::UnreadHookLine>,
     wired_agents: Vec<String>,
     tool_classes: Vec<status::ToolClasses>,
 ) -> std::process::ExitCode {
-    // Seen at all, wired or not. `None` when we could not look, which the
-    // report renders as unknown rather than as "no agent".
-    let any_agent_seen = home.as_ref().map(|_| !rows.is_empty());
+    // Running, wired or not, from the process scan alone: a row is also made
+    // for an agent that is only installed, and counting rows said "An agent is
+    // running" on a machine where none was. `None` when we could not look,
+    // which the report renders as unknown rather than as "no agent".
+    let any_agent_seen = status_any_agent_seen(home.as_deref(), &rows);
 
     // What the wiring DOES, read back from the SAME rows fetched above. This
     // was hardcoded to `None`, so the mode line read [unknown] on every install
@@ -290,6 +366,7 @@ fn status_io_cmd_rest(
         wired_agents,
         hook_trouble,
         partly_unscreened,
+        unread_hook_lines,
         tool_classes,
         any_agent_seen,
         decisions_recorded,
@@ -3173,6 +3250,122 @@ mod status_wiring_tests {
                 w.tool_classes
             );
         }
+    }
+
+    fn settings_with(home: &std::path::Path, settings: serde_json::Value) {
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            serde_json::to_vec_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn bash_line(command: &str) -> serde_json::Value {
+        serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}
+        ]}})
+    }
+
+    /// FAILS ON REVERT of the hand-written-line branch in `status_wiring`: a
+    /// line with `env` in front was skipped in silence, so the agent read as
+    /// not wired and the line was never named. Now it is "could not tell",
+    /// with the line, in the report a person reads.
+    #[test]
+    fn status_names_a_hand_written_line_as_could_not_tell() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join("bin/innerwarden");
+        runnable(&bin);
+        let command = format!("env IW_X=1 {} hook --agent claude-code", bin.display());
+        settings_with(home.path(), bash_line(&command));
+        let rows = agents_ops::rows(home.path());
+        let w = status_wiring(Some(home.path()), &rows);
+        assert_eq!(w.hook_trouble.len(), 1, "{:?}", w.hook_trouble);
+        assert!(w.unread_hook_lines.is_empty(), "said once, not twice");
+        let finding = status::trouble_finding(&w.hook_trouble[0]).unwrap();
+        match finding {
+            status::Finding::Unknown { why, .. } => {
+                assert!(why.contains(&command), "{why}");
+                assert!(why.starts_with("could not tell"), "{why}");
+            }
+            other => panic!("a hand-written line is could not tell: {other:?}"),
+        }
+    }
+
+    /// FAILS ON REVERT of `judge_wrapped_hook`'s gone branch: the binary a
+    /// hand-written line names is gone, which is the same alarm as the
+    /// guard's own line: none of its commands are screened.
+    #[test]
+    fn status_flags_a_hand_written_line_whose_binary_is_gone() {
+        let home = tempfile::TempDir::new().unwrap();
+        let gone = home.path().join("gone/innerwarden");
+        let command = format!("env IW_X=1 {} hook", gone.display());
+        settings_with(home.path(), bash_line(&command));
+        let rows = agents_ops::rows(home.path());
+        let w = status_wiring(Some(home.path()), &rows);
+        assert_eq!(w.hook_trouble.len(), 1, "{:?}", w.hook_trouble);
+        match status::trouble_finding(&w.hook_trouble[0]).unwrap() {
+            status::Finding::NotWorking { what, .. } => {
+                assert!(what.contains("which does not exist"), "{what}");
+                assert!(what.contains("none of its commands are screened"), "{what}");
+            }
+            other => panic!("a gone binary is off: {other:?}"),
+        }
+    }
+
+    /// FAILS ON REVERT of `unread_hook_lines`: beside a guard's own line that
+    /// runs, a hand-written one is still named, never dropped.
+    #[test]
+    fn a_hand_written_line_beside_a_running_hook_is_still_named() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join("bin/innerwarden");
+        runnable(&bin);
+        let own = hook::hook_command_for(&bin, false, false, Some("claude-code"));
+        let by_hand = format!("sh -c '{} hook --monitor'", bin.display());
+        settings_with(
+            home.path(),
+            serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": own}]},
+                {"matcher": "Write", "hooks": [{"type": "command", "command": by_hand}]}
+            ]}}),
+        );
+        let rows = agents_ops::rows(home.path());
+        let w = status_wiring(Some(home.path()), &rows);
+        assert!(w.hook_trouble.is_empty(), "{:?}", w.hook_trouble);
+        assert_eq!(w.wired_agents, vec!["claude-code".to_string()]);
+        assert_eq!(w.unread_hook_lines.len(), 1, "{:?}", w.unread_hook_lines);
+        match status::unread_line_finding(&w.unread_hook_lines[0]).unwrap() {
+            status::Finding::Unknown { why, .. } => assert!(why.contains(&by_hand), "{why}"),
+            other => panic!("could not tell, with the line: {other:?}"),
+        }
+    }
+
+    /// FAILS ON REVERT of `any_agent_seen` in `status`: an agent that is only
+    /// installed (a row with no pid) is not a running one, and where the
+    /// process scan cannot look nothing is claimed.
+    #[test]
+    fn an_installed_agent_is_not_a_running_one() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let mut rows = agents_ops::rows(home.path());
+        assert!(!rows.is_empty(), "the config dir makes a row");
+        rows.iter_mut().for_each(|row| row.pids.clear());
+        assert_eq!(agents_ops::any_agent_running_with(&rows, true), Some(false));
+        assert_eq!(agents_ops::any_agent_running_with(&rows, false), None);
+        // What `status` itself says, on this platform.
+        let said = status_any_agent_seen(Some(home.path()), &rows);
+        if std::path::Path::new("/proc").is_dir() {
+            assert_eq!(said, Some(false), "installed is not running");
+        } else {
+            assert_eq!(said, None, "no process scan here, so nothing is claimed");
+        }
+        assert_eq!(status_any_agent_seen(None, &rows), None);
+        rows[0].pids.push(4242);
+        assert_eq!(agents_ops::any_agent_running_with(&rows, true), Some(true));
+        assert!(matches!(
+            status::nothing_wired_finding(agents_ops::any_agent_running_with(&rows[..0], true)),
+            status::Finding::NotWorking { what, .. } if what.contains("none of the agents")
+        ));
     }
 
     /// No home: nothing is claimed either way.
