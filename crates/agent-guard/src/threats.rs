@@ -13887,10 +13887,11 @@ fn sensitive_read_nested(
 ) -> Option<(&'static str, u32)> {
     let (readings, _) = assignment_readings(content);
     let mut found = None;
-    for reading in &readings {
+    for (at, reading) in readings.iter().enumerate() {
         // A substitution that reshapes a path is judged by the path it
         // prints, in place of the line as written.
-        let hit = match resolve_path_substitutions(reading) {
+        let last = at + 1 == readings.len();
+        let hit = match resolve_path_substitutions(reading, content, last) {
             PathSubstitutions::SshUnresolved => Some((".ssh/", 60)),
             PathSubstitutions::Resolved(resolved) => {
                 sensitive_read_in(&resolved, as_written, depth)
@@ -13907,8 +13908,9 @@ fn sensitive_read_nested(
     // prints: the line as written is asked too, for these substitutions only.
     if as_written != content && as_written.contains("$(") {
         let (written, _) = assignment_readings(as_written);
-        for reading in &written {
-            let hit = match resolve_path_substitutions(reading) {
+        for (at, reading) in written.iter().enumerate() {
+            let last = at + 1 == written.len();
+            let hit = match resolve_path_substitutions(reading, as_written, last) {
                 PathSubstitutions::SshUnresolved => Some((".ssh/", 60)),
                 PathSubstitutions::Resolved(resolved) => {
                     sensitive_read_in(&resolved, as_written, depth)
@@ -13949,13 +13951,27 @@ const PATH_SHAPERS: &[&str] = &["basename", "dirname", "sed", "cut", "tr", "awk"
 /// `~/.ssh` and is not worked out (a value set at run time, a `sed` program
 /// beyond one plain `s///`) is taken as the private key: measured
 /// 2026-11-19, the `sed`, `cut` and `tr` forms were allowed.
-fn resolve_path_substitutions(line: &str) -> PathSubstitutions {
+fn resolve_path_substitutions(line: &str, raw: &str, last: bool) -> PathSubstitutions {
     if !line.contains("$(") {
         return PathSubstitutions::None;
     }
+    // The substitutions of the line as written that consume a variable the
+    // line keeps under `~/.ssh`, by their place on the line: a reading only
+    // fills values in, so the n-th substitution of a reading is the n-th
+    // one written.
+    let names = ssh_valued_names(raw);
+    let consuming: Vec<bool> = if names.is_empty() {
+        Vec::new()
+    } else {
+        top_level_substitutions(raw)
+            .iter()
+            .map(|body| consumes_a_name(body, &names))
+            .collect()
+    };
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     let mut changed = false;
+    let mut place = 0usize;
     while let Some(at) = rest.find("$(") {
         out.push_str(&rest[..at]);
         let after = &rest[at + 2..];
@@ -13965,15 +13981,18 @@ fn resolve_path_substitutions(line: &str) -> PathSubstitutions {
             break;
         };
         let body = &after[..end];
+        let consumes = consuming.get(place).copied().unwrap_or(false);
+        place += 1;
         let shapes = body
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .any(|word| PATH_SHAPERS.contains(&word));
-        if !shapes {
-            out.push_str(&rest[at..at + 2 + end + 1]);
-        } else if let Some(printed) = shaped_path(body) {
+        if let Some(printed) = (shapes || consumes).then(|| shaped_path(body)).flatten() {
             out.push_str(&printed);
             changed = true;
-        } else if body.contains(".ssh") || holds_a_name_set_from_ssh(line, body) {
+        } else if (shapes && body.contains(".ssh")) || (last && consumes) {
+            // Not worked out here, on a key's path: whatever the
+            // substitution does with it (`rev`, `xargs basename`, `awk`),
+            // what it prints may be the private key.
             return PathSubstitutions::SshUnresolved;
         } else {
             out.push_str(&rest[at..at + 2 + end + 1]);
@@ -13988,29 +14007,73 @@ fn resolve_path_substitutions(line: &str) -> PathSubstitutions {
     }
 }
 
-/// PURE. Whether `body` refers to a variable that `line` sets to text
-/// naming `~/.ssh` (`K=$(ls ~/.ssh/*.pub | head -1)`): a value the shell
-/// works out at run time from the keys' folder.
-fn holds_a_name_set_from_ssh(line: &str, body: &str) -> bool {
-    static REFERENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let reference = REFERENCE.get_or_init(|| {
-        regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").expect("static reference regex")
+/// PURE. The bodies of the `$(...)` of `line` that are not inside another
+/// one, in order.
+fn top_level_substitutions(line: &str) -> Vec<&str> {
+    let mut bodies = Vec::new();
+    let mut rest = line;
+    while let Some(at) = rest.find("$(") {
+        let after = &rest[at + 2..];
+        let Some(end) = substitution_end(after) else {
+            break;
+        };
+        bodies.push(&after[..end]);
+        rest = &after[end + 1..];
+    }
+    bodies
+}
+
+/// PURE. The variables `line` sets to a value under `~/.ssh`, written out
+/// (`F=~/.ssh/id_ed25519.pub`) or worked out at run time
+/// (`K=$(ls ~/.ssh/*.pub | head -1)`), and the name of a loop over one.
+fn ssh_valued_names(line: &str) -> Vec<String> {
+    if !line.contains(".ssh") {
+        return Vec::new();
+    }
+    static SET: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| {
+        regex::Regex::new(
+            r"(?:^|[\s;&|(])(?:(?:export|local|readonly|declare)\s+)?(?:([A-Za-z_][A-Za-z0-9_]*)=|for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s)",
+        )
+        .expect("static assignment regex")
     });
-    reference.captures_iter(body).any(|found| {
-        let name = &found[1];
-        let assignment = format!("{name}=");
-        line.match_indices(&assignment).any(|(at, _)| {
-            let starts_word = line[..at]
-                .chars()
-                .last()
-                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
-            let value = &line[at + assignment.len()..];
-            let end = value.find([';', '\n']).unwrap_or(value.len());
-            // A value written out is read into the line by its next
-            // reading and worked out there.
-            let value = &value[..end];
-            starts_word && value.contains(".ssh") && value.contains(['$', '`'])
-        })
+    let mut names = Vec::new();
+    for found in set.captures_iter(line) {
+        let (Some(whole), Some(name)) = (found.get(0), found.get(1).or_else(|| found.get(2)))
+        else {
+            continue;
+        };
+        let value = &line[whole.end()..];
+        // The value runs to the end of its command: past a substitution it
+        // opens with, which may hold a `;` of its own.
+        let from = value
+            .strip_prefix("$(")
+            .or_else(|| value.strip_prefix("\"$("))
+            .and_then(substitution_end)
+            .map_or(0, |end| end + 2);
+        let end = value[from..]
+            .find([';', '\n'])
+            .map_or(value.len(), |at| from + at);
+        if value[..end].contains(".ssh") {
+            names.push(name.as_str().to_string());
+        }
+    }
+    names
+}
+
+/// PURE. Whether `body` refers to one of `names` (`$F`, `${F}`, `${F%x}`).
+fn consumes_a_name(body: &str, names: &[String]) -> bool {
+    names.iter().any(|name| {
+        [format!("${name}"), format!("${{{name}")]
+            .iter()
+            .any(|reference| {
+                body.match_indices(reference.as_str()).any(|(at, _)| {
+                    !body[at + reference.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+            })
     })
 }
 

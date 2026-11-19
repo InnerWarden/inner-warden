@@ -243,6 +243,15 @@ fn a_key_name_built_by_a_substitution_is_refused() {
         "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | awk -F. '{print $1}')\"",
         "k=$(ls ~/.ssh/*.pub | head -1); cat \"$(echo \"$k\" | sed 's/\\.pub$//')\"",
         "for k in ~/.ssh/*.pub; do cat \"$(echo \"$k\" | sed 's/\\.pub$//')\"; done",
+        // Any substitution that consumes a variable kept under ~/.ssh and is
+        // not worked out here, whatever program it runs.
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | rev | cut -d. -f2- | rev)\"",
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | xargs basename -s .pub)\"",
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | head -c -5)\"",
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | rev | rev)\"",
+        "f=~/.ssh/id_ed25519.pub; cat ~/.ssh/\"$(echo \"$f\" | xargs basename -s .pub)\"",
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | awk -F. '{print $1\".\"$2}')\"",
+        "k=$(ls ~/.ssh/*.pub | head -1); cat \"$(echo \"$k\" | rev | cut -c5- | rev)\"",
     ] {
         assert_eq!(verdict(line), "deny", "{line}");
     }
@@ -282,5 +291,25 @@ fn a_hunt_of_the_home_in_every_search_form_is_refused() {
         "grep -rl -----BEGIN $HOME",
     ] {
         assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// A substitution worked out to `~/.ssh/config` is judged as the file
+/// named outright: the client configuration is not one of the public SSH
+/// files (`known_hosts`, `authorized_keys`, a `.pub`), so both are refused
+/// alike, and `known_hosts` passes both ways.
+#[test]
+fn a_worked_out_path_has_the_verdict_of_the_path_named_outright() {
+    for (built, named) in [
+        (
+            "f=~/.ssh/id_ed25519.pub; cat \"$(dirname \"$f\")/config\"",
+            "cat ~/.ssh/config",
+        ),
+        (
+            "f=~/.ssh/id_ed25519.pub; cat \"$(dirname \"$f\")/known_hosts\"",
+            "cat ~/.ssh/known_hosts",
+        ),
+    ] {
+        assert_eq!(verdict(built), verdict(named), "{built} / {named}");
     }
 }
