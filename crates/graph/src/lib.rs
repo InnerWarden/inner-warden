@@ -127,6 +127,10 @@ pub enum GraphPathSource {
     EnvironmentOverride,
     /// [`GUARD_CONFIG_PATH`].
     ProductConfigFile,
+    /// The `[accounts."<name>"]` entry [`GUARD_CONFIG_PATH`] carries for the
+    /// account this process runs as: an AI agent with a Linux account of its
+    /// own, whose record lives in [`AGENT_RECORDS_ROOT`]`/<name>/`.
+    AccountEntry,
     /// `$HOME/.config/innerwarden/graph.json`.
     OperatorHome,
     /// Nothing named a record file.
@@ -159,6 +163,85 @@ pub struct GraphPathResolution {
     pub source: GraphPathSource,
     /// Set only when a product config EXISTS and could not be honoured.
     pub config_problem: Option<ConfigProblem>,
+    /// Set when the product config has an entry for this account that was
+    /// not honoured, with a stable reason code. The record is then where it
+    /// would be without the entry; `status` says so.
+    pub account_problem: Option<&'static str>,
+}
+
+/// The parent of the per-account record directories the paid installer makes
+/// (`innerwarden-ctl agent-user add <name>`): `root:root 0711`, and under it
+/// `<name>/` owned `<name>:innerwarden 2750`. The account writes its own
+/// directory, the `innerwarden` group reads it, nobody else enters. Must match
+/// the paid product's `AGENT_RECORDS_ROOT`, which reads ONLY these paths.
+pub const AGENT_RECORDS_ROOT: &str = "/var/lib/innerwarden-agents";
+
+/// Whether `name` may be a declared agent account: `[a-z_][a-z0-9_-]*`, 32
+/// characters at most. The same rule the paid product applies to the keys of
+/// `[accounts]`, so no entry this side honours is one the other side ignores.
+pub fn valid_agent_account_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    name.len() <= 32
+        && (first.is_ascii_lowercase() || first == '_')
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// PURE. The record the product config gives `account` under
+/// `[accounts."<account>"]`: `Ok(None)` when it gives none (no table, no entry,
+/// or a name no entry can have), `Err` with a stable code when there is an
+/// entry and it cannot be honoured.
+///
+/// The entry is honoured only when it names exactly the account's own records
+/// under [`AGENT_RECORDS_ROOT`]: `graph_file = "<root>/<account>/graph.json"`
+/// and `events_file = "<root>/<account>/guard-events.jsonl"`. Any other path
+/// is refused, never followed: the paid product reads only those two, so a
+/// record anywhere else would be one it never sees, and a path from a file
+/// this process does not own is the hostile part of it. That pin is also what
+/// keeps an account out of every other account's directory: the only path this
+/// can return carries the caller's own name.
+pub fn account_record_entry(
+    text: &str,
+    account: &str,
+) -> Result<Option<std::path::PathBuf>, &'static str> {
+    account_record_entry_under(text, account, std::path::Path::new(AGENT_RECORDS_ROOT))
+}
+
+/// [`account_record_entry`] under another root, so a caller's tests can hold
+/// real directories without writing to `/var/lib`.
+pub fn account_record_entry_under(
+    text: &str,
+    account: &str,
+    root: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, &'static str> {
+    if text.len() as u64 > MAX_PRODUCT_CONFIG_BYTES {
+        return Err("config_too_large");
+    }
+    if !valid_agent_account_name(account) {
+        return Ok(None);
+    }
+    let parsed: toml::Value = toml::from_str(text).map_err(|_| "config_malformed")?;
+    let Some(table) = parsed.get("accounts") else {
+        return Ok(None);
+    };
+    let Some(table) = table.as_table() else {
+        return Err("config_accounts_not_a_table");
+    };
+    let Some(entry) = table.get(account) else {
+        return Ok(None);
+    };
+    let dir = root.join(account);
+    let names = |field: &str, file: &str| {
+        entry.get(field).and_then(toml::Value::as_str)
+            == Some(dir.join(file).to_string_lossy().as_ref())
+    };
+    if names("graph_file", "graph.json") && names("events_file", "guard-events.jsonl") {
+        Ok(Some(dir.join("graph.json")))
+    } else {
+        Err("account_entry_not_its_own_directory")
+    }
 }
 
 /// The single `graph_file` key the product config carries. Unknown keys are
@@ -303,27 +386,80 @@ pub fn graph_path(
     get: impl Fn(&str) -> Option<String>,
     read_config: impl FnOnce() -> ProductConfig,
 ) -> GraphPathResolution {
+    graph_path_for_account(get, None, read_config)
+}
+
+/// [`graph_path`] for the account this process runs as. Between the override
+/// and the shared record: the `[accounts."<account>"]` entry of the product
+/// config, when it names that account's own directory
+/// ([`account_record_entry`]).
+///
+/// `account` is the caller's EFFECTIVE account, read from the account
+/// database by uid, never from `USER`, `LOGNAME` or anything else in the
+/// environment: the environment of a hook is the AI agent's, and an agent that
+/// could name the account would pick whose directory it writes.
+///
+/// No entry for the account: exactly [`graph_path`]. An entry that cannot be
+/// honoured: exactly [`graph_path`] too, with [`GraphPathResolution::account_problem`]
+/// set so `status` can say the paid product will not read this account there.
+pub fn graph_path_for_account(
+    get: impl Fn(&str) -> Option<String>,
+    account: Option<&str>,
+    read_config: impl FnOnce() -> ProductConfig,
+) -> GraphPathResolution {
+    graph_path_for_account_under(
+        get,
+        account,
+        std::path::Path::new(AGENT_RECORDS_ROOT),
+        read_config,
+    )
+}
+
+/// [`graph_path_for_account`] with the per-account root supplied.
+pub fn graph_path_for_account_under(
+    get: impl Fn(&str) -> Option<String>,
+    account: Option<&str>,
+    root: &std::path::Path,
+    read_config: impl FnOnce() -> ProductConfig,
+) -> GraphPathResolution {
     if let Some(p) = get("IW_GRAPH_FILE").filter(|s| !s.trim().is_empty()) {
         return GraphPathResolution {
             path: Some(std::path::PathBuf::from(p)),
             source: GraphPathSource::EnvironmentOverride,
             config_problem: None,
+            account_problem: None,
         };
     }
 
+    let mut account_problem = None;
     let code = match read_config() {
         ProductConfig::Absent => None,
         ProductConfig::Refused(code) => Some(code),
-        ProductConfig::Present(text) => match parse_product_config(&text) {
-            Ok(path) => {
-                return GraphPathResolution {
-                    path: Some(path),
-                    source: GraphPathSource::ProductConfigFile,
-                    config_problem: None,
+        ProductConfig::Present(text) => {
+            match account.map(|account| account_record_entry_under(&text, account, root)) {
+                Some(Ok(Some(path))) => {
+                    return GraphPathResolution {
+                        path: Some(path),
+                        source: GraphPathSource::AccountEntry,
+                        config_problem: None,
+                        account_problem: None,
+                    }
                 }
+                Some(Err(code)) => account_problem = Some(code),
+                Some(Ok(None)) | None => {}
             }
-            Err(code) => Some(code),
-        },
+            match parse_product_config(&text) {
+                Ok(path) => {
+                    return GraphPathResolution {
+                        path: Some(path),
+                        source: GraphPathSource::ProductConfigFile,
+                        config_problem: None,
+                        account_problem,
+                    }
+                }
+                Err(code) => Some(code),
+            }
+        }
     };
 
     let path = get("HOME")
@@ -339,6 +475,7 @@ pub fn graph_path(
             code,
             message: fallback_message(code, path.is_some()),
         }),
+        account_problem,
         path,
     }
 }
@@ -2525,6 +2662,124 @@ mod tests {
         );
         assert_eq!(alone.source, GraphPathSource::OperatorHome);
         assert_eq!(alone.config_problem, None);
+    }
+
+    /// The product config exactly as the paid installer writes it for
+    /// `--agent-user bot` (`agent_account_entry_text` in the paid product).
+    fn with_bot() -> String {
+        "graph_file = \"/var/lib/innerwarden/guard/graph.json\"\n\
+         events_file = \"/var/lib/innerwarden/guard/guard-events.jsonl\"\n\
+         \n# An AI agent that runs as its own account, bot: its decisions are\n\
+         # recorded in its own directory, which only it writes and InnerWarden\n\
+         # reads. Written by `innerwarden-ctl agent-user add bot`.\n\
+         [accounts.\"bot\"]\n\
+         graph_file = \"/var/lib/innerwarden-agents/bot/graph.json\"\n\
+         events_file = \"/var/lib/innerwarden-agents/bot/guard-events.jsonl\"\n"
+            .to_string()
+    }
+
+    /// An account with an entry records in its own directory; every other
+    /// account, and a caller that names no account, resolves as before.
+    ///
+    /// FAILS ON REVERT: drop the `AccountEntry` arm from
+    /// [`graph_path_for_account`] and `bot` resolves to the shared record it
+    /// may not write.
+    #[test]
+    fn an_account_with_an_entry_records_in_its_own_directory() {
+        let home = [("HOME", "/home/bot")];
+        let own = graph_path_for_account(
+            env(&home),
+            Some("bot"),
+            given(ProductConfig::Present(with_bot())),
+        );
+        assert_eq!(
+            own.path,
+            Some(std::path::PathBuf::from(
+                "/var/lib/innerwarden-agents/bot/graph.json"
+            ))
+        );
+        assert_eq!(own.source, GraphPathSource::AccountEntry);
+        assert_eq!((own.config_problem, own.account_problem), (None, None));
+
+        // The operator, and a caller that names nobody: the shared record.
+        for account in [Some("maicon"), None] {
+            let other = graph_path_for_account(
+                env(&[("HOME", "/home/maicon")]),
+                account,
+                given(ProductConfig::Present(with_bot())),
+            );
+            assert_eq!(
+                other.path,
+                Some(std::path::PathBuf::from(
+                    "/var/lib/innerwarden/guard/graph.json"
+                )),
+                "{account:?}"
+            );
+            assert_eq!(other.source, GraphPathSource::ProductConfigFile);
+            assert_eq!(other.account_problem, None);
+        }
+
+        // The override still wins, as it does over the shared record.
+        let overridden = graph_path_for_account(
+            env(&[("IW_GRAPH_FILE", "/x/g.json")]),
+            Some("bot"),
+            given(ProductConfig::Present(with_bot())),
+        );
+        assert_eq!(overridden.source, GraphPathSource::EnvironmentOverride);
+
+        // An entry alone, with no shared record declared, is still honoured.
+        let only = with_bot().lines().skip(2).collect::<Vec<_>>().join("\n");
+        let resolved =
+            graph_path_for_account(env(&home), Some("bot"), given(ProductConfig::Present(only)));
+        assert_eq!(resolved.source, GraphPathSource::AccountEntry);
+    }
+
+    /// An entry that names anything but the account's own two records under
+    /// the root is refused, never followed, and the record is where it would be
+    /// without it. A name no entry can have is no entry at all.
+    ///
+    /// FAILS ON REVERT: take the path pin out of [`account_record_entry`] and
+    /// `bot` writes wherever the file says, `/etc/shadow` or another
+    /// account's directory included.
+    #[test]
+    fn an_entry_that_points_elsewhere_is_refused_and_changes_nothing() {
+        let shared = "/var/lib/innerwarden/guard/graph.json";
+        for entry in [
+            "graph_file = \"/etc/shadow\"\nevents_file = \"/var/lib/innerwarden-agents/bot/guard-events.jsonl\"",
+            "graph_file = \"/var/lib/innerwarden-agents/other/graph.json\"\nevents_file = \"/var/lib/innerwarden-agents/other/guard-events.jsonl\"",
+            "graph_file = \"/var/lib/innerwarden-agents/bot/../other/graph.json\"\nevents_file = \"/var/lib/innerwarden-agents/bot/guard-events.jsonl\"",
+            "graph_file = \"/var/lib/innerwarden-agents/bot/graph.json\"",
+            "graph_file = 3\nevents_file = \"/var/lib/innerwarden-agents/bot/guard-events.jsonl\"",
+        ] {
+            let text = format!("graph_file = \"{shared}\"\n[accounts.\"bot\"]\n{entry}\n");
+            let resolved = graph_path_for_account(
+                env(&[("HOME", "/home/bot")]),
+                Some("bot"),
+                given(ProductConfig::Present(text)),
+            );
+            assert_eq!(resolved.path, Some(std::path::PathBuf::from(shared)), "{entry}");
+            assert_eq!(resolved.source, GraphPathSource::ProductConfigFile, "{entry}");
+            assert_eq!(
+                resolved.account_problem,
+                Some("account_entry_not_its_own_directory"),
+                "{entry}"
+            );
+        }
+
+        let not_a_table = format!("graph_file = \"{shared}\"\naccounts = 3\n");
+        assert_eq!(
+            account_record_entry(&not_a_table, "bot"),
+            Err("config_accounts_not_a_table")
+        );
+        // Names an entry can never be honoured under: no lookup at all.
+        for name in ["", "Bot", "a.b", "../bot", "a/b", &"x".repeat(33)] {
+            assert_eq!(
+                account_record_entry(&with_bot(), name),
+                Ok(None),
+                "{name:?}"
+            );
+        }
+        assert_eq!(account_record_entry(&with_bot(), "nobody"), Ok(None));
     }
 
     /// Every hostile or broken shape of the config file, and the documented

@@ -137,6 +137,14 @@ pub const MAX_OWNED_STORE_BYTES: u64 = 128 * 1024 * 1024;
 /// 2. a file created here in a group-writable directory is given that
 ///    directory's group explicitly, which POSIX permits for a member of the
 ///    group.
+///
+/// A directory a group READS and only its owner writes is the third shape:
+/// the record directory of an AI agent with its own Linux account
+/// (`<name>:innerwarden 2750`, made by the paid installer), which the agent
+/// writes and InnerWarden reads. Setgid, group read, no group write, nothing
+/// for others: a new file there is `0640` in the directory's group. Without
+/// the setgid bit or with any bit for others, it is not that directory, and a
+/// new file stays `0600`.
 #[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NewFileOwnership {
@@ -152,11 +160,22 @@ pub struct NewFileOwnership {
 pub fn new_file_ownership(directory: &Path) -> NewFileOwnership {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     const GROUP_WRITE: u32 = 0o020;
+    const READ_BY_ITS_GROUP: u32 = 0o2040;
+    const OTHERS: u32 = 0o007;
     match fs::metadata(directory) {
         Ok(metadata) if metadata.permissions().mode() & GROUP_WRITE != 0 => NewFileOwnership {
             mode: 0o660,
             group: Some(metadata.gid()),
         },
+        Ok(metadata)
+            if metadata.permissions().mode() & READ_BY_ITS_GROUP == READ_BY_ITS_GROUP
+                && metadata.permissions().mode() & OTHERS == 0 =>
+        {
+            NewFileOwnership {
+                mode: 0o640,
+                group: Some(metadata.gid()),
+            }
+        }
         _ => NewFileOwnership {
             mode: 0o600,
             group: None,
@@ -1416,6 +1435,53 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    /// The record directory of an AI agent with its own account (`2750`,
+    /// setgid, its group reads): a new record there is `0640` in that group,
+    /// which is what the paid product reads. The same folder without the
+    /// setgid bit, or with anything for others, stays `0600`.
+    ///
+    /// FAILS ON REVERT: drop the group-read arm of [`new_file_ownership`] and
+    /// the record lands `0600`, which the `innerwarden` group cannot read.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_record_in_a_folder_its_group_reads_is_0640_in_that_group() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::TempDir::new().unwrap();
+        let own = dir.path().join("bot");
+        std::fs::create_dir(&own).unwrap();
+        let group = fs::metadata(&own).unwrap().gid();
+        std::fs::set_permissions(&own, fs::Permissions::from_mode(0o2750)).unwrap();
+        assert_eq!(
+            fs::metadata(&own).unwrap().permissions().mode() & 0o7777,
+            0o2750,
+            "precondition: the setgid bit held"
+        );
+        assert_eq!(
+            new_file_ownership(&own),
+            NewFileOwnership {
+                mode: 0o640,
+                group: Some(group)
+            }
+        );
+        let path = own.join("graph.json");
+        replace_owned_store_no_symlinks(&own, &path, None, b"{}", UNCONTENDED).expect("write");
+        let written = fs::metadata(&path).unwrap();
+        assert_eq!(written.permissions().mode() & 0o777, 0o640);
+        assert_eq!(written.gid(), group);
+
+        for mode in [0o750, 0o2755, 0o2751, 0o2700] {
+            std::fs::set_permissions(&own, fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(
+                new_file_ownership(&own),
+                NewFileOwnership {
+                    mode: 0o600,
+                    group: None
+                },
+                "{mode:o}"
+            );
+        }
     }
 
     /// An EXISTING file keeps the mode it has, in a group-writable directory as

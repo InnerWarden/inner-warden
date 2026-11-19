@@ -496,6 +496,71 @@ pub struct Facts {
     /// account again: the folder in its home that still holds what it
     /// recorded while it was refused.
     pub kept_apart_before: Option<String>,
+    /// Where this account's decisions are recorded and whether InnerWarden
+    /// Pro reads them there. `None` when nothing names a record.
+    pub record_place: Option<RecordPlace>,
+}
+
+/// Where this account records, as `status` says it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordPlace {
+    /// The folder the record is in.
+    pub dir: String,
+    /// The account named by an `[accounts."<name>"]` entry for this account.
+    pub account: Option<String>,
+    /// Why this account's entry was not honoured, as a stable code.
+    pub account_problem: Option<&'static str>,
+    /// Whether InnerWarden Pro reads the record in `dir`.
+    pub pro_reads: bool,
+}
+
+/// The one line that says where decisions are recorded and whether
+/// InnerWarden Pro reads them there. An entry this account has and that
+/// could not be honoured is a fault with one fix, in the `try:` line.
+pub fn record_place_finding(place: &RecordPlace) -> Finding {
+    let account = place.account.as_deref().unwrap_or("this account");
+    if let Some(code) = place.account_problem {
+        let why = match code {
+            "account_entry_not_its_own_directory" => {
+                format!("it names a folder other than /var/lib/innerwarden-agents/{account}/")
+            }
+            "account_directory_not_its_own" => format!(
+                "/var/lib/innerwarden-agents/{account} is missing, is a link, or is not a \
+                 folder only {account} writes"
+            ),
+            "config_accounts_not_a_table" => "its [accounts] section is not a table".to_string(),
+            other => format!("it could not be used ({other})"),
+        };
+        let where_to = if place.pro_reads {
+            format!("{} instead", place.dir)
+        } else {
+            format!("{} instead, which InnerWarden Pro does not read", place.dir)
+        };
+        return Finding::NotWorking {
+            what: format!(
+                "Record: /etc/innerwarden/guard.toml has an entry for {account}, but {why}, \
+                 so its decisions go to {where_to}."
+            ),
+            next: format!(
+                "sudo innerwarden-ctl agent-user add {account} (on the InnerWarden Pro \
+                 install), then run innerwarden status again"
+            ),
+        };
+    }
+    let given = place
+        .account
+        .as_deref()
+        .map(|name| format!(", the folder /etc/innerwarden/guard.toml gives this account ({name})"))
+        .unwrap_or_default();
+    let read = if place.pro_reads {
+        "InnerWarden Pro reads them there"
+    } else {
+        "InnerWarden Pro does not read them there"
+    };
+    Finding::Working(format!(
+        "Decisions are recorded in {}{given}; {read}.",
+        place.dir
+    ))
 }
 
 /// The shared record directory this account may not write, and the folder
@@ -682,6 +747,12 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     }
     if let Some(own_dir) = facts.kept_apart_before.as_deref() {
         out.push(kept_apart_before_finding(own_dir));
+    }
+    // Where the count below is read from, unless the line above already said.
+    if facts.record_kept_apart.is_none() {
+        if let Some(place) = facts.record_place.as_ref() {
+            out.push(record_place_finding(place));
+        }
     }
     // A demo call is named apart, never counted: it went through the hook,
     // but the agent did not send it.
@@ -1243,6 +1314,7 @@ mod tests {
             dashboard_reachable: Some(true),
             record_kept_apart: None,
             kept_apart_before: None,
+            record_place: None,
         }
     }
 
@@ -1312,6 +1384,72 @@ mod tests {
                 assert!(
                     next.starts_with("sudo usermod -aG innerwarden"),
                     "the command first: {next}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `status` says where decisions are recorded and whether InnerWarden Pro
+    /// reads them, before the count; an entry this account has and that was
+    /// not honoured is a fault with the Pro command that makes the folder.
+    ///
+    /// FAILS ON REVERT: drop the finding from `assess` and nothing says where
+    /// an agent account's decisions go or that the paid product misses them.
+    #[test]
+    fn status_says_where_decisions_go_and_whether_the_pro_reads_them() {
+        let mut facts = healthy();
+        facts.record_place = Some(RecordPlace {
+            dir: "/var/lib/innerwarden-agents/bot".into(),
+            account: Some("bot".into()),
+            account_problem: None,
+            pro_reads: true,
+        });
+        let findings = assess(&facts);
+        let at = findings
+            .iter()
+            .position(|f| f.to_string().contains("Decisions are recorded in"))
+            .expect("said");
+        let line = findings[at].to_string();
+        assert!(line.contains("/var/lib/innerwarden-agents/bot"), "{line}");
+        assert!(line.contains("(bot)"), "{line}");
+        assert!(line.contains("InnerWarden Pro reads them there"), "{line}");
+        let count = findings
+            .iter()
+            .position(|f| f.to_string().contains("screening decision(s) recorded"))
+            .expect("the count is still there");
+        assert!(at < count, "{findings:?}");
+
+        facts.record_place = Some(RecordPlace {
+            dir: "/home/op/.config/innerwarden".into(),
+            account: None,
+            account_problem: None,
+            pro_reads: false,
+        });
+        assert!(assess(&facts).iter().any(|f| f
+            .to_string()
+            .contains("InnerWarden Pro does not read them there")));
+
+        facts.record_place = Some(RecordPlace {
+            dir: "/var/lib/innerwarden/guard".into(),
+            account: Some("bot".into()),
+            account_problem: Some("account_directory_not_its_own"),
+            pro_reads: false,
+        });
+        match assess(&facts)
+            .into_iter()
+            .find(|f| f.to_string().contains("has an entry for bot"))
+            .expect("said")
+        {
+            Finding::NotWorking { what, next } => {
+                assert!(
+                    what.contains("/var/lib/innerwarden-agents/bot is missing"),
+                    "{what}"
+                );
+                assert!(what.contains("does not read"), "{what}");
+                assert!(
+                    next.starts_with("sudo innerwarden-ctl agent-user add bot"),
+                    "{next}"
                 );
             }
             other => panic!("{other:?}"),
@@ -1556,6 +1694,7 @@ mod tests {
             dashboard_reachable: None,
             record_kept_apart: None,
             kept_apart_before: None,
+            record_place: None,
         };
         for finding in assess(&facts) {
             assert!(
