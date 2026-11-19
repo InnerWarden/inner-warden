@@ -608,8 +608,6 @@ mod tests {
         }
     }
 
-    const NONCE: &str = "0123456789abcdef0123456789abcdef";
-
     /// The marker counts only at the top of the payload, where an agent
     /// cannot write, and only when it holds the nonce the hook was handed.
     /// A command that names it, or a payload with `true` there, is an
@@ -620,28 +618,29 @@ mod tests {
     /// record.
     #[test]
     fn only_a_top_level_marker_with_this_runs_nonce_makes_a_demo_call() {
+        // Made the way a run makes its own, so no nonce is written down here.
+        let nonce = crate::demo_io::new_nonce();
+        let other_run = crate::demo_io::new_nonce();
+        assert_ne!(nonce, other_run);
         let home = Path::new("/home/someone");
         let call = &calls(home)[0];
-        let marked = hook_payload(call, home, 0, NONCE);
-        assert!(is_demo_payload(&marked, Some(NONCE)));
+        let marked = hook_payload(call, home, 0, &nonce);
+        assert!(is_demo_payload(&marked, Some(&nonce)));
         assert!(!is_demo_payload(&marked, None), "no nonce in the env");
-        assert!(!is_demo_payload(
-            &marked,
-            Some("ffffffffffffffffffffffffffffffff")
-        ));
+        assert!(!is_demo_payload(&marked, Some(&other_run)), "another run");
         let agent_call = json!({
             "session_id": "s",
             "tool_name": "Bash",
-            "tool_input": { "command": "echo '{\"innerwarden_demo\": true}'", "innerwarden_demo": NONCE },
+            "tool_input": { "command": "echo '{\"innerwarden_demo\": true}'", "innerwarden_demo": nonce },
         })
         .to_string();
-        assert!(!is_demo_payload(&agent_call, Some(NONCE)));
+        assert!(!is_demo_payload(&agent_call, Some(&nonce)));
         let plain_true = json!({ "tool_name": "Bash", "innerwarden_demo": true }).to_string();
-        assert!(!is_demo_payload(&plain_true, Some(NONCE)));
+        assert!(!is_demo_payload(&plain_true, Some(&nonce)));
         assert!(!is_demo_payload(&plain_true, None));
         // A short value in the env is no nonce the demo made.
         assert!(!is_demo_payload(r#"{"innerwarden_demo": "x"}"#, Some("x")));
-        assert!(!is_demo_payload("not json innerwarden_demo", Some(NONCE)));
+        assert!(!is_demo_payload("not json innerwarden_demo", Some(&nonce)));
     }
 
     /// The four calls the card names, aimed at this home.

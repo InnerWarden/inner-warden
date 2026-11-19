@@ -24,7 +24,7 @@ const HOOK_WAIT: Duration = Duration::from_secs(20);
 /// A fresh nonce for this run: 128 bits from two independently, randomly
 /// keyed std hashers (the OS seeds each `RandomState`), mixed with the
 /// clock and the pid, as 32 hex digits.
-fn new_nonce() -> String {
+pub(crate) fn new_nonce() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     let salt = std::time::SystemTime::now()
