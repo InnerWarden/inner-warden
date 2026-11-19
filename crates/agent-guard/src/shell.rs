@@ -5953,11 +5953,13 @@ fn is_downloader(name: &str) -> bool {
     matches!(name, "curl" | "wget" | "fetch" | "aria2c")
 }
 
-/// Whether a download is piped into a shell running a script file
-/// (`curl -s URL | bash ./scripts/x.sh`): the script reads what was
-/// fetched on its input, and may run it as code (`source /dev/stdin`,
-/// `eval "$(cat)"`), which the guard cannot see from the line. A `-c`
-/// line or a shell reading its program from the input is judged elsewhere.
+/// Whether a download is fed to a shell running a script file, through a
+/// pipe (`curl -s URL | bash ./scripts/x.sh`) or a redirect (`bash ./x.sh <
+/// <(curl -s URL)`, `bash ./x.sh <<< "$(curl -s URL)"`): the script reads
+/// what was fetched on its input, and may run it as code (`source
+/// /dev/stdin`, `eval "$(cat)"`), which the guard cannot see from the line.
+/// A `-c` line or a shell reading its program from the input is judged
+/// elsewhere.
 pub(crate) fn download_feeds_a_shell_script(source: &str) -> bool {
     let Some((tree, _doubt)) = parse_line(source) else {
         return false;
@@ -5965,7 +5967,7 @@ pub(crate) fn download_feeds_a_shell_script(source: &str) -> bool {
     let bytes = source.as_bytes();
     let mut pipelines = Vec::new();
     collect_nodes_of_kind(tree.root_node(), "pipeline", &mut pipelines, 0);
-    pipelines.into_iter().any(|pipeline| {
+    let piped = pipelines.into_iter().any(|pipeline| {
         if node_is_in_literal_unreachable_branch(pipeline, bytes) {
             return false;
         }
@@ -5984,27 +5986,85 @@ pub(crate) fn download_feeds_a_shell_script(source: &str) -> bool {
                 fetched = true;
                 return false;
             }
-            fetched && is_shell_name(&normalized_command_name(&effective[0])) && {
-                let args: Vec<String> = effective[1..]
-                    .iter()
-                    .map(|argument| shell_literal_word(argument))
-                    .collect();
-                // The first operand is the script: `bash ./x.sh`.
-                match shell_code_input(&args) {
-                    CodeInput::Argument(script) => {
-                        !args.iter().any(|argument| {
-                            argument == "-c"
-                                || argument == "--command"
-                                || argument.strip_prefix('-').is_some_and(|flags| {
-                                    !flags.starts_with('-') && flags.contains('c')
-                                })
-                        }) && !script.is_empty()
-                    }
-                    _ => false,
-                }
+            fetched && runs_a_shell_script(effective)
+        })
+    });
+    if piped {
+        return true;
+    }
+    // A redirect is a child of the command (`<<<`) or of the statement
+    // around it (`< <(..)`).
+    let mut commands = Vec::new();
+    collect_all_commands(tree.root_node(), &mut commands, 0);
+    commands.into_iter().any(|command| {
+        if node_is_in_literal_unreachable_branch(command, bytes) {
+            return false;
+        }
+        let runs_a_script = command_words(command, bytes)
+            .as_deref()
+            .and_then(|words| effective_command_words(words, 0))
+            .is_some_and(runs_a_shell_script);
+        if !runs_a_script {
+            return false;
+        }
+        let mut redirects = Vec::new();
+        let mut cursor = command.walk();
+        redirects.extend(command.named_children(&mut cursor));
+        if let Some(statement) = command
+            .parent()
+            .filter(|parent| parent.kind() == "redirected_statement")
+        {
+            let mut cursor = statement.walk();
+            redirects.extend(statement.named_children(&mut cursor));
+        }
+        redirects.into_iter().any(|redirect| {
+            if !matches!(redirect.kind(), "file_redirect" | "herestring_redirect") {
+                return false;
             }
+            // Input only: `< <(curl ..)`, `0< <(curl ..)`, `<<< "$(curl ..)"`.
+            let text = node_text(redirect, bytes);
+            let operator = text.trim_start_matches(|c: char| c.is_ascii_digit());
+            if !operator.starts_with('<')
+                || operator.starts_with("<>")
+                || operator.starts_with("<&")
+            {
+                return false;
+            }
+            let mut inner = Vec::new();
+            collect_all_commands(redirect, &mut inner, 0);
+            inner.into_iter().any(|fetch| {
+                command_words(fetch, bytes)
+                    .as_deref()
+                    .and_then(|words| effective_command_words(words, 0))
+                    .is_some_and(produces_downloaded_bytes)
+            })
         })
     })
+}
+
+/// Whether the words run a shell on a script file (`bash ./x.sh`), not on a
+/// `-c` line or on its input.
+fn runs_a_shell_script(effective: &[String]) -> bool {
+    if !is_shell_name(&normalized_command_name(&effective[0])) {
+        return false;
+    }
+    let args: Vec<String> = effective[1..]
+        .iter()
+        .map(|argument| shell_literal_word(argument))
+        .collect();
+    // The first operand is the script: `bash ./x.sh`.
+    match shell_code_input(&args) {
+        CodeInput::Argument(script) => {
+            !args.iter().any(|argument| {
+                argument == "-c"
+                    || argument == "--command"
+                    || argument
+                        .strip_prefix('-')
+                        .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
+            }) && !script.is_empty()
+        }
+        _ => false,
+    }
 }
 
 /// World-writable directories a path the line knows may sit in.
@@ -6115,16 +6175,19 @@ pub(crate) fn line_with_known_paths(source: &str) -> Option<String> {
 /// though the line never says `.claude` where it writes. `None` when the
 /// line makes no link or uses none after it.
 pub(crate) fn line_through_links(source: &str) -> Option<String> {
-    if !source.contains("ln") {
+    if !["ln", "link", "cp"]
+        .iter()
+        .any(|name| source.contains(name))
+    {
         return None;
     }
     let (tree, _doubt) = parse_line(source)?;
     let bytes = source.as_bytes();
     let mut commands = Vec::new();
     collect_all_commands(tree.root_node(), &mut commands, 0);
-    commands.sort_by_key(|command| command.start_byte());
-    let mut text = source.to_owned();
-    let mut changed = false;
+    // Each link the line makes, at the byte of the original line where the
+    // command making it ends.
+    let mut links: Vec<(usize, LineLink)> = Vec::new();
     for command in commands {
         let Some(words) = command_words(command, bytes) else {
             continue;
@@ -6132,80 +6195,152 @@ pub(crate) fn line_through_links(source: &str) -> Option<String> {
         let Some(effective) = effective_command_words(&words, 0) else {
             continue;
         };
-        if normalized_command_name(&effective[0]) != "ln" {
-            continue;
+        if let Some(link) = link_made_by(effective) {
+            links.push((command.end_byte(), link));
         }
-        let mut symbolic = false;
-        let mut operands = Vec::new();
-        for word in &effective[1..] {
-            let literal = shell_literal_word(word);
-            if literal == "--symbolic" {
-                symbolic = true;
-            } else if let Some(flags) = literal.strip_prefix('-').filter(|f| !f.starts_with('-')) {
-                symbolic |= flags.contains('s');
-            } else if !literal.starts_with("--") {
-                operands.push(word.clone());
+    }
+    if links.is_empty() {
+        return None;
+    }
+    links.sort_by_key(|(at, _)| *at);
+    // Built from the original line, cut only at the ends the parser gave
+    // (always character boundaries): each stretch after a link is read with
+    // every link made before it, the latest first, so a link whose target
+    // names an earlier link reaches the earlier target too.
+    let mut out = String::with_capacity(source.len());
+    out.push_str(&source[..links[0].0]);
+    let mut changed = false;
+    for (index, (start, _)) in links.iter().enumerate() {
+        let end = links.get(index + 1).map_or(source.len(), |(next, _)| *next);
+        let mut stretch = source[*start..end].to_owned();
+        for (_, link) in links[..=index].iter().rev() {
+            if let Some(replaced) = link.follow(&stretch) {
+                stretch = replaced;
+                changed = true;
             }
         }
-        let [target, link] = operands.as_slice() else {
-            continue;
-        };
-        if !symbolic {
-            continue;
+        out.push_str(&stretch);
+    }
+    changed.then_some(out)
+}
+
+/// A link a command on the line makes: the name the line uses for it and
+/// the path it reaches. An empty `target` is the root.
+struct LineLink {
+    name: LinkName,
+    target: String,
+}
+
+enum LinkName {
+    Variable(String),
+    Path(String),
+}
+
+/// The link `ln [-s] TARGET LINK`, `link TARGET LINK`, `cp -s TARGET LINK`
+/// or `cp -l TARGET LINK` makes. A hard link reaches the same file a
+/// symbolic one does: a write through either changes the target.
+fn link_made_by(effective: &[String]) -> Option<LineLink> {
+    let command = normalized_command_name(&effective[0]);
+    let mut makes_link = matches!(command.as_str(), "ln" | "link");
+    if !makes_link && command != "cp" {
+        return None;
+    }
+    let mut operands = Vec::new();
+    for word in &effective[1..] {
+        let literal = shell_literal_word(word);
+        if literal == "--symbolic-link" || literal == "--link" {
+            makes_link = true;
+        } else if literal == "--target-directory" || literal.starts_with("--target-directory=") {
+            // The directory form names no link on the line.
+            return None;
+        } else if literal.starts_with("--") {
+        } else if let Some(flags) = literal.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            if command == "cp" && flags.contains(['s', 'l']) {
+                makes_link = true;
+            }
+            if flags.contains('t') {
+                return None;
+            }
+        } else {
+            operands.push(word.clone());
         }
-        let target = shell_literal_word(target);
-        let target = match target.strip_prefix('~') {
-            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("$HOME{rest}"),
-            _ => target,
-        };
-        let target = target.trim_end_matches('/').to_owned();
-        if target.is_empty() {
-            continue;
+    }
+    let [target, link] = operands.as_slice() else {
+        return None;
+    };
+    if !makes_link {
+        return None;
+    }
+    let target = shell_literal_word(target);
+    if target.is_empty() {
+        return None;
+    }
+    let target = match target.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("$HOME{rest}"),
+        _ => target,
+    };
+    // `ln -s / "$H"` makes a link to the root: kept as the empty path, so
+    // `"$H/"` reads `/`.
+    let target = target.trim_end_matches('/').to_owned();
+    let link = link.trim();
+    let unquoted = link
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(link);
+    let name = match shell_variable_name(unquoted) {
+        Some(variable) => LinkName::Variable(variable.to_owned()),
+        None => {
+            let literal = shell_literal_word(link);
+            let literal = literal.trim_end_matches('/');
+            if literal.is_empty() || literal.contains('$') {
+                return None;
+            }
+            LinkName::Path(literal.to_owned())
         }
-        let link = link.trim();
-        let unquoted = link
-            .strip_prefix('"')
-            .and_then(|inner| inner.strip_suffix('"'))
-            .unwrap_or(link);
-        let after = command.end_byte().min(text.len());
-        let (head, tail) = text.split_at(after);
-        let replaced = match shell_variable_name(unquoted) {
-            Some(name) => {
+    };
+    Some(LineLink { name, target })
+}
+
+impl LineLink {
+    /// `text` with each use of the link written as its target; `None` when
+    /// it uses none.
+    fn follow(&self, text: &str) -> Option<String> {
+        let root = self.target.is_empty();
+        let replaced = match &self.name {
+            LinkName::Variable(name) => {
+                // For the root, a slash after the name is the root's own.
                 let pattern = format!(
-                    r"\$(?:\{{{}\}}|{}\b)",
-                    regex::escape(name),
-                    regex::escape(name)
+                    r"\$(?:\{{{name}\}}|{name}\b){slash}",
+                    name = regex::escape(name),
+                    slash = if root { "/?" } else { "" }
                 );
-                let Ok(pattern) = regex::Regex::new(&pattern) else {
-                    continue;
-                };
+                let pattern = regex::Regex::new(&pattern).ok()?;
+                let target = if root { "/" } else { self.target.as_str() };
                 pattern
-                    .replace_all(tail, regex::NoExpand(&target))
+                    .replace_all(text, regex::NoExpand(target))
                     .into_owned()
             }
-            None => {
-                let literal = shell_literal_word(link);
-                let literal = literal.trim_end_matches('/');
-                if literal.is_empty() || literal.contains('$') {
-                    continue;
-                }
-                let pattern = format!(r#"{}(/|["'\s;&|)]|$)"#, regex::escape(literal));
-                let Ok(pattern) = regex::Regex::new(&pattern) else {
-                    continue;
-                };
+            LinkName::Path(literal) => {
+                let pattern = format!(
+                    r#"(^|[\s"'=;&|(<>]){}(/|["'\s;&|)]|$)"#,
+                    regex::escape(literal)
+                );
+                let pattern = regex::Regex::new(&pattern).ok()?;
                 pattern
-                    .replace_all(tail, |found: &regex::Captures<'_>| {
-                        format!("{target}{}", &found[1])
+                    .replace_all(text, |found: &regex::Captures<'_>| {
+                        let after = &found[2];
+                        let path = match (root, after) {
+                            (true, "/") => "/".to_owned(),
+                            (true, _) => format!("/{after}"),
+                            (false, _) => format!("{}{after}", self.target),
+                        };
+                        format!("{}{path}", &found[1])
                     })
                     .into_owned()
             }
         };
-        if replaced != tail {
-            text = format!("{head}{replaced}");
-            changed = true;
-        }
+        (replaced != text).then_some(replaced)
     }
-    changed.then_some(text)
 }
 
 fn is_stdin_code_executor(name: &str) -> bool {
@@ -13980,3 +14115,33 @@ mod mutant_kills_sh4;
 #[cfg(test)]
 #[path = "mutant_kills/shell_sh5.rs"]
 mod mutant_kills_sh5;
+
+#[cfg(test)]
+mod line_through_links_offsets {
+    use super::line_through_links;
+
+    /// The first link grows the line; the cut for the second must still fall
+    /// on its own end, never inside a character.
+    #[test]
+    fn a_grown_line_is_cut_where_each_link_ends() {
+        for pad in 0..8 {
+            let line = format!(
+                "ln -s ~/.claude \"$H\"; echo \"$H\"; ln -s ~/.ssh /tmp/k{}; echo é",
+                "é".repeat(pad)
+            );
+            let followed = std::panic::catch_unwind(|| line_through_links(&line))
+                .unwrap_or_else(|_| panic!("panicked on {line}"));
+            let followed = followed.unwrap_or_default();
+            assert!(followed.contains("echo \"$HOME/.claude\""), "{followed}");
+        }
+        let followed = line_through_links(
+            "ln -s ~/.claude \"$H\"; echo \"$H\"; ln -s ~/.ssh \"$K\"; echo é > \"$K/authorized_keys\"",
+        )
+        .unwrap_or_default();
+        assert!(
+            followed.ends_with("echo é > \"$HOME/.ssh/authorized_keys\""),
+            "{followed}"
+        );
+        assert!(followed.contains("ln -s ~/.ssh \"$K\""), "{followed}");
+    }
+}

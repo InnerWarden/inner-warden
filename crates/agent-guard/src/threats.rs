@@ -10438,13 +10438,6 @@ pub fn destructive_rm_root(hay: &str) -> bool {
         .any(segment_is_root_wipe)
 }
 
-/// Recursive, forced `rm` of a home directory itself or all of its contents:
-/// `~`, `~/*`, `~user`, `$HOME`, `${HOME}`, `"$HOME"`, `$HOME/*`, `/root`,
-/// `/home/<user>`, `/Users/<user>`. Correlated to one `rm` per segment and
-/// substitution body, exactly as [`destructive_rm_root`] is.
-///
-/// Only the home itself: `rm -rf ~/.cache/build`, `rm -rf "$HOME/.cache/x"`
-/// and `rm -rf /home/u/proj/build` are scoped cleanups and never match.
 /// Whether interpreter code given inline (`python3 -c`, `node -e`, `ruby
 /// -e`, `perl -e`, and a here-document read as such) removes a home or a
 /// root / system directory: `shutil.rmtree('/home/u')`, `os.removedirs`,
@@ -10457,6 +10450,7 @@ pub fn destructive_rm_root(hay: &str) -> bool {
 pub(crate) fn interpreter_code_removes_home_or_root(content: &str) -> bool {
     static CODE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static REMOVAL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RM_LIST: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let code = CODE.get_or_init(|| {
         regex::Regex::new(
             r"(?is)\b(?:python[\d.]*|node|nodejs|bun|deno|ruby|perl)\b.{0,200}?\s-[a-z]*[ce]\b",
@@ -10473,21 +10467,20 @@ pub(crate) fn interpreter_code_removes_home_or_root(content: &str) -> bool {
     let removal = REMOVAL.get_or_init(|| {
         let argument = format!(r#"(?:\\?'([^'\\]*)\\?'|\\?"([^"\\]*)\\?"|({home}))"#);
         regex::Regex::new(&format!(
-            r#"(?:\b(?:shutil\.rmtree|os\.removedirs|os\.rmdir|rmtree|remove_tree|FileUtils\.(?:rm_rf|rm_r|rmtree|remove_dir|remove_entry(?:_secure)?)|fs\.(?:rm|rmdir)|fs\.promises\.(?:rm|rmdir)|fsPromises\.(?:rm|rmdir))\s*\(\s*{argument}|\.(?:rmSync|rmdirSync)\s*\(\s*{argument}|\b(?:pathlib\.)?Path\s*\(\s*{argument}\s*\)\s*\.\s*rmdir\s*\(|(?P<homepath>(?:pathlib\.)?Path\.home\(\s*\))\s*\.\s*rmdir\s*\()"#
+            r#"(?:\b(?:shutil\.rmtree|os\.removedirs|os\.rmdir|rmtree|remove_tree|FileUtils\.(?:rm_rf|rm_r|rmtree|remove_dir|remove_entry(?:_secure)?)|fs\.(?:rm|rmdir)|fs\.promises\.(?:rm|rmdir)|fsPromises\.(?:rm|rmdir))\s*\(\s*{argument}\s*[,)]|\.(?:rmSync|rmdirSync)\s*\(\s*{argument}\s*[,)]|\b(?:pathlib\.)?Path\s*\(\s*{argument}\s*\)\s*\.\s*rmdir\s*\(|(?P<homepath>(?:pathlib\.)?Path\.home\(\s*\))\s*\.\s*rmdir\s*\()"#
         ))
         .expect("static interpreter removal regex")
     });
-    removal.captures_iter(content).any(|found| {
-        if found.name("homepath").is_some() {
-            return true;
-        }
-        let Some(path) = (1..found.len())
-            .filter_map(|group| found.get(group))
-            .map(|path| path.as_str())
-            .find(|path| !path.is_empty())
-        else {
-            return false;
-        };
+    // `subprocess.run(['rm', '-rf', '/home/u'])`, `system('rm', '-rf', '/')`, `spawnSync('rm', ['-rf', os.homedir()])`:
+    // an rm with a recursive flag handed its words one by one.
+    let rm_list = RM_LIST.get_or_init(|| {
+        let argument = format!(r#"(?:\\?'([^'\\]*)\\?'|\\?"([^"\\]*)\\?"|({home}))"#);
+        regex::Regex::new(&format!(
+            r#"\\?['"]rm\\?['"]\s*,\s*\[?\s*((?:\\?['"]-[A-Za-z-]*\\?['"]\s*,\s*)+){argument}\s*[,\])]"#
+        ))
+        .expect("static interpreter rm list regex")
+    });
+    let removes = |path: &str| {
         // The home by name, not a path written out.
         if !path.starts_with(['/', '~', '$', '.']) && path.contains(['(', '[', '{', '.']) {
             return true;
@@ -10497,9 +10490,33 @@ pub(crate) fn interpreter_code_removes_home_or_root(content: &str) -> bool {
         }
         let line = format!("rm -rf {}", path.to_ascii_lowercase());
         destructive_rm_home(&line) || destructive_rm_root(&line)
+    };
+    let first_path = |found: &regex::Captures<'_>, from: usize| {
+        (from..found.len())
+            .filter_map(|group| found.get(group))
+            .map(|path| path.as_str().to_owned())
+            .find(|path| !path.is_empty())
+    };
+    removal.captures_iter(content).any(|found| {
+        found.name("homepath").is_some() || first_path(&found, 1).is_some_and(|path| removes(&path))
+    }) || rm_list.captures_iter(content).any(|found| {
+        let flags = &found[1];
+        let recursive = flags.contains("--recursive")
+            || flags
+                .split(',')
+                .map(|flag| flag.trim().trim_matches(['\\', '\'', '"']))
+                .any(|flag| !flag.starts_with("--") && flag.contains(['r', 'R']));
+        recursive && first_path(&found, 2).is_some_and(|path| removes(&path))
     })
 }
 
+/// Recursive, forced `rm` of a home directory itself or all of its contents:
+/// `~`, `~/*`, `~user`, `$HOME`, `${HOME}`, `"$HOME"`, `$HOME/*`, `/root`,
+/// `/home/<user>`, `/Users/<user>`. Correlated to one `rm` per segment and
+/// substitution body, exactly as [`destructive_rm_root`] is.
+///
+/// Only the home itself: `rm -rf ~/.cache/build`, `rm -rf "$HOME/.cache/x"`
+/// and `rm -rf /home/u/proj/build` are scoped cleanups and never match.
 pub fn destructive_rm_home(hay: &str) -> bool {
     shell_command_segments(hay)
         .into_iter()
