@@ -3,6 +3,215 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## 1.6.14 - 2026-11-19
+
+The guard reads more of what a line hands a shell, and more of the files an
+agent could write itself a way back in through. A command inside `sh -c` is
+judged by every rule, as if typed; every shell write of the login, sudo,
+account, scheduled-job and stored-credential files is refused; and the MCP
+proxy reads what a tool call hands a shell on its input. An enforcing Claude
+Code hook now refuses when its program is gone, and `innerwarden demo` sends
+known risky calls through each connected agent's own guard path and shows what
+was refused. The guard still reads the text of a command, and what it does not
+see is written down: [Where this ends](docs/features.md#where-this-ends).
+
+### Security
+
+- **A command handed to a shell is judged by every rule.** A destructive
+  command inside `sh -c`, `bash -c` or another shell was judged only by the
+  download rules; it now gets the verdict the same command typed directly
+  gets. The value a `-c` variable may hold is read in the order the shell runs
+  it, every value it may hold is judged, and one set at run time (by `read`,
+  `printf -v` or `mapfile`, under `||`, in a subshell, a function, a `trap`
+  or a loop) is held for review. Aliases are read as written and as resolved,
+  so `alias rm=true; rm -rf /` stays refused; a function call runs its body
+  with the call's arguments; `command` and `builtin` forms, `coproc` groups,
+  namerefs (a write through `declare -n` is a write to its target), `wait -p`
+  and `getopts` names are read as bash reads them; and the code option of
+  programs that take code (`gdb`, `osascript`, `psql`, `pwsh` and their kin)
+  is read as code.
+- **Every shell write of the login, sudo, account, scheduled-job and
+  stored-credential files is refused.** `authorized_keys`, the sudo rules, the
+  account files, crontabs and stored cloud or registry credentials are refused
+  in every shell form (a redirection, `tee`, `sed -i`, `cp`, `mv`, `ln`,
+  `install`, `dd`, `truncate`, through a variable or a link the line made), as
+  the direct form already was, and so is inline interpreter code that writes
+  `authorized_keys` or the sudo rules. Every shell write of the SSH client
+  configuration is refused. Reading these files is unchanged, and files that
+  only share the name elsewhere are not matched.
+- **A startup file replaced from content the guard cannot see is held for
+  review.** Replacing or appending to a shell startup file, or creating a user
+  service or login item, from a copy, a link, a fetched variable or a
+  here-document with a substitution in it is held for review; content the
+  line shows is judged as before. A copy from the account or cron files is
+  read as a read of them.
+- **Inline interpreter code that wipes a home or writes an agent's settings
+  is refused.** Python, Node, Ruby, Perl, PHP or Lua code, in a here-document
+  or with `-c`, that writes, truncates, removes, moves or links an agent's
+  settings is refused, and so is inline code that removes a whole home or the
+  root. A scoped cleanup under the home stays allowed.
+- **A write through a link the line made reaches its target.** A write or a
+  removal through a symbolic link, a hard link or a `cp -s` or `cp -l` copy
+  the same line made is judged against what it leads to.
+- **Fetched payloads are read in more of the forms that run them.** A download
+  run through arithmetic or a subscript, a brace-expanded command word,
+  `time`, `stdbuf` or `nice` with glued values, `go run`, `go generate` or
+  `go test` of fetched source, or used as a program name gets the verdict of
+  its direct form. A download fed to a local shell script (a pipe, a process
+  substitution or a here-string) is held for review.
+- **A key is followed through the names a line builds for it.** A private key
+  name built from the public key's name (parameter operators, `basename`,
+  `dirname`, `sed`, `cut`, or a substitution that cannot be worked out on a
+  variable under `~/.ssh`) is read as the private key. A recursive search of
+  the home or a broad root for the start of a credential (cloud and token
+  prefixes, private key headers), also through `find -exec grep` and `rg`, is
+  refused. `.npmrc`, `.pypirc` and Docker and cloud CLI settings are judged
+  by the project, as `.env` is.
+- **The container runtime is refused however it is reached.** The rule on a
+  container that hands an agent the host now covers the per-user runtime
+  sockets (rootless Docker, Podman, colima, Lima, OrbStack, Rancher Desktop)
+  and the other clients that reach one (`curl --unix-socket`, `socat`,
+  `nc -U`, `DOCKER_HOST`, `docker -H`, `podman --url`, `ctr`, `nerdctl`,
+  `crictl`). Ordinary container work (`docker ps`, `run`, `build`,
+  `compose`) is unchanged.
+- **A removal is judged by the root a search hands it.** `find` with `-exec`,
+  `-execdir` or `-ok` handing what it finds to `rm`, `shred`, `unlink`,
+  `truncate`, `dd` or to a shell whose `-c` line removes it is judged as a
+  removal of the folder `find` starts from: the home, `~/.ssh`, the root,
+  system folders and the guard's places are refused, a project cleanup is
+  not. `xargs` feeding a recursive removal from a listing of a protected
+  place is refused, and from input the guard cannot read is held for review.
+  `/Users` is a system folder, as `/home` is.
+- **Killing every process, or init, is refused,** and so is `systemctl` with a
+  power target or `-H`.
+- **A rewrite of InnerWarden Pro's kernel maps is refused.** A `bpftool` write
+  to the guard's maps named by path or by name is refused; one named by a
+  numeric id is held for review.
+- **The MCP proxy reads what a tool call hands a shell.** A command handed to a
+  shell on its input and a `bash -c` line inside a call's arguments are judged
+  as command lines. Input to a shell past 64 KiB is judged within that cap and
+  the call is held for review. Orders aimed at the model inside a tool result
+  are flagged, and an override order followed by an action is held however it
+  is quoted or fenced. A tool result cut at the cap raises a partial-read
+  alert.
+- **An enforcing Claude Code hook refuses when its program cannot run.** On
+  macOS and Linux, a hook in enforce or `--block-review` ends in a short shell
+  tail, so a hook whose program is gone or dies refuses the call instead of
+  letting it through. Monitor never refuses, and Windows gets no tail.
+- **The hook reads at most 1 MiB of a tool call,** the same cap as OpenClaw's
+  path. A longer call is not read and never let through quietly: it is
+  refused in enforce, and said to have gone unscreened in monitor.
+- **The AI Jail keeps exported credentials out of the jailed command's
+  environment.** `innerwarden contain` takes out the variables whose name
+  says they hold a credential (`OPENAI_API_KEY`, `AWS_SECRET_ACCESS_KEY`,
+  `GITHUB_TOKEN` and other names ending in `_API_KEY`, `_TOKEN`, `_SECRET`,
+  `_PASSWORD` and the like), on Linux with or without `--identity` and on
+  macOS, and names the ones it took out. `--pass-env NAME` hands one in, for
+  an agent that needs its own key. It goes by the name: a secret under any
+  other name (a `DATABASE_URL` that holds a password) still reaches the jail.
+
+### Added
+
+- **`innerwarden demo`.** Sends a few known risky calls (a download piped to a
+  shell, a read of an SSH key, a write of agent settings, a home wipe inside
+  `bash -c`, an MCP call) through the guard path each connected agent really
+  uses, and shows what was refused. Nothing is run. Each demo call is recorded
+  and marked as a demo; only its alert and second opinion are skipped.
+- **`innerwarden upgrade` rewires the hooks with the new binary,** keeping the
+  mode of every hook half, and the first hook run of a new version rewires
+  once, so an upgrade brings the wiring of the version it installs. A rewire
+  never points a hook at a `cargo` build or at a binary other than the
+  installed one, and one that fails says the step to take by hand.
+- **The record keeps a refused or reviewed command whole,** up to 8192
+  characters with a mark where it is cut, beside its short label. Masking now
+  also covers passwords in URLs, `--password` and `--token` followed by a
+  space, the `-p` of `mysql` and `sshpass`, `-u user:password` for `curl` and
+  `wget`, and Basic authorization headers.
+- **An agent account the shared record refuses keeps its decisions in its own
+  home.** Where InnerWarden Pro's shared record is installed and the agent
+  runs as a Linux account outside its group, its decisions go to a private
+  record in that account's home instead of being lost, and `innerwarden
+  status` says so: Pro does not see them, and the account can edit them.
+- **`innerwarden status` judges every hook line.** Every InnerWarden hook is
+  judged, per event and matcher: a file-tool, read-tool or result hook whose
+  program is gone beside a Bash hook that runs is reported off, with the tools
+  it leaves unscreened, and the dashboard says the same. A hook line written
+  by hand is reported with the line, a bare program name found on this PATH
+  (a hook's or an MCP proxy wrapper's) is "could not tell", and "an agent is
+  running" comes from the process scan.
+- **A timeout on the Claude Code hook line.** `innerwarden install` and
+  `agents connect` write a 50 second `timeout` on each InnerWarden hook line,
+  above the 45 seconds the hook takes at most with a second opinion; without
+  one Claude Code waits 600 seconds for a hook. An operator's own `timeout`
+  is kept, background setup writes none, and `innerwarden status` says how
+  long Claude Code waits for the hook.
+
+### Fixed
+
+- **Everyday developer lines are no longer refused.** `grep` with `eval` as a
+  quoted pattern; `python3 -c` that imports `os`; a settings fixture written
+  under a throwaway `HOME` the same line made. A recursive read of the whole
+  home is held for review instead of refused; a hunt for a credential prefix
+  or a key marker in it is still refused.
+- **The guard's name in a path is no longer refused.** `cd ~/innerwarden/x`,
+  and removing a scratch file that shares a name with one of the guard's, now
+  run: the guard's own files are held by their real places (its config and
+  data folders, the installed binary, the hook in agent settings), and a
+  disable verb and its target must be in the same command. Removing the
+  guard's folders through `find` from a folder above them is still refused.
+- **`curl -K` is no longer read as `curl -k`.** An options file the guard does
+  not read is held for review with that reason; one it reads without
+  `insecure` is allowed. A search pattern that only feeds later data stages
+  is read as data, and the line `xargs` builds from literal words is judged.
+- **A key used to authenticate inside a shell line gets the verdict of the
+  direct line** (`ssh -i`, `scp -i`, `sftp -i`, `rsync -e 'ssh -i'`,
+  `ssh-add`), in `sh -c` and in an MCP tool call. Copying or showing a key
+  stays refused, and options that read commands or settings from a file are
+  never read as key use.
+- **A tool result that only quotes an order to the model passes;** it was
+  withheld.
+- **A busy machine no longer runs the hook out of time.** The hook's ten
+  seconds count the screening, not time spent waiting for a CPU while other
+  work runs (on Linux, read from the kernel), under a limit of 25 seconds on
+  the clock. `INNERWARDEN_HOOK_DEADLINE_MS` still only lowers it.
+- **The shared record's access check opens nothing.** It asks the kernel
+  whether the account may use the record and its event log instead of
+  opening them, so InnerWarden Pro's watcher no longer sees an open on every
+  screened call.
+- **`serve`, `graph`, `status` and `llm` refuse a flag they do not know**
+  instead of ignoring it, and `innerwarden check` reading from a terminal says
+  how to give it the command.
+
+### What this costs
+
+Some ordinary lines are refused or held under an enforcing hook, and the
+refusal says why. A `-c` variable set at run time is held for review, and a
+line with more than 64 function calls is refused. Editing `authorized_keys`,
+the sudo rules, a crontab or a stored credential from the agent's shell is
+refused in every form; those are yours to run. A startup file replaced from a
+copy, a runtime client pointed at a socket the line does not set, `curl -K`
+with an options file the guard does not read, a `bpftool` map write by
+numeric id, a download fed to a local script, a recursive removal fed by
+`xargs` from input the guard cannot read and a shell tool call with more than
+64 KiB of input are held for review. A recursive search of the home for
+the start of a credential is refused also when it looks for ordinary text
+that starts the same way. `.npmrc`, `.pypirc` and cloud CLI settings outside
+the project are judged as `.env` there is. A script that passes `serve`,
+`graph`, `status` or `llm` a flag they do not know now fails. An agent in
+the AI Jail that reads its key from the environment needs `--pass-env` with
+the key's name. A hook line connected by an earlier version has no `timeout`
+until it is connected again (`innerwarden status` says so). Going back to
+1.6.13 or older after this release needs an `innerwarden uninstall` with the
+newer binary first: the older one does not recognise the new hook line (see
+the README, Rolling back).
+
+The guard reads text, and its limits are listed in `docs/features.md`, under
+[The guard and its own switches](docs/features.md#the-guard-and-its-own-switches).
+The boundary there is the host: on Linux, InnerWarden Pro's Execution Gate,
+armed for an agent, decides in the kernel which programs that agent's
+processes may start, whatever the command line says. It is off until you arm
+it.
+
 ## 1.6.13 - 2026-11-16
 
 The guard reads more of what an agent starts. An agent that starts Claude

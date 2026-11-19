@@ -14,12 +14,21 @@ list, with every limit.
   than pretending to isolate. On Linux, where the host takes it, every jail
   starts its programs under a seccomp filter that refuses `TIOCSTI` and
   `TIOCLINUX`, the terminal commands that push input into your terminal, and
-  new btrfs or bcachefs subvolumes and snapshots.
+  new btrfs or bcachefs subvolumes and snapshots. Exported variables whose
+  name says they hold a credential (`OPENAI_API_KEY`, names ending in
+  `_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD` and the like) are taken out of
+  the jailed command's environment, and `--pass-env NAME` hands one in. It
+  goes by the name: a secret under another name still reaches the jail.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
   tell one agent's runs apart. See [Agent identity and trust](agent-identity.md).
 - Agent discovery: finds AI agents and agent tooling on the machine so you can
   see what is running and wire the guardrail into it.
+- `innerwarden demo`: sends a few known risky calls (a download piped to a
+  shell, a read of an SSH key, a write of agent settings, a home wipe inside
+  `bash -c`, an MCP call) through the guard path each connected agent really
+  uses, and shows what was refused. Nothing is run; each call is recorded and
+  marked as a demo.
 - Local dashboard: a read-only view on loopback at `http://127.0.0.1:8788`
   (`innerwarden dashboard`). It never leaves the machine. Port 8787 is a
   different surface: the local check-command contract served by `innerwarden
@@ -102,7 +111,8 @@ following, and says they are the person's to run, from their own terminal.
   (which rewrites the agent's hook). A read, help, a connect that keeps
   enforcing and `contain --dry-run` stay open.
 - The commands of InnerWarden Pro's tools that disarm one of its guards or
-  widen what it lets through.
+  widen what it lets through, and a `bpftool` write to Pro's kernel maps
+  named by path or by name (one named by a numeric id is held for review).
 - A write to what carries the guard: the agent settings that load its hook,
   the guard's configuration and the guard's program. That holds through a
   file tool and from the shell: a redirection, `tee`, `cp`, `mv`, `rm`, `ln`,
@@ -213,11 +223,36 @@ in the shapes above. It does not see:
 Text typed into a terminal or a REPL is read as a shell line, which is what
 it is only when a shell reads it.
 
+In the MCP proxy and in a line handed to a shell, the guard also does not see:
+
+- An order aimed at the model in a tool result when other words stand
+  between it and the action it asks for. An override order followed by an
+  action is held however it is quoted or fenced; one padded with filler
+  before the action can pass.
+- The input a shell tool call hands a shell past its first 64 KiB. The call
+  is held for review and the rest is not read.
+- What `xargs` or `find -exec` acts on, beyond what the line spells out. A
+  removal `find` hands its finds to is judged by the folder `find` starts
+  from, and a recursive removal fed by `xargs` is refused from a listing of a
+  protected place and held for review from input the guard cannot read; any
+  other command they run is judged from the literal words of the line, not
+  from the names a search finds when it runs.
+- A `-c` variable whose value is set at run time. Such a line is held for
+  review, not judged by the value it will hold.
+
 An agent's hook lets a call run unless the guard answers with a refusal. A
-guard that takes too long answers with one (ten seconds, thirty with a second
-opinion from a model configured, under an enforcing hook). A guard whose
-program is gone or cannot start answers nothing, and the
-call runs: that is why a write to the guard's program is refused above.
+guard that takes too long answers with one, under an enforcing hook: after
+ten seconds of screening (time spent waiting for a CPU is not counted on
+Linux) or 25 seconds on the clock, 20 more with a second opinion from a model
+configured. A tool call longer than 1 MiB is not read and is refused the same
+way. `innerwarden install` writes a 50 second `timeout` on the Claude Code
+hook line, so the guard's own refusal comes before Claude Code stops waiting;
+a call Claude Code stops waiting for runs. On macOS and Linux,
+an enforcing Claude Code hook line ends in a short shell tail, so a guard
+whose program is gone or dies refuses the call too. In monitor, on Windows,
+and for an agent whose hook line has no such tail, a guard that cannot start
+answers nothing and the call runs: that is why a write to the guard's program
+is refused above.
 
 Some ordinary lines are refused by the same rules, and the refusal says so: a
 program run from a variable on a line that also names the guard, an agent
