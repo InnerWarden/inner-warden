@@ -3082,7 +3082,8 @@ fn sole_literal_shell_code(command: &str) -> Option<&str> {
 /// `\UHHHHHHHH`, `\cX` and the letter escapes (`\n`, `\t`, `\e`, ...); an
 /// escape bash does not know keeps its backslash, as bash keeps it. `None`
 /// when the line holds no such word, or one that does not decode (a `\x`
-/// with no digit, a NUL, a code point that is no character): that word
+/// with no digit, a NUL, an escape that makes a character past ASCII):
+/// that word
 /// stays a line the guard cannot read.
 fn ansi_c_decoded(command: &str) -> Option<String> {
     if !command.contains("$'") {
@@ -3171,10 +3172,12 @@ fn ansi_c_word(chars: &[char], start: usize) -> Option<(String, usize)> {
             't' => '\t',
             'v' => '\u{b}',
             '\\' | '\'' | '"' | '?' => escape,
+            // A byte above 0x7f is no character on its own: bash writes the
+            // byte, and the word is not the text the guard would read.
             '0'..='7' => {
                 let (value, taken) = digits(at - 1, 3, 8);
                 at += taken - 1;
-                char::from_u32(value)?
+                char::from_u32(value).filter(char::is_ascii)?
             }
             'x' | 'u' | 'U' => {
                 let most = match escape {
@@ -3183,7 +3186,7 @@ fn ansi_c_word(chars: &[char], start: usize) -> Option<(String, usize)> {
                     _ => 8,
                 };
                 let (value, taken) = digits(at, most, 16);
-                if taken == 0 {
+                if taken == 0 || (escape == 'x' && value > 0x7f) {
                     return None;
                 }
                 at += taken;
@@ -3199,7 +3202,10 @@ fn ansi_c_word(chars: &[char], start: usize) -> Option<(String, usize)> {
                 other
             }
         };
-        if decoded == '\0' {
+        // A NUL ends the word in bash, and a character past ASCII written
+        // as an escape is read here as no text at all: either stays a line
+        // the guard cannot read, as it was before it was decoded.
+        if decoded == '\0' || !decoded.is_ascii() {
             return None;
         }
         text.push(decoded);

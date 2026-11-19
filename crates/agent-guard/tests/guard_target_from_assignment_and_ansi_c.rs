@@ -108,8 +108,18 @@ fn an_ansi_c_quoted_word_is_judged_as_the_shell_decodes_it() {
     ] {
         assert_eq!(verdict(line), "allow", "{line}");
     }
-    // What does not decode stays a line the guard cannot read.
-    assert_eq!(verdict("bash -c $'rm\\x'"), "review");
+    // What does not decode stays a line the guard cannot read: no escape
+    // digit, a NUL, a byte above 0x7f.
+    for line in [
+        "bash -c $'rm\\x'",
+        "bash -c $'rm\\c@ -rf ~'",
+        "bash -c $'rm\\0 -rf ~'",
+        "bash -c $'rm\\xff -rf ~'",
+        "bash -c $'rm\\377 -rf ~'",
+        "bash -c $'rm\\u00e9 -rf ~'",
+    ] {
+        assert_eq!(verdict(line), "review", "{line}");
+    }
 }
 
 /// FAILS ON REVERT: let a folder named after the guard count as its name at
