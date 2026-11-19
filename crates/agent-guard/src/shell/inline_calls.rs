@@ -54,6 +54,16 @@ pub(crate) struct InlineReading {
     pub(crate) unread: bool,
     /// The code hands a process what it downloads, or runs it as code.
     pub(crate) runs_download: bool,
+    /// The code runs as code what it does not write out: a file it reads
+    /// (`exec(open('setup.py').read())`), or a value built at run time
+    /// (`exec(input())`, `eval(x)`).
+    pub(crate) code_unread: bool,
+    /// The code read, as it was handed to the reader.
+    pub(crate) code: String,
+    /// The same code as the reader saw it, with the name of every call it
+    /// read the line or the code of taken out: a name left here is a call
+    /// the reader did not account for.
+    pub(crate) residue: String,
 }
 
 impl InlineReading {
@@ -65,6 +75,26 @@ impl InlineReading {
         }
         self.unread |= other.unread;
         self.runs_download |= other.runs_download;
+        self.code_unread |= other.code_unread;
+        for (mine, theirs) in [
+            (&mut self.code, other.code),
+            (&mut self.residue, other.residue),
+        ] {
+            if !theirs.is_empty() {
+                if !mine.is_empty() {
+                    mine.push('\n');
+                }
+                mine.push_str(&theirs);
+            }
+        }
+    }
+
+    /// What code read again inside the code being read adds: its findings
+    /// and the calls left in it unread, not its text, which is already in
+    /// the code that holds it.
+    fn nested(mut self) -> Self {
+        self.code.clear();
+        self
     }
 }
 
@@ -356,8 +386,27 @@ fn reads_a_url(callee: &str, arguments: &str) -> bool {
             .any(|scheme| arguments.contains(scheme))
 }
 
+/// Whether `text` is one string written out as it stands: quoted, with
+/// nothing in it a language fills in or decodes (`\\`, `${`, `#{`, and `$`
+/// in a PHP or Perl double-quoted string).
+fn plain_literal(lang: Lang, text: &str) -> bool {
+    let text = text.trim();
+    let Some(quote) = text.chars().next().filter(|c| matches!(c, '\'' | '"')) else {
+        return false;
+    };
+    let Some(body) = text[1..].strip_suffix(quote) else {
+        return false;
+    };
+    let fills_dollar = quote == '"' && matches!(lang, Lang::Php | Lang::Perl);
+    !body.contains(quote)
+        && !body.contains('\\')
+        && !body.contains("${")
+        && !body.contains("#{")
+        && !(fills_dollar && body.contains('$'))
+}
+
 /// Whether a line a process is handed downloads: a downloader with a URL.
-fn line_downloads(line: &str) -> bool {
+pub(super) fn line_downloads(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     [
         "curl",
@@ -491,6 +540,8 @@ struct Reader<'a> {
     node_calls: Vec<(NodeCall, usize)>,
     /// The functions the code defines, with their parameters.
     functions: Vec<(String, Vec<String>)>,
+    /// Where the name of each call the reader read stands, in bytes.
+    read_names: Vec<(usize, usize)>,
     /// Every call site that is not a definition, statement by statement:
     /// the callee, where its arguments start and where its statement ends.
     /// Listed once, the first time a helper's calls are looked for.
@@ -514,12 +565,26 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
         downloaded: Vec::new(),
         node_calls: Vec::new(),
         functions: Vec::new(),
+        read_names: Vec::new(),
         call_list: None,
         depth,
         out: InlineReading::default(),
     };
     reader.run();
-    reader.out
+    let mut read = vec![false; normalized.len()];
+    for (start, end) in &reader.read_names {
+        for byte in read.iter_mut().take(*end).skip(*start) {
+            *byte = true;
+        }
+    }
+    let residue = normalized
+        .char_indices()
+        .map(|(at, character)| if read[at] { ' ' } else { character })
+        .collect();
+    let mut out = reader.out;
+    out.code = code.to_owned();
+    out.residue = residue;
+    out
 }
 
 /// The code with the ways to reach a function by its name written as the
@@ -994,11 +1059,19 @@ impl Reader<'_> {
         if matches!(self.lang, Lang::Ruby | Lang::Perl | Lang::Php) {
             self.scan_command_quotes(start, end);
         }
-        for (chain, _, arguments_at) in self.call_sites(start, end) {
+        for (chain, at, arguments_at) in self.call_sites(start, end) {
             let callee = self.callee(&chain);
             let Some(sink) = sink_of(self.lang, &callee) else {
                 continue;
             };
+            let handed = call_arguments(&code[arguments_at..end]);
+            if self.name_lifted(
+                sink,
+                split_top(handed, ",").first(),
+                arguments_at + handed.len(),
+            ) {
+                self.read_names.push((at, at + chain.len()));
+            }
             let arguments = if code.as_bytes()[arguments_at - 1] == b'(' {
                 call_arguments(&code[arguments_at..end])
             } else {
@@ -1021,7 +1094,26 @@ impl Reader<'_> {
             .filter(|(_, at)| (start..end).contains(at))
             .collect();
         for (call, at) in calls {
+            // The name of the call: what stands before its `(`.
+            let bytes = code.as_bytes();
+            let mut name_end = at.saturating_sub(1);
+            while name_end > 0 && bytes[name_end - 1] == b' ' {
+                name_end -= 1;
+            }
+            let mut name_start = name_end;
+            while name_start > 0
+                && (is_name_byte(bytes[name_start - 1]) || bytes[name_start - 1] == b'.')
+            {
+                name_start -= 1;
+            }
             let arguments = call_arguments(&code[at..]);
+            if self.name_lifted(
+                Sink::Line,
+                split_top(arguments, ",").first(),
+                at + arguments.len(),
+            ) {
+                self.read_names.push((name_start, name_end));
+            }
             self.with_parameters(arguments, |reader| {
                 reader.read_node_call(call, at, arguments)
             });
@@ -1224,6 +1316,41 @@ impl Reader<'_> {
         Some((value, &body[end + close.len_utf8()..]))
     }
 
+    /// Whether a call whose first argument is `first` is accounted for by
+    /// what the reader makes of it, so its name says nothing more: a line
+    /// or code written out as a plain string (judged as written), or one
+    /// the reader cannot read at all (held for review). One the code builds
+    /// (decoded, joined, formatted, partly unread) keeps its name: hiding
+    /// what a call runs is itself what the name is refused for.
+    ///
+    /// Code run as code (`exec`, `eval`) is accounted for only when it is
+    /// written out or is a file of the project read whole: code built from
+    /// input or any other value it cannot read (`exec(input())`) keeps the
+    /// name. Nothing after a download (`done`: where the call's arguments
+    /// end) is accounted for.
+    fn name_lifted(&self, sink: Sink, first: Option<&&str>, done: usize) -> bool {
+        let Some(first) = first.map(|first| first.trim()) else {
+            return false;
+        };
+        if plain_literal(self.lang, first) {
+            return true;
+        }
+        if self.fetch_before(done) {
+            return false;
+        }
+        if opened_file(first).is_some() {
+            return true;
+        }
+        if sink == Sink::Code {
+            return false;
+        }
+        match self.fold(first, FOLD_DEPTH) {
+            Value::Unknown => true,
+            Value::Str(text) => text == UNREAD.to_string(),
+            _ => false,
+        }
+    }
+
     fn positional_value(&self, positional: &[&str], index: usize) -> Value {
         positional
             .get(index)
@@ -1334,17 +1461,35 @@ impl Reader<'_> {
                     return;
                 };
                 if let Some(path) = opened_file(first) {
+                    // A file the code reads and runs: a download is refused
+                    // ([`Self::read_load`]), any other file is code the
+                    // guard has not seen.
+                    let before = std::mem::take(&mut self.out.runs_download);
                     self.read_load(Value::Str(path));
+                    if !self.out.runs_download {
+                        self.out.code_unread = true;
+                    }
+                    self.out.runs_download |= before;
                     return;
                 }
                 match self.fold(first, FOLD_DEPTH) {
                     Value::Str(code) if !code.contains(UNREAD) => {
                         let inner = read_code(self.lang, &code, self.depth - 1);
-                        self.out.merge(inner);
+                        // Code written out is read in its place: what it
+                        // calls is left in the residue of its own reading.
+                        if plain_literal(self.lang, first) {
+                            self.read_names.push((done - arguments.len(), done));
+                        }
+                        self.out.merge(inner.nested());
                     }
                     _ => {
+                        // Code built from what it does not write out is not
+                        // read, and keeps the finding for its name
+                        // ([`Self::name_lifted`]).
                         if self.fetch_before(done) {
                             self.out.runs_download = true;
+                        } else {
+                            self.out.code_unread = true;
                         }
                     }
                 }
@@ -1366,7 +1511,7 @@ impl Reader<'_> {
         if lower.starts_with("data:") {
             if let Some(body) = data_url_body(path) {
                 let inner = read_code(self.lang, &body, self.depth - 1);
-                self.out.merge(inner);
+                self.out.merge(inner.nested());
             }
         } else if ["http://", "https://", "ftp://"]
             .iter()

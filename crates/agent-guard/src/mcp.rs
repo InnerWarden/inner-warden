@@ -3618,7 +3618,34 @@ fn analyze_command_as_read(
             detail: "inline code hands a process what it downloads, or runs it as code".into(),
         });
         score += 40;
+    } else if (inline_code.unread || inline_code.code_unread)
+        && crate::shell::inline_unread_after_download(raw_scan)
+    {
+        // What it cannot read comes after a download on the same line.
+        signals.push(AnalysisSignal {
+            signal: "dangerous_command".into(),
+            score: 40,
+            detail: "inline code runs a line or code it cannot read after the line downloads"
+                .into(),
+        });
+        score += 40;
+    } else if inline_code.code_unread
+        && !signals.iter().any(|s| s.signal == "shell_line_not_literal")
+    {
+        // `exec(open('setup.py').read())`, `eval(input())`: code the
+        // guard has not seen, held for review as a line it cannot read is.
+        signals.push(AnalysisSignal {
+            signal: "shell_line_not_literal".into(),
+            score: 20,
+            detail: "inline code runs as code what it does not write out (a file it reads, a value built at run time), which the guard cannot read".into(),
+        });
+        score += 20;
     }
+    // The name of a call the reader read (`os.system(`, `exec(`) says
+    // nothing the line it runs does not: that line is judged below, and
+    // one it cannot read is held above.
+    let inline_names_read =
+        threats::inline_call_names_read(scan_cmd, &inline_code.code, &inline_code.residue);
     if depth < STARTUP_PAYLOAD_DEPTH {
         // A line handed over again says nothing new: each is judged once,
         // where it is first handed over.
@@ -4013,7 +4040,7 @@ fn analyze_command_as_read(
     }
 
     // Dangerous command patterns from threats.rs (if not already caught above).
-    if let Some((desc, block)) = threats::check_command(scan_cmd) {
+    if let Some((desc, block)) = threats::check_command_except(scan_cmd, &inline_names_read) {
         if !signals.iter().any(|s| s.detail.contains(desc)) {
             let signal_score = if block { 40 } else { 20 };
             signals.push(AnalysisSignal {
