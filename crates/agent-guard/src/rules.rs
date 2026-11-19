@@ -750,6 +750,14 @@ impl RuleEngine {
             .collect()
     }
 
+    /// Whether the rule `id` matches only when every one of its conditions
+    /// does (`condition: all`).
+    pub(crate) fn needs_every_condition(&self, id: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|rule| rule.id == id && matches!(rule.logic, ConditionLogic::All))
+    }
+
     /// Number of loaded rules.
     pub fn rule_count(&self) -> usize {
         self.rules.len()

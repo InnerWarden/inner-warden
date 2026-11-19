@@ -98,6 +98,46 @@ mod tests {
         }
     }
 
+    /// The guard's own hook, run from an agent's shell, and the variable that
+    /// marks a call of the guard's demo: an agent that runs the hook judges
+    /// a payload it wrote in an environment it set (with the demo's marker,
+    /// a call that sends no alert), so both are refused, by every name and
+    /// path the CLI has. Asking the hook for its help is not.
+    ///
+    /// FAILS ON REVERT: take `hook` out of `GUARD_VERB_HEADS` and the
+    /// hook lines pass; take the `INNERWARDEN_DEMO_NONCE` pattern out and
+    /// the lines that only set or read it pass.
+    #[test]
+    fn running_the_guards_hook_or_setting_the_demo_marker_is_refused() {
+        for line in [
+            "innerwarden hook < payload.json",
+            r#"innerwarden hook --agent "$AGENT" < payload.json"#,
+            "iw hook --monitor < p.json",
+            "iw-guard hook < p.json",
+            "/usr/local/bin/innerwarden hook --agent claude-code < p.json",
+            "~/.local/bin/iw hook < p.json",
+            "I=innerwarden; $I hook < p.json",
+            "cat p.json | innerwarden hook",
+            "INNERWARDEN_DEMO_NONCE=0123456789abcdef0123 innerwarden hook < p.json",
+            "INNERWARDEN_DEMO_NONCE=0123456789abcdef0123 ./guard < p.json",
+            "export INNERWARDEN_DEMO_NONCE=0123456789abcdef0123",
+            "env INNERWARDEN_DEMO_NONCE=0123456789abcdef0123 sh -c true",
+            "export 'INNERWARDEN_DEMO''_NONCE'=x",
+        ] {
+            assert!(check_guard_self_disable(line).is_some(), "{line}");
+            assert!(engine_refuses(line), "{line}");
+        }
+        for line in [
+            "innerwarden hook --help",
+            "innerwarden status",
+            "git commit -m 'run the hook from the wiring'",
+            "cargo test -p innerwarden-agent-guard hook",
+        ] {
+            assert!(check_guard_self_disable(line).is_none(), "{line}");
+            assert!(!engine_refuses(line), "{line}");
+        }
+    }
+
     /// The same constructs with no guard name and no lowering verb beside
     /// them, and a guard name with nothing unread beside it: a folder or a
     /// package that holds the name is not the name.
@@ -121,7 +161,6 @@ mod tests {
             "innerwarden status &>/dev/null",
             "iw doctor &>/tmp/doctor.log; tail /tmp/doctor.log",
             "innerwarden allow --list",
-            r#"innerwarden hook --agent "$AGENT" < payload.json"#,
             r#"for a in claude codex; do innerwarden agents list | grep "$a"; done"#,
             r#"trap 'rm -f "$tmp"' EXIT; innerwarden status > "$tmp""#,
             r#"innerwarden status | tee "$(mktemp)""#,
@@ -434,6 +473,7 @@ mod tests {
             ("install", &["claude-code", "--monitor"]),
             ("agent", &["disconnect"]),
             ("uninstall", &[]),
+            ("hook", &[]),
         ];
         assert_eq!(tails.len(), GUARD_VERB_HEADS.len());
         for head in GUARD_VERB_HEADS {
@@ -445,7 +485,7 @@ mod tests {
             words.extend(tail.iter().map(|word| word.to_string()));
             assert!(guard_verb_loosens(&words), "{head}");
         }
-        for verb in ["status", "doctor", "hook", "host"] {
+        for verb in ["status", "doctor", "host"] {
             assert!(!guard_verb_loosens(&[verb.to_string(), "x".to_string()]));
         }
     }

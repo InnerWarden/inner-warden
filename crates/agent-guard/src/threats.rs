@@ -134,7 +134,12 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
         block: true,
     },
     CommandPattern {
-        pattern: r"(?:^|[;&|]\s*)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)",
+        // A command starts after a separator (a new line is one) or an
+        // opening, and also after the words that open a body (`if a; then
+        // eval x; fi`, `while a; do eval x; done`), a group (`{ eval x; }`)
+        // and a negation (`! eval x`); those last are read outside single
+        // quotes only ([`EVAL_AFTER_OPENER`]).
+        pattern: r"(?:^|[;&|(`\n]\s*|(?:^|[;&|(`\s])(?:(?:then|do|else|elif)\s+|[{!]\s+))(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)",
         description: "shell eval (dynamic command execution)",
         block: true,
     },
@@ -278,6 +283,17 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
         // `"BASH_ENV=` and a whitespace-only boundary would miss it.
         pattern: r"(?i)\b(?:BASH_ENV|LD_PRELOAD|LD_AUDIT|PYTHONSTARTUP|PERL5OPT|PERL5DB|GIT_SSH_COMMAND)\s*=",
         description: "environment preload injection",
+        block: true,
+    },
+    CommandPattern {
+        // A PATH that puts a folder anyone can write to (`/tmp`, `/var/tmp`,
+        // `/dev/shm`) in front of the system's: a program planted there runs
+        // in place of `ls` or `git`, the same hijack as BASH_ENV with no
+        // dangerous word in the line. Read where the value starts and up to
+        // the first expansion, so `PATH=$PATH:/tmp/x`, which leaves the
+        // system's programs first, and a home or project folder do not match.
+        pattern: r#"(?:^|[^A-Za-z0-9_])PATH\s*=\s*["']?(?:[^\s"':$;&|]*:)*(?:/private)?(?:/tmp|/var/tmp|/dev/shm)(?:[/:"'\s;&|]|$)"#,
+        description: "PATH puts a folder anyone can write to first",
         block: true,
     },
     CommandPattern {
@@ -463,12 +479,11 @@ pub const OBFUSCATION_INDICATORS: &[&str] = &[
     "echo -e \"\\x",
     "echo -ne '\\x",
     "$'\\x",
-    "python -c \"import os",
-    "python3 -c \"import os",
-    "python -c 'import os",
-    "python3 -c 'import os",
-    "python -c \"import subprocess",
-    "python3 -c \"import subprocess",
+    // `python3 -c "import os` is not here: importing a module hides nothing,
+    // and the same code fed on standard input was never a sign. What the
+    // code does with it (`os.system`, `subprocess.run` of a line, a write of
+    // agent settings) is read by the rules that read inline code, the same
+    // way in `-c` and in a here-document.
     "perl -e 'system",
     "perl -e 'exec",
     "ruby -e 'system",
@@ -2802,8 +2817,15 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
         ".codex",
         ".gemini",
         "claude_desktop_config",
+        // The settings name as a quoted piece of a path built at run time,
+        // `.claude` built from pieces too.
+        "'settings'",
+        "\"settings\"",
     ];
-    if !mentions_any(content, NEEDLES) && !names_guard_alias(content) {
+    if !mentions_any(content, NEEDLES)
+        && !names_guard_alias(content)
+        && !names_a_removing_find(content)
+    {
         // A name assembled by the shell (`${x:-innerwarden}`, `$(echo
         // innerwarden)`, `inner''warden`, `$'\x69nnerwarden'`) or matched
         // from a pattern (`inner*-ctl`, `inner{w..w}arden`) only reads as
@@ -2885,22 +2907,333 @@ const GUARD_DISARMED: &str = "disarms the guard, or asks it to authorise itself"
 /// What [`check_guard_self_disable`] says of the guard's own loosening
 /// verbs ([`runs_guard_loosening_verb`]).
 const GUARD_LOOSENING_VERB: &str =
-    "runs the guard's own allow, mute or monitor command, one of its agent \
+    "runs the guard's own hook, its allow, mute or monitor command, one of its agent \
      decisions (approve, profile, allow, revoke), disconnects an agent or connects or \
      installs it in monitor, uninstalls it, or starts a jail, which only the person \
      supervising the agent may run, from their own terminal";
 
-/// [`check_guard_self_disable`] on one spelling of the command.
+/// What [`guard_self_disable_in`] says of a line that rewrites, removes or
+/// moves aside the configuration an agent loads the guard from, or the
+/// guard's hook script: the refusals [`check_code_rewrites_guard_carrier`]
+/// keeps.
+const CARRIER_REWRITES: &[&str] = &[
+    "removes or moves aside the configuration that carries the guard's hook",
+    "edits an agent's configuration to remove the guard's hook",
+    "points an MCP client at a server staged in a temporary directory",
+    "edits an agent's configuration in place to remove the guard",
+    "rewrites an agent's configuration through an interpreter",
+    "deletes the guard's hook script",
+    "removes or moves aside the plugin or hook that carries the guard in OpenClaw",
+];
+
+/// What [`guard_self_disable_in`] says of a write into the guard's own
+/// configuration.
+const GUARD_CONFIG_WRITTEN: &str =
+    "writes into the guard's own configuration, which holds its allow and mute rules";
+
+/// The refusals of [`check_guard_self_disable`] that are about what a line
+/// writes, asked of a line that hands an interpreter its code inline
+/// (`python3 -c '...'`): an agent's settings that load the guard rewritten,
+/// removed or moved aside, the guard's hook script deleted, the guard's own
+/// configuration named and written by the code, what carries the guard
+/// written ([`writes_guard_carrier`]).
+///
+/// Asked of the inline form of a program an interpreter reads from a
+/// here-document ([`crate::shell::interpreter_input_as_inline_code`]): the
+/// same code refused under `-c` is refused fed on standard input. The
+/// readings of the guard's own words are left out: a guard command quoted in
+/// code that starts no program is text the code works on.
+pub(crate) fn check_code_rewrites_guard_carrier(content: &str) -> Option<(&'static str, u32)> {
+    if let Some(joined) = quoted_pieces_joined(content) {
+        if let Some(hit) = check_code_rewrites_guard_carrier(&joined) {
+            return Some(hit);
+        }
+    }
+    if let Some((_, what, score)) = guard_self_disable_patterns()
+        .iter()
+        .filter(|(_, what, _)| CARRIER_REWRITES.contains(what))
+        .find(|(re, _, _)| re.is_match(content))
+    {
+        return Some((*what, *score));
+    }
+    if interpreter_code_puts_file_onto_settings(content)
+        || interpreter_code_writes_settings_another_way(content)
+    {
+        return Some((SETTINGS_REWRITTEN_BY_INTERPRETER, 60));
+    }
+    if code_names_and_writes_guard_config(&content.to_ascii_lowercase()) {
+        return Some((GUARD_CONFIG_WRITTEN, 60));
+    }
+    writes_guard_carrier(content).then_some((GUARD_CARRIER_WRITTEN, 60))
+}
+
+/// What [`guard_self_disable_patterns`] says of interpreter code that
+/// rewrites an agent's settings.
+const SETTINGS_REWRITTEN_BY_INTERPRETER: &str =
+    "rewrites an agent's configuration through an interpreter";
+
+/// `content` with each pair of quoted pieces code joins into one string
+/// (`'set' + 'tings.json'`, PHP's `'a'.'b'`, Lua's `'a'..'b'`) written
+/// as that string, so a path built from pieces is read as the path. `None`
+/// when nothing is joined.
+fn quoted_pieces_joined(content: &str) -> Option<String> {
+    static JOIN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let join = JOIN.get_or_init(|| {
+        regex::Regex::new(r#"['"]\s*(?:\+|\.\.|\.)\s*['"]"#).expect("static join regex")
+    });
+    match join.replace_all(content, "") {
+        std::borrow::Cow::Owned(joined) => Some(joined),
+        std::borrow::Cow::Borrowed(_) => None,
+    }
+}
+
+/// [`check_guard_self_disable`] on one spelling of the command, and on the
+/// same spelling with its quoted pieces joined ([`quoted_pieces_joined`]).
 fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
+    if let Some(joined) = quoted_pieces_joined(content) {
+        if let Some(hit) = guard_self_disable_in(&joined) {
+            return Some(hit);
+        }
+    }
+    let res = guard_self_disable_patterns();
+    if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
+        return Some((*what, *score));
+    }
+    if interpreter_code_puts_file_onto_settings(content)
+        || interpreter_code_writes_settings_another_way(content)
+    {
+        return Some((SETTINGS_REWRITTEN_BY_INTERPRETER, 60));
+    }
+    guard_self_disable_after_patterns(content)
+}
+
+/// Whether inline interpreter code copies or links a file ONTO an agent's
+/// settings: `shutil.copy*`, `os.symlink`, `copyFileSync`, `symlinkSync`
+/// with the settings, or a variable assigned them, as the destination.
+/// A copy FROM the settings is a backup, a read, and stays out.
+fn interpreter_code_puts_file_onto_settings(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if !(lower.contains("copy") || lower.contains("symlink"))
+        || !(lower.contains("settings")
+            || lower.contains(".claude.json")
+            || lower.contains("mcp.json"))
+    {
+        return false;
+    }
+    static INTERPRETER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ONTO: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ASSIGNED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ONTO_NAME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    const SETTINGS: &str = r#"(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#;
+    // The first argument, with one level of calls inside it
+    // (`os.path.expanduser('~/x')`), then the destination.
+    const CALL: &str = r#"\b(?:copy\w*|symlink(?:sync)?)\s*\(\s*[^,()]*(?:\([^()]*\)[^,()]*)*,\s*"#;
+    let interpreter = INTERPRETER.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?s)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b"#,
+        )
+        .expect("static interpreter regex")
+    });
+    if !interpreter.is_match(&lower) {
+        return false;
+    }
+    let onto = ONTO.get_or_init(|| {
+        regex::Regex::new(&format!(r#"(?s){CALL}[^,)]*?{SETTINGS}"#))
+            .expect("static copy onto settings regex")
+    });
+    if onto.is_match(&lower) {
+        return true;
+    }
+    let assigned = ASSIGNED.get_or_init(|| {
+        regex::Regex::new(&format!(r#"\b([a-z_]\w*)\s*=\s*[^;\n=]*?{SETTINGS}"#))
+            .expect("static settings assignment regex")
+    });
+    let names: Vec<&str> = assigned
+        .captures_iter(&lower)
+        .filter_map(|c| c.get(1).map(|m| m.as_str()))
+        .collect();
+    if names.is_empty() {
+        return false;
+    }
+    let onto_name = ONTO_NAME.get_or_init(|| {
+        regex::Regex::new(&format!(r#"(?s){CALL}([a-z_]\w*)\s*[,)]"#))
+            .expect("static copy onto name regex")
+    });
+    onto_name
+        .captures_iter(&lower)
+        .filter_map(|c| c.get(1))
+        .any(|m| names.contains(&m.as_str()))
+}
+
+/// Whether inline interpreter code writes an agent's settings in a way the
+/// patterns of [`guard_self_disable_patterns`] do not spell out:
+///
+/// - a Node `fs` call reached through a name or a callback
+///   (`require('fs').writeFile(..)`, `fsp.writeFile(..)`,
+///   `require('fs/promises').rm(..)`); a copy or a link is left to
+///   [`interpreter_code_puts_file_onto_settings`], which tells a copy onto
+///   the settings from a backup of them;
+/// - `.replace(` or `.rename(` of a `Path` held in a name or built as a
+///   chain (`p = Path.home()/'.claude'/'settings.json'; p.replace(..)`);
+/// - a file opened with a mode or flags that are not a literal read-only
+///   one (`m = 'wb'; open(settings, m)`, `os.open(settings, os.O_TRUNC)`);
+/// - the name split across names (`a = 'settings'; b = '.json'`) beside
+///   `.claude` and a write.
+///
+/// Each only where the code names the settings, whole or in pieces.
+fn interpreter_code_writes_settings_another_way(content: &str) -> bool {
+    use std::sync::OnceLock;
+    static INTERPRETER: OnceLock<regex::Regex> = OnceLock::new();
+    static SETTINGS: OnceLock<regex::Regex> = OnceLock::new();
+    static PIECE: OnceLock<regex::Regex> = OnceLock::new();
+    static BARE_PIECE: OnceLock<regex::Regex> = OnceLock::new();
+    static SETTINGS_NAME: OnceLock<regex::Regex> = OnceLock::new();
+    static NODE_CALL: OnceLock<regex::Regex> = OnceLock::new();
+    static PATH_NAME: OnceLock<regex::Regex> = OnceLock::new();
+    static PATH_CHAIN: OnceLock<regex::Regex> = OnceLock::new();
+    static MODE_NAME: OnceLock<regex::Regex> = OnceLock::new();
+    static OS_OPEN: OnceLock<regex::Regex> = OnceLock::new();
+    static WRITE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = |cell: &'static OnceLock<regex::Regex>, pattern: &str| -> &'static regex::Regex {
+        cell.get_or_init(|| regex::Regex::new(pattern).expect("static settings write regex"))
+    };
+    let lower = content.to_ascii_lowercase();
+    if !(lower.contains("settings") || lower.contains(".claude.json") || lower.contains("mcp.json"))
+    {
+        return false;
+    }
+    if !re(
+        &INTERPRETER,
+        r#"(?s)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b"#,
+    )
+    .is_match(&lower)
+    {
+        return false;
+    }
+    let whole = re(
+        &SETTINGS,
+        r#"settings(?:\.local)?\.json|\.claude\.json|mcp\.json"#,
+    )
+    .is_match(&lower);
+    // `'settings'` as a quoted piece of a name built beside `.claude`, or
+    // the whole piece `'settings'` beside `.json` with `.claude` built
+    // from pieces too (`d='.cla'+'ude'`). A file such as `'settings.py'`
+    // is no piece.
+    let in_pieces = !whole
+        && ((lower.contains(".claude") && re(&PIECE, r#"['"]settings"#).is_match(&lower))
+            || (lower.contains(".json")
+                && re(&BARE_PIECE, r#"['"]settings(?:\.local)?['"]"#).is_match(&lower)));
+    if !(whole || in_pieces) {
+        return false;
+    }
+    if re(
+        &NODE_CALL,
+        r#"\.(?:writefile|appendfile|rm|unlink|rename|truncate)(?:sync)?\s*\("#,
+    )
+    .is_match(&lower)
+    {
+        return true;
+    }
+    // Names assigned the settings path as text (`x = '~/.claude/settings.json'`),
+    // so a `Path` built from one of them is a `Path` of the settings.
+    let settings_names: Vec<&str> = re(
+        &SETTINGS_NAME,
+        r#"\b([a-z_]\w*)\s*=\s*[^;\n=]*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+    )
+    .captures_iter(&lower)
+    .filter_map(|c| c.get(1).map(|m| m.as_str()))
+    .collect();
+    let names_a_settings_name = |value: &str| {
+        settings_names.iter().any(|name| {
+            value.match_indices(name).any(|(at, _)| {
+                let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                !value[..at].chars().next_back().is_some_and(word)
+                    && !value[at + name.len()..].chars().next().is_some_and(word)
+            })
+        })
+    };
+    // A name given a `Path` built with the settings, or with a name that
+    // holds them (not their text read), then replaced or renamed.
+    let path_names: Vec<&str> = re(
+        &PATH_NAME,
+        r#"\b([a-z_]\w*)\s*=\s*([^;\n]*\bpath\b[^;\n]*)"#,
+    )
+    .captures_iter(&lower)
+    .filter(|c| {
+        c.get(2).is_some_and(|value| {
+            let value = value.as_str();
+            (value.contains("settings")
+                || value.contains(".claude")
+                || names_a_settings_name(value))
+                && !value.contains("read")
+        })
+    })
+    .filter_map(|c| c.get(1).map(|m| m.as_str()))
+    .collect();
+    if path_names.iter().any(|name| {
+        lower.contains(&format!("{name}.replace(")) || lower.contains(&format!("{name}.rename("))
+    }) {
+        return true;
+    }
+    if lower.contains("path")
+        && re(
+            &PATH_CHAIN,
+            r#"(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)['"]\s*\)\s*\.(?:replace|rename)\s*\("#,
+        )
+        .is_match(&lower)
+    {
+        return true;
+    }
+    // A second argument of `open` that is a name, not a quoted mode.
+    if re(
+        &MODE_NAME,
+        r#"\bopen(?:sync)?\s*\((?:[^(),]|\([^()]*\))+,\s*([a-z_][\w.]*)\s*[,)]"#,
+    )
+    .captures_iter(&lower)
+    .any(|c| c.get(1).is_some_and(|mode| mode.as_str() != "os.o_rdonly"))
+    {
+        return true;
+    }
+    // `os.open` with any flags but `os.O_RDONLY` alone.
+    if re(
+        &OS_OPEN,
+        r#"\bos\.open\s*\((?:[^(),]|\([^()]*\))+,\s*([^)]*)\)"#,
+    )
+    .captures_iter(&lower)
+    .any(|c| {
+        c.get(1)
+            .is_some_and(|flags| flags.as_str().trim() != "os.o_rdonly")
+    }) {
+        return true;
+    }
+    in_pieces
+        && re(
+            &WRITE,
+            r#"["'](?:[bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2})["']|\bwrite|\bdump\b|\bunlink|\bremove\(|\brename\(|\bos\.replace\(|\bshutil\.move\(|\btruncate|file_put_contents|\bdel\b"#,
+        )
+        .is_match(&lower)
+}
+
+/// The patterns [`guard_self_disable_in`] asks first, each with what it
+/// says and its score.
+fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)] {
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str, u32)>> =
         std::sync::OnceLock::new();
-    let res = RES.get_or_init(|| {
+    RES.get_or_init(|| {
         let mut v: Vec<(regex::Regex, &'static str, u32)> = Vec::new();
         let mut add = |p: &str, what: &'static str, score: u32| {
             if let Ok(re) = regex::Regex::new(p) {
                 v.push((re, what, score));
             }
         };
+        // The variable that marks a call `innerwarden demo` sent. Only the
+        // demo sets it, for the hooks it starts: a line that sets it, or
+        // reads it out, is after a call that sends no alert.
+        add(
+            r"INNERWARDEN_DEMO_NONCE",
+            "sets or reads the marker of the guard's own demo, which only the demo may set",
+            60,
+        );
         // A wildcard force-allow switches the whole guardrail off. A narrow one
         // authorises a single command and is a legitimate operator action, so
         // only the glob forms are caught here.
@@ -2949,18 +3282,35 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         // is full of `;`, so a segment-bounded pattern stops before reaching
         // the filename. A WRITE indicator is required so that reading the
         // config, which an agent does for honest reasons, is not a finding.
+        // Writing is more than `open(..., 'w')`: pathlib writes and unlinks,
+        // `os` and `shutil` remove and move, node's `fs` does each of those.
+        // A rename, replace or move counts with the settings on either side.
         add(
-            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json).{0,400}?(?:["']w["']|\bdump\b|\bwrite\b|\bdel\b|writeFileSync|\bunlink\b)"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json).*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\(|\bwrite\b|\bwritelines\b|\bdel\b|\bunlink\b|\.truncate\(|\.write_(?:text|bytes)\(|\.rename\(|\.symlink_to\()"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
         add(
-            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:["']w["']|\bdump\b|writeFileSync).{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\().*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
+        // Opened in a mode that writes, the mode right after the settings
+        // path in the same call: `open(p, 'wb')`, `'w+'`, `'a'`, `'r+'`.
         add(
-            r#"(?i)\brm\b[^|;&]*(?:hooks?/[^\s]*innerwarden|innerwarden[^\s]*\.(?:sh|json))"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)["']?\)*\s*,\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]"#,
+            "rewrites an agent's configuration through an interpreter",
+            60,
+        );
+        // The hook script by where it is: a file or folder named for the
+        // guard right inside an agent's `hooks` folder. A file elsewhere
+        // whose path merely holds the word (`~/innerwarden/x.sh`, a scratch
+        // folder under `/tmp/claude-1000/-home-u-innerwarden/`) is not the
+        // guard's: its configuration, record and program are held by their
+        // real paths ([`writes_guard_config`], [`writes_guard_carrier`]),
+        // through a variable, a link or `..` as well.
+        add(
+            r#"(?i)\brm\b[^|;&]*\bhooks?/[^\s/'"]*innerwarden"#,
             "deletes the guard's hook script",
             60,
         );
@@ -3015,10 +3365,12 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
             60,
         );
         v
-    });
-    if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
-        return Some((*what, *score));
-    }
+    })
+}
+
+/// [`guard_self_disable_in`] past its patterns
+/// ([`guard_self_disable_patterns`]).
+fn guard_self_disable_after_patterns(content: &str) -> Option<(&'static str, u32)> {
     // The same two refusals on the words the shell hands the program: a
     // guard program named by a glob, a bracket expression or a value the
     // line assigned (`/usr/local/sbin/inner*-ctl exec-gate disarm`).
@@ -3044,10 +3396,7 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         ));
     }
     if writes_guard_config(content, 0) {
-        return Some((
-            "writes into the guard's own configuration, which holds its allow and mute rules",
-            60,
-        ));
+        return Some((GUARD_CONFIG_WRITTEN, 60));
     }
     carrier()
 }
@@ -6277,6 +6626,7 @@ fn guard_verb_is_fed(arguments: &[String]) -> bool {
 /// the list is checked before the verbs are, so a verb added there and not
 /// here is never read.
 const GUARD_VERB_HEADS: &[&str] = &[
+    "hook",
     "allow",
     "mute",
     "dry-run",
@@ -6319,6 +6669,12 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
                     .is_some_and(|first| !matches!(*first, "--list" | "--remove"))
         }
         "dry-run" | "monitor" => !asks_for_help,
+        // `innerwarden hook` is the hook the agent's own calls are screened
+        // by. Run from an agent's shell it judges a payload the agent wrote,
+        // in an environment the agent set: a quiet probe of the policy, and
+        // with the demo's marker a call that sends no alert. Only the agent's
+        // wiring runs it.
+        "hook" => !asks_for_help,
         // `innerwarden agents approve|profile|allow|revoke`: the decisions
         // about an agent are the person's, every one of them. Listing the
         // agents, connecting them and asking for help are not decisions.
@@ -6413,6 +6769,524 @@ fn writes_guard_config(content: &str, depth: u8) -> bool {
     writes_place(content, depth, |target, _| names_guard_config(target), true)
 }
 
+/// What the shell side says of a line that writes the SSH client
+/// configuration ([`writes_ssh_client_config`]).
+const SSH_CLIENT_CONFIG_WRITTEN: &str =
+    "writes the SSH client configuration, which every ssh reads and which can run a \
+     command (LocalCommand, ProxyCommand) or pull in another file (Include)";
+
+/// Whether a path names the SSH client configuration: `~/.ssh/config`, a
+/// file in `~/.ssh/config.d/` (in any home), `/etc/ssh/ssh_config` or a
+/// file in `/etc/ssh/ssh_config.d/`. A removal or a move away (`taken`)
+/// is not counted: a missing file runs nothing.
+fn names_ssh_client_config(target: &str, taken: bool) -> bool {
+    !taken
+        && named_path(&home_spelled(target)).is_some_and(|named| {
+            [
+                Place::Components(".ssh/config"),
+                Place::Components(".ssh/config.d"),
+                Place::Tree("/etc/ssh/ssh_config"),
+                Place::Tree("/etc/ssh/ssh_config.d"),
+            ]
+            .into_iter()
+            .any(|place| place.holds(&named))
+        })
+}
+
+/// Whether a command line writes the SSH client configuration
+/// ([`names_ssh_client_config`]). Every `ssh`, `scp`, `rsync` and `git`
+/// over ssh reads it without being told to, so a `LocalCommand` or
+/// `ProxyCommand` written there runs on the next connection, outside the
+/// line that wrote it. The file tools are refused the same file
+/// (`crate::file_tools`); this is the shell side, with every writer
+/// [`writes_place`] reads: a redirection, `tee`, `cp`, `ln`, `mv` onto
+/// it, `sed -i`, through a variable or a `cd`. A link the line makes is
+/// followed before this is asked (`crate::shell::line_through_links`).
+fn writes_ssh_client_config(content: &str) -> bool {
+    content.to_ascii_lowercase().contains("ssh")
+        && writes_place(content, 0, names_ssh_client_config, false)
+}
+
+/// What the shell side says of a line that writes a file of
+/// [`names_persistence_file`].
+const PERSISTENCE_FILE_WRITTEN: &str =
+    "writes a file that decides who may log in or act as root, holds stored credentials \
+     or schedules jobs";
+
+/// Whether a path names a file whose change hands over a login, root or a
+/// stored credential, or runs code later: every file the shell side already
+/// refuses to see overwritten by a redirection ([`AUTHENTICATION_WRITE_TARGETS`]:
+/// login keys and `authorized_keys`, the account database, the sudo rules,
+/// the SSH server's settings, the GnuPG keys), the sudo, account and
+/// scheduled-job groups of [`PRIVILEGED_WRITE_TARGETS`], and, in a home,
+/// the stored credentials the file tools are refused
+/// (`crate::file_tools::home_place`). A removal or a move away (`taken`) is
+/// not counted, as for [`names_ssh_client_config`].
+///
+/// Not here: the shell's startup files (`~/.bashrc`, `~/.profile`). A line
+/// that writes one is judged by what it writes there
+/// ([`check_persistence_install`] and the startup-file rule in
+/// `crate::mcp`): `echo 'export PATH=...' >> ~/.bashrc` is ordinary setup.
+fn names_persistence_file(target: &str, taken: bool) -> bool {
+    if taken {
+        return false;
+    }
+    let Some(named) = named_path(&home_spelled(target)) else {
+        return false;
+    };
+    let authentication = AUTHENTICATION_WRITE_TARGETS.iter().any(|entry| {
+        let place = match *entry {
+            ShellAuthTarget::Named(path) => Place::Components(path),
+            ShellAuthTarget::File(file) => Place::File(file),
+            ShellAuthTarget::Under(dir) => Place::Tree(dir),
+            ShellAuthTarget::InDirectory(name) => Place::Components(name),
+        };
+        place.holds(&named)
+    });
+    authentication
+        || PRIVILEGED_WRITE_TARGETS
+            .iter()
+            .filter(|group| matches!(group.what, SUDO_RULES | ACCOUNTS | SCHEDULED_JOBS))
+            .any(|group| group.places.iter().any(|place| place.holds(&named)))
+        || home_relative_path(&named).is_some_and(|relative| {
+            crate::file_tools::home_place(relative) == Some(crate::file_tools::STORED_CREDENTIALS)
+        })
+}
+
+/// The part of a path below a home, when the path says it is in one: `~/`,
+/// `~user/`, `/root/`, `/var/root/`, `/home/<user>/` or `/users/<user>/`.
+fn home_relative_path(named: &NamedPath) -> Option<&str> {
+    let path = named.path.as_str();
+    if !named.rooted {
+        return path
+            .strip_prefix('~')
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, rest)| rest);
+    }
+    if let Some(rest) = path
+        .strip_prefix("/root/")
+        .or_else(|| path.strip_prefix("/var/root/"))
+    {
+        return Some(rest);
+    }
+    ["/home/", "/users/"].iter().find_map(|base| {
+        path.strip_prefix(base)
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, rest)| rest)
+    })
+}
+
+/// A cheap test ahead of the walk [`writes_persistence_file`] makes: a line
+/// that does not hold every component of one of its places writes none.
+fn may_name_persistence_file(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    let holds = |row: &str| {
+        row.split('/')
+            .filter(|part| !part.is_empty())
+            .all(|part| lower.contains(part))
+    };
+    AUTHENTICATION_WRITE_TARGETS.iter().any(|entry| {
+        let (ShellAuthTarget::Named(row)
+        | ShellAuthTarget::File(row)
+        | ShellAuthTarget::Under(row)
+        | ShellAuthTarget::InDirectory(row)) = *entry;
+        holds(row)
+    }) || PRIVILEGED_WRITE_TARGETS
+        .iter()
+        .filter(|group| matches!(group.what, SUDO_RULES | ACCOUNTS | SCHEDULED_JOBS))
+        .flat_map(|group| group.places.iter())
+        .any(|place| {
+            let (Place::File(row) | Place::Tree(row) | Place::Components(row)) = *place;
+            holds(row)
+        })
+        || crate::file_tools::home_places_of(&[crate::file_tools::STORED_CREDENTIALS]).any(holds)
+}
+
+/// Whether a command line writes a file of [`names_persistence_file`] in any
+/// form [`writes_place`] reads: a redirection, `tee`, `sed -i`, `cp`,
+/// `mv`, `ln` (soft or hard), `install`, `dd of=`, `truncate`, through a
+/// variable, `$HOME`, a `cd` or `..`. A link the line makes is followed
+/// before this is asked (`crate::shell::line_through_links`). Reading one
+/// is not a write.
+fn writes_persistence_file(content: &str) -> bool {
+    may_name_persistence_file(content) && writes_place(content, 0, names_persistence_file, false)
+}
+
+/// What the shell side says of a line that replaces or makes a file that
+/// runs at login without showing what it holds ([`replaces_startup_file_unseen`]).
+pub const STARTUP_FILE_REPLACED_UNSEEN: &str =
+    "replaces or makes a file that runs at login or starts with the session, from \
+     content the line does not show";
+
+/// The files of a home that run at every login or shell, and the folders
+/// whose files start with the session, relative to the home (lowercase).
+const HOME_STARTUP_FILES: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+    ".zshenv",
+    ".config/fish/config.fish",
+    ".ssh/rc",
+];
+const HOME_STARTUP_FOLDERS: &[&str] = &[
+    ".config/systemd/user",
+    ".config/autostart",
+    "library/launchagents",
+];
+
+/// Whether a path names a file of a home that runs at login
+/// ([`HOME_STARTUP_FILES`]) or a folder whose files start with the session
+/// ([`HOME_STARTUP_FOLDERS`]), or a file in one. A removal or a move away
+/// (`taken`) is not counted: a missing file runs nothing.
+fn names_home_startup(target: &str, taken: bool) -> bool {
+    if taken {
+        return false;
+    }
+    let Some(named) = named_path(&home_spelled(target)) else {
+        return false;
+    };
+    home_relative_path(&named).is_some_and(|relative| {
+        let relative = relative.trim_end_matches('/');
+        HOME_STARTUP_FILES.contains(&relative)
+            || HOME_STARTUP_FOLDERS.iter().any(|folder| {
+                relative
+                    .strip_prefix(folder)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+    })
+}
+
+/// Variables a line does not choose the value of: the session sets them
+/// (`$HOME`, `$PATH`). Any other variable a startup file is written from
+/// holds what the line does not show, unless the line gave it a literal.
+const ENVIRONMENT_NAMES: &[&str] = &[
+    "home",
+    "path",
+    "user",
+    "logname",
+    "shell",
+    "pwd",
+    "lang",
+    "term",
+    "editor",
+    "visual",
+    "hostname",
+    "tmpdir",
+    "xdg_config_home",
+    "xdg_data_home",
+    "xdg_cache_home",
+    "xdg_state_home",
+    "xdg_runtime_dir",
+];
+
+/// Whether shell text expands what the line does not show: a command
+/// substitution (`$(...)` or backticks), a positional or special
+/// parameter, or a variable that is neither one of [`ENVIRONMENT_NAMES`] nor
+/// given a literal on the line (`literals`, lowercase). With `quotes`, single
+/// quotes make text literal, as on a command line; without, as in the body of
+/// an unquoted heredoc, they do not.
+fn hides_text(text: &str, literals: &[String], quotes: bool) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    let mut single = false;
+    let mut double = false;
+    while let Some(&byte) = bytes.get(index) {
+        if single {
+            single = byte != b'\'';
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => {
+                index += 2;
+                continue;
+            }
+            b'\'' if quotes && !double => single = true,
+            b'"' if quotes => double = !double,
+            b'`' => return true,
+            b'$' => {
+                let rest = &text[index + 1..];
+                if rest.starts_with('(') {
+                    return true;
+                }
+                let name: String = rest
+                    .trim_start_matches('{')
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() {
+                    if rest.starts_with(['@', '*', '{', '!']) {
+                        return true;
+                    }
+                } else {
+                    let name = name.to_ascii_lowercase();
+                    if !ENVIRONMENT_NAMES.contains(&name.as_str()) && !literals.contains(&name) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+/// The variables the segments of a line give a literal value (lowercase),
+/// as of the end of the line: `P='alias ll="ls -l"'` is one, `P=$(curl ...)` is
+/// not, and a later assignment of anything else takes the name back.
+fn literal_variables(segments: &[&str]) -> Vec<String> {
+    static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let assign = ASSIGN.get_or_init(|| {
+        regex::Regex::new(
+            r"^\s*(?:(?:export|local|readonly|declare)\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$",
+        )
+        .expect("static assignment regex")
+    });
+    let mut literals: Vec<String> = Vec::new();
+    for segment in segments {
+        let Some(captures) = assign.captures(segment) else {
+            continue;
+        };
+        let name = captures[1].to_ascii_lowercase();
+        literals.retain(|known| *known != name);
+        if !hides_text(&captures[2], &literals, true) {
+            literals.push(name);
+        }
+    }
+    literals
+}
+
+/// Whether the heredoc a segment opens has a body the line does not show:
+/// its tag is not quoted (`<<EOF`, not `<<'EOF'`, `<<"EOF"` or `<<\EOF`) and
+/// the body expands something [`hides_text`] counts. Quotes inside such a body
+/// do not stop an expansion.
+fn heredoc_hides(content: &str, segment: &str, literals: &[String]) -> bool {
+    static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let heredoc = HEREDOC.get_or_init(|| {
+        regex::Regex::new(r#"<<-?\s*(['"\\]?)([A-Za-z_][A-Za-z0-9_]*)"#)
+            .expect("static heredoc tag regex")
+    });
+    if segment.contains("<<<") {
+        return false;
+    }
+    let Some(captures) = heredoc.captures(segment) else {
+        return false;
+    };
+    if !captures[1].is_empty() {
+        return false;
+    }
+    let tag = &captures[2];
+    let start = (segment.as_ptr() as usize).saturating_sub(content.as_ptr() as usize);
+    let Some(after) = content.get(start..) else {
+        return false;
+    };
+    let body: Vec<&str> = after
+        .lines()
+        .skip(1)
+        .take_while(|line| line.trim() != tag)
+        .collect();
+    hides_text(&body.join("\n"), literals, false)
+}
+
+/// A command of a line whose effect on a startup file is shown on the line,
+/// with nothing in it the line does not show ([`hides_text`]): `echo`/`printf`,
+/// a heredoc or here-string, a `tee` fed by such an `echo`, an in-place
+/// `sed`/`perl` edit (its expression is on the line) and `truncate` (it empties
+/// the file; an empty file runs nothing). What these write is judged by what
+/// it is (`startup_file_payloads` and [`check_persistence_install`]).
+/// `echo "$P"` with `P=$(curl ...)`, an unquoted heredoc whose body runs a
+/// substitution, and `sed -i "s/x/$(curl ...)/"` show nothing.
+fn shows_what_it_writes(
+    content: &str,
+    segment: &str,
+    piped_from_text: bool,
+    literals: &[String],
+) -> bool {
+    let words = shell_tokens(segment);
+    let Some(command_index) = effective_command_index(&words) else {
+        return false;
+    };
+    let command = token_basename(&words[command_index]).to_ascii_lowercase();
+    let shown =
+        || !hides_text(segment, literals, true) && !heredoc_hides(content, segment, literals);
+    match command.as_str() {
+        "echo" | "printf" | "sed" | "gsed" | "perl" => shown(),
+        "tee" => (piped_from_text || segment.contains("<<")) && shown(),
+        "cat" => segment.contains("<<") && shown(),
+        "truncate" => true,
+        _ => false,
+    }
+}
+
+/// Whether a command line replaces or makes a file of a home that runs at
+/// login, or one in a folder whose files start with the session
+/// ([`names_home_startup`]), from content the line does not show: `cp`,
+/// `mv`, `ln`, `install`, `dd of=`, a download saved as it, the output
+/// of another program redirected into it, through a variable, `$HOME`, a
+/// `cd` or `..` ([`writes_place`]). A write whose text is on the line
+/// ([`shows_what_it_writes`]) is judged by that text instead:
+/// `echo 'export PATH=...' >> ~/.bashrc` is ordinary setup. A removal, a
+/// move away and a copy from one are not counted.
+pub fn replaces_startup_file_unseen(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if ![
+        ".bash",
+        ".profile",
+        ".zsh",
+        ".zlog",
+        ".zprofile",
+        "config.fish",
+        "ssh/rc",
+        "systemd",
+        "autostart",
+        "launchagents",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return false;
+    }
+    let segments = shell_command_segments(content);
+    let literals = literal_variables(&segments);
+    let mut unseen = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        let piped_from_text = index.checked_sub(1).is_some_and(|before| {
+            let previous = segments[before];
+            segments_are_piped(content, previous, segment)
+                && shows_what_it_writes(content, previous, false, &literals)
+        });
+        if !shows_what_it_writes(content, segment, piped_from_text, &literals) {
+            unseen.push(*segment);
+        }
+    }
+    !unseen.is_empty() && writes_place(&unseen.join("\n"), 0, names_home_startup, false)
+}
+
+/// What the shell side says of a line that installs a service or a login
+/// item from a file outside the folders they are kept in
+/// ([`installs_session_item_from_outside`]).
+pub const SESSION_ITEM_FROM_OUTSIDE: &str =
+    "installs a service or login item from a file outside the folders they are kept in";
+
+/// Whether a path names a place services and login items are kept in: a
+/// home's `.config/systemd/user` or `Library/LaunchAgents`, the system's
+/// systemd folders and its launch agent and daemon folders.
+fn names_session_item_folder(path: &str) -> bool {
+    let Some(named) = named_path(&home_spelled(path)) else {
+        return false;
+    };
+    if let Some(relative) = home_relative_path(&named) {
+        return [".config/systemd/user/", "library/launchagents/"]
+            .iter()
+            .any(|folder| relative.starts_with(folder));
+    }
+    named.rooted
+        && [
+            "/etc/systemd/",
+            "/usr/lib/systemd/",
+            "/lib/systemd/",
+            "/run/systemd/",
+            "/library/launchagents/",
+            "/library/launchdaemons/",
+            "/system/library/launchagents/",
+            "/system/library/launchdaemons/",
+        ]
+        .iter()
+        .any(|folder| named.path.starts_with(folder))
+}
+
+/// Whether a command line installs a service or a login item from a file
+/// outside the folders they are kept in ([`names_session_item_folder`]):
+/// `systemctl [--user] link|enable /tmp/u.service` links the file into the
+/// unit folder, and `launchctl load|bootstrap /tmp/x.plist` starts it at every
+/// login. A unit named by its name (`systemctl --user enable u.service`) is
+/// already in a unit folder, and copying it there is [`replaces_startup_file_unseen`].
+pub fn installs_session_item_from_outside(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if !lower.contains("systemctl") && !lower.contains("launchctl") {
+        return false;
+    }
+    shell_command_segments(content).iter().any(|segment| {
+        let words = shell_tokens(segment);
+        let Some(command_index) = effective_command_index(&words) else {
+            return false;
+        };
+        let command = token_basename(&words[command_index]).to_ascii_lowercase();
+        let operands: Vec<&String> = words[command_index + 1..]
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .collect();
+        let Some((verb, rest)) = operands.split_first() else {
+            return false;
+        };
+        let verb = verb.to_ascii_lowercase();
+        let installs = match command.as_str() {
+            "systemctl" => matches!(verb.as_str(), "link" | "enable" | "reenable"),
+            "launchctl" => matches!(verb.as_str(), "load" | "bootstrap"),
+            _ => false,
+        };
+        installs
+            && rest.iter().any(|word| {
+                let word = word.trim_matches(['"', '\'']);
+                let domain = ["gui/", "user/", "system", "pid/", "login/"]
+                    .iter()
+                    .any(|prefix| word.to_ascii_lowercase().starts_with(prefix));
+                word.contains('/') && !domain && !names_session_item_folder(word)
+            })
+    })
+}
+
+/// The places inline interpreter code is read for ([`code_writes_persistence_file`]),
+/// lowercase: the login keys, the account database, the sudo rules, the
+/// scheduled jobs and the stored credentials of a home.
+const CODE_PERSISTENCE_PATH: &str = r"(?:\.ssh/authorized_keys2?|/etc/(?:sudoers(?:\.d/[\w.-]+)?|passwd|shadow|gshadow|crontab|cron\.d/[\w.-]+)|/var/spool/cron/[\w./-]+|\.aws/credentials|\.netrc|\.kube/config|\.docker/config\.json|\.git-credentials|\.config/gcloud/[\w./-]*)";
+
+/// Whether interpreter code (lowercase) writes one of
+/// [`CODE_PERSISTENCE_PATH`]: opened to write or append (`open(P, 'a')`,
+/// `Path(P).write_text`, `.open('w')`), written whole as the first argument
+/// (`writeFileSync`, `appendFile`, `file_put_contents`) or made the
+/// destination of a copy, move, rename or link (the path after a comma).
+/// Reading one (`open(P).read()`, `copyfile(P, '/tmp/x')`) is not a write.
+fn code_names_and_writes_persistence_file(code: &str) -> bool {
+    static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let writes = WRITES.get_or_init(|| {
+        let path = CODE_PERSISTENCE_PATH;
+        regex::Regex::new(&format!(
+            r#"{path}["']?\)*\s*,\s*(?:mode\s*=\s*)?["'](?:w|a|x|r\+)[bt+]?["']|{path}.{{0,80}}?\.(?:write_text|write_bytes|open\(\s*["'](?:w|a|x))|(?:writefile\w*|appendfile\w*|file_put_contents|write)\s*\(\s*[^,]{{0,120}}?{path}|(?:copy\w*|move|rename\w*|replace|symlink\w*|link\w*|cp|mv)\s*\([^;]{{0,200}}?,[^;]{{0,200}}?{path}"#
+        ))
+        .expect("static persistence code regex")
+    });
+    writes.is_match(code)
+}
+
+/// Whether a command line hands an interpreter inline code (`python -c`,
+/// `node -e`, `perl -e`, `ruby -e`, `php -r`) that writes a file of
+/// [`names_persistence_file`] ([`code_names_and_writes_persistence_file`]).
+/// The shell writers are [`writes_persistence_file`]; this is the same file
+/// written from code.
+fn code_writes_persistence_file(content: &str) -> bool {
+    if !may_name_persistence_file(content) {
+        return false;
+    }
+    shell_command_segments(content).iter().any(|segment| {
+        let words = shell_tokens(segment);
+        let Some(command_index) = effective_command_index(&words) else {
+            return false;
+        };
+        let name = token_basename(&words[command_index]).to_ascii_lowercase();
+        let interpreter = strip_interpreter_version(&name);
+        interpreter_inline_code(interpreter, &words[command_index + 1..])
+            .is_some_and(|code| code_names_and_writes_persistence_file(&code.to_ascii_lowercase()))
+    })
+}
+
 /// What the shell side says of a line that writes what the guard is carried
 /// by.
 const GUARD_CARRIER_WRITTEN: &str =
@@ -6431,13 +7305,201 @@ const GUARD_CARRIER_WRITTEN: &str =
 /// URL, `git checkout` of one, a change of owner, and a write made by
 /// interpreter code other than the rewrites [`guard_self_disable_in`] names.
 fn writes_guard_carrier(content: &str) -> bool {
-    may_name_guard_carrier(content)
-        && writes_place(
-            content,
-            0,
-            |target, taken| names_guard_carrier(target) || (taken && names_agent_home(target)),
-            false,
+    if !may_name_guard_carrier(content) {
+        return false;
+    }
+    // The rest holds no assignment of a fresh folder, so this is asked once.
+    if let Some(rest) = without_fresh_dir_writes(content) {
+        return writes_guard_carrier(&rest);
+    }
+    writes_place(
+        content,
+        0,
+        |target, taken| names_guard_carrier(target) || (taken && names_agent_home(target)),
+        false,
+    )
+}
+
+/// `content` with the commands that only make and fill a folder the same
+/// line has just created with `mktemp -d` taken out, when that is provably
+/// all they do: a test fixture written into a throwaway home
+/// (`H=$(mktemp -d); mkdir -p "$H/.claude"; echo '{}' >
+/// "$H/.claude/settings.json"; HOME="$H" tool`). `None` when the line is not
+/// in that shape, and it is then read whole.
+///
+/// The folder is new: no agent was started in it or with it as its home, so
+/// no agent loads settings from it. What would make a write into it reach
+/// the real settings is a link planted inside it, so every command that
+/// names the folder must be one that cannot plant one:
+///
+/// * the one assignment of the variable, `NAME=$(mktemp -d ...)`, without
+///   `-u` (which names a folder and makes none), and no other word that sets
+///   the name (`for`, `read`, `export`, another assignment);
+/// * `mkdir`;
+/// * `echo`, `printf`, `cat`, `true` or `:` whose output goes by `>` or `>>`
+///   into the folder, and `tee` into it;
+/// * `rm -rf` of the folder;
+/// * a command run with `HOME` set to the folder, after the last write
+///   into it (what it does in its home cannot be followed by a write here);
+///   that command itself is kept in the line and read as written, whatever
+///   program it runs.
+///
+/// A `cd`, a link, a copy, an archive, an alias of the variable, a function
+/// or anything else that names the folder leaves the line read whole.
+fn without_fresh_dir_writes(content: &str) -> Option<String> {
+    static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let assign = ASSIGN.get_or_init(|| {
+        // `NAME=$(mktemp -d)`, quoted or not, and the same with the
+        // substitution opened, as the guard's other reading of the line has
+        // it (`NAME= mktemp -d`): there `NAME` is empty, and the folder the
+        // line writes in is under `/`, not a home either.
+        regex::Regex::new(
+            r#"^([A-Za-z_][A-Za-z0-9_]*)=(?:"\$\(mktemp(\s+[^$`;&|()<>"'\\]*)?\)"|\$\(mktemp(\s+[^$`;&|()<>"'\\]*)?\)|"?\s+mktemp(\s+[^$`;&|()<>"'\\]*)?"?)$"#,
         )
+        .expect("static fresh folder assignment regex")
+    });
+    // A here-document's body is not read for commands here, and a function
+    // runs its body where it is called: neither shape is followed.
+    if content.contains('`') || content.contains("<<") || content.contains("()") {
+        return None;
+    }
+    let segments = shell_command_segments(content);
+    let mut name = None;
+    for segment in &segments {
+        if let Some(found) = assign.captures(segment.trim()) {
+            let flags = found
+                .get(2)
+                .or_else(|| found.get(3))
+                .or_else(|| found.get(4))
+                .map_or("", |m| m.as_str());
+            let words: Vec<&str> = flags.split_whitespace().collect();
+            let makes_folder = words.iter().any(|word| {
+                *word == "--directory"
+                    || word
+                        .strip_prefix('-')
+                        .is_some_and(|f| !f.starts_with('-') && f.contains('d'))
+            });
+            let dry = words.iter().any(|word| {
+                *word == "--dry-run"
+                    || word
+                        .strip_prefix('-')
+                        .is_some_and(|f| !f.starts_with('-') && f.contains('u'))
+            });
+            if !makes_folder || dry || name.is_some() {
+                return None;
+            }
+            name = Some(found.get(1)?.as_str().to_string());
+        }
+    }
+    let name = name?;
+    // The name stands bare only in its one assignment.
+    let bare = regex::Regex::new(&format!(r"(?:^|[^$A-Za-z0-9_{{]){name}\b")).ok()?;
+    if bare.find_iter(content).count() != 1 {
+        return None;
+    }
+    let mention = regex::Regex::new(&format!(r"\$(?:\{{{name}\}}|{name}\b)")).ok()?;
+    // In the folder: the folder itself or a path below it with no `..`.
+    let in_folder = |word: &str| {
+        let word = word.trim_matches('"');
+        !word.split('/').any(|part| part == "..")
+            && [format!("${name}"), format!("${{{name}}}")]
+                .iter()
+                .any(|head| word == head || word.starts_with(&format!("{head}/")))
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut home_runs = false;
+    for segment in &segments {
+        let trimmed = segment.trim();
+        if assign.is_match(trimmed) {
+            continue;
+        }
+        if !mention.is_match(trimmed) {
+            kept.push(segment);
+            continue;
+        }
+        let words = shell_tokens(trimmed);
+        let raw: Vec<&str> = trimmed.split_whitespace().collect();
+        let program = words.first().map(|w| token_basename(w)).unwrap_or_default();
+        // `HOME=$H tool` or `env HOME=$H tool`: the folder is the tool's home.
+        let home_set = raw
+            .iter()
+            .take_while(|w| w.contains('=') || **w == "env")
+            .any(|w| w.strip_prefix("HOME=").is_some_and(in_folder));
+        if home_set {
+            let rest: Vec<&&str> = raw
+                .iter()
+                .skip_while(|w| w.contains('=') || **w == "env")
+                .collect();
+            if rest.iter().any(|w| mention.is_match(w)) {
+                return None;
+            }
+            // What the program does in the folder's home is not followed
+            // here, and any program can run a line of its own there
+            // (`HOME=$H $SHELL -c 'ln -s ...'`, `python3 -c` with
+            // `os.symlink`, a `git -c alias.x='!ln -s ...'`): no list of
+            // such programs is whole, so the segment is always kept and
+            // read as written.
+            kept.push(segment);
+            home_runs = true;
+            continue;
+        }
+        let writes_in_folder = match program {
+            "mkdir" => raw[1..].iter().all(|w| w.starts_with('-') || in_folder(w)),
+            "rm" => {
+                raw.len() == 3
+                    && matches!(raw[1], "-rf" | "-fr" | "-r" | "-Rf" | "-fR")
+                    && in_folder(raw[2])
+                    && raw[2]
+                        .trim_matches('"')
+                        .trim_end_matches('/')
+                        .ends_with(&name)
+            }
+            "tee" => raw[1..]
+                .iter()
+                .all(|w| matches!(*w, "-a" | "--append") || in_folder(w)),
+            "echo" | "printf" | "cat" | "true" | ":" => {
+                // Every mention is the target of `>` or `>>`.
+                let mut ok = false;
+                let mut targets = 0;
+                let mut iter = raw.iter().peekable();
+                while let Some(word) = iter.next() {
+                    if let Some(target) = word.strip_prefix(">>").or_else(|| word.strip_prefix('>'))
+                    {
+                        let target = if target.is_empty() {
+                            iter.next().copied().unwrap_or("")
+                        } else {
+                            target
+                        };
+                        if !in_folder(target) {
+                            return None;
+                        }
+                        targets += 1;
+                        ok = true;
+                    } else if mention.is_match(word) {
+                        return None;
+                    }
+                }
+                ok && targets == 1
+            }
+            _ => false,
+        };
+        if !writes_in_folder || (home_runs && program != "rm") {
+            return None;
+        }
+    }
+    Some(kept.join("\n"))
+}
+
+/// Whether a line may hold a `find` that removes, edits or writes what it
+/// matches ([`find_takes_and_writes`]): such a search reaches the guard's
+/// places from above them without naming them (`find /etc -name agent.toml
+/// -delete`), so it is read whatever else the line names.
+fn names_a_removing_find(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("find")
+        && ["-delete", "-exec", "-ok", "-fprint", "-fls"]
+            .iter()
+            .any(|action| lower.contains(action))
 }
 
 /// A cheap test ahead of the walk [`writes_guard_carrier`] makes: a line
@@ -6447,6 +7509,11 @@ fn may_name_guard_carrier(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
     lower.contains("innerwarden")
         || names_guard_alias(content)
+        || names_a_removing_find(content)
+        || settings_hook_programs()
+            .programs
+            .iter()
+            .any(|program| lower.contains(token_basename(program)))
         || AGENT_HOMES.iter().any(|home| lower.contains(home))
         || guard_carrier_places().any(|place| {
             let (Place::File(row) | Place::Tree(row) | Place::Components(row)) = place;
@@ -6653,6 +7720,24 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 if command == "mv" {
                     taken.extend(sources.iter().map(|path| path.to_string()));
                 }
+                // `rsync --delete` (and `--delete-before`, `--del`, ...)
+                // removes what the destination holds that the source does
+                // not: the destination folder is taken away, not only
+                // written. `--remove-source-files` takes the sources.
+                if command == "rsync" {
+                    if arguments
+                        .iter()
+                        .any(|argument| argument == "--del" || argument.starts_with("--delete"))
+                    {
+                        taken.extend(destination.clone());
+                    }
+                    if arguments
+                        .iter()
+                        .any(|argument| argument == "--remove-source-files")
+                    {
+                        taken.extend(sources.iter().map(|path| path.to_string()));
+                    }
+                }
                 if let Some(destination) = destination {
                     // Into a directory, each source lands under its own name.
                     if named_directory || sources.len() > 1 || reads_as_directory(&destination) {
@@ -6678,6 +7763,14 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 {
                     return true;
                 }
+            }
+            "find" | "gfind" => {
+                let reading = find_takes_and_writes(arguments);
+                if reading.takes {
+                    taken.extend(guard_places_a_find_reaches(&reading, &dirs));
+                }
+                taken.extend(reading.taken);
+                targets.extend(reading.written);
             }
             "dd" => targets.extend(dd_operand(arguments, "of").map(str::to_string)),
             "curl" => targets.extend(option_values(arguments, 'o', &["output"])),
@@ -6712,6 +7805,448 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
         }
     }
     false
+}
+
+/// What a `find` takes away and what it writes, for [`writes_place`].
+///
+/// With `-delete`, or `-exec`, `-execdir`, `-ok` or `-okdir` running a
+/// program that removes, moves or edits what it is handed, every root of the
+/// search is taken away, filtered or not: `find ~/.config/innerwarden -name
+/// config.json -delete` removes a file of that folder. A root above the
+/// place is read with the plain words of each pattern under it, and against
+/// the guard's places it holds ([`guard_places_a_find_reaches`]).
+/// `-fprint`, `-fprint0`, `-fprintf` and `-fls` write their file.
+struct FindReading {
+    /// Whether the search removes or edits what it matches.
+    takes: bool,
+    /// The roots, as written.
+    roots: Vec<String>,
+    /// What it takes away: each root, and each root with a pattern's words.
+    taken: Vec<String>,
+    /// The files `-fprint` and its kin write.
+    written: Vec<String>,
+    /// The tests that choose what it matches.
+    filter: FindFilter,
+}
+
+/// The name and path tests of a `find` expression, lowercase.
+#[derive(Default)]
+struct FindFilter {
+    tests: Vec<(FindTest, String)>,
+    /// The expression has `-o`: a match of any test may be enough.
+    or: bool,
+    /// The expression has `!` or `-not`: what it matches is not read.
+    not: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FindTest {
+    /// `-name`, `-iname`: a glob on the last part of the path.
+    Name,
+    /// `-path`, `-wholename` and their `-i` forms: a glob on the path.
+    Path,
+    /// `-regex`, `-iregex`: a pattern on the whole path.
+    Regex,
+}
+
+impl FindFilter {
+    /// Whether the search may match `printed` (the path as `find` prints it).
+    /// A test that cannot be read counts as a match.
+    fn may_match(&self, printed: &str) -> bool {
+        if self.tests.is_empty() || self.not {
+            return true;
+        }
+        let name = printed
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(printed);
+        let matches = |(test, pattern): &(FindTest, String)| match test {
+            FindTest::Name => glob_matches(pattern, name),
+            FindTest::Path => glob_matches(pattern, printed),
+            FindTest::Regex => regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
+                .size_limit(1 << 20)
+                .build()
+                .map_or(true, |re| re.is_match(printed)),
+        };
+        if self.or {
+            self.tests.iter().any(matches)
+        } else {
+            self.tests.iter().all(matches)
+        }
+    }
+}
+
+/// Whether a shell glob matches all of `text`: `*` (which crosses `/`, as
+/// in `find -path`), `?`, a bracket class with ranges and `!` or `^`, and a
+/// backslash escape. A bracket left open is a plain `[`.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    // One element of the pattern at `at`: whether it takes `c`, and its length.
+    let single = |at: usize, c: char| -> (bool, usize) {
+        match pattern[at] {
+            '?' => (true, 1),
+            '\\' if at + 1 < pattern.len() => (pattern[at + 1] == c, 2),
+            '[' => {
+                let mut i = at + 1;
+                let negated = matches!(pattern.get(i), Some('!' | '^'));
+                if negated {
+                    i += 1;
+                }
+                let first = i;
+                let mut found = false;
+                while i < pattern.len() && (pattern[i] != ']' || i == first) {
+                    if i + 2 < pattern.len() && pattern[i + 1] == '-' && pattern[i + 2] != ']' {
+                        found |= pattern[i] <= c && c <= pattern[i + 2];
+                        i += 3;
+                    } else {
+                        found |= pattern[i] == c;
+                        i += 1;
+                    }
+                }
+                if i >= pattern.len() {
+                    ('[' == c, 1)
+                } else {
+                    (found != negated, i + 1 - at)
+                }
+            }
+            other => (other == c, 1),
+        }
+    };
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, t));
+            p += 1;
+            continue;
+        }
+        if p < pattern.len() {
+            let (ok, width) = single(p, text[t]);
+            if ok {
+                p += width;
+                t += 1;
+                continue;
+            }
+        }
+        match star {
+            Some((star_at, from)) => {
+                p = star_at + 1;
+                t = from + 1;
+                star = Some((star_at, from + 1));
+            }
+            None => return false,
+        }
+    }
+    pattern[p..].iter().all(|c| *c == '*')
+}
+
+fn find_takes_and_writes(arguments: &[String]) -> FindReading {
+    const REMOVERS: &[&str] = &[
+        "rm", "unlink", "shred", "truncate", "mv", "rmdir", "chmod", "tee", "dd", "ln",
+    ];
+    // Options before the roots: `-H`, `-L`, `-P`, `-D debug`, `-O3`.
+    let mut at = 0usize;
+    while let Some(word) = arguments.get(at) {
+        match word.as_str() {
+            "-H" | "-L" | "-P" => at += 1,
+            "-D" => at += 2,
+            _ if word.starts_with("-O") => at += 1,
+            _ => break,
+        }
+    }
+    let roots: Vec<String> = arguments[at.min(arguments.len())..]
+        .iter()
+        .take_while(|word| {
+            !word.starts_with('-') && !matches!(word.as_str(), "(" | "!" | "\\(" | "\\!")
+        })
+        .map(|root| root.trim_matches(['"', '\'']).to_string())
+        .collect();
+    let expression = &arguments[(at + roots.len()).min(arguments.len())..];
+    let mut takes = false;
+    let mut written = Vec::new();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut filter = FindFilter::default();
+    let mut words = expression.iter().peekable();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "-delete" => takes = true,
+            "-o" | "-or" => filter.or = true,
+            "!" | "\\!" | "-not" => filter.not = true,
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                let Some(program) = words.next() else { break };
+                let program =
+                    token_basename(program.trim_matches(['"', '\''])).to_ascii_lowercase();
+                let mut handed = Vec::new();
+                for argument in words.by_ref() {
+                    if matches!(argument.as_str(), ";" | "\\;" | "+" | "';'") {
+                        break;
+                    }
+                    handed.push(argument.clone());
+                }
+                takes |= REMOVERS.contains(&program.as_str())
+                    || SHELLS.contains(&program.as_str())
+                    || (matches!(program.as_str(), "sed" | "gsed" | "perl")
+                        && handed
+                            .iter()
+                            .any(|argument| edits_in_place(&program, argument)));
+            }
+            "-fprint" | "-fprint0" | "-fls" | "-fprintf" => written.extend(words.next().cloned()),
+            test => {
+                let kind = match test {
+                    "-name" | "-iname" => FindTest::Name,
+                    "-path" | "-ipath" | "-wholename" | "-iwholename" => FindTest::Path,
+                    "-regex" | "-iregex" => FindTest::Regex,
+                    _ => continue,
+                };
+                let Some(value) = words.next() else { break };
+                let value = value.trim_matches(['"', '\'']).to_lowercase();
+                pieces.extend(
+                    value
+                        .split(|c: char| "*?[]{}()|^$\\+".contains(c))
+                        .map(|piece| piece.trim_matches('/'))
+                        .filter(|piece| !piece.is_empty() && *piece != ".")
+                        .map(str::to_string),
+                );
+                filter.tests.push((kind, value));
+            }
+        }
+    }
+    let mut taken = Vec::new();
+    if takes {
+        for root in &roots {
+            let root = root.trim_end_matches('/');
+            taken.push(root.to_string());
+            taken.extend(pieces.iter().map(|piece| format!("{root}/{piece}")));
+        }
+    }
+    FindReading {
+        takes,
+        roots,
+        taken,
+        written,
+        filter,
+    }
+}
+
+/// The guard's places a search from above them may remove: its folders,
+/// with the names it keeps in them, the agent settings that load it, and its
+/// program where the installers put it. Spelled from the root or the home.
+const GUARD_FIND_PLACES: &[(&str, &[&str])] = &[
+    ("~/.config/innerwarden", GUARD_FILE_NAMES),
+    ("/etc/innerwarden", GUARD_FILE_NAMES),
+    ("/var/lib/innerwarden", GUARD_FILE_NAMES),
+    ("/sys/fs/bpf/innerwarden", &[]),
+    ("~/.claude/settings.json", &[]),
+    ("~/.claude/settings.local.json", &[]),
+    ("~/.claude.json", &[]),
+    ("~/.codex/config.toml", &[]),
+    ("~/.cursor/mcp.json", &[]),
+    ("~/.gemini/settings.json", &[]),
+    ("~/.openclaw/openclaw.json", &[]),
+    ("~/.openclaw/extensions/innerwarden-guard", &[]),
+    ("~/.openclaw/extensions/innerwarden-replies", &[]),
+    ("~/.openclaw/hooks/innerwarden-attempts", &[]),
+    ("/usr/local/bin/innerwarden", &[]),
+    ("/usr/bin/innerwarden", &[]),
+    ("~/.local/bin/innerwarden", &[]),
+    ("~/.cargo/bin/innerwarden", &[]),
+];
+
+/// The files the guard and the host agent keep in their folders, by name
+/// (read from the code that writes them).
+const GUARD_FILE_NAMES: &[&str] = &[
+    "suppress.toml",
+    "allow.toml",
+    "allow.json",
+    "agent-profiles.toml",
+    "agents.toml",
+    "agents.lock",
+    "llm-key",
+    "llm.toml",
+    "graph.json",
+    "guard.toml",
+    "guard-events.jsonl",
+    "agent.toml",
+    "agent-kernel.toml",
+    "agent-tls.spki",
+    "notify.toml",
+    "config.json",
+    "config.toml",
+    "registry.json",
+    "sessions.json",
+    "state.json",
+    "state.db",
+    "innerwarden.db",
+    "dns-guard-mode",
+];
+
+/// What a folder of the guard holds, for [`guard_places_a_find_reaches`].
+enum FolderEntries {
+    /// Every file and folder under it, as paths below it, lowercase. Empty
+    /// for a place that is a file.
+    Listed(Vec<String>),
+    /// It is not there.
+    Missing,
+    /// It, or a folder under it, could not be read, or it holds more than
+    /// [`GUARD_FOLDER_ENTRIES`]: what it holds is not known.
+    Unread,
+}
+
+/// How many entries a folder of the guard is listed to, and how deep.
+const GUARD_FOLDER_ENTRIES: usize = 50_000;
+const GUARD_FOLDER_DEPTH: usize = 12;
+
+/// Everything under `place`, listed now, links not followed.
+fn guard_folder_entries(place: &std::path::Path) -> FolderEntries {
+    let metadata = match std::fs::symlink_metadata(place) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return FolderEntries::Missing
+        }
+        Err(_) => return FolderEntries::Unread,
+    };
+    if !metadata.is_dir() {
+        return FolderEntries::Listed(Vec::new());
+    }
+    let mut entries = Vec::new();
+    let mut pending = vec![(place.to_path_buf(), String::new(), 0usize)];
+    while let Some((folder, below, depth)) = pending.pop() {
+        let Ok(listing) = std::fs::read_dir(&folder) else {
+            return FolderEntries::Unread;
+        };
+        for entry in listing {
+            let Ok(entry) = entry else {
+                return FolderEntries::Unread;
+            };
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let path = if below.is_empty() {
+                name
+            } else {
+                format!("{below}/{name}")
+            };
+            if entries.len() >= GUARD_FOLDER_ENTRIES {
+                return FolderEntries::Unread;
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                if depth + 1 >= GUARD_FOLDER_DEPTH {
+                    return FolderEntries::Unread;
+                }
+                pending.push((entry.path(), path.clone(), depth + 1));
+            }
+            entries.push(path);
+        }
+    }
+    FolderEntries::Listed(entries)
+}
+
+/// The guard's places under a root of a search that takes what it matches,
+/// where its tests may match the place, a folder on the way to it or a file
+/// the guard keeps in it ([`FindFilter::may_match`]): `find ~ -path
+/// '*innerwarden*' -delete` and `find /etc -name agent.toml -delete` remove
+/// them. Inside a place every file is the guard's: the filter is held to the
+/// place's listing at the time of the judgment ([`guard_folder_entries`]),
+/// to [`GUARD_FILE_NAMES`] for a folder not made yet, and a folder that
+/// cannot be listed counts as a match. A relative root is read in each
+/// directory a `cd` named, and is not read without one. Not read: a root
+/// behind a variable other than the home.
+fn guard_places_a_find_reaches(reading: &FindReading, dirs: &[String]) -> Vec<String> {
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|home| home.starts_with('/'))
+        .map(|home| home.to_lowercase().trim_end_matches('/').to_string());
+    // `~/x` with the home written out, where it is known.
+    let absolute = |path: &str| -> String {
+        let path = home_spelled(path);
+        match (&home, path.strip_prefix('~')) {
+            (Some(home), Some(rest)) if rest.is_empty() || rest.starts_with('/') => {
+                collapse_path(&format!("{home}{rest}"))
+            }
+            _ => collapse_path(&path),
+        }
+    };
+    let real_home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from);
+    let programs = &settings_hook_programs().programs;
+    let mut reached = Vec::new();
+    for written in &reading.roots {
+        let mut spellings = vec![written.clone()];
+        if !written.starts_with(['/', '~', '$']) {
+            spellings = dirs.iter().map(|dir| format!("{dir}/{written}")).collect();
+        }
+        for spelled in spellings {
+            let root = absolute(&spelled);
+            if !root.starts_with(['/', '~']) {
+                continue;
+            }
+            let root = root.trim_end_matches('/');
+            let places = GUARD_FIND_PLACES
+                .iter()
+                .map(|(place, names)| (place.to_string(), *names))
+                .chain(programs.iter().map(|program| (program.clone(), &[][..])));
+            for (spelled_place, names) in places {
+                let place = absolute(&spelled_place);
+                let Some(rest) = place.strip_prefix(root) else {
+                    continue;
+                };
+                if !(rest.starts_with('/') || root.is_empty()) {
+                    continue;
+                }
+                // As `find` prints it: the root as written, then the rest.
+                let printed = |path: &str| {
+                    format!("{}{}", written.trim_end_matches('/'), &path[root.len()..])
+                };
+                let mut candidates = vec![place.clone()];
+                let mut on_the_way = place.as_str();
+                while let Some((parent, _)) = on_the_way.rsplit_once('/') {
+                    if parent.len() <= root.len() {
+                        break;
+                    }
+                    candidates.push(parent.to_string());
+                    on_the_way = parent;
+                }
+                if candidates
+                    .iter()
+                    .any(|candidate| reading.filter.may_match(&printed(candidate)))
+                {
+                    reached.push(place);
+                    continue;
+                }
+                // Inside a place of the guard every file is the guard's: the
+                // filter is held to what the folder holds now, or to the
+                // names the guard keeps there when it is not made yet. A
+                // folder that cannot be read whole may hold a match.
+                let real = match spelled_place.strip_prefix('~') {
+                    Some(rest) => match &real_home {
+                        Some(home) => home.join(rest.trim_start_matches('/')),
+                        None => {
+                            reached.push(place);
+                            continue;
+                        }
+                    },
+                    None => std::path::PathBuf::from(&spelled_place),
+                };
+                let inside: Vec<String> = match guard_folder_entries(&real) {
+                    FolderEntries::Listed(entries) => entries,
+                    FolderEntries::Missing => names.iter().map(|name| name.to_string()).collect(),
+                    FolderEntries::Unread => {
+                        reached.push(place);
+                        continue;
+                    }
+                };
+                if inside.iter().any(|entry| {
+                    reading
+                        .filter
+                        .may_match(&printed(&format!("{place}/{entry}")))
+                }) {
+                    reached.push(place);
+                }
+            }
+        }
+    }
+    reached
 }
 
 /// How many directories [`writes_place`] keeps for a line. A relative `cd`
@@ -6992,12 +8527,126 @@ fn names_guard_carrier(target: &str) -> bool {
     if guard_carrier_places().any(|place| place.holds(&named)) {
         return true;
     }
+    if names_a_settings_hook_program(target) {
+        return true;
+    }
     let mut parts = named.path.rsplit('/');
     let program = parts.next().unwrap_or_default();
     let program = program.strip_suffix(".exe").unwrap_or(program);
     (named.rooted || named.path.starts_with('~'))
         && matches!(parts.next(), Some("bin" | "sbin"))
         && GUARD_PROGRAMS.contains(&program)
+}
+
+/// The programs the agent's settings run as the guard's hook, wherever they
+/// are: the guard's own binary at any path (`/opt/iw/innerwarden hook`), or
+/// a script a hook runs whose line names the guard (`bash
+/// ~/tools/innerwarden-hook.sh`). Read once per process from Claude Code's
+/// settings in the home and in the working directory, with a leading home
+/// spelled `~`, lowercase. The settings' own files are places of
+/// [`GUARD_SETTINGS`] already; this is what their hook line points at.
+struct SettingsHookPrograms {
+    /// The home, lowercase, without its last `/`.
+    home: Option<String>,
+    /// Each program, as [`named_path`] reads it once its home is `~`.
+    programs: Vec<String>,
+}
+
+fn settings_hook_programs() -> &'static SettingsHookPrograms {
+    static PROGRAMS: std::sync::OnceLock<SettingsHookPrograms> = std::sync::OnceLock::new();
+    PROGRAMS.get_or_init(|| {
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(std::path::PathBuf::from);
+        let mut folders: Vec<std::path::PathBuf> = home.iter().cloned().collect();
+        folders.extend(std::env::current_dir().ok());
+        let home_text = home.as_ref().map(|home| {
+            home.to_string_lossy()
+                .to_lowercase()
+                .trim_end_matches('/')
+                .to_string()
+        });
+        let mut programs = Vec::new();
+        for folder in &folders {
+            for name in ["settings.json", "settings.local.json"] {
+                let Ok(bytes) = std::fs::read(folder.join(".claude").join(name)) else {
+                    continue;
+                };
+                if bytes.len() > SETTINGS_READ_BYTES {
+                    continue;
+                }
+                let Ok(settings) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue;
+                };
+                for program in guard_hook_programs_in(&settings) {
+                    if let Some(named) = named_path(&home_as_tilde(&program, home_text.as_deref()))
+                    {
+                        if (named.rooted || named.path.starts_with('~'))
+                            && !programs.contains(&named.path)
+                        {
+                            programs.push(named.path);
+                        }
+                    }
+                }
+            }
+        }
+        SettingsHookPrograms {
+            home: home_text,
+            programs,
+        }
+    })
+}
+
+/// Largest settings file read for [`settings_hook_programs`].
+const SETTINGS_READ_BYTES: usize = 1 << 20;
+
+/// The program each `PreToolUse` hook in `settings` runs, where its line
+/// names the guard: the first word, or the script a shell is handed.
+fn guard_hook_programs_in(settings: &serde_json::Value) -> Vec<String> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(serde_json::Value::as_str))
+        .filter(|command| {
+            command.to_ascii_lowercase().contains("innerwarden") || names_a_guard_program(command)
+        })
+        .filter_map(|command| {
+            let mut words = command
+                .split_whitespace()
+                .map(|word| word.trim_matches(['"', '\'']));
+            let first = words.next()?;
+            if SHELLS.contains(&token_basename(first)) {
+                words
+                    .find(|word| !word.starts_with('-'))
+                    .map(str::to_string)
+            } else {
+                Some(first.to_string())
+            }
+        })
+        .collect()
+}
+
+/// `path` lowercase, with `$HOME` and the home itself spelled `~`.
+fn home_as_tilde(path: &str, home: Option<&str>) -> String {
+    let spelled = home_spelled(path);
+    match home.and_then(|home| spelled.strip_prefix(home)) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => spelled,
+    }
+}
+
+/// Whether a path names a program the agent's settings run as the guard's
+/// hook ([`settings_hook_programs`]).
+fn names_a_settings_hook_program(target: &str) -> bool {
+    let known = settings_hook_programs();
+    !known.programs.is_empty()
+        && named_path(&home_as_tilde(target, known.home.as_deref()))
+            .is_some_and(|named| known.programs.contains(&named.path))
 }
 
 /// The folders the agents keep their settings in, each of which holds a
@@ -7162,6 +8811,12 @@ fn interpreter_code_writes_guard_config(interpreter: &str, arguments: &[String])
     if !code.contains("innerwarden") {
         return false;
     }
+    code_names_and_writes_guard_config(&code) || code_text_runs_guard_verb(&code)
+}
+
+/// Whether interpreter code (lowercase) names the guard's configuration
+/// directory and writes.
+fn code_names_and_writes_guard_config(code: &str) -> bool {
     static NAMES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
@@ -7174,7 +8829,7 @@ fn interpreter_code_writes_guard_config(interpreter: &str, arguments: &[String])
         )
         .expect("static interpreter write regex")
     });
-    (names.is_match(&code) && writes.is_match(&code)) || code_text_runs_guard_verb(&code)
+    names.is_match(code) && writes.is_match(code)
 }
 
 /// Cheap literal gate in front of a regex family.
@@ -7267,7 +8922,11 @@ pub fn check_local_credential_and_kernel_tamper(content: &str) -> Option<(&'stat
                 "uses a debugger to make a running process change its own user id",
             ),
             (
-                r"(?i)\b(?:dd|tee|cp|mv)\b[^|;&]*\b(?:of=|>)?\s*/etc/(?:passwd|shadow|gshadow|sudoers)\b",
+                // By its destination: \`dd of=\`, a file \`tee\` writes, and a
+                // move either way (it takes the database away). A copy onto
+                // it is \`names_persistence_file\`'s, which reads \`cp -t\`. A copy FROM it is a read: \`cp /etc/passwd /tmp/p\`
+                // and \`tee /tmp/x < /etc/passwd\` were denied here.
+                r"(?i)\bdd\b[^|;&]*\bof=/etc/(?:passwd|shadow|gshadow|sudoers)\b|\btee\b(?:\s+-\S+)*\s+/etc/(?:passwd|shadow|gshadow|sudoers)\b|\bmv\b[^|;&]*\s/etc/(?:passwd|shadow|gshadow|sudoers)\b",
                 "writes to the account or sudo database",
             ),
             (
@@ -7541,6 +9200,12 @@ pub fn check_anti_forensics(content: &str) -> Option<(&'static str, u32)> {
 /// executable hook into a boot, login, device or repository path, which is not
 /// something an agent does in passing.
 pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
+    if writes_ssh_client_config(content) {
+        return Some((SSH_CLIENT_CONFIG_WRITTEN, 60));
+    }
+    if writes_persistence_file(content) || code_writes_persistence_file(content) {
+        return Some((PERSISTENCE_FILE_WRITTEN, 60));
+    }
     if !mentions_any(
         content,
         &[
@@ -7616,7 +9281,10 @@ pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
                 // read-only and both were denied by an earlier version of this
                 // pattern, which matched any flag at all. Only the forms that
                 // WRITE a crontab count: `-e`, a file argument, or `-r`.
-                r"(?i)\bcrontab\b(?:\s+-u\s+\S+)?\s+(?:-e\b|-r\b|[^-\s]\S*)",
+                // \`crontab\` the program (bare or from a bin folder), not a
+                // path that ends in it: \`cp /etc/crontab /tmp/c\` copies the
+                // table out and was denied here.
+                r"(?i)(?:^|[^/\w.-]|/s?bin/)crontab\b(?:\s+-u\s+\S+)?\s+(?:-e\b|-r\b|[^-\s]\S*)",
                 "installs or replaces a scheduled task",
             ),
             (
@@ -7724,6 +9392,8 @@ const ESCAPE_HOST_DIRECTORY: &str =
     "mounts a host system directory into a container writable, which is a container escape";
 const ESCAPE_SOCKET_MOUNT: &str =
     "mounts the container runtime's socket into a container, which hands the container the host";
+const ESCAPE_SOCKET_UNREAD: &str = "points a socket client or the container runtime's CLI at a socket named by a value the line does not set, which may be the container runtime's; the guard cannot tell without running the line";
+const ESCAPE_TARGET_UNREAD: &str = "enters the namespaces of a process named by a value the line does not set, which may be PID 1; the guard cannot tell without running the line";
 
 /// A container started so that it is the host, the host entered from inside
 /// one, and the container runtime driven through its API by a raw client.
@@ -7775,22 +9445,115 @@ const ESCAPE_SOCKET_MOUNT: &str =
 /// container), and both hand whoever runs the line the host: the socket
 /// starts a privileged container on request, and `SYS_ADMIN` mounts the
 /// host's disks. An agent that needs either asks the person, who runs it.
+///
+/// The runtime socket is the socket wherever it lives: under `/run`, and in
+/// the home or the user's runtime folder where Docker Desktop, Colima,
+/// Rancher Desktop, OrbStack, Lima and Podman machine keep it (the socket, or
+/// the folder that holds it, mounted into a container). It is also reached
+/// by an interpreter one-liner that opens the socket or the runtime's TCP
+/// port itself, or uses the runtime's SDK; by `telnet` and `/dev/tcp` on
+/// the port; by `curl` on any socket, or with its options in a file, asking
+/// for a path only the runtime's API serves (`/containers/json`,
+/// `/v1.43/...`, `/libpod/`); and by a raw client handed `DOCKER_HOST` or
+/// `docker context inspect`. A socket or an `nsenter` target named by a
+/// value the line does not set is known only when the line runs, so it is
+/// held for review (score 25), not refused ([`container_reach_unread`]).
+/// Still unread: options kept in `~/.curlrc`, which curl reads without
+/// being told, and a script file an interpreter is handed.
 pub fn check_container_escape(content: &str) -> Option<(&'static str, u32)> {
     if !mentions_any(
         content,
         &[
-            "docker", "podman", "nerdctl", "ctr", "finch", "buildah", "nsenter", ".sock", "237",
+            "docker",
+            "podman",
+            "nerdctl",
+            "ctr",
+            "finch",
+            "buildah",
+            "nsenter",
+            ".sock",
+            "237",
+            "container_host",
+            "containers/",
+            "libpod",
+            "_ping",
+            "/v1.",
+            "--uni",
+            "--ab",
+            "socat",
+            "nc ",
+            "ncat",
+            "netcat",
         ],
     ) {
         return None;
     }
     // The most expanded reading first, the line as written last.
     let (readings, _) = assignment_readings(content);
-    readings
+    if let Some(what) = readings
         .iter()
         .rev()
         .find_map(|reading| container_escape_as_read(reading))
-        .map(|what| (what, 60))
+    {
+        return Some((what, 60));
+    }
+    // What is left unset once the line's own values are read in.
+    let last = readings.last()?;
+    container_reach_unread(last)
+        .or_else(|| container_reach_unread(&normalize_command(last)))
+        .map(|what| (what, 25))
+}
+
+/// A raw socket client, the runtime's own CLI (`DOCKER_HOST=`,
+/// `CONTAINER_HOST=`, `docker -H`, `podman --url`) or `nsenter` pointed by
+/// a value the line does not set: a variable from outside the line, or a
+/// command substitution. `$HOME` and `$XDG_RUNTIME_DIR` are not such a
+/// value: the path after them is on the line and read by the rules above. What it
+/// names is known only once the line runs, so it is left to a person
+/// (`review`), not refused. A target that is a container's own PID read
+/// from the runtime (`nsenter -t "$(docker inspect -f '{{.State.Pid}}' web)"`)
+/// is a container's, never PID 1, and is not flagged.
+fn container_reach_unread(text: &str) -> Option<&'static str> {
+    static RES: std::sync::OnceLock<[regex::Regex; 5]> = std::sync::OnceLock::new();
+    let [socket, setting, target, target_from_runtime, namespace] = RES.get_or_init(|| {
+        // The socket after curl's socket options, `nc -U` and socat's
+        // `UNIX-*:` addresses, when it starts with an expansion.
+        const SOCKET_FROM_VALUE: &str = concat!(
+            r#"(?i:(?:^|[\s"'])--unix?(?:-s?[ocket]*)?|(?:^|[\s"'])--ab[stract]*(?:-[unix]*(?:-s?[ocket]*)?)?)"#,
+            r#"(?:\s*=\s*|\s+)["']?(?:\$|`)"#,
+            r#"|(?i:\b(?:nc|ncat|netcat)\b)[^|;&\n]*\s-[a-zA-Z]*U\s*["']?(?:\$|`)"#,
+            r#"|(?i:\bsocat\b)[^|;&\n]*\bUNIX(?:-CONNECT|-CLIENT|-SENDTO)?:["']?(?:\$|`)"#,
+        );
+        // Where the runtime's CLI is pointed, by its settings or its flags,
+        // when the value starts with an expansion; the expansion is captured.
+        const SETTING_FROM_VALUE: &str = concat!(
+            r#"(?:(?:^|[\s;&|(])(?:export\s+)?(?:DOCKER_HOST|CONTAINER_HOST)="#,
+            r#"|(?i:\b(?:docker|podman|nerdctl)\b)[^|;&\n]*\s(?:-H|--host|--url)(?:\s*=\s*|\s+))"#,
+            r#"["']?(?:(?:unix|tcp|ssh|npipe)://)?["']?(\$\{?\w*|`)"#,
+        );
+        const TARGET_FROM_VALUE: &str = r#"\bnsenter\b[\s\S]*?(?:\s-[a-zA-Z]*t\s*|\s--target(?:\s*=\s*|\s+))["']?(?:\$|`)"#;
+        const TARGET_FROM_RUNTIME: &str = r#"\bnsenter\b[\s\S]*?(?:\s-[a-zA-Z]*t\s*|\s--target(?:\s*=\s*|\s+))["']?\$\(\s*(?:sudo\s+)?(?:docker|podman|nerdctl|crictl)\s+(?:container\s+)?inspect\b"#;
+        const NAMESPACE_FROM_VALUE: &str = r#"\bnsenter\b[\s\S]*?\s--(?:mount|uts|ipc|net|pid|user|cgroup|time)=["']?(?:/proc/)?(?:\$|`)"#;
+        [
+            SOCKET_FROM_VALUE,
+            SETTING_FROM_VALUE,
+            TARGET_FROM_VALUE,
+            TARGET_FROM_RUNTIME,
+            NAMESPACE_FROM_VALUE,
+        ]
+        .map(|p| regex::Regex::new(p).expect("static container reach regex"))
+    });
+    let unset = |found: regex::Captures<'_>| {
+        let name = found[1].trim_start_matches(['$', '{']);
+        !matches!(name, "HOME" | "XDG_RUNTIME_DIR")
+    };
+    if socket.is_match(text) || setting.captures_iter(text).any(unset) {
+        return Some(ESCAPE_SOCKET_UNREAD);
+    }
+    if (target.is_match(text) && !target_from_runtime.is_match(text)) || namespace.is_match(text) {
+        return Some(ESCAPE_TARGET_UNREAD);
+    }
+    None
 }
 
 /// [`check_container_escape`] on one reading of the line. The raw form first
@@ -7967,7 +9730,7 @@ fn container_escape_in(text: &str) -> Option<&'static str> {
         const NSENTER_PID_ONE: &str = r#"\bnsenter\b[\s\S]*?(?:\s-[a-zA-Z]*t\s*|\s--target(?:\s*=\s*|\s+))["']?\+?0*1(?:[^\w.]|$)"#;
         const NSENTER_PROC_ONE: &str = r"\bnsenter\b[\s\S]*?/proc/1/ns/";
         const RUNTIME_SOCKET: &str =
-            r"(?i)\b(?:docker|podman|containerd|crio|cri-dockerd|dockershim)\.sock\b";
+            r"(?i)\b(?:docker|podman|containerd|crio|cri-dockerd|dockershim)(?:[.-][\w-]+)*\.sock\b";
         // curl's socket options (an older curl takes any unambiguous
         // abbreviation of them), `nc -U` with its flags in any order, socat.
         const RAW_SOCKET_CLIENT: &str = concat!(
@@ -7983,6 +9746,8 @@ fn container_escape_in(text: &str) -> Option<&'static str> {
             r#"(?i:\bhttps?://[^\s/"']*:237[56]\b)"#,
             r"|(?i:\b(?:curl|wget)\b)[^|;&\n]*?[\w.\]]:237[56]\b",
             r"|(?i:\b(?:nc|ncat|netcat)\b)[^|;&\n]*\s237[56]\b",
+            r"|(?i:\btelnet\b)[^|;&\n]*\s237[56]\b",
+            r"|/dev/(?:tcp|udp)/[^/\s]+/237[56]\b",
         );
         // `--cap-add`, its value attached or not, one name or a comma list,
         // with or without `CAP_`, in any case.
@@ -8007,8 +9772,61 @@ fn container_escape_in(text: &str) -> Option<&'static str> {
             r#"/?:[^\s:"']+(?::(?:(?:rw|z|shared|slave|private|rshared|rslave|rprivate|delegated|cached|consistent|nocopy),?)*)?(?:["'\s]|$)"#,
         ]
         .concat();
-        const RUNTIME_SOCKET_PATH: &str =
-            r"/(?:var/)?run/(?:[\w.-]+/)*(?:docker|podman|containerd|crio|cri-dockerd)\.sock";
+        // A runtime socket anywhere: under `/run`, and also in the home or
+        // the user's runtime folder, where Docker Desktop, Colima, Rancher
+        // Desktop, OrbStack, Lima and Podman machine keep theirs
+        // (`~/.docker/run/docker.sock`, `~/.colima/default/docker.sock`,
+        // `podman-machine-default-api.sock`, `docker.raw.sock`).
+        const RUNTIME_SOCKET_PATH: &str = concat!(
+            r"(?:/|~/|\$\{?(?:HOME|XDG_RUNTIME_DIR)\}?/)(?:[\w.-]+/)*",
+            r"(?:docker|podman|containerd|crio|cri-dockerd)(?:[.-][\w-]+)*\.sock",
+        );
+        // The folders those runtimes keep their socket in, mounted whole.
+        const RUNTIME_SOCKET_FOLDER: &str = concat!(
+            r#"(?:(?:~|\$\{?HOME\}?|/home/[^/\s"':,]+|/var/home/[^/\s"':,]+|/Users/[^/\s"':,]+|/root)/"#,
+            r"(?:\.docker/(?:run|desktop)|\.colima(?:/[\w.-]+)?|\.orbstack(?:/run)?|\.rd",
+            r"|\.lima(?:/[\w.-]+(?:/sock)?)?|\.local/share/containers/podman/machine(?:/[\w.-]+)?)",
+            r"|(?:\$\{?XDG_RUNTIME_DIR\}?|/run/user/\d+)(?:/(?:podman|docker|containerd))?)",
+        );
+        let folder_volume = [
+            r#"(?i)(?:^|[\s"'])(?:-[a-z]*v|--volume)["']?(?:\s*=\s*|\s+)?["']?"#,
+            RUNTIME_SOCKET_FOLDER,
+            r#"/?["']?:"#,
+        ]
+        .concat();
+        let folder_mount = [
+            r#"(?i)(?:^|[\s"'])--mount["']?(?:\s*=\s*|\s+)["']?[^\s"']*?\b(?:source|src)=["']?"#,
+            RUNTIME_SOCKET_FOLDER,
+            r#"/?["']?(?:[,\s"']|$)"#,
+        ]
+        .concat();
+        // A raw HTTP client that reaches a socket (curl's socket options) or
+        // takes its options from a file (`curl -K`), asking for a path only
+        // the runtime's API serves.
+        const SOCKET_OR_CONFIG_CLIENT: &str = concat!(
+            r#"(?i:(?:^|[\s"'])--unix?(?:-s?[ocket]*)?(?:[\s="']|$))"#,
+            r#"|(?i:(?:^|[\s"'])--ab[stract]*(?:-[unix]*(?:-s?[ocket]*)?)?(?:[\s="']|$))"#,
+            r#"|(?i:\bcurl\b)[^|;&\n]*\s(?:-[a-zA-Z]*K|--config)(?:[\s="']|$)"#,
+        );
+        const RUNTIME_API_URL: &str = concat!(
+            r#"(?i)\bhttps?://[^\s/"']*(?:/v1\.\d{2}|/v\d+\.\d+\.\d+)?/"#,
+            r#"(?:containers/(?:json|create|prune)\b|containers/[^\s/"'?]+/(?:exec|start|attach|archive|update|json|export|kill|restart|wait)\b"#,
+            r#"|exec/[^\s/"'?]+/start\b|images/(?:json|create|load)\b|_ping\b|libpod/)"#,
+            r#"|\bhttps?://[^\s/"']*/v1\.\d{2}/"#,
+        );
+        // A raw client handed the runtime by its own settings.
+        const RUNTIME_BY_SETTING: &str = r"(?i)\$\{?(?:DOCKER_HOST|CONTAINER_HOST)\b|\b(?:docker|podman)\s+(?:context|machine)\s+inspect\b";
+        // The same settings read by name from inside an interpreter.
+        const RUNTIME_SETTING_NAME: &str = r"\b(?:DOCKER_HOST|CONTAINER_HOST)\b";
+        // An interpreter one-liner that opens a connection itself.
+        const INTERPRETER: &str = r"(?i)\b(?:python[\d.]*|pypy[\d.]*|perl|ruby|node(?:js)?|deno|bun|php[\d.]*|lua(?:jit)?[\d.]*|tclsh[\d.]*|pwsh|powershell|osascript|jshell|groovy)\b";
+        const OPENS_CONNECTION: &str = concat!(
+            r"(?i)\bconnect\b|\bsocket\b|socketPath|UNIXSocket|TCPSocket|IO::Socket|AF_UNIX|create_connection",
+            r"|urlopen|http\.client|HTTPConnection|\brequests\b|fsockopen|stream_socket_client|createConnection",
+            r"|unix://|http\+unix|\bfetch\b|Net::HTTP|HTTP::Tiny|\bLWP\b",
+        );
+        const RUNTIME_PORT: &str = r"(?:^|[^\w.])237[56](?:[^\w.]|$)";
+        const RUNTIME_SDK: &str = r#"(?i)\bdocker\.(?:from_env|DockerClient|APIClient)\b|\bfrom\s+docker\s+import\b|require\(\s*["']dockerode\b|\bDocker::(?:Container|Image)\b"#;
         let socket_volume = [
             r#"(?i)(?:^|[\s"'])(?:-[a-z]*v|--volume)["']?(?:\s*=\s*|\s+)?["']?"#,
             RUNTIME_SOCKET_PATH,
@@ -8050,9 +9868,32 @@ fn container_escape_in(text: &str) -> Option<&'static str> {
             (vec![RUNS, socket_mount_target.as_str()], ESCAPE_SOCKET_MOUNT),
             (vec![NSENTER_PID_ONE], ESCAPE_PID_ONE),
             (vec![NSENTER_PROC_ONE], ESCAPE_PID_ONE),
+            (vec![RUNS, folder_volume.as_str()], ESCAPE_SOCKET_MOUNT),
+            (vec![RUNS, folder_mount.as_str()], ESCAPE_SOCKET_MOUNT),
             (
                 vec![RUNTIME_SOCKET, RAW_SOCKET_CLIENT],
                 ESCAPE_RUNTIME_SOCKET,
+            ),
+            (
+                vec![SOCKET_OR_CONFIG_CLIENT, RUNTIME_API_URL],
+                ESCAPE_RUNTIME_SOCKET,
+            ),
+            (
+                vec![RAW_SOCKET_CLIENT, RUNTIME_BY_SETTING],
+                ESCAPE_RUNTIME_SOCKET,
+            ),
+            (
+                vec![INTERPRETER, RUNTIME_SOCKET, OPENS_CONNECTION],
+                ESCAPE_RUNTIME_SOCKET,
+            ),
+            (
+                vec![INTERPRETER, RUNTIME_SETTING_NAME, OPENS_CONNECTION],
+                ESCAPE_RUNTIME_SOCKET,
+            ),
+            (vec![INTERPRETER, RUNTIME_SDK], ESCAPE_RUNTIME_SOCKET),
+            (
+                vec![INTERPRETER, RUNTIME_PORT, OPENS_CONNECTION],
+                ESCAPE_RUNTIME_TCP,
             ),
             (vec![RUNTIME_TCP], ESCAPE_RUNTIME_TCP),
         ];
@@ -8995,8 +10836,18 @@ fn dd_noop_sink(hay: &str) -> bool {
 /// of anything fetched, decoded, or read from a variable stays exactly as
 /// dangerous as it was, which `eval_of_network_data_is_still_denied` pins.
 fn is_local_tool_eval_idiom(content: &str) -> bool {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
+    static AT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static IDIOM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // Every `eval` the line runs: where a command starts (the start of a
+    // line, after `;` `&` `|`, inside `{ }`, `( )`, `$( )` or backquotes, and
+    // after a keyword that opens a body).
+    let at = AT.get_or_init(|| {
+        regex::Regex::new(
+            r"(?m)(?:^|[;&|({!`\n]|\$\(|\b(?:then|do|else|elif|if|while|until|time)\b)\s*(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*(eval)(?:\s|$)",
+        )
+        .expect("static eval position regex")
+    });
+    let idiom = IDIOM.get_or_init(|| {
         // The command reaching this point may be RAW (`eval "$(kubectl
         // completion bash)"`) or STRUCTURALLY PROJECTED, which unwraps the
         // command substitution. Both forms have to match or the exemption only
@@ -9005,28 +10856,34 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
         // question.
         regex::Regex::new(
             r#"(?ix)
-            ^\s* (?: (?:command|builtin) \s+ (?:-p\s+)? (?:--\s+)? )* eval\s+ ["']? (?:\$\( | `)? \s*
+            ^eval\s+ ["']? (?:\$\( | `)? \s*
             (?:
-                  [\w.-]+ \s+ (?:completion|completions) (?:\s+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
+                  [\w.-]+ \s+ (?:completion|completions) (?:[\t\x20]+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
                 | (?:direnv|starship|zoxide|mise|rbenv|pyenv|nodenv|jenv|fnm|atuin|navi|keychain)
-                    \s+ (?:hook|init|env|activate|init-file) (?:\s+[\w.-]+)?   # direnv hook bash
-                | ssh-agent (?:\s+-s)?                                     # ssh-agent -s
-                | gpg-agent [^)`'"]*
+                    \s+ (?:hook|init|env|activate|init-file) (?:[\t\x20]+[\w.-]+)?   # direnv hook bash
+                | ssh-agent (?:[\t\x20]+-s)?                                  # ssh-agent -s
+                | gpg-agent [^)`'";&|\n]*
                 | brew \s+ shellenv
-                | dircolors [^)`'"]*
+                | dircolors [^)`'";&|\n]*
                 | opam \s+ env
                 | luarocks \s+ path
             )
-            \s* (?:\) | `)? ["']? \s*
-            (?: (?:&&|;) .* )? $
+            [\t\x20]* (?:\) | `)? ["']? [\t\x20]*
+            (?: $ | && | \|\| | ; | \n | \} | \) )
             "#,
         )
         .expect("static local-tool eval idiom regex")
     });
     let c = content.trim();
-    // The tail after `&&` is screened on its own merits by every other rule;
-    // this exemption only ever removes the `eval` finding.
-    re.is_match(c)
+    // Each `eval` of the line must be one of these idioms: the exemption only
+    // ever removes the `eval` finding, and only when no other `eval` runs
+    // (`eval "$(direnv hook bash)"; eval "$(curl ...)"` keeps it).
+    let mut evals = at
+        .captures_iter(c)
+        .filter_map(|found| found.get(1))
+        .map(|eval| &c[eval.start()..])
+        .peekable();
+    evals.peek().is_some() && evals.all(|from| idiom.is_match(from))
 }
 
 /// `shred` of a short-lived secret in a runtime or temporary directory.
@@ -9097,11 +10954,201 @@ pub fn check_command(content: &str) -> Option<(&'static str, bool)> {
     if destructive_rm_root(content) || (normalized_differs && destructive_rm_root(&normalized)) {
         return Some(("rm -rf of root (destructive)", true));
     }
+    if powers_off_the_host(content) || (normalized_differs && powers_off_the_host(&normalized)) {
+        return Some(("host shutdown or reboot", true));
+    }
     None
+}
+
+/// Whether a command of `content` powers the host off or restarts it:
+/// `shutdown` (but for `-c`, which cancels one), `reboot`, `halt`,
+/// `poweroff`, `init` or `telinit` to runlevel 0 or 6, and `systemctl`
+/// `poweroff`, `reboot`, `halt`, `kexec`, `soft-reboot`, or a `start`,
+/// `restart` or `isolate` of their targets (`poweroff.target`), also of a
+/// host or machine named with `-H` or `-M`, behind the launchers a line
+/// runs a program through ([`effective_command_index`]). Read from the
+/// program each command starts, so `echo reboot` and a commit message that names one
+/// are not.
+fn powers_off_the_host(content: &str) -> bool {
+    const TARGETS: &[&str] = &[
+        "poweroff.target",
+        "reboot.target",
+        "halt.target",
+        "kexec.target",
+        "runlevel0.target",
+        "runlevel6.target",
+    ];
+    shell_command_segments(content).into_iter().any(|segment| {
+        let words = shell_tokens(segment);
+        let Some(at) = effective_command_index(&words) else {
+            return false;
+        };
+        let program = token_basename(&words[at]).to_ascii_lowercase();
+        let arguments: Vec<&str> = words[at + 1..].iter().map(String::as_str).collect();
+        let only_asks = arguments
+            .iter()
+            .any(|word| matches!(*word, "--help" | "--version"));
+        match program.as_str() {
+            "shutdown" => !only_asks && !arguments.contains(&"-c"),
+            "reboot" | "halt" | "poweroff" => !only_asks,
+            "init" | "telinit" => matches!(arguments.first(), Some(&"0" | &"6")),
+            "systemctl" => {
+                // The words that are no option and no option's value: `-H
+                // host` and `-M machine` name where it runs (a remote host
+                // powered off is powered off), `-t`, `-p`, `-s`, `-n` and
+                // `-o` take a value as the next word.
+                let mut verbs = Vec::new();
+                let mut words = arguments.iter();
+                while let Some(word) = words.next() {
+                    if matches!(
+                        *word,
+                        "-H" | "--host"
+                            | "-M"
+                            | "--machine"
+                            | "-t"
+                            | "--type"
+                            | "-p"
+                            | "--property"
+                            | "-s"
+                            | "--signal"
+                            | "-n"
+                            | "--lines"
+                            | "-o"
+                            | "--output"
+                            | "--root"
+                            | "--job-mode"
+                            | "--kill-whom"
+                            | "--when"
+                            | "--message"
+                            | "--reboot-argument"
+                            | "--boot-loader-entry"
+                            | "--boot-loader-menu"
+                    ) {
+                        words.next();
+                    } else if !word.starts_with('-') {
+                        verbs.push(*word);
+                    }
+                }
+                let target = |unit: &str| {
+                    let unit = unit.to_ascii_lowercase();
+                    TARGETS.contains(&unit.as_str())
+                        || TARGETS
+                            .iter()
+                            .any(|target| target.strip_suffix(".target") == Some(unit.as_str()))
+                };
+                match verbs.split_first() {
+                    Some((&("poweroff" | "reboot" | "halt" | "kexec" | "soft-reboot"), _)) => {
+                        !only_asks
+                    }
+                    // A unit started, restarted or isolated: a power target
+                    // reached that way powers the host off as the verb does.
+                    Some((
+                        &("isolate"
+                        | "start"
+                        | "restart"
+                        | "try-restart"
+                        | "reload-or-restart"
+                        | "try-reload-or-restart"
+                        | "reload-or-try-restart"
+                        | "condrestart"
+                        | "force-reload"),
+                        units,
+                    )) => units.iter().any(|unit| target(unit)),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    })
 }
 
 /// The first [`DANGEROUS_COMMANDS`] pattern one spelling of a command
 /// matches, its exemptions applied.
+/// The shell eval rule as it read before the body openers were added:
+/// `eval` after a separator or an opening.
+const EVAL_AFTER_SEPARATOR: &str =
+    r"(?:^|[;&|(`\n]\s*)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)";
+
+/// `eval` where a command starts after `then`, `do`, `else`, `elif`, `{`
+/// or `!`. Text in single quotes is a line handed to a program
+/// (`bash -c 'if false; then eval "$(cat)"; fi'`), read on its own by the
+/// shell reader, which knows a branch that never runs: a match there is
+/// not taken from the outer line.
+const EVAL_AFTER_OPENER: &str = r"(?:^|[;&|(`\s])(?:(?:then|do|else|elif)\s+|[{!]\s+)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)";
+
+/// The byte spans of `content` inside single quotes, as the shell reads
+/// them: a quote opens a span only outside double quotes and not after a
+/// backslash. `$'...'` (ANSI-C quoting) is a quote of its own: inside it a
+/// backslash escapes the next character, so `\'` does not close it, and
+/// its text, whose escapes the shell expands, opens no span.
+fn single_quoted_spans(content: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut in_double = false;
+    let mut open: Option<usize> = None;
+    let mut in_ansi_c = false;
+    let mut escaped = false;
+    let mut after_dollar = false;
+    for (at, character) in content.char_indices() {
+        if let Some(start) = open {
+            if character == '\'' {
+                spans.push(start..at);
+                open = None;
+            }
+            continue;
+        }
+        if in_ansi_c {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '\'' {
+                in_ansi_c = false;
+            }
+            continue;
+        }
+        let dollar_before = std::mem::replace(&mut after_dollar, false);
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => in_double = !in_double,
+            '$' if !in_double => after_dollar = true,
+            '\'' if !in_double && dollar_before => in_ansi_c = true,
+            '\'' if !in_double => open = Some(at + 1),
+            _ => {}
+        }
+    }
+    if let Some(start) = open {
+        spans.push(start..content.len());
+    }
+    spans
+}
+
+/// Whether the shell eval rule matched `content` only through a body
+/// opener (`then`, `do`, `{`, `!`, ...) inside single quotes: no `eval`
+/// follows a separator anywhere, and each one after an opener is in a
+/// line handed to a program, which the shell reader reads on its own.
+fn eval_only_after_opener_in_single_quotes(content: &str) -> bool {
+    static READINGS: std::sync::OnceLock<(regex::Regex, regex::Regex)> = std::sync::OnceLock::new();
+    let (separator, opener) = READINGS.get_or_init(|| {
+        (
+            regex::Regex::new(EVAL_AFTER_SEPARATOR).expect("static eval separator regex"),
+            regex::Regex::new(EVAL_AFTER_OPENER).expect("static eval opener regex"),
+        )
+    });
+    if separator.is_match(content) {
+        return false;
+    }
+    let quoted = single_quoted_spans(content);
+    opener.find_iter(content).all(|found| {
+        quoted
+            .iter()
+            .any(|span| span.start <= found.start() && found.end() <= span.end)
+    })
+}
+
 fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
     for (re, description, block) in dangerous_command_regexes() {
         if re.is_match(content) {
@@ -9121,7 +11168,12 @@ fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
                 continue;
             }
             if *description == "shell eval (dynamic command execution)"
-                && is_local_tool_eval_idiom(content)
+                && (is_local_tool_eval_idiom(content) || eval_only_in_grep_patterns(re, content))
+            {
+                continue;
+            }
+            if *description == "shell eval (dynamic command execution)"
+                && eval_only_after_opener_in_single_quotes(content)
             {
                 continue;
             }
@@ -9133,6 +11185,33 @@ fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
         }
     }
     None
+}
+
+/// Whether every place `eval` reads as a command start in `content` is
+/// inside a quoted pattern handed to grep ([`crate::shell::grep_pattern_ranges`]):
+/// `cargo test 2>&1 | grep -E '^===|eval ->'` searches for the word, the
+/// `|` before it is the pattern's alternation, and nothing runs `eval`.
+/// Measured 2026-11-18: denied as a shell eval. A real `eval` anywhere on
+/// the line, a pattern given unquoted, and a line that does not parse keep
+/// the refusal, and so does a pattern in double quotes, where a
+/// substitution runs.
+fn eval_only_in_grep_patterns(re: &regex::Regex, content: &str) -> bool {
+    // Only a pattern in single quotes: in double quotes a `$(...)` runs, and
+    // an `eval` inside it is a command (`grep "$(eval id)" out.txt`).
+    let patterns: Vec<_> = crate::shell::grep_pattern_ranges(content)
+        .into_iter()
+        .filter(|range| {
+            content
+                .get(range.clone())
+                .is_some_and(|p| p.starts_with('\''))
+        })
+        .collect();
+    !patterns.is_empty()
+        && re.find_iter(content).all(|found| {
+            patterns
+                .iter()
+                .any(|range| range.start < found.start() && found.end() < range.end)
+        })
 }
 
 /// PURE. `text` with the assignments that stand in front of a command
@@ -9430,6 +11509,20 @@ fn rm_command_index(tokens: &[String]) -> Option<usize> {
                     i += 1;
                 }
             }
+            // `! rm -rf /` runs the `rm` and only inverts its status; a
+            // `(` opens a subshell whose first command runs.
+            "!" | "(" => i += 1,
+            // `coproc` runs the command after it in the background, and
+            // names the coprocess only before a group (`coproc NAME { ..; }`);
+            // before a simple command its next word is the program (measured
+            // on bash 5.1.8, 2026-11-19).
+            // (`coproc NAME { ..; }` comes here without its NAME, see
+            // [`without_coproc_name`].)
+            "coproc" => i += 1,
+            _ if tok.starts_with('(') && tok.len() > 1 => {
+                // `(rm -rf /)`: the group opens on the program's own word.
+                return (token_basename(&tok[1..]) == "rm").then_some(i);
+            }
             _ => return None,
         }
     }
@@ -9524,12 +11617,39 @@ struct RmInvocation {
     targets: Vec<String>,
 }
 
+/// The segment without the NAME of `coproc NAME { ..; }` or `coproc NAME (
+/// .. )`: the group runs, and the tokens [`rm_command_index`] reads drop
+/// the brace that tells the NAME from a program.
+fn without_coproc_name(segment: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = segment.trim_start();
+    let Some(rest) = trimmed
+        .strip_prefix("coproc")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+    else {
+        return std::borrow::Cow::Borrowed(segment);
+    };
+    let rest = rest.trim_start();
+    let name_end = rest
+        .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+        .unwrap_or(rest.len());
+    let after = rest[name_end..].trim_start();
+    if name_end == 0
+        || rest.starts_with(|c: char| c.is_ascii_digit())
+        || !after.starts_with(['{', '('])
+        || !rest[name_end..].starts_with(char::is_whitespace)
+    {
+        return std::borrow::Cow::Borrowed(segment);
+    }
+    std::borrow::Cow::Owned(format!("coproc {after}"))
+}
+
 /// Read the `rm` a segment runs, or `None` when the segment runs something
 /// else (`echo rm -rf /`). See [`fold_braced_names`] for `${HOME}`.
 fn segment_rm_invocation(segment: &str) -> Option<RmInvocation> {
     // A substitution before the command word expands away; see
     // `strip_leading_substitutions` for why only the leading ones go.
-    let folded = fold_braced_names(strip_leading_substitutions(segment));
+    let unnamed = without_coproc_name(segment);
+    let folded = fold_braced_names(strip_leading_substitutions(&unnamed));
     let segment = fold_home_expansions(&folded);
     let tokens = shell_tokens(&segment);
     let rm_idx = rm_command_index(&tokens)?;
@@ -9760,6 +11880,78 @@ pub fn destructive_rm_root(hay: &str) -> bool {
         .into_iter()
         .flat_map(shell_command_segments)
         .any(segment_is_root_wipe)
+}
+
+/// Whether interpreter code given inline (`python3 -c`, `node -e`, `ruby
+/// -e`, `perl -e`, and a here-document read as such) removes a home or a
+/// root / system directory: `shutil.rmtree('/home/u')`, `os.removedirs`,
+/// `Path(..).rmdir()`, `FileUtils.rm_rf`, `fs.rmSync`, `rmtree` and
+/// `remove_tree`, given the path written out or the home by name
+/// (`os.path.expanduser('~')`, `Path.home()`, `os.environ['HOME']`,
+/// `os.homedir()`, `Dir.home`, `$ENV{HOME}`). The same paths `rm -rf`
+/// is refused on ([`destructive_rm_home`], [`destructive_rm_root`]):
+/// `shutil.rmtree('build')` stays a cleanup.
+pub(crate) fn interpreter_code_removes_home_or_root(content: &str) -> bool {
+    static CODE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static REMOVAL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RM_LIST: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let code = CODE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?is)\b(?:python[\d.]*|node|nodejs|bun|deno|ruby|perl)\b.{0,200}?\s-[a-z]*[ce]\b",
+        )
+        .expect("static inline code regex")
+    });
+    if !code.is_match(content) {
+        return false;
+    }
+    // A single quote inside single-quoted code is written `'\''`.
+    let content = content.replace("'\\''", "'");
+    let content = content.as_str();
+    let home = r#"os\.path\.expanduser\(\s*\\?['"]~/?\\?['"]\s*\)|(?:pathlib\.)?Path\.home\(\s*\)|os\.environ\[\s*\\?['"]HOME\\?['"]\s*\]|os\.getenv\(\s*\\?['"]HOME\\?['"]\s*\)|(?:require\(\s*\\?['"](?:node:)?os\\?['"]\s*\)|\bos)?\.homedir\(\s*\)|process\.env\.HOME|ENV\[\s*\\?['"]HOME\\?['"]\s*\]|Dir\.home|\$ENV\{\s*HOME\s*\}"#;
+    let removal = REMOVAL.get_or_init(|| {
+        let argument = format!(r#"(?:\\?'([^'\\]*)\\?'|\\?"([^"\\]*)\\?"|({home}))"#);
+        regex::Regex::new(&format!(
+            r#"(?:\b(?:shutil\.rmtree|os\.removedirs|os\.rmdir|rmtree|remove_tree|FileUtils\.(?:rm_rf|rm_r|rmtree|remove_dir|remove_entry(?:_secure)?)|fs\.(?:rm|rmdir)|fs\.promises\.(?:rm|rmdir)|fsPromises\.(?:rm|rmdir))\s*\(\s*{argument}\s*[,)]|\.(?:rmSync|rmdirSync)\s*\(\s*{argument}\s*[,)]|\b(?:pathlib\.)?Path\s*\(\s*{argument}\s*\)\s*\.\s*rmdir\s*\(|(?P<homepath>(?:pathlib\.)?Path\.home\(\s*\))\s*\.\s*rmdir\s*\()"#
+        ))
+        .expect("static interpreter removal regex")
+    });
+    // `subprocess.run(['rm', '-rf', '/home/u'])`, `system('rm', '-rf', '/')`, `spawnSync('rm', ['-rf', os.homedir()])`:
+    // an rm with a recursive flag handed its words one by one.
+    let rm_list = RM_LIST.get_or_init(|| {
+        let argument = format!(r#"(?:\\?'([^'\\]*)\\?'|\\?"([^"\\]*)\\?"|({home}))"#);
+        regex::Regex::new(&format!(
+            r#"\\?['"]rm\\?['"]\s*,\s*\[?\s*((?:\\?['"]-[A-Za-z-]*\\?['"]\s*,\s*)+){argument}\s*[,\])]"#
+        ))
+        .expect("static interpreter rm list regex")
+    });
+    let removes = |path: &str| {
+        // The home by name, not a path written out.
+        if !path.starts_with(['/', '~', '$', '.']) && path.contains(['(', '[', '{', '.']) {
+            return true;
+        }
+        if path.contains(char::is_whitespace) {
+            return false;
+        }
+        let line = format!("rm -rf {}", path.to_ascii_lowercase());
+        destructive_rm_home(&line) || destructive_rm_root(&line)
+    };
+    let first_path = |found: &regex::Captures<'_>, from: usize| {
+        (from..found.len())
+            .filter_map(|group| found.get(group))
+            .map(|path| path.as_str().to_owned())
+            .find(|path| !path.is_empty())
+    };
+    removal.captures_iter(content).any(|found| {
+        found.name("homepath").is_some() || first_path(&found, 1).is_some_and(|path| removes(&path))
+    }) || rm_list.captures_iter(content).any(|found| {
+        let flags = &found[1];
+        let recursive = flags.contains("--recursive")
+            || flags
+                .split(',')
+                .map(|flag| flag.trim().trim_matches(['\\', '\'', '"']))
+                .any(|flag| !flag.starts_with("--") && flag.contains(['r', 'R']));
+        recursive && first_path(&found, 2).is_some_and(|path| removes(&path))
+    })
 }
 
 /// Recursive, forced `rm` of a home directory itself or all of its contents:
@@ -10440,19 +12632,25 @@ struct SshOptions {
     valued: &'static str,
     plain: &'static str,
     operands: usize,
+    /// Letters whose value is a file the program reads commands or settings
+    /// from, or runs: sftp's `-b` batch, `-F` config, scp's and sftp's
+    /// `-S` program, ssh's `-I` library. What that file does is not on
+    /// the line, so a line with one is not key use alone.
+    from_file: &'static str,
 }
 
 fn ssh_options(program: &str) -> Option<SshOptions> {
-    let (valued, plain, operands) = match program {
-        "ssh" => ("BbcDEeFIiJLlmOoPpQRSWw", "46AaCfGgKkMNnqsTtVvXxYy", 2),
-        "scp" => ("cDFiJloPSX", "346ABCOpqRrsTv", 1),
-        "sftp" => ("BbcDFiJlPoRSsX", "46AaCfNpqrv", 1),
+    let (valued, plain, operands, from_file) = match program {
+        "ssh" => ("BbcDEeFIiJLlmOoPpQRSWw", "46AaCfGgKkMNnqsTtVvXxYy", 2, "FI"),
+        "scp" => ("cDFiJloPSX", "346ABCOpqRrsTv", 1, "FS"),
+        "sftp" => ("BbcDFiJlPoRSsX", "46AaCfNpqrv", 1, "bFS"),
         _ => return None,
     };
     Some(SshOptions {
         valued,
         plain,
         operands,
+        from_file,
     })
 }
 
@@ -10613,6 +12811,17 @@ fn ssh_identity_places(tokens: &[String], from: usize, options: &SshOptions) -> 
             if !options.valued.contains(letter) {
                 return None;
             }
+            if options.from_file.contains(letter) {
+                let left = &letters[offset + letter.len_utf8()..];
+                let value = if left.is_empty() {
+                    tokens.get(at).map(String::as_str).unwrap_or("")
+                } else {
+                    left
+                };
+                if !(letter == 'F' && names_the_default_ssh_config(value)) {
+                    return None;
+                }
+            }
             // The value: what is left of the token, or the token after.
             let left = &letters[offset + letter.len_utf8()..];
             let (value, value_place) = if left.is_empty() {
@@ -10624,6 +12833,20 @@ fn ssh_identity_places(tokens: &[String], from: usize, options: &SshOptions) -> 
             } else {
                 (left, at - 1)
             };
+            // `-o Include=FILE` reads settings from a file and
+            // `-o PKCS11Provider=LIB` loads code: as `-F` and `-I` are.
+            let option_reads_a_file = letter == 'o'
+                && ["Include", "PKCS11Provider", "SecurityKeyProvider"]
+                    .iter()
+                    .any(|name| {
+                        value
+                            .get(..name.len())
+                            .is_some_and(|key| key.eq_ignore_ascii_case(name))
+                            && value[name.len()..].starts_with(['=', ' '])
+                    });
+            if option_reads_a_file {
+                return None;
+            }
             let names_the_identity = match letter {
                 'i' => true,
                 'o' => value
@@ -10672,6 +12895,15 @@ fn rsync_transport_places(tokens: &[String], from: usize) -> Vec<usize> {
                     .all(|(at, token)| !is_sensitive_word(token) || identity.contains(&at))
             })
     };
+    // A list of what to copy read from a file (`--files-from`,
+    // `--include-from`) may name the key: not on the line, so not key use.
+    if tokens.iter().skip(from).any(|token| {
+        ["--files-from", "--include-from"]
+            .iter()
+            .any(|option| token == option || token.starts_with(&format!("{option}=")))
+    }) {
+        return Vec::new();
+    }
     let mut places = Vec::new();
     for (at, token) in tokens.iter().enumerate().skip(from) {
         let transport = match token.strip_prefix("--rsh=") {
@@ -11302,11 +13534,235 @@ pub(crate) fn check_sensitive_read_as_written(
     content: &str,
     as_written: &str,
 ) -> Option<(&'static str, u32)> {
+    sensitive_read_nested(content, as_written, 0)
+}
+
+/// How deep [`sensitive_read_in`] follows a line handed to a shell inside a
+/// line handed to a shell (`bash -c "sh -c '...'"`). Deeper, the outer
+/// segment is read as written.
+const MAX_SHELL_LINE_DEPTH: u8 = 4;
+
+/// True when `line` names a built-in key or credential path and only uses
+/// it: every segment that names one authenticates with it (`ssh -i KEY`,
+/// `scp -o IdentityFile=KEY`, `rsync -e 'ssh -i KEY'`), loads it into the
+/// agent (`ssh-add KEY`), takes the group's and others' access to it away
+/// (`chmod 600 KEY`), or hands a shell a line that does one of these
+/// (`bash -c 'ssh -i KEY host'`), and nothing on the line reads it
+/// ([`check_sensitive_read`]). Copying or showing the key is a read and
+/// is not this.
+pub(crate) fn uses_keys_without_reading(line: &str) -> bool {
+    key_use_line(line, 0)
+}
+
+/// [`uses_keys_without_reading`] at `depth` lines handed to a shell.
+fn key_use_line(line: &str, depth: u8) -> bool {
+    if check_sensitive_read(line).is_some() {
+        return false;
+    }
+    let names = names_a_line_may_set(line);
+    let line_may_set = |name: &str| names.contains(name);
+    let mut used = false;
+    for segment in shell_command_segments(line) {
+        let tokens = shell_tokens_with_braces(segment);
+        if !tokens.iter().any(|token| is_sensitive_word(token)) {
+            continue;
+        }
+        let key_use = ssh_identity_use_only(segment, &line_may_set)
+            || key_access_narrowed(&tokens)
+            || key_loaded_into_the_agent(&tokens)
+            || (depth < MAX_SHELL_LINE_DEPTH
+                && shell_line_holding_every_sensitive_path(segment)
+                    .is_some_and(|inner| key_use_line(&inner, depth + 1)));
+        if !key_use {
+            return false;
+        }
+        used = true;
+    }
+    used
+}
+
+/// The words of `line` that name a built-in key or credential path, at
+/// any depth of quoting, split where a shell or an option splits them
+/// (`IdentityFile=KEY` gives `KEY`).
+pub(crate) fn sensitive_words_of_line(line: &str) -> Vec<String> {
+    line.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '=' | ',' | ';'))
+        .filter(|word| !word.is_empty() && is_sensitive_word(word))
+        .map(str::to_string)
+        .collect()
+}
+
+/// No word of the command is a redirection.
+fn without_redirection(tokens: &[String]) -> bool {
+    !tokens
+        .iter()
+        .any(|token| token.contains('<') || token.contains('>') || token.contains('&'))
+}
+
+/// `chmod` with a mode that leaves the group and others no access, and no
+/// option but the ones that only report: `chmod 600 KEY`, `chmod 0400 KEY`,
+/// `chmod go-rwx KEY`.
+fn key_access_narrowed(tokens: &[String]) -> bool {
+    const NARROWING: &[&str] = &[
+        "go-rwx",
+        "og-rwx",
+        "g-rwx,o-rwx",
+        "o-rwx,g-rwx",
+        "go=",
+        "og=",
+        "u=rw,go=",
+        "u=r,go=",
+        "u=rw,g=,o=",
+        "u=r,g=,o=",
+    ];
+    let Some(at) = effective_command_index(tokens) else {
+        return false;
+    };
+    if token_basename(&tokens[at]) != "chmod" || !without_redirection(tokens) {
+        return false;
+    }
+    let mut words = tokens[at + 1..].iter().map(String::as_str);
+    let mode = loop {
+        match words.next() {
+            Some("-v" | "-c" | "-f" | "--verbose" | "--changes" | "--quiet" | "--silent") => {}
+            Some(word) => break word,
+            None => return false,
+        }
+    };
+    let numeric = (3..=4).contains(&mode.len())
+        && mode.bytes().all(|b| (b'0'..=b'7').contains(&b))
+        && mode.ends_with("00");
+    (numeric || NARROWING.contains(&mode)) && words.all(|word| !word.starts_with('-'))
+}
+
+/// `ssh-add` handed key files: the agent holds them to authenticate with.
+fn key_loaded_into_the_agent(tokens: &[String]) -> bool {
+    let Some(at) = effective_command_index(tokens) else {
+        return false;
+    };
+    token_basename(&tokens[at]) == "ssh-add" && without_redirection(tokens)
+}
+
+/// The config file ssh reads on every line without being told
+/// (`~/.ssh/config`, `/etc/ssh/ssh_config`): naming it with `-F` hands
+/// the program nothing it would not read anyway.
+fn names_the_default_ssh_config(value: &str) -> bool {
+    matches!(
+        value,
+        "~/.ssh/config" | "$HOME/.ssh/config" | "${HOME}/.ssh/config" | "/etc/ssh/ssh_config"
+    )
+}
+
+/// True when the ssh-family program `segment` runs is handed a file it
+/// reads commands or settings from, or runs ([`SshOptions::from_file`],
+/// `-o Include=`, rsync's `--files-from` or a transport with one). A
+/// sensitive path on such a line is read as one: what the file does with
+/// the key (`put ~/.ssh/id_rsa` in an sftp batch) is not on the line.
+fn ssh_family_reads_a_command_file(segment: &str) -> bool {
+    let tokens = shell_tokens_with_braces(segment);
+    let Some(program_at) = effective_command_index(&tokens) else {
+        return false;
+    };
+    let program = token_basename(&tokens[program_at]).to_ascii_lowercase();
+    let reads_one = |tokens: &[String], from: usize, options: &SshOptions| {
+        let mut at = from;
+        while let Some(token) = tokens.get(at).map(String::as_str) {
+            at += 1;
+            if token == "--" {
+                break;
+            }
+            let Some(letters) = token.strip_prefix('-').filter(|l| !l.is_empty()) else {
+                continue;
+            };
+            for (offset, letter) in letters.char_indices() {
+                if options.valued.contains(letter) {
+                    let left = &letters[offset + letter.len_utf8()..];
+                    let value = if left.is_empty() {
+                        at += 1;
+                        tokens.get(at - 1).map(String::as_str).unwrap_or("")
+                    } else {
+                        left
+                    };
+                    if options.from_file.contains(letter)
+                        && !(letter == 'F' && names_the_default_ssh_config(value))
+                    {
+                        return true;
+                    }
+                    if letter == 'o'
+                        && ["include", "pkcs11provider", "securitykeyprovider"]
+                            .iter()
+                            .any(|name| value.to_ascii_lowercase().starts_with(name))
+                    {
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+        false
+    };
+    match ssh_options(&program) {
+        Some(options) => reads_one(&tokens, program_at + 1, &options),
+        None if program == "rsync" => {
+            tokens
+                .iter()
+                .enumerate()
+                .skip(program_at + 1)
+                .any(|(at, token)| {
+                    ["--files-from", "--include-from"]
+                        .iter()
+                        .any(|option| token == option || token.starts_with(&format!("{option}=")))
+                        || {
+                            let transport = token.strip_prefix("--rsh=").or_else(|| {
+                                (token == "-e" || token == "--rsh")
+                                    .then(|| tokens.get(at + 1).map(String::as_str))
+                                    .flatten()
+                            });
+                            transport.is_some_and(|transport| {
+                                let inner = shell_tokens(transport);
+                                inner.first().is_some_and(|p| token_basename(p) == "ssh")
+                                    && ssh_options("ssh")
+                                        .is_some_and(|options| reads_one(&inner, 1, &options))
+                            })
+                        }
+                })
+        }
+        None => false,
+    }
+}
+
+/// [`check_sensitive_read_as_written`] at `depth` lines handed to a shell.
+fn sensitive_read_nested(
+    content: &str,
+    as_written: &str,
+    depth: u8,
+) -> Option<(&'static str, u32)> {
     let (readings, _) = assignment_readings(content);
     readings
         .iter()
-        .filter_map(|reading| sensitive_read_in(reading, as_written))
+        .filter_map(|reading| sensitive_read_in(reading, as_written, depth))
         .max_by_key(|&(_, score)| score)
+}
+
+/// The line a shell segment hands a shell to run with `-c`, when every
+/// sensitive path of the segment is inside that line: `bash -c 'scp -i
+/// ~/.ssh/id_rsa f host:/tmp'`. The shell runs the line as its own command
+/// line, so the line is read as one, and an identity in it is key use as it
+/// is on a line typed directly. A sensitive path anywhere else in the
+/// segment (an argument after the line, `bash -c 'scp -i "$1" ...' x KEY`,
+/// or a redirection, `bash -c '...' < KEY`) is not inside the line: `None`,
+/// and the segment is read as written.
+fn shell_line_holding_every_sensitive_path(segment: &str) -> Option<String> {
+    let tokens = shell_tokens_with_braces(segment);
+    let program_at = effective_command_index(&tokens)?;
+    if !is_shell_program(&token_basename(&tokens[program_at]).to_ascii_lowercase()) {
+        return None;
+    }
+    let line_at = program_at + crate::shell::shell_inline_code_place(&tokens[program_at..])?;
+    let elsewhere = tokens
+        .iter()
+        .enumerate()
+        .any(|(at, token)| at != line_at && is_sensitive_word(token));
+    (!elsewhere).then(|| tokens[line_at].clone())
 }
 
 /// The always-secret class: a private key, the shadow files, a file whose
@@ -11585,7 +14041,7 @@ fn secret_in_hidden_folder_within(
 /// `cwd`. The text alone names none of these: `cat auth.json` after `cd
 /// ~/.codex`, `cat .hermes/auth.json` run in the home, `cat credentials` in
 /// `~/.aws`, `grep -r <token> ~/.app`. Measured 2026-11-12 on the agent hook:
-/// every one of them passed. The bool is whether it was a folder read.
+/// every one of them passed. The second part says how it was reached.
 ///
 /// Paths are resolved as [`env_read_outside_project`] resolves them, and a
 /// path the text cannot resolve is not reported.
@@ -11593,9 +14049,35 @@ pub fn stored_secret_read_in_place(
     content: &str,
     cwd: &str,
     home: Option<&str>,
-) -> Option<(String, bool)> {
+) -> Option<(String, SecretReach)> {
+    stored_secret_reach(content, cwd, home, false)
+}
+
+/// Whether the one stored secret `content`, as written, reaches is the
+/// home's, by a `grep` of the whole home for a narrow text
+/// ([`SecretReach::HomeSearched`]). Asked of the line as written: the
+/// reading the other rules scan has the search pattern blanked as data, and
+/// a blank pattern is no narrow text.
+pub fn searches_home_for_narrow_text(content: &str, cwd: &str, home: Option<&str>) -> bool {
+    matches!(
+        stored_secret_reach(content, cwd, home, true),
+        Some((_, SecretReach::HomeSearched))
+    )
+}
+
+/// [`stored_secret_read_in_place`], with a whole-home `grep` for a narrow
+/// text told apart when `patterns` is set.
+fn stored_secret_reach(
+    content: &str,
+    cwd: &str,
+    home: Option<&str>,
+    patterns: bool,
+) -> Option<(String, SecretReach)> {
     let content = strip_inert_heredoc_bodies(content);
     let mut place = CommandPlace::new(cwd, home);
+    // A search of the whole home for a narrow text: kept, and answered only
+    // when nothing on the line reaches a secret harder.
+    let mut searched: Option<String> = None;
     for segment in shell_command_segments(&content) {
         let Some(words) = place.step(segment) else {
             continue;
@@ -11612,26 +14094,210 @@ pub fn stored_secret_read_in_place(
                     continue;
                 };
                 if is_stored_credential(&path, home) {
-                    return Some((path, false));
+                    return Some((path, SecretReach::Named));
                 }
                 if let Some(secret) = secret_behind(&path, home) {
-                    return Some((secret, false));
+                    return Some((secret, SecretReach::Named));
                 }
                 if let Some(secret) = home
                     .filter(|home| holds_the_folder(&path, home) && reads_folders_whole(segment))
                     .and_then(secret_kept_in_home)
                 {
-                    return Some((secret, true));
+                    if patterns && searches_for_narrow_text(segment) {
+                        searched.get_or_insert(secret);
+                        continue;
+                    }
+                    return Some((secret, SecretReach::Folder));
                 }
                 if let Some(file) =
                     home.and_then(|home| secret_in_hidden_folder(&path, home, Some(cwd)))
                 {
-                    return Some((file, true));
+                    return Some((file, SecretReach::Folder));
                 }
             }
         }
     }
-    None
+    searched.map(|secret| (secret, SecretReach::HomeSearched))
+}
+
+/// How [`stored_secret_read_in_place`] found a command reaching a stored
+/// secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretReach {
+    /// The path names the secret, or a link or a directory makes it.
+    Named,
+    /// A whole folder that holds it is read.
+    Folder,
+    /// The whole home that holds it is searched with grep for a narrow text
+    /// ([`searches_for_narrow_text`]): the key is opened, and only a line
+    /// of it that holds that text would be printed.
+    HomeSearched,
+}
+
+/// Whether `segment` is a `grep` that prints only the lines holding a
+/// narrow text: every pattern at least three characters, two of them
+/// letters or digits, the rest of a short set that a regular expression
+/// does not widen (`.` only under `-F` or `fgrep`), and none a word a hunt
+/// for secrets looks for ([`credential_hunt_token`]). A long option this
+/// does not know is refused, since its value could be taken for the
+/// pattern. Refused: `-v` (prints
+/// the lines that do not match, so the whole key), `-z` (a whole file is
+/// one line), a pattern from a file (`-f`), and an empty or wide pattern.
+///
+/// `grep -r TODO ~` over a home that holds `~/.ssh/id_ed25519` opens the
+/// key, and prints from it only a line holding `TODO`. That is a person's
+/// call to make (`review`), not the hard refusal a read of the key is:
+/// measured 2026-11-18, every recursive search of a home that held a key
+/// was denied, whatever it looked for.
+fn searches_for_narrow_text(segment: &str) -> bool {
+    let words = shell_tokens(segment);
+    let Some(at) = effective_command_index(&words) else {
+        return false;
+    };
+    let program = token_basename(&words[at]).to_ascii_lowercase();
+    if !matches!(program.as_str(), "grep" | "egrep" | "fgrep") {
+        return false;
+    }
+    let mut fixed = program == "fgrep";
+    let mut patterns: Vec<&str> = Vec::new();
+    let mut given_by_option = false;
+    let mut positional: Option<&str> = None;
+    let mut rest = words[at + 1..].iter();
+    while let Some(word) = rest.next() {
+        let word = word.as_str();
+        if word == "--" {
+            if positional.is_none() && !given_by_option {
+                positional = rest.next().map(String::as_str);
+            }
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            match name {
+                "invert-match" | "null-data" | "file" => return false,
+                "fixed-strings" => fixed = true,
+                "regexp" => {
+                    given_by_option = true;
+                    match value.or_else(|| rest.next().map(String::as_str)) {
+                        Some(pattern) => patterns.push(pattern),
+                        None => return false,
+                    }
+                }
+                "after-context" | "before-context" | "context" | "max-count" | "devices"
+                | "directories" | "label" | "binary-files" | "exclude-dir" | "include"
+                | "exclude" | "exclude-from" | "include-dir" | "group-separator"
+                    if value.is_none() =>
+                {
+                    rest.next();
+                }
+                // Options that take no value, or whose value is given here.
+                _ if value.is_some() => {}
+                "recursive"
+                | "dereference-recursive"
+                | "line-number"
+                | "files-with-matches"
+                | "files-without-match"
+                | "count"
+                | "ignore-case"
+                | "no-ignore-case"
+                | "word-regexp"
+                | "line-regexp"
+                | "extended-regexp"
+                | "basic-regexp"
+                | "perl-regexp"
+                | "only-matching"
+                | "quiet"
+                | "silent"
+                | "no-messages"
+                | "with-filename"
+                | "no-filename"
+                | "null"
+                | "text"
+                | "byte-offset"
+                | "initial-tab"
+                | "line-buffered"
+                | "no-group-separator" => {}
+                // Any other long option: which word it takes, if any, is not
+                // known here, and a value read as the pattern (`--exclude-dir
+                // node_modules '' ~`) would make a wide search narrow.
+                _ => return false,
+            }
+            continue;
+        }
+        if let Some(flags) = word.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            for (index, flag) in flags.char_indices() {
+                let attached = &flags[index + flag.len_utf8()..];
+                match flag {
+                    'v' | 'z' | 'f' => return false,
+                    'F' => fixed = true,
+                    'e' => {
+                        given_by_option = true;
+                        let pattern = if attached.is_empty() {
+                            rest.next().map(String::as_str)
+                        } else {
+                            Some(attached)
+                        };
+                        match pattern {
+                            Some(pattern) => patterns.push(pattern),
+                            None => return false,
+                        }
+                        break;
+                    }
+                    'A' | 'B' | 'C' | 'm' | 'd' | 'D' => {
+                        if attached.is_empty() {
+                            rest.next();
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if positional.is_none() && !given_by_option {
+            positional = Some(word);
+        }
+    }
+    if !given_by_option {
+        patterns.extend(positional);
+    }
+    !patterns.is_empty()
+        && patterns.iter().all(|pattern| {
+            let narrow_char = |c: char| {
+                c.is_ascii_alphanumeric()
+                    || matches!(
+                        c,
+                        ' ' | '_' | '-' | ':' | '#' | '@' | '/' | '<' | '>' | ',' | '='
+                    )
+                    || (fixed && c == '.')
+            };
+            pattern.chars().count() >= 3
+                && pattern.chars().filter(char::is_ascii_alphanumeric).count() >= 2
+                && pattern.chars().all(narrow_char)
+                && credential_hunt_token(pattern).is_none()
+                && !names_credential_marker(pattern)
+        })
+}
+
+/// A known credential prefix or key marker in a grep pattern (`AKIA`,
+/// `ghp_`, `github_pat_`, `sk-`, `xoxb-`, `AIza`, `-----BEGIN`,
+/// `PRIVATE`, `ssh-ed25519`, ...), at the start of the pattern or after a
+/// character that is not a letter or digit. A recursive search of a home or
+/// a wide root for one of these is a hunt for keys, never a narrow text: it
+/// keeps the hard refusal (`grep -r AKIA ~` is `deny`, as before
+/// `searches_home_for_narrow_text`).
+fn names_credential_marker(pattern: &str) -> bool {
+    static MARKER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    MARKER
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)(^|[^a-z0-9])(akia|asia|aroa|aida|gh[pousr]_|github_pat_|glpat-|sk-|sk_(live|test)_|rk_live_|xox[abposr]-|aiza|ya29.|npm_[a-z0-9]|pypi-|hf_[a-z0-9]|-{3,}|begin|private|ssh-(rsa|ed25519|dss)|ecdsa-sha2|bearer|auth|cred|passw|pwd|pass|key|jwt|eyj)",
+            )
+            .expect("static credential marker regex")
+        })
+        .is_match(pattern)
 }
 
 /// Whether `path` is `home` or a folder `home` is in (`/home`, `/`): a
@@ -11777,7 +14443,7 @@ fn secret_behind(path: &str, home: Option<&str>) -> Option<String> {
 }
 
 /// [`check_sensitive_read_as_written`] on one reading of the line.
-fn sensitive_read_in(content: &str, as_written: &str) -> Option<(&'static str, u32)> {
+fn sensitive_read_in(content: &str, as_written: &str, depth: u8) -> Option<(&'static str, u32)> {
     let reader = content_reader();
     // A quoted here-document body is DATA being written, not a path being read,
     // so it is removed before any path matching. See `strip_inert_heredoc_bodies`
@@ -11820,6 +14486,25 @@ fn sensitive_read_in(content: &str, as_written: &str) -> Option<(&'static str, u
             None
         };
         let Some(path) = path else { continue };
+        // An ssh-family line handed a file of commands or settings reads the
+        // key as far as anyone can tell from the line.
+        if ssh_family_reads_a_command_file(segment) {
+            return Some((path, if is_hard_sensitive_path(path) { 60 } else { 20 }));
+        }
+        // A line handed to a shell with `-c` holding every sensitive path of
+        // the segment is read as the line it is: the inner shell runs it, and
+        // `bash -c 'scp -i KEY f host:'` uses the key the way `scp -i KEY f
+        // host:` does. The names the outer line may set still count, since a
+        // prefix assignment or an export reaches the inner shell.
+        if depth < MAX_SHELL_LINE_DEPTH {
+            if let Some(line) = shell_line_holding_every_sensitive_path(segment) {
+                let outer = format!("{as_written}\n{content}");
+                match sensitive_read_nested(&line, &outer, depth + 1) {
+                    None => continue,
+                    found => return found,
+                }
+            }
+        }
         // Key USE (ssh/scp/sftp/rsync authenticating with `-i <key>`) is not a
         // read of the key's contents. Suppress only when every sensitive path in
         // the segment is an identity-flag value; a positional exfil source still
@@ -12290,7 +14975,7 @@ pub fn check_persistence(content: &str) -> Option<(&'static str, u32)> {
             || lower.contains("crontab -r")
             || lower.contains("| crontab")
             || lower.contains("|crontab")
-            || regex::Regex::new(r"\bcrontab\s+[^-\s]")
+            || regex::Regex::new(r"(?:^|[^/\w.-]|/s?bin/)crontab\s+[^-\s]")
                 .expect("static crontab regex")
                 .is_match(&lower);
         if mutating {
@@ -12679,17 +15364,33 @@ pub fn check_tmp_execution(content: &str) -> Option<(&'static str, u32)> {
     let temp = r#"(?:/(?:tmp|var/tmp|dev/shm|run/shm)|/private/tmp)/[^\s\"'|;&)]+"#;
     let direct = DIRECT.get_or_init(|| {
         regex::Regex::new(&format!(
-            r#"(?i)(?:^|[;&|]\s*|\$\(\s*|`\s*)(?:(?:sudo|command|nohup)\s+|env(?:\s+\w+=\S+)*\s+)*[\"']?{temp}"#
+            r#"(?im)(?:^\s*|[;&|{{(]\s*|\$\(\s*|`\s*)(?:(?:sudo|command|builtin|nohup)\s+|env(?:\s+\w+=\S+)*\s+)*[\"']?{temp}"#
         ))
         .expect("static direct temp execution regex")
     });
     let interpreted = INTERPRETED.get_or_init(|| {
         regex::Regex::new(&format!(
-            r#"(?i)(?:^|[;&|]\s*|\$\(\s*|`\s*)(?:source|\.|ba?sh|zsh|dash|ksh|python\d*(?:\.\d+)?|perl|ruby|node\d*)\s+(?:-[^\s]+\s+)*[\"']?{temp}"#
+            r#"(?im)(?:^\s*|[;&|{{(]\s*|\$\(\s*|`\s*)(?:(?:command|builtin)\s+)*(?:source|\.|ba?sh|zsh|dash|ksh|python\d*(?:\.\d+)?|perl|ruby|node\d*)\s+(?:-[^\s]+\s+)*[\"']?{temp}"#
         ))
         .expect("static interpreted temp execution regex")
     });
-    if direct.is_match(&lower) || interpreted.is_match(&lower) {
+    // `bash -n file` only reads the file for its syntax: it runs nothing.
+    let runs_the_file = |found: regex::Match<'_>| {
+        let words: Vec<&str> = found.as_str().split_whitespace().collect();
+        let shell = words.iter().position(|word| {
+            matches!(
+                word.trim_start_matches([';', '&', '|', '{', '(']),
+                "sh" | "bash" | "zsh" | "dash" | "ksh"
+            )
+        });
+        !shell.is_some_and(|at| {
+            words[at + 1..]
+                .iter()
+                .take_while(|word| word.starts_with('-'))
+                .any(|flag| !flag.starts_with("--") && flag.contains('n'))
+        })
+    };
+    if direct.is_match(&lower) || interpreted.find_iter(&lower).any(runs_the_file) {
         TMP_EXECUTION_DIRS
             .iter()
             .find(|dir| lower.contains(*dir))
@@ -12914,26 +15615,220 @@ fn writes_path(lower: &str, path: &str) -> bool {
             .rfind([';', '\n'])
             .map_or(0, |index| index.saturating_add(1));
         let segment = &before[segment_start..];
+        // A copy or install writes its last word only: `cp /etc/crontab
+        // /tmp/c` reads the path, it does not write it.
+        let after = &lower[position..];
+        let last_word = !after[..after.find([';', '\n', '|', '&']).unwrap_or(after.len())]
+            .trim_end()
+            .contains(char::is_whitespace);
         if segment.contains('>')
             || [
                 "tee ",
                 "tee -a ",
                 "sed -i",
                 "perl -pi",
-                "cp ",
                 "mv ",
-                "install ",
                 "truncate ",
                 "mkdir ",
             ]
             .iter()
             .any(|verb| segment.contains(verb))
+            || (last_word
+                && ["cp ", "install "]
+                    .iter()
+                    .any(|verb| segment.contains(verb)))
         {
             return true;
         }
         offset = position + path.len();
     }
     false
+}
+
+/// A command that signals every process on the host or its init: `kill -9
+/// -1`, `kill -KILL 1`, `killall5`, `pkill -9 -u root`, `pkill -9 .`. Each
+/// takes the machine down (or every process the account may signal, which
+/// for root is all of them). What it says, when one of the segments of
+/// `cmd` is one.
+///
+/// Read by place: the program the segment runs, behind its launch wrappers,
+/// and its operands as that program reads them. A signal to one process or
+/// to a process group (`kill -9 4242`, `kill -9 -4242`), a named pattern
+/// (`pkill -f my-server`, `pkill -u root sshd`), the probe `kill -0 1`, a
+/// reload of init (`kill -HUP 1`) and `kill -l` are not.
+pub(crate) fn kills_every_process(cmd: &str) -> Option<&'static str> {
+    shell_command_segments(cmd).into_iter().find_map(|segment| {
+        let words = shell_tokens(segment);
+        let at = effective_command_index(&words)?;
+        kill_reaches_everything(&words[at..])
+    })
+}
+
+/// [`kills_every_process`] of one command, its program first.
+fn kill_reaches_everything(words: &[String]) -> Option<&'static str> {
+    let program = token_basename(words.first()?).to_ascii_lowercase();
+    match program.as_str() {
+        "killall5" => Some("killall5 signals every process on the host"),
+        "kill" => kill_operands_reach_everything(&words[1..]),
+        "pkill" | "killall" => pattern_kill_reaches_everything(&program, &words[1..]),
+        _ => None,
+    }
+}
+
+/// `kill` with a pid of -1 (every process the caller may signal) or 1 (init).
+fn kill_operands_reach_everything(args: &[String]) -> Option<&'static str> {
+    let mut signal: Option<String> = None;
+    let mut pids: Vec<&str> = Vec::new();
+    let mut at = 0usize;
+    while let Some(word) = args.get(at).map(String::as_str) {
+        at += 1;
+        if !pids.is_empty() {
+            pids.push(word);
+            continue;
+        }
+        match word {
+            "--" => {
+                pids.extend(args[at..].iter().map(String::as_str));
+                break;
+            }
+            "-l" | "-L" | "--list" | "--table" => return None,
+            "-s" | "-n" | "--signal" => {
+                signal = Some(args.get(at)?.clone());
+                at += 1;
+            }
+            _ if word.starts_with("--signal=") => {
+                signal = Some(word["--signal=".len()..].to_string());
+            }
+            _ if signal.is_none() && word.len() > 1 && word.starts_with('-') => {
+                signal = Some(word[1..].to_string());
+            }
+            _ => pids.push(word),
+        }
+    }
+    let signal = signal.unwrap_or_else(|| "TERM".into()).to_ascii_uppercase();
+    let signal = signal.strip_prefix("SIG").unwrap_or(&signal);
+    if signal == "0" {
+        return None;
+    }
+    // Init reloads or re-executes on these; the rest stop it.
+    let reload = matches!(signal, "HUP" | "1" | "USR1" | "10" | "USR2" | "12");
+    pids.iter().find_map(|pid| match *pid {
+        "-1" => Some("kill -1 signals every process the caller may signal"),
+        "1" if !reload => Some("kill signals init (pid 1), which takes the host down"),
+        _ => None,
+    })
+}
+
+/// `pkill` or `killall` with a pattern that names every process, or with
+/// root as the user and no pattern at all, or `pkill -v` (every process
+/// but the pattern's).
+fn pattern_kill_reaches_everything(program: &str, args: &[String]) -> Option<&'static str> {
+    // Short options that take a value, by program.
+    let valued = if program == "pkill" {
+        "gGPstuUFc"
+    } else {
+        "uoysn"
+    };
+    let mut patterns: Vec<&str> = Vec::new();
+    let mut users: Vec<&str> = Vec::new();
+    let mut inverse = false;
+    let mut regex = program == "pkill";
+    let mut at = 0usize;
+    while let Some(word) = args.get(at).map(String::as_str) {
+        at += 1;
+        if word == "--" {
+            patterns.extend(args[at..].iter().map(String::as_str));
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            let takes_value = matches!(
+                name,
+                "euid"
+                    | "uid"
+                    | "user"
+                    | "signal"
+                    | "group"
+                    | "pgroup"
+                    | "parent"
+                    | "session"
+                    | "terminal"
+                    | "pidfile"
+                    | "ns"
+                    | "nslist"
+                    | "older-than"
+                    | "younger-than"
+            );
+            let value = match value {
+                Some(value) => Some(value),
+                None if takes_value => {
+                    at += 1;
+                    args.get(at - 1).map(String::as_str)
+                }
+                None => None,
+            };
+            match name {
+                "euid" | "uid" | "user" => users.extend(value),
+                "inverse" => inverse = true,
+                "regexp" => regex = true,
+                _ => {}
+            }
+            continue;
+        }
+        let Some(letters) = word.strip_prefix('-').filter(|l| !l.is_empty()) else {
+            patterns.push(word);
+            continue;
+        };
+        // A signal: `-9`, `-KILL`, `-SIGTERM`.
+        if letters.chars().all(|c| c.is_ascii_digit())
+            || letters.chars().all(|c| c.is_ascii_uppercase())
+        {
+            continue;
+        }
+        for (offset, letter) in letters.char_indices() {
+            if valued.contains(letter) {
+                let rest = &letters[offset + 1..];
+                let value = if rest.is_empty() {
+                    at += 1;
+                    args.get(at - 1).map(String::as_str)
+                } else {
+                    Some(rest)
+                };
+                if letter == 'u' || (program == "pkill" && letter == 'U') {
+                    users.extend(value);
+                }
+                break;
+            }
+            match letter {
+                'v' if program == "pkill" => inverse = true,
+                'r' if program == "killall" => regex = true,
+                _ => {}
+            }
+        }
+    }
+    let root = users
+        .iter()
+        .flat_map(|users| users.split(','))
+        .any(|user| matches!(user, "root" | "0"));
+    let matches_all = |pattern: &&str| {
+        matches!(
+            *pattern,
+            "" | "." | ".*" | ".+" | "^" | "$" | "^.*" | ".*$" | "^.*$" | "^.+$"
+        )
+    };
+    if patterns.is_empty() && root {
+        return Some("signals every process of root, which is every process on the host");
+    }
+    if inverse && !patterns.is_empty() {
+        return Some("pkill -v signals every process but the ones the pattern names");
+    }
+    if regex && patterns.iter().any(matches_all) {
+        return Some("a kill pattern that names every process on the host");
+    }
+    None
 }
 
 /// Verbs that take a security control out of service.
@@ -12983,31 +15878,116 @@ fn check_disable_verb_reaches_target(lower: &str) -> Option<&'static str> {
     if INSPECTION_VERBS.iter().any(|v| lower.contains(v)) {
         return None;
     }
+    let ends = command_ends(lower);
     for target in PROTECTED_TARGETS {
-        let Some(target_at) = lower.find(target) else {
-            continue;
-        };
-        for verb in DISABLE_VERBS {
-            let mut from = 0usize;
-            while let Some(rel) = lower[from..].find(verb) {
-                let verb_at = from + rel;
-                // Verb must precede the target and sit close to it, so an
-                // unrelated "remove" elsewhere in a long pipeline does not pair
-                // with an incidental mention of the target.
-                if verb_at < target_at && target_at - verb_at <= 40 {
-                    return Some(match *target {
-                        "innerwarden" => "disable InnerWarden (flags between verb and target)",
-                        _ => "disable a host security monitor",
-                    });
-                }
-                from = verb_at + verb.len();
-                if from >= lower.len() {
-                    break;
-                }
+        for (target_at, _) in lower.match_indices(target) {
+            if let Some(hit) = disable_verb_before(lower, target, target_at, &ends) {
+                return Some(hit);
             }
         }
     }
     None
+}
+
+/// The finding of [`check_disable_verb_reaches_target`] for one mention of
+/// `target` at `target_at`: a disable verb before it, close, in the same
+/// command (no end of a command, [`command_ends`], between the two).
+fn disable_verb_before(
+    lower: &str,
+    target: &str,
+    target_at: usize,
+    ends: &[usize],
+) -> Option<&'static str> {
+    for verb in DISABLE_VERBS {
+        let mut from = 0usize;
+        while let Some(rel) = lower[from..].find(verb) {
+            let verb_at = from + rel;
+            // Verb must precede the target and sit close to it, so an
+            // unrelated "remove" elsewhere in a long pipeline does not pair
+            // with an incidental mention of the target. And in the same
+            // command: `pkill -f x; cd ~/innerwarden/wt` kills `x`, then
+            // enters a folder whose name holds the guard's.
+            if verb_at < target_at
+                && target_at - verb_at <= 40
+                && !ends.iter().any(|end| (verb_at..target_at).contains(end))
+            {
+                return Some(match target {
+                    "innerwarden" => "disable InnerWarden (flags between verb and target)",
+                    _ => "disable a host security monitor",
+                });
+            }
+            from = verb_at + verb.len();
+            if from >= lower.len() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Where each command of a line ends: the byte offset of every `;`, `&`,
+/// `|` and newline outside quotes and outside parentheses, so a command
+/// substitution is one command with the one it stands in
+/// (`kill $(pgrep -f x | grep the-target)`). Read loosely: a quote left
+/// open runs to the end of the line, and a backslash outside single quotes
+/// escapes the next character. The body of a backquoted substitution is
+/// read as one of `$(...)`, and `$'...'` closes only at a quote no
+/// backslash escapes: a `;` in either is no end of a command.
+fn command_ends(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let mut ends = Vec::new();
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'\\' => at += 1,
+            b'$' if bytes.get(at + 1) == Some(&b'\'') => {
+                at += 2;
+                while let Some(&b) = bytes.get(at) {
+                    if b == b'\\' {
+                        at += 1;
+                    } else if b == b'\'' {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            b'`' => {
+                at += 1;
+                while let Some(&b) = bytes.get(at) {
+                    if b == b'\\' {
+                        at += 1;
+                    } else if b == b'`' {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            b'\'' => {
+                at += 1;
+                while bytes.get(at).is_some_and(|&b| b != b'\'') {
+                    at += 1;
+                }
+            }
+            b'"' => {
+                at += 1;
+                while let Some(&b) = bytes.get(at) {
+                    if b == b'\\' {
+                        at += 1;
+                    } else if b == b'"' {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b';' | b'&' | b'|' | b'\n' if depth == 0 => ends.push(at),
+            _ => {}
+        }
+        at += 1;
+    }
+    ends
 }
 
 /// Tearing down the host firewall. Nothing covered this: both `ufw disable` and
@@ -13886,7 +16866,14 @@ pub fn check_sensitive_download_write(content: &str) -> Option<(&'static str, u3
         let words = shell_tokens(segment);
         download_targets.extend(download_output_targets(&words));
         // The file `tee` reads is kept: `tee /tmp/copy < KEY` copies it out.
-        direct_targets.extend(tee_named_files(&words));
+        // Not the account database or the sudo rules: reading them is
+        // allowed (`cat /etc/passwd`), so a copy of them is a read too.
+        let written = tee_files(&words, false);
+        direct_targets.extend(
+            tee_named_files(&words)
+                .into_iter()
+                .filter(|file| written.contains(file) || !is_readable_account_file(file)),
+        );
     }
     if (!redirect_scan_complete && lexical_sensitive_output_redirect(content))
         || direct_targets
@@ -14133,7 +17120,9 @@ const AUTHENTICATION_WRITE_TARGETS: &[ShellAuthTarget] = &[
     ShellAuthTarget::Named(".ssh/id_ecdsa"),
     ShellAuthTarget::Named(".ssh/id_dsa"),
     ShellAuthTarget::Named(".ssh/authorized_keys"),
+    ShellAuthTarget::Named(".ssh/authorized_keys2"),
     ShellAuthTarget::Named(".git-credentials"),
+    ShellAuthTarget::File("/etc/passwd"),
     ShellAuthTarget::File("/etc/shadow"),
     ShellAuthTarget::File("/etc/gshadow"),
     ShellAuthTarget::File("/etc/sudoers"),
@@ -14160,6 +17149,17 @@ impl ShellAuthTarget {
             }),
         }
     }
+}
+
+/// The files of [`AUTHENTICATION_WRITE_TARGETS`] the guard lets a command
+/// read (`cat /etc/passwd`): copying one out is a read, not a theft.
+fn is_readable_account_file(target: &str) -> bool {
+    matches!(
+        normalize_command_target(target)
+            .to_ascii_lowercase()
+            .as_str(),
+        "/etc/passwd" | "/etc/sudoers"
+    )
 }
 
 fn is_authentication_write_target(target: &str) -> bool {
@@ -14240,6 +17240,13 @@ pub(crate) struct PrivilegedTarget {
 /// file-tool hook) can tell its own work from a reach into root's.
 pub(crate) const ROOT_HOME: &str = "root's home directory";
 
+/// What [`PRIVILEGED_WRITE_TARGETS`] calls the sudo rules, the account
+/// database and the scheduled jobs: groups the shell side also refuses to see
+/// written in any form ([`names_persistence_file`]).
+const SUDO_RULES: &str = "the sudo rules, which decide who may run commands as root";
+const ACCOUNTS: &str = "the account and group database";
+const SCHEDULED_JOBS: &str = "the jobs the system runs on a schedule";
+
 const fn group(what: &'static str, places: &'static [Place]) -> PrivilegedGroup {
     PrivilegedGroup {
         what,
@@ -14275,7 +17282,7 @@ const fn group(what: &'static str, places: &'static [Place]) -> PrivilegedGroup 
 /// (`/usr/lib/systemd/system` before `/usr/lib`).
 const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
     group(
-        "the sudo rules, which decide who may run commands as root",
+        SUDO_RULES,
         &[
             Place::File("/etc/sudoers"),
             Place::Tree("/etc/sudoers.d"),
@@ -14284,7 +17291,7 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
         ],
     ),
     group(
-        "the account and group database",
+        ACCOUNTS,
         &[
             Place::File("/etc/passwd"),
             Place::File("/etc/shadow"),
@@ -14363,7 +17370,7 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
         ],
     ),
     group(
-        "the jobs the system runs on a schedule",
+        SCHEDULED_JOBS,
         &[
             Place::File("/etc/crontab"),
             Place::File("/etc/anacrontab"),
@@ -14954,6 +17961,15 @@ fn command_target_execution(
             TargetExecution::None
         };
     }
+    if base == "go" {
+        return if go_built_sources(effective).iter().any(|source| {
+            resolve_command_target(source, effective_cwd.as_deref(), variables) == target
+        }) {
+            TargetExecution::Interpreted
+        } else {
+            TargetExecution::None
+        };
+    }
     if !EXECUTORS.contains(&base) {
         return TargetExecution::None;
     }
@@ -15169,6 +18185,120 @@ fn wrapper_directory(
         index += 1;
     }
     None
+}
+
+/// The Go source files a `go` verb builds and runs: `go run` builds and
+/// runs them, `go test` builds and runs the tests in them and `go generate`
+/// runs the commands their `//go:generate` lines name. They are the `.go`
+/// words that follow the verb's flags, up to the first word that is not one,
+/// which starts the program's own arguments. A `-C dir` before the verb
+/// moves the command into `dir`, so each file is read from there. Empty for
+/// any other verb. A `.go` file fetched and then built this way is code from
+/// elsewhere run as surely as `sh x.sh` (measured 2026-11-18: `curl -so m.go
+/// URL && go run m.go` was allowed, and the review found `go test`,
+/// `go generate` and `go -C dir run` the same).
+///
+/// `go run mod@version` and `go install` are left as they were: the module
+/// comes through the Go module proxy and its checksum database, the same
+/// class as a package manager install, not a file fetched by hand.
+fn go_built_sources(words: &[String]) -> Vec<String> {
+    // Build and test flags that take their value as the next word.
+    const VALUE_FLAGS: &[&str] = &[
+        "-C",
+        "-o",
+        "-p",
+        "-tags",
+        "-ldflags",
+        "-gcflags",
+        "-asmflags",
+        "-gccgoflags",
+        "-mod",
+        "-modfile",
+        "-overlay",
+        "-pkgdir",
+        "-exec",
+        "-toolexec",
+        "-covermode",
+        "-coverpkg",
+        "-coverprofile",
+        "-compiler",
+        "-installsuffix",
+        "-buildmode",
+        "-pgo",
+        "-run",
+        "-skip",
+        "-bench",
+        "-benchtime",
+        "-count",
+        "-cpu",
+        "-parallel",
+        "-timeout",
+        "-shuffle",
+        "-fuzz",
+        "-fuzztime",
+        "-fuzzminimizetime",
+        "-list",
+        "-vet",
+        "-outputdir",
+        "-cpuprofile",
+        "-memprofile",
+        "-memprofilerate",
+        "-blockprofile",
+        "-blockprofilerate",
+        "-mutexprofile",
+        "-mutexprofilefraction",
+        "-trace",
+    ];
+    let mut words = words
+        .iter()
+        .skip(1)
+        .map(|word| word.trim_matches(['\'', '"']))
+        .peekable();
+    // `go -C dir verb`, `go -C=dir verb`: the only flag `go` takes before
+    // its verb.
+    let mut directory: Option<&str> = None;
+    while let Some(word) = words.peek().copied() {
+        if word == "-C" || word == "--C" {
+            words.next();
+            directory = words.next();
+        } else if let Some(dir) = word
+            .strip_prefix("-C=")
+            .or_else(|| word.strip_prefix("--C="))
+        {
+            directory = Some(dir);
+            words.next();
+        } else {
+            break;
+        }
+    }
+    if !matches!(words.next(), Some("run" | "test" | "generate")) {
+        return Vec::new();
+    }
+    let mut sources = Vec::new();
+    let mut takes_value = false;
+    for word in words {
+        if takes_value {
+            takes_value = false;
+            continue;
+        }
+        if word.starts_with('-') && sources.is_empty() {
+            let flag = word.split('=').next().unwrap_or(word);
+            let flag = flag
+                .strip_prefix('-')
+                .filter(|f| f.starts_with('-'))
+                .unwrap_or(flag);
+            takes_value = !word.contains('=') && VALUE_FLAGS.contains(&flag);
+            continue;
+        }
+        if !word.ends_with(".go") {
+            break;
+        }
+        sources.push(match directory {
+            Some(dir) if !word.starts_with('/') => format!("{}/{word}", dir.trim_end_matches('/')),
+            _ => word.to_owned(),
+        });
+    }
+    sources
 }
 
 fn interpreter_executes_target(
@@ -17376,6 +20506,27 @@ fn normalize_command_target(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `;` inside backquotes or inside `$'...'` (after an escaped quote)
+    /// is part of a word, not the end of a command: a stop verb and its
+    /// target around it stay one command.
+    #[test]
+    fn command_ends_skips_backquotes_and_ansi_c_quoting() {
+        assert!(command_ends("systemctl stop `echo x;` innerwarden-agent").is_empty());
+        assert!(command_ends("systemctl stop $'x\\';' innerwarden-agent").is_empty());
+        assert_eq!(command_ends("a `b`; c"), vec![5]);
+        assert_eq!(command_ends("a $'b\\'c'; d"), vec![9]);
+        assert!(
+            check_disable_verb_reaches_target("systemctl stop `echo x;` innerwarden-agent")
+                .is_some()
+        );
+        assert!(
+            check_disable_verb_reaches_target("systemctl stop $'x\\';' innerwarden-agent")
+                .is_some()
+        );
+        // A real end still splits: the guard's folder entered after a stop.
+        assert!(check_disable_verb_reaches_target("pkill -f x; cd ~/innerwarden/wt").is_none());
+    }
 
     /// Each was `allow` while its curl/wget twin was a staged fetch-and-run:
     /// the correlation only knew curl, wget and fetch as the producer of a file.
@@ -19852,7 +23003,7 @@ mod tests {
             27,
             "prompt-injection pattern count"
         );
-        assert_eq!(DANGEROUS_COMMANDS.len(), 40, "dangerous-command count");
+        assert_eq!(DANGEROUS_COMMANDS.len(), 41, "dangerous-command count");
         assert_eq!(API_KEY_PATTERNS.len(), 7, "API-key pattern count");
     }
 }
@@ -22338,6 +25489,45 @@ mod round_three_rule_tests {
         ] {
             assert_eq!(plain_absolute_path(written), plain, "{written}");
         }
+    }
+
+    /// A socket or an `nsenter` target the line leaves to a value from
+    /// outside it is held for a person with its own wording, and the same
+    /// value set on the line is read in its place.
+    /// FAILS ON REVERT of `container_reach_unread`.
+    #[test]
+    fn a_runtime_reach_named_from_outside_the_line_is_held_with_its_reason() {
+        assert_eq!(
+            check_container_escape("curl --unix-socket \"$SOCK\" http://localhost/health"),
+            Some((ESCAPE_SOCKET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("nsenter -t \"$P\" -m sh"),
+            Some((ESCAPE_TARGET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("DOCKER_HOST=unix://$S docker ps"),
+            Some((ESCAPE_SOCKET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("podman --url \"$U\" ps"),
+            Some((ESCAPE_SOCKET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock"),
+            None
+        );
+        assert_eq!(
+            check_container_escape("P=1; nsenter -t $P -m sh"),
+            Some((ESCAPE_PID_ONE, 60))
+        );
+        assert_eq!(check_container_escape("P=12; nsenter -t $P -n ip a"), None);
+        assert_eq!(
+            check_container_escape(
+                "nsenter -t \"$(docker inspect -f '{{.State.Pid}}' web)\" -n ip a"
+            ),
+            None
+        );
     }
 
     #[test]
@@ -24861,6 +28051,31 @@ mod redirect_fallback_tests {
     /// with it. A line handed to a new shell sets nothing for the line that
     /// handed it.
     ///
+    /// FAILS ON REVERT of the `$'...'` arm in `single_quoted_spans`: the
+    /// tracker closed `$'\''` at its `\'`, read the rest of the line as
+    /// quoted and exempted the `eval` after `then`. The exemption itself
+    /// must refuse, not only the structural reader.
+    #[test]
+    fn an_ansi_c_quote_does_not_hide_an_eval_from_the_exemption() {
+        for probe in [
+            "echo $'\\'' ; if true; then eval \"$X\"; fi ; echo 'x'",
+            "$'a\\'b' ; eval \"$X\"",
+            "$'a\\'b' ; if true; then eval \"$X\"; fi ; echo 'x'",
+        ] {
+            assert!(!eval_only_after_opener_in_single_quotes(probe), "{probe}");
+            assert_eq!(
+                dangerous_command_in(probe),
+                Some(("shell eval (dynamic command execution)", true)),
+                "{probe}"
+            );
+        }
+        assert_eq!(single_quoted_spans("$'a\\'b' 'c'"), vec![9..10]);
+        assert_eq!(single_quoted_spans("\\$'a' $$"), vec![3..4]);
+        assert!(eval_only_after_opener_in_single_quotes(
+            "bash -c 'if false; then eval \"$(cat)\"; fi'"
+        ));
+    }
+
     /// FAILS ON REVERT of the `eval` arm in `command_starts_unhooked_agent`
     /// (what the line set is lost: the first two lists pass).
     #[test]

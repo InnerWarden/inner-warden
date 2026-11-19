@@ -32,6 +32,8 @@ mod contain_io;
 mod dashboard;
 mod dashboard_community;
 mod dashboard_identity;
+mod demo;
+mod demo_io;
 mod first_run;
 mod graph_io;
 mod help;
@@ -110,6 +112,7 @@ fn status_io_cmd() -> std::process::ExitCode {
     let StatusWiring {
         hook_trouble,
         partly_unscreened,
+        unread_hook_lines,
         wired_agents,
         tool_classes,
     } = status_wiring(home.as_deref(), &rows);
@@ -118,6 +121,7 @@ fn status_io_cmd() -> std::process::ExitCode {
         rows,
         hook_trouble,
         partly_unscreened,
+        unread_hook_lines,
         wired_agents,
         tool_classes,
     )
@@ -127,6 +131,7 @@ fn status_io_cmd() -> std::process::ExitCode {
 struct StatusWiring {
     hook_trouble: Vec<status::HookTrouble>,
     partly_unscreened: Vec<status::PartlyUnscreened>,
+    unread_hook_lines: Vec<status::UnreadHookLine>,
     wired_agents: Vec<String>,
     tool_classes: Vec<status::ToolClasses>,
 }
@@ -155,6 +160,17 @@ fn status_wiring(
                                 via_proxy: false,
                             }),
                         };
+                    }
+                    // No line of the guard's own screens Bash, but one written
+                    // by hand names it (`env X=1 .../innerwarden hook`,
+                    // `sh -c '...'`): judged as the agent's hook, never skipped.
+                    if let Some(program) = wrapped_bash_verdict(home, r) {
+                        return Some(status::HookTrouble {
+                            agent: r.name.clone(),
+                            program,
+                            next: agents_ops::hook_repair_command(home, r),
+                            via_proxy: false,
+                        });
                     }
                     // An MCP agent whose proxy wrapper's binary is gone. Only
                     // a known-broken one is trouble: an unknown one stays wired
@@ -193,6 +209,33 @@ fn status_wiring(
         })
         .unwrap_or_default();
 
+    // Every other hook line that names the guard without being its own line:
+    // the one judged above as the agent's hook is not said twice.
+    let unread_hook_lines: Vec<status::UnreadHookLine> = home
+        .map(|home| {
+            use innerwarden_agent_guard::agents_ops;
+            rows.iter()
+                .flat_map(|r| {
+                    let judged = hook_trouble
+                        .iter()
+                        .find(|t| t.agent == r.name && !t.via_proxy)
+                        .map(|t| t.program.clone());
+                    let next = agents_ops::hook_repair_command(home, r);
+                    agents_ops::wrapped_hooks(home, r)
+                        .into_iter()
+                        .map(|(_, program)| program)
+                        .filter(move |program| Some(program) != judged.as_ref())
+                        .map(move |program| status::UnreadHookLine {
+                            agent: r.name.clone(),
+                            program,
+                            next: next.clone(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let wired_agents: Vec<String> = rows
         .iter()
         .filter(|r| r.guarded && !hook_trouble.iter().any(|t| t.agent == r.name))
@@ -219,9 +262,41 @@ fn status_wiring(
     StatusWiring {
         hook_trouble,
         partly_unscreened,
+        unread_hook_lines,
         wired_agents,
         tool_classes,
     }
+}
+
+/// What `status` says about whether an agent is running: the process scan's
+/// pids, never a row alone (a row is made for an agent only installed).
+/// `None` with no home or where the scan cannot look.
+fn status_any_agent_seen(
+    home: Option<&std::path::Path>,
+    rows: &[innerwarden_agent_guard::agents::AgentStatus],
+) -> Option<bool> {
+    home.and_then(|_| innerwarden_agent_guard::agents_ops::any_agent_running(rows))
+}
+
+/// The verdict on the hand-written lines that name the guard under a matcher
+/// that covers Bash, for an agent with no line of the guard's own there:
+/// "could not tell" before "off", as for the guard's own lines. `None` when
+/// there is no such line.
+fn wrapped_bash_verdict(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+) -> Option<innerwarden_agent_guard::hook::HookProgram> {
+    use innerwarden_agent_guard::{agents_ops, hook::HookProgram};
+    let verdicts: Vec<HookProgram> = agents_ops::wrapped_hooks(home, agent)
+        .into_iter()
+        .filter(|(wrapped, _)| wrapped.screens_bash)
+        .map(|(_, program)| program)
+        .collect();
+    verdicts
+        .iter()
+        .find(|verdict| matches!(verdict, HookProgram::Unknown { .. }))
+        .or_else(|| verdicts.first())
+        .cloned()
 }
 
 fn status_io_cmd_rest(
@@ -229,12 +304,15 @@ fn status_io_cmd_rest(
     rows: Vec<innerwarden_agent_guard::agents::AgentStatus>,
     hook_trouble: Vec<status::HookTrouble>,
     partly_unscreened: Vec<status::PartlyUnscreened>,
+    unread_hook_lines: Vec<status::UnreadHookLine>,
     wired_agents: Vec<String>,
     tool_classes: Vec<status::ToolClasses>,
 ) -> std::process::ExitCode {
-    // Seen at all, wired or not. `None` when we could not look, which the
-    // report renders as unknown rather than as "no agent".
-    let any_agent_seen = home.as_ref().map(|_| !rows.is_empty());
+    // Running, wired or not, from the process scan alone: a row is also made
+    // for an agent that is only installed, and counting rows said "An agent is
+    // running" on a machine where none was. `None` when we could not look,
+    // which the report renders as unknown rather than as "no agent".
+    let any_agent_seen = status_any_agent_seen(home.as_deref(), &rows);
 
     // What the wiring DOES, read back from the SAME rows fetched above. This
     // was hardcoded to `None`, so the mode line read [unknown] on every install
@@ -281,20 +359,38 @@ fn status_io_cmd_rest(
         Some(dashboard_answers(dashboard_probe_target()))
     };
 
+    let kept_apart_before = graph_io::kept_apart_before();
     let facts = status::Facts {
         never_configured,
         mode,
         wired_agents,
         hook_trouble,
         partly_unscreened,
+        unread_hook_lines,
         tool_classes,
         any_agent_seen,
         decisions_recorded,
         newest_decision_age_secs,
         decisions_by_hand,
         dashboard_reachable,
+        record_kept_apart: graph_io::shared_record_denied().map(|denied| status::RecordKeptApart {
+            shared_dir: denied.shared_dir.display().to_string(),
+            own_dir: denied
+                .own
+                .parent()
+                .unwrap_or(&denied.own)
+                .display()
+                .to_string(),
+        }),
+        kept_apart_before: kept_apart_before
+            .as_deref()
+            .map(|dir| dir.display().to_string()),
     };
     print!("{}", status::render(&facts));
+    // Said once: the note that made this line is dropped once it is printed.
+    if let Some(dir) = kept_apart_before.as_deref() {
+        graph_io::forget_kept_apart(dir);
+    }
     std::process::ExitCode::SUCCESS
 }
 
@@ -358,7 +454,8 @@ fn main() -> std::process::ExitCode {
             code
         }
         Some("install") => cmd_install(&args[1..]),
-        Some("status") => status_io_cmd(),
+        Some("status") => status_cmd(&args[1..]),
+        Some("demo") => demo_io::cmd(&args[1..]),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
         // Run by `contain` inside a jail that starts only once admitted.
@@ -466,6 +563,18 @@ fn analyze(command: &str, engine: &RuleEngine) -> serde_json::Value {
 // `render_verdict` + `is_deny` now live in `innerwarden_agent_guard::render` so the
 // Active Defence's `innerwarden check` renders byte-identically (imported at the top).
 
+/// Explain a terminal stdin read without adding noise to hooks or pipelines.
+fn check_stdin_hint(stdin_is_terminal: bool) -> Option<&'static str> {
+    if !stdin_is_terminal {
+        return None;
+    }
+    Some(if cfg!(windows) {
+        "reading a command from stdin (end with Ctrl-Z then Enter), or pass it: innerwarden check \"<command>\""
+    } else {
+        "reading a command from stdin (end with Ctrl-D), or pass it: innerwarden check \"<command>\""
+    })
+}
+
 /// `innerwarden check "<cmd>"` - analyze a command (from argv, or stdin when none is
 /// given) and print the verdict. `--json` for the full machine output. Exits 1 on
 /// a `deny` so a PreToolUse hook can gate on the exit code, and fires any
@@ -484,6 +593,9 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
         .cloned()
         .collect();
     let command = if words.is_empty() {
+        if let Some(hint) = check_stdin_hint(std::io::IsTerminal::is_terminal(&std::io::stdin())) {
+            eprintln!("{hint}");
+        }
         let mut buf = String::new();
         if std::io::stdin().read_to_string(&mut buf).is_err() {
             eprintln!("innerwarden: failed to read command from stdin");
@@ -1068,11 +1180,24 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     if let Err(why) = hook_net::arm(monitor) {
         return hook_unreadable(why, monitor);
     }
+    // A host upgraded by an older binary still runs that binary's wiring:
+    // the first hook of this version brings it up to this one's.
+    agents_io::rewire_once_per_version();
 
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         return hook_unreadable("stdin could not be read", monitor);
     }
+    // A call `innerwarden demo` sent: judged exactly as an agent's and
+    // recorded like one, with `demo: true` beside it. It is not alerted on
+    // nor asked of a second opinion, and its verdict is also written to
+    // stdout for the demo to show. The marker never skips the record: a
+    // caller that guessed or copied this run's nonce gets a quieter call, not
+    // an unrecorded one.
+    // Only with this run's nonce, handed to this process by the demo in its
+    // environment: a payload alone, whatever it carries, is never a demo call.
+    let demo_nonce = std::env::var(demo::DEMO_NONCE_ENV).ok();
+    let demo = demo::is_demo_payload(&buf, demo_nonce.as_deref());
     // PostToolUse: the tool already ran, so there is nothing to permit or
     // refuse. Record what its result carried and exit 0. Doing this BEFORE the
     // command extraction matters: a PostToolUse payload also carries the
@@ -1090,7 +1215,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // The agent's own file tools never pass through the shell. Judged on
     // where they write, before anything else: a project edit leaves here at
     // once, without loading the rule engine or touching the record.
-    if let Some(exit) = screen_file_tool(&buf, rest, monitor) {
+    if let Some(exit) = screen_file_tool(&buf, rest, monitor, demo) {
         return exit;
     }
 
@@ -1098,6 +1223,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         monitor,
         block_review,
         record: true,
+        demo,
         host: None,
     };
     let screened = match screen_shell(&buf, rest, &options) {
@@ -1112,6 +1238,16 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         blocks: would_block_under_policy,
         ..
     } = screened;
+    if demo {
+        println!(
+            "{}",
+            demo::hook_report(
+                verdict.get("recommendation").and_then(|r| r.as_str()),
+                would_block_under_policy,
+                verdict.get("explanation").and_then(|e| e.as_str()),
+            )
+        );
+    }
 
     if !monitor && would_block_under_policy {
         let rec = verdict
@@ -1162,6 +1298,12 @@ pub(crate) struct ShellScreenOptions<'a> {
     /// (OpenClaw's guard asks the person to approve a review), so the caller
     /// records it once it is.
     pub record: bool,
+    /// A call `innerwarden demo` sent: no session behaviour is read or
+    /// written, no second opinion is asked and no alert is sent, so the demo
+    /// calls nothing outside this machine. It is still recorded, with
+    /// `demo: true`. The rules, the person's suppressions and the profiles
+    /// still decide, as for an agent's call.
+    pub demo: bool,
     /// Asked after the hook's own decision, with the command: the host's own
     /// recommendation for it (`allow`, `review` or `deny`), or `None` when
     /// the host did not answer. It only ever makes the decision stricter
@@ -1212,6 +1354,7 @@ pub(crate) fn screen_shell(
         monitor,
         block_review,
         record,
+        demo,
         host,
     } = *options;
     let (lines, file_read) = match classify_hook_input(buf) {
@@ -1255,7 +1398,7 @@ pub(crate) fn screen_shell(
     // A read tool is neither: it sends nothing anywhere, so where its path
     // came from is no step of the two-step attack, and an agent opens files
     // by the dozen, so its calls would be a burst on their own.
-    let (behaviour, taints) = if file_read {
+    let (behaviour, taints) = if file_read || demo {
         (None, vec![None; judged.len()])
     } else {
         let commands: Vec<&str> = judged.iter().map(|(command, _)| command.as_str()).collect();
@@ -1289,7 +1432,13 @@ pub(crate) fn screen_shell(
         let suppressed = suppress_io::consider(&command, &rules);
         let person_allowed = suppressed.is_some();
         let verdict = suppressed
-            .or_else(|| second_opinion_io::consider(&command, &rules))
+            .or_else(|| {
+                if demo {
+                    None
+                } else {
+                    second_opinion_io::consider(&command, &rules)
+                }
+            })
             .unwrap_or(rules);
         let verdict = apply_behaviour(verdict, behaviour.as_ref());
         let verdict = apply_taint(verdict, tainted.as_ref());
@@ -1398,6 +1547,7 @@ pub(crate) fn screen_shell(
             monitor,
             would_block_under_policy,
             deciding_layer.clone(),
+            demo,
         );
     }
     ShellScreen::Screened(ShellScreened {
@@ -1411,7 +1561,9 @@ pub(crate) fn screen_shell(
 /// Record one screened shell command of `buf` and alert on a refusal, as the
 /// hook records every command it screens: in monitor a refusal is a
 /// `would_block`, in enforce `blocked` (`would_block` says the policy refuses
-/// it). The payload's event id makes a delivery idempotent.
+/// it). The payload's event id makes a delivery idempotent. A `demo` call is
+/// recorded with `demo: true` and never alerted on.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_shell(
     buf: &str,
     rest: &[String],
@@ -1420,6 +1572,7 @@ pub(crate) fn record_shell(
     monitor: bool,
     would_block: bool,
     layer: Option<graph_io::LayerLabel>,
+    demo: bool,
 ) {
     let source_session = hook_session(buf);
     let identity = hook_identity::current(agent_flag(rest).as_deref(), source_session.as_deref());
@@ -1434,8 +1587,9 @@ pub(crate) fn record_shell(
         hook_cwd(buf).as_deref(),
         identity.as_ref(),
         layer,
+        demo,
     );
-    if would_block {
+    if would_block && !demo {
         // In monitor mode this is a would-block alert; in enforce it accompanies
         // the real block. Alerting must not change the hook outcome.
         notify_io::fire(command, verdict);
@@ -1503,7 +1657,12 @@ pub(crate) fn stricter_with_host(
 /// every other file edit exits 0 at once and records nothing, because an
 /// agent edits project files all day and a record of each would bury the
 /// decisions that matter.
-fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::process::ExitCode> {
+fn screen_file_tool(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    demo: bool,
+) -> Option<std::process::ExitCode> {
     use innerwarden_agent_guard::file_tools::{self, FileToolCall};
     let payload = serde_json::from_str::<serde_json::Value>(buf).ok()?;
     let (tool, paths) = match file_tools::file_tool_call(&payload) {
@@ -1512,9 +1671,20 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
         FileToolCall::Writes { tool, paths } => (tool, paths),
     };
     Some(
-        match screen_file_writes(buf, rest, monitor, &tool, &paths) {
-            FileScreen::Pass => std::process::ExitCode::SUCCESS,
+        match screen_file_writes(buf, rest, monitor, demo, &tool, &paths) {
+            FileScreen::Pass => {
+                if demo {
+                    println!("{}", demo::hook_report(Some("allow"), false, None));
+                }
+                std::process::ExitCode::SUCCESS
+            }
             FileScreen::Refused { explanation } => {
+                if demo {
+                    println!(
+                        "{}",
+                        demo::hook_report(Some("deny"), true, Some(&explanation))
+                    );
+                }
                 if monitor {
                     return Some(std::process::ExitCode::SUCCESS);
                 }
@@ -1540,11 +1710,13 @@ pub(crate) enum FileScreen {
 
 /// The file side of the hook, for the paths one call writes (`tool` is the
 /// name the record shows): a privileged file is refused by the hard rule, a
-/// revoked agent every file change; each refusal recorded and alerted on.
+/// revoked agent every file change; each refusal recorded and, unless it is a
+/// `demo` call, alerted on.
 pub(crate) fn screen_file_writes(
     buf: &str,
     rest: &[String],
     monitor: bool,
+    demo: bool,
     tool: &str,
     paths: &[String],
 ) -> FileScreen {
@@ -1565,7 +1737,7 @@ pub(crate) fn screen_file_writes(
         // A revoked agent is refused every file change too, where profiles
         // are in force. With no profiles file this is one failed open of
         // each file and the edit goes through, as before.
-        return file_tool_revoked(buf, rest, monitor, tool, paths);
+        return file_tool_revoked(buf, rest, monitor, demo, tool, paths);
     };
     let verdict = file_tools::refusal_verdict(tool, path, what);
     let command = format!("{tool} {}", path.trim());
@@ -1588,8 +1760,11 @@ pub(crate) fn screen_file_writes(
         hook_cwd(buf).as_deref(),
         identity.as_ref(),
         deciding_layer,
+        demo,
     );
-    notify_io::fire(&command, &verdict);
+    if !demo {
+        notify_io::fire(&command, &verdict);
+    }
     FileScreen::Refused {
         explanation: file_tools::refusal_explanation(tool, path, what),
     }
@@ -1603,6 +1778,7 @@ fn file_tool_revoked(
     buf: &str,
     rest: &[String],
     monitor: bool,
+    demo: bool,
     tool: &str,
     paths: &[String],
 ) -> FileScreen {
@@ -1639,6 +1815,7 @@ fn file_tool_revoked(
         hook_cwd(buf).as_deref(),
         identity.as_ref(),
         Some(innerwarden_agent_guard::identity::RuleLayer::Hard.into()),
+        demo,
     );
     FileScreen::Refused {
         explanation: revoked.sentence().to_string(),
@@ -2494,16 +2671,54 @@ fn can_unlink(exe: &std::path::Path) -> bool {
 /// loopback so an AI agent's MCP wrapper / hook can POST to it. Mirrors the
 /// agent's `POST /api/agent/check-command` shape (body `{"command":"..."}`),
 /// minus TLS (loopback only) so the binary pulls no crypto and stays Windows-clean.
-fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
-    let mut bind = SERVE_BIND.to_string();
+/// `serve` takes only `--bind <addr>`; anything else is refused by name, and
+/// `--bind` needs its value (issue #223). Repeating `--bind` keeps the last.
+fn parse_serve_flags(rest: &[String]) -> Result<Option<String>, String> {
+    let mut bind: Option<String> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
-        if a.as_str() == "--bind" {
-            if let Some(v) = it.next() {
-                bind = v.clone();
-            }
+        match a.as_str() {
+            "--bind" => match it.next() {
+                Some(v) => bind = Some(v.clone()),
+                None => {
+                    return Err(format!(
+                        "--bind needs an address, for example --bind {SERVE_BIND}"
+                    ))
+                }
+            },
+            other => return Err(format!("unknown flag `{other}` for `serve`")),
         }
     }
+    Ok(bind)
+}
+
+/// `status` takes no arguments; anything here is refused by name (#223).
+fn parse_status_flags(rest: &[String]) -> Result<(), String> {
+    match rest.first() {
+        Some(flag) => Err(format!(
+            "unexpected argument `{flag}` for `status`; it takes no arguments"
+        )),
+        None => Ok(()),
+    }
+}
+
+fn status_cmd(rest: &[String]) -> std::process::ExitCode {
+    if let Err(msg) = parse_status_flags(rest) {
+        eprintln!("innerwarden status: {msg}");
+        return std::process::ExitCode::from(2);
+    }
+    status_io_cmd()
+}
+
+fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
+    let bind = match parse_serve_flags(rest) {
+        Ok(Some(b)) => b,
+        Ok(None) => SERVE_BIND.to_string(),
+        Err(msg) => {
+            eprintln!("innerwarden serve: {msg}");
+            return std::process::ExitCode::from(2);
+        }
+    };
 
     // Shell surface only: an engine that holds just the rules a command can
     // match, on a process that runs per tool call. See
@@ -2785,6 +3000,7 @@ fn help_text() -> String {
          \n\
          USAGE:\n  \
            {p} status                    is it on, and is it screening anything? start here\n  \
+           {p} demo [--json]             send known risky calls through each connected agent's guard\n  \
            {p} setup                     first-run wizard: pick what to enable (arrow keys)\n  \
              {p} dry-run                   put EVERY connected agent in monitor: records, never blocks\n  \
              {p} enforce                   the opposite: a denied command is actually refused\n  \
@@ -2998,6 +3214,30 @@ mod status_wiring_tests {
                     .as_deref(),
                 Some(w.partly_unscreened[0].sentence.as_str())
             );
+            // And through the row the dashboard serves: its guarded gate
+            // (`status_is_effectively_guarded` in `agents_json_with_status`)
+            // keeps the agent connected, and `agent_unscreened` says the
+            // words `status` prints.
+            let payload: serde_json::Value =
+                serde_json::from_str(&dashboard::agents_json(home.path(), &rows)).unwrap();
+            let row = payload["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == "claude-code")
+                .expect("claude-code row");
+            assert_ne!(
+                row["guardrail"]["mode"], "not_configured",
+                "monitor={monitor}: {row}"
+            );
+            assert!(row["guardrail"]["mode"].is_string(), "{row}");
+            assert_eq!(
+                row["unscreened"]["line"],
+                status::partly_unscreened_words("claude-code", &w.partly_unscreened[0].sentence)
+                    .as_str(),
+                "monitor={monitor}: {row}"
+            );
+            assert!(row.get("judges").is_none(), "{row}");
 
             // Whole again: no caveat, and the tool classes say what it judges.
             runnable(&home.path().join("gone/innerwarden"));
@@ -3012,6 +3252,122 @@ mod status_wiring_tests {
         }
     }
 
+    fn settings_with(home: &std::path::Path, settings: serde_json::Value) {
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            serde_json::to_vec_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn bash_line(command: &str) -> serde_json::Value {
+        serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": command}]}
+        ]}})
+    }
+
+    /// FAILS ON REVERT of the hand-written-line branch in `status_wiring`: a
+    /// line with `env` in front was skipped in silence, so the agent read as
+    /// not wired and the line was never named. Now it is "could not tell",
+    /// with the line, in the report a person reads.
+    #[test]
+    fn status_names_a_hand_written_line_as_could_not_tell() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join("bin/innerwarden");
+        runnable(&bin);
+        let command = format!("env IW_X=1 {} hook --agent claude-code", bin.display());
+        settings_with(home.path(), bash_line(&command));
+        let rows = agents_ops::rows(home.path());
+        let w = status_wiring(Some(home.path()), &rows);
+        assert_eq!(w.hook_trouble.len(), 1, "{:?}", w.hook_trouble);
+        assert!(w.unread_hook_lines.is_empty(), "said once, not twice");
+        let finding = status::trouble_finding(&w.hook_trouble[0]).unwrap();
+        match finding {
+            status::Finding::Unknown { why, .. } => {
+                assert!(why.contains(&command), "{why}");
+                assert!(why.starts_with("could not tell"), "{why}");
+            }
+            other => panic!("a hand-written line is could not tell: {other:?}"),
+        }
+    }
+
+    /// FAILS ON REVERT of `judge_wrapped_hook`'s gone branch: the binary a
+    /// hand-written line names is gone, which is the same alarm as the
+    /// guard's own line: none of its commands are screened.
+    #[test]
+    fn status_flags_a_hand_written_line_whose_binary_is_gone() {
+        let home = tempfile::TempDir::new().unwrap();
+        let gone = home.path().join("gone/innerwarden");
+        let command = format!("env IW_X=1 {} hook", gone.display());
+        settings_with(home.path(), bash_line(&command));
+        let rows = agents_ops::rows(home.path());
+        let w = status_wiring(Some(home.path()), &rows);
+        assert_eq!(w.hook_trouble.len(), 1, "{:?}", w.hook_trouble);
+        match status::trouble_finding(&w.hook_trouble[0]).unwrap() {
+            status::Finding::NotWorking { what, .. } => {
+                assert!(what.contains("which does not exist"), "{what}");
+                assert!(what.contains("none of its commands are screened"), "{what}");
+            }
+            other => panic!("a gone binary is off: {other:?}"),
+        }
+    }
+
+    /// FAILS ON REVERT of `unread_hook_lines`: beside a guard's own line that
+    /// runs, a hand-written one is still named, never dropped.
+    #[test]
+    fn a_hand_written_line_beside_a_running_hook_is_still_named() {
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join("bin/innerwarden");
+        runnable(&bin);
+        let own = hook::hook_command_for(&bin, false, false, Some("claude-code"));
+        let by_hand = format!("sh -c '{} hook --monitor'", bin.display());
+        settings_with(
+            home.path(),
+            serde_json::json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": own}]},
+                {"matcher": "Write", "hooks": [{"type": "command", "command": by_hand}]}
+            ]}}),
+        );
+        let rows = agents_ops::rows(home.path());
+        let w = status_wiring(Some(home.path()), &rows);
+        assert!(w.hook_trouble.is_empty(), "{:?}", w.hook_trouble);
+        assert_eq!(w.wired_agents, vec!["claude-code".to_string()]);
+        assert_eq!(w.unread_hook_lines.len(), 1, "{:?}", w.unread_hook_lines);
+        match status::unread_line_finding(&w.unread_hook_lines[0]).unwrap() {
+            status::Finding::Unknown { why, .. } => assert!(why.contains(&by_hand), "{why}"),
+            other => panic!("could not tell, with the line: {other:?}"),
+        }
+    }
+
+    /// FAILS ON REVERT of `any_agent_seen` in `status`: an agent that is only
+    /// installed (a row with no pid) is not a running one, and where the
+    /// process scan cannot look nothing is claimed.
+    #[test]
+    fn an_installed_agent_is_not_a_running_one() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        let mut rows = agents_ops::rows(home.path());
+        assert!(!rows.is_empty(), "the config dir makes a row");
+        rows.iter_mut().for_each(|row| row.pids.clear());
+        assert_eq!(agents_ops::any_agent_running_with(&rows, true), Some(false));
+        assert_eq!(agents_ops::any_agent_running_with(&rows, false), None);
+        // What `status` itself says, on this platform.
+        let said = status_any_agent_seen(Some(home.path()), &rows);
+        if std::path::Path::new("/proc").is_dir() {
+            assert_eq!(said, Some(false), "installed is not running");
+        } else {
+            assert_eq!(said, None, "no process scan here, so nothing is claimed");
+        }
+        assert_eq!(status_any_agent_seen(None, &rows), None);
+        rows[0].pids.push(4242);
+        assert_eq!(agents_ops::any_agent_running_with(&rows, true), Some(true));
+        assert!(matches!(
+            status::nothing_wired_finding(agents_ops::any_agent_running_with(&rows[..0], true)),
+            status::Finding::NotWorking { what, .. } if what.contains("none of the agents")
+        ));
+    }
+
     /// No home: nothing is claimed either way.
     #[test]
     fn status_wiring_without_a_home_claims_nothing() {
@@ -3023,6 +3379,25 @@ mod status_wiring_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn check_stdin_hint_explains_terminal_input() {
+        let hint = super::check_stdin_hint(true).expect("terminal input needs an explanation");
+        assert_eq!(hint.lines().count(), 1);
+        assert!(hint.contains("reading a command from stdin"));
+        assert!(hint.contains("innerwarden check \"<command>\""));
+        let eof_keys = if cfg!(windows) {
+            "Ctrl-Z then Enter"
+        } else {
+            "Ctrl-D"
+        };
+        assert!(hint.contains(eof_keys));
+    }
+
+    #[test]
+    fn check_stdin_hint_is_silent_for_pipes() {
+        assert_eq!(super::check_stdin_hint(false), None);
+    }
+
     /// A refusal of Active Defence's own on the host is not one a rule of the
     /// person's lifts: the remedy does not send them to `innerwarden allow`.
     /// Every other block still does.
@@ -3921,6 +4296,58 @@ mod install_target_tests {
             };
             assert!(stderr.contains(said), "{mode}: {stderr}");
         }
+    }
+}
+
+#[cfg(test)]
+mod flag_parse_tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_bind_and_keeps_the_last_one() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_serve_flags(&none).unwrap(), None);
+        let bind = |v: &str| vec!["--bind".to_string(), v.to_string()];
+        assert_eq!(
+            parse_serve_flags(&bind("127.0.0.1:9")).unwrap(),
+            Some("127.0.0.1:9".into())
+        );
+        let two = vec![
+            "--bind".to_string(),
+            "a:1".to_string(),
+            "--bind".to_string(),
+            "b:2".to_string(),
+        ];
+        assert_eq!(parse_serve_flags(&two).unwrap(), Some("b:2".into()));
+    }
+
+    #[test]
+    fn serve_refuses_an_unknown_flag_by_name() {
+        let bogus = vec!["--bnd".to_string(), "127.0.0.1:1".to_string()];
+        let err = parse_serve_flags(&bogus).unwrap_err();
+        assert!(err.contains("`--bnd`"), "{err}");
+    }
+
+    #[test]
+    fn serve_refuses_bind_without_a_value_with_an_example() {
+        let missing = vec!["--bind".to_string()];
+        let err = parse_serve_flags(&missing).unwrap_err();
+        assert!(
+            err.contains("needs an address") && err.contains(SERVE_BIND),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn status_takes_no_arguments() {
+        let none: Vec<String> = vec![];
+        assert!(parse_status_flags(&none).is_ok());
+        let bogus = vec!["--bogus".to_string()];
+        let err = parse_status_flags(&bogus).unwrap_err();
+        assert!(
+            err.contains("unexpected argument") && err.contains("`--bogus`"),
+            "{err}"
+        );
     }
 }
 

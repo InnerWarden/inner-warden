@@ -493,7 +493,7 @@ mod tests {
         let results = run(&corpus, &engine);
         let s = Scoreboard::from_results(&results);
 
-        assert_eq!(s.malicious_total, 245, "malicious corpus contract changed");
+        assert_eq!(s.malicious_total, 246, "malicious corpus contract changed");
         assert_eq!(s.benign_total, 160, "benign corpus contract changed");
 
         // The benign set must keep covering the shape the rules are most aggressive
