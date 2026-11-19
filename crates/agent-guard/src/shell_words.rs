@@ -216,6 +216,54 @@ impl Lexer {
         self.word.get_or_insert_with(Word::default)
     }
 
+    /// Whether a `{}` starting here stands where a program adds the files
+    /// it finds, or the words it reads, as the program to run: right after
+    /// `find -exec` (and `-execdir`, `-ok`, `-okdir`), `fd -x` or `-X`,
+    /// or the replace string of `xargs -I`. What runs there is a found
+    /// file, which the text does not show, so it stays a pattern.
+    fn braces_stand_for_a_program(&self) -> bool {
+        if self.word.is_some() {
+            return false;
+        }
+        self.command.words.last().is_none_or(|last| {
+            let text = last.text.as_str();
+            matches!(
+                text,
+                "-exec"
+                    | "-execdir"
+                    | "-ok"
+                    | "-okdir"
+                    | "-x"
+                    | "-X"
+                    | "--exec"
+                    | "--exec-batch"
+                    | "-I"
+                    | "-i"
+                    | "--replace"
+                    | "{}"
+            ) || text.starts_with("-I")
+                || text.starts_with("--replace=")
+                || text.starts_with("-i")
+                || matches!(
+                    text.rsplit('/').next().unwrap_or(text),
+                    "xargs"
+                        | "gxargs"
+                        | "parallel"
+                        | "sem"
+                        | "rush"
+                        | "env"
+                        | "sudo"
+                        | "exec"
+                        | "command"
+                        | "nohup"
+                        | "time"
+                        | "nice"
+                        | "timeout"
+                        | "stdbuf"
+                )
+        })
+    }
+
     fn end_word(&mut self) {
         if let Some(mut word) = self.word.take() {
             word.one_word = !word.may_split && !word.has(Mark::Pattern);
@@ -363,6 +411,17 @@ impl Lexer {
             '*' | '?' => {
                 self.word().push(c, Mark::Pattern);
                 self.at += 1;
+            }
+            // `{}` is no brace expansion: the shell hands it over as
+            // written (`find -exec wc -l {} +`, `xargs -I{}`). Read as a
+            // pattern, it left every word before it in doubt, and a folder
+            // named after the guard (`find ~/innerwarden -exec wc -l {} +`)
+            // read as the guard handed a verb the text does not show.
+            '{' if self.peek(1) == Some('}') && !self.braces_stand_for_a_program() => {
+                let word = self.word();
+                word.push('{', Mark::Plain);
+                word.push('}', Mark::Plain);
+                self.at += 2;
             }
             '{' => {
                 self.braces += 1;

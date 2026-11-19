@@ -9338,10 +9338,23 @@ fn mask_literal_command_args(
         return;
     };
     let name = normalized_command_name(&name);
-    let in_non_data_pipeline = command
-        .parent()
-        .and_then(nearest_pipeline)
-        .is_some_and(|pipeline| !pipeline_is_data_only(pipeline, source));
+    // A search runs nothing it is given and prints only lines of its input:
+    // what comes before it in a pipeline cannot run its pattern. Its pattern
+    // is code only when a stage after it runs what it prints
+    // (`grep -o ... | sh`). Asked of the whole pipeline, `git diff | grep
+    // -nP '\xe2\x80\x94'` had its pattern read as hex-escaped code.
+    let searches = matches!(name.as_str(), "grep" | "egrep" | "fgrep" | "rg" | "ripgrep");
+    let in_non_data_pipeline =
+        command
+            .parent()
+            .and_then(nearest_pipeline)
+            .is_some_and(|pipeline| {
+                if searches && !inside_a_substitution(pipeline) {
+                    !stages_after_are_data_only(pipeline, command, source)
+                } else {
+                    !pipeline_is_data_only(pipeline, source)
+                }
+            });
     if in_non_data_pipeline
         || has_execution_sink_ancestor(command, source)
         || writes_security_or_execution_sink(command, source)
@@ -10737,6 +10750,39 @@ fn pipeline_is_data_only(pipeline: tree_sitter::Node<'_>, source: &[u8]) -> bool
         && commands
             .into_iter()
             .all(|command| classify_pipeline_command(command, source) == PipelineCommand::DataOnly)
+}
+
+/// Whether `node` is inside a command or process substitution: what it
+/// prints becomes words of another command (`kill $(pgrep -f x | grep
+/// innerwarden)`), so which lines a search keeps picks what that command
+/// acts on.
+fn inside_a_substitution(node: tree_sitter::Node<'_>) -> bool {
+    let mut at = node.parent();
+    while let Some(parent) = at {
+        if matches!(
+            parent.kind(),
+            "command_substitution" | "process_substitution"
+        ) {
+            return true;
+        }
+        at = parent.parent();
+    }
+    false
+}
+
+/// Whether every command of `pipeline` after `command` only handles data
+/// ([`PipelineCommand::DataOnly`]): nothing after it runs what it prints.
+fn stages_after_are_data_only(
+    pipeline: tree_sitter::Node<'_>,
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    let mut commands = Vec::new();
+    collect_commands(pipeline, &mut commands, 0);
+    commands
+        .into_iter()
+        .filter(|later| later.start_byte() >= command.end_byte())
+        .all(|later| classify_pipeline_command(later, source) == PipelineCommand::DataOnly)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

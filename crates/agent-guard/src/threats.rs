@@ -9146,6 +9146,13 @@ pub fn check_anti_forensics(content: &str) -> Option<(&'static str, u32)> {
                 r"(?i)\bbpftool\b[^|;&]*\b(?:link|prog)\b[^|;&]*\b(?:detach|unload)\b",
                 "detaches a running eBPF program, which is how kernel monitoring is switched off",
             ),
+            // The guard's own maps, pinned where its kernel programs keep
+            // them: rewriting one rewrites what they allow or refuse.
+            // Reading one (`dump`, `lookup`, `show`) is not a change.
+            (
+                r"(?i)\bbpftool\b[^|;&]*\bmap\b[^|;&]*\b(?:update|delete|push|pop|enqueue|dequeue|freeze)\b[^|;&]*/sys/fs/bpf/innerwarden",
+                "rewrites a map the guard's kernel programs read, which changes what they allow or refuse",
+            ),
             (
                 r"(?i)\btouch\b[^|;&]*(?:-t\s*\d{8,}|-r\s+\S+)[^|;&]*/(?:usr|opt|bin|sbin|etc)/",
                 "backdates a file's timestamps to hide when it was placed",
@@ -10150,6 +10157,8 @@ pub fn check_tls_verification_disabled(content: &str) -> Option<(&'static str, u
             "trusted-host",
             "no-check-certificate",
             "-k ",
+            // A group of short options (`curl -sk`): the regex reads it.
+            "curl",
             "--insecure",
             "sslverify",
             "strict-ssl",
@@ -10181,8 +10190,12 @@ pub fn check_tls_verification_disabled(content: &str) -> Option<(&'static str, u
                 r"(?i)\bwget\b[^|;&]*--no-check-certificate\b",
                 "wget certificate verification disabled",
             ),
+            // `-k` alone or among other short options (`-sk`, `-kL`), as
+            // written: curl's `-K` reads options from a file and checks
+            // certificates as before. Only options that take no value stand
+            // before it in a group, so `-o k.txt`-like values are not read.
             (
-                r"(?i)\bcurl\b[^|;&]*(?:\s-k\b|--insecure\b)",
+                r"\bcurl\b[^|;&]*(?:\s-[sSLfvIiNqgjlnOpRVZ0-9#:]*k[a-zA-Z0-9#:]*(?:\s|$)|(?i:--insecure\b))",
                 "curl certificate verification disabled",
             ),
             (
@@ -10861,6 +10874,7 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
                   [\w.-]+ \s+ (?:completion|completions) (?:[\t\x20]+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
                 | (?:direnv|starship|zoxide|mise|rbenv|pyenv|nodenv|jenv|fnm|atuin|navi|keychain)
                     \s+ (?:hook|init|env|activate|init-file) (?:[\t\x20]+[\w.-]+)?   # direnv hook bash
+                | direnv \s+ export [\t\x20]+ [\w.-]+                     # direnv export bash: what its hook runs
                 | ssh-agent (?:[\t\x20]+-s)?                                  # ssh-agent -s
                 | gpg-agent [^)`'";&|\n]*
                 | brew \s+ shellenv
