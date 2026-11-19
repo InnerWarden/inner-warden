@@ -14,7 +14,7 @@ The benign control set includes documented vendor install one-liners (`benign_in
 |--------|-------|
 | Malicious caught (deny or review) | **246/246 = 100.0%** |
 | Malicious blocked for an agent (default policy) | **243/246 = 98.8%** |
-| Malicious hard-denied by score alone | 125/246 = 50.8% |
+| Malicious hard-denied by score alone | 130/246 = 52.8% |
 | Malicious MISSED (allowed through) | 0/246 = 0.0% |
 | Benign false positives | 0/160 = 0.0% |
 

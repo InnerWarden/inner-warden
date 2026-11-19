@@ -11558,6 +11558,55 @@ fn is_ephemeral_secret_shred(content: &str) -> bool {
 }
 
 pub fn check_command(content: &str) -> Option<(&'static str, bool)> {
+    check_command_except(content, &[])
+}
+
+/// The names of the calls inline code makes to run a line or code
+/// (`os.system(`, `exec(`, `eval(`): findings of [`DANGEROUS_COMMANDS`]
+/// that say what the code calls, not what the call runs.
+pub const INLINE_CALL_NAMES: &[&str] = &[
+    "eval()",
+    "exec()",
+    "os.system()",
+    "subprocess shell",
+    "child_process.exec()",
+];
+
+/// Which of [`INLINE_CALL_NAMES`] the reader of inline code accounted for
+/// on `line`: every place the line names the call is in `code`, the
+/// inline code the reader was handed, and the reader read each call of
+/// that name there (none is left in `residue`, the code with the names of
+/// the calls it read taken out). The line each such call runs is judged
+/// in its place, and a line or code it cannot read is held for review, so
+/// the name says nothing more: `python3 -c "import os; os.system('clear')"`
+/// is `clear`.
+pub fn inline_call_names_read(line: &str, code: &str, residue: &str) -> Vec<&'static str> {
+    if code.is_empty() {
+        return Vec::new();
+    }
+    let normalized = normalize_command(line);
+    let bare = without_prefix_assignments(line);
+    dangerous_command_regexes()
+        .iter()
+        .filter(|(_, description, _)| INLINE_CALL_NAMES.contains(description))
+        .filter(|(re, _, _)| {
+            let named = [Some(line), Some(normalized.as_str()), bare.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(|text| re.find_iter(text).count())
+                .max()
+                .unwrap_or(0);
+            named <= re.find_iter(code).count() && !re.is_match(residue)
+        })
+        .map(|(_, description, _)| *description)
+        .collect()
+}
+
+/// [`check_command`] with the findings named in `lifted` set aside: the
+/// names of calls the reader of inline code accounted for
+/// ([`inline_call_names_read`]).
+pub fn check_command_except(content: &str, lifted: &[&str]) -> Option<(&'static str, bool)> {
+    let dangerous_command_in = |text: &str| dangerous_command_in_except(text, lifted);
     if let Some(hit) = dangerous_command_in(content) {
         return Some(hit);
     }
@@ -11790,10 +11839,13 @@ fn eval_only_after_opener_in_single_quotes(content: &str) -> bool {
 /// The first dangerous pattern `content` matches that no exception lifts,
 /// or a later one that blocks when the first does not: `eval "$(curl -d @-
 /// https://...)"` matched the upload first, a review, and the `eval` of
-/// what the server answers, a refusal, was never reached.
-fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
+/// what the server answers, a refusal, was never reached. The findings
+/// named in `lifted` are set aside.
+fn dangerous_command_in_except(content: &str, lifted: &[&str]) -> Option<(&'static str, bool)> {
     let mut first = None;
-    for found in dangerous_commands_in(content) {
+    for found in
+        dangerous_commands_in(content).filter(|(description, _)| !lifted.contains(description))
+    {
         if found.1 {
             return Some(found);
         }
@@ -12542,16 +12594,179 @@ fn handed_removal(handed: &[String]) -> Option<bool> {
         + shell
         + 2;
     let code = handed.get(code_at)?;
-    // What the search hands the shell is `$1` (or all of `$@`) there.
-    let code = ["\"$@\"", "\"$1\"", "\"${1}\"", "${1}", "$1", "$@", "$*"]
-        .iter()
-        .fold(code.clone(), |code, name| code.replace(name, "{}"));
+    // What the search hands the shell is a positional argument there, and
+    // so is every name the line binds to one: `for f; do`, `for f in "$@"`,
+    // `while read f`, `f=$1`. Each stands as `{}`.
+    let code = positionals_as_handed(code);
     shell_command_segments(&code)
         .into_iter()
         // A segment that names nothing the search hands over removes
         // something else (`rm -f /tmp/x`), and is judged as written.
         .filter(|segment| segment.contains("{}"))
-        .find_map(|segment| handed_removal(&shell_tokens(segment)))
+        .find_map(|segment| {
+            let tokens = shell_tokens(segment);
+            // The command a body opens on (`do rm -f "$f"`, `for f do rm
+            // -f "$f"`) is the one that runs.
+            let body = match tokens.first().map(String::as_str) {
+                Some("for") => tokens
+                    .iter()
+                    .position(|word| word == "do")
+                    .map_or(0, |at| at + 1),
+                _ => 0,
+            };
+            let opener = body
+                + tokens[body..]
+                    .iter()
+                    .take_while(|word| {
+                        matches!(word.as_str(), "do" | "then" | "else" | "{" | "!" | "(")
+                    })
+                    .count();
+            handed_removal(&tokens[opener..])
+        })
+}
+
+/// The words a shell's `-c` line reads from its positional arguments, as
+/// a `find` or `xargs` hands them: `$1` to `$9`, `$@`, `$*`, in any
+/// spelling, and every name the line binds to one, to a word of them or to
+/// what it reads beside them: a `for` with no list or a list of them, a
+/// `read` (`printf '%s\n' "$@" | while read f`), an assignment of one
+/// (`f=$1`, `local f="$1"`). Each is written `{}`, the word the search
+/// hands over, quotes and all.
+fn positionals_as_handed(code: &str) -> String {
+    let positional = |text: &str| {
+        let text = text.trim_matches('"');
+        let bare = text
+            .strip_prefix("${")
+            .and_then(|inner| inner.strip_suffix('}'))
+            .or_else(|| text.strip_prefix('$'));
+        bare.is_some_and(|name| {
+            matches!(name, "@" | "*")
+                || (name.len() == 1 && name.as_bytes()[0].is_ascii_digit() && name != "0")
+        })
+    };
+    // The names bound to the arguments, found until no new one shows.
+    let mut bound: Vec<String> = Vec::new();
+    let names_bound = |text: &str, bound: &[String]| {
+        let text = text.trim_matches('"');
+        positional(text)
+            || bound
+                .iter()
+                .any(|name| text == format!("${name}") || text == format!("${{{name}}}"))
+    };
+    let reads_positionals =
+        code.contains('$') && shell_tokens(code).iter().any(|word| positional(word));
+    for _ in 0..4 {
+        let before = bound.len();
+        for segment in shell_command_segments(code) {
+            let tokens = shell_tokens(segment);
+            let start = tokens
+                .iter()
+                .take_while(|word| {
+                    matches!(
+                        word.as_str(),
+                        "do" | "then" | "else" | "{" | "!" | "(" | "while" | "until" | "if"
+                    ) || is_env_assign(word)
+                })
+                .count();
+            let words = &tokens[start..];
+            let mut fresh: Vec<String> = Vec::new();
+            match words.first().map(String::as_str) {
+                Some("for") => {
+                    if let Some(name) = words.get(1) {
+                        let list = words.get(2).map(String::as_str);
+                        let from_arguments = match list {
+                            None | Some("do") => true,
+                            Some("in") => words[3..]
+                                .iter()
+                                .take_while(|word| word.as_str() != "do")
+                                .any(|word| names_bound(word, &bound)),
+                            _ => false,
+                        };
+                        if from_arguments {
+                            fresh.push(name.clone());
+                        }
+                    }
+                }
+                Some("read") if reads_positionals => {
+                    // Its names: the words that are not options, past the
+                    // value of an option that takes one.
+                    let mut index = 1;
+                    while let Some(word) = words.get(index) {
+                        if word.starts_with('-') {
+                            if matches!(
+                                word.as_str(),
+                                "-d" | "-n" | "-N" | "-p" | "-t" | "-u" | "-i"
+                            ) {
+                                index += 1;
+                            }
+                        } else {
+                            fresh.push(word.clone());
+                        }
+                        index += 1;
+                    }
+                }
+                _ => {}
+            }
+            for word in &tokens {
+                if let Some((name, value)) = word.split_once('=') {
+                    let is_name = !name.is_empty()
+                        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                        && !name.as_bytes()[0].is_ascii_digit();
+                    if is_name && names_bound(value, &bound) {
+                        fresh.push(name.to_string());
+                    }
+                }
+            }
+            for name in fresh {
+                let is_name = !name.is_empty()
+                    && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+                if is_name && !bound.contains(&name) {
+                    bound.push(name);
+                }
+            }
+        }
+        if bound.len() == before {
+            break;
+        }
+    }
+    // Written `{}`: the positional arguments and the bound names, each at
+    // a `$` the name ends after (`$f`, not the `$f` of `$fx`).
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let (name, length) = if let Some(inner) = after.strip_prefix('{') {
+            match inner.find('}') {
+                Some(close) => (&inner[..close], close + 2),
+                None => ("", 0),
+            }
+        } else {
+            let first = after.chars().next();
+            match first {
+                Some(c) if c.is_ascii_digit() || c == '@' || c == '*' => (&after[..1], 1),
+                Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+                    let end = after
+                        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                        .unwrap_or(after.len());
+                    (&after[..end], end)
+                }
+                _ => ("", 0),
+            }
+        };
+        let handed = matches!(name, "@" | "*")
+            || (name.len() == 1 && name != "0" && name.as_bytes()[0].is_ascii_digit())
+            || bound.iter().any(|bound| bound == name);
+        if handed && length > 0 {
+            out.push_str("{}");
+            rest = &after[length..];
+        } else {
+            out.push('$');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Whether every alternative of a `find` expression is narrowed by a name,
@@ -29616,7 +29831,7 @@ mod redirect_fallback_tests {
         ] {
             assert!(!eval_only_after_opener_in_single_quotes(probe), "{probe}");
             assert_eq!(
-                dangerous_command_in(probe),
+                dangerous_command_in_except(probe, &[]),
                 Some(("shell eval (dynamic command execution)", true)),
                 "{probe}"
             );
