@@ -346,6 +346,8 @@ fn status_io_cmd_rest(
     let loaded = graph_io::load_graph_checked().ok();
     let (decisions_recorded, newest_decision_age_secs, decisions_by_hand) =
         status::decision_evidence(loaded.as_ref(), now_ms);
+    // What `innerwarden demo` sent is named apart, never counted as the agent's.
+    let decisions_from_demo = status::decisions_from_demo(loaded.as_ref());
 
     // Absent everything is "not set up", not "unreadable". A fresh box is not a
     // broken one, and three diagnoses send a beginner hunting a fault that does
@@ -392,6 +394,7 @@ fn status_io_cmd_rest(
         decisions_recorded,
         newest_decision_age_secs,
         decisions_by_hand,
+        decisions_from_demo,
         dashboard_reachable,
         record_kept_apart: graph_io::shared_record_denied().map(|denied| status::RecordKeptApart {
             shared_dir: denied.shared_dir.display().to_string(),

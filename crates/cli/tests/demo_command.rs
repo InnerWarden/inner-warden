@@ -484,3 +484,66 @@ fn an_unknown_argument_is_a_usage_error() {
     assert_eq!(code, Some(2), "{out}");
     assert!(out.contains("unexpected argument"), "{out}");
 }
+
+/// `status` after the demo. After only `innerwarden demo` (4 refused) and no
+/// command from the agent, it said "[on] 4 screening decision(s) recorded, the
+/// newest less than a minute ago, so commands really are reaching the guard":
+/// false proof that the agent is wired. The demo is named apart; only the
+/// agent's own call makes the count and its newest.
+///
+/// FAILS ON REVERT: count the demo calls as the agent's and the working line
+/// is back after the demo alone, and the count reads 5 beside the agent's call.
+#[test]
+fn status_names_the_demo_apart_from_the_agents_own_commands() {
+    let host = Host::new();
+    host.connect_claude_code();
+    let (code, out) = host.run(&["demo"]);
+    assert_eq!(code, Some(0), "{out}");
+    assert_eq!(host.commands().len(), 4, "{:?}", host.commands());
+
+    // Demo only.
+    let (_, status) = host.run(&["status"]);
+    assert!(
+        status.contains("4 from innerwarden demo, 0 from your agents yet"),
+        "the demo must be named apart:\n{status}"
+    );
+    assert!(
+        !status.contains("really are reaching the guard"),
+        "a demo alone is not proof the agent's commands reach the guard:\n{status}"
+    );
+    assert!(
+        !status.contains("screening decision(s) recorded"),
+        "{status}"
+    );
+
+    // Demo and one command from the agent, through the same hook.
+    let (code, _) = host.hook(&[], &demo_payload(&host.home(), "ls -la", None));
+    assert_eq!(code, Some(0));
+    let (_, status) = host.run(&["status"]);
+    assert!(
+        status.contains("1 screening decision(s) recorded, the newest")
+            && status.contains("really are reaching the guard."),
+        "the agent's own call is the evidence:\n{status}"
+    );
+    assert!(
+        status.contains("4 more from `innerwarden demo` are not counted."),
+        "{status}"
+    );
+    assert!(!status.contains("5 screening decision(s)"), "{status}");
+}
+
+/// The agent alone: the count is the agent's and no demo is named.
+#[test]
+fn status_without_a_demo_names_none() {
+    let host = Host::new();
+    host.connect_claude_code();
+    let (code, _) = host.hook(&[], &demo_payload(&host.home(), "ls -la", None));
+    assert_eq!(code, Some(0));
+    let (_, status) = host.run(&["status"]);
+    assert!(
+        status.contains("1 screening decision(s) recorded, the newest")
+            && status.contains("really are reaching the guard."),
+        "{status}"
+    );
+    assert!(!status.contains("innerwarden demo"), "{status}");
+}

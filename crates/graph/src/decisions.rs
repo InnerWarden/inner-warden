@@ -437,6 +437,16 @@ pub struct ScreeningEvidence {
     pub newest_through_agents_ms: Option<u64>,
     /// Checks run by hand, drills and verify runs included.
     pub by_hand: u64,
+    /// Calls `innerwarden demo` sent through an agent's hook. They prove the
+    /// hook answers, not that the agent's own commands reach it, so they are
+    /// counted apart and never move `newest_through_agents_ms`.
+    pub from_demo: u64,
+}
+
+/// Whether a decision is one `innerwarden demo` sent: the hook records it
+/// like an agent's, with `demo: true` beside it.
+pub fn is_demo(node: &Node) -> bool {
+    attr(node, "demo") == Some("true")
 }
 
 /// The channel of a node: the one it recorded, or, for a node written before
@@ -1031,7 +1041,13 @@ impl Graph {
     /// agent the record identifies, never a guess.
     pub fn agents_last_seen(&self) -> BTreeMap<String, u64> {
         let mut seen: BTreeMap<String, u64> = BTreeMap::new();
-        for node in self.nodes.iter().filter(|node| node.kind == "command") {
+        // A demo call names the agent whose hook it went through, but the
+        // agent did not send it: it is no sign the agent is being screened.
+        for node in self
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "command" && !is_demo(node))
+        {
             let (Some(agent), Some(ms)) = (
                 attr(node, "agent").filter(|agent| valid_agent(agent)),
                 recorded_at_ms(node),
@@ -1080,6 +1096,13 @@ impl Graph {
             if channel != "hook" && channel != "mcp" {
                 continue;
             }
+            // A demo call reached the hook, but the agent did not send it: an
+            // install whose agent never ran a command said "commands really
+            // are reaching the guard" after one `innerwarden demo`.
+            if is_demo(node) {
+                evidence.from_demo += 1;
+                continue;
+            }
             evidence.through_agents += 1;
             if let Some(ms) = recorded_at_ms(node) {
                 evidence.newest_through_agents_ms = Some(
@@ -1108,7 +1131,11 @@ impl Graph {
 
     fn channel_times(&self, unnamed_only: bool) -> BTreeMap<&'static str, u64> {
         let mut seen: BTreeMap<&'static str, u64> = BTreeMap::new();
-        for node in self.nodes.iter().filter(|node| node.kind == "command") {
+        for node in self
+            .nodes
+            .iter()
+            .filter(|node| node.kind == "command" && !is_demo(node))
+        {
             if unnamed_only && attr(node, "agent").is_some_and(valid_agent) {
                 continue;
             }
@@ -2695,7 +2722,8 @@ mod tests {
             ScreeningEvidence {
                 through_agents: 0,
                 newest_through_agents_ms: None,
-                by_hand: 3
+                by_hand: 3,
+                from_demo: 0,
             },
             "an install whose hook never fired has no evidence"
         );
@@ -2729,6 +2757,55 @@ mod tests {
         // The fixture's check-mode node under a hook channel is a check too.
         assert_eq!(record().screening_evidence().by_hand, 1);
         assert_eq!(record().screening_evidence().through_agents, 6);
+    }
+
+    /// After only `innerwarden demo`, nothing an agent sent is recorded: the
+    /// demo is counted apart and is no agent's or channel's "last seen". With
+    /// an agent's call beside it, only that call is the evidence. FAILS ON
+    /// REVERT: the demo calls counted as the agent's and dated the newest.
+    #[test]
+    fn demo_calls_are_counted_apart_from_an_agents_own() {
+        let demo = DecisionOrigin {
+            demo: true,
+            ..origin(&[])
+        };
+        let mut g = Graph::new();
+        for seq in 0..4 {
+            labelled(
+                &mut g,
+                "innerwarden-demo",
+                seq,
+                "deny",
+                &demo,
+                90_000 + seq as u64,
+            );
+        }
+        assert_eq!(
+            g.screening_evidence(),
+            ScreeningEvidence {
+                through_agents: 0,
+                newest_through_agents_ms: None,
+                by_hand: 0,
+                from_demo: 4,
+            },
+            "a demo alone is no evidence the agent reaches the guard"
+        );
+        assert!(
+            g.agents_last_seen().is_empty(),
+            "{:?}",
+            g.agents_last_seen()
+        );
+        assert!(g.channels_last_seen().is_empty());
+        assert!(g.unnamed_channels_last_seen().is_empty());
+
+        // The agent's own call, older than the demo: it is the newest that counts.
+        labelled(&mut g, "s1", 0, "allow", &origin(&[]), 7_000);
+        let evidence = g.screening_evidence();
+        assert_eq!(evidence.through_agents, 1);
+        assert_eq!(evidence.newest_through_agents_ms, Some(7_000));
+        assert_eq!(evidence.from_demo, 4);
+        assert_eq!(g.agents_last_seen().get("claude-code"), Some(&7_000));
+        assert_eq!(g.channels_last_seen().get("hook"), Some(&7_000));
     }
 
     #[test]
