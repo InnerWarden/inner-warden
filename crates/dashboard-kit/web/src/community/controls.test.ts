@@ -125,10 +125,38 @@ describe("the optional defences", () => {
     expect(jailControl(jail(true), false)).toMatchObject({ pill: "on", words: "Ready", line: "Ready: the checks a jail needs pass on this machine (sandbox-exec)." });
     expect(jailControl(jail(undefined), false)).toMatchObject({ pill: "unknown", words: "Not checked here yet", line: "Not checked here yet (sandbox-exec found)." });
     const failing = jailControl({ ...jail(false), advice: ["Install bubblewrap."] }, false);
-    expect(failing).toMatchObject({ pill: "needs", line: "Needs you: a jail does not start here yet.", more: ["Install bubblewrap."] });
+    expect(failing).toMatchObject({ pill: "not_available", words: "Not available here", line: "Not available here: Install bubblewrap.", more: [] });
+    expect(jailControl({ ...jail(false), advice: [] }, false).line).toBe("Not available here: a jail does not start on this machine.");
     expect(jailControl(jail(true, false), true)).toMatchObject({ pill: "not_available", line: "Not available on this system." });
     expect(jailControl(jail(true, false), true).step).toBeUndefined();
     expect(jailControl(undefined, true).words).toBe("Not read");
+  });
+
+  /**
+   * NEW-20261018-ai-jail-ready-userns-restricted. FAILS ON REVERT: keep the
+   * step and the alias on a check that does not pass (as before) and the
+   * Claude Code alias is offered for a jail the kernel will not start.
+   */
+  it("says why a jail does not start here, with the step that resolves it, and offers no alias or command", () => {
+    const refused = {
+      ...protection.jail,
+      checksPass: false,
+      advice: [
+        "innerwarden contain: this kernel does not let a program without privileges make a user namespace (kernel.unprivileged_userns_clone = 0), so the jail cannot be built.",
+        "",
+        "  Allow them, and keep it after a restart:",
+        "    sudo sysctl -w kernel.unprivileged_userns_clone=1",
+      ].filter((line) => line !== ""),
+    };
+    const control = jailControl(refused, true);
+    expect(control.words).toBe("Not available here");
+    expect(control.line).toBe(
+      "Not available here: this kernel does not let a program without privileges make a user namespace (kernel.unprivileged_userns_clone = 0), so the jail cannot be built.",
+    );
+    expect(control.more).toContain("    sudo sysctl -w kernel.unprivileged_userns_clone=1");
+    expect(control.tip).toBeUndefined();
+    expect(control.step).toBeUndefined();
+    expect(control.words).not.toBe("Ready");
   });
 
   it("offers a template, never a command to copy as it is, and the Claude Code alias only where Claude Code is", () => {

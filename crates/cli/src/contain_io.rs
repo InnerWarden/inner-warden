@@ -2354,16 +2354,23 @@ fn filter_pipe(rules: innerwarden_agent_guard::seccomp::Rules) -> Option<std::io
 fn restriction_advice(bwrap: &Path, probe: bool) -> Option<Vec<String>> {
     let sysctl =
         std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok();
-    let restricted = sysctl.as_deref().is_some_and(|v| v.trim() == "1");
     let grant = crate::contain::UsernsGrant {
-        probed: (probe && restricted)
-            .then(|| bwrap_gets_a_userns(bwrap))
-            .flatten(),
+        // Run wherever it may run, restricted or not: a kernel with no
+        // AppArmor restriction can still refuse one (NEW-20261018: the
+        // dashboard said "Ready" where a jail could not start).
+        probed: probe.then(|| bwrap_gets_a_userns(bwrap)).flatten(),
         own_profile: Path::new("/etc/apparmor.d/bwrap").exists()
             || Path::new("/etc/apparmor.d/usr.bin.bwrap").exists(),
         distro_profile: Path::new(crate::contain::DISTRO_BWRAP_PROFILE).exists(),
     };
-    crate::contain::userns_restriction_advice(sysctl.as_deref(), grant, bwrap)
+    let read = |path: &str| std::fs::read_to_string(path).ok();
+    crate::contain::userns_advice(
+        sysctl.as_deref(),
+        grant,
+        read("/proc/sys/kernel/unprivileged_userns_clone").as_deref(),
+        read("/proc/sys/user/max_user_namespaces").as_deref(),
+        bwrap,
+    )
 }
 
 /// Whether `bwrap` gets a user namespace here: run once with one, the root
@@ -2784,6 +2791,13 @@ fn launch_identified(
         Err(e) if matches!(scope, ScopePlan::User { .. }) => return Attempt::NeverStarted(Err(e)),
         Err(e) => return Attempt::Done(exit_from(Err(e))),
     };
+    // Under the gate, the record ends only once bwrap is gone (or once the
+    // launcher let go of it), so a launcher that dies here leaves the gate
+    // to say why nothing ran ([`hold_record_until_bwrap_ends`]).
+    let holder = identified
+        .gate_instance
+        .as_ref()
+        .and_then(|_| hold_record_until_bwrap_ends(child.id(), &record_writer));
     let info = read_info(&mut info_reader);
     drop(info_reader);
     let reported = match &info {
@@ -2793,7 +2807,9 @@ fn launch_identified(
     let record = match info {
         InfoRead::Nothing => {
             drop(record_writer);
-            return match child.wait() {
+            let status = child.wait();
+            RecordHolder::wait_out(holder);
+            return match status {
                 Ok(status) if status.success() => Attempt::Done(exit_from(Ok(status))),
                 status => Attempt::NeverStarted(status),
             };
@@ -2851,6 +2867,8 @@ fn launch_identified(
         );
         end_jail(&mut child, reported);
         drop(record_writer);
+        // Not let go: the holder ends with bwrap, which `end_jail` ended.
+        RecordHolder::wait_out(holder);
         // The launcher's own copy of a record it never handed in, and the
         // project path beside it: no instance of it ever ran.
         if record.is_ok() {
@@ -2877,11 +2895,179 @@ fn launch_identified(
         ),
     }
     drop(record_writer);
+    RecordHolder::release(holder);
     let code = exit_from(child.wait());
     if identified {
         report_contained_run(input, instance_id, started_ms, now_ms());
     }
     Attempt::Done(code)
+}
+
+/// The process that keeps the write end of a gated jail's record open after
+/// the launcher, until bwrap is gone or the launcher lets go of it.
+///
+/// Why (bubblewrap 0.9.0): bwrap arms `--die-with-parent` before it reports
+/// the jail, and the jail's first process arms its own only after it read its
+/// record. When the launcher dies, the kernel closes the launcher's
+/// descriptors (the record ends, empty) before it signals bwrap, so the
+/// jail's first process could arm it in that gap and die with bwrap, before
+/// the gate said anything: nothing ran, and nothing said why. With this
+/// process holding the record open until bwrap is gone, the jail's first
+/// process reads the end of its record only once its parent is dead; the
+/// death signal it then arms never comes, and the gate refuses the empty
+/// record on stderr, every time.
+#[cfg(target_os = "linux")]
+struct RecordHolder {
+    pid: libc::pid_t,
+    /// One byte here says the launcher let go of the record.
+    release: std::io::PipeWriter,
+}
+
+#[cfg(target_os = "linux")]
+impl RecordHolder {
+    /// The launcher handed the record in (or runs the jail without one): the
+    /// holder lets go now, and is waited for.
+    fn release(holder: Option<Self>) {
+        if let Some(mut holder) = holder {
+            let _ = std::io::Write::write_all(&mut holder.release, &[1]);
+            holder.reap();
+        }
+    }
+
+    /// The launcher did not let go: the holder ends once bwrap is gone. Called
+    /// once bwrap was waited for or ended, so this does not block on it.
+    fn wait_out(holder: Option<Self>) {
+        if let Some(holder) = holder {
+            holder.reap();
+        }
+    }
+
+    fn reap(self) {
+        let RecordHolder { pid, release } = self;
+        drop(release);
+        let mut status = 0;
+        // SAFETY: waitpid on our own child, which nothing else waits for.
+        while unsafe { libc::waitpid(pid, &mut status, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        {}
+    }
+}
+
+/// Fork the [`RecordHolder`] of the record whose write end is `record`, for
+/// the bwrap whose pid is `bwrap`. `None` (and the record behaves as before)
+/// where the kernel has no `pidfd_open` (before 5.3) or the fork fails.
+#[cfg(target_os = "linux")]
+fn hold_record_until_bwrap_ends(
+    bwrap: u32,
+    record: &impl std::os::fd::AsRawFd,
+) -> Option<RecordHolder> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let pid = libc::pid_t::try_from(bwrap).ok()?;
+    // SAFETY: pidfd_open takes a pid and no flags; bwrap is our child, not
+    // yet waited for, so its pid names it.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    let raw = libc::c_int::try_from(raw).ok().filter(|fd| *fd >= 0)?;
+    // SAFETY: a descriptor the kernel just opened for us.
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let (release_reader, release) = std::io::pipe().ok()?;
+    let keep = [
+        pidfd.as_raw_fd(),
+        release_reader.as_raw_fd(),
+        record.as_raw_fd(),
+    ];
+    // SAFETY: the child runs only async-signal-safe calls (sigaction, close,
+    // poll, read, _exit) and never returns: see [`record_holder`].
+    match unsafe { libc::fork() } {
+        -1 => None,
+        0 => unsafe { record_holder(keep) },
+        holder => Some(RecordHolder {
+            pid: holder,
+            release,
+        }),
+    }
+}
+
+/// The forked holder: it keeps only `[pidfd, release, record]`, ignores the
+/// signals a terminal sends, and exits when bwrap is gone (the pidfd reads)
+/// or the launcher let go (one byte on `release`). A `release` that ends
+/// with no byte is a launcher that died: then only bwrap's end counts.
+///
+/// # Safety
+///
+/// Only in the child of a `fork`, which it ends.
+#[cfg(target_os = "linux")]
+unsafe fn record_holder(keep: [libc::c_int; 3]) -> ! {
+    for signal in [
+        libc::SIGINT,
+        libc::SIGTERM,
+        libc::SIGHUP,
+        libc::SIGQUIT,
+        libc::SIGPIPE,
+    ] {
+        libc::signal(signal, libc::SIG_IGN);
+    }
+    let mut sorted = keep;
+    sorted.sort_unstable();
+    let mut first: libc::c_uint = 0;
+    for fd in sorted {
+        let fd = fd as libc::c_uint;
+        if fd > first {
+            close_from_to(first, fd - 1);
+        }
+        first = fd + 1;
+    }
+    close_from_to(first, libc::c_uint::MAX);
+    let [pidfd, release, _record] = keep;
+    let mut fds = [
+        libc::pollfd {
+            fd: pidfd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: release,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        if libc::poll(fds.as_mut_ptr(), 2, -1) < 0 {
+            if *libc::__errno_location() == libc::EINTR {
+                continue;
+            }
+            libc::_exit(1);
+        }
+        if fds[0].revents != 0 {
+            libc::_exit(0);
+        }
+        if fds[1].revents != 0 {
+            let mut byte = 0u8;
+            match libc::read(release, (&raw mut byte).cast(), 1) {
+                1 => libc::_exit(0),
+                -1 if *libc::__errno_location() == libc::EINTR => {}
+                // The launcher is gone without letting go: wait for bwrap.
+                _ => fds[1].fd = -1,
+            }
+        }
+    }
+}
+
+/// Close every descriptor from `first` to `last`: `close_range` (Linux 5.9),
+/// or one at a time up to 65536 where it is missing.
+///
+/// # Safety
+///
+/// Only in [`record_holder`], which owns no descriptor in that range.
+#[cfg(target_os = "linux")]
+unsafe fn close_from_to(first: libc::c_uint, last: libc::c_uint) {
+    if libc::syscall(libc::SYS_close_range, first, last, 0) == 0 {
+        return;
+    }
+    let mut fd = first;
+    while fd <= last.min(65_535) {
+        libc::close(fd as libc::c_int);
+        fd += 1;
+    }
 }
 
 /// End a jail whose command must not run, while its first process is still

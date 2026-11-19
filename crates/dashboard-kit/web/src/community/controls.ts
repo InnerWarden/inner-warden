@@ -278,14 +278,18 @@ export function jailControl(jail: Protection["jail"] | undefined, claudeHere: bo
     return { ...base, ...offered, pill: "on", words: "Ready", line: `Ready: the checks a jail needs pass on this machine${backend}.`, summary: "AI Jail ready" };
   }
   if (jail.checksPass === false) {
+    // A jail that does not start here is not on offer: no step to run it and
+    // no alias, only why and what resolves it (NEW-20261018: "Ready" and the
+    // alias were shown where the machine refused the jail a user namespace).
+    const [first, ...rest] = jail.advice;
+    const reason = first === undefined ? "" : first.replace(/^innerwarden contain:\s*/, "").trim();
     return {
       ...base,
-      ...offered,
-      pill: "needs",
-      words: "Needs you",
-      line: "Needs you: a jail does not start here yet.",
-      more: jail.advice,
-      summary: "AI Jail needs you",
+      pill: "not_available",
+      words: "Not available here",
+      line: reason === "" ? "Not available here: a jail does not start on this machine." : `Not available here: ${reason}`,
+      more: reason === "" ? jail.advice : rest,
+      summary: "AI Jail not available here",
     };
   }
   const found = jail.backend === undefined ? "" : ` (${jail.backend} found)`;

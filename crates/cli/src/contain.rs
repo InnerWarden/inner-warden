@@ -3893,6 +3893,77 @@ pub fn userns_restriction_advice(
     ])
 }
 
+/// What `contain` says when bwrap could not make a user namespace on a host
+/// with no AppArmor restriction (the case [`userns_restriction_advice`] does
+/// not cover): `probed` is that run ([`UsernsGrant::probed`]), `clone` the
+/// value of `kernel.unprivileged_userns_clone` (Debian's switch) and `max`
+/// that of `user.max_user_namespaces`. `None` unless bwrap was run and
+/// refused: a host where nothing was measured is never said to refuse. The
+/// first line is the reason, the rest the step that resolves it. Pure.
+pub fn userns_unavailable_advice(
+    probed: Option<bool>,
+    clone: Option<&str>,
+    max: Option<&str>,
+) -> Option<Vec<String>> {
+    if probed != Some(false) {
+        return None;
+    }
+    let off = |value: Option<&str>| value.is_some_and(|v| v.trim() == "0");
+    let (why, setting, on) = if off(clone) {
+        (
+            "this kernel does not let a program without privileges make a user namespace \
+             (kernel.unprivileged_userns_clone = 0), so the jail cannot be built.",
+            "kernel.unprivileged_userns_clone",
+            "1",
+        )
+    } else if off(max) {
+        (
+            "this kernel allows no user namespace at all (user.max_user_namespaces = 0), so \
+             the jail cannot be built.",
+            "user.max_user_namespaces",
+            "15000",
+        )
+    } else {
+        return Some(vec![
+            "innerwarden contain: bwrap could not make a user namespace here, so the jail \
+             cannot be built."
+                .into(),
+            "  A container or a security policy of this host may forbid it. To see bwrap's own \
+             error: bwrap --unshare-user --ro-bind / / true"
+                .into(),
+            "".into(),
+            RESTRICTION_ADVICE_END.into(),
+        ]);
+    };
+    Some(vec![
+        format!("innerwarden contain: {why}"),
+        "".into(),
+        "  Allow them, and keep it after a restart:".into(),
+        format!("    sudo sysctl -w {setting}={on}"),
+        format!("    echo '{setting} = {on}' | sudo tee /etc/sysctl.d/60-innerwarden-userns.conf"),
+        "".into(),
+        RESTRICTION_ADVICE_END.into(),
+    ])
+}
+
+/// Everything `contain` (and the dashboard's check) says of user namespaces
+/// on this host: the AppArmor restriction where the kernel has it
+/// ([`userns_restriction_advice`]), otherwise a refusal bwrap met for another
+/// reason ([`userns_unavailable_advice`]). `grant.probed` is bwrap's own run,
+/// `None` when it was not made. Pure.
+pub fn userns_advice(
+    apparmor: Option<&str>,
+    grant: UsernsGrant,
+    clone: Option<&str>,
+    max: Option<&str>,
+    bwrap: &Path,
+) -> Option<Vec<String>> {
+    if apparmor.is_some_and(|v| v.trim() == "1") {
+        return userns_restriction_advice(apparmor, grant, bwrap);
+    }
+    userns_unavailable_advice(grant.probed, clone, max)
+}
+
 /// The last line of [`userns_restriction_advice`]: what `contain` says to
 /// do once the profile is in place.
 pub const RESTRICTION_ADVICE_END: &str = "  Then run this command again. Nothing was run.";
@@ -6026,6 +6097,85 @@ mod tests {
         assert!(other
             .join("\n")
             .contains("profile bwrap /usr/local/bin/bwrap"));
+    }
+
+    /// NEW-20261018-ai-jail-ready-userns-restricted: a kernel with no AppArmor
+    /// restriction can still refuse a user namespace (Debian's
+    /// `kernel.unprivileged_userns_clone = 0`, `user.max_user_namespaces = 0`,
+    /// a container's policy), and the checks passed there, so the dashboard
+    /// said "Ready" and offered the alias. Once bwrap itself was refused, the
+    /// first line says why and the rest the step that resolves it; where bwrap
+    /// got one, or was not run, nothing is said.
+    ///
+    /// FAILS ON REVERT: ask only the AppArmor sysctl in `userns_advice` (as
+    /// `restriction_advice` did) and a refused bwrap on an unrestricted
+    /// kernel is said nothing.
+    #[test]
+    fn a_refused_user_namespace_is_said_with_its_reason_and_its_step() {
+        let bwrap = std::path::Path::new("/usr/bin/bwrap");
+        let refused = UsernsGrant {
+            probed: Some(false),
+            ..UsernsGrant::default()
+        };
+        // The Debian host: no AppArmor switch, clone off, bwrap refused.
+        let said = userns_advice(Some("0\n"), refused, Some("0\n"), Some("63311"), bwrap)
+            .expect("the check does not pass where bwrap was refused");
+        assert!(
+            said[0].contains("kernel.unprivileged_userns_clone = 0"),
+            "{said:?}"
+        );
+        assert!(userns_advice(None, refused, None, None, bwrap).is_some());
+        // The AppArmor case is unchanged: its own advice.
+        let apparmor = userns_advice(Some("1"), refused, Some("0"), None, bwrap).unwrap();
+        assert!(apparmor
+            .join("\n")
+            .contains("apparmor_restrict_unprivileged_userns"));
+        // bwrap got one: the check passes.
+        let granted = UsernsGrant {
+            probed: Some(true),
+            ..UsernsGrant::default()
+        };
+        assert_eq!(
+            userns_advice(Some("0"), granted, Some("0"), Some("0"), bwrap),
+            None
+        );
+        let lines = userns_unavailable_advice(Some(false), Some("0\n"), Some("63311\n"))
+            .expect("advice where bwrap was refused");
+        assert!(
+            lines[0].starts_with("innerwarden contain: this kernel does not let a program")
+                && lines[0].contains("kernel.unprivileged_userns_clone = 0"),
+            "{lines:?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.trim() == "sudo sysctl -w kernel.unprivileged_userns_clone=1"));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(RESTRICTION_ADVICE_END)
+        );
+        let lines = userns_unavailable_advice(Some(false), None, Some("0")).unwrap();
+        assert!(
+            lines[0].contains("user.max_user_namespaces = 0"),
+            "{lines:?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.trim() == "sudo sysctl -w user.max_user_namespaces=15000"));
+        // Refused, and no switch of the kernel says why: bwrap's own words.
+        let lines = userns_unavailable_advice(Some(false), Some("1"), Some("63311")).unwrap();
+        assert!(
+            lines[0].contains("bwrap could not make a user namespace here"),
+            "{lines:?}"
+        );
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("bwrap --unshare-user --ro-bind / / true")));
+        // Granted, or never run: nothing claimed, whatever the switches read.
+        assert_eq!(
+            userns_unavailable_advice(Some(true), Some("0"), Some("0")),
+            None
+        );
+        assert_eq!(userns_unavailable_advice(None, Some("0"), Some("0")), None);
     }
 
     /// Ubuntu 26.04 (live gate of 0.17.0, C4): its own profile for bwrap is
