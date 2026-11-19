@@ -528,6 +528,11 @@ pub fn record_place_finding(place: &RecordPlace) -> Finding {
                 "/var/lib/innerwarden-agents/{account} is missing, is a link, or is not a \
                  folder only {account} writes"
             ),
+            "account_records_root_not_root_owned" => {
+                "/var/lib/innerwarden-agents is a link, is not root's, or may be written by \
+                 an account other than root"
+                    .to_string()
+            }
             "config_accounts_not_a_table" => "its [accounts] section is not a table".to_string(),
             other => format!("it could not be used ({other})"),
         };
@@ -1477,6 +1482,23 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+
+        // The parent of the per-account folders not trusted: said why.
+        facts.record_place = Some(RecordPlace {
+            dir: "/var/lib/innerwarden/guard".into(),
+            account: Some("bot".into()),
+            account_problem: Some("account_records_root_not_root_owned"),
+            pro_reads: true,
+        });
+        let line = assess(&facts)
+            .into_iter()
+            .find(|f| f.to_string().contains("has an entry for bot"))
+            .expect("said")
+            .to_string();
+        assert!(
+            line.contains("/var/lib/innerwarden-agents is a link, is not root's"),
+            "{line}"
+        );
     }
 
     /// Once the shared record takes the account again, `status` says once

@@ -123,6 +123,7 @@ fn resolve_and_report(
         &Account {
             name: account.as_deref(),
             root: std::path::Path::new(innerwarden_graph::AGENT_RECORDS_ROOT),
+            root_owner: 0,
             owns: own_account_directory,
         },
     )
@@ -137,6 +138,10 @@ pub(crate) struct Account<'a, F: Fn(&std::path::Path) -> bool> {
     /// Where the per-account directories are:
     /// [`innerwarden_graph::AGENT_RECORDS_ROOT`] outside tests.
     pub root: &'a std::path::Path,
+    /// Who must own [`Account::root`]: `0` outside tests. A root another
+    /// account owns or may write is one where that account could swap the
+    /// per-account folder (rename it, plant a link), so it is never trusted.
+    pub root_owner: u32,
     /// Whether a directory is this account's own: a directory, not a link,
     /// owned by the effective uid, that no other account may write.
     pub owns: F,
@@ -213,6 +218,7 @@ fn resolve_report_and_place(
         &Account {
             name: None,
             root: std::path::Path::new(innerwarden_graph::AGENT_RECORDS_ROOT),
+            root_owner: 0,
             owns: |_: &std::path::Path| false,
         },
     )
@@ -256,8 +262,9 @@ fn raw_resolution(
 }
 
 /// [`raw_resolution`] for an account: its `[accounts."<name>"]` entry first,
-/// honoured only when the directory it names is the account's own
-/// ([`Account::owns`]). One that is missing, a link, someone else's or
+/// honoured only when the parent of the per-account folders is root's and
+/// nobody else may write it ([`trusted_records_root`]), and the directory it
+/// names is the account's own ([`Account::owns`]). One that is missing, a link, someone else's or
 /// writable by others is never written: the record is where it would be
 /// without the entry, and `account_problem` says why, for `status`.
 fn raw_resolution_as(
@@ -272,17 +279,39 @@ fn raw_resolution_as(
     if resolved.source != innerwarden_graph::GraphPathSource::AccountEntry {
         return resolved;
     }
-    let own = resolved
+    let problem = if !trusted_records_root(account.root, account.root_owner) {
+        "account_records_root_not_root_owned"
+    } else if resolved
         .path
         .as_deref()
         .and_then(std::path::Path::parent)
-        .is_some_and(|dir| (account.owns)(dir));
-    if own {
+        .is_some_and(|dir| (account.owns)(dir))
+    {
         return resolved;
-    }
+    } else {
+        "account_directory_not_its_own"
+    };
     let mut without = raw_resolution(config_path, &get);
-    without.account_problem = Some("account_directory_not_its_own");
+    without.account_problem = Some(problem);
     without
+}
+
+/// Whether the parent of the per-account folders can be trusted: a real
+/// directory (not a link), owned by `owner` (root outside tests), with no
+/// write bit for its group or for others. The paid installer makes it
+/// `root:root 0711`. Anything else, and the account's folder under it could
+/// be renamed or replaced by whoever may write it.
+#[cfg(unix)]
+fn trusted_records_root(root: &std::path::Path, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(root).is_ok_and(|metadata| {
+        metadata.is_dir() && metadata.uid() == owner && metadata.mode() & 0o022 == 0
+    })
+}
+
+#[cfg(not(unix))]
+fn trusted_records_root(_root: &std::path::Path, _owner: u32) -> bool {
+    false
 }
 
 /// Keep the records in this account's own directory as the paid product
@@ -512,6 +541,7 @@ fn this_account_resolution(
         &Account {
             name: account.as_deref(),
             root: std::path::Path::new(innerwarden_graph::AGENT_RECORDS_ROOT),
+            root_owner: 0,
             owns: own_account_directory,
         },
     )
@@ -541,6 +571,7 @@ pub(crate) fn record_place() -> Option<RecordPlace> {
         &Account {
             name: account.as_deref(),
             root: std::path::Path::new(innerwarden_graph::AGENT_RECORDS_ROOT),
+            root_owner: 0,
             owns: own_account_directory,
         },
         shared_record_refused,
@@ -4440,6 +4471,8 @@ mod account_record_tests {
                 dir: tempfile::TempDir::new().unwrap(),
             };
             std::fs::create_dir_all(host.root()).unwrap();
+            // As the paid installer makes it: `0711`, nobody else writes.
+            std::fs::set_permissions(host.root(), std::fs::Permissions::from_mode(0o711)).unwrap();
             std::fs::create_dir_all(host.shared()).unwrap();
             std::fs::create_dir_all(host.home()).unwrap();
             host.config_for("bot", &host.root());
@@ -4496,10 +4529,18 @@ mod account_record_tests {
                 &Account {
                     name: Some(name),
                     root: &root,
+                    root_owner: this_uid(),
                     owns: own_account_directory,
                 },
             )
         }
+    }
+
+    /// The throwaway root stands in for root's own `/var/lib/innerwarden-agents`,
+    /// so in these tests its owner is this uid.
+    fn this_uid() -> u32 {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { libc::geteuid() }
     }
 
     fn mode(path: &Path) -> u32 {
@@ -4628,6 +4669,7 @@ mod account_record_tests {
                 &Account {
                     name: Some("usr"),
                     root: &root,
+                    root_owner: 0,
                     owns: own_account_directory,
                 },
             );
@@ -4665,6 +4707,7 @@ mod account_record_tests {
                 &Account {
                     name: Some(name),
                     root: &root,
+                    root_owner: this_uid(),
                     owns: own_account_directory,
                 },
             )
@@ -4683,6 +4726,86 @@ mod account_record_tests {
         let open = resolve("bot");
         assert_eq!(open.source, GraphPathSource::EnvironmentOverride);
         assert_eq!(open.path, Some(elsewhere));
+    }
+
+    /// The parent of the per-account folders must be a real directory, root's,
+    /// that no group or other account may write: whoever may write it can
+    /// rename `bot`'s folder or plant a link in its place. Otherwise the entry
+    /// is not used, as if there were none, and the reason is kept for `status`.
+    ///
+    /// FAILS ON REVERT: drop [`trusted_records_root`] from
+    /// [`raw_resolution_as`] and each case below records in `bot`'s folder.
+    #[test]
+    fn a_parent_the_account_or_others_may_write_is_never_trusted() {
+        let resolve = |host: &Host, root: &Path, owner: u32| {
+            resolve_report_and_place_as(
+                &host.config(),
+                host.get(),
+                &std::sync::Once::new(),
+                |_: &Path| false,
+                &Account {
+                    name: Some("bot"),
+                    root,
+                    root_owner: owner,
+                    owns: own_account_directory,
+                },
+            )
+        };
+        let untrusted = |resolved: innerwarden_graph::GraphPathResolution, host: &Host, case| {
+            assert_eq!(
+                resolved.source,
+                GraphPathSource::ProductConfigFile,
+                "{case}"
+            );
+            assert_eq!(
+                resolved.path,
+                Some(host.shared().join("graph.json")),
+                "{case}"
+            );
+            assert_eq!(
+                resolved.account_problem,
+                Some("account_records_root_not_root_owned"),
+                "{case}"
+            );
+        };
+
+        // The control: the same tree, trusted, is used.
+        let host = Host::new();
+        host.own_dir();
+        let root = host.root();
+        assert_eq!(
+            resolve(&host, &root, this_uid()).source,
+            GraphPathSource::AccountEntry,
+            "precondition"
+        );
+
+        // Owned and writable by the account itself, not by root.
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            untrusted(resolve(&host, &root, 0), &host, "the account's own parent");
+        }
+
+        // Writable by its group, or by anyone.
+        for wide in [0o731, 0o713, 0o777] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(wide)).unwrap();
+            untrusted(
+                resolve(&host, &root, this_uid()),
+                &host,
+                "a parent others write",
+            );
+        }
+
+        // A link to a trusted directory, even one holding `bot`'s folder.
+        let host = Host::new();
+        host.own_dir();
+        let link = host.dir.path().join("agents-link");
+        std::os::unix::fs::symlink(host.root(), &link).unwrap();
+        host.config_for("bot", &link);
+        untrusted(
+            resolve(&host, &link, this_uid()),
+            &host,
+            "a parent that is a link",
+        );
     }
 
     /// The account is the effective uid's, from the account database. An
@@ -4728,6 +4851,7 @@ mod account_record_tests {
                 &Account {
                     name: Some(name),
                     root: &root,
+                    root_owner: this_uid(),
                     owns: own_account_directory,
                 },
                 |_: &Path| false,
