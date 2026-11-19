@@ -114,6 +114,57 @@ fn linux_backend_masks_innerwarden_secrets_and_keeps_project_available() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("CJC-J007-SECRET"));
 }
 
+/// Credential variables the person exported are not in the jail's
+/// environment, the launcher names them, and `--pass-env` hands one in.
+/// Before this, `env` in the jail printed every one of them while the help
+/// said the key stayed outside.
+///
+/// FAILS ON REVERT: drop `without_credentials` from the plain launch.
+#[cfg(target_os = "linux")]
+#[test]
+fn exported_credentials_stay_out_of_the_jail_unless_passed_by_name() {
+    let home = tempfile::TempDir::new().unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let output = cli()
+        .args([
+            "contain",
+            "--pass-env",
+            "ANTHROPIC_API_KEY",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/usr/bin/env",
+        ])
+        .env("HOME", home.path())
+        .env("OPENAI_API_KEY", "cjc-openai")
+        .env("AWS_SECRET_ACCESS_KEY", "cjc-aws")
+        .env("GITHUB_TOKEN", "cjc-gh")
+        .env("ANTHROPIC_API_KEY", "cjc-anthropic")
+        .env("CJC_ORDINARY", "cjc-ordinary")
+        .output()
+        .expect("run Linux AI Jail");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "AI Jail failed: {stderr}");
+    for secret in ["cjc-openai", "cjc-aws", "cjc-gh"] {
+        assert!(
+            !stdout.contains(secret),
+            "{secret} reached the jail: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("ANTHROPIC_API_KEY=cjc-anthropic"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("CJC_ORDINARY=cjc-ordinary"), "{stdout}");
+    assert!(
+        stderr.contains("credential variables kept out of the jail's environment:")
+            && stderr.contains("OPENAI_API_KEY")
+            && !stderr.contains("cjc-"),
+        "{stderr}"
+    );
+}
+
 /// JP-2 (JAIL-PINS fixes, `--deny-read`): a `--deny-read` link in the
 /// project (`.env` a link to `~/.config/app/secrets.env`) is covered where
 /// it leads, inside the `.config` bind. The folder between that bind and

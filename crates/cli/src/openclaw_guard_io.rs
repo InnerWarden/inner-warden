@@ -47,7 +47,7 @@ pub(crate) const FILES: [ShippedFile; 3] = [
 ];
 
 /// The most stdin one call reads.
-const MAX_STDIN_BYTES: u64 = 1024 * 1024;
+const MAX_STDIN_BYTES: u64 = crate::MAX_TOOL_CALL_BYTES;
 
 /// One check-command request to Pro on this host's loopback, connect to
 /// answer. The screening runs on every tool call, so a Pro that is down or

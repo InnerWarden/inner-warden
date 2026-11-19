@@ -147,6 +147,16 @@ fn claude_hook_screens(settings: &Value, path_env: Option<&OsStr>) -> bool {
     )
 }
 
+/// How long this agent waits for the InnerWarden hook that screens its Bash
+/// calls ([`hook::iwguard_bash_hook_timeout`]): `None` for an agent guarded
+/// some other way, with no such hook, or whose settings could not be read.
+pub fn hook_timeout(home: &Path, agent: &AgentStatus) -> Option<Option<u64>> {
+    if !agent.hookable {
+        return None;
+    }
+    hook::iwguard_bash_hook_timeout(&read_json(&home.join(".claude/settings.json"))?)
+}
+
 /// Whether the hook this agent is wired with runs a program that is there.
 /// `None` for an agent guarded some other way, or with no InnerWarden hook that
 /// screens Bash. Shared by `status`, `agents` and the dashboard so all three
@@ -307,9 +317,28 @@ pub fn unscreened_hooks(home: &Path, agent: &AgentStatus) -> Vec<hook::Unscreene
 /// when it looked. The same facts and the same rule as a hook's program
 /// ([`hook::judge_hook_program`]), worded for what goes wrong: an MCP client
 /// that cannot start the wrapper cannot start the server behind it.
+///
+/// A bare name is found on the PATH of the MCP client that starts the
+/// wrapper, which is not this process's: found here, it is "could not tell"
+/// (the client may resolve another, or none); found nowhere here, off.
 pub fn judge_proxy_program(program: &str, fact: hook::ProgramFact) -> hook::HookProgram {
     use hook::{HookProgram, ProgramFact};
     let bare = !program.contains(['/', '\\']);
+    if bare {
+        return match fact {
+            ProgramFact::Missing | ProgramFact::NotExecutable => HookProgram::Broken {
+                program: program.to_string(),
+                problem: format!(
+                    "its MCP proxy runs `{program}`, which is not on PATH: {}",
+                    hook::BARE_NOT_FOUND
+                ),
+            },
+            ProgramFact::Executable | ProgramFact::Unreadable => HookProgram::Unknown {
+                program: program.to_string(),
+                why: format!("{}: its MCP proxy runs `{program}`", hook::BARE_NAME),
+            },
+        };
+    }
     if !bare && !Path::new(program).is_absolute() {
         return HookProgram::Unknown {
             program: program.to_string(),
@@ -319,9 +348,9 @@ pub fn judge_proxy_program(program: &str, fact: hook::ProgramFact) -> hook::Hook
             ),
         };
     }
-    let what = match (fact, bare) {
-        (ProgramFact::Executable, _) => return HookProgram::Runs,
-        (ProgramFact::Unreadable, _) => {
+    let what = match fact {
+        ProgramFact::Executable => return HookProgram::Runs,
+        ProgramFact::Unreadable => {
             return HookProgram::Unknown {
                 program: program.to_string(),
                 why: format!(
@@ -329,13 +358,8 @@ pub fn judge_proxy_program(program: &str, fact: hook::ProgramFact) -> hook::Hook
                 ),
             }
         }
-        (ProgramFact::Missing | ProgramFact::NotExecutable, true) => {
-            format!("`{program}`, which is not on PATH")
-        }
-        (ProgramFact::Missing, false) => format!("{program}, which does not exist"),
-        (ProgramFact::NotExecutable, false) => {
-            format!("{program}, which is not an executable file")
-        }
+        ProgramFact::Missing => format!("{program}, which does not exist"),
+        ProgramFact::NotExecutable => format!("{program}, which is not an executable file"),
     };
     HookProgram::Broken {
         program: program.to_string(),
@@ -395,23 +419,32 @@ pub fn mcp_proxy_program(home: &Path, agent: &AgentStatus) -> Option<hook::HookP
         return None;
     }
     let path_env = std::env::var_os("PATH");
-    mcp_proxy_program_with(home, agent, path_env.as_deref())
+    mcp_proxy_program_with(home, agent, path_env.as_deref(), &usual_bin_dirs())
 }
 
 fn mcp_proxy_program_with(
     home: &Path,
     agent: &AgentStatus,
     path_env: Option<&OsStr>,
+    places: &[std::path::PathBuf],
 ) -> Option<hook::HookProgram> {
     let programs = mcp_wrapper_programs(home, agent.mcp_json.as_deref(), agent.mcp_toml.as_deref());
-    judge_proxy_programs(&programs, |program| program_fact(program, path_env))
+    let verdict = judge_proxy_programs(&programs, |program| {
+        hook_program_fact(program, path_env, places)
+    })?;
+    Some(with_bare_name_clue(verdict, path_env, places))
 }
 
 /// Whether wrappers that are all known to be unable to start leave this
-/// config's guard broken. Unknown and runs are not broken.
+/// config's guard broken. Unknown and runs are not broken. A bare name is
+/// looked for here as a hook's is ([`hook_program_fact`]): off only when it
+/// is found nowhere.
 fn proxy_is_broken(programs: &[String], path_env: Option<&OsStr>) -> bool {
+    let places = usual_bin_dirs();
     matches!(
-        judge_proxy_programs(programs, |program| program_fact(program, path_env)),
+        judge_proxy_programs(programs, |program| {
+            hook_program_fact(program, path_env, &places)
+        }),
         Some(hook::HookProgram::Broken { .. })
     )
 }
@@ -2669,13 +2702,90 @@ mod tests {
         let two = vec![abs.to_string(), "innerwarden".to_string()];
         assert_eq!(
             judge_proxy_programs(&two, |p| if p == "innerwarden" {
-                ProgramFact::Executable
-            } else {
                 ProgramFact::Missing
+            } else {
+                ProgramFact::Executable
             }),
             Some(HookProgram::Runs)
         );
         assert_eq!(judge_proxy_programs(&[], |_| ProgramFact::Missing), None);
+    }
+
+    /// A wrapper that names its program bare is found on the MCP client's
+    /// PATH, not this one: found here it is "could not tell", with where it
+    /// was found as a clue; found nowhere here (this PATH and the usual
+    /// places), off. The same rule as a hook's bare name.
+    ///
+    /// FAILS ON REVERT: judge the bare name by this process's PATH alone,
+    /// and the one found here reads as running.
+    #[test]
+    fn a_bare_proxy_program_found_here_could_not_be_told_and_one_found_nowhere_is_off() {
+        use hook::{HookProgram, ProgramFact};
+        for fact in [ProgramFact::Executable, ProgramFact::Unreadable] {
+            match judge_proxy_program("innerwarden", fact) {
+                HookProgram::Unknown { why, .. } => {
+                    assert!(why.starts_with(hook::BARE_NAME), "{fact:?}: {why}");
+                    assert!(why.contains("its MCP proxy runs `innerwarden`"), "{why}");
+                }
+                other => panic!("{fact:?}: {other:?}"),
+            }
+        }
+        for fact in [ProgramFact::Missing, ProgramFact::NotExecutable] {
+            match judge_proxy_program("innerwarden", fact) {
+                HookProgram::Broken { problem, .. } => {
+                    assert!(
+                        problem
+                            .starts_with("its MCP proxy runs `innerwarden`, which is not on PATH"),
+                        "{problem}"
+                    );
+                }
+                other => panic!("{fact:?}: {other:?}"),
+            }
+        }
+        // End to end over a real config: the wrapper's bare name is on this
+        // PATH, and the verdict says where, never "runs".
+        let home = tempfile::TempDir::new().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join("innerwarden");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::write(
+            home.path().join(".cursor/mcp.json"),
+            serde_json::json!({"mcpServers": {"fs": {
+                "command": "innerwarden",
+                "args": ["proxy", "--", "npx", "server-filesystem"]
+            }}})
+            .to_string(),
+        )
+        .unwrap();
+        let (rows, _) = rows_from_sources(home.path(), &[], None);
+        let row = rows
+            .into_iter()
+            .find(|row| row.name == "cursor")
+            .expect("cursor row");
+        assert_eq!(row.mcp_json.as_deref(), Some(".cursor/mcp.json"));
+        let path = std::ffi::OsString::from(bin.as_os_str());
+        match mcp_proxy_program_with(home.path(), &row, Some(&path), &[]) {
+            Some(HookProgram::Unknown { why, .. }) => {
+                assert!(why.starts_with(hook::BARE_NAME), "{why}");
+                assert!(
+                    why.contains(&format!("found here at {}", exe.display())),
+                    "{why}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        let nowhere = std::ffi::OsString::from(home.path().join("empty").as_os_str());
+        assert!(matches!(
+            mcp_proxy_program_with(home.path(), &row, Some(&nowhere), &[]),
+            Some(HookProgram::Broken { .. })
+        ));
     }
 
     /// A directory holding the guard's binaries (`innerwarden`, `iw-guard`)

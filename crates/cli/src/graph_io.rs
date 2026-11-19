@@ -262,13 +262,14 @@ fn keep_apart(_denied: &SharedRecordDenied) {}
 /// The directory: it cannot be reached, or it can and this account may not
 /// create a file in it (`faccessat` with the effective ids, supplementary
 /// groups included), which the graph's replace needs whatever the file's
-/// own mode. The files, when they exist, are OPENED the way the writer opens
-/// them, so the answer is the kernel's answer to the writer's own open: the
-/// graph read (`load_record_result_at`), the event sink appended
-/// (`append_guard_event_at`), both refusing links and FIFOs. Nothing is
-/// created, written or locked, because this runs on every screened call in
-/// a directory other accounts share. Opening the sink for append and closing
-/// it without a byte is a `close_write` to a watcher, and adds no line.
+/// own mode. The files, when they exist, are asked of the kernel the same
+/// way (`faccessat` with the effective ids), for what the writer does with
+/// them: the graph read (`load_record_result_at`), the event sink appended
+/// (`append_guard_event_at`). Neither is opened: this runs on every screened
+/// call in a directory other accounts share, and opening the sink for append
+/// was a `close_write` to a watcher (InnerWarden Pro's among them) on every
+/// call. A link is left to the writer, which refuses to follow it and says
+/// so. Nothing is created, written or locked.
 ///
 /// A writable directory holding the operator's `0600` graph or sink used to
 /// pass the directory check, and then every call failed with
@@ -303,18 +304,20 @@ fn shared_record_refused(record: &std::path::Path) -> bool {
     if answer != 0 && refused(&std::io::Error::last_os_error()) {
         return true;
     }
-    let mut graph = std::fs::OpenOptions::new();
-    graph.read(true);
-    innerwarden_safe_io::harden(&mut graph);
-    let mut sink = std::fs::OpenOptions::new();
-    sink.append(true);
-    innerwarden_safe_io::harden(&mut sink);
-    [
-        (graph, record.to_path_buf()),
-        (sink, dir.join("guard-events.jsonl")),
-    ]
-    .iter()
-    .any(|(options, path)| matches!(options.open(path), Err(error) if refused(&error)))
+    let file_refused = |path: &std::path::Path, mode: libc::c_int| {
+        // A link or a file that is not there: the writer's to say.
+        if !std::fs::symlink_metadata(path).is_ok_and(|m| !m.file_type().is_symlink()) {
+            return false;
+        }
+        let Ok(name) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: as above.
+        let answer =
+            unsafe { libc::faccessat(libc::AT_FDCWD, name.as_ptr(), mode, libc::AT_EACCESS) };
+        answer != 0 && refused(&std::io::Error::last_os_error())
+    };
+    file_refused(record, libc::R_OK) || file_refused(&dir.join("guard-events.jsonl"), libc::W_OK)
 }
 
 #[cfg(not(unix))]
@@ -3903,6 +3906,53 @@ mod shared_record_denied_tests {
             0,
             "the check writes nothing"
         );
+    }
+
+    /// The check opens neither record file: a watcher on the shared folder
+    /// (InnerWarden Pro's) sees no open and no `close_write` for it, on a
+    /// file this account may use and on one it may not.
+    ///
+    /// FAILS ON REVERT: open the sink for append to test it, and the watcher
+    /// sees an open and a `close_write` on every call.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_access_check_opens_no_record_file() {
+        let host = host();
+        restore(&host);
+        let record = host.guard.join("graph.json");
+        let sink = host.guard.join("guard-events.jsonl");
+        std::fs::write(&record, "{}").expect("graph");
+        std::fs::write(&sink, "").expect("sink");
+        let watched = std::ffi::CString::new(host.guard.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: plain syscalls on a descriptor this test owns; the buffer
+        // outlives the read.
+        let events = |check: &dyn Fn()| unsafe {
+            let fd = libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC);
+            assert!(fd >= 0, "inotify_init1");
+            let mask = libc::IN_OPEN | libc::IN_CLOSE_WRITE | libc::IN_CLOSE_NOWRITE;
+            assert!(libc::inotify_add_watch(fd, watched.as_ptr(), mask) >= 0);
+            check();
+            let mut buf = [0u8; 4096];
+            let read = libc::read(fd, buf.as_mut_ptr().cast(), buf.len());
+            libc::close(fd);
+            read.max(0)
+        };
+        assert_eq!(
+            events(&|| assert!(!shared_record_refused(&record))),
+            0,
+            "a usable record was opened to test it"
+        );
+        if !is_root() {
+            std::fs::set_permissions(&sink, std::fs::Permissions::from_mode(0o400))
+                .expect("chmod sink");
+            assert_eq!(
+                events(&|| assert!(shared_record_refused(&record))),
+                0,
+                "a refused sink was opened to test it"
+            );
+        }
+        // The watcher itself works: an open is seen.
+        assert!(events(&|| drop(std::fs::File::open(&record).expect("open"))) > 0);
     }
 
     /// The record kept apart is as private as the shared one: the folder

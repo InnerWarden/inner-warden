@@ -126,6 +126,48 @@ pub enum ToolClasses {
     Proxy { agent: String },
 }
 
+/// How long one wired agent waits for its InnerWarden hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookTimeout {
+    pub agent: String,
+    /// The `timeout` on its Bash hook line, in seconds; `None` when the line
+    /// names none (Claude Code then waits 600 s).
+    pub seconds: Option<u64>,
+    /// The command that rewrites its wiring in the mode it has.
+    pub next: String,
+}
+
+/// PURE: the line `status` prints for how long an agent waits for its hook.
+pub fn hook_timeout_finding(timeout: &HookTimeout) -> Finding {
+    use innerwarden_agent_guard::hook::{HOOK_LONGEST_SECS, HOOK_TIMEOUT_SECS};
+    let agent = &timeout.agent;
+    match timeout.seconds {
+        None => Finding::Optional {
+            what: format!(
+                "{agent}: its hook line names no timeout, so a hook that hangs holds the \
+                 agent for Claude Code's 600 s default (the hook ends itself within \
+                 {HOOK_LONGEST_SECS} s)."
+            ),
+            next: format!("{} (writes a {HOOK_TIMEOUT_SECS} s timeout)", timeout.next),
+        },
+        Some(seconds) if seconds <= HOOK_LONGEST_SECS => Finding::NotWorking {
+            what: format!(
+                "{agent}: Claude Code waits {seconds} s for its hook, which may take up to \
+                 {HOOK_LONGEST_SECS} s to answer or refuse; a call it stops waiting for runs \
+                 unscreened."
+            ),
+            next: format!(
+                "set \"timeout\" on the InnerWarden hook in ~/.claude/settings.json to \
+                 {HOOK_TIMEOUT_SECS}, or INNERWARDEN_HOOK_DEADLINE_MS below {seconds}000"
+            ),
+        },
+        Some(seconds) => Finding::Working(format!(
+            "{agent}: Claude Code waits up to {seconds} s for its hook, which answers or \
+             refuses within {HOOK_LONGEST_SECS} s."
+        )),
+    }
+}
+
 /// The agent's own file tools, as `status` names them.
 pub const FILE_TOOL_NAMES: &str = "Write, Edit, MultiEdit, NotebookEdit";
 
@@ -413,6 +455,10 @@ pub struct Facts {
     /// of `wired_agents`. An agent whose settings could not be read back is
     /// left out: "could not tell" is never "off".
     pub tool_classes: Vec<ToolClasses>,
+    /// How long each wired hook agent waits for its InnerWarden hook, read
+    /// from its settings. An agent whose settings could not be read is left
+    /// out.
+    pub hook_timeouts: Vec<HookTimeout>,
     /// Whether ANY agent process was visible, regardless of wiring.
     pub any_agent_seen: Option<bool>,
     /// Commands an agent's hook or the MCP proxy screened and recorded, allows
@@ -610,6 +656,7 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
             named.join(", ")
         )));
         out.extend(facts.tool_classes.iter().map(tool_classes_finding));
+        out.extend(facts.hook_timeouts.iter().map(hook_timeout_finding));
     } else if facts.hook_trouble.is_empty() {
         out.push(nothing_wired_finding(facts.any_agent_seen));
     }
@@ -912,6 +959,48 @@ mod tests {
     /// The three sentences `status` prints for what an agent's wiring judges,
     /// pinned byte for byte: moving them into shared pieces changed no
     /// output.
+    /// `status` says how long Claude Code waits for the hook: on when the
+    /// wait is past the longest the hook takes, off when it is shorter (a
+    /// call it stops waiting for runs), idle with no timeout at all.
+    ///
+    /// FAILS ON REVERT: drop the `hook_timeouts` line from `assess` and
+    /// none of the three is said.
+    #[test]
+    fn status_says_how_long_the_agent_waits_for_its_hook() {
+        use innerwarden_agent_guard::hook::{HOOK_LONGEST_SECS, HOOK_TIMEOUT_SECS};
+        let said = |seconds: Option<u64>| {
+            let mut facts = healthy();
+            facts.hook_timeouts = vec![HookTimeout {
+                agent: "claude-code".into(),
+                seconds,
+                next: "innerwarden agents connect claude-code".into(),
+            }];
+            assess(&facts)
+                .into_iter()
+                .find(|f| {
+                    f.to_string().contains("claude-code: ") && f.to_string().contains("its hook")
+                })
+                .map(|f| f.to_string())
+                .unwrap_or_default()
+        };
+        let on = said(Some(HOOK_TIMEOUT_SECS));
+        assert!(on.starts_with("  [on]"), "{on}");
+        assert!(
+            on.contains(&format!("waits up to {HOOK_TIMEOUT_SECS} s")),
+            "{on}"
+        );
+        let short = said(Some(HOOK_LONGEST_SECS));
+        assert!(short.starts_with("  [off]"), "{short}");
+        assert!(short.contains("runs unscreened"), "{short}");
+        let none = said(None);
+        assert!(none.starts_with("  [idle]"), "{none}");
+        assert!(none.contains("600 s"), "{none}");
+        assert!(
+            none.contains(&format!("writes a {HOOK_TIMEOUT_SECS} s timeout")),
+            "{none}"
+        );
+    }
+
     #[test]
     fn status_tool_classes_sentences_are_byte_identical() {
         let hook = |file_tools, reads| ToolClasses::Hook {
@@ -1098,6 +1187,7 @@ mod tests {
             partly_unscreened: vec![],
             unread_hook_lines: vec![],
             tool_classes: vec![],
+            hook_timeouts: vec![],
             any_agent_seen: Some(true),
             decisions_recorded: Some(42),
             newest_decision_age_secs: Some(90),
@@ -1409,6 +1499,7 @@ mod tests {
             partly_unscreened: vec![],
             unread_hook_lines: vec![],
             tool_classes: vec![],
+            hook_timeouts: vec![],
             any_agent_seen: None,
             decisions_recorded: None,
             newest_decision_age_secs: None,
