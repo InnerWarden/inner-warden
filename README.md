@@ -122,6 +122,12 @@ innerwarden install claude-code       # Claude Code's PreToolUse hook
 innerwarden agents connect cursor    # or: codex, gemini, openclaw
 ```
 
+See what the guard refuses for each connected agent, without running anything:
+
+```sh
+innerwarden demo
+```
+
 For command options, JSON output and exit codes, see the
 [CLI reference](crates/cli/README.md).
 
