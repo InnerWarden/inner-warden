@@ -9635,10 +9635,11 @@ pub fn check_command(content: &str) -> Option<(&'static str, bool)> {
 /// Whether a command of `content` powers the host off or restarts it:
 /// `shutdown` (but for `-c`, which cancels one), `reboot`, `halt`,
 /// `poweroff`, `init` or `telinit` to runlevel 0 or 6, and `systemctl`
-/// `poweroff`, `reboot`, `halt`, `kexec`, `soft-reboot` or an
-/// `isolate` of their targets, behind the launchers a line runs a program
-/// through ([`effective_command_index`]). Read from the program each
-/// command starts, so `echo reboot` and a commit message that names one
+/// `poweroff`, `reboot`, `halt`, `kexec`, `soft-reboot`, or a `start`,
+/// `restart` or `isolate` of their targets (`poweroff.target`), also of a
+/// host or machine named with `-H` or `-M`, behind the launchers a line
+/// runs a program through ([`effective_command_index`]). Read from the
+/// program each command starts, so `echo reboot` and a commit message that names one
 /// are not.
 fn powers_off_the_host(content: &str) -> bool {
     const TARGETS: &[&str] = &[
@@ -9664,10 +9665,67 @@ fn powers_off_the_host(content: &str) -> bool {
             "reboot" | "halt" | "poweroff" => !only_asks,
             "init" | "telinit" => matches!(arguments.first(), Some(&"0" | &"6")),
             "systemctl" => {
-                let mut verbs = arguments.iter().filter(|word| !word.starts_with('-'));
-                match verbs.next() {
-                    Some(&("poweroff" | "reboot" | "halt" | "kexec" | "soft-reboot")) => !only_asks,
-                    Some(&"isolate") => verbs.next().is_some_and(|target| TARGETS.contains(target)),
+                // The words that are no option and no option's value: `-H
+                // host` and `-M machine` name where it runs (a remote host
+                // powered off is powered off), `-t`, `-p`, `-s`, `-n` and
+                // `-o` take a value as the next word.
+                let mut verbs = Vec::new();
+                let mut words = arguments.iter();
+                while let Some(word) = words.next() {
+                    if matches!(
+                        *word,
+                        "-H" | "--host"
+                            | "-M"
+                            | "--machine"
+                            | "-t"
+                            | "--type"
+                            | "-p"
+                            | "--property"
+                            | "-s"
+                            | "--signal"
+                            | "-n"
+                            | "--lines"
+                            | "-o"
+                            | "--output"
+                            | "--root"
+                            | "--job-mode"
+                            | "--kill-whom"
+                            | "--when"
+                            | "--message"
+                            | "--reboot-argument"
+                            | "--boot-loader-entry"
+                            | "--boot-loader-menu"
+                    ) {
+                        words.next();
+                    } else if !word.starts_with('-') {
+                        verbs.push(*word);
+                    }
+                }
+                let target = |unit: &str| {
+                    let unit = unit.to_ascii_lowercase();
+                    TARGETS.contains(&unit.as_str())
+                        || TARGETS
+                            .iter()
+                            .any(|target| target.strip_suffix(".target") == Some(unit.as_str()))
+                };
+                match verbs.split_first() {
+                    Some((&("poweroff" | "reboot" | "halt" | "kexec" | "soft-reboot"), _)) => {
+                        !only_asks
+                    }
+                    // A unit started, restarted or isolated: a power target
+                    // reached that way powers the host off as the verb does.
+                    Some((
+                        &("isolate"
+                        | "start"
+                        | "restart"
+                        | "try-restart"
+                        | "reload-or-restart"
+                        | "try-reload-or-restart"
+                        | "reload-or-try-restart"
+                        | "condrestart"
+                        | "force-reload"),
+                        units,
+                    )) => units.iter().any(|unit| target(unit)),
                     _ => false,
                 }
             }

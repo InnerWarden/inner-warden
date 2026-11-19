@@ -73,9 +73,44 @@ pub(crate) fn find_with_deob(
     raw: &str,
     deob: &crate::deobfuscate::Deobfuscated,
 ) -> Option<Directive> {
-    find_in(raw)
-        .or_else(|| (deob.normalized != raw).then(|| find_in(&deob.normalized))?)
-        .or_else(|| deob.decoded.iter().find_map(|blob| find_in(blob)))
+    find_forms(raw, deob, Reading::Listing)
+}
+
+/// Look for an order aimed at the model in what a tool or a resource hands
+/// back ([`find`]), where the text is content more than help: a README, a
+/// page, a source file. Such text quotes the phrases that set the model's
+/// rules aside ("ignore previous instructions") to document them, so in an
+/// answer that order counts only inside an HTML comment or an
+/// `<IMPORTANT>`-style block, which a rendered page hides and nothing
+/// writes to quote. Outside one, the phrase list still reports it, as it
+/// did before answers were read for orders, and the response is not held
+/// for it. Every other order counts wherever it is.
+pub fn find_in_answer(text: &str) -> Option<Directive> {
+    find_forms(
+        text,
+        &crate::deobfuscate::deobfuscate(text),
+        Reading::Answer,
+    )
+}
+
+/// How a text is read: as a listing a server publishes about itself, or as
+/// the answer of a call ([`find_in_answer`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    Listing,
+    Answer,
+}
+
+/// The raw text, its de-obfuscated form and any base64 it carries, read in
+/// that order.
+fn find_forms(
+    raw: &str,
+    deob: &crate::deobfuscate::Deobfuscated,
+    reading: Reading,
+) -> Option<Directive> {
+    find_in(raw, reading)
+        .or_else(|| (deob.normalized != raw).then(|| find_in(&deob.normalized, reading))?)
+        .or_else(|| deob.decoded.iter().find_map(|blob| find_in(blob, reading)))
 }
 
 /// A gap inside one sentence: anything but a sentence end, where a dot inside
@@ -578,7 +613,7 @@ fn other_user(p: &Patterns, text: &str, c: &regex::Captures<'_>, end: usize) -> 
 }
 
 /// [`find`] on one form of the text.
-fn find_in(text: &str) -> Option<Directive> {
+fn find_in(text: &str, reading: Reading) -> Option<Directive> {
     let p = patterns();
     let text = fold(text);
     let text = text.as_str();
@@ -626,7 +661,9 @@ fn find_in(text: &str) -> Option<Directive> {
     // hidden comment or block, where nothing is a mere example.
     for (at, end) in p.override_rules.spans(text) {
         let before = tail_from(&text[..at], at.saturating_sub(24));
-        if p.mention_before.is_match(before) && !regions.contains(at) {
+        if (reading == Reading::Answer || p.mention_before.is_match(before))
+            && !regions.contains(at)
+        {
             continue;
         }
         return Some(directive("override-instructions", &text[at..end]));

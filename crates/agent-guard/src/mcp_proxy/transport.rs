@@ -983,6 +983,39 @@ fn withhold_poisoned_descriptions(raw: &str, events: &mut [ProxyDecision]) -> Op
     }
 }
 
+/// In a mode that never blocks, a server line with orders for the model goes
+/// to the client as it came. Its findings say so: each AG-DESC-POISON alert
+/// notes that the text was forwarded unchanged, and a decision whose only
+/// blocking findings are those reads as allowed, which is what happened. The
+/// alert keeps `block`, which says what a mode that blocks would have done.
+fn report_forwarded_orders(events: &mut [ProxyDecision]) {
+    for d in events
+        .iter_mut()
+        .filter(|d| d.direction == Direction::ServerToClient.label())
+    {
+        let mut found = false;
+        for alert in d
+            .verdict
+            .alerts
+            .iter_mut()
+            .filter(|a| a.rule == crate::mcp::DESC_POISON_RULE)
+        {
+            found = true;
+            alert
+                .detail
+                .push_str("; forwarded to the client unchanged: this mode does not block");
+        }
+        if found
+            && d.verdict
+                .alerts
+                .iter()
+                .all(|a| !a.block || a.rule == crate::mcp::DESC_POISON_RULE)
+        {
+            d.verdict.allowed = true;
+        }
+    }
+}
+
 /// What goes to the client for one classified server line, and the findings
 /// to report. A mode that never blocks forwards every line as it came. One
 /// that blocks withholds orders for the model in a listing
@@ -998,6 +1031,10 @@ fn server_output(action: ServerAction, blocks: bool) -> (Option<String>, Vec<Pro
                 (true, Some(d)) => {
                     withhold_poisoned_descriptions(&raw, std::slice::from_mut(d)).unwrap_or(raw)
                 }
+                (false, Some(d)) => {
+                    report_forwarded_orders(std::slice::from_mut(d));
+                    raw
+                }
                 _ => raw,
             };
             (Some(raw), event.into_iter().collect())
@@ -1006,6 +1043,7 @@ fn server_output(action: ServerAction, blocks: bool) -> (Option<String>, Vec<Pro
             let raw = if blocks {
                 withhold_poisoned_descriptions(&raw, &mut events).unwrap_or(raw)
             } else {
+                report_forwarded_orders(&mut events);
                 raw
             };
             (Some(raw), events)
@@ -2315,13 +2353,16 @@ mod tests {
             .iter()
             .any(|a| a.rule == crate::mcp::DESC_POISON_RULE && a.detail.contains("held back"))));
 
+        // A mode that never blocks forwards it, and the finding says so: the
+        // decision reads as allowed, the alert names the forwarding.
         let (out, events) = server_output(classify(&poisoned), false);
         assert_eq!(out.as_deref(), Some(poisoned.as_str()));
-        assert!(events.iter().any(|d| d
-            .verdict
-            .alerts
-            .iter()
-            .any(|a| a.rule == crate::mcp::DESC_POISON_RULE)));
+        assert!(events.iter().any(|d| d.verdict.allowed
+            && d.verdict
+                .alerts
+                .iter()
+                .any(|a| a.rule == crate::mcp::DESC_POISON_RULE
+                    && a.detail.contains("forwarded to the client unchanged"))));
 
         let clean = answer("Build passed. 42 tests, 0 failures.");
         let (out, _) = server_output(classify(&clean), true);
