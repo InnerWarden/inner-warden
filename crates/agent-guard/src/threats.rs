@@ -10779,6 +10779,12 @@ pub fn check_tls_verification_disabled(content: &str) -> Option<(&'static str, u
     ) {
         return None;
     }
+    // A command ends at a new line as at `;`, `|` or `&` (a line
+    // continuation does not end it): `curl -fsSLO "$base/x.pub"` and an
+    // `openssl pkeyutl -inkey x.pub` on the next line are two commands, and
+    // the `-inkey` of the second is no `-k` of the first (the signature
+    // check DISTRIBUTION.md gives was held for review so, measured
+    // 2026-11-19).
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
     let res = RES.get_or_init(|| {
         [
@@ -10795,11 +10801,11 @@ pub fn check_tls_verification_disabled(content: &str) -> Option<(&'static str, u
                 "Python certificate verification disabled",
             ),
             (
-                r"(?i)\bpip\b[^|;&]*--trusted-host\b",
+                r"(?i)\bpip\b(?:[^|;&\n]|\\\n)*--trusted-host\b",
                 "pip is told to trust a host without verifying its certificate",
             ),
             (
-                r"(?i)\bwget\b[^|;&]*--no-check-certificate\b",
+                r"(?i)\bwget\b(?:[^|;&\n]|\\\n)*--no-check-certificate\b",
                 "wget certificate verification disabled",
             ),
             // `-k` alone or among other short options (`-sk`, `-kL`), as
@@ -10807,19 +10813,19 @@ pub fn check_tls_verification_disabled(content: &str) -> Option<(&'static str, u
             // certificates as before. Only options that take no value stand
             // before it in a group, so `-o k.txt`-like values are not read.
             (
-                r"\bcurl\b[^|;&]*(?:\s-[sSLfvIiNqgjlnOpRVZ0-9#:]*k[a-zA-Z0-9#:]*(?:\s|$)|(?i:--insecure\b))",
+                r"\bcurl\b(?:[^|;&\n]|\\\n)*(?:\s-[sSLfvIiNqgjlnOpRVZ0-9#:]*k[a-zA-Z0-9#:]*(?:\s|$)|(?i:--insecure\b))",
                 "curl certificate verification disabled",
             ),
             (
-                r"(?i)\bgit\b[^|;&]*-c\s+http\.sslVerify\s*=\s*(?:false|0)",
+                r"(?i)\bgit\b(?:[^|;&\n]|\\\n)*-c\s+http\.sslVerify\s*=\s*(?:false|0)",
                 "git certificate verification disabled",
             ),
             (
-                r"(?i)\bnpm\b[^|;&]*(?:--strict-ssl[= ]false|config set strict-ssl false)",
+                r"(?i)\bnpm\b(?:[^|;&\n]|\\\n)*(?:--strict-ssl[= ]false|config set strict-ssl false)",
                 "npm certificate verification disabled",
             ),
             (
-                r"(?i)\bopenssl\b[^|;&]*\bs_client\b[^|;&]*-verify\s*0\b",
+                r"(?i)\bopenssl\b(?:[^|;&\n]|\\\n)*\bs_client\b(?:[^|;&\n]|\\\n)*-verify\s*0\b",
                 "openssl certificate verification disabled",
             ),
         ]
@@ -12166,7 +12172,7 @@ fn rm_command_index(tokens: &[String]) -> Option<usize> {
 /// The index of `program` when `tokens` run it behind the wrappers
 /// [`rm_command_index`] reads (`sudo`, `env`, `timeout`, `nice`, ...).
 fn wrapped_program_index(tokens: &[String], program: &str) -> Option<usize> {
-    let mut i = 0;
+    let mut i = compound_head_length(tokens);
     while i < tokens.len() && is_env_assign(&tokens[i]) {
         i += 1;
     }
@@ -12238,6 +12244,31 @@ fn wrapped_program_index(tokens: &[String], program: &str) -> Option<usize> {
                 return (token_basename(&tok[1..]) == program).then_some(i);
             }
             _ => return None,
+        }
+    }
+}
+
+/// How many leading words of a segment open the body of a compound command
+/// rather than name its program: the reserved words after which a command
+/// starts (`if`, `then`, `elif`, `else`, `do`, `while`, `until`, `{`).
+/// The head of a `case` arm is taken off the text before the words are
+/// made, by [`without_case_arm_head`]: the words lose its `)`.
+///
+/// The segments of `if true; then rm -rf ~; fi` are `if true`, `then rm -rf
+/// ~` and `fi`; of `for f in a; do rm -rf ~; done` and `select f in a; do
+/// ..; done`, the body opens on `do`. Each body runs the command after
+/// these words, and it is read as the same command written alone (measured
+/// on main 2026-11-19: `rm -rf ~` in each of these bodies was allowed while
+/// the line alone was refused).
+fn compound_head_length(tokens: &[String]) -> usize {
+    let mut i = 0;
+    loop {
+        let Some(word) = tokens.get(i).map(String::as_str) else {
+            return i;
+        };
+        match word {
+            "if" | "then" | "elif" | "else" | "do" | "while" | "until" | "{" => i += 1,
+            _ => return i,
         }
     }
 }
@@ -12357,12 +12388,32 @@ fn without_coproc_name(segment: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(format!("coproc {after}"))
 }
 
+/// The segment without the head of a `case` arm: `case WORD in` and the
+/// arm's pattern up to its `)` (`a)`, `*)`, `(b)`, `[0-9]*)`). A pattern
+/// with `|` reaches here cut at it, as every segment is, so its last
+/// alternative opens the segment. The command after the `)` runs when the
+/// arm is taken, and whichever of `;;`, `;;&` or `;&` ended the arm before,
+/// the next arm opens a segment of its own. A word that ends in `)` where a
+/// command starts names no program outside a `case`, so the strip takes
+/// nothing a command could be: `(rm -rf /)` keeps its words.
+fn without_case_arm_head(segment: &str) -> &str {
+    static HEAD: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let head = HEAD.get_or_init(|| {
+        regex::Regex::new(r#"^\s*(?:case\s+\S+\s+in\s+)?\(?[^\s()'"`;&|<>]+\)"#)
+            .expect("static case arm head regex")
+    });
+    match head.find(segment) {
+        Some(found) => &segment[found.end()..],
+        None => segment,
+    }
+}
+
 /// Read the `rm` a segment runs, or `None` when the segment runs something
 /// else (`echo rm -rf /`). See [`fold_braced_names`] for `${HOME}`.
 fn segment_rm_invocation(segment: &str) -> Option<RmInvocation> {
     // A substitution before the command word expands away; see
     // `strip_leading_substitutions` for why only the leading ones go.
-    let unnamed = without_coproc_name(segment);
+    let unnamed = without_coproc_name(without_case_arm_head(segment));
     let folded = fold_braced_names(strip_leading_substitutions(&unnamed));
     let segment = fold_home_expansions(&folded);
     let tokens = shell_tokens(&segment);
@@ -12585,44 +12636,58 @@ fn handed_removal(handed: &[String]) -> Option<bool> {
             })
             .then_some(false);
     }
-    let shell = handed
+    shell_commands_on_handed(handed)?
+        .iter()
+        .find_map(|words| handed_removal(words))
+}
+
+/// The commands of the `-c` line of a shell that `words` run (behind
+/// `sudo` and its kin) which name what is handed to that shell after the
+/// line: `$1`, `$@`, `$*`, and every name the line binds to one
+/// ([`positionals_as_handed`]), each written `{}` there. `None` when `words`
+/// run no shell with a `-c` line.
+///
+/// A `find -exec sh -c '..' _ {} +` and an `xargs sh -c '..' _` hand the
+/// shell what they found or read as those parameters: `sh -c 'for f; do rm
+/// -f "$f"; done' _` removes each of them as `rm -f {}` does. A command
+/// that names nothing handed over (`rm -f /tmp/x`) is not here: it is
+/// judged as written.
+fn shell_commands_on_handed(words: &[String]) -> Option<Vec<Vec<String>>> {
+    let shell = words
         .iter()
         .position(|word| SHELLS.contains(&token_basename(word)))?;
-    let code_at = handed[shell + 1..]
+    let code_at = words[shell + 1..]
         .iter()
         .position(|word| word.starts_with('-') && !word.starts_with("--") && word.contains('c'))?
         + shell
         + 2;
-    let code = handed.get(code_at)?;
+    let code = words.get(code_at)?;
     // What the search hands the shell is a positional argument there, and
     // so is every name the line binds to one: `for f; do`, `for f in "$@"`,
     // `while read f`, `f=$1`. Each stands as `{}`.
     let code = positionals_as_handed(code);
-    shell_command_segments(&code)
-        .into_iter()
-        // A segment that names nothing the search hands over removes
-        // something else (`rm -f /tmp/x`), and is judged as written.
-        .filter(|segment| segment.contains("{}"))
-        .find_map(|segment| {
-            let tokens = shell_tokens(segment);
-            // The command a body opens on (`do rm -f "$f"`, `for f do rm
-            // -f "$f"`) is the one that runs.
-            let body = match tokens.first().map(String::as_str) {
-                Some("for") => tokens
-                    .iter()
-                    .position(|word| word == "do")
-                    .map_or(0, |at| at + 1),
-                _ => 0,
-            };
-            let opener = body
-                + tokens[body..]
-                    .iter()
-                    .take_while(|word| {
-                        matches!(word.as_str(), "do" | "then" | "else" | "{" | "!" | "(")
-                    })
-                    .count();
-            handed_removal(&tokens[opener..])
-        })
+    Some(
+        shell_command_segments(&code)
+            .into_iter()
+            // A segment that names nothing the search hands over removes
+            // something else (`rm -f /tmp/x`), and is judged as written.
+            .filter(|segment| segment.contains("{}"))
+            .map(|segment| {
+                let tokens = shell_tokens(without_case_arm_head(segment));
+                // `for f do rm -f "$f"` opens its body on `do` in the same
+                // segment; the words a body opens on are skipped.
+                let body = match tokens.first().map(String::as_str) {
+                    Some("for") => tokens
+                        .iter()
+                        .position(|word| word == "do")
+                        .map_or(0, |at| at + 1),
+                    _ => 0,
+                };
+                let head = body + compound_head_length(&tokens[body..]);
+                tokens[head..].to_vec()
+            })
+            .collect(),
+    )
 }
 
 /// The words a shell's `-c` line reads from its positional arguments, as
@@ -13266,7 +13331,13 @@ fn removal_run(words: &[String]) -> Option<bool> {
             .iter()
             .any(|argument| argument.starts_with("of="))
             .then_some(true),
-        _ => None,
+        // A shell whose `-c` line removes what xargs hands it after the line
+        // (`xargs sh -c 'for f; do rm -f "$f"; done' _`), as a `find -exec`
+        // that hands it `{}` does ([`shell_commands_on_handed`]).
+        _ => shell_commands_on_handed(&words[at..])?
+            .iter()
+            .filter_map(|command| removal_run(command))
+            .reduce(|one, other| one || other),
     }
 }
 

