@@ -47,7 +47,7 @@
       "id": "codex",
       "installed": true,
       "judges": "mcp_server_calls",
-      "judges_line": "Calls to its MCP servers. Its built-in tools are not screened by this edition.",
+      "judges_line": "Calls to its MCP servers. Its built-in tools are not screened by InnerWarden Community.",
       "mcp": {
         "remote": 1,
         "stdio": 3,
@@ -83,7 +83,7 @@
       "id": "cursor",
       "installed": true,
       "judges": "mcp_server_calls",
-      "judges_line": "Calls to its MCP servers. Its built-in tools are not screened by this edition.",
+      "judges_line": "Calls to its MCP servers. Its built-in tools are not screened by InnerWarden Community.",
       "mcp": {
         "remote": 0,
         "stdio": 2,

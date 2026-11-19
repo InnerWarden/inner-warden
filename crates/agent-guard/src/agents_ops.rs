@@ -30,8 +30,9 @@ struct HomeMcpDiscovery {
     limited: bool,
 }
 
-/// Running agents from the signature `/proc` scan, as (name, pid). Empty off Linux
-/// (no `/proc`) - the config-dir pass still finds installed agents there.
+/// Running agents from the signature process scan (`/proc` on Linux, the
+/// kernel's process table on macOS), as (name, pid). Empty where neither can
+/// be read (Windows): the config-dir pass still finds installed agents there.
 fn scan_running() -> Vec<(String, u32)> {
     let index = SignatureIndex::new();
     // Config discovery happens once below against this user's home. A dashboard
@@ -281,10 +282,11 @@ fn wrapped_hooks_with(
 
 /// Whether any known agent is running, from the process scan alone (a row's
 /// pids), never from an agent being installed or having a config dir.
-/// `None` where the scan cannot look (no `/proc`): "none running" would be
+/// `None` where the scan cannot look (no `/proc` on Linux, no process table
+/// read on macOS, Windows): "none running" would be
 /// a claim nothing measured.
 pub fn any_agent_running(rows: &[AgentStatus]) -> Option<bool> {
-    any_agent_running_with(rows, Path::new("/proc").is_dir())
+    any_agent_running_with(rows, detect::process_scan_can_look())
 }
 
 /// PURE: [`any_agent_running`] with whether the process scan could look.
