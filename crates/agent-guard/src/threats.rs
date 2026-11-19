@@ -286,6 +286,17 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
         block: true,
     },
     CommandPattern {
+        // A PATH that puts a folder anyone can write to (`/tmp`, `/var/tmp`,
+        // `/dev/shm`) in front of the system's: a program planted there runs
+        // in place of `ls` or `git`, the same hijack as BASH_ENV with no
+        // dangerous word in the line. Read where the value starts and up to
+        // the first expansion, so `PATH=$PATH:/tmp/x`, which leaves the
+        // system's programs first, and a home or project folder do not match.
+        pattern: r#"(?:^|[^A-Za-z0-9_])PATH\s*=\s*["']?(?:[^\s"':$;&|]*:)*(?:/private)?(?:/tmp|/var/tmp|/dev/shm)(?:[/:"'\s;&|]|$)"#,
+        description: "PATH puts a folder anyone can write to first",
+        block: true,
+    },
+    CommandPattern {
         // NODE_OPTIONS is legit for memory tuning (--max-old-space-size); only the
         // module-preload forms (--require / --import) are the injection vector.
         pattern: r"(?i)\bNODE_OPTIONS\s*=\s*\S*--(?:require|import)\b",
@@ -9615,7 +9626,54 @@ pub fn check_command(content: &str) -> Option<(&'static str, bool)> {
     if destructive_rm_root(content) || (normalized_differs && destructive_rm_root(&normalized)) {
         return Some(("rm -rf of root (destructive)", true));
     }
+    if powers_off_the_host(content) || (normalized_differs && powers_off_the_host(&normalized)) {
+        return Some(("host shutdown or reboot", true));
+    }
     None
+}
+
+/// Whether a command of `content` powers the host off or restarts it:
+/// `shutdown` (but for `-c`, which cancels one), `reboot`, `halt`,
+/// `poweroff`, `init` or `telinit` to runlevel 0 or 6, and `systemctl`
+/// `poweroff`, `reboot`, `halt`, `kexec`, `soft-reboot` or an
+/// `isolate` of their targets, behind the launchers a line runs a program
+/// through ([`effective_command_index`]). Read from the program each
+/// command starts, so `echo reboot` and a commit message that names one
+/// are not.
+fn powers_off_the_host(content: &str) -> bool {
+    const TARGETS: &[&str] = &[
+        "poweroff.target",
+        "reboot.target",
+        "halt.target",
+        "kexec.target",
+        "runlevel0.target",
+        "runlevel6.target",
+    ];
+    shell_command_segments(content).into_iter().any(|segment| {
+        let words = shell_tokens(segment);
+        let Some(at) = effective_command_index(&words) else {
+            return false;
+        };
+        let program = token_basename(&words[at]).to_ascii_lowercase();
+        let arguments: Vec<&str> = words[at + 1..].iter().map(String::as_str).collect();
+        let only_asks = arguments
+            .iter()
+            .any(|word| matches!(*word, "--help" | "--version"));
+        match program.as_str() {
+            "shutdown" => !only_asks && !arguments.contains(&"-c"),
+            "reboot" | "halt" | "poweroff" => !only_asks,
+            "init" | "telinit" => matches!(arguments.first(), Some(&"0" | &"6")),
+            "systemctl" => {
+                let mut verbs = arguments.iter().filter(|word| !word.starts_with('-'));
+                match verbs.next() {
+                    Some(&("poweroff" | "reboot" | "halt" | "kexec" | "soft-reboot")) => !only_asks,
+                    Some(&"isolate") => verbs.next().is_some_and(|target| TARGETS.contains(target)),
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    })
 }
 
 /// The first [`DANGEROUS_COMMANDS`] pattern one spelling of a command
@@ -20983,7 +21041,7 @@ mod tests {
             27,
             "prompt-injection pattern count"
         );
-        assert_eq!(DANGEROUS_COMMANDS.len(), 40, "dangerous-command count");
+        assert_eq!(DANGEROUS_COMMANDS.len(), 41, "dangerous-command count");
         assert_eq!(API_KEY_PATTERNS.len(), 7, "API-key pattern count");
     }
 }

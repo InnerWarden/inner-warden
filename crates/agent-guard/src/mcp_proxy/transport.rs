@@ -866,6 +866,12 @@ fn screen_server_text(
 /// the model but could not be cleaned description by description.
 const WITHHELD_LISTING_MESSAGE: &str = "InnerWarden withheld this answer: it carried instructions aimed at the AI model that could not be removed on their own";
 
+/// The error sent in place of a tool result or a resource that carried
+/// orders for the model, in a mode that blocks. The answer is held whole:
+/// what a tool hands back is not cut into parts the proxy would choose.
+const WITHHELD_ANSWER_MESSAGE: &str =
+    "InnerWarden withheld this answer: it carried instructions aimed at the AI model";
+
 /// The reply sent in place of a server line the proxy cannot read, in `guard`
 /// and `kill` mode. The id is `null` because a line that cannot be read has
 /// none the proxy can trust (JSON-RPC 2.0, 5.1).
@@ -900,13 +906,14 @@ fn withhold_poisoned_descriptions(raw: &str, events: &mut [ProxyDecision]) -> Op
     if !events.iter().any(poisoned) {
         return None;
     }
-    let refused = |id: Value| {
+    let refused_with = |id: Value, message: &str| {
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": id,
-            "error": {"code": -32603, "message": WITHHELD_LISTING_MESSAGE},
+            "error": {"code": -32603, "message": message},
         })
     };
+    let refused = |id: Value| refused_with(id, WITHHELD_LISTING_MESSAGE);
     let Ok(mut value) = parse_value(raw) else {
         return Some(refused(Value::Null).to_string());
     };
@@ -928,6 +935,20 @@ fn withhold_poisoned_descriptions(raw: &str, events: &mut [ProxyDecision]) -> Op
                 continue;
             };
             matched = true;
+            if matches!(method.as_str(), "tools/call" | "resources/read") {
+                *message = refused_with(id.clone(), WITHHELD_ANSWER_MESSAGE);
+                for alert in d
+                    .verdict
+                    .alerts
+                    .iter_mut()
+                    .filter(|a| a.rule == crate::mcp::DESC_POISON_RULE)
+                {
+                    alert
+                        .detail
+                        .push_str("; the answer was held back from the client");
+                }
+                continue;
+            }
             let note = match super::router::withhold_listing_descriptions(&method, result) {
                 (replaced, true) if replaced > 0 => "; withheld from the client",
                 _ => {
@@ -2256,6 +2277,55 @@ mod tests {
                 assert_eq!(v["error"]["message"], WITHHELD_LISTING_MESSAGE, "{out}");
             }
         }
+    }
+
+    /// A tool result that carries orders for the model is held back whole
+    /// in a mode that blocks, the error keyed to the call's id, and nothing
+    /// of it is rewritten; a mode that never blocks forwards it as it came,
+    /// the finding reported. An ordinary result goes on untouched.
+    /// FAILS ON REVERT of the answer reading in the router (no finding) or
+    /// of the hold in `withhold_poisoned_descriptions` (the listing rewrite
+    /// found nothing to replace and refused it as a listing).
+    #[test]
+    fn a_tool_result_with_orders_for_the_model_is_held_back_in_a_mode_that_blocks() {
+        let answer = |text: &str| {
+            serde_json::json!({"jsonrpc": "2.0", "id": 9, "result": {"content": [{"type": "text", "text": text}]}}).to_string()
+        };
+        let classify = |line: &str| {
+            let mut m = IdRequestMap::new();
+            m.insert(
+                "9".into(),
+                PendingRequest {
+                    method: "tools/call".into(),
+                    tool: Some("fetch".into()),
+                },
+            );
+            classify_server_line(line, None, &mut m, &mut TaintTracker::new())
+        };
+        let poisoned = answer(&format!("Page text. {POISONED_DESC}"));
+        let (out, events) = server_output(classify(&poisoned), true);
+        let out = out.expect("a reply");
+        let v: Value = serde_json::from_str(&out).expect("json");
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["message"], WITHHELD_ANSWER_MESSAGE);
+        assert!(v.get("result").is_none(), "{out}");
+        assert!(events.iter().any(|d| d
+            .verdict
+            .alerts
+            .iter()
+            .any(|a| a.rule == crate::mcp::DESC_POISON_RULE && a.detail.contains("held back"))));
+
+        let (out, events) = server_output(classify(&poisoned), false);
+        assert_eq!(out.as_deref(), Some(poisoned.as_str()));
+        assert!(events.iter().any(|d| d
+            .verdict
+            .alerts
+            .iter()
+            .any(|a| a.rule == crate::mcp::DESC_POISON_RULE)));
+
+        let clean = answer("Build passed. 42 tests, 0 failures.");
+        let (out, _) = server_output(classify(&clean), true);
+        assert_eq!(out.as_deref(), Some(clean.as_str()));
     }
 
     // ── taint provenance through the id→request map ──────────────────────
