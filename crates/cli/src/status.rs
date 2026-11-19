@@ -77,6 +77,19 @@ pub struct HookTrouble {
     pub via_proxy: bool,
 }
 
+/// A hook line that names the guard but is not the guard's own line (see
+/// [`innerwarden_agent_guard::hook::WrappedHook`]). Listed so it never
+/// vanishes from the report: `Unknown` with the line, or `Broken` when the
+/// binary it names is certainly gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadHookLine {
+    pub agent: String,
+    /// `Broken` or `Unknown`, never `Runs`.
+    pub program: HookProgram,
+    /// The command that writes the guard's own line.
+    pub next: String,
+}
+
 /// A wired agent whose shell commands are screened while some of its other
 /// tool calls are not, because the hook wired for them cannot start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +406,9 @@ pub struct Facts {
     /// (file tools, read tools, tool results) runs a program that is not
     /// there, so those calls go unscreened. Still in `wired_agents`.
     pub partly_unscreened: Vec<PartlyUnscreened>,
+    /// Hook lines that name the guard without being its own line, beyond the
+    /// one (if any) already judged in `hook_trouble`.
+    pub unread_hook_lines: Vec<UnreadHookLine>,
     /// What each wired agent's wiring judges before a call runs, in the order
     /// of `wired_agents`. An agent whose settings could not be read back is
     /// left out: "could not tell" is never "off".
@@ -414,6 +430,64 @@ pub struct Facts {
     pub decisions_by_hand: u64,
     /// Whether the local dashboard answered. `None` when it was not probed.
     pub dashboard_reachable: Option<bool>,
+    /// Set when `/etc/innerwarden/guard.toml` names a shared record this
+    /// account is refused, so its decisions are kept in its own home instead.
+    pub record_kept_apart: Option<RecordKeptApart>,
+    /// Set once, on the first `status` after the shared record takes this
+    /// account again: the folder in its home that still holds what it
+    /// recorded while it was refused.
+    pub kept_apart_before: Option<String>,
+}
+
+/// The shared record directory this account may not write, and the folder
+/// its decisions are kept in instead. Paths as the reader should see them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordKeptApart {
+    pub shared_dir: String,
+    pub own_dir: String,
+}
+
+/// The one line that says a record was kept apart. Every screened call is
+/// still judged and recorded; the hook says nothing about this on each call,
+/// so this line is where it is said.
+///
+/// It is an integrity failure, not a placement detail: every call is still
+/// screened, but the record of it sits in a file this account, and so the
+/// agent running as it, can edit or delete, and InnerWarden Pro does not
+/// read. The fix is one command, and it is the `try:` line.
+pub fn record_kept_apart_finding(apart: &RecordKeptApart) -> Finding {
+    Finding::NotWorking {
+        what: format!(
+            "Record integrity: this account may not write the shared record in {}, \
+             so its decisions go to {} instead. Every call is still screened, but \
+             those decisions can be edited or deleted by this account (and the \
+             agent running as it), and InnerWarden Pro on this machine does not \
+             see them.",
+            apart.shared_dir, apart.own_dir
+        ),
+        next: format!(
+            "sudo usermod -aG innerwarden \"$USER\" (the group that owns {} on a \
+             Pro install), then start the agent again from a new login",
+            apart.shared_dir
+        ),
+    }
+}
+
+/// The one line, said once, about what was recorded in this account's home
+/// while it was refused the shared record. The shared record takes it again,
+/// so nothing is wrong now; whether those decisions are intact can no longer
+/// be established, which is what `[unknown]` means.
+pub fn kept_apart_before_finding(own_dir: &str) -> Finding {
+    Finding::Unknown {
+        what: format!(
+            "Decisions this account recorded while it was refused the shared record \
+             are still in {own_dir}. InnerWarden Pro never saw them, and this account \
+             could edit or delete them there."
+        ),
+        why: format!(
+            "said once. To read them: IW_GRAPH_FILE=\"{own_dir}/graph.json\" innerwarden graph"
+        ),
+    }
 }
 
 /// The caveat on an agent in `Wired into` whose other hooks do not run.
@@ -495,35 +569,7 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     // said `[on] Wired into 1: claude-code.` on a Mac whose hook pointed at a
     // cleaned build for weeks, so an agent is only "wired" here once the
     // program its hook runs is there.
-    for trouble in &facts.hook_trouble {
-        match &trouble.program {
-            HookProgram::Broken { problem, .. } => out.push(Finding::NotWorking {
-                what: format!(
-                    "{} is wired, but {problem}, so {}.",
-                    trouble.agent,
-                    if trouble.via_proxy {
-                        "its MCP servers cannot start"
-                    } else {
-                        "none of its commands are screened"
-                    }
-                ),
-                next: trouble.next.clone(),
-            }),
-            HookProgram::Unknown { why, .. } => out.push(Finding::Unknown {
-                what: format!(
-                    "{} is wired, but I could not confirm its {} can run.",
-                    trouble.agent,
-                    if trouble.via_proxy {
-                        "MCP proxy"
-                    } else {
-                        "hook"
-                    }
-                ),
-                why: format!("{why}. If it does not, `{}` rewrites it.", trouble.next),
-            }),
-            HookProgram::Runs => {}
-        }
-    }
+    out.extend(facts.hook_trouble.iter().filter_map(trouble_finding));
     // Claude Code runs a hook whose program is gone as a non-blocking error,
     // for a file write or a tool result just as for a shell command. A Bash
     // hook that runs said nothing about the others, so `[on]` stood while
@@ -534,6 +580,15 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
             next: partly.next.clone(),
         });
     }
+    // A hook line written by hand (`env X=1 ... hook`, `sh -c '...'`, a path
+    // with a space and no quotes) was skipped in silence: it is not the
+    // guard's own line, so nothing judged it. It is named here, with the line.
+    out.extend(
+        facts
+            .unread_hook_lines
+            .iter()
+            .filter_map(unread_line_finding),
+    );
     if !facts.wired_agents.is_empty() {
         // An agent with some of its tools unscreened is named with that
         // caveat: the same agent read `[off] ... not screened` above and then
@@ -556,29 +611,18 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
         )));
         out.extend(facts.tool_classes.iter().map(tool_classes_finding));
     } else if facts.hook_trouble.is_empty() {
-        match facts.any_agent_seen {
-            Some(true) => out.push(Finding::NotWorking {
-                what: "An agent is running but nothing is wired to the guard, so \
-                       its commands are not screened."
-                    .into(),
-                next: "innerwarden agents connect --all --monitor".into(),
-            }),
-            Some(false) => out.push(Finding::NotWorking {
-                what: "No agent is wired, and none of the agents I know by name \
-                       are running."
-                    .into(),
-                next: "start your agent, then: innerwarden agents connect --all --monitor".into(),
-            }),
-            None => out.push(Finding::Unknown {
-                what: "Could not tell whether any agent is running.".into(),
-                why: "Process inspection failed. An agent may well be running; I \
-                      simply could not look."
-                    .into(),
-            }),
-        }
+        out.push(nothing_wired_finding(facts.any_agent_seen));
     }
 
     // ── Evidence ────────────────────────────────────────────────────────────
+    // Before the count: the count below is read from the record this account
+    // writes, and when that is its own home the reader has to know first.
+    if let Some(apart) = facts.record_kept_apart.as_ref() {
+        out.push(record_kept_apart_finding(apart));
+    }
+    if let Some(own_dir) = facts.kept_apart_before.as_deref() {
+        out.push(kept_apart_before_finding(own_dir));
+    }
     match facts.decisions_recorded {
         Some(0) if facts.decisions_by_hand > 0 => out.push(Finding::Unknown {
             what: format!(
@@ -658,6 +702,89 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     }
 
     out
+}
+
+/// The line for one wired agent whose hook or MCP proxy is not known to run.
+/// `None` for one that runs. Shared with `demo`, so the two say the same.
+pub fn trouble_finding(trouble: &HookTrouble) -> Option<Finding> {
+    match &trouble.program {
+        HookProgram::Broken { problem, .. } => Some(Finding::NotWorking {
+            what: format!(
+                "{} is wired, but {problem}, so {}.",
+                trouble.agent,
+                if trouble.via_proxy {
+                    "its MCP servers cannot start"
+                } else {
+                    "none of its commands are screened"
+                }
+            ),
+            next: trouble.next.clone(),
+        }),
+        HookProgram::Unknown { why, .. } => Some(Finding::Unknown {
+            what: format!(
+                "{} is wired, but I could not confirm its {} can run.",
+                trouble.agent,
+                if trouble.via_proxy {
+                    "MCP proxy"
+                } else {
+                    "hook"
+                }
+            ),
+            why: format!("{why}. If it does not, `{}` rewrites it.", trouble.next),
+        }),
+        HookProgram::Runs => None,
+    }
+}
+
+/// The line for a hook line that names the guard but is not its own line.
+pub fn unread_line_finding(line: &UnreadHookLine) -> Option<Finding> {
+    match &line.program {
+        HookProgram::Broken { problem, .. } => Some(Finding::NotWorking {
+            what: format!(
+                "{} has a hook line that cannot start: {problem}, so that line screens nothing.",
+                line.agent
+            ),
+            next: line.next.clone(),
+        }),
+        HookProgram::Unknown { why, .. } => Some(Finding::Unknown {
+            what: format!(
+                "{} has a hook line I could not read as the guard's own.",
+                line.agent
+            ),
+            why: format!("{why}. `{}` writes the guard's own line.", line.next),
+        }),
+        HookProgram::Runs => None,
+    }
+}
+
+/// The line when no agent is wired and no wiring is in trouble, from whether
+/// any agent was seen (`None`: could not look). Shared with `demo`.
+pub fn nothing_wired_finding(any_agent_seen: Option<bool>) -> Finding {
+    match any_agent_seen {
+        Some(true) => Finding::NotWorking {
+            what: "An agent is running but nothing is wired to the guard, so \
+                   its commands are not screened."
+                .into(),
+            next: "innerwarden agents connect --all --monitor".into(),
+        },
+        Some(false) => Finding::NotWorking {
+            what: "No agent is wired, and none of the agents I know by name \
+                   are running."
+                .into(),
+            next: "start your agent, then: innerwarden agents connect --all --monitor".into(),
+        },
+        // Unknown, never "none running": on macOS and Windows the process
+        // scan has nothing to read (it reads /proc), and a failed look is not
+        // an empty one. The step that connects the agents installed here is
+        // still named, because it does not depend on the answer.
+        None => Finding::Unknown {
+            what: "Could not tell whether any agent is running.".into(),
+            why: "I could not look at the running processes here. An agent may \
+                  well be running. To connect the agents installed here: \
+                  innerwarden agents connect --all --monitor"
+                .into(),
+        },
+    }
 }
 
 /// Is this install doing its job? Only `Working` on the things that matter.
@@ -969,13 +1096,119 @@ mod tests {
             wired_agents: vec!["claude-code".into()],
             hook_trouble: vec![],
             partly_unscreened: vec![],
+            unread_hook_lines: vec![],
             tool_classes: vec![],
             any_agent_seen: Some(true),
             decisions_recorded: Some(42),
             newest_decision_age_secs: Some(90),
             decisions_by_hand: 0,
             dashboard_reachable: Some(true),
+            record_kept_apart: None,
+            kept_apart_before: None,
         }
+    }
+
+    /// An account refused the shared record is told once, here, that its
+    /// decisions are kept apart and what puts them back, and the line comes
+    /// before the count it changes the meaning of.
+    ///
+    /// FAILS ON REVERT: drop the finding from `assess` and nothing anywhere
+    /// says the Pro side cannot see this account's blocks.
+    #[test]
+    fn a_record_kept_apart_is_said_once_before_the_count() {
+        let mut facts = healthy();
+        assert!(!assess(&facts)
+            .iter()
+            .any(|f| f.to_string().contains("shared record")));
+        facts.record_kept_apart = Some(RecordKeptApart {
+            shared_dir: "/var/lib/innerwarden/guard".into(),
+            own_dir: "/home/agent/.config/innerwarden".into(),
+        });
+        let findings = assess(&facts);
+        let apart: Vec<usize> = findings
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.to_string().contains("shared record"))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(apart.len(), 1, "said once: {findings:?}");
+        let count = findings
+            .iter()
+            .position(|f| f.to_string().contains("screening decision(s) recorded"))
+            .expect("the count is still there");
+        assert!(apart[0] < count, "{findings:?}");
+        match &findings[apart[0]] {
+            Finding::NotWorking { what, next } => {
+                assert!(what.contains("/var/lib/innerwarden/guard"), "{what}");
+                assert!(what.contains("/home/agent/.config/innerwarden"), "{what}");
+                assert!(what.contains("does not see them"), "{what}");
+                assert!(next.contains("usermod -aG innerwarden"), "{next}");
+            }
+            other => panic!("the Pro side missing these is a fault to fix: {other:?}"),
+        }
+    }
+
+    /// The line is an integrity failure, and the group step leads the fix.
+    ///
+    /// FAILS ON REVERT: the line said only that decisions were "kept" in the
+    /// home, with the command after a description of the group.
+    #[test]
+    fn a_record_kept_apart_is_an_integrity_failure_with_the_group_step_first() {
+        let finding = record_kept_apart_finding(&RecordKeptApart {
+            shared_dir: "/var/lib/innerwarden/guard".into(),
+            own_dir: "/home/agent/.config/innerwarden".into(),
+        });
+        let mut facts = healthy();
+        facts.record_kept_apart = Some(RecordKeptApart {
+            shared_dir: "/var/lib/innerwarden/guard".into(),
+            own_dir: "/home/agent/.config/innerwarden".into(),
+        });
+        assert_eq!(
+            headline(&assess(&facts)),
+            "InnerWarden is installed but NOT fully protecting this machine."
+        );
+        match finding {
+            Finding::NotWorking { what, next } => {
+                assert!(what.starts_with("Record integrity:"), "{what}");
+                assert!(what.contains("edited or deleted"), "{what}");
+                assert!(
+                    next.starts_with("sudo usermod -aG innerwarden"),
+                    "the command first: {next}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Once the shared record takes the account again, `status` says once
+    /// that what it recorded meanwhile is still in its home, and how to read it.
+    ///
+    /// FAILS ON REVERT: drop the finding from `assess` and the decisions kept
+    /// apart are never mentioned again once the group is fixed.
+    #[test]
+    fn decisions_kept_apart_before_are_mentioned_once_the_record_is_shared_again() {
+        let mut facts = healthy();
+        facts.kept_apart_before = Some("/home/agent/.config/innerwarden".into());
+        let findings = assess(&facts);
+        let lines: Vec<String> = findings
+            .iter()
+            .map(ToString::to_string)
+            .filter(|line| line.contains("refused the shared record"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{findings:?}");
+        assert!(
+            lines[0].contains("/home/agent/.config/innerwarden"),
+            "{}",
+            lines[0]
+        );
+        let read_with = format!(
+            "IW_GRAPH_FILE=\"{}/graph.json\"",
+            "/home/agent/.config/innerwarden"
+        );
+        assert!(lines[0].contains(&read_with), "{}", lines[0]);
+        assert!(findings.iter().any(
+            |f| matches!(f, Finding::Unknown { what, .. } if what.contains("never saw them"))
+        ));
     }
 
     /// Measured on a clean box: install, `agents connect --all`, then `status`.
@@ -1174,18 +1407,40 @@ mod tests {
             wired_agents: vec![],
             hook_trouble: vec![],
             partly_unscreened: vec![],
+            unread_hook_lines: vec![],
             tool_classes: vec![],
             any_agent_seen: None,
             decisions_recorded: None,
             newest_decision_age_secs: None,
             decisions_by_hand: 0,
             dashboard_reachable: None,
+            record_kept_apart: None,
+            kept_apart_before: None,
         };
         for finding in assess(&facts) {
             assert!(
                 !matches!(finding, Finding::NotWorking { .. }),
                 "nothing was established, so nothing may be reported as off: {finding:?}"
             );
+        }
+    }
+
+    /// Where the process scan cannot look (macOS, Windows), nothing wired is
+    /// "could not tell", never "no agent", and the line still names the
+    /// command that connects one: `demo` prints this line as its whole
+    /// answer when nothing is wired.
+    #[test]
+    fn nothing_wired_and_no_scan_is_unknown_and_names_how_to_connect() {
+        match nothing_wired_finding(None) {
+            Finding::Unknown { what, why } => {
+                assert!(what.contains("Could not tell"), "{what}");
+                assert!(
+                    why.contains("innerwarden agents connect --all --monitor"),
+                    "{why}"
+                );
+                assert!(!why.contains("none of the agents"), "{why}");
+            }
+            other => panic!("a scan that could not look is not an answer: {other:?}"),
         }
     }
 
@@ -1445,6 +1700,36 @@ mod tests {
             "{findings:?}"
         );
         assert!(headline(&findings).contains("NOT fully protecting"));
+    }
+
+    /// A bare name FOUND here is resolved on the agent's PATH, not this one:
+    /// status says it could not tell, never an OK that could be false.
+    #[test]
+    fn a_wired_hook_whose_bare_program_is_found_here_could_not_be_told() {
+        {
+            let fact = ProgramFact::Executable;
+            let f = wired_to("innerwarden", fact, "innerwarden install claude-code");
+            let findings = assess(&f);
+            assert!(
+                findings.iter().any(|x| matches!(
+                    x,
+                    Finding::Unknown { why, .. }
+                        if why.contains("could not tell: bare name, resolved on the agent's PATH")
+                )),
+                "{fact:?}: {findings:?}"
+            );
+            assert!(
+                !findings
+                    .iter()
+                    .any(|x| matches!(x, Finding::Working(what) if what.starts_with("Wired into"))),
+                "{fact:?}: {findings:?}"
+            );
+            assert_eq!(
+                headline(&findings),
+                "InnerWarden is on, but some things could not be verified.",
+                "{fact:?}"
+            );
+        }
     }
 
     /// A hook that could not be checked is unknown, never off, and never on.

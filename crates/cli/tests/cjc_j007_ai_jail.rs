@@ -1674,7 +1674,7 @@ fn a_home_folder_linked_outside_the_home_hides_where_it_leads() {
 /// the project, or outside the home, stops it too.
 ///
 /// FAILS ON REVERT (measured): drop the home check in `plan_hidden_home`
-/// and the launch goes on with the link to `/etc/apt`; drop the check of
+/// and the launch goes on with the link outside the home; drop the check of
 /// what the jail needs in `validate_jail_inputs` and the jail starts with
 /// its project under an empty mount; drop the `steered_by` check and the
 /// planted link is followed.
@@ -1690,21 +1690,25 @@ fn a_planted_link_never_moves_a_hidden_home_path() {
         ),
         (
             ".cache/git/credential",
-            "/etc/apt",
+            "outside",
             "a link in a folder a program in the jail can write",
         ),
         ("own-link", "project", "holds the project"),
-        ("own-link", "/etc/apt", "outside the home"),
+        ("own-link", "outside", "outside the home"),
     ] {
         let home = home_that_hides(&[hidden]);
         let h = home.path();
         let project = tempfile::TempDir::new_in(h).unwrap();
         std::fs::write(project.path().join("main.rs"), "fn main() {}").unwrap();
         std::fs::create_dir_all(h.join(".cache/git")).unwrap();
+        // A folder outside the home that the test makes itself. It was
+        // `/etc/apt`, which a host without apt (Rocky, el9) does not have.
+        let outside = tempfile::TempDir::new().unwrap();
+        assert!(!outside.path().starts_with(h));
         let to = if target == "project" {
             project.path().to_path_buf()
         } else {
-            std::path::PathBuf::from(target)
+            outside.path().to_path_buf()
         };
         std::os::unix::fs::symlink(&to, h.join(hidden)).unwrap();
         let marker = project.path().join("COMMAND-RAN");

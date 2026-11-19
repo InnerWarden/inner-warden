@@ -442,8 +442,34 @@ pub fn hook_command_for(
         .filter(|agent| is_agent_id(agent))
         .map(|agent| format!(" --agent {agent}"))
         .unwrap_or_default();
-    format!("\"{}\" hook{flag}{agent}", iw_guard.display())
+    // A hook that refuses closes when it cannot run: see [`FAIL_CLOSED`].
+    let closed = if !monitor && cfg!(unix) {
+        FAIL_CLOSED
+    } else {
+        ""
+    };
+    format!("\"{}\" hook{flag}{agent}{closed}", iw_guard.display())
 }
+
+/// Written after a hook that refuses (enforce, `--block-review`), never after
+/// one in monitor, which never acts.
+///
+/// Claude Code refuses a call only on exit 2; any other failure of the hook is
+/// "non-blocking" and the call runs. So a hook whose binary is gone (127),
+/// cannot be executed (126) or was killed (128 + signal) let every call run
+/// unscreened, silently. The shell Claude Code runs the hook line in turns
+/// exactly those three into 2 and leaves every other code as it was: 0 still
+/// allows, 2 still refuses.
+///
+/// A hook that times out is not covered: Claude Code may end the shell that
+/// runs this line when its hook timeout fires, and then the tail never runs.
+/// Only the three failures of the binary above are closed.
+///
+/// Unix only: on Windows the line may not reach a POSIX shell, and a line the
+/// shell cannot parse would leave every call unscreened, which is worse.
+/// Recognition ([`hook_command_words`]) accepts this exact text on every
+/// platform, so uninstall and repair keep finding the line.
+pub const FAIL_CLOSED: &str = " || { s=$?; [ $s -ge 126 ] && exit 2; exit $s; }";
 
 /// A plain agent id (`claude-code`): lowercase letters, digits, `-` and `_`.
 pub fn is_agent_id(value: &str) -> bool {
@@ -649,18 +675,47 @@ fn install_hook_with_link_policy(
              replacing it"
         ));
     }
+    // Background setup keeps the mode of EVERY half it rewrites, not only the
+    // Bash one: an enforcing `Write|Edit` or `Read|Grep|Glob` hook with no
+    // enforcing Bash hook beside it was rewritten to the Bash half's mode,
+    // monitor, and a monitor half beside an enforcing Bash hook was raised.
+    // A half that is not there yet takes the Bash half's mode, as before.
+    let half_command = |matcher: &str| -> String {
+        match exact_matcher_iwguard_mode(&existing, matcher).filter(|_| reject_symlinks) {
+            Some(mode) => {
+                let mode = mode.max(requested_mode);
+                let (block_review, monitor) = mode.flags();
+                hook_command_for(iw_guard, block_review, monitor, agent_flag.as_deref())
+            }
+            None => cmd.clone(),
+        }
+    };
     let merged = merge_pretooluse_bash_hook(existing.clone(), &cmd);
-    // The file-tools half: the same binary and mode, on the agent's own
+    // The file-tools half: the same binary, on the agent's own
     // `Write`/`Edit` tools, which never pass through the shell.
-    let merged = merge_pretooluse_file_hook(merged, &cmd);
+    let merged =
+        merge_pretooluse_file_hook(merged, &half_command(crate::file_tools::FILE_TOOLS_MATCHER));
     // The read half: `Read`, `Grep` and `Glob`, judged by the secret rules
-    // of the shell, with the same binary and mode.
-    let merged = merge_pretooluse_read_hook(merged, &cmd);
+    // of the shell, with the same binary.
+    let merged =
+        merge_pretooluse_read_hook(merged, &half_command(crate::file_tools::READ_TOOLS_MATCHER));
     // The observation half. Written with the SAME binary and the same mode
     // flags, because a PostToolUse hook that points at a different build is a
     // seam that drifts silently: it would keep feeding a store the screening
     // half no longer reads.
-    let merged = merge_posttooluse_hook(merged, &cmd);
+    //
+    // Its mode follows the same rule as the other halves: a PostToolUse line
+    // already there keeps its own mode, never weaker than asked, and only a
+    // missing one takes the Bash half's. Writing the Bash half's mode on it
+    // turned an enforcing line into `--monitor` when no Bash hook enforced.
+    let post_command = match posttooluse_iwguard_mode(&existing).filter(|_| reject_symlinks) {
+        Some(mode) => {
+            let (block_review, monitor) = mode.max(requested_mode).flags();
+            hook_command_for(iw_guard, block_review, monitor, agent_flag.as_deref())
+        }
+        None => cmd.clone(),
+    };
+    let merged = merge_posttooluse_hook(merged, &post_command);
     // Automatic setup must not treat any recognised legacy hook as proof that
     // the requested wiring is already correct. Reconcile aliases, duplicate
     // entries and mode/path drift first; skip only an exact semantic no-op.
@@ -698,6 +753,20 @@ fn install_hook_with_link_policy(
 /// unknown flags is intentional: detection is also used by uninstall, so a
 /// command that merely mentions InnerWarden must remain operator-owned.
 fn hook_command_words(command: &str) -> Option<Vec<String>> {
+    // The one piece of shell the grammar knows: the exact [`FAIL_CLOSED`]
+    // tail [`hook_command_for`] writes. Any other composition stays refused.
+    let command = command.trim();
+    plain_hook_command_words(command.strip_suffix(FAIL_CLOSED).unwrap_or(command))
+}
+
+/// The grammar of every release before [`FAIL_CLOSED`]: no shell at all.
+///
+/// Kept apart because it is the rollback limit. A binary from before the
+/// tail reads a line that carries it as an operator's command, not as its
+/// own: going back to it, `install` adds a second hook beside this one and
+/// `uninstall` leaves this one in place, still refusing. Remove the hooks
+/// with this binary (`innerwarden uninstall`) before installing an older one.
+fn plain_hook_command_words(command: &str) -> Option<Vec<String>> {
     let mut chars = command.trim().chars().peekable();
     let mut words = Vec::new();
 
@@ -814,6 +883,11 @@ fn iwguard_hook_parts(hook: &Value) -> Option<(HookProtection, Option<String>)> 
         .get("command")
         .and_then(Value::as_str)
         .and_then(hook_command_words)?;
+    hook_parts_of_words(&words)
+}
+
+/// [`iwguard_hook_parts`] once the command is split into words.
+fn hook_parts_of_words(words: &[String]) -> Option<(HookProtection, Option<String>)> {
     let (executable, rest) = words.split_first()?;
     let (subcommand, flags) = rest.split_first()?;
     if !is_innerwarden_executable(executable) || subcommand != "hook" {
@@ -906,6 +980,39 @@ fn strongest_effective_iwguard_hook_mode(settings: &Value) -> Option<HookProtect
         .into_iter()
         .flatten()
         .filter(|entry| bash_matcher_coverage(entry) == BashMatcherCoverage::Includes)
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(iwguard_hook_mode)
+        .max()
+}
+
+/// Strongest recognised InnerWarden mode in the `PreToolUse` entries whose
+/// matcher is exactly `matcher`: the entries [`merge_pretooluse_tools_hook`]
+/// rewrites in place.
+fn exact_matcher_iwguard_mode(settings: &Value, matcher: &str) -> Option<HookProtection> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("matcher").and_then(Value::as_str) == Some(matcher))
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(iwguard_hook_mode)
+        .max()
+}
+
+/// Strongest recognised InnerWarden mode among the `PostToolUse` hooks,
+/// under any matcher: [`merge_posttooluse_hook`] replaces ours wherever it
+/// sits.
+fn posttooluse_iwguard_mode(settings: &Value) -> Option<HookProtection> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PostToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
         .flatten()
         .filter_map(iwguard_hook_mode)
@@ -1030,27 +1137,164 @@ pub fn judge_hook_program(program: &str, fact: ProgramFact) -> HookProgram {
             ),
         };
     }
-    let problem = match (fact, bare) {
-        (ProgramFact::Executable, _) => return HookProgram::Runs,
-        (ProgramFact::Unreadable, _) => {
+    // A bare name is found on the PATH of the agent that runs the hook, which
+    // is not this process's PATH and cannot be read from here. Found here (on
+    // this PATH or in a usual place), the agent may still resolve another, so
+    // an OK could be false: "could not tell". Found nowhere here, the agent
+    // will likely not find it either: that is off, the same alarm as a path
+    // that does not exist.
+    if bare {
+        return match fact {
+            ProgramFact::Missing | ProgramFact::NotExecutable => HookProgram::Broken {
+                program: program.to_string(),
+                problem: format!(
+                    "its hook runs `{program}`, which is not on PATH: {BARE_NOT_FOUND}"
+                ),
+            },
+            ProgramFact::Executable | ProgramFact::Unreadable => HookProgram::Unknown {
+                program: program.to_string(),
+                why: bare_name_why(program),
+            },
+        };
+    }
+    let problem = match fact {
+        ProgramFact::Executable => return HookProgram::Runs,
+        ProgramFact::Unreadable => {
             return HookProgram::Unknown {
                 program: program.to_string(),
                 why: format!("its hook runs {program}, and I could not look to see if it is there"),
             }
         }
-        // A shell skips a PATH entry that is not executable and keeps looking,
-        // so for a bare name the two facts mean the same thing.
-        (ProgramFact::Missing | ProgramFact::NotExecutable, true) => {
-            format!("its hook runs `{program}`, which is not on PATH")
-        }
-        (ProgramFact::Missing, false) => format!("its hook runs {program}, which does not exist"),
-        (ProgramFact::NotExecutable, false) => {
+        ProgramFact::Missing => format!("its hook runs {program}, which does not exist"),
+        ProgramFact::NotExecutable => {
             format!("its hook runs {program}, which is not an executable file")
         }
     };
     HookProgram::Broken {
         program: program.to_string(),
         problem,
+    }
+}
+
+/// Why a hook that names its program bare cannot be judged from here.
+pub const BARE_NAME: &str = "could not tell: bare name, resolved on the agent's PATH";
+
+/// Why a bare name found nowhere here is off.
+pub const BARE_NOT_FOUND: &str =
+    "not found on this shell's PATH or the usual places; the agent will likely not find it either";
+
+fn bare_name_why(program: &str) -> String {
+    format!("{BARE_NAME}: its hook runs `{program}`")
+}
+
+/// The clue a caller adds to a bare name's `why`: where it was found here
+/// (`Some`: this PATH or a usual place), or that the look failed (`None`).
+/// Only a clue: the agent resolves the name on a PATH of its own.
+pub fn bare_name_clue(found_here: Option<&Path>) -> String {
+    match found_here {
+        Some(path) => format!(
+            "; found here at {}, the agent may resolve another",
+            path.display()
+        ),
+        None => "; I could not look for it here".to_string(),
+    }
+}
+
+/// A hook line that names the guard's binary and its `hook` verb but is not
+/// in the grammar [`hook_command_for`] writes: something else comes first
+/// (`env X=1 /p/innerwarden hook`, `sh -c '/p/innerwarden hook'`), or a path
+/// holds a space and no quotes. Never the guard's own line, so never touched
+/// by install or uninstall; `status` names it so it cannot vanish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedHook {
+    /// The command exactly as the settings file holds it.
+    pub command: String,
+    /// The word that names the guard's binary, quotes removed.
+    pub program: String,
+    /// Under `PreToolUse` with a matcher that certainly includes Bash.
+    pub screens_bash: bool,
+}
+
+/// The word in `command` that names the guard's binary right before `hook`,
+/// read loosely: words split on whitespace and shell punctuation, quotes
+/// dropped. Only for naming a line in `status`; never to claim it as ours.
+fn wrapped_guard_program(command: &str) -> Option<String> {
+    let words: Vec<&str> = command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '`'))
+        .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
+        .filter(|word| !word.is_empty())
+        .collect();
+    words
+        .windows(2)
+        .find(|pair| is_innerwarden_executable(pair[0]) && pair[1] == "hook")
+        .map(|pair| pair[0].to_string())
+}
+
+/// Every hook line, under any event and matcher, that names the guard but is
+/// not one [`is_iwguard_hook`] reads as ours, in file order.
+pub fn wrapped_iwguard_hooks(settings: &Value) -> Vec<WrappedHook> {
+    let Some(events) = settings.get("hooks").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (event, entries) in events {
+        for entry in entries.as_array().into_iter().flatten() {
+            let screens_bash = event == "PreToolUse"
+                && bash_matcher_coverage(entry) == BashMatcherCoverage::Includes;
+            for hook in entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if is_iwguard_hook(hook) {
+                    continue;
+                }
+                let Some(command) = hook.get("command").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some(program) = wrapped_guard_program(command) {
+                    out.push(WrappedHook {
+                        command: command.to_string(),
+                        program,
+                        screens_bash,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// PURE: judge a [`WrappedHook`] from what the caller found when it looked
+/// for the binary it names. Never `Runs`: what comes before the binary (an
+/// `env`, a `sh -c`, a split path) decides what actually starts, so the line
+/// is "could not tell", with the line in the words. Only a binary that is
+/// certainly gone (an absolute path that does not exist or is not
+/// executable) is the same alarm as the guard's own line: nothing it names
+/// can start.
+pub fn judge_wrapped_hook(hook: &WrappedHook, fact: ProgramFact) -> HookProgram {
+    let program = hook.program.as_str();
+    let line = &hook.command;
+    if Path::new(program).is_absolute() {
+        let gone = match fact {
+            ProgramFact::Missing => Some("which does not exist"),
+            ProgramFact::NotExecutable => Some("which is not an executable file"),
+            ProgramFact::Executable | ProgramFact::Unreadable => None,
+        };
+        if let Some(gone) = gone {
+            return HookProgram::Broken {
+                program: program.to_string(),
+                problem: format!("its hook line `{line}` runs {program}, {gone}"),
+            };
+        }
+    }
+    HookProgram::Unknown {
+        program: program.to_string(),
+        why: format!(
+            "could not tell: its hook line `{line}` names {program} but does not start with \
+             it, so I cannot say what that line runs"
+        ),
     }
 }
 
@@ -1073,6 +1317,31 @@ pub fn effective_iwguard_hook_programs(settings: &Value) -> Vec<String> {
         .filter_map(|hook| hook.get("command").and_then(Value::as_str))
         .filter_map(hook_command_words)
         .filter_map(|words| words.into_iter().next())
+        .collect()
+}
+
+/// The words of each InnerWarden hook Claude Code runs before `tool`
+/// (`Bash`, `Read`, `Write`, ...), quotes removed, in file order: the
+/// hooks under a `PreToolUse` matcher that certainly includes the tool.
+/// Empty when no hook of ours is wired for it.
+///
+/// Read with the same small grammar detection uses, so a hook is only ever
+/// taken from a command this module already calls its own. `innerwarden
+/// demo` runs these, as written, to show what each one answers.
+pub fn iwguard_hook_commands_for_tool(settings: &Value, tool: &str) -> Vec<Vec<String>> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| tool_matcher_coverage(entry, tool) == BashMatcherCoverage::Includes)
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|hook| is_iwguard_hook(hook))
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+        .filter_map(hook_command_words)
+        .filter(|words| !words.is_empty())
         .collect()
 }
 
@@ -1355,6 +1624,48 @@ pub fn uninstall_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The tail [`hook_command_for`] writes after a refusing hook on this
+    /// platform: [`FAIL_CLOSED`] on unix, nothing elsewhere.
+    const CLOSED: &str = if cfg!(unix) { FAIL_CLOSED } else { "" };
+
+    /// `innerwarden demo` sends each call only to the hooks Claude Code would
+    /// run for that tool: ours, under a matcher that includes it, never an
+    /// operator's hook beside it.
+    ///
+    /// FAILS ON REVERT: drop the matcher filter and the Bash hook is listed
+    /// for `Read`; drop the ownership filter and the operator's hook is run.
+    #[test]
+    fn hook_commands_for_a_tool_are_ours_under_its_matcher() {
+        let settings = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "\"/p/innerwarden\" hook --agent claude-code"},
+                {"type": "command", "command": "/usr/local/bin/my-own-check"}
+            ]},
+            {"matcher": "Read|Grep|Glob", "hooks": [
+                {"type": "command", "command": "\"/p/innerwarden\" hook --monitor"}
+            ]}
+        ]}});
+        assert_eq!(
+            iwguard_hook_commands_for_tool(&settings, "Bash"),
+            vec![vec![
+                "/p/innerwarden".to_string(),
+                "hook".into(),
+                "--agent".into(),
+                "claude-code".into()
+            ]]
+        );
+        assert_eq!(
+            iwguard_hook_commands_for_tool(&settings, "Read"),
+            vec![vec![
+                "/p/innerwarden".to_string(),
+                "hook".into(),
+                "--monitor".into()
+            ]]
+        );
+        assert!(iwguard_hook_commands_for_tool(&settings, "Write").is_empty());
+        assert!(iwguard_hook_commands_for_tool(&json!({}), "Bash").is_empty());
+    }
 
     #[test]
     fn merge_into_empty_adds_bash_hook() {
@@ -1642,7 +1953,7 @@ mod tests {
         assert_eq!(entries.len(), 1, "{new}");
         assert_eq!(
             entries[0]["hooks"][0]["command"],
-            "\"/opt/innerwarden\" hook --agent claude-code"
+            format!("\"/opt/innerwarden\" hook --agent claude-code{CLOSED}")
         );
         assert!(!needs_iwguard_hook_reconciliation(&new, iw, false, true));
 
@@ -2012,12 +2323,282 @@ mod tests {
         }
     }
 
+    /// NEW-20261112-hook-missing-binary-fails-open. The line an enforcing hook
+    /// runs in, run by `sh -c` the way Claude Code runs it: a binary that is
+    /// gone, cannot run or dies refuses (2) in enforce; in monitor the same
+    /// failure stays a non-blocking error, because monitor never acts. Every
+    /// code the binary itself returns passes through unchanged.
+    ///
+    /// Run under `sh` and, where it exists, `bash`: macOS `/bin/sh` is bash,
+    /// which execs a lone command in place of itself, so a monitor line whose
+    /// binary is killed takes the shell down with the same signal instead of
+    /// returning 128 + n. Both read as the same failure here.
+    #[cfg(unix)]
+    #[test]
+    fn a_refusing_hook_that_cannot_run_refuses_and_monitor_never_acts() {
+        use std::os::unix::process::ExitStatusExt;
+        let shells: Vec<&str> = ["sh", "/bin/bash"]
+            .into_iter()
+            .filter(|s| *s == "sh" || Path::new(s).exists())
+            .collect();
+        for shell in shells {
+            refusing_hook_cases(shell, |status: std::process::ExitStatus| {
+                status.code().or(status.signal().map(|n| 128 + n))
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    fn refusing_hook_cases(shell: &str, code: impl Fn(std::process::ExitStatus) -> Option<i32>) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("innerwarden");
+        let run = |line: &str| {
+            code(
+                std::process::Command::new(shell)
+                    .args(["-c", line])
+                    .stdin(std::process::Stdio::null())
+                    .status()
+                    .unwrap(),
+            )
+        };
+        let script = |body: &str, mode: u32| {
+            fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let enforce = hook_command_for(&bin, false, false, Some("claude-code"));
+        let review = hook_command_for(&bin, true, false, Some("claude-code"));
+        let monitor = hook_command_for(&bin, false, true, Some("claude-code"));
+        assert!(!monitor.contains(FAIL_CLOSED), "{monitor}");
+
+        // Gone: 127 from the shell. Before this, Claude Code ran the call.
+        assert_eq!(run(&enforce), Some(2));
+        assert_eq!(run(&review), Some(2));
+        assert_eq!(run(&monitor), Some(127));
+        // Not executable: 126.
+        script("exit 0", 0o644);
+        assert_eq!(run(&enforce), Some(2));
+        assert_eq!(run(&monitor), Some(126));
+        // Killed by a signal: 128 + n.
+        script("kill -KILL $$", 0o755);
+        assert_eq!(run(&enforce), Some(2));
+        assert_eq!(run(&monitor), Some(137));
+        // The binary's own answers are untouched.
+        for code in [0, 1, 2] {
+            script(&format!("exit {code}"), 0o755);
+            assert_eq!(run(&enforce), Some(code));
+            assert_eq!(run(&monitor), Some(code));
+        }
+    }
+
+    /// The wrapped line stays ours, so uninstall and repair find it; anything
+    /// else after it, or a tail that is not exactly ours, is not.
+    #[test]
+    fn the_fail_closed_tail_is_recognised_and_nothing_wider_is() {
+        for (command, mode) in [
+            (
+                format!("\"/x/innerwarden\" hook --agent claude-code{FAIL_CLOSED}"),
+                HookProtection::Enforce,
+            ),
+            (
+                format!("\"/x/innerwarden\" hook --block-review{FAIL_CLOSED}"),
+                HookProtection::BlockReview,
+            ),
+            // Never written, but still ours: repair rewrites it to plain monitor.
+            (
+                format!("\"/x/innerwarden\" hook --monitor{FAIL_CLOSED}"),
+                HookProtection::Monitor,
+            ),
+        ] {
+            assert_eq!(
+                iwguard_hook_mode(&json!({ "command": command })),
+                Some(mode),
+                "{command}"
+            );
+        }
+        for command in [
+            format!("\"/x/innerwarden\" hook{FAIL_CLOSED}; rm -rf /"),
+            format!("\"/x/innerwarden\" hook{FAIL_CLOSED}{FAIL_CLOSED}"),
+            "\"/x/innerwarden\" hook || exit 2".to_string(),
+            "\"/x/innerwarden\" hook || { s=$?; [ $s -ge 1 ] && exit 2; exit $s; }".to_string(),
+        ] {
+            assert_eq!(
+                iwguard_hook_mode(&json!({ "command": command })),
+                None,
+                "{command}"
+            );
+        }
+        // An enforce hook written before the tail is drift: repair adds it.
+        let plain = "\"/x/innerwarden\" hook --agent claude-code";
+        let settings = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": plain}]},
+            {"matcher": crate::file_tools::FILE_TOOLS_MATCHER,
+             "hooks": [{"type": "command", "command": plain}]},
+            {"matcher": crate::file_tools::READ_TOOLS_MATCHER,
+             "hooks": [{"type": "command", "command": plain}]}
+        ]}});
+        assert_eq!(
+            needs_iwguard_hook_reconciliation(&settings, Path::new("/x/innerwarden"), false, true),
+            cfg!(unix)
+        );
+        // And the wrapped one is removed by uninstall like any other.
+        let wrapped = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command",
+              "command": format!("{plain}{FAIL_CLOSED}")}]}
+        ]}});
+        assert_eq!(remove_iwguard_pretooluse_hook(wrapped).1, 1);
+    }
+
+    /// The rollback limit: the grammar of every release before the tail does
+    /// not read a line that carries it as ours, so an older binary neither
+    /// replaces nor removes it. Documented in the README ("Rolling back").
+    #[test]
+    fn a_binary_from_before_the_tail_does_not_know_the_line() {
+        let plain = "\"/x/innerwarden\" hook --agent claude-code";
+        // What a release before the tail recognised: the plain grammar, then
+        // the same reading of the words.
+        let before_the_tail = |command: &str| {
+            plain_hook_command_words(command).and_then(|words| hook_parts_of_words(&words))
+        };
+        let wrapped = format!("{plain}{FAIL_CLOSED}");
+        assert!(before_the_tail(plain).is_some());
+        assert_eq!(
+            before_the_tail(&wrapped),
+            None,
+            "an older binary reads it as foreign"
+        );
+        assert!(iwguard_hook_mode(&json!({ "command": wrapped })).is_some());
+    }
+
+    /// Background setup keeps the mode of each half it rewrites: an enforcing
+    /// file or read hook with no enforcing Bash hook stays enforcing, and a
+    /// monitor half beside an enforcing Bash hook stays monitor.
+    #[test]
+    fn automatic_setup_keeps_the_mode_of_every_half() {
+        let iw = Path::new("/opt/innerwarden");
+        let enforce = format!("\"/opt/innerwarden\" hook --agent claude-code{CLOSED}");
+        let monitor = "\"/opt/innerwarden\" hook --monitor --agent claude-code".to_string();
+        let entry = |matcher: &str, command: &str| json!({"matcher": matcher, "hooks": [{"type": "command", "command": command}]});
+        let commands = |v: &Value, matcher: &str| -> Vec<String> {
+            v["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["matcher"] == matcher)
+                .flat_map(|e| e["hooks"].as_array().unwrap().clone())
+                .map(|h| h["command"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let file = crate::file_tools::FILE_TOOLS_MATCHER;
+        let read = crate::file_tools::READ_TOOLS_MATCHER;
+        for (wired, want_bash, want_file, want_read) in [
+            // Write|Edit in enforce, no Bash line: the file half stays enforce,
+            // the new halves take the monitor automatic setup asks for.
+            (
+                json!({"hooks": {"PreToolUse": [entry(file, &enforce)]}}),
+                &monitor,
+                &enforce,
+                &monitor,
+            ),
+            // Write|Edit and Read in enforce, Bash in monitor.
+            (
+                json!({"hooks": {"PreToolUse": [
+                    entry("Bash", &monitor), entry(file, &enforce), entry(read, &enforce)]}}),
+                &monitor,
+                &enforce,
+                &enforce,
+            ),
+            // The other way: a monitor read half beside an enforcing Bash hook.
+            (
+                json!({"hooks": {"PreToolUse": [
+                    entry("Bash", &enforce), entry(file, &enforce), entry(read, &monitor)]}}),
+                &enforce,
+                &enforce,
+                &monitor,
+            ),
+        ] {
+            let home = tempfile::TempDir::new().unwrap();
+            let path = home.path().join(".claude/settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, serde_json::to_vec_pretty(&wired).unwrap()).unwrap();
+            install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+            let now: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(commands(&now, "Bash"), vec![want_bash.clone()], "{wired}");
+            assert_eq!(commands(&now, file), vec![want_file.clone()], "{wired}");
+            assert_eq!(commands(&now, read), vec![want_read.clone()], "{wired}");
+            // And a second pass changes nothing.
+            let body = fs::read(&path).unwrap();
+            install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), body, "{wired}");
+        }
+    }
+
+    /// The PostToolUse half follows the same rule: an enforcing line there
+    /// with no enforcing Bash hook stays enforcing, a monitor one beside an
+    /// enforcing Bash hook stays monitor, and a missing one takes the Bash
+    /// half's mode.
+    #[test]
+    fn automatic_setup_keeps_the_mode_of_the_posttooluse_half() {
+        let iw = Path::new("/opt/innerwarden");
+        let enforce = format!("\"/opt/innerwarden\" hook --agent claude-code{CLOSED}");
+        let monitor = "\"/opt/innerwarden\" hook --monitor --agent claude-code".to_string();
+        let entry = |matcher: &str, command: &str| json!({"matcher": matcher, "hooks": [{"type": "command", "command": command}]});
+        let post_commands = |v: &Value| -> Vec<String> {
+            v["hooks"]["PostToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|e| e["hooks"].as_array().unwrap().clone())
+                .map(|h| h["command"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for (wired, want_post) in [
+            // PostToolUse in enforce, no Bash line.
+            (
+                json!({"hooks": {"PostToolUse": [entry("*", &enforce)]}}),
+                &enforce,
+            ),
+            // PostToolUse in enforce, Bash in monitor.
+            (
+                json!({"hooks": {"PreToolUse": [entry("Bash", &monitor)],
+                                 "PostToolUse": [entry("*", &enforce)]}}),
+                &enforce,
+            ),
+            // A monitor PostToolUse line beside an enforcing Bash hook.
+            (
+                json!({"hooks": {"PreToolUse": [entry("Bash", &enforce)],
+                                 "PostToolUse": [entry("*", &monitor)]}}),
+                &monitor,
+            ),
+            // No PostToolUse line yet: it takes the Bash half's mode.
+            (
+                json!({"hooks": {"PreToolUse": [entry("Bash", &enforce)]}}),
+                &enforce,
+            ),
+        ] {
+            let home = tempfile::TempDir::new().unwrap();
+            let path = home.path().join(".claude/settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, serde_json::to_vec_pretty(&wired).unwrap()).unwrap();
+            install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+            let now: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(post_commands(&now), vec![want_post.clone()], "{wired}");
+            // And a second pass changes nothing.
+            let body = fs::read(&path).unwrap();
+            install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), body, "{wired}");
+        }
+    }
+
     #[test]
     fn hook_command_quotes_path_and_wires_block_review() {
         let c = hook_command(Path::new("/usr/local/bin/innerwarden"), false, false);
-        assert_eq!(c, "\"/usr/local/bin/innerwarden\" hook");
+        assert_eq!(c, format!("\"/usr/local/bin/innerwarden\" hook{CLOSED}"));
         let c2 = hook_command(Path::new("/x/innerwarden"), true, false);
-        assert_eq!(c2, "\"/x/innerwarden\" hook --block-review");
+        assert_eq!(
+            c2,
+            format!("\"/x/innerwarden\" hook --block-review{CLOSED}")
+        );
         // monitor wins over block_review (records, never blocks).
         let c3 = hook_command(Path::new("/x/innerwarden"), true, true);
         assert_eq!(c3, "\"/x/innerwarden\" hook --monitor");
@@ -2083,7 +2664,7 @@ mod tests {
         // An id that is not a plain id is left out, never quoted in.
         assert_eq!(
             hook_command_for(Path::new("/x/innerwarden"), false, false, Some("x; rm")),
-            "\"/x/innerwarden\" hook"
+            format!("\"/x/innerwarden\" hook{CLOSED}")
         );
     }
 
@@ -2202,7 +2783,7 @@ mod tests {
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            "\"/opt/innerwarden\" hook --agent claude-code",
+            format!("\"/opt/innerwarden\" hook --agent claude-code{CLOSED}"),
             "switching mode rewrites the mode and keeps the name"
         );
     }
@@ -2245,7 +2826,7 @@ mod tests {
         // A new connection names the agent it serves.
         assert_eq!(
             v["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
-            "\"/opt/innerwarden\" hook --block-review --agent claude-code"
+            format!("\"/opt/innerwarden\" hook --block-review --agent claude-code{CLOSED}")
         );
 
         // Idempotent: the Bash hook, the file-tools hook and the read-tools
@@ -2265,7 +2846,7 @@ mod tests {
             let alias_home = tempfile::TempDir::new().unwrap();
             let report = install_hook(alias_home.path(), alias, None, iw, false, false).unwrap();
             assert_eq!(std::fs::read(&report.settings_path).unwrap(), expected);
-            assert!(report.hook_command.ends_with(" --agent claude-code"));
+            assert!(report.hook_command.contains(" --agent claude-code"));
 
             install_hook(alias_home.path(), "claude-code", None, iw, false, false).unwrap();
             assert_eq!(std::fs::read(&report.settings_path).unwrap(), expected);
@@ -2548,7 +3129,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             installed["command"],
-            "\"/current/target/release/innerwarden\" hook --block-review"
+            format!("\"/current/target/release/innerwarden\" hook --block-review{CLOSED}")
         );
         assert_eq!(installed["timeout"], 21);
         assert_eq!(installed["operator_note"], "keep");
@@ -2898,26 +3479,166 @@ mod hook_program_tests {
         }
     }
 
-    /// A bare name is found through `PATH`, as the agent's shell finds it. An
-    /// unquoted command is read by the same grammar as a quoted one.
+    /// A bare name is found on the agent's own PATH, which this process cannot
+    /// see. Found here, the answer is "could not tell", never an OK that could
+    /// be false. Found nowhere here (this PATH and the usual places), it is
+    /// off. An unquoted command is read by the same grammar as a quoted one.
+    ///
+    /// FAILS ON REVERT: let a bare name take the lookup's answer again and
+    /// `Executable` reads `Runs`.
     #[test]
-    fn a_bare_program_that_is_not_on_path_does_not_run() {
+    fn a_bare_program_found_here_could_not_be_told_and_one_found_nowhere_is_off() {
         let settings = measured("innerwarden hook --agent claude-code");
         assert_eq!(
             effective_iwguard_hook_programs(&settings),
             vec!["innerwarden".to_string()]
         );
-        match judge_iwguard_hooks(&settings, |_| ProgramFact::Missing) {
-            Some(HookProgram::Broken { program, problem }) => {
-                assert_eq!(program, "innerwarden");
-                assert_eq!(problem, "its hook runs `innerwarden`, which is not on PATH");
+        for fact in [ProgramFact::Executable, ProgramFact::Unreadable] {
+            match judge_iwguard_hooks(&settings, |_| fact) {
+                Some(HookProgram::Unknown { program, why }) => {
+                    assert_eq!(program, "innerwarden");
+                    assert!(why.starts_with(BARE_NAME), "{fact:?}: {why}");
+                }
+                other => panic!("{fact:?}: found here is not the agent's answer: {other:?}"),
             }
-            other => panic!("a name no PATH directory holds cannot start: {other:?}"),
         }
+        // Found nowhere here (PATH and the usual places): off, as before.
+        for fact in [ProgramFact::Missing, ProgramFact::NotExecutable] {
+            match judge_iwguard_hooks(&settings, |_| fact) {
+                Some(HookProgram::Broken { program, problem }) => {
+                    assert_eq!(program, "innerwarden");
+                    assert!(
+                        problem.starts_with("its hook runs `innerwarden`, which is not on PATH"),
+                        "{problem}"
+                    );
+                    assert!(problem.ends_with(BARE_NOT_FOUND), "{problem}");
+                }
+                other => panic!("{fact:?}: a name found nowhere cannot start: {other:?}"),
+            }
+        }
+    }
+
+    /// The installer's line (an absolute path in quotes) keeps its verdicts:
+    /// the bare-name rule and the hand-written lines change nothing for it.
+    #[test]
+    fn the_installers_quoted_absolute_line_keeps_its_verdicts() {
+        let program = abs("opt/iw bin");
+        let settings = measured(&format!("\"{program}\" hook --agent claude-code"));
         assert_eq!(
             judge_iwguard_hooks(&settings, |_| ProgramFact::Executable),
             Some(HookProgram::Runs)
         );
+        assert!(matches!(
+            judge_iwguard_hooks(&settings, |_| ProgramFact::Missing),
+            Some(HookProgram::Broken { .. })
+        ));
+        assert!(wrapped_iwguard_hooks(&settings).is_empty());
+        // The line the installer writes, fail-closed tail included.
+        let written = hook_command_for(Path::new(&program), false, false, Some("claude-code"));
+        assert!(wrapped_iwguard_hooks(&measured(&written)).is_empty());
+    }
+
+    fn one_wrapped(command: &str) -> WrappedHook {
+        let found = wrapped_iwguard_hooks(&measured(command));
+        assert_eq!(found.len(), 1, "{command}: {found:?}");
+        assert!(found[0].screens_bash);
+        assert_eq!(found[0].command, command);
+        found[0].clone()
+    }
+
+    fn unknown_naming_the_line(verdict: HookProgram, command: &str) {
+        match verdict {
+            HookProgram::Unknown { why, .. } => {
+                assert!(why.starts_with("could not tell"), "{why}");
+                assert!(why.contains(command), "the line itself is named: {why}");
+            }
+            other => panic!("{command}: a hand-written line is could not tell: {other:?}"),
+        }
+    }
+
+    /// `env X=1 /p/innerwarden hook`: not the guard's line, so it used to be
+    /// skipped in silence. Now it is found, with the binary it names.
+    ///
+    /// FAILS ON REVERT: drop `wrapped_iwguard_hooks` (or let it skip a line
+    /// whose first word is not the guard) and nothing is found.
+    #[test]
+    fn a_line_with_env_in_front_is_could_not_tell_with_the_line() {
+        let program = abs("opt/iw");
+        let command = format!("env IW_X=1 {program} hook --agent claude-code");
+        assert!(!is_iwguard_hook(&json!({"command": command})));
+        let wrapped = one_wrapped(&command);
+        assert_eq!(wrapped.program, program);
+        unknown_naming_the_line(
+            judge_wrapped_hook(&wrapped, ProgramFact::Executable),
+            &command,
+        );
+    }
+
+    /// A path with a space and no quotes: the shell splits it, so what starts
+    /// is not knowable from the text.
+    #[test]
+    fn a_path_with_a_space_and_no_quotes_is_could_not_tell_with_the_line() {
+        let command = if cfg!(windows) {
+            r"C:\my tools\innerwarden.exe hook".to_string()
+        } else {
+            "/home/my user/bin/innerwarden hook".to_string()
+        };
+        let wrapped = one_wrapped(&command);
+        for fact in [ProgramFact::Missing, ProgramFact::Executable] {
+            unknown_naming_the_line(judge_wrapped_hook(&wrapped, fact), &command);
+        }
+    }
+
+    /// `sh -c '/p/innerwarden hook'`: the binary is inside the quoted script.
+    #[test]
+    fn a_line_through_sh_c_is_could_not_tell_with_the_line() {
+        let program = abs("opt/iw");
+        let command = format!("sh -c '{program} hook --monitor'");
+        let wrapped = one_wrapped(&command);
+        assert_eq!(wrapped.program, program);
+        unknown_naming_the_line(
+            judge_wrapped_hook(&wrapped, ProgramFact::Executable),
+            &command,
+        );
+    }
+
+    /// A hand-written line whose binary is gone is the same alarm as the
+    /// guard's own line: nothing it names can start.
+    ///
+    /// FAILS ON REVERT: make `judge_wrapped_hook` always "could not tell"
+    /// and the gone binary reads unknown.
+    #[test]
+    fn a_hand_written_line_whose_binary_is_gone_is_broken() {
+        let program = abs("gone/target/release");
+        let command = format!("env IW_X=1 {program} hook");
+        let wrapped = one_wrapped(&command);
+        match judge_wrapped_hook(&wrapped, ProgramFact::Missing) {
+            HookProgram::Broken {
+                program: named,
+                problem,
+            } => {
+                assert_eq!(named, program);
+                assert!(problem.contains(&command), "{problem}");
+                assert!(problem.ends_with("which does not exist"), "{problem}");
+            }
+            other => panic!("a gone binary is the same alarm: {other:?}"),
+        }
+    }
+
+    /// Lines that do not name the guard's binary with `hook` stay the
+    /// operator's: nothing is reported for them.
+    #[test]
+    fn a_line_that_only_mentions_the_guard_is_not_named() {
+        for command in [
+            "/operator/check.sh",
+            "/usr/sbin/iw dev wlan0 hook",
+            "innerwarden-helper hook",
+        ] {
+            assert!(
+                wrapped_iwguard_hooks(&measured(command)).is_empty(),
+                "{command}"
+            );
+        }
     }
 
     #[test]

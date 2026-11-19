@@ -208,7 +208,12 @@ fn route(engine: Option<&RuleEngine>, msg: &Value, method: &str) -> usize {
     )
     .verdict
     .alerts
-    .len()
+    .iter()
+    // A text past the proxy's 64 KiB read cap is cut, and the cut is said
+    // with AG-RESP-PARTIAL; the ordinary text here is just over it. That
+    // notice is no rule matching the text, which is what is counted.
+    .filter(|alert| alert.rule != "AG-RESP-PARTIAL")
+    .count()
 }
 
 fn tool_result(engine: Option<&RuleEngine>, text: &str) -> usize {
