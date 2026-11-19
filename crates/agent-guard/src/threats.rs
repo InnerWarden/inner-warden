@@ -7014,6 +7014,10 @@ fn may_name_guard_carrier(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
     lower.contains("innerwarden")
         || names_guard_alias(content)
+        || settings_hook_programs()
+            .programs
+            .iter()
+            .any(|program| lower.contains(token_basename(program)))
         || AGENT_HOMES.iter().any(|home| lower.contains(home))
         || guard_carrier_places().any(|place| {
             let (Place::File(row) | Place::Tree(row) | Place::Components(row)) = place;
@@ -7220,6 +7224,24 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 if command == "mv" {
                     taken.extend(sources.iter().map(|path| path.to_string()));
                 }
+                // `rsync --delete` (and `--delete-before`, `--del`, ...)
+                // removes what the destination holds that the source does
+                // not: the destination folder is taken away, not only
+                // written. `--remove-source-files` takes the sources.
+                if command == "rsync" {
+                    if arguments
+                        .iter()
+                        .any(|argument| argument == "--del" || argument.starts_with("--delete"))
+                    {
+                        taken.extend(destination.clone());
+                    }
+                    if arguments
+                        .iter()
+                        .any(|argument| argument == "--remove-source-files")
+                    {
+                        taken.extend(sources.iter().map(|path| path.to_string()));
+                    }
+                }
                 if let Some(destination) = destination {
                     // Into a directory, each source lands under its own name.
                     if named_directory || sources.len() > 1 || reads_as_directory(&destination) {
@@ -7245,6 +7267,11 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 {
                     return true;
                 }
+            }
+            "find" | "gfind" => {
+                let (taken_by_find, written_by_find) = find_takes_and_writes(arguments);
+                taken.extend(taken_by_find);
+                targets.extend(written_by_find);
             }
             "dd" => targets.extend(dd_operand(arguments, "of").map(str::to_string)),
             "curl" => targets.extend(option_values(arguments, 'o', &["output"])),
@@ -7279,6 +7306,102 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
         }
     }
     false
+}
+
+/// What a `find` takes away and what it writes, for [`writes_place`].
+///
+/// With `-delete`, or `-exec`, `-execdir`, `-ok` or `-okdir` running a
+/// program that removes, moves or edits what it is handed, every root of the
+/// search is taken away, filtered or not: `find ~/.config/innerwarden -name
+/// config.json -delete` removes a file of that folder. A root above the
+/// place (`find ~/.config -path '*innerwarden*' -delete`) is read with the
+/// plain words of each `-name`, `-path` or `-regex` pattern under it.
+/// `-fprint`, `-fprint0`, `-fprintf` and `-fls` write their file.
+///
+/// Not read: a root above the place with a pattern that does not spell the
+/// place (`find ~ -name config.json -delete`).
+fn find_takes_and_writes(arguments: &[String]) -> (Vec<String>, Vec<String>) {
+    const REMOVERS: &[&str] = &[
+        "rm", "unlink", "shred", "truncate", "mv", "rmdir", "chmod", "tee", "dd", "ln",
+    ];
+    const PATTERNS: &[&str] = &[
+        "-name",
+        "-iname",
+        "-path",
+        "-ipath",
+        "-wholename",
+        "-iwholename",
+        "-regex",
+        "-iregex",
+    ];
+    // Options before the roots: `-H`, `-L`, `-P`, `-D debug`, `-O3`.
+    let mut at = 0usize;
+    while let Some(word) = arguments.get(at) {
+        match word.as_str() {
+            "-H" | "-L" | "-P" => at += 1,
+            "-D" => at += 2,
+            _ if word.starts_with("-O") => at += 1,
+            _ => break,
+        }
+    }
+    let roots: Vec<&String> = arguments[at.min(arguments.len())..]
+        .iter()
+        .take_while(|word| {
+            !word.starts_with('-') && !matches!(word.as_str(), "(" | "!" | "\\(" | "\\!")
+        })
+        .collect();
+    let expression = &arguments[(at + roots.len()).min(arguments.len())..];
+    let mut takes = false;
+    let mut written = Vec::new();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut words = expression.iter().peekable();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "-delete" => takes = true,
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                let Some(program) = words.next() else { break };
+                let program =
+                    token_basename(program.trim_matches(['"', '\''])).to_ascii_lowercase();
+                let mut handed = Vec::new();
+                for argument in words.by_ref() {
+                    if matches!(argument.as_str(), ";" | "\\;" | "+" | "';'") {
+                        break;
+                    }
+                    handed.push(argument.clone());
+                }
+                takes |= REMOVERS.contains(&program.as_str())
+                    || SHELLS.contains(&program.as_str())
+                    || (matches!(program.as_str(), "sed" | "gsed" | "perl")
+                        && handed
+                            .iter()
+                            .any(|argument| edits_in_place(&program, argument)));
+            }
+            "-fprint" | "-fprint0" | "-fls" => written.extend(words.next().cloned()),
+            "-fprintf" => written.extend(words.next().cloned()),
+            pattern if PATTERNS.contains(&pattern) => {
+                if let Some(value) = words.next() {
+                    pieces.extend(
+                        value
+                            .trim_matches(['"', '\''])
+                            .split(|c: char| "*?[]{}()|^$\\+".contains(c))
+                            .map(|piece| piece.trim_matches('/'))
+                            .filter(|piece| !piece.is_empty() && *piece != ".")
+                            .map(str::to_string),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut taken = Vec::new();
+    if takes {
+        for root in roots {
+            let root = root.trim_matches(['"', '\'']).trim_end_matches('/');
+            taken.push(root.to_string());
+            taken.extend(pieces.iter().map(|piece| format!("{root}/{piece}")));
+        }
+    }
+    (taken, written)
 }
 
 /// How many directories [`writes_place`] keeps for a line. A relative `cd`
@@ -7559,12 +7682,126 @@ fn names_guard_carrier(target: &str) -> bool {
     if guard_carrier_places().any(|place| place.holds(&named)) {
         return true;
     }
+    if names_a_settings_hook_program(target) {
+        return true;
+    }
     let mut parts = named.path.rsplit('/');
     let program = parts.next().unwrap_or_default();
     let program = program.strip_suffix(".exe").unwrap_or(program);
     (named.rooted || named.path.starts_with('~'))
         && matches!(parts.next(), Some("bin" | "sbin"))
         && GUARD_PROGRAMS.contains(&program)
+}
+
+/// The programs the agent's settings run as the guard's hook, wherever they
+/// are: the guard's own binary at any path (`/opt/iw/innerwarden hook`), or
+/// a script a hook runs whose line names the guard (`bash
+/// ~/tools/innerwarden-hook.sh`). Read once per process from Claude Code's
+/// settings in the home and in the working directory, with a leading home
+/// spelled `~`, lowercase. The settings' own files are places of
+/// [`GUARD_SETTINGS`] already; this is what their hook line points at.
+struct SettingsHookPrograms {
+    /// The home, lowercase, without its last `/`.
+    home: Option<String>,
+    /// Each program, as [`named_path`] reads it once its home is `~`.
+    programs: Vec<String>,
+}
+
+fn settings_hook_programs() -> &'static SettingsHookPrograms {
+    static PROGRAMS: std::sync::OnceLock<SettingsHookPrograms> = std::sync::OnceLock::new();
+    PROGRAMS.get_or_init(|| {
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(std::path::PathBuf::from);
+        let mut folders: Vec<std::path::PathBuf> = home.iter().cloned().collect();
+        folders.extend(std::env::current_dir().ok());
+        let home_text = home.as_ref().map(|home| {
+            home.to_string_lossy()
+                .to_lowercase()
+                .trim_end_matches('/')
+                .to_string()
+        });
+        let mut programs = Vec::new();
+        for folder in &folders {
+            for name in ["settings.json", "settings.local.json"] {
+                let Ok(bytes) = std::fs::read(folder.join(".claude").join(name)) else {
+                    continue;
+                };
+                if bytes.len() > SETTINGS_READ_BYTES {
+                    continue;
+                }
+                let Ok(settings) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue;
+                };
+                for program in guard_hook_programs_in(&settings) {
+                    if let Some(named) = named_path(&home_as_tilde(&program, home_text.as_deref()))
+                    {
+                        if (named.rooted || named.path.starts_with('~'))
+                            && !programs.contains(&named.path)
+                        {
+                            programs.push(named.path);
+                        }
+                    }
+                }
+            }
+        }
+        SettingsHookPrograms {
+            home: home_text,
+            programs,
+        }
+    })
+}
+
+/// Largest settings file read for [`settings_hook_programs`].
+const SETTINGS_READ_BYTES: usize = 1 << 20;
+
+/// The program each `PreToolUse` hook in `settings` runs, where its line
+/// names the guard: the first word, or the script a shell is handed.
+fn guard_hook_programs_in(settings: &serde_json::Value) -> Vec<String> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(serde_json::Value::as_str))
+        .filter(|command| {
+            command.to_ascii_lowercase().contains("innerwarden") || names_a_guard_program(command)
+        })
+        .filter_map(|command| {
+            let mut words = command
+                .split_whitespace()
+                .map(|word| word.trim_matches(['"', '\'']));
+            let first = words.next()?;
+            if SHELLS.contains(&token_basename(first)) {
+                words
+                    .find(|word| !word.starts_with('-'))
+                    .map(str::to_string)
+            } else {
+                Some(first.to_string())
+            }
+        })
+        .collect()
+}
+
+/// `path` lowercase, with `$HOME` and the home itself spelled `~`.
+fn home_as_tilde(path: &str, home: Option<&str>) -> String {
+    let spelled = home_spelled(path);
+    match home.and_then(|home| spelled.strip_prefix(home)) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => spelled,
+    }
+}
+
+/// Whether a path names a program the agent's settings run as the guard's
+/// hook ([`settings_hook_programs`]).
+fn names_a_settings_hook_program(target: &str) -> bool {
+    let known = settings_hook_programs();
+    !known.programs.is_empty()
+        && named_path(&home_as_tilde(target, known.home.as_deref()))
+            .is_some_and(|named| known.programs.contains(&named.path))
 }
 
 /// The folders the agents keep their settings in, each of which holds a

@@ -132,3 +132,58 @@ fn rsync_rsh_with_an_outside_configuration_is_not_key_use() {
         "allow"
     );
 }
+
+/// A `find` that removes, edits or writes over what is under a place of the
+/// guard is that removal, filtered or not, whatever the root is spelled as.
+/// Measured on main on 2026-11-19: every line here but the `-exec` ones was
+/// allowed; only an unfiltered `-delete` was refused, as a bulk deletion.
+#[test]
+fn find_over_the_guards_places_is_their_removal() {
+    for line in [
+        "find ~/.config/innerwarden -name config.json -delete",
+        "find /etc/innerwarden -name '*.toml' -delete",
+        "find /var/lib/innerwarden -name '*.db' -delete",
+        "find -L ~/.config/innerwarden -name x -delete",
+        "d=~/.config/innerwarden; find $d -name '*.json' -delete",
+        "cd ~/.config && find innerwarden -name config.json -delete",
+        "find ~/.config -path '*innerwarden*' -delete",
+        "find ~/.config/innerwarden -name suppress.toml -exec rm {} \\;",
+        "find ~/.config/innerwarden -name suppress.toml -exec rm -f {} +",
+        "find ~/.config/innerwarden -name '*.toml' -execdir rm {} \\;",
+        "find ~/.config/innerwarden -name '*.toml' -exec sed -i s/a/b/ {} \\;",
+        "find /tmp -name x -fprint ~/.config/innerwarden/suppress.toml",
+        "find . -fprint /etc/innerwarden/agent.toml",
+        "find ~/.claude -name settings.json -delete",
+        "find /tmp -name x -fprint ~/.ssh/config",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    for line in [
+        "find . -name '*.pyc' -delete",
+        "find ~/innerwarden -name '*.orig' -delete",
+        "find ~ -name '*.pyc' -delete",
+        "find /tmp -name x -fprint /tmp/list",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// `rsync --delete` into a place of the guard removes what it holds.
+#[test]
+fn rsync_delete_into_the_guards_places_is_their_removal() {
+    for line in [
+        "rsync -a --delete empty/ ~/.config/innerwarden/",
+        "rsync -a --delete-after /tmp/e/ ~/.config/innerwarden/",
+        "rsync -a --delete /tmp/e/ /etc/innerwarden/",
+        "rsync -a --delete /tmp/e/ ~/.claude/",
+        "rsync -a --remove-source-files ~/.claude/settings.json /tmp/",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    for line in [
+        "rsync -a --delete src/ /srv/app/",
+        "rsync -a --delete src/ ./build/",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
