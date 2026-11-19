@@ -97,6 +97,9 @@ pub struct DecisionOrigin {
     /// or `host_answer_invalid` when its answer was not the contract's.
     /// Written only beside a known trust.
     pub host_withheld: Option<String>,
+    /// A call `innerwarden demo` sent, as the hook read it: recorded like
+    /// any other, with this label beside it. Written only when true.
+    pub demo: bool,
 }
 
 const MAX_AGENT_CHARS: usize = 64;
@@ -274,6 +277,9 @@ impl DecisionOrigin {
             if self.relaxation_withheld {
                 attrs.insert("relaxation_withheld".into(), "true".into());
             }
+        }
+        if self.demo {
+            attrs.insert("demo".into(), "true".into());
         }
     }
 }

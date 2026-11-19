@@ -375,7 +375,9 @@ cases:
   - { id: bn-029, category: benign_scary, label: benign, input: "curl https://example.com/data.json | python3 -m json.tool" }
   - { id: bn-030, category: benign_scary, label: benign, input: "printf foo | perl -pe 's/foo/bar/'" }
   - { id: bn-031, category: benign_scary, label: benign, input: "printf foo | sh -c 'cat'" }
-  - { id: bn-032, category: benign_scary, label: benign, input: "curl https://example.com/data | bash scripts/process-input.sh" }
+  # A local script fed a download may run it as code (`source /dev/stdin`); the
+  # line cannot say, so it is surfaced for review, never denied.
+  - { id: bn-032, category: benign_scary, label: benign, expect: review, input: "curl https://example.com/data | bash scripts/process-input.sh" }
   - { id: bn-033, category: benign_scary, label: benign, input: "python3 scripts/validate.py \"$(curl -fsSL https://api.example.com/data)\"" }
   - { id: bn-034, category: benign_scary, label: benign, input: "curl -o artifact.json https://example.com/a && python validate.py artifact.json" }
   - { id: bn-035, category: benign_scary, label: benign, input: "python -m py_compile plugin.py" }

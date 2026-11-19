@@ -1183,6 +1183,31 @@ pub fn effective_iwguard_hook_programs(settings: &Value) -> Vec<String> {
         .collect()
 }
 
+/// The words of each InnerWarden hook Claude Code runs before `tool`
+/// (`Bash`, `Read`, `Write`, ...), quotes removed, in file order: the
+/// hooks under a `PreToolUse` matcher that certainly includes the tool.
+/// Empty when no hook of ours is wired for it.
+///
+/// Read with the same small grammar detection uses, so a hook is only ever
+/// taken from a command this module already calls its own. `innerwarden
+/// demo` runs these, as written, to show what each one answers.
+pub fn iwguard_hook_commands_for_tool(settings: &Value, tool: &str) -> Vec<Vec<String>> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| tool_matcher_coverage(entry, tool) == BashMatcherCoverage::Includes)
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|hook| is_iwguard_hook(hook))
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+        .filter_map(hook_command_words)
+        .filter(|words| !words.is_empty())
+        .collect()
+}
+
 /// PURE: can the InnerWarden hooks that screen Bash actually start? `None`
 /// when there are none.
 ///
@@ -1466,6 +1491,44 @@ mod tests {
     /// The tail [`hook_command_for`] writes after a refusing hook on this
     /// platform: [`FAIL_CLOSED`] on unix, nothing elsewhere.
     const CLOSED: &str = if cfg!(unix) { FAIL_CLOSED } else { "" };
+
+    /// `innerwarden demo` sends each call only to the hooks Claude Code would
+    /// run for that tool: ours, under a matcher that includes it, never an
+    /// operator's hook beside it.
+    ///
+    /// FAILS ON REVERT: drop the matcher filter and the Bash hook is listed
+    /// for `Read`; drop the ownership filter and the operator's hook is run.
+    #[test]
+    fn hook_commands_for_a_tool_are_ours_under_its_matcher() {
+        let settings = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "\"/p/innerwarden\" hook --agent claude-code"},
+                {"type": "command", "command": "/usr/local/bin/my-own-check"}
+            ]},
+            {"matcher": "Read|Grep|Glob", "hooks": [
+                {"type": "command", "command": "\"/p/innerwarden\" hook --monitor"}
+            ]}
+        ]}});
+        assert_eq!(
+            iwguard_hook_commands_for_tool(&settings, "Bash"),
+            vec![vec![
+                "/p/innerwarden".to_string(),
+                "hook".into(),
+                "--agent".into(),
+                "claude-code".into()
+            ]]
+        );
+        assert_eq!(
+            iwguard_hook_commands_for_tool(&settings, "Read"),
+            vec![vec![
+                "/p/innerwarden".to_string(),
+                "hook".into(),
+                "--monitor".into()
+            ]]
+        );
+        assert!(iwguard_hook_commands_for_tool(&settings, "Write").is_empty());
+        assert!(iwguard_hook_commands_for_tool(&json!({}), "Bash").is_empty());
+    }
 
     #[test]
     fn merge_into_empty_adds_bash_hook() {
