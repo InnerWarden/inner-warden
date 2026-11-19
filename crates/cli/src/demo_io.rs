@@ -16,9 +16,29 @@ use innerwarden_agent_guard::{agents_ops, hook};
 
 use crate::demo::{self, AgentDemo, CallResult, DemoCall, Outcome, Via};
 
-/// How long one hook gets to answer. A hook answers in well under a second;
-/// this only bounds one that hangs, so the demo itself never does.
+/// How long one hook, or its program's `--version`, gets to answer. A hook
+/// answers in well under a second; this only bounds one that hangs, so the
+/// demo itself never does.
 const HOOK_WAIT: Duration = Duration::from_secs(20);
+
+/// A fresh nonce for this run: 128 bits from two independently, randomly
+/// keyed std hashers (the OS seeds each `RandomState`), mixed with the
+/// clock and the pid, as 32 hex digits.
+fn new_nonce() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let salt = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let half = || {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u128(salt);
+        hasher.write_u32(std::process::id());
+        hasher.finish()
+    };
+    format!("{:016x}{:016x}", half(), half())
+}
 
 pub(crate) fn cmd(rest: &[String]) -> ExitCode {
     let mut as_json = false;
@@ -42,9 +62,13 @@ pub(crate) fn cmd(rest: &[String]) -> ExitCode {
     };
     let rows = agents_ops::rows(&home);
     let calls = demo::calls(&home);
-    let agents = gather(&home, &rows, &calls);
+    let nonce = new_nonce();
+    let agents = gather(&home, &rows, &calls, &nonce);
+    // "Running" only from the process scan (a row's pids), never from an
+    // agent's config dir or binary merely being here.
+    let running = rows.iter().any(|row| !row.pids.is_empty());
     let none = (!agents.iter().any(|a| a.wired))
-        .then(|| crate::status::nothing_wired_finding(Some(!rows.is_empty())));
+        .then(|| crate::status::nothing_wired_finding(Some(running)));
     if as_json {
         println!("{}", demo::to_json(&agents, none.as_ref()));
     } else {
@@ -54,7 +78,7 @@ pub(crate) fn cmd(rest: &[String]) -> ExitCode {
 }
 
 /// Every agent here that can be wired, with what each connected one answered.
-fn gather(home: &Path, rows: &[AgentStatus], calls: &[DemoCall]) -> Vec<AgentDemo> {
+fn gather(home: &Path, rows: &[AgentStatus], calls: &[DemoCall], nonce: &str) -> Vec<AgentDemo> {
     let wiring = crate::status_wiring(Some(home), rows);
     let mut engine: Option<RuleEngine> = None;
     let mut out = Vec::new();
@@ -107,7 +131,7 @@ fn gather(home: &Path, rows: &[AgentStatus], calls: &[DemoCall]) -> Vec<AgentDem
             None => demo::connected_finding(&row.name, via, mode.as_deref()),
         };
         let results = match via {
-            Via::Hook => through_hooks(home, calls),
+            Via::Hook => through_hooks(home, calls, nonce),
             Via::Proxy => {
                 let engine = engine.get_or_insert_with(RuleEngine::load_embedded);
                 through_proxy(calls, row.mode, engine)
@@ -130,7 +154,7 @@ fn gather(home: &Path, rows: &[AgentStatus], calls: &[DemoCall]) -> Vec<AgentDem
 /// tool, as the settings write it: the same program, the same flags, the
 /// payload on stdin. Claude Code's settings are the ones every hook agent
 /// is wired in (`agents_ops::hook_program` reads the same file).
-fn through_hooks(home: &Path, calls: &[DemoCall]) -> Vec<CallResult> {
+fn through_hooks(home: &Path, calls: &[DemoCall], nonce: &str) -> Vec<CallResult> {
     let settings = std::fs::read_to_string(home.join(".claude/settings.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -148,7 +172,7 @@ fn through_hooks(home: &Path, calls: &[DemoCall]) -> Vec<CallResult> {
                     let speaks = match versions.iter().find(|(p, _)| p == program) {
                         Some((_, known)) => known.clone(),
                         None => {
-                            let known = speaks_demo(program);
+                            let known = speaks_demo(program, HOOK_WAIT);
                             versions.push((program.clone(), known.clone()));
                             known
                         }
@@ -158,8 +182,14 @@ fn through_hooks(home: &Path, calls: &[DemoCall]) -> Vec<CallResult> {
                         result.why = Some(why);
                         return result;
                     }
-                    let payload = demo::hook_payload(call, home, index);
-                    let (exit, stdout, stderr) = run_hook(words, home, &payload);
+                    let payload = demo::hook_payload(call, home, index, nonce);
+                    let (exit, stdout, stderr) = run_bounded(
+                        words,
+                        Some(home),
+                        Some((demo::DEMO_NONCE_ENV, nonce)),
+                        Some(&payload),
+                        HOOK_WAIT,
+                    );
                     let (outcome, recommendation, why) = demo::hook_outcome(exit, &stdout, &stderr);
                     CallResult {
                         recommendation,
@@ -182,15 +212,25 @@ fn through_hooks(home: &Path, calls: &[DemoCall]) -> Vec<CallResult> {
 
 /// Whether the hook's program is this same version: an older one has no idea
 /// what the demo marker means and would record the calls, and alert on them,
-/// as an agent's. `Err` says why the call was not sent.
-fn speaks_demo(program: &str) -> Result<(), String> {
+/// as an agent's. `Err` says why the call was not sent. Bounded by `wait`,
+/// like the hook itself.
+fn speaks_demo(program: &str, wait: Duration) -> Result<(), String> {
     let ours = env!("CARGO_PKG_VERSION");
-    let output = Command::new(program)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("its hook runs {program}, which could not be started: {e}"))?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let words = [program.to_string(), "--version".to_string()];
+    let (exit, stdout, stderr) = run_bounded(&words, None, None, None, wait);
+    match exit {
+        None => return Err(format!(
+            "its hook runs {program}, whose --version did not answer in {}s, so it was not sent",
+            wait.as_secs()
+        )),
+        Some(-1) if stdout.is_empty() => {
+            return Err(format!(
+                "its hook runs {program}, which could not be started: {stderr}"
+            ))
+        }
+        Some(_) => {}
+    }
+    let text = stdout;
     let theirs = text.split_whitespace().nth(1).unwrap_or("").to_string();
     if theirs == ours {
         Ok(())
@@ -203,16 +243,33 @@ fn speaks_demo(program: &str) -> Result<(), String> {
     }
 }
 
-/// Run one hook with `payload` on stdin: exit code (`None` when it did not
-/// finish in [`HOOK_WAIT`] and was stopped), stdout and stderr.
-fn run_hook(words: &[String], home: &Path, payload: &str) -> (Option<i32>, String, String) {
-    let child = Command::new(&words[0])
+/// Run `words` with `stdin` (or none), in `dir` when given, with `env`
+/// added: exit code (`None` when it did not finish in `wait` and was
+/// stopped; `Some(-1)` when it could not be started), stdout and stderr.
+fn run_bounded(
+    words: &[String],
+    dir: Option<&Path>,
+    env: Option<(&str, &str)>,
+    stdin: Option<&str>,
+    wait: Duration,
+) -> (Option<i32>, String, String) {
+    let mut command = Command::new(&words[0]);
+    command
         .args(&words[1..])
-        .current_dir(home)
-        .stdin(Stdio::piped())
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+    if let Some(dir) = dir {
+        command.current_dir(dir);
+    }
+    if let Some((key, value)) = env {
+        command.env(key, value);
+    }
+    let child = command.spawn();
     let mut child = match child {
         Ok(child) => child,
         Err(e) => {
@@ -223,16 +280,14 @@ fn run_hook(words: &[String], home: &Path, payload: &str) -> (Option<i32>, Strin
             )
         }
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(payload.as_bytes());
+    if let (Some(mut pipe), Some(text)) = (child.stdin.take(), stdin) {
+        let _ = pipe.write_all(text.as_bytes());
     }
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if started.elapsed() < HOOK_WAIT => {
-                std::thread::sleep(Duration::from_millis(10))
-            }
+            Ok(None) if started.elapsed() < wait => std::thread::sleep(Duration::from_millis(10)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -334,5 +389,33 @@ mod tests {
         // A mixed or unreadable wiring shows what its recording half does.
         let mixed = through_proxy(&calls, Some(GuardMode::Mixed), &engine);
         assert!(mixed.iter().all(|r| r.outcome != Outcome::Refused));
+    }
+
+    /// A hook program whose `--version` hangs is stopped at the wait, and
+    /// the call is not sent, so the demo itself never hangs.
+    ///
+    /// FAILS ON REVERT: run `--version` with no bound and this waits out the
+    /// program's sleep.
+    #[cfg(unix)]
+    #[test]
+    fn a_version_check_that_hangs_is_stopped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let program = dir.path().join("innerwarden");
+        std::fs::write(&program, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = Instant::now();
+        let got = speaks_demo(program.to_str().unwrap(), Duration::from_millis(300));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let why = got.unwrap_err();
+        assert!(why.contains("did not answer"), "{why}");
+    }
+
+    /// Two runs never share a nonce, and each is long enough to count.
+    #[test]
+    fn each_run_has_its_own_nonce() {
+        let (a, b) = (new_nonce(), new_nonce());
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 32);
     }
 }

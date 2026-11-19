@@ -1079,7 +1079,10 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // A call `innerwarden demo` sent: judged exactly as an agent's, but
     // nothing is recorded, alerted on or asked of a second opinion, and the
     // verdict is also written to stdout for the demo to show.
-    let demo = demo::is_demo_payload(&buf);
+    // Only with this run's nonce, handed to this process by the demo in its
+    // environment: a payload alone, whatever it carries, is never a demo call.
+    let demo_nonce = std::env::var(demo::DEMO_NONCE_ENV).ok();
+    let demo = demo::is_demo_payload(&buf, demo_nonce.as_deref());
     if demo && hook_tool_result(&buf).is_some() {
         return std::process::ExitCode::SUCCESS;
     }

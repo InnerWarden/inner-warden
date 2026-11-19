@@ -7,10 +7,13 @@
 //!
 //! Nothing is ever run. A hook only judges the call it is given and answers
 //! with an exit code; the MCP proxy's judgment is made here, by the proxy's own
-//! code, with no server started. The calls carry [`DEMO_MARKER`] at the top of
-//! the payload, a field no agent writes and no tool input can reach, and a hook
-//! that sees it records nothing, alerts nobody and asks no second opinion, so
-//! the demo leaves the record and the session state as they were.
+//! code, with no server started. Each run makes a fresh random nonce and hands
+//! it to the hooks it starts in [`DEMO_NONCE_ENV`]; the calls carry the same
+//! value at [`DEMO_MARKER`], at the top of the payload, where no agent writes.
+//! A hook treats a call as the demo's only when the two match, and then records
+//! nothing, alerts nobody and asks no second opinion, so the demo leaves the
+//! record and the session state as they were. Session behaviour, taint and the
+//! host are not consulted for a demo call, so a live session can refuse more.
 //!
 //! This half is pure: the calls, how a hook's answer is read, the report and
 //! the exit code. `demo_io` does the looking and the running.
@@ -21,8 +24,20 @@ use serde_json::{json, Value};
 
 use crate::status::Finding;
 
-/// The top-level payload field that marks a call `innerwarden demo` sent.
+/// The top-level payload field that marks a call `innerwarden demo` sent. It
+/// holds this run's nonce, never a plain `true`.
 pub(crate) const DEMO_MARKER: &str = "innerwarden_demo";
+
+/// The environment variable the demo sets, for the hooks it starts and only
+/// for them, to this run's nonce.
+pub(crate) const DEMO_NONCE_ENV: &str = "INNERWARDEN_DEMO_NONCE";
+
+/// A nonce shorter than this is not one the demo made, so it marks nothing.
+const MIN_NONCE_LEN: usize = 16;
+
+/// What an allowed line adds: the demo judges the call alone.
+pub(crate) const NO_SESSION_CHECKS: &str =
+    "session and host checks not applied here; a live session can refuse more";
 
 /// The session id a demo call names, so no agent's session window is touched
 /// even by a hook that predates the marker.
@@ -34,18 +49,25 @@ pub(crate) const EXIT_SOME_PASS: u8 = 1;
 pub(crate) const EXIT_USAGE: u8 = 2;
 pub(crate) const EXIT_NOTHING_CONNECTED: u8 = 3;
 
-/// Whether a hook payload is one `innerwarden demo` sent: `true` at
-/// [`DEMO_MARKER`], at the top level only. An agent controls what goes inside
-/// `tool_input`, never the payload around it, so a command that merely
-/// mentions the marker is screened and recorded like any other.
-pub(crate) fn is_demo_payload(buf: &str) -> bool {
+/// Whether a hook payload is one `innerwarden demo` sent: this run's nonce
+/// (`nonce`, read from [`DEMO_NONCE_ENV`] by the hook) at [`DEMO_MARKER`],
+/// at the top level only. An agent controls what goes inside `tool_input`,
+/// never the payload around it nor the hook's environment, so a command that
+/// merely mentions the marker, or a payload with `true` there, is screened
+/// and recorded like any other.
+pub(crate) fn is_demo_payload(buf: &str, nonce: Option<&str>) -> bool {
+    let Some(nonce) = nonce.filter(|n| n.len() >= MIN_NONCE_LEN) else {
+        return false;
+    };
     if !buf.contains(DEMO_MARKER) {
         return false;
     }
-    serde_json::from_str::<Value>(buf)
-        .ok()
-        .and_then(|payload| payload.get(DEMO_MARKER).and_then(Value::as_bool))
-        == Some(true)
+    serde_json::from_str::<Value>(buf).ok().and_then(|payload| {
+        payload
+            .get(DEMO_MARKER)
+            .and_then(Value::as_str)
+            .map(|value| value == nonce)
+    }) == Some(true)
 }
 
 /// The line a hook writes to stdout for a demo call: what it decided, so the
@@ -124,8 +146,9 @@ pub(crate) fn calls(home: &Path) -> Vec<DemoCall> {
     ]
 }
 
-/// The PreToolUse payload for one call, in Claude Code's shape, marked.
-pub(crate) fn hook_payload(call: &DemoCall, home: &Path, index: usize) -> String {
+/// The PreToolUse payload for one call, in Claude Code's shape, marked with
+/// this run's nonce.
+pub(crate) fn hook_payload(call: &DemoCall, home: &Path, index: usize, nonce: &str) -> String {
     json!({
         "session_id": DEMO_SESSION,
         "hook_event_name": "PreToolUse",
@@ -133,7 +156,7 @@ pub(crate) fn hook_payload(call: &DemoCall, home: &Path, index: usize) -> String
         "tool_name": call.tool,
         "tool_input": call.hook_input,
         "tool_use_id": format!("{DEMO_SESSION}-{index}"),
-        DEMO_MARKER: true,
+        DEMO_MARKER: nonce,
     })
     .to_string()
 }
@@ -166,7 +189,8 @@ pub(crate) enum Outcome {
     /// runs the call after a hook error that is not a refusal.
     Failed,
     /// Not sent: the hook runs a different version of InnerWarden, which
-    /// would record the call as an agent's.
+    /// would record the call as an agent's. Not tested, so it is counted
+    /// neither as stopped nor as let through.
     NotSent,
 }
 
@@ -189,7 +213,7 @@ impl Outcome {
             Outcome::Allowed => "LET THROUGH",
             Outcome::NotScreened => "NOT SCREENED",
             Outcome::Failed => "HOOK FAILED",
-            Outcome::NotSent => "not sent",
+            Outcome::NotSent => "not tested",
         }
     }
 
@@ -273,7 +297,14 @@ pub(crate) fn hook_outcome(
             text("explanation").or(first_stderr),
         ),
         Some(0) if blocks => (Outcome::WouldRefuse, recommendation, text("explanation")),
-        Some(0) => (Outcome::Allowed, recommendation, text("explanation")),
+        Some(0) => (
+            Outcome::Allowed,
+            recommendation,
+            Some(match text("explanation") {
+                Some(why) => format!("{why}; {NO_SESSION_CHECKS}"),
+                None => NO_SESSION_CHECKS.to_string(),
+            }),
+        ),
         Some(code) => (
             Outcome::Failed,
             None,
@@ -331,13 +362,25 @@ pub(crate) struct AgentDemo {
 pub(crate) fn connected_finding(agent: &str, via: Via, mode: Option<&str>) -> Finding {
     let path = match via {
         Via::Hook => "its hook",
-        Via::Proxy => "the MCP proxy (judged here by the proxy's own rules; no server was started)",
+        Via::Proxy => {
+            "the MCP proxy (judged here by the proxy's own rules, without agent profiles \
+             or identity; no server was started)"
+        }
     };
-    let mode = match mode {
-        Some("enforce") => "enforce".to_string(),
-        Some("monitor") => "monitor, which records and never refuses".to_string(),
-        Some(other) => format!("{other} (part records, part refuses)"),
-        None => "a mode that did not read back".to_string(),
+    let mode = match (via, mode) {
+        (_, Some("enforce")) => "enforce".to_string(),
+        (_, Some("monitor")) => "monitor, which records and never refuses".to_string(),
+        // Each hook is run, so a mixed wiring's answers are each hook's own.
+        (Via::Hook, Some(other)) => format!("{other} (part records, part refuses)"),
+        (Via::Hook, None) => "a mode that did not read back".to_string(),
+        // The proxy is judged here once, in the weaker of its modes.
+        (Via::Proxy, Some(other)) => {
+            format!("{other}; some servers only record, so every call is shown as they get it")
+        }
+        (Via::Proxy, None) => {
+            "a mode that did not read back, so every call is shown as a recording server gets it"
+                .to_string()
+        }
     };
     Finding::Working(format!("{agent} is wired through {path}, in {mode}."))
 }
@@ -447,16 +490,40 @@ fn summary(agents: &[AgentDemo]) -> String {
                 .into()
         }
         _ => {
-            let passed = sent
+            let tested: Vec<&&CallResult> = sent
+                .iter()
+                .filter(|c| c.outcome != Outcome::NotSent)
+                .collect();
+            let untested = sent.len() - tested.len();
+            let passed = tested
                 .iter()
                 .filter(|c| c.outcome != Outcome::Refused)
                 .count();
-            format!(
-                "{passed} of {} calls would NOT have been stopped. The lines above say why.",
-                sent.len()
-            )
+            let mut line = if tested.is_empty() {
+                "No call was tested.".to_string()
+            } else {
+                format!(
+                    "{passed} of {} tested calls would NOT have been stopped.",
+                    tested.len()
+                )
+            };
+            if untested > 0 {
+                line.push_str(&format!(" {untested} not tested."));
+            }
+            line.push_str(" The lines above say why.");
+            line
         }
     }
+}
+
+/// Whether the only thing between this run and exit 0 is calls that were
+/// not tested: no tested call got through and every wiring runs.
+fn only_untested(agents: &[AgentDemo]) -> bool {
+    let sent = || agents.iter().filter(|a| a.connected).flat_map(|a| &a.calls);
+    sent().any(|c| c.outcome == Outcome::NotSent)
+        && sent().all(|c| matches!(c.outcome, Outcome::Refused | Outcome::NotSent))
+        && !agents.iter().any(wired_in_trouble)
+        && !agents.iter().any(partly)
 }
 
 /// PURE: the report for a machine (`--json`).
@@ -482,6 +549,7 @@ pub(crate) fn to_json(agents: &[AgentDemo], none: Option<&Finding>) -> Value {
         "result": match code {
             EXIT_ALL_REFUSED => "all_refused",
             EXIT_NOTHING_CONNECTED => "nothing_connected",
+            _ if only_untested(agents) => "some_not_tested",
             _ => "some_not_stopped",
         },
         "exit_code": code,
@@ -532,25 +600,40 @@ mod tests {
         }
     }
 
+    const NONCE: &str = "0123456789abcdef0123456789abcdef";
+
     /// The marker counts only at the top of the payload, where an agent
-    /// cannot write. A command that names it is an agent's command.
+    /// cannot write, and only when it holds the nonce the hook was handed.
+    /// A command that names it, or a payload with `true` there, is an
+    /// agent's command.
     ///
-    /// FAILS ON REVERT: read the marker anywhere in the text and the second
-    /// payload skips the record.
+    /// FAILS ON REVERT: read the marker anywhere in the text, or accept
+    /// `true` or a value without the nonce, and an agent's payload skips the
+    /// record.
     #[test]
-    fn only_a_top_level_marker_makes_a_demo_call() {
+    fn only_a_top_level_marker_with_this_runs_nonce_makes_a_demo_call() {
         let home = Path::new("/home/someone");
         let call = &calls(home)[0];
-        assert!(is_demo_payload(&hook_payload(call, home, 0)));
+        let marked = hook_payload(call, home, 0, NONCE);
+        assert!(is_demo_payload(&marked, Some(NONCE)));
+        assert!(!is_demo_payload(&marked, None), "no nonce in the env");
+        assert!(!is_demo_payload(
+            &marked,
+            Some("ffffffffffffffffffffffffffffffff")
+        ));
         let agent_call = json!({
             "session_id": "s",
             "tool_name": "Bash",
-            "tool_input": { "command": "echo '{\"innerwarden_demo\": true}'", "innerwarden_demo": true },
+            "tool_input": { "command": "echo '{\"innerwarden_demo\": true}'", "innerwarden_demo": NONCE },
         })
         .to_string();
-        assert!(!is_demo_payload(&agent_call));
-        assert!(!is_demo_payload(r#"{"innerwarden_demo": "true"}"#));
-        assert!(!is_demo_payload("not json innerwarden_demo"));
+        assert!(!is_demo_payload(&agent_call, Some(NONCE)));
+        let plain_true = json!({ "tool_name": "Bash", "innerwarden_demo": true }).to_string();
+        assert!(!is_demo_payload(&plain_true, Some(NONCE)));
+        assert!(!is_demo_payload(&plain_true, None));
+        // A short value in the env is no nonce the demo made.
+        assert!(!is_demo_payload(r#"{"innerwarden_demo": "x"}"#, Some("x")));
+        assert!(!is_demo_payload("not json innerwarden_demo", Some(NONCE)));
     }
 
     /// The four calls the card names, aimed at this home.
@@ -598,7 +681,10 @@ mod tests {
 
         assert_eq!(hook_outcome(Some(0), &deny, "").0, Outcome::WouldRefuse);
         let allow = hook_report(Some("allow"), false, None);
-        assert_eq!(hook_outcome(Some(0), &allow, "").0, Outcome::Allowed);
+        let (o, _, why) = hook_outcome(Some(0), &allow, "");
+        assert_eq!(o, Outcome::Allowed);
+        // A call let through says the session and host were not consulted.
+        assert_eq!(why.as_deref(), Some(NO_SESSION_CHECKS));
         let (o, _, why) = hook_outcome(Some(1), "", "panic");
         assert_eq!(o, Outcome::Failed);
         assert_eq!(why.as_deref(), Some("the hook exited 1: panic"));
@@ -651,6 +737,47 @@ mod tests {
             ..agent(false, None, &[])
         };
         assert_eq!(exit_code(&[broken]), 1);
+    }
+
+    /// A call the hook was never sent is not tested: it is not counted as
+    /// let through, the line says so, and the exit still is not 0.
+    ///
+    /// FAILS ON REVERT: count `NotSent` as passed and the summary says
+    /// "2 of 2 calls would NOT have been stopped" for calls never tested.
+    #[test]
+    fn a_call_not_sent_is_not_tested_and_not_counted_as_let_through() {
+        use Outcome::*;
+        let all_untested = [agent(true, Some("enforce"), &[NotSent, NotSent])];
+        let text = render(&all_untested, None, 2);
+        assert!(text.contains("not tested    Bash"), "{text}");
+        assert!(text.contains("No call was tested. 2 not tested."), "{text}");
+        assert!(!text.contains("would NOT"), "{text}");
+        assert_eq!(exit_code(&all_untested), 1);
+        assert_eq!(to_json(&all_untested, None)["result"], "some_not_tested");
+
+        let mixed = [agent(true, Some("enforce"), &[Refused, NotSent, Allowed])];
+        let text = render(&mixed, None, 3);
+        assert!(
+            text.contains("1 of 2 tested calls would NOT have been stopped. 1 not tested."),
+            "{text}"
+        );
+        assert_eq!(to_json(&mixed, None)["result"], "some_not_stopped");
+    }
+
+    /// The MCP line says what the proxy judgment here leaves out, and a mixed
+    /// proxy wiring is not called "part refuses" when every call is shown as
+    /// a recording server gets it.
+    #[test]
+    fn the_mcp_line_names_what_it_leaves_out_and_reads_mixed_honestly() {
+        let line = connected_finding("cursor", Via::Proxy, Some("MIXED")).to_string();
+        assert!(
+            line.contains("without agent profiles or identity"),
+            "{line}"
+        );
+        assert!(!line.contains("part refuses"), "{line}");
+        assert!(line.contains("some servers only record"), "{line}");
+        let hook = connected_finding("claude-code", Via::Hook, Some("MIXED")).to_string();
+        assert!(hook.contains("part records, part refuses"), "{hook}");
     }
 
     /// The report stays short: a header, a line per agent and per call, and
