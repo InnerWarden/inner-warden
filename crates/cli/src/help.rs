@@ -241,10 +241,12 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              Run <command> inside a filesystem/namespace JAIL with the guard hook armed\n  \
              INSIDE it (Linux bwrap, macOS sandbox-exec). InnerWarden's own folder (its\n  \
              API key with it) and the project's secrets are not shown to the jailed\n  \
-             command, and credential variables you exported (OPENAI_API_KEY,\n  \
-             AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN and other names ending in _API_KEY,\n  \
-             _TOKEN, _SECRET, _PASSWORD and the like) are taken out of its environment;\n  \
-             contain names the ones it took out.\n\
+             command. Variables you exported are taken out of its environment by the\n  \
+             pattern of their NAME: OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN and\n  \
+             other names ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD and the like;\n  \
+             contain names the ones it took out. A secret under any other name (a\n  \
+             DATABASE_URL holding a password, STRIPE_SK) still reaches the jail: unset\n  \
+             it before the launch.\n\
              \n  \
              --project DIR     the directory the jailed command may write (default: cwd)\n  \
              --deny-read GLOB  one more path the jail must not expose\n  \
@@ -664,8 +666,9 @@ mod tests {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let help = flat(&usage("contain", &[]).expect("contain has usage"));
         for said in [
-            "credential variables you exported (OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN",
-            "are taken out of its environment; contain names the ones it took out.",
+            "Variables you exported are taken out of its environment by the pattern of their NAME: OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN",
+            "contain names the ones it took out.",
+            "A secret under any other name (a DATABASE_URL holding a password, STRIPE_SK) still reaches the jail",
             "--pass-env NAME hand one credential variable to the jailed command",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
