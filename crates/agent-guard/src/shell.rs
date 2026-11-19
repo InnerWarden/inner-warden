@@ -3032,7 +3032,18 @@ fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assign
             }) {
                 return None;
             }
-            let name = node_text(assignment.child_by_field_name("name")?, source);
+            let name_node = assignment.child_by_field_name("name")?;
+            // `C[0]=..` writes the element `$C` reads: the name is `C`.
+            let written = node_text(name_node, source);
+            let (name, subscripted) = match written.split_once('[') {
+                Some((name, _)) => (name.to_owned(), true),
+                None => (written, false),
+            };
+            // `C+=..` appends to what `C` held: the guard does not join
+            // the two, so the value is not written out.
+            let appends = source
+                .get(name_node.end_byte()..)
+                .is_some_and(|rest| rest.starts_with(b"+="));
             let value = assignment
                 .child_by_field_name("value")
                 .map(|value| node_text(value, source))
@@ -3040,14 +3051,20 @@ fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assign
             let raw = value.trim();
             // A value with an expansion outside single quotes is not
             // written out.
-            let written_out = raw.starts_with('\'') || !raw.contains(['$', '`']);
+            let written_out = !appends && (raw.starts_with('\'') || !raw.contains(['$', '`']));
+            let mut scopes = assignment_scopes(assignment, source);
+            if subscripted {
+                // One element may not be the one `$C` reads: the value
+                // before it is judged too.
+                scopes.push(0..0);
+            }
             Some((
                 name,
                 written_out.then(|| shell_literal_word(raw)),
                 assignment.end_byte(),
                 ancestor_of_kind(assignment, "function_definition")
                     .map(|definition| definition.byte_range()),
-                assignment_scopes(assignment, source),
+                scopes,
             ))
         })
         .collect();

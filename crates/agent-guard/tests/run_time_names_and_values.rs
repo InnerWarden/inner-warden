@@ -223,3 +223,67 @@ fn a_trap_set_through_a_variable_is_a_trap() {
         ],
     );
 }
+
+/// Measured allowed on a1ddf82 (2026-11-19): `C[0]=..` writes the
+/// element `$C` reads, directly or through a reference.
+#[test]
+fn a_write_to_an_element_reaches_the_name() {
+    assert_verdict(
+        "deny",
+        &[
+            "C=ok; C[0]='rm -rf ~'; sh -c \"$C\"",
+            "C=ok; declare -n R=C; R[0]='rm -rf ~'; sh -c \"$C\"",
+            "C='rm -rf ~'; C[1]=ok; sh -c \"$C\"",
+        ],
+    );
+    assert_verdict("allow", &["a[0]=x; a[1]=y; echo \"${a[@]}\""]);
+}
+
+/// Measured on a1ddf82 (2026-11-19): `C+=..` was judged as the piece it
+/// appends alone, and `C='rm'; C+=' -rf /'` was allowed.
+#[test]
+fn an_append_is_not_read_as_the_whole_value() {
+    assert_ne!(verdict("C='rm'; C+=' -rf /'; sh -c \"$C\""), "allow");
+    assert_ne!(
+        verdict("C=ok; declare -n R=C; R+=' ; rm -rf /'; sh -c \"$C\""),
+        "allow"
+    );
+    assert_verdict(
+        "allow",
+        &[
+            "PATH+=:/opt/bin; make",
+            "args+=(--release); cargo build \"${args[@]}\"",
+        ],
+    );
+}
+
+/// `unset -n R` drops the reference, not the value of the name it refers
+/// to: `C` still holds `rm -rf ~`. Already refused before this change
+/// (`unset` parses as its own node, never read as clearing a value); kept
+/// so a reading of `unset` that empties the target fails here.
+#[test]
+fn unset_n_drops_the_reference_not_the_value() {
+    assert_verdict(
+        "deny",
+        &["C='rm -rf ~'; declare -n R=C; unset -n R; sh -c \"$C\""],
+    );
+}
+
+/// A program named by a variable the line does not set (`"$CC"`) may be
+/// `trap`: a shell line after it is reviewed, never refused, and lines
+/// without one keep their verdict.
+#[test]
+fn a_program_from_an_unset_variable_only_reviews_a_handed_line() {
+    assert_verdict(
+        "allow",
+        &[
+            "\"$CC\" -o app main.c",
+            "$EDITOR notes.md",
+            "\"$CC\" -c x.c && make",
+        ],
+    );
+    assert_eq!(
+        verdict("\"$CC\" -o app main.c; C='make test'; sh -c \"$C\""),
+        "review"
+    );
+}
