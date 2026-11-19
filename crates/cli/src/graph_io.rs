@@ -114,12 +114,131 @@ fn resolve_and_report(
     get: impl Fn(&str) -> Option<String>,
     reported: &std::sync::Once,
 ) -> innerwarden_graph::GraphPathResolution {
-    let resolved = innerwarden_graph::graph_path(get, || read_product_config_at(config_path));
+    resolve_report_and_place(config_path, get, reported, shared_dir_denied)
+}
+
+/// [`resolve_and_report`] with the access check supplied, so a test can say
+/// "this account is refused" without a second account on the machine.
+fn resolve_report_and_place(
+    config_path: &std::path::Path,
+    get: impl Fn(&str) -> Option<String>,
+    reported: &std::sync::Once,
+    denied: impl Fn(&std::path::Path) -> bool,
+) -> innerwarden_graph::GraphPathResolution {
+    let mut resolved = raw_resolution(config_path, &get);
     if let Some(problem) = resolved.config_problem.as_ref() {
         let message = problem.message.clone();
         reported.call_once(move || eprintln!("innerwarden: {message}"));
     }
+    if let Some(denied) = shared_record_denied_for(&resolved, &get, denied) {
+        resolved.path = Some(denied.own);
+        resolved.source = innerwarden_graph::GraphPathSource::OperatorHome;
+    }
     resolved
+}
+
+/// The one call into the model crate's resolver: the environment, then the
+/// product config, then the home, before any account's access is weighed.
+fn raw_resolution(
+    config_path: &std::path::Path,
+    get: impl Fn(&str) -> Option<String>,
+) -> innerwarden_graph::GraphPathResolution {
+    innerwarden_graph::graph_path(get, || read_product_config_at(config_path))
+}
+
+/// The shared record this account may not write, and the record in its own
+/// home it writes instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SharedRecordDenied {
+    /// The directory `/etc/innerwarden/guard.toml` names.
+    pub shared_dir: std::path::PathBuf,
+    /// The record file in this account's own home.
+    pub own: std::path::PathBuf,
+}
+
+/// When the product config names a shared record and this account is refused
+/// its directory, the record in this account's own home.
+///
+/// An AI agent that runs as its own Linux account, outside the group that owns
+/// the shared directory, could not open it: every call said `a guard event was
+/// not recorded ... PermissionDenied` and `graph record skipped`, and its
+/// decisions were kept nowhere. Its own home is a record it can write, and the
+/// split this makes is said once, by `innerwarden status`
+/// ([`shared_record_denied`]), not on every call.
+///
+/// Only a refusal moves the record. A directory that does not exist yet, or
+/// fails for any other reason, stays where the config says and fails loudly
+/// through the recording-health path, as before: quietly writing somewhere
+/// else for those would split the two products with nothing to say why.
+fn shared_record_denied_for(
+    resolved: &innerwarden_graph::GraphPathResolution,
+    get: impl Fn(&str) -> Option<String>,
+    denied: impl Fn(&std::path::Path) -> bool,
+) -> Option<SharedRecordDenied> {
+    if resolved.source != innerwarden_graph::GraphPathSource::ProductConfigFile {
+        return None;
+    }
+    let shared_dir = resolved.path.as_deref()?.parent()?;
+    if !denied(shared_dir) {
+        return None;
+    }
+    let own = get("HOME")
+        .filter(|home| !home.trim().is_empty())
+        .map(|home| std::path::PathBuf::from(home).join(".config/innerwarden/graph.json"))?;
+    Some(SharedRecordDenied {
+        shared_dir: shared_dir.to_path_buf(),
+        own,
+    })
+}
+
+/// Whether this account is refused the directory the shared record lives in:
+/// it cannot reach it, or it can and may not create a file there.
+///
+/// Asked of the kernel (`faccessat` with the effective ids, supplementary
+/// groups included) and never by writing a probe file: this runs on every
+/// screened call, in a directory other accounts share. Only `EACCES` and
+/// `EPERM` count. Anything else, a directory that is not there yet included,
+/// is left to the writer, which says what went wrong.
+#[cfg(unix)]
+fn shared_dir_denied(dir: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let refused = |error: &std::io::Error| matches!(error.raw_os_error(), Some(code) if code == libc::EACCES || code == libc::EPERM);
+    match std::fs::symlink_metadata(dir) {
+        Err(error) => refused(&error),
+        Ok(metadata) if metadata.is_dir() => {
+            let Ok(name) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+                return false;
+            };
+            // SAFETY: `name` is a valid NUL-terminated string that outlives
+            // the call, and `faccessat` only reads it.
+            let answer = unsafe {
+                libc::faccessat(
+                    libc::AT_FDCWD,
+                    name.as_ptr(),
+                    libc::W_OK | libc::X_OK,
+                    libc::AT_EACCESS,
+                )
+            };
+            answer != 0 && refused(&std::io::Error::last_os_error())
+        }
+        Ok(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn shared_dir_denied(_dir: &std::path::Path) -> bool {
+    false
+}
+
+/// For `innerwarden status`: the shared record this account is refused, when
+/// its decisions are being kept in its own home instead.
+pub(crate) fn shared_record_denied() -> Option<SharedRecordDenied> {
+    let get = |key: &str| std::env::var(key).ok();
+    let resolved = raw_resolution(
+        std::path::Path::new(innerwarden_graph::GUARD_CONFIG_PATH),
+        get,
+    );
+    shared_record_denied_for(&resolved, get, shared_dir_denied)
 }
 
 /// [`resolve_and_report`] against the process-wide once-guard.
@@ -139,7 +258,8 @@ fn resolution() -> innerwarden_graph::GraphPathResolution {
 }
 
 /// The Community graph file: env `IW_GRAPH_FILE`, else the location declared in
-/// `/etc/innerwarden/guard.toml` by the paid installer, else
+/// `/etc/innerwarden/guard.toml` by the paid installer (unless this account is
+/// refused that directory, see [`shared_record_denied_for`]), else
 /// `~/.config/innerwarden/graph.json`. Resolved by the model crate so all CLI
 /// entrypoints use the same local record.
 ///
@@ -998,6 +1118,10 @@ fn emit_guard_event(
     let Some(dir) = graph_path.parent() else {
         return;
     };
+    // The graph's own writer creates this folder, but only after this line is
+    // appended, so the first refusal in a new record (an agent account's own
+    // home, the first time it is refused) was lost with `entity not found`.
+    let _ = std::fs::create_dir_all(dir);
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -3438,5 +3562,219 @@ mod flag_parse_tests {
     fn graph_refuses_an_unknown_flag_by_name() {
         let err = parse_graph_flags(&args(&["--bogus"])).unwrap_err();
         assert!(err.contains("`--bogus`"), "{err}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod shared_record_denied_tests {
+    use super::*;
+    use innerwarden_graph::GraphPathSource;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn is_root() -> bool {
+        // SAFETY: reads the process credentials, cannot fail.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn env(home: &std::path::Path) -> impl Fn(&str) -> Option<String> + use<> {
+        let home = home.to_string_lossy().to_string();
+        move |key| (key == "HOME").then(|| home.clone())
+    }
+
+    /// A Pro host's layout, in a temporary folder: a product config naming a
+    /// record in `guard/`, and an agent home of its own.
+    struct Host {
+        _root: tempfile::TempDir,
+        config: std::path::PathBuf,
+        guard: std::path::PathBuf,
+        home: std::path::PathBuf,
+    }
+
+    fn host() -> Host {
+        let root = tempfile::TempDir::new().expect("tempdir");
+        let lib = root.path().join("lib");
+        let guard = lib.join("guard");
+        std::fs::create_dir_all(&guard).expect("guard dir");
+        let config = root.path().join("guard.toml");
+        std::fs::write(
+            &config,
+            format!("graph_file = \"{}\"\n", guard.join("graph.json").display()),
+        )
+        .expect("config");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let home = root.path().join("home");
+        std::fs::create_dir_all(&home).expect("home");
+        Host {
+            _root: root,
+            config,
+            guard,
+            home,
+        }
+    }
+
+    /// Put the modes of the Pro layout on the fake one, with the bits THIS
+    /// account reads (the owner's) set the way an account outside the
+    /// `innerwarden` group reads them: `drwxr-x---` and `drwxrws---` give
+    /// such an account nothing, and so does `d---------` to its owner.
+    fn as_seen_by_an_outsider(host: &Host) {
+        std::fs::set_permissions(&host.guard, std::fs::Permissions::from_mode(0o2070))
+            .expect("chmod guard");
+    }
+
+    fn restore(host: &Host) {
+        let _ = std::fs::set_permissions(
+            host.guard.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o750),
+        );
+        let _ = std::fs::set_permissions(&host.guard, std::fs::Permissions::from_mode(0o2770));
+    }
+
+    /// The account the shared directory refuses records in its own home, and
+    /// the move is not reported on the call.
+    ///
+    /// FAILS ON REVERT: drop the placement from `resolve_report_and_place`
+    /// and the path stays in the refused directory.
+    #[test]
+    fn an_account_refused_the_shared_record_records_in_its_own_home() {
+        let host = host();
+        let resolved = resolve_report_and_place(
+            &host.config,
+            env(&host.home),
+            &std::sync::Once::new(),
+            |_| true,
+        );
+        assert_eq!(
+            resolved.path,
+            Some(host.home.join(".config/innerwarden/graph.json"))
+        );
+        assert_eq!(resolved.source, GraphPathSource::OperatorHome);
+        assert_eq!(resolved.config_problem, None, "nothing said on the call");
+
+        // The control: an account that may write it keeps the shared record.
+        let resolved = resolve_report_and_place(
+            &host.config,
+            env(&host.home),
+            &std::sync::Once::new(),
+            |_| false,
+        );
+        assert_eq!(resolved.path, Some(host.guard.join("graph.json")));
+        assert_eq!(resolved.source, GraphPathSource::ProductConfigFile);
+    }
+
+    /// Only a record the product config named moves: an explicit
+    /// `IW_GRAPH_FILE` is the operator's choice, and with no home there is
+    /// nowhere of this account's own to move to.
+    #[test]
+    fn an_override_or_a_missing_home_is_left_alone() {
+        let host = host();
+        let home = host.home.to_string_lossy().to_string();
+        let resolved = resolve_report_and_place(
+            &host.config,
+            move |key| match key {
+                "IW_GRAPH_FILE" => Some("/chosen/graph.json".into()),
+                "HOME" => Some(home.clone()),
+                _ => None,
+            },
+            &std::sync::Once::new(),
+            |_| true,
+        );
+        assert_eq!(resolved.path, Some("/chosen/graph.json".into()));
+        assert_eq!(resolved.source, GraphPathSource::EnvironmentOverride);
+
+        let resolved =
+            resolve_report_and_place(&host.config, |_| None, &std::sync::Once::new(), |_| true);
+        assert_eq!(resolved.path, Some(host.guard.join("graph.json")));
+    }
+
+    /// The access check, on real directories. Root reads every mode as
+    /// writable, so the refused rows are asserted only for an ordinary account.
+    #[test]
+    fn the_access_check_reads_refusal_and_nothing_else() {
+        let host = host();
+        restore(&host);
+        // The Pro modes, for an account that owns (or is in the group of)
+        // the directory: it may write, so it keeps the shared record.
+        assert!(!shared_dir_denied(&host.guard));
+        // Not there yet, under a parent it may write: the writer creates it.
+        assert!(!shared_dir_denied(&host.guard.join("not-yet")));
+        if is_root() {
+            return;
+        }
+        // The Pro modes as an account outside the group reads them.
+        as_seen_by_an_outsider(&host);
+        assert!(shared_dir_denied(&host.guard));
+        restore(&host);
+        // A parent it may not cross (`drwxr-x---` to an outsider).
+        std::fs::set_permissions(
+            host.guard.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o050),
+        )
+        .expect("chmod lib");
+        assert!(shared_dir_denied(&host.guard));
+        restore(&host);
+        // A directory another account really owns, where one is there to ask.
+        let root_home = std::path::Path::new("/root/innerwarden/guard");
+        if std::fs::symlink_metadata("/root").is_ok_and(|m| m.permissions().mode() & 0o001 == 0) {
+            assert!(shared_dir_denied(root_home));
+        }
+    }
+
+    /// End to end on one refused call: the block lands in the account's own
+    /// home, the graph and the event sink both, and nothing is written into
+    /// the shared directory.
+    ///
+    /// FAILS ON REVERT: without the placement the write goes at the refused
+    /// directory and both files in the home stay absent.
+    #[test]
+    fn a_block_from_a_refused_account_is_kept_in_its_own_home() {
+        if is_root() {
+            return;
+        }
+        let host = host();
+        as_seen_by_an_outsider(&host);
+        let resolved = resolve_report_and_place(
+            &host.config,
+            env(&host.home),
+            &std::sync::Once::new(),
+            shared_dir_denied,
+        );
+        let path = resolved.path.expect("a record path");
+        record_to(
+            &path,
+            "rm -rf /",
+            &json!({"recommendation": "deny", "risk_score": 95}),
+            DecisionMode::Enforce,
+            DecisionOutcome::Blocked,
+            Some("s1"),
+            None,
+            DecisionOrigin::default(),
+        );
+        restore(&host);
+        let own = host.home.join(".config/innerwarden");
+        let graph = std::fs::read_to_string(own.join("graph.json")).expect("graph in the home");
+        assert!(graph.contains("rm -rf /"), "{graph}");
+        let events =
+            std::fs::read_to_string(own.join("guard-events.jsonl")).expect("events in the home");
+        assert!(events.contains("guard.blocked"), "{events}");
+        assert_eq!(
+            std::fs::read_dir(&host.guard).expect("guard dir").count(),
+            0,
+            "nothing written where this account is refused"
+        );
+    }
+
+    /// `status` and the writer agree: what one moves, the other reports.
+    #[test]
+    fn status_names_what_the_writer_moved() {
+        let host = host();
+        let resolved = raw_resolution(&host.config, env(&host.home));
+        let denied =
+            shared_record_denied_for(&resolved, env(&host.home), |_| true).expect("reported");
+        assert_eq!(denied.shared_dir, host.guard);
+        assert_eq!(denied.own, host.home.join(".config/innerwarden/graph.json"));
+        assert_eq!(
+            shared_record_denied_for(&resolved, env(&host.home), |_| false),
+            None
+        );
     }
 }

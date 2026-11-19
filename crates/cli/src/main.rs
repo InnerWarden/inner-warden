@@ -293,6 +293,15 @@ fn status_io_cmd_rest(
         newest_decision_age_secs,
         decisions_by_hand,
         dashboard_reachable,
+        record_kept_apart: graph_io::shared_record_denied().map(|denied| status::RecordKeptApart {
+            shared_dir: denied.shared_dir.display().to_string(),
+            own_dir: denied
+                .own
+                .parent()
+                .unwrap_or(&denied.own)
+                .display()
+                .to_string(),
+        }),
     };
     print!("{}", status::render(&facts));
     std::process::ExitCode::SUCCESS

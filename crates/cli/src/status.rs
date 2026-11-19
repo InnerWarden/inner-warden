@@ -414,6 +414,38 @@ pub struct Facts {
     pub decisions_by_hand: u64,
     /// Whether the local dashboard answered. `None` when it was not probed.
     pub dashboard_reachable: Option<bool>,
+    /// Set when `/etc/innerwarden/guard.toml` names a shared record this
+    /// account is refused, so its decisions are kept in its own home instead.
+    pub record_kept_apart: Option<RecordKeptApart>,
+}
+
+/// The shared record directory this account may not write, and the folder
+/// its decisions are kept in instead. Paths as the reader should see them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordKeptApart {
+    pub shared_dir: String,
+    pub own_dir: String,
+}
+
+/// The one line that says a record was kept apart. Every screened call is
+/// still judged and recorded; the hook says nothing about this on each call,
+/// so this line is where it is said.
+pub fn record_kept_apart_finding(apart: &RecordKeptApart) -> Finding {
+    Finding::NotWorking {
+        what: format!(
+            "This account may not write the shared record in {}, so its \
+             decisions are kept in {} instead. They are still screened and \
+             recorded, but InnerWarden Pro on this machine does not see them, and \
+             this account can edit that copy.",
+            apart.shared_dir, apart.own_dir
+        ),
+        next: format!(
+            "add this account to the group that owns {} (innerwarden on a Pro \
+             install): sudo usermod -aG innerwarden \"$USER\", then start the agent \
+             again from a new login",
+            apart.shared_dir
+        ),
+    }
 }
 
 /// The caveat on an agent in `Wired into` whose other hooks do not run.
@@ -579,6 +611,11 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     }
 
     // ── Evidence ────────────────────────────────────────────────────────────
+    // Before the count: the count below is read from the record this account
+    // writes, and when that is its own home the reader has to know first.
+    if let Some(apart) = facts.record_kept_apart.as_ref() {
+        out.push(record_kept_apart_finding(apart));
+    }
     match facts.decisions_recorded {
         Some(0) if facts.decisions_by_hand > 0 => out.push(Finding::Unknown {
             what: format!(
@@ -975,6 +1012,47 @@ mod tests {
             newest_decision_age_secs: Some(90),
             decisions_by_hand: 0,
             dashboard_reachable: Some(true),
+            record_kept_apart: None,
+        }
+    }
+
+    /// An account refused the shared record is told once, here, that its
+    /// decisions are kept apart and what puts them back, and the line comes
+    /// before the count it changes the meaning of.
+    ///
+    /// FAILS ON REVERT: drop the finding from `assess` and nothing anywhere
+    /// says the Pro side cannot see this account's blocks.
+    #[test]
+    fn a_record_kept_apart_is_said_once_before_the_count() {
+        let mut facts = healthy();
+        assert!(!assess(&facts)
+            .iter()
+            .any(|f| f.to_string().contains("shared record")));
+        facts.record_kept_apart = Some(RecordKeptApart {
+            shared_dir: "/var/lib/innerwarden/guard".into(),
+            own_dir: "/home/agent/.config/innerwarden".into(),
+        });
+        let findings = assess(&facts);
+        let apart: Vec<usize> = findings
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.to_string().contains("shared record"))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(apart.len(), 1, "said once: {findings:?}");
+        let count = findings
+            .iter()
+            .position(|f| f.to_string().contains("screening decision(s) recorded"))
+            .expect("the count is still there");
+        assert!(apart[0] < count, "{findings:?}");
+        match &findings[apart[0]] {
+            Finding::NotWorking { what, next } => {
+                assert!(what.contains("/var/lib/innerwarden/guard"), "{what}");
+                assert!(what.contains("/home/agent/.config/innerwarden"), "{what}");
+                assert!(what.contains("does not see them"), "{what}");
+                assert!(next.contains("usermod -aG innerwarden"), "{next}");
+            }
+            other => panic!("the Pro side missing these is a fault to fix: {other:?}"),
         }
     }
 
@@ -1180,6 +1258,7 @@ mod tests {
             newest_decision_age_secs: None,
             decisions_by_hand: 0,
             dashboard_reachable: None,
+            record_kept_apart: None,
         };
         for finding in assess(&facts) {
             assert!(
