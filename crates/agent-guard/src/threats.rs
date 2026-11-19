@@ -2822,7 +2822,10 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
         "'settings'",
         "\"settings\"",
     ];
-    if !mentions_any(content, NEEDLES) && !names_guard_alias(content) {
+    if !mentions_any(content, NEEDLES)
+        && !names_guard_alias(content)
+        && !names_a_removing_find(content)
+    {
         // A name assembled by the shell (`${x:-innerwarden}`, `$(echo
         // innerwarden)`, `inner''warden`, `$'\x69nnerwarden'`) or matched
         // from a pattern (`inner*-ctl`, `inner{w..w}arden`) only reads as
@@ -7007,6 +7010,18 @@ fn without_fresh_dir_writes(content: &str) -> Option<String> {
     Some(kept.join("\n"))
 }
 
+/// Whether a line may hold a `find` that removes, edits or writes what it
+/// matches ([`find_takes_and_writes`]): such a search reaches the guard's
+/// places from above them without naming them (`find /etc -name agent.toml
+/// -delete`), so it is read whatever else the line names.
+fn names_a_removing_find(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("find")
+        && ["-delete", "-exec", "-ok", "-fprint", "-fls"]
+            .iter()
+            .any(|action| lower.contains(action))
+}
+
 /// A cheap test ahead of the walk [`writes_guard_carrier`] makes: a line
 /// that names no guard program and no agent folder, and does not hold every
 /// component of one carrier place, writes none.
@@ -7014,6 +7029,7 @@ fn may_name_guard_carrier(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
     lower.contains("innerwarden")
         || names_guard_alias(content)
+        || names_a_removing_find(content)
         || settings_hook_programs()
             .programs
             .iter()
@@ -7269,9 +7285,12 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 }
             }
             "find" | "gfind" => {
-                let (taken_by_find, written_by_find) = find_takes_and_writes(arguments);
-                taken.extend(taken_by_find);
-                targets.extend(written_by_find);
+                let reading = find_takes_and_writes(arguments);
+                if reading.takes {
+                    taken.extend(guard_places_a_find_reaches(&reading, &dirs));
+                }
+                taken.extend(reading.taken);
+                targets.extend(reading.written);
             }
             "dd" => targets.extend(dd_operand(arguments, "of").map(str::to_string)),
             "curl" => targets.extend(option_values(arguments, 'o', &["output"])),
@@ -7314,25 +7333,138 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
 /// program that removes, moves or edits what it is handed, every root of the
 /// search is taken away, filtered or not: `find ~/.config/innerwarden -name
 /// config.json -delete` removes a file of that folder. A root above the
-/// place (`find ~/.config -path '*innerwarden*' -delete`) is read with the
-/// plain words of each `-name`, `-path` or `-regex` pattern under it.
+/// place is read with the plain words of each pattern under it, and against
+/// the guard's places it holds ([`guard_places_a_find_reaches`]).
 /// `-fprint`, `-fprint0`, `-fprintf` and `-fls` write their file.
-///
-/// Not read: a root above the place with a pattern that does not spell the
-/// place (`find ~ -name config.json -delete`).
-fn find_takes_and_writes(arguments: &[String]) -> (Vec<String>, Vec<String>) {
+struct FindReading {
+    /// Whether the search removes or edits what it matches.
+    takes: bool,
+    /// The roots, as written.
+    roots: Vec<String>,
+    /// What it takes away: each root, and each root with a pattern's words.
+    taken: Vec<String>,
+    /// The files `-fprint` and its kin write.
+    written: Vec<String>,
+    /// The tests that choose what it matches.
+    filter: FindFilter,
+}
+
+/// The name and path tests of a `find` expression, lowercase.
+#[derive(Default)]
+struct FindFilter {
+    tests: Vec<(FindTest, String)>,
+    /// The expression has `-o`: a match of any test may be enough.
+    or: bool,
+    /// The expression has `!` or `-not`: what it matches is not read.
+    not: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FindTest {
+    /// `-name`, `-iname`: a glob on the last part of the path.
+    Name,
+    /// `-path`, `-wholename` and their `-i` forms: a glob on the path.
+    Path,
+    /// `-regex`, `-iregex`: a pattern on the whole path.
+    Regex,
+}
+
+impl FindFilter {
+    /// Whether the search may match `printed` (the path as `find` prints it).
+    /// A test that cannot be read counts as a match.
+    fn may_match(&self, printed: &str) -> bool {
+        if self.tests.is_empty() || self.not {
+            return true;
+        }
+        let name = printed
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(printed);
+        let matches = |(test, pattern): &(FindTest, String)| match test {
+            FindTest::Name => glob_matches(pattern, name),
+            FindTest::Path => glob_matches(pattern, printed),
+            FindTest::Regex => regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
+                .size_limit(1 << 20)
+                .build()
+                .map_or(true, |re| re.is_match(printed)),
+        };
+        if self.or {
+            self.tests.iter().any(matches)
+        } else {
+            self.tests.iter().all(matches)
+        }
+    }
+}
+
+/// Whether a shell glob matches all of `text`: `*` (which crosses `/`, as
+/// in `find -path`), `?`, a bracket class with ranges and `!` or `^`, and a
+/// backslash escape. A bracket left open is a plain `[`.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    // One element of the pattern at `at`: whether it takes `c`, and its length.
+    let single = |at: usize, c: char| -> (bool, usize) {
+        match pattern[at] {
+            '?' => (true, 1),
+            '\\' if at + 1 < pattern.len() => (pattern[at + 1] == c, 2),
+            '[' => {
+                let mut i = at + 1;
+                let negated = matches!(pattern.get(i), Some('!' | '^'));
+                if negated {
+                    i += 1;
+                }
+                let first = i;
+                let mut found = false;
+                while i < pattern.len() && (pattern[i] != ']' || i == first) {
+                    if i + 2 < pattern.len() && pattern[i + 1] == '-' && pattern[i + 2] != ']' {
+                        found |= pattern[i] <= c && c <= pattern[i + 2];
+                        i += 3;
+                    } else {
+                        found |= pattern[i] == c;
+                        i += 1;
+                    }
+                }
+                if i >= pattern.len() {
+                    ('[' == c, 1)
+                } else {
+                    (found != negated, i + 1 - at)
+                }
+            }
+            other => (other == c, 1),
+        }
+    };
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, t));
+            p += 1;
+            continue;
+        }
+        if p < pattern.len() {
+            let (ok, width) = single(p, text[t]);
+            if ok {
+                p += width;
+                t += 1;
+                continue;
+            }
+        }
+        match star {
+            Some((star_at, from)) => {
+                p = star_at + 1;
+                t = from + 1;
+                star = Some((star_at, from + 1));
+            }
+            None => return false,
+        }
+    }
+    pattern[p..].iter().all(|c| *c == '*')
+}
+
+fn find_takes_and_writes(arguments: &[String]) -> FindReading {
     const REMOVERS: &[&str] = &[
         "rm", "unlink", "shred", "truncate", "mv", "rmdir", "chmod", "tee", "dd", "ln",
-    ];
-    const PATTERNS: &[&str] = &[
-        "-name",
-        "-iname",
-        "-path",
-        "-ipath",
-        "-wholename",
-        "-iwholename",
-        "-regex",
-        "-iregex",
     ];
     // Options before the roots: `-H`, `-L`, `-P`, `-D debug`, `-O3`.
     let mut at = 0usize;
@@ -7344,20 +7476,24 @@ fn find_takes_and_writes(arguments: &[String]) -> (Vec<String>, Vec<String>) {
             _ => break,
         }
     }
-    let roots: Vec<&String> = arguments[at.min(arguments.len())..]
+    let roots: Vec<String> = arguments[at.min(arguments.len())..]
         .iter()
         .take_while(|word| {
             !word.starts_with('-') && !matches!(word.as_str(), "(" | "!" | "\\(" | "\\!")
         })
+        .map(|root| root.trim_matches(['"', '\'']).to_string())
         .collect();
     let expression = &arguments[(at + roots.len()).min(arguments.len())..];
     let mut takes = false;
     let mut written = Vec::new();
     let mut pieces: Vec<String> = Vec::new();
+    let mut filter = FindFilter::default();
     let mut words = expression.iter().peekable();
     while let Some(word) = words.next() {
         match word.as_str() {
             "-delete" => takes = true,
+            "-o" | "-or" => filter.or = true,
+            "!" | "\\!" | "-not" => filter.not = true,
             "-exec" | "-execdir" | "-ok" | "-okdir" => {
                 let Some(program) = words.next() else { break };
                 let program =
@@ -7376,32 +7512,167 @@ fn find_takes_and_writes(arguments: &[String]) -> (Vec<String>, Vec<String>) {
                             .iter()
                             .any(|argument| edits_in_place(&program, argument)));
             }
-            "-fprint" | "-fprint0" | "-fls" => written.extend(words.next().cloned()),
-            "-fprintf" => written.extend(words.next().cloned()),
-            pattern if PATTERNS.contains(&pattern) => {
-                if let Some(value) = words.next() {
-                    pieces.extend(
-                        value
-                            .trim_matches(['"', '\''])
-                            .split(|c: char| "*?[]{}()|^$\\+".contains(c))
-                            .map(|piece| piece.trim_matches('/'))
-                            .filter(|piece| !piece.is_empty() && *piece != ".")
-                            .map(str::to_string),
-                    );
-                }
+            "-fprint" | "-fprint0" | "-fls" | "-fprintf" => written.extend(words.next().cloned()),
+            test => {
+                let kind = match test {
+                    "-name" | "-iname" => FindTest::Name,
+                    "-path" | "-ipath" | "-wholename" | "-iwholename" => FindTest::Path,
+                    "-regex" | "-iregex" => FindTest::Regex,
+                    _ => continue,
+                };
+                let Some(value) = words.next() else { break };
+                let value = value.trim_matches(['"', '\'']).to_lowercase();
+                pieces.extend(
+                    value
+                        .split(|c: char| "*?[]{}()|^$\\+".contains(c))
+                        .map(|piece| piece.trim_matches('/'))
+                        .filter(|piece| !piece.is_empty() && *piece != ".")
+                        .map(str::to_string),
+                );
+                filter.tests.push((kind, value));
             }
-            _ => {}
         }
     }
     let mut taken = Vec::new();
     if takes {
-        for root in roots {
-            let root = root.trim_matches(['"', '\'']).trim_end_matches('/');
+        for root in &roots {
+            let root = root.trim_end_matches('/');
             taken.push(root.to_string());
             taken.extend(pieces.iter().map(|piece| format!("{root}/{piece}")));
         }
     }
-    (taken, written)
+    FindReading {
+        takes,
+        roots,
+        taken,
+        written,
+        filter,
+    }
+}
+
+/// The guard's places a search from above them may remove: its folders,
+/// with the names it keeps in them, the agent settings that load it, and its
+/// program where the installers put it. Spelled from the root or the home.
+const GUARD_FIND_PLACES: &[(&str, &[&str])] = &[
+    ("~/.config/innerwarden", GUARD_FILE_NAMES),
+    ("/etc/innerwarden", GUARD_FILE_NAMES),
+    ("/var/lib/innerwarden", GUARD_FILE_NAMES),
+    ("/sys/fs/bpf/innerwarden", &[]),
+    ("~/.claude/settings.json", &[]),
+    ("~/.claude/settings.local.json", &[]),
+    ("~/.claude.json", &[]),
+    ("~/.codex/config.toml", &[]),
+    ("~/.cursor/mcp.json", &[]),
+    ("~/.gemini/settings.json", &[]),
+    ("~/.openclaw/openclaw.json", &[]),
+    ("~/.openclaw/extensions/innerwarden-guard", &[]),
+    ("~/.openclaw/extensions/innerwarden-replies", &[]),
+    ("~/.openclaw/hooks/innerwarden-attempts", &[]),
+    ("/usr/local/bin/innerwarden", &[]),
+    ("/usr/bin/innerwarden", &[]),
+    ("~/.local/bin/innerwarden", &[]),
+    ("~/.cargo/bin/innerwarden", &[]),
+];
+
+/// The files the guard and the host agent keep in their folders, by name
+/// (read from the code that writes them).
+const GUARD_FILE_NAMES: &[&str] = &[
+    "suppress.toml",
+    "allow.toml",
+    "allow.json",
+    "agent-profiles.toml",
+    "agents.toml",
+    "agents.lock",
+    "llm-key",
+    "llm.toml",
+    "graph.json",
+    "guard.toml",
+    "guard-events.jsonl",
+    "agent.toml",
+    "agent-kernel.toml",
+    "agent-tls.spki",
+    "notify.toml",
+    "config.json",
+    "config.toml",
+    "registry.json",
+    "sessions.json",
+    "state.json",
+    "state.db",
+    "innerwarden.db",
+    "dns-guard-mode",
+];
+
+/// The guard's places under a root of a search that takes what it matches,
+/// where its tests may match the place, a folder on the way to it or a file
+/// the guard keeps in it ([`FindFilter::may_match`]): `find ~ -path
+/// '*innerwarden*' -delete` and `find /etc -name agent.toml -delete` remove
+/// them. A relative root is read in each directory a `cd` named, and is
+/// not read without one. Not read: a file the guard keeps under a name not
+/// in [`GUARD_FILE_NAMES`], and a root behind a variable other than the home.
+fn guard_places_a_find_reaches(reading: &FindReading, dirs: &[String]) -> Vec<String> {
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|home| home.starts_with('/'))
+        .map(|home| home.to_lowercase().trim_end_matches('/').to_string());
+    // `~/x` with the home written out, where it is known.
+    let absolute = |path: &str| -> String {
+        let path = home_spelled(path);
+        match (&home, path.strip_prefix('~')) {
+            (Some(home), Some(rest)) if rest.is_empty() || rest.starts_with('/') => {
+                collapse_path(&format!("{home}{rest}"))
+            }
+            _ => collapse_path(&path),
+        }
+    };
+    let programs = &settings_hook_programs().programs;
+    let mut reached = Vec::new();
+    for written in &reading.roots {
+        let mut spellings = vec![written.clone()];
+        if !written.starts_with(['/', '~', '$']) {
+            spellings = dirs.iter().map(|dir| format!("{dir}/{written}")).collect();
+        }
+        for spelled in spellings {
+            let root = absolute(&spelled);
+            if !root.starts_with(['/', '~']) {
+                continue;
+            }
+            let root = root.trim_end_matches('/');
+            let places = GUARD_FIND_PLACES
+                .iter()
+                .map(|(place, names)| (place.to_string(), *names))
+                .chain(programs.iter().map(|program| (program.clone(), &[][..])));
+            for (place, names) in places {
+                let place = absolute(&place);
+                let Some(rest) = place.strip_prefix(root) else {
+                    continue;
+                };
+                if !(rest.starts_with('/') || root.is_empty()) {
+                    continue;
+                }
+                // As `find` prints it: the root as written, then the rest.
+                let printed = |path: &str| {
+                    format!("{}{}", written.trim_end_matches('/'), &path[root.len()..])
+                };
+                let mut candidates = vec![place.clone()];
+                let mut on_the_way = place.as_str();
+                while let Some((parent, _)) = on_the_way.rsplit_once('/') {
+                    if parent.len() <= root.len() {
+                        break;
+                    }
+                    candidates.push(parent.to_string());
+                    on_the_way = parent;
+                }
+                candidates.extend(names.iter().map(|name| format!("{place}/{name}")));
+                if candidates
+                    .iter()
+                    .any(|candidate| reading.filter.may_match(&printed(candidate)))
+                {
+                    reached.push(place);
+                }
+            }
+        }
+    }
+    reached
 }
 
 /// How many directories [`writes_place`] keeps for a line. A relative `cd`
