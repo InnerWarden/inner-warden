@@ -2953,6 +2953,11 @@ fn analyze_command_at(
     context: Option<&WorkingContext>,
     depth: u8,
 ) -> CommandAnalysis {
+    if let Some(bare) = guard_check_without_its_line(command) {
+        let mut analysis = analyze_command_at(&bare, rule_engine, protected_reads, context, depth);
+        analysis.command = command.trim().to_string();
+        return analysis;
+    }
     let as_bash = analyze_command_as_read(command, rule_engine, protected_reads, context, depth);
     if !command.contains("&>") {
         return as_bash;
@@ -2972,6 +2977,88 @@ fn analyze_command_at(
     } else {
         as_bash
     }
+}
+
+/// Where the guard's own program is installed, as a person or an installer
+/// writes the path to it.
+const GUARD_PROGRAM_DIRS: &[&str] = &[
+    "/usr/local/bin/",
+    "/usr/bin/",
+    "/bin/",
+    "/opt/homebrew/bin/",
+    "~/.local/bin/",
+    "~/.cargo/bin/",
+];
+
+/// `innerwarden check [options] '<line>'` (or `iw check`): the guard asked
+/// for its verdict on a line, which it reads and never runs. The line is
+/// data, so a dangerous one (`systemctl stop innerwarden-agent`) is not
+/// what this command does; the command is judged without it, as
+/// `innerwarden check [options]`.
+///
+/// Only when the text shows that nothing else runs: one simple command, no
+/// pipe, no redirection to a file, no input from the line or a file, no
+/// substitution anywhere, every word handed over as written (quoted or
+/// not, nothing the shell expands), the program the guard's by its bare
+/// name or its path in a folder it is installed in, and the first word
+/// after it `check`. A program merely named `innerwarden` somewhere else
+/// (`./innerwarden`, `/tmp/x/innerwarden`) may be anything and is judged
+/// with its words; the guard's other commands run for real and are judged
+/// as they were.
+fn guard_check_without_its_line(command: &str) -> Option<String> {
+    let lower = command.to_ascii_lowercase();
+    if !(lower.contains("innerwarden") || lower.contains("iw")) || !lower.contains("check") {
+        return None;
+    }
+    let line = crate::shell_words::read_line(command);
+    let [only] = line.commands.as_slice() else {
+        return None;
+    };
+    if !line.nested.is_empty()
+        || !line.arrays.is_empty()
+        || only.piped
+        || only.writes_file
+        || !only.inputs.is_empty()
+        || !only.reads.is_empty()
+    {
+        return None;
+    }
+    let [program, subcommand, rest @ ..] = only.words.as_slice() else {
+        return None;
+    };
+    if !only
+        .words
+        .iter()
+        .all(|word| word.is_plain() && word.substitutions.is_empty())
+    {
+        return None;
+    }
+    let path = program.text.as_str();
+    let guard = matches!(path, "innerwarden" | "iw")
+        || path.strip_suffix("innerwarden").is_some_and(|dir| {
+            GUARD_PROGRAM_DIRS.contains(&dir)
+                && (!dir.starts_with('~') || program.open_tildes == [0])
+        });
+    if !guard || subcommand.text != "check" {
+        return None;
+    }
+    // `check` takes `--json` and `--human`; every other word is the line
+    // it judges (`innerwarden check rm -rf /` judges `rm -rf /`).
+    let options: Vec<&str> = rest
+        .iter()
+        .map(|word| word.text.as_str())
+        .filter(|word| matches!(*word, "--json" | "--human"))
+        .collect();
+    if rest.len() == options.len() {
+        return None;
+    }
+    Some(
+        std::iter::once(path)
+            .chain(std::iter::once("check"))
+            .chain(options)
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
 }
 
 /// [`analyze_command_at`] on one reading of the command.
@@ -3172,6 +3259,7 @@ fn analyze_command_as_read(
     // rewrite of the guard's kernel maps changes what it refuses.
     if let Some((what, s)) = threats::check_anti_forensics(scan_cmd)
         .or_else(|| threats::check_guard_bpf_map_write(scan_cmd))
+        .or_else(|| threats::check_guard_bpf_detach(scan_cmd))
     {
         signals.push(AnalysisSignal {
             signal: "anti_forensics".into(),
