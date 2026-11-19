@@ -3661,6 +3661,26 @@ fn analyze_command_as_read(
                     .into(),
             });
             score += 50;
+        } else if let Some(fed) = crate::threats::xargs_feeds_removal(scan_cmd) {
+            // `ls / | xargs -I X rm -rf /X`: the targets come from what xargs
+            // reads, not from the line.
+            let (score_added, detail) = match fed {
+                crate::threats::XargsRemoval::ListsProtectedPlace => (
+                    50,
+                    "removal by xargs of what a listing of the filesystem root, a home \
+                     or a credential store prints",
+                ),
+                crate::threats::XargsRemoval::Unread => (
+                    25,
+                    "removal by xargs of paths it reads from input the guard does not see",
+                ),
+            };
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: score_added,
+                detail: detail.into(),
+            });
+            score += score_added;
         }
         if lower.contains("chmod 777") || lower.contains("chmod -r 777") {
             signals.push(AnalysisSignal {
