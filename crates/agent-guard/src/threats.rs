@@ -9392,6 +9392,8 @@ const ESCAPE_HOST_DIRECTORY: &str =
     "mounts a host system directory into a container writable, which is a container escape";
 const ESCAPE_SOCKET_MOUNT: &str =
     "mounts the container runtime's socket into a container, which hands the container the host";
+const ESCAPE_SOCKET_UNREAD: &str = "points a socket client or the container runtime's CLI at a socket named by a value the line does not set, which may be the container runtime's; the guard cannot tell without running the line";
+const ESCAPE_TARGET_UNREAD: &str = "enters the namespaces of a process named by a value the line does not set, which may be PID 1; the guard cannot tell without running the line";
 
 /// A container started so that it is the host, the host entered from inside
 /// one, and the container runtime driven through its API by a raw client.
@@ -9443,22 +9445,115 @@ const ESCAPE_SOCKET_MOUNT: &str =
 /// container), and both hand whoever runs the line the host: the socket
 /// starts a privileged container on request, and `SYS_ADMIN` mounts the
 /// host's disks. An agent that needs either asks the person, who runs it.
+///
+/// The runtime socket is the socket wherever it lives: under `/run`, and in
+/// the home or the user's runtime folder where Docker Desktop, Colima,
+/// Rancher Desktop, OrbStack, Lima and Podman machine keep it (the socket, or
+/// the folder that holds it, mounted into a container). It is also reached
+/// by an interpreter one-liner that opens the socket or the runtime's TCP
+/// port itself, or uses the runtime's SDK; by `telnet` and `/dev/tcp` on
+/// the port; by `curl` on any socket, or with its options in a file, asking
+/// for a path only the runtime's API serves (`/containers/json`,
+/// `/v1.43/...`, `/libpod/`); and by a raw client handed `DOCKER_HOST` or
+/// `docker context inspect`. A socket or an `nsenter` target named by a
+/// value the line does not set is known only when the line runs, so it is
+/// held for review (score 25), not refused ([`container_reach_unread`]).
+/// Still unread: options kept in `~/.curlrc`, which curl reads without
+/// being told, and a script file an interpreter is handed.
 pub fn check_container_escape(content: &str) -> Option<(&'static str, u32)> {
     if !mentions_any(
         content,
         &[
-            "docker", "podman", "nerdctl", "ctr", "finch", "buildah", "nsenter", ".sock", "237",
+            "docker",
+            "podman",
+            "nerdctl",
+            "ctr",
+            "finch",
+            "buildah",
+            "nsenter",
+            ".sock",
+            "237",
+            "container_host",
+            "containers/",
+            "libpod",
+            "_ping",
+            "/v1.",
+            "--uni",
+            "--ab",
+            "socat",
+            "nc ",
+            "ncat",
+            "netcat",
         ],
     ) {
         return None;
     }
     // The most expanded reading first, the line as written last.
     let (readings, _) = assignment_readings(content);
-    readings
+    if let Some(what) = readings
         .iter()
         .rev()
         .find_map(|reading| container_escape_as_read(reading))
-        .map(|what| (what, 60))
+    {
+        return Some((what, 60));
+    }
+    // What is left unset once the line's own values are read in.
+    let last = readings.last()?;
+    container_reach_unread(last)
+        .or_else(|| container_reach_unread(&normalize_command(last)))
+        .map(|what| (what, 25))
+}
+
+/// A raw socket client, the runtime's own CLI (`DOCKER_HOST=`,
+/// `CONTAINER_HOST=`, `docker -H`, `podman --url`) or `nsenter` pointed by
+/// a value the line does not set: a variable from outside the line, or a
+/// command substitution. `$HOME` and `$XDG_RUNTIME_DIR` are not such a
+/// value: the path after them is on the line and read by the rules above. What it
+/// names is known only once the line runs, so it is left to a person
+/// (`review`), not refused. A target that is a container's own PID read
+/// from the runtime (`nsenter -t "$(docker inspect -f '{{.State.Pid}}' web)"`)
+/// is a container's, never PID 1, and is not flagged.
+fn container_reach_unread(text: &str) -> Option<&'static str> {
+    static RES: std::sync::OnceLock<[regex::Regex; 5]> = std::sync::OnceLock::new();
+    let [socket, setting, target, target_from_runtime, namespace] = RES.get_or_init(|| {
+        // The socket after curl's socket options, `nc -U` and socat's
+        // `UNIX-*:` addresses, when it starts with an expansion.
+        const SOCKET_FROM_VALUE: &str = concat!(
+            r#"(?i:(?:^|[\s"'])--unix?(?:-s?[ocket]*)?|(?:^|[\s"'])--ab[stract]*(?:-[unix]*(?:-s?[ocket]*)?)?)"#,
+            r#"(?:\s*=\s*|\s+)["']?(?:\$|`)"#,
+            r#"|(?i:\b(?:nc|ncat|netcat)\b)[^|;&\n]*\s-[a-zA-Z]*U\s*["']?(?:\$|`)"#,
+            r#"|(?i:\bsocat\b)[^|;&\n]*\bUNIX(?:-CONNECT|-CLIENT|-SENDTO)?:["']?(?:\$|`)"#,
+        );
+        // Where the runtime's CLI is pointed, by its settings or its flags,
+        // when the value starts with an expansion; the expansion is captured.
+        const SETTING_FROM_VALUE: &str = concat!(
+            r#"(?:(?:^|[\s;&|(])(?:export\s+)?(?:DOCKER_HOST|CONTAINER_HOST)="#,
+            r#"|(?i:\b(?:docker|podman|nerdctl)\b)[^|;&\n]*\s(?:-H|--host|--url)(?:\s*=\s*|\s+))"#,
+            r#"["']?(?:(?:unix|tcp|ssh|npipe)://)?["']?(\$\{?\w*|`)"#,
+        );
+        const TARGET_FROM_VALUE: &str = r#"\bnsenter\b[\s\S]*?(?:\s-[a-zA-Z]*t\s*|\s--target(?:\s*=\s*|\s+))["']?(?:\$|`)"#;
+        const TARGET_FROM_RUNTIME: &str = r#"\bnsenter\b[\s\S]*?(?:\s-[a-zA-Z]*t\s*|\s--target(?:\s*=\s*|\s+))["']?\$\(\s*(?:sudo\s+)?(?:docker|podman|nerdctl|crictl)\s+(?:container\s+)?inspect\b"#;
+        const NAMESPACE_FROM_VALUE: &str = r#"\bnsenter\b[\s\S]*?\s--(?:mount|uts|ipc|net|pid|user|cgroup|time)=["']?(?:/proc/)?(?:\$|`)"#;
+        [
+            SOCKET_FROM_VALUE,
+            SETTING_FROM_VALUE,
+            TARGET_FROM_VALUE,
+            TARGET_FROM_RUNTIME,
+            NAMESPACE_FROM_VALUE,
+        ]
+        .map(|p| regex::Regex::new(p).expect("static container reach regex"))
+    });
+    let unset = |found: regex::Captures<'_>| {
+        let name = found[1].trim_start_matches(['$', '{']);
+        !matches!(name, "HOME" | "XDG_RUNTIME_DIR")
+    };
+    if socket.is_match(text) || setting.captures_iter(text).any(unset) {
+        return Some(ESCAPE_SOCKET_UNREAD);
+    }
+    if (target.is_match(text) && !target_from_runtime.is_match(text)) || namespace.is_match(text) {
+        return Some(ESCAPE_TARGET_UNREAD);
+    }
+    None
 }
 
 /// [`check_container_escape`] on one reading of the line. The raw form first
@@ -9635,7 +9730,7 @@ fn container_escape_in(text: &str) -> Option<&'static str> {
         const NSENTER_PID_ONE: &str = r#"\bnsenter\b[\s\S]*?(?:\s-[a-zA-Z]*t\s*|\s--target(?:\s*=\s*|\s+))["']?\+?0*1(?:[^\w.]|$)"#;
         const NSENTER_PROC_ONE: &str = r"\bnsenter\b[\s\S]*?/proc/1/ns/";
         const RUNTIME_SOCKET: &str =
-            r"(?i)\b(?:docker|podman|containerd|crio|cri-dockerd|dockershim)\.sock\b";
+            r"(?i)\b(?:docker|podman|containerd|crio|cri-dockerd|dockershim)(?:[.-][\w-]+)*\.sock\b";
         // curl's socket options (an older curl takes any unambiguous
         // abbreviation of them), `nc -U` with its flags in any order, socat.
         const RAW_SOCKET_CLIENT: &str = concat!(
@@ -9651,6 +9746,8 @@ fn container_escape_in(text: &str) -> Option<&'static str> {
             r#"(?i:\bhttps?://[^\s/"']*:237[56]\b)"#,
             r"|(?i:\b(?:curl|wget)\b)[^|;&\n]*?[\w.\]]:237[56]\b",
             r"|(?i:\b(?:nc|ncat|netcat)\b)[^|;&\n]*\s237[56]\b",
+            r"|(?i:\btelnet\b)[^|;&\n]*\s237[56]\b",
+            r"|/dev/(?:tcp|udp)/[^/\s]+/237[56]\b",
         );
         // `--cap-add`, its value attached or not, one name or a comma list,
         // with or without `CAP_`, in any case.
@@ -9675,8 +9772,61 @@ fn container_escape_in(text: &str) -> Option<&'static str> {
             r#"/?:[^\s:"']+(?::(?:(?:rw|z|shared|slave|private|rshared|rslave|rprivate|delegated|cached|consistent|nocopy),?)*)?(?:["'\s]|$)"#,
         ]
         .concat();
-        const RUNTIME_SOCKET_PATH: &str =
-            r"/(?:var/)?run/(?:[\w.-]+/)*(?:docker|podman|containerd|crio|cri-dockerd)\.sock";
+        // A runtime socket anywhere: under `/run`, and also in the home or
+        // the user's runtime folder, where Docker Desktop, Colima, Rancher
+        // Desktop, OrbStack, Lima and Podman machine keep theirs
+        // (`~/.docker/run/docker.sock`, `~/.colima/default/docker.sock`,
+        // `podman-machine-default-api.sock`, `docker.raw.sock`).
+        const RUNTIME_SOCKET_PATH: &str = concat!(
+            r"(?:/|~/|\$\{?(?:HOME|XDG_RUNTIME_DIR)\}?/)(?:[\w.-]+/)*",
+            r"(?:docker|podman|containerd|crio|cri-dockerd)(?:[.-][\w-]+)*\.sock",
+        );
+        // The folders those runtimes keep their socket in, mounted whole.
+        const RUNTIME_SOCKET_FOLDER: &str = concat!(
+            r#"(?:(?:~|\$\{?HOME\}?|/home/[^/\s"':,]+|/var/home/[^/\s"':,]+|/Users/[^/\s"':,]+|/root)/"#,
+            r"(?:\.docker/(?:run|desktop)|\.colima(?:/[\w.-]+)?|\.orbstack(?:/run)?|\.rd",
+            r"|\.lima(?:/[\w.-]+(?:/sock)?)?|\.local/share/containers/podman/machine(?:/[\w.-]+)?)",
+            r"|(?:\$\{?XDG_RUNTIME_DIR\}?|/run/user/\d+)(?:/(?:podman|docker|containerd))?)",
+        );
+        let folder_volume = [
+            r#"(?i)(?:^|[\s"'])(?:-[a-z]*v|--volume)["']?(?:\s*=\s*|\s+)?["']?"#,
+            RUNTIME_SOCKET_FOLDER,
+            r#"/?["']?:"#,
+        ]
+        .concat();
+        let folder_mount = [
+            r#"(?i)(?:^|[\s"'])--mount["']?(?:\s*=\s*|\s+)["']?[^\s"']*?\b(?:source|src)=["']?"#,
+            RUNTIME_SOCKET_FOLDER,
+            r#"/?["']?(?:[,\s"']|$)"#,
+        ]
+        .concat();
+        // A raw HTTP client that reaches a socket (curl's socket options) or
+        // takes its options from a file (`curl -K`), asking for a path only
+        // the runtime's API serves.
+        const SOCKET_OR_CONFIG_CLIENT: &str = concat!(
+            r#"(?i:(?:^|[\s"'])--unix?(?:-s?[ocket]*)?(?:[\s="']|$))"#,
+            r#"|(?i:(?:^|[\s"'])--ab[stract]*(?:-[unix]*(?:-s?[ocket]*)?)?(?:[\s="']|$))"#,
+            r#"|(?i:\bcurl\b)[^|;&\n]*\s(?:-[a-zA-Z]*K|--config)(?:[\s="']|$)"#,
+        );
+        const RUNTIME_API_URL: &str = concat!(
+            r#"(?i)\bhttps?://[^\s/"']*(?:/v1\.\d{2}|/v\d+\.\d+\.\d+)?/"#,
+            r#"(?:containers/(?:json|create|prune)\b|containers/[^\s/"'?]+/(?:exec|start|attach|archive|update|json|export|kill|restart|wait)\b"#,
+            r#"|exec/[^\s/"'?]+/start\b|images/(?:json|create|load)\b|_ping\b|libpod/)"#,
+            r#"|\bhttps?://[^\s/"']*/v1\.\d{2}/"#,
+        );
+        // A raw client handed the runtime by its own settings.
+        const RUNTIME_BY_SETTING: &str = r"(?i)\$\{?(?:DOCKER_HOST|CONTAINER_HOST)\b|\b(?:docker|podman)\s+(?:context|machine)\s+inspect\b";
+        // The same settings read by name from inside an interpreter.
+        const RUNTIME_SETTING_NAME: &str = r"\b(?:DOCKER_HOST|CONTAINER_HOST)\b";
+        // An interpreter one-liner that opens a connection itself.
+        const INTERPRETER: &str = r"(?i)\b(?:python[\d.]*|pypy[\d.]*|perl|ruby|node(?:js)?|deno|bun|php[\d.]*|lua(?:jit)?[\d.]*|tclsh[\d.]*|pwsh|powershell|osascript|jshell|groovy)\b";
+        const OPENS_CONNECTION: &str = concat!(
+            r"(?i)\bconnect\b|\bsocket\b|socketPath|UNIXSocket|TCPSocket|IO::Socket|AF_UNIX|create_connection",
+            r"|urlopen|http\.client|HTTPConnection|\brequests\b|fsockopen|stream_socket_client|createConnection",
+            r"|unix://|http\+unix|\bfetch\b|Net::HTTP|HTTP::Tiny|\bLWP\b",
+        );
+        const RUNTIME_PORT: &str = r"(?:^|[^\w.])237[56](?:[^\w.]|$)";
+        const RUNTIME_SDK: &str = r#"(?i)\bdocker\.(?:from_env|DockerClient|APIClient)\b|\bfrom\s+docker\s+import\b|require\(\s*["']dockerode\b|\bDocker::(?:Container|Image)\b"#;
         let socket_volume = [
             r#"(?i)(?:^|[\s"'])(?:-[a-z]*v|--volume)["']?(?:\s*=\s*|\s+)?["']?"#,
             RUNTIME_SOCKET_PATH,
@@ -9718,9 +9868,32 @@ fn container_escape_in(text: &str) -> Option<&'static str> {
             (vec![RUNS, socket_mount_target.as_str()], ESCAPE_SOCKET_MOUNT),
             (vec![NSENTER_PID_ONE], ESCAPE_PID_ONE),
             (vec![NSENTER_PROC_ONE], ESCAPE_PID_ONE),
+            (vec![RUNS, folder_volume.as_str()], ESCAPE_SOCKET_MOUNT),
+            (vec![RUNS, folder_mount.as_str()], ESCAPE_SOCKET_MOUNT),
             (
                 vec![RUNTIME_SOCKET, RAW_SOCKET_CLIENT],
                 ESCAPE_RUNTIME_SOCKET,
+            ),
+            (
+                vec![SOCKET_OR_CONFIG_CLIENT, RUNTIME_API_URL],
+                ESCAPE_RUNTIME_SOCKET,
+            ),
+            (
+                vec![RAW_SOCKET_CLIENT, RUNTIME_BY_SETTING],
+                ESCAPE_RUNTIME_SOCKET,
+            ),
+            (
+                vec![INTERPRETER, RUNTIME_SOCKET, OPENS_CONNECTION],
+                ESCAPE_RUNTIME_SOCKET,
+            ),
+            (
+                vec![INTERPRETER, RUNTIME_SETTING_NAME, OPENS_CONNECTION],
+                ESCAPE_RUNTIME_SOCKET,
+            ),
+            (vec![INTERPRETER, RUNTIME_SDK], ESCAPE_RUNTIME_SOCKET),
+            (
+                vec![INTERPRETER, RUNTIME_PORT, OPENS_CONNECTION],
+                ESCAPE_RUNTIME_TCP,
             ),
             (vec![RUNTIME_TCP], ESCAPE_RUNTIME_TCP),
         ];
@@ -25316,6 +25489,45 @@ mod round_three_rule_tests {
         ] {
             assert_eq!(plain_absolute_path(written), plain, "{written}");
         }
+    }
+
+    /// A socket or an `nsenter` target the line leaves to a value from
+    /// outside it is held for a person with its own wording, and the same
+    /// value set on the line is read in its place.
+    /// FAILS ON REVERT of `container_reach_unread`.
+    #[test]
+    fn a_runtime_reach_named_from_outside_the_line_is_held_with_its_reason() {
+        assert_eq!(
+            check_container_escape("curl --unix-socket \"$SOCK\" http://localhost/health"),
+            Some((ESCAPE_SOCKET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("nsenter -t \"$P\" -m sh"),
+            Some((ESCAPE_TARGET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("DOCKER_HOST=unix://$S docker ps"),
+            Some((ESCAPE_SOCKET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("podman --url \"$U\" ps"),
+            Some((ESCAPE_SOCKET_UNREAD, 25))
+        );
+        assert_eq!(
+            check_container_escape("export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock"),
+            None
+        );
+        assert_eq!(
+            check_container_escape("P=1; nsenter -t $P -m sh"),
+            Some((ESCAPE_PID_ONE, 60))
+        );
+        assert_eq!(check_container_escape("P=12; nsenter -t $P -n ip a"), None);
+        assert_eq!(
+            check_container_escape(
+                "nsenter -t \"$(docker inspect -f '{{.State.Pid}}' web)\" -n ip a"
+            ),
+            None
+        );
     }
 
     #[test]

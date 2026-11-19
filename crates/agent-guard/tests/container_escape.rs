@@ -142,3 +142,142 @@ fn ordinary_container_work_is_allowed() {
         );
     }
 }
+
+/// The runtime's socket where Docker Desktop, Colima, Rancher Desktop,
+/// OrbStack, Lima and Podman machine keep it (the home, the user's runtime
+/// folder, macOS's temporary folders), and the runtime reached by a client or
+/// a spelling the rule did not name: an interpreter one-liner that opens the
+/// socket or the TCP port itself, the runtime's SDK, `telnet` and
+/// `/dev/tcp` on the port, `curl` with its options in a file or on any
+/// socket asking for a path only the runtime's API serves, and a client
+/// handed the runtime by `DOCKER_HOST` or `docker context inspect`.
+///
+/// Each line here was answered "allow" (or refused only by another rule) on
+/// origin/main at e7d2d78, measured 2026-11-19.
+#[test]
+fn the_runtime_reached_from_the_home_or_by_another_client_is_refused() {
+    for cmd in [
+        "docker run -v ~/.docker/run/docker.sock:/s alpine sh",
+        "docker run -v $HOME/.colima/default/docker.sock:/s alpine sh",
+        "docker run -v ${HOME}/.rd/docker.sock:/var/run/x.sock alpine sh",
+        "docker run -v /Users/dev/.docker/run/docker.sock:/s alpine sh",
+        "docker run -v /home/dev/.orbstack/run/docker.sock:/s alpine sh",
+        "docker run --mount type=bind,source=/Users/dev/.orbstack/run/docker.sock,target=/s alpine",
+        "docker run --mount type=bind,src=$HOME/.colima/default/docker.sock,dst=/s alpine",
+        "docker run -v ~/.docker/run:/r alpine sh",
+        "docker run -v ~/.colima/default:/r alpine sh",
+        "docker run -v $HOME/.orbstack/run:/r alpine sh",
+        "docker run --mount type=bind,source=/Users/dev/.lima/docker/sock,target=/r alpine sh",
+        "podman run -v $XDG_RUNTIME_DIR/podman/podman.sock:/s alpine sh",
+        "podman run -v /run/user/1000/podman:/r alpine sh",
+        "curl --unix-socket ~/Library/Containers/com.docker.docker/Data/docker.raw.sock http://d/info",
+        "curl --unix-socket ~/Library/Containers/com.docker.docker/Data/docker-cli.sock http://d/info",
+        "curl --unix-socket /var/folders/x/T/podman/podman-machine-default-api.sock http://d/v4.0.0/libpod/info",
+        "python3 -c \"import socket; s=socket.socket(socket.AF_UNIX); s.connect('/var/run/docker.sock'); s.send(b'GET /containers/json HTTP/1.0\\r\\n\\r\\n')\"",
+        "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1', 2375)); s.send(b'GET /info HTTP/1.0\\r\\n\\r\\n')\"",
+        "node -e \"require('http').get({socketPath:'/var/run/docker.sock',path:'/containers/json'},r=>r.pipe(process.stdout))\"",
+        "php -r '$s=stream_socket_client(\"unix:///var/run/docker.sock\");'",
+        "python3 -c \"import docker; docker.from_env().containers.run('alpine','sh',privileged=True)\"",
+        "python3 -c \"import os,socket; s=socket.socket(socket.AF_UNIX); s.connect(os.environ['DOCKER_HOST'][7:])\"",
+        "telnet 127.0.0.1 2375",
+        "curl -K docker.cfg http://localhost/containers/json",
+        "curl --config ./api.cfg http://localhost/v1.43/containers/create",
+        "curl --unix-socket /tmp/x.sock http://localhost/containers/json",
+        "curl --unix-socket /tmp/x.sock -X POST http://d/containers/web/exec",
+        "curl --unix-socket \"$SOCK\" http://localhost/containers/json",
+        "curl --unix-socket \"${DOCKER_HOST#unix://}\" http://localhost/info",
+        "curl --unix-socket $(docker context inspect -f '{{.Endpoints.docker.Host}}') http://d/info",
+    ] {
+        let analysis = analyze_command(cmd, None);
+        assert_eq!(analysis.recommendation, "deny", "{cmd}");
+        assert!(blocks_for_agent(&analysis), "{cmd}");
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|s| s.signal == "container_escape" && s.score == 60),
+            "refused, but not as a container escape: {cmd}: {:?}",
+            analysis.signals
+        );
+    }
+}
+
+/// A raw socket client or `nsenter` pointed by a value the line does not
+/// set: what it names is known only once the line runs, so a person reads it.
+/// Each was answered "allow" on origin/main at e7d2d78, measured 2026-11-19.
+#[test]
+fn the_runtime_named_by_a_value_from_outside_the_line_is_held_for_review() {
+    for cmd in [
+        "curl --unix-socket \"$SOCK\" http://localhost/health",
+        "curl --unix-socket=$(cat /tmp/where) http://d/info",
+        "DOCKER_HOST=unix://$S docker ps",
+        "export DOCKER_HOST=\"$H\"; docker run alpine sh",
+        "CONTAINER_HOST=unix://${S} podman ps",
+        "podman --url \"$U\" ps",
+        "podman --url=unix://$U ps",
+        "docker -H unix://$S ps",
+        "docker --host \"$(cat /tmp/where)\" ps",
+        "docker -H `cat /tmp/where` ps",
+        "nsenter -t \"$P\" -m sh",
+        "nsenter -t $(pgrep -o systemd) -a sh",
+        "nsenter --target=`pidof init` -m sh",
+        "nsenter --mount=/proc/$P/ns/mnt sh",
+    ] {
+        let analysis = analyze_command(cmd, None);
+        assert_eq!(
+            analysis.recommendation, "review",
+            "{cmd}: {:?}",
+            analysis.signals
+        );
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|s| s.signal == "container_escape" && s.score == 25),
+            "held, but not as a container escape: {cmd}: {:?}",
+            analysis.signals
+        );
+    }
+}
+
+/// The lines beside the new ones that stay ordinary work: the home mounted
+/// for a cache or a config file, the runtime socket named without a client
+/// that opens it, an interpreter that only looks, a socket that is the
+/// line's own, and `nsenter` into a container's PID read from the runtime.
+#[test]
+fn ordinary_work_beside_the_runtime_reach_is_allowed() {
+    for cmd in [
+        "docker run --rm -v ~/.cache:/cache alpine ls /cache",
+        "docker run --rm -v ~/.docker/config.json:/root/.docker/config.json:ro alpine",
+        "docker run --rm -v $HOME/src:/src alpine ls",
+        "docker run --rm -v ~/.colima-notes:/n alpine ls",
+        "ls -l ~/.docker/run/docker.sock",
+        "docker context create colima --docker host=unix://$HOME/.colima/default/docker.sock",
+        "export DOCKER_HOST=unix://$HOME/.colima/default/docker.sock",
+        "DOCKER_HOST=unix://$XDG_RUNTIME_DIR/docker.sock docker ps",
+        "S=/tmp/d.sock; DOCKER_HOST=unix://$S docker ps",
+        "docker -H unix:///var/run/docker.sock ps",
+        "podman --url unix:///run/podman/podman.sock ps",
+        "curl -H \"$AUTH\" https://api.example.com/v1/items",
+        "docker ps --format \"$FMT\"",
+        "python3 -c \"import socket; print(socket.gethostname())\"",
+        "python3 -c \"import os; print(os.path.exists('/var/run/docker.sock'))\"",
+        "python3 -c \"import os; print(os.environ.get('DOCKER_HOST'))\"",
+        "node -e \"require('http').get('http://localhost:3000/health')\"",
+        "curl --unix-socket /tmp/app.sock http://localhost/health",
+        "curl --unix-socket /tmp/app.sock http://localhost/images/logo.png",
+        "S=/tmp/app.sock; curl --unix-socket \"$S\" http://localhost/health",
+        "curl http://localhost/containers/json",
+        "nsenter -t \"$(docker inspect -f '{{.State.Pid}}' web)\" -n ss -ltn",
+        "nsenter -t \"$(podman inspect -f '{{.State.Pid}}' web)\" -n ip a",
+        "P=12; nsenter -t $P -n ip a",
+        "telnet localhost 8080",
+    ] {
+        let analysis = analyze_command(cmd, None);
+        assert_eq!(
+            analysis.recommendation, "allow",
+            "ordinary work: {cmd}: {:?}",
+            analysis.signals
+        );
+    }
+}
