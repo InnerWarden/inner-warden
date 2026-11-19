@@ -283,6 +283,7 @@ fn status_io_cmd_rest(
         Some(dashboard_answers(dashboard_probe_target()))
     };
 
+    let kept_apart_before = graph_io::kept_apart_before();
     let facts = status::Facts {
         never_configured,
         mode,
@@ -295,8 +296,24 @@ fn status_io_cmd_rest(
         newest_decision_age_secs,
         decisions_by_hand,
         dashboard_reachable,
+        record_kept_apart: graph_io::shared_record_denied().map(|denied| status::RecordKeptApart {
+            shared_dir: denied.shared_dir.display().to_string(),
+            own_dir: denied
+                .own
+                .parent()
+                .unwrap_or(&denied.own)
+                .display()
+                .to_string(),
+        }),
+        kept_apart_before: kept_apart_before
+            .as_deref()
+            .map(|dir| dir.display().to_string()),
     };
     print!("{}", status::render(&facts));
+    // Said once: the note that made this line is dropped once it is printed.
+    if let Some(dir) = kept_apart_before.as_deref() {
+        graph_io::forget_kept_apart(dir);
+    }
     std::process::ExitCode::SUCCESS
 }
 

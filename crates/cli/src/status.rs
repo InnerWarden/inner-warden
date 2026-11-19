@@ -414,6 +414,64 @@ pub struct Facts {
     pub decisions_by_hand: u64,
     /// Whether the local dashboard answered. `None` when it was not probed.
     pub dashboard_reachable: Option<bool>,
+    /// Set when `/etc/innerwarden/guard.toml` names a shared record this
+    /// account is refused, so its decisions are kept in its own home instead.
+    pub record_kept_apart: Option<RecordKeptApart>,
+    /// Set once, on the first `status` after the shared record takes this
+    /// account again: the folder in its home that still holds what it
+    /// recorded while it was refused.
+    pub kept_apart_before: Option<String>,
+}
+
+/// The shared record directory this account may not write, and the folder
+/// its decisions are kept in instead. Paths as the reader should see them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordKeptApart {
+    pub shared_dir: String,
+    pub own_dir: String,
+}
+
+/// The one line that says a record was kept apart. Every screened call is
+/// still judged and recorded; the hook says nothing about this on each call,
+/// so this line is where it is said.
+///
+/// It is an integrity failure, not a placement detail: every call is still
+/// screened, but the record of it sits in a file this account, and so the
+/// agent running as it, can edit or delete, and InnerWarden Pro does not
+/// read. The fix is one command, and it is the `try:` line.
+pub fn record_kept_apart_finding(apart: &RecordKeptApart) -> Finding {
+    Finding::NotWorking {
+        what: format!(
+            "Record integrity: this account may not write the shared record in {}, \
+             so its decisions go to {} instead. Every call is still screened, but \
+             those decisions can be edited or deleted by this account (and the \
+             agent running as it), and InnerWarden Pro on this machine does not \
+             see them.",
+            apart.shared_dir, apart.own_dir
+        ),
+        next: format!(
+            "sudo usermod -aG innerwarden \"$USER\" (the group that owns {} on a \
+             Pro install), then start the agent again from a new login",
+            apart.shared_dir
+        ),
+    }
+}
+
+/// The one line, said once, about what was recorded in this account's home
+/// while it was refused the shared record. The shared record takes it again,
+/// so nothing is wrong now; whether those decisions are intact can no longer
+/// be established, which is what `[unknown]` means.
+pub fn kept_apart_before_finding(own_dir: &str) -> Finding {
+    Finding::Unknown {
+        what: format!(
+            "Decisions this account recorded while it was refused the shared record \
+             are still in {own_dir}. InnerWarden Pro never saw them, and this account \
+             could edit or delete them there."
+        ),
+        why: format!(
+            "said once. To read them: IW_GRAPH_FILE=\"{own_dir}/graph.json\" innerwarden graph"
+        ),
+    }
 }
 
 /// The caveat on an agent in `Wired into` whose other hooks do not run.
@@ -532,6 +590,14 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     }
 
     // ── Evidence ────────────────────────────────────────────────────────────
+    // Before the count: the count below is read from the record this account
+    // writes, and when that is its own home the reader has to know first.
+    if let Some(apart) = facts.record_kept_apart.as_ref() {
+        out.push(record_kept_apart_finding(apart));
+    }
+    if let Some(own_dir) = facts.kept_apart_before.as_deref() {
+        out.push(kept_apart_before_finding(own_dir));
+    }
     match facts.decisions_recorded {
         Some(0) if facts.decisions_by_hand > 0 => out.push(Finding::Unknown {
             what: format!(
@@ -985,7 +1051,112 @@ mod tests {
             newest_decision_age_secs: Some(90),
             decisions_by_hand: 0,
             dashboard_reachable: Some(true),
+            record_kept_apart: None,
+            kept_apart_before: None,
         }
+    }
+
+    /// An account refused the shared record is told once, here, that its
+    /// decisions are kept apart and what puts them back, and the line comes
+    /// before the count it changes the meaning of.
+    ///
+    /// FAILS ON REVERT: drop the finding from `assess` and nothing anywhere
+    /// says the Pro side cannot see this account's blocks.
+    #[test]
+    fn a_record_kept_apart_is_said_once_before_the_count() {
+        let mut facts = healthy();
+        assert!(!assess(&facts)
+            .iter()
+            .any(|f| f.to_string().contains("shared record")));
+        facts.record_kept_apart = Some(RecordKeptApart {
+            shared_dir: "/var/lib/innerwarden/guard".into(),
+            own_dir: "/home/agent/.config/innerwarden".into(),
+        });
+        let findings = assess(&facts);
+        let apart: Vec<usize> = findings
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.to_string().contains("shared record"))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(apart.len(), 1, "said once: {findings:?}");
+        let count = findings
+            .iter()
+            .position(|f| f.to_string().contains("screening decision(s) recorded"))
+            .expect("the count is still there");
+        assert!(apart[0] < count, "{findings:?}");
+        match &findings[apart[0]] {
+            Finding::NotWorking { what, next } => {
+                assert!(what.contains("/var/lib/innerwarden/guard"), "{what}");
+                assert!(what.contains("/home/agent/.config/innerwarden"), "{what}");
+                assert!(what.contains("does not see them"), "{what}");
+                assert!(next.contains("usermod -aG innerwarden"), "{next}");
+            }
+            other => panic!("the Pro side missing these is a fault to fix: {other:?}"),
+        }
+    }
+
+    /// The line is an integrity failure, and the group step leads the fix.
+    ///
+    /// FAILS ON REVERT: the line said only that decisions were "kept" in the
+    /// home, with the command after a description of the group.
+    #[test]
+    fn a_record_kept_apart_is_an_integrity_failure_with_the_group_step_first() {
+        let finding = record_kept_apart_finding(&RecordKeptApart {
+            shared_dir: "/var/lib/innerwarden/guard".into(),
+            own_dir: "/home/agent/.config/innerwarden".into(),
+        });
+        let mut facts = healthy();
+        facts.record_kept_apart = Some(RecordKeptApart {
+            shared_dir: "/var/lib/innerwarden/guard".into(),
+            own_dir: "/home/agent/.config/innerwarden".into(),
+        });
+        assert_eq!(
+            headline(&assess(&facts)),
+            "InnerWarden is installed but NOT fully protecting this machine."
+        );
+        match finding {
+            Finding::NotWorking { what, next } => {
+                assert!(what.starts_with("Record integrity:"), "{what}");
+                assert!(what.contains("edited or deleted"), "{what}");
+                assert!(
+                    next.starts_with("sudo usermod -aG innerwarden"),
+                    "the command first: {next}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Once the shared record takes the account again, `status` says once
+    /// that what it recorded meanwhile is still in its home, and how to read it.
+    ///
+    /// FAILS ON REVERT: drop the finding from `assess` and the decisions kept
+    /// apart are never mentioned again once the group is fixed.
+    #[test]
+    fn decisions_kept_apart_before_are_mentioned_once_the_record_is_shared_again() {
+        let mut facts = healthy();
+        facts.kept_apart_before = Some("/home/agent/.config/innerwarden".into());
+        let findings = assess(&facts);
+        let lines: Vec<String> = findings
+            .iter()
+            .map(ToString::to_string)
+            .filter(|line| line.contains("refused the shared record"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{findings:?}");
+        assert!(
+            lines[0].contains("/home/agent/.config/innerwarden"),
+            "{}",
+            lines[0]
+        );
+        let read_with = format!(
+            "IW_GRAPH_FILE=\"{}/graph.json\"",
+            "/home/agent/.config/innerwarden"
+        );
+        assert!(lines[0].contains(&read_with), "{}", lines[0]);
+        assert!(findings.iter().any(
+            |f| matches!(f, Finding::Unknown { what, .. } if what.contains("never saw them"))
+        ));
     }
 
     /// Measured on a clean box: install, `agents connect --all`, then `status`.
@@ -1190,6 +1361,8 @@ mod tests {
             newest_decision_age_secs: None,
             decisions_by_hand: 0,
             dashboard_reachable: None,
+            record_kept_apart: None,
+            kept_apart_before: None,
         };
         for finding in assess(&facts) {
             assert!(
