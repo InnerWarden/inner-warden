@@ -6962,26 +6962,165 @@ fn names_home_startup(target: &str, taken: bool) -> bool {
     })
 }
 
-/// A command of a line whose effect on a startup file is shown on the line:
-/// `echo`/`printf` of text that holds no command substitution, a heredoc or
-/// here-string, a `tee` fed by such an `echo`, an in-place `sed`/`perl`
-/// edit (its expression is on the line) and `truncate` (it empties the file;
-/// an empty file runs nothing). What these write is judged by what it is
-/// (`startup_file_payloads` and [`check_persistence_install`]).
-fn shows_what_it_writes(segment: &str, piped_from_text: bool) -> bool {
+/// Variables a line does not choose the value of: the session sets them
+/// (`$HOME`, `$PATH`). Any other variable a startup file is written from
+/// holds what the line does not show, unless the line gave it a literal.
+const ENVIRONMENT_NAMES: &[&str] = &[
+    "home",
+    "path",
+    "user",
+    "logname",
+    "shell",
+    "pwd",
+    "lang",
+    "term",
+    "editor",
+    "visual",
+    "hostname",
+    "tmpdir",
+    "xdg_config_home",
+    "xdg_data_home",
+    "xdg_cache_home",
+    "xdg_state_home",
+    "xdg_runtime_dir",
+];
+
+/// Whether shell text expands what the line does not show: a command
+/// substitution (`$(...)` or backticks), a positional or special
+/// parameter, or a variable that is neither one of [`ENVIRONMENT_NAMES`] nor
+/// given a literal on the line (`literals`, lowercase). With `quotes`, single
+/// quotes make text literal, as on a command line; without, as in the body of
+/// an unquoted heredoc, they do not.
+fn hides_text(text: &str, literals: &[String], quotes: bool) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    let mut single = false;
+    let mut double = false;
+    while let Some(&byte) = bytes.get(index) {
+        if single {
+            single = byte != b'\'';
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => {
+                index += 2;
+                continue;
+            }
+            b'\'' if quotes && !double => single = true,
+            b'"' if quotes => double = !double,
+            b'`' => return true,
+            b'$' => {
+                let rest = &text[index + 1..];
+                if rest.starts_with('(') {
+                    return true;
+                }
+                let name: String = rest
+                    .trim_start_matches('{')
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() {
+                    if rest.starts_with(['@', '*', '{', '!']) {
+                        return true;
+                    }
+                } else {
+                    let name = name.to_ascii_lowercase();
+                    if !ENVIRONMENT_NAMES.contains(&name.as_str()) && !literals.contains(&name) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+/// The variables the segments of a line give a literal value (lowercase),
+/// as of the end of the line: `P='alias ll="ls -l"'` is one, `P=$(curl ...)` is
+/// not, and a later assignment of anything else takes the name back.
+fn literal_variables(segments: &[&str]) -> Vec<String> {
+    static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let assign = ASSIGN.get_or_init(|| {
+        regex::Regex::new(
+            r"^\s*(?:(?:export|local|readonly|declare)\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$",
+        )
+        .expect("static assignment regex")
+    });
+    let mut literals: Vec<String> = Vec::new();
+    for segment in segments {
+        let Some(captures) = assign.captures(segment) else {
+            continue;
+        };
+        let name = captures[1].to_ascii_lowercase();
+        literals.retain(|known| *known != name);
+        if !hides_text(&captures[2], &literals, true) {
+            literals.push(name);
+        }
+    }
+    literals
+}
+
+/// Whether the heredoc a segment opens has a body the line does not show:
+/// its tag is not quoted (`<<EOF`, not `<<'EOF'`, `<<"EOF"` or `<<\EOF`) and
+/// the body expands something [`hides_text`] counts. Quotes inside such a body
+/// do not stop an expansion.
+fn heredoc_hides(content: &str, segment: &str, literals: &[String]) -> bool {
+    static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let heredoc = HEREDOC.get_or_init(|| {
+        regex::Regex::new(r#"<<-?\s*(['"\\]?)([A-Za-z_][A-Za-z0-9_]*)"#)
+            .expect("static heredoc tag regex")
+    });
+    if segment.contains("<<<") {
+        return false;
+    }
+    let Some(captures) = heredoc.captures(segment) else {
+        return false;
+    };
+    if !captures[1].is_empty() {
+        return false;
+    }
+    let tag = &captures[2];
+    let start = (segment.as_ptr() as usize).saturating_sub(content.as_ptr() as usize);
+    let Some(after) = content.get(start..) else {
+        return false;
+    };
+    let body: Vec<&str> = after
+        .lines()
+        .skip(1)
+        .take_while(|line| line.trim() != tag)
+        .collect();
+    hides_text(&body.join("\n"), literals, false)
+}
+
+/// A command of a line whose effect on a startup file is shown on the line,
+/// with nothing in it the line does not show ([`hides_text`]): `echo`/`printf`,
+/// a heredoc or here-string, a `tee` fed by such an `echo`, an in-place
+/// `sed`/`perl` edit (its expression is on the line) and `truncate` (it empties
+/// the file; an empty file runs nothing). What these write is judged by what
+/// it is (`startup_file_payloads` and [`check_persistence_install`]).
+/// `echo "$P"` with `P=$(curl ...)`, an unquoted heredoc whose body runs a
+/// substitution, and `sed -i "s/x/$(curl ...)/"` show nothing.
+fn shows_what_it_writes(
+    content: &str,
+    segment: &str,
+    piped_from_text: bool,
+    literals: &[String],
+) -> bool {
     let words = shell_tokens(segment);
     let Some(command_index) = effective_command_index(&words) else {
         return false;
     };
     let command = token_basename(&words[command_index]).to_ascii_lowercase();
-    // A substitution in single quotes is text: `echo 'eval "$(pyenv init -)"'`.
-    let unquoted: String = segment.split('\'').step_by(2).collect::<Vec<_>>().join(" ");
-    let substitutes = unquoted.contains("$(") || unquoted.contains('`');
+    let shown =
+        || !hides_text(segment, literals, true) && !heredoc_hides(content, segment, literals);
     match command.as_str() {
-        "echo" | "printf" => !substitutes,
-        "tee" => piped_from_text || segment.contains("<<"),
-        "cat" => segment.contains("<<"),
-        "sed" | "gsed" | "perl" | "truncate" => true,
+        "echo" | "printf" | "sed" | "gsed" | "perl" => shown(),
+        "tee" => (piped_from_text || segment.contains("<<")) && shown(),
+        "cat" => segment.contains("<<") && shown(),
+        "truncate" => true,
         _ => false,
     }
 }
@@ -7015,17 +7154,93 @@ pub fn replaces_startup_file_unseen(content: &str) -> bool {
         return false;
     }
     let segments = shell_command_segments(content);
+    let literals = literal_variables(&segments);
     let mut unseen = Vec::with_capacity(segments.len());
     for (index, segment) in segments.iter().enumerate() {
         let piped_from_text = index.checked_sub(1).is_some_and(|before| {
             let previous = segments[before];
-            segments_are_piped(content, previous, segment) && shows_what_it_writes(previous, false)
+            segments_are_piped(content, previous, segment)
+                && shows_what_it_writes(content, previous, false, &literals)
         });
-        if !shows_what_it_writes(segment, piped_from_text) {
+        if !shows_what_it_writes(content, segment, piped_from_text, &literals) {
             unseen.push(*segment);
         }
     }
     !unseen.is_empty() && writes_place(&unseen.join("\n"), 0, names_home_startup, false)
+}
+
+/// What the shell side says of a line that installs a service or a login
+/// item from a file outside the folders they are kept in
+/// ([`installs_session_item_from_outside`]).
+pub const SESSION_ITEM_FROM_OUTSIDE: &str =
+    "installs a service or login item from a file outside the folders they are kept in";
+
+/// Whether a path names a place services and login items are kept in: a
+/// home's `.config/systemd/user` or `Library/LaunchAgents`, the system's
+/// systemd folders and its launch agent and daemon folders.
+fn names_session_item_folder(path: &str) -> bool {
+    let Some(named) = named_path(&home_spelled(path)) else {
+        return false;
+    };
+    if let Some(relative) = home_relative_path(&named) {
+        return [".config/systemd/user/", "library/launchagents/"]
+            .iter()
+            .any(|folder| relative.starts_with(folder));
+    }
+    named.rooted
+        && [
+            "/etc/systemd/",
+            "/usr/lib/systemd/",
+            "/lib/systemd/",
+            "/run/systemd/",
+            "/library/launchagents/",
+            "/library/launchdaemons/",
+            "/system/library/launchagents/",
+            "/system/library/launchdaemons/",
+        ]
+        .iter()
+        .any(|folder| named.path.starts_with(folder))
+}
+
+/// Whether a command line installs a service or a login item from a file
+/// outside the folders they are kept in ([`names_session_item_folder`]):
+/// `systemctl [--user] link|enable /tmp/u.service` links the file into the
+/// unit folder, and `launchctl load|bootstrap /tmp/x.plist` starts it at every
+/// login. A unit named by its name (`systemctl --user enable u.service`) is
+/// already in a unit folder, and copying it there is [`replaces_startup_file_unseen`].
+pub fn installs_session_item_from_outside(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if !lower.contains("systemctl") && !lower.contains("launchctl") {
+        return false;
+    }
+    shell_command_segments(content).iter().any(|segment| {
+        let words = shell_tokens(segment);
+        let Some(command_index) = effective_command_index(&words) else {
+            return false;
+        };
+        let command = token_basename(&words[command_index]).to_ascii_lowercase();
+        let operands: Vec<&String> = words[command_index + 1..]
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .collect();
+        let Some((verb, rest)) = operands.split_first() else {
+            return false;
+        };
+        let verb = verb.to_ascii_lowercase();
+        let installs = match command.as_str() {
+            "systemctl" => matches!(verb.as_str(), "link" | "enable" | "reenable"),
+            "launchctl" => matches!(verb.as_str(), "load" | "bootstrap"),
+            _ => false,
+        };
+        installs
+            && rest.iter().any(|word| {
+                let word = word.trim_matches(['"', '\'']);
+                let domain = ["gui/", "user/", "system", "pid/", "login/"]
+                    .iter()
+                    .any(|prefix| word.to_ascii_lowercase().starts_with(prefix));
+                word.contains('/') && !domain && !names_session_item_folder(word)
+            })
+    })
 }
 
 /// The places inline interpreter code is read for ([`code_writes_persistence_file`]),

@@ -3372,8 +3372,21 @@ fn analyze_command_as_read(
     // `~/.config/systemd/user`): what it will run cannot be judged, so the
     // line is held for review. The persistence it already scored counts
     // toward that, so the line lands at review, not past it.
-    if !signals.iter().any(|s| s.signal == "persistence_install")
-        && threats::replaces_startup_file_unseen(scan_cmd)
+    // Read on the raw line as well: the projection masks quoted text, and
+    // with it the `"$P"` that makes a write unseen.
+    let unseen_install = if threats::replaces_startup_file_unseen(cmd)
+        || threats::replaces_startup_file_unseen(scan_cmd)
+    {
+        Some(threats::STARTUP_FILE_REPLACED_UNSEEN)
+    } else if threats::installs_session_item_from_outside(cmd)
+        || threats::installs_session_item_from_outside(scan_cmd)
+    {
+        Some(threats::SESSION_ITEM_FROM_OUTSIDE)
+    } else {
+        None
+    };
+    if let Some(detail) =
+        unseen_install.filter(|_| !signals.iter().any(|s| s.signal == "persistence_install"))
     {
         let already: u32 = signals
             .iter()
@@ -3385,7 +3398,7 @@ fn analyze_command_as_read(
             signals.push(AnalysisSignal {
                 signal: "persistence_install".into(),
                 score: lift,
-                detail: threats::STARTUP_FILE_REPLACED_UNSEEN.into(),
+                detail: detail.into(),
             });
             score += lift;
         }
