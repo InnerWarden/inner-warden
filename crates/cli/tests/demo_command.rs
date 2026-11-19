@@ -142,9 +142,10 @@ fn with_no_agent_connected_it_says_so_and_how_to_connect() {
 }
 
 /// Claude Code wired in enforce: every call goes through the hook its
-/// settings name and comes back with a verdict; the download, the key read
-/// and the settings write are refused; the exit code says whether all four
-/// were; and the record, the session store and the settings are untouched.
+/// settings name and comes back with a verdict; all four (the download, the
+/// key read, the settings write and `rm -rf ~` inside `bash -c`) are
+/// refused and the exit is 0; and the record, the session store and the
+/// settings are untouched.
 ///
 /// FAILS ON REVERT: without the demo marker the hook records the four calls
 /// into graph.json; without the hook's report the verdicts are missing.
@@ -168,7 +169,12 @@ fn an_enforcing_hook_refuses_the_calls_and_nothing_is_recorded() {
     assert_eq!(agent["mode"], "enforce");
     let calls = agent["calls"].as_array().unwrap();
     assert_eq!(calls.len(), 4, "{json}");
-    for id in ["download-to-shell", "read-ssh-key", "write-agent-settings"] {
+    for id in [
+        "download-to-shell",
+        "read-ssh-key",
+        "write-agent-settings",
+        "rm-home-in-bash-c",
+    ] {
         let call = calls.iter().find(|c| c["id"] == id).unwrap();
         assert_eq!(call["outcome"], "refused", "{id}: {json}");
         assert_ne!(call["recommendation"], "allow", "{id}: {json}");
@@ -177,9 +183,8 @@ fn an_enforcing_hook_refuses_the_calls_and_nothing_is_recorded() {
             "{id}: {json}"
         );
     }
-    let all_refused = calls.iter().all(|c| c["outcome"] == "refused");
-    assert_eq!(code, Some(if all_refused { 0 } else { 1 }), "{json}");
-    assert_eq!(v["exit_code"], if all_refused { 0 } else { 1 });
+    assert_eq!(code, Some(0), "{json}");
+    assert_eq!(v["exit_code"], 0);
 
     assert!(!host.record().exists(), "the demo wrote the record");
     assert!(

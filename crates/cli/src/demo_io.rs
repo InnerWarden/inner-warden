@@ -219,10 +219,12 @@ fn speaks_demo(program: &str, wait: Duration) -> Result<(), String> {
     let words = [program.to_string(), "--version".to_string()];
     let (exit, stdout, stderr) = run_bounded(&words, None, None, None, wait);
     match exit {
-        None => return Err(format!(
+        None => {
+            return Err(format!(
             "its hook runs {program}, whose --version did not answer in {}s, so it was not sent",
             wait.as_secs()
-        )),
+        ))
+        }
         Some(-1) if stdout.is_empty() => {
             return Err(format!(
                 "its hook runs {program}, which could not be started: {stderr}"
