@@ -30,9 +30,61 @@ fn find_handing_its_root_to_rm_is_the_rm_of_that_root() {
         "find / -maxdepth 1 -exec rm -rf {} +",
         "sudo find /etc -exec rm {} +",
         "find /home -exec rm -rf {} \\;",
+        "find /Users -exec rm -rf {} +",
         "find ~/.ssh -delete",
     ] {
         assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// The search handing what it finds to a shell that removes `$1`, `$@` or
+/// `{}`, or to `unlink`, `shred`, `truncate` or `dd of=`, is the same
+/// removal of its root as `rm`.
+#[test]
+fn find_handing_its_root_to_a_shell_or_another_remover_is_the_same_removal() {
+    for line in [
+        "find ~ -exec sh -c 'rm -rf \"$1\"' _ {} \\;",
+        "find ~/.ssh -exec sh -c 'rm -rf \"$1\"' _ {} \\;",
+        "find ~/.ssh -exec bash -c 'rm -rf {}' \\;",
+        "find ~/.ssh -exec sh -c 'rm -f \"$@\"' _ {} +",
+        "find ~ -exec shred -u {} +",
+        "find ~/.ssh -exec shred -u {} +",
+        "find ~/.ssh -exec unlink {} \\;",
+        "find ~/.gnupg -type f -exec truncate -s0 {} +",
+        "find ~/.ssh -exec dd if=/dev/zero of={} \\;",
+        "find / -exec sudo shred {} +",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    for line in [
+        "find . -name '*.sh' -exec sh -c 'shellcheck \"$1\"' _ {} \\;",
+        "find build -exec sh -c 'rm -rf \"$1\"' _ {} \\;",
+        "find . -name '*.tmp' -exec sh -c 'rm -f \"$1\"' _ {} \\;",
+        "find ~/.ssh -exec sh -c 'rm -f /tmp/x; wc -l \"$1\"' _ {} \\;",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// The folder of homes on macOS is refused as /home is, by name and through
+/// a search; one home's project under it is not.
+#[test]
+fn the_folder_of_homes_on_macos_is_refused_as_home_is() {
+    for line in [
+        "rm -rf /Users",
+        "rm -rf /Users/",
+        "rm -rf /Users/*",
+        "sudo rm -rf /users",
+        "find /Users -exec rm -rf {} +",
+        "rm -rf /home",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    for line in [
+        "rm -rf /Users/dev/proj/target",
+        "find /Users/dev/proj -name '*.o' -delete",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
     }
 }
 

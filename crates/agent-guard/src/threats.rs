@@ -11972,6 +11972,9 @@ fn unfiltered_find_delete(hay: &str) -> bool {
 const RM_SYSTEM_DIRS: &[&str] = &[
     "bin", "sbin", "etc", "usr", "boot", "lib", "lib32", "lib64", "var", "root", "home", "opt",
     "sys", "proc", "dev", "srv", "run", "mnt", "media",
+    // The folder of homes on macOS, as written and as a lowercased line
+    // reads it.
+    "Users", "users",
 ];
 
 /// `VAR=value` environment-assignment prefix (not a program word).
@@ -12368,19 +12371,9 @@ fn find_alternative_removes(words: &[String]) -> (bool, bool) {
                     .filter(|word| !matches!(word.as_str(), ";" | "\\;" | "+"))
                     .cloned()
                     .collect();
-                if let Some(rm) = rm_command_index(&handed) {
-                    let operands = &handed[rm + 1..];
-                    // The tokens drop a bare `{}`: an `rm` left with only
-                    // its options is handed what the search finds.
-                    if operands
-                        .iter()
-                        .all(|operand| operand.starts_with('-') || operand.contains("{}"))
-                    {
-                        removes = true;
-                        no_preserve |= operands
-                            .iter()
-                            .any(|operand| operand == "--no-preserve-root");
-                    }
+                if let Some(wipes_root) = handed_removal(&handed) {
+                    removes = true;
+                    no_preserve |= wipes_root;
                 }
                 index += length;
                 continue;
@@ -12390,6 +12383,60 @@ fn find_alternative_removes(words: &[String]) -> (bool, bool) {
         index += 1;
     }
     (removes, no_preserve)
+}
+
+/// Whether the command `-exec` and its kin run removes the file the search
+/// hands it: `rm` given only options and `{}` (the tokens drop a bare
+/// `{}`), `unlink`, `shred`, `truncate`, or `dd` with an `of=` of it,
+/// behind `sudo` and its kin; or a shell whose `-c` line does that to
+/// `$1`, `$@` or `{}` (`sh -c 'rm -rf "$1"' _ {}`). `Some` with whether
+/// the `rm` carries `--no-preserve-root`.
+fn handed_removal(handed: &[String]) -> Option<bool> {
+    if let Some(rm) = rm_command_index(handed) {
+        let operands = &handed[rm + 1..];
+        return operands
+            .iter()
+            .all(|operand| operand.starts_with('-') || operand.contains("{}"))
+            .then(|| {
+                operands
+                    .iter()
+                    .any(|operand| operand == "--no-preserve-root")
+            });
+    }
+    for remover in ["unlink", "shred", "truncate"] {
+        if wrapped_program_index(handed, remover).is_some() {
+            return Some(false);
+        }
+    }
+    if let Some(dd) = wrapped_program_index(handed, "dd") {
+        return handed[dd + 1..]
+            .iter()
+            .any(|operand| {
+                operand
+                    .strip_prefix("of=")
+                    .is_some_and(|target| target.is_empty() || target.contains("{}"))
+            })
+            .then_some(false);
+    }
+    let shell = handed
+        .iter()
+        .position(|word| SHELLS.contains(&token_basename(word)))?;
+    let code_at = handed[shell + 1..]
+        .iter()
+        .position(|word| word.starts_with('-') && !word.starts_with("--") && word.contains('c'))?
+        + shell
+        + 2;
+    let code = handed.get(code_at)?;
+    // What the search hands the shell is `$1` (or all of `$@`) there.
+    let code = ["\"$@\"", "\"$1\"", "\"${1}\"", "${1}", "$1", "$@", "$*"]
+        .iter()
+        .fold(code.clone(), |code, name| code.replace(name, "{}"));
+    shell_command_segments(&code)
+        .into_iter()
+        // A segment that names nothing the search hands over removes
+        // something else (`rm -f /tmp/x`), and is judged as written.
+        .filter(|segment| segment.contains("{}"))
+        .find_map(|segment| handed_removal(&shell_tokens(segment)))
 }
 
 /// Whether every alternative of a `find` expression is narrowed by a name,
