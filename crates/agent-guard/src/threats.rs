@@ -6807,6 +6807,111 @@ fn writes_ssh_client_config(content: &str) -> bool {
         && writes_place(content, 0, names_ssh_client_config, false)
 }
 
+/// What the shell side says of a line that writes a file of
+/// [`names_persistence_file`].
+const PERSISTENCE_FILE_WRITTEN: &str =
+    "writes a file that decides who may log in or act as root, holds stored credentials \
+     or schedules jobs";
+
+/// Whether a path names a file whose change hands over a login, root or a
+/// stored credential, or runs code later: every file the shell side already
+/// refuses to see overwritten by a redirection ([`AUTHENTICATION_WRITE_TARGETS`]:
+/// login keys and `authorized_keys`, the account database, the sudo rules,
+/// the SSH server's settings, the GnuPG keys), the sudo, account and
+/// scheduled-job groups of [`PRIVILEGED_WRITE_TARGETS`], and, in a home,
+/// the stored credentials the file tools are refused
+/// (`crate::file_tools::home_place`). A removal or a move away (`taken`) is
+/// not counted, as for [`names_ssh_client_config`].
+///
+/// Not here: the shell's startup files (`~/.bashrc`, `~/.profile`). A line
+/// that writes one is judged by what it writes there
+/// ([`check_persistence_install`] and the startup-file rule in
+/// `crate::mcp`): `echo 'export PATH=...' >> ~/.bashrc` is ordinary setup.
+fn names_persistence_file(target: &str, taken: bool) -> bool {
+    if taken {
+        return false;
+    }
+    let Some(named) = named_path(&home_spelled(target)) else {
+        return false;
+    };
+    let authentication = AUTHENTICATION_WRITE_TARGETS.iter().any(|entry| {
+        let place = match *entry {
+            ShellAuthTarget::Named(path) => Place::Components(path),
+            ShellAuthTarget::File(file) => Place::File(file),
+            ShellAuthTarget::Under(dir) => Place::Tree(dir),
+            ShellAuthTarget::InDirectory(name) => Place::Components(name),
+        };
+        place.holds(&named)
+    });
+    authentication
+        || PRIVILEGED_WRITE_TARGETS
+            .iter()
+            .filter(|group| matches!(group.what, SUDO_RULES | ACCOUNTS | SCHEDULED_JOBS))
+            .any(|group| group.places.iter().any(|place| place.holds(&named)))
+        || home_relative_path(&named).is_some_and(|relative| {
+            crate::file_tools::home_place(relative) == Some(crate::file_tools::STORED_CREDENTIALS)
+        })
+}
+
+/// The part of a path below a home, when the path says it is in one: `~/`,
+/// `~user/`, `/root/`, `/var/root/`, `/home/<user>/` or `/users/<user>/`.
+fn home_relative_path(named: &NamedPath) -> Option<&str> {
+    let path = named.path.as_str();
+    if !named.rooted {
+        return path
+            .strip_prefix('~')
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, rest)| rest);
+    }
+    if let Some(rest) = path
+        .strip_prefix("/root/")
+        .or_else(|| path.strip_prefix("/var/root/"))
+    {
+        return Some(rest);
+    }
+    ["/home/", "/users/"].iter().find_map(|base| {
+        path.strip_prefix(base)
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(_, rest)| rest)
+    })
+}
+
+/// A cheap test ahead of the walk [`writes_persistence_file`] makes: a line
+/// that does not hold every component of one of its places writes none.
+fn may_name_persistence_file(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    let holds = |row: &str| {
+        row.split('/')
+            .filter(|part| !part.is_empty())
+            .all(|part| lower.contains(part))
+    };
+    AUTHENTICATION_WRITE_TARGETS.iter().any(|entry| {
+        let (ShellAuthTarget::Named(row)
+        | ShellAuthTarget::File(row)
+        | ShellAuthTarget::Under(row)
+        | ShellAuthTarget::InDirectory(row)) = *entry;
+        holds(row)
+    }) || PRIVILEGED_WRITE_TARGETS
+        .iter()
+        .filter(|group| matches!(group.what, SUDO_RULES | ACCOUNTS | SCHEDULED_JOBS))
+        .flat_map(|group| group.places.iter())
+        .any(|place| {
+            let (Place::File(row) | Place::Tree(row) | Place::Components(row)) = *place;
+            holds(row)
+        })
+        || crate::file_tools::home_places_of(&[crate::file_tools::STORED_CREDENTIALS]).any(holds)
+}
+
+/// Whether a command line writes a file of [`names_persistence_file`] in any
+/// form [`writes_place`] reads: a redirection, `tee`, `sed -i`, `cp`,
+/// `mv`, `ln` (soft or hard), `install`, `dd of=`, `truncate`, through a
+/// variable, `$HOME`, a `cd` or `..`. A link the line makes is followed
+/// before this is asked (`crate::shell::line_through_links`). Reading one
+/// is not a write.
+fn writes_persistence_file(content: &str) -> bool {
+    may_name_persistence_file(content) && writes_place(content, 0, names_persistence_file, false)
+}
+
 /// What the shell side says of a line that writes what the guard is carried
 /// by.
 const GUARD_CARRIER_WRITTEN: &str =
@@ -8718,6 +8823,9 @@ pub fn check_anti_forensics(content: &str) -> Option<(&'static str, u32)> {
 pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
     if writes_ssh_client_config(content) {
         return Some((SSH_CLIENT_CONFIG_WRITTEN, 60));
+    }
+    if writes_persistence_file(content) {
+        return Some((PERSISTENCE_FILE_WRITTEN, 60));
     }
     if !mentions_any(
         content,
@@ -16442,7 +16550,9 @@ const AUTHENTICATION_WRITE_TARGETS: &[ShellAuthTarget] = &[
     ShellAuthTarget::Named(".ssh/id_ecdsa"),
     ShellAuthTarget::Named(".ssh/id_dsa"),
     ShellAuthTarget::Named(".ssh/authorized_keys"),
+    ShellAuthTarget::Named(".ssh/authorized_keys2"),
     ShellAuthTarget::Named(".git-credentials"),
+    ShellAuthTarget::File("/etc/passwd"),
     ShellAuthTarget::File("/etc/shadow"),
     ShellAuthTarget::File("/etc/gshadow"),
     ShellAuthTarget::File("/etc/sudoers"),
@@ -16549,6 +16659,13 @@ pub(crate) struct PrivilegedTarget {
 /// file-tool hook) can tell its own work from a reach into root's.
 pub(crate) const ROOT_HOME: &str = "root's home directory";
 
+/// What [`PRIVILEGED_WRITE_TARGETS`] calls the sudo rules, the account
+/// database and the scheduled jobs: groups the shell side also refuses to see
+/// written in any form ([`names_persistence_file`]).
+const SUDO_RULES: &str = "the sudo rules, which decide who may run commands as root";
+const ACCOUNTS: &str = "the account and group database";
+const SCHEDULED_JOBS: &str = "the jobs the system runs on a schedule";
+
 const fn group(what: &'static str, places: &'static [Place]) -> PrivilegedGroup {
     PrivilegedGroup {
         what,
@@ -16584,7 +16701,7 @@ const fn group(what: &'static str, places: &'static [Place]) -> PrivilegedGroup 
 /// (`/usr/lib/systemd/system` before `/usr/lib`).
 const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
     group(
-        "the sudo rules, which decide who may run commands as root",
+        SUDO_RULES,
         &[
             Place::File("/etc/sudoers"),
             Place::Tree("/etc/sudoers.d"),
@@ -16593,7 +16710,7 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
         ],
     ),
     group(
-        "the account and group database",
+        ACCOUNTS,
         &[
             Place::File("/etc/passwd"),
             Place::File("/etc/shadow"),
@@ -16672,7 +16789,7 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
         ],
     ),
     group(
-        "the jobs the system runs on a schedule",
+        SCHEDULED_JOBS,
         &[
             Place::File("/etc/crontab"),
             Place::File("/etc/anacrontab"),
