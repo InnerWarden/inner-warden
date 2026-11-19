@@ -24,7 +24,15 @@
 //! write.
 //!
 //! A tool never seen before is pinned as it is heard and goes through as
-//! before. A server reinstalled on purpose is recognised again with
+//! before, with two exceptions held like a change until the person approves
+//! them: a definition over [`MAX_KEPT_DEFINITION_BYTES`] (measured before its
+//! hash is trusted), and, in a listing that is the whole of the server's tools,
+//! a tool that looks like a pinned one the listing no longer has
+//! ([`looks_renamed`]: the same input schema, or nearly the same
+//! description), reported as a possible rename. Tools a listing leaves
+//! without a pin (over [`MAX_PINNED_TOOLS`], a name too long, a full record)
+//! are screened as before and reported ([`TOOLS_UNPINNED_RULE`]), never
+//! silently. A server reinstalled on purpose is recognised again with
 //! `innerwarden mcp forget <server>`: its pins are dropped, and the next
 //! listing pins what it holds.
 //!
@@ -37,7 +45,7 @@
 //! when something in it changed. A record the proxy cannot read is left as it
 //! is: the session pins in memory and nothing is written over it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -49,6 +57,15 @@ pub const TOOL_CHANGED_RULE: &str = "AG-MCP-TOOL-CHANGED";
 
 /// The rule of the finding a call to a held tool raises.
 pub const TOOL_HELD_RULE: &str = "AG-MCP-TOOL-HELD";
+
+/// The rule of the finding (a warning, never a block) for tools a listing
+/// left without a pin ([`ListingCheck::unpinned_notice`]).
+pub const TOOLS_UNPINNED_RULE: &str = "AG-MCP-TOOLS-UNPINNED";
+
+/// The `sha256` of a tool held since it was first heard (a possible rename,
+/// a definition over [`MAX_KEPT_DEFINITION_BYTES`]): no definition of it
+/// approved yet. No hex digest is this word.
+pub const UNAPPROVED: &str = "unapproved";
 
 /// The fields of a tool entry that make its definition, in the order a change
 /// is reported.
@@ -62,15 +79,16 @@ pub const PINNED_FIELDS: &[&str] = &[
 ];
 
 /// Most tools pinned for one server. A server listing more has the rest
-/// screened as before, unpinned.
+/// screened as before, unpinned, and the proxy says how many
+/// ([`ListingCheck::unpinned_notice`]).
 pub const MAX_PINNED_TOOLS: usize = 1024;
 
 /// Longest tool name pinned. A longer one is not pinned.
 pub const MAX_PINNED_NAME_BYTES: usize = 128;
 
-/// Largest definition kept whole beside its hash, so a later change can be
-/// told field by field. A larger one keeps its hash only, and a change to it
-/// is reported as a change of the definition.
+/// Largest definition pinned: kept whole beside its hash, so a later change
+/// can be told field by field. A larger one is measured before its hash is
+/// trusted and held, like a change, until the person approves it.
 pub const MAX_KEPT_DEFINITION_BYTES: usize = 64 * 1024;
 
 /// Most servers the record keeps.
@@ -356,10 +374,6 @@ fn now_utc() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn kept(definition: &Value) -> Option<Value> {
-    (canonical_json(definition).len() <= MAX_KEPT_DEFINITION_BYTES).then(|| definition.clone())
-}
-
 impl PinRecord {
     /// The id of the server `needle` names: its id, its command line as
     /// `innerwarden mcp list` prints it, or a prefix of its id (four
@@ -449,74 +463,162 @@ impl PinRecord {
     }
 
     /// Compare one `tools/list` result against `server`'s pins (adding the
-    /// server, started by `command`, if it is new): a tool first heard is
-    /// pinned, one heard as pinned clears a change still waiting (the server
-    /// went back), one heard different is a change, kept for the person.
-    /// Returns the changed tools with their hashes as heard, and whether the
-    /// record changed.
+    /// server, started by `command`, if it is new), reading the listing as
+    /// complete when it carries no `nextCursor`
+    /// ([`PinRecord::check_listing_with`]).
     pub fn check_listing(
         &mut self,
         server: &str,
         command: &[String],
         result: &Value,
-    ) -> (Vec<(ToolChange, String)>, bool) {
+    ) -> ListingCheck {
+        let complete = result.get("nextCursor").is_none();
+        self.check_listing_with(server, command, result, complete)
+    }
+
+    /// Compare one `tools/list` result against `server`'s pins: a tool first
+    /// heard is pinned, one heard as pinned clears a change still waiting (the
+    /// server went back), one heard different is a change, kept for the
+    /// person. A tool first heard is held instead of pinned when its
+    /// definition is over [`MAX_KEPT_DEFINITION_BYTES`], or when the listing is
+    /// `complete` (the whole of the server's tools, not one page of them) and
+    /// the tool looks like a pinned one that is no longer listed
+    /// ([`looks_renamed`]). Either waits for the person's approval like a
+    /// change. Tools left unpinned (over [`MAX_PINNED_TOOLS`], a name over
+    /// [`MAX_PINNED_NAME_BYTES`], or a record already holding
+    /// [`MAX_PINNED_SERVERS`]) are counted, so the proxy can say so.
+    pub fn check_listing_with(
+        &mut self,
+        server: &str,
+        command: &[String],
+        result: &Value,
+        complete: bool,
+    ) -> ListingCheck {
+        let mut check = ListingCheck::default();
         let Some(tools) = result.get("tools").and_then(Value::as_array) else {
-            return (Vec::new(), false);
+            return check;
         };
         if !self.servers.contains_key(server) && self.servers.len() >= MAX_PINNED_SERVERS {
-            return (Vec::new(), false);
+            check.record_full = tools.len();
+            return check;
         }
-        let mut dirty = false;
         let pins = self.servers.entry(server.to_string()).or_insert_with(|| {
-            dirty = true;
+            check.dirty = true;
             ServerPins {
                 command: command.to_vec(),
                 tools: BTreeMap::new(),
             }
         });
+        // The pinned tools this listing no longer has, with the definition
+        // kept for them: what a new tool is compared with for a rename.
+        let vanished: Vec<(String, Value)> = if complete {
+            let listed: HashSet<&str> = tools
+                .iter()
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .collect();
+            pins.tools
+                .iter()
+                .filter(|(name, pin)| !listed.contains(name.as_str()) && pin.sha256 != UNAPPROVED)
+                .filter_map(|(name, pin)| pin.definition.clone().map(|d| (name.clone(), d)))
+                .collect()
+        } else {
+            Vec::new()
+        };
         let now = now_utc();
-        let mut changes = Vec::new();
         for tool in tools {
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
             if name.len() > MAX_PINNED_NAME_BYTES {
+                check.long_names += 1;
                 continue;
             }
             let definition = definition_of(tool);
-            let hash = definition_hash(&definition);
+            // The size is read before the hash is trusted: a definition over
+            // the ceiling is held whatever it hashes to.
+            let text = canonical_json(&definition);
+            let size = text.len();
+            let hash = hex(&Sha256::digest(text.as_bytes()));
+            let small = size <= MAX_KEPT_DEFINITION_BYTES;
+            let keep = || small.then(|| definition.clone());
             match pins.tools.get_mut(name) {
                 None => {
-                    if pins.tools.len() < MAX_PINNED_TOOLS {
-                        pins.tools.insert(
-                            name.to_string(),
-                            ToolPin {
-                                sha256: hash,
-                                definition: kept(&definition),
-                                pinned_at: now.clone(),
-                                changed: None,
+                    if pins.tools.len() >= MAX_PINNED_TOOLS {
+                        check.over_limit += 1;
+                        continue;
+                    }
+                    let why = if small {
+                        vanished.iter().find_map(|(old, kept)| {
+                            looks_renamed(kept, &definition).map(|how| {
+                                format!("possible rename of `{}` ({how})", printable(old))
+                            })
+                        })
+                    } else {
+                        Some(oversize(size))
+                    };
+                    let pin = match &why {
+                        None => ToolPin {
+                            sha256: hash.clone(),
+                            definition: keep(),
+                            pinned_at: now.clone(),
+                            changed: None,
+                        },
+                        Some(why) => ToolPin {
+                            sha256: UNAPPROVED.to_string(),
+                            definition: None,
+                            pinned_at: now.clone(),
+                            changed: Some(ChangedDefinition {
+                                sha256: hash.clone(),
+                                definition: keep(),
+                                seen_at: now.clone(),
+                                fields: vec![why.clone()],
+                            }),
+                        },
+                    };
+                    pins.tools.insert(name.to_string(), pin);
+                    check.dirty = true;
+                    if let Some(why) = why {
+                        check.changes.push((
+                            ToolChange {
+                                tool: name.to_string(),
+                                fields: vec![why],
                             },
-                        );
-                        dirty = true;
+                            hash,
+                        ));
                     }
                 }
                 Some(pin) if pin.sha256 == hash => {
                     if pin.changed.take().is_some() {
-                        dirty = true;
+                        check.dirty = true;
                     }
                 }
                 Some(pin) => {
-                    let fields = changed_fields(pin.definition.as_ref(), &definition);
+                    let waiting = pin.changed.as_ref().filter(|c| !c.fields.is_empty());
+                    let fields = match waiting {
+                        // Heard as it was when first held: what it was held for.
+                        Some(c) if c.sha256 == hash => c.fields.clone(),
+                        _ if !small && pin.sha256 == UNAPPROVED => vec![oversize(size)],
+                        // Never approved, heard different again: still the
+                        // reason it was held for.
+                        Some(c) if pin.sha256 == UNAPPROVED => c.fields.clone(),
+                        _ => {
+                            let mut fields = changed_fields(pin.definition.as_ref(), &definition);
+                            if !small {
+                                fields.push(oversize(size));
+                            }
+                            fields
+                        }
+                    };
                     if pin.changed.as_ref().map(|c| c.sha256.as_str()) != Some(hash.as_str()) {
                         pin.changed = Some(ChangedDefinition {
                             sha256: hash.clone(),
-                            definition: kept(&definition),
+                            definition: keep(),
                             seen_at: now.clone(),
                             fields: fields.clone(),
                         });
-                        dirty = true;
+                        check.dirty = true;
                     }
-                    changes.push((
+                    check.changes.push((
                         ToolChange {
                             tool: name.to_string(),
                             fields,
@@ -526,7 +628,109 @@ impl PinRecord {
                 }
             }
         }
-        (changes, dirty)
+        check
+    }
+}
+
+/// Why a definition over the ceiling is held.
+fn oversize(size: usize) -> String {
+    format!(
+        "definition of {size} bytes, over the {} KiB the proxy pins",
+        MAX_KEPT_DEFINITION_BYTES / 1024
+    )
+}
+
+/// Whether `new`, a tool first heard, looks like `old`, a pinned tool the
+/// same listing no longer has, and how: the same input schema (one that names
+/// at least one property, so two tools that take nothing are not alike), or
+/// descriptions of three words or more sharing at least 80% of their words
+/// (lowercase, letters and digits, as sets: shared over all). Simple on
+/// purpose: a server that renames a tool and keeps what it takes, or what it
+/// says, is caught; one that rewrites both is a new tool.
+pub fn looks_renamed(old: &Value, new: &Value) -> Option<&'static str> {
+    let schema = |d: &Value| {
+        d.get("inputSchema")
+            .filter(|s| {
+                s.get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|p| !p.is_empty())
+            })
+            .map(canonical_json)
+    };
+    if let (Some(a), Some(b)) = (schema(old), schema(new)) {
+        if a == b {
+            return Some("same input schema");
+        }
+    }
+    let words = |d: &Value| -> HashSet<String> {
+        d.get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .collect()
+    };
+    let (a, b) = (words(old), words(new));
+    if a.len() < 3 || b.len() < 3 {
+        return None;
+    }
+    let shared = a.intersection(&b).count();
+    let all = a.union(&b).count();
+    (shared * 5 >= all * 4).then_some("nearly the same description")
+}
+
+/// What one listing did to a server's pins ([`PinRecord::check_listing`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListingCheck {
+    /// The tools to hold, each with the hash it was heard with: changed since
+    /// pinned, or first heard and held (a possible rename, a definition over
+    /// the ceiling).
+    pub changes: Vec<(ToolChange, String)>,
+    /// Whether the record changed.
+    pub dirty: bool,
+    /// Tools first heard and left unpinned: the server has
+    /// [`MAX_PINNED_TOOLS`] pinned already.
+    pub over_limit: usize,
+    /// Tools left unpinned for a name over [`MAX_PINNED_NAME_BYTES`].
+    pub long_names: usize,
+    /// Tools left unpinned because the record holds [`MAX_PINNED_SERVERS`]
+    /// servers already and this one is not among them.
+    pub record_full: usize,
+}
+
+impl ListingCheck {
+    /// What the proxy says of the tools it left unpinned, if any: never
+    /// silent, since a later change to them is not caught.
+    pub fn unpinned_notice(&self, server: &str) -> Option<String> {
+        let mut why = Vec::new();
+        if self.over_limit > 0 {
+            why.push(format!(
+                "{} over the limit of {MAX_PINNED_TOOLS} pinned tools per server",
+                self.over_limit
+            ));
+        }
+        if self.long_names > 0 {
+            why.push(format!(
+                "{} with a name over {MAX_PINNED_NAME_BYTES} bytes",
+                self.long_names
+            ));
+        }
+        if self.record_full > 0 {
+            why.push(format!(
+                "{} because the pin record already holds {MAX_PINNED_SERVERS} servers",
+                self.record_full
+            ));
+        }
+        if why.is_empty() {
+            return None;
+        }
+        let total = self.over_limit + self.long_names + self.record_full;
+        Some(format!(
+            "MCP server {server}: {total} tool(s) of this listing left without a pin ({}); \
+             they are screened as before, but a later change to their definition is not caught",
+            why.join("; ")
+        ))
     }
 }
 
@@ -547,6 +751,12 @@ pub struct PinSession {
     /// `tools/list` answers with tools to hold, by request id, for the
     /// transport to rewrite before the client sees them.
     holds: Vec<(Value, Vec<String>)>,
+    /// The last listing carried a `nextCursor`: the next one is a later page,
+    /// not the whole list.
+    paging: bool,
+    /// What the proxy says of tools left without a pin, for the router to
+    /// report ([`PinSession::take_notices`]).
+    notices: Vec<String>,
 }
 
 impl PinSession {
@@ -561,6 +771,8 @@ impl PinSession {
             unreadable: None,
             held: HashMap::new(),
             holds: Vec::new(),
+            paging: false,
+            notices: Vec::new(),
         };
         session.reload();
         session
@@ -609,12 +821,22 @@ impl PinSession {
     /// of it ([`PinSession::take_holds`]).
     pub fn check_listing(&mut self, id: Option<&Value>, result: &Value) -> Vec<ToolChange> {
         self.reload();
-        let (changes, dirty) = self
+        // Only the whole list says a pinned tool is gone: a page of it, or
+        // the page after one, does not.
+        let more = result.get("nextCursor").is_some_and(|c| !c.is_null());
+        let complete = !more && !self.paging;
+        self.paging = more;
+        let check = self
             .record
-            .check_listing(&self.server, &self.command, result);
-        if dirty {
+            .check_listing_with(&self.server, &self.command, result, complete);
+        if check.dirty {
             self.persist();
         }
+        if let Some(notice) = check.unpinned_notice(&self.server) {
+            tracing::warn!("innerwarden proxy: {notice}");
+            self.notices.push(notice);
+        }
+        let changes = check.changes;
         // A tool heard as pinned again is no longer held.
         if let Some(tools) = result.get("tools").and_then(Value::as_array) {
             for tool in tools {
@@ -642,6 +864,23 @@ impl PinSession {
         std::mem::take(&mut self.holds)
     }
 
+    /// What the proxy says of tools the listings left without a pin, taken.
+    pub fn take_notices(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.notices)
+    }
+
+    /// The pin of `tool` when it has never had a definition approved (held
+    /// since first heard), with why it was held.
+    fn unapproved(&self, tool: &str) -> Option<String> {
+        let pin = self.record.servers.get(&self.server)?.tools.get(tool)?;
+        (pin.sha256 == UNAPPROVED).then(|| {
+            pin.changed
+                .as_ref()
+                .map(|c| c.fields.join(", "))
+                .unwrap_or_default()
+        })
+    }
+
     /// Whether `tool` is held this session. A held tool is checked against the
     /// record on disk again: once the person approved the definition it was
     /// heard with, it is released.
@@ -665,6 +904,17 @@ impl PinSession {
     /// The finding for a changed tool: what changed, and how it is approved.
     pub fn change_detail(&self, change: &ToolChange) -> String {
         let tool = printable(&change.tool);
+        if self.unapproved(&change.tool).is_some() {
+            return format!(
+                "MCP tool `{}` is new and held until the person approves it (server {}): {}; \
+                 only the person can approve it: innerwarden mcp approve {} {}",
+                tool,
+                self.server,
+                change.fields.join(", "),
+                self.server,
+                tool
+            );
+        }
         format!(
             "MCP tool `{}` changed its definition since this proxy first pinned it \
              (server {}): {}; only the person can approve it: innerwarden mcp approve {} {}",
@@ -678,6 +928,14 @@ impl PinSession {
 
     /// The finding for a call to a held tool.
     pub fn held_detail(&self, tool: &str) -> String {
+        if let Some(why) = self.unapproved(tool) {
+            let tool = printable(tool);
+            return format!(
+                "MCP tool `{tool}` is held: it was new and has no approved definition ({why}) \
+                 (server {}); only the person can approve it: innerwarden mcp approve {} {tool}",
+                self.server, self.server
+            );
+        }
         let tool = printable(tool);
         format!(
             "MCP tool `{tool}` is held: its definition changed since this proxy first pinned \
