@@ -927,7 +927,7 @@ real	real-002	deny
 real	real-003	deny
 real	real-004	deny
 real	real-005	review
-real	real-006	deny
+real	real-006	allow
 real	real-007	deny
 real	real-008	deny
 real	real-009	deny

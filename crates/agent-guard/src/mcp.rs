@@ -3361,6 +3361,22 @@ fn analyze_command_as_read(
     let scan_owned = crate::threats::strip_shell_noops(raw_scan);
     let scan_cmd = scan_owned.as_str();
 
+    // Inline code read for the lines it hands to processes (judged further
+    // down, each in its own place) and for the strings it holds only as
+    // data. The checks that ask what a line runs (a removal, a kill, a
+    // dangerous command) read the line with those strings taken out:
+    // `python3 - <<'EOF'` that edits a file with `s.replace('rm -rf --
+    // "$dir"/x', ...)` runs no removal. Only while the lines its calls run
+    // are still judged here (below [`STARTUP_PAYLOAD_DEPTH`]); every other
+    // check (the guard's own words, startup files, secrets) reads the line
+    // whole.
+    let inline_code = crate::shell::inline_code_reading(raw_scan);
+    let command_scan_owned = (depth < STARTUP_PAYLOAD_DEPTH)
+        .then(|| crate::shell::with_inline_data_blanked(raw_scan, &inline_code))
+        .flatten()
+        .map(|blanked| crate::threats::strip_shell_noops(&blanked));
+    let command_scan = command_scan_owned.as_deref().unwrap_or(scan_cmd);
+
     let mut signals = Vec::new();
     let mut score: u32 = 0;
     let mut atr_matches = Vec::new();
@@ -3480,7 +3496,7 @@ fn analyze_command_as_read(
     }
 
     // Irreversible destruction of data, and of the infrastructure holding it.
-    if let Some((what, s)) = threats::check_data_destruction(scan_cmd) {
+    if let Some((what, s)) = threats::check_data_destruction(command_scan) {
         signals.push(AnalysisSignal {
             signal: "data_destruction".into(),
             score: s,
@@ -3836,7 +3852,6 @@ fn analyze_command_as_read(
     // is; a download it hands a process or runs as code is refused.
     // Measured 2026-11-19: 34 of 62 such lines over six languages were
     // allowed (`os.system(c)`, `spawn(cmd)`, `fetch(u).then(eval)`).
-    let inline_code = crate::shell::inline_code_reading(raw_scan);
     if inline_code.unread && !signals.iter().any(|s| s.signal == "shell_line_not_literal") {
         signals.push(AnalysisSignal {
             signal: "shell_line_not_literal".into(),
@@ -3967,7 +3982,7 @@ fn analyze_command_as_read(
 
     // Destructive commands.
     {
-        let lower = scan_cmd.to_ascii_lowercase();
+        let lower = command_scan.to_ascii_lowercase();
         // Precise root-wipe detection (shared with threats::check_command): a bare
         // `/` or a top-level system dir, flag-order-independent, NOT a scoped
         // subpath like `rm -rf /var/lib/app/cache`, which was a false block.
@@ -4020,7 +4035,7 @@ fn analyze_command_as_read(
             });
             score += 50;
         } else if context.is_some_and(|place| {
-            crate::threats::destructive_rm_in_place(scan_cmd, &place.cwd, place.home.as_deref())
+            crate::threats::destructive_rm_in_place(command_scan, &place.cwd, place.home.as_deref())
         }) {
             // `rm -rf *`, `.`, `./*`, `..` are a wipe only where they run: from
             // the home or from `/`. Anywhere else they keep the verdict above.
@@ -4032,7 +4047,7 @@ fn analyze_command_as_read(
                     .into(),
             });
             score += 50;
-        } else if let Some(fed) = crate::threats::xargs_feeds_removal(scan_cmd) {
+        } else if let Some(fed) = crate::threats::xargs_feeds_removal(command_scan) {
             // `ls / | xargs -I X rm -rf /X`: the targets come from what xargs
             // reads, not from the line.
             let (score_added, detail) = match fed {
@@ -4080,7 +4095,7 @@ fn analyze_command_as_read(
         }
         // Fork bomb. The classic `:(){ :|:& };:` plus whitespace variants.
         // Spec 079 P3: was a destructive miss.
-        if scan_cmd.replace(' ', "").contains(":(){:|:&};:") {
+        if command_scan.replace(' ', "").contains(":(){:|:&};:") {
             signals.push(AnalysisSignal {
                 signal: "destructive_command".into(),
                 score: 50,
@@ -4091,7 +4106,7 @@ fn analyze_command_as_read(
         // Every process on the host, or its init: `kill -9 -1`, `kill -9 1`,
         // `killall5`, `pkill -9 -u root`. One process, a group or a named
         // pattern stays allowed.
-        if let Some(detail) = crate::threats::kills_every_process(scan_cmd) {
+        if let Some(detail) = crate::threats::kills_every_process(command_scan) {
             signals.push(AnalysisSignal {
                 signal: "destructive_command".into(),
                 score: 50,
@@ -4295,7 +4310,7 @@ fn analyze_command_as_read(
     }
 
     // Dangerous command patterns from threats.rs (if not already caught above).
-    if let Some((desc, block)) = threats::check_command_except(scan_cmd, &inline_names_read) {
+    if let Some((desc, block)) = threats::check_command_except(command_scan, &inline_names_read) {
         if !signals.iter().any(|s| s.detail.contains(desc)) {
             let signal_score = if block { 40 } else { 20 };
             signals.push(AnalysisSignal {

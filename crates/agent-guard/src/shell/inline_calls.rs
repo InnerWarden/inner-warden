@@ -64,6 +64,10 @@ pub(crate) struct InlineReading {
     /// read the line or the code of taken out: a name left here is a call
     /// the reader did not account for.
     pub(crate) residue: String,
+    /// Each piece of code whose strings are only data, as the line holds
+    /// it, beside the same code with what its strings and comments hold
+    /// taken out ([`data_literals_blanked`]).
+    pub(crate) data_blanked: Vec<(String, String)>,
 }
 
 impl InlineReading {
@@ -76,6 +80,7 @@ impl InlineReading {
         self.unread |= other.unread;
         self.runs_download |= other.runs_download;
         self.code_unread |= other.code_unread;
+        self.data_blanked.extend(other.data_blanked);
         for (mine, theirs) in [
             (&mut self.code, other.code),
             (&mut self.residue, other.residue),
@@ -585,6 +590,197 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
     out.code = code.to_owned();
     out.residue = residue;
     out
+}
+
+/// Where the string literals and comments of `code` in `lang` stand, in
+/// bytes: `None` when the code holds a string that runs code where it
+/// stands (an f-string, a template or an interpolation with an expression
+/// in it), a quote left open, or a form whose literals are not told apart
+/// here from code (a regular expression, a Ruby command quote or
+/// here-document). Only Python, Node and Ruby are read.
+fn data_literal_ranges(lang: Lang, code: &str) -> Option<Vec<(usize, usize)>> {
+    if !matches!(lang, Lang::Python | Lang::Js | Lang::Ruby) {
+        return None;
+    }
+    let bytes = code.as_bytes();
+    let mut ranges = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if !code.is_char_boundary(at) {
+            at += 1;
+            continue;
+        }
+        let byte = bytes[at];
+        let rest = &code[at..];
+        let comment = match lang {
+            Lang::Python | Lang::Ruby => byte == b'#',
+            _ => rest.starts_with("//"),
+        };
+        if comment {
+            let end = at + rest.find('\n').unwrap_or(rest.len());
+            ranges.push((at, end));
+            at = end;
+            continue;
+        }
+        if lang == Lang::Js && rest.starts_with("/*") {
+            let end = at + rest.find("*/")? + 2;
+            ranges.push((at, end));
+            at = end;
+            continue;
+        }
+        match byte {
+            b'\'' | b'"' => {}
+            // A template is a string in Node; a tagged one (`$\`ls\``)
+            // may run what it holds.
+            b'\x60' if lang == Lang::Js => {
+                let before = code[..at].trim_end().bytes().last();
+                if before.is_some_and(|b| is_name_byte(b) || b == b')' || b == b']') {
+                    return None;
+                }
+            }
+            // A Ruby or a Node regular expression, a Ruby command quote,
+            // a Ruby here-document: not read here.
+            b'/' | b'\x60' if lang != Lang::Python => return None,
+            b'\x60' => return None,
+            b'%' if lang == Lang::Ruby => return None,
+            b'<' if lang == Lang::Ruby && rest.starts_with("<<") => return None,
+            _ => {
+                at += 1;
+                continue;
+            }
+        }
+        // A Python prefix (`r`, `b`, `f`, `rb`) stands before the quote.
+        let mut prefix = String::new();
+        if lang == Lang::Python {
+            let mut start = at;
+            while start > 0 && b"rRbBuUfF".contains(&bytes[start - 1]) && at - start < 2 {
+                start -= 1;
+            }
+            if start > 0 && is_name_byte(bytes[start - 1]) {
+                start = at;
+            }
+            prefix = code[start..at].to_ascii_lowercase();
+        }
+        let quote = byte;
+        let triple = lang == Lang::Python
+            && rest.len() >= 3
+            && rest.as_bytes()[1] == quote
+            && rest.as_bytes()[2] == quote;
+        let open = if triple { 3 } else { 1 };
+        let mut end = at + open;
+        loop {
+            let b = *bytes.get(end)?;
+            if b == b'\\' {
+                end += 2;
+                continue;
+            }
+            if b == quote && (!triple || bytes[end..].starts_with(&[quote, quote, quote])) {
+                end += open;
+                break;
+            }
+            if b == b'\n' && !triple && quote != b'\x60' {
+                return None;
+            }
+            end += 1;
+        }
+        let inner = &code[at + open..end - open];
+        let runs_code = match lang {
+            Lang::Python => prefix.contains('f') && inner.contains('{'),
+            Lang::Js => quote == b'\x60' && inner.contains("\x24{"),
+            _ => quote == b'"' && inner.contains("#{"),
+        };
+        if runs_code {
+            return None;
+        }
+        ranges.push((at + open, end - open));
+        at = end;
+    }
+    Some(ranges)
+}
+
+/// The names that, standing in code outside its strings, may start a
+/// process or run code in a way [`read_code`] does not account for.
+fn may_run_beyond_reading(lang: Lang, outside: &str) -> bool {
+    static PATTERNS: std::sync::OnceLock<[regex::Regex; 3]> = std::sync::OnceLock::new();
+    let [python, js, ruby] = PATTERNS.get_or_init(|| {
+        [
+            regex::Regex::new(
+                r"\b(?:system|popen\w*|exec\w*|eval|spawn\w*|Popen|getoutput|getstatusoutput|check_output|check_call|run_path|run_module|import_module|__import__|getattr|setattr|globals|locals|vars|compile|__builtins__|builtins|fork\w*|breakpoint|subprocess|pty|commands|runpy|importlib|ctypes|cffi|pickle|marshal|dill|codeop|asyncio|multiprocessing|plumbum|pexpect|invoke|fabric|paramiko|webbrowser)\b|__\w+__|\bimport\s+(?:sh|code)\b|\bfrom\s+(?:sh|code)\s+import\b",
+            )
+            .expect("valid regex"),
+            regex::Regex::new(
+                r"\b(?:child_process|exec\w*|spawn\w*|fork|eval|Function|vm|require|import|Deno|Bun|process|Worker|execa|shelljs|zx|globalThis|global|Reflect|constructor|module|dlopen)\b",
+            )
+            .expect("valid regex"),
+            regex::Regex::new(
+                r"\b(?:system|exec|spawn|popen\w*|capture\w*|Open3|PTY|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec|send|public_send|__send__|method|define_method|load|require\w*|fork|syscall|Kernel|IO|binding|ObjectSpace|const_get|Process|open)\b",
+            )
+            .expect("valid regex"),
+        ]
+    });
+    match lang {
+        Lang::Python => python.is_match(outside),
+        Lang::Js => js.is_match(outside),
+        Lang::Ruby => ruby.is_match(outside),
+        _ => true,
+    }
+}
+
+/// `code` with what its strings and comments hold taken out, when they
+/// are only data: the code runs no process and no code but through calls
+/// [`read_code`] read (`reading`, read from this same code), whose lines
+/// are judged in their own place. A string the code only edits, prints,
+/// writes or names (`s.replace('rm -rf -- "$d"/x', ...)`) is not a line
+/// any process runs. `None` when that cannot be said: the reading left a
+/// line or code unread or runs a download, a name outside the strings may
+/// reach a process the reader does not read (`may_run_beyond_reading`),
+/// or a string may run code where it stands.
+pub(crate) fn data_literals_blanked(
+    lang: Lang,
+    code: &str,
+    reading: &InlineReading,
+) -> Option<String> {
+    if reading.unread || reading.code_unread || reading.runs_download {
+        return None;
+    }
+    // The reader marks the names it read on its normalized code; one
+    // rewritten there (`getattr(os, "system")`) is not blanked here.
+    if reading.residue.len() != code.len() || normalized_code(lang, code) != code {
+        return None;
+    }
+    let ranges = data_literal_ranges(lang, code)?;
+    let mut blanked = String::with_capacity(code.len());
+    let mut outside = String::with_capacity(code.len());
+    let mut last = 0;
+    for &(start, end) in &ranges {
+        blanked.push_str(&code[last..start]);
+        outside.push_str(reading.residue.get(last..start)?);
+        outside.push(' ');
+        last = end;
+    }
+    blanked.push_str(&code[last..]);
+    outside.push_str(reading.residue.get(last..)?);
+    if lang == Lang::Js {
+        // `require('fs')` and its kind load a module that starts nothing.
+        static PLAIN: std::sync::OnceLock<(regex::Regex, regex::Regex)> =
+            std::sync::OnceLock::new();
+        let (plain, any) = PLAIN.get_or_init(|| {
+            (
+                regex::Regex::new(
+                    r#"\brequire\(\s*(?:'(?:node:)?(?:fs|fs/promises|path|os|util)'|"(?:node:)?(?:fs|fs/promises|path|os|util)")\s*\)"#,
+                )
+                .expect("valid regex"),
+                regex::Regex::new(r"\brequire\b").expect("valid regex"),
+            )
+        });
+        if any.find_iter(&outside).count() <= plain.find_iter(code).count() {
+            outside = any.replace_all(&outside, " ").into_owned();
+        }
+    }
+    if may_run_beyond_reading(lang, &outside) {
+        return None;
+    }
+    Some(blanked)
 }
 
 /// The code with the ways to reach a function by its name written as the

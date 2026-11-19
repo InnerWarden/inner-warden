@@ -2771,19 +2771,48 @@ pub(crate) fn inline_code_reading(source: &str) -> InlineReading {
         if let Some(lang) = inline_calls::Lang::of(&language) {
             // In double quotes the shell takes the backslash off `$`, a
             // backtick, `"` and `\\`: the program reads the code without it.
+            let as_written = code;
             let code = if double_quoted {
-                double_quote_unescaped(&code)
+                double_quote_unescaped(&as_written)
             } else {
-                code
+                as_written.clone()
             };
-            reading.merge(inline_calls::read_code(
-                lang,
-                &code,
-                inline_calls::CODE_DEPTH,
-            ));
+            let mut piece = inline_calls::read_code(lang, &code, inline_calls::CODE_DEPTH);
+            // Its strings are blanked in the line only where the line holds
+            // the code as the program reads it.
+            if code == as_written {
+                if let Some(blanked) = inline_calls::data_literals_blanked(lang, &code, &piece) {
+                    piece.data_blanked.push((as_written, blanked));
+                }
+            }
+            reading.merge(piece);
         }
     }
     reading
+}
+
+/// The shell line `scan` with the strings of its inline code taken out
+/// where they are only data ([`InlineReading::data_blanked`]): text the
+/// code edits, prints or writes is not a line any process runs, and the
+/// lines its calls run are judged in their own place. `None` when the
+/// reading leaves anything unread, or no such piece stands in `scan`.
+pub(crate) fn with_inline_data_blanked(scan: &str, reading: &InlineReading) -> Option<String> {
+    if reading.unread
+        || reading.code_unread
+        || reading.runs_download
+        || reading.data_blanked.is_empty()
+    {
+        return None;
+    }
+    let mut out = scan.to_owned();
+    let mut changed = false;
+    for (as_written, blanked) in &reading.data_blanked {
+        if as_written != blanked && out.contains(as_written.as_str()) {
+            out = out.replace(as_written.as_str(), blanked);
+            changed = true;
+        }
+    }
+    changed.then_some(out)
 }
 
 /// Whether inline code that runs a line or code it cannot read
@@ -5733,7 +5762,53 @@ fn parse_read_budget(len: usize) -> usize {
 /// Every caller already takes `None` as a line with no structure to trust and
 /// reads it the conservative way.
 pub(crate) fn parse_bash(source: &str) -> Option<tree_sitter::Tree> {
+    if source.len() < PARSE_CACHE_FROM {
+        return parse_bash_uncached(source);
+    }
+    // The same long line is parsed by many checks in one analysis: 19
+    // times for a 64 KiB `python3 -c` line, 5 to 8 ms each in release, most
+    // of its 240 to 280 ms (measured 2026-11-19). A tree depends on the text
+    // alone, and a copy of one is cheap (a reference count).
+    PARSE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(at) = cache.iter().position(|(text, _)| text == source) {
+            let entry = cache.remove(at);
+            let tree = entry.1.clone();
+            cache.push(entry);
+            return tree;
+        }
+        let tree = parse_bash_uncached(source);
+        if cache.len() >= PARSE_CACHE_SIZE {
+            cache.remove(0);
+        }
+        cache.push((source.to_owned(), tree.clone()));
+        tree
+    })
+}
+
+/// The shortest text whose parse [`parse_bash`] keeps: below it a parse
+/// costs less than the copy of the text a kept one needs.
+const PARSE_CACHE_FROM: usize = 4 * 1024;
+/// How many parses [`parse_bash`] keeps on a thread, the latest used last.
+const PARSE_CACHE_SIZE: usize = 8;
+
+thread_local! {
+    static PARSE_CACHE: std::cell::RefCell<Vec<(String, Option<tree_sitter::Tree>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many long texts [`parse_bash_uncached`] parsed on this thread.
+    static LONG_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn parse_bash_uncached(source: &str) -> Option<tree_sitter::Tree> {
     use std::cell::Cell;
+    #[cfg(test)]
+    if source.len() >= PARSE_CACHE_FROM {
+        LONG_PARSES.with(|count| count.set(count.get() + 1));
+    }
 
     let mut parser = tree_sitter::Parser::new();
     parser
@@ -11676,6 +11751,26 @@ fn basename(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A long line is parsed once in an analysis, not once per check that
+    /// reads it: a 64 KiB `python3 -c` line was parsed 19 times, 5 to 8 ms
+    /// each in release, most of its 240 to 280 ms (measured 2026-11-19).
+    ///
+    /// FAILS ON REVERT: parse again on every call and the count is many.
+    #[test]
+    fn a_long_line_is_parsed_once_in_an_analysis() {
+        let mut line = String::from("python3 -c \"");
+        while line.len() < 64 * 1024 - 64 {
+            line.push_str("s = 'rm -rf -- $d'; t = s.replace('a','b'); ");
+        }
+        line.push('"');
+        PARSE_CACHE.with(|cache| cache.borrow_mut().clear());
+        LONG_PARSES.with(|count| count.set(0));
+        let _ = crate::mcp::analyze_command(&line, None);
+        let parses = LONG_PARSES.with(std::cell::Cell::get);
+        // The line, and the code it hands `python3` read as a shell line.
+        assert!(parses <= 2, "parsed {parses} times");
+    }
 
     /// FAILS ON REVERT of the function-body term in `handed_shell_lines`:
     /// the line as written (before any call is written out) was read as

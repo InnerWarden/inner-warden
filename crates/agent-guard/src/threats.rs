@@ -570,6 +570,33 @@ pub const INNERWARDEN_SELF_PATHS: &[&str] = &[
     "/sys/fs/bpf/innerwarden",
 ];
 
+/// The other places the installers of Community and Pro write (read
+/// 2026-11-19 from Pro's `scripts/web-install.sh` and `scripts/install.sh`
+/// and Community's `iw-guard-install.sh` and `.deb`/`.rpm`), lowercase, as
+/// [`check_security_tamper`] reads a line: the guard's helper scripts and
+/// release pin, its run-time folder, its systemd units and the links that
+/// enable them, its sudo rules, its audit rule, the boot setting that turns
+/// on its kernel layer, its launchd jobs and folders on macOS, and the
+/// licence text the packages ship. Removing or moving one takes a part of
+/// the guard away as surely as removing its binary: `rm -rf
+/// /usr/local/lib/innerwarden/` was allowed (measured 2026-11-19).
+pub const INNERWARDEN_INSTALL_PATHS: &[&str] = &[
+    "/usr/local/lib/innerwarden",
+    "/run/innerwarden",
+    "/etc/systemd/system/innerwarden-",
+    ".wants/innerwarden-",
+    "/etc/sudoers.d/innerwarden",
+    "/etc/audit/rules.d/innerwarden",
+    "/etc/default/grub.d/99-innerwarden",
+    "/library/launchdaemons/com.innerwarden.",
+    "/usr/local/etc/innerwarden",
+    "/usr/local/var/lib/innerwarden",
+    "/usr/local/var/log/innerwarden",
+    "/var/log/innerwarden",
+    "/usr/bin/innerwarden",
+    "/usr/share/doc/innerwarden",
+];
+
 // ── Check functions ─────────────────────────────────────────────────────
 
 /// Check content for injection patterns. Returns first match.
@@ -18081,10 +18108,15 @@ fn lowering_verb_target_unread(reading: &str) -> bool {
 /// [`check_security_tamper`] on one reading of the line.
 fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     let lower = content.to_ascii_lowercase();
+    // A `pkill -f` whose pattern matches no command line of the guard kills
+    // none of its processes, whatever words it holds: `pkill -f 'cargo test
+    // -p innerwarden-agent-guard'` stops a test run. Such a command is no
+    // kill of the guard, and the two checks of one below do not read it.
+    let (kill_read, names_guard) = pkills_read(content, &lower);
     // Direct verb+target phrases (service control / process kill / self-disable).
     if let Some(i) = SECURITY_TAMPER_INDICATORS
         .iter()
-        .find(|i| lower.contains(*i))
+        .find(|i| kill_read.contains(*i))
         .filter(|i| !(**i == "innerwarden uninstall" && uninstall_only_asks(&lower)))
     {
         return Some((*i, 60));
@@ -18100,8 +18132,14 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     // Adjacency was never the signal. A defence-evasion verb reaching a protected
     // target is. Matching on that tolerates intervening flags without widening to
     // "any mention of innerwarden", which would flag `systemctl status`.
-    if let Some(hit) = check_disable_verb_reaches_target(&lower) {
+    if let Some(hit) = check_disable_verb_reaches_target(&kill_read) {
         return Some((hit, 60));
+    }
+    if names_guard {
+        return Some((
+            "kill InnerWarden (a pkill -f pattern that matches its command line)",
+            60,
+        ));
     }
     // Tearing down the host firewall is the same intent as stopping the monitor,
     // and nothing covered it: `ufw disable` and `iptables -F` both scored 0.
@@ -18126,6 +18164,7 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     // with any incidental mention of an InnerWarden path.
     let redirect_over_self = INNERWARDEN_SELF_PATHS
         .iter()
+        .chain(INNERWARDEN_INSTALL_PATHS)
         .any(|p| lower.contains(&format!("> {p}")) || lower.contains(&format!(">{p}")));
     // Deleting or moving an InnerWarden file: a removal/move verb plus an
     // InnerWarden path. Reading or grepping a file under /etc/innerwarden stays
@@ -18148,12 +18187,200 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     // cleanup step got told they were tampering with security monitoring.
     let removal_of_self = shell_command_segments(&lower).into_iter().any(|seg| {
         REMOVAL_VERBS.iter().any(|v| seg.contains(v))
-            && INNERWARDEN_SELF_PATHS.iter().any(|p| seg.contains(p))
+            && INNERWARDEN_SELF_PATHS
+                .iter()
+                .chain(INNERWARDEN_INSTALL_PATHS)
+                .any(|p| seg.contains(p))
     });
     if redirect_over_self || removal_of_self {
         return Some(("removing or altering InnerWarden files", 60));
     }
     None
+}
+
+/// Command lines the guard's own processes run with: the Community CLI (its
+/// hook, its MCP proxy, its dashboard) and the Pro daemons, as their
+/// installers and units start them. A `pkill -f` pattern is matched against
+/// each, as `pkill` matches it against every process's command line.
+const GUARD_PROCESS_LINES: &[&str] = &[
+    "/usr/local/bin/innerwarden hook --agent claude-code",
+    "/usr/local/bin/innerwarden mcp-proxy -- npx -y server",
+    "/usr/local/bin/innerwarden dashboard",
+    "/usr/bin/innerwarden hook",
+    "/home/user/.local/bin/innerwarden hook",
+    "innerwarden",
+    "/usr/local/bin/innerwarden-sensor --config /etc/innerwarden/config.toml",
+    "/usr/local/bin/innerwarden-agent --config /etc/innerwarden/agent.toml --dashboard",
+    "/usr/bin/innerwarden-agent --dashboard",
+    "/usr/local/bin/innerwarden-watchdog",
+    "/usr/local/bin/innerwarden-supervisor",
+    "/usr/local/bin/innerwarden-ctl",
+    "/usr/local/bin/innerwarden-dns-guard --bind 127.0.0.2:53 --events /var/lib/innerwarden/dns_guard-events.jsonl",
+    "/usr/local/bin/innerwarden-sensor-esf",
+    "/usr/local/bin/innerwarden-esf-bridge",
+];
+
+/// What a `pkill -f PATTERN` does to the guard's processes.
+#[derive(Debug, PartialEq)]
+enum PkillReach {
+    /// The pattern matches none of [`GUARD_PROCESS_LINES`].
+    Misses,
+    /// It matches one of them by the guard's name, which it spells some
+    /// way the plain words do not (`[i]nnerwarden`, `inner.arden`).
+    NamesGuard,
+    /// Not read surely, or it matches them by something else
+    /// (`dashboard`, `bin`): left to the checks of the words.
+    Unread,
+}
+
+/// `lower` with every `pkill -f` command of `content` (its lowercase
+/// twin, byte for byte) blanked whose pattern matches none of
+/// [`GUARD_PROCESS_LINES`], and whether one matches them by the guard's
+/// name ([`PkillReach`]). Read from `content` as written: `-F` (a
+/// pidfile) is not `-f`. A command read any less surely (no `-f`, an
+/// option not known, more than one pattern, a pattern that is not a
+/// regular expression) is left as it stands.
+fn pkills_read(content: &str, lower: &str) -> (String, bool) {
+    if !lower.contains("pkill") || content.len() != lower.len() {
+        return (lower.to_owned(), false);
+    }
+    let mut names_guard = false;
+    let mut out = lower.as_bytes().to_vec();
+    let base = content.as_ptr() as usize;
+    for segment in shell_command_segments(content) {
+        let Some(offset) = (segment.as_ptr() as usize).checked_sub(base) else {
+            continue;
+        };
+        if offset + segment.len() > out.len() {
+            continue;
+        }
+        match pkill_reach(segment) {
+            PkillReach::Misses => {
+                for byte in &mut out[offset..offset + segment.len()] {
+                    *byte = b' ';
+                }
+            }
+            PkillReach::NamesGuard => names_guard = true,
+            PkillReach::Unread => {}
+        }
+    }
+    let read = String::from_utf8(out).unwrap_or_else(|_| lower.to_owned());
+    (read, names_guard)
+}
+
+/// What `segment`, when it is one `pkill -f PATTERN`, does to the guard's
+/// processes.
+fn pkill_reach(segment: &str) -> PkillReach {
+    use PkillReach::*;
+    let words = shell_tokens(segment);
+    let Some(at) = words.iter().position(|word| {
+        let name = word.rsplit('/').next().unwrap_or(word);
+        name == "pkill"
+    }) else {
+        return Unread;
+    };
+    // Only a plain `pkill`, or one behind `sudo`, `nohup` or `timeout N`.
+    let mut before = words[..at].iter().map(String::as_str);
+    while let Some(word) = before.next() {
+        let duration = |word: Option<&str>| {
+            word.is_some_and(|w| {
+                !w.is_empty()
+                    && w.trim_end_matches(['s', 'm', 'h', 'd'])
+                        .parse::<f64>()
+                        .is_ok()
+            })
+        };
+        let known = match word {
+            "sudo" | "nohup" => true,
+            "timeout" => duration(before.next()),
+            _ => false,
+        };
+        if !known {
+            return Unread;
+        }
+    }
+    let mut full = false;
+    let mut patterns: Vec<&str> = Vec::new();
+    let mut index = at + 1;
+    let mut options_done = false;
+    while let Some(word) = words.get(index) {
+        let word = word.as_str();
+        index += 1;
+        if options_done || !word.starts_with('-') || word == "-" {
+            patterns.push(word);
+            continue;
+        }
+        match word {
+            "--" => options_done = true,
+            "--full" => full = true,
+            "--ignore-case" => {}
+            "-u" | "-U" | "-g" | "-G" | "-P" | "-s" | "-t" | "--euid" | "--uid" | "--group"
+            | "--pgroup" | "--parent" | "--session" | "--terminal" | "--signal" | "--ns"
+            | "--nslist" | "-q" | "--queue" => index += 1,
+            "-n" | "-o" | "-e" | "-c" | "-x" | "--newest" | "--oldest" | "--echo" | "--count"
+            | "--exact" => {}
+            _ if word.starts_with("--") => {
+                // `--signal=KILL`, `--euid=0`: one word. Any other long
+                // option is not read.
+                if ![
+                    "--signal=",
+                    "--euid=",
+                    "--uid=",
+                    "--group=",
+                    "--pgroup=",
+                    "--parent=",
+                    "--session=",
+                    "--terminal=",
+                ]
+                .iter()
+                .any(|prefix| word.starts_with(prefix))
+                {
+                    return Unread;
+                }
+            }
+            _ => {
+                let flags = &word[1..];
+                // A signal: `-9`, `-KILL`, `-SIGTERM`, `-HUP`.
+                if flags.bytes().all(|b| b.is_ascii_digit())
+                    || (flags.bytes().all(|b| b.is_ascii_uppercase()) && flags.len() >= 3)
+                {
+                    continue;
+                }
+                if !flags.bytes().all(|b| b"fienoxc".contains(&b)) {
+                    return Unread;
+                }
+                full |= flags.contains('f');
+            }
+        }
+    }
+    let [pattern] = patterns.as_slice() else {
+        return Unread;
+    };
+    if !full || pattern.is_empty() {
+        return Unread;
+    }
+    // Matched with case ignored, `-i` or not: a pattern that may match the
+    // guard's line in any case counts.
+    let Ok(regex) = regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .size_limit(1 << 20)
+        .build()
+    else {
+        return Unread;
+    };
+    // By the name when the line with the name spelled out of reach no
+    // longer matches.
+    let unnamed = |line: &str| line.replace("innerwarden", "xxxxxxxxxxx");
+    if GUARD_PROCESS_LINES
+        .iter()
+        .any(|line| regex.is_match(line) && !regex.is_match(&unnamed(line)))
+    {
+        NamesGuard
+    } else if GUARD_PROCESS_LINES.iter().any(|line| regex.is_match(line)) {
+        Unread
+    } else {
+        Misses
+    }
 }
 
 /// Check for download-and-execute via pipe. Returns score.
