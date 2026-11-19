@@ -6403,6 +6403,13 @@ fn command_or_inline_program_consumes_stdin_as_code(words: &[String], depth: u8)
 }
 
 fn shell_inline_code_payload(words: &[String]) -> Option<String> {
+    shell_inline_code_place(words).map(|at| shell_literal_word(&words[at]))
+}
+
+/// The place in `words` (a shell's name first) of the code a shell runs
+/// with `-c` (`bash -c LINE`, `sh -ec LINE`, `zsh -o x -c LINE`), when
+/// there is one.
+pub(crate) fn shell_inline_code_place(words: &[String]) -> Option<usize> {
     let command = words.first()?;
     let name = normalized_command_name(command);
     if !matches!(
@@ -6422,7 +6429,7 @@ fn shell_inline_code_payload(words: &[String]) -> Option<String> {
                 .strip_prefix('-')
                 .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
         {
-            return args.get(index + 1).cloned();
+            return (index + 2 < words.len()).then_some(index + 2);
         }
         if argument == "--" || (!argument.starts_with('-') && !argument.starts_with('+')) {
             return None;
