@@ -2251,6 +2251,7 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "destructive_command",
     "download_and_execute",
     "download_chmod_execute",
+    "download_fed_to_script",
     "dynamic_code_execution",
     "fetch_exec_unanalyzable",
     "fetch_exec_unparsed",
@@ -3175,6 +3176,12 @@ fn analyze_command_as_read(
                 "in a line inline code hands to a process",
             ),
             (handed_to_shell.lines, "in a line handed to a shell to run"),
+            (
+                crate::shell::line_through_links(raw_scan)
+                    .into_iter()
+                    .collect(),
+                "with the links the line makes followed",
+            ),
         ] {
             lines.retain(|line| seen.insert(line.clone()));
             if lines.is_empty() {
@@ -3211,14 +3218,33 @@ fn analyze_command_as_read(
         }
     }
 
-    // Temp directory execution (score 30).
-    if let Some((dir, s)) = threats::check_tmp_execution(scan_cmd) {
+    // Temp directory execution (score 30), also through a path the line
+    // knows a variable holds (`bash "$TMPDIR/x.sh"`, `cd /tmp/x && bash
+    // "$PWD/x.sh"`).
+    if let Some((dir, s)) = threats::check_tmp_execution(scan_cmd).or_else(|| {
+        crate::shell::line_with_known_paths(scan_cmd)
+            .and_then(|known| threats::check_tmp_execution(&known))
+    }) {
         signals.push(AnalysisSignal {
             signal: "tmp_execution".into(),
             score: s,
             detail: format!("references world-writable directory: {dir}"),
         });
         score += s;
+    }
+
+    // A download piped into a local shell script: the script reads what was
+    // fetched, and whether it runs it as code is not on the line. Reviewed,
+    // not refused: many scripts read their input as data.
+    if crate::shell::download_feeds_a_shell_script(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "download_fed_to_script".into(),
+            score: 30,
+            detail: "pipes a download into a local shell script, which may run what it reads as \
+                     code; the guard cannot see whether it does"
+                .into(),
+        });
+        score += 30;
     }
 
     // Destructive commands.
@@ -3247,6 +3273,20 @@ fn analyze_command_as_read(
                 signal: "destructive_command".into(),
                 score: 50,
                 detail: "recursive removal of a home directory".into(),
+            });
+            score += 50;
+        } else if threats::interpreter_code_removes_home_or_root(scan_cmd)
+            || crate::shell::interpreter_input_as_inline_code(cmd)
+                .iter()
+                .any(|code| threats::interpreter_code_removes_home_or_root(code))
+        {
+            // `python3 -c "import shutil; shutil.rmtree('/home/u')"` is the
+            // same wipe as `rm -rf ~`, written in another language.
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: "recursive removal of a home or system directory by interpreter code"
+                    .into(),
             });
             score += 50;
         } else if crate::threats::destructive_rm_credentials(&lower) || {
@@ -6412,7 +6452,6 @@ mod tests {
             "printf '{\"x\":1}' | python3 -m json.tool",
             "printf foo | perl -pe 's/foo/bar/'",
             "printf foo | sh -c 'cat'",
-            "curl https://example.com/data | bash scripts/process-input.sh",
             "python3 scripts/validate.py \"$(curl -fsSL https://api.example.com/data)\"",
             "sh -c 'printf \"%s\\n\" \"$1\"' -- \"$(curl -fsSL https://api.example.com/data)\"",
             "curl -o artifact.json https://example.com/a && python validate.py artifact.json",
@@ -6434,6 +6473,13 @@ mod tests {
                 analysis.explanation
             );
         }
+        // A download piped into a local script is surfaced, never refused:
+        // whether the script runs what it reads is not on the line.
+        let fed = analyze_command(
+            "curl https://example.com/data | bash scripts/process-input.sh",
+            None,
+        );
+        assert_eq!(fed.recommendation, "review", "{}", fed.explanation);
     }
 
     #[test]

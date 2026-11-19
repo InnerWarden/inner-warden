@@ -5730,6 +5730,261 @@ fn is_downloader(name: &str) -> bool {
     matches!(name, "curl" | "wget" | "fetch" | "aria2c")
 }
 
+/// Whether a download is piped into a shell running a script file
+/// (`curl -s URL | bash ./scripts/x.sh`): the script reads what was
+/// fetched on its input, and may run it as code (`source /dev/stdin`,
+/// `eval "$(cat)"`), which the guard cannot see from the line. A `-c`
+/// line or a shell reading its program from the input is judged elsewhere.
+pub(crate) fn download_feeds_a_shell_script(source: &str) -> bool {
+    let Some((tree, _doubt)) = parse_line(source) else {
+        return false;
+    };
+    let bytes = source.as_bytes();
+    let mut pipelines = Vec::new();
+    collect_nodes_of_kind(tree.root_node(), "pipeline", &mut pipelines, 0);
+    pipelines.into_iter().any(|pipeline| {
+        if node_is_in_literal_unreachable_branch(pipeline, bytes) {
+            return false;
+        }
+        let mut commands = Vec::new();
+        collect_commands(pipeline, &mut commands, 0);
+        commands.sort_by_key(|command| command.start_byte());
+        let mut fetched = false;
+        commands.into_iter().any(|command| {
+            let Some(words) = command_words(command, bytes) else {
+                return false;
+            };
+            let Some(effective) = effective_command_words(&words, 0) else {
+                return false;
+            };
+            if produces_downloaded_bytes(effective) {
+                fetched = true;
+                return false;
+            }
+            fetched && is_shell_name(&normalized_command_name(&effective[0])) && {
+                let args: Vec<String> = effective[1..]
+                    .iter()
+                    .map(|argument| shell_literal_word(argument))
+                    .collect();
+                // The first operand is the script: `bash ./x.sh`.
+                match shell_code_input(&args) {
+                    CodeInput::Argument(script) => {
+                        !args.iter().any(|argument| {
+                            argument == "-c"
+                                || argument == "--command"
+                                || argument.strip_prefix('-').is_some_and(|flags| {
+                                    !flags.starts_with('-') && flags.contains('c')
+                                })
+                        }) && !script.is_empty()
+                    }
+                    _ => false,
+                }
+            }
+        })
+    })
+}
+
+/// World-writable directories a path the line knows may sit in.
+const WORLD_WRITABLE_DIRS: [&str; 5] = ["/tmp", "/var/tmp", "/dev/shm", "/run/shm", "/private/tmp"];
+
+fn in_world_writable_dir(path: &str) -> bool {
+    WORLD_WRITABLE_DIRS
+        .iter()
+        .any(|dir| path == *dir || path.starts_with(&format!("{dir}/")))
+}
+
+/// The line with each path it knows written in for the variable that holds
+/// it, when one of them is in a world-writable directory: `$TMPDIR` is
+/// `/tmp`, `$PWD` after `cd /tmp/x` is `/tmp/x`, and `$f` after
+/// `f=/tmp/x.sh` is `/tmp/x.sh`. So `bash "$TMPDIR/x.sh"` is judged as
+/// `bash /tmp/x.sh` is. `None` when nothing is written in.
+pub(crate) fn line_with_known_paths(source: &str) -> Option<String> {
+    if !source.contains('$') {
+        return None;
+    }
+    let (tree, _doubt) = parse_line(source)?;
+    let bytes = source.as_bytes();
+    // Where each name gets a world-writable path, in text order: `cd`
+    // sets `PWD`, an assignment written out sets its name.
+    let mut known: Vec<(usize, String, Option<String>)> = Vec::new();
+    let mut commands = Vec::new();
+    collect_all_commands(tree.root_node(), &mut commands, 0);
+    for command in &commands {
+        let Some(words) = command_words(*command, bytes) else {
+            continue;
+        };
+        if words
+            .first()
+            .is_some_and(|name| normalized_command_name(name) == "cd")
+        {
+            let target = words
+                .iter()
+                .skip(1)
+                .map(|word| shell_literal_word(word))
+                .find(|word| !word.starts_with('-'));
+            known.push((
+                command.end_byte(),
+                "PWD".to_owned(),
+                target.filter(|target| in_world_writable_dir(target)),
+            ));
+        }
+    }
+    let mut assignments = Vec::new();
+    collect_nodes_of_kind(tree.root_node(), "variable_assignment", &mut assignments, 0);
+    for assignment in assignments {
+        let Some(name) = assignment.child_by_field_name("name") else {
+            continue;
+        };
+        let raw = assignment
+            .child_by_field_name("value")
+            .map(|value| node_text(value, bytes))
+            .unwrap_or_default();
+        let raw = raw.trim();
+        let written_out = raw.starts_with('\'') || !raw.contains(['$', '`']);
+        let value = written_out
+            .then(|| shell_literal_word(raw))
+            .filter(|value| in_world_writable_dir(value));
+        known.push((assignment.end_byte(), node_text(name, bytes), value));
+    }
+    known.sort_by_key(|(at, _, _)| *at);
+    static EXPANSION: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let expansion = EXPANSION.get_or_init(|| {
+        regex::Regex::new(
+            r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?::?[-=][^}]*)?\}|([A-Za-z_][A-Za-z0-9_]*))",
+        )
+        .expect("static expansion regex")
+    });
+    let mut out = String::with_capacity(source.len());
+    let mut last = 0;
+    let mut changed = false;
+    for found in expansion.captures_iter(source) {
+        let whole = found.get(0).expect("match");
+        let Some(name) = found
+            .get(1)
+            .or_else(|| found.get(2))
+            .map(|name| name.as_str())
+        else {
+            continue;
+        };
+        let value = if name == "TMPDIR" {
+            Some("/tmp".to_owned())
+        } else {
+            known
+                .iter()
+                .rev()
+                .find(|(at, set, _)| *at <= whole.start() && set == name)
+                .and_then(|(_, _, value)| value.clone())
+        };
+        if let Some(value) = value {
+            out.push_str(&source[last..whole.start()]);
+            out.push_str(&value);
+            last = whole.end();
+            changed = true;
+        }
+    }
+    out.push_str(&source[last..]);
+    changed.then_some(out)
+}
+
+/// The line with each path under a link it makes (`ln -s TARGET LINK`)
+/// written as the path under `TARGET`, after the `ln`: `ln -s ~/.claude
+/// "$H"; echo '{}' > "$H/settings.json"` writes `~/.claude/settings.json`,
+/// though the line never says `.claude` where it writes. `None` when the
+/// line makes no link or uses none after it.
+pub(crate) fn line_through_links(source: &str) -> Option<String> {
+    if !source.contains("ln") {
+        return None;
+    }
+    let (tree, _doubt) = parse_line(source)?;
+    let bytes = source.as_bytes();
+    let mut commands = Vec::new();
+    collect_all_commands(tree.root_node(), &mut commands, 0);
+    commands.sort_by_key(|command| command.start_byte());
+    let mut text = source.to_owned();
+    let mut changed = false;
+    for command in commands {
+        let Some(words) = command_words(command, bytes) else {
+            continue;
+        };
+        let Some(effective) = effective_command_words(&words, 0) else {
+            continue;
+        };
+        if normalized_command_name(&effective[0]) != "ln" {
+            continue;
+        }
+        let mut symbolic = false;
+        let mut operands = Vec::new();
+        for word in &effective[1..] {
+            let literal = shell_literal_word(word);
+            if literal == "--symbolic" {
+                symbolic = true;
+            } else if let Some(flags) = literal.strip_prefix('-').filter(|f| !f.starts_with('-')) {
+                symbolic |= flags.contains('s');
+            } else if !literal.starts_with("--") {
+                operands.push(word.clone());
+            }
+        }
+        let [target, link] = operands.as_slice() else {
+            continue;
+        };
+        if !symbolic {
+            continue;
+        }
+        let target = shell_literal_word(target);
+        let target = match target.strip_prefix('~') {
+            Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("$HOME{rest}"),
+            _ => target,
+        };
+        let target = target.trim_end_matches('/').to_owned();
+        if target.is_empty() {
+            continue;
+        }
+        let link = link.trim();
+        let unquoted = link
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .unwrap_or(link);
+        let after = command.end_byte().min(text.len());
+        let (head, tail) = text.split_at(after);
+        let replaced = match shell_variable_name(unquoted) {
+            Some(name) => {
+                let pattern = format!(
+                    r"\$(?:\{{{}\}}|{}\b)",
+                    regex::escape(name),
+                    regex::escape(name)
+                );
+                let Ok(pattern) = regex::Regex::new(&pattern) else {
+                    continue;
+                };
+                pattern
+                    .replace_all(tail, regex::NoExpand(&target))
+                    .into_owned()
+            }
+            None => {
+                let literal = shell_literal_word(link);
+                let literal = literal.trim_end_matches('/');
+                if literal.is_empty() || literal.contains('$') {
+                    continue;
+                }
+                let pattern = format!(r#"{}(/|["'\s;&|)]|$)"#, regex::escape(literal));
+                let Ok(pattern) = regex::Regex::new(&pattern) else {
+                    continue;
+                };
+                pattern
+                    .replace_all(tail, |found: &regex::Captures<'_>| {
+                        format!("{target}{}", &found[1])
+                    })
+                    .into_owned()
+            }
+        };
+        if replaced != tail {
+            text = format!("{head}{replaced}");
+            changed = true;
+        }
+    }
+    changed.then_some(text)
+}
+
 fn is_stdin_code_executor(name: &str) -> bool {
     matches!(
         versionless_interpreter_name(name),

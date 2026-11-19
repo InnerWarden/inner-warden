@@ -10445,6 +10445,61 @@ pub fn destructive_rm_root(hay: &str) -> bool {
 ///
 /// Only the home itself: `rm -rf ~/.cache/build`, `rm -rf "$HOME/.cache/x"`
 /// and `rm -rf /home/u/proj/build` are scoped cleanups and never match.
+/// Whether interpreter code given inline (`python3 -c`, `node -e`, `ruby
+/// -e`, `perl -e`, and a here-document read as such) removes a home or a
+/// root / system directory: `shutil.rmtree('/home/u')`, `os.removedirs`,
+/// `Path(..).rmdir()`, `FileUtils.rm_rf`, `fs.rmSync`, `rmtree` and
+/// `remove_tree`, given the path written out or the home by name
+/// (`os.path.expanduser('~')`, `Path.home()`, `os.environ['HOME']`,
+/// `os.homedir()`, `Dir.home`, `$ENV{HOME}`). The same paths `rm -rf`
+/// is refused on ([`destructive_rm_home`], [`destructive_rm_root`]):
+/// `shutil.rmtree('build')` stays a cleanup.
+pub(crate) fn interpreter_code_removes_home_or_root(content: &str) -> bool {
+    static CODE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static REMOVAL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let code = CODE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?is)\b(?:python[\d.]*|node|nodejs|bun|deno|ruby|perl)\b.{0,200}?\s-[a-z]*[ce]\b",
+        )
+        .expect("static inline code regex")
+    });
+    if !code.is_match(content) {
+        return false;
+    }
+    // A single quote inside single-quoted code is written `'\''`.
+    let content = content.replace("'\\''", "'");
+    let content = content.as_str();
+    let home = r#"os\.path\.expanduser\(\s*\\?['"]~/?\\?['"]\s*\)|(?:pathlib\.)?Path\.home\(\s*\)|os\.environ\[\s*\\?['"]HOME\\?['"]\s*\]|os\.getenv\(\s*\\?['"]HOME\\?['"]\s*\)|(?:require\(\s*\\?['"](?:node:)?os\\?['"]\s*\)|\bos)?\.homedir\(\s*\)|process\.env\.HOME|ENV\[\s*\\?['"]HOME\\?['"]\s*\]|Dir\.home|\$ENV\{\s*HOME\s*\}"#;
+    let removal = REMOVAL.get_or_init(|| {
+        let argument = format!(r#"(?:\\?'([^'\\]*)\\?'|\\?"([^"\\]*)\\?"|({home}))"#);
+        regex::Regex::new(&format!(
+            r#"(?:\b(?:shutil\.rmtree|os\.removedirs|os\.rmdir|rmtree|remove_tree|FileUtils\.(?:rm_rf|rm_r|rmtree|remove_dir|remove_entry(?:_secure)?)|fs\.(?:rm|rmdir)|fs\.promises\.(?:rm|rmdir)|fsPromises\.(?:rm|rmdir))\s*\(\s*{argument}|\.(?:rmSync|rmdirSync)\s*\(\s*{argument}|\b(?:pathlib\.)?Path\s*\(\s*{argument}\s*\)\s*\.\s*rmdir\s*\(|(?P<homepath>(?:pathlib\.)?Path\.home\(\s*\))\s*\.\s*rmdir\s*\()"#
+        ))
+        .expect("static interpreter removal regex")
+    });
+    removal.captures_iter(content).any(|found| {
+        if found.name("homepath").is_some() {
+            return true;
+        }
+        let Some(path) = (1..found.len())
+            .filter_map(|group| found.get(group))
+            .map(|path| path.as_str())
+            .find(|path| !path.is_empty())
+        else {
+            return false;
+        };
+        // The home by name, not a path written out.
+        if !path.starts_with(['/', '~', '$', '.']) && path.contains(['(', '[', '{', '.']) {
+            return true;
+        }
+        if path.contains(char::is_whitespace) {
+            return false;
+        }
+        let line = format!("rm -rf {}", path.to_ascii_lowercase());
+        destructive_rm_home(&line) || destructive_rm_root(&line)
+    })
+}
+
 pub fn destructive_rm_home(hay: &str) -> bool {
     shell_command_segments(hay)
         .into_iter()
