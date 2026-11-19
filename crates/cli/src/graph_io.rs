@@ -1022,7 +1022,7 @@ fn record_to(
         );
     }
     // Emit a compact, append-only guard event for a CO-LOCATED InnerWarden host
-    // agent (Enterprise) to ingest — so the free guard's blocks (command AND MCP)
+    // agent (Enterprise) to ingest, so the free guard's blocks (command AND MCP)
     // reach the paid incident pipeline / graph / model. Block-only + best-effort:
     // Allowed decisions are skipped, keeping the hook hot path cheap and the sink
     // small. Uses the already-redacted command + verdict (no raw secrets), and a
