@@ -389,6 +389,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              and output schema, annotations) the first time a server lists it. A tool\n  \
              whose definition changes later is reported field by field and, in guard\n  \
              and kill mode, held: left out of the tool list and refused when called.\n  \
+             A new tool that looks like a pinned one gone from the list (a possible\n  \
+             rename), or a definition over 64 KiB, is held the same way.\n  \
              list      the servers pinned, and the tools held with what changed\n  \
              approve   accept the changed definition of one tool (or --all of them)\n  \
              forget    drop a server's pins after you reinstalled it on purpose\n  \

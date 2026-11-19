@@ -206,6 +206,14 @@ fn route_server_to_client(
                             true,
                         ));
                     }
+                    // Tools left without a pin: a warning, never silent.
+                    for notice in pins.take_notices() {
+                        verdict.alerts.push(VerdictAlert::builtin(
+                            super::pins::TOOLS_UNPINNED_RULE,
+                            notice,
+                            false,
+                        ));
+                    }
                 }
             }
             ProxyDecision {

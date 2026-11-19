@@ -3129,8 +3129,8 @@ const GUARD_DISARMED: &str = "disarms the guard, or asks it to authorise itself"
 /// verbs ([`runs_guard_loosening_verb`]).
 const GUARD_LOOSENING_VERB: &str =
     "runs the guard's own hook, its allow, mute or monitor command, one of its agent \
-     decisions (approve, profile, allow, revoke), an approval of a changed MCP tool or a \
-     reset of a server's pinned tools, disconnects an agent or connects or \
+     decisions (approve, profile, allow, revoke), an approval of a changed MCP tool (mcp approve) \
+     or dropping a server's pinned tools (mcp forget), disconnects an agent or connects or \
      installs it in monitor, uninstalls it, or starts a jail, which only the person \
      supervising the agent may run, from their own terminal";
 
