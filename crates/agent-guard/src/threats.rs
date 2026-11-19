@@ -2893,7 +2893,7 @@ const GUARD_DISARMED: &str = "disarms the guard, or asks it to authorise itself"
 /// What [`check_guard_self_disable`] says of the guard's own loosening
 /// verbs ([`runs_guard_loosening_verb`]).
 const GUARD_LOOSENING_VERB: &str =
-    "runs the guard's own allow, mute or monitor command, one of its agent \
+    "runs the guard's own hook, its allow, mute or monitor command, one of its agent \
      decisions (approve, profile, allow, revoke), disconnects an agent or connects or \
      installs it in monitor, uninstalls it, or starts a jail, which only the person \
      supervising the agent may run, from their own terminal";
@@ -3212,6 +3212,14 @@ fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)]
                 v.push((re, what, score));
             }
         };
+        // The variable that marks a call `innerwarden demo` sent. Only the
+        // demo sets it, for the hooks it starts: a line that sets it, or
+        // reads it out, is after a call that sends no alert.
+        add(
+            r"INNERWARDEN_DEMO_NONCE",
+            "sets or reads the marker of the guard's own demo, which only the demo may set",
+            60,
+        );
         // A wildcard force-allow switches the whole guardrail off. A narrow one
         // authorises a single command and is a legitimate operator action, so
         // only the glob forms are caught here.
@@ -6597,6 +6605,7 @@ fn guard_verb_is_fed(arguments: &[String]) -> bool {
 /// the list is checked before the verbs are, so a verb added there and not
 /// here is never read.
 const GUARD_VERB_HEADS: &[&str] = &[
+    "hook",
     "allow",
     "mute",
     "dry-run",
@@ -6639,6 +6648,12 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
                     .is_some_and(|first| !matches!(*first, "--list" | "--remove"))
         }
         "dry-run" | "monitor" => !asks_for_help,
+        // `innerwarden hook` is the hook the agent's own calls are screened
+        // by. Run from an agent's shell it judges a payload the agent wrote,
+        // in an environment the agent set: a quiet probe of the policy, and
+        // with the demo's marker a call that sends no alert. Only the agent's
+        // wiring runs it.
+        "hook" => !asks_for_help,
         // `innerwarden agents approve|profile|allow|revoke`: the decisions
         // about an agent are the person's, every one of them. Listing the
         // agents, connecting them and asking for help are not decisions.

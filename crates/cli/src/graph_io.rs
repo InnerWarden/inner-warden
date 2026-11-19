@@ -527,7 +527,9 @@ pub(crate) fn project_name(cwd: &str) -> Option<String> {
 /// Record a hook decision. `would_block_under_policy` is the exact result of the
 /// hook policy (`deny`, plus review when strict); monitor mode records that as
 /// `would_block`, while enforcement records `blocked` only when the hook really
-/// returns its blocking exit code.
+/// returns its blocking exit code. `demo` labels a call `innerwarden demo`
+/// sent: it is recorded all the same, with `demo: true`, and leaves no
+/// `guard.blocked` line for the host.
 #[allow(clippy::too_many_arguments)]
 pub fn record_hook(
     command: &str,
@@ -540,6 +542,7 @@ pub fn record_hook(
     cwd: Option<&str>,
     identity: Option<&Identity>,
     layer: Option<LayerLabel>,
+    demo: bool,
 ) {
     let (mode, outcome) = if monitor {
         (
@@ -560,6 +563,8 @@ pub fn record_hook(
             },
         )
     };
+    let mut origin = hook_origin(verdict, agent, cwd, identity, layer);
+    origin.demo = demo;
     record(
         command,
         verdict,
@@ -567,7 +572,7 @@ pub fn record_hook(
         outcome,
         source_session,
         source_event_id,
-        hook_origin(verdict, agent, cwd, identity, layer),
+        origin,
     );
 }
 
@@ -747,10 +752,14 @@ fn record_to(
     // Allowed decisions are skipped, keeping the hook hot path cheap and the sink
     // small. Uses the already-redacted command + verdict (no raw secrets), and a
     // failure here never affects the verdict or the graph record.
-    if matches!(
-        outcome,
-        DecisionOutcome::Blocked | DecisionOutcome::WouldBlock
-    ) {
+    // A demo call is recorded, but it is no event for the host to act on:
+    // the demo sent it, and nothing an agent did is behind it.
+    if !origin.demo
+        && matches!(
+            outcome,
+            DecisionOutcome::Blocked | DecisionOutcome::WouldBlock
+        )
+    {
         emit_guard_event(
             path,
             &command,
