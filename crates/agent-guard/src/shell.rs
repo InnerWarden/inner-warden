@@ -2801,7 +2801,7 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         let Some(words) = command_words(*command, bytes) else {
             continue;
         };
-        let set: Vec<(String, String)> = assignments
+        let set: Vec<(String, Option<String>)> = assignments
             .iter()
             .filter(|(_, _, at)| *at <= command.start_byte())
             .map(|(name, value, _)| (name.clone(), value.clone()))
@@ -2842,11 +2842,18 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
     handed
 }
 
-/// The variables the line sets to a value written out (`C='rm -rf ~'`),
-/// each with where its assignment ends.
-fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(String, String, usize)> {
+/// Every variable the line sets, in order, with its value when it is
+/// written out (`C='rm -rf ~'`) and `None` when it is built at run time
+/// (`C=$(curl ...)`), each with where its assignment ends. The last
+/// assignment before a command is the value it sees: measured 2026-11-18,
+/// `C='echo ok'; C=$(curl -s URL); sh -c "$C"` was read as `echo ok`.
+fn literal_assignments(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Vec<(String, Option<String>, usize)> {
     let mut found = Vec::new();
     collect_nodes_of_kind(root, "variable_assignment", &mut found, 0);
+    found.sort_by_key(|assignment| assignment.end_byte());
     found
         .into_iter()
         .filter_map(|assignment| {
@@ -2859,7 +2866,11 @@ fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(Strin
             // A value with an expansion outside single quotes is not
             // written out.
             let written_out = raw.starts_with('\'') || !raw.contains(['$', '`']);
-            written_out.then(|| (name, shell_literal_word(raw), assignment.end_byte()))
+            Some((
+                name,
+                written_out.then(|| shell_literal_word(raw)),
+                assignment.end_byte(),
+            ))
         })
         .collect()
 }
@@ -2869,7 +2880,7 @@ fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(Strin
 fn handed_lines_of(
     words: &[String],
     depth: u8,
-    assignments: &[(String, String)],
+    assignments: &[(String, Option<String>)],
     handed: &mut HandedLines,
 ) {
     if depth > HANDED_LEVELS_READ {
@@ -2879,7 +2890,18 @@ fn handed_lines_of(
     let Some(effective) = effective_command_words(words, 0) else {
         return;
     };
-    let name = normalized_command_name(&effective[0]);
+    // A program named at run time (`X=bash; $X -c ...`, `$(echo bash) -c
+    // ...`) is the program the line names for it when the line does.
+    let run_time =
+        program_is_named_at_run_time(&effective[0]) && !names_a_shell_at_run_time(&effective[0]);
+    let resolved = if run_time {
+        program_named_on_the_line(&effective[0], assignments)
+    } else {
+        None
+    };
+    let name = resolved
+        .clone()
+        .unwrap_or_else(|| normalized_command_name(&effective[0]));
     match name.as_str() {
         "xargs" => {
             if let Some(at) = xargs_command_start(effective) {
@@ -2907,6 +2929,21 @@ fn handed_lines_of(
                 }
             }
         }
+        // A program the line does not name may be a shell: a `-c` line
+        // written out is read as one (`$(echo bash) -c 'rm -rf /'`). One not
+        // written out is left to the other rules (`$CC -c "$SRC"` compiles).
+        _ if run_time && resolved.is_none() => {
+            let args: Vec<String> = effective[1..]
+                .iter()
+                .map(|argument| shell_literal_word(argument))
+                .collect();
+            if let Some(at) = shell_c_operand(&args) {
+                let written = effective[1 + at].trim();
+                if let Some(line) = operand_line(written, &effective[2 + at..], assignments) {
+                    handed.lines.push(line);
+                }
+            }
+        }
         // Code in another language is read by [`inline_process_lines`];
         // `source` and `.` are handed a file, not a line.
         _ if is_stdin_code_executor(&name) => {}
@@ -2926,7 +2963,7 @@ fn handed_lines_of(
 fn operand_line(
     written: &str,
     after: &[String],
-    assignments: &[(String, String)],
+    assignments: &[(String, Option<String>)],
 ) -> Option<String> {
     let in_double_quotes = written
         .strip_prefix('"')
@@ -2957,7 +2994,48 @@ fn operand_line(
         .iter()
         .rev()
         .find(|(set, _)| set == name)
-        .map(|(_, value)| value.clone())
+        .and_then(|(_, value)| value.clone())
+}
+
+/// The program a command word named at run time stands for when the line
+/// says: a variable set on the line to a name written out (`X=bash; $X`),
+/// or a substitution that only prints one (`$(echo bash)`, `$(printf sh)`).
+fn program_named_on_the_line(
+    word: &str,
+    assignments: &[(String, Option<String>)],
+) -> Option<String> {
+    let word: String = word.chars().filter(|c| *c != '"').collect();
+    let word = word.trim();
+    let named = if let Some(inner) = word
+        .strip_prefix("$(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .or_else(|| {
+            word.strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+        }) {
+        let parts: Vec<String> = inner.split_whitespace().map(shell_literal_word).collect();
+        match parts
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            ["echo" | "printf", name] | ["printf", "%s" | "%s\\n", name] => (*name).to_owned(),
+            _ => return None,
+        }
+    } else {
+        let name = word
+            .strip_prefix("${")
+            .and_then(|rest| rest.strip_suffix('}'))
+            .or_else(|| word.strip_prefix('$'))?;
+        assignments
+            .iter()
+            .rev()
+            .find(|(set, _)| set == name)
+            .and_then(|(_, value)| value.clone())?
+    };
+    let program = named.split_whitespace().next()?;
+    Some(normalized_command_name(program))
 }
 
 fn is_shell_name(name: &str) -> bool {
@@ -8896,7 +8974,9 @@ fn effective_command_words(words: &[String], depth: u8) -> Option<&[String]> {
         "env" => unwrap_env(args),
         "command" => unwrap_command(args),
         "sudo" | "doas" => unwrap_privilege_wrapper(args),
-        "nohup" | "setsid" | "busybox" | "toybox" => unwrap_simple_wrapper(args),
+        // `coproc` runs the simple command after it (a NAME is only given
+        // before a compound command).
+        "nohup" | "setsid" | "busybox" | "toybox" | "coproc" => unwrap_simple_wrapper(args),
         "nice" => unwrap_nice(args),
         "timeout" => unwrap_timeout(args),
         "stdbuf" => unwrap_options_with_values(args, &STDBUF_OPTIONS),
