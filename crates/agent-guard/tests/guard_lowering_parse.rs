@@ -23,6 +23,16 @@ use innerwarden_agent_guard::mcp::analyze_command;
 /// and is counted there. Outside a sweep the ceiling holds.
 const NO_CEILINGS_ENV: &str = "IW_NO_WALL_CLOCK_CEILINGS";
 
+/// Set (to `1`) where the 3 s ceiling is asked for: the `perf` job of
+/// `.github/workflows/nightly-deep.yml`, which runs this file alone on a
+/// machine doing nothing else (the switch of `hot_path_budget.rs`). Without
+/// it each line still has to be read within [`HANG_BOUND`], far above a
+/// loaded runner and far below the minutes an exponential reading takes.
+const CEILINGS_ENV: &str = "IW_WALL_CLOCK_CEILINGS";
+
+/// The bound every run holds: a reading gone exponential takes minutes.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
 fn verdict(command: &str) -> String {
     analyze_command(command, None).recommendation
 }
@@ -382,9 +392,10 @@ fn a_reading_cut_short_refuses_a_line_naming_the_guard() {
 /// lowering took over 40 s, and 880 bytes of `env -S X=1` took 15 s, past
 /// the hook's 9 to 17 s timeout). The reading is one pass per level now,
 /// paid from a budget that is a bounded multiple of the line. The ceiling
-/// is for a debug build on a loaded runner and is far above what these
-/// take (milliseconds); what it catches is the exponential reading, which
-/// takes minutes.
+/// is for a debug build on a quiet runner (the nightly `perf` job) and is far
+/// above what these take (milliseconds); every other run holds each line to
+/// [`HANG_BOUND`] (60 s), so a loaded machine no longer fails it, while the
+/// exponential reading, which takes minutes, still does.
 ///
 /// FAILS ON REVERT: with the reading of the words after every bare `<`, or
 /// of every `env -S` string in a pass, the first cases run for minutes.
@@ -411,13 +422,20 @@ fn a_line_built_to_be_slow_to_read_is_read_in_bounded_time() {
         format!("{}true", "a=$(".repeat(2000)),
         "case x in a) ;; esac ".repeat(2000),
     ];
-    let ceiling_is_asserted = std::env::var_os(NO_CEILINGS_ENV).is_none();
+    let ceiling = if std::env::var_os(NO_CEILINGS_ENV).is_some() {
+        // A mutation sweep: the sweep's own timeout counts a slow mutant.
+        Duration::MAX
+    } else if std::env::var_os(CEILINGS_ENV).is_some_and(|v| v == "1") {
+        ceiling
+    } else {
+        HANG_BOUND
+    };
     for command in lowerings.iter().chain(&others) {
         let start = Instant::now();
         let verdict = verdict(command);
         let took = start.elapsed();
         assert!(
-            !ceiling_is_asserted || took < ceiling,
+            took < ceiling,
             "{} bytes took {took:?}: {:?}",
             command.len(),
             &command[..command.len().min(80)]

@@ -583,10 +583,16 @@ fn resolve_planned(
             let others = crate::contain::other_jail_views(&real, &named, &shown);
             dirs.extend(others);
         }
-        (
-            dirs,
-            crate::contain::launch_env(std::env::vars_os()).child_env,
-        )
+        // The command's own `PATH` (and a loader variable only when passed
+        // by name): what the allow list lets in, as without the flag.
+        let child_env = crate::contain::launch_env(std::env::vars_os())
+            .child_env
+            .into_iter()
+            .filter(|(name, _)| {
+                crate::contain::env_goes_in(std::ffi::OsStr::new(name), &args.pass_env)
+            })
+            .collect();
+        (dirs, child_env)
     } else {
         (Vec::new(), Vec::new())
     };
@@ -2439,20 +2445,59 @@ fn run_plain(bwrap: &Path, plan: &crate::contain::LinuxJailPlan, input: &JailInp
     exit_from(command.status())
 }
 
-/// The credential variables of the launcher's environment the jail's command
-/// does not get ([`crate::contain::credential_vars`]).
+/// The variables of the launcher's environment the jail's command does not
+/// get ([`crate::contain::env_kept_out`]): all but the few a shell needs and
+/// those passed with `--pass-env`. The jail's own `IW_*`, which the launch
+/// sets, are never among them.
 fn credentials_kept_out(input: &JailInputs) -> Vec<std::ffi::OsString> {
-    crate::contain::credential_vars(
+    let set = crate::contain::compute_jail_env(input);
+    let set: Vec<&str> = set.iter().map(|(name, _)| name.as_str()).collect();
+    crate::contain::env_kept_out(
         std::env::vars_os().map(|(name, _)| name),
         &input.args.pass_env,
+        &set,
     )
 }
 
-/// Take the credential variables out of the environment `command` (bwrap,
-/// or the program that starts it, or sandbox-exec) hands the jail.
+/// Take those variables out of the environment `command` (bwrap, or the
+/// program that starts it, or sandbox-exec) hands the jail.
 fn without_credentials(command: &mut Command, input: &JailInputs) {
+    without_credentials_but(command, input, &[]);
+}
+
+/// As [`without_credentials`], leaving `kept` for the program that starts
+/// bwrap (`systemd-run` finds the user's manager by them); bwrap then takes
+/// them out of the jail's own environment ([`unset_in_jail`]).
+fn without_credentials_but(command: &mut Command, input: &JailInputs, kept: &[&str]) {
     for name in credentials_kept_out(input) {
-        command.env_remove(name);
+        if !kept.iter().any(|k| name.as_os_str() == *k) {
+            command.env_remove(name);
+        }
+    }
+}
+
+/// The variables `systemd-run --user` needs to reach the user's manager.
+/// They are no secret (a folder and a socket address), and the jail still
+/// never gets them unless passed: bwrap unsets them ([`unset_in_jail`]).
+#[cfg(target_os = "linux")]
+const SCOPE_RUNNER_ENV: &[&str] = &["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"];
+
+/// `--unsetenv NAME` for each of `names` the launcher has and the jail must
+/// not get, put right after bwrap's path in the scope's argv
+/// (`[.., "--", bwrap, bwrap_args..]`), so bwrap applies it to the jail.
+#[cfg(target_os = "linux")]
+fn unset_in_jail(args: &mut Vec<String>, names: &[&str], input: &JailInputs) {
+    let out = credentials_kept_out(input);
+    let Some(at) = args.iter().position(|a| a == "--") else {
+        return;
+    };
+    let mut put = at + 2;
+    for name in names {
+        if out.iter().any(|o| o.as_os_str() == *name) {
+            args.insert(put, "--unsetenv".to_string());
+            args.insert(put + 1, (*name).to_string());
+            put += 2;
+        }
     }
 }
 
@@ -2772,12 +2817,18 @@ fn launch_identified(
             return Attempt::Done(ExitCode::from(2));
         }
     };
-    let (program, args) = launch_argv(bwrap, &plan.bwrap_args, scope);
+    let (program, mut args) = launch_argv(bwrap, &plan.bwrap_args, scope);
+    let runner_env: &[&str] = if matches!(scope, ScopePlan::User { .. }) {
+        unset_in_jail(&mut args, SCOPE_RUNNER_ENV, input);
+        SCOPE_RUNNER_ENV
+    } else {
+        &[]
+    };
     let started_ms = now_ms();
     let mut command = Command::new(&program);
     command.args(&args).envs(plan.env.iter().cloned());
     helper_env(&mut command);
-    without_credentials(&mut command, input);
+    without_credentials_but(&mut command, input, runner_env);
     let spawned = command.spawn();
     // Ours must close, or the read below never ends and the jail never sees
     // the end of its record.
@@ -3924,7 +3975,7 @@ fn announce(input: &JailInputs) {
         );
     }
     eprintln!("{}", crate::contain::iw_folder_said(input));
-    if let Some(said) = crate::contain::credentials_said(&credentials_kept_out(input)) {
+    if let Some(said) = crate::contain::env_said(&credentials_kept_out(input)) {
         eprintln!("{said}");
     }
 }
@@ -3954,7 +4005,7 @@ fn exit_from(status: std::io::Result<std::process::ExitStatus>) -> ExitCode {
 }
 
 fn print_credentials_kept_out(input: &JailInputs) {
-    if let Some(said) = crate::contain::credentials_said(&credentials_kept_out(input)) {
+    if let Some(said) = crate::contain::env_said(&credentials_kept_out(input)) {
         println!("#{}", said.trim_start());
     }
 }

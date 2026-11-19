@@ -782,13 +782,13 @@ fn classify_hook_input(buf: &str) -> HookInput {
 /// hook refuses it in enforce and says it went unscreened in monitor.
 pub(crate) const MAX_TOOL_CALL_BYTES: u64 = 1024 * 1024;
 
-const TOOL_CALL_TOO_LONG: &str =
+pub(crate) const TOOL_CALL_TOO_LONG: &str =
     "the tool call is longer than the 1 MiB the hook reads, so it was not read";
 
 /// Read one tool call from `reader`, at most [`MAX_TOOL_CALL_BYTES`].
 /// `Ok(None)` for a call longer than that: the rest is never read, so a
 /// caller that sends without end does not grow the hook either.
-fn read_tool_call(reader: impl std::io::Read) -> std::io::Result<Option<String>> {
+pub(crate) fn read_tool_call(reader: impl std::io::Read) -> std::io::Result<Option<String>> {
     let mut buf = String::new();
     reader
         .take(MAX_TOOL_CALL_BYTES + 1)
@@ -3081,7 +3081,7 @@ fn help_text() -> String {
            \x20                                opt-in monitor-only discovery while dashboard runs\n  \
            {p} contain [--enforce] -- <cmd>\n  \
            \x20                                run <cmd> in a filesystem/namespace JAIL with the guard active inside\n  \
-           \x20                                (Linux bwrap / macOS sandbox-exec; exported credential variables are taken out)\n  \
+           \x20                                (Linux bwrap / macOS sandbox-exec; only the variables a shell needs go in)\n  \
            {p} hook [--block-review|--monitor]\n  \
            \x20                                PreToolUse adapter (reads the tool call on stdin)\n  \
            {p} allow \"<glob>\" | mute <ATR-rule|category>\n  \

@@ -14,6 +14,33 @@
 use innerwarden_agent_guard::mcp::analyze_command;
 use std::time::{Duration, Instant};
 
+/// Set (to `1`) where the 1 s ceiling per line is asked for: the `perf` job
+/// of `.github/workflows/nightly-deep.yml`, which runs this file alone on a
+/// machine doing nothing else (the switch of `hot_path_budget.rs`). Every
+/// other run holds each line to [`HANG_BOUND`]: on a loaded machine (load 8
+/// to 12, 2026-11-19) both timed tests failed the whole suite at the 1 s
+/// ceiling and passed 3 of 3 alone, while a stall the test exists for (a
+/// reader gone exponential) takes minutes.
+const CEILINGS_ENV: &str = "IW_WALL_CLOCK_CEILINGS";
+
+/// Set by a mutation sweep: the sweep's own timeout counts a slow mutant.
+const NO_CEILINGS_ENV: &str = "IW_NO_WALL_CLOCK_CEILINGS";
+
+/// The bound every run holds on one line.
+const HANG_BOUND: Duration = Duration::from_secs(60);
+
+/// What one line may take in this run: 1 s where asked for, none in a
+/// mutation sweep, [`HANG_BOUND`] otherwise.
+fn line_ceiling() -> Duration {
+    if std::env::var_os(NO_CEILINGS_ENV).is_some() {
+        Duration::MAX
+    } else if std::env::var_os(CEILINGS_ENV).is_some_and(|v| v == "1") {
+        Duration::from_secs(1)
+    } else {
+        HANG_BOUND
+    }
+}
+
 const RUNNERS: &[&str] = &[
     "python3 -c",
     "node -e",
@@ -82,8 +109,9 @@ fn line_for(runner: &str, body: &str) -> String {
 }
 
 /// Judges every line, each on its own, and names those that panic or take
-/// longer than a second.
+/// longer than [`line_ceiling`] (a second in the nightly perf job).
 fn judge_all(lines: &[String], timed: bool) {
+    let ceiling = line_ceiling();
     let mut panicked = Vec::new();
     let mut slow = Vec::new();
     static WHERE: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -101,7 +129,7 @@ fn judge_all(lines: &[String], timed: bool) {
         let took = started.elapsed();
         if outcome.is_err() {
             panicked.push(line.chars().take(160).collect::<String>());
-        } else if timed && took > Duration::from_secs(1) {
+        } else if timed && took > ceiling {
             slow.push((line.chars().take(160).collect::<String>(), took));
         }
     }
@@ -117,7 +145,7 @@ fn judge_all(lines: &[String], timed: bool) {
         "panicked on {} lines, at {places:?}: {panicked:#?}",
         panicked.len()
     );
-    assert!(slow.is_empty(), "slower than 1 s: {slow:#?}");
+    assert!(slow.is_empty(), "slower than {ceiling:?}: {slow:#?}");
 }
 
 #[test]

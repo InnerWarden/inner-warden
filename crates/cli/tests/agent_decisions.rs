@@ -81,12 +81,7 @@ impl Host {
 
     fn run(&self, mut command: Command, stdin: &str) -> Run {
         let mut child = command.spawn().expect("run innerwarden");
-        child
-            .stdin
-            .as_mut()
-            .unwrap()
-            .write_all(stdin.as_bytes())
-            .unwrap();
+        feed(&mut child, stdin);
         let out = child.wait_with_output().unwrap();
         Run {
             code: out.status.code(),
@@ -320,4 +315,46 @@ fn an_unknown_flag_or_a_verb_out_of_place_is_not_a_decision() {
     assert_eq!(odd.code, Some(1));
     assert!(odd.stderr.contains("is not an option"), "{}", odd.stderr);
     assert!(!host.profiles_path().exists());
+}
+
+/// Hand `stdin` to `child`. A child that refuses before it reads (an
+/// agent's shell, no terminal) may have exited and closed its end already:
+/// the write then fails with a closed pipe, which only says the child is
+/// gone. Its effect (exit code, what it wrote) is what each test checks.
+/// Any other write error is a failure of the test run.
+fn feed(child: &mut std::process::Child, stdin: &str) {
+    let Some(pipe) = child.stdin.as_mut() else {
+        return;
+    };
+    match pipe.write_all(stdin.as_bytes()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => panic!("writing the child's stdin: {e}"),
+    }
+}
+
+/// The race behind the BrokenPipe of
+/// `a_decision_without_the_person_at_a_terminal_changes_nothing` (1 in 3
+/// runs alone on a lab host), made certain: the child has exited before a
+/// byte is written, and the run still collects its exit.
+///
+/// FAILS ON REVERT: `write_all(..).unwrap()` (as before) panics on the
+/// closed pipe.
+#[cfg(unix)]
+#[test]
+fn a_child_that_exits_before_reading_is_collected_not_a_broken_pipe() {
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "exec 0<&-; exit 2"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run sh");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while child.try_wait().expect("try_wait").is_none() {
+        assert!(std::time::Instant::now() < deadline, "sh never exited");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    feed(&mut child, "y\n");
+    assert_eq!(child.wait_with_output().unwrap().status.code(), Some(2));
 }
