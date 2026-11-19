@@ -6912,6 +6912,381 @@ fn writes_persistence_file(content: &str) -> bool {
     may_name_persistence_file(content) && writes_place(content, 0, names_persistence_file, false)
 }
 
+/// What the shell side says of a line that replaces or makes a file that
+/// runs at login without showing what it holds ([`replaces_startup_file_unseen`]).
+pub const STARTUP_FILE_REPLACED_UNSEEN: &str =
+    "replaces or makes a file that runs at login or starts with the session, from \
+     content the line does not show";
+
+/// The files of a home that run at every login or shell, and the folders
+/// whose files start with the session, relative to the home (lowercase).
+const HOME_STARTUP_FILES: &[&str] = &[
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".bash_logout",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zlogin",
+    ".zlogout",
+    ".zshenv",
+    ".config/fish/config.fish",
+    ".ssh/rc",
+];
+const HOME_STARTUP_FOLDERS: &[&str] = &[
+    ".config/systemd/user",
+    ".config/autostart",
+    "library/launchagents",
+];
+
+/// Whether a path names a file of a home that runs at login
+/// ([`HOME_STARTUP_FILES`]) or a folder whose files start with the session
+/// ([`HOME_STARTUP_FOLDERS`]), or a file in one. A removal or a move away
+/// (`taken`) is not counted: a missing file runs nothing.
+fn names_home_startup(target: &str, taken: bool) -> bool {
+    if taken {
+        return false;
+    }
+    let Some(named) = named_path(&home_spelled(target)) else {
+        return false;
+    };
+    home_relative_path(&named).is_some_and(|relative| {
+        let relative = relative.trim_end_matches('/');
+        HOME_STARTUP_FILES.contains(&relative)
+            || HOME_STARTUP_FOLDERS.iter().any(|folder| {
+                relative
+                    .strip_prefix(folder)
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+    })
+}
+
+/// Variables a line does not choose the value of: the session sets them
+/// (`$HOME`, `$PATH`). Any other variable a startup file is written from
+/// holds what the line does not show, unless the line gave it a literal.
+const ENVIRONMENT_NAMES: &[&str] = &[
+    "home",
+    "path",
+    "user",
+    "logname",
+    "shell",
+    "pwd",
+    "lang",
+    "term",
+    "editor",
+    "visual",
+    "hostname",
+    "tmpdir",
+    "xdg_config_home",
+    "xdg_data_home",
+    "xdg_cache_home",
+    "xdg_state_home",
+    "xdg_runtime_dir",
+];
+
+/// Whether shell text expands what the line does not show: a command
+/// substitution (`$(...)` or backticks), a positional or special
+/// parameter, or a variable that is neither one of [`ENVIRONMENT_NAMES`] nor
+/// given a literal on the line (`literals`, lowercase). With `quotes`, single
+/// quotes make text literal, as on a command line; without, as in the body of
+/// an unquoted heredoc, they do not.
+fn hides_text(text: &str, literals: &[String], quotes: bool) -> bool {
+    let bytes = text.as_bytes();
+    let mut index = 0usize;
+    let mut single = false;
+    let mut double = false;
+    while let Some(&byte) = bytes.get(index) {
+        if single {
+            single = byte != b'\'';
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'\\' => {
+                index += 2;
+                continue;
+            }
+            b'\'' if quotes && !double => single = true,
+            b'"' if quotes => double = !double,
+            b'`' => return true,
+            b'$' => {
+                let rest = &text[index + 1..];
+                if rest.starts_with('(') {
+                    return true;
+                }
+                let name: String = rest
+                    .trim_start_matches('{')
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if name.is_empty() {
+                    if rest.starts_with(['@', '*', '{', '!']) {
+                        return true;
+                    }
+                } else {
+                    let name = name.to_ascii_lowercase();
+                    if !ENVIRONMENT_NAMES.contains(&name.as_str()) && !literals.contains(&name) {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+/// The variables the segments of a line give a literal value (lowercase),
+/// as of the end of the line: `P='alias ll="ls -l"'` is one, `P=$(curl ...)` is
+/// not, and a later assignment of anything else takes the name back.
+fn literal_variables(segments: &[&str]) -> Vec<String> {
+    static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let assign = ASSIGN.get_or_init(|| {
+        regex::Regex::new(
+            r"^\s*(?:(?:export|local|readonly|declare)\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$",
+        )
+        .expect("static assignment regex")
+    });
+    let mut literals: Vec<String> = Vec::new();
+    for segment in segments {
+        let Some(captures) = assign.captures(segment) else {
+            continue;
+        };
+        let name = captures[1].to_ascii_lowercase();
+        literals.retain(|known| *known != name);
+        if !hides_text(&captures[2], &literals, true) {
+            literals.push(name);
+        }
+    }
+    literals
+}
+
+/// Whether the heredoc a segment opens has a body the line does not show:
+/// its tag is not quoted (`<<EOF`, not `<<'EOF'`, `<<"EOF"` or `<<\EOF`) and
+/// the body expands something [`hides_text`] counts. Quotes inside such a body
+/// do not stop an expansion.
+fn heredoc_hides(content: &str, segment: &str, literals: &[String]) -> bool {
+    static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let heredoc = HEREDOC.get_or_init(|| {
+        regex::Regex::new(r#"<<-?\s*(['"\\]?)([A-Za-z_][A-Za-z0-9_]*)"#)
+            .expect("static heredoc tag regex")
+    });
+    if segment.contains("<<<") {
+        return false;
+    }
+    let Some(captures) = heredoc.captures(segment) else {
+        return false;
+    };
+    if !captures[1].is_empty() {
+        return false;
+    }
+    let tag = &captures[2];
+    let start = (segment.as_ptr() as usize).saturating_sub(content.as_ptr() as usize);
+    let Some(after) = content.get(start..) else {
+        return false;
+    };
+    let body: Vec<&str> = after
+        .lines()
+        .skip(1)
+        .take_while(|line| line.trim() != tag)
+        .collect();
+    hides_text(&body.join("\n"), literals, false)
+}
+
+/// A command of a line whose effect on a startup file is shown on the line,
+/// with nothing in it the line does not show ([`hides_text`]): `echo`/`printf`,
+/// a heredoc or here-string, a `tee` fed by such an `echo`, an in-place
+/// `sed`/`perl` edit (its expression is on the line) and `truncate` (it empties
+/// the file; an empty file runs nothing). What these write is judged by what
+/// it is (`startup_file_payloads` and [`check_persistence_install`]).
+/// `echo "$P"` with `P=$(curl ...)`, an unquoted heredoc whose body runs a
+/// substitution, and `sed -i "s/x/$(curl ...)/"` show nothing.
+fn shows_what_it_writes(
+    content: &str,
+    segment: &str,
+    piped_from_text: bool,
+    literals: &[String],
+) -> bool {
+    let words = shell_tokens(segment);
+    let Some(command_index) = effective_command_index(&words) else {
+        return false;
+    };
+    let command = token_basename(&words[command_index]).to_ascii_lowercase();
+    let shown =
+        || !hides_text(segment, literals, true) && !heredoc_hides(content, segment, literals);
+    match command.as_str() {
+        "echo" | "printf" | "sed" | "gsed" | "perl" => shown(),
+        "tee" => (piped_from_text || segment.contains("<<")) && shown(),
+        "cat" => segment.contains("<<") && shown(),
+        "truncate" => true,
+        _ => false,
+    }
+}
+
+/// Whether a command line replaces or makes a file of a home that runs at
+/// login, or one in a folder whose files start with the session
+/// ([`names_home_startup`]), from content the line does not show: `cp`,
+/// `mv`, `ln`, `install`, `dd of=`, a download saved as it, the output
+/// of another program redirected into it, through a variable, `$HOME`, a
+/// `cd` or `..` ([`writes_place`]). A write whose text is on the line
+/// ([`shows_what_it_writes`]) is judged by that text instead:
+/// `echo 'export PATH=...' >> ~/.bashrc` is ordinary setup. A removal, a
+/// move away and a copy from one are not counted.
+pub fn replaces_startup_file_unseen(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if ![
+        ".bash",
+        ".profile",
+        ".zsh",
+        ".zlog",
+        ".zprofile",
+        "config.fish",
+        "ssh/rc",
+        "systemd",
+        "autostart",
+        "launchagents",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return false;
+    }
+    let segments = shell_command_segments(content);
+    let literals = literal_variables(&segments);
+    let mut unseen = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        let piped_from_text = index.checked_sub(1).is_some_and(|before| {
+            let previous = segments[before];
+            segments_are_piped(content, previous, segment)
+                && shows_what_it_writes(content, previous, false, &literals)
+        });
+        if !shows_what_it_writes(content, segment, piped_from_text, &literals) {
+            unseen.push(*segment);
+        }
+    }
+    !unseen.is_empty() && writes_place(&unseen.join("\n"), 0, names_home_startup, false)
+}
+
+/// What the shell side says of a line that installs a service or a login
+/// item from a file outside the folders they are kept in
+/// ([`installs_session_item_from_outside`]).
+pub const SESSION_ITEM_FROM_OUTSIDE: &str =
+    "installs a service or login item from a file outside the folders they are kept in";
+
+/// Whether a path names a place services and login items are kept in: a
+/// home's `.config/systemd/user` or `Library/LaunchAgents`, the system's
+/// systemd folders and its launch agent and daemon folders.
+fn names_session_item_folder(path: &str) -> bool {
+    let Some(named) = named_path(&home_spelled(path)) else {
+        return false;
+    };
+    if let Some(relative) = home_relative_path(&named) {
+        return [".config/systemd/user/", "library/launchagents/"]
+            .iter()
+            .any(|folder| relative.starts_with(folder));
+    }
+    named.rooted
+        && [
+            "/etc/systemd/",
+            "/usr/lib/systemd/",
+            "/lib/systemd/",
+            "/run/systemd/",
+            "/library/launchagents/",
+            "/library/launchdaemons/",
+            "/system/library/launchagents/",
+            "/system/library/launchdaemons/",
+        ]
+        .iter()
+        .any(|folder| named.path.starts_with(folder))
+}
+
+/// Whether a command line installs a service or a login item from a file
+/// outside the folders they are kept in ([`names_session_item_folder`]):
+/// `systemctl [--user] link|enable /tmp/u.service` links the file into the
+/// unit folder, and `launchctl load|bootstrap /tmp/x.plist` starts it at every
+/// login. A unit named by its name (`systemctl --user enable u.service`) is
+/// already in a unit folder, and copying it there is [`replaces_startup_file_unseen`].
+pub fn installs_session_item_from_outside(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if !lower.contains("systemctl") && !lower.contains("launchctl") {
+        return false;
+    }
+    shell_command_segments(content).iter().any(|segment| {
+        let words = shell_tokens(segment);
+        let Some(command_index) = effective_command_index(&words) else {
+            return false;
+        };
+        let command = token_basename(&words[command_index]).to_ascii_lowercase();
+        let operands: Vec<&String> = words[command_index + 1..]
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .collect();
+        let Some((verb, rest)) = operands.split_first() else {
+            return false;
+        };
+        let verb = verb.to_ascii_lowercase();
+        let installs = match command.as_str() {
+            "systemctl" => matches!(verb.as_str(), "link" | "enable" | "reenable"),
+            "launchctl" => matches!(verb.as_str(), "load" | "bootstrap"),
+            _ => false,
+        };
+        installs
+            && rest.iter().any(|word| {
+                let word = word.trim_matches(['"', '\'']);
+                let domain = ["gui/", "user/", "system", "pid/", "login/"]
+                    .iter()
+                    .any(|prefix| word.to_ascii_lowercase().starts_with(prefix));
+                word.contains('/') && !domain && !names_session_item_folder(word)
+            })
+    })
+}
+
+/// The places inline interpreter code is read for ([`code_writes_persistence_file`]),
+/// lowercase: the login keys, the account database, the sudo rules, the
+/// scheduled jobs and the stored credentials of a home.
+const CODE_PERSISTENCE_PATH: &str = r"(?:\.ssh/authorized_keys2?|/etc/(?:sudoers(?:\.d/[\w.-]+)?|passwd|shadow|gshadow|crontab|cron\.d/[\w.-]+)|/var/spool/cron/[\w./-]+|\.aws/credentials|\.netrc|\.kube/config|\.docker/config\.json|\.git-credentials|\.config/gcloud/[\w./-]*)";
+
+/// Whether interpreter code (lowercase) writes one of
+/// [`CODE_PERSISTENCE_PATH`]: opened to write or append (`open(P, 'a')`,
+/// `Path(P).write_text`, `.open('w')`), written whole as the first argument
+/// (`writeFileSync`, `appendFile`, `file_put_contents`) or made the
+/// destination of a copy, move, rename or link (the path after a comma).
+/// Reading one (`open(P).read()`, `copyfile(P, '/tmp/x')`) is not a write.
+fn code_names_and_writes_persistence_file(code: &str) -> bool {
+    static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let writes = WRITES.get_or_init(|| {
+        let path = CODE_PERSISTENCE_PATH;
+        regex::Regex::new(&format!(
+            r#"{path}["']?\)*\s*,\s*(?:mode\s*=\s*)?["'](?:w|a|x|r\+)[bt+]?["']|{path}.{{0,80}}?\.(?:write_text|write_bytes|open\(\s*["'](?:w|a|x))|(?:writefile\w*|appendfile\w*|file_put_contents|write)\s*\(\s*[^,]{{0,120}}?{path}|(?:copy\w*|move|rename\w*|replace|symlink\w*|link\w*|cp|mv)\s*\([^;]{{0,200}}?,[^;]{{0,200}}?{path}"#
+        ))
+        .expect("static persistence code regex")
+    });
+    writes.is_match(code)
+}
+
+/// Whether a command line hands an interpreter inline code (`python -c`,
+/// `node -e`, `perl -e`, `ruby -e`, `php -r`) that writes a file of
+/// [`names_persistence_file`] ([`code_names_and_writes_persistence_file`]).
+/// The shell writers are [`writes_persistence_file`]; this is the same file
+/// written from code.
+fn code_writes_persistence_file(content: &str) -> bool {
+    if !may_name_persistence_file(content) {
+        return false;
+    }
+    shell_command_segments(content).iter().any(|segment| {
+        let words = shell_tokens(segment);
+        let Some(command_index) = effective_command_index(&words) else {
+            return false;
+        };
+        let name = token_basename(&words[command_index]).to_ascii_lowercase();
+        let interpreter = strip_interpreter_version(&name);
+        interpreter_inline_code(interpreter, &words[command_index + 1..])
+            .is_some_and(|code| code_names_and_writes_persistence_file(&code.to_ascii_lowercase()))
+    })
+}
+
 /// What the shell side says of a line that writes what the guard is carried
 /// by.
 const GUARD_CARRIER_WRITTEN: &str =
@@ -8547,7 +8922,11 @@ pub fn check_local_credential_and_kernel_tamper(content: &str) -> Option<(&'stat
                 "uses a debugger to make a running process change its own user id",
             ),
             (
-                r"(?i)\b(?:dd|tee|cp|mv)\b[^|;&]*\b(?:of=|>)?\s*/etc/(?:passwd|shadow|gshadow|sudoers)\b",
+                // By its destination: \`dd of=\`, a file \`tee\` writes, and a
+                // move either way (it takes the database away). A copy onto
+                // it is \`names_persistence_file\`'s, which reads \`cp -t\`. A copy FROM it is a read: \`cp /etc/passwd /tmp/p\`
+                // and \`tee /tmp/x < /etc/passwd\` were denied here.
+                r"(?i)\bdd\b[^|;&]*\bof=/etc/(?:passwd|shadow|gshadow|sudoers)\b|\btee\b(?:\s+-\S+)*\s+/etc/(?:passwd|shadow|gshadow|sudoers)\b|\bmv\b[^|;&]*\s/etc/(?:passwd|shadow|gshadow|sudoers)\b",
                 "writes to the account or sudo database",
             ),
             (
@@ -8824,7 +9203,7 @@ pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
     if writes_ssh_client_config(content) {
         return Some((SSH_CLIENT_CONFIG_WRITTEN, 60));
     }
-    if writes_persistence_file(content) {
+    if writes_persistence_file(content) || code_writes_persistence_file(content) {
         return Some((PERSISTENCE_FILE_WRITTEN, 60));
     }
     if !mentions_any(
@@ -8902,7 +9281,10 @@ pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
                 // read-only and both were denied by an earlier version of this
                 // pattern, which matched any flag at all. Only the forms that
                 // WRITE a crontab count: `-e`, a file argument, or `-r`.
-                r"(?i)\bcrontab\b(?:\s+-u\s+\S+)?\s+(?:-e\b|-r\b|[^-\s]\S*)",
+                // \`crontab\` the program (bare or from a bin folder), not a
+                // path that ends in it: \`cp /etc/crontab /tmp/c\` copies the
+                // table out and was denied here.
+                r"(?i)(?:^|[^/\w.-]|/s?bin/)crontab\b(?:\s+-u\s+\S+)?\s+(?:-e\b|-r\b|[^-\s]\S*)",
                 "installs or replaces a scheduled task",
             ),
             (
@@ -14420,7 +14802,7 @@ pub fn check_persistence(content: &str) -> Option<(&'static str, u32)> {
             || lower.contains("crontab -r")
             || lower.contains("| crontab")
             || lower.contains("|crontab")
-            || regex::Regex::new(r"\bcrontab\s+[^-\s]")
+            || regex::Regex::new(r"(?:^|[^/\w.-]|/s?bin/)crontab\s+[^-\s]")
                 .expect("static crontab regex")
                 .is_match(&lower);
         if mutating {
@@ -15060,20 +15442,28 @@ fn writes_path(lower: &str, path: &str) -> bool {
             .rfind([';', '\n'])
             .map_or(0, |index| index.saturating_add(1));
         let segment = &before[segment_start..];
+        // A copy or install writes its last word only: `cp /etc/crontab
+        // /tmp/c` reads the path, it does not write it.
+        let after = &lower[position..];
+        let last_word = !after[..after.find([';', '\n', '|', '&']).unwrap_or(after.len())]
+            .trim_end()
+            .contains(char::is_whitespace);
         if segment.contains('>')
             || [
                 "tee ",
                 "tee -a ",
                 "sed -i",
                 "perl -pi",
-                "cp ",
                 "mv ",
-                "install ",
                 "truncate ",
                 "mkdir ",
             ]
             .iter()
             .any(|verb| segment.contains(verb))
+            || (last_word
+                && ["cp ", "install "]
+                    .iter()
+                    .any(|verb| segment.contains(verb)))
         {
             return true;
         }
@@ -16303,7 +16693,14 @@ pub fn check_sensitive_download_write(content: &str) -> Option<(&'static str, u3
         let words = shell_tokens(segment);
         download_targets.extend(download_output_targets(&words));
         // The file `tee` reads is kept: `tee /tmp/copy < KEY` copies it out.
-        direct_targets.extend(tee_named_files(&words));
+        // Not the account database or the sudo rules: reading them is
+        // allowed (`cat /etc/passwd`), so a copy of them is a read too.
+        let written = tee_files(&words, false);
+        direct_targets.extend(
+            tee_named_files(&words)
+                .into_iter()
+                .filter(|file| written.contains(file) || !is_readable_account_file(file)),
+        );
     }
     if (!redirect_scan_complete && lexical_sensitive_output_redirect(content))
         || direct_targets
@@ -16579,6 +16976,17 @@ impl ShellAuthTarget {
             }),
         }
     }
+}
+
+/// The files of [`AUTHENTICATION_WRITE_TARGETS`] the guard lets a command
+/// read (`cat /etc/passwd`): copying one out is a read, not a theft.
+fn is_readable_account_file(target: &str) -> bool {
+    matches!(
+        normalize_command_target(target)
+            .to_ascii_lowercase()
+            .as_str(),
+        "/etc/passwd" | "/etc/sudoers"
+    )
 }
 
 fn is_authentication_write_target(target: &str) -> bool {
