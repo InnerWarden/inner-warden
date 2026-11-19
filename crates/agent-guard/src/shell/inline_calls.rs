@@ -39,6 +39,9 @@ pub(super) const CODE_DEPTH: u8 = 3;
 const MAX_CODE: usize = 64 * 1024;
 /// The longest string a fold builds.
 const MAX_VALUE: usize = 16 * 1024;
+/// The most items a list grown one step at a time (`x += [...]`) is
+/// followed to; past it the list is not read.
+const MAX_LIST: usize = 1024;
 
 /// What [`read_code`] finds in a piece of inline code.
 #[derive(Debug, Default, PartialEq)]
@@ -488,6 +491,10 @@ struct Reader<'a> {
     node_calls: Vec<(NodeCall, usize)>,
     /// The functions the code defines, with their parameters.
     functions: Vec<(String, Vec<String>)>,
+    /// Every call site that is not a definition, statement by statement:
+    /// the callee, where its arguments start and where its statement ends.
+    /// Listed once, the first time a helper's calls are looked for.
+    call_list: Option<Vec<(String, usize, usize)>>,
     depth: u8,
     out: InlineReading,
 }
@@ -507,6 +514,7 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
         downloaded: Vec::new(),
         node_calls: Vec::new(),
         functions: Vec::new(),
+        call_list: None,
         depth,
         out: InlineReading::default(),
     };
@@ -652,6 +660,16 @@ fn replace_call_heads(
     }
     out.push_str(rest);
     out
+}
+
+/// Where the name at the end of `text` starts: just after its last
+/// character that cannot be in a JavaScript name, however many bytes that
+/// character takes.
+fn after_last_non_name(text: &str) -> usize {
+    text.char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_' || *c == '$'))
+        .map_or(0, |(at, c)| at + c.len_utf8())
 }
 
 /// Where the bracket that closes the one just before `text` is, outside
@@ -880,7 +898,7 @@ impl Reader<'_> {
                     (!is_name_byte(before) && !matches!(before, b'.' | b':' | b'>')) || after_call
                 });
             if !starts {
-                at += 1;
+                at += code[at..].chars().next().map_or(1, char::len_utf8);
                 continue;
             }
             let chain_end = self.chain_end(at, end);
@@ -1033,15 +1051,31 @@ impl Reader<'_> {
             read(self);
             return;
         };
-        let mut bindings = Vec::new();
         let code = self.code;
-        for (start, end) in statements(code) {
-            for (chain, at, arguments_at) in self.call_sites(start, end) {
-                let defining = code[..at].trim_end().ends_with("def")
-                    || code[..at].trim_end().ends_with("function");
-                if chain != function || defining {
-                    continue;
+        if self.call_list.is_none() {
+            let mut list = Vec::new();
+            for (start, end) in statements(code) {
+                for (chain, at, arguments_at) in self.call_sites(start, end) {
+                    let defining = code[..at].trim_end().ends_with("def")
+                        || code[..at].trim_end().ends_with("function");
+                    if !defining {
+                        list.push((chain, arguments_at, end));
+                    }
                 }
+            }
+            self.call_list = Some(list);
+        }
+        let calls: Vec<(usize, usize)> = self
+            .call_list
+            .iter()
+            .flatten()
+            .filter(|(chain, _, _)| *chain == function)
+            .map(|(_, arguments_at, end)| (*arguments_at, *end))
+            .take(65)
+            .collect();
+        let mut bindings = Vec::new();
+        {
+            for (arguments_at, end) in calls {
                 let handed = split_top(call_arguments(&code[arguments_at..end]), ",");
                 let values: Vec<(String, Value)> = parameters
                     .iter()
@@ -1533,8 +1567,13 @@ impl Reader<'_> {
         }
         let mut value = self.fold(expression, FOLD_DEPTH);
         if append {
-            let before = self.vars.get(name).cloned().unwrap_or(Value::Unknown);
+            let before = self.vars.remove(name).unwrap_or(Value::Unknown);
             value = match (before, value) {
+                (Value::List(first), Value::List(second))
+                    if first.len() + second.len() > MAX_LIST =>
+                {
+                    Value::Unknown
+                }
                 (Value::List(mut first), Value::List(second)) => {
                     first.extend(second);
                     Value::List(first)
@@ -1593,13 +1632,17 @@ impl Reader<'_> {
         if matches!(self.lang, Lang::Python | Lang::Ruby) {
             let pieces = split_top(text, " % ");
             if pieces.len() == 2 {
-                if let Value::Str(format) = self.fold(pieces[0], depth - 1) {
-                    let values = match self.fold(pieces[1], depth - 1) {
-                        Value::List(items) => items,
-                        other => vec![other],
-                    };
-                    return capped(percent_format(&format, &values));
-                }
+                // Each side is folded once: reading the whole again as a
+                // term when the left is not a string folded it twice per
+                // level, 2^FOLD_DEPTH walks of the code.
+                let Value::Str(format) = self.fold(pieces[0], depth - 1) else {
+                    return Value::Unknown;
+                };
+                let values = match self.fold(pieces[1], depth - 1) {
+                    Value::List(items) => items,
+                    other => vec![other],
+                };
+                return capped(percent_format(&format, &values));
             }
         }
         self.fold_term(text, depth)
@@ -1709,7 +1752,8 @@ impl Reader<'_> {
         if matches!(bytes.get(end), Some(b'$' | b'@')) {
             end += 1;
             if bytes.get(end) == Some(&b'^') {
-                end = (end + 2).min(bytes.len());
+                end += 1;
+                end += text[end..].chars().next().map_or(0, char::len_utf8);
             }
         }
         loop {
@@ -2321,18 +2365,14 @@ fn defined_functions(lang: Lang, code: &str) -> Vec<(String, Vec<String>)> {
                 };
                 (&inside[open + 1..], inside[..open].trim_end())
             } else {
-                let start = before
-                    .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-                    .map_or(0, |at| at + 1);
+                let start = after_last_non_name(before);
                 (&before[start..], before[..start].trim_end())
             };
             let Some(head) = head.strip_suffix('=') else {
                 continue;
             };
             let head = head.trim_end();
-            let start = head
-                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
-                .map_or(0, |at| at + 1);
+            let start = after_last_non_name(head);
             let name = &head[start..];
             if !name.is_empty() {
                 functions.push((name.to_owned(), parameters_of(parameters)));
@@ -2788,6 +2828,98 @@ mod tests {
             (Lang::Python, "import json,urllib.request; d=json.load(urllib.request.urlopen('https://x.example/a')); print(d)"),
         ] {
             assert!(!read(lang, code).runs_download, "{code}");
+        }
+    }
+
+    /// The reader's own cost on the largest code it reads, built to hit
+    /// each place that grew faster than the code: `(X) % (Y)` folded X
+    /// twice per level (2^FOLD_DEPTH walks), each call of a helper's
+    /// parameter listed every statement's calls again, and `x += [...]`
+    /// copied the whole list at each step. FAILS ON REVERT of the first two
+    /// (about 65 s each in a debug build, measured 2026-11-19); the list,
+    /// now capped at MAX_LIST, stayed under the second before.
+    #[test]
+    fn the_largest_code_read_is_read_in_well_under_a_second() {
+        let limit = std::time::Duration::from_secs(1);
+        let mut cases = Vec::new();
+
+        let filler = "é".repeat(4 * 1024);
+        let mut left = format!("\"%s {filler}\"");
+        for _ in 0..FOLD_DEPTH {
+            left = format!("({left}) % (\"x\")");
+        }
+        cases.push((Lang::Python, format!("import os; os.system({left})")));
+        cases.push((Lang::Ruby, format!("system({left})")));
+
+        let mut helper = String::from("import os\ndef sh(c):\n");
+        while helper.len() < MAX_CODE - 64 {
+            helper.push_str("    os.system(c)\n");
+        }
+        cases.push((Lang::Python, helper));
+
+        let mut grown = String::from("import os\na = []\n");
+        let mut item = 0;
+        while grown.len() < MAX_CODE - 64 {
+            grown.push_str(&format!("a += [\"é{item}\"]\n"));
+            item += 1;
+        }
+        grown.push_str("subprocess.run(a)\n");
+        cases.push((Lang::Python, grown));
+
+        let mut flat = String::new();
+        while flat.len() < MAX_CODE - 64 {
+            flat.push_str("é\u{a0}🦀$^é sh(é) ");
+        }
+        for lang in [
+            Lang::Python,
+            Lang::Js,
+            Lang::Ruby,
+            Lang::Perl,
+            Lang::Php,
+            Lang::Lua,
+        ] {
+            cases.push((lang, flat.clone()));
+        }
+
+        for (lang, code) in cases {
+            let started = std::time::Instant::now();
+            let _ = read_code(lang, &code, 4);
+            let took = started.elapsed();
+            assert!(
+                took < limit,
+                "{lang:?} took {took:?}: {}",
+                code.chars().take(80).collect::<String>()
+            );
+        }
+    }
+
+    /// A character of more than one byte where the reader steps through the
+    /// code (between tokens, after `$^`, before a JavaScript `=>`) cut it
+    /// in two and the guard panicked. FAILS ON REVERT.
+    #[test]
+    fn a_multibyte_character_anywhere_does_not_panic() {
+        for code in [
+            "é=1",
+            "x\u{a0}=\u{a0}1; os.system('ls')",
+            "🦀 system('ls')",
+            "$^é",
+            "@^é",
+            "print $^é",
+            "'éx=>1'",
+            "f = éx=>éx",
+            "const é = (a) => a",
+            "s = (é) => é; s('x')",
+        ] {
+            for lang in [
+                Lang::Python,
+                Lang::Js,
+                Lang::Ruby,
+                Lang::Perl,
+                Lang::Php,
+                Lang::Lua,
+            ] {
+                let _ = read(lang, code);
+            }
         }
     }
 
