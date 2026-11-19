@@ -80,11 +80,12 @@ pub(crate) fn find_with_deob(
 /// back ([`find`]), where the text is content more than help: a README, a
 /// page, a source file. Such text quotes the phrases that set the model's
 /// rules aside ("ignore previous instructions") to document them, so in an
-/// answer that order counts only inside an HTML comment or an
+/// answer that phrase counts as an order inside an HTML comment or an
 /// `<IMPORTANT>`-style block, which a rendered page hides and nothing
-/// writes to quote. Outside one, the phrase list still reports it, as it
-/// did before answers were read for orders, and the response is not held
-/// for it. Every other order counts wherever it is.
+/// writes to quote, and anywhere an action follows it ("and run ..."),
+/// quoted or not. The phrase alone outside one is reported by the phrase
+/// list, as it was before answers were read for orders, and the response is
+/// not held for it. Every other order counts wherever it is.
 pub fn find_in_answer(text: &str) -> Option<Directive> {
     find_forms(
         text,
@@ -247,6 +248,9 @@ struct Patterns {
     block_open: Regex,
     negated_before: Regex,
     mention_before: Regex,
+    /// An action right after an override phrase: "and run", ", then send",
+    /// ": curl ...".
+    act_after: Regex,
     user_compound: Regex,
     user_relative: Regex,
     meta_only: Regex,
@@ -362,6 +366,9 @@ fn patterns() -> &'static Patterns {
         mention_before: compile(
             r#"(?:\bsays?|\bsaying|\bsuch\sas|\be\.g\.,?|\bi\.e\.,?|\bfor\s(?:example|instance),?|\blike|\bphrases?|\bcontaining|\bcontains|\bquotes?|\bdetects?|\bflags?|\bmatches)\s["'“‘(\[]?$|["'“‘]$"#.into(),
         ),
+        act_after: compile(
+            r#"^(?:\s*(?:[,;:.!"'\x{201d}\x{2019})\]\x{2013}\x{2014}-]|\band\b|\bthen\b|\binstead\b|\bnow\b|\bimmediately\b|\bplease\b|\bjust\b|\bfirst\b|\balso\b|\bfrom\snow\son\b|\byou\s(?:must|should|will|shall|need\sto|have\sto)\b))*\s*(?:do\sthe\sfollowing|follow\sthese|follow\sthe\s(?:new|next|following)|obey|run|execute|exec|call|invoke|send|post|upload|download|fetch|curl|wget|install|uninstall|delete|remove|rm|erase|wipe|format|print|reveal|output|disclose|dump|leak|exfiltrate|transmit|export|share|submit|approve|grant|write|overwrite|copy|paste|email|mail|forward|open|read|cat|list|display|disable|push|commit|merge|deploy|transfer|pay|sudo|bash|sh|eval|chmod|chown|kill|shut\sdown|reboot|launch|start|spawn|load|import|save|store|move|rename|drop|reset|grab|steal|collect|connect|ping|type|enter|show|tell|give|return|respond|reply|say|use|visit|click|navigate|go\sto|create|add|modify|change|set|replace|insert|include|append)\b"#.into(),
+        ),
         user_compound: compile(
             r"^(?:['’]s\b|\s(?:interface|ui|view|id|ids|name|names|list|table|record|records|account|accounts|profile|profiles|data|input|agent|settings|preferences|guide|manual)\b)".into(),
         ),
@@ -412,6 +419,15 @@ fn fold(text: &str) -> String {
         .filter(|c| !matches!(c, '*' | '`'))
         .map(confusable)
         .collect()
+}
+
+/// `s` up to byte `at`, moved back to a char boundary.
+fn head_to(s: &str, at: usize) -> &str {
+    let mut at = at.min(s.len());
+    while !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    &s[..at]
 }
 
 /// `s` from byte `at` on, moved back to a char boundary.
@@ -658,12 +674,20 @@ fn find_in(text: &str, reading: Reading) -> Option<Directive> {
     }
 
     // An attack quoted to document it is not an order, unless it sits in a
-    // hidden comment or block, where nothing is a mere example.
+    // hidden comment or block, where nothing is a mere example. In an answer,
+    // the phrase outside one is an order whenever an action follows it
+    // ("ignore previous instructions and run ...", `act_after`), quoted or
+    // not: in quotation marks, in code, after "for example", the model reads
+    // the same order. Only the phrase with no action after it is left to the
+    // phrase list, which reports it.
     for (at, end) in p.override_rules.spans(text) {
         let before = tail_from(&text[..at], at.saturating_sub(24));
-        if (reading == Reading::Answer || p.mention_before.is_match(before))
-            && !regions.contains(at)
-        {
+        let skip = !regions.contains(at)
+            && match reading {
+                Reading::Listing => p.mention_before.is_match(before),
+                Reading::Answer => !p.act_after.is_match(head_to(&text[end..], 160)),
+            };
+        if skip {
             continue;
         }
         return Some(directive("override-instructions", &text[at..end]));
