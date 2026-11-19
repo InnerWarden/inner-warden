@@ -693,6 +693,14 @@ fn guard_readings(content: &str) -> (Vec<String>, bool) {
     (readings, settled)
 }
 
+/// The readings of a line as the shell reads its own assignments into it,
+/// past the line as written ([`assignment_readings`]): for a caller that
+/// projects each one before it asks its rules.
+pub(crate) fn assignment_readings_past_written(content: &str) -> Vec<String> {
+    let (readings, _) = assignment_readings(content);
+    readings.into_iter().skip(1).collect()
+}
+
 /// [`child_agent_without_its_hook`] on every reading of a line
 /// ([`guard_readings`]). The rule reads a line's words itself, as the shell
 /// hands them to its programs, so it is asked of the line as written: a
@@ -2662,7 +2670,9 @@ enum Assigned {
 /// ([`assignment_readings`]). Cut at its first `$`, `F=$D/id_rsa` gave `F`
 /// no value at all and `cat $F` read as `cat` alone (found 2026-11-10).
 fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
-    if !content.contains('$') || !(content.contains('=') || content.contains("for")) {
+    if !content.contains('$')
+        || !(content.contains('=') || content.contains("for") || content.contains("<<<"))
+    {
         return Assigned::AsWritten;
     }
     static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -2678,7 +2688,9 @@ fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
         let (Some(head), Some(name)) = (capture.get(0), capture.get(1)) else {
             break;
         };
-        let (value, taken) = assigned_value(&content[head.end()..]);
+        let (value, taken) = printed_literal_value(&content[head.end()..])
+            .map(|(value, taken)| (Some(value), taken))
+            .unwrap_or_else(|| assigned_value(&content[head.end()..]));
         from = head.end() + taken;
         // A value that holds its own name (`PATH=$PATH:/x`) says what the
         // name held before, which the line does not show: read into itself
@@ -2706,6 +2718,22 @@ fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
                 .entry(name.as_str())
                 .or_insert_with(|| word.to_owned());
         }
+    }
+    // `read NAME <<< word` gives the name the word.
+    static READ_HERE_STRING: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let read_here_string = READ_HERE_STRING.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?:^|[\s;&|(])read\s+(?:-r\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*<<<\s*('[^']*'|"[^"$`\\]*"|[^\s;&|()$`'"\\]+)"#,
+        )
+        .expect("a valid pattern")
+    });
+    for found in read_here_string.captures_iter(content) {
+        let (Some(name), Some(word)) = (found.get(1), found.get(2)) else {
+            continue;
+        };
+        values
+            .entry(name.as_str())
+            .or_insert_with(|| word.as_str().trim_matches(['\'', '"']).to_owned());
     }
     if values.is_empty() {
         return Assigned::AsWritten;
@@ -3008,6 +3036,27 @@ fn assigned_value(text: &str) -> (Option<String>, usize) {
         }
     }
     (shown.then_some(value), end)
+}
+
+/// The value of an assignment that prints one literal word:
+/// `$(printf innerwarden-agent)`, `$(echo 'x')`, with or without double
+/// quotes around the substitution. A `printf` format with `%` or `\\` is
+/// not a literal. `(value, bytes taken)`.
+fn printed_literal_value(text: &str) -> Option<(String, usize)> {
+    static PRINTED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let printed = PRINTED.get_or_init(|| {
+        regex::Regex::new(
+            r#"^("?)\$\(\s*(printf|echo)\s+(?:-n\s+|--\s+)?('[^'%\\]*'|"[^"$`%\\]*"|[^\s;&|()$`'"%\\]+)\s*\)("?)(?:$|[\s;&|)])"#,
+        )
+        .expect("a valid pattern")
+    });
+    let found = printed.captures(text)?;
+    if found[1] != found[4] {
+        return None;
+    }
+    let word = found.get(3)?.as_str().trim_matches(['\'', '"']).to_owned();
+    let end = found.get(4)?.end();
+    Some((word, end))
 }
 
 /// Whether `text` holds `$name` or `${name}`.
@@ -3773,7 +3822,7 @@ impl Look {
 
     /// What text read deeper than [`KERNEL_TEXT_DEPTH`] is taken for.
     fn too_deep(self, text: &str) -> bool {
-        self == Look::Kernel && names_a_guard_program(text)
+        self == Look::Kernel && names_a_guard_program_as_program(text)
     }
 }
 
@@ -5368,6 +5417,24 @@ fn names_a_guard_program(text: &str) -> bool {
         .get_or_init(|| {
             regex::Regex::new(
                 r"(?i)(?:^|[^a-z0-9_.-])(?:innerwarden(?:-ctl)?|iw(?:-guard)?)(?:\.exe)?(?:$|[^a-z0-9_.-])",
+            )
+            .expect("a valid pattern")
+        })
+        .is_match(text)
+}
+
+/// Whether text names a guard program where a program can be: as a word or
+/// the end of a path, never as a folder a path goes through. `gh api
+/// repos/InnerWarden/inner-warden/jobs/$j/logs` names a repository, and the
+/// `$j` after `inner-warden/` cannot make it the guard's program (measured
+/// refused 2026-11-19: read down to the last level, the folder took it). A
+/// name the expansion may finish (`/opt/innerwarden$X`) still counts.
+fn names_a_guard_program_as_program(text: &str) -> bool {
+    static NAMED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    NAMED
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)(?:^|[^a-z0-9_.-])(?:innerwarden(?:-ctl)?|iw(?:-guard)?)(?:\.exe)?(?:$|[^a-z0-9_./-])",
             )
             .expect("a valid pattern")
         })
@@ -17934,6 +18001,85 @@ fn check_account_manipulation(lower: &str) -> Option<&'static str> {
 /// to a "deny" recommendation, so an agent told to "turn off the monitoring"
 /// is blocked in-path. A status read or restart is NOT flagged.
 pub fn check_security_tamper(content: &str) -> Option<(&'static str, u32)> {
+    if let Some(hit) = security_tamper_as_written(content) {
+        return Some(hit);
+    }
+    // As the shell reads it: a variable set earlier on the line stands for
+    // its value (`S=innerwarden-agent; systemctl stop $S` stops the guard as
+    // the line written out does; measured allowed 2026-11-19), the same
+    // readings [`check_guard_self_disable`] asks its rules about.
+    let (readings, _) = guard_readings(content);
+    if let Some(hit) = readings
+        .iter()
+        .filter(|reading| reading.as_str() != content)
+        .find_map(|reading| security_tamper_as_written(reading))
+    {
+        return Some(hit);
+    }
+    // A verb that stops a service or a process, given a name no reading
+    // shows: it may be the guard's.
+    readings
+        .last()
+        .is_some_and(|reading| lowering_verb_target_unread(reading))
+        .then_some((LOWERING_TARGET_UNREAD, 25))
+}
+
+/// What [`check_security_tamper`] says of a service or process stopped by a
+/// name the line does not show.
+pub const LOWERING_TARGET_UNREAD: &str =
+    "stops, disables or kills a service or process named by a value the line does not show, which may be the guard's";
+
+/// Whether a command of `reading` stops, disables, masks or kills a service
+/// (`systemctl`, `service`, `launchctl`), or kills processes by name
+/// (`pkill`, `killall`), with a target the text does not show whole: an
+/// expansion no assignment of the line resolves. `kill $PID` is not here: a
+/// process number names no program.
+fn lowering_verb_target_unread(reading: &str) -> bool {
+    if !reading.contains(['$', '`']) {
+        return false;
+    }
+    let line = crate::shell_words::read_line(reading);
+    line.commands.iter().any(|command| {
+        let words: Vec<String> = command.words.iter().map(|word| word.text.clone()).collect();
+        let Some(at) = effective_command_index(&words) else {
+            return false;
+        };
+        let unread = |word: &crate::shell_words::Word| !word.is_plain();
+        let operands: Vec<&crate::shell_words::Word> = command.words[at + 1..]
+            .iter()
+            .filter(|word| !(word.is_plain() && word.text.starts_with('-')))
+            .collect();
+        match program_name(&words[at]).as_str() {
+            "systemctl" => operands.split_first().is_some_and(|(verb, targets)| {
+                verb.is_plain()
+                    && matches!(
+                        verb.text.as_str(),
+                        "stop" | "disable" | "mask" | "kill" | "freeze" | "isolate"
+                    )
+                    && targets.iter().any(|word| unread(word))
+            }),
+            "service" => {
+                operands.first().is_some_and(|name| unread(name))
+                    && operands
+                        .get(1)
+                        .is_some_and(|verb| !verb.is_plain() || verb.text == "stop")
+            }
+            "launchctl" => operands.split_first().is_some_and(|(verb, targets)| {
+                verb.is_plain()
+                    && matches!(
+                        verb.text.as_str(),
+                        "unload" | "bootout" | "remove" | "stop" | "disable"
+                    )
+                    && targets.iter().any(|word| unread(word))
+            }),
+            "pkill" | "killall" => operands.iter().any(|word| unread(word)),
+            _ => false,
+        }
+    })
+}
+
+/// [`check_security_tamper`] on one reading of the line.
+fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     let lower = content.to_ascii_lowercase();
     // Direct verb+target phrases (service control / process kill / self-disable).
     if let Some(i) = SECURITY_TAMPER_INDICATORS

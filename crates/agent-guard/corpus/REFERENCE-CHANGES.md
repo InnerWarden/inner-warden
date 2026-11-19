@@ -17,3 +17,13 @@ case is not named.
   review to deny: inline code that runs as code what it does not write out,
   after a command of the same line that downloads, runs the download. Both
   were already stopped for an agent; nothing else moved.
+- 2026-11-19: real/real-018 and real/real-027 deny -> allow. Both are
+  labelled benign with `expect: review` in `corpus/real/cases.yml`: a
+  review would have been accepted, a deny was a false positive, and the
+  reference now holds allow. Both hold a path through a folder named after
+  the guard with an expansion after it (`'/home/u/innerwarden/old'/...`,
+  `.../out-$i.log`); read down to the last level, the folder was taken for
+  the guard's program, and a folder a path goes through names no program.
+  Nothing else on either line earns a review, so the line is allowed rather
+  than held. real: 4/5 caught, 23/31 false positives (was 25/31); proof and
+  attack-2026-11 unchanged.

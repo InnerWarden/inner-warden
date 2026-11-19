@@ -2958,6 +2958,39 @@ fn analyze_command_at(
         analysis.command = command.trim().to_string();
         return analysis;
     }
+    // A `$'...'` word is read as the shell decodes it (`bash -c
+    // $'rm\x20-rf ~'` runs `rm -rf ~`), and the decoded line is judged. Its
+    // verdict stands unless the line as written scores higher for something
+    // other than holding a line the guard could not read.
+    if let Some(decoded) = ansi_c_decoded(command) {
+        let mut as_decoded =
+            analyze_command_at(&decoded, rule_engine, protected_reads, context, depth);
+        let as_written =
+            analyze_command_unwrapped(command, rule_engine, protected_reads, context, depth);
+        let unread: u32 = as_written
+            .signals
+            .iter()
+            .filter(|signal| signal.signal == "shell_line_not_literal")
+            .map(|signal| signal.score)
+            .sum();
+        if as_written.risk_score.saturating_sub(unread) > as_decoded.risk_score {
+            return as_written;
+        }
+        as_decoded.command = command.trim().to_string();
+        return as_decoded;
+    }
+    analyze_command_unwrapped(command, rule_engine, protected_reads, context, depth)
+}
+
+/// [`analyze_command_at`] past the `innerwarden check` and `$'...'`
+/// readings: a sole literal handed to `eval` or a shell, else the line.
+fn analyze_command_unwrapped(
+    command: &str,
+    rule_engine: Option<&RuleEngine>,
+    protected_reads: &[String],
+    context: Option<&WorkingContext>,
+    depth: u8,
+) -> CommandAnalysis {
     // A line that only runs a single-quoted literal (`eval '<code>'`, `bash
     // -c '<code>'`) runs exactly that code: when the code is allowed written
     // out, so is the line, and the words quoted inside the code are data, as
@@ -3042,6 +3075,142 @@ fn sole_literal_shell_code(command: &str) -> Option<&str> {
         .and_then(|found| found.get(1))
         .map(|code| code.as_str())
         .filter(|code| !code.trim().is_empty())
+}
+
+/// `command` with every `$'...'` word the shell reads unquoted written as
+/// the single-quoted text bash decodes it to: `\xHH`, `\NNN`, `\uHHHH`,
+/// `\UHHHHHHHH`, `\cX` and the letter escapes (`\n`, `\t`, `\e`, ...); an
+/// escape bash does not know keeps its backslash, as bash keeps it. `None`
+/// when the line holds no such word, or one that does not decode (a `\x`
+/// with no digit, a NUL, an escape that makes a character past ASCII):
+/// that word
+/// stays a line the guard cannot read.
+fn ansi_c_decoded(command: &str) -> Option<String> {
+    if !command.contains("$'") {
+        return None;
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let mut at = 0;
+    let mut single = false;
+    let mut double = false;
+    let mut changed = false;
+    while at < chars.len() {
+        let c = chars[at];
+        if single {
+            single = c != '\'';
+            out.push(c);
+            at += 1;
+            continue;
+        }
+        if c == '\\' {
+            out.push(c);
+            if let Some(&next) = chars.get(at + 1) {
+                out.push(next);
+            }
+            at += 2;
+            continue;
+        }
+        if !double && c == '$' && chars.get(at + 1) == Some(&'\'') {
+            let (text, end) = ansi_c_word(&chars, at + 2)?;
+            out.push('\'');
+            out.push_str(&text.replace('\'', "'\\''"));
+            out.push('\'');
+            at = end;
+            changed = true;
+            continue;
+        }
+        match c {
+            '\'' if !double => single = true,
+            '"' => double = !double,
+            _ => {}
+        }
+        out.push(c);
+        at += 1;
+    }
+    changed.then_some(out)
+}
+
+/// The text of a `$'...'` word whose body starts at `start`, and where the
+/// word ends; `None` when it does not decode or never closes.
+fn ansi_c_word(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let digits = |from: usize, most: usize, radix: u32| -> (u32, usize) {
+        let mut value = 0u32;
+        let mut taken = 0;
+        while taken < most {
+            match chars.get(from + taken).and_then(|c| c.to_digit(radix)) {
+                Some(digit) => {
+                    value = value * radix + digit;
+                    taken += 1;
+                }
+                None => break,
+            }
+        }
+        (value, taken)
+    };
+    let mut text = String::new();
+    let mut at = start;
+    loop {
+        let c = *chars.get(at)?;
+        if c == '\'' {
+            break;
+        }
+        if c != '\\' {
+            text.push(c);
+            at += 1;
+            continue;
+        }
+        let escape = *chars.get(at + 1)?;
+        at += 2;
+        let decoded = match escape {
+            'a' => '\u{7}',
+            'b' => '\u{8}',
+            'e' | 'E' => '\u{1b}',
+            'f' => '\u{c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'v' => '\u{b}',
+            '\\' | '\'' | '"' | '?' => escape,
+            // A byte above 0x7f is no character on its own: bash writes the
+            // byte, and the word is not the text the guard would read.
+            '0'..='7' => {
+                let (value, taken) = digits(at - 1, 3, 8);
+                at += taken - 1;
+                char::from_u32(value).filter(char::is_ascii)?
+            }
+            'x' | 'u' | 'U' => {
+                let most = match escape {
+                    'x' => 2,
+                    'u' => 4,
+                    _ => 8,
+                };
+                let (value, taken) = digits(at, most, 16);
+                if taken == 0 || (escape == 'x' && value > 0x7f) {
+                    return None;
+                }
+                at += taken;
+                char::from_u32(value)?
+            }
+            'c' => {
+                let control = *chars.get(at)?;
+                at += 1;
+                char::from_u32(u32::from(control.to_ascii_uppercase()) ^ 0x40)?
+            }
+            other => {
+                text.push('\\');
+                other
+            }
+        };
+        // A NUL ends the word in bash, and a character past ASCII written
+        // as an escape is read here as no text at all: either stays a line
+        // the guard cannot read, as it was before it was decoded.
+        if decoded == '\0' || !decoded.is_ascii() {
+            return None;
+        }
+        text.push(decoded);
+    }
+    Some((text, at + 1))
 }
 
 /// Where the guard's own program is installed, as a person or an installer
@@ -3948,7 +4117,28 @@ fn analyze_command_as_read(
     // Security-control tampering: disabling/removing InnerWarden or the host's
     // other security monitors (defense evasion, MITRE T1562/T1489). Blocked
     // in-path so an agent cannot quietly turn off the guardrail.
-    if let Some((indicator, s)) = threats::check_security_tamper(scan_cmd) {
+    // As [`guard_self_disable_on`] asks it: of the line the projection
+    // leaves, of the one before the no-ops go, and of the line as written
+    // where the projection hid something in doubt. The strongest answer
+    // stands: an unread target (25) gives way to one a reading names (60).
+    // A value the projection drops (`S=$(printf innerwarden-agent)`) is read
+    // into the line as written first, and that reading projected in turn:
+    // quoted data in it stays data.
+    let read_in: Vec<String> = threats::assignment_readings_past_written(cmd)
+        .iter()
+        .map(|reading| threats::strip_shell_noops(&crate::shell::project(reading).scan))
+        .collect();
+    let tamper = [
+        Some(scan_cmd),
+        Some(raw_scan),
+        projection.masks_in_doubt.then_some(cmd),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(read_in.iter().map(String::as_str))
+    .filter_map(threats::check_security_tamper)
+    .max_by_key(|(_, s)| *s);
+    if let Some((indicator, s)) = tamper {
         signals.push(AnalysisSignal {
             signal: "security_tooling_tamper".into(),
             score: s,

@@ -939,7 +939,7 @@ real	real-014	deny
 real	real-015	review
 real	real-016	allow
 real	real-017	review
-real	real-018	deny
+real	real-018	allow
 real	real-019	review
 real	real-020	deny
 real	real-021	deny
@@ -948,7 +948,7 @@ real	real-023	deny
 real	real-024	allow
 real	real-025	deny
 real	real-026	deny
-real	real-027	deny
+real	real-027	allow
 real	real-028	deny
 real	real-029	deny
 real	real-030	deny
