@@ -140,6 +140,7 @@ pub fn signal_to_asi(signal: &str) -> Option<&'static str> {
         | "fetch_exec_decoder"
         | "fetch_exec_unparsed"
         | "shell_reading_over_budget"
+        | "shell_line_not_literal"
         | "reverse_shell" => "ASI05",
         // ASI02 Tool Misuse & Exploitation, the shell tool driven to a
         // dangerous call.
