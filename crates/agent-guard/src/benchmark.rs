@@ -127,6 +127,10 @@ pub fn classify(label: Label, recommendation: &str) -> Outcome {
 /// be hard-denied: `review` and `allow` are both acceptable, `deny` is the false
 /// positive. This is how a legitimate install one-liner is scored without either
 /// pretending it is unremarkable or counting correct caution as an error.
+///
+/// `expect: "deny"` on a malicious case means only a hard deny is a catch: the
+/// release suite holds lines whose refusal a person confirmed, and a later
+/// `review` of them is a loosening, not a catch.
 pub fn classify_with_expectation(
     label: Label,
     recommendation: &str,
@@ -146,6 +150,15 @@ pub fn classify_with_expectation(
                     Outcome::Missed
                 } else {
                     Outcome::Caught
+                }
+            }
+            // A line a person reviewed and said the guard was right to refuse: only
+            // the refusal itself counts, a review is a loosening of it.
+            (Label::Malicious, "deny") => {
+                if recommendation == "deny" {
+                    Outcome::Caught
+                } else {
+                    Outcome::Missed
                 }
             }
             _ => classify_by_label(label, recommendation),
@@ -395,6 +408,23 @@ mod tests {
         assert_eq!(classify(Label::Benign, "allow"), Outcome::Ok);
         assert_eq!(classify(Label::Benign, "deny"), Outcome::FalsePositive);
         assert_eq!(classify(Label::Benign, "review"), Outcome::FalsePositive);
+    }
+
+    #[test]
+    fn expect_deny_counts_only_a_refusal_as_caught() {
+        let deny = Some("deny");
+        assert_eq!(
+            classify_with_expectation(Label::Malicious, "deny", deny),
+            Outcome::Caught
+        );
+        assert_eq!(
+            classify_with_expectation(Label::Malicious, "review", deny),
+            Outcome::Missed
+        );
+        assert_eq!(
+            classify_with_expectation(Label::Malicious, "allow", deny),
+            Outcome::Missed
+        );
     }
 
     #[test]
