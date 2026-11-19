@@ -10496,6 +10496,78 @@ pub fn destructive_rm_root(hay: &str) -> bool {
         .any(segment_is_root_wipe)
 }
 
+/// Whether interpreter code given inline (`python3 -c`, `node -e`, `ruby
+/// -e`, `perl -e`, and a here-document read as such) removes a home or a
+/// root / system directory: `shutil.rmtree('/home/u')`, `os.removedirs`,
+/// `Path(..).rmdir()`, `FileUtils.rm_rf`, `fs.rmSync`, `rmtree` and
+/// `remove_tree`, given the path written out or the home by name
+/// (`os.path.expanduser('~')`, `Path.home()`, `os.environ['HOME']`,
+/// `os.homedir()`, `Dir.home`, `$ENV{HOME}`). The same paths `rm -rf`
+/// is refused on ([`destructive_rm_home`], [`destructive_rm_root`]):
+/// `shutil.rmtree('build')` stays a cleanup.
+pub(crate) fn interpreter_code_removes_home_or_root(content: &str) -> bool {
+    static CODE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static REMOVAL: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static RM_LIST: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let code = CODE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?is)\b(?:python[\d.]*|node|nodejs|bun|deno|ruby|perl)\b.{0,200}?\s-[a-z]*[ce]\b",
+        )
+        .expect("static inline code regex")
+    });
+    if !code.is_match(content) {
+        return false;
+    }
+    // A single quote inside single-quoted code is written `'\''`.
+    let content = content.replace("'\\''", "'");
+    let content = content.as_str();
+    let home = r#"os\.path\.expanduser\(\s*\\?['"]~/?\\?['"]\s*\)|(?:pathlib\.)?Path\.home\(\s*\)|os\.environ\[\s*\\?['"]HOME\\?['"]\s*\]|os\.getenv\(\s*\\?['"]HOME\\?['"]\s*\)|(?:require\(\s*\\?['"](?:node:)?os\\?['"]\s*\)|\bos)?\.homedir\(\s*\)|process\.env\.HOME|ENV\[\s*\\?['"]HOME\\?['"]\s*\]|Dir\.home|\$ENV\{\s*HOME\s*\}"#;
+    let removal = REMOVAL.get_or_init(|| {
+        let argument = format!(r#"(?:\\?'([^'\\]*)\\?'|\\?"([^"\\]*)\\?"|({home}))"#);
+        regex::Regex::new(&format!(
+            r#"(?:\b(?:shutil\.rmtree|os\.removedirs|os\.rmdir|rmtree|remove_tree|FileUtils\.(?:rm_rf|rm_r|rmtree|remove_dir|remove_entry(?:_secure)?)|fs\.(?:rm|rmdir)|fs\.promises\.(?:rm|rmdir)|fsPromises\.(?:rm|rmdir))\s*\(\s*{argument}\s*[,)]|\.(?:rmSync|rmdirSync)\s*\(\s*{argument}\s*[,)]|\b(?:pathlib\.)?Path\s*\(\s*{argument}\s*\)\s*\.\s*rmdir\s*\(|(?P<homepath>(?:pathlib\.)?Path\.home\(\s*\))\s*\.\s*rmdir\s*\()"#
+        ))
+        .expect("static interpreter removal regex")
+    });
+    // `subprocess.run(['rm', '-rf', '/home/u'])`, `system('rm', '-rf', '/')`, `spawnSync('rm', ['-rf', os.homedir()])`:
+    // an rm with a recursive flag handed its words one by one.
+    let rm_list = RM_LIST.get_or_init(|| {
+        let argument = format!(r#"(?:\\?'([^'\\]*)\\?'|\\?"([^"\\]*)\\?"|({home}))"#);
+        regex::Regex::new(&format!(
+            r#"\\?['"]rm\\?['"]\s*,\s*\[?\s*((?:\\?['"]-[A-Za-z-]*\\?['"]\s*,\s*)+){argument}\s*[,\])]"#
+        ))
+        .expect("static interpreter rm list regex")
+    });
+    let removes = |path: &str| {
+        // The home by name, not a path written out.
+        if !path.starts_with(['/', '~', '$', '.']) && path.contains(['(', '[', '{', '.']) {
+            return true;
+        }
+        if path.contains(char::is_whitespace) {
+            return false;
+        }
+        let line = format!("rm -rf {}", path.to_ascii_lowercase());
+        destructive_rm_home(&line) || destructive_rm_root(&line)
+    };
+    let first_path = |found: &regex::Captures<'_>, from: usize| {
+        (from..found.len())
+            .filter_map(|group| found.get(group))
+            .map(|path| path.as_str().to_owned())
+            .find(|path| !path.is_empty())
+    };
+    removal.captures_iter(content).any(|found| {
+        found.name("homepath").is_some() || first_path(&found, 1).is_some_and(|path| removes(&path))
+    }) || rm_list.captures_iter(content).any(|found| {
+        let flags = &found[1];
+        let recursive = flags.contains("--recursive")
+            || flags
+                .split(',')
+                .map(|flag| flag.trim().trim_matches(['\\', '\'', '"']))
+                .any(|flag| !flag.starts_with("--") && flag.contains(['r', 'R']));
+        recursive && first_path(&found, 2).is_some_and(|path| removes(&path))
+    })
+}
+
 /// Recursive, forced `rm` of a home directory itself or all of its contents:
 /// `~`, `~/*`, `~user`, `$HOME`, `${HOME}`, `"$HOME"`, `$HOME/*`, `/root`,
 /// `/home/<user>`, `/Users/<user>`. Correlated to one `rm` per segment and
