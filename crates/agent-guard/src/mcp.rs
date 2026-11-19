@@ -152,6 +152,21 @@ pub(crate) fn inspect_declared_tool_call(
             ),
             true,
         ));
+    } else if let Some(length) = (names_a_shell_tool(tool_name) || names_a_process_tool(tool_name))
+        .then(|| stdin_past_cap(args))
+        .flatten()
+    {
+        // Any other program: the input within the cap is judged with the
+        // call's lines, and what lies past it is not read, said here as a
+        // review. Before, the whole input was skipped unread and unsaid.
+        alerts.push(VerdictAlert::builtin(
+            "AG-STDIN-PARTIAL",
+            format!(
+                "standard input of {length} bytes read as code in its first \
+                 {MAX_STDIN_READ_BYTES} bytes only; the rest was not read"
+            ),
+            false,
+        ));
     }
     if !commands.is_empty() {
         let mut blocks = false;
@@ -274,7 +289,9 @@ pub(crate) fn inspect_declared_tool_call(
         ));
     }
 
-    if let Some(alert) = privileged_write_alert(tool_name, args, declared) {
+    // A line that only uses a key names it as the line it is, judged above:
+    // the same rule as the command string, which this check never read.
+    if let Some(alert) = privileged_write_alert(tool_name, file_args, declared) {
         alerts.push(alert);
     }
 
@@ -600,12 +617,36 @@ fn long_stdin_to_a_shell(args: &serde_json::Value) -> Option<usize> {
     if !program_is_a_shell(object) {
         return None;
     }
-    object
+    stdin_past_cap(args)
+}
+
+/// The length of the longest standard input a call hands its program past
+/// [`MAX_STDIN_READ_BYTES`], whatever the program: only the part within it
+/// is read as code ([`stdin_within_cap`]).
+fn stdin_past_cap(args: &serde_json::Value) -> Option<usize> {
+    args.as_object()?
         .iter()
         .filter(|(key, _)| STDIN_KEYS.contains(&canonical_key(key).as_str()))
         .filter_map(|(_, value)| scalar_text(value).map(|text| text.len()))
         .filter(|length| *length > MAX_STDIN_READ_BYTES)
         .max()
+}
+
+/// Standard input up to [`MAX_STDIN_READ_BYTES`], cut after the last whole
+/// line within it (or on a char boundary, when no line ends there), so a
+/// line cut in two is not judged as a shorter line it never was.
+fn stdin_within_cap(text: &str) -> &str {
+    if text.len() <= MAX_STDIN_READ_BYTES {
+        return text;
+    }
+    let mut end = MAX_STDIN_READ_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    match text[..end].rfind('\n') {
+        Some(newline) => &text[..=newline],
+        None => &text[..end],
+    }
 }
 
 /// What the guard says of a command it cannot read as words.
@@ -1076,9 +1117,10 @@ fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCall
         let Some(text) = scalar_text(value) else {
             continue;
         };
-        if text.len() > MAX_STDIN_READ_BYTES {
-            continue;
-        }
+        // Past the cap, the part within it is read and the rest is not: the
+        // call says so ([`stdin_past_cap`]), and a shell is refused it
+        // (AG-STDIN-LONG).
+        let text = stdin_within_cap(&text);
         if !text.trim().is_empty() {
             let delimiter = (0usize..)
                 .map(|n| format!("IW_STDIN_{n}"))
