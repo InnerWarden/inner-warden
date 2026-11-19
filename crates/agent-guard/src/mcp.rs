@@ -3519,8 +3519,16 @@ fn analyze_command_as_read(
         score += s;
     }
 
-    // Arranging to run again after this session ends.
-    if let Some((what, s)) = threats::check_persistence_install(scan_cmd) {
+    // Arranging to run again after this session ends. A program fed to an
+    // interpreter as a here-document is read as the same code given inline:
+    // `python3 -c "open('/etc/cron.d/x','w').write(...)"` was refused and
+    // the same code on standard input allowed (measured 2026-11-19).
+    let persistence = threats::check_persistence_install(scan_cmd).or_else(|| {
+        crate::shell::interpreter_input_as_inline_code(cmd)
+            .iter()
+            .find_map(|line| threats::check_persistence_install(line))
+    });
+    if let Some((what, s)) = persistence {
         signals.push(AnalysisSignal {
             signal: "persistence_install".into(),
             score: s,

