@@ -122,6 +122,18 @@ fn route_client_to_server(
         // Confused-deputy: escalate a call whose argument was laundered from an
         // untrusted tool result relayed earlier this session.
         if let Some(t) = taint {
+            // A tool whose definition changed since it was pinned is held
+            // until the person approves it (`super::pins`).
+            if let Some(pins) = t.pins.as_mut() {
+                if pins.is_held(&name) {
+                    verdict.allowed = false;
+                    verdict.alerts.push(VerdictAlert::builtin(
+                        super::pins::TOOL_HELD_RULE,
+                        pins.held_detail(&safe_tool_name(&name)),
+                        true,
+                    ));
+                }
+            }
             let alert = t.arg_taint_alert(&name, &args);
             // What the call sent, so the answer repeating it does not taint it.
             t.note_call(env.id.as_ref(), &args, alert.is_some());
@@ -179,11 +191,25 @@ fn route_server_to_client(
             // What the server says each tool does, so a call to a tool it
             // declares read-only is not taken for a write (see
             // `mcp::ToolDeclaration`).
+            let mut verdict = inspect_tools_list_result(result, engine);
             if let Some(t) = taint {
                 t.record_tools_list(result);
+                // A tool pinned before whose definition changed is reported
+                // field by field, and held in a mode that blocks
+                // (`super::pins`).
+                if let Some(pins) = t.pins.as_mut() {
+                    for change in pins.check_listing(env.id.as_ref(), result) {
+                        verdict.allowed = false;
+                        verdict.alerts.push(VerdictAlert::builtin(
+                            super::pins::TOOL_CHANGED_RULE,
+                            pins.change_detail(&change),
+                            true,
+                        ));
+                    }
+                }
             }
             ProxyDecision {
-                verdict: inspect_tools_list_result(result, engine),
+                verdict,
                 direction: dir.label(),
                 method: Some("tools/list".into()),
                 tool_name: None,

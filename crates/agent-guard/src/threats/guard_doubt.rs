@@ -474,6 +474,7 @@ mod tests {
             ("agent", &["disconnect"]),
             ("uninstall", &[]),
             ("hook", &[]),
+            ("mcp", &["approve", "0123abcd4567", "read_file"]),
         ];
         assert_eq!(tails.len(), GUARD_VERB_HEADS.len());
         for head in GUARD_VERB_HEADS {

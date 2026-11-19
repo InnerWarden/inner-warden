@@ -3129,7 +3129,8 @@ const GUARD_DISARMED: &str = "disarms the guard, or asks it to authorise itself"
 /// verbs ([`runs_guard_loosening_verb`]).
 const GUARD_LOOSENING_VERB: &str =
     "runs the guard's own hook, its allow, mute or monitor command, one of its agent \
-     decisions (approve, profile, allow, revoke), disconnects an agent or connects or \
+     decisions (approve, profile, allow, revoke), an approval of a changed MCP tool or a \
+     reset of a server's pinned tools, disconnects an agent or connects or \
      installs it in monitor, uninstalls it, or starts a jail, which only the person \
      supervising the agent may run, from their own terminal";
 
@@ -6857,6 +6858,7 @@ const GUARD_VERB_HEADS: &[&str] = &[
     "install",
     "agent",
     "uninstall",
+    "mcp",
 ];
 
 /// The arguments after `innerwarden`: whether they widen what is let through.
@@ -6890,6 +6892,18 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
                     .is_some_and(|first| !matches!(*first, "--list" | "--remove"))
         }
         "dry-run" | "monitor" => !asks_for_help,
+        // `innerwarden mcp approve|forget`: approving a changed MCP tool
+        // definition, or dropping a server's pins so the next listing is
+        // trusted as first heard, is the person's (`mcp_proxy::pins`): a
+        // server that changed a tool must not have the agent it steers wave
+        // the change through. Listing the pins and help are not decisions.
+        "mcp" => {
+            !asks_for_help
+                && first_positional(&rest).is_some_and(|first| {
+                    let sub = first.to_ascii_lowercase();
+                    MCP_PIN_DECISION_VERBS.contains(&sub.as_str())
+                })
+        }
         // `innerwarden hook` is the hook the agent's own calls are screened
         // by. Run from an agent's shell it judges a payload the agent wrote,
         // in an environment the agent set: a quiet probe of the policy, and
@@ -6978,6 +6992,10 @@ fn contain_own_args<'a>(rest: &[&'a str]) -> Vec<&'a str> {
     }
     own
 }
+
+/// The `innerwarden mcp` verbs that decide about a server's pinned tool
+/// definitions.
+pub const MCP_PIN_DECISION_VERBS: &[&str] = &["approve", "forget"];
 
 /// The `innerwarden agents` verbs that decide about an agent.
 pub const AGENT_DECISION_VERBS: &[&str] = &["approve", "profile", "allow", "revoke"];

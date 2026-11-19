@@ -342,11 +342,33 @@ pub struct TaintTracker {
     /// first, until the answer to it is recorded (see "A value the agent
     /// sent").
     sent: VecDeque<(Box<str>, HashSet<Box<str>>)>,
+    /// The pins of this server's tool definitions ([`super::pins`]), when the
+    /// proxy keeps them. Not taint either: kept here for the same reason as
+    /// `declared`.
+    pub(crate) pins: Option<super::pins::PinSession>,
 }
 
 impl TaintTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Keep this server's tool definitions pinned ([`super::pins`]): a
+    /// `tools/list` answer is checked against the pins, and a call to a tool
+    /// whose definition changed is found.
+    pub fn with_pins(mut self, pins: super::pins::PinSession) -> Self {
+        self.pins = Some(pins);
+        self
+    }
+
+    /// The tool listings to rewrite before the client sees them: each answer's
+    /// id and the changed tools to take out of it
+    /// ([`super::pins::PinSession::take_holds`]).
+    pub fn take_pin_holds(&mut self) -> Vec<(Value, Vec<String>)> {
+        self.pins
+            .as_mut()
+            .map(super::pins::PinSession::take_holds)
+            .unwrap_or_default()
     }
 
     /// Remember what one `tools/list` result declares about each tool it
