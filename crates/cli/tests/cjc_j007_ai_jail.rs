@@ -1079,6 +1079,19 @@ fn a_jail_the_host_did_not_admit_never_runs_its_command() {
 /// the launcher is SIGKILLed the moment the request arrives, after bwrap
 /// reported the jail's first process and before the launcher decided.
 ///
+/// The launcher's death has two endings, and which one comes was a race
+/// (bubblewrap 0.9.0): bwrap's own process dies with the launcher
+/// (`--die-with-parent`, armed before it reports the jail), and the jail's
+/// first process arms the same for itself only after it has read its record.
+/// The kernel closes the dead launcher's descriptors (the record ends, empty)
+/// before it signals bwrap, so the jail sometimes armed it in between and died
+/// with bwrap, silently, before the gate ran (3 of 20 runs on a loaded
+/// machine, 2026-11-19). The other ending, a jail that outlives its launcher,
+/// is the one the gate exists for, so the test holds the jail stopped until
+/// the launcher's death has landed (bwrap is gone), then lets it go on. Every
+/// wait is for a signal: the request, the stopped state, bwrap gone, stderr's
+/// end. The gate's refusal is asserted in every run.
+///
 /// FAILS ON REVERT: hand the jail its command without the gate (drop
 /// `gate_instance` in `build_linux_jail`, as before this fix) and the
 /// command runs once the launcher is gone.
@@ -1142,13 +1155,23 @@ fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
             Err(e) => panic!("accept: {e}"),
         }
     };
+    // bwrap's process is the launcher's child, and the jail's first process
+    // is bwrap's: it reported it before the launcher asked the host.
+    let bwrap = only_child_named(child.id(), "bwrap");
+    let jail = only_child_named(bwrap, "bwrap");
+    signal(jail, "-STOP");
+    wait_for(|| process_state(jail) == Some('T'), "the jail to stop");
     child.kill().expect("SIGKILL the launcher");
     child.wait().unwrap();
+    wait_for(
+        || matches!(process_state(bwrap), None | Some('Z')),
+        "bwrap to die with the launcher",
+    );
+    signal(jail, "-CONT");
     let stderr = stderr
         .recv_timeout(std::time::Duration::from_secs(30))
         .expect("every process of the jail ended");
     drop(held);
-    std::thread::sleep(std::time::Duration::from_millis(500));
     assert!(
         !marker.exists(),
         "the command ran without an admission: {stderr}"
@@ -1162,6 +1185,61 @@ fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
         "a process of the jail is left: {:?}",
         processes_naming(&marker)
     );
+}
+
+/// The state letter and the parent of `pid`, from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn state_and_parent(pid: u32) -> Option<(char, u32, String)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let name = stat[open + 1..close].to_string();
+    let mut rest = stat[close + 1..].split_whitespace();
+    let state = rest.next()?.chars().next()?;
+    let parent = rest.next()?.parse().ok()?;
+    Some((state, parent, name))
+}
+
+#[cfg(target_os = "linux")]
+fn process_state(pid: u32) -> Option<char> {
+    state_and_parent(pid).map(|(state, _, _)| state)
+}
+
+/// The one child of `parent` named `name`.
+#[cfg(target_os = "linux")]
+fn only_child_named(parent: u32, name: &str) -> u32 {
+    let found: Vec<u32> = std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|&pid| state_and_parent(pid).is_some_and(|(_, p, n)| p == parent && n == name))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "children of {parent} named {name}: {found:?}"
+    );
+    found[0]
+}
+
+#[cfg(target_os = "linux")]
+fn signal(pid: u32, which: &str) {
+    let status = std::process::Command::new("kill")
+        .args([which, &pid.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill {which} {pid}");
+}
+
+/// Wait for `done`, checked every 10 ms; the bound only turns a hang into a
+/// failure.
+#[cfg(target_os = "linux")]
+fn wait_for(done: impl Fn() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "waited for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 /// JP-1 (JAIL-PINS fixes): an identified jail started with an

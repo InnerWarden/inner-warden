@@ -40,6 +40,15 @@ pub const DEADLINE: Duration = Duration::from_secs(10);
 /// default, zero, or anything that is not a number leaves the default.
 pub const DEADLINE_ENV: &str = "INNERWARDEN_HOOK_DEADLINE_MS";
 
+/// Raises [`DEADLINE`], in milliseconds, in a DEBUG build only: the test
+/// suites run the debug binary beside every other test binary, and on a
+/// loaded machine a screening that is not about the deadline at all ran past
+/// ten seconds and was refused by it (`hook_profiles.rs`, 2026-11-18). A
+/// release build does not read it. [`DEADLINE_ENV`], when set, wins: the
+/// tests of the deadline itself lower it.
+#[cfg(debug_assertions)]
+pub const TEST_DEADLINE_ENV: &str = "IW_TEST_HOOK_DEADLINE_MS";
+
 static MONITOR: AtomicBool = AtomicBool::new(false);
 
 /// Milliseconds after [`arm`] at which the watchdog ends the hook. Zero while
@@ -82,7 +91,24 @@ fn millis(duration: Duration) -> u64 {
 /// be set; the caller refuses the call as one it could not read.
 pub fn arm(monitor: bool) -> Result<(), &'static str> {
     let named = std::env::var(DEADLINE_ENV).ok();
+    #[cfg(debug_assertions)]
+    if named.is_none() {
+        let raised = std::env::var(TEST_DEADLINE_ENV).ok();
+        if let Some(deadline) = test_deadline_from(raised.as_deref()) {
+            return arm_with(monitor, deadline);
+        }
+    }
     arm_with(monitor, deadline_from(named.as_deref()))
+}
+
+/// The deadline [`TEST_DEADLINE_ENV`] names, debug builds only: any positive
+/// number of milliseconds, `None` for anything else.
+#[cfg(debug_assertions)]
+fn test_deadline_from(named: Option<&str>) -> Option<Duration> {
+    named
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .map(Duration::from_millis)
 }
 
 fn arm_with(monitor: bool, deadline: Duration) -> Result<(), &'static str> {
@@ -239,6 +265,22 @@ mod tests {
             "18446744073709551616",
         ] {
             assert_eq!(deadline_from(Some(kept)), DEADLINE, "{kept:?}");
+        }
+    }
+
+    /// The test suites' raise reads only in a debug build, takes a positive
+    /// number of milliseconds, and nothing else. The release build has no
+    /// such variable (it is not compiled in), which is what keeps the test
+    /// above true for what ships.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_test_raise_takes_only_a_positive_number() {
+        assert_eq!(
+            test_deadline_from(Some("120000")),
+            Some(Duration::from_secs(120))
+        );
+        for ignored in [None, Some("0"), Some(""), Some("abc"), Some("-5")] {
+            assert_eq!(test_deadline_from(ignored), None, "{ignored:?}");
         }
     }
 
