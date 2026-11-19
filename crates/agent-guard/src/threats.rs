@@ -9497,8 +9497,18 @@ fn dd_noop_sink(hay: &str) -> bool {
 /// of anything fetched, decoded, or read from a variable stays exactly as
 /// dangerous as it was, which `eval_of_network_data_is_still_denied` pins.
 fn is_local_tool_eval_idiom(content: &str) -> bool {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
+    static AT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static IDIOM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // Every `eval` the line runs: where a command starts (the start of a
+    // line, after `;` `&` `|`, inside `{ }`, `( )`, `$( )` or backquotes, and
+    // after a keyword that opens a body).
+    let at = AT.get_or_init(|| {
+        regex::Regex::new(
+            r"(?m)(?:^|[;&|({!`\n]|\$\(|\b(?:then|do|else|elif|if|while|until|time)\b)\s*(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*(eval)(?:\s|$)",
+        )
+        .expect("static eval position regex")
+    });
+    let idiom = IDIOM.get_or_init(|| {
         // The command reaching this point may be RAW (`eval "$(kubectl
         // completion bash)"`) or STRUCTURALLY PROJECTED, which unwraps the
         // command substitution. Both forms have to match or the exemption only
@@ -9507,28 +9517,34 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
         // question.
         regex::Regex::new(
             r#"(?ix)
-            ^\s* (?: (?:command|builtin) \s+ (?:-p\s+)? (?:--\s+)? )* eval\s+ ["']? (?:\$\( | `)? \s*
+            ^eval\s+ ["']? (?:\$\( | `)? \s*
             (?:
-                  [\w.-]+ \s+ (?:completion|completions) (?:\s+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
+                  [\w.-]+ \s+ (?:completion|completions) (?:[\t\x20]+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
                 | (?:direnv|starship|zoxide|mise|rbenv|pyenv|nodenv|jenv|fnm|atuin|navi|keychain)
-                    \s+ (?:hook|init|env|activate|init-file) (?:\s+[\w.-]+)?   # direnv hook bash
-                | ssh-agent (?:\s+-s)?                                     # ssh-agent -s
-                | gpg-agent [^)`'"]*
+                    \s+ (?:hook|init|env|activate|init-file) (?:[\t\x20]+[\w.-]+)?   # direnv hook bash
+                | ssh-agent (?:[\t\x20]+-s)?                                  # ssh-agent -s
+                | gpg-agent [^)`'";&|\n]*
                 | brew \s+ shellenv
-                | dircolors [^)`'"]*
+                | dircolors [^)`'";&|\n]*
                 | opam \s+ env
                 | luarocks \s+ path
             )
-            \s* (?:\) | `)? ["']? \s*
-            (?: (?:&&|;) .* )? $
+            [\t\x20]* (?:\) | `)? ["']? [\t\x20]*
+            (?: $ | && | \|\| | ; | \n | \} | \) )
             "#,
         )
         .expect("static local-tool eval idiom regex")
     });
     let c = content.trim();
-    // The tail after `&&` is screened on its own merits by every other rule;
-    // this exemption only ever removes the `eval` finding.
-    re.is_match(c)
+    // Each `eval` of the line must be one of these idioms: the exemption only
+    // ever removes the `eval` finding, and only when no other `eval` runs
+    // (`eval "$(direnv hook bash)"; eval "$(curl ...)"` keeps it).
+    let mut evals = at
+        .captures_iter(c)
+        .filter_map(|found| found.get(1))
+        .map(|eval| &c[eval.start()..])
+        .peekable();
+    evals.peek().is_some() && evals.all(|from| idiom.is_match(from))
 }
 
 /// `shred` of a short-lived secret in a runtime or temporary directory.
@@ -13508,17 +13524,33 @@ pub fn check_tmp_execution(content: &str) -> Option<(&'static str, u32)> {
     let temp = r#"(?:/(?:tmp|var/tmp|dev/shm|run/shm)|/private/tmp)/[^\s\"'|;&)]+"#;
     let direct = DIRECT.get_or_init(|| {
         regex::Regex::new(&format!(
-            r#"(?i)(?:^|[;&|]\s*|\$\(\s*|`\s*)(?:(?:sudo|command|nohup)\s+|env(?:\s+\w+=\S+)*\s+)*[\"']?{temp}"#
+            r#"(?im)(?:^\s*|[;&|{{(]\s*|\$\(\s*|`\s*)(?:(?:sudo|command|builtin|nohup)\s+|env(?:\s+\w+=\S+)*\s+)*[\"']?{temp}"#
         ))
         .expect("static direct temp execution regex")
     });
     let interpreted = INTERPRETED.get_or_init(|| {
         regex::Regex::new(&format!(
-            r#"(?i)(?:^|[;&|]\s*|\$\(\s*|`\s*)(?:source|\.|ba?sh|zsh|dash|ksh|python\d*(?:\.\d+)?|perl|ruby|node\d*)\s+(?:-[^\s]+\s+)*[\"']?{temp}"#
+            r#"(?im)(?:^\s*|[;&|{{(]\s*|\$\(\s*|`\s*)(?:(?:command|builtin)\s+)*(?:source|\.|ba?sh|zsh|dash|ksh|python\d*(?:\.\d+)?|perl|ruby|node\d*)\s+(?:-[^\s]+\s+)*[\"']?{temp}"#
         ))
         .expect("static interpreted temp execution regex")
     });
-    if direct.is_match(&lower) || interpreted.is_match(&lower) {
+    // `bash -n file` only reads the file for its syntax: it runs nothing.
+    let runs_the_file = |found: regex::Match<'_>| {
+        let words: Vec<&str> = found.as_str().split_whitespace().collect();
+        let shell = words.iter().position(|word| {
+            matches!(
+                word.trim_start_matches([';', '&', '|', '{', '(']),
+                "sh" | "bash" | "zsh" | "dash" | "ksh"
+            )
+        });
+        !shell.is_some_and(|at| {
+            words[at + 1..]
+                .iter()
+                .take_while(|word| word.starts_with('-'))
+                .any(|flag| !flag.starts_with("--") && flag.contains('n'))
+        })
+    };
+    if direct.is_match(&lower) || interpreted.find_iter(&lower).any(runs_the_file) {
         TMP_EXECUTION_DIRS
             .iter()
             .find(|dir| lower.contains(*dir))

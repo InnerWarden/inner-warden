@@ -2269,6 +2269,7 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "security_tooling_tamper",
     "sensitive_credential_read",
     "sensitive_file_overwrite",
+    "shell_reading_over_budget",
     "tls_verification_disabled",
     "tmp_execution",
     "untrusted_software_source",
@@ -3475,6 +3476,19 @@ fn analyze_command_as_read(
     // only the raw-scan `dangerous_command` remains. Before this, an over-budget
     // fetch-and-execute denied on that generic 40 alone, which is fail-closed by
     // accident and states no reason for it.
+    // A line that calls more functions defined on it than the reading writes
+    // out runs bodies no rule read: refused, never left as read without them.
+    if projection.names_over_budget {
+        push_unique_signal(
+            &mut signals,
+            AnalysisSignal {
+                signal: "shell_reading_over_budget".into(),
+                score: 40,
+                detail: "calls more functions defined on the line than the guard reads, so what they run is unread".into(),
+            },
+        );
+        score += 40;
+    }
     if !projection.parsed
         && signals.iter().any(|s| {
             matches!(
