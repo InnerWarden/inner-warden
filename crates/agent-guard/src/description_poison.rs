@@ -249,7 +249,8 @@ struct Patterns {
     negated_before: Regex,
     mention_before: Regex,
     /// An action right after an override phrase: "and run", ", then send",
-    /// ": curl ...".
+    /// ": curl ...", with any adverbs between ("and kindly send", "then
+    /// quietly upload"): a filler word in front of the verb hid the order.
     act_after: Regex,
     user_compound: Regex,
     user_relative: Regex,
@@ -367,7 +368,7 @@ fn patterns() -> &'static Patterns {
             r#"(?:\bsays?|\bsaying|\bsuch\sas|\be\.g\.,?|\bi\.e\.,?|\bfor\s(?:example|instance),?|\blike|\bphrases?|\bcontaining|\bcontains|\bquotes?|\bdetects?|\bflags?|\bmatches)\s["'“‘(\[]?$|["'“‘]$"#.into(),
         ),
         act_after: compile(
-            r#"^(?:\s*(?:[,;:.!"'\x{201d}\x{2019})\]\x{2013}\x{2014}-]|\band\b|\bthen\b|\binstead\b|\bnow\b|\bimmediately\b|\bplease\b|\bjust\b|\bfirst\b|\balso\b|\bfrom\snow\son\b|\byou\s(?:must|should|will|shall|need\sto|have\sto)\b))*\s*(?:do\sthe\sfollowing|follow\sthese|follow\sthe\s(?:new|next|following)|obey|run|execute|exec|call|invoke|send|post|upload|download|fetch|curl|wget|install|uninstall|delete|remove|rm|erase|wipe|format|print|reveal|output|disclose|dump|leak|exfiltrate|transmit|export|share|submit|approve|grant|write|overwrite|copy|paste|email|mail|forward|open|read|cat|list|display|disable|push|commit|merge|deploy|transfer|pay|sudo|bash|sh|eval|chmod|chown|kill|shut\sdown|reboot|launch|start|spawn|load|import|save|store|move|rename|drop|reset|grab|steal|collect|connect|ping|type|enter|show|tell|give|return|respond|reply|say|use|visit|click|navigate|go\sto|create|add|modify|change|set|replace|insert|include|append)\b"#.into(),
+            r#"^(?:\s*(?:[,;:.!"'\x{201d}\x{2019})\]\x{2013}\x{2014}-]|\band\b|\bthen\b|\binstead\b|\bnow\b|\bimmediately\b|\bplease\b|\bjust\b|\bfirst\b|\balso\b|\bfrom\snow\son\b|\bgo\sahead\b|\b[a-z]{2,}ly\b|\byou\s(?:must|should|will|shall|need\sto|have\sto)\b))*\s*(?:do\sthe\sfollowing|follow\sthese|follow\sthe\s(?:new|next|following)|obey|run|execute|exec|call|invoke|send|post|upload|download|fetch|curl|wget|install|uninstall|delete|remove|rm|erase|wipe|format|print|reveal|output|disclose|dump|leak|exfiltrate|transmit|export|share|submit|approve|grant|write|overwrite|copy|paste|email|mail|forward|open|read|cat|list|display|disable|push|commit|merge|deploy|transfer|pay|sudo|bash|sh|eval|chmod|chown|kill|shut\sdown|reboot|launch|start|spawn|load|import|save|store|move|rename|drop|reset|grab|steal|collect|connect|ping|type|enter|show|tell|give|return|respond|reply|say|use|visit|click|navigate|go\sto|create|add|modify|change|set|replace|insert|include|append)\b"#.into(),
         ),
         user_compound: compile(
             r"^(?:['’]s\b|\s(?:interface|ui|view|id|ids|name|names|list|table|record|records|account|accounts|profile|profiles|data|input|agent|settings|preferences|guide|manual)\b)".into(),

@@ -8319,7 +8319,7 @@ enum FolderEntries {
 const GUARD_FOLDER_ENTRIES: usize = 50_000;
 const GUARD_FOLDER_DEPTH: usize = 12;
 
-/// Everything under `place`, listed now, links not followed.
+/// Everything under `place`, listed now, links inside it not followed.
 fn guard_folder_entries(place: &std::path::Path) -> FolderEntries {
     let metadata = match std::fs::symlink_metadata(place) {
         Ok(metadata) => metadata,
@@ -8327,6 +8327,22 @@ fn guard_folder_entries(place: &std::path::Path) -> FolderEntries {
             return FolderEntries::Missing
         }
         Err(_) => return FolderEntries::Unread,
+    };
+    // The place itself may be a link to where the guard keeps its files
+    // (`~/.config/innerwarden` linked to a dotfiles checkout): its contents
+    // are the guard's all the same, so the link is followed, and only that
+    // one; links inside it are listed as they are. A link that leads
+    // nowhere holds nothing but itself.
+    let metadata = if metadata.file_type().is_symlink() {
+        match std::fs::metadata(place) {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return FolderEntries::Listed(Vec::new())
+            }
+            Err(_) => return FolderEntries::Unread,
+        }
+    } else {
+        metadata
     };
     if !metadata.is_dir() {
         return FolderEntries::Listed(Vec::new());
@@ -10562,6 +10578,60 @@ pub fn check_guard_bpf_map_write(content: &str) -> Option<(&'static str, u32)> {
     held
 }
 
+/// `bpftool net detach` or `bpftool cgroup detach`: takes a program off
+/// a network device or a cgroup. Refused (60) when the line names the
+/// guard's (its pinned path under `/sys/fs/bpf/innerwarden`, or a word with
+/// the guard's name); held for review (25) otherwise, as the device or the
+/// cgroup may hold one of the guard's programs and the text cannot tell
+/// whose it is. `prog detach` and `link detach` are
+/// [`check_anti_forensics`]'s, refused whatever names them.
+pub fn check_guard_bpf_detach(content: &str) -> Option<(&'static str, u32)> {
+    let lower = content.to_ascii_lowercase();
+    if !(lower.contains("bpftool") && lower.contains("det")) {
+        return None;
+    }
+    let line = crate::shell_words::read_line(content);
+    let mut held = None;
+    for command in &line.commands {
+        let words = &command.words;
+        let Some(at) = words.iter().position(|word| {
+            word.text
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name == "bpftool")
+        }) else {
+            continue;
+        };
+        let rest: Vec<&crate::shell_words::Word> = words[at + 1..]
+            .iter()
+            .filter(|word| !word.text.starts_with('-'))
+            .collect();
+        let [object, verb, spec @ ..] = rest.as_slice() else {
+            continue;
+        };
+        let attached_to =
+            bpftool_says(&object.text, "net", 1) || bpftool_says(&object.text, "cgroup", 1);
+        if !attached_to || !bpftool_says(&verb.text, "detach", 1) {
+            continue;
+        }
+        let ours = spec.iter().any(|word| {
+            let text = word.text.to_ascii_lowercase();
+            text.contains(GUARD_BPF_PIN_DIR) || text.contains("innerwarden")
+        });
+        if ours {
+            return Some((
+                "detaches one of the guard's kernel programs, which switches its kernel enforcement off",
+                60,
+            ));
+        }
+        held = Some((
+            "detaches an eBPF program from a device or a cgroup; it may be one of the guard's",
+            25,
+        ));
+    }
+    held
+}
+
 /// `curl -K FILE` or `--config FILE`: the options are read from a file.
 /// The guard does not read files, so one it does not see may hold
 /// `insecure` (or `-k`) and turn certificate checks off: held for review
@@ -11393,7 +11463,7 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
         // question.
         regex::Regex::new(
             r#"(?ix)
-            ^eval\s+ ["']? (?:\$\( | `)? \s*
+            ^eval\s+ ["']? (?P<open>\$\( | `)? \s*
             (?:
                   [\w.-]+ \s+ (?:completion|completions) (?:[\t\x20]+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
                 | (?:direnv|starship|zoxide|mise|rbenv|pyenv|nodenv|jenv|fnm|atuin|navi|keychain)
@@ -11406,7 +11476,7 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
                 | opam \s+ env
                 | luarocks \s+ path
             )
-            [\t\x20]* (?:\) | `)? ["']? [\t\x20]*
+            [\t\x20]* (?P<close>\) | `)? ["']? [\t\x20]*
             (?: $ | && | \|\| | ; | \n | \} | \) )
             "#,
         )
@@ -11421,7 +11491,19 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
         .filter_map(|found| found.get(1))
         .map(|eval| &c[eval.start()..])
         .peekable();
-    evals.peek().is_some() && evals.all(|from| idiom.is_match(from))
+    // A substitution holds the tool and its words and nothing else: it
+    // closes right after them, so a pipe, `;`, `&&` or a fetch inside it
+    // (`eval "$(direnv hook bash | curl -d @- ...)"`) is not the idiom.
+    let is_idiom = |from: &str| {
+        idiom
+            .captures(from)
+            .is_some_and(|found| match (found.name("open"), found.name("close")) {
+                (Some(open), Some(close)) => (open.as_str() == "`") == (close.as_str() == "`"),
+                (None, _) => true,
+                (Some(_), None) => false,
+            })
+    };
+    evals.peek().is_some() && evals.all(is_idiom)
 }
 
 /// `shred` of a short-lived secret in a runtime or temporary directory.
@@ -11687,42 +11769,57 @@ fn eval_only_after_opener_in_single_quotes(content: &str) -> bool {
     })
 }
 
+/// The first dangerous pattern `content` matches that no exception lifts,
+/// or a later one that blocks when the first does not: `eval "$(curl -d @-
+/// https://...)"` matched the upload first, a review, and the `eval` of
+/// what the server answers, a refusal, was never reached.
 fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
-    for (re, description, block) in dangerous_command_regexes() {
-        if re.is_match(content) {
-            // The legacy regex intentionally stays in the public signature set,
-            // but its textual `.*\|.*` shape also matches `||` and unrelated
-            // commands joined by `&&`. Require the shell AST to prove an actual
-            // downloader-to-interpreter pipeline before returning this finding.
-            if *description == "pipe to shell"
-                && !crate::shell::has_download_execution_pipeline(content)
-                && !crate::shell::has_executed_download_execution_payload(content)
-                && crate::shell::structure_available(content)
-            {
-                continue;
-            }
-            // `dd of=/dev/null` is a no-op write sink, not an overwrite.
-            if *description == "dd overwrite" && dd_noop_sink(content) {
-                continue;
-            }
-            if *description == "shell eval (dynamic command execution)"
-                && (is_local_tool_eval_idiom(content) || eval_only_in_grep_patterns(re, content))
-            {
-                continue;
-            }
-            if *description == "shell eval (dynamic command execution)"
-                && eval_only_after_opener_in_single_quotes(content)
-            {
-                continue;
-            }
-            if *description == "shred (unrecoverable delete)" && is_ephemeral_secret_shred(content)
-            {
-                continue;
-            }
-            return Some((description, *block));
+    let mut first = None;
+    for found in dangerous_commands_in(content) {
+        if found.1 {
+            return Some(found);
         }
+        first = first.or(Some(found));
     }
-    None
+    first
+}
+
+/// Each dangerous pattern `content` matches that no exception lifts, in
+/// the order of the list.
+fn dangerous_commands_in(content: &str) -> impl Iterator<Item = (&'static str, bool)> + '_ {
+    dangerous_command_regexes()
+        .iter()
+        .filter_map(move |(re, description, block)| {
+            dangerous_command_kept(content, re, description, *block)
+        })
+}
+
+/// `description` as a finding on `content`, unless an exception lifts it.
+fn dangerous_command_kept(
+    content: &str,
+    re: &regex::Regex,
+    description: &'static str,
+    block: bool,
+) -> Option<(&'static str, bool)> {
+    if !re.is_match(content) {
+        return None;
+    }
+    // The legacy regex intentionally stays in the public signature set,
+    // but its textual `.*\|.*` shape also matches `||` and unrelated
+    // commands joined by `&&`. Require the shell AST to prove an actual
+    // downloader-to-interpreter pipeline before returning this finding.
+    let lifted = (description == "pipe to shell"
+        && !crate::shell::has_download_execution_pipeline(content)
+        && !crate::shell::has_executed_download_execution_payload(content)
+        && crate::shell::structure_available(content))
+        // `dd of=/dev/null` is a no-op write sink, not an overwrite.
+        || (description == "dd overwrite" && dd_noop_sink(content))
+        || (description == "shell eval (dynamic command execution)"
+            && (is_local_tool_eval_idiom(content)
+                || eval_only_in_grep_patterns(re, content)
+                || eval_only_after_opener_in_single_quotes(content)))
+        || (description == "shred (unrecoverable delete)" && is_ephemeral_secret_shred(content));
+    (!lifted).then_some((description, block))
 }
 
 /// Whether every place `eval` reads as a command start in `content` is
