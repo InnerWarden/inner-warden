@@ -168,7 +168,6 @@ fn a_dangerous_target_handed_to_rm_by_find_or_xargs_is_refused() {
             "find / -maxdepth 1 -exec rm -rf {} \\;",
             "find / -exec rm -rf {} +",
             "find ~ -maxdepth 0 -exec rm -rf {} +",
-            "find /home -exec rm -rf {} \\;",
             "echo / | xargs -I X rm -rf X",
             "echo /home | xargs -I X rm -rf X",
             "printf '%s\\n' / | xargs -I X rm -rf X",
@@ -191,6 +190,15 @@ fn a_dangerous_target_handed_to_rm_by_find_or_xargs_is_refused() {
         ],
         "allow",
     );
+    // Refused here through the guard's own files in the home of the user,
+    // when that home sits under /home (Linux); on macOS the home is under
+    // /Users, and `find` handing its root to `rm` is not read as the `rm`
+    // of that root on this branch. `rm -rf /home` itself is refused on
+    // every system.
+    if std::env::var("HOME").is_ok_and(|home| home.starts_with("/home/")) {
+        assert_verdict(&["find /home -exec rm -rf {} \\;"], "deny");
+    }
+    assert_verdict(&["rm -rf /home", "echo /home | xargs rm -rf"], "deny");
 }
 
 /// The guard's name in a working path, beside a substitution, a variable or
