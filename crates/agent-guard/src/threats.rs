@@ -3299,8 +3299,15 @@ fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)]
             "rewrites an agent's configuration through an interpreter",
             60,
         );
+        // The hook script by where it is: a file or folder named for the
+        // guard right inside an agent's `hooks` folder. A file elsewhere
+        // whose path merely holds the word (`~/innerwarden/x.sh`, a scratch
+        // folder under `/tmp/claude-1000/-home-u-innerwarden/`) is not the
+        // guard's: its configuration, record and program are held by their
+        // real paths ([`writes_guard_config`], [`writes_guard_carrier`]),
+        // through a variable, a link or `..` as well.
         add(
-            r#"(?i)\brm\b[^|;&]*(?:hooks?/[^\s]*innerwarden|innerwarden[^\s]*\.(?:sh|json))"#,
+            r#"(?i)\brm\b[^|;&]*\bhooks?/[^\s/'"]*innerwarden"#,
             "deletes the guard's hook script",
             60,
         );
@@ -6759,6 +6766,44 @@ fn writes_guard_config(content: &str, depth: u8) -> bool {
     writes_place(content, depth, |target, _| names_guard_config(target), true)
 }
 
+/// What the shell side says of a line that writes the SSH client
+/// configuration ([`writes_ssh_client_config`]).
+const SSH_CLIENT_CONFIG_WRITTEN: &str =
+    "writes the SSH client configuration, which every ssh reads and which can run a \
+     command (LocalCommand, ProxyCommand) or pull in another file (Include)";
+
+/// Whether a path names the SSH client configuration: `~/.ssh/config`, a
+/// file in `~/.ssh/config.d/` (in any home), `/etc/ssh/ssh_config` or a
+/// file in `/etc/ssh/ssh_config.d/`. A removal or a move away (`taken`)
+/// is not counted: a missing file runs nothing.
+fn names_ssh_client_config(target: &str, taken: bool) -> bool {
+    !taken
+        && named_path(&home_spelled(target)).is_some_and(|named| {
+            [
+                Place::Components(".ssh/config"),
+                Place::Components(".ssh/config.d"),
+                Place::Tree("/etc/ssh/ssh_config"),
+                Place::Tree("/etc/ssh/ssh_config.d"),
+            ]
+            .into_iter()
+            .any(|place| place.holds(&named))
+        })
+}
+
+/// Whether a command line writes the SSH client configuration
+/// ([`names_ssh_client_config`]). Every `ssh`, `scp`, `rsync` and `git`
+/// over ssh reads it without being told to, so a `LocalCommand` or
+/// `ProxyCommand` written there runs on the next connection, outside the
+/// line that wrote it. The file tools are refused the same file
+/// (`crate::file_tools`); this is the shell side, with every writer
+/// [`writes_place`] reads: a redirection, `tee`, `cp`, `ln`, `mv` onto
+/// it, `sed -i`, through a variable or a `cd`. A link the line makes is
+/// followed before this is asked (`crate::shell::line_through_links`).
+fn writes_ssh_client_config(content: &str) -> bool {
+    content.to_ascii_lowercase().contains("ssh")
+        && writes_place(content, 0, names_ssh_client_config, false)
+}
+
 /// What the shell side says of a line that writes what the guard is carried
 /// by.
 const GUARD_CARRIER_WRITTEN: &str =
@@ -8069,6 +8114,9 @@ pub fn check_anti_forensics(content: &str) -> Option<(&'static str, u32)> {
 /// executable hook into a boot, login, device or repository path, which is not
 /// something an agent does in passing.
 pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
+    if writes_ssh_client_config(content) {
+        return Some((SSH_CLIENT_CONFIG_WRITTEN, 60));
+    }
     if !mentions_any(
         content,
         &[
