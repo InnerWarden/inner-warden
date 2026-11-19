@@ -8,6 +8,10 @@
 
 use std::ops::Range;
 
+mod inline_calls;
+
+pub(crate) use inline_calls::InlineReading;
+
 const MAX_AST_DEPTH: usize = 64;
 const MAX_AST_NODES: usize = 16_384;
 
@@ -2754,8 +2758,92 @@ fn process_lines_in_order(source: &str) -> Vec<String> {
 /// here-document or a here-string, and the program of an awk. Each piece
 /// of code's lines in the order of its calls ([`process_lines_in_order`]).
 /// What a process is handed is a shell line, and the caller judges it as
-/// one.
-pub(crate) fn inline_process_lines(source: &str) -> Vec<String> {
+/// one. Read further ([`inline_calls`]): also the lines the code builds at
+/// run time, whether a process line is left unread, and whether the code
+/// runs what it downloads.
+pub(crate) fn inline_code_reading(source: &str) -> InlineReading {
+    let mut reading = InlineReading::default();
+    for (language, code, double_quoted) in inline_code_pieces(source) {
+        reading.merge(InlineReading {
+            lines: process_lines_in_order(&code),
+            ..InlineReading::default()
+        });
+        if let Some(lang) = inline_calls::Lang::of(&language) {
+            // In double quotes the shell takes the backslash off `$`, a
+            // backtick, `"` and `\\`: the program reads the code without it.
+            let code = if double_quoted {
+                double_quote_unescaped(&code)
+            } else {
+                code
+            };
+            reading.merge(inline_calls::read_code(
+                lang,
+                &code,
+                inline_calls::CODE_DEPTH,
+            ));
+        }
+    }
+    reading
+}
+
+/// A double-quoted shell word's text as the shell hands it on: the
+/// backslash taken off `$`, a backtick, `"`, `\\` and a line end.
+fn double_quote_unescaped(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            if let Some(next) =
+                characters.next_if(|next| matches!(next, '$' | '`' | '"' | '\\' | '\n'))
+            {
+                if next != '\n' {
+                    out.push(next);
+                }
+                continue;
+            }
+        }
+        out.push(character);
+    }
+    out
+}
+
+/// The modules given as `data:` URLs to Node's `--import`, `--require`
+/// and `--loader`, decoded: Node loads each as code.
+fn node_data_url_modules(arguments: &[String]) -> Vec<String> {
+    const LOADS: [&str; 5] = [
+        "--import",
+        "--require",
+        "-r",
+        "--loader",
+        "--experimental-loader",
+    ];
+    let mut modules = Vec::new();
+    for (at, argument) in arguments.iter().enumerate() {
+        let argument = shell_word(argument);
+        let value = if LOADS.contains(&argument.as_str()) {
+            arguments.get(at + 1).map(|value| shell_word(value))
+        } else {
+            LOADS.iter().find_map(|option| {
+                argument
+                    .strip_prefix(option)
+                    .and_then(|rest| rest.strip_prefix('='))
+                    .map(str::to_owned)
+            })
+        };
+        if let Some(body) = value.as_deref().and_then(inline_calls::data_url_body) {
+            modules.push(body);
+        }
+    }
+    modules
+}
+
+/// The pieces of inline code in the shell line `source`, each with its
+/// language: the code a program of one of the languages read here
+/// ([`is_code_language`]) is handed in an argument, in a `data:` module, or
+/// on stdin by a here-document or a here-string, and the program of an awk;
+/// and whether the code was written in double quotes, with the shell's
+/// backslashes still in it.
+fn inline_code_pieces(source: &str) -> Vec<(String, String, bool)> {
     let Some((tree, _doubt)) = parse_line(source) else {
         return Vec::new();
     };
@@ -2776,11 +2864,21 @@ pub(crate) fn inline_process_lines(source: &str) -> Vec<String> {
         let name = normalized_command_name(&effective[0]);
         if matches!(name.as_str(), "awk" | "gawk" | "mawk" | "nawk") {
             for argument in &effective[1..] {
-                lines.extend(process_lines_in_order(&shell_word(argument)));
+                lines.push(("awk".to_owned(), shell_word(argument), false));
             }
         } else if is_code_language(&name) {
+            let language = interpreter_language(&name).to_owned();
+            if language == "node" {
+                for module in node_data_url_modules(&effective[1..]) {
+                    lines.push((language.clone(), module, false));
+                }
+            }
             if let CodeInput::Argument(code) = command_code_input(effective) {
-                lines.extend(process_lines_in_order(&code));
+                let double_quoted = effective[1..].iter().any(|word| {
+                    let word = word.trim();
+                    word.starts_with('"') && word.ends_with('"') && shell_literal_word(word) == code
+                });
+                lines.push((language, code, double_quoted));
             }
         }
     }
@@ -2788,8 +2886,13 @@ pub(crate) fn inline_process_lines(source: &str) -> Vec<String> {
     collect_nodes_of_kind(tree.root_node(), "heredoc_body", &mut bodies, 0);
     collect_nodes_of_kind(tree.root_node(), "herestring_redirect", &mut bodies, 0);
     for body in bodies {
-        if stdin_code_owner(body).is_some_and(|owner| stdin_code_language(owner, bytes).is_some()) {
-            lines.extend(process_lines_in_order(&stdin_code_text(body, bytes)));
+        let language = stdin_code_owner(body).and_then(|owner| stdin_code_language(owner, bytes));
+        if let Some(language) = language {
+            lines.push((
+                interpreter_language(&language).to_owned(),
+                stdin_code_text(body, bytes),
+                false,
+            ));
         }
     }
     lines
@@ -3903,6 +4006,19 @@ const NODE_NAME_PASSES: usize = 16;
 /// The lines come back in the order the code makes the calls, each call
 /// once.
 fn node_process_payloads(source: &str) -> Vec<String> {
+    let mut calls: Vec<(usize, String)> = node_called_sinks(source)
+        .into_iter()
+        .filter_map(|(call, at)| {
+            node_call_payload(node_call_arguments(&source[at..]), call).map(|line| (at, line))
+        })
+        .collect();
+    calls.dedup_by_key(|(at, _)| *at);
+    calls.into_iter().map(|(_, line)| line).collect()
+}
+
+/// Where inline Node code calls a function of `child_process`, as the kind
+/// of call and the byte its arguments start at, in the order of the code.
+fn node_called_sinks(source: &str) -> Vec<(NodeCall, usize)> {
     // A module name can be written with escapes or in parts, so no word
     // decides beforehand that the code loads nothing.
     let mut names = vec![
@@ -3927,23 +4043,20 @@ fn node_process_payloads(source: &str) -> Vec<String> {
         }
         names.extend(found);
     }
-    let mut calls: Vec<(usize, String)> = node_value_mentions(source, &names)
+    let mut calls: Vec<(NodeCall, usize)> = node_value_mentions(source, &names)
         .into_iter()
         .filter_map(
             |(start, end, value)| match node_value_use(source, start, end, value) {
-                NodeUse::Called(call, at) => {
-                    node_call_payload(node_call_arguments(&source[at..]), call)
-                        .map(|line| (at, line))
-                }
+                NodeUse::Called(call, at) => Some((call, at)),
                 NodeUse::Named(_) => None,
             },
         )
         .collect();
     // Two mentions can reach the same call (`require` is both a loader and
     // a name), and the mentions are not in the order of the code.
-    calls.sort_by_key(|(at, _)| *at);
-    calls.dedup_by_key(|(at, _)| *at);
-    calls.into_iter().map(|(_, line)| line).collect()
+    calls.sort_by_key(|(_, at)| *at);
+    calls.dedup_by_key(|(_, at)| *at);
+    calls
 }
 
 fn is_js_name_byte(byte: u8) -> bool {
@@ -9215,16 +9328,31 @@ fn perl_code_input(args: &[String]) -> CodeInput {
             .strip_prefix('-')
             .filter(|flags| !flags.starts_with('-'))
         {
-            if flags.contains('c') {
-                return CodeInput::None;
-            }
-            if let Some(position) = flags.find(['e', 'E']) {
-                let inline = &flags[position + 1..];
-                return if inline.is_empty() {
-                    next_code_argument(args, index)
-                } else {
-                    CodeInput::Argument(inline.to_owned())
-                };
+            // A cluster is read flag by flag: what follows `-M`, `-m`, `-I`,
+            // `-x`, `-i`, `-C`, `-d` or `-D` is its value, and `-l` and `-0`
+            // take digits. Measured 2026-11-19: `-MLWP::Simple -e CODE` read
+            // the `e` of `Simple` as `-e` and lost the code.
+            let mut flag_chars = flags.char_indices().peekable();
+            while let Some((position, flag)) = flag_chars.next() {
+                match flag {
+                    'c' => return CodeInput::None,
+                    'e' | 'E' => {
+                        let inline = &flags[position + 1..];
+                        return if inline.is_empty() {
+                            next_code_argument(args, index)
+                        } else {
+                            CodeInput::Argument(inline.to_owned())
+                        };
+                    }
+                    'I' | 'M' | 'm' | 'x' | 'i' | 'C' | 'd' | 'D' => break,
+                    'l' | '0' => {
+                        while flag_chars
+                            .next_if(|(_, digit)| digit.is_ascii_hexdigit() || *digit == 'x')
+                            .is_some()
+                        {}
+                    }
+                    _ => {}
+                }
             }
             if matches!(flags.chars().next(), Some('I' | 'M' | 'm')) && flags.len() == 1 {
                 index += 2;

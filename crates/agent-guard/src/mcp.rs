@@ -3509,13 +3509,35 @@ fn analyze_command_as_read(
         });
         score += 20;
     }
+    // Inline code read for the lines it builds at run time: a process line
+    // it leaves unread is reviewed, as a shell's `-c` line built at run time
+    // is; a download it hands a process or runs as code is refused.
+    // Measured 2026-11-19: 34 of 62 such lines over six languages were
+    // allowed (`os.system(c)`, `spawn(cmd)`, `fetch(u).then(eval)`).
+    let inline_code = crate::shell::inline_code_reading(raw_scan);
+    if inline_code.unread && !signals.iter().any(|s| s.signal == "shell_line_not_literal") {
+        signals.push(AnalysisSignal {
+            signal: "shell_line_not_literal".into(),
+            score: 20,
+            detail: "inline code hands a process a line built at run time from values it does not write out, which the guard cannot read".into(),
+        });
+        score += 20;
+    }
+    if inline_code.runs_download {
+        signals.push(AnalysisSignal {
+            signal: "dangerous_command".into(),
+            score: 40,
+            detail: "inline code hands a process what it downloads, or runs it as code".into(),
+        });
+        score += 40;
+    }
     if depth < STARTUP_PAYLOAD_DEPTH {
         // A line handed over again says nothing new: each is judged once,
         // where it is first handed over.
         let mut seen = std::collections::HashSet::new();
         for (mut lines, handed_by) in [
             (
-                crate::shell::inline_process_lines(raw_scan),
+                inline_code.lines,
                 "in a line inline code hands to a process",
             ),
             (handed_to_shell.lines, "in a line handed to a shell to run"),
