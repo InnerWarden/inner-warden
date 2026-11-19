@@ -12181,11 +12181,147 @@ pub(crate) fn check_sensitive_read_as_written(
     content: &str,
     as_written: &str,
 ) -> Option<(&'static str, u32)> {
+    sensitive_read_nested(content, as_written, 0)
+}
+
+/// How deep [`sensitive_read_in`] follows a line handed to a shell inside a
+/// line handed to a shell (`bash -c "sh -c '...'"`). Deeper, the outer
+/// segment is read as written.
+const MAX_SHELL_LINE_DEPTH: u8 = 4;
+
+/// True when `line` names a built-in key or credential path and only uses
+/// it: every segment that names one authenticates with it (`ssh -i KEY`,
+/// `scp -o IdentityFile=KEY`, `rsync -e 'ssh -i KEY'`), loads it into the
+/// agent (`ssh-add KEY`), takes the group's and others' access to it away
+/// (`chmod 600 KEY`), or hands a shell a line that does one of these
+/// (`bash -c 'ssh -i KEY host'`), and nothing on the line reads it
+/// ([`check_sensitive_read`]). Copying or showing the key is a read and
+/// is not this.
+pub(crate) fn uses_keys_without_reading(line: &str) -> bool {
+    key_use_line(line, 0)
+}
+
+/// [`uses_keys_without_reading`] at `depth` lines handed to a shell.
+fn key_use_line(line: &str, depth: u8) -> bool {
+    if check_sensitive_read(line).is_some() {
+        return false;
+    }
+    let names = names_a_line_may_set(line);
+    let line_may_set = |name: &str| names.contains(name);
+    let mut used = false;
+    for segment in shell_command_segments(line) {
+        let tokens = shell_tokens_with_braces(segment);
+        if !tokens.iter().any(|token| is_sensitive_word(token)) {
+            continue;
+        }
+        let key_use = ssh_identity_use_only(segment, &line_may_set)
+            || key_access_narrowed(&tokens)
+            || key_loaded_into_the_agent(&tokens)
+            || (depth < MAX_SHELL_LINE_DEPTH
+                && shell_line_holding_every_sensitive_path(segment)
+                    .is_some_and(|inner| key_use_line(&inner, depth + 1)));
+        if !key_use {
+            return false;
+        }
+        used = true;
+    }
+    used
+}
+
+/// The words of `line` that name a built-in key or credential path, at
+/// any depth of quoting, split where a shell or an option splits them
+/// (`IdentityFile=KEY` gives `KEY`).
+pub(crate) fn sensitive_words_of_line(line: &str) -> Vec<String> {
+    line.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '=' | ',' | ';'))
+        .filter(|word| !word.is_empty() && is_sensitive_word(word))
+        .map(str::to_string)
+        .collect()
+}
+
+/// No word of the command is a redirection.
+fn without_redirection(tokens: &[String]) -> bool {
+    !tokens
+        .iter()
+        .any(|token| token.contains('<') || token.contains('>') || token.contains('&'))
+}
+
+/// `chmod` with a mode that leaves the group and others no access, and no
+/// option but the ones that only report: `chmod 600 KEY`, `chmod 0400 KEY`,
+/// `chmod go-rwx KEY`.
+fn key_access_narrowed(tokens: &[String]) -> bool {
+    const NARROWING: &[&str] = &[
+        "go-rwx",
+        "og-rwx",
+        "g-rwx,o-rwx",
+        "o-rwx,g-rwx",
+        "go=",
+        "og=",
+        "u=rw,go=",
+        "u=r,go=",
+        "u=rw,g=,o=",
+        "u=r,g=,o=",
+    ];
+    let Some(at) = effective_command_index(tokens) else {
+        return false;
+    };
+    if token_basename(&tokens[at]) != "chmod" || !without_redirection(tokens) {
+        return false;
+    }
+    let mut words = tokens[at + 1..].iter().map(String::as_str);
+    let mode = loop {
+        match words.next() {
+            Some("-v" | "-c" | "-f" | "--verbose" | "--changes" | "--quiet" | "--silent") => {}
+            Some(word) => break word,
+            None => return false,
+        }
+    };
+    let numeric = (3..=4).contains(&mode.len())
+        && mode.bytes().all(|b| (b'0'..=b'7').contains(&b))
+        && mode.ends_with("00");
+    (numeric || NARROWING.contains(&mode)) && words.all(|word| !word.starts_with('-'))
+}
+
+/// `ssh-add` handed key files: the agent holds them to authenticate with.
+fn key_loaded_into_the_agent(tokens: &[String]) -> bool {
+    let Some(at) = effective_command_index(tokens) else {
+        return false;
+    };
+    token_basename(&tokens[at]) == "ssh-add" && without_redirection(tokens)
+}
+
+/// [`check_sensitive_read_as_written`] at `depth` lines handed to a shell.
+fn sensitive_read_nested(
+    content: &str,
+    as_written: &str,
+    depth: u8,
+) -> Option<(&'static str, u32)> {
     let (readings, _) = assignment_readings(content);
     readings
         .iter()
-        .filter_map(|reading| sensitive_read_in(reading, as_written))
+        .filter_map(|reading| sensitive_read_in(reading, as_written, depth))
         .max_by_key(|&(_, score)| score)
+}
+
+/// The line a shell segment hands a shell to run with `-c`, when every
+/// sensitive path of the segment is inside that line: `bash -c 'scp -i
+/// ~/.ssh/id_rsa f host:/tmp'`. The shell runs the line as its own command
+/// line, so the line is read as one, and an identity in it is key use as it
+/// is on a line typed directly. A sensitive path anywhere else in the
+/// segment (an argument after the line, `bash -c 'scp -i "$1" ...' x KEY`,
+/// or a redirection, `bash -c '...' < KEY`) is not inside the line: `None`,
+/// and the segment is read as written.
+fn shell_line_holding_every_sensitive_path(segment: &str) -> Option<String> {
+    let tokens = shell_tokens_with_braces(segment);
+    let program_at = effective_command_index(&tokens)?;
+    if !is_shell_program(&token_basename(&tokens[program_at]).to_ascii_lowercase()) {
+        return None;
+    }
+    let line_at = program_at + crate::shell::shell_inline_code_place(&tokens[program_at..])?;
+    let elsewhere = tokens
+        .iter()
+        .enumerate()
+        .any(|(at, token)| at != line_at && is_sensitive_word(token));
+    (!elsewhere).then(|| tokens[line_at].clone())
 }
 
 /// The always-secret class: a private key, the shadow files, a file whose
@@ -12866,7 +13002,7 @@ fn secret_behind(path: &str, home: Option<&str>) -> Option<String> {
 }
 
 /// [`check_sensitive_read_as_written`] on one reading of the line.
-fn sensitive_read_in(content: &str, as_written: &str) -> Option<(&'static str, u32)> {
+fn sensitive_read_in(content: &str, as_written: &str, depth: u8) -> Option<(&'static str, u32)> {
     let reader = content_reader();
     // A quoted here-document body is DATA being written, not a path being read,
     // so it is removed before any path matching. See `strip_inert_heredoc_bodies`
@@ -12909,6 +13045,20 @@ fn sensitive_read_in(content: &str, as_written: &str) -> Option<(&'static str, u
             None
         };
         let Some(path) = path else { continue };
+        // A line handed to a shell with `-c` holding every sensitive path of
+        // the segment is read as the line it is: the inner shell runs it, and
+        // `bash -c 'scp -i KEY f host:'` uses the key the way `scp -i KEY f
+        // host:` does. The names the outer line may set still count, since a
+        // prefix assignment or an export reaches the inner shell.
+        if depth < MAX_SHELL_LINE_DEPTH {
+            if let Some(line) = shell_line_holding_every_sensitive_path(segment) {
+                let outer = format!("{as_written}\n{content}");
+                match sensitive_read_nested(&line, &outer, depth + 1) {
+                    None => continue,
+                    found => return found,
+                }
+            }
+        }
         // Key USE (ssh/scp/sftp/rsync authenticating with `-i <key>`) is not a
         // read of the key's contents. Suppress only when every sensitive path in
         // the segment is an identity-flag value; a positional exfil source still
@@ -14039,6 +14189,192 @@ fn writes_path(lower: &str, path: &str) -> bool {
         offset = position + path.len();
     }
     false
+}
+
+/// A command that signals every process on the host or its init: `kill -9
+/// -1`, `kill -KILL 1`, `killall5`, `pkill -9 -u root`, `pkill -9 .`. Each
+/// takes the machine down (or every process the account may signal, which
+/// for root is all of them). What it says, when one of the segments of
+/// `cmd` is one.
+///
+/// Read by place: the program the segment runs, behind its launch wrappers,
+/// and its operands as that program reads them. A signal to one process or
+/// to a process group (`kill -9 4242`, `kill -9 -4242`), a named pattern
+/// (`pkill -f my-server`, `pkill -u root sshd`), the probe `kill -0 1`, a
+/// reload of init (`kill -HUP 1`) and `kill -l` are not.
+pub(crate) fn kills_every_process(cmd: &str) -> Option<&'static str> {
+    shell_command_segments(cmd).into_iter().find_map(|segment| {
+        let words = shell_tokens(segment);
+        let at = effective_command_index(&words)?;
+        kill_reaches_everything(&words[at..])
+    })
+}
+
+/// [`kills_every_process`] of one command, its program first.
+fn kill_reaches_everything(words: &[String]) -> Option<&'static str> {
+    let program = token_basename(words.first()?).to_ascii_lowercase();
+    match program.as_str() {
+        "killall5" => Some("killall5 signals every process on the host"),
+        "kill" => kill_operands_reach_everything(&words[1..]),
+        "pkill" | "killall" => pattern_kill_reaches_everything(&program, &words[1..]),
+        _ => None,
+    }
+}
+
+/// `kill` with a pid of -1 (every process the caller may signal) or 1 (init).
+fn kill_operands_reach_everything(args: &[String]) -> Option<&'static str> {
+    let mut signal: Option<String> = None;
+    let mut pids: Vec<&str> = Vec::new();
+    let mut at = 0usize;
+    while let Some(word) = args.get(at).map(String::as_str) {
+        at += 1;
+        if !pids.is_empty() {
+            pids.push(word);
+            continue;
+        }
+        match word {
+            "--" => {
+                pids.extend(args[at..].iter().map(String::as_str));
+                break;
+            }
+            "-l" | "-L" | "--list" | "--table" => return None,
+            "-s" | "-n" | "--signal" => {
+                signal = Some(args.get(at)?.clone());
+                at += 1;
+            }
+            _ if word.starts_with("--signal=") => {
+                signal = Some(word["--signal=".len()..].to_string());
+            }
+            _ if signal.is_none() && word.len() > 1 && word.starts_with('-') => {
+                signal = Some(word[1..].to_string());
+            }
+            _ => pids.push(word),
+        }
+    }
+    let signal = signal.unwrap_or_else(|| "TERM".into()).to_ascii_uppercase();
+    let signal = signal.strip_prefix("SIG").unwrap_or(&signal);
+    if signal == "0" {
+        return None;
+    }
+    // Init reloads or re-executes on these; the rest stop it.
+    let reload = matches!(signal, "HUP" | "1" | "USR1" | "10" | "USR2" | "12");
+    pids.iter().find_map(|pid| match *pid {
+        "-1" => Some("kill -1 signals every process the caller may signal"),
+        "1" if !reload => Some("kill signals init (pid 1), which takes the host down"),
+        _ => None,
+    })
+}
+
+/// `pkill` or `killall` with a pattern that names every process, or with
+/// root as the user and no pattern at all, or `pkill -v` (every process
+/// but the pattern's).
+fn pattern_kill_reaches_everything(program: &str, args: &[String]) -> Option<&'static str> {
+    // Short options that take a value, by program.
+    let valued = if program == "pkill" {
+        "gGPstuUFc"
+    } else {
+        "uoysn"
+    };
+    let mut patterns: Vec<&str> = Vec::new();
+    let mut users: Vec<&str> = Vec::new();
+    let mut inverse = false;
+    let mut regex = program == "pkill";
+    let mut at = 0usize;
+    while let Some(word) = args.get(at).map(String::as_str) {
+        at += 1;
+        if word == "--" {
+            patterns.extend(args[at..].iter().map(String::as_str));
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, value) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            let takes_value = matches!(
+                name,
+                "euid"
+                    | "uid"
+                    | "user"
+                    | "signal"
+                    | "group"
+                    | "pgroup"
+                    | "parent"
+                    | "session"
+                    | "terminal"
+                    | "pidfile"
+                    | "ns"
+                    | "nslist"
+                    | "older-than"
+                    | "younger-than"
+            );
+            let value = match value {
+                Some(value) => Some(value),
+                None if takes_value => {
+                    at += 1;
+                    args.get(at - 1).map(String::as_str)
+                }
+                None => None,
+            };
+            match name {
+                "euid" | "uid" | "user" => users.extend(value),
+                "inverse" => inverse = true,
+                "regexp" => regex = true,
+                _ => {}
+            }
+            continue;
+        }
+        let Some(letters) = word.strip_prefix('-').filter(|l| !l.is_empty()) else {
+            patterns.push(word);
+            continue;
+        };
+        // A signal: `-9`, `-KILL`, `-SIGTERM`.
+        if letters.chars().all(|c| c.is_ascii_digit())
+            || letters.chars().all(|c| c.is_ascii_uppercase())
+        {
+            continue;
+        }
+        for (offset, letter) in letters.char_indices() {
+            if valued.contains(letter) {
+                let rest = &letters[offset + 1..];
+                let value = if rest.is_empty() {
+                    at += 1;
+                    args.get(at - 1).map(String::as_str)
+                } else {
+                    Some(rest)
+                };
+                if letter == 'u' || (program == "pkill" && letter == 'U') {
+                    users.extend(value);
+                }
+                break;
+            }
+            match letter {
+                'v' if program == "pkill" => inverse = true,
+                'r' if program == "killall" => regex = true,
+                _ => {}
+            }
+        }
+    }
+    let root = users
+        .iter()
+        .flat_map(|users| users.split(','))
+        .any(|user| matches!(user, "root" | "0"));
+    let matches_all = |pattern: &&str| {
+        matches!(
+            *pattern,
+            "" | "." | ".*" | ".+" | "^" | "$" | "^.*" | ".*$" | "^.*$" | "^.+$"
+        )
+    };
+    if patterns.is_empty() && root {
+        return Some("signals every process of root, which is every process on the host");
+    }
+    if inverse && !patterns.is_empty() {
+        return Some("pkill -v signals every process but the ones the pattern names");
+    }
+    if regex && patterns.iter().any(matches_all) {
+        return Some("a kill pattern that names every process on the host");
+    }
+    None
 }
 
 /// Verbs that take a security control out of service.

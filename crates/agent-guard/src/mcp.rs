@@ -209,6 +209,42 @@ pub(crate) fn inspect_declared_tool_call(
         Some(words_a_server_may_join(args, &read_keys))
     };
 
+    let only_inert_unread = unread.as_object().is_none_or(|object| {
+        object.keys().all(|key| {
+            let key = canonical_key(key);
+            [INERT_KEYS, WORKING_FOLDER_KEYS, ENV_KEYS]
+                .iter()
+                .any(|keys| keys.contains(&key.as_str()))
+        })
+    });
+    let lines_read = shell_tool && !commands.is_empty() && only_inert_unread;
+    // Every line the call runs only uses a key: authenticates with it,
+    // loads it into the agent or narrows who may read it
+    // ([`threats::uses_keys_without_reading`]), and every field but a
+    // folder, an environment or a note is such a line. The same line typed as
+    // a shell tool's command string is judged by the analyzer alone and
+    // allowed, so here the key's name in those lines is not a sensitive file
+    // and not the credential the ATR rules look for. A field the reading
+    // did not take is still read for one, and so is a line that reads or
+    // copies the key.
+    let key_use_only = lines_read
+        && commands
+            .iter()
+            .any(|command| threats::uses_keys_without_reading(&command.line))
+        && commands.iter().all(|command| {
+            threats::sensitive_words_of_line(&command.line).is_empty()
+                || threats::uses_keys_without_reading(&command.line)
+        });
+    let masked_args = key_use_only.then(|| {
+        let mut masked = args_str.clone();
+        for command in &commands {
+            for word in threats::sensitive_words_of_line(&command.line) {
+                masked = masked.replace(&word, "KEYFILE");
+            }
+        }
+        masked
+    });
+
     if let Some(desc) = threats::check_credentials(&args_str) {
         alerts.push(VerdictAlert::builtin(
             "AG-CRED",
@@ -217,8 +253,14 @@ pub(crate) fn inspect_declared_tool_call(
         ));
     }
 
+    let file_args = if key_use_only { unread.as_ref() } else { args };
+    let file_text = if key_use_only {
+        std::borrow::Cow::Owned(file_args.to_string())
+    } else {
+        std::borrow::Cow::Borrowed(args_str.as_str())
+    };
     if let Some(path) =
-        sensitive_path_in_arguments(args).or_else(|| threats::check_sensitive_path(&args_str))
+        sensitive_path_in_arguments(file_args).or_else(|| threats::check_sensitive_path(&file_text))
     {
         // G6 (deep-test): hard-block a tool reading the always-secret stores, SSH/GPG
         // private keys, /etc/shadow, credential files. The config-ish paths (.env,
@@ -277,15 +319,6 @@ pub(crate) fn inspect_declared_tool_call(
     // so it keeps the name. A field the reading did not take that is more
     // than a folder, an environment or a note (`stdin`, text handed to the
     // program) is read by nothing but the name: with one, the name stays.
-    let only_inert_unread = unread.as_object().is_none_or(|object| {
-        object.keys().all(|key| {
-            let key = canonical_key(key);
-            [INERT_KEYS, WORKING_FOLDER_KEYS, ENV_KEYS]
-                .iter()
-                .any(|keys| keys.contains(&key.as_str()))
-        })
-    });
-    let lines_read = shell_tool && !commands.is_empty() && only_inert_unread;
     if let Some(engine) = rule_engine {
         let context = AtrContext::tool_call(tool_name, &args_str);
         let without_name = lines_read.then(|| {
@@ -294,11 +327,18 @@ pub(crate) fn inspect_declared_tool_call(
                 ..context
             })
         });
+        // With the key's name masked, the rules that still match: a rule
+        // that matched the name alone is not kept.
+        let without_key = masked_args
+            .as_deref()
+            .map(|masked| engine.check_context(AtrContext::tool_call(tool_name, masked)));
         for m in engine.check_context(context).into_iter().filter(|m| {
             without_name.as_ref().is_none_or(|kept| {
                 engine.needs_every_condition(&m.rule_id)
                     || kept.iter().any(|k| k.rule_id == m.rule_id)
-            })
+            }) && without_key
+                .as_ref()
+                .is_none_or(|kept| kept.iter().any(|k| k.rule_id == m.rule_id))
         }) {
             let block = m.severity == "critical" || m.severity == "high";
             alerts.push(VerdictAlert::from_atr(&m, block));
@@ -3566,6 +3606,17 @@ fn analyze_command_as_read(
                 signal: "destructive_command".into(),
                 score: 50,
                 detail: "fork bomb (resource-exhaustion denial of service)".into(),
+            });
+            score += 50;
+        }
+        // Every process on the host, or its init: `kill -9 -1`, `kill -9 1`,
+        // `killall5`, `pkill -9 -u root`. One process, a group or a named
+        // pattern stays allowed.
+        if let Some(detail) = crate::threats::kills_every_process(scan_cmd) {
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: detail.into(),
             });
             score += 50;
         }
