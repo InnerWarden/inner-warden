@@ -242,6 +242,35 @@ fn require_bwrap() {
     );
 }
 
+/// A macOS jail test starts a real sandbox. Where `sandbox-exec` cannot start
+/// one, nothing the test asserts can be measured: a sandbox cannot start
+/// another, so a suite run from an already sandboxed shell (an agent's, or a
+/// sandboxed terminal) fails every such test for a reason that is not the
+/// jail's. Outside CI the test then says what it needs and is skipped, on
+/// stderr; in CI (`CI` set) it fails, so a runner never passes without
+/// measuring.
+#[cfg(target_os = "macos")]
+fn sandbox_starts_here(test: &str) -> bool {
+    let started = Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .stdin(std::process::Stdio::null())
+        .output();
+    let why = match started {
+        Ok(out) if out.status.success() => return true,
+        Ok(out) => format!(
+            "sandbox-exec could not start a sandbox here (exit {:?}: {})",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => format!("sandbox-exec could not be run here: {e}"),
+    };
+    let need = "this test needs a shell that can start a macOS sandbox, one not already \
+                inside a sandbox";
+    assert!(std::env::var_os("CI").is_none(), "{test}: {why}; {need}");
+    eprintln!("SKIPPED {test}: {why}; {need}");
+    false
+}
+
 /// The bwrap `contain` runs: the first of its trusted paths with no symbolic
 /// link on the way to it (`/bin` is one on a usr-merged host).
 #[cfg(target_os = "linux")]
@@ -1136,6 +1165,134 @@ fn a_jail_the_host_did_not_admit_never_runs_its_command() {
 /// the launcher is SIGKILLed the moment the request arrives, after bwrap
 /// reported the jail's first process and before the launcher decided.
 ///
+/// The launcher's death had two endings, and which one came was a race
+/// (bubblewrap 0.9.0): bwrap's own process dies with the launcher
+/// (`--die-with-parent`, armed before it reports the jail), and the jail's
+/// first process arms the same for itself only after it has read its record.
+/// The kernel closes the dead launcher's descriptors (the record ends, empty)
+/// before it signals bwrap, so the jail sometimes armed it in between and died
+/// with bwrap, silently, before the gate ran (3 of 20 runs on a loaded
+/// machine, 2026-11-19). Now a holder the launcher forks keeps the record
+/// open until bwrap is gone, so the jail reads its end only once its parent
+/// is dead, and the gate's refusal comes every time. Nothing here holds the
+/// jail: the launcher is killed and the test waits for stderr's end.
+///
+/// FAILS ON REVERT: hand the jail its command without the gate (drop
+/// `gate_instance` in `build_linux_jail`) and the command runs once the
+/// launcher is gone; drop the holder (`hold_record_until_bwrap_ends`) and no
+/// process outside the launcher and the jail holds the record open, and in
+/// some runs the jail dies silently.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    require_bwrap();
+    let home = home_that_starts_only_once_admitted();
+    let project = tempfile::TempDir::new().unwrap();
+    let marker = project.path().join("COMMAND-RAN");
+    let script = format!("touch '{}'", marker.display());
+    // Active Defence is "installed" (its ctl is found), and its agent is a
+    // listener that takes the request and answers nothing.
+    let ad = tempfile::TempDir::new().unwrap();
+    let ctl = ad.path().join("innerwarden-ctl");
+    std::fs::write(&ctl, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = identified_without_a_scope(&mut command)
+        .env("IW_AD_CLI_DIRS", ad.path())
+        .env("INNERWARDEN_AGENT_URL", &url)
+        .spawn()
+        .expect("run Linux AI Jail with --identity");
+    let stderr = stderr_to_end(&mut child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let held = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    panic!(
+                        "the launcher never asked the host: {}",
+                        stderr
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap_or_default()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    // bwrap's process is the launcher's child, and the jail's first process
+    // is bwrap's: it reported it before the launcher asked the host.
+    let bwrap = only_child_named(child.id(), "bwrap");
+    let jail = only_child_named(bwrap, "bwrap");
+    // The write end of the record the jail waits on is held by a process
+    // that is neither the launcher nor in the jail: the holder.
+    let waits_on = pipe_ends(jail, false);
+    let holders: Vec<u32> = children_of(child.id())
+        .into_iter()
+        .filter(|&pid| pid != bwrap)
+        .filter(|&pid| !pipe_ends(pid, true).is_disjoint(&waits_on))
+        .collect();
+    assert_eq!(
+        holders.len(),
+        1,
+        "one process outside the launcher holds the jail's record open: {holders:?}"
+    );
+    child.kill().expect("SIGKILL the launcher");
+    child.wait().unwrap();
+    let stderr = stderr
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("every process of the jail ended");
+    drop(held);
+    assert!(
+        !marker.exists(),
+        "the command ran without an admission: {stderr}"
+    );
+    assert!(
+        stderr.contains("innerwarden contain: this jail holds no record that the host admitted it"),
+        "the gate refused it: {stderr}"
+    );
+    assert!(
+        processes_naming(&marker).is_empty(),
+        "a process of the jail is left: {:?}",
+        processes_naming(&marker)
+    );
+}
+
+/// SEC-4, the race forced: the same launcher death as
+/// [`a_launcher_that_dies_before_the_host_answers_starts_nothing`], with the
+/// jail held stopped until the launcher's death has landed, so the jail
+/// outlives its launcher in every run, the ending the gate exists for.
+///
+/// A launcher that dies while it waits for the host's answer (killed,
+/// a Ctrl-C, the OOM killer) leaves its jail an empty record, and the jail
+/// does not start its command: the gate refuses it.
+///
+/// The host here is a listener that takes the request and never answers;
+/// the launcher is SIGKILLed the moment the request arrives, after bwrap
+/// reported the jail's first process and before the launcher decided.
+///
 /// The launcher's death has two endings, and which one comes was a race
 /// (bubblewrap 0.9.0): bwrap's own process dies with the launcher
 /// (`--die-with-parent`, armed before it reports the jail), and the jail's
@@ -1154,7 +1311,7 @@ fn a_jail_the_host_did_not_admit_never_runs_its_command() {
 /// command runs once the launcher is gone.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
+fn a_launcher_that_dies_with_its_jail_held_stopped_starts_nothing() {
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     let home = home_that_starts_only_once_admitted();
@@ -1244,39 +1401,9 @@ fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
     );
 }
 
-/// The state letter and the parent of `pid`, from `/proc/<pid>/stat`.
-#[cfg(target_os = "linux")]
-fn state_and_parent(pid: u32) -> Option<(char, u32, String)> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let open = stat.find('(')?;
-    let close = stat.rfind(')')?;
-    let name = stat[open + 1..close].to_string();
-    let mut rest = stat[close + 1..].split_whitespace();
-    let state = rest.next()?.chars().next()?;
-    let parent = rest.next()?.parse().ok()?;
-    Some((state, parent, name))
-}
-
 #[cfg(target_os = "linux")]
 fn process_state(pid: u32) -> Option<char> {
     state_and_parent(pid).map(|(state, _, _)| state)
-}
-
-/// The one child of `parent` named `name`.
-#[cfg(target_os = "linux")]
-fn only_child_named(parent: u32, name: &str) -> u32 {
-    let found: Vec<u32> = std::fs::read_dir("/proc")
-        .unwrap()
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
-        .filter(|&pid| state_and_parent(pid).is_some_and(|(_, p, n)| p == parent && n == name))
-        .collect();
-    assert_eq!(
-        found.len(),
-        1,
-        "children of {parent} named {name}: {found:?}"
-    );
-    found[0]
 }
 
 #[cfg(target_os = "linux")]
@@ -1297,6 +1424,70 @@ fn wait_for(done: impl Fn() -> bool, what: &str) {
         assert!(std::time::Instant::now() < deadline, "waited for {what}");
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// The state letter and the parent of `pid`, from `/proc/<pid>/stat`.
+#[cfg(target_os = "linux")]
+fn state_and_parent(pid: u32) -> Option<(char, u32, String)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let open = stat.find('(')?;
+    let close = stat.rfind(')')?;
+    let name = stat[open + 1..close].to_string();
+    let mut rest = stat[close + 1..].split_whitespace();
+    let state = rest.next()?.chars().next()?;
+    let parent = rest.next()?.parse().ok()?;
+    Some((state, parent, name))
+}
+
+/// The one child of `parent` named `name`.
+#[cfg(target_os = "linux")]
+fn only_child_named(parent: u32, name: &str) -> u32 {
+    let found: Vec<u32> = std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|&pid| state_and_parent(pid).is_some_and(|(_, p, n)| p == parent && n == name))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "children of {parent} named {name}: {found:?}"
+    );
+    found[0]
+}
+
+/// The children of `parent`.
+#[cfg(target_os = "linux")]
+fn children_of(parent: u32) -> Vec<u32> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_string_lossy().parse::<u32>().ok())
+        .filter(|&pid| state_and_parent(pid).is_some_and(|(_, p, _)| p == parent))
+        .collect()
+}
+
+/// The pipes `pid` holds open for writing (`write`) or for reading, by
+/// inode, from `/proc/<pid>/fd` and the access mode in `fdinfo`.
+#[cfg(target_os = "linux")]
+fn pipe_ends(pid: u32, write: bool) -> std::collections::BTreeSet<String> {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Default::default();
+    };
+    fds.flatten()
+        .filter_map(|fd| {
+            let target = std::fs::read_link(fd.path()).ok()?;
+            let target = target.to_str()?.strip_prefix("pipe:")?.to_string();
+            let info = std::fs::read_to_string(format!(
+                "/proc/{pid}/fdinfo/{}",
+                fd.file_name().to_string_lossy()
+            ))
+            .ok()?;
+            let flags = info.lines().find_map(|l| l.strip_prefix("flags:"))?.trim();
+            let mode = u32::from_str_radix(flags, 8).ok()? & 0o3;
+            (mode == u32::from(write)).then_some(target)
+        })
+        .collect()
 }
 
 /// JP-1 (JAIL-PINS fixes): an identified jail started with an
@@ -1431,6 +1622,10 @@ fn identified_in(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_folder_above_a_hidden_home_path_cannot_be_renamed() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_folder_above_a_hidden_home_path_cannot_be_renamed") {
+        return;
+    }
     #[cfg(target_os = "linux")]
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
@@ -1485,6 +1680,10 @@ fn a_folder_above_a_hidden_home_path_cannot_be_renamed() {
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_a_link_down_the_way_to_a_hidden_home_path_stays_in_place() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("on_macos_a_link_down_the_way_to_a_hidden_home_path_stays_in_place") {
+        return;
+    }
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
     std::fs::create_dir_all(h.join(".local/state")).unwrap();
@@ -2268,6 +2467,10 @@ fn claude_codes_folders_are_the_jails_own_through_a_linked_claude_folder() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_of_a_profile_inside_the_project_is_never_written() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_read_only_path_of_a_profile_inside_the_project_is_never_written") {
+        return;
+    }
     #[cfg(target_os = "linux")]
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
@@ -2714,6 +2917,10 @@ fn a_link_into_a_hidden_folder_is_left_out_and_the_jail_still_starts() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn the_persons_own_link_on_the_way_to_a_read_only_path_is_followed() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("the_persons_own_link_on_the_way_to_a_read_only_path_is_followed") {
+        return;
+    }
     use std::os::unix::fs::symlink;
     #[cfg(target_os = "linux")]
     require_bwrap();
@@ -2759,6 +2966,10 @@ fn the_persons_own_link_on_the_way_to_a_read_only_path_is_followed() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_that_is_a_link_stays_read_only_where_it_leads() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_read_only_path_that_is_a_link_stays_read_only_where_it_leads") {
+        return;
+    }
     use std::os::unix::fs::symlink;
     #[cfg(target_os = "linux")]
     require_bwrap();
@@ -2850,6 +3061,10 @@ fn a_read_only_path_that_is_a_link_stays_read_only_where_it_leads() {
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_a_read_only_config_folder_is_never_written() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("on_macos_a_read_only_config_folder_is_never_written") {
+        return;
+    }
     let (_home, h) = extra_home();
     std::fs::create_dir_all(h.join(".config/git")).unwrap();
     std::fs::write(h.join(".config/git/config"), "[user]\n").unwrap();
@@ -2885,6 +3100,12 @@ fn on_macos_a_read_only_config_folder_is_never_written() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_under_a_home_folder_kept_as_a_link_is_read_only_where_the_agent_runs_it() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here(
+        "a_read_only_path_under_a_home_folder_kept_as_a_link_is_read_only_where_the_agent_runs_it",
+    ) {
+        return;
+    }
     use std::os::unix::fs::symlink;
     #[cfg(target_os = "linux")]
     require_bwrap();
@@ -2938,6 +3159,11 @@ fn a_read_only_path_under_a_home_folder_kept_as_a_link_is_read_only_where_the_ag
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_in_a_project_reached_through_a_link_is_never_written() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_read_only_path_in_a_project_reached_through_a_link_is_never_written")
+    {
+        return;
+    }
     use std::os::unix::fs::symlink;
     #[cfg(target_os = "linux")]
     require_bwrap();
@@ -2987,6 +3213,10 @@ fn a_read_only_path_in_a_project_reached_through_a_link_is_never_written() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_where_a_hidden_dotdir_leads_never_shows_the_secret() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_read_only_path_where_a_hidden_dotdir_leads_never_shows_the_secret") {
+        return;
+    }
     use std::os::unix::fs::symlink;
     #[cfg(target_os = "linux")]
     require_bwrap();
@@ -3034,6 +3264,10 @@ fn a_read_only_path_where_a_hidden_dotdir_leads_never_shows_the_secret() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_git_file_that_names_a_folder_of_the_home_never_shows_it_writable() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_git_file_that_names_a_folder_of_the_home_never_shows_it_writable") {
+        return;
+    }
     #[cfg(target_os = "linux")]
     require_bwrap();
     // A home outside the temporary folders a macOS jail may write anyway.
@@ -3156,6 +3390,10 @@ fn git_dir_by_hand(dir: &std::path::Path) {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_forged_worktree_never_shows_a_folder_of_the_home_writable() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_forged_worktree_never_shows_a_folder_of_the_home_writable") {
+        return;
+    }
     #[cfg(target_os = "linux")]
     require_bwrap();
     let home = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -3266,6 +3504,10 @@ fn a_forged_worktree_never_shows_a_folder_of_the_home_writable() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_real_worktree_still_works_in_the_jail() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_real_worktree_still_works_in_the_jail") {
+        return;
+    }
     #[cfg(target_os = "linux")]
     require_bwrap();
     let home = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -3356,6 +3598,11 @@ fn a_real_worktree_still_works_in_the_jail() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_worktree_of_a_repository_in_a_folder_every_jail_writes_still_works() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_worktree_of_a_repository_in_a_folder_every_jail_writes_still_works")
+    {
+        return;
+    }
     #[cfg(target_os = "linux")]
     require_bwrap();
     let home = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -3443,6 +3690,12 @@ fn a_worktree_of_a_repository_in_a_folder_every_jail_writes_still_works() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here(
+        "a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable",
+    ) {
+        return;
+    }
     #[cfg(target_os = "linux")]
     require_bwrap();
     let (_home, h) = extra_home();
@@ -3520,6 +3773,12 @@ fn a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writa
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_a_link_at_a_read_only_path_is_denied_as_named_and_where_it_leads() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here(
+        "on_macos_a_link_at_a_read_only_path_is_denied_as_named_and_where_it_leads",
+    ) {
+        return;
+    }
     use std::os::unix::fs::symlink;
     let (_home, h) = extra_home();
     std::fs::create_dir_all(h.join(".local/share")).unwrap();
@@ -3988,6 +4247,10 @@ fn a_dotdir_linked_into_a_folder_the_jail_shows_stays_hidden() {
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_a_dotdir_linked_into_a_folder_the_jail_writes_stays_hidden() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("on_macos_a_dotdir_linked_into_a_folder_the_jail_writes_stays_hidden") {
+        return;
+    }
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
     std::fs::create_dir_all(h.join(".config/ssh")).unwrap();
@@ -4041,6 +4304,10 @@ fn outside_the_home() -> tempfile::TempDir {
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_a_dotdir_a_link_leads_outside_the_home_is_denied_there() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("on_macos_a_dotdir_a_link_leads_outside_the_home_is_denied_there") {
+        return;
+    }
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
     let elsewhere = outside_the_home();
@@ -4085,6 +4352,12 @@ fn on_macos_a_dotdir_a_link_leads_outside_the_home_is_denied_there() {
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_innerwardens_folder_linked_out_of_the_home_is_denied_where_it_leads() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here(
+        "on_macos_innerwardens_folder_linked_out_of_the_home_is_denied_where_it_leads",
+    ) {
+        return;
+    }
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
     let elsewhere = outside_the_home();
@@ -4133,6 +4406,10 @@ fn on_macos_innerwardens_folder_linked_out_of_the_home_is_denied_where_it_leads(
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_a_deny_read_link_out_of_the_home_is_denied_where_it_leads() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("on_macos_a_deny_read_link_out_of_the_home_is_denied_where_it_leads") {
+        return;
+    }
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
     let elsewhere = outside_the_home();
@@ -4430,6 +4707,11 @@ fn a_dotdir_that_leads_into_the_project_is_hidden_there_and_said() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_link_inside_a_dotdir_the_jail_never_shows_is_hidden_where_it_leads() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_link_inside_a_dotdir_the_jail_never_shows_is_hidden_where_it_leads")
+    {
+        return;
+    }
     #[cfg(target_os = "linux")]
     require_bwrap();
     for identity in [false, cfg!(target_os = "linux")] {
@@ -4664,6 +4946,12 @@ fn an_identified_jail_never_moves_the_records_folder_away() {
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_a_denied_place_below_a_folder_the_jail_writes_stays_where_the_hosts_link_leads() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here(
+        "on_macos_a_denied_place_below_a_folder_the_jail_writes_stays_where_the_hosts_link_leads",
+    ) {
+        return;
+    }
     for in_project in [true, false] {
         let home = tempfile::TempDir::new().unwrap();
         let h = std::fs::canonicalize(home.path()).unwrap();
@@ -4728,6 +5016,10 @@ fn on_macos_a_denied_place_below_a_folder_the_jail_writes_stays_where_the_hosts_
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_no_folder_above_what_the_jail_denies_moves() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("on_macos_no_folder_above_what_the_jail_denies_moves") {
+        return;
+    }
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
     let project = tempfile::TempDir::new().unwrap();
@@ -4811,6 +5103,12 @@ fn on_macos_no_folder_above_what_the_jail_denies_moves() {
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_the_launcher_makes_a_missing_config_folder_before_the_sandbox() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here(
+        "on_macos_the_launcher_makes_a_missing_config_folder_before_the_sandbox",
+    ) {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
@@ -4902,6 +5200,10 @@ fn on_macos_the_launcher_makes_a_missing_config_folder_before_the_sandbox() {
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_every_folder_the_launcher_makes_is_said() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("on_macos_every_folder_the_launcher_makes_is_said") {
+        return;
+    }
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
     std::fs::create_dir_all(h.join(".config")).unwrap();
@@ -4962,6 +5264,10 @@ fn on_macos_every_folder_the_launcher_makes_is_said() {
 #[cfg(target_os = "macos")]
 #[test]
 fn on_macos_a_folder_kept_in_place_still_reads_as_writable() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("on_macos_a_folder_kept_in_place_still_reads_as_writable") {
+        return;
+    }
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
     std::fs::create_dir_all(h.join(".config")).unwrap();
@@ -5043,6 +5349,10 @@ fn on_macos_a_folder_kept_in_place_still_reads_as_writable() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_worktree_named_onto_where_a_hidden_dotdir_leads_is_left_out() {
+    #[cfg(target_os = "macos")]
+    if !sandbox_starts_here("a_worktree_named_onto_where_a_hidden_dotdir_leads_is_left_out") {
+        return;
+    }
     #[cfg(target_os = "linux")]
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
