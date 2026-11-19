@@ -6174,6 +6174,140 @@ pub(crate) fn line_with_known_paths(source: &str) -> Option<String> {
 /// "$H"; echo '{}' > "$H/settings.json"` writes `~/.claude/settings.json`,
 /// though the line never says `.claude` where it writes. `None` when the
 /// line makes no link or uses none after it.
+/// The command lines `xargs` builds from the words a literal `echo` or
+/// `printf` hands it through a pipe: `echo / | xargs -I X rm -rf X` runs
+/// `rm -rf /`, which the line as written does not show. With a replace
+/// string (`-I R`, `-i`) one line per word, else one line with every
+/// word added. Words the text does not show whole, input from a file
+/// (`-a`) or options this reading does not know build nothing: the line is
+/// judged as written, as before.
+pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
+    use crate::shell_words::read_line;
+    let line = read_line(source);
+    let mut built = Vec::new();
+    for pair in line.commands.windows(2) {
+        let [feeder, runner] = pair else { continue };
+        if !feeder.piped || !feeder.words.iter().all(|word| word.is_plain()) {
+            continue;
+        }
+        let Some(program) = feeder.words.first() else {
+            continue;
+        };
+        let items: Vec<String> = match program.text.rsplit('/').next() {
+            Some("echo") => feeder.words[1..]
+                .iter()
+                .skip_while(|word| matches!(word.text.as_str(), "-n" | "-e" | "-E" | "-ne" | "-en"))
+                .flat_map(|word| {
+                    word.text
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+            Some("printf") => match feeder.words.get(1..) {
+                Some([format, args @ ..]) if !args.is_empty() && format.text.starts_with("%s") => {
+                    args.iter()
+                        .flat_map(|word| {
+                            word.text
+                                .split_whitespace()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .collect()
+                }
+                Some([format]) => format
+                    .text
+                    .replace("\\n", " ")
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if items.is_empty() || !runner.words.iter().all(|word| word.is_plain()) {
+            continue;
+        }
+        let Some(at) = runner
+            .words
+            .iter()
+            .position(|word| matches!(word.text.rsplit('/').next(), Some("xargs" | "gxargs")))
+        else {
+            continue;
+        };
+        let mut replace: Option<String> = None;
+        let mut rest = runner.words[at + 1..].iter().map(|word| word.text.as_str());
+        let mut program_words: Vec<&str> = Vec::new();
+        let mut known = true;
+        while let Some(word) = rest.next() {
+            match word {
+                "-I" | "--replace" => match rest.next() {
+                    Some(value) => replace = Some(value.to_string()),
+                    None => known = false,
+                },
+                "-i" => replace = Some("{}".to_string()),
+                "-0" | "-r" | "-t" | "-x" | "--null" | "--no-run-if-empty" | "--verbose" => {}
+                "-n" | "-P" | "-L" | "-s" | "-d" | "-E" => {
+                    rest.next();
+                }
+                _ if word.starts_with("--replace=") => {
+                    replace = Some(word["--replace=".len()..].to_string());
+                }
+                _ if word.starts_with("-I") => replace = Some(word[2..].to_string()),
+                _ if word.starts_with("-n")
+                    || word.starts_with("-P")
+                    || word.starts_with("-L")
+                    || word.starts_with("-d") => {}
+                _ if word.starts_with('-') => {
+                    known = false;
+                    break;
+                }
+                _ => {
+                    program_words.push(word);
+                    program_words.extend(rest.by_ref());
+                }
+            }
+        }
+        if !known || replace.as_deref() == Some("") {
+            continue;
+        }
+        if program_words.is_empty() {
+            program_words.push("echo");
+        }
+        // An item goes to the program as one word, never through a shell.
+        let quoted = |item: &str| {
+            if item
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_./~@%+=:,-".contains(c))
+            {
+                item.to_string()
+            } else {
+                format!("'{}'", item.replace('\'', "'\\''"))
+            }
+        };
+        match replace {
+            Some(token) => {
+                for item in items.iter().take(64) {
+                    let item = quoted(item);
+                    built.push(
+                        program_words
+                            .iter()
+                            .map(|word| word.replace(&token, &item))
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    );
+                }
+            }
+            None => {
+                let mut words: Vec<String> = program_words.iter().map(|w| w.to_string()).collect();
+                words.extend(items.iter().take(64).map(|item| quoted(item)));
+                built.push(words.join(" "));
+            }
+        }
+    }
+    built
+}
+
 pub(crate) fn line_through_links(source: &str) -> Option<String> {
     if !["ln", "link", "cp"]
         .iter()
@@ -9338,10 +9472,23 @@ fn mask_literal_command_args(
         return;
     };
     let name = normalized_command_name(&name);
-    let in_non_data_pipeline = command
-        .parent()
-        .and_then(nearest_pipeline)
-        .is_some_and(|pipeline| !pipeline_is_data_only(pipeline, source));
+    // A search runs nothing it is given and prints only lines of its input:
+    // what comes before it in a pipeline cannot run its pattern. Its pattern
+    // is code only when a stage after it runs what it prints
+    // (`grep -o ... | sh`). Asked of the whole pipeline, `git diff | grep
+    // -nP '\xe2\x80\x94'` had its pattern read as hex-escaped code.
+    let searches = matches!(name.as_str(), "grep" | "egrep" | "fgrep" | "rg" | "ripgrep");
+    let in_non_data_pipeline =
+        command
+            .parent()
+            .and_then(nearest_pipeline)
+            .is_some_and(|pipeline| {
+                if searches && !inside_a_substitution(pipeline) {
+                    !stages_after_are_data_only(pipeline, command, source)
+                } else {
+                    !pipeline_is_data_only(pipeline, source)
+                }
+            });
     if in_non_data_pipeline
         || has_execution_sink_ancestor(command, source)
         || writes_security_or_execution_sink(command, source)
@@ -10757,6 +10904,39 @@ fn pipeline_is_data_only(pipeline: tree_sitter::Node<'_>, source: &[u8]) -> bool
         && commands
             .into_iter()
             .all(|command| classify_pipeline_command(command, source) == PipelineCommand::DataOnly)
+}
+
+/// Whether `node` is inside a command or process substitution: what it
+/// prints becomes words of another command (`kill $(pgrep -f x | grep
+/// innerwarden)`), so which lines a search keeps picks what that command
+/// acts on.
+fn inside_a_substitution(node: tree_sitter::Node<'_>) -> bool {
+    let mut at = node.parent();
+    while let Some(parent) = at {
+        if matches!(
+            parent.kind(),
+            "command_substitution" | "process_substitution"
+        ) {
+            return true;
+        }
+        at = parent.parent();
+    }
+    false
+}
+
+/// Whether every command of `pipeline` after `command` only handles data
+/// ([`PipelineCommand::DataOnly`]): nothing after it runs what it prints.
+fn stages_after_are_data_only(
+    pipeline: tree_sitter::Node<'_>,
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    let mut commands = Vec::new();
+    collect_commands(pipeline, &mut commands, 0);
+    commands
+        .into_iter()
+        .filter(|later| later.start_byte() >= command.end_byte())
+        .all(|later| classify_pipeline_command(later, source) == PipelineCommand::DataOnly)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

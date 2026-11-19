@@ -3168,8 +3168,11 @@ fn analyze_command_as_read(
         score += s;
     }
 
-    // Removing the record of what happened ends an investigation.
-    if let Some((what, s)) = threats::check_anti_forensics(scan_cmd) {
+    // Removing the record of what happened ends an investigation, and a
+    // rewrite of the guard's kernel maps changes what it refuses.
+    if let Some((what, s)) = threats::check_anti_forensics(scan_cmd)
+        .or_else(|| threats::check_guard_bpf_map_write(scan_cmd))
+    {
         signals.push(AnalysisSignal {
             signal: "anti_forensics".into(),
             score: s,
@@ -3253,7 +3256,9 @@ fn analyze_command_as_read(
 
     // Certificate verification switched off: the precondition for a
     // machine-in-the-middle. Review on its own, deny alongside anything else.
-    if let Some((what, s)) = threats::check_tls_verification_disabled(scan_cmd) {
+    if let Some((what, s)) = threats::check_tls_verification_disabled(scan_cmd)
+        .or_else(|| threats::check_curl_options_file(scan_cmd, cmd))
+    {
         signals.push(AnalysisSignal {
             signal: "tls_verification_disabled".into(),
             score: s,
@@ -3519,6 +3524,10 @@ fn analyze_command_as_read(
                     .into_iter()
                     .collect(),
                 "with the links the line makes followed",
+            ),
+            (
+                crate::shell::lines_xargs_builds(cmd),
+                "in a line xargs builds from the words handed to it",
             ),
         ] {
             lines.retain(|line| seen.insert(line.clone()));

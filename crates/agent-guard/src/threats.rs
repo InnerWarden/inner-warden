@@ -10411,6 +10411,257 @@ pub fn check_cloud_control_plane(content: &str) -> Option<(&'static str, u32)> {
         .map(|(_, what, score)| (*what, *score))
 }
 
+/// The maps the guard's kernel programs keep, by the names its eBPF object
+/// gives them. The kernel keeps 15 characters of a name, so a name cut there
+/// is one of them too.
+const GUARD_BPF_MAPS: &[&str] = &[
+    "ALLOWLIST",
+    "ALLOWLIST_V6",
+    "BLOCKED_PIDS",
+    "BLOCKLIST",
+    "BLOCKLIST_V6",
+    "BPRM_OFFSETS",
+    "CGROUP_ALLOWLIST",
+    "CGROUP_CAPABILITIES",
+    "COMM_ALLOWLIST",
+    "COMM_CAPABILITIES",
+    "EVENTS",
+    "EXCEPTION_LIST",
+    "EXEC_ALLOWLIST",
+    "EXEC_ALLOW",
+    "EXEC_ENV",
+    "EXEC_GATE_SCOPE",
+    "EXEC_PATH_SCRATCH",
+    "EXEC_PENDING",
+    "EXEC_PENDING_BLANK",
+    "EXEC_PROBE_MODE",
+    "EXEC_RAN_RATE_LIMIT",
+    "EXEC_RAN_THREAD",
+    "EXEC_SKIPPED",
+    "EXEC_TRUSTED_PREFIX",
+    "FD_OFFSETS",
+    "INODE_SIZE",
+    "JAIL_ALLOW",
+    "JAIL_ARGV",
+    "JAIL_ARGV_BLANK",
+    "JAIL_ARGV_SCRATCH",
+    "JAIL_CONFIG",
+    "JAIL_DECIDED",
+    "JAIL_FILE_RATE",
+    "JAIL_FILES",
+    "JAIL_GATED",
+    "JAIL_GEN",
+    "JAIL_OFFSETS",
+    "JAIL_SCOPE",
+    "JAIL_SOCK_ALLOW",
+    "JAIL_SOCK_RATE",
+    "JAIL_TAIL",
+    "JAIL_TAKEN",
+    "JUDGE_EVENTS",
+    "LSM_POLICY",
+    "MOUNT_RATE_LIMIT",
+    "PID_CHAIN",
+    "PID_RATE_LIMIT",
+    "PRE_CONNECT_SEEN",
+    "RESOLVER_OFFSETS",
+    "RESOLVER_WATCH",
+    "SCOPED_RATE_LIMIT",
+    "SECRET_READLIST",
+    "SECRET_READ_OFFSETS",
+    "SECRET_READ_SCOPE",
+    "SELF_CGROUP",
+    "TARGET_RATE_LIMIT",
+    "TASK_OFFSETS",
+    "TCP_STATE_LOST",
+    "TCP_STATE_OFFSETS",
+    "TIMING_ENTRY",
+    "UDP_CONNECT_RATE",
+];
+
+/// Where the guard pins its kernel programs, links and maps.
+const GUARD_BPF_PIN_DIR: &str = "/sys/fs/bpf/innerwarden";
+
+/// `word` is `whole`, or a prefix of it of at least `least` characters:
+/// bpftool takes a command cut short (`bpftool m upd`).
+fn bpftool_says(word: &str, whole: &str, least: usize) -> bool {
+    let word = word.to_ascii_lowercase();
+    word.len() >= least.min(whole.len()) && whole.starts_with(&word)
+}
+
+/// A write of a map with bpftool (`update`, `delete`, `push`, `pop`,
+/// `enqueue`, `dequeue`, `freeze`): refused (60) when the map is one of
+/// the guard's, by its pinned path or its name, since a rewrite changes what
+/// the guard's kernel programs allow or refuse; held for review (25) when it
+/// is named by a number, or a word the text does not show, whose owner the
+/// text cannot tell. Reading a map changes nothing. Detaching a program or a
+/// link is [`check_anti_forensics`]'s, whatever names it.
+pub fn check_guard_bpf_map_write(content: &str) -> Option<(&'static str, u32)> {
+    if !content.to_ascii_lowercase().contains("bpftool") {
+        return None;
+    }
+    const WRITES: [&str; 7] = [
+        "update", "delete", "push", "pop", "enqueue", "dequeue", "freeze",
+    ];
+    let line = crate::shell_words::read_line(content);
+    let mut held = None;
+    for command in &line.commands {
+        let words = &command.words;
+        let Some(at) = words.iter().position(|word| {
+            word.text
+                .rsplit('/')
+                .next()
+                .is_some_and(|name| name == "bpftool")
+        }) else {
+            continue;
+        };
+        let rest: Vec<&crate::shell_words::Word> = words[at + 1..]
+            .iter()
+            .filter(|word| !word.text.starts_with('-'))
+            .collect();
+        let [object, verb, spec @ ..] = rest.as_slice() else {
+            continue;
+        };
+        if !bpftool_says(&object.text, "map", 1)
+            || !WRITES
+                .iter()
+                .any(|whole| bpftool_says(&verb.text, whole, 2))
+        {
+            continue;
+        }
+        let (kind, value) = match spec {
+            [kind, value, ..] => (*kind, *value),
+            _ => {
+                held = Some(("rewrites an eBPF map the text does not name; it may be one the guard's kernel programs read", 25));
+                continue;
+            }
+        };
+        let path = value.text.trim_end_matches('/');
+        let ours = kind.is_plain()
+            && value.is_plain()
+            && ((bpftool_says(&kind.text, "pinned", 1)
+                && (path == GUARD_BPF_PIN_DIR
+                    || path.starts_with(&format!("{GUARD_BPF_PIN_DIR}/"))))
+                || (bpftool_says(&kind.text, "name", 1)
+                    && GUARD_BPF_MAPS.iter().any(|name| {
+                        let name_cut = &name[..name.len().min(15)];
+                        value.text.eq_ignore_ascii_case(name)
+                            || value.text.eq_ignore_ascii_case(name_cut)
+                    })));
+        if ours {
+            return Some((
+                "rewrites a map the guard's kernel programs read, which changes what they allow or refuse",
+                60,
+            ));
+        }
+        let unknown_owner =
+            !kind.is_plain() || !value.is_plain() || bpftool_says(&kind.text, "id", 1);
+        if unknown_owner {
+            held = Some(("rewrites an eBPF map named by a number or a value the text does not show, which may be one the guard's kernel programs read", 25));
+        }
+    }
+    held
+}
+
+/// `curl -K FILE` or `--config FILE`: the options are read from a file.
+/// The guard does not read files, so one it does not see may hold
+/// `insecure` (or `-k`) and turn certificate checks off: held for review
+/// (25) with that said. When the options come on standard input from the
+/// line itself (`-K -` with a here-document or a here-string) they are
+/// seen: with `insecure`, `-k` or another options file among them they are
+/// held the same; without, nothing is said.
+pub fn check_curl_options_file(scan: &str, raw: &str) -> Option<(&'static str, u32)> {
+    const UNREAD: &str = "curl options file not read; it may turn TLS checks off";
+    if !(scan.contains("curl") && (scan.contains('K') || scan.contains("--config"))) {
+        return None;
+    }
+    let value_of = |words: &[crate::shell_words::Word]| -> Option<Option<String>> {
+        // Some(Some(value)): a value as written; Some(None): one not shown.
+        let mut found = None;
+        let mut iter = words.iter().peekable();
+        while let Some(word) = iter.next() {
+            let text = word.text.as_str();
+            let value = if text == "--config" {
+                Some(iter.peek().map(|next| (next.is_plain(), next.text.clone())))
+            } else if let Some(rest) = text.strip_prefix("--config=") {
+                Some(Some((word.is_plain(), rest.to_string())))
+            } else if text.starts_with('-') && !text.starts_with("--") {
+                let group = &text[1..];
+                group
+                    .find('K')
+                    .filter(|&k| {
+                        group[..k]
+                            .chars()
+                            .all(|c| "sSLfvIiNqgjlnOpRVZ0123456789#:k".contains(c))
+                    })
+                    .map(|k| {
+                        let attached = &group[k + 1..];
+                        if attached.is_empty() {
+                            iter.peek().map(|next| (next.is_plain(), next.text.clone()))
+                        } else {
+                            Some((word.is_plain(), attached.to_string()))
+                        }
+                    })
+            } else {
+                None
+            };
+            if let Some(value) = value {
+                found = Some(value.filter(|(plain, _)| *plain).map(|(_, text)| text));
+                break;
+            }
+        }
+        found
+    };
+    let scanned = crate::shell_words::read_line(scan);
+    let mut stdin_curls = 0usize;
+    for command in &scanned.commands {
+        if !command
+            .words
+            .iter()
+            .any(|word| word.text.rsplit('/').next() == Some("curl"))
+        {
+            continue;
+        }
+        match value_of(&command.words) {
+            None => continue,
+            Some(Some(value)) if value == "-" || value == "/dev/stdin" => stdin_curls += 1,
+            Some(_) => return Some((UNREAD, 25)),
+        }
+    }
+    if stdin_curls == 0 {
+        return None;
+    }
+    // The options on standard input, read from the line as written: the
+    // projection blanks a here-document's body.
+    static INSECURE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let insecure = INSECURE.get_or_init(|| {
+        regex::Regex::new(r"(?mi)^\s*(?:-k\b|-{0,2}(?:proxy-)?insecure\b|-K\b|-{0,2}config\b)")
+            .expect("static curl options regex")
+    });
+    let read = crate::shell_words::read_line(raw);
+    let mut seen = 0usize;
+    for command in &read.commands {
+        let is_curl = command
+            .words
+            .iter()
+            .any(|word| word.text.rsplit('/').next() == Some("curl"));
+        if !is_curl
+            || !matches!(value_of(&command.words), Some(Some(ref v)) if v == "-" || v == "/dev/stdin")
+        {
+            continue;
+        }
+        if command.inputs.is_empty() {
+            return Some((UNREAD, 25));
+        }
+        for body in &command.inputs {
+            if body.contains(['$', '`']) || insecure.is_match(body) {
+                return Some((UNREAD, 25));
+            }
+        }
+        seen += 1;
+    }
+    (seen < stdin_curls).then_some((UNREAD, 25))
+}
+
 /// Certificate verification switched off.
 ///
 /// Every one of these went through the same red team's corpus unremarked at
@@ -10430,6 +10681,8 @@ pub fn check_tls_verification_disabled(content: &str) -> Option<(&'static str, u
             "trusted-host",
             "no-check-certificate",
             "-k ",
+            // A group of short options (`curl -sk`): the regex reads it.
+            "curl",
             "--insecure",
             "sslverify",
             "strict-ssl",
@@ -10461,8 +10714,12 @@ pub fn check_tls_verification_disabled(content: &str) -> Option<(&'static str, u
                 r"(?i)\bwget\b[^|;&]*--no-check-certificate\b",
                 "wget certificate verification disabled",
             ),
+            // `-k` alone or among other short options (`-sk`, `-kL`), as
+            // written: curl's `-K` reads options from a file and checks
+            // certificates as before. Only options that take no value stand
+            // before it in a group, so `-o k.txt`-like values are not read.
             (
-                r"(?i)\bcurl\b[^|;&]*(?:\s-k\b|--insecure\b)",
+                r"\bcurl\b[^|;&]*(?:\s-[sSLfvIiNqgjlnOpRVZ0-9#:]*k[a-zA-Z0-9#:]*(?:\s|$)|(?i:--insecure\b))",
                 "curl certificate verification disabled",
             ),
             (
@@ -11141,6 +11398,7 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
                   [\w.-]+ \s+ (?:completion|completions) (?:[\t\x20]+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
                 | (?:direnv|starship|zoxide|mise|rbenv|pyenv|nodenv|jenv|fnm|atuin|navi|keychain)
                     \s+ (?:hook|init|env|activate|init-file) (?:[\t\x20]+[\w.-]+)?   # direnv hook bash
+                | direnv \s+ export [\t\x20]+ [\w.-]+                     # direnv export bash: what its hook runs
                 | ssh-agent (?:[\t\x20]+-s)?                                  # ssh-agent -s
                 | gpg-agent [^)`'";&|\n]*
                 | brew \s+ shellenv
