@@ -379,6 +379,25 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              --operator   your own script, run with no terminal\n  \
              Printing this help writes nothing."
         ),
+        "mcp" => format!(
+            "{p} mcp [list]\n\
+             {p} mcp approve <server> <tool>\n\
+             {p} mcp approve <server> --all\n\
+             {p} mcp forget <server>\n\
+             \n  \
+             The proxy pins each MCP tool's definition (name, title, description, input\n  \
+             and output schema, annotations) the first time a server lists it. A tool\n  \
+             whose definition changes later is reported field by field and, in guard\n  \
+             and kill mode, held: left out of the tool list and refused when called.\n  \
+             list      the servers pinned, and the tools held with what changed\n  \
+             approve   accept the changed definition of one tool (or --all of them)\n  \
+             forget    drop a server's pins after you reinstalled it on purpose\n  \
+             A server is named by the id `list` prints, or its command line.\n  \
+             approve and forget need a terminal, and the guard refuses an agent that\n  \
+             runs them.\n  \
+             --operator   your own script, run with no terminal\n  \
+             Printing this help writes nothing."
+        ),
         "mute" => format!(
             "{p} mute [--operator] <ATR-rule-id|category>\n\
              {p} mute --list\n\
@@ -1176,5 +1195,6 @@ mod tests {
         "graph",
         "llm",
         "host",
+        "mcp",
     ];
 }

@@ -13,8 +13,9 @@ use std::io::Read;
 use std::sync::Arc;
 
 use innerwarden_agent_guard::mcp_proxy::enforce::ProxyMode;
+use innerwarden_agent_guard::mcp_proxy::pins::PinSession;
 use innerwarden_agent_guard::mcp_proxy::router::ProxyDecision;
-use innerwarden_agent_guard::mcp_proxy::transport::{run_proxy_with_profile, ProxyConfig};
+use innerwarden_agent_guard::mcp_proxy::transport::{run_proxy_pinned, ProxyConfig};
 use innerwarden_agent_guard::render::{is_deny, render_verdict};
 use innerwarden_agent_guard::{hook, mcp::analyze_command, rules::RuleEngine};
 
@@ -42,6 +43,7 @@ mod hook_net;
 mod host_decide;
 mod host_decide_io;
 mod http_io;
+mod mcp_pins_io;
 mod notify_io;
 mod observe;
 mod observe_io;
@@ -450,6 +452,7 @@ fn main() -> std::process::ExitCode {
         Some("check") => cmd_check(&args[1..]),
         Some("serve") => cmd_serve(&args[1..]),
         Some("proxy") => cmd_proxy(&args[1..]),
+        Some("mcp") => mcp_pins_io::cmd(&args[1..]),
         Some("hook") => cmd_hook(&args[1..]),
         // The four verbs both layers implement run HERE, and say so when the
         // host layer also has one, so its version is discoverable instead of
@@ -2925,6 +2928,19 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
         "innerwarden: proxy mode={mode_label} label={label} rules={} server={server_cmd:?}",
         engine.rule_count()
     );
+    // The server's tool definitions are pinned on first sight, so a tool that
+    // changes later is caught (and held in guard and kill mode) until the
+    // person approves it with `innerwarden mcp approve`.
+    let pins = PinSession::new(
+        innerwarden_agent_guard::mcp_proxy::pins::default_path(),
+        &server_cmd,
+    );
+    if let Some(why) = pins.unreadable() {
+        eprintln!(
+            "innerwarden proxy: the MCP tool pins cannot be used ({why}); this session pins in \
+             memory only and the file is left as it is"
+        );
+    }
     let cfg = ProxyConfig {
         server_cmd,
         mode,
@@ -3003,7 +3019,13 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
             let _ = tx.try_send(body);
         }
     };
-    let result = rt.block_on(run_proxy_with_profile(cfg, Some(engine), profile, on_event));
+    let result = rt.block_on(run_proxy_pinned(
+        cfg,
+        Some(engine),
+        profile,
+        Some(pins),
+        on_event,
+    ));
     // The server is stopped and reaped by now. Dropping the runtime normally
     // would wait for its blocking tasks, and the read on our stdin is one that
     // cannot be cancelled: a proxy told to stop while its client was still
@@ -3064,6 +3086,8 @@ fn help_text() -> String {
            \x20                                PreToolUse adapter (reads the tool call on stdin)\n  \
            {p} allow \"<glob>\" | mute <ATR-rule|category>\n  \
            \x20                                stop the guard bugging you about a trusted command / rule\n  \
+           {p} mcp [list|approve <server> <tool>|forget <server>]\n  \
+           \x20                                MCP tools whose definition changed since the proxy pinned it\n  \
            {p} notify [flags]            configure Telegram/Slack/Discord/webhook alerts\n  \
            {p} graph [--json|--stats|--clear]\n  \
            \x20                                local narrative of screened actions, verdicts, and outcomes\n  \

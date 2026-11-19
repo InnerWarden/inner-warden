@@ -13,6 +13,9 @@ description = "AI agent protection module for InnerWarden — detect AI agents, 
 innerwarden-safe-io = { path = "../safe-io" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The proxy's own hash of each MCP tool definition it pins (`mcp_proxy::pins`).
+# Already in the tree through the CLI; same version.
+sha2 = "0.11"
 # Format-preserving TOML editing for Codex's ~/.codex/config.toml [mcp_servers.*]
 # (wrap each MCP server through the guard proxy without wrecking the user's file).
 toml_edit = "0.25"

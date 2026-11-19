@@ -78,6 +78,7 @@ use super::enforce::{apply_layers, ProxyAction, ProxyMode};
 use super::jsonrpc::{
     envelope_of, has_duplicate_keys, parse_line, parse_value, JsonRpcEnvelope, ParsedLine,
 };
+use super::pins::PinSession;
 use super::router::{route_message, Direction, PendingRequest, ProxyDecision};
 use super::taint::TaintTracker;
 use crate::profiles::ProxyProfile;
@@ -983,6 +984,114 @@ fn withhold_poisoned_descriptions(raw: &str, events: &mut [ProxyDecision]) -> Op
     }
 }
 
+/// The tool listings with a tool whose definition changed since it was pinned
+/// ([`super::pins`]): in a mode that blocks, each changed tool is taken out of
+/// the answer it came in (`holds`: the answer's id and the tools), so the
+/// client never lists it; a call to it is refused by the router until the
+/// person approves it. In a mode that never blocks the line goes on as it
+/// came, and the findings say so. `None` when nothing was rewritten.
+///
+/// Fails closed: a line the rewrite cannot read, or an answer it cannot find,
+/// is replaced by an error keyed to the answer's id.
+fn withhold_changed_tools(
+    raw: &str,
+    holds: &[(Value, Vec<String>)],
+    events: &mut [ProxyDecision],
+    blocks: bool,
+) -> Option<String> {
+    if holds.is_empty() {
+        return None;
+    }
+    let note = |events: &mut [ProxyDecision], id: &Value, text: &str| {
+        for d in events
+            .iter_mut()
+            .filter(|d| d.request_id.as_ref() == Some(id))
+        {
+            for alert in d
+                .verdict
+                .alerts
+                .iter_mut()
+                .filter(|a| a.rule == super::pins::TOOL_CHANGED_RULE)
+            {
+                alert.detail.push_str(text);
+            }
+            if !blocks
+                && d.verdict
+                    .alerts
+                    .iter()
+                    .all(|a| !a.block || a.rule == super::pins::TOOL_CHANGED_RULE)
+            {
+                d.verdict.allowed = true;
+            }
+        }
+    };
+    if !blocks {
+        for (id, _) in holds {
+            note(
+                events,
+                id,
+                "; forwarded to the client unchanged: this mode does not block",
+            );
+        }
+        return None;
+    }
+    let refused = |id: &Value| {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": -32603, "message": WITHHELD_CHANGED_TOOLS_MESSAGE},
+        })
+        .to_string()
+    };
+    let Ok(mut value) = parse_value(raw) else {
+        let (id, _) = &holds[0];
+        note(events, id, "; the line was refused");
+        return Some(refused(id));
+    };
+    for (id, names) in holds {
+        let messages: Vec<&mut Value> = match &mut value {
+            Value::Array(items) => items.iter_mut().collect(),
+            single => vec![single],
+        };
+        let mut matched = false;
+        for message in messages {
+            let answers = envelope_of(message)
+                .is_some_and(|env| env.method.is_none() && env.id.as_ref() == Some(id));
+            if !answers {
+                continue;
+            }
+            let Some(tools) = message
+                .get_mut("result")
+                .and_then(|r| r.get_mut("tools"))
+                .and_then(Value::as_array_mut)
+            else {
+                continue;
+            };
+            matched = true;
+            tools.retain(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_none_or(|name| !names.iter().any(|held| held == name))
+            });
+        }
+        if !matched {
+            note(events, id, "; the line was refused");
+            return Some(refused(id));
+        }
+        note(
+            events,
+            id,
+            "; held from the client until the person approves it",
+        );
+    }
+    Some(value.to_string())
+}
+
+/// The error sent in place of a tool listing whose changed tools could not be
+/// taken out of it.
+const WITHHELD_CHANGED_TOOLS_MESSAGE: &str =
+    "InnerWarden withheld this answer: a tool in it changed its definition and could not be held on its own";
+
 /// In a mode that never blocks, a server line with orders for the model goes
 /// to the client as it came. Its findings say so: each AG-DESC-POISON alert
 /// notes that the text was forwarded unchanged, and a decision whose only
@@ -1182,15 +1291,33 @@ pub async fn run_proxy_with_profile<F>(
 where
     F: Fn(&ProxyDecision),
 {
+    run_proxy_pinned(cfg, engine, profile, None, on_event).await
+}
+
+/// [`run_proxy_with_profile`] that also keeps the server's tool definitions
+/// pinned ([`super::pins`]): a tool whose definition changed since it was
+/// first heard is reported, and held in a mode that blocks, until the person
+/// approves it. `None` is [`run_proxy_with_profile`] exactly.
+pub async fn run_proxy_pinned<F>(
+    cfg: ProxyConfig,
+    engine: Option<Arc<RuleEngine>>,
+    profile: Option<ProxyProfile>,
+    pins: Option<PinSession>,
+    on_event: F,
+) -> std::io::Result<i32>
+where
+    F: Fn(&ProxyDecision),
+{
     // Registered before the server is spawned, so a stop request that arrives
     // while it starts is not lost.
     let stop = stop_requested();
-    run_proxy_until(
+    run_proxy_until_pinned(
         tokio::io::stdin(),
         tokio::io::stdout(),
         cfg,
         engine,
         profile,
+        pins,
         on_event,
         stop,
     )
@@ -1215,12 +1342,31 @@ where
     W: AsyncWrite + Unpin,
     F: Fn(&ProxyDecision),
 {
-    run_proxy_until(
+    run_proxy_with_io_pinned(client_in, client_out, cfg, engine, None, on_event).await
+}
+
+/// [`run_proxy_with_io`] with the server's tool definitions pinned
+/// ([`run_proxy_pinned`]).
+pub async fn run_proxy_with_io_pinned<R, W, F>(
+    client_in: R,
+    client_out: W,
+    cfg: ProxyConfig,
+    engine: Option<Arc<RuleEngine>>,
+    pins: Option<PinSession>,
+    on_event: F,
+) -> std::io::Result<i32>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: Fn(&ProxyDecision),
+{
+    run_proxy_until_pinned(
         client_in,
         client_out,
         cfg,
         engine,
         None,
+        pins,
         on_event,
         std::future::pending(),
     )
@@ -1229,12 +1375,39 @@ where
 
 /// The proxy loop. `stop` resolving ends the session as a stop request does:
 /// the server is stopped and reaped, then this returns.
+#[cfg(test)]
 async fn run_proxy_until<R, W, F, S>(
+    client_in: R,
+    client_out: W,
+    cfg: ProxyConfig,
+    engine: Option<Arc<RuleEngine>>,
+    profile: Option<ProxyProfile>,
+    on_event: F,
+    stop: S,
+) -> std::io::Result<i32>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: Fn(&ProxyDecision),
+    S: Future<Output = ()>,
+{
+    run_proxy_until_pinned(
+        client_in, client_out, cfg, engine, profile, None, on_event, stop,
+    )
+    .await
+}
+
+/// The proxy loop, with the server's tool definitions pinned when `pins` is
+/// set ([`super::pins`]). `stop` resolving ends the session as a stop
+/// request does: the server is stopped and reaped, then this returns.
+#[allow(clippy::too_many_arguments)]
+async fn run_proxy_until_pinned<R, W, F, S>(
     client_in: R,
     mut client_out: W,
     cfg: ProxyConfig,
     engine: Option<Arc<RuleEngine>>,
     profile: Option<ProxyProfile>,
+    pins: Option<PinSession>,
     on_event: F,
     stop: S,
 ) -> std::io::Result<i32>
@@ -1269,6 +1442,9 @@ where
     // Per-connection session state for confused-deputy detection: tool results
     // record their long tokens; a later call reusing one is escalated.
     let mut taint = TaintTracker::new();
+    if let Some(pins) = pins {
+        taint = taint.with_pins(pins);
+    }
     // Loop breaker for this session (see classify_client_line), on a monotonic
     // clock that starts with the proxy.
     let mut breaker = crate::breaker::Breaker::new(crate::breaker::BreakerConfig::default());
@@ -1354,7 +1530,17 @@ where
                         let action = classify_server_line_in(
                             &line, cfg.mode, engine, &mut map, &mut taint,
                         );
-                        let (out, events) = server_output(action, cfg.mode.blocks());
+                        let (out, mut events) = server_output(action, cfg.mode.blocks());
+                        // A tool whose definition changed since it was
+                        // pinned is held out of the listing (`super::pins`).
+                        let holds = taint.take_pin_holds();
+                        let out = match out {
+                            Some(raw) => Some(
+                                withhold_changed_tools(&raw, &holds, &mut events, cfg.mode.blocks())
+                                    .unwrap_or(raw),
+                            ),
+                            None => None,
+                        };
                         if let Some(raw) = out {
                             if let Err(e) = write_line(&mut client_out, &raw).await {
                                 break Err(e);

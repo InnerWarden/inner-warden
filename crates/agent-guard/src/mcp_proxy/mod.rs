@@ -20,6 +20,7 @@
 pub mod content;
 pub mod enforce;
 pub mod jsonrpc;
+pub mod pins;
 pub mod router;
 pub mod taint;
 pub mod transport;
