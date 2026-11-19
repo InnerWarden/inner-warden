@@ -235,14 +235,23 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         }
         "contain" => format!(
             "{p} contain [--monitor|--enforce|--block-review] [--project DIR]\n  \
-             \x20              [--deny-read GLOB] [--dry-run] [--setup] [--identity]\n  \
+             \x20              [--deny-read GLOB] [--pass-env NAME] [--dry-run] [--setup]\n  \
+             \x20              [--identity]\n  \
              \x20              -- <command...>\n  \
              Run <command> inside a filesystem/namespace JAIL with the guard hook armed\n  \
-             INSIDE it (Linux bwrap, macOS sandbox-exec). Your API key and the project's\n  \
-             secrets stay outside what the jailed command can read.\n\
+             INSIDE it (Linux bwrap, macOS sandbox-exec). InnerWarden's own folder (its\n  \
+             API key with it) and the project's secrets are not shown to the jailed\n  \
+             command. Variables you exported are taken out of its environment by the\n  \
+             pattern of their NAME: OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN and\n  \
+             other names ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD and the like;\n  \
+             contain names the ones it took out. A secret under any other name (a\n  \
+             DATABASE_URL holding a password, STRIPE_SK) still reaches the jail: unset\n  \
+             it before the launch.\n\
              \n  \
              --project DIR     the directory the jailed command may write (default: cwd)\n  \
              --deny-read GLOB  one more path the jail must not expose\n  \
+             --pass-env NAME   hand one credential variable to the jailed command (repeat\n  \
+             \x20                 for more), for an agent that needs its own key\n  \
              --dry-run         print the jail that would be built and run nothing\n  \
              --setup           arm the in-jail hook only\n  \
              --identity        (Linux) record the run as an identified instance\n\
@@ -648,6 +657,26 @@ mod tests {
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
         }
+    }
+
+    /// The contain help says the jail takes exported credential variables out
+    /// and how to hand one in, never that the key stays outside.
+    #[test]
+    fn the_contain_help_says_which_keys_stay_out_and_how_to_pass_one() {
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let help = flat(&usage("contain", &[]).expect("contain has usage"));
+        for said in [
+            "Variables you exported are taken out of its environment by the pattern of their NAME: OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN",
+            "contain names the ones it took out.",
+            "A secret under any other name (a DATABASE_URL holding a password, STRIPE_SK) still reaches the jail",
+            "--pass-env NAME hand one credential variable to the jailed command",
+        ] {
+            assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
+        }
+        assert!(
+            !help.contains("Your API key and the project's secrets stay outside"),
+            "{help}"
+        );
     }
 
     /// The contain help and the README say where an identified jail keeps

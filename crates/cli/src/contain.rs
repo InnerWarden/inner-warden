@@ -15,11 +15,12 @@
 //!     uses the rules embedded in the binary (`RuleEngine::load_embedded`).
 //!   * The key is NEVER passed via env (the agent shares the hook's environment).
 //!     In-jail LLM/notify enrichment is simply disabled; a `deny` still denies.
-//!   * v1 INHERITS the host environment (like a normal shell), so credential env
-//!     vars already exported (`OPENAI_API_KEY`, `AWS_*`, ...) are visible in-jail -
-//!     the agent needs its own key to run, so a blanket scrub would break it. An
-//!     opt-in env allowlist is v2. (The InnerWarden key is not one of these: it is
-//!     read from the shadowed `~/.config/innerwarden`, never the environment.)
+//!   * The jail INHERITS the host environment (like a normal shell) except the
+//!     credential variables (`credential_vars`: `OPENAI_API_KEY`,
+//!     `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, ...), which the launcher takes
+//!     out; `--pass-env NAME` hands one in, for an agent that needs its own key.
+//!     (The InnerWarden key is not one of these: it is read from the shadowed
+//!     `~/.config/innerwarden`, never the environment.)
 //!   * `.ssh` / `.aws` / `.gnupg` (and macOS Mail/Messages/Safari) are never
 //!     exposed. Deny rules are emitted LAST (last-wins on both backends).
 //!   * The backend binary is resolved from trusted absolute paths by the I/O
@@ -101,6 +102,10 @@ pub struct ContainArgs {
     /// Paths under the home a jail profile hides (`hide_home`), joined to the
     /// home. Empty without one.
     pub hide_home: Vec<PathBuf>,
+    /// `--pass-env NAME`: credential variables the person hands to the jail's
+    /// command by name. Every other one [`credential_vars`] finds in the
+    /// launcher's environment is taken out of the jail's.
+    pub pass_env: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -142,6 +147,7 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
     let mut setup_only = false;
     let mut identity = false;
     let mut deny_read: Vec<String> = DEFAULT_DENY_READ.iter().map(|s| s.to_string()).collect();
+    let mut pass_env: Vec<String> = Vec::new();
     let extra_rw: Vec<PathBuf> = Vec::new();
     let extra_ro: Vec<PathBuf> = Vec::new();
 
@@ -175,6 +181,17 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
                     deny_read.push(g.clone());
                 }
             }
+            "--pass-env" => match it.next() {
+                Some(name) if !name.is_empty() && !name.contains('=') => {
+                    pass_env.push(name.clone())
+                }
+                _ => {
+                    return Err(ContainError::Unsupported(
+                        "--pass-env takes the name of one variable, e.g. `--pass-env ANTHROPIC_API_KEY`"
+                            .into(),
+                    ))
+                }
+            },
             "--dry-run" => dry_run = true,
             "--setup" => setup_only = true,
             innerwarden_agent_guard::identity::IDENTITY_FLAG => identity = true,
@@ -215,7 +232,74 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
         identity,
         start: innerwarden_agent_guard::profiles::JailStart::Always,
         hide_home: Vec::new(),
+        pass_env,
     })
+}
+
+/// The endings of a variable's name that say it holds a credential: an API
+/// key, a token, a secret, a password, a private key, a cloud access key.
+/// Read upper-cased. Checked against the names the providers document for
+/// their keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+/// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
+/// `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`, `HF_TOKEN`,
+/// `AZURE_CLIENT_SECRET`, `CLAUDE_CODE_OAUTH_TOKEN`,
+/// `GOOGLE_APPLICATION_CREDENTIALS`, `DOCKER_PASSWORD`, `VAULT_TOKEN`) in
+/// [`tests::credential_variables_are_found_by_name_and_a_passed_one_is_kept`].
+pub const CREDENTIAL_ENDINGS: &[&str] = &[
+    "_API_KEY",
+    "_APIKEY",
+    "_TOKEN",
+    "_SECRET",
+    "_SECRET_KEY",
+    "_ACCESS_KEY",
+    "_ACCESS_KEY_ID",
+    "_PASSWORD",
+    "_PASSWD",
+    "_PRIVATE_KEY",
+    "_CREDENTIALS",
+];
+
+/// Credential variables whose name has none of [`CREDENTIAL_ENDINGS`].
+pub const CREDENTIAL_NAMES: &[&str] = &["PGPASSWORD", "MYSQL_PWD", "REDISCLI_AUTH"];
+
+/// PURE. The names in `names` (the launcher's environment) that hold a
+/// credential and were not passed by name with `--pass-env`, sorted. The
+/// jail's command starts without them: an agent in a jail used to get every
+/// key the person had exported, while the help said the key stayed outside.
+pub fn credential_vars<I>(names: I, pass: &[String]) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut out: Vec<std::ffi::OsString> = names
+        .into_iter()
+        .filter(|name| {
+            let upper = name.as_encoded_bytes().to_ascii_uppercase();
+            let credential = CREDENTIAL_NAMES.iter().any(|n| upper == n.as_bytes())
+                || CREDENTIAL_ENDINGS
+                    .iter()
+                    .any(|end| upper.len() > end.len() && upper.ends_with(end.as_bytes()));
+            credential && !pass.iter().any(|kept| name.as_os_str() == kept.as_str())
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// What the launcher says of the credential variables it kept out of the
+/// jail's environment; `None` when there were none.
+pub fn credentials_said(kept_out: &[std::ffi::OsString]) -> Option<String> {
+    if kept_out.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = kept_out
+        .iter()
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    Some(format!(
+        "  credential variables kept out of the jail's environment: {} (pass one in with --pass-env NAME).",
+        names.join(", ")
+    ))
 }
 
 /// Which of the jail settings a profile also sets were given on the command
@@ -235,7 +319,7 @@ pub fn jail_flags_given(argv: &[String]) -> JailFlagsGiven {
             "--" => break,
             "--project" => given.project = true,
             // Flags that take a value: skip it, it is not a flag.
-            "--agent" | "--deny-read" => {
+            "--agent" | "--deny-read" | "--pass-env" => {
                 it.next();
             }
             other if !other.starts_with('-') => break,
@@ -5467,6 +5551,7 @@ mod tests {
             identity: false,
             start: innerwarden_agent_guard::profiles::JailStart::Always,
             hide_home: vec![],
+            pass_env: vec![],
         }
     }
 
@@ -8374,6 +8459,93 @@ mod tests {
         // no PATH and no loader variable: nothing to hand back
         let bare = launch_env([(OsString::from("HOME"), OsString::from("/h"))]);
         assert_eq!(bare, LaunchEnv::default());
+    }
+
+    /// The credential variables are found by name, whatever their case, a
+    /// name that only ends like one is not cut short (`_TOKEN` alone is no
+    /// credential name), and `--pass-env` keeps one by its exact name.
+    ///
+    /// FAILS ON REVERT: let `credential_vars` find nothing, and the
+    /// provider names below stay in the jail.
+    #[test]
+    fn credential_variables_are_found_by_name_and_a_passed_one_is_kept() {
+        use std::ffi::OsString;
+        let credentials = [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+            "NPM_TOKEN",
+            "HF_TOKEN",
+            "AZURE_CLIENT_SECRET",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "DOCKER_PASSWORD",
+            "VAULT_TOKEN",
+            "PGPASSWORD",
+            "MYSQL_PWD",
+            "my_service_api_key",
+        ];
+        let ordinary = [
+            "PATH",
+            "HOME",
+            "TERM",
+            "LANG",
+            "SHELL",
+            "USER",
+            "EDITOR",
+            "_TOKEN",
+            "TOKENIZERS",
+            "SSH_TTY",
+            "IW_GRAPH_FILE",
+            "KEYMAP",
+        ];
+        let names = || {
+            credentials
+                .iter()
+                .chain(ordinary.iter())
+                .map(|name| OsString::from(*name))
+        };
+        let mut want: Vec<OsString> = credentials.iter().map(OsString::from).collect();
+        want.sort();
+        assert_eq!(credential_vars(names(), &[]), want);
+        let kept = credential_vars(names(), &["ANTHROPIC_API_KEY".into()]);
+        assert!(!kept.contains(&OsString::from("ANTHROPIC_API_KEY")));
+        assert_eq!(kept.len(), credentials.len() - 1);
+        // Passing a name keeps that name only, not another case of it.
+        assert!(credential_vars(names(), &["openai_api_key".into()])
+            .contains(&OsString::from("OPENAI_API_KEY")));
+        let said = credentials_said(&kept).expect("said");
+        assert!(said.contains("OPENAI_API_KEY") && said.contains("--pass-env NAME"));
+        assert_eq!(credentials_said(&[]), None);
+    }
+
+    /// `--pass-env NAME` is read, more than once, and never as the start
+    /// of the command; a missing name is refused.
+    #[test]
+    fn pass_env_takes_one_name_each_time() {
+        let parsed = parse_contain_args(&argv(&[
+            "--pass-env",
+            "ANTHROPIC_API_KEY",
+            "--pass-env",
+            "GH_TOKEN",
+            "--",
+            "claude",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.pass_env, ["ANTHROPIC_API_KEY", "GH_TOKEN"]);
+        assert_eq!(parsed.child, ["claude"]);
+        for bad in [&["--pass-env"][..], &["--pass-env", "A=b", "--", "x"]] {
+            assert!(matches!(
+                parse_contain_args(&argv(bad)),
+                Err(ContainError::Unsupported(ref m)) if m.contains("--pass-env")
+            ));
+        }
+        assert!(!jail_flags_given(&argv(&["--pass-env", "--project", "--", "x"])).project);
     }
 
     /// With `--identity` a writable bind may not bring the host's `/run` (the

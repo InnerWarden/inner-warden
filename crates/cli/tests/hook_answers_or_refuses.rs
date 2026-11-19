@@ -101,6 +101,60 @@ fn a_hook_whose_caller_never_closes_stdin_refuses_the_call() {
     }
 }
 
+/// A tool call longer than the 1 MiB the hook reads is not read and is never
+/// let through quietly: refused in enforce (2), said to have gone unscreened
+/// in monitor (1). One just under the cap is answered as any other. The
+/// caller keeps sending past the cap; the hook does not wait for the end.
+///
+/// FAILS ON REVERT: with stdin read whole, the long call is judged as `ls`
+/// and allowed (0).
+#[test]
+fn a_tool_call_past_the_cap_is_not_read_and_not_allowed() {
+    const CAP: usize = 1024 * 1024;
+    let payload = |len: usize| {
+        let bare =
+            serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "ls", "pad": ""}})
+                .to_string();
+        let pad = "a".repeat(len - bare.len());
+        serde_json::json!({"tool_name": "Bash", "tool_input": {"command": "ls", "pad": pad}})
+            .to_string()
+    };
+    let run = |flags: &[&str], body: String| {
+        let host = Host::new();
+        let mut child = host.hook(flags).spawn().expect("run innerwarden hook");
+        let mut stdin = child.stdin.take().expect("stdin");
+        // Its own thread: a hook that stops reading at the cap leaves this
+        // write with nowhere to go, and it then fails, which is fine.
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(body.as_bytes());
+        });
+        let out = ended(child, "long call");
+        let _ = writer.join();
+        out
+    };
+    assert_eq!(payload(CAP).len(), CAP);
+    let (code, said) = run(&[], payload(CAP));
+    assert_eq!(code, Some(0), "just at the cap: {said}");
+    for (flags, expected, says) in [
+        (
+            &[][..],
+            2,
+            "refusing it rather than letting it run unscreened",
+        ),
+        (&["--monitor"][..], 1, "it was NOT screened"),
+    ] {
+        for len in [CAP + 1, 4 * CAP] {
+            let (code, said) = run(flags, payload(len));
+            assert_eq!(code, Some(expected), "{flags:?} {len}: {said}");
+            assert!(
+                said.contains("longer than the 1 MiB the hook reads"),
+                "{said}"
+            );
+            assert!(said.contains(says), "{flags:?}: {said}");
+        }
+    }
+}
+
 /// With the net armed, a call the hook reads in time gets the answer it got
 /// before: an everyday command runs (0, nothing said), a destructive one is
 /// refused by the rule that names it, not by the net.

@@ -13,10 +13,14 @@
 //!
 //! **No answer in time.** A line that costs more to read than the agent
 //! waits, a caller that never closes stdin, a wait that never ends. A
-//! watchdog thread ends the hook at [`DEADLINE`], well inside the wait of the
-//! agents this hook is wired to. A wait the hook makes on purpose and bounds
-//! itself (the second opinion of a model) moves the deadline by its bound
-//! with [`allow_wait`].
+//! watchdog thread ends the hook once it has spent [`DEADLINE`] on the
+//! screening, or [`WALL_CAP`] on the clock, well inside the wait of the
+//! agents this hook is wired to. Time the screening thread spent ready to run
+//! while the CPUs ran something else (a `cargo build` beside it) is not the
+//! screening's: on Linux it is read from the kernel (`run_delay` in the
+//! thread's `schedstat`) and left out of [`DEADLINE`], never out of
+//! [`WALL_CAP`]. A wait the hook makes on purpose and bounds itself (the
+//! second opinion of a model) moves both by its bound with [`allow_wait`].
 //!
 //! Both end as a call the hook could not read does: 2 in enforce (the call
 //! is refused), 1 in monitor (it never blocks, and says the call went
@@ -35,6 +39,18 @@ use std::time::{Duration, Instant};
 /// unless its operator set less.
 pub const DEADLINE: Duration = Duration::from_secs(10);
 
+/// The most the hook takes on the clock, waiting for a CPU included, before
+/// it ends itself. Under [`hook::HOOK_TIMEOUT_SECS`], the wait `install`
+/// writes for Claude Code, with room for a second opinion's bound
+/// ([`hook::HOOK_LONGEST_SECS`]).
+///
+/// [`hook::HOOK_TIMEOUT_SECS`]: innerwarden_agent_guard::hook::HOOK_TIMEOUT_SECS
+/// [`hook::HOOK_LONGEST_SECS`]: innerwarden_agent_guard::hook::HOOK_LONGEST_SECS
+pub const WALL_CAP: Duration = Duration::from_secs(25);
+
+// The screening's deadline comes before the limit on the clock.
+const _: () = assert!(DEADLINE.as_millis() < WALL_CAP.as_millis());
+
 /// Lowers [`DEADLINE`], in milliseconds, for an operator whose agent waits
 /// less for a hook than the default. It never raises it: a value above the
 /// default, zero, or anything that is not a number leaves the default.
@@ -51,9 +67,13 @@ pub const TEST_DEADLINE_ENV: &str = "IW_TEST_HOOK_DEADLINE_MS";
 
 static MONITOR: AtomicBool = AtomicBool::new(false);
 
-/// Milliseconds after [`arm`] at which the watchdog ends the hook. Zero while
-/// no deadline is armed.
+/// Milliseconds of screening after [`arm`] at which the watchdog ends the
+/// hook. Zero while no deadline is armed.
 static DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds on the clock after [`arm`] at which the watchdog ends the
+/// hook whatever the screening spent. Zero while no deadline is armed.
+static WALL_MS: AtomicU64 = AtomicU64::new(0);
 
 const OUT_OF_TIME_ENFORCE: &str =
     "InnerWarden hook: the screening of this tool call did not finish in time; refusing it \
@@ -95,7 +115,9 @@ pub fn arm(monitor: bool) -> Result<(), &'static str> {
     if named.is_none() {
         let raised = std::env::var(TEST_DEADLINE_ENV).ok();
         if let Some(deadline) = test_deadline_from(raised.as_deref()) {
-            return arm_with(monitor, deadline);
+            // A raise for a loaded test suite raises the limit on the clock
+            // with it: the clock is what a loaded suite runs out of.
+            return arm_with_cap(monitor, deadline, deadline.max(WALL_CAP));
         }
     }
     arm_with(monitor, deadline_from(named.as_deref()))
@@ -111,36 +133,126 @@ fn test_deadline_from(named: Option<&str>) -> Option<Duration> {
         .map(Duration::from_millis)
 }
 
+/// The limit on the clock for a deadline: [`WALL_CAP`], or the deadline
+/// itself where the environment lowered it (the agent waits that long on the
+/// clock, not on the screening).
+fn wall_cap_for(deadline: Duration) -> Duration {
+    if deadline < DEADLINE {
+        deadline
+    } else {
+        WALL_CAP
+    }
+}
+
 fn arm_with(monitor: bool, deadline: Duration) -> Result<(), &'static str> {
+    arm_with_cap(monitor, deadline, wall_cap_for(deadline))
+}
+
+fn arm_with_cap(monitor: bool, deadline: Duration, cap: Duration) -> Result<(), &'static str> {
     MONITOR.store(monitor, Ordering::SeqCst);
     #[cfg(unix)]
     fault::install()?;
+    // Opened here, on the thread that screens: the file is that thread's.
+    let queue = RunQueue::of_this_thread();
     let armed = Instant::now();
     DEADLINE_MS.store(millis(deadline).max(1), Ordering::SeqCst);
+    WALL_MS.store(millis(cap).max(1), Ordering::SeqCst);
     std::thread::Builder::new()
         .name("hook-deadline".into())
-        .spawn(move || watch(armed))
+        .spawn(move || watch(armed, &queue))
         .map(|_| ())
         .map_err(|_| "no screening deadline could be set")
 }
 
 /// The hook is about to make a wait it bounds itself by `bound`: move the
-/// deadline by as much. Nothing to move when no deadline is armed (the same
-/// code runs under `innerwarden check`).
+/// deadline and the limit on the clock by as much. Nothing to move when no
+/// deadline is armed (the same code runs under `innerwarden check`).
 pub fn allow_wait(bound: Duration) {
-    let _ = DEADLINE_MS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
-        (armed != 0).then(|| armed.saturating_add(millis(bound)))
-    });
+    for limit in [&DEADLINE_MS, &WALL_MS] {
+        let _ = limit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
+            (armed != 0).then(|| armed.saturating_add(millis(bound)))
+        });
+    }
 }
 
-/// Sleep to the deadline, read it again (a wait may have moved it), end the
-/// hook once it is behind.
-fn watch(armed: Instant) -> ! {
+/// How long the screening thread has waited, ready to run, for a CPU since
+/// the net was armed: `run_delay`, the second field of the thread's
+/// `/proc/thread-self/schedstat`, in nanoseconds. Zero where it cannot be
+/// read (not Linux, no `/proc`), which is the clock alone, as before.
+struct RunQueue {
+    #[cfg(target_os = "linux")]
+    file: Option<std::fs::File>,
+    at_arm: Duration,
+}
+
+impl RunQueue {
+    fn of_this_thread() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let file = std::fs::File::open("/proc/thread-self/schedstat").ok();
+            let mut queue = RunQueue {
+                file,
+                at_arm: Duration::ZERO,
+            };
+            queue.at_arm = queue.total();
+            queue
+        }
+        #[cfg(not(target_os = "linux"))]
+        RunQueue {
+            at_arm: Duration::ZERO,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn total(&self) -> Duration {
+        use std::os::unix::fs::FileExt;
+        let Some(file) = &self.file else {
+            return Duration::ZERO;
+        };
+        let mut buf = [0u8; 96];
+        let Ok(read) = file.read_at(&mut buf, 0) else {
+            return Duration::ZERO;
+        };
+        std::str::from_utf8(&buf[..read])
+            .ok()
+            .and_then(|text| text.split_whitespace().nth(1))
+            .and_then(|field| field.parse::<u64>().ok())
+            .map_or(Duration::ZERO, Duration::from_nanos)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn total(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    fn since_armed(&self) -> Duration {
+        self.total().saturating_sub(self.at_arm)
+    }
+}
+
+/// PURE: what is left before the hook is out of time, or `None` once it
+/// is: the screening is `wall` less what it spent `queued` for a CPU, held
+/// to `deadline`; the clock is held to `cap` whatever was queued.
+fn time_left(
+    wall: Duration,
+    queued: Duration,
+    deadline: Duration,
+    cap: Duration,
+) -> Option<Duration> {
+    let screening = wall.saturating_sub(queued);
+    let left = deadline.checked_sub(screening)?.min(cap.checked_sub(wall)?);
+    (!left.is_zero()).then_some(left)
+}
+
+/// Sleep to the deadline, read it again (a wait may have moved it, time
+/// spent waiting for a CPU puts it later), end the hook once it is behind.
+fn watch(armed: Instant, queue: &RunQueue) -> ! {
     loop {
         let deadline = Duration::from_millis(DEADLINE_MS.load(Ordering::SeqCst));
-        match deadline.checked_sub(armed.elapsed()) {
-            Some(left) if !left.is_zero() => std::thread::sleep(left),
-            _ => {
+        let cap = Duration::from_millis(WALL_MS.load(Ordering::SeqCst));
+        match time_left(armed.elapsed(), queue.since_armed(), deadline, cap) {
+            Some(left) => std::thread::sleep(left.max(Duration::from_millis(1))),
+            None => {
                 if MONITOR.load(Ordering::SeqCst) {
                     end(OUT_OF_TIME_MONITOR, crate::unreadable_exit_code(true))
                 } else {
@@ -317,6 +429,9 @@ mod tests {
                     std::hint::black_box(0u8);
                 }
             }
+            "queued-work" => {
+                queued_work_as_child();
+            }
             "allowed-wait" => {
                 arm_with(monitor, Duration::from_millis(200)).expect("arm");
                 allow_wait(Duration::from_secs(3));
@@ -326,6 +441,50 @@ mod tests {
             }
             other => panic!("{test}: unknown end {other}"),
         }
+    }
+
+    /// Pin this thread to one CPU, start four threads that spin on the same
+    /// CPU, arm a 400 ms deadline with a 20 s limit on the clock, and do
+    /// 150 ms of the screening thread's own CPU work. Most of the clock goes
+    /// to waiting for that CPU. Says how long it took on the clock, and ends
+    /// with 0 if the net let it finish.
+    #[cfg(target_os = "linux")]
+    fn queued_work_as_child() -> ! {
+        // SAFETY: a zeroed cpu_set_t is an empty set; CPU_SET writes inside
+        // it; sched_setaffinity(0, ..) pins the calling thread, and threads
+        // started after it inherit the mask.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_SET(0, &mut set);
+            assert_eq!(
+                libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set),
+                0
+            );
+        }
+        for _ in 0..4 {
+            std::thread::spawn(|| loop {
+                std::hint::black_box(0u8);
+            });
+        }
+        let cpu = || {
+            // SAFETY: clock_gettime writes the timespec it is given.
+            let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+            Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+        };
+        let started = Instant::now();
+        arm_with_cap(false, Duration::from_millis(400), Duration::from_secs(20)).expect("arm");
+        let at_arm = cpu();
+        while cpu() - at_arm < Duration::from_millis(150) {
+            std::hint::black_box(0u8);
+        }
+        eprintln!("wall_ms={}", started.elapsed().as_millis());
+        std::process::exit(0)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn queued_work_as_child() -> ! {
+        std::process::exit(0)
     }
 
     /// Run this test again as a child told to end one way; its exit code,
@@ -417,6 +576,55 @@ mod tests {
             assert!(said.contains("did not finish in time"), "{mode}: {said}");
             assert!(said.contains(says), "{mode}: {said}");
         }
+    }
+
+    /// Time the screening thread spent waiting for a CPU is not screening:
+    /// a 400 ms deadline lets 150 ms of work finish though the CPU it runs on
+    /// is shared with four spinning threads and the clock passes 400 ms.
+    ///
+    /// FAILS ON REVERT: count the clock alone (`since_armed` always zero)
+    /// and the call is refused (2) at 400 ms on the clock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn time_spent_waiting_for_a_cpu_is_not_the_screenings() {
+        const TEST: &str = "time_spent_waiting_for_a_cpu_is_not_the_screenings";
+        act_as_child(TEST);
+        let (code, said, _) = child(TEST, "enforce:queued-work");
+        assert_eq!(code, Some(0), "{said}");
+        let wall: u64 = said
+            .lines()
+            .find_map(|line| line.strip_prefix("wall_ms="))
+            .and_then(|ms| ms.trim().parse().ok())
+            .expect("the child says how long it took");
+        assert!(
+            wall > 400,
+            "the work never waited for its CPU ({wall} ms), so this proves nothing"
+        );
+    }
+
+    /// The pure rule: screening is the clock less the time queued, held to
+    /// the deadline; the clock is held to its limit whatever was queued.
+    #[test]
+    fn the_deadline_is_the_screenings_and_the_clock_has_its_own_limit() {
+        let ms = Duration::from_millis;
+        let (deadline, cap) = (ms(1000), ms(5000));
+        assert_eq!(time_left(ms(400), ms(0), deadline, cap), Some(ms(600)));
+        // 3 s on the clock, 2.5 s of it queued: 500 ms of screening.
+        assert_eq!(time_left(ms(3000), ms(2500), deadline, cap), Some(ms(500)));
+        assert_eq!(time_left(ms(1000), ms(0), deadline, cap), None);
+        // Queued or not, the clock's limit holds.
+        assert_eq!(time_left(ms(5000), ms(4900), deadline, cap), None);
+        assert_eq!(time_left(ms(4800), ms(4500), deadline, cap), Some(ms(200)));
+        // A lowered deadline is also the clock's limit.
+        assert_eq!(wall_cap_for(ms(300)), ms(300));
+        assert_eq!(wall_cap_for(DEADLINE), WALL_CAP);
+        // The limit on the clock and a second opinion's bound stay under the
+        // wait `install` writes for Claude Code.
+        use innerwarden_agent_guard::hook::HOOK_LONGEST_SECS;
+        assert_eq!(
+            WALL_CAP + crate::second_opinion_io::LLM_ANSWER_BOUND,
+            Duration::from_secs(HOOK_LONGEST_SECS)
+        );
     }
 
     /// A wait the hook bounds itself moves the deadline by its bound, and

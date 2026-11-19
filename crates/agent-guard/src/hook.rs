@@ -123,18 +123,33 @@ pub fn merge_posttooluse_hook(mut settings: Value, hook_command: &str) -> Value 
     // reinstall with a new binary path does not leave the old one behind. An
     // entry whose hook list becomes empty is removed with it; operator hooks in
     // the same entry are untouched.
+    // The fields InnerWarden does not own on the first such hook (the
+    // `timeout` `install` or the operator set) are kept on the new one, as
+    // the PreToolUse merge keeps them: a rewrite dropped them.
+    let mut kept: Option<serde_json::Map<String, Value>> = None;
     arr.retain_mut(|entry| {
         let Some(list) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
             return true;
         };
         let was_empty = list.is_empty();
-        list.retain(|hook| !is_iwguard_hook(hook));
+        list.retain(|hook| {
+            if !is_iwguard_hook(hook) {
+                return true;
+            }
+            if kept.is_none() {
+                kept = hook.as_object().cloned();
+            }
+            false
+        });
         was_empty || !list.is_empty()
     });
 
+    let mut hook = kept.unwrap_or_default();
+    hook.insert("type".into(), json!("command"));
+    hook.insert("command".into(), json!(hook_command));
     arr.push(json!({
         "matcher": "*",
-        "hooks": [ { "type": "command", "command": hook_command } ]
+        "hooks": [ Value::Object(hook) ]
     }));
     settings
 }
@@ -211,6 +226,83 @@ pub fn merge_pretooluse_bash_hook(mut settings: Value, hook_command: &str) -> Va
         arr.push(replacement);
     }
     settings
+}
+
+/// The longest an InnerWarden hook takes to answer or refuse, in seconds:
+/// the hook's own limit on the clock (`hook_net::WALL_CAP`, 25 s) plus the
+/// one wait it may add on purpose, a second opinion's 20 s. Past it the hook
+/// has ended itself, refusing the call in enforce.
+pub const HOOK_LONGEST_SECS: u64 = 45;
+
+/// The `timeout` `install` writes on each InnerWarden hook line for Claude
+/// Code, in seconds. Without one Claude Code waits 600 s for a hook, and a
+/// hook it stops waiting for is a non-blocking error: the call runs. So it
+/// is above [`HOOK_LONGEST_SECS`], where the hook's own refusal always comes
+/// first. Measured on 2026-11-19 (4 cores): a hook answers in 0.19 s at the
+/// median and 0.38 s at most with nothing else running, 1.6 s at most during
+/// a `cargo build` (load 10), with about 40 ms of its own CPU.
+pub const HOOK_TIMEOUT_SECS: u64 = 50;
+
+// The hook's own refusal comes before Claude Code stops waiting, and the
+// wait stays well under Claude Code's 600 s default.
+const _: () = assert!(HOOK_LONGEST_SECS < HOOK_TIMEOUT_SECS && HOOK_TIMEOUT_SECS < 600);
+
+/// PURE: every InnerWarden hook line, before or after a tool runs, with a
+/// `timeout` of [`HOOK_TIMEOUT_SECS`] where it has none. A `timeout` already
+/// on a line (the operator's) is kept as it is; nothing else changes.
+pub fn with_hook_timeouts(mut settings: Value) -> Value {
+    for event in ["PreToolUse", "PostToolUse"] {
+        let Some(entries) = settings
+            .get_mut("hooks")
+            .and_then(|hooks| hooks.get_mut(event))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for hook in entries
+            .iter_mut()
+            .filter_map(|entry| entry.get_mut("hooks").and_then(Value::as_array_mut))
+            .flatten()
+        {
+            if !is_iwguard_hook(hook) {
+                continue;
+            }
+            if let Some(object) = hook.as_object_mut() {
+                object
+                    .entry("timeout")
+                    .or_insert_with(|| json!(HOOK_TIMEOUT_SECS));
+            }
+        }
+    }
+    settings
+}
+
+/// What Claude Code's settings say of how long it waits for the InnerWarden
+/// hook that screens Bash: `None` when there is no such hook, `Some(None)`
+/// when it names no `timeout` (Claude Code then waits 600 s), else the
+/// seconds. Of several such lines, the shortest wait.
+pub fn iwguard_bash_hook_timeout(settings: &Value) -> Option<Option<u64>> {
+    let waits: Vec<Option<u64>> = settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| bash_matcher_coverage(entry) == BashMatcherCoverage::Includes)
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter(|hook| is_iwguard_hook(hook))
+        .map(|hook| {
+            hook.get("timeout").and_then(|t| {
+                t.as_u64()
+                    .or_else(|| t.as_f64().filter(|s| *s >= 0.0).map(|s| s.ceil() as u64))
+            })
+        })
+        .collect();
+    if waits.is_empty() {
+        return None;
+    }
+    Some(waits.iter().flatten().min().copied())
 }
 
 /// Idempotently install the hook on the agent's own file tools
@@ -716,6 +808,16 @@ fn install_hook_with_link_policy(
         None => cmd.clone(),
     };
     let merged = merge_posttooluse_hook(merged, &post_command);
+    // Claude Code waits 600 s for a hook that names no `timeout`; every line
+    // of ours gets [`HOOK_TIMEOUT_SECS`] unless the operator set one. Only an
+    // explicit install or connect writes it: background setup keeps every
+    // line it does not have to change exactly as it was, and `status` says
+    // when the line has none.
+    let merged = if reject_symlinks {
+        merged
+    } else {
+        with_hook_timeouts(merged)
+    };
     // Automatic setup must not treat any recognised legacy hook as proof that
     // the requested wiring is already correct. Reconcile aliases, duplicate
     // entries and mode/path drift first; skip only an exact semantic no-op.
@@ -2834,6 +2936,108 @@ mod tests {
         install_hook(home.path(), "claude-code", None, iw, true, false).unwrap();
         let v2: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v2["hooks"]["PreToolUse"].as_array().unwrap().len(), 3);
+    }
+
+    /// `install` writes a `timeout` of [`HOOK_TIMEOUT_SECS`] on every line of
+    /// ours (Bash, file tools, read tools, results), above the longest the
+    /// hook takes, keeps an operator's own `timeout` and leaves the
+    /// operator's hooks alone. Background setup writes none, and keeps each
+    /// half's mode as before.
+    ///
+    /// FAILS ON REVERT: drop `with_hook_timeouts` from the install and the
+    /// lines name no timeout, so Claude Code waits 600 s on a hook.
+    #[test]
+    fn install_writes_a_timeout_above_the_longest_the_hook_takes() {
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(
+            &settings,
+            serde_json::to_string(&json!({"hooks": {"PreToolUse": [
+                {"matcher": "Bash", "hooks": [
+                    {"type": "command", "command": "/operator/lint.sh"},
+                    {"type": "command", "command": "\"/old/innerwarden\" hook --monitor", "timeout": 9}
+                ]},
+                {"matcher": crate::file_tools::FILE_TOOLS_MATCHER, "hooks": [
+                    {"type": "command", "command": "\"/old/innerwarden\" hook"}
+                ]}
+            ]}}))
+            .unwrap(),
+        )
+        .unwrap();
+        let iw = Path::new("/opt/innerwarden");
+        // Background setup adds no timeout to a line, and keeps each half's
+        // mode: the file-tools half enforced before and still does.
+        install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            exact_matcher_iwguard_mode(&v, crate::file_tools::FILE_TOOLS_MATCHER),
+            Some(HookProtection::Enforce)
+        );
+        assert!(
+            !serde_json::to_string(&v)
+                .unwrap()
+                .contains(&format!("\"timeout\":{HOOK_TIMEOUT_SECS}")),
+            "{v}"
+        );
+        // An explicit install writes it on every line of ours.
+        install_hook(home.path(), "claude-code", None, iw, false, true).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let mut ours = 0;
+        for event in ["PreToolUse", "PostToolUse"] {
+            for entry in v["hooks"][event].as_array().unwrap() {
+                for hook in entry["hooks"].as_array().unwrap() {
+                    let command = hook["command"].as_str().unwrap();
+                    if command == "/operator/lint.sh" {
+                        assert!(hook.get("timeout").is_none(), "{hook}");
+                        continue;
+                    }
+                    ours += 1;
+                    let want = if entry["matcher"] == "Bash" {
+                        9
+                    } else {
+                        HOOK_TIMEOUT_SECS
+                    };
+                    assert_eq!(hook["timeout"], want, "{event} {hook}");
+                }
+            }
+        }
+        assert_eq!(ours, 4, "{v}");
+        assert_eq!(iwguard_bash_hook_timeout(&v), Some(Some(9)));
+        // A second background run finds nothing to change.
+        let before = std::fs::read_to_string(&settings).unwrap();
+        install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), before);
+    }
+
+    /// What the settings say of the wait for the Bash hook: none of ours,
+    /// ours with no timeout, or the shortest of ours.
+    #[test]
+    fn the_bash_hooks_timeout_is_read_back() {
+        assert_eq!(iwguard_bash_hook_timeout(&json!({})), None);
+        let line = |timeout: Option<Value>| {
+            let mut hook = json!({"type": "command", "command": "\"/opt/innerwarden\" hook"});
+            if let Some(t) = timeout {
+                hook["timeout"] = t;
+            }
+            hook
+        };
+        let one = |hooks: Vec<Value>| json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": hooks}]}});
+        assert_eq!(
+            iwguard_bash_hook_timeout(&one(vec![line(None)])),
+            Some(None)
+        );
+        assert_eq!(
+            iwguard_bash_hook_timeout(&one(vec![line(Some(json!(50))), line(Some(json!(7.5)))])),
+            Some(Some(8))
+        );
+        // An operator's hook is not ours.
+        assert_eq!(
+            iwguard_bash_hook_timeout(&one(vec![
+                json!({"type": "command", "command": "/x", "timeout": 3})
+            ])),
+            None
+        );
     }
 
     #[test]

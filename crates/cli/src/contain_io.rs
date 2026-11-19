@@ -2195,6 +2195,7 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         }
         println!("# innerwarden contain - DRY RUN (Linux / bubblewrap)");
         print_plan_env(&plan.env);
+        print_credentials_kept_out(input);
         #[cfg(target_os = "linux")]
         if input.args.identity {
             println!("# {}", dry_run_scope_line());
@@ -2274,7 +2275,7 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     #[cfg(target_os = "linux")]
     let input = &held_input;
     let code = match build_linux_jail(input) {
-        Ok(plan) => run_plain(bwrap, &plan),
+        Ok(plan) => run_plain(bwrap, &plan, input),
         Err(e) => {
             eprintln!("innerwarden contain: {e}");
             ExitCode::from(2)
@@ -2422,12 +2423,30 @@ fn host_key() -> Option<[u8; 32]> {
 }
 
 /// The jail as it runs without `--identity`: bwrap, its arguments, waited for.
-fn run_plain(bwrap: &Path, plan: &crate::contain::LinuxJailPlan) -> ExitCode {
-    let status = Command::new(bwrap)
+fn run_plain(bwrap: &Path, plan: &crate::contain::LinuxJailPlan, input: &JailInputs) -> ExitCode {
+    let mut command = Command::new(bwrap);
+    command
         .args(&plan.bwrap_args)
-        .envs(plan.env.iter().cloned())
-        .status();
-    exit_from(status)
+        .envs(plan.env.iter().cloned());
+    without_credentials(&mut command, input);
+    exit_from(command.status())
+}
+
+/// The credential variables of the launcher's environment the jail's command
+/// does not get ([`crate::contain::credential_vars`]).
+fn credentials_kept_out(input: &JailInputs) -> Vec<std::ffi::OsString> {
+    crate::contain::credential_vars(
+        std::env::vars_os().map(|(name, _)| name),
+        &input.args.pass_env,
+    )
+}
+
+/// Take the credential variables out of the environment `command` (bwrap,
+/// or the program that starts it, or sandbox-exec) hands the jail.
+fn without_credentials(command: &mut Command, input: &JailInputs) {
+    for name in credentials_kept_out(input) {
+        command.env_remove(name);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2751,6 +2770,7 @@ fn launch_identified(
     let mut command = Command::new(&program);
     command.args(&args).envs(plan.env.iter().cloned());
     helper_env(&mut command);
+    without_credentials(&mut command, input);
     let spawned = command.spawn();
     // Ours must close, or the read below never ends and the jail never sees
     // the end of its record.
@@ -3644,6 +3664,7 @@ fn run_macos(input: &JailInputs) -> ExitCode {
     if input.args.dry_run {
         println!("# innerwarden contain - DRY RUN (macOS / sandbox-exec)");
         print_plan_env(&plan.env);
+        print_credentials_kept_out(input);
         println!("# --- sandbox profile ---");
         println!("{}", plan.profile);
         // What a real run would make in the home; a dry run makes nothing.
@@ -3681,11 +3702,10 @@ fn run_macos(input: &JailInputs) -> ExitCode {
     announce(input);
     // argv = [sandbox-exec, -p, <profile>, --, child...]; run argv[1..] under the
     // resolved binary.
-    let status = Command::new(sb)
-        .args(&plan.argv[1..])
-        .envs(plan.env.iter().cloned())
-        .status();
-    exit_from(status)
+    let mut command = Command::new(sb);
+    command.args(&plan.argv[1..]).envs(plan.env.iter().cloned());
+    without_credentials(&mut command, input);
+    exit_from(command.status())
 }
 
 fn announce(input: &JailInputs) {
@@ -3718,6 +3738,9 @@ fn announce(input: &JailInputs) {
         );
     }
     eprintln!("{}", crate::contain::iw_folder_said(input));
+    if let Some(said) = crate::contain::credentials_said(&credentials_kept_out(input)) {
+        eprintln!("{said}");
+    }
 }
 
 /// Map a finished child status to an exit code, mapping a signal death to
@@ -3741,6 +3764,12 @@ fn exit_from(status: std::io::Result<std::process::ExitStatus>) -> ExitCode {
             eprintln!("innerwarden contain: failed to launch the jail: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn print_credentials_kept_out(input: &JailInputs) {
+    if let Some(said) = crate::contain::credentials_said(&credentials_kept_out(input)) {
+        println!("#{}", said.trim_start());
     }
 }
 

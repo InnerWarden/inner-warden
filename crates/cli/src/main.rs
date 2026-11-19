@@ -360,6 +360,23 @@ fn status_io_cmd_rest(
     };
 
     let kept_apart_before = graph_io::kept_apart_before();
+    // How long each wired hook agent waits for its hook.
+    let hook_timeouts: Vec<status::HookTimeout> = home
+        .as_deref()
+        .map(|home| {
+            use innerwarden_agent_guard::agents_ops;
+            rows.iter()
+                .filter(|r| wired_agents.contains(&r.name))
+                .filter_map(|r| {
+                    Some(status::HookTimeout {
+                        agent: r.name.clone(),
+                        seconds: agents_ops::hook_timeout(home, r)?,
+                        next: agents_ops::hook_repair_command(home, r),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let facts = status::Facts {
         never_configured,
         mode,
@@ -368,6 +385,7 @@ fn status_io_cmd_rest(
         partly_unscreened,
         unread_hook_lines,
         tool_classes,
+        hook_timeouts,
         any_agent_seen,
         decisions_recorded,
         newest_decision_age_secs,
@@ -756,6 +774,25 @@ fn classify_hook_input(buf: &str) -> HookInput {
 /// The exit code for a tool call the hook could not read. Claude Code treats
 /// 2 as "block, show stderr" and any other non-zero as "show stderr, carry
 /// on". Enforce refuses (fail-closed); monitor never blocks, so it says so.
+/// The most of one tool call a hook reads, the same as OpenClaw's path
+/// (`openclaw_guard_io`). A call past it is not read, and not judged: the
+/// hook refuses it in enforce and says it went unscreened in monitor.
+pub(crate) const MAX_TOOL_CALL_BYTES: u64 = 1024 * 1024;
+
+const TOOL_CALL_TOO_LONG: &str =
+    "the tool call is longer than the 1 MiB the hook reads, so it was not read";
+
+/// Read one tool call from `reader`, at most [`MAX_TOOL_CALL_BYTES`].
+/// `Ok(None)` for a call longer than that: the rest is never read, so a
+/// caller that sends without end does not grow the hook either.
+fn read_tool_call(reader: impl std::io::Read) -> std::io::Result<Option<String>> {
+    let mut buf = String::new();
+    reader
+        .take(MAX_TOOL_CALL_BYTES + 1)
+        .read_to_string(&mut buf)?;
+    Ok((buf.len() as u64 <= MAX_TOOL_CALL_BYTES).then_some(buf))
+}
+
 fn unreadable_exit_code(monitor: bool) -> u8 {
     if monitor {
         1
@@ -1184,10 +1221,11 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // the first hook of this version brings it up to this one's.
     agents_io::rewire_once_per_version();
 
-    let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() {
-        return hook_unreadable("stdin could not be read", monitor);
-    }
+    let buf = match read_tool_call(std::io::stdin()) {
+        Ok(Some(buf)) => buf,
+        Ok(None) => return hook_unreadable(TOOL_CALL_TOO_LONG, monitor),
+        Err(_) => return hook_unreadable("stdin could not be read", monitor),
+    };
     // A call `innerwarden demo` sent: judged exactly as an agent's and
     // recorded like one, with `demo: true` beside it. It is not alerted on
     // nor asked of a second opinion, and its verdict is also written to
@@ -3021,7 +3059,7 @@ fn help_text() -> String {
            \x20                                opt-in monitor-only discovery while dashboard runs\n  \
            {p} contain [--enforce] -- <cmd>\n  \
            \x20                                run <cmd> in a filesystem/namespace JAIL with the guard active inside\n  \
-           \x20                                (Linux bwrap / macOS sandbox-exec; your API key stays outside the jail)\n  \
+           \x20                                (Linux bwrap / macOS sandbox-exec; exported credential variables are taken out)\n  \
            {p} hook [--block-review|--monitor]\n  \
            \x20                                PreToolUse adapter (reads the tool call on stdin)\n  \
            {p} allow \"<glob>\" | mute <ATR-rule|category>\n  \
