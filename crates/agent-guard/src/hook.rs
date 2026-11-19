@@ -1138,13 +1138,23 @@ pub fn judge_hook_program(program: &str, fact: ProgramFact) -> HookProgram {
         };
     }
     // A bare name is found on the PATH of the agent that runs the hook, which
-    // is not this process's PATH and cannot be read from here. Found here, it
-    // may still be missing there, and the other way round: an OK on this
-    // lookup could be false, so neither answer is given as the agent's.
+    // is not this process's PATH and cannot be read from here. Found here (on
+    // this PATH or in a usual place), the agent may still resolve another, so
+    // an OK could be false: "could not tell". Found nowhere here, the agent
+    // will likely not find it either: that is off, the same alarm as a path
+    // that does not exist.
     if bare {
-        return HookProgram::Unknown {
-            program: program.to_string(),
-            why: bare_name_why(program),
+        return match fact {
+            ProgramFact::Missing | ProgramFact::NotExecutable => HookProgram::Broken {
+                program: program.to_string(),
+                problem: format!(
+                    "its hook runs `{program}`, which is not on PATH: {BARE_NOT_FOUND}"
+                ),
+            },
+            ProgramFact::Executable | ProgramFact::Unreadable => HookProgram::Unknown {
+                program: program.to_string(),
+                why: bare_name_why(program),
+            },
         };
     }
     let problem = match fact {
@@ -1169,23 +1179,24 @@ pub fn judge_hook_program(program: &str, fact: ProgramFact) -> HookProgram {
 /// Why a hook that names its program bare cannot be judged from here.
 pub const BARE_NAME: &str = "could not tell: bare name, resolved on the agent's PATH";
 
+/// Why a bare name found nowhere here is off.
+pub const BARE_NOT_FOUND: &str =
+    "not found on this shell's PATH or the usual places; the agent will likely not find it either";
+
 fn bare_name_why(program: &str) -> String {
-    format!(
-        "{BARE_NAME}: its hook runs `{program}`, which the agent finds on its own PATH, \
-         and that PATH is not visible from here"
-    )
+    format!("{BARE_NAME}: its hook runs `{program}`")
 }
 
-/// The clue a caller adds to a bare name's `why`: where THIS process's PATH
-/// finds it (`Some`), or that it does not (`None`). Only a clue: the agent
-/// resolves the name on a PATH of its own.
+/// The clue a caller adds to a bare name's `why`: where it was found here
+/// (`Some`: this PATH or a usual place), or that the look failed (`None`).
+/// Only a clue: the agent resolves the name on a PATH of its own.
 pub fn bare_name_clue(found_here: Option<&Path>) -> String {
     match found_here {
         Some(path) => format!(
-            " (on this command's PATH it is {}, which may not be the one the agent finds)",
+            "; found here at {}, the agent may resolve another",
             path.display()
         ),
-        None => " (it is not on this command's PATH either)".to_string(),
+        None => "; I could not look for it here".to_string(),
     }
 }
 
@@ -3469,35 +3480,40 @@ mod hook_program_tests {
     }
 
     /// A bare name is found on the agent's own PATH, which this process cannot
-    /// see. Found here or not, the answer is "could not tell", never an OK
-    /// that could be false and never an "off" that could be false. An
-    /// unquoted command is read by the same grammar as a quoted one.
+    /// see. Found here, the answer is "could not tell", never an OK that could
+    /// be false. Found nowhere here (this PATH and the usual places), it is
+    /// off. An unquoted command is read by the same grammar as a quoted one.
     ///
     /// FAILS ON REVERT: let a bare name take the lookup's answer again and
-    /// `Executable` reads `Runs`, `Missing` reads `Broken`.
+    /// `Executable` reads `Runs`.
     #[test]
-    fn a_bare_program_could_not_be_told_whatever_this_path_holds() {
+    fn a_bare_program_found_here_could_not_be_told_and_one_found_nowhere_is_off() {
         let settings = measured("innerwarden hook --agent claude-code");
         assert_eq!(
             effective_iwguard_hook_programs(&settings),
             vec!["innerwarden".to_string()]
         );
-        for fact in [
-            ProgramFact::Executable,
-            ProgramFact::Missing,
-            ProgramFact::NotExecutable,
-            ProgramFact::Unreadable,
-        ] {
+        for fact in [ProgramFact::Executable, ProgramFact::Unreadable] {
             match judge_iwguard_hooks(&settings, |_| fact) {
                 Some(HookProgram::Unknown { program, why }) => {
                     assert_eq!(program, "innerwarden");
                     assert!(why.starts_with(BARE_NAME), "{fact:?}: {why}");
-                    assert!(
-                        why.contains("could not tell: bare name, resolved on the agent's PATH"),
-                        "{why}"
-                    );
                 }
-                other => panic!("{fact:?}: a bare name is judged on the agent's PATH: {other:?}"),
+                other => panic!("{fact:?}: found here is not the agent's answer: {other:?}"),
+            }
+        }
+        // Found nowhere here (PATH and the usual places): off, as before.
+        for fact in [ProgramFact::Missing, ProgramFact::NotExecutable] {
+            match judge_iwguard_hooks(&settings, |_| fact) {
+                Some(HookProgram::Broken { program, problem }) => {
+                    assert_eq!(program, "innerwarden");
+                    assert!(
+                        problem.starts_with("its hook runs `innerwarden`, which is not on PATH"),
+                        "{problem}"
+                    );
+                    assert!(problem.ends_with(BARE_NOT_FOUND), "{problem}");
+                }
+                other => panic!("{fact:?}: a name found nowhere cannot start: {other:?}"),
             }
         }
     }

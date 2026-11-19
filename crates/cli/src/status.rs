@@ -1486,13 +1486,31 @@ mod tests {
         assert!(headline(&findings).contains("NOT fully protecting"));
     }
 
-    /// A bare name is resolved on the agent's PATH, not this one: missing
-    /// here or found here, status says it could not tell, never off and
-    /// never on. (Was `a_wired_hook_whose_bare_program_is_not_on_path_is_not_on`,
-    /// which read a miss on this process's PATH as the agent's.)
     #[test]
-    fn a_wired_hook_with_a_bare_program_could_not_be_told() {
-        for fact in [ProgramFact::Missing, ProgramFact::Executable] {
+    fn a_wired_hook_whose_bare_program_is_not_on_path_is_not_on() {
+        let f = wired_to(
+            "innerwarden",
+            ProgramFact::Missing,
+            "innerwarden install claude-code",
+        );
+        let findings = assess(&f);
+        assert!(
+            findings.iter().any(|x| matches!(
+                x,
+                Finding::NotWorking { what, .. }
+                    if what.contains("its hook runs `innerwarden`, which is not on PATH")
+            )),
+            "{findings:?}"
+        );
+        assert!(headline(&findings).contains("NOT fully protecting"));
+    }
+
+    /// A bare name FOUND here is resolved on the agent's PATH, not this one:
+    /// status says it could not tell, never an OK that could be false.
+    #[test]
+    fn a_wired_hook_whose_bare_program_is_found_here_could_not_be_told() {
+        {
+            let fact = ProgramFact::Executable;
             let f = wired_to("innerwarden", fact, "innerwarden install claude-code");
             let findings = assess(&f);
             assert!(

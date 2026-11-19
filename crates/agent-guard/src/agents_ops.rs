@@ -138,8 +138,11 @@ pub fn program_fact(program: &str, path_env: Option<&OsStr>) -> hook::ProgramFac
 /// tell" is never "off"; one whose program is gone does not, because it
 /// screens nothing.
 fn claude_hook_screens(settings: &Value, path_env: Option<&OsStr>) -> bool {
+    let places = usual_bin_dirs();
     matches!(
-        hook::judge_iwguard_hooks(settings, |program| program_fact(program, path_env)),
+        hook::judge_iwguard_hooks(settings, |program| {
+            hook_program_fact(program, path_env, &places)
+        }),
         Some(hook::HookProgram::Runs | hook::HookProgram::Unknown { .. })
     )
 }
@@ -154,22 +157,79 @@ pub fn hook_program(home: &Path, agent: &AgentStatus) -> Option<hook::HookProgra
     }
     let settings = read_json(&home.join(".claude/settings.json"))?;
     let path_env = std::env::var_os("PATH");
-    hook_program_with(&settings, path_env.as_deref())
+    hook_program_with(&settings, path_env.as_deref(), &usual_bin_dirs())
 }
 
-fn hook_program_with(settings: &Value, path_env: Option<&OsStr>) -> Option<hook::HookProgram> {
-    let verdict = hook::judge_iwguard_hooks(settings, |program| program_fact(program, path_env))?;
-    Some(with_bare_name_clue(verdict, path_env))
+fn hook_program_with(
+    settings: &Value,
+    path_env: Option<&OsStr>,
+    places: &[std::path::PathBuf],
+) -> Option<hook::HookProgram> {
+    let verdict = hook::judge_iwguard_hooks(settings, |program| {
+        hook_program_fact(program, path_env, places)
+    })?;
+    Some(with_bare_name_clue(verdict, path_env, places))
 }
 
-/// A bare name's "could not tell", with where this process's PATH finds it
-/// as a clue. Any other verdict as it is.
-fn with_bare_name_clue(verdict: hook::HookProgram, path_env: Option<&OsStr>) -> hook::HookProgram {
+/// Where a guard installed under a bare name usually lives, beyond `PATH`:
+/// a shell that runs a hook may have a PATH this process lacks, and these are
+/// the directories installers write to.
+fn usual_bin_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if let Ok(home) = hook::home_dir() {
+        dirs.push(home.join(".local/bin"));
+    }
+    for dir in ["/usr/local/bin", "/usr/bin", "/opt/homebrew/bin"] {
+        dirs.push(std::path::PathBuf::from(dir));
+    }
+    dirs
+}
+
+/// A bare name found here: on this process's `PATH`, else in one of
+/// `places`. Metadata only, never run.
+fn find_bare_name(
+    program: &str,
+    path_env: Option<&OsStr>,
+    places: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    find_on_path(&[program], path_env).or_else(|| {
+        places
+            .iter()
+            .map(|dir| dir.join(program))
+            .find(|candidate| executable_file(candidate))
+    })
+}
+
+/// [`program_fact`] for a hook's program: a bare name is looked for on this
+/// PATH AND in the usual places, so "found nowhere" (off) is only said when
+/// the agent will likely not find it either.
+fn hook_program_fact(
+    program: &str,
+    path_env: Option<&OsStr>,
+    places: &[std::path::PathBuf],
+) -> hook::ProgramFact {
+    if program.contains(['/', '\\']) {
+        return program_fact(program, path_env);
+    }
+    if find_bare_name(program, path_env, places).is_some() {
+        hook::ProgramFact::Executable
+    } else {
+        hook::ProgramFact::Missing
+    }
+}
+
+/// A bare name's "could not tell", with where it was found here as a clue.
+/// Any other verdict as it is.
+fn with_bare_name_clue(
+    verdict: hook::HookProgram,
+    path_env: Option<&OsStr>,
+    places: &[std::path::PathBuf],
+) -> hook::HookProgram {
     match verdict {
         hook::HookProgram::Unknown { program, why }
             if !program.contains(['/', '\\']) && why.starts_with(hook::BARE_NAME) =>
         {
-            let found = find_on_path(&[program.as_str()], path_env);
+            let found = find_bare_name(&program, path_env, places);
             let why = format!("{why}{}", hook::bare_name_clue(found.as_deref()));
             hook::HookProgram::Unknown { program, why }
         }
@@ -235,7 +295,8 @@ pub fn unscreened_hooks(home: &Path, agent: &AgentStatus) -> Vec<hook::Unscreene
         return Vec::new();
     };
     let path_env = std::env::var_os("PATH");
-    let fact = |program: &str| program_fact(program, path_env.as_deref());
+    let places = usual_bin_dirs();
+    let fact = |program: &str| hook_program_fact(program, path_env.as_deref(), &places);
     match hook::judge_iwguard_hooks(&settings, fact) {
         Some(hook::HookProgram::Runs) => hook::unscreened_iwguard_hooks(&settings, fact),
         _ => Vec::new(),
@@ -3045,38 +3106,75 @@ mod tests {
 mod bare_name_clue_tests {
     use super::*;
 
-    /// A bare name is "could not tell" with a clue: where this process's PATH
-    /// finds it, or that it does not.
-    ///
-    /// FAILS ON REVERT of `with_bare_name_clue`: neither clue is said.
-    #[test]
-    fn a_bare_name_says_where_this_path_finds_it_as_a_clue() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let bin = dir.path().join("innerwarden");
+    fn runnable_in(dir: &Path) -> std::path::PathBuf {
+        let bin = dir.join("innerwarden");
         std::fs::write(&bin, "#!/bin/sh\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let settings = serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+        bin
+    }
+
+    fn bare() -> Value {
+        serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
             {"type": "command", "command": "innerwarden hook --agent claude-code"}
-        ]}]}});
-        if cfg!(unix) {
-            match hook_program_with(&settings, Some(dir.path().as_os_str())) {
-                Some(hook::HookProgram::Unknown { why, .. }) => {
-                    assert!(why.starts_with(hook::BARE_NAME), "{why}");
-                    assert!(why.contains(&bin.display().to_string()), "{why}");
-                }
-                other => panic!("a bare name is could not tell: {other:?}"),
-            }
-        }
+        ]}]}})
+    }
+
+    /// A bare name found here, on this PATH or in a usual place, is "could
+    /// not tell" with where it was found; found nowhere, it is off.
+    ///
+    /// FAILS ON REVERT of `with_bare_name_clue` (no "found here at"), of the
+    /// usual places in `find_bare_name` (a guard only in a usual place reads
+    /// off), and of the bare-name rule (found on PATH reads `Runs`).
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_name_found_here_says_where_and_one_found_nowhere_is_off() {
+        let on_path = tempfile::TempDir::new().unwrap();
+        let bin = runnable_in(on_path.path());
         let empty = tempfile::TempDir::new().unwrap();
-        match hook_program_with(&settings, Some(empty.path().as_os_str())) {
+        let none: Vec<std::path::PathBuf> = Vec::new();
+
+        match hook_program_with(&bare(), Some(on_path.path().as_os_str()), &none) {
             Some(hook::HookProgram::Unknown { why, .. }) => {
-                assert!(why.contains("not on this command's PATH either"), "{why}")
+                assert!(why.starts_with(hook::BARE_NAME), "{why}");
+                assert!(
+                    why.contains(&format!(
+                        "found here at {}, the agent may resolve another",
+                        bin.display()
+                    )),
+                    "{why}"
+                );
             }
-            other => panic!("not found here is still could not tell: {other:?}"),
+            other => panic!("found on this PATH is could not tell: {other:?}"),
+        }
+
+        // Not on PATH, but in a usual place: found here all the same.
+        let usual = tempfile::TempDir::new().unwrap();
+        let in_usual = runnable_in(usual.path());
+        match hook_program_with(
+            &bare(),
+            Some(empty.path().as_os_str()),
+            &[usual.path().to_path_buf()],
+        ) {
+            Some(hook::HookProgram::Unknown { why, .. }) => {
+                assert!(why.contains(&in_usual.display().to_string()), "{why}")
+            }
+            other => panic!("found in a usual place is could not tell: {other:?}"),
+        }
+
+        // Found nowhere: off.
+        match hook_program_with(
+            &bare(),
+            Some(empty.path().as_os_str()),
+            &[empty.path().to_path_buf()],
+        ) {
+            Some(hook::HookProgram::Broken { problem, .. }) => {
+                assert!(problem.ends_with(hook::BARE_NOT_FOUND), "{problem}")
+            }
+            other => panic!("found nowhere is off: {other:?}"),
         }
     }
 }
