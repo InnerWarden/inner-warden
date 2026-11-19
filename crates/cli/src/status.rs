@@ -707,10 +707,15 @@ pub fn nothing_wired_finding(any_agent_seen: Option<bool>) -> Finding {
                 .into(),
             next: "start your agent, then: innerwarden agents connect --all --monitor".into(),
         },
+        // Unknown, never "none running": on macOS and Windows the process
+        // scan has nothing to read (it reads /proc), and a failed look is not
+        // an empty one. The step that connects the agents installed here is
+        // still named, because it does not depend on the answer.
         None => Finding::Unknown {
             what: "Could not tell whether any agent is running.".into(),
-            why: "Process inspection failed. An agent may well be running; I \
-                  simply could not look."
+            why: "I could not look at the running processes here. An agent may \
+                  well be running. To connect the agents installed here: \
+                  innerwarden agents connect --all --monitor"
                 .into(),
         },
     }
@@ -1244,6 +1249,25 @@ mod tests {
                 !matches!(finding, Finding::NotWorking { .. }),
                 "nothing was established, so nothing may be reported as off: {finding:?}"
             );
+        }
+    }
+
+    /// Where the process scan cannot look (macOS, Windows), nothing wired is
+    /// "could not tell", never "no agent", and the line still names the
+    /// command that connects one: `demo` prints this line as its whole
+    /// answer when nothing is wired.
+    #[test]
+    fn nothing_wired_and_no_scan_is_unknown_and_names_how_to_connect() {
+        match nothing_wired_finding(None) {
+            Finding::Unknown { what, why } => {
+                assert!(what.contains("Could not tell"), "{what}");
+                assert!(
+                    why.contains("innerwarden agents connect --all --monitor"),
+                    "{why}"
+                );
+                assert!(!why.contains("none of the agents"), "{why}");
+            }
+            other => panic!("a scan that could not look is not an answer: {other:?}"),
         }
     }
 
