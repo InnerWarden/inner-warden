@@ -11319,19 +11319,25 @@ struct SshOptions {
     valued: &'static str,
     plain: &'static str,
     operands: usize,
+    /// Letters whose value is a file the program reads commands or settings
+    /// from, or runs: sftp's `-b` batch, `-F` config, scp's and sftp's
+    /// `-S` program, ssh's `-I` library. What that file does is not on
+    /// the line, so a line with one is not key use alone.
+    from_file: &'static str,
 }
 
 fn ssh_options(program: &str) -> Option<SshOptions> {
-    let (valued, plain, operands) = match program {
-        "ssh" => ("BbcDEeFIiJLlmOoPpQRSWw", "46AaCfGgKkMNnqsTtVvXxYy", 2),
-        "scp" => ("cDFiJloPSX", "346ABCOpqRrsTv", 1),
-        "sftp" => ("BbcDFiJlPoRSsX", "46AaCfNpqrv", 1),
+    let (valued, plain, operands, from_file) = match program {
+        "ssh" => ("BbcDEeFIiJLlmOoPpQRSWw", "46AaCfGgKkMNnqsTtVvXxYy", 2, "FI"),
+        "scp" => ("cDFiJloPSX", "346ABCOpqRrsTv", 1, "FS"),
+        "sftp" => ("BbcDFiJlPoRSsX", "46AaCfNpqrv", 1, "bFS"),
         _ => return None,
     };
     Some(SshOptions {
         valued,
         plain,
         operands,
+        from_file,
     })
 }
 
@@ -11492,6 +11498,17 @@ fn ssh_identity_places(tokens: &[String], from: usize, options: &SshOptions) -> 
             if !options.valued.contains(letter) {
                 return None;
             }
+            if options.from_file.contains(letter) {
+                let left = &letters[offset + letter.len_utf8()..];
+                let value = if left.is_empty() {
+                    tokens.get(at).map(String::as_str).unwrap_or("")
+                } else {
+                    left
+                };
+                if !(letter == 'F' && names_the_default_ssh_config(value)) {
+                    return None;
+                }
+            }
             // The value: what is left of the token, or the token after.
             let left = &letters[offset + letter.len_utf8()..];
             let (value, value_place) = if left.is_empty() {
@@ -11503,6 +11520,20 @@ fn ssh_identity_places(tokens: &[String], from: usize, options: &SshOptions) -> 
             } else {
                 (left, at - 1)
             };
+            // `-o Include=FILE` reads settings from a file and
+            // `-o PKCS11Provider=LIB` loads code: as `-F` and `-I` are.
+            let option_reads_a_file = letter == 'o'
+                && ["Include", "PKCS11Provider", "SecurityKeyProvider"]
+                    .iter()
+                    .any(|name| {
+                        value
+                            .get(..name.len())
+                            .is_some_and(|key| key.eq_ignore_ascii_case(name))
+                            && value[name.len()..].starts_with(['=', ' '])
+                    });
+            if option_reads_a_file {
+                return None;
+            }
             let names_the_identity = match letter {
                 'i' => true,
                 'o' => value
@@ -11551,6 +11582,15 @@ fn rsync_transport_places(tokens: &[String], from: usize) -> Vec<usize> {
                     .all(|(at, token)| !is_sensitive_word(token) || identity.contains(&at))
             })
     };
+    // A list of what to copy read from a file (`--files-from`,
+    // `--include-from`) may name the key: not on the line, so not key use.
+    if tokens.iter().skip(from).any(|token| {
+        ["--files-from", "--include-from"]
+            .iter()
+            .any(|option| token == option || token.starts_with(&format!("{option}=")))
+    }) {
+        return Vec::new();
+    }
     let mut places = Vec::new();
     for (at, token) in tokens.iter().enumerate().skip(from) {
         let transport = match token.strip_prefix("--rsh=") {
@@ -12287,6 +12327,94 @@ fn key_loaded_into_the_agent(tokens: &[String]) -> bool {
         return false;
     };
     token_basename(&tokens[at]) == "ssh-add" && without_redirection(tokens)
+}
+
+/// The config file ssh reads on every line without being told
+/// (`~/.ssh/config`, `/etc/ssh/ssh_config`): naming it with `-F` hands
+/// the program nothing it would not read anyway.
+fn names_the_default_ssh_config(value: &str) -> bool {
+    matches!(
+        value,
+        "~/.ssh/config" | "$HOME/.ssh/config" | "${HOME}/.ssh/config" | "/etc/ssh/ssh_config"
+    )
+}
+
+/// True when the ssh-family program `segment` runs is handed a file it
+/// reads commands or settings from, or runs ([`SshOptions::from_file`],
+/// `-o Include=`, rsync's `--files-from` or a transport with one). A
+/// sensitive path on such a line is read as one: what the file does with
+/// the key (`put ~/.ssh/id_rsa` in an sftp batch) is not on the line.
+fn ssh_family_reads_a_command_file(segment: &str) -> bool {
+    let tokens = shell_tokens_with_braces(segment);
+    let Some(program_at) = effective_command_index(&tokens) else {
+        return false;
+    };
+    let program = token_basename(&tokens[program_at]).to_ascii_lowercase();
+    let reads_one = |tokens: &[String], from: usize, options: &SshOptions| {
+        let mut at = from;
+        while let Some(token) = tokens.get(at).map(String::as_str) {
+            at += 1;
+            if token == "--" {
+                break;
+            }
+            let Some(letters) = token.strip_prefix('-').filter(|l| !l.is_empty()) else {
+                continue;
+            };
+            for (offset, letter) in letters.char_indices() {
+                if options.valued.contains(letter) {
+                    let left = &letters[offset + letter.len_utf8()..];
+                    let value = if left.is_empty() {
+                        at += 1;
+                        tokens.get(at - 1).map(String::as_str).unwrap_or("")
+                    } else {
+                        left
+                    };
+                    if options.from_file.contains(letter)
+                        && !(letter == 'F' && names_the_default_ssh_config(value))
+                    {
+                        return true;
+                    }
+                    if letter == 'o'
+                        && ["include", "pkcs11provider", "securitykeyprovider"]
+                            .iter()
+                            .any(|name| value.to_ascii_lowercase().starts_with(name))
+                    {
+                        return true;
+                    }
+                    break;
+                }
+            }
+        }
+        false
+    };
+    match ssh_options(&program) {
+        Some(options) => reads_one(&tokens, program_at + 1, &options),
+        None if program == "rsync" => {
+            tokens
+                .iter()
+                .enumerate()
+                .skip(program_at + 1)
+                .any(|(at, token)| {
+                    ["--files-from", "--include-from"]
+                        .iter()
+                        .any(|option| token == option || token.starts_with(&format!("{option}=")))
+                        || {
+                            let transport = token.strip_prefix("--rsh=").or_else(|| {
+                                (token == "-e" || token == "--rsh")
+                                    .then(|| tokens.get(at + 1).map(String::as_str))
+                                    .flatten()
+                            });
+                            transport.is_some_and(|transport| {
+                                let inner = shell_tokens(transport);
+                                inner.first().is_some_and(|p| token_basename(p) == "ssh")
+                                    && ssh_options("ssh")
+                                        .is_some_and(|options| reads_one(&inner, 1, &options))
+                            })
+                        }
+                })
+        }
+        None => false,
+    }
 }
 
 /// [`check_sensitive_read_as_written`] at `depth` lines handed to a shell.
@@ -13045,6 +13173,11 @@ fn sensitive_read_in(content: &str, as_written: &str, depth: u8) -> Option<(&'st
             None
         };
         let Some(path) = path else { continue };
+        // An ssh-family line handed a file of commands or settings reads the
+        // key as far as anyone can tell from the line.
+        if ssh_family_reads_a_command_file(segment) {
+            return Some((path, if is_hard_sensitive_path(path) { 60 } else { 20 }));
+        }
         // A line handed to a shell with `-c` holding every sensitive path of
         // the segment is read as the line it is: the inner shell runs it, and
         // `bash -c 'scp -i KEY f host:'` uses the key the way `scp -i KEY f
