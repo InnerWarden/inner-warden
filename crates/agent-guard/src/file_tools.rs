@@ -551,7 +551,7 @@ const HOME_PLACES: &[HomeGroup] = &[
         ],
     },
     HomeGroup {
-        what: "your stored credentials",
+        what: STORED_CREDENTIALS,
         files: &[
             ".aws/credentials",
             ".aws/config",
@@ -871,8 +871,20 @@ fn home_relative(path: &Path, home: &Path) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
+/// Every file and folder of the [`HOME_PLACES`] groups named `whats`,
+/// relative to the home.
+pub(crate) fn home_places_of(whats: &'static [&'static str]) -> impl Iterator<Item = &'static str> {
+    HOME_PLACES
+        .iter()
+        .filter(move |group| whats.contains(&group.what))
+        .flat_map(|group| group.files.iter().chain(group.trees.iter()).copied())
+}
+
+/// What [`HOME_PLACES`] calls the stored credentials.
+pub(crate) const STORED_CREDENTIALS: &str = "your stored credentials";
+
 /// The group of [`HOME_PLACES`] a home-relative path is in.
-fn home_place(relative: &str) -> Option<&'static str> {
+pub(crate) fn home_place(relative: &str) -> Option<&'static str> {
     HOME_PLACES
         .iter()
         .find(|group| {
