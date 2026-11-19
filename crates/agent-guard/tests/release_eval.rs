@@ -129,21 +129,58 @@ fn board_with(
 /// allowed from an empty home. Every run judges from the same empty home and
 /// folder, so the number is the same on a laptop, a lab machine and CI. Not under
 /// `/tmp`: `find /tmp -name '*.toml' -delete` would then search the home.
-fn judge_from_an_empty_place() -> tempfile::TempDir {
-    let place = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("an empty place");
-    let home = place.path().join("home");
-    let work = place.path().join("work");
-    std::fs::create_dir_all(&home).expect("an empty home");
-    std::fs::create_dir_all(&work).expect("an empty working folder");
-    std::env::set_var("HOME", &home);
-    std::env::remove_var("XDG_CONFIG_HOME");
-    std::env::set_current_dir(&work).expect("judge from the empty folder");
-    place
+///
+/// The guard reads the home from the process environment, not from an argument,
+/// so this binary holds ONE test on purpose: nothing else runs beside it while
+/// the home is changed, and the home, `XDG_CONFIG_HOME` and the working folder
+/// are put back when the place is dropped.
+struct EmptyPlace {
+    _dir: tempfile::TempDir,
+    home: Option<std::ffi::OsString>,
+    xdg: Option<std::ffi::OsString>,
+    cwd: std::path::PathBuf,
+}
+
+impl EmptyPlace {
+    fn enter() -> Self {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("an empty place");
+        let home = dir.path().join("home");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&home).expect("an empty home");
+        std::fs::create_dir_all(&work).expect("an empty working folder");
+        let saved = EmptyPlace {
+            home: std::env::var_os("HOME"),
+            xdg: std::env::var_os("XDG_CONFIG_HOME"),
+            cwd: std::env::current_dir().expect("the working folder"),
+            _dir: dir,
+        };
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::set_current_dir(&work).expect("judge from the empty folder");
+        saved
+    }
+}
+
+impl Drop for EmptyPlace {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.cwd);
+        match &self.home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        match &self.xdg {
+            Some(x) => std::env::set_var("XDG_CONFIG_HOME", x),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
 }
 
 #[test]
 fn release_safety_suite_holds_against_the_reference() {
-    let _place = judge_from_an_empty_place();
+    // The checks of this file's own helpers run first, before the home changes.
+    a_reference_line_must_have_three_fields();
+    a_loosening_is_worse_and_a_tightening_is_not();
+    let _place = EmptyPlace::enter();
     let engine = RuleEngine::load_embedded();
     let mut all: Vec<(&str, Vec<CaseResult>)> = Vec::new();
     let mut expects: BTreeMap<&str, BTreeMap<String, Option<String>>> = BTreeMap::new();
@@ -338,7 +375,6 @@ fn release_safety_suite_holds_against_the_reference() {
     );
 }
 
-#[test]
 fn a_reference_line_must_have_three_fields() {
     let r = parse_reference("# c\nproof\trs-001\tdeny\n");
     assert_eq!(r[&("proof".into(), "rs-001".into())], "deny");
@@ -346,7 +382,6 @@ fn a_reference_line_must_have_three_fields() {
     assert!(bad.is_err());
 }
 
-#[test]
 fn a_loosening_is_worse_and_a_tightening_is_not() {
     assert!(worse(Outcome::Caught, Outcome::Missed));
     assert!(worse(Outcome::Ok, Outcome::FalsePositive));
