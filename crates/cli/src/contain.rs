@@ -15,10 +15,11 @@
 //!     uses the rules embedded in the binary (`RuleEngine::load_embedded`).
 //!   * The key is NEVER passed via env (the agent shares the hook's environment).
 //!     In-jail LLM/notify enrichment is simply disabled; a `deny` still denies.
-//!   * The jail INHERITS the host environment (like a normal shell) except the
-//!     credential variables (`credential_vars`: `OPENAI_API_KEY`,
-//!     `AWS_SECRET_ACCESS_KEY`, `GITHUB_TOKEN`, ...), which the launcher takes
-//!     out; `--pass-env NAME` hands one in, for an agent that needs its own key.
+//!   * The jail gets only the variables a shell needs from the host
+//!     environment (`env_goes_in`: `PATH`, `HOME`, `USER`, `LANG`, `LC_*`,
+//!     `TERM`, the proxy settings, ...); the launcher takes every other one
+//!     out, a credential under any name included; `--pass-env NAME` hands one
+//!     in, for an agent that needs its own key.
 //!     (The InnerWarden key is not one of these: it is read from the shadowed
 //!     `~/.config/innerwarden`, never the environment.)
 //!   * `.ssh` / `.aws` / `.gnupg` (and macOS Mail/Messages/Safari) are never
@@ -102,9 +103,9 @@ pub struct ContainArgs {
     /// Paths under the home a jail profile hides (`hide_home`), joined to the
     /// home. Empty without one.
     pub hide_home: Vec<PathBuf>,
-    /// `--pass-env NAME`: credential variables the person hands to the jail's
-    /// command by name. Every other one [`credential_vars`] finds in the
-    /// launcher's environment is taken out of the jail's.
+    /// `--pass-env NAME`: variables the person hands to the jail's command by
+    /// name. Every other one [`env_goes_in`] does not let in is taken out of
+    /// the jail's environment ([`env_kept_out`]).
     pub pass_env: Vec<String>,
 }
 
@@ -236,49 +237,55 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
     })
 }
 
-/// The endings of a variable's name that say it holds a credential: an API
-/// key, a token, a secret, a password, a private key, a cloud access key.
-/// Read upper-cased. Checked against the names the providers document for
-/// their keys (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
-/// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
-/// `GITHUB_TOKEN`, `GH_TOKEN`, `NPM_TOKEN`, `HF_TOKEN`,
-/// `AZURE_CLIENT_SECRET`, `CLAUDE_CODE_OAUTH_TOKEN`,
-/// `GOOGLE_APPLICATION_CREDENTIALS`, `DOCKER_PASSWORD`, `VAULT_TOKEN`) in
-/// [`tests::credential_variables_are_found_by_name_and_a_passed_one_is_kept`].
-pub const CREDENTIAL_ENDINGS: &[&str] = &[
-    "_API_KEY",
-    "_APIKEY",
-    "_TOKEN",
-    "_SECRET",
-    "_SECRET_KEY",
-    "_ACCESS_KEY",
-    "_ACCESS_KEY_ID",
-    "_PASSWORD",
-    "_PASSWD",
-    "_PRIVATE_KEY",
-    "_CREDENTIALS",
+/// The variables of the launcher's environment the jail's command gets
+/// without being asked: what a shell and its programs need to run. Every
+/// other one stays out unless `--pass-env NAME` hands it in. Also in: every
+/// `LC_*` locale variable and the proxy settings (`*_PROXY`, `NO_PROXY`, in
+/// either case), where they are set ([`env_goes_in`]).
+pub const ENV_ALLOWED: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "TERM",
+    "TZ",
+    "TMPDIR",
+    "COLORTERM",
 ];
 
-/// Credential variables whose name has none of [`CREDENTIAL_ENDINGS`].
-pub const CREDENTIAL_NAMES: &[&str] = &["PGPASSWORD", "MYSQL_PWD", "REDISCLI_AUTH"];
+/// How [`env_said`] and the help name what goes in without `--pass-env`.
+pub const ENV_ALLOWED_WORDS: &str =
+    "PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*, TERM, TZ, TMPDIR, COLORTERM and the proxy settings";
 
-/// PURE. The names in `names` (the launcher's environment) that hold a
-/// credential and were not passed by name with `--pass-env`, sorted. The
-/// jail's command starts without them: an agent in a jail used to get every
-/// key the person had exported, while the help said the key stayed outside.
-pub fn credential_vars<I>(names: I, pass: &[String]) -> Vec<std::ffi::OsString>
+/// PURE. Whether the variable `name` reaches the jail's command: one of
+/// [`ENV_ALLOWED`], a locale `LC_*`, a proxy setting, or one passed by its
+/// exact name with `--pass-env`.
+pub fn env_goes_in(name: &std::ffi::OsStr, pass: &[String]) -> bool {
+    let bytes = name.as_encoded_bytes();
+    let upper = bytes.to_ascii_uppercase();
+    ENV_ALLOWED.iter().any(|kept| bytes == kept.as_bytes())
+        || (bytes.starts_with(b"LC_") && bytes.len() > 3)
+        || upper == b"NO_PROXY"
+        || (upper.len() > b"_PROXY".len() && upper.ends_with(b"_PROXY"))
+        || pass.iter().any(|kept| name == kept.as_str())
+}
+
+/// PURE. The names in `names` (the launcher's environment) the jail's command
+/// does not get, sorted: every one [`env_goes_in`] leaves out, except those
+/// the launch sets itself (`set_by_launch`, the jail's own `IW_*`). An
+/// allow list: a secret under a name no pattern knows (a `DATABASE_URL`
+/// holding a password, `STRIPE_SK`) reached the jail when only the names
+/// that looked like a credential were taken out.
+pub fn env_kept_out<I>(names: I, pass: &[String], set_by_launch: &[&str]) -> Vec<std::ffi::OsString>
 where
     I: IntoIterator<Item = std::ffi::OsString>,
 {
     let mut out: Vec<std::ffi::OsString> = names
         .into_iter()
         .filter(|name| {
-            let upper = name.as_encoded_bytes().to_ascii_uppercase();
-            let credential = CREDENTIAL_NAMES.iter().any(|n| upper == n.as_bytes())
-                || CREDENTIAL_ENDINGS
-                    .iter()
-                    .any(|end| upper.len() > end.len() && upper.ends_with(end.as_bytes()));
-            credential && !pass.iter().any(|kept| name.as_os_str() == kept.as_str())
+            !env_goes_in(name, pass) && !set_by_launch.iter().any(|set| name.as_os_str() == *set)
         })
         .collect();
     out.sort();
@@ -286,9 +293,9 @@ where
     out
 }
 
-/// What the launcher says of the credential variables it kept out of the
-/// jail's environment; `None` when there were none.
-pub fn credentials_said(kept_out: &[std::ffi::OsString]) -> Option<String> {
+/// What the launcher says of the variables it kept out of the jail's
+/// environment, by name only (never a value); `None` when there were none.
+pub fn env_said(kept_out: &[std::ffi::OsString]) -> Option<String> {
     if kept_out.is_empty() {
         return None;
     }
@@ -297,7 +304,7 @@ pub fn credentials_said(kept_out: &[std::ffi::OsString]) -> Option<String> {
         .map(|name| name.to_string_lossy().into_owned())
         .collect();
     Some(format!(
-        "  credential variables kept out of the jail's environment: {} (pass one in with --pass-env NAME).",
+        "  variables kept out of the jail's environment: {} (only {ENV_ALLOWED_WORDS} go in; pass one in with --pass-env NAME).",
         names.join(", ")
     ))
 }
@@ -8611,16 +8618,17 @@ mod tests {
         assert_eq!(bare, LaunchEnv::default());
     }
 
-    /// The credential variables are found by name, whatever their case, a
-    /// name that only ends like one is not cut short (`_TOKEN` alone is no
-    /// credential name), and `--pass-env` keeps one by its exact name.
+    /// The jail's command gets only what a shell needs, a variable passed by
+    /// its exact name, and the jail's own `IW_*`: every credential the old
+    /// name patterns found is still out, and so is one under a name no pattern
+    /// knows (`DATABASE_URL`, `STRIPE_SK`). Locale and proxy settings go in.
     ///
-    /// FAILS ON REVERT: let `credential_vars` find nothing, and the
-    /// provider names below stay in the jail.
+    /// FAILS ON REVERT: go back to the credential name patterns and
+    /// `DATABASE_URL`, `STRIPE_SK` and `EDITOR` reach the jail.
     #[test]
-    fn credential_variables_are_found_by_name_and_a_passed_one_is_kept() {
+    fn only_what_a_shell_needs_goes_in_and_every_other_name_stays_out() {
         use std::ffi::OsString;
-        let credentials = [
+        let out_by_default = [
             "OPENAI_API_KEY",
             "ANTHROPIC_API_KEY",
             "GEMINI_API_KEY",
@@ -8639,39 +8647,57 @@ mod tests {
             "PGPASSWORD",
             "MYSQL_PWD",
             "my_service_api_key",
+            "DATABASE_URL",
+            "STRIPE_SK",
+            "EDITOR",
+            "SSH_AUTH_SOCK",
+            "LD_PRELOAD",
+            "path",
+            "LC_",
+            "_PROXY",
+            "XDG_RUNTIME_DIR",
         ];
-        let ordinary = [
+        let goes_in = [
             "PATH",
             "HOME",
-            "TERM",
-            "LANG",
-            "SHELL",
             "USER",
-            "EDITOR",
-            "_TOKEN",
-            "TOKENIZERS",
-            "SSH_TTY",
-            "IW_GRAPH_FILE",
-            "KEYMAP",
+            "LOGNAME",
+            "SHELL",
+            "LANG",
+            "LC_ALL",
+            "LC_CTYPE",
+            "TERM",
+            "TZ",
+            "TMPDIR",
+            "COLORTERM",
+            "HTTP_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "NO_PROXY",
+            "no_proxy",
         ];
         let names = || {
-            credentials
+            out_by_default
                 .iter()
-                .chain(ordinary.iter())
+                .chain(goes_in.iter())
+                .chain(["IW_GRAPH_FILE"].iter())
                 .map(|name| OsString::from(*name))
         };
-        let mut want: Vec<OsString> = credentials.iter().map(OsString::from).collect();
+        let mut want: Vec<OsString> = out_by_default.iter().map(OsString::from).collect();
         want.sort();
-        assert_eq!(credential_vars(names(), &[]), want);
-        let kept = credential_vars(names(), &["ANTHROPIC_API_KEY".into()]);
-        assert!(!kept.contains(&OsString::from("ANTHROPIC_API_KEY")));
-        assert_eq!(kept.len(), credentials.len() - 1);
-        // Passing a name keeps that name only, not another case of it.
-        assert!(credential_vars(names(), &["openai_api_key".into()])
+        assert_eq!(env_kept_out(names(), &[], &["IW_GRAPH_FILE"]), want);
+        // The launch's own variable is out only when the launch does not set it.
+        assert!(env_kept_out(names(), &[], &[]).contains(&OsString::from("IW_GRAPH_FILE")));
+        // Passed by its exact name: in; another case of it: still out.
+        let kept = env_kept_out(names(), &["DATABASE_URL".into()], &["IW_GRAPH_FILE"]);
+        assert!(!kept.contains(&OsString::from("DATABASE_URL")));
+        assert_eq!(kept.len(), out_by_default.len() - 1);
+        assert!(env_kept_out(names(), &["openai_api_key".into()], &[])
             .contains(&OsString::from("OPENAI_API_KEY")));
-        let said = credentials_said(&kept).expect("said");
-        assert!(said.contains("OPENAI_API_KEY") && said.contains("--pass-env NAME"));
-        assert_eq!(credentials_said(&[]), None);
+        let said = env_said(&kept).expect("said");
+        assert!(said.contains("STRIPE_SK") && said.contains("--pass-env NAME"));
+        assert!(said.contains(ENV_ALLOWED_WORDS), "{said}");
+        assert_eq!(env_said(&[]), None);
     }
 
     /// `--pass-env NAME` is read, more than once, and never as the start

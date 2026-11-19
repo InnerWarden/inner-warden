@@ -114,12 +114,14 @@ fn linux_backend_masks_innerwarden_secrets_and_keeps_project_available() {
     assert!(!String::from_utf8_lossy(&output.stdout).contains("CJC-J007-SECRET"));
 }
 
-/// Credential variables the person exported are not in the jail's
-/// environment, the launcher names them, and `--pass-env` hands one in.
-/// Before this, `env` in the jail printed every one of them while the help
-/// said the key stayed outside.
+/// Only what a shell needs of the person's environment is in the jail's
+/// (locale and proxy settings included); every other variable, a credential
+/// under any name included, stays out, the launcher names them, and
+/// `--pass-env` hands one in. Before the allow list a secret under a name no
+/// pattern knew (`DATABASE_URL`, `STRIPE_SK`) reached the jail.
 ///
-/// FAILS ON REVERT: drop `without_credentials` from the plain launch.
+/// FAILS ON REVERT: drop `without_credentials` from the plain launch, or go
+/// back to the credential name patterns (`DATABASE_URL` reaches the jail).
 #[cfg(target_os = "linux")]
 #[test]
 fn exported_credentials_stay_out_of_the_jail_unless_passed_by_name() {
@@ -141,6 +143,10 @@ fn exported_credentials_stay_out_of_the_jail_unless_passed_by_name() {
         .env("GITHUB_TOKEN", "cjc-gh")
         .env("ANTHROPIC_API_KEY", "cjc-anthropic")
         .env("CJC_ORDINARY", "cjc-ordinary")
+        .env("DATABASE_URL", "cjc-database")
+        .env("STRIPE_SK", "cjc-stripe")
+        .env("LC_CJC", "cjc-locale")
+        .env("HTTPS_PROXY", "cjc-proxy")
         .output()
         .expect("run Linux AI Jail");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -152,6 +158,11 @@ fn exported_credentials_stay_out_of_the_jail_unless_passed_by_name() {
         ("OPENAI_API_KEY", "cjc-openai"),
         ("AWS_SECRET_ACCESS_KEY", "cjc-aws"),
         ("GITHUB_TOKEN", "cjc-gh"),
+        // A secret under a name no pattern knows, and an ordinary variable:
+        // only what a shell needs goes in.
+        ("DATABASE_URL", "cjc-database"),
+        ("STRIPE_SK", "cjc-stripe"),
+        ("CJC_ORDINARY", "cjc-ordinary"),
     ] {
         assert!(!stdout.contains(value), "{name} reached the jail");
     }
@@ -159,13 +170,22 @@ fn exported_credentials_stay_out_of_the_jail_unless_passed_by_name() {
         stdout.contains("ANTHROPIC_API_KEY=cjc-anthropic"),
         "ANTHROPIC_API_KEY, passed by name, did not reach the jail"
     );
+    for line in ["LC_CJC=cjc-locale", "HTTPS_PROXY=cjc-proxy"] {
+        assert!(
+            stdout.contains(line),
+            "a locale or proxy setting did not reach the jail"
+        );
+    }
     assert!(
-        stdout.contains("CJC_ORDINARY=cjc-ordinary"),
-        "an ordinary variable did not reach the jail"
-    );
-    assert!(
-        stderr.contains("credential variables kept out of the jail's environment:")
-            && stderr.contains("OPENAI_API_KEY")
+        stderr.contains("variables kept out of the jail's environment:")
+            && [
+                "OPENAI_API_KEY",
+                "DATABASE_URL",
+                "STRIPE_SK",
+                "CJC_ORDINARY"
+            ]
+            .iter()
+            .all(|name| stderr.contains(name))
             && !stderr.contains("cjc-"),
         "the jail's notice does not name the variables kept out, or shows a value"
     );

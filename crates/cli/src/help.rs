@@ -241,17 +241,17 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              Run <command> inside a filesystem/namespace JAIL with the guard hook armed\n  \
              INSIDE it (Linux bwrap, macOS sandbox-exec). InnerWarden's own folder (its\n  \
              API key with it) and the project's secrets are not shown to the jailed\n  \
-             command. Variables you exported are taken out of its environment by the\n  \
-             pattern of their NAME: OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN and\n  \
-             other names ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD and the like;\n  \
-             contain names the ones it took out. A secret under any other name (a\n  \
-             DATABASE_URL holding a password, STRIPE_SK) still reaches the jail: unset\n  \
-             it before the launch.\n\
+             command. Of the variables you exported, only what a shell needs goes in:\n  \
+             PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*, TERM, TZ, TMPDIR, COLORTERM\n  \
+             and the proxy settings (*_PROXY, NO_PROXY). Every other one stays out, an\n  \
+             API key or a DATABASE_URL holding a password alike, and contain names the\n  \
+             ones it kept out (never their values). An agent that reads its key or any\n  \
+             other variable from the environment needs --pass-env NAME.\n\
              \n  \
              --project DIR     the directory the jailed command may write (default: cwd)\n  \
              --deny-read GLOB  one more path the jail must not expose\n  \
-             --pass-env NAME   hand one credential variable to the jailed command (repeat\n  \
-             \x20                 for more), for an agent that needs its own key\n  \
+             --pass-env NAME   hand one variable of your environment to the jailed command\n  \
+             \x20                 (repeat for more), for an agent that needs its own key\n  \
              --dry-run         print the jail that would be built and run nothing\n  \
              --setup           arm the in-jail hook only\n  \
              --identity        (Linux) record the run as an identified instance\n\
@@ -678,17 +678,21 @@ mod tests {
         }
     }
 
-    /// The contain help says the jail takes exported credential variables out
-    /// and how to hand one in, never that the key stays outside.
+    /// The contain help says which variables go in, that every other one stays
+    /// out and is named, and how to hand one in, never that the key stays
+    /// outside.
+    ///
+    /// FAILS ON REVERT: the help of the name patterns, which said a secret
+    /// under any other name still reached the jail.
     #[test]
     fn the_contain_help_says_which_keys_stay_out_and_how_to_pass_one() {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let help = flat(&usage("contain", &[]).expect("contain has usage"));
         for said in [
-            "Variables you exported are taken out of its environment by the pattern of their NAME: OPENAI_API_KEY, AWS_SECRET_ACCESS_KEY, GITHUB_TOKEN",
-            "contain names the ones it took out.",
-            "A secret under any other name (a DATABASE_URL holding a password, STRIPE_SK) still reaches the jail",
-            "--pass-env NAME hand one credential variable to the jailed command",
+            "Of the variables you exported, only what a shell needs goes in: PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*, TERM, TZ, TMPDIR, COLORTERM and the proxy settings (*_PROXY, NO_PROXY).",
+            "Every other one stays out, an API key or a DATABASE_URL holding a password alike, and contain names the ones it kept out (never their values).",
+            "needs --pass-env NAME",
+            "--pass-env NAME hand one variable of your environment to the jailed command",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
@@ -696,6 +700,7 @@ mod tests {
             !help.contains("Your API key and the project's secrets stay outside"),
             "{help}"
         );
+        assert!(!help.contains("still reaches the jail"), "{help}");
     }
 
     /// The contain help and the README say where an identified jail keeps

@@ -46,9 +46,6 @@ pub(crate) const FILES: [ShippedFile; 3] = [
     },
 ];
 
-/// The most stdin one call reads.
-const MAX_STDIN_BYTES: u64 = crate::MAX_TOOL_CALL_BYTES;
-
 /// One check-command request to Pro on this host's loopback, connect to
 /// answer. The screening runs on every tool call, so a Pro that is down or
 /// busy costs at most this, and the local verdict stands. Pro's own Claude
@@ -118,12 +115,57 @@ pub(crate) fn help_text() -> String {
     )
 }
 
-fn read_stdin() -> String {
-    let mut buffer = String::new();
-    let _ = std::io::stdin()
-        .take(MAX_STDIN_BYTES)
-        .read_to_string(&mut buffer);
-    buffer
+/// One call from stdin, read as the Claude Code hook reads one
+/// ([`crate::read_tool_call`]): `Stdin::Whole`, or `Stdin::TooLong` for a call
+/// past [`crate::MAX_TOOL_CALL_BYTES`] (1 MiB), which is never judged on the part that was read
+/// (it was cut there, silently, before).
+fn read_stdin() -> Stdin {
+    match crate::read_tool_call(std::io::stdin()) {
+        Ok(Some(text)) => Stdin::Whole(text),
+        Ok(None) => Stdin::TooLong,
+        // Unreadable bytes (not UTF-8) or a read error: no JSON, as before.
+        Err(_) => Stdin::Whole(String::new()),
+    }
+}
+
+/// What [`read_stdin`] got.
+enum Stdin {
+    Whole(String),
+    TooLong,
+}
+
+impl Stdin {
+    /// The text, or `None` for a call too long to read, which is said on
+    /// stderr for `what` (the plugin's own log) so the cut is never silent.
+    fn text(self, what: &str) -> Option<String> {
+        match self {
+            Stdin::Whole(text) => Some(text),
+            Stdin::TooLong => {
+                eprintln!(
+                    "InnerWarden openclaw {what}: {}.",
+                    crate::TOOL_CALL_TOO_LONG
+                );
+                None
+            }
+        }
+    }
+}
+
+/// The answer to a call too long to read: refused in enforce, and said to
+/// have gone unscreened in monitor (`allow` with `unreadable`), the hook's
+/// verdict for the same call. `why` says it, for the plugin to log.
+fn too_long_answer(monitor: bool) -> Value {
+    if monitor {
+        eprintln!("InnerWarden openclaw: this call was NOT screened (monitor mode never blocks).");
+    } else {
+        eprintln!("InnerWarden openclaw: refusing it rather than letting it run unscreened.");
+    }
+    json!({
+        "decision": (if monitor { "allow" } else { "deny" }),
+        "unreadable": true,
+        "too_long": true,
+        "why": crate::TOOL_CALL_TOO_LONG,
+    })
 }
 
 fn now() -> u64 {
@@ -153,7 +195,10 @@ fn answer_line(value: &Value) -> std::process::ExitCode {
 fn cmd_screen(rest: &[String]) -> std::process::ExitCode {
     let mode = Mode::parse(flag(rest, "--mode").as_deref());
     let monitor = mode == Mode::Monitor;
-    let Ok(call) = serde_json::from_str::<ToolCall>(&read_stdin()) else {
+    let Some(text) = read_stdin().text("screen") else {
+        return answer_line(&too_long_answer(monitor));
+    };
+    let Ok(call) = serde_json::from_str::<ToolCall>(&text) else {
         // Unreadable: the plugin refuses in enforce, records nothing in monitor.
         return answer_line(&json!({ "decision": "deny", "unreadable": true }));
     };
@@ -270,7 +315,10 @@ fn screen_command(
 /// person answered (or nobody did, which is a refusal).
 fn cmd_resolved(rest: &[String]) -> std::process::ExitCode {
     let resolution = Resolution::parse(flag(rest, "--decision").as_deref().unwrap_or(""));
-    let Ok(body) = serde_json::from_str::<Value>(&read_stdin()) else {
+    let Some(text) = read_stdin().text("resolved") else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    let Ok(body) = serde_json::from_str::<Value>(&text) else {
         return std::process::ExitCode::SUCCESS;
     };
     let Ok(call) =
@@ -314,7 +362,10 @@ fn cmd_resolved(rest: &[String]) -> std::process::ExitCode {
 /// recorded it. A call that ran other than as it was screened (a plugin
 /// froze a rewrite of its own under an approval) is recorded as such.
 fn cmd_ran() -> std::process::ExitCode {
-    let Ok(body) = serde_json::from_str::<Value>(&read_stdin()) else {
+    let Some(text) = read_stdin().text("ran") else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    let Ok(body) = serde_json::from_str::<Value>(&text) else {
         return std::process::ExitCode::SUCCESS;
     };
     let Some(dir) = record_dir() else {

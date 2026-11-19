@@ -3,6 +3,21 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## Unreleased
+
+### Security
+
+- **The AI Jail lets in only what a shell needs of your environment.**
+  `innerwarden contain` took out the variables whose name looked like a
+  credential, so a secret under any other name (a `DATABASE_URL` holding a
+  password, `STRIPE_SK`) reached the jailed command. It now hands in only
+  `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`,
+  `TZ`, `TMPDIR`, `COLORTERM` and the proxy settings (`*_PROXY`,
+  `NO_PROXY`), on Linux with or without `--identity` and on macOS, and names
+  every variable it kept out (never a value). The cost: an agent that read
+  any other variable from the environment (its API key, `CLAUDE_CONFIG_DIR`,
+  `EDITOR`, a loader variable) now needs `--pass-env NAME` for each.
+
 ## 1.6.14 - 2026-11-19
 
 The guard reads more of what a line hands a shell, and more of the files an

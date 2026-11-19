@@ -257,6 +257,66 @@ fn an_unreadable_call_is_refused_in_enforce_only() {
     assert_eq!(answer["decision"], "deny");
 }
 
+/// A call longer than the 1 MiB the path reads is not judged on its first
+/// MiB: it is refused in enforce, said to have gone unscreened in monitor,
+/// and the answer and stderr say why (the hook's verdict for the same call).
+///
+/// FAILS ON REVERT: read the first MiB with `take` (as before) and monitor
+/// answers `deny` with nothing said of the cut.
+#[test]
+fn a_call_past_the_cap_is_said_and_gets_the_hooks_verdict() {
+    let host = Host::new();
+    let long = json!({
+        "tool": "exec",
+        "params": {"command": format!("echo {}", "a".repeat(1024 * 1024 + 16))},
+        "session": SESSION,
+    })
+    .to_string();
+    for (mode, decision, said) in [
+        (
+            "enforce",
+            "deny",
+            "refusing it rather than letting it run unscreened",
+        ),
+        ("monitor", "allow", "this call was NOT screened"),
+    ] {
+        let mut child = Command::new(bin())
+            .args(["openclaw", "screen", "--mode", mode])
+            .env("HOME", host.home())
+            .env("USERPROFILE", host.home())
+            .env("IW_GRAPH_FILE", host.graph())
+            .env("INNERWARDEN_AGENT_URL", "off")
+            .env("IW_AD_CLI_DIRS", "")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run innerwarden");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let body = long.clone();
+        // The reader stops past the cap: a write it no longer reads ends in a
+        // closed pipe, which is the point, not a failure.
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(body.as_bytes());
+        });
+        let out = child.wait_with_output().expect("collect output");
+        writer.join().expect("writer");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let answer: Value = serde_json::from_slice(&out.stdout).expect("one JSON answer");
+        assert_eq!(answer["decision"], decision, "{mode}: {answer}");
+        assert_eq!(answer["too_long"], true, "{mode}: {answer}");
+        assert_eq!(answer["unreadable"], true, "{mode}: {answer}");
+        assert!(
+            answer["why"]
+                .as_str()
+                .is_some_and(|why| why.contains("1 MiB")),
+            "{answer}"
+        );
+        assert!(stderr.contains("longer than the 1 MiB"), "{mode}: {stderr}");
+        assert!(stderr.contains(said), "{mode}: {stderr}");
+    }
+}
+
 /// `agents connect openclaw` lays the plugin next to the MCP proxy, in
 /// monitor, and never touches the person's plugin policy; `enforce` turns
 /// it on; `dry-run` back; `disconnect` takes it out.
