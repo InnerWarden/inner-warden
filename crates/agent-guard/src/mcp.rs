@@ -2269,6 +2269,8 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "security_tooling_tamper",
     "sensitive_credential_read",
     "sensitive_file_overwrite",
+    "shell_line_not_literal",
+    "shell_reading_over_budget",
     "tls_verification_disabled",
     "tmp_execution",
     "untrusted_software_source",
@@ -3116,13 +3118,68 @@ fn analyze_command_as_read(
     // escapes of the code apart. Its charged signals are added once each,
     // but for a download it runs: the code's own reading of the data flow
     // above is that observation, charged once.
+    // A line handed to a shell to run (`bash -c '...'`, `su -c`, a debugger's
+    // `shell`, behind `sudo`, `xargs` or `find -exec`) is the same: the
+    // download rules read it already, the rest of the rules read it here.
+    // Measured 2026-11-18: `bash -c 'rm -rf /'` was allowed.
+    // Read on the projection and on the line as written, and the worst of
+    // the two holds: the projection writes a called function's body out at
+    // the call, so an assignment in it comes last in text order and would
+    // hide the written-out value it may overwrite (`C='rm -rf ~'; f() {
+    // C=$X; }; f; sh -c "$C"` was reviewed, not refused).
+    let mut handed_to_shell = crate::shell::handed_shell_lines(raw_scan);
+    if cmd != raw_scan {
+        let as_written = crate::shell::handed_shell_lines(cmd);
+        handed_to_shell.over_budget |= as_written.over_budget;
+        handed_to_shell.not_literal |= as_written.not_literal;
+        for line in as_written.lines {
+            if !handed_to_shell.lines.contains(&line) {
+                handed_to_shell.lines.push(line);
+            }
+        }
+    }
+    // What the reading of handed lines could not read is said, not left as
+    // read: a line handed through more levels than are read (`xargs` or
+    // `find` past four, a shell's line past [`STARTUP_PAYLOAD_DEPTH`] shells
+    // with one more still pending) is refused; a `-c` line not written out
+    // (`sh -c "$C"`) is reviewed.
+    if handed_to_shell.over_budget
+        || (depth >= STARTUP_PAYLOAD_DEPTH && !handed_to_shell.lines.is_empty())
+    {
+        push_unique_signal(
+            &mut signals,
+            AnalysisSignal {
+                signal: "shell_reading_over_budget".into(),
+                score: 40,
+                detail: "hands a line to run through more levels of shells, xargs or find than the guard reads".into(),
+            },
+        );
+        score += 40;
+    }
+    if handed_to_shell.not_literal && !signals.iter().any(|s| s.signal == "shell_line_not_literal")
+    {
+        signals.push(AnalysisSignal {
+            signal: "shell_line_not_literal".into(),
+            score: 20,
+            detail: "hands a shell a line built at run time (a variable or a substitution), which the guard cannot read".into(),
+        });
+        score += 20;
+    }
     if depth < STARTUP_PAYLOAD_DEPTH {
-        let mut lines = crate::shell::inline_process_lines(raw_scan);
         // A line handed over again says nothing new: each is judged once,
         // where it is first handed over.
         let mut seen = std::collections::HashSet::new();
-        lines.retain(|line| seen.insert(line.clone()));
-        if !lines.is_empty() {
+        for (mut lines, handed_by) in [
+            (
+                crate::shell::inline_process_lines(raw_scan),
+                "in a line inline code hands to a process",
+            ),
+            (handed_to_shell.lines, "in a line handed to a shell to run"),
+        ] {
+            lines.retain(|line| seen.insert(line.clone()));
+            if lines.is_empty() {
+                continue;
+            }
             let inner = analyze_command_at(
                 &lines.join("\n"),
                 rule_engine,
@@ -3136,17 +3193,20 @@ fn analyze_command_as_read(
                     || handed.signal.starts_with("fetch_exec_")
                     || (handed.signal == "dangerous_command"
                         && handed.detail.contains("pipe to shell"));
-                if fetch_exec || signals.iter().any(|s| s.signal == handed.signal) {
+                // The same finding is charged once; another finding under
+                // the same name is its own (`chmod -R 777 build; sh -c 'rm
+                // -rf /'` holds two).
+                let detail = format!("{handed_by}: {}", handed.detail);
+                if fetch_exec
+                    || signals.iter().any(|s| {
+                        s.signal == handed.signal
+                            && (s.detail == handed.detail || s.detail == detail)
+                    })
+                {
                     continue;
                 }
                 score += handed.score;
-                signals.push(AnalysisSignal {
-                    detail: format!(
-                        "in a line inline code hands to a process: {}",
-                        handed.detail
-                    ),
-                    ..handed
-                });
+                signals.push(AnalysisSignal { detail, ..handed });
             }
         }
     }
@@ -3475,6 +3535,19 @@ fn analyze_command_as_read(
     // only the raw-scan `dangerous_command` remains. Before this, an over-budget
     // fetch-and-execute denied on that generic 40 alone, which is fail-closed by
     // accident and states no reason for it.
+    // A line that calls more functions defined on it than the reading writes
+    // out runs bodies no rule read: refused, never left as read without them.
+    if projection.names_over_budget {
+        push_unique_signal(
+            &mut signals,
+            AnalysisSignal {
+                signal: "shell_reading_over_budget".into(),
+                score: 40,
+                detail: "calls more functions defined on the line than the guard reads, so what they run is unread".into(),
+            },
+        );
+        score += 40;
+    }
     if !projection.parsed
         && signals.iter().any(|s| {
             matches!(

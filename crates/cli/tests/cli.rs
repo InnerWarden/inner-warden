@@ -28,11 +28,24 @@ fn scratch_graph() -> &'static std::path::Path {
     })
 }
 
+/// A scratch home for the whole test binary, empty: no agent wiring to touch.
+fn scratch_home() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| tempfile::TempDir::new().expect("scratch home"))
+        .path()
+}
+
 /// The CLI under test, pointed at a disposable record by default. A test that
 /// asserts on the record sets `IW_GRAPH_FILE` again; the later value wins.
 fn cli() -> Command {
     let mut command = Command::new(bin());
     command.env("IW_GRAPH_FILE", scratch_graph());
+    // A disposable home too: the hook rewires the Claude Code settings it
+    // finds under HOME once per version, and a debug build doing that on the
+    // developer's own home pointed every guard hook of that machine at
+    // `target/debug`. A test about a home sets HOME again; the later value wins.
+    command.env("HOME", scratch_home());
+    command.env("USERPROFILE", scratch_home());
     // A proxy that refuses a call reports it to the local agent. Off here, so
     // a developer running the suite on a host with an agent never gets the
     // suite's fake attacks as cases; the one test of the report turns it on.
@@ -94,11 +107,12 @@ fn benign_command_allows_with_exit_0() {
 }
 
 #[test]
-fn reads_command_from_stdin() {
+fn check_reads_command_from_stdin_without_stderr_noise() {
     let mut child = cli()
         .arg("check")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn innerwarden");
     child
@@ -114,6 +128,11 @@ fn reads_command_from_stdin() {
         "reverse shell on stdin must deny"
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("\"deny\""));
+    assert!(
+        out.stderr.is_empty(),
+        "piped check must stay quiet on stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

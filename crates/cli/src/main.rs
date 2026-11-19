@@ -360,7 +360,7 @@ fn main() -> std::process::ExitCode {
             code
         }
         Some("install") => cmd_install(&args[1..]),
-        Some("status") => status_io_cmd(),
+        Some("status") => status_cmd(&args[1..]),
         Some("demo") => demo_io::cmd(&args[1..]),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
@@ -469,6 +469,18 @@ fn analyze(command: &str, engine: &RuleEngine) -> serde_json::Value {
 // `render_verdict` + `is_deny` now live in `innerwarden_agent_guard::render` so the
 // Active Defence's `innerwarden check` renders byte-identically (imported at the top).
 
+/// Explain a terminal stdin read without adding noise to hooks or pipelines.
+fn check_stdin_hint(stdin_is_terminal: bool) -> Option<&'static str> {
+    if !stdin_is_terminal {
+        return None;
+    }
+    Some(if cfg!(windows) {
+        "reading a command from stdin (end with Ctrl-Z then Enter), or pass it: innerwarden check \"<command>\""
+    } else {
+        "reading a command from stdin (end with Ctrl-D), or pass it: innerwarden check \"<command>\""
+    })
+}
+
 /// `innerwarden check "<cmd>"` - analyze a command (from argv, or stdin when none is
 /// given) and print the verdict. `--json` for the full machine output. Exits 1 on
 /// a `deny` so a PreToolUse hook can gate on the exit code, and fires any
@@ -487,6 +499,9 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
         .cloned()
         .collect();
     let command = if words.is_empty() {
+        if let Some(hint) = check_stdin_hint(std::io::IsTerminal::is_terminal(&std::io::stdin())) {
+            eprintln!("{hint}");
+        }
         let mut buf = String::new();
         if std::io::stdin().read_to_string(&mut buf).is_err() {
             eprintln!("innerwarden: failed to read command from stdin");
@@ -1071,6 +1086,9 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     if let Err(why) = hook_net::arm(monitor) {
         return hook_unreadable(why, monitor);
     }
+    // A host upgraded by an older binary still runs that binary's wiring:
+    // the first hook of this version brings it up to this one's.
+    agents_io::rewire_once_per_version();
 
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
@@ -2558,16 +2576,54 @@ fn can_unlink(exe: &std::path::Path) -> bool {
 /// loopback so an AI agent's MCP wrapper / hook can POST to it. Mirrors the
 /// agent's `POST /api/agent/check-command` shape (body `{"command":"..."}`),
 /// minus TLS (loopback only) so the binary pulls no crypto and stays Windows-clean.
-fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
-    let mut bind = SERVE_BIND.to_string();
+/// `serve` takes only `--bind <addr>`; anything else is refused by name, and
+/// `--bind` needs its value (issue #223). Repeating `--bind` keeps the last.
+fn parse_serve_flags(rest: &[String]) -> Result<Option<String>, String> {
+    let mut bind: Option<String> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
-        if a.as_str() == "--bind" {
-            if let Some(v) = it.next() {
-                bind = v.clone();
-            }
+        match a.as_str() {
+            "--bind" => match it.next() {
+                Some(v) => bind = Some(v.clone()),
+                None => {
+                    return Err(format!(
+                        "--bind needs an address, for example --bind {SERVE_BIND}"
+                    ))
+                }
+            },
+            other => return Err(format!("unknown flag `{other}` for `serve`")),
         }
     }
+    Ok(bind)
+}
+
+/// `status` takes no arguments; anything here is refused by name (#223).
+fn parse_status_flags(rest: &[String]) -> Result<(), String> {
+    match rest.first() {
+        Some(flag) => Err(format!(
+            "unexpected argument `{flag}` for `status`; it takes no arguments"
+        )),
+        None => Ok(()),
+    }
+}
+
+fn status_cmd(rest: &[String]) -> std::process::ExitCode {
+    if let Err(msg) = parse_status_flags(rest) {
+        eprintln!("innerwarden status: {msg}");
+        return std::process::ExitCode::from(2);
+    }
+    status_io_cmd()
+}
+
+fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
+    let bind = match parse_serve_flags(rest) {
+        Ok(Some(b)) => b,
+        Ok(None) => SERVE_BIND.to_string(),
+        Err(msg) => {
+            eprintln!("innerwarden serve: {msg}");
+            return std::process::ExitCode::from(2);
+        }
+    };
 
     // Shell surface only: an engine that holds just the rules a command can
     // match, on a process that runs per tool call. See
@@ -3112,6 +3168,25 @@ mod status_wiring_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn check_stdin_hint_explains_terminal_input() {
+        let hint = super::check_stdin_hint(true).expect("terminal input needs an explanation");
+        assert_eq!(hint.lines().count(), 1);
+        assert!(hint.contains("reading a command from stdin"));
+        assert!(hint.contains("innerwarden check \"<command>\""));
+        let eof_keys = if cfg!(windows) {
+            "Ctrl-Z then Enter"
+        } else {
+            "Ctrl-D"
+        };
+        assert!(hint.contains(eof_keys));
+    }
+
+    #[test]
+    fn check_stdin_hint_is_silent_for_pipes() {
+        assert_eq!(super::check_stdin_hint(false), None);
+    }
+
     /// A refusal of Active Defence's own on the host is not one a rule of the
     /// person's lifts: the remedy does not send them to `innerwarden allow`.
     /// Every other block still does.
@@ -4010,6 +4085,58 @@ mod install_target_tests {
             };
             assert!(stderr.contains(said), "{mode}: {stderr}");
         }
+    }
+}
+
+#[cfg(test)]
+mod flag_parse_tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_bind_and_keeps_the_last_one() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_serve_flags(&none).unwrap(), None);
+        let bind = |v: &str| vec!["--bind".to_string(), v.to_string()];
+        assert_eq!(
+            parse_serve_flags(&bind("127.0.0.1:9")).unwrap(),
+            Some("127.0.0.1:9".into())
+        );
+        let two = vec![
+            "--bind".to_string(),
+            "a:1".to_string(),
+            "--bind".to_string(),
+            "b:2".to_string(),
+        ];
+        assert_eq!(parse_serve_flags(&two).unwrap(), Some("b:2".into()));
+    }
+
+    #[test]
+    fn serve_refuses_an_unknown_flag_by_name() {
+        let bogus = vec!["--bnd".to_string(), "127.0.0.1:1".to_string()];
+        let err = parse_serve_flags(&bogus).unwrap_err();
+        assert!(err.contains("`--bnd`"), "{err}");
+    }
+
+    #[test]
+    fn serve_refuses_bind_without_a_value_with_an_example() {
+        let missing = vec!["--bind".to_string()];
+        let err = parse_serve_flags(&missing).unwrap_err();
+        assert!(
+            err.contains("needs an address") && err.contains(SERVE_BIND),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn status_takes_no_arguments() {
+        let none: Vec<String> = vec![];
+        assert!(parse_status_flags(&none).is_ok());
+        let bogus = vec!["--bogus".to_string()];
+        let err = parse_status_flags(&bogus).unwrap_err();
+        assert!(
+            err.contains("unexpected argument") && err.contains("`--bogus`"),
+            "{err}"
+        );
     }
 }
 
