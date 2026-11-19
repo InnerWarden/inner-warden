@@ -99,8 +99,19 @@ const RUN_MARKERS: &[&str] = &[
     "child_process",
     "`",
     "qx",
+    // Perl's `open(F, "cmd |")`, Ruby's and Tcl's `open("|cmd")`, PHP's
+    // `proc_open`.
     "open(",
+    "proc_open",
     "getline",
+    // Ruby's `%x(...)` and `Open3`, PHP's `passthru`.
+    "%x(",
+    "%x{",
+    "%x[",
+    "%x<",
+    "%x|",
+    "open3",
+    "passthru",
     "| \"",
     "|\"",
     "\" |",
@@ -141,13 +152,69 @@ fn names_guard_raw(text: &str) -> bool {
     })
 }
 
+/// What code that finds a function by a name it computes holds: the call
+/// that starts a program may then be named nowhere in it
+/// (`getattr(os, 'sy' + 'stem')`, `Kernel.send(...)`, `eval`).
+const DYNAMIC_LOOKUPS: &[&str] = &[
+    "getattr",
+    "__import__",
+    "importlib",
+    "__builtins__",
+    "__dict__",
+    "globals(",
+    "locals(",
+    "vars(",
+    "eval",
+    "compile(",
+    "send(",
+    "public_send",
+    "method(",
+    "call_user_func",
+    "methodcaller",
+];
+
+/// Whether code builds a name by joining quoted pieces: `'sy' + 'stem'`,
+/// PHP's `'sy'.'stem'`, Lua's `'sy'..'stem'`, `''.join(...)`.
+fn code_joins_quoted_pieces(low: &str) -> bool {
+    let bytes = low.as_bytes();
+    let quote = |b: u8| b == b'\'' || b == b'"';
+    bytes.iter().enumerate().any(|(at, &b)| {
+        if !quote(b) {
+            return false;
+        }
+        let rest = low[at + 1..].trim_start();
+        let after_op = rest
+            .strip_prefix("..")
+            .or_else(|| rest.strip_prefix('+'))
+            .or_else(|| rest.strip_prefix('.'));
+        match after_op {
+            Some(tail) if !rest.starts_with(".join") => tail
+                .trim_start()
+                .as_bytes()
+                .first()
+                .is_some_and(|&c| quote(c)),
+            _ => false,
+        }
+    }) || low.contains("''.join")
+        || low.contains("\"\".join")
+}
+
+/// Whether code for one of [`INTERPRETERS`] holds a way to start a program,
+/// or finds a function by a name it computes, which may be one that does.
+pub(super) fn code_starts_a_program(code: &str) -> bool {
+    let low = code.to_ascii_lowercase();
+    RUN_MARKERS.iter().any(|m| low.contains(m))
+        || DYNAMIC_LOOKUPS.iter().any(|m| low.contains(m))
+        || code_joins_quoted_pieces(&low)
+}
+
 /// Code for an interpreter that names a guard CLI and starts a program.
 fn code_runs_guard<'a>(texts: impl Iterator<Item = &'a str>) -> bool {
     let (mut named, mut runs) = (false, false);
     for text in texts {
         let low = text.to_ascii_lowercase();
         named |= names_guard_raw(&low);
-        runs |= RUN_MARKERS.iter().any(|m| low.contains(m));
+        runs |= code_starts_a_program(&low);
     }
     named && runs
 }

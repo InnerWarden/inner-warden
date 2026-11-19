@@ -96,6 +96,16 @@ installer sends one anonymous, opt-out install ping (version + OS + CPU arch
 only: no IP, no host data; set `INNERWARDEN_NO_TELEMETRY=1` to disable). A
 `cargo install` or from-source build sends nothing at all.
 
+### Rolling back
+
+On macOS and Linux, a hook that refuses (enforce, `--block-review`) ends in a
+short shell tail, so a hook whose binary is gone or cannot run refuses instead
+of letting the call through. Releases up to 1.6.13 do not recognise a hook line
+with that tail as their own: installed over it, they add a second hook beside it,
+and their `uninstall` leaves it in place, still refusing. Before going back to
+1.6.13 or older, run `innerwarden uninstall` with the newer binary, then install
+the older one and connect again.
+
 ## First commands
 
 Check the guard's status and screen a command without running it:

@@ -28,11 +28,24 @@ fn scratch_graph() -> &'static std::path::Path {
     })
 }
 
+/// A scratch home for the whole test binary, empty: no agent wiring to touch.
+fn scratch_home() -> &'static std::path::Path {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| tempfile::TempDir::new().expect("scratch home"))
+        .path()
+}
+
 /// The CLI under test, pointed at a disposable record by default. A test that
 /// asserts on the record sets `IW_GRAPH_FILE` again; the later value wins.
 fn cli() -> Command {
     let mut command = Command::new(bin());
     command.env("IW_GRAPH_FILE", scratch_graph());
+    // A disposable home too: the hook rewires the Claude Code settings it
+    // finds under HOME once per version, and a debug build doing that on the
+    // developer's own home pointed every guard hook of that machine at
+    // `target/debug`. A test about a home sets HOME again; the later value wins.
+    command.env("HOME", scratch_home());
+    command.env("USERPROFILE", scratch_home());
     // A proxy that refuses a call reports it to the local agent. Off here, so
     // a developer running the suite on a host with an agent never gets the
     // suite's fake attacks as cases; the one test of the report turns it on.
@@ -1241,6 +1254,82 @@ fn graph_never_persists_a_secret_in_a_screened_command() {
         body.contains("[REDACTED]"),
         "the command was recorded but masked: {body}"
     );
+}
+
+/// The one command node `graph --json` prints for a fresh record.
+fn only_command_in(gp: &str) -> serde_json::Value {
+    let out = cli()
+        .args(["graph", "--json"])
+        .env("IW_GRAPH_FILE", gp)
+        .output()
+        .expect("run graph");
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let commands: Vec<_> = printed["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["kind"] == "command")
+        .cloned()
+        .collect();
+    assert_eq!(commands.len(), 1, "{printed}");
+    commands.into_iter().next().unwrap()
+}
+
+#[test]
+fn a_long_review_comes_out_whole_in_graph_json() {
+    // The label is cut for the screen; the person reviewing the decision, and
+    // the rules tuned on it, need the line as it was screened.
+    let dir = tempfile::TempDir::new().unwrap();
+    let graph = dir.path().join("graph.json");
+    let gp = graph.to_str().unwrap();
+    let cmd = format!(
+        "chmod 777 build/out {}",
+        "build/generated/asset.bin ".repeat(20)
+    );
+    let cmd = cmd.trim();
+    let out = cli()
+        .args(["check", cmd, "--json"])
+        .env("IW_GRAPH_FILE", gp)
+        .env("IW_GUARD_SESSION", "long-review")
+        .output()
+        .expect("run check");
+    let verdict: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(verdict["recommendation"], "review", "{verdict}");
+
+    let node = only_command_in(gp);
+    assert!(node["label"].as_str().unwrap().chars().count() <= 120);
+    assert_eq!(node["attrs"]["command_full"], cmd, "{node}");
+}
+
+#[test]
+fn a_long_command_keeps_its_token_masked_in_the_full_text() {
+    // Assembled at runtime so no contiguous token literal lives in the source.
+    let secret = format!("sk-proj{}", "-FAKEfake1111fake2222fake3333value789");
+    let dir = tempfile::TempDir::new().unwrap();
+    let graph = dir.path().join("graph.json");
+    let gp = graph.to_str().unwrap();
+    let cmd = format!(
+        "chmod 777 build/out && OPENAI_API_KEY={secret} make {}",
+        "target ".repeat(40)
+    );
+    let cmd = cmd.trim();
+    cli()
+        .args(["check", cmd, "--json"])
+        .env("IW_GRAPH_FILE", gp)
+        .env("IW_GUARD_SESSION", "long-secret")
+        .output()
+        .expect("run check");
+
+    let node = only_command_in(gp);
+    let full = node["attrs"]["command_full"].as_str().expect("kept whole");
+    assert!(!full.contains(&secret), "secret leaked: {full}");
+    assert!(full.contains("[REDACTED]"), "{full}");
+    assert!(
+        full.ends_with("target"),
+        "the rest of the line is there: {full}"
+    );
+    let body = std::fs::read_to_string(&graph).unwrap();
+    assert!(!body.contains(&secret), "secret leaked into the file");
 }
 
 #[test]

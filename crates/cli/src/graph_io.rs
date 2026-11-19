@@ -313,7 +313,7 @@ impl std::fmt::Display for GraphRecordError {
 /// It was waited for without a limit, which held the hook's verdict for as
 /// long as the lock was held.
 fn save(
-    graph: &Graph,
+    mut graph: Graph,
     path: &std::path::Path,
     expected: Option<&[u8]>,
     lock_wait: Duration,
@@ -321,12 +321,13 @@ fn save(
     // Bound the store on the way out (audit UNSF-05). Readers cap what they
     // SHOW; without this the file itself grew for the life of the install. Doing
     // it here means every writer is covered, rather than each remembering to.
-    let mut graph = graph.clone();
-    let dropped = graph.prune();
+    // The graph is taken by value and pruned in place, and the JSON the prune
+    // measured is the one written: at the cap a clone and a second
+    // serialisation of ~12 MiB were most of what a record cost.
+    let (dropped, json) = graph.prune_to_json();
     if dropped > 0 {
         eprintln!("innerwarden: graph pruned {dropped} oldest node(s) to stay within the cap");
     }
-    let graph = &graph;
     let trusted_root = path
         .parent()
         .ok_or(GraphRecordError::DirectoryUnavailable)?;
@@ -334,7 +335,7 @@ fn save(
         trusted_root,
         path,
         expected,
-        graph.to_json().as_bytes(),
+        json.as_bytes(),
         lock_wait,
     )
     .map_err(|error| match error {
@@ -590,6 +591,11 @@ pub fn record_mcp(
 
     let verdict = mcp_graph_verdict(decision);
     let (mode, outcome) = mcp_context(decision, proxy_mode);
+    // For an MCP call the "whole command" the graph keeps (`command_full` on a
+    // deny or review) is this summary: the tool name and its redacted
+    // arguments, already cut at 240 characters by the router
+    // (`MAX_TOOL_SUMMARY_CHARS`). The raw arguments never reach this boundary,
+    // so nothing past those 240 characters is kept anywhere.
     record(
         summary,
         &verdict,
@@ -694,6 +700,35 @@ fn record(
     source_event_id: Option<&str>,
     origin: DecisionOrigin,
 ) {
+    let Some(path) = graph_path() else { return };
+    record_to(
+        &path,
+        command,
+        verdict,
+        mode,
+        outcome,
+        source_session,
+        source_event_id,
+        origin,
+    );
+}
+
+/// [`record`] into the graph at `path` (and `guard-events.jsonl` beside it).
+/// One mask, [`redact_secrets`](innerwarden_agent_guard::redact::redact_secrets),
+/// runs once on the command here, before anything is kept: the node's short
+/// label, its `command_full` and the `guard.blocked` line's `detail` are all
+/// cut from that one masked text, so no copy can hold what another hides.
+#[allow(clippy::too_many_arguments)]
+fn record_to(
+    path: &std::path::Path,
+    command: &str,
+    verdict: &Value,
+    mode: DecisionMode,
+    outcome: DecisionOutcome,
+    source_session: Option<&str>,
+    source_event_id: Option<&str>,
+    origin: DecisionOrigin,
+) {
     // Redact secrets from the command BEFORE it is persisted. A secret in a
     // screened command (`export API_KEY=…`, `curl -H "Authorization: sk-…"`)
     // must never be written to the local Community record. Detection already ran
@@ -706,7 +741,6 @@ fn record(
     let verdict = innerwarden_agent_guard::redact::redact_json_secrets(verdict);
     let session = session_id(source_session);
     let event_hash = source_event_id.and_then(|event_id| hook_event_hash(&session, event_id));
-    let Some(path) = graph_path() else { return };
     // Emit a compact, append-only guard event for a CO-LOCATED InnerWarden host
     // agent (Enterprise) to ingest — so the free guard's blocks (command AND MCP)
     // reach the paid incident pipeline / graph / model. Block-only + best-effort:
@@ -718,7 +752,7 @@ fn record(
         DecisionOutcome::Blocked | DecisionOutcome::WouldBlock
     ) {
         emit_guard_event(
-            &path,
+            path,
             &command,
             &verdict,
             DecisionContextParts { mode, outcome },
@@ -727,7 +761,7 @@ fn record(
         );
     }
     if let Err(error) = record_at_with_origin(
-        &path,
+        path,
         &session,
         &command,
         &verdict,
@@ -743,11 +777,11 @@ fn record(
         eprintln!("innerwarden: graph record skipped ({error})");
         // stderr alone hid a six-hour outage. Persist it where the CLI and the
         // dashboard can find it, and tell someone ONCE per episode.
-        let outage = crate::record_health::note_failure_at(&path, &error.to_string());
-        if crate::record_health::is_first_of_episode_at(&path) {
+        let outage = crate::record_health::note_failure_at(path, &error.to_string());
+        if crate::record_health::is_first_of_episode_at(path) {
             crate::notify_io::fire_text(&outage.summary());
         }
-    } else if let Some(ended) = crate::record_health::note_success_at(&path) {
+    } else if let Some(ended) = crate::record_health::note_success_at(path) {
         eprintln!(
             "innerwarden: recording recovered after {} lost action(s)",
             ended.lost
@@ -1119,7 +1153,7 @@ where
     ) {
         return Ok(());
     }
-    save(&g, path, expected.as_deref(), lock_timeout)
+    save(g, path, expected.as_deref(), lock_timeout)
 }
 
 /// Domain-separated one-way identity for one provider hook delivery. Length
@@ -1915,6 +1949,166 @@ mod product_config_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one secret every case below hides, assembled at runtime so no
+    /// credential-shaped literal sits whole in the source.
+    fn hidden() -> String {
+        format!("Zq9x{}", "W4vTk7")
+    }
+
+    /// Record `command` as a blocked deny through the same path the hook
+    /// takes, and return what reached disk: the graph and the sink.
+    fn recorded(command: &str) -> (String, String) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("graph.json");
+        record_to(
+            &path,
+            command,
+            &json!({"recommendation": "deny", "risk_score": 90}),
+            DecisionMode::Enforce,
+            DecisionOutcome::Blocked,
+            Some("s"),
+            None,
+            DecisionOrigin::default(),
+        );
+        let graph = std::fs::read_to_string(&path).expect("graph written");
+        let sink =
+            std::fs::read_to_string(dir.path().join("guard-events.jsonl")).expect("sink written");
+        (graph, sink)
+    }
+
+    fn assert_hidden_everywhere(command: &str, secret: &str) {
+        let (graph, sink) = recorded(command);
+        assert!(!graph.contains(secret), "secret in graph.json");
+        assert!(!sink.contains(secret), "secret in guard-events.jsonl");
+        assert!(graph.contains("[REDACTED]"), "masked in graph.json");
+        assert!(sink.contains("[REDACTED]"), "masked in guard-events.jsonl");
+    }
+
+    #[test]
+    fn a_password_flag_url_and_basic_auth_never_reach_disk() {
+        let s = hidden();
+        let pad = "--verbose ".repeat(20);
+        for command in [
+            format!("app login {pad} --password {s}"),
+            format!("app login {pad} --password x{s}"),
+            format!("psql {pad} postgres://app:{s}@db.internal/main"),
+            format!("curl {pad} -H 'Authorization: Basic {s}' https://x.example"),
+        ] {
+            assert_hidden_everywhere(&command, &s);
+        }
+    }
+
+    #[test]
+    fn a_secret_past_the_full_command_cut_never_reaches_disk() {
+        let s = hidden();
+        let head = format!(
+            "chmod 777 out {}",
+            "a".repeat(innerwarden_graph::MAX_FULL_COMMAND_CHARS)
+        );
+        let command = format!("{head} --token {s}");
+        let (graph, sink) = recorded(&command);
+        assert!(!graph.contains(&s), "secret in graph.json");
+        // The sink keeps the whole masked line, not the cut one.
+        assert!(!sink.contains(&s), "secret in guard-events.jsonl");
+        assert!(sink.contains("--token [REDACTED]"), "masked, not dropped");
+        assert!(graph.contains("chars cut]"), "the cut is marked");
+    }
+
+    #[test]
+    fn a_secret_across_the_full_command_cut_leaves_no_part_behind() {
+        let s = hidden();
+        // The password starts four characters before the cut: cutting first
+        // and masking after would keep "Zq9x" in command_full.
+        let prefix = "psql postgres://app:";
+        let head = format!(
+            "chmod 777 out {}",
+            "a".repeat(innerwarden_graph::MAX_FULL_COMMAND_CHARS - prefix.len() - 4 - 14)
+        );
+        let command = format!("{head}{prefix}{s}@db/main");
+        assert_eq!(
+            command.find(&s).unwrap(),
+            innerwarden_graph::MAX_FULL_COMMAND_CHARS - 4,
+            "the setup puts the secret across the cut"
+        );
+        let (graph, sink) = recorded(&command);
+        assert!(
+            !graph.contains(&s[..4]),
+            "a piece of the secret in graph.json"
+        );
+        assert!(
+            !sink.contains(&s[..4]),
+            "a piece of the secret in guard-events.jsonl"
+        );
+    }
+
+    /// The full command fills the 12 MiB store far sooner than labels did.
+    /// On a store already full of long reviews, every record leaves the file
+    /// under its cap, and only a few of them have to prune to do it.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn a_store_full_of_long_reviews_stays_under_its_cap_and_prunes_rarely() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("graph.json");
+        let long = |i: usize| {
+            format!(
+                "chmod 777 out-{i} {}",
+                "x".repeat(innerwarden_graph::MAX_FULL_COMMAND_CHARS)
+            )
+        };
+        let review = json!({"recommendation": "review", "risk_score": 40});
+        // Seed past the cap without going through disk on each one.
+        let mut seed = Graph::default();
+        let mut i = 0;
+        while seed.to_json().len() <= Graph::MAX_BYTES + Graph::MAX_BYTES / 8 {
+            for _ in 0..100 {
+                seed.ingest_verdict("s", i, &long(i), &review);
+                i += 1;
+            }
+        }
+        std::fs::write(&path, seed.to_json()).unwrap();
+
+        let calls = 30;
+        let mut pruned_calls = 0;
+        for _ in 0..calls {
+            let before = std::fs::metadata(&path).unwrap().len();
+            record_at_with_options(
+                &path,
+                "s",
+                &long(i),
+                &review,
+                DecisionMode::Enforce,
+                DecisionOutcome::Allowed,
+                None,
+                Duration::from_secs(5),
+                || {},
+            )
+            .expect("recorded");
+            i += 1;
+            let after = std::fs::metadata(&path).unwrap().len();
+            assert!(
+                after <= Graph::MAX_BYTES as u64,
+                "the file must stay under its cap: {after}"
+            );
+            if after < before {
+                pruned_calls += 1;
+            }
+        }
+        // Each prune sheds a margin beyond what the new record needs, so the
+        // calls after it write without pruning: the first call prunes the
+        // seed's overflow, then one in many.
+        assert!(
+            pruned_calls <= 1 + calls / 10,
+            "pruned on {pruned_calls} of {calls} calls"
+        );
+        let g: Graph = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(
+            g.nodes
+                .iter()
+                .any(|n| n.label.starts_with(&format!("chmod 777 out-{}", i - 1))),
+            "the newest record survives"
+        );
+    }
 
     #[test]
     fn channel_is_written_by_the_calling_path() {
