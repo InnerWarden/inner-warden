@@ -1280,6 +1280,152 @@ fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
     );
 }
 
+/// SEC-4, the race forced: the same launcher death as
+/// [`a_launcher_that_dies_before_the_host_answers_starts_nothing`], with the
+/// jail held stopped until the launcher's death has landed, so the jail
+/// outlives its launcher in every run, the ending the gate exists for.
+///
+/// A launcher that dies while it waits for the host's answer (killed,
+/// a Ctrl-C, the OOM killer) leaves its jail an empty record, and the jail
+/// does not start its command: the gate refuses it.
+///
+/// The host here is a listener that takes the request and never answers;
+/// the launcher is SIGKILLed the moment the request arrives, after bwrap
+/// reported the jail's first process and before the launcher decided.
+///
+/// The launcher's death has two endings, and which one comes was a race
+/// (bubblewrap 0.9.0): bwrap's own process dies with the launcher
+/// (`--die-with-parent`, armed before it reports the jail), and the jail's
+/// first process arms the same for itself only after it has read its record.
+/// The kernel closes the dead launcher's descriptors (the record ends, empty)
+/// before it signals bwrap, so the jail sometimes armed it in between and died
+/// with bwrap, silently, before the gate ran (3 of 20 runs on a loaded
+/// machine, 2026-11-19). The other ending, a jail that outlives its launcher,
+/// is the one the gate exists for, so the test holds the jail stopped until
+/// the launcher's death has landed (bwrap is gone), then lets it go on. Every
+/// wait is for a signal: the request, the stopped state, bwrap gone, stderr's
+/// end. The gate's refusal is asserted in every run.
+///
+/// FAILS ON REVERT: hand the jail its command without the gate (drop
+/// `gate_instance` in `build_linux_jail`, as before this fix) and the
+/// command runs once the launcher is gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_launcher_that_dies_with_its_jail_held_stopped_starts_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    require_bwrap();
+    let home = home_that_starts_only_once_admitted();
+    let project = tempfile::TempDir::new().unwrap();
+    let marker = project.path().join("COMMAND-RAN");
+    let script = format!("touch '{}'", marker.display());
+    // Active Defence is "installed" (its ctl is found), and its agent is a
+    // listener that takes the request and answers nothing.
+    let ad = tempfile::TempDir::new().unwrap();
+    let ctl = ad.path().join("innerwarden-ctl");
+    std::fs::write(&ctl, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&ctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+
+    let mut command = cli();
+    command
+        .args([
+            "contain",
+            "--identity",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &script,
+        ])
+        .env("HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = identified_without_a_scope(&mut command)
+        .env("IW_AD_CLI_DIRS", ad.path())
+        .env("INNERWARDEN_AGENT_URL", &url)
+        .spawn()
+        .expect("run Linux AI Jail with --identity");
+    let stderr = stderr_to_end(&mut child);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let held = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() > deadline || child.try_wait().unwrap().is_some() {
+                    let _ = child.kill();
+                    panic!(
+                        "the launcher never asked the host: {}",
+                        stderr
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .unwrap_or_default()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(e) => panic!("accept: {e}"),
+        }
+    };
+    // bwrap's process is the launcher's child, and the jail's first process
+    // is bwrap's: it reported it before the launcher asked the host.
+    let bwrap = only_child_named(child.id(), "bwrap");
+    let jail = only_child_named(bwrap, "bwrap");
+    signal(jail, "-STOP");
+    wait_for(|| process_state(jail) == Some('T'), "the jail to stop");
+    child.kill().expect("SIGKILL the launcher");
+    child.wait().unwrap();
+    wait_for(
+        || matches!(process_state(bwrap), None | Some('Z')),
+        "bwrap to die with the launcher",
+    );
+    signal(jail, "-CONT");
+    let stderr = stderr
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("every process of the jail ended");
+    drop(held);
+    assert!(
+        !marker.exists(),
+        "the command ran without an admission: {stderr}"
+    );
+    assert!(
+        stderr.contains("innerwarden contain: this jail holds no record that the host admitted it"),
+        "the gate refused it: {stderr}"
+    );
+    assert!(
+        processes_naming(&marker).is_empty(),
+        "a process of the jail is left: {:?}",
+        processes_naming(&marker)
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn process_state(pid: u32) -> Option<char> {
+    state_and_parent(pid).map(|(state, _, _)| state)
+}
+
+#[cfg(target_os = "linux")]
+fn signal(pid: u32, which: &str) {
+    let status = std::process::Command::new("kill")
+        .args([which, &pid.to_string()])
+        .status()
+        .expect("run kill");
+    assert!(status.success(), "kill {which} {pid}");
+}
+
+/// Wait for `done`, checked every 10 ms; the bound only turns a hang into a
+/// failure.
+#[cfg(target_os = "linux")]
+fn wait_for(done: impl Fn() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !done() {
+        assert!(std::time::Instant::now() < deadline, "waited for {what}");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// The state letter and the parent of `pid`, from `/proc/<pid>/stat`.
 #[cfg(target_os = "linux")]
 fn state_and_parent(pid: u32) -> Option<(char, u32, String)> {
