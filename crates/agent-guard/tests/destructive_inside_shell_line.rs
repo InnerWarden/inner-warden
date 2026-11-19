@@ -369,3 +369,99 @@ fn a_program_named_at_run_time_with_an_unwritten_c_line_is_reviewed() {
     }
     assert_allowed(&["CC=gcc; $CC -c main.c -o main.o", "$CC -c main.c -o main.o"]);
 }
+
+/// A written-out value a function body may overwrite is still judged: the
+/// worst of the values the name may hold decides. Measured 2026-11-18: the
+/// first line below was reviewed, where the line before the change of the
+/// function-body term refused it.
+#[test]
+fn a_written_out_value_a_function_may_overwrite_is_still_judged() {
+    assert_same_as_direct(&[
+        ("C='rm -rf ~'; f() { C=$X; }; f; sh -c \"$C\"", "rm -rf ~"),
+        (
+            "C='rm -rf /'; f() { C=$(date); }; f; bash -c \"$C\"",
+            "rm -rf /",
+        ),
+    ]);
+    let line = "C='rm -rf ~'; f() { C=$X; }; f; sh -c \"$C\"";
+    assert!(
+        signals(line).iter().any(|s| s == "shell_line_not_literal"),
+        "{line}: {:?}",
+        signals(line)
+    );
+}
+
+/// A trap on DEBUG, RETURN or ERR runs between commands: every variable is
+/// decided at run time. Measured 2026-11-18: the first line below was read
+/// as `ok` and allowed.
+#[test]
+fn a_trap_between_commands_makes_every_variable_run_time() {
+    for line in [
+        "f() { C=$X; }; trap f DEBUG; C=ok; sh -c \"$C\"",
+        "f() { C=$X; }; trap f RETURN; C=ok; sh -c \"$C\"",
+        "trap 'C=$X' DEBUG; C=ok; sh -c \"$C\"",
+        "trap 'C=$X' SIGERR; C=ok; sh -c \"$C\"",
+    ] {
+        assert_eq!(verdict(line), "review", "{line}");
+        assert!(
+            signals(line).iter().any(|s| s == "shell_line_not_literal"),
+            "{line}: {:?}",
+            signals(line)
+        );
+    }
+    assert_allowed(&["trap 'rm -f out.tmp' EXIT; C=make; sh -c \"$C\""]);
+}
+
+/// A command in a loop runs again after every assignment of the loop, and
+/// after a function the loop defines later. Measured 2026-11-18: both lines
+/// below were read as `ok` and allowed.
+#[test]
+fn a_command_in_a_loop_sees_every_value_the_loop_sets() {
+    assert_same_as_direct(&[
+        (
+            "C=ok; for i in 1 2; do f; sh -c \"$C\"; f() { C='rm -rf ~'; }; done",
+            "rm -rf ~",
+        ),
+        (
+            "C=ok; while true; do sh -c \"$C\"; C='rm -rf ~'; done",
+            "rm -rf ~",
+        ),
+    ]);
+    let line = "C=ok; for i in 1 2; do f; sh -c \"$C\"; f() { C=$X; }; done";
+    assert_eq!(verdict(line), "review", "{line}");
+    assert_allowed(&[
+        "for f in *.txt; do sh -c \"wc -l $f\"; done",
+        "C=make; for i in 1 2; do sh -c \"$C\"; done",
+    ]);
+}
+
+/// A shell line in a function body reads a variable its body does not set
+/// first: it holds what the caller left, which the text order does not say.
+/// Measured 2026-11-18: the first line below was read as `ok` and allowed.
+#[test]
+fn a_function_body_reading_a_variable_from_outside_is_run_time() {
+    // Called where the call is written out, and called by a trap, which is
+    // not written out at any place in the text.
+    for line in [
+        "C=ok; f2() { sh -c \"$C\"; }; C=$X; f2",
+        "C=ok; f2() { sh -c \"$C\"; }; C=$X; trap f2 EXIT",
+    ] {
+        assert_eq!(verdict(line), "review", "{line}");
+        assert!(
+            signals(line).iter().any(|s| s == "shell_line_not_literal"),
+            "{line}: {:?}",
+            signals(line)
+        );
+    }
+    assert_same_as_direct(&[("C=ok; f2() { sh -c \"$C\"; }; C='rm -rf ~'; f2", "rm -rf ~")]);
+    // Set first in the body, the text order holds.
+    assert_allowed(&["C=$X; f() { C='make test'; sh -c \"$C\"; }; f"]);
+}
+
+/// The accepted effect of reading a program named at run time with `-c` as a
+/// shell: a compiler's `-c` with a source not written out is reviewed.
+#[test]
+fn a_compiler_c_flag_with_an_unwritten_source_is_reviewed() {
+    assert_eq!(verdict("$CC -c \"$SRC\" -o out.o"), "review");
+    assert_allowed(&["$CC -c main.c -o main.o"]);
+}

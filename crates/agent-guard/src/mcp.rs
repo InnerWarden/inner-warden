@@ -3122,7 +3122,22 @@ fn analyze_command_as_read(
     // `shell`, behind `sudo`, `xargs` or `find -exec`) is the same: the
     // download rules read it already, the rest of the rules read it here.
     // Measured 2026-11-18: `bash -c 'rm -rf /'` was allowed.
-    let handed_to_shell = crate::shell::handed_shell_lines(raw_scan);
+    // Read on the projection and on the line as written, and the worst of
+    // the two holds: the projection writes a called function's body out at
+    // the call, so an assignment in it comes last in text order and would
+    // hide the written-out value it may overwrite (`C='rm -rf ~'; f() {
+    // C=$X; }; f; sh -c "$C"` was reviewed, not refused).
+    let mut handed_to_shell = crate::shell::handed_shell_lines(raw_scan);
+    if cmd != raw_scan {
+        let as_written = crate::shell::handed_shell_lines(cmd);
+        handed_to_shell.over_budget |= as_written.over_budget;
+        handed_to_shell.not_literal |= as_written.not_literal;
+        for line in as_written.lines {
+            if !handed_to_shell.lines.contains(&line) {
+                handed_to_shell.lines.push(line);
+            }
+        }
+    }
     // What the reading of handed lines could not read is said, not left as
     // read: a line handed through more levels than are read (`xargs` or
     // `find` past four, a shell's line past [`STARTUP_PAYLOAD_DEPTH`] shells

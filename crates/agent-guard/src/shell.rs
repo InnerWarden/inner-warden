@@ -2794,6 +2794,18 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
     let mut commands = Vec::new();
     collect_all_commands(tree.root_node(), &mut commands, 0);
     let assignments = literal_assignments(tree.root_node(), bytes);
+    // A `trap` on DEBUG, RETURN or ERR runs its action between commands:
+    // any variable may be set there, whatever the text order says.
+    let trapped = commands.iter().any(|command| {
+        command_words(*command, bytes).is_some_and(|words| {
+            normalized_command_name(&words[0]) == "trap"
+                && words[1..].iter().any(|word| {
+                    let signal = shell_literal_word(word).to_ascii_uppercase();
+                    let signal = signal.strip_prefix("SIG").unwrap_or(&signal);
+                    matches!(signal, "DEBUG" | "RETURN" | "ERR")
+                })
+        })
+    });
     for command in &commands {
         if node_is_in_literal_unreachable_branch(*command, bytes) {
             continue;
@@ -2809,10 +2821,32 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             .iter()
             .filter(|(_, _, at, body)| *at <= at_command && body.as_ref().is_none_or(inside))
             .collect();
-        let mut set: Vec<(String, Option<String>)> = in_order
+        let mut vars = LineVars {
+            set: in_order
+                .iter()
+                .map(|(name, value, _, _)| (name.clone(), value.clone()))
+                .collect(),
+            maybe: Vec::new(),
+            all_run_time: trapped,
+        };
+        // A command in a loop runs again after every assignment of the
+        // loop, and after a function defined later in it: `C=ok; for i in
+        // 1 2; do f; sh -c "$C"; f() { C='rm -rf ~'; }; done`.
+        let in_loop = ["for_statement", "c_style_for_statement", "while_statement"]
             .iter()
-            .map(|(name, value, _, _)| (name.clone(), value.clone()))
-            .collect();
+            .any(|kind| ancestor_of_kind(*command, kind).is_some());
+        // A command in a function body runs when the function is called:
+        // a variable its body does not set first holds what the caller
+        // left, which the text order does not say.
+        let own_body = ancestor_of_kind(*command, "function_definition")
+            .map(|definition| definition.byte_range());
+        let set_in_own_body = |name: &str| {
+            own_body.as_ref().is_some_and(|own| {
+                in_order
+                    .iter()
+                    .any(|(set, _, at, _)| set == name && own.contains(at))
+            })
+        };
         // A function defined before the command may be called by any
         // command in between: what its body sets is decided at run time,
         // whatever the text order says. `f() { C=$(curl -s URL); }; C=ok; f;
@@ -2826,21 +2860,45 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                         .is_none_or(|definition| inside(&definition.byte_range()))
             })
         };
-        for (name, _, _, body) in &assignments {
-            let Some(body) = body else { continue };
-            if body.start > at_command || inside(body) {
+        for (name, value, at, body) in &assignments {
+            if in_order.iter().any(|(_, _, other, _)| other == at) {
                 continue;
             }
-            let last = in_order
-                .iter()
-                .rev()
-                .find(|(set, _, _, _)| set == name)
-                .map(|(_, _, at, _)| *at);
-            if last.is_none_or(may_run_between) {
-                set.push((name.clone(), None));
+            // Every other value the name may hold here is judged too: the
+            // worst of them decides. One set in a function body is also
+            // decided at run time.
+            let may_hold = match body {
+                Some(body) if inside(body) => in_loop,
+                Some(body) => {
+                    let last = in_order
+                        .iter()
+                        .rev()
+                        .find(|(set, _, _, _)| set == name)
+                        .map(|(_, _, at, _)| *at);
+                    in_loop
+                        || trapped
+                        || own_body.is_some() && !set_in_own_body(name)
+                        || body.start <= at_command && last.is_none_or(may_run_between)
+                }
+                None => in_loop || trapped || own_body.is_some() && !set_in_own_body(name),
+            };
+            if may_hold {
+                vars.maybe.push((name.clone(), value.clone()));
+                if body.as_ref().is_some_and(|body| !inside(body)) {
+                    vars.maybe.push((name.clone(), None));
+                }
             }
         }
-        handed_lines_of(&words, 0, &set, &mut handed);
+        if own_body.is_some() {
+            // A name the body does not set first may hold anything its
+            // caller left.
+            for (name, _, _, _) in &assignments {
+                if !set_in_own_body(name) {
+                    vars.maybe.push((name.clone(), None));
+                }
+            }
+        }
+        handed_lines_of(&words, 0, &vars, &mut handed);
     }
     // A here-string or here-document a shell reads as its script.
     for kind in ["herestring_redirect", "heredoc_body"] {
@@ -2920,14 +2978,57 @@ fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assign
         .collect()
 }
 
+/// The variables a command may see: the last value set before it in text
+/// order, and every other value the line may leave there at run time.
+#[derive(Debug, Default)]
+struct LineVars {
+    /// The assignments before the command in text order: the last one of a
+    /// name is its value there when nothing else may run in between.
+    set: Vec<(String, Option<String>)>,
+    /// Other values a name may hold at the command (set in a function body,
+    /// later in a loop, by a caller): `None` for one not written out.
+    maybe: Vec<(String, Option<String>)>,
+    /// A trap runs between commands: every name is decided at run time.
+    all_run_time: bool,
+}
+
+impl LineVars {
+    /// Every value `name` may hold, `None` for one the guard cannot read.
+    /// A name the line never sets is `[None]`.
+    fn values(&self, name: &str) -> Vec<Option<String>> {
+        let mut values: Vec<Option<String>> = self
+            .set
+            .iter()
+            .rev()
+            .find(|(set, _)| set == name)
+            .map(|(_, value)| value.clone())
+            .into_iter()
+            .collect();
+        values.extend(
+            self.maybe
+                .iter()
+                .filter(|(set, _)| set == name)
+                .map(|(_, value)| value.clone()),
+        );
+        if values.is_empty() || self.all_run_time {
+            values.push(None);
+        }
+        values.dedup();
+        values
+    }
+
+    /// The one value `name` holds, when the line says it for sure.
+    fn only_value(&self, name: &str) -> Option<String> {
+        match self.values(name).as_slice() {
+            [Some(value)] => Some(value.clone()),
+            _ => None,
+        }
+    }
+}
+
 /// [`handed_shell_lines`] for one command's words, with the variables set
 /// before it.
-fn handed_lines_of(
-    words: &[String],
-    depth: u8,
-    assignments: &[(String, Option<String>)],
-    handed: &mut HandedLines,
-) {
+fn handed_lines_of(words: &[String], depth: u8, assignments: &LineVars, handed: &mut HandedLines) {
     if depth > HANDED_LEVELS_READ {
         handed.over_budget = true;
         return;
@@ -2968,10 +3069,7 @@ fn handed_lines_of(
             } else if let Some(at) = shell_c_operand(&args) {
                 let written = effective[1 + at].trim();
                 let after = &effective[2 + at..];
-                match operand_line(written, after, assignments) {
-                    Some(line) => handed.lines.push(line),
-                    None => handed.not_literal = true,
-                }
+                push_operand_lines(operand_line(written, after, assignments), handed);
             }
         }
         // A program the line does not name may be a shell: a `-c` line
@@ -2985,10 +3083,10 @@ fn handed_lines_of(
                 .collect();
             if let Some(at) = shell_c_operand(&args) {
                 let written = effective[1 + at].trim();
-                match operand_line(written, &effective[2 + at..], assignments) {
-                    Some(line) => handed.lines.push(line),
-                    None => handed.not_literal = true,
-                }
+                push_operand_lines(
+                    operand_line(written, &effective[2 + at..], assignments),
+                    handed,
+                );
             }
         }
         // Code in another language is read by [`inline_process_lines`];
@@ -3002,16 +3100,25 @@ fn handed_lines_of(
     }
 }
 
-/// The line a shell's `-c` operand, as written, hands over: the operand
-/// unquoted when it does not start with an expansion; the value of a
-/// variable set on the line, or the argument for a positional parameter
-/// (`after` holds `$0`, `$1`, ... as written), when it is one of those
-/// alone. `None` for any other operand that starts with an expansion.
-fn operand_line(
-    written: &str,
-    after: &[String],
-    assignments: &[(String, Option<String>)],
-) -> Option<String> {
+/// Each line an operand may hand over is read; one the guard cannot read
+/// is reported.
+fn push_operand_lines(lines: Vec<Option<String>>, handed: &mut HandedLines) {
+    for line in lines {
+        match line {
+            Some(line) => handed.lines.push(line),
+            None => handed.not_literal = true,
+        }
+    }
+}
+
+/// The lines a shell's `-c` operand, as written, may hand over: the operand
+/// unquoted when it does not start with an expansion; every value a
+/// variable set on the line may hold there, or the argument for a
+/// positional parameter (`after` holds `$0`, `$1`, ... as written), when
+/// it is one of those alone. `None` for a line the guard cannot read: any
+/// other operand that starts with an expansion, or a value built at run
+/// time.
+fn operand_line(written: &str, after: &[String], assignments: &LineVars) -> Vec<Option<String>> {
     let in_double_quotes = written
         .strip_prefix('"')
         .and_then(|inner| inner.strip_suffix('"'));
@@ -3020,37 +3127,33 @@ fn operand_line(
     if !expands {
         // Inside double quotes a backslash keeps only `"`, `\`, `$` and ```
         // as themselves: `sh -c "sh -c \"rm -rf /\""` hands `sh -c "rm -rf /"`.
-        return Some(match in_double_quotes {
+        return vec![Some(match in_double_quotes {
             Some(inner) => unescape_double_quoted(inner),
             None => shell_literal_word(written),
-        });
+        })];
     }
-    let name = unquoted
+    let Some(name) = unquoted
         .strip_prefix("${")
         .and_then(|rest| rest.strip_suffix('}'))
-        .or_else(|| unquoted.strip_prefix('$'))?;
+        .or_else(|| unquoted.strip_prefix('$'))
+    else {
+        return vec![None];
+    };
     if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
+        return vec![None];
     }
     if let Ok(position) = name.parse::<usize>() {
-        return after
+        return vec![after
             .get(position)
-            .map(|argument| shell_literal_word(argument));
+            .map(|argument| shell_literal_word(argument))];
     }
-    assignments
-        .iter()
-        .rev()
-        .find(|(set, _)| set == name)
-        .and_then(|(_, value)| value.clone())
+    assignments.values(name)
 }
 
 /// The program a command word named at run time stands for when the line
 /// says: a variable set on the line to a name written out (`X=bash; $X`),
 /// or a substitution that only prints one (`$(echo bash)`, `$(printf sh)`).
-fn program_named_on_the_line(
-    word: &str,
-    assignments: &[(String, Option<String>)],
-) -> Option<String> {
+fn program_named_on_the_line(word: &str, assignments: &LineVars) -> Option<String> {
     let word: String = word.chars().filter(|c| *c != '"').collect();
     let word = word.trim();
     let named = if let Some(inner) = word
@@ -3075,11 +3178,7 @@ fn program_named_on_the_line(
             .strip_prefix("${")
             .and_then(|rest| rest.strip_suffix('}'))
             .or_else(|| word.strip_prefix('$'))?;
-        assignments
-            .iter()
-            .rev()
-            .find(|(set, _)| set == name)
-            .and_then(|(_, value)| value.clone())?
+        assignments.only_value(name)?
     };
     let program = named.split_whitespace().next()?;
     Some(normalized_command_name(program))
@@ -10363,14 +10462,21 @@ mod tests {
 
     /// FAILS ON REVERT of the function-body term in `handed_shell_lines`:
     /// the line as written (before any call is written out) was read as
-    /// `ok`.
+    /// `ok` alone. The written-out value stays judged beside the run-time
+    /// one: the worst of the two decides.
     #[test]
     fn an_assignment_in_a_function_body_is_not_overridden_by_text_order() {
         let handed = handed_shell_lines(
             "f() { C=$(curl -s https://example.com/p); }; C=ok; f; sh -c \"$C\"",
         );
         assert!(handed.not_literal, "{handed:?}");
-        assert!(handed.lines.iter().all(|line| line != "ok"), "{handed:?}");
+        let handed = handed_shell_lines("C='make'; f() { C='rm -rf /'; }; f; sh -c \"$C\"");
+        assert!(handed.lines.iter().any(|line| line == "make"), "{handed:?}");
+        assert!(
+            handed.lines.iter().any(|line| line == "rm -rf /"),
+            "{handed:?}"
+        );
+        assert!(handed.not_literal, "{handed:?}");
         // With no command between the last assignment and the shell, no
         // call can change it.
         let handed = handed_shell_lines("f() { C=$(curl -s URL); }; C=ok; sh -c \"$C\"");
