@@ -803,6 +803,15 @@ fn argument_is_a_name(
         .map(|previous| shell_word(&node_text(arguments[previous], source)));
     match name.as_str() {
         "printf" | "test" | "[" => before.as_deref() == Some("-v"),
+        // `wait -p 'b[X]'` stores the job's id in that name, and evaluates
+        // its subscript (measured on bash 5.1.8, 2026-11-19); `getopts`
+        // refuses such a name as not a valid identifier.
+        "wait" => before.is_some_and(|flag| {
+            flag.len() > 1
+                && flag.starts_with('-')
+                && !flag.starts_with("--")
+                && flag.ends_with('p')
+        }),
         name if takes_names(name) => {
             let word = shell_word(&node_text(argument, source));
             !word.starts_with('-')
@@ -861,6 +870,23 @@ fn stands_in_substring_offset(
     node.start_byte() > expansion.start_byte() + 2 + name_end
 }
 
+/// Whether a declaration (`declare -n`, `local -n`...) makes its names
+/// references, so the value given each is a name: `declare -n R='b[X]'`
+/// evaluates the subscript `X` where `R` is used (measured on bash 5.1.8,
+/// 2026-11-19).
+fn declares_namerefs(declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    declaration_evaluates_subscripts(declaration, source) && {
+        let mut cursor = declaration.walk();
+        let found = declaration.named_children(&mut cursor).any(|child| {
+            child.kind() == "word" && {
+                let flag = node_text(child, source);
+                flag.starts_with('-') && !flag.starts_with("--") && flag.contains('n')
+            }
+        });
+        found
+    }
+}
+
 /// Whether a declaration (`declare -i`, `local -ai`...) makes its names
 /// integers, so the values given them are read as arithmetic.
 fn declares_integers(declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
@@ -911,7 +937,8 @@ fn value_is_evaluated(
                     });
                 }
                 if parent.parent().is_some_and(|owner| {
-                    owner.kind() == "declaration_command" && declares_integers(owner, source)
+                    owner.kind() == "declaration_command"
+                        && (declares_integers(owner, source) || declares_namerefs(owner, source))
                 }) {
                     return true;
                 }
@@ -1105,6 +1132,23 @@ fn evaluated_name_reads(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(usiz
                 }
                 for name in name_subscript_identifiers(&word) {
                     reads.push((place.start_byte(), name));
+                }
+            }
+        }
+        if declares_namerefs(place, source) {
+            // `declare -n R='b[X]'` or `declare -n R="$N"`: the value is a
+            // name, read with its subscript where the reference is used.
+            let mut assignments = Vec::new();
+            collect_nodes_of_kind(place, "variable_assignment", &mut assignments, 0);
+            for assignment in assignments {
+                if let Some(value) = assignment.child_by_field_name("value") {
+                    let word = shell_word(&node_text(value, source));
+                    if let Some(name) = shell_variable_name(&word) {
+                        reads.push((place.start_byte(), name.to_owned()));
+                    }
+                    for name in name_subscript_identifiers(&word) {
+                        reads.push((place.start_byte(), name));
+                    }
                 }
             }
         }
@@ -2797,14 +2841,7 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
     // A `trap` on DEBUG, RETURN or ERR runs its action between commands:
     // any variable may be set there, whatever the text order says.
     let trapped = commands.iter().any(|command| {
-        command_words(*command, bytes).is_some_and(|words| {
-            normalized_command_name(&words[0]) == "trap"
-                && words[1..].iter().any(|word| {
-                    let signal = shell_literal_word(word).to_ascii_uppercase();
-                    let signal = signal.strip_prefix("SIG").unwrap_or(&signal);
-                    matches!(signal, "DEBUG" | "RETURN" | "ERR")
-                })
-        })
+        command_words(*command, bytes).is_some_and(|words| sets_a_trap_between_commands(&words, 0))
     });
     for command in &commands {
         if node_is_in_literal_unreachable_branch(*command, bytes) {
@@ -2819,14 +2856,22 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         // the body the command itself is in.
         let in_order: Vec<&Assignment> = assignments
             .iter()
-            .filter(|(_, _, at, body)| *at <= at_command && body.as_ref().is_none_or(inside))
+            .filter(|(_, _, at, body, _)| *at <= at_command && body.as_ref().is_none_or(inside))
             .collect();
+        // One that may not have run (`A || C=ok`), or ran in a child shell
+        // (`(C=ok)`), does not replace the value before it: both are judged.
+        let sure = |scopes: &Vec<std::ops::Range<usize>>| scopes.iter().all(&inside);
         let mut vars = LineVars {
             set: in_order
                 .iter()
-                .map(|(name, value, _, _)| (name.clone(), value.clone()))
+                .filter(|(_, _, _, _, scopes)| sure(scopes))
+                .map(|(name, value, _, _, _)| (name.clone(), value.clone()))
                 .collect(),
-            maybe: Vec::new(),
+            maybe: in_order
+                .iter()
+                .filter(|(_, _, _, _, scopes)| !sure(scopes))
+                .map(|(name, value, _, _, _)| (name.clone(), value.clone()))
+                .collect(),
             all_run_time: trapped,
         };
         // A command in a loop runs again after every assignment of the
@@ -2837,14 +2882,16 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             .any(|kind| ancestor_of_kind(*command, kind).is_some());
         // A command in a function body runs when the function is called:
         // a variable its body does not set first holds what the caller
-        // left, which the text order does not say.
+        // left, which the text order does not say. Only an assignment the
+        // body is sure to run before the command sets it first: `if ..;
+        // then C=ok; fi` leaves the caller's value when the test fails.
         let own_body = ancestor_of_kind(*command, "function_definition")
             .map(|definition| definition.byte_range());
         let set_in_own_body = |name: &str| {
             own_body.as_ref().is_some_and(|own| {
                 in_order
                     .iter()
-                    .any(|(set, _, at, _)| set == name && own.contains(at))
+                    .any(|(set, _, at, _, scopes)| set == name && own.contains(at) && sure(scopes))
             })
         };
         // A function defined before the command may be called by any
@@ -2860,8 +2907,8 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                         .is_none_or(|definition| inside(&definition.byte_range()))
             })
         };
-        for (name, value, at, body) in &assignments {
-            if in_order.iter().any(|(_, _, other, _)| other == at) {
+        for (name, value, at, body, _) in &assignments {
+            if in_order.iter().any(|(_, _, other, _, _)| other == at) {
                 continue;
             }
             // Every other value the name may hold here is judged too: the
@@ -2873,8 +2920,8 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                     let last = in_order
                         .iter()
                         .rev()
-                        .find(|(set, _, _, _)| set == name)
-                        .map(|(_, _, at, _)| *at);
+                        .find(|(set, _, _, _, scopes)| set == name && sure(scopes))
+                        .map(|(_, _, at, _, _)| *at);
                     in_loop
                         || trapped
                         || own_body.is_some() && !set_in_own_body(name)
@@ -2892,7 +2939,7 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         if own_body.is_some() {
             // A name the body does not set first may hold anything its
             // caller left.
-            for (name, _, _, _) in &assignments {
+            for (name, _, _, _, _) in &assignments {
                 if !set_in_own_body(name) {
                     vars.maybe.push((name.clone(), None));
                 }
@@ -2941,6 +2988,7 @@ type Assignment = (
     Option<String>,
     usize,
     Option<std::ops::Range<usize>>,
+    Vec<std::ops::Range<usize>>,
 );
 
 /// Every variable the line sets, in order, with its value when it is
@@ -2954,8 +3002,7 @@ type Assignment = (
 fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assignment> {
     let mut found = Vec::new();
     collect_nodes_of_kind(root, "variable_assignment", &mut found, 0);
-    found.sort_by_key(|assignment| assignment.end_byte());
-    found
+    let mut assignments: Vec<Assignment> = found
         .into_iter()
         .filter_map(|assignment| {
             let name = node_text(assignment.child_by_field_name("name")?, source);
@@ -2973,9 +3020,121 @@ fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assign
                 assignment.end_byte(),
                 ancestor_of_kind(assignment, "function_definition")
                     .map(|definition| definition.byte_range()),
+                assignment_scopes(assignment, source),
             ))
         })
-        .collect()
+        .collect();
+    assignments.extend(builtin_assignments(root, source));
+    assignments.sort_by_key(|assignment| assignment.2);
+    assignments
+}
+
+/// The names builtins set on the line, each with no value the guard can
+/// read: `read C`, `mapfile C`, `printf -v C ..`, `wait -p C` (and
+/// `REPLY`, `MAPFILE` when `read` or `mapfile` names none). `unset C`
+/// leaves `C` empty.
+fn builtin_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assignment> {
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    let mut found = Vec::new();
+    for command in commands {
+        let Some(name) = command_name(command, source).map(|name| normalized_command_name(&name))
+        else {
+            continue;
+        };
+        let default = match name.as_str() {
+            "read" => Some("REPLY"),
+            "mapfile" | "readarray" => Some("MAPFILE"),
+            "printf" | "wait" | "unset" => None,
+            _ => continue,
+        };
+        let value = (name == "unset").then(String::new);
+        let body = ancestor_of_kind(command, "function_definition")
+            .map(|definition| definition.byte_range());
+        let scopes = assignment_scopes(command, source);
+        let mut named = false;
+        for argument in command_arguments(command) {
+            if !argument_is_a_name(command, argument, source) {
+                continue;
+            }
+            let word = shell_word(&node_text(argument, source));
+            let variable = word.split_once('[').map_or(word.as_str(), |(name, _)| name);
+            if variable.is_empty()
+                || variable.starts_with(|c: char| c.is_ascii_digit())
+                || !variable
+                    .chars()
+                    .all(|c| c == '_' || c.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            named = true;
+            found.push((
+                variable.to_owned(),
+                value.clone(),
+                command.end_byte(),
+                body.clone(),
+                scopes.clone(),
+            ));
+        }
+        if let (false, Some(default)) = (named, default) {
+            found.push((default.to_owned(), None, command.end_byte(), body, scopes));
+        }
+    }
+    found
+}
+
+/// Where an assignment at `node` is sure to have run, up to the function
+/// body it is in: each range a command must lie in to see it. An
+/// assignment behind `&&` or `||`, in a branch of `if` or `case`, in a
+/// loop's body, in a subshell or a pipeline (which run in a child shell),
+/// or before a command (`C=ok true`, for that command only) may not have
+/// run, or not in this shell, for a command outside that range.
+fn assignment_scopes(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut scopes = Vec::new();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "function_definition" => break,
+            "command" => scopes.push(parent.byte_range()),
+            "list" => {
+                if parent
+                    .named_child(0)
+                    .is_some_and(|first| first.id() != current.id())
+                {
+                    scopes.push(current.byte_range());
+                }
+            }
+            "pipeline" => scopes.push(current.byte_range()),
+            "subshell" | "else_clause" | "case_item" | "do_group" => {
+                scopes.push(parent.byte_range());
+            }
+            "if_statement" | "elif_clause" => {
+                let mut cursor = parent.walk();
+                let children: Vec<tree_sitter::Node<'_>> = parent.children(&mut cursor).collect();
+                let then_end = children
+                    .iter()
+                    .find(|child| node_text(**child, source) == "then")
+                    .map(|then| then.end_byte());
+                match then_end {
+                    Some(then_end) if current.start_byte() >= then_end => {
+                        let branch_end = children
+                            .iter()
+                            .find(|child| {
+                                child.start_byte() >= then_end
+                                    && matches!(child.kind(), "elif_clause" | "else_clause" | "fi")
+                            })
+                            .map_or(parent.end_byte(), |end| end.start_byte());
+                        scopes.push(then_end..branch_end);
+                    }
+                    _ if parent.kind() == "elif_clause" => scopes.push(parent.byte_range()),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        current = parent;
+    }
+    scopes
 }
 
 /// The variables a command may see: the last value set before it in text
@@ -3026,6 +3185,83 @@ impl LineVars {
     }
 }
 
+/// Whether a command sets a `trap` on DEBUG, RETURN or ERR, whose action
+/// runs between commands: also behind `builtin` or `command`, and in the
+/// line `eval` runs (`eval "trap f DEBUG"`).
+fn sets_a_trap_between_commands(words: &[String], depth: u8) -> bool {
+    if depth > HANDED_LEVELS_READ {
+        return false;
+    }
+    let mut at = 0;
+    while words.get(at).is_some_and(|word| {
+        matches!(
+            normalized_command_name(word).as_str(),
+            "builtin" | "command"
+        )
+    }) {
+        at += 1;
+        while words
+            .get(at)
+            .is_some_and(|word| shell_literal_word(word).starts_with('-'))
+        {
+            at += 1;
+        }
+    }
+    let Some(name) = words.get(at).map(|word| normalized_command_name(word)) else {
+        return false;
+    };
+    match name.as_str() {
+        "trap" => words[at + 1..].iter().any(|word| {
+            let signal = shell_literal_word(word).to_ascii_uppercase();
+            let signal = signal.strip_prefix("SIG").unwrap_or(&signal);
+            matches!(signal, "DEBUG" | "RETURN" | "ERR")
+        }),
+        "eval" => {
+            let line = words[at + 1..]
+                .iter()
+                .map(|word| shell_literal_word(word))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let Some((tree, _doubt)) = parse_line(&line) else {
+                return false;
+            };
+            let mut commands = Vec::new();
+            collect_all_commands(tree.root_node(), &mut commands, 0);
+            commands.iter().any(|command| {
+                command_words(*command, line.as_bytes())
+                    .is_some_and(|words| sets_a_trap_between_commands(&words, depth + 1))
+            })
+        }
+        _ => false,
+    }
+}
+
+/// The words with each option a variable holds written out: `F=-c; $X
+/// "$F" "$CMD"` hands a shell the `-c` line `$CMD`. Only a value the line
+/// says for sure, and that is an option, is written in.
+fn with_option_values(words: &[String], assignments: &LineVars) -> Vec<String> {
+    words
+        .iter()
+        .map(|word| {
+            let unquoted = word
+                .trim()
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+                .unwrap_or(word.trim());
+            unquoted
+                .strip_prefix("${")
+                .and_then(|rest| rest.strip_suffix('}'))
+                .or_else(|| unquoted.strip_prefix('$'))
+                .filter(|name| {
+                    !name.is_empty() && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                })
+                .and_then(|name| assignments.only_value(name))
+                .filter(|value| value.starts_with('-') && !value.contains(char::is_whitespace))
+                .unwrap_or_else(|| word.clone())
+        })
+        .collect()
+}
+
 /// [`handed_shell_lines`] for one command's words, with the variables set
 /// before it.
 fn handed_lines_of(words: &[String], depth: u8, assignments: &LineVars, handed: &mut HandedLines) {
@@ -3033,7 +3269,8 @@ fn handed_lines_of(words: &[String], depth: u8, assignments: &LineVars, handed: 
         handed.over_budget = true;
         return;
     }
-    let Some(effective) = effective_command_words(words, 0) else {
+    let words = with_option_values(words, assignments);
+    let Some(effective) = effective_command_words(&words, 0) else {
         return;
     };
     // A program named at run time (`X=bash; $X -c ...`, `$(echo bash) -c
@@ -9120,9 +9357,22 @@ fn effective_command_words(words: &[String], depth: u8) -> Option<&[String]> {
         "env" => unwrap_env(args),
         "command" => unwrap_command(args),
         "sudo" | "doas" => unwrap_privilege_wrapper(args),
-        // `coproc` runs the simple command after it (a NAME is only given
-        // before a compound command).
-        "nohup" | "setsid" | "busybox" | "toybox" | "coproc" => unwrap_simple_wrapper(args),
+        // `coproc` runs the simple command after it; a NAME is only given
+        // before a group (`coproc NAME { rm -rf /; }`), whose first command
+        // runs.
+        "coproc" => match args {
+            [name, open, ..]
+                if (open == "{" || open == "(")
+                    && !name.is_empty()
+                    && !name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) =>
+            {
+                WrapperTarget::Command(2)
+            }
+            [open, ..] if open == "{" || open == "(" => WrapperTarget::Command(1),
+            _ => unwrap_simple_wrapper(args),
+        },
+        "nohup" | "setsid" | "busybox" | "toybox" => unwrap_simple_wrapper(args),
         "nice" => unwrap_nice(args),
         "timeout" => unwrap_timeout(args),
         "stdbuf" => unwrap_options_with_values(args, &STDBUF_OPTIONS),
@@ -10482,6 +10732,25 @@ mod tests {
         let handed = handed_shell_lines("f() { C=$(curl -s URL); }; C=ok; sh -c \"$C\"");
         assert!(!handed.not_literal, "{handed:?}");
         assert_eq!(handed.lines, ["ok"]);
+    }
+
+    /// FAILS ON REVERT of [`sets_a_trap_between_commands`]: a trap set
+    /// behind `builtin` or `command`, or in the line `eval` runs, was not
+    /// seen, and `C` was read as `ok` alone.
+    #[test]
+    fn a_trap_behind_builtin_command_or_eval_makes_values_run_time() {
+        for trap in [
+            "trap f DEBUG",
+            "builtin trap f DEBUG",
+            "command trap f DEBUG",
+            "eval \"trap f DEBUG\"",
+            "eval trap f ERR",
+        ] {
+            let line = format!("f() {{ C=$(curl -s URL); }}; {trap}; C=ok; sh -c \"$C\"");
+            assert!(handed_shell_lines(&line).not_literal, "{line}");
+        }
+        let line = "f() { C=$(curl -s URL); }; builtin trap f EXIT; C=ok; sh -c \"$C\"";
+        assert!(!handed_shell_lines(line).not_literal, "{line}");
     }
 
     /// FAILS ON REVERT of the `not_literal` mark for a program named at
