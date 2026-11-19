@@ -512,9 +512,38 @@ impl ProStatus {
         }
     }
 
+    /// The same answer read by a process that is not the agent: a shell
+    /// running `agents list`, or the dashboard. Pro answers for its caller's
+    /// scope, so "outside the scope" there is the shell's scope, not the
+    /// agent's: the agent's gate is not known from it, and nothing about it
+    /// (no "arm it" step either) may rest on it.
+    pub fn seen_from_outside(&self) -> Self {
+        let mut status = self.clone();
+        if status.in_scope == Some(false) {
+            status.in_scope = None;
+            status.exec_gate = None;
+        }
+        status
+    }
+
+    /// PURE. [`Self::line`] for a caller that is not the agent (see
+    /// [`Self::seen_from_outside`]): a gate whose scope does not hold the
+    /// caller is "not visible from here", never "off".
+    pub fn line_seen_from_outside(&self) -> String {
+        let gate = match self.in_scope {
+            Some(false) => Some("not visible from here"),
+            _ => self.gate_for_agent(),
+        };
+        self.line_with_gate(gate)
+    }
+
     /// PURE. One line for the person: tier, the gate for this agent, the DNS
     /// Guard and the licence, each as Pro said it.
     pub fn line(&self) -> String {
+        self.line_with_gate(self.gate_for_agent())
+    }
+
+    fn line_with_gate(&self, gate: Option<&str>) -> String {
         let said = |value: Option<&str>| value.unwrap_or("not reported").to_string();
         let licence = match (self.licence_valid, self.valid_until.as_deref()) {
             (Some(true), Some(until)) => format!("valid until {until}"),
@@ -524,7 +553,7 @@ impl ProStatus {
         };
         format!(
             "InnerWarden Pro on this host: Execution Gate for this agent {}, DNS Guard {}, licence {licence}.",
-            said(self.gate_for_agent()),
+            said(gate),
             said(self.dns_guard.as_deref()),
         )
     }
@@ -1199,6 +1228,42 @@ mod tests {
         assert_eq!(suggestion(&with), None);
         with.pro = None;
         assert_eq!(suggestion(&with), None, "Pro said nothing: nothing is said");
+    }
+
+    /// `agents list` and the dashboard read Pro from a shell, not from the
+    /// agent: a gate whose scope does not hold that caller is "not visible
+    /// from here", never "off", and no "arm it" step rests on it.
+    /// (NEW-20261113-agents-list-gate-off-from-shell)
+    #[test]
+    fn a_gate_read_from_outside_the_agent_is_not_visible_not_off() {
+        let from_shell = ProStatus {
+            licence_valid: Some(true),
+            exec_gate: Some("enforce".into()),
+            in_scope: Some(false),
+            dns_guard: Some("observe".into()),
+            ..ProStatus::default()
+        };
+        let line = from_shell.line_seen_from_outside();
+        assert!(
+            line.contains("Execution Gate for this agent not visible from here"),
+            "{line}"
+        );
+        assert!(!line.contains(" off"), "{line}");
+
+        let mut with = facts(Some(Trigger::OwnerAsked));
+        with.pro_installed = true;
+        with.pro = Some(from_shell.seen_from_outside());
+        assert_eq!(suggestion(&with), None, "no arm step from a shell's scope");
+
+        // In scope, the mode is the mode, from a shell or not.
+        let inside = ProStatus {
+            in_scope: Some(true),
+            ..from_shell.clone()
+        };
+        assert!(inside
+            .line_seen_from_outside()
+            .contains("Execution Gate for this agent enforce"));
+        assert_eq!(inside.seen_from_outside(), inside);
     }
 
     /// The record's facts, read for the dashboard: monitor letting a call

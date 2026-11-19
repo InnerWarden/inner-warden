@@ -264,10 +264,17 @@ pub(crate) fn restart_words(agent_id: &str, display_name: &str) -> RestartWords 
 }
 
 /// What a command that changed agents' configs prints at its end: the
-/// shared restart line, byte for byte as it always was, then one line per
-/// agent saying how to restart that one. Each agent once, in the order given.
+/// shared restart line, byte for byte as it always was, why ([`RESTART_WHY`]),
+/// then one line per agent saying how to restart that one. Each agent once,
+/// in the order given; with none named, how to restart any of them.
 pub(crate) fn restart_footer(agent_ids: &[String]) -> Vec<String> {
-    let mut lines = vec![crate::RESTART_GUARDED_AGENTS.to_string()];
+    let mut lines = vec![
+        crate::RESTART_GUARDED_AGENTS.to_string(),
+        format!("  {RESTART_WHY}"),
+    ];
+    if agent_ids.is_empty() {
+        lines.push("  Quit each guarded agent and start it again.".to_string());
+    }
     let mut seen: Vec<&str> = Vec::new();
     for id in agent_ids {
         if seen.contains(&id.as_str()) {
@@ -567,13 +574,25 @@ mod tests {
             vec![
                 "  Restart guarded agents so they reload their hook or MCP configuration."
                     .to_string(),
+                "  An agent reads its hook or MCP config only when it starts.".to_string(),
                 "  Claude Code: In Claude Code, type /exit, then run claude.".to_string(),
                 "  Codex: Quit Codex and start it again.".to_string(),
                 "  Cursor: Quit Cursor and start it again.".to_string(),
             ]
         );
         assert_eq!(lines[0], crate::RESTART_GUARDED_AGENTS);
-        assert_eq!(restart_footer(&[]), vec![crate::RESTART_GUARDED_AGENTS]);
+        // With no agent named the footer still says why and how.
+        // (NEW-20261023-restart-guarded-agents-says-not-how)
+        let none = restart_footer(&[]);
+        assert_eq!(none[0], crate::RESTART_GUARDED_AGENTS);
+        assert!(
+            none.iter().any(|l| l.contains("only when it starts")),
+            "{none:?}"
+        );
+        assert!(
+            none.iter().any(|l| l.contains("start it again")),
+            "{none:?}"
+        );
     }
 
     #[test]

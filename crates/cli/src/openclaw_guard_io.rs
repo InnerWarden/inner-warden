@@ -597,13 +597,16 @@ pub(crate) fn dashboard_field(home: &Path) -> Value {
     let pro = pro_installed.then(pro_status).flatten();
     let trigger =
         guard::trigger_from_sink(&sink_tail(), now().saturating_sub(TRIGGER_LOOKBACK_SECONDS));
+    // The dashboard is not the agent: Pro's answer is for its own scope.
+    let pro_line = pro.as_ref().map(ProStatus::line_seen_from_outside);
+    let pro = pro.as_ref().map(ProStatus::seen_from_outside);
     let suggestion = take_suggestion(trigger, true, pro_installed, pro.clone());
     let value = json!({
         "screened": state.files && state.mode.is_some() && !state.turned_off,
         "mode": state.mode.map(Mode::as_str),
         "turned_off": state.turned_off,
         "pro_installed": pro_installed,
-        "pro_line": pro.as_ref().map(ProStatus::line),
+        "pro_line": pro_line,
         "suggestion": suggestion,
     });
     if let Ok(mut cache) = CACHE.lock() {
@@ -847,9 +850,11 @@ pub(crate) fn status_lines(home: &Path) -> Vec<String> {
     };
     lines.push(format!("  OpenClaw's own tools: {screened}"));
     let pro_installed = crate::upsell_io::active_defence_installed();
+    // Read from a shell, not from the agent: Pro's answer is for the shell's
+    // scope, so the agent's gate is not visible from here.
     let pro = pro_installed.then(pro_status).flatten();
     if let Some(pro) = &pro {
-        lines.push(format!("  {}", pro.line()));
+        lines.push(format!("  {}", pro.line_seen_from_outside()));
     } else if pro_installed {
         lines.push(
             "  InnerWarden Pro is installed here; its status could not be read on this host's \
@@ -857,6 +862,7 @@ pub(crate) fn status_lines(home: &Path) -> Vec<String> {
                 .into(),
         );
     }
+    let pro = pro.as_ref().map(ProStatus::seen_from_outside);
     if let Some(line) = take_suggestion(Some(Trigger::OwnerAsked), true, pro_installed, pro) {
         lines.push(format!("  {line}"));
     }

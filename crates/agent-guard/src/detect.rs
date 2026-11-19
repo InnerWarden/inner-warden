@@ -1,6 +1,7 @@
 //! Auto-detection of AI agents running on the server.
 //!
-//! Scans /proc to find running processes that match known agent signatures.
+//! Scans the running processes (`/proc` on Linux, the kernel's process table
+//! on macOS) to find those that match known agent signatures.
 //! Also scans home directories for MCP config files to discover which
 //! MCP servers are configured (and can be auto-wrapped).
 
@@ -9,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
-use crate::signatures::SignatureIndex;
+use crate::signatures::{Signature, SignatureIndex};
 
 /// A detected AI agent running on the server.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -22,9 +23,242 @@ pub struct DetectedAgent {
     pub mcp_configs: Vec<PathBuf>,
 }
 
-/// Scan running processes for known AI agents.
+/// Scan running processes for known AI agents: `/proc` on Linux, the
+/// kernel's process table (libproc and `sysctl`) on macOS. Both match an
+/// agent by the same rule ([`identify_process`]).
 pub fn scan_processes(index: &SignatureIndex) -> Vec<DetectedAgent> {
+    platform_scan(index)
+}
+
+/// Whether [`scan_processes`] can look at this host's processes at all. Where
+/// it cannot, "no agent running" would be a claim nothing measured.
+pub fn process_scan_can_look() -> bool {
+    platform_scan_can_look()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_scan(index: &SignatureIndex) -> Vec<DetectedAgent> {
     scan_processes_in_dir(index, Path::new("/proc"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_scan_can_look() -> bool {
+    Path::new("/proc").is_dir()
+}
+
+#[cfg(target_os = "macos")]
+fn platform_scan(index: &SignatureIndex) -> Vec<DetectedAgent> {
+    match macos::process_table() {
+        Some(table) => agents_in_table(index, table, macos::argv),
+        None => {
+            warn!("agent-guard: the process table could not be read, cannot scan processes");
+            vec![]
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_scan_can_look() -> bool {
+    macos::list_pids().is_some()
+}
+
+/// The one rule every platform's scan matches an agent by. The process name
+/// is enough for native binaries, but interpreter-launched agents (OpenClaw
+/// is `node .../openclaw/dist/index.js`, its name "MainThread" on Linux,
+/// "node" on macOS) only reveal their identity in the argv, which is read
+/// only when the name does not match.
+fn identify_process(
+    index: &SignatureIndex,
+    comm: &str,
+    argv: impl FnOnce() -> Vec<String>,
+) -> Option<&'static Signature> {
+    index.identify(comm).or_else(|| {
+        let argv = argv();
+        let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        index.identify_cmdline(&argv_refs)
+    })
+}
+
+/// Keep the first process seen for each agent.
+fn note_agent(found: &mut HashMap<String, DetectedAgent>, sig: &Signature, pid: u32, comm: &str) {
+    found
+        .entry(sig.name.to_string())
+        .or_insert_with(|| DetectedAgent {
+            name: sig.name.to_string(),
+            vendor: sig.vendor.to_string(),
+            pid,
+            comm: comm.to_string(),
+            integration: format!("{:?}", sig.integration).to_lowercase(),
+            mcp_configs: vec![],
+        });
+}
+
+/// The agents found, by name, logged once.
+fn finish_scan(found: HashMap<String, DetectedAgent>) -> Vec<DetectedAgent> {
+    let mut results: Vec<DetectedAgent> = found.into_values().collect();
+    results.sort_by(|a, b| a.name.cmp(&b.name));
+
+    if results.is_empty() {
+        info!("agent-guard: no AI agents detected");
+    } else {
+        for agent in &results {
+            info!(
+                name = %agent.name,
+                pid = agent.pid,
+                integration = %agent.integration,
+                "agent-guard: detected AI agent"
+            );
+        }
+    }
+
+    results
+}
+
+/// The agents in a process table read some other way than `/proc` (the
+/// macOS scan): (pid, process name) pairs, with `argv_of` reading a
+/// process's argv when its name is not an agent's.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn agents_in_table(
+    index: &SignatureIndex,
+    table: Vec<(u32, String)>,
+    argv_of: impl Fn(u32) -> Vec<String>,
+) -> Vec<DetectedAgent> {
+    let mut found: HashMap<String, DetectedAgent> = HashMap::new();
+    for (pid, comm) in table {
+        if let Some(sig) = identify_process(index, &comm, || argv_of(pid)) {
+            note_agent(&mut found, sig, pid, &comm);
+        }
+    }
+    finish_scan(found)
+}
+
+/// PURE: the argv in a macOS `KERN_PROCARGS2` buffer: `argc` as a native
+/// int, the executable path and its NUL padding, then `argc` NUL-ended
+/// arguments (the environment follows and is never read). Empty arguments
+/// are dropped, as the `/proc` reader drops them.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn parse_procargs2(buf: &[u8]) -> Vec<String> {
+    let Some(head) = buf.get(..4) else {
+        return Vec::new();
+    };
+    let argc = i32::from_ne_bytes([head[0], head[1], head[2], head[3]]);
+    let Ok(argc) = usize::try_from(argc) else {
+        return Vec::new();
+    };
+    let rest = &buf[4..];
+    let Some(path_end) = rest.iter().position(|&b| b == 0) else {
+        return Vec::new();
+    };
+    let args_start = rest[path_end..]
+        .iter()
+        .position(|&b| b != 0)
+        .map_or(rest.len(), |offset| path_end + offset);
+    rest[args_start..]
+        .split(|&b| b == 0)
+        .take(argc)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8_lossy(arg).into_owned())
+        .collect()
+}
+
+/// The macOS process table, read from the kernel: no `/proc` there.
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::ffi::{c_int, c_void};
+
+    /// Every pid the kernel lists, or `None` when the list could not be read.
+    pub(super) fn list_pids() -> Option<Vec<u32>> {
+        // SAFETY: a null buffer asks only for the count.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        let count = usize::try_from(count).ok().filter(|n| *n > 0)?;
+        // Room for processes started between the two calls.
+        let capacity = count + 64;
+        let mut pids: Vec<c_int> = vec![0; capacity];
+        let bytes = c_int::try_from(capacity * std::mem::size_of::<c_int>()).ok()?;
+        // SAFETY: the buffer holds `bytes` bytes and outlives the call.
+        let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast::<c_void>(), bytes) };
+        let got = usize::try_from(got).ok().filter(|n| *n > 0)?;
+        pids.truncate(got.min(capacity));
+        Some(
+            pids.into_iter()
+                .filter_map(|pid| u32::try_from(pid).ok().filter(|pid| *pid > 0))
+                .collect(),
+        )
+    }
+
+    /// A process's name, or `None` when it is gone or cannot be read.
+    pub(super) fn name(pid: u32) -> Option<String> {
+        let pid = c_int::try_from(pid).ok()?;
+        let mut buf = [0u8; 256];
+        // SAFETY: the buffer holds its length in bytes and outlives the call.
+        let len =
+            unsafe { libc::proc_name(pid, buf.as_mut_ptr().cast::<c_void>(), buf.len() as u32) };
+        let len = usize::try_from(len).ok().filter(|n| *n > 0)?;
+        Some(String::from_utf8_lossy(&buf[..len.min(buf.len())]).into_owned())
+    }
+
+    /// A process's argv, empty when it cannot be read (another user's
+    /// process, or one that ended).
+    pub(super) fn argv(pid: u32) -> Vec<String> {
+        let Ok(pid) = c_int::try_from(pid) else {
+            return Vec::new();
+        };
+        let Some(argmax) = argmax() else {
+            return Vec::new();
+        };
+        let mut buf = vec![0u8; argmax];
+        let mut size: libc::size_t = buf.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+        // SAFETY: `size` is the buffer's length and both outlive the call.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                buf.as_mut_ptr().cast::<c_void>(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return Vec::new();
+        }
+        buf.truncate(size.min(buf.len()));
+        super::parse_procargs2(&buf)
+    }
+
+    /// The kernel's limit on argv plus environment, the size of the buffer
+    /// `KERN_PROCARGS2` fills.
+    fn argmax() -> Option<usize> {
+        let mut value: c_int = 0;
+        let mut size: libc::size_t = std::mem::size_of::<c_int>();
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        // SAFETY: `value` is a c_int and `size` says so.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                (&mut value as *mut c_int).cast::<c_void>(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        usize::try_from(value).ok().filter(|n| *n > 0)
+    }
+
+    /// (pid, name) for every process whose name could be read.
+    pub(super) fn process_table() -> Option<Vec<(u32, String)>> {
+        let pids = list_pids()?;
+        Some(
+            pids.into_iter()
+                .filter_map(|pid| name(pid).map(|name| (pid, name)))
+                .collect(),
+        )
+    }
 }
 
 /// Read `/proc/<pid>/cmdline` as a NUL-separated argv vector. Returns an empty
@@ -76,46 +310,12 @@ fn scan_processes_in_dir(index: &SignatureIndex, proc: &Path) -> Vec<DetectedAge
             Err(_) => continue,
         };
 
-        // `comm` is enough for native binaries, but interpreter-launched
-        // agents (OpenClaw is `node .../openclaw/dist/index.js`, comm =
-        // "MainThread") only reveal their identity in the cmdline. Fall back
-        // to scanning argv when comm does not match.
-        let sig = index.identify(&comm).or_else(|| {
-            let argv = read_cmdline(&entry.path());
-            let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-            index.identify_cmdline(&argv_refs)
-        });
-
-        if let Some(sig) = sig {
-            let key = sig.name.to_string();
-            found.entry(key).or_insert_with(|| DetectedAgent {
-                name: sig.name.to_string(),
-                vendor: sig.vendor.to_string(),
-                pid,
-                comm: comm.clone(),
-                integration: format!("{:?}", sig.integration).to_lowercase(),
-                mcp_configs: vec![],
-            });
+        if let Some(sig) = identify_process(index, &comm, || read_cmdline(&entry.path())) {
+            note_agent(&mut found, sig, pid, &comm);
         }
     }
 
-    let mut results: Vec<DetectedAgent> = found.into_values().collect();
-    results.sort_by(|a, b| a.name.cmp(&b.name));
-
-    if results.is_empty() {
-        info!("agent-guard: no AI agents detected");
-    } else {
-        for agent in &results {
-            info!(
-                name = %agent.name,
-                pid = agent.pid,
-                integration = %agent.integration,
-                "agent-guard: detected AI agent"
-            );
-        }
-    }
-
-    results
+    finish_scan(found)
 }
 
 /// Scan for MCP config files in user home directories.
@@ -270,6 +470,92 @@ mod tests {
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "OpenClaw");
         assert_eq!(agents[0].comm, "MainThread");
+    }
+
+    /// The macOS scan matches by the same rule as `/proc`: the name, then the
+    /// argv only when the name is not an agent's (node running OpenClaw).
+    /// (NEW-20261119-macos-agent-process-scan-missing)
+    #[test]
+    fn a_process_table_is_matched_by_the_same_rule_as_proc() {
+        let index = SignatureIndex::new();
+        let table = vec![
+            (10, "claude".to_string()),
+            (11, "node".to_string()),
+            (12, "zsh".to_string()),
+            (13, "claude".to_string()),
+        ];
+        let argv_reads = std::cell::RefCell::new(Vec::new());
+        let agents = agents_in_table(&index, table, |pid| {
+            argv_reads.borrow_mut().push(pid);
+            match pid {
+                11 => vec![
+                    "/opt/homebrew/bin/node".into(),
+                    "/opt/homebrew/lib/node_modules/openclaw/dist/index.js".into(),
+                    "gateway".into(),
+                ],
+                _ => vec!["/bin/zsh".into()],
+            }
+        });
+        let names: Vec<(&str, u32)> = agents.iter().map(|a| (a.name.as_str(), a.pid)).collect();
+        assert_eq!(names, vec![("Claude Code", 10), ("OpenClaw", 11)]);
+        assert_eq!(
+            *argv_reads.borrow(),
+            vec![11, 12],
+            "argv read only past a name"
+        );
+    }
+
+    /// A `KERN_PROCARGS2` buffer: argc, the executable path with its NUL
+    /// padding, the arguments, then the environment, which is never read.
+    #[test]
+    fn procargs2_gives_the_argv_and_never_the_environment() {
+        let mut buf = 3i32.to_ne_bytes().to_vec();
+        buf.extend_from_slice(b"/usr/local/bin/node    ");
+        buf.extend_from_slice(b"node /x/openclaw/dist/index.js gateway ");
+        buf.extend_from_slice(b"HOME=/Users/a SECRET=s ");
+        assert_eq!(
+            parse_procargs2(&buf),
+            vec!["node", "/x/openclaw/dist/index.js", "gateway"]
+        );
+        assert!(parse_procargs2(&[]).is_empty());
+        assert!(parse_procargs2(&(-1i32).to_ne_bytes()).is_empty());
+        let mut no_path_end = 1i32.to_ne_bytes().to_vec();
+        no_path_end.extend_from_slice(b"/bin/x");
+        assert!(parse_procargs2(&no_path_end).is_empty());
+    }
+
+    /// On macOS the scan reads the kernel's process table: a program named
+    /// like an agent is found by its pid, its name and its argv.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_macos_scan_finds_a_running_agent_by_name_and_argv() {
+        assert!(process_scan_can_look());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("claude");
+        std::fs::copy("/bin/sleep", &fake).expect("copy sleep");
+        let mut child = std::process::Command::new(&fake)
+            .arg("30")
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let table = macos::process_table().expect("process table");
+        let argv = macos::argv(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        let (_, name) = table
+            .iter()
+            .find(|(p, _)| *p == pid)
+            .unwrap_or_else(|| panic!("pid {pid} not in the table"));
+        assert_eq!(name, "claude");
+        assert!(
+            argv.first().is_some_and(|a| a.ends_with("/claude")),
+            "{argv:?}"
+        );
+        assert_eq!(argv.get(1).map(String::as_str), Some("30"), "{argv:?}");
+        let index = SignatureIndex::new();
+        let found = agents_in_table(&index, vec![(pid, name.clone())], macos::argv);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "Claude Code");
     }
 
     #[test]

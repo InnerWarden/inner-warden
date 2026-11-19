@@ -3404,7 +3404,9 @@ mod status_wiring_tests {
 
     /// FAILS ON REVERT of `any_agent_seen` in `status`: an agent that is only
     /// installed (a row with no pid) is not a running one, and where the
-    /// process scan cannot look nothing is claimed.
+    /// process scan cannot look nothing is claimed. Whether it can look is the
+    /// scan's own answer (`/proc` on Linux, the process table on macOS), not
+    /// whether `/proc` exists: macOS has a scan of its own.
     #[test]
     fn an_installed_agent_is_not_a_running_one() {
         let home = tempfile::TempDir::new().unwrap();
@@ -3416,7 +3418,7 @@ mod status_wiring_tests {
         assert_eq!(agents_ops::any_agent_running_with(&rows, false), None);
         // What `status` itself says, on this platform.
         let said = status_any_agent_seen(Some(home.path()), &rows);
-        if std::path::Path::new("/proc").is_dir() {
+        if innerwarden_agent_guard::detect::process_scan_can_look() {
             assert_eq!(said, Some(false), "installed is not running");
         } else {
             assert_eq!(said, None, "no process scan here, so nothing is claimed");

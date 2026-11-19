@@ -210,7 +210,7 @@ fn hook_shell_only_words() -> String {
 /// What the MCP proxy judges, in the words `status` prints after "judged
 /// before they run: ".
 const PROXY_WORDS: &str =
-    "calls to its MCP servers. Its built-in tools are not screened by this edition.";
+    "calls to its MCP servers. Its built-in tools are not screened by InnerWarden Community.";
 
 /// PURE: the line `status` prints for what one agent's wiring judges.
 pub fn tool_classes_finding(classes: &ToolClasses) -> Finding {
@@ -1049,10 +1049,23 @@ mod tests {
             }),
             Finding::Working(
                 "codex: judged before they run: calls to its MCP servers. Its built-in \
-                 tools are not screened by this edition."
+                 tools are not screened by InnerWarden Community."
                     .into()
             )
         );
+    }
+
+    /// The product is named by its name, never "this edition".
+    /// (NEW-20261017-status-edition-word)
+    #[test]
+    fn what_the_proxy_judges_names_the_product_not_an_edition() {
+        let Finding::Working(line) = tool_classes_finding(&ToolClasses::Proxy {
+            agent: "gemini".into(),
+        }) else {
+            panic!("a proxy agent is working");
+        };
+        assert!(!line.contains("edition"), "{line}");
+        assert!(line.contains("InnerWarden Community"), "{line}");
     }
 
     /// `tool_classes_for` answers what the block `main` used to run inline

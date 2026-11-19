@@ -878,7 +878,7 @@ describe("Protection, Agents and Tokens", () => {
     const text = textOf(screening);
     expect(text).toContain("2 of 3 local servers wrapped.");
     expect(text).toContain("1 remote server is not screened (Community wraps local servers only).");
-    expect(text).toContain("Calls to its MCP servers. Its built-in tools are not screened by this edition.");
+    expect(text).toContain("Calls to its MCP servers. Its built-in tools are not screened by InnerWarden Community.");
     // Gemini was screened before its settings changed and not since: never "Screened".
     const gemini = screening.slice(screening.indexOf('data-screening="gemini"'));
     expect(textOf(gemini)).toContain("Nothing since its settings changed on 27 Sept at 14:05");
