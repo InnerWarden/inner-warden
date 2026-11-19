@@ -785,8 +785,11 @@ fn connect_automatically(
 /// it wrote that, and a 1.6.12 upgraded to 1.6.13 kept Read, Grep and Glob
 /// unscreened (NEW-20261116-upgrade-leaves-read-tools-unwired).
 ///
-/// Unlike [`reconcile`], this does not wait for `auto_connect`: it connects
-/// nothing new, it only completes wiring the person already chose. A
+/// Unlike [`reconcile`], this does not wait for `auto_connect`: it touches
+/// only agents that already have an InnerWarden hook, and completes the
+/// wiring the person already chose. A half that agent does not have yet
+/// (Read|Grep|Glob after an upgrade, say) IS written, in the mode of its Bash
+/// half; every half already there keeps its own mode, never weaker. A
 /// disconnect or exclusion still wins.
 pub fn rewire_existing(home: &Path, guard_bin: &str) -> ReconcileReport {
     rewire_existing_within(home, guard_bin, POLICY_LOCK_WAIT)

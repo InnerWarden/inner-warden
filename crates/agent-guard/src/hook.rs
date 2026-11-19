@@ -703,7 +703,19 @@ fn install_hook_with_link_policy(
     // flags, because a PostToolUse hook that points at a different build is a
     // seam that drifts silently: it would keep feeding a store the screening
     // half no longer reads.
-    let merged = merge_posttooluse_hook(merged, &cmd);
+    //
+    // Its mode follows the same rule as the other halves: a PostToolUse line
+    // already there keeps its own mode, never weaker than asked, and only a
+    // missing one takes the Bash half's. Writing the Bash half's mode on it
+    // turned an enforcing line into `--monitor` when no Bash hook enforced.
+    let post_command = match posttooluse_iwguard_mode(&existing).filter(|_| reject_symlinks) {
+        Some(mode) => {
+            let (block_review, monitor) = mode.max(requested_mode).flags();
+            hook_command_for(iw_guard, block_review, monitor, agent_flag.as_deref())
+        }
+        None => cmd.clone(),
+    };
+    let merged = merge_posttooluse_hook(merged, &post_command);
     // Automatic setup must not treat any recognised legacy hook as proof that
     // the requested wiring is already correct. Reconcile aliases, duplicate
     // entries and mode/path drift first; skip only an exact semantic no-op.
@@ -985,6 +997,22 @@ fn exact_matcher_iwguard_mode(settings: &Value, matcher: &str) -> Option<HookPro
         .into_iter()
         .flatten()
         .filter(|entry| entry.get("matcher").and_then(Value::as_str) == Some(matcher))
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .filter_map(iwguard_hook_mode)
+        .max()
+}
+
+/// Strongest recognised InnerWarden mode among the `PostToolUse` hooks,
+/// under any matcher: [`merge_posttooluse_hook`] replaces ours wherever it
+/// sits.
+fn posttooluse_iwguard_mode(settings: &Value) -> Option<HookProtection> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PostToolUse"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
         .flatten()
         .filter_map(iwguard_hook_mode)
@@ -2298,6 +2326,63 @@ mod tests {
             assert_eq!(commands(&now, "Bash"), vec![want_bash.clone()], "{wired}");
             assert_eq!(commands(&now, file), vec![want_file.clone()], "{wired}");
             assert_eq!(commands(&now, read), vec![want_read.clone()], "{wired}");
+            // And a second pass changes nothing.
+            let body = fs::read(&path).unwrap();
+            install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), body, "{wired}");
+        }
+    }
+
+    /// The PostToolUse half follows the same rule: an enforcing line there
+    /// with no enforcing Bash hook stays enforcing, a monitor one beside an
+    /// enforcing Bash hook stays monitor, and a missing one takes the Bash
+    /// half's mode.
+    #[test]
+    fn automatic_setup_keeps_the_mode_of_the_posttooluse_half() {
+        let iw = Path::new("/opt/innerwarden");
+        let enforce = format!("\"/opt/innerwarden\" hook --agent claude-code{CLOSED}");
+        let monitor = "\"/opt/innerwarden\" hook --monitor --agent claude-code".to_string();
+        let entry = |matcher: &str, command: &str| json!({"matcher": matcher, "hooks": [{"type": "command", "command": command}]});
+        let post_commands = |v: &Value| -> Vec<String> {
+            v["hooks"]["PostToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|e| e["hooks"].as_array().unwrap().clone())
+                .map(|h| h["command"].as_str().unwrap().to_string())
+                .collect()
+        };
+        for (wired, want_post) in [
+            // PostToolUse in enforce, no Bash line.
+            (
+                json!({"hooks": {"PostToolUse": [entry("*", &enforce)]}}),
+                &enforce,
+            ),
+            // PostToolUse in enforce, Bash in monitor.
+            (
+                json!({"hooks": {"PreToolUse": [entry("Bash", &monitor)],
+                                 "PostToolUse": [entry("*", &enforce)]}}),
+                &enforce,
+            ),
+            // A monitor PostToolUse line beside an enforcing Bash hook.
+            (
+                json!({"hooks": {"PreToolUse": [entry("Bash", &enforce)],
+                                 "PostToolUse": [entry("*", &monitor)]}}),
+                &monitor,
+            ),
+            // No PostToolUse line yet: it takes the Bash half's mode.
+            (
+                json!({"hooks": {"PreToolUse": [entry("Bash", &enforce)]}}),
+                &enforce,
+            ),
+        ] {
+            let home = tempfile::TempDir::new().unwrap();
+            let path = home.path().join(".claude/settings.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, serde_json::to_vec_pretty(&wired).unwrap()).unwrap();
+            install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();
+            let now: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(post_commands(&now), vec![want_post.clone()], "{wired}");
             // And a second pass changes nothing.
             let body = fs::read(&path).unwrap();
             install_hook_no_symlinks(home.path(), "claude-code", None, iw, false, true).unwrap();

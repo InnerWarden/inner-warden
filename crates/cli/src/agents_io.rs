@@ -33,8 +33,9 @@ pub(crate) fn invoked_as() -> Option<String> {
 
 /// `innerwarden agents rewire`: bring the wiring already there up to this
 /// binary's, in the mode it has ([`agent_policy::rewire_existing`]). Connects
-/// nothing new and never lowers a mode, so it is not one of the verbs that
-/// lower a guard. The upgrade runs it with the NEW binary.
+/// no new agent; for an agent already connected it writes the halves it lacks
+/// in the mode of its Bash half, keeps each other half's mode and never lowers
+/// one, so it is not one of the verbs that lower a guard. The upgrade runs it with the NEW binary.
 fn cmd_rewire() -> std::process::ExitCode {
     let (Ok(home), Some(bin)) = (hook::home_dir(), invoked_as()) else {
         eprintln!("innerwarden agents rewire: could not tell the home or this program's path");
