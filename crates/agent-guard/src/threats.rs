@@ -2822,7 +2822,10 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
         "'settings'",
         "\"settings\"",
     ];
-    if !mentions_any(content, NEEDLES) && !names_guard_alias(content) {
+    if !mentions_any(content, NEEDLES)
+        && !names_guard_alias(content)
+        && !names_a_removing_find(content)
+    {
         // A name assembled by the shell (`${x:-innerwarden}`, `$(echo
         // innerwarden)`, `inner''warden`, `$'\x69nnerwarden'`) or matched
         // from a pattern (`inner*-ctl`, `inner{w..w}arden`) only reads as
@@ -3299,8 +3302,15 @@ fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)]
             "rewrites an agent's configuration through an interpreter",
             60,
         );
+        // The hook script by where it is: a file or folder named for the
+        // guard right inside an agent's `hooks` folder. A file elsewhere
+        // whose path merely holds the word (`~/innerwarden/x.sh`, a scratch
+        // folder under `/tmp/claude-1000/-home-u-innerwarden/`) is not the
+        // guard's: its configuration, record and program are held by their
+        // real paths ([`writes_guard_config`], [`writes_guard_carrier`]),
+        // through a variable, a link or `..` as well.
         add(
-            r#"(?i)\brm\b[^|;&]*(?:hooks?/[^\s]*innerwarden|innerwarden[^\s]*\.(?:sh|json))"#,
+            r#"(?i)\brm\b[^|;&]*\bhooks?/[^\s/'"]*innerwarden"#,
             "deletes the guard's hook script",
             60,
         );
@@ -6759,6 +6769,44 @@ fn writes_guard_config(content: &str, depth: u8) -> bool {
     writes_place(content, depth, |target, _| names_guard_config(target), true)
 }
 
+/// What the shell side says of a line that writes the SSH client
+/// configuration ([`writes_ssh_client_config`]).
+const SSH_CLIENT_CONFIG_WRITTEN: &str =
+    "writes the SSH client configuration, which every ssh reads and which can run a \
+     command (LocalCommand, ProxyCommand) or pull in another file (Include)";
+
+/// Whether a path names the SSH client configuration: `~/.ssh/config`, a
+/// file in `~/.ssh/config.d/` (in any home), `/etc/ssh/ssh_config` or a
+/// file in `/etc/ssh/ssh_config.d/`. A removal or a move away (`taken`)
+/// is not counted: a missing file runs nothing.
+fn names_ssh_client_config(target: &str, taken: bool) -> bool {
+    !taken
+        && named_path(&home_spelled(target)).is_some_and(|named| {
+            [
+                Place::Components(".ssh/config"),
+                Place::Components(".ssh/config.d"),
+                Place::Tree("/etc/ssh/ssh_config"),
+                Place::Tree("/etc/ssh/ssh_config.d"),
+            ]
+            .into_iter()
+            .any(|place| place.holds(&named))
+        })
+}
+
+/// Whether a command line writes the SSH client configuration
+/// ([`names_ssh_client_config`]). Every `ssh`, `scp`, `rsync` and `git`
+/// over ssh reads it without being told to, so a `LocalCommand` or
+/// `ProxyCommand` written there runs on the next connection, outside the
+/// line that wrote it. The file tools are refused the same file
+/// (`crate::file_tools`); this is the shell side, with every writer
+/// [`writes_place`] reads: a redirection, `tee`, `cp`, `ln`, `mv` onto
+/// it, `sed -i`, through a variable or a `cd`. A link the line makes is
+/// followed before this is asked (`crate::shell::line_through_links`).
+fn writes_ssh_client_config(content: &str) -> bool {
+    content.to_ascii_lowercase().contains("ssh")
+        && writes_place(content, 0, names_ssh_client_config, false)
+}
+
 /// What the shell side says of a line that writes what the guard is carried
 /// by.
 const GUARD_CARRIER_WRITTEN: &str =
@@ -6962,6 +7010,18 @@ fn without_fresh_dir_writes(content: &str) -> Option<String> {
     Some(kept.join("\n"))
 }
 
+/// Whether a line may hold a `find` that removes, edits or writes what it
+/// matches ([`find_takes_and_writes`]): such a search reaches the guard's
+/// places from above them without naming them (`find /etc -name agent.toml
+/// -delete`), so it is read whatever else the line names.
+fn names_a_removing_find(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("find")
+        && ["-delete", "-exec", "-ok", "-fprint", "-fls"]
+            .iter()
+            .any(|action| lower.contains(action))
+}
+
 /// A cheap test ahead of the walk [`writes_guard_carrier`] makes: a line
 /// that names no guard program and no agent folder, and does not hold every
 /// component of one carrier place, writes none.
@@ -6969,6 +7029,11 @@ fn may_name_guard_carrier(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
     lower.contains("innerwarden")
         || names_guard_alias(content)
+        || names_a_removing_find(content)
+        || settings_hook_programs()
+            .programs
+            .iter()
+            .any(|program| lower.contains(token_basename(program)))
         || AGENT_HOMES.iter().any(|home| lower.contains(home))
         || guard_carrier_places().any(|place| {
             let (Place::File(row) | Place::Tree(row) | Place::Components(row)) = place;
@@ -7175,6 +7240,24 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 if command == "mv" {
                     taken.extend(sources.iter().map(|path| path.to_string()));
                 }
+                // `rsync --delete` (and `--delete-before`, `--del`, ...)
+                // removes what the destination holds that the source does
+                // not: the destination folder is taken away, not only
+                // written. `--remove-source-files` takes the sources.
+                if command == "rsync" {
+                    if arguments
+                        .iter()
+                        .any(|argument| argument == "--del" || argument.starts_with("--delete"))
+                    {
+                        taken.extend(destination.clone());
+                    }
+                    if arguments
+                        .iter()
+                        .any(|argument| argument == "--remove-source-files")
+                    {
+                        taken.extend(sources.iter().map(|path| path.to_string()));
+                    }
+                }
                 if let Some(destination) = destination {
                     // Into a directory, each source lands under its own name.
                     if named_directory || sources.len() > 1 || reads_as_directory(&destination) {
@@ -7200,6 +7283,14 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 {
                     return true;
                 }
+            }
+            "find" | "gfind" => {
+                let reading = find_takes_and_writes(arguments);
+                if reading.takes {
+                    taken.extend(guard_places_a_find_reaches(&reading, &dirs));
+                }
+                taken.extend(reading.taken);
+                targets.extend(reading.written);
             }
             "dd" => targets.extend(dd_operand(arguments, "of").map(str::to_string)),
             "curl" => targets.extend(option_values(arguments, 'o', &["output"])),
@@ -7234,6 +7325,448 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
         }
     }
     false
+}
+
+/// What a `find` takes away and what it writes, for [`writes_place`].
+///
+/// With `-delete`, or `-exec`, `-execdir`, `-ok` or `-okdir` running a
+/// program that removes, moves or edits what it is handed, every root of the
+/// search is taken away, filtered or not: `find ~/.config/innerwarden -name
+/// config.json -delete` removes a file of that folder. A root above the
+/// place is read with the plain words of each pattern under it, and against
+/// the guard's places it holds ([`guard_places_a_find_reaches`]).
+/// `-fprint`, `-fprint0`, `-fprintf` and `-fls` write their file.
+struct FindReading {
+    /// Whether the search removes or edits what it matches.
+    takes: bool,
+    /// The roots, as written.
+    roots: Vec<String>,
+    /// What it takes away: each root, and each root with a pattern's words.
+    taken: Vec<String>,
+    /// The files `-fprint` and its kin write.
+    written: Vec<String>,
+    /// The tests that choose what it matches.
+    filter: FindFilter,
+}
+
+/// The name and path tests of a `find` expression, lowercase.
+#[derive(Default)]
+struct FindFilter {
+    tests: Vec<(FindTest, String)>,
+    /// The expression has `-o`: a match of any test may be enough.
+    or: bool,
+    /// The expression has `!` or `-not`: what it matches is not read.
+    not: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FindTest {
+    /// `-name`, `-iname`: a glob on the last part of the path.
+    Name,
+    /// `-path`, `-wholename` and their `-i` forms: a glob on the path.
+    Path,
+    /// `-regex`, `-iregex`: a pattern on the whole path.
+    Regex,
+}
+
+impl FindFilter {
+    /// Whether the search may match `printed` (the path as `find` prints it).
+    /// A test that cannot be read counts as a match.
+    fn may_match(&self, printed: &str) -> bool {
+        if self.tests.is_empty() || self.not {
+            return true;
+        }
+        let name = printed
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(printed);
+        let matches = |(test, pattern): &(FindTest, String)| match test {
+            FindTest::Name => glob_matches(pattern, name),
+            FindTest::Path => glob_matches(pattern, printed),
+            FindTest::Regex => regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
+                .size_limit(1 << 20)
+                .build()
+                .map_or(true, |re| re.is_match(printed)),
+        };
+        if self.or {
+            self.tests.iter().any(matches)
+        } else {
+            self.tests.iter().all(matches)
+        }
+    }
+}
+
+/// Whether a shell glob matches all of `text`: `*` (which crosses `/`, as
+/// in `find -path`), `?`, a bracket class with ranges and `!` or `^`, and a
+/// backslash escape. A bracket left open is a plain `[`.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    // One element of the pattern at `at`: whether it takes `c`, and its length.
+    let single = |at: usize, c: char| -> (bool, usize) {
+        match pattern[at] {
+            '?' => (true, 1),
+            '\\' if at + 1 < pattern.len() => (pattern[at + 1] == c, 2),
+            '[' => {
+                let mut i = at + 1;
+                let negated = matches!(pattern.get(i), Some('!' | '^'));
+                if negated {
+                    i += 1;
+                }
+                let first = i;
+                let mut found = false;
+                while i < pattern.len() && (pattern[i] != ']' || i == first) {
+                    if i + 2 < pattern.len() && pattern[i + 1] == '-' && pattern[i + 2] != ']' {
+                        found |= pattern[i] <= c && c <= pattern[i + 2];
+                        i += 3;
+                    } else {
+                        found |= pattern[i] == c;
+                        i += 1;
+                    }
+                }
+                if i >= pattern.len() {
+                    ('[' == c, 1)
+                } else {
+                    (found != negated, i + 1 - at)
+                }
+            }
+            other => (other == c, 1),
+        }
+    };
+    let (mut p, mut t) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, t));
+            p += 1;
+            continue;
+        }
+        if p < pattern.len() {
+            let (ok, width) = single(p, text[t]);
+            if ok {
+                p += width;
+                t += 1;
+                continue;
+            }
+        }
+        match star {
+            Some((star_at, from)) => {
+                p = star_at + 1;
+                t = from + 1;
+                star = Some((star_at, from + 1));
+            }
+            None => return false,
+        }
+    }
+    pattern[p..].iter().all(|c| *c == '*')
+}
+
+fn find_takes_and_writes(arguments: &[String]) -> FindReading {
+    const REMOVERS: &[&str] = &[
+        "rm", "unlink", "shred", "truncate", "mv", "rmdir", "chmod", "tee", "dd", "ln",
+    ];
+    // Options before the roots: `-H`, `-L`, `-P`, `-D debug`, `-O3`.
+    let mut at = 0usize;
+    while let Some(word) = arguments.get(at) {
+        match word.as_str() {
+            "-H" | "-L" | "-P" => at += 1,
+            "-D" => at += 2,
+            _ if word.starts_with("-O") => at += 1,
+            _ => break,
+        }
+    }
+    let roots: Vec<String> = arguments[at.min(arguments.len())..]
+        .iter()
+        .take_while(|word| {
+            !word.starts_with('-') && !matches!(word.as_str(), "(" | "!" | "\\(" | "\\!")
+        })
+        .map(|root| root.trim_matches(['"', '\'']).to_string())
+        .collect();
+    let expression = &arguments[(at + roots.len()).min(arguments.len())..];
+    let mut takes = false;
+    let mut written = Vec::new();
+    let mut pieces: Vec<String> = Vec::new();
+    let mut filter = FindFilter::default();
+    let mut words = expression.iter().peekable();
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            "-delete" => takes = true,
+            "-o" | "-or" => filter.or = true,
+            "!" | "\\!" | "-not" => filter.not = true,
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                let Some(program) = words.next() else { break };
+                let program =
+                    token_basename(program.trim_matches(['"', '\''])).to_ascii_lowercase();
+                let mut handed = Vec::new();
+                for argument in words.by_ref() {
+                    if matches!(argument.as_str(), ";" | "\\;" | "+" | "';'") {
+                        break;
+                    }
+                    handed.push(argument.clone());
+                }
+                takes |= REMOVERS.contains(&program.as_str())
+                    || SHELLS.contains(&program.as_str())
+                    || (matches!(program.as_str(), "sed" | "gsed" | "perl")
+                        && handed
+                            .iter()
+                            .any(|argument| edits_in_place(&program, argument)));
+            }
+            "-fprint" | "-fprint0" | "-fls" | "-fprintf" => written.extend(words.next().cloned()),
+            test => {
+                let kind = match test {
+                    "-name" | "-iname" => FindTest::Name,
+                    "-path" | "-ipath" | "-wholename" | "-iwholename" => FindTest::Path,
+                    "-regex" | "-iregex" => FindTest::Regex,
+                    _ => continue,
+                };
+                let Some(value) = words.next() else { break };
+                let value = value.trim_matches(['"', '\'']).to_lowercase();
+                pieces.extend(
+                    value
+                        .split(|c: char| "*?[]{}()|^$\\+".contains(c))
+                        .map(|piece| piece.trim_matches('/'))
+                        .filter(|piece| !piece.is_empty() && *piece != ".")
+                        .map(str::to_string),
+                );
+                filter.tests.push((kind, value));
+            }
+        }
+    }
+    let mut taken = Vec::new();
+    if takes {
+        for root in &roots {
+            let root = root.trim_end_matches('/');
+            taken.push(root.to_string());
+            taken.extend(pieces.iter().map(|piece| format!("{root}/{piece}")));
+        }
+    }
+    FindReading {
+        takes,
+        roots,
+        taken,
+        written,
+        filter,
+    }
+}
+
+/// The guard's places a search from above them may remove: its folders,
+/// with the names it keeps in them, the agent settings that load it, and its
+/// program where the installers put it. Spelled from the root or the home.
+const GUARD_FIND_PLACES: &[(&str, &[&str])] = &[
+    ("~/.config/innerwarden", GUARD_FILE_NAMES),
+    ("/etc/innerwarden", GUARD_FILE_NAMES),
+    ("/var/lib/innerwarden", GUARD_FILE_NAMES),
+    ("/sys/fs/bpf/innerwarden", &[]),
+    ("~/.claude/settings.json", &[]),
+    ("~/.claude/settings.local.json", &[]),
+    ("~/.claude.json", &[]),
+    ("~/.codex/config.toml", &[]),
+    ("~/.cursor/mcp.json", &[]),
+    ("~/.gemini/settings.json", &[]),
+    ("~/.openclaw/openclaw.json", &[]),
+    ("~/.openclaw/extensions/innerwarden-guard", &[]),
+    ("~/.openclaw/extensions/innerwarden-replies", &[]),
+    ("~/.openclaw/hooks/innerwarden-attempts", &[]),
+    ("/usr/local/bin/innerwarden", &[]),
+    ("/usr/bin/innerwarden", &[]),
+    ("~/.local/bin/innerwarden", &[]),
+    ("~/.cargo/bin/innerwarden", &[]),
+];
+
+/// The files the guard and the host agent keep in their folders, by name
+/// (read from the code that writes them).
+const GUARD_FILE_NAMES: &[&str] = &[
+    "suppress.toml",
+    "allow.toml",
+    "allow.json",
+    "agent-profiles.toml",
+    "agents.toml",
+    "agents.lock",
+    "llm-key",
+    "llm.toml",
+    "graph.json",
+    "guard.toml",
+    "guard-events.jsonl",
+    "agent.toml",
+    "agent-kernel.toml",
+    "agent-tls.spki",
+    "notify.toml",
+    "config.json",
+    "config.toml",
+    "registry.json",
+    "sessions.json",
+    "state.json",
+    "state.db",
+    "innerwarden.db",
+    "dns-guard-mode",
+];
+
+/// What a folder of the guard holds, for [`guard_places_a_find_reaches`].
+enum FolderEntries {
+    /// Every file and folder under it, as paths below it, lowercase. Empty
+    /// for a place that is a file.
+    Listed(Vec<String>),
+    /// It is not there.
+    Missing,
+    /// It, or a folder under it, could not be read, or it holds more than
+    /// [`GUARD_FOLDER_ENTRIES`]: what it holds is not known.
+    Unread,
+}
+
+/// How many entries a folder of the guard is listed to, and how deep.
+const GUARD_FOLDER_ENTRIES: usize = 50_000;
+const GUARD_FOLDER_DEPTH: usize = 12;
+
+/// Everything under `place`, listed now, links not followed.
+fn guard_folder_entries(place: &std::path::Path) -> FolderEntries {
+    let metadata = match std::fs::symlink_metadata(place) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return FolderEntries::Missing
+        }
+        Err(_) => return FolderEntries::Unread,
+    };
+    if !metadata.is_dir() {
+        return FolderEntries::Listed(Vec::new());
+    }
+    let mut entries = Vec::new();
+    let mut pending = vec![(place.to_path_buf(), String::new(), 0usize)];
+    while let Some((folder, below, depth)) = pending.pop() {
+        let Ok(listing) = std::fs::read_dir(&folder) else {
+            return FolderEntries::Unread;
+        };
+        for entry in listing {
+            let Ok(entry) = entry else {
+                return FolderEntries::Unread;
+            };
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let path = if below.is_empty() {
+                name
+            } else {
+                format!("{below}/{name}")
+            };
+            if entries.len() >= GUARD_FOLDER_ENTRIES {
+                return FolderEntries::Unread;
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                if depth + 1 >= GUARD_FOLDER_DEPTH {
+                    return FolderEntries::Unread;
+                }
+                pending.push((entry.path(), path.clone(), depth + 1));
+            }
+            entries.push(path);
+        }
+    }
+    FolderEntries::Listed(entries)
+}
+
+/// The guard's places under a root of a search that takes what it matches,
+/// where its tests may match the place, a folder on the way to it or a file
+/// the guard keeps in it ([`FindFilter::may_match`]): `find ~ -path
+/// '*innerwarden*' -delete` and `find /etc -name agent.toml -delete` remove
+/// them. Inside a place every file is the guard's: the filter is held to the
+/// place's listing at the time of the judgment ([`guard_folder_entries`]),
+/// to [`GUARD_FILE_NAMES`] for a folder not made yet, and a folder that
+/// cannot be listed counts as a match. A relative root is read in each
+/// directory a `cd` named, and is not read without one. Not read: a root
+/// behind a variable other than the home.
+fn guard_places_a_find_reaches(reading: &FindReading, dirs: &[String]) -> Vec<String> {
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|home| home.starts_with('/'))
+        .map(|home| home.to_lowercase().trim_end_matches('/').to_string());
+    // `~/x` with the home written out, where it is known.
+    let absolute = |path: &str| -> String {
+        let path = home_spelled(path);
+        match (&home, path.strip_prefix('~')) {
+            (Some(home), Some(rest)) if rest.is_empty() || rest.starts_with('/') => {
+                collapse_path(&format!("{home}{rest}"))
+            }
+            _ => collapse_path(&path),
+        }
+    };
+    let real_home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from);
+    let programs = &settings_hook_programs().programs;
+    let mut reached = Vec::new();
+    for written in &reading.roots {
+        let mut spellings = vec![written.clone()];
+        if !written.starts_with(['/', '~', '$']) {
+            spellings = dirs.iter().map(|dir| format!("{dir}/{written}")).collect();
+        }
+        for spelled in spellings {
+            let root = absolute(&spelled);
+            if !root.starts_with(['/', '~']) {
+                continue;
+            }
+            let root = root.trim_end_matches('/');
+            let places = GUARD_FIND_PLACES
+                .iter()
+                .map(|(place, names)| (place.to_string(), *names))
+                .chain(programs.iter().map(|program| (program.clone(), &[][..])));
+            for (spelled_place, names) in places {
+                let place = absolute(&spelled_place);
+                let Some(rest) = place.strip_prefix(root) else {
+                    continue;
+                };
+                if !(rest.starts_with('/') || root.is_empty()) {
+                    continue;
+                }
+                // As `find` prints it: the root as written, then the rest.
+                let printed = |path: &str| {
+                    format!("{}{}", written.trim_end_matches('/'), &path[root.len()..])
+                };
+                let mut candidates = vec![place.clone()];
+                let mut on_the_way = place.as_str();
+                while let Some((parent, _)) = on_the_way.rsplit_once('/') {
+                    if parent.len() <= root.len() {
+                        break;
+                    }
+                    candidates.push(parent.to_string());
+                    on_the_way = parent;
+                }
+                if candidates
+                    .iter()
+                    .any(|candidate| reading.filter.may_match(&printed(candidate)))
+                {
+                    reached.push(place);
+                    continue;
+                }
+                // Inside a place of the guard every file is the guard's: the
+                // filter is held to what the folder holds now, or to the
+                // names the guard keeps there when it is not made yet. A
+                // folder that cannot be read whole may hold a match.
+                let real = match spelled_place.strip_prefix('~') {
+                    Some(rest) => match &real_home {
+                        Some(home) => home.join(rest.trim_start_matches('/')),
+                        None => {
+                            reached.push(place);
+                            continue;
+                        }
+                    },
+                    None => std::path::PathBuf::from(&spelled_place),
+                };
+                let inside: Vec<String> = match guard_folder_entries(&real) {
+                    FolderEntries::Listed(entries) => entries,
+                    FolderEntries::Missing => names.iter().map(|name| name.to_string()).collect(),
+                    FolderEntries::Unread => {
+                        reached.push(place);
+                        continue;
+                    }
+                };
+                if inside.iter().any(|entry| {
+                    reading
+                        .filter
+                        .may_match(&printed(&format!("{place}/{entry}")))
+                }) {
+                    reached.push(place);
+                }
+            }
+        }
+    }
+    reached
 }
 
 /// How many directories [`writes_place`] keeps for a line. A relative `cd`
@@ -7514,12 +8047,126 @@ fn names_guard_carrier(target: &str) -> bool {
     if guard_carrier_places().any(|place| place.holds(&named)) {
         return true;
     }
+    if names_a_settings_hook_program(target) {
+        return true;
+    }
     let mut parts = named.path.rsplit('/');
     let program = parts.next().unwrap_or_default();
     let program = program.strip_suffix(".exe").unwrap_or(program);
     (named.rooted || named.path.starts_with('~'))
         && matches!(parts.next(), Some("bin" | "sbin"))
         && GUARD_PROGRAMS.contains(&program)
+}
+
+/// The programs the agent's settings run as the guard's hook, wherever they
+/// are: the guard's own binary at any path (`/opt/iw/innerwarden hook`), or
+/// a script a hook runs whose line names the guard (`bash
+/// ~/tools/innerwarden-hook.sh`). Read once per process from Claude Code's
+/// settings in the home and in the working directory, with a leading home
+/// spelled `~`, lowercase. The settings' own files are places of
+/// [`GUARD_SETTINGS`] already; this is what their hook line points at.
+struct SettingsHookPrograms {
+    /// The home, lowercase, without its last `/`.
+    home: Option<String>,
+    /// Each program, as [`named_path`] reads it once its home is `~`.
+    programs: Vec<String>,
+}
+
+fn settings_hook_programs() -> &'static SettingsHookPrograms {
+    static PROGRAMS: std::sync::OnceLock<SettingsHookPrograms> = std::sync::OnceLock::new();
+    PROGRAMS.get_or_init(|| {
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(std::path::PathBuf::from);
+        let mut folders: Vec<std::path::PathBuf> = home.iter().cloned().collect();
+        folders.extend(std::env::current_dir().ok());
+        let home_text = home.as_ref().map(|home| {
+            home.to_string_lossy()
+                .to_lowercase()
+                .trim_end_matches('/')
+                .to_string()
+        });
+        let mut programs = Vec::new();
+        for folder in &folders {
+            for name in ["settings.json", "settings.local.json"] {
+                let Ok(bytes) = std::fs::read(folder.join(".claude").join(name)) else {
+                    continue;
+                };
+                if bytes.len() > SETTINGS_READ_BYTES {
+                    continue;
+                }
+                let Ok(settings) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                    continue;
+                };
+                for program in guard_hook_programs_in(&settings) {
+                    if let Some(named) = named_path(&home_as_tilde(&program, home_text.as_deref()))
+                    {
+                        if (named.rooted || named.path.starts_with('~'))
+                            && !programs.contains(&named.path)
+                        {
+                            programs.push(named.path);
+                        }
+                    }
+                }
+            }
+        }
+        SettingsHookPrograms {
+            home: home_text,
+            programs,
+        }
+    })
+}
+
+/// Largest settings file read for [`settings_hook_programs`].
+const SETTINGS_READ_BYTES: usize = 1 << 20;
+
+/// The program each `PreToolUse` hook in `settings` runs, where its line
+/// names the guard: the first word, or the script a shell is handed.
+fn guard_hook_programs_in(settings: &serde_json::Value) -> Vec<String> {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(serde_json::Value::as_array))
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(serde_json::Value::as_str))
+        .filter(|command| {
+            command.to_ascii_lowercase().contains("innerwarden") || names_a_guard_program(command)
+        })
+        .filter_map(|command| {
+            let mut words = command
+                .split_whitespace()
+                .map(|word| word.trim_matches(['"', '\'']));
+            let first = words.next()?;
+            if SHELLS.contains(&token_basename(first)) {
+                words
+                    .find(|word| !word.starts_with('-'))
+                    .map(str::to_string)
+            } else {
+                Some(first.to_string())
+            }
+        })
+        .collect()
+}
+
+/// `path` lowercase, with `$HOME` and the home itself spelled `~`.
+fn home_as_tilde(path: &str, home: Option<&str>) -> String {
+    let spelled = home_spelled(path);
+    match home.and_then(|home| spelled.strip_prefix(home)) {
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => spelled,
+    }
+}
+
+/// Whether a path names a program the agent's settings run as the guard's
+/// hook ([`settings_hook_programs`]).
+fn names_a_settings_hook_program(target: &str) -> bool {
+    let known = settings_hook_programs();
+    !known.programs.is_empty()
+        && named_path(&home_as_tilde(target, known.home.as_deref()))
+            .is_some_and(|named| known.programs.contains(&named.path))
 }
 
 /// The folders the agents keep their settings in, each of which holds a
@@ -8069,6 +8716,9 @@ pub fn check_anti_forensics(content: &str) -> Option<(&'static str, u32)> {
 /// executable hook into a boot, login, device or repository path, which is not
 /// something an agent does in passing.
 pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
+    if writes_ssh_client_config(content) {
+        return Some((SSH_CLIENT_CONFIG_WRITTEN, 60));
+    }
     if !mentions_any(
         content,
         &[
