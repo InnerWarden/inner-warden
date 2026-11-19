@@ -569,6 +569,9 @@ pub fn record_place_finding(place: &RecordPlace) -> Finding {
 pub struct RecordKeptApart {
     pub shared_dir: String,
     pub own_dir: String,
+    /// This account's name, from the account database by uid. Empty when it
+    /// could not be read.
+    pub account: String,
 }
 
 /// The one line that says a record was kept apart. Every screened call is
@@ -578,8 +581,16 @@ pub struct RecordKeptApart {
 /// It is an integrity failure, not a placement detail: every call is still
 /// screened, but the record of it sits in a file this account, and so the
 /// agent running as it, can edit or delete, and InnerWarden Pro does not
-/// read. The fix is one command, and it is the `try:` line.
+/// read. The fix is one command, and it is the `try:` line: a folder of the
+/// account's own that InnerWarden Pro makes and reads, never the
+/// `innerwarden` group, which reads every member's decisions and
+/// InnerWarden's own state.
 pub fn record_kept_apart_finding(apart: &RecordKeptApart) -> Finding {
+    let account = if apart.account.is_empty() {
+        "\"$(id -un)\"".to_string()
+    } else {
+        apart.account.clone()
+    };
     Finding::NotWorking {
         what: format!(
             "Record integrity: this account may not write the shared record in {}, \
@@ -590,9 +601,10 @@ pub fn record_kept_apart_finding(apart: &RecordKeptApart) -> Finding {
             apart.shared_dir, apart.own_dir
         ),
         next: format!(
-            "sudo usermod -aG innerwarden \"$USER\" (the group that owns {} on a \
-             Pro install), then start the agent again from a new login",
-            apart.shared_dir
+            "sudo innerwarden-ctl agent-user add {account} (on the InnerWarden Pro \
+             install: a folder of its own for this account that Pro reads; never add \
+             an AI agent's account to the innerwarden group), then run innerwarden \
+             status again"
         ),
     }
 }
@@ -1333,6 +1345,7 @@ mod tests {
         facts.record_kept_apart = Some(RecordKeptApart {
             shared_dir: "/var/lib/innerwarden/guard".into(),
             own_dir: "/home/agent/.config/innerwarden".into(),
+            account: "agent".into(),
         });
         let findings = assess(&facts);
         let apart: Vec<usize> = findings
@@ -1352,26 +1365,35 @@ mod tests {
                 assert!(what.contains("/var/lib/innerwarden/guard"), "{what}");
                 assert!(what.contains("/home/agent/.config/innerwarden"), "{what}");
                 assert!(what.contains("does not see them"), "{what}");
-                assert!(next.contains("usermod -aG innerwarden"), "{next}");
+                assert!(
+                    next.contains("innerwarden-ctl agent-user add agent"),
+                    "{next}"
+                );
+                assert!(!next.contains("usermod"), "never the group: {next}");
             }
             other => panic!("the Pro side missing these is a fault to fix: {other:?}"),
         }
     }
 
-    /// The line is an integrity failure, and the group step leads the fix.
+    /// The line is an integrity failure, and the command that gives the
+    /// account a folder of its own leads the fix. It never says to join the
+    /// `innerwarden` group, which reads every member's decisions.
     ///
     /// FAILS ON REVERT: the line said only that decisions were "kept" in the
-    /// home, with the command after a description of the group.
+    /// home, with the command after a description of the group; then it led
+    /// with `usermod -aG innerwarden`.
     #[test]
-    fn a_record_kept_apart_is_an_integrity_failure_with_the_group_step_first() {
+    fn a_record_kept_apart_is_an_integrity_failure_with_the_own_folder_step_first() {
         let finding = record_kept_apart_finding(&RecordKeptApart {
             shared_dir: "/var/lib/innerwarden/guard".into(),
             own_dir: "/home/agent/.config/innerwarden".into(),
+            account: "agent".into(),
         });
         let mut facts = healthy();
         facts.record_kept_apart = Some(RecordKeptApart {
             shared_dir: "/var/lib/innerwarden/guard".into(),
             own_dir: "/home/agent/.config/innerwarden".into(),
+            account: "agent".into(),
         });
         assert_eq!(
             headline(&assess(&facts)),
@@ -1382,9 +1404,10 @@ mod tests {
                 assert!(what.starts_with("Record integrity:"), "{what}");
                 assert!(what.contains("edited or deleted"), "{what}");
                 assert!(
-                    next.starts_with("sudo usermod -aG innerwarden"),
+                    next.starts_with("sudo innerwarden-ctl agent-user add agent"),
                     "the command first: {next}"
                 );
+                assert!(!next.contains("usermod"), "never the group: {next}");
             }
             other => panic!("{other:?}"),
         }

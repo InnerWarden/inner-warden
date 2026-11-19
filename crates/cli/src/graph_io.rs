@@ -4636,6 +4636,55 @@ mod account_record_tests {
         }
     }
 
+    /// `IW_GRAPH_FILE` cannot move the record of an account with an entry
+    /// out of its own folder; an account without one is redirected by it as
+    /// before (the tests and `contain` rely on that).
+    ///
+    /// FAILS ON REVERT: look at the override before the entry in
+    /// `graph_path_for_account_under` and `bot` records in `elsewhere`, a
+    /// file the paid product never reads.
+    #[test]
+    fn the_override_cannot_move_an_account_with_an_entry() {
+        let host = Host::new();
+        let own = host.own_dir();
+        let root = host.root();
+        let elsewhere = host.dir.path().join("elsewhere/graph.json");
+        let elsewhere_text = elsewhere.display().to_string();
+        let home = host.home().display().to_string();
+        let get = |key: &str| match key {
+            "IW_GRAPH_FILE" => Some(elsewhere_text.clone()),
+            "HOME" => Some(home.clone()),
+            _ => None,
+        };
+        let resolve = |name: &str| {
+            resolve_report_and_place_as(
+                &host.config(),
+                get,
+                &std::sync::Once::new(),
+                |_: &Path| false,
+                &Account {
+                    name: Some(name),
+                    root: &root,
+                    owns: own_account_directory,
+                },
+            )
+        };
+        let bot = resolve("bot");
+        assert_eq!(bot.source, GraphPathSource::AccountEntry);
+        assert_eq!(bot.path, Some(own.join("graph.json")));
+
+        let maicon = resolve("maicon");
+        assert_eq!(maicon.source, GraphPathSource::EnvironmentOverride);
+        assert_eq!(maicon.path, Some(elsewhere.clone()));
+
+        // `bot`'s folder not its own: the entry is not used, so the override
+        // wins as it would without one.
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let open = resolve("bot");
+        assert_eq!(open.source, GraphPathSource::EnvironmentOverride);
+        assert_eq!(open.path, Some(elsewhere));
+    }
+
     /// The account is the effective uid's, from the account database. An
     /// environment that names `bot` (the AI agent's, inherited by a hook)
     /// picks nothing.
@@ -4700,14 +4749,22 @@ mod account_record_tests {
         assert_eq!(maicon.dir, host.shared());
         assert_eq!((maicon.account, maicon.pro_reads), (None, true));
 
-        let same = own.join("graph.json").display().to_string();
+        // `bot` has an entry: an override elsewhere does not move it.
+        let other_get = |key: &str| (key == "IW_GRAPH_FILE").then(|| "/x/graph.json".to_string());
+        let pinned = place(&other_get, "bot");
+        assert_eq!((pinned.dir.clone(), pinned.pro_reads), (own.clone(), true));
+
+        // `maicon` has none: the override wins, read by Pro only when it names
+        // the shared record.
+        let same = host.shared().join("graph.json").display().to_string();
         let same_get = |key: &str| (key == "IW_GRAPH_FILE").then(|| same.clone());
         assert!(
-            place(&same_get, "bot").pro_reads,
-            "the override names its own"
+            place(&same_get, "maicon").pro_reads,
+            "the override names the shared record"
         );
-        let other_get = |key: &str| (key == "IW_GRAPH_FILE").then(|| "/x/graph.json".to_string());
-        assert!(!place(&other_get, "bot").pro_reads, "an override elsewhere");
+        let moved = place(&other_get, "maicon");
+        assert_eq!(moved.dir, PathBuf::from("/x"));
+        assert!(!moved.pro_reads, "an override elsewhere");
 
         std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o777)).unwrap();
         let refused = place(&get, "bot");

@@ -404,6 +404,7 @@ fn status_io_cmd_rest(
                 .unwrap_or(&denied.own)
                 .display()
                 .to_string(),
+            account: graph_io::effective_account().unwrap_or_default(),
         }),
         kept_apart_before: kept_apart_before
             .as_deref()

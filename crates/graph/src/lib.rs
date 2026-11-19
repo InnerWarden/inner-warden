@@ -389,10 +389,16 @@ pub fn graph_path(
     graph_path_for_account(get, None, read_config)
 }
 
-/// [`graph_path`] for the account this process runs as. Between the override
-/// and the shared record: the `[accounts."<account>"]` entry of the product
-/// config, when it names that account's own directory
-/// ([`account_record_entry`]).
+/// [`graph_path`] for the account this process runs as. FIRST, before the
+/// override: the `[accounts."<account>"]` entry of the product config, when
+/// it names that account's own directory ([`account_record_entry`]). Then
+/// `IW_GRAPH_FILE`, the shared record and the home, as [`graph_path`].
+///
+/// The entry beats `IW_GRAPH_FILE` because the override comes from the
+/// environment, and a hook's environment is the AI agent's: an agent could
+/// otherwise point its own record away from the folder the paid product
+/// reads. Without an entry for the account the override wins as always, so
+/// the tests and `contain` keep redirecting the record.
 ///
 /// `account` is the caller's EFFECTIVE account, read from the account
 /// database by uid, never from `USER`, `LOGNAME` or anything else in the
@@ -422,44 +428,74 @@ pub fn graph_path_for_account_under(
     root: &std::path::Path,
     read_config: impl FnOnce() -> ProductConfig,
 ) -> GraphPathResolution {
-    if let Some(p) = get("IW_GRAPH_FILE").filter(|s| !s.trim().is_empty()) {
+    let overridden = get("IW_GRAPH_FILE").filter(|s| !s.trim().is_empty());
+    // With no account to look up, the override needs no file read at all:
+    // this runs once per screened action on the hook hot path.
+    let Some(account) = account else {
+        if let Some(p) = overridden {
+            return GraphPathResolution {
+                path: Some(std::path::PathBuf::from(p)),
+                source: GraphPathSource::EnvironmentOverride,
+                config_problem: None,
+                account_problem: None,
+            };
+        }
+        return graph_path_from_config(get, read_config(), None);
+    };
+
+    // The account's entry beats the override. `IW_GRAPH_FILE` is in the
+    // environment the AI agent hands its hook, so an agent with a folder the
+    // paid product reads could otherwise move its own record out of it.
+    let config = read_config();
+    let mut account_problem = None;
+    if let ProductConfig::Present(text) = &config {
+        match account_record_entry_under(text, account, root) {
+            Ok(Some(path)) => {
+                return GraphPathResolution {
+                    path: Some(path),
+                    source: GraphPathSource::AccountEntry,
+                    config_problem: None,
+                    account_problem: None,
+                }
+            }
+            Err(code) => account_problem = Some(code),
+            Ok(None) => {}
+        }
+    }
+    // No entry, or one that cannot be honoured: exactly as without an account.
+    if let Some(p) = overridden {
         return GraphPathResolution {
             path: Some(std::path::PathBuf::from(p)),
             source: GraphPathSource::EnvironmentOverride,
             config_problem: None,
-            account_problem: None,
+            account_problem,
         };
     }
+    graph_path_from_config(get, config, account_problem)
+}
 
-    let mut account_problem = None;
-    let code = match read_config() {
+/// The product config's shared record, else the home: the two last steps of
+/// [`graph_path_for_account_under`], once the override and the account entry
+/// have had their say.
+fn graph_path_from_config(
+    get: impl Fn(&str) -> Option<String>,
+    config: ProductConfig,
+    account_problem: Option<&'static str>,
+) -> GraphPathResolution {
+    let code = match config {
         ProductConfig::Absent => None,
         ProductConfig::Refused(code) => Some(code),
-        ProductConfig::Present(text) => {
-            match account.map(|account| account_record_entry_under(&text, account, root)) {
-                Some(Ok(Some(path))) => {
-                    return GraphPathResolution {
-                        path: Some(path),
-                        source: GraphPathSource::AccountEntry,
-                        config_problem: None,
-                        account_problem: None,
-                    }
+        ProductConfig::Present(text) => match parse_product_config(&text) {
+            Ok(path) => {
+                return GraphPathResolution {
+                    path: Some(path),
+                    source: GraphPathSource::ProductConfigFile,
+                    config_problem: None,
+                    account_problem,
                 }
-                Some(Err(code)) => account_problem = Some(code),
-                Some(Ok(None)) | None => {}
             }
-            match parse_product_config(&text) {
-                Ok(path) => {
-                    return GraphPathResolution {
-                        path: Some(path),
-                        source: GraphPathSource::ProductConfigFile,
-                        config_problem: None,
-                        account_problem,
-                    }
-                }
-                Err(code) => Some(code),
-            }
-        }
+            Err(code) => Some(code),
+        },
     };
 
     let path = get("HOME")
@@ -2683,7 +2719,8 @@ mod tests {
     ///
     /// FAILS ON REVERT: drop the `AccountEntry` arm from
     /// [`graph_path_for_account`] and `bot` resolves to the shared record it
-    /// may not write.
+    /// may not write; check the override before the entry and `bot` moves
+    /// its record to `/x/g.json`.
     #[test]
     fn an_account_with_an_entry_records_in_its_own_directory() {
         let home = [("HOME", "/home/bot")];
@@ -2719,13 +2756,44 @@ mod tests {
             assert_eq!(other.account_problem, None);
         }
 
-        // The override still wins, as it does over the shared record.
-        let overridden = graph_path_for_account(
-            env(&[("IW_GRAPH_FILE", "/x/g.json")]),
+        // The entry beats the override: the agent hands its hook the
+        // environment, and cannot move its own record with it.
+        let pinned = graph_path_for_account(
+            env(&[("IW_GRAPH_FILE", "/x/g.json"), ("HOME", "/home/bot")]),
             Some("bot"),
             given(ProductConfig::Present(with_bot())),
         );
-        assert_eq!(overridden.source, GraphPathSource::EnvironmentOverride);
+        assert_eq!(pinned.source, GraphPathSource::AccountEntry);
+        assert_eq!(
+            pinned.path,
+            Some(std::path::PathBuf::from(
+                "/var/lib/innerwarden-agents/bot/graph.json"
+            ))
+        );
+
+        // Without an entry for the account, the override wins as before.
+        for account in [Some("maicon"), None] {
+            let overridden = graph_path_for_account(
+                env(&[("IW_GRAPH_FILE", "/x/g.json")]),
+                account,
+                given(ProductConfig::Present(with_bot())),
+            );
+            assert_eq!(overridden.source, GraphPathSource::EnvironmentOverride);
+            assert_eq!(overridden.path, Some(std::path::PathBuf::from("/x/g.json")));
+        }
+        // An entry that cannot be honoured: the override, and the reason kept.
+        let bad = graph_path_for_account(
+            env(&[("IW_GRAPH_FILE", "/x/g.json")]),
+            Some("bot"),
+            given(ProductConfig::Present(
+                "[accounts.\"bot\"]\ngraph_file = \"/etc/shadow\"\n".into(),
+            )),
+        );
+        assert_eq!(bad.source, GraphPathSource::EnvironmentOverride);
+        assert_eq!(
+            bad.account_problem,
+            Some("account_entry_not_its_own_directory")
+        );
 
         // An entry alone, with no shared record declared, is still honoured.
         let only = with_bot().lines().skip(2).collect::<Vec<_>>().join("\n");
