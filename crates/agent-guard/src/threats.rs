@@ -11972,6 +11972,9 @@ fn unfiltered_find_delete(hay: &str) -> bool {
 const RM_SYSTEM_DIRS: &[&str] = &[
     "bin", "sbin", "etc", "usr", "boot", "lib", "lib32", "lib64", "var", "root", "home", "opt",
     "sys", "proc", "dev", "srv", "run", "mnt", "media",
+    // The folder of homes on macOS, as written and as a lowercased line
+    // reads it.
+    "Users", "users",
 ];
 
 /// `VAR=value` environment-assignment prefix (not a program word).
@@ -11990,6 +11993,12 @@ fn is_env_assign(token: &str) -> bool {
 /// and return the index of the `rm` token when the segment actually runs `rm`.
 /// Returns None for `echo rm -rf /` (echo is the program) or any non-rm command.
 fn rm_command_index(tokens: &[String]) -> Option<usize> {
+    wrapped_program_index(tokens, "rm")
+}
+
+/// The index of `program` when `tokens` run it behind the wrappers
+/// [`rm_command_index`] reads (`sudo`, `env`, `timeout`, `nice`, ...).
+fn wrapped_program_index(tokens: &[String], program: &str) -> Option<usize> {
     let mut i = 0;
     while i < tokens.len() && is_env_assign(&tokens[i]) {
         i += 1;
@@ -11997,7 +12006,7 @@ fn rm_command_index(tokens: &[String]) -> Option<usize> {
     loop {
         let tok = tokens.get(i)?;
         match token_basename(tok) {
-            "rm" => return Some(i),
+            name if name == program => return Some(i),
             "sudo" | "doas" => {
                 i += 1;
                 while i < tokens.len() && tokens[i].starts_with('-') {
@@ -12059,7 +12068,7 @@ fn rm_command_index(tokens: &[String]) -> Option<usize> {
             "coproc" => i += 1,
             _ if tok.starts_with('(') && tok.len() > 1 => {
                 // `(rm -rf /)`: the group opens on the program's own word.
-                return (token_basename(&tok[1..]) == "rm").then_some(i);
+                return (token_basename(&tok[1..]) == program).then_some(i);
             }
             _ => return None,
         }
@@ -12190,7 +12199,9 @@ fn segment_rm_invocation(segment: &str) -> Option<RmInvocation> {
     let folded = fold_braced_names(strip_leading_substitutions(&unnamed));
     let segment = fold_home_expansions(&folded);
     let tokens = shell_tokens(&segment);
-    let rm_idx = rm_command_index(&tokens)?;
+    let Some(rm_idx) = rm_command_index(&tokens) else {
+        return find_rm_invocation(&tokens);
+    };
 
     let mut recursive = false;
     let mut force = false;
@@ -12226,6 +12237,255 @@ fn segment_rm_invocation(segment: &str) -> Option<RmInvocation> {
         no_preserve,
         targets,
     })
+}
+
+/// A `find` that removes what it finds, read as the `rm` of each root of
+/// the search: `-delete`, or `-exec`, `-execdir`, `-ok` or `-okdir`
+/// handing `{}` to `rm`. The search walks the whole root, so `find ~/.ssh
+/// -exec rm -rf {} +` takes away the folder as `rm -rf ~/.ssh` does, and
+/// `find ~ -exec rm {} +` every file of the home, with or without `-r`.
+/// A search narrowed by a name, path or regex test (`find . -name '*.pyc'
+/// -exec rm {} +`) is not a removal of its root: `None`, as it is with no
+/// removal. Each alternative of `-o` runs its own action on what it
+/// matches, and a test under `!` or `-not` narrows nothing the guard can
+/// read.
+fn find_rm_invocation(tokens: &[String]) -> Option<RmInvocation> {
+    let at = wrapped_program_index(tokens, "find")?;
+    let arguments = &tokens[at + 1..];
+    // Options before the roots: `-H`, `-L`, `-P`, `-D debug`, `-O3`.
+    let mut index = 0usize;
+    while let Some(word) = arguments.get(index) {
+        match word.as_str() {
+            "-H" | "-L" | "-P" => index += 1,
+            "-D" => index += 2,
+            _ if word.starts_with("-O") => index += 1,
+            _ => break,
+        }
+    }
+    let rest = arguments.get(index..).unwrap_or_default();
+    let mut roots: Vec<String> = rest
+        .iter()
+        .take_while(|word| {
+            !word.starts_with('-') && !matches!(word.as_str(), "(" | "!" | "\\(" | "\\!" | ",")
+        })
+        .cloned()
+        .collect();
+    let expression = &rest[roots.len()..];
+    let mut no_preserve = false;
+    // The action of a search runs on what its own alternative matches:
+    // `-name '*.pyc' -o -name '*.pyo' -delete` deletes `.pyo` files only.
+    let removes = find_alternatives(expression)
+        .into_iter()
+        .any(|alternative| {
+            let (removes, wipes_root) = find_alternative_removes(alternative);
+            no_preserve |= wipes_root;
+            removes && !find_and_group_narrows(alternative)
+        });
+    if !removes {
+        return None;
+    }
+    // GNU find searches `.` when it is given no root.
+    if roots.is_empty() {
+        roots.push(".".to_string());
+    }
+    Some(RmInvocation {
+        recursive_force: true,
+        no_preserve,
+        targets: roots,
+    })
+}
+
+/// The words of a `-exec`, `-execdir`, `-ok` or `-okdir` starting at
+/// `words[0]` (the option), up to its `;` or `+`: how many there are.
+fn find_exec_length(words: &[String]) -> usize {
+    words
+        .iter()
+        .skip(1)
+        .position(|word| matches!(word.as_str(), ";" | "\\;" | "+"))
+        .map_or(words.len(), |end| end + 2)
+}
+
+/// Where the parenthesis `words[0]` opens closes, as an index of `words`.
+fn find_group_end(words: &[String]) -> usize {
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        match word.as_str() {
+            "(" | "\\(" => depth += 1,
+            ")" | "\\)" => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return index;
+                }
+            }
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                index += find_exec_length(&words[index..]);
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    words.len()
+}
+
+/// A `find` expression split at its `-o` outside parentheses: each part
+/// matches, and runs its actions, on its own.
+fn find_alternatives(words: &[String]) -> Vec<&[String]> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        match word.as_str() {
+            "(" | "\\(" => index += find_group_end(&words[index..]),
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                index += find_exec_length(&words[index..]);
+                continue;
+            }
+            "-o" | "-or" => {
+                parts.push(&words[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    parts.push(&words[start.min(words.len())..]);
+    parts
+}
+
+/// Whether one alternative of a `find` expression removes what it matches
+/// (`-delete`, or `rm` handed `{}` by `-exec` and its kin), and whether
+/// that `rm` carries `--no-preserve-root`.
+fn find_alternative_removes(words: &[String]) -> (bool, bool) {
+    let mut removes = false;
+    let mut no_preserve = false;
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        match word.as_str() {
+            "-delete" => removes = true,
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                let length = find_exec_length(&words[index..]);
+                let handed: Vec<String> = words[index + 1..index + length]
+                    .iter()
+                    .filter(|word| !matches!(word.as_str(), ";" | "\\;" | "+"))
+                    .cloned()
+                    .collect();
+                if let Some(wipes_root) = handed_removal(&handed) {
+                    removes = true;
+                    no_preserve |= wipes_root;
+                }
+                index += length;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    (removes, no_preserve)
+}
+
+/// Whether the command `-exec` and its kin run removes the file the search
+/// hands it: `rm` given only options and `{}` (the tokens drop a bare
+/// `{}`), `unlink`, `shred`, `truncate`, or `dd` with an `of=` of it,
+/// behind `sudo` and its kin; or a shell whose `-c` line does that to
+/// `$1`, `$@` or `{}` (`sh -c 'rm -rf "$1"' _ {}`). `Some` with whether
+/// the `rm` carries `--no-preserve-root`.
+fn handed_removal(handed: &[String]) -> Option<bool> {
+    if let Some(rm) = rm_command_index(handed) {
+        let operands = &handed[rm + 1..];
+        return operands
+            .iter()
+            .all(|operand| operand.starts_with('-') || operand.contains("{}"))
+            .then(|| {
+                operands
+                    .iter()
+                    .any(|operand| operand == "--no-preserve-root")
+            });
+    }
+    for remover in ["unlink", "shred", "truncate"] {
+        if wrapped_program_index(handed, remover).is_some() {
+            return Some(false);
+        }
+    }
+    if let Some(dd) = wrapped_program_index(handed, "dd") {
+        return handed[dd + 1..]
+            .iter()
+            .any(|operand| {
+                operand
+                    .strip_prefix("of=")
+                    .is_some_and(|target| target.is_empty() || target.contains("{}"))
+            })
+            .then_some(false);
+    }
+    let shell = handed
+        .iter()
+        .position(|word| SHELLS.contains(&token_basename(word)))?;
+    let code_at = handed[shell + 1..]
+        .iter()
+        .position(|word| word.starts_with('-') && !word.starts_with("--") && word.contains('c'))?
+        + shell
+        + 2;
+    let code = handed.get(code_at)?;
+    // What the search hands the shell is `$1` (or all of `$@`) there.
+    let code = ["\"$@\"", "\"$1\"", "\"${1}\"", "${1}", "$1", "$@", "$*"]
+        .iter()
+        .fold(code.clone(), |code, name| code.replace(name, "{}"));
+    shell_command_segments(&code)
+        .into_iter()
+        // A segment that names nothing the search hands over removes
+        // something else (`rm -f /tmp/x`), and is judged as written.
+        .filter(|segment| segment.contains("{}"))
+        .find_map(|segment| handed_removal(&shell_tokens(segment)))
+}
+
+/// Whether every alternative of a `find` expression is narrowed by a name,
+/// path or regex test ([`find_and_group_narrows`]).
+fn find_expression_narrows(words: &[String]) -> bool {
+    find_alternatives(words)
+        .into_iter()
+        .all(find_and_group_narrows)
+}
+
+/// Whether a part of a `find` expression with no `-o` outside parentheses
+/// matches only what a name, path or regex test lets through: a test that
+/// `!` or `-not` turns around narrows nothing the guard can read.
+fn find_and_group_narrows(words: &[String]) -> bool {
+    let mut negated = false;
+    let mut index = 0usize;
+    while let Some(word) = words.get(index) {
+        match word.as_str() {
+            "!" | "\\!" | "-not" => {
+                negated = !negated;
+                index += 1;
+                continue;
+            }
+            "(" | "\\(" => {
+                let end = find_group_end(&words[index..]) + index;
+                let inside = words.get(index + 1..end).unwrap_or_default();
+                if !negated && find_expression_narrows(inside) {
+                    return true;
+                }
+                index = end;
+            }
+            "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" | "-regex"
+            | "-iregex" | "-lname" | "-ilname" => {
+                if !negated {
+                    return true;
+                }
+                index += 1;
+            }
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                index += find_exec_length(&words[index..]);
+                negated = false;
+                continue;
+            }
+            _ => {}
+        }
+        negated = false;
+        index += 1;
+    }
+    false
 }
 
 /// Does a single shell command segment run `rm` (behind sudo/env/timeout wrappers)
@@ -12576,6 +12836,171 @@ fn rm_target_is_credential_store(target: &str) -> bool {
         || in_home
             .strip_prefix(".ssh/id_")
             .is_some_and(|key| !key.contains('/') && !key.ends_with(".pub"))
+}
+
+/// What an `xargs` that feeds a removal is handed, for
+/// [`xargs_feeds_removal`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XargsRemoval {
+    /// Its input comes from a command or a file the line does not show:
+    /// what it removes cannot be read.
+    Unread,
+    /// Its input lists the filesystem root, a top-level system folder, a
+    /// home or a credential store (`ls /`, `find ~`, `ls ~/.ssh`): what
+    /// it removes is in one of them.
+    ListsProtectedPlace,
+}
+
+/// Whether a command of `hay` is an `xargs` (with or without `-I`) that
+/// hands what it reads to a recursive `rm`, to `shred` or to a `dd` that
+/// writes `of=`, and what it reads. `None` when no such `xargs` runs, or
+/// its input is read: words written on the line (`echo build dist | xargs
+/// rm -rf`, judged as the line it builds), or the files of the project, as
+/// a `find` from a folder of it (`find . -name node_modules -prune | xargs
+/// rm -rf`) or `git ls-files` lists them.
+///
+/// `ls / | xargs -I X rm -rf /X` and `ls ~/.ssh | xargs rm -rf` remove
+/// what the guard refuses to remove by name, and ran at allow.
+pub fn xargs_feeds_removal(hay: &str) -> Option<XargsRemoval> {
+    let line = crate::shell_words::read_line(hay);
+    let mut found = None;
+    for (index, command) in line.commands.iter().enumerate() {
+        // As written: `xargs -I X` and `-i` are not the same option.
+        let words: Vec<String> = command.words.iter().map(|word| word.text.clone()).collect();
+        let Some(at) = effective_command_index(&words) else {
+            continue;
+        };
+        if !matches!(program_name(&words[at]).as_str(), "xargs" | "gxargs") {
+            continue;
+        }
+        let launched = launcher_options_end(&words, at, &XARGS).or_else(|| {
+            // An option the spec does not know: the first remover after it.
+            (at + 1..words.len()).find(|&word| {
+                matches!(
+                    program_name(&words[word]).as_str(),
+                    "rm" | "shred" | "dd" | "sudo" | "doas"
+                )
+            })
+        });
+        let Some(launched) = launched else { continue };
+        let Some(recursive) = removal_run(&words[launched..]) else {
+            continue;
+        };
+        let feeder = index
+            .checked_sub(1)
+            .and_then(|before| line.commands.get(before))
+            .filter(|before| before.piped);
+        let verdict = match feeder {
+            // Every file a listing of the home prints, removed one by one,
+            // is the home gone, with or without `-r`.
+            Some(feeder) => feeder_reading(feeder)
+                .filter(|reading| recursive || *reading == XargsRemoval::ListsProtectedPlace),
+            None if !recursive => None,
+            // A here-string or here-document: its words are on the line.
+            None if command.reads.is_empty() && !command.inputs.is_empty() => {
+                let listed = command.inputs.iter().any(|input| {
+                    input
+                        .split_whitespace()
+                        .any(|item| names_protected_place(&item.to_ascii_lowercase()))
+                });
+                listed.then_some(XargsRemoval::ListsProtectedPlace)
+            }
+            // A file, or the input the line does not show.
+            None => Some(XargsRemoval::Unread),
+        };
+        match verdict {
+            Some(XargsRemoval::ListsProtectedPlace) => return verdict,
+            Some(XargsRemoval::Unread) => found = verdict,
+            None => {}
+        }
+    }
+    found
+}
+
+/// Whether `words` (a command and its arguments, behind `sudo` and its
+/// kin) remove what they are handed: `Some(true)` for `rm` with `-r`,
+/// `-R` or `--recursive`, `shred`, or `dd` with an `of=`; `Some(false)`
+/// for an `rm` without them, which takes files one by one.
+fn removal_run(words: &[String]) -> Option<bool> {
+    let at = effective_command_index(words)?;
+    let arguments = &words[at + 1..];
+    match program_name(&words[at]).as_str() {
+        "rm" => Some(arguments.iter().any(|argument| {
+            argument == "--recursive"
+                || (argument.starts_with('-')
+                    && !argument.starts_with("--")
+                    && argument.contains(['r', 'R']))
+        })),
+        "shred" => Some(true),
+        "dd" => arguments
+            .iter()
+            .any(|argument| argument.starts_with("of="))
+            .then_some(true),
+        _ => None,
+    }
+}
+
+/// What a command piped into a removing `xargs` hands it
+/// ([`xargs_feeds_removal`]): `None` when it is read.
+fn feeder_reading(feeder: &crate::shell_words::Command) -> Option<XargsRemoval> {
+    let words: Vec<String> = feeder
+        .words
+        .iter()
+        .map(|word| word.text.to_ascii_lowercase())
+        .collect();
+    let Some(at) = effective_command_index(&words) else {
+        return Some(XargsRemoval::Unread);
+    };
+    let program = program_name(&words[at]);
+    let operands: Vec<&String> = words[at + 1..]
+        .iter()
+        .filter(|word| !word.starts_with('-'))
+        .collect();
+    if operands
+        .iter()
+        .any(|operand| names_protected_place(operand))
+    {
+        return Some(XargsRemoval::ListsProtectedPlace);
+    }
+    let plain = feeder.words.iter().all(|word| word.is_plain());
+    match program.as_str() {
+        // The words it prints are on the line: the line xargs builds from
+        // them is judged as written.
+        "echo" | "printf" if plain => None,
+        "git" if plain => None,
+        // A search from folders of the project, never above it.
+        "find" if plain => {
+            let roots: Vec<&String> = words[at + 1..]
+                .iter()
+                .skip_while(|word| matches!(word.as_str(), "-h" | "-l" | "-p"))
+                .take_while(|word| !word.starts_with('-') && !matches!(word.as_str(), "(" | "!"))
+                .collect();
+            let in_project = |root: &&String| {
+                !root.starts_with(['/', '~', '$']) && !root.split('/').any(|part| part == "..")
+            };
+            if roots.iter().all(in_project) {
+                None
+            } else {
+                Some(XargsRemoval::Unread)
+            }
+        }
+        _ => Some(XargsRemoval::Unread),
+    }
+}
+
+/// A path that is the filesystem root, a top-level system folder, a home,
+/// or a credential store in one, itself or all of its contents, as an
+/// `rm` target is read ([`rm_target_is_root_or_system`],
+/// [`rm_target_is_home`], [`rm_target_is_credential_store`]).
+fn names_protected_place(path: &str) -> bool {
+    let path = path.trim_matches(['"', '\'']);
+    let path = match path.strip_prefix("${home}") {
+        Some(rest) => format!("$home{rest}"),
+        None => path.to_string(),
+    };
+    rm_target_is_root_or_system(&path)
+        || rm_target_is_home(&path)
+        || rm_target_is_credential_store(&path)
 }
 
 /// Recursive, forced `rm` whose operand, resolved from the directory the
