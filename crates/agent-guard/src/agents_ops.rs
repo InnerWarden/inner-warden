@@ -45,25 +45,30 @@ fn scan_running() -> Vec<(String, u32)> {
 /// Check exact executable basenames through filesystem metadata only. Agent
 /// binaries are never launched (including with `--version`) during discovery.
 fn executable_on_path(names: &[&str], path_env: Option<&OsStr>) -> bool {
-    let Some(path_env) = path_env else {
-        return false;
-    };
+    find_on_path(names, path_env).is_some()
+}
+
+/// The first executable file a `PATH` walk finds for any of `names`,
+/// metadata only, never run.
+fn find_on_path(names: &[&str], path_env: Option<&OsStr>) -> Option<std::path::PathBuf> {
+    let path_env = path_env?;
     std::env::split_paths(path_env)
         .filter(|directory| !directory.as_os_str().is_empty())
-        .any(|directory| {
-            names.iter().any(|name| {
+        .find_map(|directory| {
+            names.iter().find_map(|name| {
                 let direct = directory.join(name);
                 if executable_file(&direct) {
-                    return true;
+                    return Some(direct);
                 }
                 #[cfg(windows)]
                 {
-                    ["exe", "cmd", "bat", "com"].iter().any(|extension| {
-                        executable_file(&directory.join(format!("{name}.{extension}")))
+                    ["exe", "cmd", "bat", "com"].iter().find_map(|extension| {
+                        let candidate = directory.join(format!("{name}.{extension}"));
+                        executable_file(&candidate).then_some(candidate)
                     })
                 }
                 #[cfg(not(windows))]
-                false
+                None
             })
         })
 }
@@ -149,9 +154,72 @@ pub fn hook_program(home: &Path, agent: &AgentStatus) -> Option<hook::HookProgra
     }
     let settings = read_json(&home.join(".claude/settings.json"))?;
     let path_env = std::env::var_os("PATH");
-    hook::judge_iwguard_hooks(&settings, |program| {
-        program_fact(program, path_env.as_deref())
-    })
+    hook_program_with(&settings, path_env.as_deref())
+}
+
+fn hook_program_with(settings: &Value, path_env: Option<&OsStr>) -> Option<hook::HookProgram> {
+    let verdict = hook::judge_iwguard_hooks(settings, |program| program_fact(program, path_env))?;
+    Some(with_bare_name_clue(verdict, path_env))
+}
+
+/// A bare name's "could not tell", with where this process's PATH finds it
+/// as a clue. Any other verdict as it is.
+fn with_bare_name_clue(verdict: hook::HookProgram, path_env: Option<&OsStr>) -> hook::HookProgram {
+    match verdict {
+        hook::HookProgram::Unknown { program, why }
+            if !program.contains(['/', '\\']) && why.starts_with(hook::BARE_NAME) =>
+        {
+            let found = find_on_path(&[program.as_str()], path_env);
+            let why = format!("{why}{}", hook::bare_name_clue(found.as_deref()));
+            hook::HookProgram::Unknown { program, why }
+        }
+        other => other,
+    }
+}
+
+/// Each hook line in this agent's settings that names the guard but is not
+/// the guard's own line ([`hook::WrappedHook`]), with its verdict. Empty for
+/// an agent guarded some other way. `status` names every one, so a line
+/// written by hand never vanishes from the report.
+pub fn wrapped_hooks(
+    home: &Path,
+    agent: &AgentStatus,
+) -> Vec<(hook::WrappedHook, hook::HookProgram)> {
+    if !agent.hookable {
+        return Vec::new();
+    }
+    let Some(settings) = read_json(&home.join(".claude/settings.json")) else {
+        return Vec::new();
+    };
+    let path_env = std::env::var_os("PATH");
+    wrapped_hooks_with(&settings, path_env.as_deref())
+}
+
+fn wrapped_hooks_with(
+    settings: &Value,
+    path_env: Option<&OsStr>,
+) -> Vec<(hook::WrappedHook, hook::HookProgram)> {
+    hook::wrapped_iwguard_hooks(settings)
+        .into_iter()
+        .map(|wrapped| {
+            let verdict =
+                hook::judge_wrapped_hook(&wrapped, program_fact(&wrapped.program, path_env));
+            (wrapped, verdict)
+        })
+        .collect()
+}
+
+/// Whether any known agent is running, from the process scan alone (a row's
+/// pids), never from an agent being installed or having a config dir.
+/// `None` where the scan cannot look (no `/proc`): "none running" would be
+/// a claim nothing measured.
+pub fn any_agent_running(rows: &[AgentStatus]) -> Option<bool> {
+    any_agent_running_with(rows, Path::new("/proc").is_dir())
+}
+
+/// PURE: [`any_agent_running`] with whether the process scan could look.
+pub fn any_agent_running_with(rows: &[AgentStatus], scan_could_look: bool) -> Option<bool> {
+    scan_could_look.then(|| rows.iter().any(|row| !row.pids.is_empty()))
 }
 
 /// The tools a wired agent's hooks leave unscreened while its Bash hook runs:
@@ -2970,5 +3038,45 @@ mod tests {
             program_fact("innerwarden", None),
             hook::ProgramFact::Missing
         );
+    }
+}
+
+#[cfg(test)]
+mod bare_name_clue_tests {
+    use super::*;
+
+    /// A bare name is "could not tell" with a clue: where this process's PATH
+    /// finds it, or that it does not.
+    ///
+    /// FAILS ON REVERT of `with_bare_name_clue`: neither clue is said.
+    #[test]
+    fn a_bare_name_says_where_this_path_finds_it_as_a_clue() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("innerwarden");
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let settings = serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "innerwarden hook --agent claude-code"}
+        ]}]}});
+        if cfg!(unix) {
+            match hook_program_with(&settings, Some(dir.path().as_os_str())) {
+                Some(hook::HookProgram::Unknown { why, .. }) => {
+                    assert!(why.starts_with(hook::BARE_NAME), "{why}");
+                    assert!(why.contains(&bin.display().to_string()), "{why}");
+                }
+                other => panic!("a bare name is could not tell: {other:?}"),
+            }
+        }
+        let empty = tempfile::TempDir::new().unwrap();
+        match hook_program_with(&settings, Some(empty.path().as_os_str())) {
+            Some(hook::HookProgram::Unknown { why, .. }) => {
+                assert!(why.contains("not on this command's PATH either"), "{why}")
+            }
+            other => panic!("not found here is still could not tell: {other:?}"),
+        }
     }
 }

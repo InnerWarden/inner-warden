@@ -1137,27 +1137,153 @@ pub fn judge_hook_program(program: &str, fact: ProgramFact) -> HookProgram {
             ),
         };
     }
-    let problem = match (fact, bare) {
-        (ProgramFact::Executable, _) => return HookProgram::Runs,
-        (ProgramFact::Unreadable, _) => {
+    // A bare name is found on the PATH of the agent that runs the hook, which
+    // is not this process's PATH and cannot be read from here. Found here, it
+    // may still be missing there, and the other way round: an OK on this
+    // lookup could be false, so neither answer is given as the agent's.
+    if bare {
+        return HookProgram::Unknown {
+            program: program.to_string(),
+            why: bare_name_why(program),
+        };
+    }
+    let problem = match fact {
+        ProgramFact::Executable => return HookProgram::Runs,
+        ProgramFact::Unreadable => {
             return HookProgram::Unknown {
                 program: program.to_string(),
                 why: format!("its hook runs {program}, and I could not look to see if it is there"),
             }
         }
-        // A shell skips a PATH entry that is not executable and keeps looking,
-        // so for a bare name the two facts mean the same thing.
-        (ProgramFact::Missing | ProgramFact::NotExecutable, true) => {
-            format!("its hook runs `{program}`, which is not on PATH")
-        }
-        (ProgramFact::Missing, false) => format!("its hook runs {program}, which does not exist"),
-        (ProgramFact::NotExecutable, false) => {
+        ProgramFact::Missing => format!("its hook runs {program}, which does not exist"),
+        ProgramFact::NotExecutable => {
             format!("its hook runs {program}, which is not an executable file")
         }
     };
     HookProgram::Broken {
         program: program.to_string(),
         problem,
+    }
+}
+
+/// Why a hook that names its program bare cannot be judged from here.
+pub const BARE_NAME: &str = "could not tell: bare name, resolved on the agent's PATH";
+
+fn bare_name_why(program: &str) -> String {
+    format!(
+        "{BARE_NAME}: its hook runs `{program}`, which the agent finds on its own PATH, \
+         and that PATH is not visible from here"
+    )
+}
+
+/// The clue a caller adds to a bare name's `why`: where THIS process's PATH
+/// finds it (`Some`), or that it does not (`None`). Only a clue: the agent
+/// resolves the name on a PATH of its own.
+pub fn bare_name_clue(found_here: Option<&Path>) -> String {
+    match found_here {
+        Some(path) => format!(
+            " (on this command's PATH it is {}, which may not be the one the agent finds)",
+            path.display()
+        ),
+        None => " (it is not on this command's PATH either)".to_string(),
+    }
+}
+
+/// A hook line that names the guard's binary and its `hook` verb but is not
+/// in the grammar [`hook_command_for`] writes: something else comes first
+/// (`env X=1 /p/innerwarden hook`, `sh -c '/p/innerwarden hook'`), or a path
+/// holds a space and no quotes. Never the guard's own line, so never touched
+/// by install or uninstall; `status` names it so it cannot vanish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WrappedHook {
+    /// The command exactly as the settings file holds it.
+    pub command: String,
+    /// The word that names the guard's binary, quotes removed.
+    pub program: String,
+    /// Under `PreToolUse` with a matcher that certainly includes Bash.
+    pub screens_bash: bool,
+}
+
+/// The word in `command` that names the guard's binary right before `hook`,
+/// read loosely: words split on whitespace and shell punctuation, quotes
+/// dropped. Only for naming a line in `status`; never to claim it as ours.
+fn wrapped_guard_program(command: &str) -> Option<String> {
+    let words: Vec<&str> = command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '&' | '|' | '(' | ')' | '`'))
+        .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
+        .filter(|word| !word.is_empty())
+        .collect();
+    words
+        .windows(2)
+        .find(|pair| is_innerwarden_executable(pair[0]) && pair[1] == "hook")
+        .map(|pair| pair[0].to_string())
+}
+
+/// Every hook line, under any event and matcher, that names the guard but is
+/// not one [`is_iwguard_hook`] reads as ours, in file order.
+pub fn wrapped_iwguard_hooks(settings: &Value) -> Vec<WrappedHook> {
+    let Some(events) = settings.get("hooks").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (event, entries) in events {
+        for entry in entries.as_array().into_iter().flatten() {
+            let screens_bash = event == "PreToolUse"
+                && bash_matcher_coverage(entry) == BashMatcherCoverage::Includes;
+            for hook in entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if is_iwguard_hook(hook) {
+                    continue;
+                }
+                let Some(command) = hook.get("command").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some(program) = wrapped_guard_program(command) {
+                    out.push(WrappedHook {
+                        command: command.to_string(),
+                        program,
+                        screens_bash,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// PURE: judge a [`WrappedHook`] from what the caller found when it looked
+/// for the binary it names. Never `Runs`: what comes before the binary (an
+/// `env`, a `sh -c`, a split path) decides what actually starts, so the line
+/// is "could not tell", with the line in the words. Only a binary that is
+/// certainly gone (an absolute path that does not exist or is not
+/// executable) is the same alarm as the guard's own line: nothing it names
+/// can start.
+pub fn judge_wrapped_hook(hook: &WrappedHook, fact: ProgramFact) -> HookProgram {
+    let program = hook.program.as_str();
+    let line = &hook.command;
+    if Path::new(program).is_absolute() {
+        let gone = match fact {
+            ProgramFact::Missing => Some("which does not exist"),
+            ProgramFact::NotExecutable => Some("which is not an executable file"),
+            ProgramFact::Executable | ProgramFact::Unreadable => None,
+        };
+        if let Some(gone) = gone {
+            return HookProgram::Broken {
+                program: program.to_string(),
+                problem: format!("its hook line `{line}` runs {program}, {gone}"),
+            };
+        }
+    }
+    HookProgram::Unknown {
+        program: program.to_string(),
+        why: format!(
+            "could not tell: its hook line `{line}` names {program} but does not start with \
+             it, so I cannot say what that line runs"
+        ),
     }
 }
 
@@ -3342,26 +3468,161 @@ mod hook_program_tests {
         }
     }
 
-    /// A bare name is found through `PATH`, as the agent's shell finds it. An
+    /// A bare name is found on the agent's own PATH, which this process cannot
+    /// see. Found here or not, the answer is "could not tell", never an OK
+    /// that could be false and never an "off" that could be false. An
     /// unquoted command is read by the same grammar as a quoted one.
+    ///
+    /// FAILS ON REVERT: let a bare name take the lookup's answer again and
+    /// `Executable` reads `Runs`, `Missing` reads `Broken`.
     #[test]
-    fn a_bare_program_that_is_not_on_path_does_not_run() {
+    fn a_bare_program_could_not_be_told_whatever_this_path_holds() {
         let settings = measured("innerwarden hook --agent claude-code");
         assert_eq!(
             effective_iwguard_hook_programs(&settings),
             vec!["innerwarden".to_string()]
         );
-        match judge_iwguard_hooks(&settings, |_| ProgramFact::Missing) {
-            Some(HookProgram::Broken { program, problem }) => {
-                assert_eq!(program, "innerwarden");
-                assert_eq!(problem, "its hook runs `innerwarden`, which is not on PATH");
+        for fact in [
+            ProgramFact::Executable,
+            ProgramFact::Missing,
+            ProgramFact::NotExecutable,
+            ProgramFact::Unreadable,
+        ] {
+            match judge_iwguard_hooks(&settings, |_| fact) {
+                Some(HookProgram::Unknown { program, why }) => {
+                    assert_eq!(program, "innerwarden");
+                    assert!(why.starts_with(BARE_NAME), "{fact:?}: {why}");
+                    assert!(
+                        why.contains("could not tell: bare name, resolved on the agent's PATH"),
+                        "{why}"
+                    );
+                }
+                other => panic!("{fact:?}: a bare name is judged on the agent's PATH: {other:?}"),
             }
-            other => panic!("a name no PATH directory holds cannot start: {other:?}"),
         }
+    }
+
+    /// The installer's line (an absolute path in quotes) keeps its verdicts:
+    /// the bare-name rule and the hand-written lines change nothing for it.
+    #[test]
+    fn the_installers_quoted_absolute_line_keeps_its_verdicts() {
+        let program = abs("opt/iw bin");
+        let settings = measured(&format!("\"{program}\" hook --agent claude-code"));
         assert_eq!(
             judge_iwguard_hooks(&settings, |_| ProgramFact::Executable),
             Some(HookProgram::Runs)
         );
+        assert!(matches!(
+            judge_iwguard_hooks(&settings, |_| ProgramFact::Missing),
+            Some(HookProgram::Broken { .. })
+        ));
+        assert!(wrapped_iwguard_hooks(&settings).is_empty());
+        // The line the installer writes, fail-closed tail included.
+        let written = hook_command_for(Path::new(&program), false, false, Some("claude-code"));
+        assert!(wrapped_iwguard_hooks(&measured(&written)).is_empty());
+    }
+
+    fn one_wrapped(command: &str) -> WrappedHook {
+        let found = wrapped_iwguard_hooks(&measured(command));
+        assert_eq!(found.len(), 1, "{command}: {found:?}");
+        assert!(found[0].screens_bash);
+        assert_eq!(found[0].command, command);
+        found[0].clone()
+    }
+
+    fn unknown_naming_the_line(verdict: HookProgram, command: &str) {
+        match verdict {
+            HookProgram::Unknown { why, .. } => {
+                assert!(why.starts_with("could not tell"), "{why}");
+                assert!(why.contains(command), "the line itself is named: {why}");
+            }
+            other => panic!("{command}: a hand-written line is could not tell: {other:?}"),
+        }
+    }
+
+    /// `env X=1 /p/innerwarden hook`: not the guard's line, so it used to be
+    /// skipped in silence. Now it is found, with the binary it names.
+    ///
+    /// FAILS ON REVERT: drop `wrapped_iwguard_hooks` (or let it skip a line
+    /// whose first word is not the guard) and nothing is found.
+    #[test]
+    fn a_line_with_env_in_front_is_could_not_tell_with_the_line() {
+        let program = abs("opt/iw");
+        let command = format!("env IW_X=1 {program} hook --agent claude-code");
+        assert!(!is_iwguard_hook(&json!({"command": command})));
+        let wrapped = one_wrapped(&command);
+        assert_eq!(wrapped.program, program);
+        unknown_naming_the_line(
+            judge_wrapped_hook(&wrapped, ProgramFact::Executable),
+            &command,
+        );
+    }
+
+    /// A path with a space and no quotes: the shell splits it, so what starts
+    /// is not knowable from the text.
+    #[test]
+    fn a_path_with_a_space_and_no_quotes_is_could_not_tell_with_the_line() {
+        let command = if cfg!(windows) {
+            r"C:\my tools\innerwarden.exe hook".to_string()
+        } else {
+            "/home/my user/bin/innerwarden hook".to_string()
+        };
+        let wrapped = one_wrapped(&command);
+        for fact in [ProgramFact::Missing, ProgramFact::Executable] {
+            unknown_naming_the_line(judge_wrapped_hook(&wrapped, fact), &command);
+        }
+    }
+
+    /// `sh -c '/p/innerwarden hook'`: the binary is inside the quoted script.
+    #[test]
+    fn a_line_through_sh_c_is_could_not_tell_with_the_line() {
+        let program = abs("opt/iw");
+        let command = format!("sh -c '{program} hook --monitor'");
+        let wrapped = one_wrapped(&command);
+        assert_eq!(wrapped.program, program);
+        unknown_naming_the_line(
+            judge_wrapped_hook(&wrapped, ProgramFact::Executable),
+            &command,
+        );
+    }
+
+    /// A hand-written line whose binary is gone is the same alarm as the
+    /// guard's own line: nothing it names can start.
+    ///
+    /// FAILS ON REVERT: make `judge_wrapped_hook` always "could not tell"
+    /// and the gone binary reads unknown.
+    #[test]
+    fn a_hand_written_line_whose_binary_is_gone_is_broken() {
+        let program = abs("gone/target/release");
+        let command = format!("env IW_X=1 {program} hook");
+        let wrapped = one_wrapped(&command);
+        match judge_wrapped_hook(&wrapped, ProgramFact::Missing) {
+            HookProgram::Broken {
+                program: named,
+                problem,
+            } => {
+                assert_eq!(named, program);
+                assert!(problem.contains(&command), "{problem}");
+                assert!(problem.ends_with("which does not exist"), "{problem}");
+            }
+            other => panic!("a gone binary is the same alarm: {other:?}"),
+        }
+    }
+
+    /// Lines that do not name the guard's binary with `hook` stay the
+    /// operator's: nothing is reported for them.
+    #[test]
+    fn a_line_that_only_mentions_the_guard_is_not_named() {
+        for command in [
+            "/operator/check.sh",
+            "/usr/sbin/iw dev wlan0 hook",
+            "innerwarden-helper hook",
+        ] {
+            assert!(
+                wrapped_iwguard_hooks(&measured(command)).is_empty(),
+                "{command}"
+            );
+        }
     }
 
     #[test]
