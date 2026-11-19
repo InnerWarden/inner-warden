@@ -7602,13 +7602,75 @@ const GUARD_FILE_NAMES: &[&str] = &[
     "dns-guard-mode",
 ];
 
+/// What a folder of the guard holds, for [`guard_places_a_find_reaches`].
+enum FolderEntries {
+    /// Every file and folder under it, as paths below it, lowercase. Empty
+    /// for a place that is a file.
+    Listed(Vec<String>),
+    /// It is not there.
+    Missing,
+    /// It, or a folder under it, could not be read, or it holds more than
+    /// [`GUARD_FOLDER_ENTRIES`]: what it holds is not known.
+    Unread,
+}
+
+/// How many entries a folder of the guard is listed to, and how deep.
+const GUARD_FOLDER_ENTRIES: usize = 50_000;
+const GUARD_FOLDER_DEPTH: usize = 12;
+
+/// Everything under `place`, listed now, links not followed.
+fn guard_folder_entries(place: &std::path::Path) -> FolderEntries {
+    let metadata = match std::fs::symlink_metadata(place) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return FolderEntries::Missing
+        }
+        Err(_) => return FolderEntries::Unread,
+    };
+    if !metadata.is_dir() {
+        return FolderEntries::Listed(Vec::new());
+    }
+    let mut entries = Vec::new();
+    let mut pending = vec![(place.to_path_buf(), String::new(), 0usize)];
+    while let Some((folder, below, depth)) = pending.pop() {
+        let Ok(listing) = std::fs::read_dir(&folder) else {
+            return FolderEntries::Unread;
+        };
+        for entry in listing {
+            let Ok(entry) = entry else {
+                return FolderEntries::Unread;
+            };
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            let path = if below.is_empty() {
+                name
+            } else {
+                format!("{below}/{name}")
+            };
+            if entries.len() >= GUARD_FOLDER_ENTRIES {
+                return FolderEntries::Unread;
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                if depth + 1 >= GUARD_FOLDER_DEPTH {
+                    return FolderEntries::Unread;
+                }
+                pending.push((entry.path(), path.clone(), depth + 1));
+            }
+            entries.push(path);
+        }
+    }
+    FolderEntries::Listed(entries)
+}
+
 /// The guard's places under a root of a search that takes what it matches,
 /// where its tests may match the place, a folder on the way to it or a file
 /// the guard keeps in it ([`FindFilter::may_match`]): `find ~ -path
 /// '*innerwarden*' -delete` and `find /etc -name agent.toml -delete` remove
-/// them. A relative root is read in each directory a `cd` named, and is
-/// not read without one. Not read: a file the guard keeps under a name not
-/// in [`GUARD_FILE_NAMES`], and a root behind a variable other than the home.
+/// them. Inside a place every file is the guard's: the filter is held to the
+/// place's listing at the time of the judgment ([`guard_folder_entries`]),
+/// to [`GUARD_FILE_NAMES`] for a folder not made yet, and a folder that
+/// cannot be listed counts as a match. A relative root is read in each
+/// directory a `cd` named, and is not read without one. Not read: a root
+/// behind a variable other than the home.
 fn guard_places_a_find_reaches(reading: &FindReading, dirs: &[String]) -> Vec<String> {
     let home = std::env::var("HOME")
         .ok()
@@ -7624,6 +7686,9 @@ fn guard_places_a_find_reaches(reading: &FindReading, dirs: &[String]) -> Vec<St
             _ => collapse_path(&path),
         }
     };
+    let real_home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(std::path::PathBuf::from);
     let programs = &settings_hook_programs().programs;
     let mut reached = Vec::new();
     for written in &reading.roots {
@@ -7641,8 +7706,8 @@ fn guard_places_a_find_reaches(reading: &FindReading, dirs: &[String]) -> Vec<St
                 .iter()
                 .map(|(place, names)| (place.to_string(), *names))
                 .chain(programs.iter().map(|program| (program.clone(), &[][..])));
-            for (place, names) in places {
-                let place = absolute(&place);
+            for (spelled_place, names) in places {
+                let place = absolute(&spelled_place);
                 let Some(rest) = place.strip_prefix(root) else {
                     continue;
                 };
@@ -7662,11 +7727,40 @@ fn guard_places_a_find_reaches(reading: &FindReading, dirs: &[String]) -> Vec<St
                     candidates.push(parent.to_string());
                     on_the_way = parent;
                 }
-                candidates.extend(names.iter().map(|name| format!("{place}/{name}")));
                 if candidates
                     .iter()
                     .any(|candidate| reading.filter.may_match(&printed(candidate)))
                 {
+                    reached.push(place);
+                    continue;
+                }
+                // Inside a place of the guard every file is the guard's: the
+                // filter is held to what the folder holds now, or to the
+                // names the guard keeps there when it is not made yet. A
+                // folder that cannot be read whole may hold a match.
+                let real = match spelled_place.strip_prefix('~') {
+                    Some(rest) => match &real_home {
+                        Some(home) => home.join(rest.trim_start_matches('/')),
+                        None => {
+                            reached.push(place);
+                            continue;
+                        }
+                    },
+                    None => std::path::PathBuf::from(&spelled_place),
+                };
+                let inside: Vec<String> = match guard_folder_entries(&real) {
+                    FolderEntries::Listed(entries) => entries,
+                    FolderEntries::Missing => names.iter().map(|name| name.to_string()).collect(),
+                    FolderEntries::Unread => {
+                        reached.push(place);
+                        continue;
+                    }
+                };
+                if inside.iter().any(|entry| {
+                    reading
+                        .filter
+                        .may_match(&printed(&format!("{place}/{entry}")))
+                }) {
                     reached.push(place);
                 }
             }
