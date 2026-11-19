@@ -134,7 +134,12 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
         block: true,
     },
     CommandPattern {
-        pattern: r"(?:^|[;&|]\s*)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)",
+        // A command starts after a separator (a new line is one) or an
+        // opening, and also after the words that open a body (`if a; then
+        // eval x; fi`, `while a; do eval x; done`), a group (`{ eval x; }`)
+        // and a negation (`! eval x`); those last are read outside single
+        // quotes only ([`EVAL_AFTER_OPENER`]).
+        pattern: r"(?:^|[;&|(`\n]\s*|(?:^|[;&|(`\s])(?:(?:then|do|else|elif)\s+|[{!]\s+))(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)",
         description: "shell eval (dynamic command execution)",
         block: true,
     },
@@ -463,12 +468,11 @@ pub const OBFUSCATION_INDICATORS: &[&str] = &[
     "echo -e \"\\x",
     "echo -ne '\\x",
     "$'\\x",
-    "python -c \"import os",
-    "python3 -c \"import os",
-    "python -c 'import os",
-    "python3 -c 'import os",
-    "python -c \"import subprocess",
-    "python3 -c \"import subprocess",
+    // `python3 -c "import os` is not here: importing a module hides nothing,
+    // and the same code fed on standard input was never a sign. What the
+    // code does with it (`os.system`, `subprocess.run` of a line, a write of
+    // agent settings) is read by the rules that read inline code, the same
+    // way in `-c` and in a here-document.
     "perl -e 'system",
     "perl -e 'exec",
     "ruby -e 'system",
@@ -2802,6 +2806,10 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
         ".codex",
         ".gemini",
         "claude_desktop_config",
+        // The settings name as a quoted piece of a path built at run time,
+        // `.claude` built from pieces too.
+        "'settings'",
+        "\"settings\"",
     ];
     if !mentions_any(content, NEEDLES) && !names_guard_alias(content) {
         // A name assembled by the shell (`${x:-innerwarden}`, `$(echo
@@ -2890,11 +2898,314 @@ const GUARD_LOOSENING_VERB: &str =
      installs it in monitor, uninstalls it, or starts a jail, which only the person \
      supervising the agent may run, from their own terminal";
 
-/// [`check_guard_self_disable`] on one spelling of the command.
+/// What [`guard_self_disable_in`] says of a line that rewrites, removes or
+/// moves aside the configuration an agent loads the guard from, or the
+/// guard's hook script: the refusals [`check_code_rewrites_guard_carrier`]
+/// keeps.
+const CARRIER_REWRITES: &[&str] = &[
+    "removes or moves aside the configuration that carries the guard's hook",
+    "edits an agent's configuration to remove the guard's hook",
+    "points an MCP client at a server staged in a temporary directory",
+    "edits an agent's configuration in place to remove the guard",
+    "rewrites an agent's configuration through an interpreter",
+    "deletes the guard's hook script",
+    "removes or moves aside the plugin or hook that carries the guard in OpenClaw",
+];
+
+/// What [`guard_self_disable_in`] says of a write into the guard's own
+/// configuration.
+const GUARD_CONFIG_WRITTEN: &str =
+    "writes into the guard's own configuration, which holds its allow and mute rules";
+
+/// The refusals of [`check_guard_self_disable`] that are about what a line
+/// writes, asked of a line that hands an interpreter its code inline
+/// (`python3 -c '...'`): an agent's settings that load the guard rewritten,
+/// removed or moved aside, the guard's hook script deleted, the guard's own
+/// configuration named and written by the code, what carries the guard
+/// written ([`writes_guard_carrier`]).
+///
+/// Asked of the inline form of a program an interpreter reads from a
+/// here-document ([`crate::shell::interpreter_input_as_inline_code`]): the
+/// same code refused under `-c` is refused fed on standard input. The
+/// readings of the guard's own words are left out: a guard command quoted in
+/// code that starts no program is text the code works on.
+pub(crate) fn check_code_rewrites_guard_carrier(content: &str) -> Option<(&'static str, u32)> {
+    if let Some(joined) = quoted_pieces_joined(content) {
+        if let Some(hit) = check_code_rewrites_guard_carrier(&joined) {
+            return Some(hit);
+        }
+    }
+    if let Some((_, what, score)) = guard_self_disable_patterns()
+        .iter()
+        .filter(|(_, what, _)| CARRIER_REWRITES.contains(what))
+        .find(|(re, _, _)| re.is_match(content))
+    {
+        return Some((*what, *score));
+    }
+    if interpreter_code_puts_file_onto_settings(content)
+        || interpreter_code_writes_settings_another_way(content)
+    {
+        return Some((SETTINGS_REWRITTEN_BY_INTERPRETER, 60));
+    }
+    if code_names_and_writes_guard_config(&content.to_ascii_lowercase()) {
+        return Some((GUARD_CONFIG_WRITTEN, 60));
+    }
+    writes_guard_carrier(content).then_some((GUARD_CARRIER_WRITTEN, 60))
+}
+
+/// What [`guard_self_disable_patterns`] says of interpreter code that
+/// rewrites an agent's settings.
+const SETTINGS_REWRITTEN_BY_INTERPRETER: &str =
+    "rewrites an agent's configuration through an interpreter";
+
+/// `content` with each pair of quoted pieces code joins into one string
+/// (`'set' + 'tings.json'`, PHP's `'a'.'b'`, Lua's `'a'..'b'`) written
+/// as that string, so a path built from pieces is read as the path. `None`
+/// when nothing is joined.
+fn quoted_pieces_joined(content: &str) -> Option<String> {
+    static JOIN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let join = JOIN.get_or_init(|| {
+        regex::Regex::new(r#"['"]\s*(?:\+|\.\.|\.)\s*['"]"#).expect("static join regex")
+    });
+    match join.replace_all(content, "") {
+        std::borrow::Cow::Owned(joined) => Some(joined),
+        std::borrow::Cow::Borrowed(_) => None,
+    }
+}
+
+/// [`check_guard_self_disable`] on one spelling of the command, and on the
+/// same spelling with its quoted pieces joined ([`quoted_pieces_joined`]).
 fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
+    if let Some(joined) = quoted_pieces_joined(content) {
+        if let Some(hit) = guard_self_disable_in(&joined) {
+            return Some(hit);
+        }
+    }
+    let res = guard_self_disable_patterns();
+    if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
+        return Some((*what, *score));
+    }
+    if interpreter_code_puts_file_onto_settings(content)
+        || interpreter_code_writes_settings_another_way(content)
+    {
+        return Some((SETTINGS_REWRITTEN_BY_INTERPRETER, 60));
+    }
+    guard_self_disable_after_patterns(content)
+}
+
+/// Whether inline interpreter code copies or links a file ONTO an agent's
+/// settings: `shutil.copy*`, `os.symlink`, `copyFileSync`, `symlinkSync`
+/// with the settings, or a variable assigned them, as the destination.
+/// A copy FROM the settings is a backup, a read, and stays out.
+fn interpreter_code_puts_file_onto_settings(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if !(lower.contains("copy") || lower.contains("symlink"))
+        || !(lower.contains("settings")
+            || lower.contains(".claude.json")
+            || lower.contains("mcp.json"))
+    {
+        return false;
+    }
+    static INTERPRETER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ONTO: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ASSIGNED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static ONTO_NAME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    const SETTINGS: &str = r#"(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#;
+    // The first argument, with one level of calls inside it
+    // (`os.path.expanduser('~/x')`), then the destination.
+    const CALL: &str = r#"\b(?:copy\w*|symlink(?:sync)?)\s*\(\s*[^,()]*(?:\([^()]*\)[^,()]*)*,\s*"#;
+    let interpreter = INTERPRETER.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?s)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b"#,
+        )
+        .expect("static interpreter regex")
+    });
+    if !interpreter.is_match(&lower) {
+        return false;
+    }
+    let onto = ONTO.get_or_init(|| {
+        regex::Regex::new(&format!(r#"(?s){CALL}[^,)]*?{SETTINGS}"#))
+            .expect("static copy onto settings regex")
+    });
+    if onto.is_match(&lower) {
+        return true;
+    }
+    let assigned = ASSIGNED.get_or_init(|| {
+        regex::Regex::new(&format!(r#"\b([a-z_]\w*)\s*=\s*[^;\n=]*?{SETTINGS}"#))
+            .expect("static settings assignment regex")
+    });
+    let names: Vec<&str> = assigned
+        .captures_iter(&lower)
+        .filter_map(|c| c.get(1).map(|m| m.as_str()))
+        .collect();
+    if names.is_empty() {
+        return false;
+    }
+    let onto_name = ONTO_NAME.get_or_init(|| {
+        regex::Regex::new(&format!(r#"(?s){CALL}([a-z_]\w*)\s*[,)]"#))
+            .expect("static copy onto name regex")
+    });
+    onto_name
+        .captures_iter(&lower)
+        .filter_map(|c| c.get(1))
+        .any(|m| names.contains(&m.as_str()))
+}
+
+/// Whether inline interpreter code writes an agent's settings in a way the
+/// patterns of [`guard_self_disable_patterns`] do not spell out:
+///
+/// - a Node `fs` call reached through a name or a callback
+///   (`require('fs').writeFile(..)`, `fsp.writeFile(..)`,
+///   `require('fs/promises').rm(..)`); a copy or a link is left to
+///   [`interpreter_code_puts_file_onto_settings`], which tells a copy onto
+///   the settings from a backup of them;
+/// - `.replace(` or `.rename(` of a `Path` held in a name or built as a
+///   chain (`p = Path.home()/'.claude'/'settings.json'; p.replace(..)`);
+/// - a file opened with a mode or flags that are not a literal read-only
+///   one (`m = 'wb'; open(settings, m)`, `os.open(settings, os.O_TRUNC)`);
+/// - the name split across names (`a = 'settings'; b = '.json'`) beside
+///   `.claude` and a write.
+///
+/// Each only where the code names the settings, whole or in pieces.
+fn interpreter_code_writes_settings_another_way(content: &str) -> bool {
+    use std::sync::OnceLock;
+    static INTERPRETER: OnceLock<regex::Regex> = OnceLock::new();
+    static SETTINGS: OnceLock<regex::Regex> = OnceLock::new();
+    static PIECE: OnceLock<regex::Regex> = OnceLock::new();
+    static BARE_PIECE: OnceLock<regex::Regex> = OnceLock::new();
+    static SETTINGS_NAME: OnceLock<regex::Regex> = OnceLock::new();
+    static NODE_CALL: OnceLock<regex::Regex> = OnceLock::new();
+    static PATH_NAME: OnceLock<regex::Regex> = OnceLock::new();
+    static PATH_CHAIN: OnceLock<regex::Regex> = OnceLock::new();
+    static MODE_NAME: OnceLock<regex::Regex> = OnceLock::new();
+    static OS_OPEN: OnceLock<regex::Regex> = OnceLock::new();
+    static WRITE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = |cell: &'static OnceLock<regex::Regex>, pattern: &str| -> &'static regex::Regex {
+        cell.get_or_init(|| regex::Regex::new(pattern).expect("static settings write regex"))
+    };
+    let lower = content.to_ascii_lowercase();
+    if !(lower.contains("settings") || lower.contains(".claude.json") || lower.contains("mcp.json"))
+    {
+        return false;
+    }
+    if !re(
+        &INTERPRETER,
+        r#"(?s)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b"#,
+    )
+    .is_match(&lower)
+    {
+        return false;
+    }
+    let whole = re(
+        &SETTINGS,
+        r#"settings(?:\.local)?\.json|\.claude\.json|mcp\.json"#,
+    )
+    .is_match(&lower);
+    // `'settings'` as a quoted piece of a name built beside `.claude`, or
+    // the whole piece `'settings'` beside `.json` with `.claude` built
+    // from pieces too (`d='.cla'+'ude'`). A file such as `'settings.py'`
+    // is no piece.
+    let in_pieces = !whole
+        && ((lower.contains(".claude") && re(&PIECE, r#"['"]settings"#).is_match(&lower))
+            || (lower.contains(".json")
+                && re(&BARE_PIECE, r#"['"]settings(?:\.local)?['"]"#).is_match(&lower)));
+    if !(whole || in_pieces) {
+        return false;
+    }
+    if re(
+        &NODE_CALL,
+        r#"\.(?:writefile|appendfile|rm|unlink|rename|truncate)(?:sync)?\s*\("#,
+    )
+    .is_match(&lower)
+    {
+        return true;
+    }
+    // Names assigned the settings path as text (`x = '~/.claude/settings.json'`),
+    // so a `Path` built from one of them is a `Path` of the settings.
+    let settings_names: Vec<&str> = re(
+        &SETTINGS_NAME,
+        r#"\b([a-z_]\w*)\s*=\s*[^;\n=]*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+    )
+    .captures_iter(&lower)
+    .filter_map(|c| c.get(1).map(|m| m.as_str()))
+    .collect();
+    let names_a_settings_name = |value: &str| {
+        settings_names.iter().any(|name| {
+            value.match_indices(name).any(|(at, _)| {
+                let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                !value[..at].chars().next_back().is_some_and(word)
+                    && !value[at + name.len()..].chars().next().is_some_and(word)
+            })
+        })
+    };
+    // A name given a `Path` built with the settings, or with a name that
+    // holds them (not their text read), then replaced or renamed.
+    let path_names: Vec<&str> = re(
+        &PATH_NAME,
+        r#"\b([a-z_]\w*)\s*=\s*([^;\n]*\bpath\b[^;\n]*)"#,
+    )
+    .captures_iter(&lower)
+    .filter(|c| {
+        c.get(2).is_some_and(|value| {
+            let value = value.as_str();
+            (value.contains("settings")
+                || value.contains(".claude")
+                || names_a_settings_name(value))
+                && !value.contains("read")
+        })
+    })
+    .filter_map(|c| c.get(1).map(|m| m.as_str()))
+    .collect();
+    if path_names.iter().any(|name| {
+        lower.contains(&format!("{name}.replace(")) || lower.contains(&format!("{name}.rename("))
+    }) {
+        return true;
+    }
+    if lower.contains("path")
+        && re(
+            &PATH_CHAIN,
+            r#"(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)['"]\s*\)\s*\.(?:replace|rename)\s*\("#,
+        )
+        .is_match(&lower)
+    {
+        return true;
+    }
+    // A second argument of `open` that is a name, not a quoted mode.
+    if re(
+        &MODE_NAME,
+        r#"\bopen(?:sync)?\s*\((?:[^(),]|\([^()]*\))+,\s*([a-z_][\w.]*)\s*[,)]"#,
+    )
+    .captures_iter(&lower)
+    .any(|c| c.get(1).is_some_and(|mode| mode.as_str() != "os.o_rdonly"))
+    {
+        return true;
+    }
+    // `os.open` with any flags but `os.O_RDONLY` alone.
+    if re(
+        &OS_OPEN,
+        r#"\bos\.open\s*\((?:[^(),]|\([^()]*\))+,\s*([^)]*)\)"#,
+    )
+    .captures_iter(&lower)
+    .any(|c| {
+        c.get(1)
+            .is_some_and(|flags| flags.as_str().trim() != "os.o_rdonly")
+    }) {
+        return true;
+    }
+    in_pieces
+        && re(
+            &WRITE,
+            r#"["'](?:[bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2})["']|\bwrite|\bdump\b|\bunlink|\bremove\(|\brename\(|\bos\.replace\(|\bshutil\.move\(|\btruncate|file_put_contents|\bdel\b"#,
+        )
+        .is_match(&lower)
+}
+
+/// The patterns [`guard_self_disable_in`] asks first, each with what it
+/// says and its score.
+fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)] {
     static RES: std::sync::OnceLock<Vec<(regex::Regex, &'static str, u32)>> =
         std::sync::OnceLock::new();
-    let res = RES.get_or_init(|| {
+    RES.get_or_init(|| {
         let mut v: Vec<(regex::Regex, &'static str, u32)> = Vec::new();
         let mut add = |p: &str, what: &'static str, score: u32| {
             if let Ok(re) = regex::Regex::new(p) {
@@ -2949,13 +3260,23 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         // is full of `;`, so a segment-bounded pattern stops before reaching
         // the filename. A WRITE indicator is required so that reading the
         // config, which an agent does for honest reasons, is not a finding.
+        // Writing is more than `open(..., 'w')`: pathlib writes and unlinks,
+        // `os` and `shutil` remove and move, node's `fs` does each of those.
+        // A rename, replace or move counts with the settings on either side.
         add(
-            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json).{0,400}?(?:["']w["']|\bdump\b|\bwrite\b|\bdel\b|writeFileSync|\bunlink\b)"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json).*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\(|\bwrite\b|\bwritelines\b|\bdel\b|\bunlink\b|\.truncate\(|\.write_(?:text|bytes)\(|\.rename\(|\.symlink_to\()"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
         add(
-            r#"(?is)(?:python3?|node|ruby|perl)\b.{0,200}?-[ce]\b.{0,400}?(?:["']w["']|\bdump\b|writeFileSync).{0,400}?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\().*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#,
+            "rewrites an agent's configuration through an interpreter",
+            60,
+        );
+        // Opened in a mode that writes, the mode right after the settings
+        // path in the same call: `open(p, 'wb')`, `'w+'`, `'a'`, `'r+'`.
+        add(
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)["']?\)*\s*,\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
@@ -3015,10 +3336,12 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
             60,
         );
         v
-    });
-    if let Some((_, what, score)) = res.iter().find(|(re, _, _)| re.is_match(content)) {
-        return Some((*what, *score));
-    }
+    })
+}
+
+/// [`guard_self_disable_in`] past its patterns
+/// ([`guard_self_disable_patterns`]).
+fn guard_self_disable_after_patterns(content: &str) -> Option<(&'static str, u32)> {
     // The same two refusals on the words the shell hands the program: a
     // guard program named by a glob, a bracket expression or a value the
     // line assigned (`/usr/local/sbin/inner*-ctl exec-gate disarm`).
@@ -3044,10 +3367,7 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
         ));
     }
     if writes_guard_config(content, 0) {
-        return Some((
-            "writes into the guard's own configuration, which holds its allow and mute rules",
-            60,
-        ));
+        return Some((GUARD_CONFIG_WRITTEN, 60));
     }
     carrier()
 }
@@ -6431,13 +6751,189 @@ const GUARD_CARRIER_WRITTEN: &str =
 /// URL, `git checkout` of one, a change of owner, and a write made by
 /// interpreter code other than the rewrites [`guard_self_disable_in`] names.
 fn writes_guard_carrier(content: &str) -> bool {
-    may_name_guard_carrier(content)
-        && writes_place(
-            content,
-            0,
-            |target, taken| names_guard_carrier(target) || (taken && names_agent_home(target)),
-            false,
+    if !may_name_guard_carrier(content) {
+        return false;
+    }
+    // The rest holds no assignment of a fresh folder, so this is asked once.
+    if let Some(rest) = without_fresh_dir_writes(content) {
+        return writes_guard_carrier(&rest);
+    }
+    writes_place(
+        content,
+        0,
+        |target, taken| names_guard_carrier(target) || (taken && names_agent_home(target)),
+        false,
+    )
+}
+
+/// `content` with the commands that only make and fill a folder the same
+/// line has just created with `mktemp -d` taken out, when that is provably
+/// all they do: a test fixture written into a throwaway home
+/// (`H=$(mktemp -d); mkdir -p "$H/.claude"; echo '{}' >
+/// "$H/.claude/settings.json"; HOME="$H" tool`). `None` when the line is not
+/// in that shape, and it is then read whole.
+///
+/// The folder is new: no agent was started in it or with it as its home, so
+/// no agent loads settings from it. What would make a write into it reach
+/// the real settings is a link planted inside it, so every command that
+/// names the folder must be one that cannot plant one:
+///
+/// * the one assignment of the variable, `NAME=$(mktemp -d ...)`, without
+///   `-u` (which names a folder and makes none), and no other word that sets
+///   the name (`for`, `read`, `export`, another assignment);
+/// * `mkdir`;
+/// * `echo`, `printf`, `cat`, `true` or `:` whose output goes by `>` or `>>`
+///   into the folder, and `tee` into it;
+/// * `rm -rf` of the folder;
+/// * a command run with `HOME` set to the folder, after the last write
+///   into it (what it does in its home cannot be followed by a write here);
+///   that command itself is kept in the line and read as written, whatever
+///   program it runs.
+///
+/// A `cd`, a link, a copy, an archive, an alias of the variable, a function
+/// or anything else that names the folder leaves the line read whole.
+fn without_fresh_dir_writes(content: &str) -> Option<String> {
+    static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let assign = ASSIGN.get_or_init(|| {
+        // `NAME=$(mktemp -d)`, quoted or not, and the same with the
+        // substitution opened, as the guard's other reading of the line has
+        // it (`NAME= mktemp -d`): there `NAME` is empty, and the folder the
+        // line writes in is under `/`, not a home either.
+        regex::Regex::new(
+            r#"^([A-Za-z_][A-Za-z0-9_]*)=(?:"\$\(mktemp(\s+[^$`;&|()<>"'\\]*)?\)"|\$\(mktemp(\s+[^$`;&|()<>"'\\]*)?\)|"?\s+mktemp(\s+[^$`;&|()<>"'\\]*)?"?)$"#,
         )
+        .expect("static fresh folder assignment regex")
+    });
+    // A here-document's body is not read for commands here, and a function
+    // runs its body where it is called: neither shape is followed.
+    if content.contains('`') || content.contains("<<") || content.contains("()") {
+        return None;
+    }
+    let segments = shell_command_segments(content);
+    let mut name = None;
+    for segment in &segments {
+        if let Some(found) = assign.captures(segment.trim()) {
+            let flags = found
+                .get(2)
+                .or_else(|| found.get(3))
+                .or_else(|| found.get(4))
+                .map_or("", |m| m.as_str());
+            let words: Vec<&str> = flags.split_whitespace().collect();
+            let makes_folder = words.iter().any(|word| {
+                *word == "--directory"
+                    || word
+                        .strip_prefix('-')
+                        .is_some_and(|f| !f.starts_with('-') && f.contains('d'))
+            });
+            let dry = words.iter().any(|word| {
+                *word == "--dry-run"
+                    || word
+                        .strip_prefix('-')
+                        .is_some_and(|f| !f.starts_with('-') && f.contains('u'))
+            });
+            if !makes_folder || dry || name.is_some() {
+                return None;
+            }
+            name = Some(found.get(1)?.as_str().to_string());
+        }
+    }
+    let name = name?;
+    // The name stands bare only in its one assignment.
+    let bare = regex::Regex::new(&format!(r"(?:^|[^$A-Za-z0-9_{{]){name}\b")).ok()?;
+    if bare.find_iter(content).count() != 1 {
+        return None;
+    }
+    let mention = regex::Regex::new(&format!(r"\$(?:\{{{name}\}}|{name}\b)")).ok()?;
+    // In the folder: the folder itself or a path below it with no `..`.
+    let in_folder = |word: &str| {
+        let word = word.trim_matches('"');
+        !word.split('/').any(|part| part == "..")
+            && [format!("${name}"), format!("${{{name}}}")]
+                .iter()
+                .any(|head| word == head || word.starts_with(&format!("{head}/")))
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut home_runs = false;
+    for segment in &segments {
+        let trimmed = segment.trim();
+        if assign.is_match(trimmed) {
+            continue;
+        }
+        if !mention.is_match(trimmed) {
+            kept.push(segment);
+            continue;
+        }
+        let words = shell_tokens(trimmed);
+        let raw: Vec<&str> = trimmed.split_whitespace().collect();
+        let program = words.first().map(|w| token_basename(w)).unwrap_or_default();
+        // `HOME=$H tool` or `env HOME=$H tool`: the folder is the tool's home.
+        let home_set = raw
+            .iter()
+            .take_while(|w| w.contains('=') || **w == "env")
+            .any(|w| w.strip_prefix("HOME=").is_some_and(in_folder));
+        if home_set {
+            let rest: Vec<&&str> = raw
+                .iter()
+                .skip_while(|w| w.contains('=') || **w == "env")
+                .collect();
+            if rest.iter().any(|w| mention.is_match(w)) {
+                return None;
+            }
+            // What the program does in the folder's home is not followed
+            // here, and any program can run a line of its own there
+            // (`HOME=$H $SHELL -c 'ln -s ...'`, `python3 -c` with
+            // `os.symlink`, a `git -c alias.x='!ln -s ...'`): no list of
+            // such programs is whole, so the segment is always kept and
+            // read as written.
+            kept.push(segment);
+            home_runs = true;
+            continue;
+        }
+        let writes_in_folder = match program {
+            "mkdir" => raw[1..].iter().all(|w| w.starts_with('-') || in_folder(w)),
+            "rm" => {
+                raw.len() == 3
+                    && matches!(raw[1], "-rf" | "-fr" | "-r" | "-Rf" | "-fR")
+                    && in_folder(raw[2])
+                    && raw[2]
+                        .trim_matches('"')
+                        .trim_end_matches('/')
+                        .ends_with(&name)
+            }
+            "tee" => raw[1..]
+                .iter()
+                .all(|w| matches!(*w, "-a" | "--append") || in_folder(w)),
+            "echo" | "printf" | "cat" | "true" | ":" => {
+                // Every mention is the target of `>` or `>>`.
+                let mut ok = false;
+                let mut targets = 0;
+                let mut iter = raw.iter().peekable();
+                while let Some(word) = iter.next() {
+                    if let Some(target) = word.strip_prefix(">>").or_else(|| word.strip_prefix('>'))
+                    {
+                        let target = if target.is_empty() {
+                            iter.next().copied().unwrap_or("")
+                        } else {
+                            target
+                        };
+                        if !in_folder(target) {
+                            return None;
+                        }
+                        targets += 1;
+                        ok = true;
+                    } else if mention.is_match(word) {
+                        return None;
+                    }
+                }
+                ok && targets == 1
+            }
+            _ => false,
+        };
+        if !writes_in_folder || (home_runs && program != "rm") {
+            return None;
+        }
+    }
+    Some(kept.join("\n"))
 }
 
 /// A cheap test ahead of the walk [`writes_guard_carrier`] makes: a line
@@ -7162,6 +7658,12 @@ fn interpreter_code_writes_guard_config(interpreter: &str, arguments: &[String])
     if !code.contains("innerwarden") {
         return false;
     }
+    code_names_and_writes_guard_config(&code) || code_text_runs_guard_verb(&code)
+}
+
+/// Whether interpreter code (lowercase) names the guard's configuration
+/// directory and writes.
+fn code_names_and_writes_guard_config(code: &str) -> bool {
     static NAMES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
@@ -7174,7 +7676,7 @@ fn interpreter_code_writes_guard_config(interpreter: &str, arguments: &[String])
         )
         .expect("static interpreter write regex")
     });
-    (names.is_match(&code) && writes.is_match(&code)) || code_text_runs_guard_verb(&code)
+    names.is_match(code) && writes.is_match(code)
 }
 
 /// Cheap literal gate in front of a regex family.
@@ -8995,8 +9497,18 @@ fn dd_noop_sink(hay: &str) -> bool {
 /// of anything fetched, decoded, or read from a variable stays exactly as
 /// dangerous as it was, which `eval_of_network_data_is_still_denied` pins.
 fn is_local_tool_eval_idiom(content: &str) -> bool {
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
+    static AT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    static IDIOM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    // Every `eval` the line runs: where a command starts (the start of a
+    // line, after `;` `&` `|`, inside `{ }`, `( )`, `$( )` or backquotes, and
+    // after a keyword that opens a body).
+    let at = AT.get_or_init(|| {
+        regex::Regex::new(
+            r"(?m)(?:^|[;&|({!`\n]|\$\(|\b(?:then|do|else|elif|if|while|until|time)\b)\s*(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*(eval)(?:\s|$)",
+        )
+        .expect("static eval position regex")
+    });
+    let idiom = IDIOM.get_or_init(|| {
         // The command reaching this point may be RAW (`eval "$(kubectl
         // completion bash)"`) or STRUCTURALLY PROJECTED, which unwraps the
         // command substitution. Both forms have to match or the exemption only
@@ -9005,28 +9517,34 @@ fn is_local_tool_eval_idiom(content: &str) -> bool {
         // question.
         regex::Regex::new(
             r#"(?ix)
-            ^\s* (?: (?:command|builtin) \s+ (?:-p\s+)? (?:--\s+)? )* eval\s+ ["']? (?:\$\( | `)? \s*
+            ^eval\s+ ["']? (?:\$\( | `)? \s*
             (?:
-                  [\w.-]+ \s+ (?:completion|completions) (?:\s+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
+                  [\w.-]+ \s+ (?:completion|completions) (?:[\t\x20]+[\w.-]+){0,3}   # kubectl completion bash, gh completion -s bash
                 | (?:direnv|starship|zoxide|mise|rbenv|pyenv|nodenv|jenv|fnm|atuin|navi|keychain)
-                    \s+ (?:hook|init|env|activate|init-file) (?:\s+[\w.-]+)?   # direnv hook bash
-                | ssh-agent (?:\s+-s)?                                     # ssh-agent -s
-                | gpg-agent [^)`'"]*
+                    \s+ (?:hook|init|env|activate|init-file) (?:[\t\x20]+[\w.-]+)?   # direnv hook bash
+                | ssh-agent (?:[\t\x20]+-s)?                                  # ssh-agent -s
+                | gpg-agent [^)`'";&|\n]*
                 | brew \s+ shellenv
-                | dircolors [^)`'"]*
+                | dircolors [^)`'";&|\n]*
                 | opam \s+ env
                 | luarocks \s+ path
             )
-            \s* (?:\) | `)? ["']? \s*
-            (?: (?:&&|;) .* )? $
+            [\t\x20]* (?:\) | `)? ["']? [\t\x20]*
+            (?: $ | && | \|\| | ; | \n | \} | \) )
             "#,
         )
         .expect("static local-tool eval idiom regex")
     });
     let c = content.trim();
-    // The tail after `&&` is screened on its own merits by every other rule;
-    // this exemption only ever removes the `eval` finding.
-    re.is_match(c)
+    // Each `eval` of the line must be one of these idioms: the exemption only
+    // ever removes the `eval` finding, and only when no other `eval` runs
+    // (`eval "$(direnv hook bash)"; eval "$(curl ...)"` keeps it).
+    let mut evals = at
+        .captures_iter(c)
+        .filter_map(|found| found.get(1))
+        .map(|eval| &c[eval.start()..])
+        .peekable();
+    evals.peek().is_some() && evals.all(|from| idiom.is_match(from))
 }
 
 /// `shred` of a short-lived secret in a runtime or temporary directory.
@@ -9102,6 +9620,91 @@ pub fn check_command(content: &str) -> Option<(&'static str, bool)> {
 
 /// The first [`DANGEROUS_COMMANDS`] pattern one spelling of a command
 /// matches, its exemptions applied.
+/// The shell eval rule as it read before the body openers were added:
+/// `eval` after a separator or an opening.
+const EVAL_AFTER_SEPARATOR: &str =
+    r"(?:^|[;&|(`\n]\s*)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)";
+
+/// `eval` where a command starts after `then`, `do`, `else`, `elif`, `{`
+/// or `!`. Text in single quotes is a line handed to a program
+/// (`bash -c 'if false; then eval "$(cat)"; fi'`), read on its own by the
+/// shell reader, which knows a branch that never runs: a match there is
+/// not taken from the outer line.
+const EVAL_AFTER_OPENER: &str = r"(?:^|[;&|(`\s])(?:(?:then|do|else|elif)\s+|[{!]\s+)(?:(?:command|builtin)\s+(?:-p\s+)?(?:--\s+)?)*eval(?:\s|$)";
+
+/// The byte spans of `content` inside single quotes, as the shell reads
+/// them: a quote opens a span only outside double quotes and not after a
+/// backslash. `$'...'` (ANSI-C quoting) is a quote of its own: inside it a
+/// backslash escapes the next character, so `\'` does not close it, and
+/// its text, whose escapes the shell expands, opens no span.
+fn single_quoted_spans(content: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    let mut in_double = false;
+    let mut open: Option<usize> = None;
+    let mut in_ansi_c = false;
+    let mut escaped = false;
+    let mut after_dollar = false;
+    for (at, character) in content.char_indices() {
+        if let Some(start) = open {
+            if character == '\'' {
+                spans.push(start..at);
+                open = None;
+            }
+            continue;
+        }
+        if in_ansi_c {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '\'' {
+                in_ansi_c = false;
+            }
+            continue;
+        }
+        let dollar_before = std::mem::replace(&mut after_dollar, false);
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => in_double = !in_double,
+            '$' if !in_double => after_dollar = true,
+            '\'' if !in_double && dollar_before => in_ansi_c = true,
+            '\'' if !in_double => open = Some(at + 1),
+            _ => {}
+        }
+    }
+    if let Some(start) = open {
+        spans.push(start..content.len());
+    }
+    spans
+}
+
+/// Whether the shell eval rule matched `content` only through a body
+/// opener (`then`, `do`, `{`, `!`, ...) inside single quotes: no `eval`
+/// follows a separator anywhere, and each one after an opener is in a
+/// line handed to a program, which the shell reader reads on its own.
+fn eval_only_after_opener_in_single_quotes(content: &str) -> bool {
+    static READINGS: std::sync::OnceLock<(regex::Regex, regex::Regex)> = std::sync::OnceLock::new();
+    let (separator, opener) = READINGS.get_or_init(|| {
+        (
+            regex::Regex::new(EVAL_AFTER_SEPARATOR).expect("static eval separator regex"),
+            regex::Regex::new(EVAL_AFTER_OPENER).expect("static eval opener regex"),
+        )
+    });
+    if separator.is_match(content) {
+        return false;
+    }
+    let quoted = single_quoted_spans(content);
+    opener.find_iter(content).all(|found| {
+        quoted
+            .iter()
+            .any(|span| span.start <= found.start() && found.end() <= span.end)
+    })
+}
+
 fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
     for (re, description, block) in dangerous_command_regexes() {
         if re.is_match(content) {
@@ -9121,7 +9724,12 @@ fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
                 continue;
             }
             if *description == "shell eval (dynamic command execution)"
-                && is_local_tool_eval_idiom(content)
+                && (is_local_tool_eval_idiom(content) || eval_only_in_grep_patterns(re, content))
+            {
+                continue;
+            }
+            if *description == "shell eval (dynamic command execution)"
+                && eval_only_after_opener_in_single_quotes(content)
             {
                 continue;
             }
@@ -9133,6 +9741,33 @@ fn dangerous_command_in(content: &str) -> Option<(&'static str, bool)> {
         }
     }
     None
+}
+
+/// Whether every place `eval` reads as a command start in `content` is
+/// inside a quoted pattern handed to grep ([`crate::shell::grep_pattern_ranges`]):
+/// `cargo test 2>&1 | grep -E '^===|eval ->'` searches for the word, the
+/// `|` before it is the pattern's alternation, and nothing runs `eval`.
+/// Measured 2026-11-18: denied as a shell eval. A real `eval` anywhere on
+/// the line, a pattern given unquoted, and a line that does not parse keep
+/// the refusal, and so does a pattern in double quotes, where a
+/// substitution runs.
+fn eval_only_in_grep_patterns(re: &regex::Regex, content: &str) -> bool {
+    // Only a pattern in single quotes: in double quotes a `$(...)` runs, and
+    // an `eval` inside it is a command (`grep "$(eval id)" out.txt`).
+    let patterns: Vec<_> = crate::shell::grep_pattern_ranges(content)
+        .into_iter()
+        .filter(|range| {
+            content
+                .get(range.clone())
+                .is_some_and(|p| p.starts_with('\''))
+        })
+        .collect();
+    !patterns.is_empty()
+        && re.find_iter(content).all(|found| {
+            patterns
+                .iter()
+                .any(|range| range.start < found.start() && found.end() < range.end)
+        })
 }
 
 /// PURE. `text` with the assignments that stand in front of a command
@@ -11585,7 +12220,7 @@ fn secret_in_hidden_folder_within(
 /// `cwd`. The text alone names none of these: `cat auth.json` after `cd
 /// ~/.codex`, `cat .hermes/auth.json` run in the home, `cat credentials` in
 /// `~/.aws`, `grep -r <token> ~/.app`. Measured 2026-11-12 on the agent hook:
-/// every one of them passed. The bool is whether it was a folder read.
+/// every one of them passed. The second part says how it was reached.
 ///
 /// Paths are resolved as [`env_read_outside_project`] resolves them, and a
 /// path the text cannot resolve is not reported.
@@ -11593,9 +12228,35 @@ pub fn stored_secret_read_in_place(
     content: &str,
     cwd: &str,
     home: Option<&str>,
-) -> Option<(String, bool)> {
+) -> Option<(String, SecretReach)> {
+    stored_secret_reach(content, cwd, home, false)
+}
+
+/// Whether the one stored secret `content`, as written, reaches is the
+/// home's, by a `grep` of the whole home for a narrow text
+/// ([`SecretReach::HomeSearched`]). Asked of the line as written: the
+/// reading the other rules scan has the search pattern blanked as data, and
+/// a blank pattern is no narrow text.
+pub fn searches_home_for_narrow_text(content: &str, cwd: &str, home: Option<&str>) -> bool {
+    matches!(
+        stored_secret_reach(content, cwd, home, true),
+        Some((_, SecretReach::HomeSearched))
+    )
+}
+
+/// [`stored_secret_read_in_place`], with a whole-home `grep` for a narrow
+/// text told apart when `patterns` is set.
+fn stored_secret_reach(
+    content: &str,
+    cwd: &str,
+    home: Option<&str>,
+    patterns: bool,
+) -> Option<(String, SecretReach)> {
     let content = strip_inert_heredoc_bodies(content);
     let mut place = CommandPlace::new(cwd, home);
+    // A search of the whole home for a narrow text: kept, and answered only
+    // when nothing on the line reaches a secret harder.
+    let mut searched: Option<String> = None;
     for segment in shell_command_segments(&content) {
         let Some(words) = place.step(segment) else {
             continue;
@@ -11612,26 +12273,210 @@ pub fn stored_secret_read_in_place(
                     continue;
                 };
                 if is_stored_credential(&path, home) {
-                    return Some((path, false));
+                    return Some((path, SecretReach::Named));
                 }
                 if let Some(secret) = secret_behind(&path, home) {
-                    return Some((secret, false));
+                    return Some((secret, SecretReach::Named));
                 }
                 if let Some(secret) = home
                     .filter(|home| holds_the_folder(&path, home) && reads_folders_whole(segment))
                     .and_then(secret_kept_in_home)
                 {
-                    return Some((secret, true));
+                    if patterns && searches_for_narrow_text(segment) {
+                        searched.get_or_insert(secret);
+                        continue;
+                    }
+                    return Some((secret, SecretReach::Folder));
                 }
                 if let Some(file) =
                     home.and_then(|home| secret_in_hidden_folder(&path, home, Some(cwd)))
                 {
-                    return Some((file, true));
+                    return Some((file, SecretReach::Folder));
                 }
             }
         }
     }
-    None
+    searched.map(|secret| (secret, SecretReach::HomeSearched))
+}
+
+/// How [`stored_secret_read_in_place`] found a command reaching a stored
+/// secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretReach {
+    /// The path names the secret, or a link or a directory makes it.
+    Named,
+    /// A whole folder that holds it is read.
+    Folder,
+    /// The whole home that holds it is searched with grep for a narrow text
+    /// ([`searches_for_narrow_text`]): the key is opened, and only a line
+    /// of it that holds that text would be printed.
+    HomeSearched,
+}
+
+/// Whether `segment` is a `grep` that prints only the lines holding a
+/// narrow text: every pattern at least three characters, two of them
+/// letters or digits, the rest of a short set that a regular expression
+/// does not widen (`.` only under `-F` or `fgrep`), and none a word a hunt
+/// for secrets looks for ([`credential_hunt_token`]). A long option this
+/// does not know is refused, since its value could be taken for the
+/// pattern. Refused: `-v` (prints
+/// the lines that do not match, so the whole key), `-z` (a whole file is
+/// one line), a pattern from a file (`-f`), and an empty or wide pattern.
+///
+/// `grep -r TODO ~` over a home that holds `~/.ssh/id_ed25519` opens the
+/// key, and prints from it only a line holding `TODO`. That is a person's
+/// call to make (`review`), not the hard refusal a read of the key is:
+/// measured 2026-11-18, every recursive search of a home that held a key
+/// was denied, whatever it looked for.
+fn searches_for_narrow_text(segment: &str) -> bool {
+    let words = shell_tokens(segment);
+    let Some(at) = effective_command_index(&words) else {
+        return false;
+    };
+    let program = token_basename(&words[at]).to_ascii_lowercase();
+    if !matches!(program.as_str(), "grep" | "egrep" | "fgrep") {
+        return false;
+    }
+    let mut fixed = program == "fgrep";
+    let mut patterns: Vec<&str> = Vec::new();
+    let mut given_by_option = false;
+    let mut positional: Option<&str> = None;
+    let mut rest = words[at + 1..].iter();
+    while let Some(word) = rest.next() {
+        let word = word.as_str();
+        if word == "--" {
+            if positional.is_none() && !given_by_option {
+                positional = rest.next().map(String::as_str);
+            }
+            break;
+        }
+        if let Some(long) = word.strip_prefix("--") {
+            let (name, value) = long
+                .split_once('=')
+                .map_or((long, None), |(n, v)| (n, Some(v)));
+            match name {
+                "invert-match" | "null-data" | "file" => return false,
+                "fixed-strings" => fixed = true,
+                "regexp" => {
+                    given_by_option = true;
+                    match value.or_else(|| rest.next().map(String::as_str)) {
+                        Some(pattern) => patterns.push(pattern),
+                        None => return false,
+                    }
+                }
+                "after-context" | "before-context" | "context" | "max-count" | "devices"
+                | "directories" | "label" | "binary-files" | "exclude-dir" | "include"
+                | "exclude" | "exclude-from" | "include-dir" | "group-separator"
+                    if value.is_none() =>
+                {
+                    rest.next();
+                }
+                // Options that take no value, or whose value is given here.
+                _ if value.is_some() => {}
+                "recursive"
+                | "dereference-recursive"
+                | "line-number"
+                | "files-with-matches"
+                | "files-without-match"
+                | "count"
+                | "ignore-case"
+                | "no-ignore-case"
+                | "word-regexp"
+                | "line-regexp"
+                | "extended-regexp"
+                | "basic-regexp"
+                | "perl-regexp"
+                | "only-matching"
+                | "quiet"
+                | "silent"
+                | "no-messages"
+                | "with-filename"
+                | "no-filename"
+                | "null"
+                | "text"
+                | "byte-offset"
+                | "initial-tab"
+                | "line-buffered"
+                | "no-group-separator" => {}
+                // Any other long option: which word it takes, if any, is not
+                // known here, and a value read as the pattern (`--exclude-dir
+                // node_modules '' ~`) would make a wide search narrow.
+                _ => return false,
+            }
+            continue;
+        }
+        if let Some(flags) = word.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            for (index, flag) in flags.char_indices() {
+                let attached = &flags[index + flag.len_utf8()..];
+                match flag {
+                    'v' | 'z' | 'f' => return false,
+                    'F' => fixed = true,
+                    'e' => {
+                        given_by_option = true;
+                        let pattern = if attached.is_empty() {
+                            rest.next().map(String::as_str)
+                        } else {
+                            Some(attached)
+                        };
+                        match pattern {
+                            Some(pattern) => patterns.push(pattern),
+                            None => return false,
+                        }
+                        break;
+                    }
+                    'A' | 'B' | 'C' | 'm' | 'd' | 'D' => {
+                        if attached.is_empty() {
+                            rest.next();
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if positional.is_none() && !given_by_option {
+            positional = Some(word);
+        }
+    }
+    if !given_by_option {
+        patterns.extend(positional);
+    }
+    !patterns.is_empty()
+        && patterns.iter().all(|pattern| {
+            let narrow_char = |c: char| {
+                c.is_ascii_alphanumeric()
+                    || matches!(
+                        c,
+                        ' ' | '_' | '-' | ':' | '#' | '@' | '/' | '<' | '>' | ',' | '='
+                    )
+                    || (fixed && c == '.')
+            };
+            pattern.chars().count() >= 3
+                && pattern.chars().filter(char::is_ascii_alphanumeric).count() >= 2
+                && pattern.chars().all(narrow_char)
+                && credential_hunt_token(pattern).is_none()
+                && !names_credential_marker(pattern)
+        })
+}
+
+/// A known credential prefix or key marker in a grep pattern (`AKIA`,
+/// `ghp_`, `github_pat_`, `sk-`, `xoxb-`, `AIza`, `-----BEGIN`,
+/// `PRIVATE`, `ssh-ed25519`, ...), at the start of the pattern or after a
+/// character that is not a letter or digit. A recursive search of a home or
+/// a wide root for one of these is a hunt for keys, never a narrow text: it
+/// keeps the hard refusal (`grep -r AKIA ~` is `deny`, as before
+/// `searches_home_for_narrow_text`).
+fn names_credential_marker(pattern: &str) -> bool {
+    static MARKER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    MARKER
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)(^|[^a-z0-9])(akia|asia|aroa|aida|gh[pousr]_|github_pat_|glpat-|sk-|sk_(live|test)_|rk_live_|xox[abposr]-|aiza|ya29.|npm_[a-z0-9]|pypi-|hf_[a-z0-9]|-{3,}|begin|private|ssh-(rsa|ed25519|dss)|ecdsa-sha2|bearer|auth|cred|passw|pwd|pass|key|jwt|eyj)",
+            )
+            .expect("static credential marker regex")
+        })
+        .is_match(pattern)
 }
 
 /// Whether `path` is `home` or a folder `home` is in (`/home`, `/`): a
@@ -12679,17 +13524,33 @@ pub fn check_tmp_execution(content: &str) -> Option<(&'static str, u32)> {
     let temp = r#"(?:/(?:tmp|var/tmp|dev/shm|run/shm)|/private/tmp)/[^\s\"'|;&)]+"#;
     let direct = DIRECT.get_or_init(|| {
         regex::Regex::new(&format!(
-            r#"(?i)(?:^|[;&|]\s*|\$\(\s*|`\s*)(?:(?:sudo|command|nohup)\s+|env(?:\s+\w+=\S+)*\s+)*[\"']?{temp}"#
+            r#"(?im)(?:^\s*|[;&|{{(]\s*|\$\(\s*|`\s*)(?:(?:sudo|command|builtin|nohup)\s+|env(?:\s+\w+=\S+)*\s+)*[\"']?{temp}"#
         ))
         .expect("static direct temp execution regex")
     });
     let interpreted = INTERPRETED.get_or_init(|| {
         regex::Regex::new(&format!(
-            r#"(?i)(?:^|[;&|]\s*|\$\(\s*|`\s*)(?:source|\.|ba?sh|zsh|dash|ksh|python\d*(?:\.\d+)?|perl|ruby|node\d*)\s+(?:-[^\s]+\s+)*[\"']?{temp}"#
+            r#"(?im)(?:^\s*|[;&|{{(]\s*|\$\(\s*|`\s*)(?:(?:command|builtin)\s+)*(?:source|\.|ba?sh|zsh|dash|ksh|python\d*(?:\.\d+)?|perl|ruby|node\d*)\s+(?:-[^\s]+\s+)*[\"']?{temp}"#
         ))
         .expect("static interpreted temp execution regex")
     });
-    if direct.is_match(&lower) || interpreted.is_match(&lower) {
+    // `bash -n file` only reads the file for its syntax: it runs nothing.
+    let runs_the_file = |found: regex::Match<'_>| {
+        let words: Vec<&str> = found.as_str().split_whitespace().collect();
+        let shell = words.iter().position(|word| {
+            matches!(
+                word.trim_start_matches([';', '&', '|', '{', '(']),
+                "sh" | "bash" | "zsh" | "dash" | "ksh"
+            )
+        });
+        !shell.is_some_and(|at| {
+            words[at + 1..]
+                .iter()
+                .take_while(|word| word.starts_with('-'))
+                .any(|flag| !flag.starts_with("--") && flag.contains('n'))
+        })
+    };
+    if direct.is_match(&lower) || interpreted.find_iter(&lower).any(runs_the_file) {
         TMP_EXECUTION_DIRS
             .iter()
             .find(|dir| lower.contains(*dir))
@@ -12983,31 +13844,116 @@ fn check_disable_verb_reaches_target(lower: &str) -> Option<&'static str> {
     if INSPECTION_VERBS.iter().any(|v| lower.contains(v)) {
         return None;
     }
+    let ends = command_ends(lower);
     for target in PROTECTED_TARGETS {
-        let Some(target_at) = lower.find(target) else {
-            continue;
-        };
-        for verb in DISABLE_VERBS {
-            let mut from = 0usize;
-            while let Some(rel) = lower[from..].find(verb) {
-                let verb_at = from + rel;
-                // Verb must precede the target and sit close to it, so an
-                // unrelated "remove" elsewhere in a long pipeline does not pair
-                // with an incidental mention of the target.
-                if verb_at < target_at && target_at - verb_at <= 40 {
-                    return Some(match *target {
-                        "innerwarden" => "disable InnerWarden (flags between verb and target)",
-                        _ => "disable a host security monitor",
-                    });
-                }
-                from = verb_at + verb.len();
-                if from >= lower.len() {
-                    break;
-                }
+        for (target_at, _) in lower.match_indices(target) {
+            if let Some(hit) = disable_verb_before(lower, target, target_at, &ends) {
+                return Some(hit);
             }
         }
     }
     None
+}
+
+/// The finding of [`check_disable_verb_reaches_target`] for one mention of
+/// `target` at `target_at`: a disable verb before it, close, in the same
+/// command (no end of a command, [`command_ends`], between the two).
+fn disable_verb_before(
+    lower: &str,
+    target: &str,
+    target_at: usize,
+    ends: &[usize],
+) -> Option<&'static str> {
+    for verb in DISABLE_VERBS {
+        let mut from = 0usize;
+        while let Some(rel) = lower[from..].find(verb) {
+            let verb_at = from + rel;
+            // Verb must precede the target and sit close to it, so an
+            // unrelated "remove" elsewhere in a long pipeline does not pair
+            // with an incidental mention of the target. And in the same
+            // command: `pkill -f x; cd ~/innerwarden/wt` kills `x`, then
+            // enters a folder whose name holds the guard's.
+            if verb_at < target_at
+                && target_at - verb_at <= 40
+                && !ends.iter().any(|end| (verb_at..target_at).contains(end))
+            {
+                return Some(match target {
+                    "innerwarden" => "disable InnerWarden (flags between verb and target)",
+                    _ => "disable a host security monitor",
+                });
+            }
+            from = verb_at + verb.len();
+            if from >= lower.len() {
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// Where each command of a line ends: the byte offset of every `;`, `&`,
+/// `|` and newline outside quotes and outside parentheses, so a command
+/// substitution is one command with the one it stands in
+/// (`kill $(pgrep -f x | grep the-target)`). Read loosely: a quote left
+/// open runs to the end of the line, and a backslash outside single quotes
+/// escapes the next character. The body of a backquoted substitution is
+/// read as one of `$(...)`, and `$'...'` closes only at a quote no
+/// backslash escapes: a `;` in either is no end of a command.
+fn command_ends(line: &str) -> Vec<usize> {
+    let bytes = line.as_bytes();
+    let mut ends = Vec::new();
+    let mut depth = 0usize;
+    let mut at = 0usize;
+    while let Some(&byte) = bytes.get(at) {
+        match byte {
+            b'\\' => at += 1,
+            b'$' if bytes.get(at + 1) == Some(&b'\'') => {
+                at += 2;
+                while let Some(&b) = bytes.get(at) {
+                    if b == b'\\' {
+                        at += 1;
+                    } else if b == b'\'' {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            b'`' => {
+                at += 1;
+                while let Some(&b) = bytes.get(at) {
+                    if b == b'\\' {
+                        at += 1;
+                    } else if b == b'`' {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            b'\'' => {
+                at += 1;
+                while bytes.get(at).is_some_and(|&b| b != b'\'') {
+                    at += 1;
+                }
+            }
+            b'"' => {
+                at += 1;
+                while let Some(&b) = bytes.get(at) {
+                    if b == b'\\' {
+                        at += 1;
+                    } else if b == b'"' {
+                        break;
+                    }
+                    at += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b';' | b'&' | b'|' | b'\n' if depth == 0 => ends.push(at),
+            _ => {}
+        }
+        at += 1;
+    }
+    ends
 }
 
 /// Tearing down the host firewall. Nothing covered this: both `ufw disable` and
@@ -14954,6 +15900,15 @@ fn command_target_execution(
             TargetExecution::None
         };
     }
+    if base == "go" {
+        return if go_built_sources(effective).iter().any(|source| {
+            resolve_command_target(source, effective_cwd.as_deref(), variables) == target
+        }) {
+            TargetExecution::Interpreted
+        } else {
+            TargetExecution::None
+        };
+    }
     if !EXECUTORS.contains(&base) {
         return TargetExecution::None;
     }
@@ -15169,6 +16124,120 @@ fn wrapper_directory(
         index += 1;
     }
     None
+}
+
+/// The Go source files a `go` verb builds and runs: `go run` builds and
+/// runs them, `go test` builds and runs the tests in them and `go generate`
+/// runs the commands their `//go:generate` lines name. They are the `.go`
+/// words that follow the verb's flags, up to the first word that is not one,
+/// which starts the program's own arguments. A `-C dir` before the verb
+/// moves the command into `dir`, so each file is read from there. Empty for
+/// any other verb. A `.go` file fetched and then built this way is code from
+/// elsewhere run as surely as `sh x.sh` (measured 2026-11-18: `curl -so m.go
+/// URL && go run m.go` was allowed, and the review found `go test`,
+/// `go generate` and `go -C dir run` the same).
+///
+/// `go run mod@version` and `go install` are left as they were: the module
+/// comes through the Go module proxy and its checksum database, the same
+/// class as a package manager install, not a file fetched by hand.
+fn go_built_sources(words: &[String]) -> Vec<String> {
+    // Build and test flags that take their value as the next word.
+    const VALUE_FLAGS: &[&str] = &[
+        "-C",
+        "-o",
+        "-p",
+        "-tags",
+        "-ldflags",
+        "-gcflags",
+        "-asmflags",
+        "-gccgoflags",
+        "-mod",
+        "-modfile",
+        "-overlay",
+        "-pkgdir",
+        "-exec",
+        "-toolexec",
+        "-covermode",
+        "-coverpkg",
+        "-coverprofile",
+        "-compiler",
+        "-installsuffix",
+        "-buildmode",
+        "-pgo",
+        "-run",
+        "-skip",
+        "-bench",
+        "-benchtime",
+        "-count",
+        "-cpu",
+        "-parallel",
+        "-timeout",
+        "-shuffle",
+        "-fuzz",
+        "-fuzztime",
+        "-fuzzminimizetime",
+        "-list",
+        "-vet",
+        "-outputdir",
+        "-cpuprofile",
+        "-memprofile",
+        "-memprofilerate",
+        "-blockprofile",
+        "-blockprofilerate",
+        "-mutexprofile",
+        "-mutexprofilefraction",
+        "-trace",
+    ];
+    let mut words = words
+        .iter()
+        .skip(1)
+        .map(|word| word.trim_matches(['\'', '"']))
+        .peekable();
+    // `go -C dir verb`, `go -C=dir verb`: the only flag `go` takes before
+    // its verb.
+    let mut directory: Option<&str> = None;
+    while let Some(word) = words.peek().copied() {
+        if word == "-C" || word == "--C" {
+            words.next();
+            directory = words.next();
+        } else if let Some(dir) = word
+            .strip_prefix("-C=")
+            .or_else(|| word.strip_prefix("--C="))
+        {
+            directory = Some(dir);
+            words.next();
+        } else {
+            break;
+        }
+    }
+    if !matches!(words.next(), Some("run" | "test" | "generate")) {
+        return Vec::new();
+    }
+    let mut sources = Vec::new();
+    let mut takes_value = false;
+    for word in words {
+        if takes_value {
+            takes_value = false;
+            continue;
+        }
+        if word.starts_with('-') && sources.is_empty() {
+            let flag = word.split('=').next().unwrap_or(word);
+            let flag = flag
+                .strip_prefix('-')
+                .filter(|f| f.starts_with('-'))
+                .unwrap_or(flag);
+            takes_value = !word.contains('=') && VALUE_FLAGS.contains(&flag);
+            continue;
+        }
+        if !word.ends_with(".go") {
+            break;
+        }
+        sources.push(match directory {
+            Some(dir) if !word.starts_with('/') => format!("{}/{word}", dir.trim_end_matches('/')),
+            _ => word.to_owned(),
+        });
+    }
+    sources
 }
 
 fn interpreter_executes_target(
@@ -17376,6 +18445,27 @@ fn normalize_command_target(target: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `;` inside backquotes or inside `$'...'` (after an escaped quote)
+    /// is part of a word, not the end of a command: a stop verb and its
+    /// target around it stay one command.
+    #[test]
+    fn command_ends_skips_backquotes_and_ansi_c_quoting() {
+        assert!(command_ends("systemctl stop `echo x;` innerwarden-agent").is_empty());
+        assert!(command_ends("systemctl stop $'x\\';' innerwarden-agent").is_empty());
+        assert_eq!(command_ends("a `b`; c"), vec![5]);
+        assert_eq!(command_ends("a $'b\\'c'; d"), vec![9]);
+        assert!(
+            check_disable_verb_reaches_target("systemctl stop `echo x;` innerwarden-agent")
+                .is_some()
+        );
+        assert!(
+            check_disable_verb_reaches_target("systemctl stop $'x\\';' innerwarden-agent")
+                .is_some()
+        );
+        // A real end still splits: the guard's folder entered after a stop.
+        assert!(check_disable_verb_reaches_target("pkill -f x; cd ~/innerwarden/wt").is_none());
+    }
 
     /// Each was `allow` while its curl/wget twin was a staged fetch-and-run:
     /// the correlation only knew curl, wget and fetch as the producer of a file.
@@ -24861,6 +25951,31 @@ mod redirect_fallback_tests {
     /// with it. A line handed to a new shell sets nothing for the line that
     /// handed it.
     ///
+    /// FAILS ON REVERT of the `$'...'` arm in `single_quoted_spans`: the
+    /// tracker closed `$'\''` at its `\'`, read the rest of the line as
+    /// quoted and exempted the `eval` after `then`. The exemption itself
+    /// must refuse, not only the structural reader.
+    #[test]
+    fn an_ansi_c_quote_does_not_hide_an_eval_from_the_exemption() {
+        for probe in [
+            "echo $'\\'' ; if true; then eval \"$X\"; fi ; echo 'x'",
+            "$'a\\'b' ; eval \"$X\"",
+            "$'a\\'b' ; if true; then eval \"$X\"; fi ; echo 'x'",
+        ] {
+            assert!(!eval_only_after_opener_in_single_quotes(probe), "{probe}");
+            assert_eq!(
+                dangerous_command_in(probe),
+                Some(("shell eval (dynamic command execution)", true)),
+                "{probe}"
+            );
+        }
+        assert_eq!(single_quoted_spans("$'a\\'b' 'c'"), vec![9..10]);
+        assert_eq!(single_quoted_spans("\\$'a' $$"), vec![3..4]);
+        assert!(eval_only_after_opener_in_single_quotes(
+            "bash -c 'if false; then eval \"$(cat)\"; fi'"
+        ));
+    }
+
     /// FAILS ON REVERT of the `eval` arm in `command_starts_unhooked_agent`
     /// (what the line set is lost: the first two lists pass).
     #[test]

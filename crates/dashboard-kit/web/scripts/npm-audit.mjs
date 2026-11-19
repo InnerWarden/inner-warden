@@ -24,7 +24,7 @@
 
 import { execFileSync } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -212,16 +212,30 @@ export function main(io = realNpm, out = console.log, err = console.error, waive
  * having audited nothing. Windows compares without case (drive letters).
  */
 export function isEntry(argv1, self = fileURLToPath(import.meta.url), platform = process.platform) {
-  if (!argv1) return false;
-  let a;
-  let b;
-  try {
-    a = realpathSync(resolve(argv1));
-    b = realpathSync(self);
-  } catch {
-    return false;
-  }
-  return platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  return entryState(argv1, self, platform) === "entry";
 }
 
-if (isEntry(process.argv[1])) process.exit(main());
+/**
+ * "entry" when node was asked to run this file, "other" when it was asked to
+ * run another one (a test importing it), and "unresolved" when a path could
+ * not be resolved and `argv1` names this file. That last one used to read as
+ * "other": the gate exited 0 having audited nothing. It is a failure.
+ */
+export function entryState(argv1, self = fileURLToPath(import.meta.url), platform = process.platform) {
+  if (!argv1) return "other";
+  const same = (x, y) => (platform === "win32" ? x.toLowerCase() === y.toLowerCase() : x === y);
+  try {
+    const a = realpathSync(resolve(argv1));
+    const b = realpathSync(self);
+    return same(a, b) ? "entry" : "other";
+  } catch {
+    return same(basename(argv1), basename(self)) ? "unresolved" : "other";
+  }
+}
+
+const state = entryState(process.argv[1]);
+if (state === "unresolved") {
+  console.error("npm audit: could not resolve the path this script was run from; nothing was audited");
+  process.exit(1);
+}
+if (state === "entry") process.exit(main());

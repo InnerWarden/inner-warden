@@ -11,7 +11,10 @@
 //! between them: a rate alert crossing from the persisted tracker into the
 //! verdict, then `--block-review` turning it into a refusal.
 //!
-//! Both env vars keep the run off the developer's own state.
+//! The env vars keep the run off the developer's own state: HOME above all,
+//! because the hook rewires the Claude Code settings under it once per
+//! version, and this test run against the real home once pointed every guard
+//! hook of a machine at `target/debug/innerwarden`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -20,12 +23,29 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
 }
 
-/// Above `NOTABLE_CALLS_PER_MINUTE`, so the rate alert genuinely FIRES during
+/// The burst, on top of the seeded calls, is above
+/// `NOTABLE_CALLS_PER_MINUTE`, so the rate alert genuinely FIRES during
 /// this run. That is the point: the property under test is not "no alert", it
 /// is "an alert that fires does not refuse the command". A burst that stayed
 /// under the threshold would pass whatever the verdict logic did, and prove
 /// nothing about it.
-const BURST: usize = innerwarden_agent_guard::session::NOTABLE_CALLS_PER_MINUTE as usize + 10;
+///
+/// The burst is counted, not timed. Spawning that many hooks inside the
+/// tracker's one-minute window failed on a loaded runner (load 13 on 4 cores):
+/// the early calls aged out of the window before the late ones ran, the alert
+/// never fired, and the guard test below went red over the machine's speed.
+/// So the session starts with `NOTABLE_CALLS_PER_MINUTE` calls already on
+/// record ([`Host::seed_busy`]) and the burst only has to add the rest.
+const NOTABLE: usize = innerwarden_agent_guard::session::NOTABLE_CALLS_PER_MINUTE as usize;
+const BURST: usize = 10;
+
+/// Unix milliseconds now, from the same clock the hook reads.
+fn now_ms() -> i64 {
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after 1970");
+    i64::try_from(since.as_millis()).expect("fits")
+}
 
 struct Host {
     _dir: tempfile::TempDir,
@@ -45,6 +65,22 @@ impl Host {
         }
     }
 
+    /// Put `NOTABLE` calls on record for `session`, stamped an hour ahead of
+    /// the clock so the one-minute window never ages them out however slow
+    /// the run is. The next call the hook records crosses the threshold.
+    fn seed_busy(&self, session: &str) {
+        let ahead = now_ms() + 60 * 60 * 1000;
+        let store = serde_json::json!({
+            "sessions": {
+                session: {
+                    "last_seen_ms": now_ms(),
+                    "call_times_ms": vec![ahead; NOTABLE],
+                }
+            }
+        });
+        std::fs::write(&self.sessions, store.to_string()).expect("seed the session store");
+    }
+
     /// Screen one command exactly as the PreToolUse hook does. `true` = allowed.
     fn screen(&self, session: &str, command: &str) -> bool {
         let payload = serde_json::json!({
@@ -56,6 +92,8 @@ impl Host {
 
         let mut child = Command::new(bin())
             .args(["hook", "--block-review"])
+            .env("HOME", self._dir.path())
+            .env("USERPROFILE", self._dir.path())
             .env("IW_GRAPH_FILE", &self.graph)
             .env("IW_SESSION_FILE", &self.sessions)
             .stdin(Stdio::piped())
@@ -82,6 +120,7 @@ impl Host {
 #[test]
 fn a_burst_of_harmless_commands_is_never_refused() {
     let host = Host::new();
+    host.seed_busy("burst-session");
     let mut refused = Vec::new();
 
     for n in 0..BURST {
@@ -111,7 +150,8 @@ fn a_burst_of_harmless_commands_is_never_refused() {
 /// Skipped under coverage, for the reason `.tarpaulin.toml` already predicts:
 /// "if a coverage run dies with no failing test named, look for a test whose
 /// assertion depends on TIME or on process supervision". This one spawns the
-/// hook once per command in the burst, over a hundred processes, and
+/// hook once per command in the burst (over a hundred processes when that was
+/// measured, before the session was seeded), and
 /// instrumenting every one of them turns a test of the session tracker into a
 /// test of how fast the instrumentation can fork. Measured on the runner:
 /// `Timed out waiting for test response` after sixty seconds, against sixteen
@@ -126,6 +166,7 @@ fn a_burst_of_harmless_commands_is_never_refused() {
 #[test]
 fn the_session_layer_really_ran_during_the_burst() {
     let host = Host::new();
+    host.seed_busy("counted-session");
     for n in 0..BURST {
         host.screen("counted-session", &format!("cat README.md # read {n}"));
     }
@@ -139,9 +180,12 @@ fn the_session_layer_really_ran_during_the_burst() {
         .as_array()
         .expect("the burst must be recorded against the session id")
         .len();
-    assert!(
-        calls as u32 > innerwarden_agent_guard::session::NOTABLE_CALLS_PER_MINUTE,
-        "only {calls} calls recorded, below the threshold that raises the alert; \
-         the burst test would pass without the alert ever firing"
+    // Every call of the burst was counted on top of the seeded ones: the
+    // tracker ran in each hook, and the alert was over its threshold for all
+    // of them. A count, so it holds on a runner of any speed.
+    assert_eq!(
+        calls,
+        NOTABLE + BURST,
+        "{calls} calls recorded; the burst test would pass without the alert ever firing"
     );
 }

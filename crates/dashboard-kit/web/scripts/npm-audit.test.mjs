@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import {
   advisoryId,
   compareVersions,
+  entryState,
   isEntry,
   judge,
   main,
@@ -152,6 +153,23 @@ test("main: a waiver left behind after the advisory went fails", () => {
   const { code, err } = runMain(fakeNpm({ audit: JSON.stringify(report()) }));
   assert.equal(code, 1);
   assert.match(err.join("\n"), /no longer matches/);
+});
+
+test("a path to this script that cannot be resolved fails the gate instead of skipping it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "npm-audit-unresolved-"));
+  try {
+    // A dangling link named like the script: realpath fails on it.
+    const dangling = join(dir, "npm-audit.mjs");
+    symlinkSync(join(dir, "gone.mjs"), dangling);
+    assert.equal(entryState(dangling), "unresolved");
+    assert.equal(isEntry(dangling), false);
+    // Another file that cannot be resolved is someone else's: not this gate.
+    assert.equal(entryState(join(dir, "missing.mjs")), "other");
+    assert.equal(entryState(self), "entry");
+    assert.equal(entryState(undefined), "other");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("the script runs when reached through a symlink, and only then is it the entry", () => {

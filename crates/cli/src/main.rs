@@ -358,7 +358,7 @@ fn main() -> std::process::ExitCode {
             code
         }
         Some("install") => cmd_install(&args[1..]),
-        Some("status") => status_io_cmd(),
+        Some("status") => status_cmd(&args[1..]),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
         // Run by `contain` inside a jail that starts only once admitted.
@@ -1083,6 +1083,9 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     if let Err(why) = hook_net::arm(monitor) {
         return hook_unreadable(why, monitor);
     }
+    // A host upgraded by an older binary still runs that binary's wiring:
+    // the first hook of this version brings it up to this one's.
+    agents_io::rewire_once_per_version();
 
     let mut buf = String::new();
     if std::io::stdin().read_to_string(&mut buf).is_err() {
@@ -2509,16 +2512,54 @@ fn can_unlink(exe: &std::path::Path) -> bool {
 /// loopback so an AI agent's MCP wrapper / hook can POST to it. Mirrors the
 /// agent's `POST /api/agent/check-command` shape (body `{"command":"..."}`),
 /// minus TLS (loopback only) so the binary pulls no crypto and stays Windows-clean.
-fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
-    let mut bind = SERVE_BIND.to_string();
+/// `serve` takes only `--bind <addr>`; anything else is refused by name, and
+/// `--bind` needs its value (issue #223). Repeating `--bind` keeps the last.
+fn parse_serve_flags(rest: &[String]) -> Result<Option<String>, String> {
+    let mut bind: Option<String> = None;
     let mut it = rest.iter();
     while let Some(a) = it.next() {
-        if a.as_str() == "--bind" {
-            if let Some(v) = it.next() {
-                bind = v.clone();
-            }
+        match a.as_str() {
+            "--bind" => match it.next() {
+                Some(v) => bind = Some(v.clone()),
+                None => {
+                    return Err(format!(
+                        "--bind needs an address, for example --bind {SERVE_BIND}"
+                    ))
+                }
+            },
+            other => return Err(format!("unknown flag `{other}` for `serve`")),
         }
     }
+    Ok(bind)
+}
+
+/// `status` takes no arguments; anything here is refused by name (#223).
+fn parse_status_flags(rest: &[String]) -> Result<(), String> {
+    match rest.first() {
+        Some(flag) => Err(format!(
+            "unexpected argument `{flag}` for `status`; it takes no arguments"
+        )),
+        None => Ok(()),
+    }
+}
+
+fn status_cmd(rest: &[String]) -> std::process::ExitCode {
+    if let Err(msg) = parse_status_flags(rest) {
+        eprintln!("innerwarden status: {msg}");
+        return std::process::ExitCode::from(2);
+    }
+    status_io_cmd()
+}
+
+fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
+    let bind = match parse_serve_flags(rest) {
+        Ok(Some(b)) => b,
+        Ok(None) => SERVE_BIND.to_string(),
+        Err(msg) => {
+            eprintln!("innerwarden serve: {msg}");
+            return std::process::ExitCode::from(2);
+        }
+    };
 
     // Shell surface only: an engine that holds just the rules a command can
     // match, on a process that runs per tool call. See
@@ -3013,6 +3054,30 @@ mod status_wiring_tests {
                     .as_deref(),
                 Some(w.partly_unscreened[0].sentence.as_str())
             );
+            // And through the row the dashboard serves: its guarded gate
+            // (`status_is_effectively_guarded` in `agents_json_with_status`)
+            // keeps the agent connected, and `agent_unscreened` says the
+            // words `status` prints.
+            let payload: serde_json::Value =
+                serde_json::from_str(&dashboard::agents_json(home.path(), &rows)).unwrap();
+            let row = payload["agents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == "claude-code")
+                .expect("claude-code row");
+            assert_ne!(
+                row["guardrail"]["mode"], "not_configured",
+                "monitor={monitor}: {row}"
+            );
+            assert!(row["guardrail"]["mode"].is_string(), "{row}");
+            assert_eq!(
+                row["unscreened"]["line"],
+                status::partly_unscreened_words("claude-code", &w.partly_unscreened[0].sentence)
+                    .as_str(),
+                "monitor={monitor}: {row}"
+            );
+            assert!(row.get("judges").is_none(), "{row}");
 
             // Whole again: no caveat, and the tool classes say what it judges.
             runnable(&home.path().join("gone/innerwarden"));
@@ -3955,6 +4020,58 @@ mod install_target_tests {
             };
             assert!(stderr.contains(said), "{mode}: {stderr}");
         }
+    }
+}
+
+#[cfg(test)]
+mod flag_parse_tests {
+    use super::*;
+
+    #[test]
+    fn serve_parses_bind_and_keeps_the_last_one() {
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_serve_flags(&none).unwrap(), None);
+        let bind = |v: &str| vec!["--bind".to_string(), v.to_string()];
+        assert_eq!(
+            parse_serve_flags(&bind("127.0.0.1:9")).unwrap(),
+            Some("127.0.0.1:9".into())
+        );
+        let two = vec![
+            "--bind".to_string(),
+            "a:1".to_string(),
+            "--bind".to_string(),
+            "b:2".to_string(),
+        ];
+        assert_eq!(parse_serve_flags(&two).unwrap(), Some("b:2".into()));
+    }
+
+    #[test]
+    fn serve_refuses_an_unknown_flag_by_name() {
+        let bogus = vec!["--bnd".to_string(), "127.0.0.1:1".to_string()];
+        let err = parse_serve_flags(&bogus).unwrap_err();
+        assert!(err.contains("`--bnd`"), "{err}");
+    }
+
+    #[test]
+    fn serve_refuses_bind_without_a_value_with_an_example() {
+        let missing = vec!["--bind".to_string()];
+        let err = parse_serve_flags(&missing).unwrap_err();
+        assert!(
+            err.contains("needs an address") && err.contains(SERVE_BIND),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn status_takes_no_arguments() {
+        let none: Vec<String> = vec![];
+        assert!(parse_status_flags(&none).is_ok());
+        let bogus = vec!["--bogus".to_string()];
+        let err = parse_status_flags(&bogus).unwrap_err();
+        assert!(
+            err.contains("unexpected argument") && err.contains("`--bogus`"),
+            "{err}"
+        );
     }
 }
 
