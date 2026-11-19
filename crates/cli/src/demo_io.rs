@@ -65,10 +65,11 @@ pub(crate) fn cmd(rest: &[String]) -> ExitCode {
     let nonce = new_nonce();
     let agents = gather(&home, &rows, &calls, &nonce);
     // "Running" only from the process scan (a row's pids), never from an
-    // agent's config dir or binary merely being here.
-    let running = rows.iter().any(|row| !row.pids.is_empty());
-    let none = (!agents.iter().any(|a| a.wired))
-        .then(|| crate::status::nothing_wired_finding(Some(running)));
+    // agent's config dir or binary merely being here; unknown where the scan
+    // cannot look. Shared with `status`.
+    let running = agents_ops::any_agent_running(&rows);
+    let none =
+        (!agents.iter().any(|a| a.wired)).then(|| crate::status::nothing_wired_finding(running));
     if as_json {
         println!("{}", demo::to_json(&agents, none.as_ref()));
     } else {
