@@ -495,35 +495,7 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     // said `[on] Wired into 1: claude-code.` on a Mac whose hook pointed at a
     // cleaned build for weeks, so an agent is only "wired" here once the
     // program its hook runs is there.
-    for trouble in &facts.hook_trouble {
-        match &trouble.program {
-            HookProgram::Broken { problem, .. } => out.push(Finding::NotWorking {
-                what: format!(
-                    "{} is wired, but {problem}, so {}.",
-                    trouble.agent,
-                    if trouble.via_proxy {
-                        "its MCP servers cannot start"
-                    } else {
-                        "none of its commands are screened"
-                    }
-                ),
-                next: trouble.next.clone(),
-            }),
-            HookProgram::Unknown { why, .. } => out.push(Finding::Unknown {
-                what: format!(
-                    "{} is wired, but I could not confirm its {} can run.",
-                    trouble.agent,
-                    if trouble.via_proxy {
-                        "MCP proxy"
-                    } else {
-                        "hook"
-                    }
-                ),
-                why: format!("{why}. If it does not, `{}` rewrites it.", trouble.next),
-            }),
-            HookProgram::Runs => {}
-        }
-    }
+    out.extend(facts.hook_trouble.iter().filter_map(trouble_finding));
     // Claude Code runs a hook whose program is gone as a non-blocking error,
     // for a file write or a tool result just as for a shell command. A Bash
     // hook that runs said nothing about the others, so `[on]` stood while
@@ -556,26 +528,7 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
         )));
         out.extend(facts.tool_classes.iter().map(tool_classes_finding));
     } else if facts.hook_trouble.is_empty() {
-        match facts.any_agent_seen {
-            Some(true) => out.push(Finding::NotWorking {
-                what: "An agent is running but nothing is wired to the guard, so \
-                       its commands are not screened."
-                    .into(),
-                next: "innerwarden agents connect --all --monitor".into(),
-            }),
-            Some(false) => out.push(Finding::NotWorking {
-                what: "No agent is wired, and none of the agents I know by name \
-                       are running."
-                    .into(),
-                next: "start your agent, then: innerwarden agents connect --all --monitor".into(),
-            }),
-            None => out.push(Finding::Unknown {
-                what: "Could not tell whether any agent is running.".into(),
-                why: "Process inspection failed. An agent may well be running; I \
-                      simply could not look."
-                    .into(),
-            }),
-        }
+        out.push(nothing_wired_finding(facts.any_agent_seen));
     }
 
     // ── Evidence ────────────────────────────────────────────────────────────
@@ -658,6 +611,63 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     }
 
     out
+}
+
+/// The line for one wired agent whose hook or MCP proxy is not known to run.
+/// `None` for one that runs. Shared with `demo`, so the two say the same.
+pub fn trouble_finding(trouble: &HookTrouble) -> Option<Finding> {
+    match &trouble.program {
+        HookProgram::Broken { problem, .. } => Some(Finding::NotWorking {
+            what: format!(
+                "{} is wired, but {problem}, so {}.",
+                trouble.agent,
+                if trouble.via_proxy {
+                    "its MCP servers cannot start"
+                } else {
+                    "none of its commands are screened"
+                }
+            ),
+            next: trouble.next.clone(),
+        }),
+        HookProgram::Unknown { why, .. } => Some(Finding::Unknown {
+            what: format!(
+                "{} is wired, but I could not confirm its {} can run.",
+                trouble.agent,
+                if trouble.via_proxy {
+                    "MCP proxy"
+                } else {
+                    "hook"
+                }
+            ),
+            why: format!("{why}. If it does not, `{}` rewrites it.", trouble.next),
+        }),
+        HookProgram::Runs => None,
+    }
+}
+
+/// The line when no agent is wired and no wiring is in trouble, from whether
+/// any agent was seen (`None`: could not look). Shared with `demo`.
+pub fn nothing_wired_finding(any_agent_seen: Option<bool>) -> Finding {
+    match any_agent_seen {
+        Some(true) => Finding::NotWorking {
+            what: "An agent is running but nothing is wired to the guard, so \
+                   its commands are not screened."
+                .into(),
+            next: "innerwarden agents connect --all --monitor".into(),
+        },
+        Some(false) => Finding::NotWorking {
+            what: "No agent is wired, and none of the agents I know by name \
+                   are running."
+                .into(),
+            next: "start your agent, then: innerwarden agents connect --all --monitor".into(),
+        },
+        None => Finding::Unknown {
+            what: "Could not tell whether any agent is running.".into(),
+            why: "Process inspection failed. An agent may well be running; I \
+                  simply could not look."
+                .into(),
+        },
+    }
 }
 
 /// Is this install doing its job? Only `Working` on the things that matter.

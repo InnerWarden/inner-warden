@@ -32,6 +32,8 @@ mod contain_io;
 mod dashboard;
 mod dashboard_community;
 mod dashboard_identity;
+mod demo;
+mod demo_io;
 mod first_run;
 mod graph_io;
 mod help;
@@ -359,6 +361,7 @@ fn main() -> std::process::ExitCode {
         }
         Some("install") => cmd_install(&args[1..]),
         Some("status") => status_io_cmd(),
+        Some("demo") => demo_io::cmd(&args[1..]),
         Some("agents") => agents_io::cmd(&args[1..]),
         Some("contain") => contain_io::cmd(&args[1..]),
         // Run by `contain` inside a jail that starts only once admitted.
@@ -1073,6 +1076,13 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         return hook_unreadable("stdin could not be read", monitor);
     }
+    // A call `innerwarden demo` sent: judged exactly as an agent's, but
+    // nothing is recorded, alerted on or asked of a second opinion, and the
+    // verdict is also written to stdout for the demo to show.
+    let demo = demo::is_demo_payload(&buf);
+    if demo && hook_tool_result(&buf).is_some() {
+        return std::process::ExitCode::SUCCESS;
+    }
     // PostToolUse: the tool already ran, so there is nothing to permit or
     // refuse. Record what its result carried and exit 0. Doing this BEFORE the
     // command extraction matters: a PostToolUse payload also carries the
@@ -1090,14 +1100,15 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // The agent's own file tools never pass through the shell. Judged on
     // where they write, before anything else: a project edit leaves here at
     // once, without loading the rule engine or touching the record.
-    if let Some(exit) = screen_file_tool(&buf, rest, monitor) {
+    if let Some(exit) = screen_file_tool(&buf, rest, monitor, demo) {
         return exit;
     }
 
     let options = ShellScreenOptions {
         monitor,
         block_review,
-        record: true,
+        record: !demo,
+        demo,
         host: None,
     };
     let screened = match screen_shell(&buf, rest, &options) {
@@ -1112,6 +1123,16 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         blocks: would_block_under_policy,
         ..
     } = screened;
+    if demo {
+        println!(
+            "{}",
+            demo::hook_report(
+                verdict.get("recommendation").and_then(|r| r.as_str()),
+                would_block_under_policy,
+                verdict.get("explanation").and_then(|e| e.as_str()),
+            )
+        );
+    }
 
     if !monitor && would_block_under_policy {
         let rec = verdict
@@ -1162,6 +1183,11 @@ pub(crate) struct ShellScreenOptions<'a> {
     /// (OpenClaw's guard asks the person to approve a review), so the caller
     /// records it once it is.
     pub record: bool,
+    /// A call `innerwarden demo` sent: no session behaviour is read or
+    /// written and no second opinion is asked, so the demo changes nothing
+    /// and calls nothing outside this machine. The rules, the person's
+    /// suppressions and the profiles still decide, as for an agent's call.
+    pub demo: bool,
     /// Asked after the hook's own decision, with the command: the host's own
     /// recommendation for it (`allow`, `review` or `deny`), or `None` when
     /// the host did not answer. It only ever makes the decision stricter
@@ -1212,6 +1238,7 @@ pub(crate) fn screen_shell(
         monitor,
         block_review,
         record,
+        demo,
         host,
     } = *options;
     let (lines, file_read) = match classify_hook_input(buf) {
@@ -1255,7 +1282,7 @@ pub(crate) fn screen_shell(
     // A read tool is neither: it sends nothing anywhere, so where its path
     // came from is no step of the two-step attack, and an agent opens files
     // by the dozen, so its calls would be a burst on their own.
-    let (behaviour, taints) = if file_read {
+    let (behaviour, taints) = if file_read || demo {
         (None, vec![None; judged.len()])
     } else {
         let commands: Vec<&str> = judged.iter().map(|(command, _)| command.as_str()).collect();
@@ -1289,7 +1316,13 @@ pub(crate) fn screen_shell(
         let suppressed = suppress_io::consider(&command, &rules);
         let person_allowed = suppressed.is_some();
         let verdict = suppressed
-            .or_else(|| second_opinion_io::consider(&command, &rules))
+            .or_else(|| {
+                if demo {
+                    None
+                } else {
+                    second_opinion_io::consider(&command, &rules)
+                }
+            })
             .unwrap_or(rules);
         let verdict = apply_behaviour(verdict, behaviour.as_ref());
         let verdict = apply_taint(verdict, tainted.as_ref());
@@ -1503,7 +1536,12 @@ pub(crate) fn stricter_with_host(
 /// every other file edit exits 0 at once and records nothing, because an
 /// agent edits project files all day and a record of each would bury the
 /// decisions that matter.
-fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::process::ExitCode> {
+fn screen_file_tool(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    demo: bool,
+) -> Option<std::process::ExitCode> {
     use innerwarden_agent_guard::file_tools::{self, FileToolCall};
     let payload = serde_json::from_str::<serde_json::Value>(buf).ok()?;
     let (tool, paths) = match file_tools::file_tool_call(&payload) {
@@ -1512,9 +1550,20 @@ fn screen_file_tool(buf: &str, rest: &[String], monitor: bool) -> Option<std::pr
         FileToolCall::Writes { tool, paths } => (tool, paths),
     };
     Some(
-        match screen_file_writes(buf, rest, monitor, &tool, &paths) {
-            FileScreen::Pass => std::process::ExitCode::SUCCESS,
+        match screen_file_writes(buf, rest, monitor, !demo, &tool, &paths) {
+            FileScreen::Pass => {
+                if demo {
+                    println!("{}", demo::hook_report(Some("allow"), false, None));
+                }
+                std::process::ExitCode::SUCCESS
+            }
             FileScreen::Refused { explanation } => {
+                if demo {
+                    println!(
+                        "{}",
+                        demo::hook_report(Some("deny"), true, Some(&explanation))
+                    );
+                }
                 if monitor {
                     return Some(std::process::ExitCode::SUCCESS);
                 }
@@ -1545,6 +1594,7 @@ pub(crate) fn screen_file_writes(
     buf: &str,
     rest: &[String],
     monitor: bool,
+    record: bool,
     tool: &str,
     paths: &[String],
 ) -> FileScreen {
@@ -1565,9 +1615,14 @@ pub(crate) fn screen_file_writes(
         // A revoked agent is refused every file change too, where profiles
         // are in force. With no profiles file this is one failed open of
         // each file and the edit goes through, as before.
-        return file_tool_revoked(buf, rest, monitor, tool, paths);
+        return file_tool_revoked(buf, rest, monitor, record, tool, paths);
     };
     let verdict = file_tools::refusal_verdict(tool, path, what);
+    if !record {
+        return FileScreen::Refused {
+            explanation: file_tools::refusal_explanation(tool, path, what),
+        };
+    }
     let command = format!("{tool} {}", path.trim());
     let payload_session = hook_session(buf);
     let identity = hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
@@ -1603,6 +1658,7 @@ fn file_tool_revoked(
     buf: &str,
     rest: &[String],
     monitor: bool,
+    record: bool,
     tool: &str,
     paths: &[String],
 ) -> FileScreen {
@@ -1620,6 +1676,11 @@ fn file_tool_revoked(
         return FileScreen::Pass;
     };
     let path = paths.first().map(|p| p.trim()).unwrap_or("");
+    if !record {
+        return FileScreen::Refused {
+            explanation: revoked.sentence().to_string(),
+        };
+    }
     let command = format!("{tool} {path}");
     let verdict = serde_json::json!({
         "recommendation": "deny",
@@ -2785,6 +2846,7 @@ fn help_text() -> String {
          \n\
          USAGE:\n  \
            {p} status                    is it on, and is it screening anything? start here\n  \
+           {p} demo [--json]             send known risky calls through each connected agent's guard\n  \
            {p} setup                     first-run wizard: pick what to enable (arrow keys)\n  \
              {p} dry-run                   put EVERY connected agent in monitor: records, never blocks\n  \
              {p} enforce                   the opposite: a denied command is actually refused\n  \

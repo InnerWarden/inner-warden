@@ -207,6 +207,24 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              dashboard answers. Anything it cannot read says [unknown], never [off].\n  \
              Takes no arguments."
         ),
+        "demo" => format!(
+            "{p} demo [--json]\n  \
+             Send four well-known risky calls (a download piped into a shell, a read of\n  \
+             ~/.ssh/id_ed25519, a write to ~/.claude/settings.json, rm -rf ~ inside bash -c)\n  \
+             the way each connected agent's own calls go: through the hook its settings\n  \
+             run, or through the MCP proxy's own rules. Prints, per agent, whether it is\n  \
+             wired and what happened to each call. Nothing is run and nothing is\n  \
+             recorded; the MCP servers are not started.\n\
+             \n  \
+             --json    machine output\n\
+             \n  \
+             Exit codes:\n  \
+             0  every call sent to every connected agent was refused\n  \
+             1  at least one call would not have been stopped, or a wired agent's\n  \
+             \x20  hook or proxy cannot run\n  \
+             2  bad arguments\n  \
+             3  no agent is connected (the output says how to connect one)"
+        ),
         "agents" => {
             if rest.first().map(String::as_str) == Some("auto-connect") {
                 crate::agents_io::auto_connect_help_text()
@@ -1114,6 +1132,7 @@ mod tests {
         "install",
         "uninstall",
         "status",
+        "demo",
         "agents",
         "contain",
         "enforce",
