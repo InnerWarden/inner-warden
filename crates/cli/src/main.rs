@@ -1094,16 +1094,16 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     if std::io::stdin().read_to_string(&mut buf).is_err() {
         return hook_unreadable("stdin could not be read", monitor);
     }
-    // A call `innerwarden demo` sent: judged exactly as an agent's, but
-    // nothing is recorded, alerted on or asked of a second opinion, and the
-    // verdict is also written to stdout for the demo to show.
+    // A call `innerwarden demo` sent: judged exactly as an agent's and
+    // recorded like one, with `demo: true` beside it. It is not alerted on
+    // nor asked of a second opinion, and its verdict is also written to
+    // stdout for the demo to show. The marker never skips the record: a
+    // caller that guessed or copied this run's nonce gets a quieter call, not
+    // an unrecorded one.
     // Only with this run's nonce, handed to this process by the demo in its
     // environment: a payload alone, whatever it carries, is never a demo call.
     let demo_nonce = std::env::var(demo::DEMO_NONCE_ENV).ok();
     let demo = demo::is_demo_payload(&buf, demo_nonce.as_deref());
-    if demo && hook_tool_result(&buf).is_some() {
-        return std::process::ExitCode::SUCCESS;
-    }
     // PostToolUse: the tool already ran, so there is nothing to permit or
     // refuse. Record what its result carried and exit 0. Doing this BEFORE the
     // command extraction matters: a PostToolUse payload also carries the
@@ -1128,7 +1128,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let options = ShellScreenOptions {
         monitor,
         block_review,
-        record: !demo,
+        record: true,
         demo,
         host: None,
     };
@@ -1205,9 +1205,10 @@ pub(crate) struct ShellScreenOptions<'a> {
     /// records it once it is.
     pub record: bool,
     /// A call `innerwarden demo` sent: no session behaviour is read or
-    /// written and no second opinion is asked, so the demo changes nothing
-    /// and calls nothing outside this machine. The rules, the person's
-    /// suppressions and the profiles still decide, as for an agent's call.
+    /// written, no second opinion is asked and no alert is sent, so the demo
+    /// calls nothing outside this machine. It is still recorded, with
+    /// `demo: true`. The rules, the person's suppressions and the profiles
+    /// still decide, as for an agent's call.
     pub demo: bool,
     /// Asked after the hook's own decision, with the command: the host's own
     /// recommendation for it (`allow`, `review` or `deny`), or `None` when
@@ -1452,6 +1453,7 @@ pub(crate) fn screen_shell(
             monitor,
             would_block_under_policy,
             deciding_layer.clone(),
+            demo,
         );
     }
     ShellScreen::Screened(ShellScreened {
@@ -1465,7 +1467,9 @@ pub(crate) fn screen_shell(
 /// Record one screened shell command of `buf` and alert on a refusal, as the
 /// hook records every command it screens: in monitor a refusal is a
 /// `would_block`, in enforce `blocked` (`would_block` says the policy refuses
-/// it). The payload's event id makes a delivery idempotent.
+/// it). The payload's event id makes a delivery idempotent. A `demo` call is
+/// recorded with `demo: true` and never alerted on.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_shell(
     buf: &str,
     rest: &[String],
@@ -1474,6 +1478,7 @@ pub(crate) fn record_shell(
     monitor: bool,
     would_block: bool,
     layer: Option<graph_io::LayerLabel>,
+    demo: bool,
 ) {
     let source_session = hook_session(buf);
     let identity = hook_identity::current(agent_flag(rest).as_deref(), source_session.as_deref());
@@ -1488,8 +1493,9 @@ pub(crate) fn record_shell(
         hook_cwd(buf).as_deref(),
         identity.as_ref(),
         layer,
+        demo,
     );
-    if would_block {
+    if would_block && !demo {
         // In monitor mode this is a would-block alert; in enforce it accompanies
         // the real block. Alerting must not change the hook outcome.
         notify_io::fire(command, verdict);
@@ -1571,7 +1577,7 @@ fn screen_file_tool(
         FileToolCall::Writes { tool, paths } => (tool, paths),
     };
     Some(
-        match screen_file_writes(buf, rest, monitor, !demo, &tool, &paths) {
+        match screen_file_writes(buf, rest, monitor, demo, &tool, &paths) {
             FileScreen::Pass => {
                 if demo {
                     println!("{}", demo::hook_report(Some("allow"), false, None));
@@ -1610,12 +1616,13 @@ pub(crate) enum FileScreen {
 
 /// The file side of the hook, for the paths one call writes (`tool` is the
 /// name the record shows): a privileged file is refused by the hard rule, a
-/// revoked agent every file change; each refusal recorded and alerted on.
+/// revoked agent every file change; each refusal recorded and, unless it is a
+/// `demo` call, alerted on.
 pub(crate) fn screen_file_writes(
     buf: &str,
     rest: &[String],
     monitor: bool,
-    record: bool,
+    demo: bool,
     tool: &str,
     paths: &[String],
 ) -> FileScreen {
@@ -1636,14 +1643,9 @@ pub(crate) fn screen_file_writes(
         // A revoked agent is refused every file change too, where profiles
         // are in force. With no profiles file this is one failed open of
         // each file and the edit goes through, as before.
-        return file_tool_revoked(buf, rest, monitor, record, tool, paths);
+        return file_tool_revoked(buf, rest, monitor, demo, tool, paths);
     };
     let verdict = file_tools::refusal_verdict(tool, path, what);
-    if !record {
-        return FileScreen::Refused {
-            explanation: file_tools::refusal_explanation(tool, path, what),
-        };
-    }
     let command = format!("{tool} {}", path.trim());
     let payload_session = hook_session(buf);
     let identity = hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
@@ -1664,8 +1666,11 @@ pub(crate) fn screen_file_writes(
         hook_cwd(buf).as_deref(),
         identity.as_ref(),
         deciding_layer,
+        demo,
     );
-    notify_io::fire(&command, &verdict);
+    if !demo {
+        notify_io::fire(&command, &verdict);
+    }
     FileScreen::Refused {
         explanation: file_tools::refusal_explanation(tool, path, what),
     }
@@ -1679,7 +1684,7 @@ fn file_tool_revoked(
     buf: &str,
     rest: &[String],
     monitor: bool,
-    record: bool,
+    demo: bool,
     tool: &str,
     paths: &[String],
 ) -> FileScreen {
@@ -1697,11 +1702,6 @@ fn file_tool_revoked(
         return FileScreen::Pass;
     };
     let path = paths.first().map(|p| p.trim()).unwrap_or("");
-    if !record {
-        return FileScreen::Refused {
-            explanation: revoked.sentence().to_string(),
-        };
-    }
     let command = format!("{tool} {path}");
     let verdict = serde_json::json!({
         "recommendation": "deny",
@@ -1721,6 +1721,7 @@ fn file_tool_revoked(
         hook_cwd(buf).as_deref(),
         identity.as_ref(),
         Some(innerwarden_agent_guard::identity::RuleLayer::Hard.into()),
+        demo,
     );
     FileScreen::Refused {
         explanation: revoked.sentence().to_string(),

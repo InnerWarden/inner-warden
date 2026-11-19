@@ -170,7 +170,7 @@ fn cmd_screen(rest: &[String]) -> std::process::ExitCode {
             "unreadable": true,
         })),
         Screen::Files { tool, paths } => {
-            match crate::screen_file_writes(&buf, &rest, monitor, true, tool, paths) {
+            match crate::screen_file_writes(&buf, &rest, monitor, false, tool, paths) {
                 crate::FileScreen::Pass => answer_line(&guard::answer(Decision::Allow, None, None)),
                 crate::FileScreen::Refused { .. } => {
                     answer_line(&guard::answer(Decision::Deny, None, None))
@@ -234,6 +234,7 @@ fn screen_command(
             monitor,
             decision != Decision::Allow,
             screened.layer.clone(),
+            false,
         );
         return answer_line(&with_host(guard::answer(decision, None, None)));
     }
@@ -299,6 +300,7 @@ fn cmd_resolved(rest: &[String]) -> std::process::ExitCode {
         false,
         !resolution.ran(),
         None,
+        false,
     );
     std::process::ExitCode::SUCCESS
 }

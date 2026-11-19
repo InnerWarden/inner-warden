@@ -51,10 +51,18 @@ pub(crate) const EXIT_NOTHING_CONNECTED: u8 = 3;
 
 /// Whether a hook payload is one `innerwarden demo` sent: this run's nonce
 /// (`nonce`, read from [`DEMO_NONCE_ENV`] by the hook) at [`DEMO_MARKER`],
-/// at the top level only. An agent controls what goes inside `tool_input`,
-/// never the payload around it nor the hook's environment, so a command that
-/// merely mentions the marker, or a payload with `true` there, is screened
-/// and recorded like any other.
+/// at the top level only. A command that merely mentions the marker, or a
+/// payload with `true` there, is not a demo call.
+///
+/// What this does NOT prove: that the demo sent the call. The agent's own
+/// hook runs with the environment its agent gives it, so an agent cannot set
+/// the variable there; but an agent with a shell can run `innerwarden hook`
+/// itself with any environment and payload it likes, and the nonce sits in
+/// `/proc/<pid>/environ` of the demo's hooks, readable by the same user,
+/// while they run. So a demo call only ever changes what is quiet: no alert,
+/// no second opinion, no session behaviour. It is recorded like any other,
+/// with `demo: true`. And the guard refuses an agent's shell line that runs
+/// its hook or sets [`DEMO_NONCE_ENV`], as it refuses its other commands.
 pub(crate) fn is_demo_payload(buf: &str, nonce: Option<&str>) -> bool {
     let Some(nonce) = nonce.filter(|n| n.len() >= MIN_NONCE_LEN) else {
         return false;
@@ -434,7 +442,7 @@ fn header(sent: usize) -> String {
     }
     format!(
         "\n  InnerWarden demo: {sent} risky calls, sent the way each connected agent's own calls go.\n  \
-         Nothing was run, and nothing was recorded.\n\n"
+         Nothing was run; each call a hook judged is in the record, marked demo.\n\n"
     )
 }
 
@@ -545,7 +553,7 @@ pub(crate) fn to_json(agents: &[AgentDemo], none: Option<&Finding>) -> Value {
     let code = exit_code(agents);
     json!({
         "nothing_run": true,
-        "nothing_recorded": true,
+        "recorded_as_demo": true,
         "result": match code {
             EXIT_ALL_REFUSED => "all_refused",
             EXIT_NOTHING_CONNECTED => "nothing_connected",

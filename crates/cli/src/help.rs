@@ -213,8 +213,9 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              ~/.ssh/id_ed25519, a write to ~/.claude/settings.json, rm -rf ~ inside bash -c)\n  \
              the way each connected agent's own calls go: through the hook its settings\n  \
              run, or through the MCP proxy's own rules. Prints, per agent, whether it is\n  \
-             wired and what happened to each call. Nothing is run and nothing is\n  \
-             recorded; the MCP servers are not started.\n\
+             wired and what happened to each call. Nothing is run. A call a hook\n  \
+             judged is recorded like an agent's, marked demo, and sends no alert;\n  \
+             the MCP servers are not started.\n\
              \n  \
              --json    machine output\n\
              \n  \
