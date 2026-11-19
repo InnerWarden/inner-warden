@@ -13886,10 +13886,379 @@ fn sensitive_read_nested(
     depth: u8,
 ) -> Option<(&'static str, u32)> {
     let (readings, _) = assignment_readings(content);
-    readings
+    let mut found = None;
+    for reading in &readings {
+        // A substitution that reshapes a path is judged by the path it
+        // prints, in place of the line as written.
+        let hit = match resolve_path_substitutions(reading) {
+            PathSubstitutions::SshUnresolved => Some((".ssh/", 60)),
+            PathSubstitutions::Resolved(resolved) => {
+                sensitive_read_in(&resolved, as_written, depth)
+            }
+            PathSubstitutions::None => sensitive_read_in(reading, as_written, depth),
+        };
+        found = [found, hit]
+            .into_iter()
+            .flatten()
+            .max_by_key(|&(_, score)| score);
+    }
+    // The reading the other rules scan blanks what a command only prints,
+    // and `$(echo "$F" | sed 's/\.pub$//')` is a path made from what `echo`
+    // prints: the line as written is asked too, for these substitutions only.
+    if as_written != content && as_written.contains("$(") {
+        let (written, _) = assignment_readings(as_written);
+        for reading in &written {
+            let hit = match resolve_path_substitutions(reading) {
+                PathSubstitutions::SshUnresolved => Some((".ssh/", 60)),
+                PathSubstitutions::Resolved(resolved) => {
+                    sensitive_read_in(&resolved, as_written, depth)
+                }
+                PathSubstitutions::None => None,
+            };
+            found = [found, hit]
+                .into_iter()
+                .flatten()
+                .max_by_key(|&(_, score)| score);
+        }
+    }
+    found
+}
+
+/// What a line's command substitutions make of a path the line names, when
+/// each one that reshapes a path is worked out ([`resolve_path_substitutions`]).
+#[derive(Debug, PartialEq, Eq)]
+enum PathSubstitutions {
+    /// No substitution reshapes a path.
+    None,
+    /// The line with each such substitution replaced by what it prints.
+    Resolved(String),
+    /// One reshapes a path in `~/.ssh` and is not worked out here.
+    SshUnresolved,
+}
+
+/// The programs that reshape a name: what they print is a path made from
+/// the one they are given.
+const PATH_SHAPERS: &[&str] = &["basename", "dirname", "sed", "cut", "tr", "awk"];
+
+/// PURE. Each `$(...)` of `line` that runs `basename`, `dirname`, or prints a
+/// path through `sed s///`, `cut` or `tr` (`$(echo P | sed 's/\.pub$//')`),
+/// worked out on the path it is given: `cat "$(dirname "$F")/$(basename "$F"
+/// .pub)"` with `F=~/.ssh/id_ed25519.pub` reads `~/.ssh/id_ed25519`, and
+/// `cat "$(dirname "$F")/known_hosts"` reads the public file. Asked of a line
+/// whose own assignments are already read into it. One that holds a path in
+/// `~/.ssh` and is not worked out (a value set at run time, a `sed` program
+/// beyond one plain `s///`) is taken as the private key: measured
+/// 2026-11-19, the `sed`, `cut` and `tr` forms were allowed.
+fn resolve_path_substitutions(line: &str) -> PathSubstitutions {
+    if !line.contains("$(") {
+        return PathSubstitutions::None;
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut changed = false;
+    while let Some(at) = rest.find("$(") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let Some(end) = substitution_end(after) else {
+            out.push_str(&rest[at..]);
+            rest = "";
+            break;
+        };
+        let body = &after[..end];
+        let shapes = body
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| PATH_SHAPERS.contains(&word));
+        if !shapes {
+            out.push_str(&rest[at..at + 2 + end + 1]);
+        } else if let Some(printed) = shaped_path(body) {
+            out.push_str(&printed);
+            changed = true;
+        } else if body.contains(".ssh") || holds_a_name_set_from_ssh(line, body) {
+            return PathSubstitutions::SshUnresolved;
+        } else {
+            out.push_str(&rest[at..at + 2 + end + 1]);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    if changed {
+        PathSubstitutions::Resolved(out)
+    } else {
+        PathSubstitutions::None
+    }
+}
+
+/// PURE. Whether `body` refers to a variable that `line` sets to text
+/// naming `~/.ssh` (`K=$(ls ~/.ssh/*.pub | head -1)`): a value the shell
+/// works out at run time from the keys' folder.
+fn holds_a_name_set_from_ssh(line: &str, body: &str) -> bool {
+    static REFERENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let reference = REFERENCE.get_or_init(|| {
+        regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").expect("static reference regex")
+    });
+    reference.captures_iter(body).any(|found| {
+        let name = &found[1];
+        let assignment = format!("{name}=");
+        line.match_indices(&assignment).any(|(at, _)| {
+            let starts_word = line[..at]
+                .chars()
+                .last()
+                .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_'));
+            let value = &line[at + assignment.len()..];
+            let end = value.find([';', '\n']).unwrap_or(value.len());
+            // A value written out is read into the line by its next
+            // reading and worked out there.
+            let value = &value[..end];
+            starts_word && value.contains(".ssh") && value.contains(['$', '`'])
+        })
+    })
+}
+
+/// PURE. Where the `)` that closes a `$(` is in `text` (the text after the
+/// `$(`), past nested parentheses and quotes.
+fn substitution_end(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (at, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => escaped = true,
+            (Some('"'), '"') => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') if depth == 0 => return Some(at),
+            (None, ')') => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// PURE. The words of a short command, with quotes and backslashes taken
+/// as the shell takes them, and the `|` that ends each stage of a pipeline
+/// as a word of its own. `None` for anything decided at run time: a `$`, a
+/// backtick, a glob, a redirection, a list.
+fn plain_words(text: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                started = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '"' => {
+                started = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) => {
+                            word.push(chars.next()?);
+                        }
+                        '$' | '`' => return None,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                started = true;
+                word.push(chars.next()?);
+            }
+            '$' | '`' | '*' | '?' | '[' | '<' | '>' | ';' | '&' | '(' | ')' => return None,
+            '|' => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+                words.push("|".to_string());
+            }
+            c if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            c => {
+                started = true;
+                word.push(c);
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
+}
+
+/// PURE. What the substitution body `body` prints, when it is one of the
+/// forms [`resolve_path_substitutions`] works out: `basename P [SUFFIX]`,
+/// `dirname P`, or `echo P` / `printf %s P` piped through any number of
+/// `sed 's/RE/TEXT/[g]'`, `cut -dC -fN` and `tr -d SET` / `tr SET1 SET2`
+/// stages.
+fn shaped_path(body: &str) -> Option<String> {
+    let words = plain_words(body)?;
+    let stages: Vec<&[String]> = words.split(|word| word == "|").collect();
+    let (first, rest) = stages.split_first()?;
+    let mut value = match first
         .iter()
-        .filter_map(|reading| sensitive_read_in(reading, as_written, depth))
-        .max_by_key(|&(_, score)| score)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["basename", path] => basename_of(path, ""),
+        ["basename", path, suffix] => basename_of(path, suffix),
+        ["dirname", path] => dirname_of(path),
+        ["echo", path] | ["printf", "%s", path] | ["printf", "%s\\n", path] => (*path).to_string(),
+        _ => return None,
+    };
+    for stage in rest {
+        let stage: Vec<&str> = stage.iter().map(String::as_str).collect();
+        value = match stage.as_slice() {
+            ["sed", program] | ["sed", "-e", program] => sed_substitute(&value, program)?,
+            ["cut", delimiter, field] => cut_field(&value, delimiter, field)?,
+            ["tr", "-d", set] => {
+                let set = plain_set(set)?;
+                value.chars().filter(|c| !set.contains(c)).collect()
+            }
+            ["tr", from, to] => {
+                let (from, to) = (plain_set(from)?, plain_set(to)?);
+                if from.len() != to.len() {
+                    return None;
+                }
+                value
+                    .chars()
+                    .map(|c| from.iter().position(|f| *f == c).map_or(c, |at| to[at]))
+                    .collect()
+            }
+            ["basename"] | ["dirname"] | ["xargs", "basename"] | ["xargs", "dirname"] => {
+                if stage.last() == Some(&"basename") {
+                    basename_of(&value, "")
+                } else {
+                    dirname_of(&value)
+                }
+            }
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+fn basename_of(path: &str, suffix: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return if path.is_empty() {
+            String::new()
+        } else {
+            "/".to_string()
+        };
+    }
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    match name.strip_suffix(suffix) {
+        Some(stem) if !suffix.is_empty() && !stem.is_empty() => stem.to_string(),
+        _ => name.to_string(),
+    }
+}
+
+fn dirname_of(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return if path.starts_with('/') {
+            "/".to_string()
+        } else {
+            ".".to_string()
+        };
+    }
+    match trimmed.rfind('/') {
+        None => ".".to_string(),
+        Some(at) => {
+            let dir = trimmed[..at].trim_end_matches('/');
+            if dir.is_empty() {
+                "/".to_string()
+            } else {
+                dir.to_string()
+            }
+        }
+    }
+}
+
+/// A `tr` set written out letter by letter: no range, class or escape.
+fn plain_set(set: &str) -> Option<Vec<char>> {
+    (!set.is_empty() && !set.contains(['-', '[', '\\']) || set == "-")
+        .then(|| set.chars().collect())
+}
+
+/// `sed` with one plain `s///`: a pattern Rust's regex reads the way a basic
+/// regular expression does (no groups, intervals, alternation or
+/// backreferences), a replacement with no `&` or `\`, and the `g` flag or
+/// none.
+fn sed_substitute(value: &str, program: &str) -> Option<String> {
+    let rest = program.strip_prefix('s')?;
+    let delimiter = rest.chars().next()?;
+    if delimiter.is_alphanumeric() || delimiter == '\\' {
+        return None;
+    }
+    let parts: Vec<&str> = rest[delimiter.len_utf8()..].split(delimiter).collect();
+    let [pattern, replacement, flags] = parts.as_slice() else {
+        return None;
+    };
+    if pattern.contains(['(', ')', '{', '}', '|', '+']) || replacement.contains(['&', '\\', '$']) {
+        return None;
+    }
+    let every = match *flags {
+        "" => false,
+        "g" => true,
+        _ => return None,
+    };
+    let regex = regex::Regex::new(pattern).ok()?;
+    Some(if every {
+        regex.replace_all(value, *replacement).into_owned()
+    } else {
+        regex.replace(value, *replacement).into_owned()
+    })
+}
+
+/// `cut -dC -fN` (or `-d C` written apart is not read) of one line.
+fn cut_field(value: &str, delimiter: &str, field: &str) -> Option<String> {
+    let delimiter = delimiter.strip_prefix("-d")?;
+    let mut chars = delimiter.chars();
+    let (Some(delimiter), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    let field = field.strip_prefix("-f")?;
+    let parts: Vec<&str> = value.split(delimiter).collect();
+    let pick = |n: &str| -> Option<usize> { n.parse::<usize>().ok().filter(|n| *n > 0) };
+    let fields: Vec<&str> = if let Some((from, to)) = field.split_once('-') {
+        let from = if from.is_empty() { 1 } else { pick(from)? };
+        let to = if to.is_empty() {
+            parts.len()
+        } else {
+            pick(to)?.min(parts.len())
+        };
+        parts.get(from - 1..to)?.to_vec()
+    } else {
+        let mut picked = Vec::new();
+        for n in field.split(',') {
+            if let Some(part) = parts.get(pick(n)? - 1) {
+                picked.push(*part);
+            }
+        }
+        picked
+    };
+    Some(fields.join(&delimiter.to_string()))
 }
 
 /// The line a shell segment hands a shell to run with `-c`, when every

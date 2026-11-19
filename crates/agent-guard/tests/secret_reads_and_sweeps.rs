@@ -224,3 +224,63 @@ fn ordinary_startup_lines_and_redirections_still_pass() {
         assert_eq!(verdict(line), "allow", "{line}");
     }
 }
+
+/// FAILS ON REVERT of `resolve_path_substitutions`: a substitution that
+/// reshapes a path in `~/.ssh` (`basename`, `dirname`, `sed s///`, `cut`,
+/// `tr`) is worked out before the check, and one that cannot be worked out
+/// is the key. The `sed`, `cut` and `tr` forms were allowed.
+#[test]
+fn a_key_name_built_by_a_substitution_is_refused() {
+    for line in [
+        "f=~/.ssh/id_ed25519.pub; cat \"$(dirname \"$f\")/$(basename \"$f\" .pub)\"",
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | sed 's/\\.pub$//')\"",
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | cut -d. -f1-2)\"",
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo $f | tr -d .pub)\"",
+        "cat \"$(dirname ~/.ssh/id_rsa.pub)/id_rsa\"",
+        // Not worked out here: a program beyond one plain s///, a value
+        // set at run time from the keys' folder.
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | sed -E 's/(.*)\\.pub/\\1/')\"",
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | awk -F. '{print $1}')\"",
+        "k=$(ls ~/.ssh/*.pub | head -1); cat \"$(echo \"$k\" | sed 's/\\.pub$//')\"",
+        "for k in ~/.ssh/*.pub; do cat \"$(echo \"$k\" | sed 's/\\.pub$//')\"; done",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// The neighbours: a substitution worked out to a public file or to a
+/// project path, and one that only prints.
+#[test]
+fn a_substitution_worked_out_to_an_ordinary_path_still_passes() {
+    for line in [
+        "f=~/.ssh/id_ed25519.pub; cat \"$(dirname \"$f\")/known_hosts\"",
+        "f=~/.ssh/id_ed25519.pub; cat \"$(echo \"$f\" | sed 's/\\.pub$/.pub/')\"",
+        "f=src/main.rs; cat \"$(dirname \"$f\")/lib.rs\"",
+        "cat \"$(echo src/main.rs | sed 's/main/lib/')\"",
+        "k=$(ls src/*.rs | head -1); cat \"$(echo \"$k\" | sed 's/main/lib/')\"",
+        "v=$(echo 1.2.3 | cut -d. -f1); echo $v",
+        "ls \"$(dirname ~/.ssh/known_hosts)\"",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// The hunt over a home in the forms that name no `-r`: `find -exec grep`,
+/// `rg` and `ag` (which recurse), and a `-----BEGIN` pattern with no `--`.
+#[test]
+fn a_hunt_of_the_home_in_every_search_form_is_refused() {
+    for line in [
+        "find ~ -exec grep -l AKIA {} +",
+        "find ~ -type f -exec grep -l AKIA {} \\;",
+        "find / -type f -exec grep -l ghp_ {} +",
+        "rg -l AKIA ~",
+        "rg AKIA $HOME",
+        "ag -l AKIA ~",
+        "ag ghp_ /home",
+        "grep -r -----BEGIN ~",
+        "grep -r \"-----BEGIN\" /home",
+        "grep -rl -----BEGIN $HOME",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
