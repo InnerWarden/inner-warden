@@ -2837,12 +2837,31 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
     let bytes = source.as_bytes();
     let mut commands = Vec::new();
     collect_all_commands(tree.root_node(), &mut commands, 0);
-    let assignments = literal_assignments(tree.root_node(), bytes);
+    let namerefs = nameref_targets(tree.root_node(), bytes);
+    // A write through a reference is a write to the name it refers to:
+    // `C=ok; declare -n R=C; R='rm -rf ~'; sh -c "$C"` runs `rm -rf ~`.
+    let (assignments, unknown_reference_written) =
+        through_namerefs(literal_assignments(tree.root_node(), bytes), &namerefs);
+    // Every value a name may hold anywhere on the line, for a trap set
+    // through a variable (`t=trap; $t f DEBUG`, `E="trap f DEBUG"; eval "$E"`).
+    let anywhere = LineVars {
+        set: Vec::new(),
+        maybe: assignments
+            .iter()
+            .map(|(name, value, _, _, _)| (name.clone(), value.clone()))
+            .collect(),
+        all_run_time: false,
+        namerefs: namerefs.clone(),
+    };
     // A `trap` on DEBUG, RETURN or ERR runs its action between commands:
-    // any variable may be set there, whatever the text order says.
-    let trapped = commands.iter().any(|command| {
-        command_words(*command, bytes).is_some_and(|words| sets_a_trap_between_commands(&words, 0))
-    });
+    // any variable may be set there, whatever the text order says. A write
+    // through a reference whose name the line does not say may set any of
+    // them too.
+    let trapped = unknown_reference_written
+        || commands.iter().any(|command| {
+            command_words(*command, bytes)
+                .is_some_and(|words| sets_a_trap_between_commands(&words, 0, &anywhere))
+        });
     for command in &commands {
         if node_is_in_literal_unreachable_branch(*command, bytes) {
             continue;
@@ -2873,6 +2892,7 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                 .map(|(name, value, _, _, _)| (name.clone(), value.clone()))
                 .collect(),
             all_run_time: trapped,
+            namerefs: namerefs.clone(),
         };
         // A command in a loop runs again after every assignment of the
         // loop, and after a function defined later in it: `C=ok; for i in
@@ -3005,7 +3025,25 @@ fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assign
     let mut assignments: Vec<Assignment> = found
         .into_iter()
         .filter_map(|assignment| {
-            let name = node_text(assignment.child_by_field_name("name")?, source);
+            // `declare -n R=C` makes `R` a reference to `C`; it writes no
+            // value ([`nameref_targets`]).
+            if assignment.parent().is_some_and(|owner| {
+                owner.kind() == "declaration_command" && declares_namerefs(owner, source)
+            }) {
+                return None;
+            }
+            let name_node = assignment.child_by_field_name("name")?;
+            // `C[0]=..` writes the element `$C` reads: the name is `C`.
+            let written = node_text(name_node, source);
+            let (name, subscripted) = match written.split_once('[') {
+                Some((name, _)) => (name.to_owned(), true),
+                None => (written, false),
+            };
+            // `C+=..` appends to what `C` held: the guard does not join
+            // the two, so the value is not written out.
+            let appends = source
+                .get(name_node.end_byte()..)
+                .is_some_and(|rest| rest.starts_with(b"+="));
             let value = assignment
                 .child_by_field_name("value")
                 .map(|value| node_text(value, source))
@@ -3013,14 +3051,20 @@ fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assign
             let raw = value.trim();
             // A value with an expansion outside single quotes is not
             // written out.
-            let written_out = raw.starts_with('\'') || !raw.contains(['$', '`']);
+            let written_out = !appends && (raw.starts_with('\'') || !raw.contains(['$', '`']));
+            let mut scopes = assignment_scopes(assignment, source);
+            if subscripted {
+                // One element may not be the one `$C` reads: the value
+                // before it is judged too.
+                scopes.push(0..0);
+            }
             Some((
                 name,
                 written_out.then(|| shell_literal_word(raw)),
                 assignment.end_byte(),
                 ancestor_of_kind(assignment, "function_definition")
                     .map(|definition| definition.byte_range()),
-                assignment_scopes(assignment, source),
+                scopes,
             ))
         })
         .collect();
@@ -3149,12 +3193,21 @@ struct LineVars {
     maybe: Vec<(String, Option<String>)>,
     /// A trap runs between commands: every name is decided at run time.
     all_run_time: bool,
+    /// The references the line declares ([`nameref_targets`]).
+    namerefs: Vec<(String, Option<String>)>,
 }
 
 impl LineVars {
     /// Every value `name` may hold, `None` for one the guard cannot read.
     /// A name the line never sets is `[None]`.
     fn values(&self, name: &str) -> Vec<Option<String>> {
+        // Reading a reference reads the name it refers to.
+        let name = match resolve_nameref(&self.namerefs, name) {
+            Some(Some(target)) => target,
+            Some(None) => return vec![None],
+            None => name.to_owned(),
+        };
+        let name = name.as_str();
         let mut values: Vec<Option<String>> = self
             .set
             .iter()
@@ -3185,12 +3238,144 @@ impl LineVars {
     }
 }
 
+/// The references the line declares (`declare -n R=C`, `local -n`,
+/// `typeset -n`), each with the name it refers to when the line writes
+/// it out (`C` for `R=C` and `R='C[1]'`), `None` when it does not
+/// (`local -n R=$1`, `declare -n R`).
+fn nameref_targets(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(String, Option<String>)> {
+    let mut declarations = Vec::new();
+    collect_nodes_of_kind(root, "declaration_command", &mut declarations, 0);
+    let mut found = Vec::new();
+    for declaration in declarations {
+        if !declares_namerefs(declaration, source) {
+            continue;
+        }
+        let mut cursor = declaration.walk();
+        for child in declaration.named_children(&mut cursor) {
+            match child.kind() {
+                "variable_assignment" => {
+                    let Some(name) = child.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let raw = child
+                        .child_by_field_name("value")
+                        .map(|value| node_text(value, source))
+                        .unwrap_or_default();
+                    let raw = raw.trim();
+                    let written_out = raw.starts_with('\'') || !raw.contains(['$', '`']);
+                    let target = written_out
+                        .then(|| shell_literal_word(raw))
+                        .map(|value| {
+                            value
+                                .split_once('[')
+                                .map_or(value.as_str(), |(name, _)| name)
+                                .to_owned()
+                        })
+                        .filter(|target| {
+                            !target.is_empty()
+                                && !target.starts_with(|c: char| c.is_ascii_digit())
+                                && target
+                                    .chars()
+                                    .all(|c| c == '_' || c.is_ascii_alphanumeric())
+                        });
+                    found.push((node_text(name, source), target));
+                }
+                "word" | "simple_expansion" | "expansion" | "string" | "raw_string" => {
+                    let word = shell_word(&node_text(child, source));
+                    if !word.starts_with('-') {
+                        found.push((word, None));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// What `name` refers to through the references the line declares:
+/// `None` when it is not one, `Some(None)` when the line does not say
+/// (or the references go round).
+fn resolve_nameref(namerefs: &[(String, Option<String>)], name: &str) -> Option<Option<String>> {
+    let mut current = name.to_owned();
+    let mut followed = false;
+    for _ in 0..8 {
+        let Some((_, target)) = namerefs.iter().rev().find(|(set, _)| *set == current) else {
+            return followed.then_some(Some(current));
+        };
+        match target {
+            Some(target) => current = target.clone(),
+            None => return Some(None),
+        }
+        followed = true;
+    }
+    Some(None)
+}
+
+/// The assignments with each write through a reference made a write to
+/// the name it refers to, and whether the line writes through a reference
+/// whose name it does not say.
+fn through_namerefs(
+    assignments: Vec<Assignment>,
+    namerefs: &[(String, Option<String>)],
+) -> (Vec<Assignment>, bool) {
+    let mut unknown = false;
+    let assignments = assignments
+        .into_iter()
+        .map(
+            |(name, value, at, body, scopes)| match resolve_nameref(namerefs, &name) {
+                Some(Some(target)) => (target, value, at, body, scopes),
+                Some(None) => {
+                    unknown = true;
+                    (name, value, at, body, scopes)
+                }
+                None => (name, value, at, body, scopes),
+            },
+        )
+        .collect();
+    (assignments, unknown)
+}
+
+/// Every value a word may stand for: itself when written out, the values
+/// the line may give the variable it is alone (`$t`, `"${t}"`), `None`
+/// for any other expansion.
+fn word_values(word: &str, vars: &LineVars) -> Vec<Option<String>> {
+    let trimmed = word.trim();
+    if trimmed.starts_with('\'') || !trimmed.contains(['$', '`']) {
+        return vec![Some(shell_literal_word(trimmed))];
+    }
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    match unquoted
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .or_else(|| unquoted.strip_prefix('$'))
+    {
+        Some(name)
+            if !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) =>
+        {
+            vars.values(name)
+        }
+        _ => vec![None],
+    }
+}
+
+/// The most lines `eval` may be handed that are read for a trap; past it
+/// the trap is taken as set.
+const EVAL_LINES_READ: usize = 16;
+
 /// Whether a command sets a `trap` on DEBUG, RETURN or ERR, whose action
-/// runs between commands: also behind `builtin` or `command`, and in the
-/// line `eval` runs (`eval "trap f DEBUG"`).
-fn sets_a_trap_between_commands(words: &[String], depth: u8) -> bool {
+/// runs between commands: also behind `builtin` or `command`, in the
+/// line `eval` runs (`eval "trap f DEBUG"`), and through a variable
+/// (`t=trap; $t f DEBUG`, `E="trap f DEBUG"; eval "$E"`). A program or
+/// an `eval` line the line does not write out may be a trap.
+fn sets_a_trap_between_commands(words: &[String], depth: u8, vars: &LineVars) -> bool {
     if depth > HANDED_LEVELS_READ {
-        return false;
+        return true;
     }
     let mut at = 0;
     while words.get(at).is_some_and(|word| {
@@ -3207,9 +3392,19 @@ fn sets_a_trap_between_commands(words: &[String], depth: u8) -> bool {
             at += 1;
         }
     }
-    let Some(name) = words.get(at).map(|word| normalized_command_name(word)) else {
+    let Some(word) = words.get(at) else {
         return false;
     };
+    if program_is_named_at_run_time(word) {
+        return word_values(word, vars).into_iter().any(|value| {
+            value.is_none_or(|value| {
+                let mut named: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
+                named.extend(words[at + 1..].iter().cloned());
+                sets_a_trap_between_commands(&named, depth + 1, vars)
+            })
+        });
+    }
+    let name = normalized_command_name(word);
     match name.as_str() {
         "trap" => words[at + 1..].iter().any(|word| {
             let signal = shell_literal_word(word).to_ascii_uppercase();
@@ -3217,19 +3412,39 @@ fn sets_a_trap_between_commands(words: &[String], depth: u8) -> bool {
             matches!(signal, "DEBUG" | "RETURN" | "ERR")
         }),
         "eval" => {
-            let line = words[at + 1..]
-                .iter()
-                .map(|word| shell_literal_word(word))
-                .collect::<Vec<_>>()
-                .join(" ");
-            let Some((tree, _doubt)) = parse_line(&line) else {
-                return false;
-            };
-            let mut commands = Vec::new();
-            collect_all_commands(tree.root_node(), &mut commands, 0);
-            commands.iter().any(|command| {
-                command_words(*command, line.as_bytes())
-                    .is_some_and(|words| sets_a_trap_between_commands(&words, depth + 1))
+            // Every line `eval` may be handed, one per value its words
+            // may hold.
+            let mut lines: Vec<Vec<String>> = vec![Vec::new()];
+            for word in &words[at + 1..] {
+                let values = word_values(word, vars);
+                if values.iter().any(Option::is_none) {
+                    return true;
+                }
+                lines = lines
+                    .iter()
+                    .flat_map(|line| {
+                        values.iter().flatten().map(move |value| {
+                            let mut line = line.clone();
+                            line.push(value.clone());
+                            line
+                        })
+                    })
+                    .collect();
+                if lines.len() > EVAL_LINES_READ {
+                    return true;
+                }
+            }
+            lines.iter().any(|line| {
+                let line = line.join(" ");
+                let Some((tree, _doubt)) = parse_line(&line) else {
+                    return false;
+                };
+                let mut commands = Vec::new();
+                collect_all_commands(tree.root_node(), &mut commands, 0);
+                commands.iter().any(|command| {
+                    command_words(*command, line.as_bytes())
+                        .is_some_and(|words| sets_a_trap_between_commands(&words, depth + 1, vars))
+                })
             })
         }
         _ => false,
@@ -3255,8 +3470,16 @@ fn with_option_values(words: &[String], assignments: &LineVars) -> Vec<String> {
                 .filter(|name| {
                     !name.is_empty() && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
                 })
-                .and_then(|name| assignments.only_value(name))
-                .filter(|value| value.starts_with('-') && !value.contains(char::is_whitespace))
+                // Any option it may hold: `-c` from one value is enough.
+                .and_then(|name| {
+                    assignments
+                        .values(name)
+                        .into_iter()
+                        .flatten()
+                        .find(|value| {
+                            value.starts_with('-') && !value.contains(char::is_whitespace)
+                        })
+                })
                 .unwrap_or_else(|| word.clone())
         })
         .collect()
