@@ -1064,7 +1064,12 @@ impl Reader<'_> {
             let Some(sink) = sink_of(self.lang, &callee) else {
                 continue;
             };
-            if self.name_lifted(split_top(call_arguments(&code[arguments_at..end]), ",").first()) {
+            let handed = call_arguments(&code[arguments_at..end]);
+            if self.name_lifted(
+                sink,
+                split_top(handed, ",").first(),
+                arguments_at + handed.len(),
+            ) {
                 self.read_names.push((at, at + chain.len()));
             }
             let arguments = if code.as_bytes()[arguments_at - 1] == b'(' {
@@ -1102,7 +1107,11 @@ impl Reader<'_> {
                 name_start -= 1;
             }
             let arguments = call_arguments(&code[at..]);
-            if self.name_lifted(split_top(arguments, ",").first()) {
+            if self.name_lifted(
+                Sink::Line,
+                split_top(arguments, ",").first(),
+                at + arguments.len(),
+            ) {
                 self.read_names.push((name_start, name_end));
             }
             self.with_parameters(arguments, |reader| {
@@ -1313,12 +1322,27 @@ impl Reader<'_> {
     /// the reader cannot read at all (held for review). One the code builds
     /// (decoded, joined, formatted, partly unread) keeps its name: hiding
     /// what a call runs is itself what the name is refused for.
-    fn name_lifted(&self, first: Option<&&str>) -> bool {
+    ///
+    /// Code run as code (`exec`, `eval`) is accounted for only when it is
+    /// written out or is a file of the project read whole: code built from
+    /// input or any other value it cannot read (`exec(input())`) keeps the
+    /// name. Nothing after a download (`done`: where the call's arguments
+    /// end) is accounted for.
+    fn name_lifted(&self, sink: Sink, first: Option<&&str>, done: usize) -> bool {
         let Some(first) = first.map(|first| first.trim()) else {
             return false;
         };
-        if plain_literal(self.lang, first) || opened_file(first).is_some() {
+        if plain_literal(self.lang, first) {
             return true;
+        }
+        if self.fetch_before(done) {
+            return false;
+        }
+        if opened_file(first).is_some() {
+            return true;
+        }
+        if sink == Sink::Code {
+            return false;
         }
         match self.fold(first, FOLD_DEPTH) {
             Value::Unknown => true,
@@ -1459,6 +1483,9 @@ impl Reader<'_> {
                         self.out.merge(inner.nested());
                     }
                     _ => {
+                        // Code built from what it does not write out is not
+                        // read, and keeps the finding for its name
+                        // ([`Self::name_lifted`]).
                         if self.fetch_before(done) {
                             self.out.runs_download = true;
                         } else {
