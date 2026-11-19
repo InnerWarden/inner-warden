@@ -55,11 +55,41 @@ const RUNS: usize = 50;
 /// while a ceiling there "caught" 92 mutants that the first run had seen
 /// survive.
 ///
-/// Outside a sweep the ceilings hold, which is where a slow change is caught.
+/// It wins over [`CEILINGS_ENV`].
 const NO_CEILINGS_ENV: &str = "IW_NO_WALL_CLOCK_CEILINGS";
 
+/// Set (to `1`) where the ceilings are asked for: the `perf` job of
+/// `.github/workflows/nightly-deep.yml`, which runs this file alone on a
+/// machine doing nothing else. Without it the ceilings are not asserted, and
+/// what each test asserts about behaviour still is.
+///
+/// A ceiling asserted inside `cargo test --workspace` measures the machine as
+/// much as the code: the suite runs this file beside every other test binary,
+/// and on a loaded machine `the_shell_surface_loads_only_what_can_match_it`
+/// failed the whole suite and passed 5 of 5 alone (2026-11-18). A regression
+/// in time is caught by the nightly job, where a failure means the code.
+const CEILINGS_ENV: &str = "IW_WALL_CLOCK_CEILINGS";
+
 fn ceilings_are_asserted() -> bool {
-    std::env::var_os(NO_CEILINGS_ENV).is_none()
+    ceilings_asked_for(
+        std::env::var_os(CEILINGS_ENV).as_deref(),
+        std::env::var_os(NO_CEILINGS_ENV).is_some(),
+    )
+}
+
+fn ceilings_asked_for(asked: Option<&std::ffi::OsStr>, sweep: bool) -> bool {
+    !sweep && asked.is_some_and(|value| value == "1")
+}
+
+/// The switch itself: the ceilings hold only when asked for, and a mutation
+/// sweep turns them off even then.
+#[test]
+fn the_ceilings_hold_only_when_asked_for() {
+    use std::ffi::OsStr;
+    assert!(ceilings_asked_for(Some(OsStr::new("1")), false));
+    assert!(!ceilings_asked_for(None, false));
+    assert!(!ceilings_asked_for(Some(OsStr::new("0")), false));
+    assert!(!ceilings_asked_for(Some(OsStr::new("1")), true));
 }
 
 fn median_micros(command: &str, engine: &RuleEngine) -> u128 {
