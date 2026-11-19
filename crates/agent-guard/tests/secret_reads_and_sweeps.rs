@@ -313,3 +313,21 @@ fn a_worked_out_path_has_the_verdict_of_the_path_named_outright() {
         assert_eq!(verdict(built), verdict(named), "{built} / {named}");
     }
 }
+
+/// The key read holds wherever the substitution stands on the line: one
+/// that consumes a variable kept under `~/.ssh` and comes before an
+/// ordinary read of a public file is still the key. `last` in
+/// `resolve_path_substitutions` is the last reading of the line (every
+/// value read into it), not its last command.
+#[test]
+fn a_key_read_before_an_ordinary_read_on_the_same_line_is_refused() {
+    for line in [
+        "f=~/.ssh/id_rsa; cat \"$(echo \"$f\")\"; cat ~/.ssh/known_hosts",
+        "f=~/.ssh/id_rsa.pub; cat \"$(echo \"$f\" | head -c -5)\"; cat ~/.ssh/known_hosts",
+        "f=~/.ssh/id_rsa.pub; cat \"$(echo \"$f\" | rev | rev)\" && cat ~/.ssh/known_hosts",
+        "cat ~/.ssh/known_hosts; f=~/.ssh/id_rsa.pub; cat \"$(echo \"$f\" | head -c -5)\"",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+        assert_eq!(in_project(line).recommendation, "deny", "{line}");
+    }
+}
