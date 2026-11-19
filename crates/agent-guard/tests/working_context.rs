@@ -702,7 +702,17 @@ fn a_stored_login_raises_a_softer_read_and_keeps_a_harder_one() {
     assert_eq!(read.len(), 1, "{raised:?}");
     assert_eq!(read[0].0, 60, "{raised:?}");
     assert!(read[0].1.contains(".codex/auth.json"), "{}", read[0].1);
-    assert_eq!(raised.risk_score, alone.risk_score + 40, "{raised:?}");
+    // The read is raised by 40, once. The home's `.npmrc` is also a login
+    // file outside the project (`credential_read_outside_project`, 10),
+    // judged by the project since 2026-11-19 as `.env` is.
+    assert!(
+        raised
+            .signals
+            .iter()
+            .any(|s| s.signal == "credential_read_outside_project" && s.score == 10),
+        "{raised:?}"
+    );
+    assert_eq!(raised.risk_score, alone.risk_score + 40 + 10, "{raised:?}");
 
     let command = "cat ~/.ssh/id_ed25519 ~/.codex/auth.json";
     let alone = analyze_command(command, None);

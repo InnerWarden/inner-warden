@@ -9749,24 +9749,44 @@ fn safe_string_literal(value: &str, language: LiteralLanguage) -> bool {
     }
 }
 
+/// Whether `command` prints into a file that runs later or hands out a
+/// login: by a redirection of it, or by a `tee` it is piped into
+/// (`echo '...' | tee -a ~/.bashrc`, kept since 2026-11-19: the printed
+/// text was blanked as data and a beacon in it was never read).
 fn writes_security_or_execution_sink(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    let Some(redirected) = ancestor_of_kind(command, "redirected_statement") else {
-        return false;
-    };
-    let text = node_text(redirected, source).to_ascii_lowercase();
-    text.contains('>')
-        && [
-            ".bashrc",
-            ".bash_profile",
-            "/.profile",
-            "/etc/profile",
-            "/etc/sudoers",
-            "authorized_keys",
-            "/etc/cron",
-            ".config/autostart",
-        ]
-        .iter()
-        .any(|sink| text.contains(sink))
+    let redirected = ancestor_of_kind(command, "redirected_statement")
+        .map(|redirected| node_text(redirected, source).to_ascii_lowercase())
+        .filter(|text| text.contains('>'));
+    let piped = command
+        .parent()
+        .and_then(nearest_pipeline)
+        .map(|pipeline| node_text(pipeline, source).to_ascii_lowercase())
+        .filter(|text| text.contains("tee"));
+    [redirected, piped]
+        .into_iter()
+        .flatten()
+        .any(|text| names_security_or_execution_sink(&text))
+}
+
+/// [`writes_security_or_execution_sink`] of the text of the statement.
+fn names_security_or_execution_sink(text: &str) -> bool {
+    [
+        ".bashrc",
+        ".bash_profile",
+        ".bash_login",
+        ".zshrc",
+        ".zshenv",
+        ".zprofile",
+        ".zlogin",
+        "/.profile",
+        "/etc/profile",
+        "/etc/sudoers",
+        "authorized_keys",
+        "/etc/cron",
+        ".config/autostart",
+    ]
+    .iter()
+    .any(|sink| text.contains(sink))
 }
 
 fn writes_payload_executed_later(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {

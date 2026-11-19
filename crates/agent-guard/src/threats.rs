@@ -347,6 +347,8 @@ pub const SENSITIVE_PATHS: &[&str] = &[
     ".kube/",
     ".azure/",
     ".gcloud/",
+    // Where the gcloud CLI keeps its logins and tokens.
+    ".config/gcloud/",
     ".docker/config.json",
     // Cargo's registry token, the whole of the file (`cargo login`), as
     // `credentials` or `credentials.toml`.
@@ -2660,7 +2662,7 @@ enum Assigned {
 /// ([`assignment_readings`]). Cut at its first `$`, `F=$D/id_rsa` gave `F`
 /// no value at all and `cat $F` read as `cat` alone (found 2026-11-10).
 fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
-    if !content.contains('$') || !content.contains('=') {
+    if !content.contains('$') || !(content.contains('=') || content.contains("for")) {
         return Assigned::AsWritten;
     }
     static ASSIGN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
@@ -2685,6 +2687,26 @@ fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
             values.entry(name.as_str()).or_insert(value);
         }
     }
+    // A loop over one word gives its name that word: `for F in
+    // ~/.ssh/*.pub; do cat "${F%.pub}"; done` reads every private key.
+    static ONE_WORD_LOOP: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let one_word_loop = ONE_WORD_LOOP.get_or_init(|| {
+        regex::Regex::new(
+            r"(?:^|[\s;&|(])for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^\s;&|()]+)\s*(?:;|\n)\s*do\b",
+        )
+        .expect("a valid pattern")
+    });
+    for found in one_word_loop.captures_iter(content) {
+        let (Some(name), Some(word)) = (found.get(1), found.get(2)) else {
+            continue;
+        };
+        let word = word.as_str().trim_matches(['\'', '"']);
+        if !word.contains(['$', '`']) {
+            values
+                .entry(name.as_str())
+                .or_insert_with(|| word.to_owned());
+        }
+    }
     if values.is_empty() {
         return Assigned::AsWritten;
     }
@@ -2706,6 +2728,23 @@ fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
                 if braced[end..].starts_with('}') {
                     (&braced[..end], end + 2)
                 } else {
+                    // An operator on a value the line sets (`${F%.pub}`,
+                    // `${F/.pub}`, `${F:0:-4}`) is worked out as the shell
+                    // works it out: the name of a public key with its
+                    // `.pub` cut off is the private key.
+                    let worked = values
+                        .get(&braced[..end])
+                        .filter(|_| end > 0)
+                        .and_then(|value| parameter_operation(value, &braced[end..]));
+                    if let Some((value, used)) = worked {
+                        out.push_str(&value);
+                        changed = true;
+                        rest = &braced[end + used..];
+                        if out.len() > limit {
+                            return Assigned::PastLimit;
+                        }
+                        continue;
+                    }
                     ("", 0)
                 }
             }
@@ -2734,6 +2773,188 @@ fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
     } else {
         Assigned::Expanded(out)
     }
+}
+
+/// PURE. What `${NAME<operation>}` gives when `NAME` holds `value`:
+/// `operation` is the text after the name, up to and with the closing
+/// `}`, and the answer is the value worked out and how many bytes of
+/// `operation` it took. The operations a shell has on a set value: a
+/// default (`:-`, `-`, `:=`, `=`, `:?`, `?`) is the value, an
+/// alternative (`:+`, `+`) its word, a prefix or suffix cut (`#`, `##`,
+/// `%`, `%%`), a replacement (`/`, `//`, `/#`, `/%`), a substring
+/// (`:OFFSET`, `:OFFSET:LENGTH`) and a change of case (`^^`, `,,`, `^`,
+/// `,`). `None` when the operation holds what is decided at run time (a
+/// `$`, a backtick, a nested brace) or is not one of these: the reference
+/// is then left as written, as before.
+///
+/// `F=~/.ssh/id_rsa.pub; cat ${F%.pub}` reads the private key: measured
+/// 2026-11-16, six of eight such forms were allowed, one of them handing
+/// the key to an upload.
+fn parameter_operation(value: &str, operation: &str) -> Option<(String, usize)> {
+    let close = operation.find('}')?;
+    let body = &operation[..close];
+    if body.contains(['$', '`', '{']) {
+        return None;
+    }
+    let used = close + 1;
+    let word =
+        |text: &str| -> String { text.chars().filter(|c| !matches!(c, '\'' | '"')).collect() };
+    let chars: Vec<char> = value.chars().collect();
+    let len = chars.len();
+    let text = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
+    let worked = if let Some(rest) = body.strip_prefix(":-").or_else(|| body.strip_prefix(":=")) {
+        if value.is_empty() {
+            word(rest)
+        } else {
+            value.to_owned()
+        }
+    } else if body.starts_with(":?") || body.starts_with(['-', '=', '?']) {
+        value.to_owned()
+    } else if let Some(rest) = body.strip_prefix(":+") {
+        if value.is_empty() {
+            String::new()
+        } else {
+            word(rest)
+        }
+    } else if let Some(rest) = body.strip_prefix('+') {
+        word(rest)
+    } else if let Some(pattern) = body.strip_prefix("##") {
+        let pattern = word(pattern);
+        match (0..=len)
+            .rev()
+            .find(|&at| glob_matches(&pattern, &text(0..at)))
+        {
+            Some(cut) => text(cut..len),
+            None => value.to_owned(),
+        }
+    } else if let Some(pattern) = body.strip_prefix('#') {
+        let pattern = word(pattern);
+        match (0..=len).find(|&at| glob_matches(&pattern, &text(0..at))) {
+            Some(cut) => text(cut..len),
+            None => value.to_owned(),
+        }
+    } else if let Some(pattern) = body.strip_prefix("%%") {
+        let pattern = word(pattern);
+        match (0..=len).find(|&at| glob_matches(&pattern, &text(at..len))) {
+            Some(cut) => text(0..cut),
+            None => value.to_owned(),
+        }
+    } else if let Some(pattern) = body.strip_prefix('%') {
+        let pattern = word(pattern);
+        match (0..=len)
+            .rev()
+            .find(|&at| glob_matches(&pattern, &text(at..len)))
+        {
+            Some(cut) => text(0..cut),
+            None => value.to_owned(),
+        }
+    } else if let Some(rest) = body.strip_prefix('/') {
+        replaced_in(value, rest)
+    } else if let Some(rest) = body.strip_prefix(':') {
+        let (offset, length) = rest
+            .split_once(':')
+            .map_or((rest, None), |(offset, length)| (offset, Some(length)));
+        let number = |text: &str| text.trim().parse::<i64>().ok();
+        let size = i64::try_from(len).ok()?;
+        let offset = number(offset)?;
+        let start = if offset < 0 {
+            (size + offset).max(0)
+        } else {
+            offset.min(size)
+        };
+        let end = match length {
+            None => size,
+            Some(length) => {
+                let length = number(length)?;
+                if length < 0 {
+                    size + length
+                } else {
+                    (start + length).min(size)
+                }
+            }
+        };
+        if end < start {
+            return None;
+        }
+        text(usize::try_from(start).ok()?..usize::try_from(end).ok()?)
+    } else {
+        let mut rest = value.chars();
+        match (body, rest.next()) {
+            ("^^", _) => value.to_uppercase(),
+            (",,", _) => value.to_lowercase(),
+            ("^" | ",", None) => String::new(),
+            ("^", Some(first)) => first.to_uppercase().chain(rest).collect(),
+            (",", Some(first)) => first.to_lowercase().chain(rest).collect(),
+            _ => return None,
+        }
+    };
+    Some((worked, used))
+}
+
+/// PURE. `${NAME/PATTERN/WORD}` of `value`, given what follows the first
+/// `/`: the first match, the longest at the first place one starts,
+/// replaced by `WORD` (every match with `//`, only at the start with `/#`,
+/// only at the end with `/%`). An empty pattern changes nothing.
+fn replaced_in(value: &str, operation: &str) -> String {
+    let (every, anchor, rest) = match operation.chars().next() {
+        Some('/') => (true, None, &operation[1..]),
+        Some('#') => (false, Some(true), &operation[1..]),
+        Some('%') => (false, Some(false), &operation[1..]),
+        _ => (false, None, operation),
+    };
+    let unquoted =
+        |text: &str| -> String { text.chars().filter(|c| !matches!(c, '\'' | '"')).collect() };
+    let (pattern, replacement) = rest.split_once('/').unwrap_or((rest, ""));
+    let pattern = unquoted(pattern);
+    let replacement = unquoted(replacement);
+    if pattern.is_empty() {
+        return value.to_owned();
+    }
+    let chars: Vec<char> = value.chars().collect();
+    let len = chars.len();
+    let text = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
+    match anchor {
+        Some(true) => {
+            return match (0..=len)
+                .rev()
+                .find(|&end| glob_matches(&pattern, &text(0..end)))
+            {
+                Some(end) => format!("{replacement}{}", text(end..len)),
+                None => value.to_owned(),
+            };
+        }
+        Some(false) => {
+            return match (0..=len).find(|&at| glob_matches(&pattern, &text(at..len))) {
+                Some(at) => format!("{}{replacement}", text(0..at)),
+                None => value.to_owned(),
+            };
+        }
+        None => {}
+    }
+    let mut out = String::new();
+    let mut at = 0;
+    let mut replaced = false;
+    while at < len {
+        let found = (!replaced || every)
+            .then(|| {
+                (at + 1..=len)
+                    .rev()
+                    .find(|&end| glob_matches(&pattern, &text(at..end)))
+            })
+            .flatten();
+        match found {
+            Some(end) => {
+                out.push_str(&replacement);
+                replaced = true;
+                at = end;
+            }
+            None => {
+                out.push(chars[at]);
+                at += 1;
+            }
+        }
+    }
+    out
 }
 
 /// PURE. The value an assignment gives, read from the text after its `=`:
@@ -9219,6 +9440,10 @@ pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
             ".bashrc",
             ".bash_profile",
             ".zshrc",
+            ".zshenv",
+            ".zprofile",
+            ".zlogin",
+            ".bash_login",
             ".profile",
             "authorized_keys",
             "crontab",
@@ -9269,7 +9494,10 @@ pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
                 // directory is deliberately not a signal: `~/.cargo`,
                 // `~/.local`, `~/.nvm` are half of a developer's PATH, and
                 // matching on them refused the line every developer writes.
-                r"(?i)(?:/tmp/|/dev/shm/|/var/tmp/|\bcurl\b|\bwget\b|base64\s+-d|\bnc\b\s)[^|;&]*(?:>>?|\btee\b[^|;&]*)\s*(?:~|/root|/home/\S+)/\.(?:bashrc|bash_profile|zshrc|profile)\b",
+                // A payload piped into \`tee\` counts as one redirected
+                // (\`echo 'curl URL' | tee -a ~/.bashrc\`), and so do the
+                // other startup files of bash and zsh.
+                r"(?i)(?:/tmp/|/dev/shm/|/var/tmp/|\bcurl\b|\bwget\b|base64\s+-d|\bnc\b\s)[^|;&]*(?:>>?|(?:\|\s*)?\btee\b[^|;&]*)\s*(?:~|/root|/home/\S+)/\.(?:bashrc|bash_profile|bash_login|zshrc|zshenv|zprofile|zlogin|profile)\b",
                 "appends a payload from a temporary or hidden path to a shell startup file",
             ),
             (
@@ -9304,6 +9532,17 @@ pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
     if let Some((_, what)) = res.iter().find(|(re, _)| re.is_match(content)) {
         return Some((*what, 60));
     }
+    // The patterns read a command up to its first `|`, `;` or `&`. One inside
+    // the quoted payload (`echo 'curl -s URL -o /tmp/b 2>&1' >> ~/.bashrc`)
+    // or in a redirection between descriptors (`2>&1`) ends no command, and
+    // it stopped the reading before the file written: measured 2026-11-13,
+    // a beacon appended to `.bashrc` with `2>&1` in it was allowed.
+    let joined = without_inner_separators(content);
+    if joined != content {
+        if let Some((_, what)) = res.iter().find(|(re, _)| re.is_match(&joined)) {
+            return Some((*what, 60));
+        }
+    }
     let normalized = normalize_command(content);
     if normalized == content {
         return None;
@@ -9311,6 +9550,47 @@ pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
     res.iter()
         .find(|(re, _)| re.is_match(&normalized))
         .map(|(_, what)| (*what, 60))
+}
+
+/// PURE. `content` with every `|`, `;` and `&` that ends no command made a
+/// space: one inside single or double quotes, and the `&` of a redirection
+/// between descriptors or of both streams (`2>&1`, `>&2`, `&>`, `&>>`).
+/// Everything else, the `>` and `>>` of each redirection too, is kept.
+fn without_inner_separators(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let mut out = String::with_capacity(content.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (at, c) in content.char_indices() {
+        if escaped {
+            escaped = false;
+            out.push(c);
+            continue;
+        }
+        match (quote, c) {
+            (Some('"') | None, '\\') => {
+                escaped = true;
+                out.push(c);
+            }
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                out.push(c);
+            }
+            (Some(open), c) if c == open => {
+                quote = None;
+                out.push(c);
+            }
+            (Some(_), '|' | ';' | '&') => out.push(' '),
+            (None, '&')
+                if at.checked_sub(1).and_then(|before| bytes.get(before)) == Some(&b'>')
+                    || bytes.get(at + 1) == Some(&b'>') =>
+            {
+                out.push(' ');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Kubernetes actions that reach the node, the cluster's identity, or its
@@ -12176,7 +12456,13 @@ pub fn env_read_outside_project(
             // An operand can sit inside a larger word: `--env-file=/x/.env`,
             // `curl -F f=@/x/.env`, `open('/x/.env')`.
             for piece in word.split(['=', '@', '(', ')', ',', '\'', '"', '<', '>']) {
-                if check_sensitive_path(piece) != Some(".env") {
+                // Every file of the soft class is judged by the project, as
+                // `.env` is: `.npmrc`, `.pypirc`, the Docker and cloud CLI
+                // logins. A project's own `.npmrc` is ordinary work; the
+                // home's holds the publish token of every package the person
+                // owns (measured 2026-11-12: three of three read anywhere
+                // were a review the hook let through).
+                if !check_sensitive_path(piece).is_some_and(|path| !is_hard_sensitive_path(path)) {
                     continue;
                 }
                 if let Some(path) = place.resolve(piece) {
@@ -13307,7 +13593,9 @@ fn hunt_searcher() -> &'static regex::Regex {
     static SEARCHER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     SEARCHER.get_or_init(|| {
         regex::Regex::new(
-            r"(?i)\b(?:find|locate|fd)\b|\b(?:grep|egrep|rg|ag|ack)\b[^|;&]*\s-{1,2}[a-zA-Z]*r",
+            // `rg`, `ag` and `ack` search every folder below the ones
+            // they are given without being told to.
+            r"(?i)\b(?:find|locate|fd|rg|ag|ack)\b|\b(?:grep|egrep|fgrep)\b[^|;&]*\s-{1,2}[a-zA-Z]*[rR]",
         )
         .expect("static credential-hunt searcher regex")
     })
@@ -13457,14 +13745,38 @@ pub fn check_credential_hunt_beside_in(
         return None;
     }
     seen.iter().zip(&written).find_map(|(seen, written)| {
-        (hunt_searcher().is_match(seen) && names_broad_root(seen, home))
-            .then(|| check_credential_hunt_in(written, home))
-            .flatten()
+        // The root is asked of both: a word after `--` may be hidden with
+        // the pattern (`grep -r -- -----BEGIN /srv`).
+        (hunt_searcher().is_match(seen)
+            && (names_broad_root(seen, home) || names_broad_root(written, home)))
+        .then(|| check_credential_hunt_in(written, home))
+        .flatten()
     })
 }
 
 pub fn check_credential_hunt(content: &str) -> Option<(String, u32)> {
     check_credential_hunt_in(content, None)
+}
+
+/// The first known start of a credential in `segment` (an AWS key id, a
+/// GitHub, GitLab, OpenAI, Stripe or Slack token, a Google API key, a PEM
+/// header, an SSH public key type, a bearer header), where a word or a
+/// pattern starts: after the start of the text or a character that is not a
+/// letter or digit. Measured 2026-11-18, `grep -r AKIA /home` and the same
+/// over `/etc` for each of these was allowed: none was a word the hunt
+/// looked for.
+fn credential_prefix_in(segment: &str) -> Option<String> {
+    static PREFIX: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PREFIX
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?i)(?:^|[^a-z0-9])(akia|asia|gh[pousr]_|github_pat_|glpat-|sk-|sk_live_|rk_live_|xox[abposr]-|aiza|-----begin|ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2|bearer\b)",
+            )
+            .expect("static credential prefix regex")
+        })
+        .captures(segment)
+        .and_then(|found| found.get(1))
+        .map(|found| found.as_str().to_string())
 }
 
 /// [`check_credential_hunt`] of a line run with `home` as its home.
@@ -13493,10 +13805,20 @@ fn check_credential_hunt_in(content: &str, home: Option<&str>) -> Option<(String
     });
 
     for segment in shell_command_segments(content) {
-        if !secret_token.is_match(segment) {
+        // A key's or a token's own first letters (`AKIA`, `ghp_`, `sk-`,
+        // `-----BEGIN`, `ssh-rsa`, `Bearer`) looked for over a wide root
+        // finds the secret itself, not a file that may hold one: refused.
+        let prefix = credential_prefix_in(segment);
+        if prefix.is_none() && !secret_token.is_match(segment) {
             continue;
         }
         if !names_broad_root(segment, home) && !whole_fs.is_match(segment) {
+            continue;
+        }
+        if let Some(prefix) = prefix.filter(|_| searcher.is_match(segment)) {
+            return Some((prefix, 60));
+        }
+        if !secret_token.is_match(segment) {
             continue;
         }
         // Either an enumerating verb, or a reader pointed at a glob: the
@@ -13737,10 +14059,442 @@ fn sensitive_read_nested(
     depth: u8,
 ) -> Option<(&'static str, u32)> {
     let (readings, _) = assignment_readings(content);
-    readings
+    let mut found = None;
+    for (at, reading) in readings.iter().enumerate() {
+        // A substitution that reshapes a path is judged by the path it
+        // prints, in place of the line as written.
+        let last = at + 1 == readings.len();
+        let hit = match resolve_path_substitutions(reading, content, last) {
+            PathSubstitutions::SshUnresolved => Some((".ssh/", 60)),
+            PathSubstitutions::Resolved(resolved) => {
+                sensitive_read_in(&resolved, as_written, depth)
+            }
+            PathSubstitutions::None => sensitive_read_in(reading, as_written, depth),
+        };
+        found = [found, hit]
+            .into_iter()
+            .flatten()
+            .max_by_key(|&(_, score)| score);
+    }
+    // The reading the other rules scan blanks what a command only prints,
+    // and `$(echo "$F" | sed 's/\.pub$//')` is a path made from what `echo`
+    // prints: the line as written is asked too, for these substitutions only.
+    if as_written != content && as_written.contains("$(") {
+        let (written, _) = assignment_readings(as_written);
+        for (at, reading) in written.iter().enumerate() {
+            let last = at + 1 == written.len();
+            let hit = match resolve_path_substitutions(reading, as_written, last) {
+                PathSubstitutions::SshUnresolved => Some((".ssh/", 60)),
+                PathSubstitutions::Resolved(resolved) => {
+                    sensitive_read_in(&resolved, as_written, depth)
+                }
+                PathSubstitutions::None => None,
+            };
+            found = [found, hit]
+                .into_iter()
+                .flatten()
+                .max_by_key(|&(_, score)| score);
+        }
+    }
+    found
+}
+
+/// What a line's command substitutions make of a path the line names, when
+/// each one that reshapes a path is worked out ([`resolve_path_substitutions`]).
+#[derive(Debug, PartialEq, Eq)]
+enum PathSubstitutions {
+    /// No substitution reshapes a path.
+    None,
+    /// The line with each such substitution replaced by what it prints.
+    Resolved(String),
+    /// One reshapes a path in `~/.ssh` and is not worked out here.
+    SshUnresolved,
+}
+
+/// The programs that reshape a name: what they print is a path made from
+/// the one they are given.
+const PATH_SHAPERS: &[&str] = &["basename", "dirname", "sed", "cut", "tr", "awk"];
+
+/// PURE. Each `$(...)` of `line` that runs `basename`, `dirname`, or prints a
+/// path through `sed s///`, `cut` or `tr` (`$(echo P | sed 's/\.pub$//')`),
+/// worked out on the path it is given: `cat "$(dirname "$F")/$(basename "$F"
+/// .pub)"` with `F=~/.ssh/id_ed25519.pub` reads `~/.ssh/id_ed25519`, and
+/// `cat "$(dirname "$F")/known_hosts"` reads the public file. Asked of a line
+/// whose own assignments are already read into it. One that holds a path in
+/// `~/.ssh` and is not worked out (a value set at run time, a `sed` program
+/// beyond one plain `s///`) is taken as the private key: measured
+/// 2026-11-19, the `sed`, `cut` and `tr` forms were allowed.
+fn resolve_path_substitutions(line: &str, raw: &str, last: bool) -> PathSubstitutions {
+    if !line.contains("$(") {
+        return PathSubstitutions::None;
+    }
+    // The substitutions of the line as written that consume a variable the
+    // line keeps under `~/.ssh`, by their place on the line: a reading only
+    // fills values in, so the n-th substitution of a reading is the n-th
+    // one written.
+    let names = ssh_valued_names(raw);
+    let consuming: Vec<bool> = if names.is_empty() {
+        Vec::new()
+    } else {
+        top_level_substitutions(raw)
+            .iter()
+            .map(|body| consumes_a_name(body, &names))
+            .collect()
+    };
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut changed = false;
+    let mut place = 0usize;
+    while let Some(at) = rest.find("$(") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let Some(end) = substitution_end(after) else {
+            out.push_str(&rest[at..]);
+            rest = "";
+            break;
+        };
+        let body = &after[..end];
+        let consumes = consuming.get(place).copied().unwrap_or(false);
+        place += 1;
+        let shapes = body
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| PATH_SHAPERS.contains(&word));
+        if let Some(printed) = (shapes || consumes).then(|| shaped_path(body)).flatten() {
+            out.push_str(&printed);
+            changed = true;
+        } else if (shapes && body.contains(".ssh")) || (last && consumes) {
+            // Not worked out here, on a key's path: whatever the
+            // substitution does with it (`rev`, `xargs basename`, `awk`),
+            // what it prints may be the private key.
+            return PathSubstitutions::SshUnresolved;
+        } else {
+            out.push_str(&rest[at..at + 2 + end + 1]);
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    if changed {
+        PathSubstitutions::Resolved(out)
+    } else {
+        PathSubstitutions::None
+    }
+}
+
+/// PURE. The bodies of the `$(...)` of `line` that are not inside another
+/// one, in order.
+fn top_level_substitutions(line: &str) -> Vec<&str> {
+    let mut bodies = Vec::new();
+    let mut rest = line;
+    while let Some(at) = rest.find("$(") {
+        let after = &rest[at + 2..];
+        let Some(end) = substitution_end(after) else {
+            break;
+        };
+        bodies.push(&after[..end]);
+        rest = &after[end + 1..];
+    }
+    bodies
+}
+
+/// PURE. The variables `line` sets to a value under `~/.ssh`, written out
+/// (`F=~/.ssh/id_ed25519.pub`) or worked out at run time
+/// (`K=$(ls ~/.ssh/*.pub | head -1)`), and the name of a loop over one.
+fn ssh_valued_names(line: &str) -> Vec<String> {
+    if !line.contains(".ssh") {
+        return Vec::new();
+    }
+    static SET: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| {
+        regex::Regex::new(
+            r"(?:^|[\s;&|(])(?:(?:export|local|readonly|declare)\s+)?(?:([A-Za-z_][A-Za-z0-9_]*)=|for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s)",
+        )
+        .expect("static assignment regex")
+    });
+    let mut names = Vec::new();
+    for found in set.captures_iter(line) {
+        let (Some(whole), Some(name)) = (found.get(0), found.get(1).or_else(|| found.get(2)))
+        else {
+            continue;
+        };
+        let value = &line[whole.end()..];
+        // The value runs to the end of its command: past a substitution it
+        // opens with, which may hold a `;` of its own.
+        let from = value
+            .strip_prefix("$(")
+            .or_else(|| value.strip_prefix("\"$("))
+            .and_then(substitution_end)
+            .map_or(0, |end| end + 2);
+        let end = value[from..]
+            .find([';', '\n'])
+            .map_or(value.len(), |at| from + at);
+        if value[..end].contains(".ssh") {
+            names.push(name.as_str().to_string());
+        }
+    }
+    names
+}
+
+/// PURE. Whether `body` refers to one of `names` (`$F`, `${F}`, `${F%x}`).
+fn consumes_a_name(body: &str, names: &[String]) -> bool {
+    names.iter().any(|name| {
+        [format!("${name}"), format!("${{{name}")]
+            .iter()
+            .any(|reference| {
+                body.match_indices(reference.as_str()).any(|(at, _)| {
+                    !body[at + reference.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+            })
+    })
+}
+
+/// PURE. Where the `)` that closes a `$(` is in `text` (the text after the
+/// `$(`), past nested parentheses and quotes.
+fn substitution_end(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (at, c) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, c) {
+            (Some('\''), '\'') => quote = None,
+            (Some('\''), _) => {}
+            (_, '\\') => escaped = true,
+            (Some('"'), '"') => quote = None,
+            (Some(_), _) => {}
+            (None, '\'' | '"') => quote = Some(c),
+            (None, '(') => depth += 1,
+            (None, ')') if depth == 0 => return Some(at),
+            (None, ')') => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// PURE. The words of a short command, with quotes and backslashes taken
+/// as the shell takes them, and the `|` that ends each stage of a pipeline
+/// as a word of its own. `None` for anything decided at run time: a `$`, a
+/// backtick, a glob, a redirection, a list.
+fn plain_words(text: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut started = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                started = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '"' => {
+                started = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) => {
+                            word.push(chars.next()?);
+                        }
+                        '$' | '`' => return None,
+                        c => word.push(c),
+                    }
+                }
+            }
+            '\\' => {
+                started = true;
+                word.push(chars.next()?);
+            }
+            '$' | '`' | '*' | '?' | '[' | '<' | '>' | ';' | '&' | '(' | ')' => return None,
+            '|' => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+                words.push("|".to_string());
+            }
+            c if c.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            c => {
+                started = true;
+                word.push(c);
+            }
+        }
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
+}
+
+/// PURE. What the substitution body `body` prints, when it is one of the
+/// forms [`resolve_path_substitutions`] works out: `basename P [SUFFIX]`,
+/// `dirname P`, or `echo P` / `printf %s P` piped through any number of
+/// `sed 's/RE/TEXT/[g]'`, `cut -dC -fN` and `tr -d SET` / `tr SET1 SET2`
+/// stages.
+fn shaped_path(body: &str) -> Option<String> {
+    let words = plain_words(body)?;
+    let stages: Vec<&[String]> = words.split(|word| word == "|").collect();
+    let (first, rest) = stages.split_first()?;
+    let mut value = match first
         .iter()
-        .filter_map(|reading| sensitive_read_in(reading, as_written, depth))
-        .max_by_key(|&(_, score)| score)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        ["basename", path] => basename_of(path, ""),
+        ["basename", path, suffix] => basename_of(path, suffix),
+        ["dirname", path] => dirname_of(path),
+        ["echo", path] | ["printf", "%s", path] | ["printf", "%s\\n", path] => (*path).to_string(),
+        _ => return None,
+    };
+    for stage in rest {
+        let stage: Vec<&str> = stage.iter().map(String::as_str).collect();
+        value = match stage.as_slice() {
+            ["sed", program] | ["sed", "-e", program] => sed_substitute(&value, program)?,
+            ["cut", delimiter, field] => cut_field(&value, delimiter, field)?,
+            ["tr", "-d", set] => {
+                let set = plain_set(set)?;
+                value.chars().filter(|c| !set.contains(c)).collect()
+            }
+            ["tr", from, to] => {
+                let (from, to) = (plain_set(from)?, plain_set(to)?);
+                if from.len() != to.len() {
+                    return None;
+                }
+                value
+                    .chars()
+                    .map(|c| from.iter().position(|f| *f == c).map_or(c, |at| to[at]))
+                    .collect()
+            }
+            ["basename"] | ["dirname"] | ["xargs", "basename"] | ["xargs", "dirname"] => {
+                if stage.last() == Some(&"basename") {
+                    basename_of(&value, "")
+                } else {
+                    dirname_of(&value)
+                }
+            }
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+fn basename_of(path: &str, suffix: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return if path.is_empty() {
+            String::new()
+        } else {
+            "/".to_string()
+        };
+    }
+    let name = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    match name.strip_suffix(suffix) {
+        Some(stem) if !suffix.is_empty() && !stem.is_empty() => stem.to_string(),
+        _ => name.to_string(),
+    }
+}
+
+fn dirname_of(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return if path.starts_with('/') {
+            "/".to_string()
+        } else {
+            ".".to_string()
+        };
+    }
+    match trimmed.rfind('/') {
+        None => ".".to_string(),
+        Some(at) => {
+            let dir = trimmed[..at].trim_end_matches('/');
+            if dir.is_empty() {
+                "/".to_string()
+            } else {
+                dir.to_string()
+            }
+        }
+    }
+}
+
+/// A `tr` set written out letter by letter: no range, class or escape.
+fn plain_set(set: &str) -> Option<Vec<char>> {
+    (!set.is_empty() && !set.contains(['-', '[', '\\']) || set == "-")
+        .then(|| set.chars().collect())
+}
+
+/// `sed` with one plain `s///`: a pattern Rust's regex reads the way a basic
+/// regular expression does (no groups, intervals, alternation or
+/// backreferences), a replacement with no `&` or `\`, and the `g` flag or
+/// none.
+fn sed_substitute(value: &str, program: &str) -> Option<String> {
+    let rest = program.strip_prefix('s')?;
+    let delimiter = rest.chars().next()?;
+    if delimiter.is_alphanumeric() || delimiter == '\\' {
+        return None;
+    }
+    let parts: Vec<&str> = rest[delimiter.len_utf8()..].split(delimiter).collect();
+    let [pattern, replacement, flags] = parts.as_slice() else {
+        return None;
+    };
+    if pattern.contains(['(', ')', '{', '}', '|', '+']) || replacement.contains(['&', '\\', '$']) {
+        return None;
+    }
+    let every = match *flags {
+        "" => false,
+        "g" => true,
+        _ => return None,
+    };
+    let regex = regex::Regex::new(pattern).ok()?;
+    Some(if every {
+        regex.replace_all(value, *replacement).into_owned()
+    } else {
+        regex.replace(value, *replacement).into_owned()
+    })
+}
+
+/// `cut -dC -fN` (or `-d C` written apart is not read) of one line.
+fn cut_field(value: &str, delimiter: &str, field: &str) -> Option<String> {
+    let delimiter = delimiter.strip_prefix("-d")?;
+    let mut chars = delimiter.chars();
+    let (Some(delimiter), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    let field = field.strip_prefix("-f")?;
+    let parts: Vec<&str> = value.split(delimiter).collect();
+    let pick = |n: &str| -> Option<usize> { n.parse::<usize>().ok().filter(|n| *n > 0) };
+    let fields: Vec<&str> = if let Some((from, to)) = field.split_once('-') {
+        let from = if from.is_empty() { 1 } else { pick(from)? };
+        let to = if to.is_empty() {
+            parts.len()
+        } else {
+            pick(to)?.min(parts.len())
+        };
+        parts.get(from - 1..to)?.to_vec()
+    } else {
+        let mut picked = Vec::new();
+        for n in field.split(',') {
+            if let Some(part) = parts.get(pick(n)? - 1) {
+                picked.push(*part);
+            }
+        }
+        picked
+    };
+    Some(fields.join(&delimiter.to_string()))
 }
 
 /// The line a shell segment hands a shell to run with `-c`, when every
@@ -26586,7 +27340,7 @@ mod guard_reading_tests {
         };
         assert_eq!(
             expanded("I=iw; $I ${I} $IW ${IW} ${I:-x} $1 $"),
-            Some("I=iw; iw iw $IW ${IW} ${I:-x} $1 $".to_string())
+            Some("I=iw; iw iw $IW ${IW} iw $1 $".to_string())
         );
         assert_eq!(
             expanded("I=one; I=two; $I"),
