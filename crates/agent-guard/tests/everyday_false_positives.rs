@@ -9,16 +9,19 @@
 //!   as the guard with a verb in hiding. The shell hands `{}` over as
 //!   written; only where a found file is the program run (`-exec {}`,
 //!   `fd -x {}`, `xargs -I{} {}`) is it unshown;
-//! - `curl -K api.cfg` and `curl --config` read options from a file, and
-//!   `-K` was read as `-k` (the match ignored case); `curl -sk`, `-k` in
-//!   a group of options, was not read at all;
+//! - `curl -K api.cfg` and `curl --config` read options from a file the
+//!   guard does not read; `-K` was matched as `-k` (the match ignored case),
+//!   so the reason was wrong. It stays a review, saying why; `curl -sk`, `-k`
+//!   in a group of options, was not read at all;
 //! - `git diff | grep -nP '\\xe2\\x80\\x94'`: a search pattern after a pipe
 //!   was read as code, hex escapes and all, though nothing after the search
 //!   runs what it prints;
 //! - `eval "$(direnv export bash)"` was refused while `eval "$(direnv hook
 //!   bash)"`, the hook that runs it, was not;
-//! - `bpftool map update|delete pinned /sys/fs/bpf/innerwarden/...`, a
-//!   rewrite of the maps the guard's kernel programs read, was allowed.
+//! - `bpftool map update|delete` of the maps the guard's kernel programs
+//!   read, by path or name, was allowed, and by number too;
+//! - `echo / | xargs -I X rm -rf X` was allowed: the line `xargs` builds
+//!   was not read.
 //!
 //! The lines of the guard's name in a working path that 1.6.13 refused as a
 //! change of the kernel protection (`tmux send-keys -t innerwarden "...$(...)"`,
@@ -103,8 +106,13 @@ fn the_guard_run_on_found_files_or_its_files_changed_is_still_refused() {
     );
 }
 
-/// FAILS ON REVERT of the `bpftool map` pattern in `check_anti_forensics`
-/// (every refused line is allowed). Reading a map changes nothing.
+/// FAILS ON REVERT of `check_guard_bpf_map_write` (threats.rs): every
+/// line below is allowed. A write of one of the guard's maps, by its pinned
+/// path or its name (cut to the 15 characters the kernel keeps, or in
+/// bpftool's short commands), is refused; by a number, or a value the text
+/// does not show, its owner cannot be told, so it is held for review.
+/// Reading a map changes nothing. Detaching a program or a link stays
+/// refused whatever names it, by number too, as on main.
 #[test]
 fn a_rewrite_of_the_guards_kernel_maps_is_refused() {
     assert_verdict(
@@ -112,14 +120,74 @@ fn a_rewrite_of_the_guards_kernel_maps_is_refused() {
             "bpftool map delete pinned /sys/fs/bpf/innerwarden/exec_allow key 0",
             "sudo bpftool map update pinned /sys/fs/bpf/innerwarden/exec_allow key 1 0 0 0 value 1 0 0 0",
             "bpftool map freeze pinned /sys/fs/bpf/innerwarden/secret_paths",
+            "bpftool map update name EXEC_ALLOWLIST key 1 0 0 0 value 1 0 0 0",
+            "bpftool map update name exec_allowlist key 1 value 1",
+            "sudo bpftool map delete name SECRET_READLIST key 0",
+            "bpftool map freeze name LSM_POLICY",
+            "bpftool m upd name EXEC_RAN_RATE_L key 1 value 1",
+            "bpftool map push name JAIL_ALLOW value 1",
+            "bpftool prog detach id 12",
+            "bpftool link detach id 3",
+            "bpftool link detach pinned /sys/fs/bpf/innerwarden/links/innerwarden_lsm_exec",
         ],
         "deny",
     );
     assert_verdict(
         &[
+            "bpftool map delete id 12 key 0",
+            "sudo bpftool map update id 7 key 1 value 1",
+            "bpftool map update pinned \"$P\" key 1 value 1",
+        ],
+        "review",
+    );
+    assert_verdict(
+        &[
             "bpftool map dump pinned /sys/fs/bpf/innerwarden/exec_allow",
+            "bpftool map dump name EXEC_ALLOWLIST",
+            "bpftool map lookup pinned /sys/fs/bpf/innerwarden/exec_allow key 0",
             "bpftool map show",
             "bpftool prog list | grep innerwarden",
+            "bpftool map update pinned /sys/fs/bpf/mine/m key 1 value 1",
+            "bpftool map update name MY_MAP key 1 value 1",
+        ],
+        "allow",
+    );
+}
+
+/// A file a search finds, or a word `xargs` is handed, is the target of
+/// the program it runs: `rm -rf` is judged by what it removes. With `{}`
+/// read as written this stays as on main for `find`; for `xargs` fed by a
+/// literal `echo` or `printf`, the line `xargs` builds is judged too.
+///
+/// FAILS ON REVERT of `lines_xargs_builds` (shell.rs): every `xargs` line
+/// in the first list is allowed.
+#[test]
+fn a_dangerous_target_handed_to_rm_by_find_or_xargs_is_refused() {
+    assert_verdict(
+        &[
+            "find / -maxdepth 1 -exec rm -rf {} \\;",
+            "find / -exec rm -rf {} +",
+            "find ~ -maxdepth 0 -exec rm -rf {} +",
+            "find /home -exec rm -rf {} \\;",
+            "echo / | xargs -I X rm -rf X",
+            "echo /home | xargs -I X rm -rf X",
+            "printf '%s\\n' / | xargs -I X rm -rf X",
+            "echo / | xargs rm -rf",
+            "echo ~ | xargs -I{} rm -rf {}",
+            "echo ~/.ssh | xargs -I X rm -rf X",
+            "echo ~/.claude/settings.json | xargs rm -f",
+            "echo innerwarden-agent | xargs systemctl stop",
+        ],
+        "deny",
+    );
+    assert_verdict(
+        &[
+            "find . -name node_modules -prune -exec rm -rf {} +",
+            "find build -name '*.o' -exec rm -f {} \\;",
+            "echo build dist | xargs rm -rf",
+            "printf '%s\\n' node_modules dist | xargs -I X rm -rf X",
+            "echo src/a.rs src/b.rs | xargs wc -l",
+            "echo 'a;rm -rf /' | xargs echo",
         ],
         "allow",
     );
@@ -149,15 +217,43 @@ fn the_guards_name_in_a_working_path_is_not_a_kernel_change() {
     );
 }
 
-/// FAILS ON REVERT of the curl pattern in `check_tls_verification_disabled`:
-/// `-K` is `review` again, and `-sk` and `-kL` are allowed.
+/// `curl -K FILE` and `--config FILE` read options from a file the guard
+/// does not read, which may hold `insecure`: held for review, and the
+/// reason says so. Options handed on standard input from the line itself
+/// are read: without `insecure` or `-k` they pass.
+///
+/// FAILS ON REVERT of `check_curl_options_file` (threats.rs): the unread
+/// files are allowed. FAILS ON REVERT of the curl pattern in
+/// `check_tls_verification_disabled`: `-sk` and `-kL` are allowed, and
+/// `-K` reads as certificates off.
 #[test]
-fn a_curl_options_file_is_not_certificates_off() {
+fn a_curl_options_file_the_guard_does_not_read_is_held_for_review() {
+    const UNREAD: &str = "curl options file not read; it may turn TLS checks off";
+    for line in [
+        "curl -K ~/.config/curl/api.cfg https://api.example.com/v1/items",
+        "curl --config ./curlrc https://api.example.com/v1/items",
+        "curl --config=./curlrc https://api.example.com",
+        "curl -sK api.cfg https://api.example.com",
+        "curl -Kapi.cfg https://api.example.com",
+        "curl -K \"$CFG\" https://api.example.com",
+        "curl -K - https://api.example.com",
+        "curl -K - https://api.example.com <<'EOF'\ninsecure\nEOF",
+        "curl -K - https://api.example.com <<< '-k'",
+        "curl -K - https://api.example.com <<'EOF'\nconfig = other.cfg\nEOF",
+        "curl -K - https://api.example.com <<EOF\nheader = \"X: $TOKEN\"\nEOF",
+    ] {
+        let analysis = analyze_command(line, None);
+        assert_eq!(analysis.recommendation, "review", "{line}");
+        assert!(
+            analysis.signals.iter().any(|s| s.detail == UNREAD),
+            "{line}: {:?}",
+            analysis.signals
+        );
+    }
     assert_verdict(
         &[
-            "curl -K ~/.config/curl/api.cfg https://api.example.com/v1/items",
-            "curl --config ./curlrc https://api.example.com/v1/items",
-            "curl -sK api.cfg https://api.example.com",
+            "curl -K - https://api.example.com <<'EOF'\nheader = \"Accept: application/json\"\nEOF",
+            "curl -K - https://api.example.com <<< 'silent'",
             "curl -o k.txt https://api.example.com",
         ],
         "allow",
@@ -171,6 +267,8 @@ fn a_curl_options_file_is_not_certificates_off() {
         "curl -kK api.cfg https://api.example.com",
         "curl https://api.example.com -k",
     ] {
+        let analysis = analyze_command(line, None);
+        assert_eq!(analysis.recommendation, "review", "{line}");
         assert!(
             has_signal(line, "tls_verification_disabled"),
             "{line}: certificate checks are off"
