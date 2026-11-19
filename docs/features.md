@@ -71,13 +71,20 @@ write it, and the installer adds the operator.
 
 An AI agent that runs as its own Linux account is not in that group unless you
 add it. Such an account still has every call screened, and its decisions are
-kept in its own home instead, so Pro does not see its refusals.
+kept in its own home instead (`~/.config/innerwarden`, the folder `0700` and
+the files `0600`). That is a failure of the record's integrity: Pro does not
+see those refusals, and the account, so the agent running as it, can edit or
+delete them. The same happens when the shared directory is writable but the
+graph or `guard-events.jsonl` in it is a file the account may not open.
 `innerwarden status`, run as that account, says so in one line; the hook
 says nothing about it on each call. To let Pro see them, add the agent's
 account to the group, then start the agent again from a new login so the
 group applies:
 
     sudo usermod -aG innerwarden <agent-account>
+
+The first `innerwarden status` after that says once that the decisions of
+the meantime are still in the home, and how to read them.
 
 The account can then write the shared record, the same as the operator, and
 so it can also change what others recorded there. A folder of its own that

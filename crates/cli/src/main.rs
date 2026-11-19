@@ -281,6 +281,7 @@ fn status_io_cmd_rest(
         Some(dashboard_answers(dashboard_probe_target()))
     };
 
+    let kept_apart_before = graph_io::kept_apart_before();
     let facts = status::Facts {
         never_configured,
         mode,
@@ -302,8 +303,15 @@ fn status_io_cmd_rest(
                 .display()
                 .to_string(),
         }),
+        kept_apart_before: kept_apart_before
+            .as_deref()
+            .map(|dir| dir.display().to_string()),
     };
     print!("{}", status::render(&facts));
+    // Said once: the note that made this line is dropped once it is printed.
+    if let Some(dir) = kept_apart_before.as_deref() {
+        graph_io::forget_kept_apart(dir);
+    }
     std::process::ExitCode::SUCCESS
 }
 
