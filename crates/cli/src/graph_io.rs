@@ -3421,7 +3421,7 @@ mod tests {
         // one second each (the old bounds), a loaded machine starved a writer
         // past its lock timeout, or this thread past its receive, and the test
         // failed with nothing wrong in the code.
-        const SIGNAL_BOUND: Duration = Duration::from_secs(60);
+        const SIGNAL_BOUND: Duration = Duration::from_secs(10);
         let seed_lock =
             GraphLock::acquire_with_timeout(&path, GRAPH_LOCK_TIMEOUT, || {}).expect("seed lock");
         let start = Arc::new(Barrier::new(3));

@@ -3183,8 +3183,9 @@ mod tests {
         // asked to stop with SIGTERM, so it can finish cleanly, and is not left
         // to the SIGKILL of a dropped child.
         //
-        // The proxy's grace after SIGTERM is lengthened for this proxy only,
-        // and the wait ends when the server's group is gone (its trap exits).
+        // The proxy waits for a signal here, not for its 1 s grace: for this
+        // proxy only, the grace is a bound of 5 s on the wait for the
+        // server's group to be gone, which ends as soon as the trap exits.
         // With the 1 s grace, a loaded runner killed a server whose trap had
         // not yet run, and this failed with nothing wrong in the proxy. A
         // proxy that kills without asking still leaves the file empty.
@@ -3196,9 +3197,9 @@ mod tests {
         let (proxy_out, from_proxy) = duplex(16384);
         drop(from_proxy);
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(10),
             TEST_STOP_GRACE.scope(
-                std::time::Duration::from_secs(60),
+                std::time::Duration::from_secs(5),
                 run_proxy_with_io(
                     proxy_in,
                     proxy_out,

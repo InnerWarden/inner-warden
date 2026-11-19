@@ -55,7 +55,7 @@ impl Host {
             // not by the profile ("did not finish in time"). Raised in debug
             // builds only (`hook_net::TEST_DEADLINE_ENV`); the hook still
             // answers as soon as it has screened.
-            .env("IW_TEST_HOOK_DEADLINE_MS", "120000")
+            .env("IW_TEST_HOOK_DEADLINE_MS", "30000")
             .current_dir(self.home().join("proj"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
