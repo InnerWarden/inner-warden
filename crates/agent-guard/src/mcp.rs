@@ -138,6 +138,21 @@ pub(crate) fn inspect_declared_tool_call(
         Some(read) => (read.commands, read.read_keys),
         None => (Vec::new(), Vec::new()),
     };
+    // Standard input past what the guard reads as code, handed to a shell,
+    // which runs it: what it runs is not known, so it is refused unread.
+    let long_stdin = (names_a_shell_tool(tool_name) || names_a_process_tool(tool_name))
+        .then(|| long_stdin_to_a_shell(args))
+        .flatten();
+    if let Some(length) = long_stdin {
+        alerts.push(VerdictAlert::builtin(
+            "AG-STDIN-LONG",
+            format!(
+                "standard input of {length} bytes handed to a shell is longer than the \
+                 {MAX_STDIN_READ_BYTES} bytes the guard reads as code; refused unread"
+            ),
+            true,
+        ));
+    }
     if !commands.is_empty() {
         let mut blocks = false;
         for command in &commands {
@@ -158,7 +173,7 @@ pub(crate) fn inspect_declared_tool_call(
         }
         if commands.iter().all(|command| command.exclusive) {
             return Verdict {
-                allowed: !blocks,
+                allowed: !blocks && long_stdin.is_none(),
                 alerts,
             };
         }
@@ -525,6 +540,34 @@ const WORKING_FOLDER_KEYS: &[&str] = &[
     "chdir",
 ];
 
+/// The keys whose value is what a call hands its program on standard input,
+/// as [`canonical_key`] gives them: `stdin`, `standard_input`, ...
+const STDIN_KEYS: &[&str] = &["stdin", "standardinput", "stdindata"];
+
+/// The most standard input a call may hand its program and still be read as
+/// code ([`read_tool_call`]). The text is judged once with each command line
+/// of the call and once on its own, by the whole analyzer, so it is bounded
+/// on its own and well under the proxy's line cap (4 MiB). Longer input is
+/// not read: the field stays a field nothing reads, and the call is judged
+/// as it was before standard input was read at all (its name conditions and
+/// the checks on its arguments).
+pub(crate) const MAX_STDIN_READ_BYTES: usize = 64 * 1024;
+
+/// The length of the longest standard input a call hands a program that is
+/// a shell, when it is past [`MAX_STDIN_READ_BYTES`] and so not read.
+fn long_stdin_to_a_shell(args: &serde_json::Value) -> Option<usize> {
+    let object = args.as_object()?;
+    if !program_is_a_shell(object) {
+        return None;
+    }
+    object
+        .iter()
+        .filter(|(key, _)| STDIN_KEYS.contains(&canonical_key(key).as_str()))
+        .filter_map(|(_, value)| scalar_text(value).map(|text| text.len()))
+        .filter(|length| *length > MAX_STDIN_READ_BYTES)
+        .max()
+}
+
 /// What the guard says of a command it cannot read as words.
 const UNREADABLE_COMMAND: &str = "a command in a shape that cannot be read as words";
 /// What the guard says of arguments it cannot read as words.
@@ -614,6 +657,59 @@ fn program_is_a_shell(object: &serde_json::Map<String, serde_json::Value>) -> bo
                     .is_some_and(|program| threats::is_shell_program(program))
             }
         })
+}
+
+/// The line a call hands a shell to run when its program and arguments
+/// are that and nothing more: `{"command": "bash", "args": ["-c", "<line>"]}`,
+/// `{"command": "bash -c", "args": ["<line>"]}` or an argv list of the same
+/// three words. The shell runs the line as a command string, so the line is
+/// what is judged; read as `bash '-c' '<line>'`, the line was also text in
+/// an argument of the outer command, where `scp -i ~/.ssh/id_rsa ...` read
+/// as a copy of the key. With a word after the line (`$0`, `$1`) the call
+/// is not this shape and is read joined.
+fn line_handed_to_a_shell(object: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    use serde_json::Value;
+    let mut words: Vec<String> = Vec::new();
+    let mut programs = 0;
+    for key in PROGRAM_KEYS {
+        let Some(value) = object.get(*key).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        programs += 1;
+        match value {
+            Value::String(text) if *key == "program" || *key == "executable" => {
+                words.push(text.trim().to_string())
+            }
+            Value::String(text) => words.extend(threats::shell_tokens(text)),
+            Value::Array(items) => words.extend(
+                scalar_words(items)?
+                    .into_iter()
+                    .map(std::borrow::Cow::into_owned),
+            ),
+            _ => return None,
+        }
+    }
+    let arguments: Vec<&Value> = ARGUMENT_KEYS
+        .iter()
+        .filter_map(|key| object.get(*key))
+        .filter(|value| !value.is_null())
+        .collect();
+    if programs != 1 || arguments.len() > 1 {
+        return None;
+    }
+    if let Some(value) = arguments.first() {
+        words.extend(
+            scalar_words(value.as_array()?)?
+                .into_iter()
+                .map(std::borrow::Cow::into_owned),
+        );
+    }
+    match words.as_slice() {
+        [shell, flag, line] if flag == "-c" && threats::is_shell_program(shell) => {
+            Some(line.clone())
+        }
+        _ => None,
+    }
 }
 
 /// A shell or process tool call as [`read_tool_call`] reads it.
@@ -922,6 +1018,57 @@ fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCall
             }
         }
     }
+    // What the call hands its program on standard input. A shell or an
+    // interpreter runs it as its program, so it is judged as the program
+    // reads it: each command line with the text fed to it as a
+    // here-document, which the analyzer reads as code where the program
+    // takes it as code. A shell tool's input may reach the shell the tool
+    // starts as well, whatever its command line runs, and so may the input
+    // of a call whose program is a shell: there it is also judged as a line
+    // of its own. The lines are judged as the call's own lines are: alone
+    // when those are (a shell tool's command string, whose call was judged
+    // by its lines only before), with the checks on the arguments when not.
+    let stdin_exclusive = !commands.is_empty() && commands.iter().all(|c| c.exclusive);
+    for (key, value) in object {
+        if !STDIN_KEYS.contains(&canonical_key(key).as_str()) {
+            continue;
+        }
+        let Some(text) = scalar_text(value) else {
+            continue;
+        };
+        if text.len() > MAX_STDIN_READ_BYTES {
+            continue;
+        }
+        if !text.trim().is_empty() {
+            let delimiter = (0usize..)
+                .map(|n| format!("IW_STDIN_{n}"))
+                .find(|delimiter| !text.lines().any(|line| line.trim() == delimiter))
+                .unwrap_or_default();
+            let mut lines: Vec<String> = commands
+                .iter()
+                .map(|command| format!("{} <<'{delimiter}'\n{text}\n{delimiter}", command.line))
+                .collect();
+            if shell_tool || typed_into_a_shell {
+                lines.push(match &exported {
+                    Some(exported) => format!("{exported}{text}"),
+                    None => text.to_string(),
+                });
+            }
+            for line in lines {
+                if !commands.iter().any(|known| known.line == line.as_str()) {
+                    commands.push(ToolCommand {
+                        line: Cow::Owned(line),
+                        exclusive: stdin_exclusive,
+                    });
+                }
+            }
+        }
+        // The field is not counted as read: the lines above add to what the
+        // call is judged by and take nothing from it. A call that holds
+        // standard input keeps what it was judged by before (a field nothing
+        // else reads: the name conditions, the checks on the arguments, and
+        // the hook's refusal of a shell call with a field it does not read).
+    }
     // Arguments with no program to add them to are read for nothing.
     unread_field |= !argument_readings.is_empty()
         && !PROGRAM_KEYS.iter().any(|key| {
@@ -978,6 +1125,40 @@ fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCall
     }
     if produced_a_line {
         read_keys.extend(env_read);
+    }
+    // A shell tool that starts a shell and hands it every field of the call
+    // (`{"command": "bash", "args": ["-c", "<line>"]}`), beside a folder or
+    // a note, runs that line as its command string would. The line is also
+    // judged on its own, as that string is. This reading adds to the others
+    // and replaces none: the joined reading of the program and its
+    // arguments stays, and so do the checks on the arguments (a credential,
+    // a key path, the ATR rules over the call), which a line judged alone
+    // would skip.
+    let whole_call_read = object.iter().all(|(key, value)| {
+        let canonical = canonical_key(key);
+        value.is_null()
+            || read_keys.contains(&key.as_str())
+            || INERT_KEYS.contains(&canonical.as_str())
+            || WORKING_FOLDER_KEYS.contains(&canonical.as_str())
+    });
+    if shell_tool
+        && typed_into_a_shell
+        && unreadable.is_none()
+        && !unnamed_variable
+        && whole_call_read
+    {
+        if let Some(line) = line_handed_to_a_shell(object) {
+            let line = match &exported {
+                Some(exported) => format!("{exported}{line}"),
+                None => line,
+            };
+            if !commands.iter().any(|known| known.line == line.as_str()) {
+                commands.push(ToolCommand {
+                    line: Cow::Owned(line),
+                    exclusive: false,
+                });
+            }
+        }
     }
     ToolCallRead {
         commands,
@@ -2090,6 +2271,44 @@ pub fn inspect_listed_description(owner: &str, description: &str) -> Verdict {
         .collect();
     Verdict {
         allowed: alerts.is_empty(),
+        alerts,
+    }
+}
+
+/// The most of a tool result or a resource read for orders aimed at the
+/// model ([`inspect_answer_orders`]): the 64 KiB the proxy hands
+/// [`inspect_response`] of an answer (the router's
+/// `MAX_SCANNED_RESULT_BYTES`), held here as well so a caller that hands
+/// more does not make the orders, the de-obfuscation and the base64 decoding
+/// read without a bound. Past it the answer is not read for orders, and the
+/// finding says so.
+pub const MAX_ANSWER_ORDER_BYTES: usize = 64 * 1024;
+
+/// Inspect what a tool or a resource hands back for orders aimed at the
+/// model ([`crate::description_poison::find_in_answer`]), up to
+/// [`MAX_ANSWER_ORDER_BYTES`]. An order found blocks; an answer longer than
+/// that is read up to it and reported with an alert that does not block.
+pub fn inspect_answer_orders(content: &str) -> Verdict {
+    let mut end = content.len().min(MAX_ANSWER_ORDER_BYTES);
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut alerts: Vec<VerdictAlert> = crate::description_poison::find_in_answer(&content[..end])
+        .map(|d| desc_poison_alert("tool or resource answer", &d))
+        .into_iter()
+        .collect();
+    if end < content.len() {
+        alerts.push(VerdictAlert::builtin(
+            "AG-RESP-PARTIAL",
+            format!(
+                "answer of {} bytes read for orders to the model in its first {end} bytes only",
+                content.len()
+            ),
+            false,
+        ));
+    }
+    Verdict {
+        allowed: !alerts.iter().any(|alert| alert.block),
         alerts,
     }
 }
