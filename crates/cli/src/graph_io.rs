@@ -3417,6 +3417,14 @@ mod tests {
         let path = dir.path().join("graph.json");
         // Hold the OS lock first so both simulated agent writers are proven to
         // contend before either can load the graph.
+        //
+        // Every wait below ends on a signal: a writer reports its contention on
+        // the channel, and the seed lock is released only after both did. The
+        // bound is only there so a broken run fails instead of hanging. With
+        // one second each (the old bounds), a loaded machine starved a writer
+        // past its lock timeout, or this thread past its receive, and the test
+        // failed with nothing wrong in the code.
+        const SIGNAL_BOUND: Duration = Duration::from_secs(10);
         let seed_lock =
             GraphLock::acquire_with_timeout(&path, GRAPH_LOCK_TIMEOUT, || {}).expect("seed lock");
         let start = Arc::new(Barrier::new(3));
@@ -3442,7 +3450,7 @@ mod tests {
                     DecisionMode::Monitor,
                     DecisionOutcome::Allowed,
                     None,
-                    Duration::from_secs(1),
+                    SIGNAL_BOUND,
                     || contended_tx.send(session).unwrap(),
                 )
             })
@@ -3452,10 +3460,10 @@ mod tests {
 
         start.wait();
         let first = contended_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(SIGNAL_BOUND)
             .expect("first writer contended");
         let second = contended_rx
-            .recv_timeout(Duration::from_secs(1))
+            .recv_timeout(SIGNAL_BOUND)
             .expect("second writer contended");
         assert_ne!(first, second);
         drop(seed_lock);

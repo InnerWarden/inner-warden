@@ -1542,7 +1542,7 @@ async fn stop_server(server: &mut Server, wait_first: Duration) -> std::io::Resu
         }
     }
     server.ask_to_stop();
-    let deadline = tokio::time::Instant::now() + STOP_GRACE;
+    let deadline = tokio::time::Instant::now() + stop_grace();
     if exited.is_none() {
         if let Ok(status) = tokio::time::timeout_at(deadline, server.wait()).await {
             exited = Some(status);
@@ -1554,6 +1554,27 @@ async fn stop_server(server: &mut Server, wait_first: Duration) -> std::io::Resu
         Some(status) => status,
         None => server.wait().await,
     }
+}
+
+/// The grace between asking the server to stop and killing it: [`STOP_GRACE`].
+///
+/// A test that proves the server was asked first can lengthen it for its own
+/// proxy: a server's SIGTERM handler is a process the machine has to schedule,
+/// and on a loaded runner one second was not always enough for it to write
+/// that it had been asked (CI macOS, 2026-11-19). The wait still ends as soon
+/// as the server's group is gone, so a longer grace only matters to a server
+/// that is slow to get the CPU.
+fn stop_grace() -> Duration {
+    #[cfg(test)]
+    if let Ok(grace) = TEST_STOP_GRACE.try_with(|grace| *grace) {
+        return grace;
+    }
+    STOP_GRACE
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_STOP_GRACE: Duration;
 }
 
 /// Resolves when the process is asked to stop: SIGTERM, SIGHUP or SIGINT.
@@ -3161,6 +3182,13 @@ mod tests {
         // gone, so the server's first line cannot be delivered). The server is
         // asked to stop with SIGTERM, so it can finish cleanly, and is not left
         // to the SIGKILL of a dropped child.
+        //
+        // The proxy waits for a signal here, not for its 1 s grace: for this
+        // proxy only, the grace is a bound of 5 s on the wait for the
+        // server's group to be gone, which ends as soon as the trap exits.
+        // With the 1 s grace, a loaded runner killed a server whose trap had
+        // not yet run, and this failed with nothing wrong in the proxy. A
+        // proxy that kills without asking still leaves the file empty.
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("server.pid");
         let asked = dir.path().join("asked-to-stop");
@@ -3170,19 +3198,22 @@ mod tests {
         drop(from_proxy);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_proxy_with_io(
-                proxy_in,
-                proxy_out,
-                advisory(vec![
-                    "sh".into(),
-                    "-c".into(),
-                    script.into(),
-                    "sh".into(),
-                    pid_file.display().to_string(),
-                    asked.display().to_string(),
-                ]),
-                None,
-                |_d: &ProxyDecision| {},
+            TEST_STOP_GRACE.scope(
+                std::time::Duration::from_secs(5),
+                run_proxy_with_io(
+                    proxy_in,
+                    proxy_out,
+                    advisory(vec![
+                        "sh".into(),
+                        "-c".into(),
+                        script.into(),
+                        "sh".into(),
+                        pid_file.display().to_string(),
+                        asked.display().to_string(),
+                    ]),
+                    None,
+                    |_d: &ProxyDecision| {},
+                ),
             ),
         )
         .await

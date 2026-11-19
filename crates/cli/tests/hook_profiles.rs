@@ -50,6 +50,12 @@ impl Host {
             .env("IW_SESSION_FILE", self.dir.path().join("sessions.json"))
             .env_remove("IW_GUARD_SESSION")
             .env("INNERWARDEN_AGENT_URL", "off")
+            // Not a test of the deadline: on a loaded machine the debug
+            // hook ran past its ten seconds here and was refused by the net,
+            // not by the profile ("did not finish in time"). Raised in debug
+            // builds only (`hook_net::TEST_DEADLINE_ENV`); the hook still
+            // answers as soon as it has screened.
+            .env("IW_TEST_HOOK_DEADLINE_MS", "30000")
             .current_dir(self.home().join("proj"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
