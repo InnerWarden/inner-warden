@@ -8,8 +8,12 @@
 //! files in that scratch home.
 
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Instant;
+
+mod fork_safe;
+use fork_safe::{copy_the_binary, spawn_without_racing_a_copy};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
@@ -50,19 +54,24 @@ impl Host {
 
     /// Run the hook once with `payload`; the exit code and stderr.
     fn hook(&self, flags: &[&str], payload: &str) -> (Option<i32>, String) {
-        let mut child = Command::new(bin())
-            .arg("hook")
-            .args(flags)
-            .env("HOME", self.home())
-            .env("USERPROFILE", self.home())
-            .env("IW_GRAPH_FILE", self.dir.path().join("graph.json"))
-            .env("IW_SESSION_FILE", self.dir.path().join("sessions.json"))
-            .current_dir(self.project())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("run innerwarden hook");
+        self.hook_as(Path::new(bin()), flags, payload)
+    }
+
+    /// [`Host::hook`] with `program` as the guard binary.
+    fn hook_as(&self, program: &Path, flags: &[&str], payload: &str) -> (Option<i32>, String) {
+        let mut child = spawn_without_racing_a_copy(
+            Command::new(program)
+                .arg("hook")
+                .args(flags)
+                .env("HOME", self.home())
+                .env("USERPROFILE", self.home())
+                .env("IW_GRAPH_FILE", self.dir.path().join("graph.json"))
+                .env("IW_SESSION_FILE", self.dir.path().join("sessions.json"))
+                .current_dir(self.project())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
         child
             .stdin
             .as_mut()
@@ -102,6 +111,167 @@ impl Host {
 
 fn record(host: &Host) -> String {
     std::fs::read_to_string(host.dir.path().join("graph.json")).unwrap_or_default()
+}
+
+/// NEW-20261112-claude-hook-file-tools-unscreened, measured on 1.6.12: the
+/// five reads passed with exit 0 because nothing ran for Read and Grep. This
+/// goes the way a person does: `innerwarden install claude-code` in a scratch
+/// home, then for each call the settings entry Claude Code would pick for
+/// that tool, its command line run by `sh -c` with the payload on stdin.
+/// Every one refuses, and Glob is wired the same way.
+#[cfg(unix)]
+#[test]
+fn an_installed_hook_refuses_the_five_reads_that_passed_on_1_6_12() {
+    let host = Host::new();
+    let install = spawn_without_racing_a_copy(
+        Command::new(bin())
+            .args(["install", "claude-code"])
+            .env("HOME", host.home())
+            .env("USERPROFILE", host.home())
+            .env("IW_GRAPH_FILE", host.dir.path().join("graph.json"))
+            .env("IW_SESSION_FILE", host.dir.path().join("sessions.json"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .wait_with_output()
+    .expect("run innerwarden install");
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let settings: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(host.home().join(".claude/settings.json")).expect("settings written"),
+    )
+    .expect("settings json");
+    let line_for = |tool: &str| -> String {
+        settings["hooks"]["PreToolUse"]
+            .as_array()
+            .expect("PreToolUse")
+            .iter()
+            .find(|entry| {
+                entry["matcher"]
+                    .as_str()
+                    .is_some_and(|m| m.split('|').any(|t| t == tool))
+            })
+            .and_then(|entry| entry["hooks"][0]["command"].as_str())
+            .unwrap_or_else(|| panic!("no hook for {tool}: {settings}"))
+            .to_string()
+    };
+    assert!(!line_for("Glob").is_empty());
+    let run = |line: &str, payload: &str| -> (Option<i32>, String) {
+        let mut child = spawn_without_racing_a_copy(
+            Command::new("sh")
+                .args(["-c", line])
+                .env("HOME", host.home())
+                .env("IW_GRAPH_FILE", host.dir.path().join("graph.json"))
+                .env("IW_SESSION_FILE", host.dir.path().join("sessions.json"))
+                .current_dir(host.project())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped()),
+        );
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(payload.as_bytes())
+            .expect("write stdin");
+        let out = child.wait_with_output().expect("output");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    for (tool, payload) in [
+        ("Read", host.read(&host.at(".hermes/.env"))),
+        ("Read", host.read(&host.at(".codex/auth.json"))),
+        ("Read", host.read(&host.at(".ssh/id_ed25519"))),
+        ("Grep", host.grep(&host.at(".hermes"))),
+        ("Grep", host.grep(&host.at(".ssh"))),
+    ] {
+        let (code, stderr) = run(&line_for(tool), &payload);
+        assert_eq!(code, Some(2), "{tool} {payload}: {stderr}");
+    }
+}
+
+/// NEW-20261116-upgrade-leaves-read-tools-unwired: a home wired by 1.6.12
+/// (Bash and file tools, no read tools) and upgraded by that binary keeps
+/// that wiring. The first hook the NEW binary runs brings it up to this
+/// version's, in the mode it had, once: the next call changes nothing.
+/// `agents rewire`, what the upgrade now runs with the new binary, is a no-op
+/// after that.
+///
+/// The binary runs from a copy outside the cargo build directory, the way an
+/// installed one does: a cargo build never rewires anything
+/// (`rewire_never_to_a_build.rs`).
+#[test]
+fn the_first_hook_of_a_new_version_wires_the_read_tools() {
+    let host = Host::new();
+    let installed_dir = host.dir.path().join("bin");
+    std::fs::create_dir_all(&installed_dir).unwrap();
+    let installed = installed_dir.join(Path::new(bin()).file_name().unwrap());
+    copy_the_binary(Path::new(bin()), &installed);
+    let old = format!("\"{}\" hook --agent claude-code", installed.display());
+    let wired_by_1_6_12 = serde_json::json!({"hooks": {"PreToolUse": [
+        {"matcher": "Bash", "hooks": [{"type": "command", "command": old}]},
+        {"matcher": "Write|Edit|MultiEdit|NotebookEdit",
+         "hooks": [{"type": "command", "command": old}]}
+    ]}});
+    let path = host.home().join(".claude/settings.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, serde_json::to_vec_pretty(&wired_by_1_6_12).unwrap()).unwrap();
+    let read_tools_wired = || {
+        let now: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        now["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["matcher"] == "Read|Grep|Glob")
+    };
+    assert!(!read_tools_wired());
+
+    let harmless = host.call("Bash", serde_json::json!({ "command": "ls" }));
+    let (code, stderr) = host.hook_as(&installed, &["--agent", "claude-code"], &harmless);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(
+        read_tools_wired(),
+        "{}",
+        std::fs::read_to_string(&path).unwrap()
+    );
+    let body = std::fs::read(&path).unwrap();
+    assert!(
+        !String::from_utf8_lossy(&body).contains("--monitor"),
+        "enforce stays enforce"
+    );
+
+    let (code, _) = host.hook_as(&installed, &["--agent", "claude-code"], &harmless);
+    assert_eq!(code, Some(0));
+    assert_eq!(std::fs::read(&path).unwrap(), body, "once per version");
+
+    let rewire = spawn_without_racing_a_copy(
+        Command::new(&installed)
+            .args(["agents", "rewire"])
+            .env("HOME", host.home())
+            .env("USERPROFILE", host.home())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .wait_with_output()
+    .expect("agents rewire");
+    assert!(
+        rewire.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rewire.stderr)
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        body,
+        "nothing left to rewire"
+    );
 }
 
 /// The row's proof: the five calls measured as passing are refused before

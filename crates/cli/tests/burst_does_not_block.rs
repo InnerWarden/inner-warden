@@ -11,7 +11,10 @@
 //! between them: a rate alert crossing from the persisted tracker into the
 //! verdict, then `--block-review` turning it into a refusal.
 //!
-//! Both env vars keep the run off the developer's own state.
+//! The env vars keep the run off the developer's own state: HOME above all,
+//! because the hook rewires the Claude Code settings under it once per
+//! version, and this test run against the real home once pointed every guard
+//! hook of a machine at `target/debug/innerwarden`.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -89,6 +92,8 @@ impl Host {
 
         let mut child = Command::new(bin())
             .args(["hook", "--block-review"])
+            .env("HOME", self._dir.path())
+            .env("USERPROFILE", self._dir.path())
             .env("IW_GRAPH_FILE", &self.graph)
             .env("IW_SESSION_FILE", &self.sessions)
             .stdin(Stdio::piped())

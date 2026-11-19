@@ -16,6 +16,92 @@ pub(crate) fn lowers_a_guard(rest: &[String]) -> bool {
     }
 }
 
+/// The program this process was started as, the way the hook line names it:
+/// `argv[0]` when it is an absolute path (the hook line and the upgrade both
+/// run an absolute path), else the resolved executable. Rewiring to the
+/// resolved path instead would turn a hook that names a symlink or a package
+/// shim into one that names whatever it points at today.
+pub(crate) fn invoked_as() -> Option<String> {
+    let argv0 = std::env::args_os().next().map(std::path::PathBuf::from);
+    match argv0 {
+        Some(path) if path.is_absolute() => Some(path.display().to_string()),
+        _ => std::env::current_exe()
+            .ok()
+            .map(|p| p.display().to_string()),
+    }
+}
+
+/// `innerwarden agents rewire`: bring the wiring already there up to this
+/// binary's, in the mode it has ([`agent_policy::rewire_existing`]). Connects
+/// no new agent; for an agent already connected it writes the halves it lacks
+/// in the mode of its Bash half, keeps each other half's mode and never lowers
+/// one, so it is not one of the verbs that lower a guard. The upgrade runs it with the NEW binary.
+fn cmd_rewire() -> std::process::ExitCode {
+    let (Ok(home), Some(bin)) = (hook::home_dir(), invoked_as()) else {
+        eprintln!("innerwarden agents rewire: could not tell the home or this program's path");
+        return std::process::ExitCode::from(1);
+    };
+    let report = agent_policy::rewire_existing(&home, &bin);
+    for line in &report.notices {
+        println!("{line}");
+    }
+    if report.connected > 0 {
+        println!(
+            "Re-wired {} connected agent(s) so this version's hooks are the ones they run.",
+            report.connected
+        );
+        println!("Restart them to pick it up: a hook is read at agent startup.");
+    }
+    if report.failed > 0 {
+        std::process::ExitCode::from(1)
+    } else if report.refused {
+        // Not a failure of the command, but the wiring was left as it was:
+        // the upgrade reads this code to say so and how to rewire.
+        std::process::ExitCode::from(3)
+    } else {
+        std::process::ExitCode::SUCCESS
+    }
+}
+
+/// Once per version of this binary at its path: [`agent_policy::rewire_existing`],
+/// from the hook.
+///
+/// The upgrade now rewires with the new binary, but a host upgraded by an
+/// older one (1.6.12 to 1.6.13, any `npm`, `deb` or copied binary) never ran
+/// that, and the hook is the one part of the new binary sure to run. A stamp
+/// beside the agent policy records the version and path that last rewired, so
+/// every later call costs one small read. Before any rewire, a call reads
+/// Claude Code's settings and writes nothing when there is nothing of ours to
+/// bring up to date. A run that failed or could not take the lock writes no
+/// stamp and is tried again on the next call. Silent: what it changed is said
+/// by `status` and `agents`.
+pub(crate) fn rewire_once_per_version() {
+    let (Ok(home), Some(bin)) = (hook::home_dir(), invoked_as()) else {
+        return;
+    };
+    let bin = agent_policy::wired_name_of(&home, &bin);
+    let stamp = agent_policy::config_path(&home).with_file_name("rewired");
+    let want = format!("{} {bin}\n", env!("CARGO_PKG_VERSION"));
+    if std::fs::read_to_string(&stamp).is_ok_and(|have| have == want) {
+        return;
+    }
+    // A cargo build, or a binary the hooks do not run: leave the home
+    // exactly as it is, stamp included.
+    if agent_policy::refuse_rewire_to(&home, &bin).is_some() {
+        return;
+    }
+    // Nothing of ours to bring up to date: write nothing, not even the
+    // stamp, so a hook on a home with no wiring leaves no file behind.
+    if !agent_policy::claude_wiring_needs_rewire(&home, &bin) {
+        return;
+    }
+    let report =
+        agent_policy::rewire_existing_within(&home, &bin, std::time::Duration::from_millis(50));
+    if !report.has_failures() {
+        let _ = std::fs::write(&stamp, want);
+    }
+}
+
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     // The person's decisions about an agent (approve, profile, allow,
     // revoke): verbs of their own, never part of discovery or wiring.
@@ -23,6 +109,9 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
         innerwarden_agent_guard::threats::AGENT_DECISION_VERBS.contains(&verb.as_str())
     }) {
         return crate::agent_decisions_io::cmd(rest);
+    }
+    if rest.first().map(String::as_str) == Some("rewire") {
+        return cmd_rewire();
     }
     if rest.first().map(String::as_str) != Some("auto-connect") {
         if let Err(error) = agents_ops::validate_args(rest) {

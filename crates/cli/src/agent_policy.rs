@@ -90,6 +90,9 @@ pub struct ReconcileReport {
     /// What this pass did to each agent it considered, for the watcher's log
     /// gate ([`lines_to_log`]). The one-shot CLI prints `notices` instead.
     pub outcomes: BTreeMap<String, AgentTick>,
+    /// A rewire that [`refuse_rewire_to`] stopped before it touched anything:
+    /// the wiring is left as it was, which the caller has to say.
+    pub refused: bool,
 }
 
 /// What one reconcile pass did to one agent.
@@ -672,9 +675,13 @@ fn hook_needs_automatic_reconciliation(
     agent: &innerwarden_agent_guard::agents::AgentStatus,
     guard_bin: &str,
 ) -> bool {
-    if !agent.hookable {
-        return false;
-    }
+    agent.hookable && claude_wiring_needs_rewire(home, guard_bin)
+}
+
+/// Whether Claude Code's settings carry InnerWarden wiring that this binary
+/// would rewrite. Reads one file and writes nothing, so the hook can ask it
+/// before deciding to take the policy lock at all.
+pub fn claude_wiring_needs_rewire(home: &Path, guard_bin: &str) -> bool {
     let path = home.join(".claude/settings.json");
     innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &path)
         .ok()
@@ -730,33 +737,190 @@ fn reconcile_unlocked(home: &Path, guard_bin: &str, policy: &AgentPolicy) -> Rec
             report.skipped += 1;
             continue;
         }
-        report.attempted += 1;
-        let result = innerwarden_agent_guard::agents_ops::connect_one_result_automatic(
-            home, &agent, guard_bin, false,
-            true, // Hard invariant: automatic wiring is always monitor-only.
-        );
-        match result.effect {
-            innerwarden_agent_guard::agents_ops::ConnectEffect::Connected => {
-                report.connected += 1;
-                report
-                    .outcomes
-                    .insert(agent.name.clone(), AgentTick::Wrote(result.line.clone()));
-                report.notices.push(result.line);
-            }
-            innerwarden_agent_guard::agents_ops::ConnectEffect::Unchanged
-            | innerwarden_agent_guard::agents_ops::ConnectEffect::Skipped => {
-                report.skipped += 1;
-            }
-            innerwarden_agent_guard::agents_ops::ConnectEffect::Failed => {
-                report.failed += 1;
-                report
-                    .outcomes
-                    .insert(agent.name.clone(), AgentTick::Failed(result.line.clone()));
-                report.notices.push(result.line);
-            }
-        }
+        connect_automatically(home, &agent, guard_bin, &mut report);
     }
     report
+}
+
+/// One automatic connection, counted into `report`.
+fn connect_automatically(
+    home: &Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+    guard_bin: &str,
+    report: &mut ReconcileReport,
+) {
+    report.attempted += 1;
+    let result = innerwarden_agent_guard::agents_ops::connect_one_result_automatic(
+        home, agent, guard_bin, false,
+        true, // Hard invariant: automatic wiring is always monitor-only.
+    );
+    match result.effect {
+        innerwarden_agent_guard::agents_ops::ConnectEffect::Connected => {
+            report.connected += 1;
+            report
+                .outcomes
+                .insert(agent.name.clone(), AgentTick::Wrote(result.line.clone()));
+            report.notices.push(result.line);
+        }
+        innerwarden_agent_guard::agents_ops::ConnectEffect::Unchanged
+        | innerwarden_agent_guard::agents_ops::ConnectEffect::Skipped => {
+            report.skipped += 1;
+        }
+        innerwarden_agent_guard::agents_ops::ConnectEffect::Failed => {
+            report.failed += 1;
+            report
+                .outcomes
+                .insert(agent.name.clone(), AgentTick::Failed(result.line.clone()));
+            report.notices.push(result.line);
+        }
+    }
+}
+
+/// Bring the hook wiring that is ALREADY there up to this binary's: the
+/// halves it judges with (file tools, read tools, tool results) and the line
+/// it writes, in the mode the wiring already has, never weaker.
+///
+/// Run by the NEW binary after an upgrade. The previous binary only knows
+/// the wiring of its own version, so when it rewired after replacing itself
+/// it wrote that, and a 1.6.12 upgraded to 1.6.13 kept Read, Grep and Glob
+/// unscreened (NEW-20261116-upgrade-leaves-read-tools-unwired).
+///
+/// Unlike [`reconcile`], this does not wait for `auto_connect`: it touches
+/// only agents that already have an InnerWarden hook, and completes the
+/// wiring the person already chose. A half that agent does not have yet
+/// (Read|Grep|Glob after an upgrade, say) IS written, in the mode of its Bash
+/// half; every half already there keeps its own mode, never weaker. A
+/// disconnect or exclusion still wins.
+pub fn rewire_existing(home: &Path, guard_bin: &str) -> ReconcileReport {
+    rewire_existing_within(home, guard_bin, POLICY_LOCK_WAIT)
+}
+
+/// [`rewire_existing`], waiting at most `wait` for the policy lock: the hook
+/// path cannot wait long, and gives up to try again on its next call.
+pub fn rewire_existing_within(
+    home: &Path,
+    guard_bin: &str,
+    wait: std::time::Duration,
+) -> ReconcileReport {
+    let named = wired_name_of(home, guard_bin);
+    let guard_bin = named.as_str();
+    if let Some(why) = refuse_rewire_to(home, guard_bin) {
+        return ReconcileReport {
+            notices: vec![why],
+            refused: true,
+            ..ReconcileReport::default()
+        };
+    }
+    let run = with_lock_within(home, wait, || {
+        let policy = load(home)?;
+        let mut report = ReconcileReport::default();
+        for agent in innerwarden_agent_guard::agents_ops::detected_guardable(home) {
+            report.detected += 1;
+            report.outcomes.insert(agent.name.clone(), AgentTick::Quiet);
+            if !is_reviewed_integration(&agent)
+                || is_excluded(&policy, &agent.name)
+                || !hook_needs_automatic_reconciliation(home, &agent, guard_bin)
+            {
+                report.skipped += 1;
+                continue;
+            }
+            connect_automatically(home, &agent, guard_bin, &mut report);
+        }
+        Ok(report)
+    });
+    run.unwrap_or_else(ReconcileReport::lock_failure)
+}
+
+/// Why a rewire must not point the wiring at `guard_bin`, or `None` when it
+/// may (NEW-20261118-dev-build-rewired-real-claude-hooks).
+///
+/// A rewire brings the wiring up to the binary that is already wired, never
+/// to another one: the upgrade replaces the binary at the path the hooks name
+/// and then runs it there. Two cases it refused nothing for, and a test of the
+/// workspace that ran `target/debug/innerwarden hook` against the real home
+/// turned every guard hook of that machine into the debug build:
+///
+/// - a program inside a cargo build directory, which the next `cargo build`
+///   replaces with whatever the tree holds then;
+/// - a program other than the one the hooks already run.
+pub fn refuse_rewire_to(home: &Path, guard_bin: &str) -> Option<String> {
+    // The path as written and the file it resolves to: a link such as
+    // `~/.local/bin/innerwarden -> target/debug/innerwarden` reads as an
+    // installed binary by its name alone.
+    let resolved = std::fs::canonicalize(guard_bin).ok();
+    if is_cargo_build_output(Path::new(guard_bin))
+        || resolved.as_deref().is_some_and(is_cargo_build_output)
+    {
+        return Some(format!(
+            "Not rewired: {guard_bin} is a cargo build output, not an installed binary."
+        ));
+    }
+    let wired = claude_hook_programs(home);
+    if wired
+        .iter()
+        .any(|program| !same_program(program, guard_bin))
+    {
+        return Some(format!(
+            "Not rewired: the hooks run {}, not {guard_bin}. Connect this binary explicitly \
+             with `innerwarden agents connect` if it is the one to use.",
+            wired.join(", ")
+        ));
+    }
+    None
+}
+
+/// The path the hooks already use for `guard_bin`: a wired program that is
+/// the same file (a link the person runs, where the upgrade knows only the
+/// file it resolves to) keeps its name, so a rewire never turns a hook that
+/// names a link into one that names whatever the link points at today.
+/// `guard_bin` itself when no wired program is the same file.
+pub fn wired_name_of(home: &Path, guard_bin: &str) -> String {
+    claude_hook_programs(home)
+        .into_iter()
+        .find(|program| same_program(program, guard_bin))
+        .unwrap_or_else(|| guard_bin.to_string())
+}
+
+/// The programs the InnerWarden Bash hooks in Claude Code's settings run.
+fn claude_hook_programs(home: &Path) -> Vec<String> {
+    let path = home.join(".claude/settings.json");
+    innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &path)
+        .ok()
+        .flatten()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .map(|settings| innerwarden_agent_guard::hook::effective_iwguard_hook_programs(&settings))
+        .unwrap_or_default()
+}
+
+fn same_program(a: &str, b: &str) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// PURE but for reading two marker files: whether `program` sits in a cargo
+/// target directory. Cargo marks the root of every target directory, the
+/// default `target/` and any `CARGO_TARGET_DIR`, with `CACHEDIR.TAG` and
+/// `.rustc_info.json`; a path through `target/{debug,release}` counts too,
+/// so a tree that was cleaned still reads as one.
+pub fn is_cargo_build_output(program: &Path) -> bool {
+    let words: Vec<_> = program
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let through_target = words
+        .windows(2)
+        .any(|pair| pair[0] == "target" && matches!(pair[1].as_str(), "debug" | "release"))
+        || words
+            .windows(3)
+            .any(|w| w[0] == "target" && matches!(w[2].as_str(), "debug" | "release"));
+    through_target
+        || program
+            .ancestors()
+            .skip(1)
+            .any(|dir| dir.join("CACHEDIR.TAG").is_file() && dir.join(".rustc_info.json").is_file())
 }
 
 fn reconcile_current(
@@ -1022,6 +1186,176 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// NEW-20261116-upgrade-leaves-read-tools-unwired. A host wired in
+    /// enforce by 1.6.12 (Bash and file tools, no read tools), with
+    /// auto-connect never turned on, which is the default. What the upgrade
+    /// ran before ([`reconcile`]) changed nothing there; [`rewire_existing`]
+    /// adds the read half in the mode the wiring already has, keeps the rest,
+    /// and is a no-op on the next run. A disconnected agent is left alone.
+    #[test]
+    fn rewire_completes_existing_wiring_without_auto_connect() {
+        let guard_bin = "/abs/innerwarden";
+        let old = "\"/abs/innerwarden\" hook --agent claude-code";
+        let wired_by_1_6_12 = serde_json::json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": old}]},
+            {"matcher": "Write|Edit|MultiEdit|NotebookEdit",
+             "hooks": [{"type": "command", "command": old}]}
+        ]}});
+        let home = tempfile::TempDir::new().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec_pretty(&wired_by_1_6_12).unwrap()).unwrap();
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap()
+        };
+
+        // What the upgrade did before: nothing, auto-connect is off.
+        let before = reconcile(home.path(), guard_bin, &AgentPolicy::default());
+        assert_eq!(before.connected, 0);
+        assert!(!innerwarden_agent_guard::hook::iwguard_judges_read_tools(
+            &read()
+        ));
+
+        let report = rewire_existing(home.path(), guard_bin);
+        assert_eq!(report.connected, 1, "{:?}", report.notices);
+        let now = read();
+        assert!(innerwarden_agent_guard::hook::iwguard_judges_read_tools(
+            &now
+        ));
+        assert!(innerwarden_agent_guard::hook::iwguard_judges_file_tools(
+            &now
+        ));
+        // Still enforce, never lowered to the monitor automatic setup asks for.
+        for entry in now["hooks"]["PreToolUse"].as_array().unwrap() {
+            let command = entry["hooks"][0]["command"].as_str().unwrap();
+            assert!(!command.contains("--monitor"), "{command}");
+        }
+        let body = std::fs::read(&path).unwrap();
+        assert_eq!(rewire_existing(home.path(), guard_bin).connected, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), body, "second run is a no-op");
+
+        // A disconnected agent stays as the person left it.
+        std::fs::write(&path, serde_json::to_vec_pretty(&wired_by_1_6_12).unwrap()).unwrap();
+        save(
+            home.path(),
+            &AgentPolicy {
+                excluded: vec!["claude-code".into()],
+                ..AgentPolicy::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rewire_existing(home.path(), guard_bin).connected, 0);
+        assert_eq!(read(), wired_by_1_6_12);
+    }
+
+    /// NEW-20261118-dev-build-rewired-real-claude-hooks: a rewire never points
+    /// the wiring at a cargo build, nor at a binary the hooks do not run.
+    #[test]
+    fn a_rewire_never_points_at_a_build_or_another_binary() {
+        for build in [
+            "/home/dev/innerwarden/target/debug/innerwarden",
+            "/home/dev/innerwarden/target/release/innerwarden",
+            "/w/target/x86_64-unknown-linux-gnu/release/innerwarden",
+        ] {
+            assert!(is_cargo_build_output(Path::new(build)), "{build}");
+        }
+        for installed in [
+            "/home/dev/.local/bin/innerwarden",
+            "/usr/local/bin/innerwarden",
+            "/opt/target/innerwarden",
+        ] {
+            assert!(!is_cargo_build_output(Path::new(installed)), "{installed}");
+        }
+        // A CARGO_TARGET_DIR with any name: cargo's marker files say so.
+        let custom = tempfile::TempDir::new().unwrap();
+        std::fs::write(custom.path().join("CACHEDIR.TAG"), "Signature").unwrap();
+        std::fs::write(custom.path().join(".rustc_info.json"), "{}").unwrap();
+        assert!(is_cargo_build_output(
+            &custom.path().join("debug/innerwarden")
+        ));
+
+        let home = tempfile::TempDir::new().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let wired = serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash",
+            "hooks": [{"type": "command",
+                       "command": "\"/abs/innerwarden\" hook --agent claude-code"}]}]}});
+        std::fs::write(&path, serde_json::to_vec_pretty(&wired).unwrap()).unwrap();
+        assert_eq!(refuse_rewire_to(home.path(), "/abs/innerwarden"), None);
+        assert!(refuse_rewire_to(home.path(), "/other/innerwarden").is_some());
+        assert!(refuse_rewire_to(
+            home.path(),
+            "/home/dev/innerwarden/target/debug/innerwarden"
+        )
+        .is_some());
+        let report = rewire_existing(home.path(), "/other/innerwarden");
+        assert_eq!(report.connected, 0);
+        assert_eq!(read_json(&path), wired, "nothing rewritten");
+    }
+
+    /// Item of the same incident: a link with an installed-looking name that
+    /// resolves into a cargo build is a build too. And a rewire run by the
+    /// file a link resolves to (the macOS upgrade) keeps the link the hooks
+    /// name instead of writing the file behind it.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewire_reads_links_both_ways() {
+        let root = tempfile::TempDir::new().unwrap();
+        let wire = |home: &Path, program: &Path| {
+            let path = home.join(".claude/settings.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let wired = serde_json::json!({"hooks": {"PreToolUse": [{"matcher": "Bash",
+                "hooks": [{"type": "command",
+                           "command": format!("\"{}\" hook --agent claude-code", program.display())}]}]}});
+            std::fs::write(&path, serde_json::to_vec_pretty(&wired).unwrap()).unwrap();
+            path
+        };
+
+        // ~/.local/bin/innerwarden -> target/debug/innerwarden
+        let build = root.path().join("src/target/debug/innerwarden");
+        std::fs::create_dir_all(build.parent().unwrap()).unwrap();
+        std::fs::write(&build, "").unwrap();
+        let link = root.path().join("local/bin/innerwarden");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&build, &link).unwrap();
+        let home = root.path().join("home-a");
+        let settings = wire(&home, &link);
+        let before = read_json(&settings);
+        let link_s = link.display().to_string();
+        assert!(
+            !is_cargo_build_output(&link),
+            "the name alone reads as installed"
+        );
+        assert!(refuse_rewire_to(&home, &link_s).is_some());
+        let report = rewire_existing(&home, &link_s);
+        assert!(report.refused && report.connected == 0, "{report:?}");
+        assert_eq!(read_json(&settings), before, "nothing rewritten");
+
+        // /usr/local/bin/innerwarden -> /opt/innerwarden/innerwarden, run as the file.
+        let file = root.path().join("opt/innerwarden/innerwarden");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "").unwrap();
+        let named = root.path().join("usr/bin/innerwarden");
+        std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&file, &named).unwrap();
+        let home = root.path().join("home-b");
+        let settings = wire(&home, &named);
+        let file_s = file.display().to_string();
+        assert_eq!(wired_name_of(&home, &file_s), named.display().to_string());
+        let report = rewire_existing(&home, &file_s);
+        assert!(!report.refused, "{report:?}");
+        let body = std::fs::read_to_string(&settings).unwrap();
+        assert!(body.contains(&named.display().to_string()), "{body}");
+        assert!(
+            !body.contains(&file_s),
+            "the hook must keep the link: {body}"
+        );
+    }
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
     }
 
     fn pass(ticks: &[(&str, AgentTick)]) -> BTreeMap<String, AgentTick> {
