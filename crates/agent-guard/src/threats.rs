@@ -10080,6 +10080,20 @@ fn rm_command_index(tokens: &[String]) -> Option<usize> {
                     i += 1;
                 }
             }
+            // `! rm -rf /` runs the `rm` and only inverts its status; a
+            // `(` opens a subshell whose first command runs.
+            "!" | "(" => i += 1,
+            // `coproc` runs the command after it in the background, and
+            // names the coprocess only before a group (`coproc NAME { ..; }`);
+            // before a simple command its next word is the program (measured
+            // on bash 5.1.8, 2026-11-19).
+            // (`coproc NAME { ..; }` comes here without its NAME, see
+            // [`without_coproc_name`].)
+            "coproc" => i += 1,
+            _ if tok.starts_with('(') && tok.len() > 1 => {
+                // `(rm -rf /)`: the group opens on the program's own word.
+                return (token_basename(&tok[1..]) == "rm").then_some(i);
+            }
             _ => return None,
         }
     }
@@ -10174,12 +10188,39 @@ struct RmInvocation {
     targets: Vec<String>,
 }
 
+/// The segment without the NAME of `coproc NAME { ..; }` or `coproc NAME (
+/// .. )`: the group runs, and the tokens [`rm_command_index`] reads drop
+/// the brace that tells the NAME from a program.
+fn without_coproc_name(segment: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = segment.trim_start();
+    let Some(rest) = trimmed
+        .strip_prefix("coproc")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+    else {
+        return std::borrow::Cow::Borrowed(segment);
+    };
+    let rest = rest.trim_start();
+    let name_end = rest
+        .find(|c: char| !(c == '_' || c.is_ascii_alphanumeric()))
+        .unwrap_or(rest.len());
+    let after = rest[name_end..].trim_start();
+    if name_end == 0
+        || rest.starts_with(|c: char| c.is_ascii_digit())
+        || !after.starts_with(['{', '('])
+        || !rest[name_end..].starts_with(char::is_whitespace)
+    {
+        return std::borrow::Cow::Borrowed(segment);
+    }
+    std::borrow::Cow::Owned(format!("coproc {after}"))
+}
+
 /// Read the `rm` a segment runs, or `None` when the segment runs something
 /// else (`echo rm -rf /`). See [`fold_braced_names`] for `${HOME}`.
 fn segment_rm_invocation(segment: &str) -> Option<RmInvocation> {
     // A substitution before the command word expands away; see
     // `strip_leading_substitutions` for why only the leading ones go.
-    let folded = fold_braced_names(strip_leading_substitutions(segment));
+    let unnamed = without_coproc_name(segment);
+    let folded = fold_braced_names(strip_leading_substitutions(&unnamed));
     let segment = fold_home_expansions(&folded);
     let tokens = shell_tokens(&segment);
     let rm_idx = rm_command_index(&tokens)?;

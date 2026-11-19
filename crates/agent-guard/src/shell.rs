@@ -803,6 +803,15 @@ fn argument_is_a_name(
         .map(|previous| shell_word(&node_text(arguments[previous], source)));
     match name.as_str() {
         "printf" | "test" | "[" => before.as_deref() == Some("-v"),
+        // `wait -p 'b[X]'` stores the job's id in that name, and evaluates
+        // its subscript (measured on bash 5.1.8, 2026-11-19); `getopts`
+        // refuses such a name as not a valid identifier.
+        "wait" => before.is_some_and(|flag| {
+            flag.len() > 1
+                && flag.starts_with('-')
+                && !flag.starts_with("--")
+                && flag.ends_with('p')
+        }),
         name if takes_names(name) => {
             let word = shell_word(&node_text(argument, source));
             !word.starts_with('-')
@@ -861,6 +870,23 @@ fn stands_in_substring_offset(
     node.start_byte() > expansion.start_byte() + 2 + name_end
 }
 
+/// Whether a declaration (`declare -n`, `local -n`...) makes its names
+/// references, so the value given each is a name: `declare -n R='b[X]'`
+/// evaluates the subscript `X` where `R` is used (measured on bash 5.1.8,
+/// 2026-11-19).
+fn declares_namerefs(declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    declaration_evaluates_subscripts(declaration, source) && {
+        let mut cursor = declaration.walk();
+        let found = declaration.named_children(&mut cursor).any(|child| {
+            child.kind() == "word" && {
+                let flag = node_text(child, source);
+                flag.starts_with('-') && !flag.starts_with("--") && flag.contains('n')
+            }
+        });
+        found
+    }
+}
+
 /// Whether a declaration (`declare -i`, `local -ai`...) makes its names
 /// integers, so the values given them are read as arithmetic.
 fn declares_integers(declaration: tree_sitter::Node<'_>, source: &[u8]) -> bool {
@@ -911,7 +937,8 @@ fn value_is_evaluated(
                     });
                 }
                 if parent.parent().is_some_and(|owner| {
-                    owner.kind() == "declaration_command" && declares_integers(owner, source)
+                    owner.kind() == "declaration_command"
+                        && (declares_integers(owner, source) || declares_namerefs(owner, source))
                 }) {
                     return true;
                 }
@@ -1105,6 +1132,23 @@ fn evaluated_name_reads(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(usiz
                 }
                 for name in name_subscript_identifiers(&word) {
                     reads.push((place.start_byte(), name));
+                }
+            }
+        }
+        if declares_namerefs(place, source) {
+            // `declare -n R='b[X]'` or `declare -n R="$N"`: the value is a
+            // name, read with its subscript where the reference is used.
+            let mut assignments = Vec::new();
+            collect_nodes_of_kind(place, "variable_assignment", &mut assignments, 0);
+            for assignment in assignments {
+                if let Some(value) = assignment.child_by_field_name("value") {
+                    let word = shell_word(&node_text(value, source));
+                    if let Some(name) = shell_variable_name(&word) {
+                        reads.push((place.start_byte(), name.to_owned()));
+                    }
+                    for name in name_subscript_identifiers(&word) {
+                        reads.push((place.start_byte(), name));
+                    }
                 }
             }
         }
@@ -2793,19 +2837,31 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
     let bytes = source.as_bytes();
     let mut commands = Vec::new();
     collect_all_commands(tree.root_node(), &mut commands, 0);
-    let assignments = literal_assignments(tree.root_node(), bytes);
+    let namerefs = nameref_targets(tree.root_node(), bytes);
+    // A write through a reference is a write to the name it refers to:
+    // `C=ok; declare -n R=C; R='rm -rf ~'; sh -c "$C"` runs `rm -rf ~`.
+    let (assignments, unknown_reference_written) =
+        through_namerefs(literal_assignments(tree.root_node(), bytes), &namerefs);
+    // Every value a name may hold anywhere on the line, for a trap set
+    // through a variable (`t=trap; $t f DEBUG`, `E="trap f DEBUG"; eval "$E"`).
+    let anywhere = LineVars {
+        set: Vec::new(),
+        maybe: assignments
+            .iter()
+            .map(|(name, value, _, _, _)| (name.clone(), value.clone()))
+            .collect(),
+        all_run_time: false,
+        namerefs: namerefs.clone(),
+    };
     // A `trap` on DEBUG, RETURN or ERR runs its action between commands:
-    // any variable may be set there, whatever the text order says.
-    let trapped = commands.iter().any(|command| {
-        command_words(*command, bytes).is_some_and(|words| {
-            normalized_command_name(&words[0]) == "trap"
-                && words[1..].iter().any(|word| {
-                    let signal = shell_literal_word(word).to_ascii_uppercase();
-                    let signal = signal.strip_prefix("SIG").unwrap_or(&signal);
-                    matches!(signal, "DEBUG" | "RETURN" | "ERR")
-                })
-        })
-    });
+    // any variable may be set there, whatever the text order says. A write
+    // through a reference whose name the line does not say may set any of
+    // them too.
+    let trapped = unknown_reference_written
+        || commands.iter().any(|command| {
+            command_words(*command, bytes)
+                .is_some_and(|words| sets_a_trap_between_commands(&words, 0, &anywhere))
+        });
     for command in &commands {
         if node_is_in_literal_unreachable_branch(*command, bytes) {
             continue;
@@ -2819,15 +2875,24 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         // the body the command itself is in.
         let in_order: Vec<&Assignment> = assignments
             .iter()
-            .filter(|(_, _, at, body)| *at <= at_command && body.as_ref().is_none_or(inside))
+            .filter(|(_, _, at, body, _)| *at <= at_command && body.as_ref().is_none_or(inside))
             .collect();
+        // One that may not have run (`A || C=ok`), or ran in a child shell
+        // (`(C=ok)`), does not replace the value before it: both are judged.
+        let sure = |scopes: &Vec<std::ops::Range<usize>>| scopes.iter().all(&inside);
         let mut vars = LineVars {
             set: in_order
                 .iter()
-                .map(|(name, value, _, _)| (name.clone(), value.clone()))
+                .filter(|(_, _, _, _, scopes)| sure(scopes))
+                .map(|(name, value, _, _, _)| (name.clone(), value.clone()))
                 .collect(),
-            maybe: Vec::new(),
+            maybe: in_order
+                .iter()
+                .filter(|(_, _, _, _, scopes)| !sure(scopes))
+                .map(|(name, value, _, _, _)| (name.clone(), value.clone()))
+                .collect(),
             all_run_time: trapped,
+            namerefs: namerefs.clone(),
         };
         // A command in a loop runs again after every assignment of the
         // loop, and after a function defined later in it: `C=ok; for i in
@@ -2837,14 +2902,16 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             .any(|kind| ancestor_of_kind(*command, kind).is_some());
         // A command in a function body runs when the function is called:
         // a variable its body does not set first holds what the caller
-        // left, which the text order does not say.
+        // left, which the text order does not say. Only an assignment the
+        // body is sure to run before the command sets it first: `if ..;
+        // then C=ok; fi` leaves the caller's value when the test fails.
         let own_body = ancestor_of_kind(*command, "function_definition")
             .map(|definition| definition.byte_range());
         let set_in_own_body = |name: &str| {
             own_body.as_ref().is_some_and(|own| {
                 in_order
                     .iter()
-                    .any(|(set, _, at, _)| set == name && own.contains(at))
+                    .any(|(set, _, at, _, scopes)| set == name && own.contains(at) && sure(scopes))
             })
         };
         // A function defined before the command may be called by any
@@ -2860,8 +2927,8 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                         .is_none_or(|definition| inside(&definition.byte_range()))
             })
         };
-        for (name, value, at, body) in &assignments {
-            if in_order.iter().any(|(_, _, other, _)| other == at) {
+        for (name, value, at, body, _) in &assignments {
+            if in_order.iter().any(|(_, _, other, _, _)| other == at) {
                 continue;
             }
             // Every other value the name may hold here is judged too: the
@@ -2873,8 +2940,8 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                     let last = in_order
                         .iter()
                         .rev()
-                        .find(|(set, _, _, _)| set == name)
-                        .map(|(_, _, at, _)| *at);
+                        .find(|(set, _, _, _, scopes)| set == name && sure(scopes))
+                        .map(|(_, _, at, _, _)| *at);
                     in_loop
                         || trapped
                         || own_body.is_some() && !set_in_own_body(name)
@@ -2892,7 +2959,7 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         if own_body.is_some() {
             // A name the body does not set first may hold anything its
             // caller left.
-            for (name, _, _, _) in &assignments {
+            for (name, _, _, _, _) in &assignments {
                 if !set_in_own_body(name) {
                     vars.maybe.push((name.clone(), None));
                 }
@@ -2941,6 +3008,7 @@ type Assignment = (
     Option<String>,
     usize,
     Option<std::ops::Range<usize>>,
+    Vec<std::ops::Range<usize>>,
 );
 
 /// Every variable the line sets, in order, with its value when it is
@@ -2954,11 +3022,28 @@ type Assignment = (
 fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assignment> {
     let mut found = Vec::new();
     collect_nodes_of_kind(root, "variable_assignment", &mut found, 0);
-    found.sort_by_key(|assignment| assignment.end_byte());
-    found
+    let mut assignments: Vec<Assignment> = found
         .into_iter()
         .filter_map(|assignment| {
-            let name = node_text(assignment.child_by_field_name("name")?, source);
+            // `declare -n R=C` makes `R` a reference to `C`; it writes no
+            // value ([`nameref_targets`]).
+            if assignment.parent().is_some_and(|owner| {
+                owner.kind() == "declaration_command" && declares_namerefs(owner, source)
+            }) {
+                return None;
+            }
+            let name_node = assignment.child_by_field_name("name")?;
+            // `C[0]=..` writes the element `$C` reads: the name is `C`.
+            let written = node_text(name_node, source);
+            let (name, subscripted) = match written.split_once('[') {
+                Some((name, _)) => (name.to_owned(), true),
+                None => (written, false),
+            };
+            // `C+=..` appends to what `C` held: the guard does not join
+            // the two, so the value is not written out.
+            let appends = source
+                .get(name_node.end_byte()..)
+                .is_some_and(|rest| rest.starts_with(b"+="));
             let value = assignment
                 .child_by_field_name("value")
                 .map(|value| node_text(value, source))
@@ -2966,16 +3051,134 @@ fn literal_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assign
             let raw = value.trim();
             // A value with an expansion outside single quotes is not
             // written out.
-            let written_out = raw.starts_with('\'') || !raw.contains(['$', '`']);
+            let written_out = !appends && (raw.starts_with('\'') || !raw.contains(['$', '`']));
+            let mut scopes = assignment_scopes(assignment, source);
+            if subscripted {
+                // One element may not be the one `$C` reads: the value
+                // before it is judged too.
+                scopes.push(0..0);
+            }
             Some((
                 name,
                 written_out.then(|| shell_literal_word(raw)),
                 assignment.end_byte(),
                 ancestor_of_kind(assignment, "function_definition")
                     .map(|definition| definition.byte_range()),
+                scopes,
             ))
         })
-        .collect()
+        .collect();
+    assignments.extend(builtin_assignments(root, source));
+    assignments.sort_by_key(|assignment| assignment.2);
+    assignments
+}
+
+/// The names builtins set on the line, each with no value the guard can
+/// read: `read C`, `mapfile C`, `printf -v C ..`, `wait -p C` (and
+/// `REPLY`, `MAPFILE` when `read` or `mapfile` names none). `unset C`
+/// leaves `C` empty.
+fn builtin_assignments(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Assignment> {
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    let mut found = Vec::new();
+    for command in commands {
+        let Some(name) = command_name(command, source).map(|name| normalized_command_name(&name))
+        else {
+            continue;
+        };
+        let default = match name.as_str() {
+            "read" => Some("REPLY"),
+            "mapfile" | "readarray" => Some("MAPFILE"),
+            "printf" | "wait" | "unset" => None,
+            _ => continue,
+        };
+        let value = (name == "unset").then(String::new);
+        let body = ancestor_of_kind(command, "function_definition")
+            .map(|definition| definition.byte_range());
+        let scopes = assignment_scopes(command, source);
+        let mut named = false;
+        for argument in command_arguments(command) {
+            if !argument_is_a_name(command, argument, source) {
+                continue;
+            }
+            let word = shell_word(&node_text(argument, source));
+            let variable = word.split_once('[').map_or(word.as_str(), |(name, _)| name);
+            if variable.is_empty()
+                || variable.starts_with(|c: char| c.is_ascii_digit())
+                || !variable
+                    .chars()
+                    .all(|c| c == '_' || c.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            named = true;
+            found.push((
+                variable.to_owned(),
+                value.clone(),
+                command.end_byte(),
+                body.clone(),
+                scopes.clone(),
+            ));
+        }
+        if let (false, Some(default)) = (named, default) {
+            found.push((default.to_owned(), None, command.end_byte(), body, scopes));
+        }
+    }
+    found
+}
+
+/// Where an assignment at `node` is sure to have run, up to the function
+/// body it is in: each range a command must lie in to see it. An
+/// assignment behind `&&` or `||`, in a branch of `if` or `case`, in a
+/// loop's body, in a subshell or a pipeline (which run in a child shell),
+/// or before a command (`C=ok true`, for that command only) may not have
+/// run, or not in this shell, for a command outside that range.
+fn assignment_scopes(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<std::ops::Range<usize>> {
+    let mut scopes = Vec::new();
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        match parent.kind() {
+            "function_definition" => break,
+            "command" => scopes.push(parent.byte_range()),
+            "list" => {
+                if parent
+                    .named_child(0)
+                    .is_some_and(|first| first.id() != current.id())
+                {
+                    scopes.push(current.byte_range());
+                }
+            }
+            "pipeline" => scopes.push(current.byte_range()),
+            "subshell" | "else_clause" | "case_item" | "do_group" => {
+                scopes.push(parent.byte_range());
+            }
+            "if_statement" | "elif_clause" => {
+                let mut cursor = parent.walk();
+                let children: Vec<tree_sitter::Node<'_>> = parent.children(&mut cursor).collect();
+                let then_end = children
+                    .iter()
+                    .find(|child| node_text(**child, source) == "then")
+                    .map(|then| then.end_byte());
+                match then_end {
+                    Some(then_end) if current.start_byte() >= then_end => {
+                        let branch_end = children
+                            .iter()
+                            .find(|child| {
+                                child.start_byte() >= then_end
+                                    && matches!(child.kind(), "elif_clause" | "else_clause" | "fi")
+                            })
+                            .map_or(parent.end_byte(), |end| end.start_byte());
+                        scopes.push(then_end..branch_end);
+                    }
+                    _ if parent.kind() == "elif_clause" => scopes.push(parent.byte_range()),
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        current = parent;
+    }
+    scopes
 }
 
 /// The variables a command may see: the last value set before it in text
@@ -2990,12 +3193,21 @@ struct LineVars {
     maybe: Vec<(String, Option<String>)>,
     /// A trap runs between commands: every name is decided at run time.
     all_run_time: bool,
+    /// The references the line declares ([`nameref_targets`]).
+    namerefs: Vec<(String, Option<String>)>,
 }
 
 impl LineVars {
     /// Every value `name` may hold, `None` for one the guard cannot read.
     /// A name the line never sets is `[None]`.
     fn values(&self, name: &str) -> Vec<Option<String>> {
+        // Reading a reference reads the name it refers to.
+        let name = match resolve_nameref(&self.namerefs, name) {
+            Some(Some(target)) => target,
+            Some(None) => return vec![None],
+            None => name.to_owned(),
+        };
+        let name = name.as_str();
         let mut values: Vec<Option<String>> = self
             .set
             .iter()
@@ -3026,6 +3238,253 @@ impl LineVars {
     }
 }
 
+/// The references the line declares (`declare -n R=C`, `local -n`,
+/// `typeset -n`), each with the name it refers to when the line writes
+/// it out (`C` for `R=C` and `R='C[1]'`), `None` when it does not
+/// (`local -n R=$1`, `declare -n R`).
+fn nameref_targets(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<(String, Option<String>)> {
+    let mut declarations = Vec::new();
+    collect_nodes_of_kind(root, "declaration_command", &mut declarations, 0);
+    let mut found = Vec::new();
+    for declaration in declarations {
+        if !declares_namerefs(declaration, source) {
+            continue;
+        }
+        let mut cursor = declaration.walk();
+        for child in declaration.named_children(&mut cursor) {
+            match child.kind() {
+                "variable_assignment" => {
+                    let Some(name) = child.child_by_field_name("name") else {
+                        continue;
+                    };
+                    let raw = child
+                        .child_by_field_name("value")
+                        .map(|value| node_text(value, source))
+                        .unwrap_or_default();
+                    let raw = raw.trim();
+                    let written_out = raw.starts_with('\'') || !raw.contains(['$', '`']);
+                    let target = written_out
+                        .then(|| shell_literal_word(raw))
+                        .map(|value| {
+                            value
+                                .split_once('[')
+                                .map_or(value.as_str(), |(name, _)| name)
+                                .to_owned()
+                        })
+                        .filter(|target| {
+                            !target.is_empty()
+                                && !target.starts_with(|c: char| c.is_ascii_digit())
+                                && target
+                                    .chars()
+                                    .all(|c| c == '_' || c.is_ascii_alphanumeric())
+                        });
+                    found.push((node_text(name, source), target));
+                }
+                "word" | "simple_expansion" | "expansion" | "string" | "raw_string" => {
+                    let word = shell_word(&node_text(child, source));
+                    if !word.starts_with('-') {
+                        found.push((word, None));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// What `name` refers to through the references the line declares:
+/// `None` when it is not one, `Some(None)` when the line does not say
+/// (or the references go round).
+fn resolve_nameref(namerefs: &[(String, Option<String>)], name: &str) -> Option<Option<String>> {
+    let mut current = name.to_owned();
+    let mut followed = false;
+    for _ in 0..8 {
+        let Some((_, target)) = namerefs.iter().rev().find(|(set, _)| *set == current) else {
+            return followed.then_some(Some(current));
+        };
+        match target {
+            Some(target) => current = target.clone(),
+            None => return Some(None),
+        }
+        followed = true;
+    }
+    Some(None)
+}
+
+/// The assignments with each write through a reference made a write to
+/// the name it refers to, and whether the line writes through a reference
+/// whose name it does not say.
+fn through_namerefs(
+    assignments: Vec<Assignment>,
+    namerefs: &[(String, Option<String>)],
+) -> (Vec<Assignment>, bool) {
+    let mut unknown = false;
+    let assignments = assignments
+        .into_iter()
+        .map(
+            |(name, value, at, body, scopes)| match resolve_nameref(namerefs, &name) {
+                Some(Some(target)) => (target, value, at, body, scopes),
+                Some(None) => {
+                    unknown = true;
+                    (name, value, at, body, scopes)
+                }
+                None => (name, value, at, body, scopes),
+            },
+        )
+        .collect();
+    (assignments, unknown)
+}
+
+/// Every value a word may stand for: itself when written out, the values
+/// the line may give the variable it is alone (`$t`, `"${t}"`), `None`
+/// for any other expansion.
+fn word_values(word: &str, vars: &LineVars) -> Vec<Option<String>> {
+    let trimmed = word.trim();
+    if trimmed.starts_with('\'') || !trimmed.contains(['$', '`']) {
+        return vec![Some(shell_literal_word(trimmed))];
+    }
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .unwrap_or(trimmed);
+    match unquoted
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+        .or_else(|| unquoted.strip_prefix('$'))
+    {
+        Some(name)
+            if !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) =>
+        {
+            vars.values(name)
+        }
+        _ => vec![None],
+    }
+}
+
+/// The most lines `eval` may be handed that are read for a trap; past it
+/// the trap is taken as set.
+const EVAL_LINES_READ: usize = 16;
+
+/// Whether a command sets a `trap` on DEBUG, RETURN or ERR, whose action
+/// runs between commands: also behind `builtin` or `command`, in the
+/// line `eval` runs (`eval "trap f DEBUG"`), and through a variable
+/// (`t=trap; $t f DEBUG`, `E="trap f DEBUG"; eval "$E"`). A program or
+/// an `eval` line the line does not write out may be a trap.
+fn sets_a_trap_between_commands(words: &[String], depth: u8, vars: &LineVars) -> bool {
+    if depth > HANDED_LEVELS_READ {
+        return true;
+    }
+    let mut at = 0;
+    while words.get(at).is_some_and(|word| {
+        matches!(
+            normalized_command_name(word).as_str(),
+            "builtin" | "command"
+        )
+    }) {
+        at += 1;
+        while words
+            .get(at)
+            .is_some_and(|word| shell_literal_word(word).starts_with('-'))
+        {
+            at += 1;
+        }
+    }
+    let Some(word) = words.get(at) else {
+        return false;
+    };
+    if program_is_named_at_run_time(word) {
+        return word_values(word, vars).into_iter().any(|value| {
+            value.is_none_or(|value| {
+                let mut named: Vec<String> = value.split_whitespace().map(str::to_owned).collect();
+                named.extend(words[at + 1..].iter().cloned());
+                sets_a_trap_between_commands(&named, depth + 1, vars)
+            })
+        });
+    }
+    let name = normalized_command_name(word);
+    match name.as_str() {
+        "trap" => words[at + 1..].iter().any(|word| {
+            let signal = shell_literal_word(word).to_ascii_uppercase();
+            let signal = signal.strip_prefix("SIG").unwrap_or(&signal);
+            matches!(signal, "DEBUG" | "RETURN" | "ERR")
+        }),
+        "eval" => {
+            // Every line `eval` may be handed, one per value its words
+            // may hold.
+            let mut lines: Vec<Vec<String>> = vec![Vec::new()];
+            for word in &words[at + 1..] {
+                let values = word_values(word, vars);
+                if values.iter().any(Option::is_none) {
+                    return true;
+                }
+                lines = lines
+                    .iter()
+                    .flat_map(|line| {
+                        values.iter().flatten().map(move |value| {
+                            let mut line = line.clone();
+                            line.push(value.clone());
+                            line
+                        })
+                    })
+                    .collect();
+                if lines.len() > EVAL_LINES_READ {
+                    return true;
+                }
+            }
+            lines.iter().any(|line| {
+                let line = line.join(" ");
+                let Some((tree, _doubt)) = parse_line(&line) else {
+                    return false;
+                };
+                let mut commands = Vec::new();
+                collect_all_commands(tree.root_node(), &mut commands, 0);
+                commands.iter().any(|command| {
+                    command_words(*command, line.as_bytes())
+                        .is_some_and(|words| sets_a_trap_between_commands(&words, depth + 1, vars))
+                })
+            })
+        }
+        _ => false,
+    }
+}
+
+/// The words with each option a variable holds written out: `F=-c; $X
+/// "$F" "$CMD"` hands a shell the `-c` line `$CMD`. Only a value the line
+/// says for sure, and that is an option, is written in.
+fn with_option_values(words: &[String], assignments: &LineVars) -> Vec<String> {
+    words
+        .iter()
+        .map(|word| {
+            let unquoted = word
+                .trim()
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+                .unwrap_or(word.trim());
+            unquoted
+                .strip_prefix("${")
+                .and_then(|rest| rest.strip_suffix('}'))
+                .or_else(|| unquoted.strip_prefix('$'))
+                .filter(|name| {
+                    !name.is_empty() && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                })
+                // Any option it may hold: `-c` from one value is enough.
+                .and_then(|name| {
+                    assignments
+                        .values(name)
+                        .into_iter()
+                        .flatten()
+                        .find(|value| {
+                            value.starts_with('-') && !value.contains(char::is_whitespace)
+                        })
+                })
+                .unwrap_or_else(|| word.clone())
+        })
+        .collect()
+}
+
 /// [`handed_shell_lines`] for one command's words, with the variables set
 /// before it.
 fn handed_lines_of(words: &[String], depth: u8, assignments: &LineVars, handed: &mut HandedLines) {
@@ -3033,7 +3492,8 @@ fn handed_lines_of(words: &[String], depth: u8, assignments: &LineVars, handed: 
         handed.over_budget = true;
         return;
     }
-    let Some(effective) = effective_command_words(words, 0) else {
+    let words = with_option_values(words, assignments);
+    let Some(effective) = effective_command_words(&words, 0) else {
         return;
     };
     // A program named at run time (`X=bash; $X -c ...`, `$(echo bash) -c
@@ -9120,9 +9580,22 @@ fn effective_command_words(words: &[String], depth: u8) -> Option<&[String]> {
         "env" => unwrap_env(args),
         "command" => unwrap_command(args),
         "sudo" | "doas" => unwrap_privilege_wrapper(args),
-        // `coproc` runs the simple command after it (a NAME is only given
-        // before a compound command).
-        "nohup" | "setsid" | "busybox" | "toybox" | "coproc" => unwrap_simple_wrapper(args),
+        // `coproc` runs the simple command after it; a NAME is only given
+        // before a group (`coproc NAME { rm -rf /; }`), whose first command
+        // runs.
+        "coproc" => match args {
+            [name, open, ..]
+                if (open == "{" || open == "(")
+                    && !name.is_empty()
+                    && !name.starts_with(|c: char| c.is_ascii_digit())
+                    && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric()) =>
+            {
+                WrapperTarget::Command(2)
+            }
+            [open, ..] if open == "{" || open == "(" => WrapperTarget::Command(1),
+            _ => unwrap_simple_wrapper(args),
+        },
+        "nohup" | "setsid" | "busybox" | "toybox" => unwrap_simple_wrapper(args),
         "nice" => unwrap_nice(args),
         "timeout" => unwrap_timeout(args),
         "stdbuf" => unwrap_options_with_values(args, &STDBUF_OPTIONS),
@@ -10482,6 +10955,25 @@ mod tests {
         let handed = handed_shell_lines("f() { C=$(curl -s URL); }; C=ok; sh -c \"$C\"");
         assert!(!handed.not_literal, "{handed:?}");
         assert_eq!(handed.lines, ["ok"]);
+    }
+
+    /// FAILS ON REVERT of [`sets_a_trap_between_commands`]: a trap set
+    /// behind `builtin` or `command`, or in the line `eval` runs, was not
+    /// seen, and `C` was read as `ok` alone.
+    #[test]
+    fn a_trap_behind_builtin_command_or_eval_makes_values_run_time() {
+        for trap in [
+            "trap f DEBUG",
+            "builtin trap f DEBUG",
+            "command trap f DEBUG",
+            "eval \"trap f DEBUG\"",
+            "eval trap f ERR",
+        ] {
+            let line = format!("f() {{ C=$(curl -s URL); }}; {trap}; C=ok; sh -c \"$C\"");
+            assert!(handed_shell_lines(&line).not_literal, "{line}");
+        }
+        let line = "f() { C=$(curl -s URL); }; builtin trap f EXIT; C=ok; sh -c \"$C\"";
+        assert!(!handed_shell_lines(line).not_literal, "{line}");
     }
 
     /// FAILS ON REVERT of the `not_literal` mark for a program named at
