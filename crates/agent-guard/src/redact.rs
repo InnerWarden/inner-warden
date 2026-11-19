@@ -25,44 +25,93 @@ pub struct Redaction {
 
 struct Pattern {
     re: Regex,
-    /// When set, only this capture group is masked (keeps the `key=` prefix so
-    /// the shape is still readable); otherwise the whole match is masked.
-    group: Option<usize>,
+    /// The capture groups that hold the secret, in order: the first one that
+    /// took part in the match is masked (keeps the `key=` prefix, a URL's user
+    /// name or a flag readable). Empty: the whole match is masked.
+    groups: &'static [usize],
 }
+
+/// Names a program reads a password from on its own command line, as a short
+/// flag. Kept to programs where that flag means a password, so `-p` of `mkdir`
+/// or `ssh` is never touched.
+const PASSWORD_FLAG_PROGRAMS: &str =
+    r"(?:mysql|mariadb|mysqldump|mysqladmin|mysqlimport|mysqlshow|mysqlcheck|mariadb-dump|sshpass)";
 
 fn patterns() -> &'static [Pattern] {
     static P: OnceLock<Vec<Pattern>> = OnceLock::new();
     P.get_or_init(|| {
-        let mk = |re: &str, group: Option<usize>| Pattern {
+        let mk = |re: &str, groups: &'static [usize]| Pattern {
             re: Regex::new(re).expect("static redaction regex"),
-            group,
+            groups,
         };
+        // A value as a shell or a config writes it: quoted whole, or up to the
+        // next blank, quote or shell separator (`;`, `|`, `&`), so a command
+        // chained after the value stays readable to whoever reviews it.
+        // Groups: 1 single-quoted, 2 double-quoted, 3 bare.
+        let value = r#"(?:'([^']*)'|"([^"]*)"|([^\s'";|&]+))"#;
         vec![
             // PEM private keys (whole block header, enough to flag+mask).
-            mk(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", None),
+            mk(r"-----BEGIN [A-Z ]*PRIVATE KEY-----", &[]),
             // AWS access key id.
-            mk(r"AKIA[0-9A-Z]{16}", None),
-            // Bearer / authorization tokens.
-            mk(r"(?i)bearer\s+[A-Za-z0-9._\-]{16,}", None),
-            // key=value secrets: password / passwd / token / secret / api[_-]key.
+            mk(r"AKIA[0-9A-Z]{16}", &[]),
+            // A password in a URL: scheme://user:PASSWORD@host. The user name
+            // stays, the password goes, whatever its length.
             mk(
-                r#"(?i)(password|passwd|token|secret|api[_-]?key|access[_-]?key)\s*[=:]\s*['"]?([^\s'"]{6,})"#,
-                Some(2),
+                r#"(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@'"]*:([^\s/@'"]+)@"#,
+                &[1],
+            ),
+            // Authorization (and Proxy-Authorization) headers, any scheme:
+            // Basic <base64>, Bearer <token>, Token <x>, or a bare value.
+            mk(
+                r#"(?i)authorization['"]?\s*[:=]\s*(?:(?:basic|bearer|token|digest|negotiate)\s+)?([^\s'",]+)"#,
+                &[1],
+            ),
+            // Bearer tokens outside a header.
+            mk(r"(?i)bearer\s+[A-Za-z0-9._\-]{16,}", &[]),
+            // A long flag that takes a secret, with a blank or `=`:
+            // --password VALUE, --token=VALUE, --api-key 'VALUE'. Short values too.
+            mk(
+                &format!(
+                    r"(?i)(?:^|[\s'\x22])--?(?:password|passwd|pass|pwd|token|auth[_-]?token|access[_-]?token|secret|client[_-]?secret|api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key)(?:\s+|=){value}"
+                ),
+                &[1, 2, 3],
+            ),
+            // A short flag that is a password only for some programs:
+            // mysql -pVALUE, mysql -p VALUE, sshpass -p VALUE.
+            mk(
+                &format!(
+                    r"(?i:\b{PASSWORD_FLAG_PROGRAMS})\b[^|;&\n]*?\s-p\s*(?:'([^']*)'|\x22([^\x22]*)\x22|([^\s'\x22;|&\-][^\s'\x22;|&]*))"
+                ),
+                &[1, 2, 3],
+            ),
+            // curl/wget user:password (a URL after -u is the URL rule's). Kept
+            // to curl and wget, so `docker run --user 1000:1000` is never touched.
+            mk(
+                r#"(?i:\b(?:curl|wget))\b[^|;&\n]*?\s(?:-u|--user|--proxy-user)(?:\s+|=)['"]?[^\s:'"/;|&]+:([^\s'"/;|&][^\s'";|&]*|/[^\s'"/;|&][^\s'";|&]*)"#,
+                &[1],
+            ),
+            // key=value / key: value secrets, quoted or not, any length:
+            // password / passwd / token / secret / api[_-]key / access[_-]key.
+            mk(
+                &format!(
+                    r#"(?i)(?:password|passwd|token|secret|api[_-]?key|access[_-]?key)['"]?\s*[=:]\s*{value}"#
+                ),
+                &[1, 2, 3],
             ),
             // Provider API tokens by distinctive prefix, caught even when pasted
             // bare (not in a key=value), which is how an AI agent most often leaks
             // one into a shell command (`curl -H "Authorization: sk-…"`, a raw arg).
-            mk(r"sk-[A-Za-z0-9_\-]{20,}", None), // OpenAI (incl. sk-proj-…)
-            mk(r"gh[opsur]_[A-Za-z0-9]{20,}", None), // GitHub PAT / OAuth / server tokens
-            mk(r"github_pat_[A-Za-z0-9_]{20,}", None), // GitHub fine-grained PAT
-            mk(r"xox[baprs]-[A-Za-z0-9\-]{10,}", None), // Slack
-            mk(r"AIza[0-9A-Za-z_\-]{35}", None), // Google API key
+            mk(r"sk-[A-Za-z0-9_\-]{20,}", &[]), // OpenAI (incl. sk-proj-…)
+            mk(r"gh[opsur]_[A-Za-z0-9]{20,}", &[]), // GitHub PAT / OAuth / server tokens
+            mk(r"github_pat_[A-Za-z0-9_]{20,}", &[]), // GitHub fine-grained PAT
+            mk(r"xox[baprs]-[A-Za-z0-9\-]{10,}", &[]), // Slack
+            mk(r"AIza[0-9A-Za-z_\-]{35}", &[]), // Google API key
             // JWT (three base64url segments).
-            mk(r"eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}", None),
+            mk(r"eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}", &[]),
             // US SSN.
-            mk(r"\b\d{3}-\d{2}-\d{4}\b", None),
+            mk(r"\b\d{3}-\d{2}-\d{4}\b", &[]),
             // 16-digit card number (grouped or not).
-            mk(r"\b(?:\d[ -]?){15}\d\b", None),
+            mk(r"\b(?:\d[ -]?){15}\d\b", &[]),
         ]
     })
 }
@@ -133,12 +182,22 @@ pub fn redact_secrets(input: &str) -> Redaction {
         // replace group-or-whole, right-to-left so byte offsets stay valid.
         let spans: Vec<(usize, usize)> =
             p.re.captures_iter(&text)
-                .filter_map(|c| match p.group {
-                    Some(g) => c.get(g).map(|m| (m.start(), m.end())),
-                    None => c.get(0).map(|m| (m.start(), m.end())),
+                .filter_map(|c| {
+                    if p.groups.is_empty() {
+                        c.get(0)
+                    } else {
+                        p.groups.iter().find_map(|&g| c.get(g))
+                    }
+                    .map(|m| (m.start(), m.end()))
                 })
                 .collect();
         for (start, end) in spans.into_iter().rev() {
+            // An earlier pattern already masked this span (a header caught as
+            // Authorization and again as Bearer, say): nothing left to hide.
+            // An empty quoted value has nothing to hide either.
+            if start == end || &text[start..end] == MASK {
+                continue;
+            }
             text.replace_range(start..end, MASK);
             count += 1;
         }
@@ -209,6 +268,187 @@ mod tests {
         let r = redact_secrets(raw);
         assert!(!r.text.contains("BEGIN RSA PRIVATE KEY"));
         assert!(r.count >= 2);
+    }
+
+    /// Every secret below is assembled at runtime, so no credential-shaped
+    /// literal sits whole in the source.
+    fn pw() -> String {
+        format!("hun{}", "ter2")
+    }
+
+    #[test]
+    fn masks_a_password_in_a_url_and_keeps_the_user() {
+        let pw = pw();
+        for raw in [
+            format!("psql postgres://app:{pw}@db.internal:5432/main"),
+            format!("git clone https://bob:{pw}@git.example/x.git"),
+            format!("curl 'https://u:{pw}@api.example/v1'"),
+            format!("redis-cli -u redis://:{pw}@cache:6379"),
+        ] {
+            let r = redact_secrets(&raw);
+            assert!(!r.text.contains(&pw), "leaked from {raw:?}: {}", r.text);
+            assert!(r.text.contains(":[REDACTED]@"), "{}", r.text);
+        }
+        let r = redact_secrets(&format!("psql postgres://app:{pw}@db/main"));
+        assert!(r.text.contains("postgres://app:"), "user stays: {}", r.text);
+        // A URL with no password is left alone.
+        let clean = "curl https://api.example:8443/v1 && ssh git@host";
+        assert_eq!(redact_secrets(clean).text, clean);
+    }
+
+    #[test]
+    fn masks_a_secret_flag_written_with_a_blank() {
+        let pw = pw();
+        for raw in [
+            format!("app login --password {pw}"),
+            format!("app login --password x{pw}"),
+            format!("deploy --token {pw} --region eu"),
+            format!("cli --api-key '{pw} with space'"),
+            format!("cli --client-secret=\"{pw}\""),
+            format!("openssl enc -pass pass:{pw} -in f"),
+        ] {
+            let r = redact_secrets(&raw);
+            assert!(!r.text.contains(&pw), "leaked from {raw:?}: {}", r.text);
+            assert!(r.text.contains("[REDACTED]"), "{}", r.text);
+        }
+        // The rest of the line stays readable.
+        let r = redact_secrets(&format!("deploy --token {pw} --region eu"));
+        assert_eq!(r.text, "deploy --token [REDACTED] --region eu");
+        // A one-character password is still a password.
+        let r = redact_secrets("app login --password x");
+        assert_eq!(r.text, "app login --password [REDACTED]");
+        // A flag that names a file, not a secret, is left alone.
+        let clean = "app login --password-file /run/pw --token-file t.txt";
+        assert_eq!(redact_secrets(clean).text, clean);
+    }
+
+    #[test]
+    fn masks_minus_p_only_where_it_means_a_password() {
+        let pw = pw();
+        for raw in [
+            format!("mysql -u root -p{pw} shop"),
+            format!("mysql -u root -p {pw}"),
+            format!("mysqldump -uroot -p'{pw}' shop > dump.sql"),
+            format!("sshpass -p {pw} ssh host"),
+        ] {
+            let r = redact_secrets(&raw);
+            assert!(!r.text.contains(&pw), "leaked from {raw:?}: {}", r.text);
+        }
+        // -p of other programs, and mysql -P (port), are not passwords.
+        for clean in [
+            "mkdir -p build/out",
+            "ssh -p 2222 host",
+            "mysql -u root -P 3306 -h db",
+            "mysql -u root -p -h db",
+        ] {
+            assert_eq!(redact_secrets(clean).text, clean, "{clean}");
+        }
+    }
+
+    #[test]
+    fn masks_basic_and_any_authorization_header() {
+        let basic = format!("dXNl{}", "cjpodW50ZXIy");
+        let short = format!("t{}", "0k");
+        for (raw, secret) in [
+            (
+                format!("curl -H 'Authorization: Basic {basic}' https://x"),
+                &basic,
+            ),
+            (
+                format!("curl -H \"authorization: basic {basic}\" x"),
+                &basic,
+            ),
+            (
+                format!("curl -H 'Proxy-Authorization: Basic {basic}' x"),
+                &basic,
+            ),
+            (format!("curl -H 'Authorization: Bearer {short}' x"), &short),
+            (format!("curl -H 'Authorization: {short}' x"), &short),
+        ] {
+            let r = redact_secrets(&raw);
+            assert!(
+                !r.text.contains(secret.as_str()),
+                "leaked from {raw:?}: {}",
+                r.text
+            );
+        }
+        let r = redact_secrets(&format!("curl -H 'Authorization: Basic {basic}' https://x"));
+        assert_eq!(
+            r.text,
+            "curl -H 'Authorization: Basic [REDACTED]' https://x"
+        );
+        assert_eq!(r.count, 1, "masked once, not once per pattern");
+    }
+
+    #[test]
+    fn masks_short_and_quoted_key_values() {
+        let pw = pw();
+        for raw in [
+            "PASSWORD=ab".to_string(),
+            format!("export DB_PASSWORD='{pw} two words'"),
+            format!("{{\"token\": \"{pw}\"}}"),
+            format!("secret: {pw}"),
+        ] {
+            let r = redact_secrets(&raw);
+            assert!(!r.text.contains(&pw), "leaked from {raw:?}: {}", r.text);
+            assert!(r.text.contains("[REDACTED]"), "{}", r.text);
+        }
+        assert_eq!(redact_secrets("PASSWORD=ab").text, "PASSWORD=[REDACTED]");
+        let r = redact_secrets(&format!("export DB_PASSWORD='{pw} two words' && run"));
+        assert_eq!(r.text, "export DB_PASSWORD='[REDACTED]' && run");
+    }
+
+    #[test]
+    fn curl_user_and_password() {
+        let pw = pw();
+        let r = redact_secrets(&format!("curl -u admin:{pw} https://x"));
+        assert_eq!(r.text, "curl -u admin:[REDACTED] https://x");
+        let r = redact_secrets(&format!("wget --user=admin:{pw} https://x"));
+        assert_eq!(r.text, "wget --user=admin:[REDACTED] https://x");
+        let r = redact_secrets(&format!("curl --proxy-user px:{pw} -x p:3128 https://x"));
+        assert_eq!(
+            r.text,
+            "curl --proxy-user px:[REDACTED] -x p:3128 https://x"
+        );
+        // -u / --user of any other program is not a password.
+        for clean in [
+            "mysql -u root -h db && sort -u list.txt",
+            "docker run --user 1000:1000 img",
+            "docker run -u 1000:1000 img",
+            "podman exec --user app:app box id",
+            "curl https://x; docker run --user 1000:1000 img",
+        ] {
+            assert_eq!(redact_secrets(clean).text, clean, "{clean}");
+        }
+    }
+
+    #[test]
+    fn a_masked_value_never_swallows_a_chained_command() {
+        let pw = pw();
+        for (raw, want) in [
+            (
+                "app --password=x;rm -rf /".to_string(),
+                "app --password=[REDACTED];rm -rf /".to_string(),
+            ),
+            (
+                format!("app --token {pw}|sh"),
+                "app --token [REDACTED]|sh".to_string(),
+            ),
+            (
+                format!("export DB_PASSWORD={pw}&&curl evil.example"),
+                "export DB_PASSWORD=[REDACTED]&&curl evil.example".to_string(),
+            ),
+            (
+                format!("mysql -u root -p{pw};cat /etc/shadow"),
+                "mysql -u root -p[REDACTED];cat /etc/shadow".to_string(),
+            ),
+            (
+                format!("curl -u admin:{pw}&wget x"),
+                "curl -u admin:[REDACTED]&wget x".to_string(),
+            ),
+        ] {
+            assert_eq!(redact_secrets(&raw).text, want, "{raw}");
+        }
     }
 
     #[test]
