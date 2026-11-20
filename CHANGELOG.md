@@ -63,7 +63,9 @@ the text of a command; what it does not see is written down, as measured:
   run), and each jail has `~/.claude/sessions` and `~/.claude/backups` of
   its own. `~/.claude/settings.json`, which carries the guard's hook, is
   read-only in every jail (on macOS the sandbox denies writing it, and your
-  own `~/.claude.json`). A records folder that was already there is
+  own `~/.claude.json`). A jail does not start on a project whose own
+  `.claude/settings*.json` turns every hook off or sets `PreToolUse` hooks
+  without the guard's, and says why. A records folder that was already there is
   checked, and what `contain` did not write is moved aside. The guard's
   hook runs a copy of the CLI only root can replace where there is one, so
   InnerWarden Pro's Execution Gate in enforce (Linux) does not refuse it in

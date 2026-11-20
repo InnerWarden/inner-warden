@@ -2400,6 +2400,44 @@ pub fn kept_claude_settings(left: &serde_json::Value) -> serde_json::Value {
     Value::Object(kept)
 }
 
+/// The project's own Claude Code settings, read before a jail starts
+/// ([`project_settings_refusal`]).
+pub(crate) const PROJECT_CLAUDE_SETTINGS: [&str; 2] =
+    [".claude/settings.json", ".claude/settings.local.json"];
+
+/// PURE. Why a jail does not start on a project whose Claude Code settings
+/// file `name` holds `settings`, or `None`. Claude Code reads a project's
+/// settings beside the person's, and the project is writable in the jail:
+/// `disableAllHooks` there turns the guard's hook off, and `PreToolUse`
+/// hooks with none of the guard's in them put other hooks where the guard
+/// screens. Hooks on other events, permissions Claude Code saved ("always
+/// allow") and every other setting are left as they are.
+pub fn project_settings_refusal(name: &str, settings: &serde_json::Value) -> Option<String> {
+    if settings
+        .get("disableAllHooks")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return Some(format!(
+            "the project's {name} turns every hook off (\"disableAllHooks\": true), the guard's \
+             included; remove that setting and start the jail again"
+        ));
+    }
+    let pre_tool_use = settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get("PreToolUse"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| !entries.is_empty());
+    if pre_tool_use && !innerwarden_agent_guard::hook::has_iwguard_wiring(settings) {
+        return Some(format!(
+            "the project's {name} sets PreToolUse hooks with none of InnerWarden's in them; \
+             remove them, or add the guard's hook there (innerwarden setup), and start the \
+             jail again"
+        ));
+    }
+    None
+}
+
 /// The folder, beside the launcher's records, that holds one folder per
 /// project for Claude Code's settings file in a jail with no launch record.
 pub(crate) const PROJECT_CLAUDE_DIR: &str = "jail-claude";
@@ -8526,6 +8564,44 @@ mod tests {
             kept_claude_settings(&serde_json::json!(["not", "an", "object"])),
             serde_json::json!({})
         );
+    }
+
+    /// Decision on the project's own settings (review of #352): a jail does
+    /// not start on a project whose `.claude/settings*.json` turns every
+    /// hook off or sets PreToolUse hooks with none of the guard's; it says
+    /// why. What Claude Code itself saves there ("always allow"), hooks on
+    /// other events and PreToolUse hooks beside the guard's start as before.
+    ///
+    /// FAILS ON REVERT: let `project_settings_refusal` return `None`.
+    #[test]
+    fn a_project_that_turns_the_guards_hook_off_keeps_the_jail_from_starting() {
+        use serde_json::json;
+        let ours = json!({"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "/usr/local/bin/innerwarden hook --agent claude-code"}
+        ]});
+        let other = json!({"matcher": "Bash", "hooks": [
+            {"type": "command", "command": "/usr/bin/true"}
+        ]});
+        let off = json!({"disableAllHooks": true});
+        let why = project_settings_refusal(".claude/settings.json", &off).unwrap();
+        assert!(why.contains("disableAllHooks") && why.contains(".claude/settings.json"));
+        let replaced = json!({"hooks": {"PreToolUse": [other.clone()]}});
+        let why = project_settings_refusal(".claude/settings.local.json", &replaced).unwrap();
+        assert!(why.contains("PreToolUse"), "{why}");
+        for fine in [
+            json!({"permissions": {"allow": ["Bash(npm test)"]}}),
+            json!({"disableAllHooks": false}),
+            json!({"hooks": {"PostToolUse": [other.clone()]}}),
+            json!({"hooks": {"PreToolUse": [ours.clone(), other.clone()]}}),
+            json!({"hooks": {"PreToolUse": []}}),
+            json!({}),
+        ] {
+            assert_eq!(
+                project_settings_refusal(".claude/settings.json", &fine),
+                None,
+                "{fine}"
+            );
+        }
     }
 
     /// Two projects of one name never share a folder; the name is kept to

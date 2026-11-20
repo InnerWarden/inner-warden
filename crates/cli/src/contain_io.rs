@@ -203,6 +203,13 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         eprintln!("innerwarden contain: {error}");
         return ExitCode::from(2);
     }
+    // The project's own Claude Code settings: one that turns the guard's
+    // hook off, or sets PreToolUse hooks without it, keeps the jail from
+    // starting, before anything on the host is changed.
+    if let Some(why) = project_settings_refused(&input.args.project) {
+        eprintln!("innerwarden contain: refusing to start: {why}");
+        return ExitCode::from(2);
+    }
 
     // Arm the guard hook for the agent (idempotent) - but NOT on --dry-run, which
     // must be read-only and never mutate the real ~/.claude/settings.json. The jail
@@ -398,6 +405,34 @@ fn existing_home_paths(home: &Path) -> Vec<PathBuf> {
     )
     .collect()
 }
+
+/// The first of the project's Claude Code settings files that keeps a jail
+/// from starting, and why ([`crate::contain::project_settings_refusal`]).
+/// Each is read as Claude Code reads it (a link followed), at most
+/// [`MAX_PROJECT_SETTINGS_BYTES`]; one that is not there, is larger, or is
+/// not JSON keeps nothing from starting (Claude Code does not take it
+/// either).
+fn project_settings_refused(project: &Path) -> Option<String> {
+    use std::io::Read;
+    crate::contain::PROJECT_CLAUDE_SETTINGS
+        .iter()
+        .find_map(|name| {
+            let mut bytes = Vec::new();
+            std::fs::File::open(project.join(name))
+                .ok()?
+                .take(MAX_PROJECT_SETTINGS_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .ok()?;
+            if bytes.len() as u64 > MAX_PROJECT_SETTINGS_BYTES {
+                return None;
+            }
+            let settings: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            crate::contain::project_settings_refusal(name, &settings)
+        })
+}
+
+/// The largest project settings file read before a jail starts.
+const MAX_PROJECT_SETTINGS_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Said where one of Claude Code's settings that carry the guard's hook
 /// is a link: the jail does not lay it read-only, so a program there can
@@ -6152,6 +6187,37 @@ mod tests {
         std::fs::remove_dir(&folder).unwrap();
         assert!(!make_plain_records(&plan(&identified)));
         assert!(!folder.exists());
+    }
+
+    /// The project's settings files as the launcher reads them: the first
+    /// that keeps the jail from starting, a link followed as Claude Code
+    /// follows it; one that is not JSON, or not there, keeps nothing from
+    /// starting.
+    ///
+    /// FAILS ON REVERT: read neither file.
+    #[test]
+    fn the_projects_settings_files_are_read_before_a_jail_starts() {
+        let project = tempfile::tempdir().unwrap();
+        let p = project.path();
+        assert_eq!(project_settings_refused(p), None);
+        std::fs::create_dir_all(p.join(".claude")).unwrap();
+        std::fs::write(p.join(".claude/settings.json"), "not json").unwrap();
+        assert_eq!(project_settings_refused(p), None);
+        let elsewhere = p.join("off.json");
+        std::fs::write(&elsewhere, r#"{"disableAllHooks":true}"#).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&elsewhere, p.join(".claude/settings.local.json")).unwrap();
+            let why = project_settings_refused(p).unwrap();
+            assert!(why.contains(".claude/settings.local.json"), "{why}");
+        }
+        std::fs::write(
+            p.join(".claude/settings.json"),
+            r#"{"permissions":{"allow":["Bash(ls)"]}}"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        assert!(project_settings_refused(p).is_some());
     }
 
     /// Review of #352, item 3, as the launcher does it before a plain jail

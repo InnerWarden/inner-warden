@@ -131,8 +131,16 @@ list, with every limit.
   denies writing them and keeps `~/.claude` in place: before, a program in
   the jail could take the hook out, or turn hooks off, for every run after.
   Where one is a link, the jail cannot lay it read-only, and `contain` says
-  so as it starts. The project's own `.claude/settings*.json` stay
-  writable in the project, as the rest of the project is.
+  so as it starts. The project's own `.claude/settings.json` and
+  `.claude/settings.local.json` stay writable in the project, as the rest
+  of the project is, and Claude Code keeps saving there what you allow.
+  But a jail does not start on a project where one of them turns every
+  hook off (`"disableAllHooks": true`) or sets `PreToolUse` hooks with
+  none of InnerWarden's in them: `contain` says which file and why, exits
+  2 and changes nothing. Hooks on other events, and `PreToolUse` hooks
+  beside the guard's, start as before. This is read as the jail starts: a
+  change a program in the jail makes there holds back the next start, not
+  the run it is made in.
   Claude Code's settings file, `~/.claude.json`, was gone at every launch
   of a Linux jail without `--identity` (the jail's home is an empty folder
   of its own), and two such jails wrote the same session file in

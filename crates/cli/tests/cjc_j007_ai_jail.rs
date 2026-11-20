@@ -3975,6 +3975,52 @@ fn a_folder_the_jail_cannot_have_of_its_own_is_said_to_be_the_hosts() {
         .is_symlink());
 }
 
+/// Decision on the project's own settings (review of #352): a project
+/// whose `.claude/settings.json` turns every hook off keeps the jail from
+/// starting, says why, exits 2, and changes nothing on the host (the
+/// guard's hook is not armed). Refused before the jail is built, so no
+/// bubblewrap is needed.
+///
+/// FAILS ON REVERT: read no project settings before the jail starts.
+#[cfg(unix)]
+#[test]
+fn a_project_whose_settings_turn_the_hooks_off_never_starts_a_jail() {
+    let home = state_home();
+    let h = home.path();
+    let project = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(project.path().join(".claude")).unwrap();
+    std::fs::write(
+        project.path().join(".claude/settings.json"),
+        r#"{"disableAllHooks": true}"#,
+    )
+    .unwrap();
+    let output = cli()
+        .args([
+            "contain",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo STARTED",
+        ])
+        .env("HOME", h)
+        .output()
+        .expect("run contain");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{out} {err}");
+    assert!(!out.contains("STARTED"), "{out}");
+    assert!(
+        err.contains("refusing to start") && err.contains("disableAllHooks"),
+        "{err}"
+    );
+    assert!(
+        !h.join(".claude/settings.json").exists(),
+        "the hook was armed"
+    );
+}
+
 /// Review of #352, item 2: `~/.claude/settings.json` carries the guard's
 /// hook and `~/.claude` is writable in a jail; a program there rewrote it
 /// (hooks off, the hook taken out) for every run after. Now the file is
