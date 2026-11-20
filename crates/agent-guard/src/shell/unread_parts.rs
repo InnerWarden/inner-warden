@@ -33,8 +33,8 @@ use super::{
     collect_all_commands, collect_nodes_of_kind, command_arguments, command_code_input,
     command_words, effective_command_words, heredoc_owner, is_folder_printer, is_shell_name,
     node_is_in_literal_unreachable_branch, node_text, normalized_command_name, parse_complete_tree,
-    runtime_word_ends_in_literal_program, shell_inline_code_place, shell_literal_word, shell_word,
-    CodeInput, MAX_AST_DEPTH,
+    piped_input, runtime_word_ends_in_literal_program, shell_inline_code_place, shell_literal_word,
+    shell_word, stdin_text_of, CodeInput, PipedInput, MAX_AST_DEPTH,
 };
 use std::collections::HashMap;
 
@@ -801,6 +801,15 @@ fn input_from_unread_pipe(command: tree_sitter::Node<'_>, source: &[u8], names: 
     let Some(pipeline) = unit.parent().filter(|parent| parent.kind() == "pipeline") else {
         return false;
     };
+    // `cat <<EOF | sh`: the grammar hangs the `| sh` inside the
+    // here-document, so the writer is the command it belongs to.
+    if pipeline
+        .parent()
+        .is_some_and(|parent| parent.kind() == "heredoc_redirect")
+        && pipeline.named_child(0).is_some_and(|first| first == unit)
+    {
+        return piped_input(command, source) == Some(PipedInput::Unread);
+    }
     let mut cursor = pipeline.walk();
     let stages: Vec<_> = pipeline.named_children(&mut cursor).collect();
     let Some(at) = stages.iter().position(|stage| *stage == unit) else {
@@ -938,6 +947,24 @@ fn command_unread(
                 || input_from_unread_pipe(command, source, names)
             {
                 return Some(UNREAD_CODE);
+            }
+            // The script a pipe, a here-document or a here-string hands a
+            // shell, written out on the line, is read as a line of its own,
+            // as a `-c` line is.
+            if is_shell_name(&name) {
+                let script = match piped_input(command, source) {
+                    Some(PipedInput::Text(script)) => Some(script),
+                    Some(PipedInput::Unread) => None,
+                    None => stdin_text_of(command, source),
+                };
+                if let Some(script) = script {
+                    if depth >= DEPTH {
+                        return Some(UNREAD_CODE);
+                    }
+                    if let Some(found) = unread_part_at(&script, depth + 1, Vec::new()) {
+                        return Some(found);
+                    }
+                }
             }
         }
         CodeInput::None => {}
