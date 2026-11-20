@@ -721,6 +721,8 @@ mod tests {
         );
     }
 
+    // Every case runs the stand-in through `/bin/sh` ([`FAKE_APP_SERVER`]).
+    #[cfg(unix)]
     mod asking_codex {
         use super::*;
         use std::path::PathBuf;

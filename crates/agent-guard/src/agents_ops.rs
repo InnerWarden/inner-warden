@@ -3844,6 +3844,7 @@ mod tests {
     const CODEX_NOT_ACTIVE: &str = "  codex - its PreToolUse hook is installed, but it is NOT active: Codex skips it: it is not trusted yet. Run `/hooks` inside Codex and trust the innerwarden hook";
     const CODEX_UNSCREENED: &str = "      Until the hook is active, only calls to MCP servers behind the proxy are screened. Codex's shell commands and file changes run unscreened.";
 
+    #[cfg(unix)]
     const NOTHING_TO_CONNECT: &str =
         "innerwarden agents, all 1 guardable agent(s) are wired. Nothing to connect.";
     const ONE_NOT_GUARDED: &str = "innerwarden agents, found (1 not guarded yet):";
@@ -3863,6 +3864,7 @@ mod tests {
 
     /// The notes `agents connect` prints under an agent's lines, as they sit
     /// in its result.
+    #[cfg(unix)]
     fn indented(notes: Vec<String>) -> String {
         notes.iter().map(|note| format!("\n      {note}")).collect()
     }
@@ -4622,7 +4624,8 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+// Every case runs a program found by a bare name, with Unix modes.
+#[cfg(all(test, unix))]
 mod bare_name_clue_tests {
     use super::*;
 
@@ -4649,7 +4652,6 @@ mod bare_name_clue_tests {
     /// FAILS ON REVERT of `with_bare_name_clue` (no "found here at"), of the
     /// usual places in `find_bare_name` (a guard only in a usual place reads
     /// off), and of the bare-name rule (found on PATH reads `Runs`).
-    #[cfg(unix)]
     #[test]
     fn a_bare_name_found_here_says_where_and_one_found_nowhere_is_off() {
         let on_path = tempfile::TempDir::new().unwrap();
