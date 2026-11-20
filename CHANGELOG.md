@@ -34,6 +34,26 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Fixed
 
+- **The MCP proxy judges a payment, a message, a share or a delete by where
+  its values came from, not by its name.** Each listed tool is classed once,
+  from its input schema, its MCP annotations and its name as a hint
+  (money-movement, send-external, share, delete, read-secret, fetch-url,
+  read-only). A call that moves money, sends, shares or deletes, whose
+  recipient, account, amount or target appeared in nothing a server said this
+  session, is allowed and recorded: ATR-2026-098 and ATR-2026-040 stay in the
+  alert as labels when they matched only the tool's name or an argument's
+  name. The same value taken from a tool result, a resource or a listing
+  keeps the refusal it had. Measured through `innerwarden proxy --mode
+  guard` on AgentDojo v1.2.2: the user's own calls refused went from 25 of
+  339 to 0 (in that run every tool answered with a placeholder, so no user
+  value appeared in a result), and the injection tasks' attack calls refused
+  went from 22 of 47 to 27, with none refused before let through. A call
+  judged on its own, outside a proxy session (`innerwarden check`, the
+  release suite), has no provenance and is judged as before.
+- **An address in quotes in a tool result taints the call that sends to it.**
+  `'someone@example.com'` was recorded with its opening quote, so a call to
+  `someone@example.com` was not found to carry it, while the same address
+  without quotes was.
 - **Prose written with `cat` after a `cd` runs.** `cd repo && cat >>
   notes.md <<'EOF'` with words of the guard's rules in the text was refused
   as a line to run, while the same `cat` alone was allowed. It is now read

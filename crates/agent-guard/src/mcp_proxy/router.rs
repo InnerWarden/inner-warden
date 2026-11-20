@@ -141,6 +141,10 @@ fn route_client_to_server(
                 verdict.allowed = false;
                 verdict.alerts.push(alert);
             }
+            // What the tool does and where its sensitive values came from
+            // decide a refusal by name (`super::effect`).
+            let class = t.effect_of(&name, &args);
+            super::effect::apply_table(&name, &args, class, &t.seen, engine, &mut verdict);
         }
         let safe_name = safe_tool_name(&name);
         return ProxyDecision {
@@ -202,6 +206,7 @@ fn route_server_to_client(
             // `mcp::ToolDeclaration`).
             let mut verdict = inspect_tools_list_result(result, engine);
             if let Some(t) = taint {
+                t.seen.record(&result.to_string());
                 t.record_tools_list(result);
                 // A tool pinned before whose definition changed is reported
                 // field by field, and held in a mode that blocks
@@ -254,8 +259,11 @@ fn route_server_to_client(
         ) => {
             // A resource listing is also remembered: a later `resources/read`
             // is checked against what the server announced.
-            if let (Some(t), "resources/list" | "resources/templates/list") = (taint, method) {
-                t.resources.record_listing(method, result);
+            if let Some(t) = taint {
+                t.seen.record(&result.to_string());
+                if let "resources/list" | "resources/templates/list" = method {
+                    t.resources.record_listing(method, result);
+                }
             }
             ProxyDecision {
                 verdict: inspect_listing_result(method, result),
@@ -282,6 +290,9 @@ fn route_server_to_client(
             if let Some(t) = taint {
                 let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
                 let tool = responded.and_then(|r| r.tool.as_deref());
+                if read < length {
+                    t.seen.note_unread();
+                }
                 t.record_answer(
                     env.id.as_ref(),
                     &content,
@@ -309,6 +320,15 @@ fn route_server_to_client(
             let scanned = truncate_on_boundary(whole, MAX_SCANNED_RESULT_BYTES);
             let read = scanned.len();
             let content = crate::redact::redact_secrets(&scanned).text;
+            // What a resource holds reached the model: a value in it is not
+            // one that came from nowhere (`super::effect`).
+            if let Some(t) = taint {
+                if read < length {
+                    t.seen.note_unread();
+                } else {
+                    t.seen.record(&content);
+                }
+            }
             ProxyDecision {
                 verdict: inspect_answer(&content, (read, length), engine),
                 direction: dir.label(),

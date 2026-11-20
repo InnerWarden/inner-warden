@@ -347,6 +347,13 @@ pub struct TaintTracker {
     /// proxy keeps them. Not taint either: kept here for the same reason as
     /// `declared`.
     pub(crate) pins: Option<super::pins::PinSession>,
+    /// What each listed tool does ([`super::effect::EffectClass::of_tool`]),
+    /// classed once when its `tools/list` entry is read. Not taint either:
+    /// kept here for the same reason as `declared`.
+    effects: HashMap<Box<str>, super::effect::EffectClass>,
+    /// What servers said this session, to tell where a call's sensitive
+    /// value came from ([`super::effect`]).
+    pub(crate) seen: super::effect::SeenText,
 }
 
 impl TaintTracker {
@@ -385,6 +392,14 @@ impl TaintTracker {
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
+            let class = super::effect::EffectClass::of_tool(tool);
+            if let Some(kept) = self.effects.get_mut(name) {
+                *kept = class;
+            } else if name.len() <= MAX_DECLARED_NAME_BYTES
+                && self.effects.len() < MAX_DECLARED_TOOLS
+            {
+                self.effects.insert(name.into(), class);
+            }
             match ToolDeclaration::of(tool) {
                 ToolDeclaration::Unknown => {
                     self.declared.remove(name);
@@ -400,6 +415,20 @@ impl TaintTracker {
                 }
             }
         }
+    }
+
+    /// What a call to `tool` with `args` does: the class its listing gave
+    /// it, else one read from its name and the call's argument names. A tool
+    /// past the listing's bounds is classed at its call the same way.
+    pub(crate) fn effect_of(&self, tool: &str, args: &Value) -> super::effect::EffectClass {
+        if let Some(class) = self.effects.get(tool) {
+            return *class;
+        }
+        let slots: Vec<&str> = args
+            .as_object()
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        super::effect::EffectClass::of(tool, None, &slots)
     }
 
     /// What the server declared about `tool`, as last heard.
@@ -472,6 +501,11 @@ impl TaintTracker {
     /// Record one result's tokens, leaving out a token not yet kept that is
     /// one of `sent` (what the call it answers sent).
     fn record(&mut self, text: &str, provenance: Provenance, sent: Option<&HashSet<Box<str>>>) {
+        if text.len() > MAX_SCAN_BYTES {
+            self.seen.note_unread();
+        } else {
+            self.seen.record(text);
+        }
         self.results += 1;
         let newest = self.results;
         // Tokens an earlier result holds, and what this result costs with
@@ -983,6 +1017,15 @@ fn tokenize(text: &str) -> Vec<Cow<'_, str>> {
         // Trim only TRAILING sentence punctuation (`evil.com/x,` → `evil.com/x`);
         // keep leading chars so paths/URLs stay intact (`/etc/...`, `~/.ssh/...`).
         let tok = raw.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
+        // A word in quotes is the word: `'mark@example.com'` is the address
+        // a later call sends to without the quotes. Only a quote that also
+        // closes the word is taken off; an address on a header line
+        // (`<alice@corp.com>`) keeps its bracket (see
+        // `a_reply_to_the_sender_of_a_mail_read_is_not_tainted`).
+        let tok = match tok.chars().next() {
+            Some(q @ ('\'' | '"' | '`')) if raw[tok.len()..].starts_with(q) => &tok[1..],
+            _ => tok,
+        };
         if tok.len() >= MIN_TOKEN_LEN {
             if tok.contains('@') && tok.bytes().any(|b| b.is_ascii_uppercase()) {
                 out.push(Cow::Owned(tok.to_ascii_lowercase()));

@@ -18,6 +18,7 @@
 //! exists purely to route and inspect a message.
 
 pub mod content;
+pub mod effect;
 pub mod enforce;
 pub mod jsonrpc;
 pub mod pins;
