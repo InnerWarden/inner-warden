@@ -218,7 +218,10 @@ fn a_renamed_tool_is_reported_and_held() {
     assert!(changes.is_empty(), "{changes:?}");
     assert!(!s.is_held("send_mail"));
 
-    // One page of a paged list, and the page after it: nothing is gone.
+    // One page of a paged list says nothing is gone. Its pages are gathered,
+    // and the last one closes the listing: read_file is on no page, so the
+    // two tools that take what it took are held as possible renames (both
+    // passed here before the pages were gathered).
     let mut s = PinSession::new(None, &cmd());
     s.check_listing(
         None,
@@ -228,7 +231,12 @@ fn a_renamed_tool_is_reported_and_held() {
     page["nextCursor"] = json!("2");
     assert!(s.check_listing(None, &page).is_empty());
     let last = listing(json!([tool("read_again", "Read a file.", "path")]));
-    assert!(s.check_listing(None, &last).is_empty());
+    let held: Vec<String> = s
+        .check_listing(None, &last)
+        .into_iter()
+        .map(|c| c.tool)
+        .collect();
+    assert_eq!(held, vec!["read_copy", "read_again"]);
 
     // Two tools that take nothing are not alike.
     assert_eq!(

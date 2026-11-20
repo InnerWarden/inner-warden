@@ -6,9 +6,10 @@
 //!
 //! Every run here uses a scratch home and record.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
@@ -72,6 +73,10 @@ impl Home {
         ]});
         std::fs::write(self.listing(), listing.to_string()).expect("listing");
         let listing_path = self.listing();
+        // The client stays connected until the answer is in: a client that
+        // leaves gets the server's last output only for the proxy's drain
+        // window (3 s), and a loaded machine can take longer than that to
+        // start the server.
         let mut child = self
             .command()
             .args([
@@ -83,24 +88,50 @@ impl Home {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn proxy");
-        child
-            .stdin
-            .take()
-            .expect("stdin")
+        let mut stdin = child.stdin.take().expect("stdin");
+        stdin
             .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n")
             .expect("write");
+        stdin.flush().expect("flush");
+        let stdout = child.stdout.take().expect("stdout");
+        let (lines, answers) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if lines.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let answer = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match answers.recv_timeout(left) {
+                Ok(line) => {
+                    let found = serde_json::from_str::<serde_json::Value>(&line)
+                        .ok()
+                        .filter(|m| m["id"] == 1);
+                    seen.push(line);
+                    if found.is_some() {
+                        break found;
+                    }
+                }
+                Err(_) => break None,
+            }
+        };
+        // Now the client leaves, and the proxy with it.
+        drop(stdin);
+        if answer.is_none() {
+            let _ = child.kill();
+        }
         let out = child.wait_with_output().expect("proxy output");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let v: serde_json::Value = stdout
-            .lines()
-            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-            .find(|m| m["id"] == 1)
-            .unwrap_or_else(|| {
-                panic!(
-                    "no answer: {stdout} / {}",
-                    String::from_utf8_lossy(&out.stderr)
-                )
-            });
+        let v: serde_json::Value = answer.unwrap_or_else(|| {
+            panic!(
+                "no answer: {} / {}",
+                seen.join("\n"),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
         v["result"]["tools"]
             .as_array()
             .expect("tools")

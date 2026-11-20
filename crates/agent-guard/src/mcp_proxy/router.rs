@@ -214,6 +214,14 @@ fn route_server_to_client(
                             false,
                         ));
                     }
+                    // A paged listing too long to check whole: a warning too.
+                    for notice in pins.take_cut_notices() {
+                        verdict.alerts.push(VerdictAlert::builtin(
+                            super::pins::LISTING_CUT_RULE,
+                            notice,
+                            false,
+                        ));
+                    }
                 }
             }
             ProxyDecision {
