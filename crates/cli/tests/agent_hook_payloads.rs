@@ -652,7 +652,7 @@ fn a_claude_code_payload_is_refused_through_its_line() {
 /// line, Claude Code and Codex run the call.
 ///
 /// Claude Code's line is its own ([`hook_command_for`], the short shell
-/// tail): it refuses with the shell's own "not found".
+/// tail): it refuses with exit 2, and the shell names the missing program.
 ///
 /// FAILS ON REVERT: write the plain line in `HookSpec::command` (pass `false`
 /// to `hook_command_shaped`) and Codex reads the missing program as a call
@@ -678,12 +678,15 @@ fn a_missing_program_is_a_refusal_on_every_agent_in_enforce() {
     ] {
         let answer = host.run(shell, &enforce(agent), &payload);
         assert_eq!(reads(&answer), Call::Refused, "{agent}: {}", answer.stderr);
+        // Claude Code's line has no message of its own: the shell names the
+        // program it could not start, in its own words ("not found" in dash,
+        // "No such file or directory" in bash and in macOS's /bin/sh).
         let said = if agent == "claude-code" {
-            "not found"
+            gone.display().to_string()
         } else {
-            "refusing this tool call rather than letting it run unscreened"
+            "refusing this tool call rather than letting it run unscreened".to_string()
         };
-        assert!(answer.stderr.contains(said), "{agent}: {}", answer.stderr);
+        assert!(answer.stderr.contains(&said), "{agent}: {}", answer.stderr);
         let answer = host.run(shell, &monitor(agent), &payload);
         assert_eq!(
             reads(&answer),
