@@ -13040,8 +13040,7 @@ fn segment_is_root_wipe(segment: &str) -> bool {
     let Some(rm) = segment_rm_invocation(segment) else {
         return false;
     };
-    rm.no_preserve
-        || (rm.recursive && rm.targets.iter().any(|t| rm_target_is_root_or_system(t)))
+    rm.no_preserve || (rm.recursive && rm.targets.iter().any(|t| rm_target_is_root_or_system(t)))
 }
 
 /// Does a single shell command segment run a recursive `rm` of a home
