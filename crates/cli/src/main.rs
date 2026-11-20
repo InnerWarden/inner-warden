@@ -1536,6 +1536,11 @@ enum ReviewAnswer {
     /// ordinary work (a program named by a variable, a value read from a
     /// file); `--block-review` refuses them for whoever wants that.
     WarnCodex,
+    /// Cursor, for a shell command or an MCP call: `permission: "ask"` on
+    /// stdout, exit 0 (its hooks documentation, `beforeShellExecution` and
+    /// `beforeMCPExecution`). A read takes allow or deny only, so a review
+    /// of a read is [`ReviewAnswer::Refuse`].
+    AskCursor,
     /// Every other agent: refused, exit 2 with the reason on stderr, as a
     /// `deny` is. That is Gemini CLI, whose `decision: "ask"` is not proven
     /// to reach a person: in 0.68.0 (`scheduler/scheduler.ts`,
@@ -1551,10 +1556,22 @@ enum ReviewAnswer {
 /// How a review is answered for `agent` (the hook line's `--agent`). A hook
 /// line with no agent is the Claude Code line the guard always wrote.
 fn review_answer(agent: Option<&str>) -> ReviewAnswer {
+    review_answer_for(agent, cursor_event())
+}
+
+/// PURE: [`review_answer`], with the Cursor event the call came on.
+fn review_answer_for(
+    agent: Option<&str>,
+    cursor: Option<innerwarden_agent_guard::cursor_hook::Event>,
+) -> ReviewAnswer {
     match agent {
         None | Some("claude-code") => ReviewAnswer::AskClaudeCode,
         Some(innerwarden_agent_guard::hermes_hook::AGENT) => ReviewAnswer::AskHermes,
         Some("codex") => ReviewAnswer::WarnCodex,
+        Some(innerwarden_agent_guard::cursor_hook::AGENT) => match cursor {
+            Some(event) if event.can_ask() => ReviewAnswer::AskCursor,
+            _ => ReviewAnswer::Refuse,
+        },
         Some(_) => ReviewAnswer::Refuse,
     }
 }
@@ -1594,6 +1611,7 @@ fn review_answer_line(answer: ReviewAnswer, explanation: &str) -> Option<String>
                  instead, connect the hook with --block-review."
             ),
         }),
+        ReviewAnswer::AskCursor => return Some(innerwarden_agent_guard::cursor_hook::ask(&ask)),
         ReviewAnswer::Refuse => return None,
     };
     Some(json.to_string())
@@ -1613,7 +1631,65 @@ fn is_review(verdict: &serde_json::Value) -> bool {
     verdict.get("recommendation").and_then(|r| r.as_str()) == Some("review")
 }
 
+/// The Cursor event this hook run is answering, once its payload was read.
+static CURSOR_EVENT: std::sync::OnceLock<innerwarden_agent_guard::cursor_hook::Event> =
+    std::sync::OnceLock::new();
+
+/// Whether this run already wrote its answer to stdout.
+static HOOK_ANSWERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The guard's reason for a refusal, for an agent that reads it in JSON.
+static HOOK_REFUSAL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn cursor_event() -> Option<innerwarden_agent_guard::cursor_hook::Event> {
+    CURSOR_EVENT.get().copied()
+}
+
+/// Keep the reason of a refusal for [`cursor_answer`].
+fn note_refusal(reason: String) {
+    if let Ok(mut slot) = HOOK_REFUSAL.lock() {
+        slot.get_or_insert(reason);
+    }
+}
+
+/// The words of a refusal whose reason only went to stderr.
+const CURSOR_REFUSED: &str = "InnerWarden refused this call. Its reason is in the hook's output.";
+
+/// What the hook writes for Cursor once the screening ended with `exit`.
+///
+/// Cursor reads a JSON `permission` on stdout after exit 0, and blocks a
+/// call whose hook said nothing or something else, so a call the guard
+/// lets through is answered `allow`, never with silence. A refusal (exit 2)
+/// carries its reason as `deny` too. An answer already written (an ask)
+/// stands. Any other end is left as it is: in monitor mode it is 1, and
+/// Cursor runs the call, as monitor mode wants.
+fn cursor_answer(exit: std::process::ExitCode) -> std::process::ExitCode {
+    use innerwarden_agent_guard::cursor_hook;
+    if HOOK_ANSWERED.load(std::sync::atomic::Ordering::SeqCst) {
+        return exit;
+    }
+    if exit == std::process::ExitCode::SUCCESS {
+        println!("{}", cursor_hook::allow());
+    } else if exit == std::process::ExitCode::from(2) {
+        let reason = HOOK_REFUSAL
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| CURSOR_REFUSED.to_string());
+        println!("{}", cursor_hook::deny(&reason));
+    }
+    exit
+}
+
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
+    let exit = cmd_hook_screen(rest);
+    if agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::cursor_hook::AGENT) {
+        return cursor_answer(exit);
+    }
+    exit
+}
+
+fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     let block_review = rest.iter().any(|a| a == "--block-review");
     // Monitor (observe-only): still records every command into the graph, but never
     // blocks. A dev gets the live dashboard/narrative without the guardrail denying
@@ -1633,6 +1709,27 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         Ok(ToolCallRead::Whole(buf)) => buf,
         Ok(ToolCallRead::TooLong(head)) => return hook_too_long(&head, rest, monitor),
         Err(_) => return hook_unreadable("", rest, "stdin could not be read", monitor),
+    };
+    // Cursor sends each event in its own shape: read as the call every other
+    // agent's hook carries, and the event kept for the answer.
+    let buf = if agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::cursor_hook::AGENT) {
+        use innerwarden_agent_guard::cursor_hook::{self, CursorCall};
+        match cursor_hook::read(&buf) {
+            CursorCall::Call(event, call) => {
+                let _ = CURSOR_EVENT.set(event);
+                call.to_string()
+            }
+            CursorCall::Canonical => buf,
+            CursorCall::Other => return std::process::ExitCode::SUCCESS,
+            CursorCall::Unreadable(why) => {
+                note_refusal(format!(
+                    "InnerWarden could not read this call ({why}) and refused it."
+                ));
+                return hook_unreadable(&buf, rest, why, monitor);
+            }
+        }
+    } else {
+        buf
     };
     // A call `innerwarden demo` sent: judged exactly as an agent's and
     // recorded like one, with `demo: true` beside it. It is not alerted on
@@ -1702,6 +1799,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
                 verdict.get("explanation").and_then(|e| e.as_str()),
             )
         );
+        HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     if !monitor && would_block_under_policy {
@@ -1714,6 +1812,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
             .and_then(|e| e.as_str())
             .unwrap_or("");
         eprintln!("InnerWarden blocked this command (recommendation={rec}): {expl}");
+        note_refusal(format!("InnerWarden blocked this call ({rec}): {expl}"));
         // Offer the safer neighbour BEFORE the override, when one exists.
         //
         // The two lines are not equivalent and their order is the point. An
@@ -1749,9 +1848,11 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         match review_answer_line(review_answer(agent_flag(rest).as_deref()), expl) {
             Some(line) => {
                 println!("{line}");
+                HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
                 std::process::ExitCode::SUCCESS
             }
             None => {
+                note_refusal(review_refusal_line(expl));
                 eprintln!("{}", review_refusal_line(expl));
                 eprintln!("{}", hook_block_remedy(&verdict));
                 std::process::ExitCode::from(2)
@@ -4540,7 +4641,28 @@ mod tests {
         // Gemini's ask is not proven to reach a person, and an agent this
         // table does not know may not read an answer at all.
         assert_eq!(review_answer(Some("gemini")), ReviewAnswer::Refuse);
-        assert_eq!(review_answer(Some("cursor")), ReviewAnswer::Refuse);
+        assert_eq!(review_answer(Some("openclaw")), ReviewAnswer::Refuse);
+        // Cursor asks for a shell command or an MCP call; a read cannot be
+        // asked about, and a Cursor call of no known event is not either.
+        {
+            use innerwarden_agent_guard::cursor_hook::Event;
+            assert_eq!(
+                review_answer_for(Some("cursor"), Some(Event::Shell)),
+                ReviewAnswer::AskCursor
+            );
+            assert_eq!(
+                review_answer_for(Some("cursor"), Some(Event::Mcp)),
+                ReviewAnswer::AskCursor
+            );
+            assert_eq!(
+                review_answer_for(Some("cursor"), Some(Event::Read)),
+                ReviewAnswer::Refuse
+            );
+            assert_eq!(
+                review_answer_for(Some("cursor"), None),
+                ReviewAnswer::Refuse
+            );
+        }
         assert_eq!(review_answer(Some("openclaw")), ReviewAnswer::Refuse);
     }
 

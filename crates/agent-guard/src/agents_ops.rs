@@ -4602,8 +4602,9 @@ mod tests {
         }
     }
 
-    /// Only Codex and Gemini, found through their own reviewed MCP config,
-    /// have a hook beside the proxy. The same name over another file does not.
+    /// Only Codex, Gemini and Cursor, found through their own reviewed MCP
+    /// config, have a hook beside the proxy. The same name over another file
+    /// does not.
     #[test]
     fn the_hook_beside_the_proxy_is_for_codex_and_gemini_by_their_own_config() {
         assert_eq!(
@@ -4617,7 +4618,11 @@ mod tests {
         assert_eq!(hook_spec("codex", Some(".codex/mcp.json"), None), None);
         assert_eq!(hook_spec("gemini", Some(".gemini/mcp.json"), None), None);
         assert_eq!(hook_spec("codex", None, None), None);
-        assert_eq!(hook_spec("cursor", Some(".cursor/mcp.json"), None), None);
+        assert_eq!(
+            hook_spec("cursor", Some(".cursor/mcp.json"), None),
+            Some(&agent_hooks::CURSOR)
+        );
+        assert_eq!(hook_spec("cursor", Some(".cursor/other.json"), None), None);
         assert_eq!(hook_spec("claude-code", None, None), None);
     }
 }

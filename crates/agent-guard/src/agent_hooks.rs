@@ -1,5 +1,5 @@
 //! The blocking hook for the agents that keep it outside Claude Code's
-//! settings: Codex CLI and Gemini CLI.
+//! settings: Codex CLI, Gemini CLI and Cursor.
 //!
 //! Both run a command before a tool call and refuse the call when the command
 //! exits 2 with text on stderr, which is what `innerwarden hook` answers. So
@@ -9,6 +9,11 @@
 //! |--------|---------------------------|--------------|--------------|
 //! | Codex  | `~/.codex/hooks.json`     | `PreToolUse` | seconds      |
 //! | Gemini | `~/.gemini/settings.json` | `BeforeTool` | milliseconds |
+//! | Cursor | `~/.cursor/hooks.json`    | `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile` | seconds |
+//!
+//! Cursor's file lists the hooks flat under each event (no group, no
+//! matcher), carries `version: 1` and a `failClosed` switch per entry, and
+//! Cursor reads a JSON `permission` on stdout ([`crate::cursor_hook`]).
 //!
 //! The entry carries no matcher, so every tool call reaches the hook and the
 //! guard lets through what it does not screen. It carries an explicit timeout,
@@ -64,6 +69,7 @@ const CODEX_HOME_VAR: &str = "CODEX_HOME";
 pub enum Host {
     Codex,
     Gemini,
+    Cursor,
 }
 
 /// Where one agent keeps its hook, and what the entry written there holds.
@@ -76,8 +82,11 @@ pub struct HookSpec {
     pub host: Host,
     /// The file that holds the hook, relative to the home directory.
     pub file: &'static str,
-    /// The event the hook is listed under.
+    /// The event the hook is listed under, and the name the listing gives it.
     pub event: &'static str,
+    /// Further events the same entry is listed under (Cursor's), each of
+    /// which must hold it for the hook to be on.
+    pub more_events: &'static [&'static str],
     /// How long the agent waits for the hook, in the agent's own unit:
     /// seconds for Codex, milliseconds for Gemini.
     pub timeout: u64,
@@ -101,6 +110,7 @@ pub static CODEX: HookSpec = HookSpec {
     host: Host::Codex,
     file: ".codex/hooks.json",
     event: "PreToolUse",
+    more_events: &[],
     timeout: 60,
     mcp_config: CODEX_CONFIG,
     file_tools: "`apply_patch`",
@@ -118,6 +128,7 @@ pub static GEMINI: HookSpec = HookSpec {
     host: Host::Gemini,
     file: ".gemini/settings.json",
     event: "BeforeTool",
+    more_events: &[],
     timeout: 60_000,
     mcp_config: ".gemini/settings.json",
     file_tools: "`write_file` and `replace`",
@@ -128,9 +139,33 @@ pub static GEMINI: HookSpec = HookSpec {
               the guard into 1.",
 };
 
+/// Cursor. The timeout is in seconds. Read in Cursor's hooks documentation
+/// (cursor.com/docs/agent/hooks, as published on 2026-11-20), not measured
+/// on a running Cursor.
+pub static CURSOR: HookSpec = HookSpec {
+    agent: "cursor",
+    product: "Cursor",
+    host: Host::Cursor,
+    file: ".cursor/hooks.json",
+    event: crate::cursor_hook::SHELL_EVENT,
+    more_events: &[
+        crate::cursor_hook::MCP_EVENT,
+        crate::cursor_hook::READ_EVENT,
+    ],
+    timeout: 60,
+    mcp_config: ".cursor/mcp.json",
+    file_tools: "",
+    measured: "Judged only by the payloads Cursor's hooks documentation gives \
+               (cursor.com/docs/agent/hooks, read on 2026-11-20), not on a running Cursor.",
+    minimum: "a Cursor that runs hooks from ~/.cursor/hooks.json with `failClosed` \
+              (its hooks documentation of 2026-11; the version that added `failClosed` is \
+              not named there). On a Cursor without it, a guard that cannot answer still \
+              refuses in enforce mode on Linux and macOS, where the line ends in exit 2.",
+};
+
 /// The hook wiring for the agent the listing calls `agent`, when it has one.
 pub fn spec_for(agent: &str) -> Option<&'static HookSpec> {
-    [&CODEX, &GEMINI]
+    [&CODEX, &GEMINI, &CURSOR]
         .into_iter()
         .find(|spec| spec.agent == agent)
 }
@@ -167,6 +202,11 @@ fn fail_closed_gap(product: &str) -> String {
 }
 
 impl HookSpec {
+    /// Every event the entry is listed under: [`HookSpec::event`] first.
+    pub fn events(&self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.event).chain(self.more_events.iter().copied())
+    }
+
     /// The file that holds the hook, under `home`.
     pub fn path(&self, home: &Path) -> PathBuf {
         home.join(self.file)
@@ -190,14 +230,25 @@ impl HookSpec {
     /// How long the agent waits for the hook before it runs the tool.
     pub fn wait(&self) -> Duration {
         match self.host {
-            Host::Codex => Duration::from_secs(self.timeout),
+            Host::Codex | Host::Cursor => Duration::from_secs(self.timeout),
             Host::Gemini => Duration::from_millis(self.timeout),
         }
     }
 
     /// The one group `agents connect` writes under the event: a command hook
-    /// with a timeout and no matcher.
+    /// with a timeout and no matcher. For Cursor it is the hook itself, flat
+    /// in the event's list, with `failClosed` on in enforce mode and off in
+    /// monitor, which never refuses.
     fn entry(&self, command: &str) -> Value {
+        if self.host == Host::Cursor {
+            let monitor = hook::read_hook_line(&json!({ "command": command }))
+                .is_some_and(|line| line.monitor);
+            return json!({
+                "command": command,
+                "timeout": self.timeout,
+                "failClosed": !monitor,
+            });
+        }
         let mut hook = Map::new();
         hook.insert("type".to_string(), Value::from("command"));
         if self.host == Host::Gemini {
@@ -219,6 +270,7 @@ impl HookSpec {
                  `grep_search`"
             }
             Host::Codex => "",
+            Host::Cursor => return crate::cursor_hook::screened(),
         };
         format!(
             "shell commands, changes to privileged files through {}{reads}, and calls to MCP \
@@ -286,6 +338,12 @@ impl HookSpec {
                  here."
                     .to_string(),
             ),
+            Host::Cursor => {
+                lines.extend(crate::cursor_hook::gaps());
+                lines.push(format!("Needs {}", self.minimum));
+                lines.push(self.measured.to_string());
+                return lines;
+            }
         }
         if self.host == Host::Gemini {
             lines.push(fail_closed_gap(self.product));
@@ -307,6 +365,8 @@ impl HookSpec {
 
 /// One InnerWarden hook found under the event, with where it sits.
 struct Found {
+    /// The event it is listed under.
+    event: &'static str,
     group: usize,
     index: usize,
     line: hook::HookLine,
@@ -316,25 +376,42 @@ struct Found {
     timeout: Option<u64>,
 }
 
-/// Every InnerWarden hook under the spec's event, in file order.
+/// Every InnerWarden hook under the spec's events, in file order. In
+/// Cursor's flat lists each hook is its own group, at index 0.
 fn found(settings: &Value, spec: &HookSpec) -> Vec<Found> {
-    let Some(groups) = settings
-        .get("hooks")
-        .and_then(|hooks| hooks.get(spec.event))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for (group, entry) in groups.iter().enumerate() {
-        let Some(list) = entry.get("hooks").and_then(Value::as_array) else {
+    for event in spec.events() {
+        let Some(groups) = settings
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .and_then(Value::as_array)
+        else {
             continue;
+        };
+        found_in(groups, spec, event, &mut out);
+    }
+    out
+}
+
+/// [`found`] for one event's list.
+fn found_in(groups: &[Value], spec: &HookSpec, event: &'static str, out: &mut Vec<Found>) {
+    for (group, entry) in groups.iter().enumerate() {
+        let flat;
+        let list: &[Value] = if spec.host == Host::Cursor {
+            flat = [entry.clone()];
+            &flat
+        } else {
+            match entry.get("hooks").and_then(Value::as_array) {
+                Some(list) => list,
+                None => continue,
+            }
         };
         for (index, hook) in list.iter().enumerate() {
             let Some(line) = hook::read_hook_line(hook) else {
                 continue;
             };
             out.push(Found {
+                event,
                 group,
                 index,
                 line,
@@ -347,7 +424,6 @@ fn found(settings: &Value, spec: &HookSpec) -> Vec<Found> {
             });
         }
     }
-    out
 }
 
 /// Whether a group holds a hook of ours, and whether it holds nothing else
@@ -535,6 +611,9 @@ fn vacate(mut settings: Value, event: &str) -> (Value, usize) {
 /// its place. Otherwise the entry goes at the end, behind every hook that is
 /// already there. Every other key, group and hook stays as it was.
 pub fn merge(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, String> {
+    if spec.host == Host::Cursor {
+        return merge_flat(settings, spec, command);
+    }
     let mut settings = match settings {
         Value::Null => json!({}),
         other => other,
@@ -590,6 +669,78 @@ pub fn merge(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, S
         trim_empty_groups(groups);
     }
     Ok(settings)
+}
+
+/// Whether Cursor reads hooks from a file with this `version`: a positive
+/// whole number, as its documentation requires.
+fn cursor_version_ok(settings: &Value) -> bool {
+    settings
+        .get("version")
+        .and_then(Value::as_u64)
+        .is_some_and(|version| version > 0)
+}
+
+/// PURE: [`merge`] for Cursor's flat lists. Under each event every hook of
+/// ours comes out and one entry goes where the first of them was, else at
+/// the end: no hook of the person's moves, and a re-run writes nothing. A
+/// `version` Cursor would not read becomes 1. Every other key and hook stays
+/// as it was.
+fn merge_flat(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, String> {
+    let mut settings = match settings {
+        Value::Null => json!({}),
+        other => other,
+    };
+    let version_ok = cursor_version_ok(&settings);
+    let root = settings
+        .as_object_mut()
+        .ok_or("its top level is not a JSON object")?;
+    if !version_ok {
+        root.insert("version".to_string(), json!(1));
+    }
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("`hooks` is not a JSON object")?;
+    let entry = spec.entry(command);
+    for event in spec.events() {
+        let list = hooks
+            .entry(event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| format!("`hooks.{event}` is not a list"))?;
+        let first = list
+            .iter()
+            .position(|hook| hook::read_hook_line(hook).is_some());
+        list.retain(|hook| hook::read_hook_line(hook).is_none());
+        match first {
+            Some(at) => list.insert(at, entry.clone()),
+            None => list.push(entry.clone()),
+        }
+    }
+    Ok(settings)
+}
+
+/// PURE: take every hook of ours out of Cursor's flat lists. A list that
+/// held only hooks of ours goes; every other key and hook stays.
+fn vacate_flat(mut settings: Value, spec: &HookSpec) -> (Value, usize) {
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return (settings, 0);
+    };
+    let mut removed = 0usize;
+    for event in spec.events() {
+        let Some(list) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let before = list.len();
+        list.retain(|hook| hook::read_hook_line(hook).is_none());
+        let gone = before - list.len();
+        removed += gone;
+        if gone > 0 && list.is_empty() {
+            hooks.remove(event);
+        }
+    }
+    (settings, removed)
 }
 
 /// Read the settings file as JSON. A missing or blank file is `Null`: there
@@ -669,6 +820,7 @@ pub fn uninstall_noting_moved(
     let (cleaned, removed) = match spec.host {
         Host::Codex => vacate(settings.clone(), spec.event),
         Host::Gemini => hook::remove_iwguard_hooks_for_event(settings.clone(), spec.event),
+        Host::Cursor => vacate_flat(settings.clone(), spec),
     };
     if removed == 0 {
         return Ok((0, Vec::new()));
@@ -735,7 +887,7 @@ pub struct LeftBehind {
 /// settings when its text holds an InnerWarden hook line. Neither rules the
 /// hook out: which copy such a line runs cannot be told from the text.
 pub fn left_behind(home: &Path, binary: &Path) -> Vec<LeftBehind> {
-    [&CODEX, &GEMINI]
+    [&CODEX, &GEMINI, &CURSOR]
         .into_iter()
         .filter_map(|spec| {
             let seen = still_runs(&spec.path(home), spec, binary)?;
@@ -816,6 +968,12 @@ pub fn left_behind_lines(left: &[LeftBehind]) -> Vec<String> {
                     "Gemini would start a hook whose program is gone before every tool call: \
                      in enforce mode it refuses every call, in monitor mode it runs them \
                      unscreened on Linux and macOS and refuses them on Windows."
+                }
+                Host::Cursor => {
+                    "Cursor would start a hook whose program is gone before every shell \
+                     command, MCP call and file read of its agent: in enforce mode \
+                     (`failClosed`) it refuses every one, in monitor mode it runs them \
+                     unscreened."
                 }
             }
             .to_string(),
@@ -1087,7 +1245,7 @@ fn state_with(home: &Path, spec: &HookSpec, fact: impl Fn(&str) -> hook::Program
     };
     let config = match spec.host {
         Host::Codex => codex_config(home),
-        Host::Gemini => None,
+        Host::Gemini | Host::Cursor => None,
     };
     judge(&settings, spec, &path, config.as_ref(), fact)
 }
@@ -1108,6 +1266,9 @@ fn judge(
     fact: impl Fn(&str) -> hook::ProgramFact,
 ) -> HookState {
     let ours = found(settings, spec);
+    if spec.host == Host::Cursor {
+        return judge_flat(settings, spec, &ours, fact);
+    }
     let [only] = ours.as_slice() else {
         return if ours.is_empty() {
             HookState::Absent
@@ -1131,7 +1292,7 @@ fn judge(
     // started, so its program cannot hold a call up.
     let switched_off = match spec.host {
         Host::Gemini => gemini_switch(settings, &command),
-        Host::Codex => None,
+        Host::Codex | Host::Cursor => None,
     };
     if let Some(reason) = switched_off {
         return HookState::Off(reason);
@@ -1170,7 +1331,7 @@ fn judge(
                 Trust::Skipped(skip) => Some(Reason::Codex(skip)),
             }
         }
-        Host::Gemini => None,
+        Host::Gemini | Host::Cursor => None,
     };
     match skipped {
         Some(reason) => HookState::Off(reason),
@@ -1178,6 +1339,52 @@ fn judge(
             monitor: only.line.monitor,
             block_review: only.line.block_review,
         },
+    }
+}
+
+/// PURE: [`judge`] for Cursor. The hook is on only when each of its events
+/// lists exactly the entry `agents connect` writes, all for one program and
+/// mode, in a file whose `version` Cursor reads, and the program is there.
+/// One event without it leaves that kind of call unscreened, so it is not
+/// on. Every doubt is "off", as for the others.
+fn judge_flat(
+    settings: &Value,
+    spec: &HookSpec,
+    ours: &[Found],
+    fact: impl Fn(&str) -> hook::ProgramFact,
+) -> HookState {
+    let Some(first) = ours.first() else {
+        return HookState::Absent;
+    };
+    let command = spec.command(
+        Path::new(&first.line.program),
+        first.line.block_review,
+        first.line.monitor,
+    );
+    let expected = spec.entry(&command);
+    let each_once = spec.events().all(|event| {
+        let mine: Vec<&Found> = ours.iter().filter(|hook| hook.event == event).collect();
+        matches!(mine.as_slice(), [only] if settings["hooks"][event][only.group] == expected)
+    });
+    if !each_once || !cursor_version_ok(settings) {
+        return HookState::Off(Reason::Altered);
+    }
+    // The enforcing entry carries `failClosed`: Cursor refuses the call when
+    // the program does not start. The monitor entry never refuses.
+    let refuses = !first.line.monitor;
+    match hook::judge_hook_program(&first.line.program, fact(&first.line.program)) {
+        hook::HookProgram::Runs => HookState::On {
+            monitor: first.line.monitor,
+            block_review: first.line.block_review,
+        },
+        hook::HookProgram::Broken { problem, .. } => HookState::Off(Reason::Broken {
+            clause: problem,
+            refuses,
+        }),
+        hook::HookProgram::Unknown { why, .. } => HookState::Off(Reason::Unchecked {
+            clause: why,
+            refuses,
+        }),
     }
 }
 

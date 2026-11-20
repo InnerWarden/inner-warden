@@ -2634,8 +2634,11 @@ mod tests {
                 crate::status::Finding::Working(text) => text,
                 other => panic!("{other:?}"),
             };
+            // The first line: a hook beside the proxy (Cursor's) prints its
+            // gaps on the lines after it.
+            let first = printed.lines().next().unwrap_or_default();
             assert!(
-                printed
+                first
                     .to_lowercase()
                     .ends_with(&row["judges_line"].as_str().unwrap().to_lowercase()),
                 "{printed}"
@@ -2645,7 +2648,9 @@ mod tests {
             row_of(&payload, "claude-code")["judges"],
             "shell_and_privileged_files"
         );
-        assert_eq!(row_of(&payload, "cursor")["judges"], "mcp_server_calls");
+        // Cursor's hooks are on beside the proxy since `agents connect` wires
+        // them; they do not judge its file edits.
+        assert_eq!(row_of(&payload, "cursor")["judges"], "shell_only");
     }
 
     /// FAILS ON REVERT: a Bash hook that runs beside file-tool and result

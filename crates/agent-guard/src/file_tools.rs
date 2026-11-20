@@ -995,6 +995,8 @@ const HOME_GUARD_FILES: &[&str] = &[
     ".claude.json",
     ".mcp.json",
     ".cursor/mcp.json",
+    // Where Cursor reads the guard's hook from.
+    ".cursor/hooks.json",
     ".codex/config.toml",
     ".codex/hooks.json",
     // zsh runs it before the hook line Codex starts.

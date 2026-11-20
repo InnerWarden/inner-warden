@@ -409,6 +409,13 @@ pub fn judges(classes: &ToolClasses) -> (&'static str, String) {
             file_tools: false, ..
         } => ("shell_only", sentence(&hook_shell_only_words())),
         ToolClasses::Proxy { .. } => ("mcp_server_calls", sentence(PROXY_WORDS)),
+        // Cursor's hooks judge its shell commands, MCP calls and reads, never
+        // its file edits: the short label must not say privileged files.
+        ToolClasses::HookAndProxy {
+            agent, screened, ..
+        } if agent == innerwarden_agent_guard::cursor_hook::AGENT => {
+            ("shell_only", sentence(screened))
+        }
         ToolClasses::HookAndProxy { screened, .. } => {
             ("shell_and_privileged_files", sentence(screened))
         }

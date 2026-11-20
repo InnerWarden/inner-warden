@@ -13,6 +13,23 @@ guard, and refused if it lets through a line main stops. The guard still reads
 the text of a command; what it does not see is written down, as measured:
 [Where this ends](docs/features.md#where-this-ends).
 
+### Added
+
+- **Cursor is screened through its own hooks.** `innerwarden agents connect
+  cursor` now writes an entry under `beforeShellExecution`,
+  `beforeMCPExecution` and `beforeReadFile` in `~/.cursor/hooks.json`,
+  beside the MCP proxy it already wired, so Cursor's shell commands, the
+  command lines and paths in its MCP calls and its reads of secrets are judged
+  before they run. Every call the guard lets through is answered
+  `permission: "allow"`, a refusal is exit 2 with the reason, and a review of a
+  shell command or an MCP call asks you. Enforce writes `failClosed: true`,
+  monitor does not. `agents disconnect cursor` and `innerwarden uninstall`
+  take out only the guard's entries; `agents` and `status` say what is
+  screened and what is not (its file edits are not: Cursor has no hook before
+  an edit). A shell command that rewrites or removes `~/.cursor/hooks.json` is
+  refused. Judged only by the payloads Cursor's hooks documentation gives,
+  not on a running Cursor.
+
 ### Security
 
 - **A review asks you instead of passing unseen.** In enforce mode the hook

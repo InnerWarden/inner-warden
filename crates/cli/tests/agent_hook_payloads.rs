@@ -29,7 +29,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use innerwarden_agent_guard::agent_hooks::{CODEX, GEMINI};
+use innerwarden_agent_guard::agent_hooks::{CODEX, CURSOR, GEMINI};
 use innerwarden_agent_guard::hook::hook_command_for;
 use serde_json::{json, Value};
 
@@ -1307,4 +1307,255 @@ fn a_review_for_an_agent_with_no_way_to_ask_is_refused_with_the_reason() {
         &host.run("/bin/sh", &monitor, &payload(review)),
         "unknown agent monitor",
     );
+}
+
+/// Cursor, its hooks documentation (cursor.com/docs/agent/hooks, read on
+/// 2026-11-20): exit 2 blocks; on exit 0 stdout is read as JSON, and
+/// `permission` `deny` blocks, `ask` asks the person, `allow` runs, and
+/// stdout that is not JSON of that shape blocks too. Any other end (another
+/// exit, a signal, a timeout) runs the call unless the entry carries
+/// `failClosed: true`.
+fn cursor_reads(answer: &Answer, fail_closed: bool) -> Call {
+    match answer.code {
+        Some(2) => Call::Refused,
+        Some(0) => match serde_json::from_str::<Value>(answer.stdout.trim()) {
+            Ok(out) => match out["permission"].as_str() {
+                Some("allow") => Call::Runs,
+                Some("ask") => Call::Asks,
+                _ => Call::Refused,
+            },
+            Err(_) => Call::Refused,
+        },
+        _ if fail_closed => Call::Refused,
+        _ => Call::Runs,
+    }
+}
+
+impl Host {
+    /// A Cursor hook payload: the fields every event carries, then the
+    /// event's own, as its hooks documentation lists them.
+    fn cursor(&self, event: &str, fields: Value) -> Value {
+        let mut payload = json!({
+            "conversation_id": "668320d2-2fd8-4888-b33c-2a466fec86e7",
+            "generation_id": "490b90b7-a2ce-4c2c-bb76-cb77b125df2f",
+            "model": "default",
+            "hook_event_name": event,
+            "cursor_version": "1.7.2",
+            "workspace_roots": [self.project()],
+            "user_email": null,
+            "transcript_path": null,
+        });
+        for (key, value) in fields.as_object().expect("fields") {
+            payload[key] = value.clone();
+        }
+        payload
+    }
+
+    fn cursor_shell(&self, command: &str) -> Value {
+        self.cursor(
+            "beforeShellExecution",
+            json!({"command": command, "cwd": self.project(), "sandbox": false}),
+        )
+    }
+
+    fn cursor_mcp(&self, server: &str, tool: &str, input: Value) -> Value {
+        self.cursor(
+            "beforeMCPExecution",
+            json!({
+                "tool_name": tool,
+                "tool_input": input.to_string(),
+                "mcp_server_name": server,
+                "command": "npx some-server",
+            }),
+        )
+    }
+
+    fn cursor_read(&self, path: &Path) -> Value {
+        self.cursor(
+            "beforeReadFile",
+            json!({"file_path": path, "content": "file text", "attachments": []}),
+        )
+    }
+}
+
+/// The answer Cursor reads on stdout, as JSON.
+fn cursor_json(answer: &Answer) -> Value {
+    serde_json::from_str(answer.stdout.trim())
+        .unwrap_or_else(|_| panic!("one JSON line on stdout: {:?}", answer.stdout))
+}
+
+/// Cursor's three events, through the enforcing line `agents connect cursor`
+/// writes, read as Cursor reads the answer: every call the guard lets
+/// through is answered `allow` (Cursor blocks a hook that says nothing), a
+/// refusal is exit 2 with the reason in `deny`, and a review of a shell
+/// command or an MCP call asks the person. A read rated review cannot be
+/// asked about, and a read of a secret is refused.
+///
+/// FAILS ON REVERT of `cursor_answer` in `cmd_hook` (an allowed call says
+/// nothing and Cursor blocks it), or of `cursor_hook::read` (no payload of
+/// Cursor's is read and every call is refused as unreadable).
+#[cfg(unix)]
+#[test]
+fn cursor_payloads_are_answered_in_cursors_words() {
+    let host = Host::new();
+    std::fs::create_dir_all(host.home().join(".ssh")).expect("ssh");
+    std::fs::write(host.home().join(".ssh/id_ed25519"), "dummy key\n").expect("key");
+    std::fs::write(host.project().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+    let line = CURSOR.command(bin(), false, false);
+    let run = |payload: Value| host.run("/bin/sh", &line, &payload);
+
+    // Shell: allow, deny, review.
+    let ls = run(host.cursor_shell("ls -la"));
+    assert_eq!(ls.code, Some(0), "{}", ls.stderr);
+    assert_eq!(cursor_reads(&ls, true), Call::Runs);
+    assert_eq!(cursor_json(&ls)["permission"], "allow");
+    let rm = run(host.cursor_shell("rm -rf ~"));
+    assert_eq!(rm.code, Some(2), "{}", rm.stderr);
+    assert_eq!(cursor_reads(&rm, true), Call::Refused);
+    let denied = cursor_json(&rm);
+    assert_eq!(denied["permission"], "deny");
+    assert!(
+        denied["agent_message"]
+            .as_str()
+            .is_some_and(|m| m.contains("InnerWarden")),
+        "{denied}"
+    );
+    let review = run(host.cursor_shell("chmod 777 ./build.sh"));
+    assert_eq!(review.code, Some(0), "{}", review.stderr);
+    assert_eq!(cursor_reads(&review, true), Call::Asks, "{}", review.stdout);
+    assert!(
+        cursor_json(&review)["user_message"]
+            .as_str()
+            .is_some_and(|m| m.contains("world-writable permissions")),
+        "{}",
+        review.stdout
+    );
+
+    // MCP: the command lines in a tool's arguments.
+    let mcp_rm = run(host.cursor_mcp("shell", "run_command", json!({"command": "rm -rf ~"})));
+    assert_eq!(
+        cursor_reads(&mcp_rm, true),
+        Call::Refused,
+        "{}",
+        mcp_rm.stderr
+    );
+    let mcp_ls = run(host.cursor_mcp("shell", "run_command", json!({"command": "ls"})));
+    assert_eq!(cursor_reads(&mcp_ls, true), Call::Runs, "{}", mcp_ls.stderr);
+    let weather = run(host.cursor_mcp("weather", "forecast", json!({"city": "Leeds"})));
+    assert_eq!(
+        cursor_reads(&weather, true),
+        Call::Runs,
+        "{}",
+        weather.stderr
+    );
+
+    // Reads: a private key is refused, a project file runs.
+    let key = run(host.cursor_read(&host.home().join(".ssh/id_ed25519")));
+    assert_eq!(cursor_reads(&key, true), Call::Refused, "{}", key.stderr);
+    let main = run(host.cursor_read(&host.project().join("src/main.rs")));
+    assert_eq!(cursor_reads(&main, true), Call::Runs, "{}", main.stderr);
+
+    // An event the guard is not wired for is let through, in Cursor's words.
+    let other = run(host.cursor("afterFileEdit", json!({"file_path": "x"})));
+    assert_eq!(cursor_reads(&other, true), Call::Runs, "{}", other.stderr);
+
+    // A Cursor shell call it cannot read is refused, with the reason.
+    let broken = run(host.cursor("beforeShellExecution", json!({"cwd": host.project()})));
+    assert_eq!(
+        cursor_reads(&broken, true),
+        Call::Refused,
+        "{}",
+        broken.stderr
+    );
+    assert_eq!(cursor_json(&broken)["permission"], "deny");
+}
+
+/// `--block-review` refuses a review, and monitor lets every call run,
+/// answered `allow`, a deny included; a call it cannot read ends in 1 there,
+/// which Cursor runs (the monitor entry carries `failClosed: false`).
+#[cfg(unix)]
+#[test]
+fn cursor_block_review_and_monitor() {
+    let host = Host::new();
+    let block = CURSOR.command(bin(), true, false);
+    let review = host.run(
+        "/bin/sh",
+        &block,
+        &host.cursor_shell("chmod 777 ./build.sh"),
+    );
+    assert_eq!(
+        cursor_reads(&review, true),
+        Call::Refused,
+        "{}",
+        review.stderr
+    );
+    assert_eq!(cursor_json(&review)["permission"], "deny");
+
+    let monitor = CURSOR.command(bin(), false, true);
+    for command in ["rm -rf ~", "chmod 777 ./build.sh", "ls"] {
+        let answer = host.run("/bin/sh", &monitor, &host.cursor_shell(command));
+        assert_eq!(answer.code, Some(0), "{command}: {}", answer.stderr);
+        assert_eq!(cursor_json(&answer)["permission"], "allow", "{command}");
+    }
+    let broken = host.run(
+        "/bin/sh",
+        &monitor,
+        &host.cursor("beforeShellExecution", json!({"cwd": host.project()})),
+    );
+    assert_eq!(
+        cursor_reads(&broken, false),
+        Call::Runs,
+        "{}",
+        broken.stderr
+    );
+}
+
+/// A guard that is gone refuses every Cursor call in enforce mode (the line
+/// starts /bin/sh itself and ends in 2, and the entry carries
+/// `failClosed`), and runs it in monitor mode.
+#[cfg(unix)]
+#[test]
+fn a_missing_program_is_a_refusal_on_cursor_in_enforce() {
+    let host = Host::new();
+    let gone = host.dir.path().join("moved-away/innerwarden");
+    let payload = host.cursor_shell("ls");
+    let enforce = host.run("/bin/sh", &CURSOR.command(&gone, false, false), &payload);
+    assert_eq!(enforce.code, Some(2), "{}", enforce.stderr);
+    assert_eq!(cursor_reads(&enforce, true), Call::Refused);
+    let monitor = host.run("/bin/sh", &CURSOR.command(&gone, false, true), &payload);
+    assert_ne!(monitor.code, Some(0));
+    assert_eq!(
+        cursor_reads(&monitor, false),
+        Call::Runs,
+        "{}",
+        monitor.stderr
+    );
+}
+
+/// The reading of Cursor's answer is Cursor's rule, held to what its
+/// documentation states.
+#[test]
+fn cursors_reading_of_a_hook_answer_is_its_own_rule() {
+    let answer = |code: Option<i32>, stdout: &str| Answer {
+        code,
+        stdout: stdout.to_string(),
+        stderr: String::new(),
+    };
+    assert_eq!(cursor_reads(&answer(Some(2), ""), false), Call::Refused);
+    assert_eq!(
+        cursor_reads(&answer(Some(0), r#"{"permission":"allow"}"#), false),
+        Call::Runs
+    );
+    assert_eq!(
+        cursor_reads(&answer(Some(0), r#"{"permission":"ask"}"#), false),
+        Call::Asks
+    );
+    assert_eq!(
+        cursor_reads(&answer(Some(0), r#"{"permission":"deny"}"#), false),
+        Call::Refused
+    );
+    assert_eq!(cursor_reads(&answer(Some(0), ""), false), Call::Refused);
+    assert_eq!(cursor_reads(&answer(Some(1), ""), false), Call::Runs);
+    assert_eq!(cursor_reads(&answer(Some(1), ""), true), Call::Refused);
+    assert_eq!(cursor_reads(&answer(None, ""), true), Call::Refused);
 }
