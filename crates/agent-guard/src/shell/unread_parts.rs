@@ -31,7 +31,7 @@
 
 use super::{
     collect_all_commands, collect_nodes_of_kind, command_arguments, command_code_input,
-    command_words, effective_command_words, is_folder_printer, is_shell_name,
+    command_words, effective_command_words, heredoc_owner, is_folder_printer, is_shell_name,
     node_is_in_literal_unreachable_branch, node_text, normalized_command_name, parse_complete_tree,
     runtime_word_ends_in_literal_program, shell_inline_code_place, shell_literal_word, shell_word,
     CodeInput, MAX_AST_DEPTH,
@@ -732,16 +732,28 @@ fn heredoc_is_literal(heredoc: tree_sitter::Node<'_>, source: &[u8]) -> bool {
 /// A here-document or a here-string a command reads holds a part not read,
 /// or its input is a file a part not read names.
 fn input_unread(command: tree_sitter::Node<'_>, source: &[u8], names: &Names) -> bool {
+    // The redirects on the command itself, and those the grammar hangs on an
+    // enclosing statement whose owner ([`heredoc_owner`]) is this command:
+    // `cd x && python3 - <<EOF` hangs the here-document on the whole list.
     let mut owners = vec![command];
-    if let Some(parent) = command
-        .parent()
-        .filter(|parent| parent.kind() == "redirected_statement")
-    {
-        owners.push(parent);
+    let mut node = command;
+    while let Some(parent) = node.parent() {
+        match parent.kind() {
+            "redirected_statement" => owners.push(parent),
+            "list" | "pipeline" => {}
+            _ => break,
+        }
+        node = parent;
     }
     owners.into_iter().any(|owner| {
         let mut cursor = owner.walk();
-        let children: Vec<_> = owner.children(&mut cursor).collect();
+        let children: Vec<_> = owner
+            .children(&mut cursor)
+            .filter(|child| {
+                owner.id() == command.id()
+                    || heredoc_owner(*child).is_some_and(|reader| reader.id() == command.id())
+            })
+            .collect();
         children.into_iter().any(|child| match child.kind() {
             "heredoc_redirect" => {
                 !heredoc_is_literal(child, source) && {

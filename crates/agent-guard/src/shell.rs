@@ -577,8 +577,7 @@ fn with_evaluated_subscripts_run(text: &str) -> Option<String> {
     let mut bodies = Vec::new();
     collect_nodes_of_kind(tree.root_node(), "heredoc_body", &mut bodies, 0);
     for body in bodies {
-        let read_by_a_shell = ancestor_of_kind(body, "redirected_statement")
-            .and_then(|statement| statement.child_by_field_name("body"))
+        let read_by_a_shell = heredoc_owner(body)
             .and_then(|command| command_name(command, bytes))
             .is_some_and(|name| {
                 matches!(
@@ -3973,13 +3972,57 @@ fn find_exec_commands(words: &[String]) -> Vec<&[String]> {
 
 /// The command a here-document's body or a here-string is stdin of.
 fn stdin_code_owner(body: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
-    if body.kind() == "herestring_redirect" {
-        body.parent().filter(|parent| parent.kind() == "command")
+    heredoc_owner(body)
+}
+
+/// The simple command a redirect belongs to, read as bash reads the line.
+///
+/// `redirect` is a `heredoc_body`, a `heredoc_redirect`, a
+/// `herestring_redirect` or any other redirect of a `redirected_statement`.
+/// The grammar hangs the redirects after the last command of a list or a
+/// pipeline on the whole list: `cd x && python3 - <<'EOF'` parses as one
+/// statement whose body is the list `cd x && python3 -`. Bash hands the
+/// here-document to `python3`, the command the redirect is written after,
+/// so the owner is the last command of that list or pipeline (`a; b <<EOF`
+/// already parses with the redirect on `b` alone). A compound body
+/// (subshell, group, loop) takes the redirect as its own stdin; the first
+/// command in it that reads stdin is the first command, as before.
+///
+/// Every reader that asks "what reads this here-document" asks here, so the
+/// mask of data (`cat`, `tee`), the code read as Python or Node, the script
+/// read as a shell's and the unread-input check all agree on one owner.
+pub(crate) fn heredoc_owner(redirect: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let redirect = if redirect.kind() == "heredoc_body" {
+        redirect.parent().unwrap_or(redirect)
     } else {
-        ancestor_of_kind(body, "redirected_statement")
-            .and_then(|redirected| redirected.child_by_field_name("body"))
-            .and_then(first_command)
+        redirect
+    };
+    if let Some(command) = redirect
+        .parent()
+        .filter(|parent| parent.kind() == "command")
+    {
+        return Some(command);
     }
+    let statement = redirect
+        .parent()
+        .filter(|parent| parent.kind() == "redirected_statement")
+        .or_else(|| ancestor_of_kind(redirect, "redirected_statement"))?;
+    let mut node = statement.child_by_field_name("body")?;
+    for _ in 0..MAX_AST_DEPTH {
+        match node.kind() {
+            "command" => return Some(node),
+            "list" | "pipeline" => {
+                let mut cursor = node.walk();
+                node = node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() != "comment")
+                    .last()?;
+            }
+            "redirected_statement" => node = node.child_by_field_name("body")?,
+            _ => return first_command(node),
+        }
+    }
+    None
 }
 
 /// The text a here-document's body or a here-string hands over.
@@ -5299,9 +5342,7 @@ pub(crate) fn has_executed_download_execution_payload(source: &str) -> bool {
             if !payload_is_dangerous {
                 return false;
             }
-            let owner_executes_stdin = redirected
-                .child_by_field_name("body")
-                .and_then(first_command)
+            let owner_executes_stdin = heredoc_owner(body)
                 .and_then(|command| command_words(command, bytes))
                 .and_then(|words| {
                     effective_command_words(&words, 0).map(|effective| {
@@ -10735,9 +10776,7 @@ fn mask_data_heredoc(
     else {
         return;
     };
-    let owner_command = redirected
-        .child_by_field_name("body")
-        .and_then(first_command);
+    let owner_command = heredoc_owner(body);
     let owner = owner_command
         .and_then(|command| command_name(command, source))
         .map(|name| normalized_command_name(&name));
@@ -11015,22 +11054,8 @@ pub(crate) fn interpreter_input_as_inline_code(source: &str) -> Vec<String> {
 /// The interpreter `body` is handed to as its program, with the code given
 /// inline ([`interpreter_input_as_inline_code`]).
 fn interpreter_of_heredoc(body: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
-    let redirect = body.parent().filter(|n| n.kind() == "heredoc_redirect")?;
-    let statement = redirect
-        .parent()
-        .filter(|n| n.kind() == "redirected_statement")?;
-    let mut cursor = statement.walk();
-    let body_node = statement
-        .children(&mut cursor)
-        .find(|child| matches!(child.kind(), "command" | "list"))?;
-    let command = match body_node {
-        list if list.kind() == "list" => {
-            let last =
-                list.named_child(list.named_child_count().checked_sub(1)?.try_into().ok()?)?;
-            (last.kind() == "command").then_some(last)?
-        }
-        command => command,
-    };
+    body.parent().filter(|n| n.kind() == "heredoc_redirect")?;
+    let command = heredoc_owner(body)?;
     let head = std::str::from_utf8(source.get(command.byte_range())?).ok()?;
     let words: Vec<&str> = head.split_whitespace().collect();
     let (first, rest) = words.split_first()?;

@@ -46,3 +46,12 @@ case is not named.
   control now held for review, none is refused, and no case moved toward
   allow. proof false positives 0/160 to 8/160; attack-2026-11 0/138 to
   4/138; real unchanged (4/5 caught, 22/31 false positives).
+- 2026-11-20: real/real-004, real/real-008, real/real-009 and real/real-010
+  go from deny to allow. A here-document belongs to the command it is
+  written after: in `cd dir && cat >> file <<'EOF'` bash hands it to `cat`,
+  and the guard took the list's first command (`cd`) as its reader, so prose
+  written with `cat` after `cd` was screened as a line to run while the same
+  `cat` alone was allowed. The owner now comes from the tree
+  (`shell::heredoc_owner`), for every reader of a here-document. Real false
+  positives 22/31 to 18/31; proof and attack-2026-11 unchanged, no case moved
+  toward a miss.

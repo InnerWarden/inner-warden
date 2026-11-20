@@ -925,13 +925,13 @@ attack-2026-11	a11-515	allow
 real	real-001	deny
 real	real-002	deny
 real	real-003	deny
-real	real-004	deny
+real	real-004	allow
 real	real-005	review
 real	real-006	allow
 real	real-007	deny
-real	real-008	deny
-real	real-009	deny
-real	real-010	deny
+real	real-008	allow
+real	real-009	allow
+real	real-010	allow
 real	real-011	deny
 real	real-012	deny
 real	real-013	deny
