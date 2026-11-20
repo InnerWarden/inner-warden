@@ -3867,6 +3867,7 @@ fn analyze_command_as_read(
         let as_written = crate::shell::handed_shell_lines(cmd);
         handed_to_shell.over_budget |= as_written.over_budget;
         handed_to_shell.not_literal |= as_written.not_literal;
+        handed_to_shell.file_not_shown |= as_written.file_not_shown;
         for line in as_written.lines {
             if !handed_to_shell.lines.contains(&line) {
                 handed_to_shell.lines.push(line);
@@ -3890,6 +3891,22 @@ fn analyze_command_as_read(
             },
         );
         score += 40;
+    }
+    // A file the line prints into without showing the text, then runs: held
+    // as a line it cannot read is, unless the download rules already hold
+    // the same file (a download staged and then run).
+    if handed_to_shell.file_not_shown
+        && !signals.iter().any(|s| {
+            s.signal == "shell_line_not_literal"
+                || s.detail.contains("staged to a file and then executed")
+        })
+    {
+        signals.push(AnalysisSignal {
+            signal: "shell_line_not_literal".into(),
+            score: 20,
+            detail: "runs a file the line writes with text it does not show (a variable or a substitution), which the guard cannot read".into(),
+        });
+        score += 20;
     }
     if handed_to_shell.not_literal && !signals.iter().any(|s| s.signal == "shell_line_not_literal")
     {
