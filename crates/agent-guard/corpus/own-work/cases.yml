@@ -83,6 +83,9 @@ cases:
     label: benign
     input: "git worktree remove ../innerwarden"
   # 1.6.15: deny (disabling or tampering with security monitoring)
+  # --force discards uncommitted changes in that worktree's folder. Benign
+  # here: the folder is a throwaway worktree of a fix, its work already
+  # committed on its branch; the main checkout is not touched.
   - id: own-014
     category: own_worktree_remove
     label: benign
@@ -93,6 +96,9 @@ cases:
     label: benign
     input: "cd ~/src/innerwarden && git worktree remove ~/src/innerwarden/wt-fix"
   # 1.6.15: deny (disabling or tampering with security monitoring)
+  # --force discards uncommitted changes in that worktree's folder. Benign
+  # here: the folder is a throwaway worktree of a fix, its work already
+  # committed on its branch; the main checkout is not touched.
   - id: own-016
     category: own_worktree_remove
     label: benign
