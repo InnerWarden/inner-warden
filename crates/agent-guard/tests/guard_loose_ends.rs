@@ -123,7 +123,10 @@ fn an_eval_idiom_with_more_inside_its_substitution_is_not_the_idiom() {
             "eval \"$(starship init bash)\" && echo ok",
             "eval \"$(brew shellenv)\"",
         ],
-        "allow",
+        // Held for review since 2026-11-20, no longer allowed: the code an
+        // `eval` runs is what a program prints (fail closed on what the
+        // guard cannot read, `src/shell/unread_parts.rs`); still not refused.
+        "review",
     );
 }
 

@@ -167,13 +167,21 @@ fn the_same_calls_on_project_files_or_reading_settings_stay_allowed() {
 /// protection.
 #[test]
 fn a_guard_word_beside_a_quoted_expansion_is_not_the_guard_run() {
-    assert_allowed(&[
+    // Held for review since 2026-11-20, no longer allowed: a program the guard does not know is handed
+    // `$N`, which the line does not set
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    for line in [
         "iwt read test001 innerwarden \"$N\"",
         "for i in $(seq 1 3); do iwt read test001 innerwarden \"$N\" | tail -5; done",
+        // `tmux send-keys` types `$X` into a shell, which runs it.
+        "tmux send-keys -t innerwarden \"$X\" Enter",
+    ] {
+        assert_eq!(verdict(line).0, "review", "{line}");
+    }
+    assert_allowed(&[
         "for i in $(seq 1 3); do out=$(iwt read test001 innerwarden 80); done",
         "tmux send-keys -t innerwarden \"cd ~/innerwarden && $(echo ls)\" Enter",
         "tmux send-keys -t innerwarden \"cargo test $(echo -q)\" Enter",
-        "tmux send-keys -t innerwarden \"$X\" Enter",
     ]);
 }
 
@@ -184,9 +192,14 @@ fn a_kill_beside_a_folder_named_for_the_guard_is_not_disabling_it() {
     assert_allowed(&[
         "pkill -f x; cd ~/innerwarden/wt",
         "pkill -f cargo; cd ~/innerwarden/wt && ls",
-        "kill $(pgrep -f vite); cd ~/innerwarden/site",
         "kill %1 && cd /opt/innerwarden",
     ]);
+    // Held for review since 2026-11-20, no longer allowed: what `kill` stops is what `pgrep` prints
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_eq!(
+        verdict("kill $(pgrep -f vite); cd ~/innerwarden/site").0,
+        "review"
+    );
 }
 
 /// Paths, folders and text that hold the guard's name, run nothing of it.
@@ -197,14 +210,24 @@ fn paths_and_text_that_name_the_guard_stay_allowed() {
         "cd ~/innerwarden/wt && SHA=$(git rev-parse HEAD) && echo $SHA",
         "mkdir -p ~/iwt-journal && D=$(date -u +%Y-%m-%dT%H:%MZ) && SHA=$(git -C ~/innerwarden/inner-warden rev-parse --short HEAD) && echo \"$D $SHA\" >> ~/iwt-journal/T-003.md",
         "ls /opt/innerwarden/ && x=$(ls /opt/innerwarden | wc -l)",
-        "ssh test001 \"cd ~/innerwarden/wt && cargo test $ARGS\"",
         "sed -i 's#~/.config/innerwarden/hook.sh#X#' notes.md",
-        "sed -i \"s/$A/$B/\" docs/innerwarden.md",
         "git commit -F - <<'MSG'\nGuard: read text as text\n\nThe at job runs at 5pm; innerwarden disarm stays refused.\nMSG",
         "git commit -m \"$(cat <<'EOF'\nGuard: schedule\n\nThe at job runs at 5pm; innerwarden disarm stays refused.\nEOF\n)\"",
         "gh pr create --title t --body \"Refuses innerwarden disarm; innerwarden monitor stays refused.\"",
         "gh pr create --title t --body \"$(cat <<'EOF'\n## Summary\n- innerwarden disarm is refused\n- systemctl stop innerwarden-agent too\nEOF\n)\"",
     ]);
+    // Held for review since 2026-11-20, no longer allowed: the line `ssh` runs on the other host holds
+    // `$ARGS`, the expression `sed -i` applies (which may run or write)
+    // holds `$A` and `$B`, none of which the line sets
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_eq!(
+        verdict("sed -i \"s/$A/$B/\" docs/innerwarden.md").0,
+        "review"
+    );
+    assert_eq!(
+        verdict("ssh test001 \"cd ~/innerwarden/wt && cargo test $ARGS\"").0,
+        "review"
+    );
 }
 
 /// A word not shown right after the guard's own name is still one of its
@@ -220,7 +243,10 @@ fn a_quoted_expansion_after_the_guard_name_stays_refused() {
         "iw \"$X\"",
         "innerwarden-ctl \"$X\"",
     ]);
-    assert_allowed(&["iwt read test001 innerwarden \"$N\""]);
+    // Held for review since 2026-11-20, no longer allowed: a program the guard does not know is handed
+    // `$N`, which the line does not set; still not refused
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_eq!(verdict("iwt read test001 innerwarden \"$N\"").0, "review");
 }
 
 /// What the readings above must not let through: the guard run by path, by

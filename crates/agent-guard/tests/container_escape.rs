@@ -101,7 +101,6 @@ fn ordinary_container_work_is_allowed() {
     for cmd in [
         "docker ps",
         "docker run --rm alpine echo hi",
-        "docker run --rm -v \"$PWD\":/src alpine sh -c 'ls /src'",
         "docker run --rm -v /srv/data:/data:ro alpine ls /data",
         "docker run --rm -v .:/app -w /app node:22 npm test",
         "docker run --rm -v ./:/app -w /app node:22 npm test",
@@ -120,7 +119,6 @@ fn ordinary_container_work_is_allowed() {
         "podman run --rm alpine echo hi",
         "nsenter -t 12 -n ip a",
         "nsenter -n -t 100 ss -ltn",
-        "nsenter -t \"$(docker inspect -f '{{.State.Pid}}' web)\" -n ss -ltn",
         "readlink /proc/1/ns/net",
         "ls -l /var/run/docker.sock",
         "export DOCKER_HOST=unix:///var/run/docker.sock",
@@ -140,6 +138,15 @@ fn ordinary_container_work_is_allowed() {
             "ordinary work: {cmd}: {:?}",
             analysis.signals
         );
+    }
+    // Held for review since 2026-11-20, no longer allowed: the mount or the process a container
+    // runtime is handed is a value the guard cannot read
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    for cmd in [
+        "docker run --rm -v \"$PWD\":/src alpine sh -c 'ls /src'",
+        "nsenter -t \"$(docker inspect -f '{{.State.Pid}}' web)\" -n ss -ltn",
+    ] {
+        assert_eq!(analyze_command(cmd, None).recommendation, "review", "{cmd}");
     }
 }
 
@@ -258,7 +265,6 @@ fn ordinary_work_beside_the_runtime_reach_is_allowed() {
         "S=/tmp/d.sock; DOCKER_HOST=unix://$S docker ps",
         "docker -H unix:///var/run/docker.sock ps",
         "podman --url unix:///run/podman/podman.sock ps",
-        "curl -H \"$AUTH\" https://api.example.com/v1/items",
         "docker ps --format \"$FMT\"",
         "python3 -c \"import socket; print(socket.gethostname())\"",
         "python3 -c \"import os; print(os.path.exists('/var/run/docker.sock'))\"",
@@ -268,8 +274,6 @@ fn ordinary_work_beside_the_runtime_reach_is_allowed() {
         "curl --unix-socket /tmp/app.sock http://localhost/images/logo.png",
         "S=/tmp/app.sock; curl --unix-socket \"$S\" http://localhost/health",
         "curl http://localhost/containers/json",
-        "nsenter -t \"$(docker inspect -f '{{.State.Pid}}' web)\" -n ss -ltn",
-        "nsenter -t \"$(podman inspect -f '{{.State.Pid}}' web)\" -n ip a",
         "P=12; nsenter -t $P -n ip a",
         "telnet localhost 8080",
     ] {
@@ -279,5 +283,15 @@ fn ordinary_work_beside_the_runtime_reach_is_allowed() {
             "ordinary work: {cmd}: {:?}",
             analysis.signals
         );
+    }
+    // Held for review since 2026-11-20, no longer allowed: the header a request sends, or the
+    // process `nsenter` enters, is a value the guard cannot read
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    for cmd in [
+        "curl -H \"$AUTH\" https://api.example.com/v1/items",
+        "nsenter -t \"$(docker inspect -f '{{.State.Pid}}' web)\" -n ss -ltn",
+        "nsenter -t \"$(podman inspect -f '{{.State.Pid}}' web)\" -n ip a",
+    ] {
+        assert_eq!(analyze_command(cmd, None).recommendation, "review", "{cmd}");
     }
 }

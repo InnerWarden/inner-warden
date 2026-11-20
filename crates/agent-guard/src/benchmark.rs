@@ -552,11 +552,22 @@ mod tests {
             s.caught,
             s.malicious_total
         );
-        assert!(
-            s.false_positives == 0,
+        // Since 2026-11-20 a line with a part the guard cannot read is never
+        // allowed (`shell/unread_parts.rs`): these benign controls are held
+        // for review, by decision, and are counted here as the cost of it.
+        // Any other false positive fails, as before.
+        let held_by_unread_rule = [
+            "bn-033", "bn-128", "bn-129", "bn-130", "bn-131", "bn-132", "bn-133", "bn-134",
+        ];
+        let false_positives: Vec<&str> = results
+            .iter()
+            .filter(|r| r.outcome == Outcome::FalsePositive)
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(
+            false_positives, held_by_unread_rule,
             "false positives regressed above the corpus contract: got {}/{}",
-            s.false_positives,
-            s.benign_total
+            s.false_positives, s.benign_total
         );
         // `caught` counts `review` as a catch, so it cannot tell "surfaced" from
         // "stopped": a change that moved 54 attack cases from hard-deny to review left
@@ -600,6 +611,12 @@ mod tests {
             "bn-149", "bn-150", "bn-151", "bn-152", "bn-153", "bn-154", "bn-155", "bn-156",
             "bn-157", "bn-158", "bn-159", "bn-160",
         ] {
+            // Held for review since 2026-11-20 by the rule on unread parts
+            // (listed above); every other one must still be allowed.
+            if held_by_unread_rule.contains(&id) {
+                assert_eq!(outcome(id), Outcome::FalsePositive, "{id}");
+                continue;
+            }
             assert_eq!(
                 outcome(id),
                 Outcome::Ok,

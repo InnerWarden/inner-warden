@@ -328,7 +328,6 @@ fn everyday_developer_lines_are_allowed() {
             "bash scripts/test.sh --fast",
             "sh -c 'cd web && npm test'",
             "ps aux | grep node | grep -v grep",
-            "kill $(lsof -t -i:3000)",
             "tail -f logs/app.log | grep ERROR",
             "base64 -d fixtures/blob.b64 > fixtures/blob.bin",
             "for f in src/*.rs; do rustfmt \"$f\"; done",
@@ -336,8 +335,6 @@ fn everyday_developer_lines_are_allowed() {
             "node -e 'console.log(process.version)'",
             "python3 -c \"import json,sys; print(json.load(open('package.json'))['version'])\"",
             "perl -pi -e 's/old/new/g' file.txt",
-            "eval \"$(direnv hook bash)\"",
-            "source <(kubectl completion bash)",
             "cd \"$(git rev-parse --show-toplevel)\" && cargo test",
             "\"$(npm bin)/eslint\" src",
             "mkdir -p build && cd build && cmake .. && make",
@@ -345,6 +342,17 @@ fn everyday_developer_lines_are_allowed() {
             "gh pr create --title 'Fix x' --body 'Closes #12'",
         ],
         "allow",
+    );
+    // Held for review since 2026-11-20, no longer allowed: what `kill` stops, and the code an `eval` or
+    // `source` runs, is what another program prints
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_verdict(
+        &[
+            "kill $(lsof -t -i:3000)",
+            "eval \"$(direnv hook bash)\"",
+            "source <(kubectl completion bash)",
+        ],
+        "review",
     );
 }
 

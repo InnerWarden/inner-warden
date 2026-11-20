@@ -139,9 +139,6 @@ fn everyday_lines_like_these_stay_allowed() {
         "command -v python3 >/dev/null && python3 --version",
         "command ls -la",
         "builtin cd src && ls",
-        "{ eval \"$(direnv hook bash)\"; }",
-        "cd app\neval \"$(pyenv init -)\"\npython --version",
-        "eval \"$(ssh-agent -s)\" && ssh-add ~/.ssh/id_ed25519",
         "pwsh -c 'Get-ChildItem'",
         "gdb -batch -ex run -ex bt ./a.out",
         "nice cargo build",
@@ -184,10 +181,15 @@ fn every_eval_on_the_line_must_be_an_idiom() {
     ] {
         assert_eq!(verdict(line), "deny", "{line}");
     }
-    assert_allowed(&[
+    // Held for review since 2026-11-20, no longer allowed: the code an `eval` runs is what a program prints;
+    // still not refused
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    for line in [
         "eval \"$(direnv hook bash)\"\neval \"$(starship init bash)\"",
         "eval \"$(direnv hook bash)\"; cargo test",
-    ]);
+    ] {
+        assert_eq!(verdict(line), "review", "{line}");
+    }
 }
 
 /// `command` and `builtin` in front of `alias` or of a function call, and a
