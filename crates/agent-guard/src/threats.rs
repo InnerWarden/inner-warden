@@ -15850,7 +15850,7 @@ fn content_reader() -> &'static regex::Regex {
     static READER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     READER.get_or_init(|| {
         regex::Regex::new(
-            r"(?i)\b(?:cat|head|tail|less|more|grep|egrep|fgrep|rg|awk|sed|cut|strings|base64|tar|zip|cp|scp|rsync)\b|\bopen\s*\(|\b(?:readFileSync|readFile|createReadStream|readTextFile|readTextFileSync|file_get_contents)\s*\(|\bcurl\b[^|;&]*@",
+            r"(?i)\b(?:cat|head|tail|less|more|grep|egrep|fgrep|rg|ag|ack|awk|sed|cut|strings|base64|tar|zip|cp|scp|rsync)\b|\bopen\s*\(|\b(?:readFileSync|readFile|createReadStream|readTextFile|readTextFileSync|file_get_contents)\s*\(|\bcurl\b[^|;&]*@",
         )
         .expect("static sensitive-reader regex")
     })
@@ -16129,7 +16129,10 @@ pub enum SecretReach {
 /// does not know is refused, since its value could be taken for the
 /// pattern. Refused: `-v` (prints
 /// the lines that do not match, so the whole key), `-z` (a whole file is
-/// one line), a pattern from a file (`-f`), and an empty or wide pattern.
+/// one line), lines of context (`-A`, `-B`, `-C`, `-NUM` and their long
+/// forms: `grep -r -A 40 OPENSSH ~` prints a key whole from the lines after
+/// its first, as a `Grep` with context does), a pattern from a file
+/// (`-f`), and an empty or wide pattern.
 ///
 /// `grep -r TODO ~` over a home that holds `~/.ssh/id_ed25519` opens the
 /// key, and prints from it only a line holding `TODO`. That is a person's
@@ -16163,7 +16166,10 @@ fn searches_for_narrow_text(segment: &str) -> bool {
                 .split_once('=')
                 .map_or((long, None), |(n, v)| (n, Some(v)));
             match name {
-                "invert-match" | "null-data" | "file" => return false,
+                // Lines of context print the lines around a match whole: a
+                // match in a key's first line prints the key.
+                "invert-match" | "null-data" | "file" | "after-context" | "before-context"
+                | "context" => return false,
                 "fixed-strings" => fixed = true,
                 "regexp" => {
                     given_by_option = true;
@@ -16172,9 +16178,9 @@ fn searches_for_narrow_text(segment: &str) -> bool {
                         None => return false,
                     }
                 }
-                "after-context" | "before-context" | "context" | "max-count" | "devices"
-                | "directories" | "label" | "binary-files" | "exclude-dir" | "include"
-                | "exclude" | "exclude-from" | "include-dir" | "group-separator"
+                "max-count" | "devices" | "directories" | "label" | "binary-files"
+                | "exclude-dir" | "include" | "exclude" | "exclude-from" | "include-dir"
+                | "group-separator"
                     if value.is_none() =>
                 {
                     rest.next();
@@ -16232,7 +16238,11 @@ fn searches_for_narrow_text(segment: &str) -> bool {
                         }
                         break;
                     }
-                    'A' | 'B' | 'C' | 'm' | 'd' | 'D' => {
+                    // Lines of context, `-A 40` or GNU's `-40`: the lines
+                    // around a match, a key's body after its first line.
+                    'A' | 'B' | 'C' => return false,
+                    _ if flag.is_ascii_digit() => return false,
+                    'm' | 'd' | 'D' => {
                         if attached.is_empty() {
                             rest.next();
                         }
@@ -16304,8 +16314,8 @@ pub fn glob_aims_at_secrets(glob: &str) -> bool {
 }
 
 /// A known credential prefix or key marker in a grep pattern (`AKIA`,
-/// `ghp_`, `github_pat_`, `sk-`, `xoxb-`, `AIza`, `-----BEGIN`,
-/// `PRIVATE`, `ssh-ed25519`, ...), at the start of the pattern or after a
+/// `ghp_`, `github_pat_`, `sk-`, `sk_live`, `xoxb-`, `AIza`, `-----BEGIN`,
+/// `PRIVATE`, `OPENSSH`, `ssh-ed25519`, ...), at the start of the pattern or after a
 /// character that is not a letter or digit. A recursive search of a home or
 /// a wide root for one of these is a hunt for keys, never a narrow text: it
 /// keeps the hard refusal (`grep -r AKIA ~` is `deny`, as before
@@ -16320,7 +16330,7 @@ fn names_credential_marker(pattern: &str) -> bool {
     MARKER
         .get_or_init(|| {
             regex::Regex::new(
-                r"(?i)(^|[^a-z0-9])(akia|asia|aroa|aida|gh[pousr]_|github_pat_|glpat-|sk-|sk_(live|test)_|rk_live_|xox[abposr]-|aiza|ya29.|npm_[a-z0-9]|pypi-|hf_[a-z0-9]|-{3,}|begin\b|private|ssh-(rsa|ed25519|dss)|ecdsa-sha2|bearer|auth|cred|passw|pwd|pass\b|key|jwt|eyj|b3blbnnzac1rzxk|aaaa[bc]3nzac1|mii[a-z][a-z0-9+/])",
+                r"(?i)(^|[^a-z0-9])(akia|asia|aroa|aida|gh[pousr]_|github_pat_|glpat-|sk-|sk_(live|test)|rk_(live|test)|xox[abposr]-|aiza|ya29.|npm_[a-z0-9]|pypi-|hf_[a-z0-9]|-{3,}|begin\b|private|openssh|ssh-(rsa|ed25519|dss)|ecdsa-sha2|bearer|auth|cred|passw|pwd|pass\b|key|jwt|eyj|b3blbnnzac1rzxk|aaaa[bc]3nzac1|mii[a-z][a-z0-9+/])",
             )
             .expect("static credential marker regex")
         })
@@ -16337,14 +16347,18 @@ fn holds_the_folder(path: &str, home: &str) -> bool {
 
 /// Whether `segment` reads whole folders, the hidden files in them too: a
 /// recursive `grep`, an archive, a recursive copy or sync, a `find` that
-/// runs a program on what it finds, and `rg` or `ag` told to read hidden
-/// files (they leave them out by default).
+/// runs a program on what it finds, `rg` or `ag` told to read hidden
+/// files (they leave them out by default; `ag -u` reads them), and a
+/// `git grep --no-index`, which reads the files of a folder that is no
+/// repository, hidden ones too.
 fn reads_folders_whole(segment: &str) -> bool {
     static WHOLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let whole = WHOLE.get_or_init(|| {
         regex::Regex::new(concat!(
             r"(?i)\b(?:grep|egrep|fgrep)\b[^|;&]*\s(?:-[a-z]*r|--recursive|--dereference-recursive|-d\s*recurse|--directories=recurse)",
             r"|\b(?:rg|ag)\b[^|;&]*\s(?:--hidden|-\.|-uu|-[a-z]*u[a-z]*u|--unrestricted)",
+            r"|\bag\b[^|;&]*\s-[a-z]*u",
+            r"|\bgit\b[^|;&]*\sgrep\b[^|;&]*\s--no-index\b",
             r"|\back\b|\btar\b|\brsync\b",
             r"|\b(?:zip|cp|scp)\b[^|;&]*\s-[a-z]*[ra]",
             r"|\bfind\b[^|;&]*\s-(?:exec|execdir|ok|okdir)\b",
