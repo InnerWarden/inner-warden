@@ -17,7 +17,9 @@
 //! which is the only way to guarantee byte-fidelity; the typed envelope here
 //! exists purely to route and inspect a message.
 
+pub(crate) mod canon;
 pub mod content;
+pub mod effect;
 pub mod enforce;
 pub mod jsonrpc;
 pub mod pins;

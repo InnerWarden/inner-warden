@@ -347,6 +347,13 @@ pub struct TaintTracker {
     /// proxy keeps them. Not taint either: kept here for the same reason as
     /// `declared`.
     pub(crate) pins: Option<super::pins::PinSession>,
+    /// What each listed tool does ([`super::effect::EffectClass::of_tool`]),
+    /// classed once when its `tools/list` entry is read. Not taint either:
+    /// kept here for the same reason as `declared`.
+    effects: HashMap<Box<str>, super::effect::EffectClass>,
+    /// What servers said this session, to tell where a call's sensitive
+    /// value came from ([`super::effect`]).
+    pub(crate) seen: super::effect::SeenText,
 }
 
 impl TaintTracker {
@@ -385,6 +392,14 @@ impl TaintTracker {
             let Some(name) = tool.get("name").and_then(Value::as_str) else {
                 continue;
             };
+            let class = super::effect::EffectClass::of_tool(tool);
+            if let Some(kept) = self.effects.get_mut(name) {
+                *kept = class;
+            } else if name.len() <= MAX_DECLARED_NAME_BYTES
+                && self.effects.len() < MAX_DECLARED_TOOLS
+            {
+                self.effects.insert(name.into(), class);
+            }
             match ToolDeclaration::of(tool) {
                 ToolDeclaration::Unknown => {
                     self.declared.remove(name);
@@ -400,6 +415,20 @@ impl TaintTracker {
                 }
             }
         }
+    }
+
+    /// What a call to `tool` with `args` does: the class its listing gave
+    /// it, else one read from its name and the call's argument names. A tool
+    /// past the listing's bounds is classed at its call the same way.
+    pub(crate) fn effect_of(&self, tool: &str, args: &Value) -> super::effect::EffectClass {
+        if let Some(class) = self.effects.get(tool) {
+            return *class;
+        }
+        let slots: Vec<&str> = args
+            .as_object()
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        super::effect::EffectClass::of(tool, None, &slots)
     }
 
     /// What the server declared about `tool`, as last heard.
@@ -472,13 +501,35 @@ impl TaintTracker {
     /// Record one result's tokens, leaving out a token not yet kept that is
     /// one of `sent` (what the call it answers sent).
     fn record(&mut self, text: &str, provenance: Provenance, sent: Option<&HashSet<Box<str>>>) {
+        if text.len() > MAX_SCAN_BYTES {
+            self.seen.note_unread();
+        } else {
+            self.seen.record(text);
+        }
         self.results += 1;
         let newest = self.results;
         // Tokens an earlier result holds, and what this result costs with
         // them.
         let mut seen_again: Vec<usize> = Vec::new();
         let mut whole_cost = 0;
-        for raw in tokenize(text) {
+        // Recorded in one spelling (`super::canon`): a value read as
+        // `attacker[at]evil[.]com` or `attacker%40evil.com` is the value a
+        // call sends as `attacker@evil.com`. Arguments are searched in both
+        // spellings (`arg_taint_alert`).
+        let canon = super::canon::canonical(text);
+        // What the server said as written, to tell a value it repeated
+        // verbatim from one it only spelled like a value the call sent: the
+        // exemption below is for the agent's own value repeated as sent
+        // (`note_call` keeps it as sent). A value sent clean and answered
+        // defanged (`evil.com/inbox` sent, `evil[.]com/inbox` said) is
+        // recorded, as on main.
+        let verbatim: Option<HashSet<String>> = match (&canon, sent) {
+            (Cow::Owned(_), Some(_)) => {
+                Some(tokenize(text).into_iter().map(Cow::into_owned).collect())
+            }
+            _ => None,
+        };
+        for raw in tokenize(&canon) {
             let tok = kept_part(&raw, provenance);
             match self.find(tok) {
                 Some(slot) => {
@@ -495,7 +546,9 @@ impl TaintTracker {
                 None => {
                     // The call itself sent it: the agent's value, not one
                     // the server brought in.
-                    if sent.is_some_and(|sent| sent.contains(&*raw)) {
+                    if sent.is_some_and(|sent| sent.contains(&*raw))
+                        && verbatim.as_ref().is_none_or(|said| said.contains(&*raw))
+                    {
                         continue;
                     }
                     whole_cost += cost_of(tok);
@@ -551,6 +604,17 @@ impl TaintTracker {
             // sent in other capitals is the same address.
             if hit == Ok(None) && s.contains('@') && s.bytes().any(|b| b.is_ascii_uppercase()) {
                 hit = self.first_recorded_in(&s.to_ascii_lowercase(), &mut steps, exempt);
+            }
+            // The same value in another spelling: results are recorded in one
+            // (`super::canon`), and a destination with a scheme or a trailing
+            // `/` more or less is the same destination.
+            if hit == Ok(None) {
+                for form in spellings(s) {
+                    hit = self.first_recorded_in(&form, &mut steps, exempt);
+                    if hit != Ok(None) {
+                        break;
+                    }
+                }
             }
         });
         match hit {
@@ -982,16 +1046,120 @@ fn tokenize(text: &str) -> Vec<Cow<'_, str>> {
     for raw in slice.split_whitespace() {
         // Trim only TRAILING sentence punctuation (`evil.com/x,` → `evil.com/x`);
         // keep leading chars so paths/URLs stay intact (`/etc/...`, `~/.ssh/...`).
-        let tok = raw.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
-        if tok.len() >= MIN_TOKEN_LEN {
-            if tok.contains('@') && tok.bytes().any(|b| b.is_ascii_uppercase()) {
-                out.push(Cow::Owned(tok.to_ascii_lowercase()));
-            } else {
-                out.push(Cow::Borrowed(tok));
+        let tok = raw.trim_end_matches(TRAILING);
+        // A word in quotes is the word: `'mark@example.com'` is the address
+        // a later call sends to without the quotes. A quote that also closes
+        // the word is taken off; an address on a header line
+        // (`<alice@corp.com>`) keeps its bracket (see
+        // `a_reply_to_the_sender_of_a_mail_read_is_not_tainted`).
+        let tok = match tok.chars().next() {
+            Some(q @ ('\'' | '"' | '`')) if raw[tok.len()..].starts_with(q) => &tok[1..],
+            _ => tok,
+        };
+        // An address, a link or an account number with a quote on one side
+        // only, or glued to the next word (`'mark@example.com'.The`,
+        // `to:'mark@example.com'`, `"a@b.com'`): the piece between quotes
+        // is kept in its place. Each piece is part of the word, so an
+        // argument that holds the word holds the piece: nothing the word
+        // matched is lost, and the result costs no more than before. Other
+        // words keep their quotes (a quoted tool name a package lists,
+        // `['generate_report',`, is not taken for the value it names).
+        let pieces = tok
+            .split(QUOTES)
+            .map(|piece| piece.trim_end_matches(TRAILING))
+            .filter(|piece| piece.len() >= MIN_TOKEN_LEN && is_value_shaped(piece));
+        if tok.contains(QUOTES) && pieces.clone().next().is_some() {
+            for piece in pieces {
+                push_token(&mut out, piece);
+            }
+        } else {
+            push_token(&mut out, tok);
+        }
+    }
+    out
+}
+
+/// The longest argument whose other spellings are searched too: an address
+/// or a link, not a document.
+const MAX_SPELLED_ARG_BYTES: usize = 2048;
+
+/// The other spellings an argument is searched in ([`TaintTracker::arg_taint_alert`]):
+/// in one spelling ([`super::canon::canonical`], lower-cased when it holds
+/// `@`), and, for one word up to [`MAX_SPELLED_ARG_BYTES`], with no scheme,
+/// `https://`, `http://` or `mailto:` in front, each with and without a
+/// trailing `/`. Not the argument as written, which is searched first.
+fn spellings(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |form: String| {
+        if form != s && !out.contains(&form) {
+            out.push(form);
+        }
+    };
+    let canon = super::canon::canonical(s);
+    let canon = if canon.contains('@') {
+        canon.to_lowercase()
+    } else {
+        canon.into_owned()
+    };
+    push(canon.clone());
+    if canon.len() <= MAX_SPELLED_ARG_BYTES && !canon.trim().contains(char::is_whitespace) {
+        let bare = super::canon::without_scheme(canon.trim()).trim_end_matches('/');
+        if !bare.is_empty() {
+            for scheme in ["", "https://", "http://", "mailto:"] {
+                push(format!("{scheme}{bare}"));
+                push(format!("{scheme}{bare}/"));
             }
         }
     }
     out
+}
+
+/// Whether a word is an address, a link or an account number: a
+/// destination ([`is_destination`]), a link without its scheme
+/// (`www.example.com`, `example.com/path`), or an IBAN-shaped word (two
+/// letters, two digits, then 11 to 30 letters and digits).
+fn is_value_shaped(word: &str) -> bool {
+    if is_destination(word)
+        || word
+            .get(..4)
+            .is_some_and(|w| w.eq_ignore_ascii_case("www."))
+    {
+        return true;
+    }
+    if let Some((host, _)) = word.split_once('/') {
+        let labels: Vec<&str> = host.split('.').collect();
+        if labels.len() >= 2
+            && labels
+                .iter()
+                .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+            && labels
+                .last()
+                .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_alphabetic()))
+        {
+            return true;
+        }
+    }
+    let b = word.as_bytes();
+    (15..=34).contains(&b.len())
+        && b[..2].iter().all(u8::is_ascii_alphabetic)
+        && b[2..4].iter().all(u8::is_ascii_digit)
+        && b[4..].iter().all(u8::is_ascii_alphanumeric)
+}
+
+/// The quotes a word can be wrapped in.
+const QUOTES: [char; 3] = ['\'', '"', '`'];
+/// What is taken off the end of a word: sentence punctuation and quotes.
+const TRAILING: [char; 12] = ['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'', '`'];
+
+/// Keep `tok` when it is long enough; one with `@` lower-cased.
+fn push_token<'a>(out: &mut Vec<Cow<'a, str>>, tok: &'a str) {
+    if tok.len() >= MIN_TOKEN_LEN {
+        if tok.contains('@') && tok.bytes().any(|b| b.is_ascii_uppercase()) {
+            out.push(Cow::Owned(tok.to_ascii_lowercase()));
+        } else {
+            out.push(Cow::Borrowed(tok));
+        }
+    }
 }
 
 /// Visit every string leaf in a JSON value (recursively through objects/arrays).
@@ -1069,6 +1237,34 @@ mod tests {
     /// version of this change refused; main does not. Holds the main's
     /// behaviour until a destination inside a word is taken out with the
     /// user's request as its release.
+    /// The agent's own value is left out of the answer to its call only when
+    /// the server repeats it as sent. Repeated in another spelling, it is the
+    /// server's text and is recorded, as on main: a later call carrying that
+    /// spelling is refused.
+    ///
+    /// FAILS ON REVERT of `verbatim` in `record`: the defanged echo is
+    /// matched to the clean value sent and is not recorded.
+    #[test]
+    fn a_value_sent_and_echoed_in_another_spelling_is_still_recorded() {
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(1)), &json!({"url": "evil.com/inbox"}), false);
+        t.record_answer(
+            Some(&json!(1)),
+            "Saved evil[.]com/inbox",
+            Provenance::Content,
+        );
+        assert!(t
+            .arg_taint_alert("post_webpage", &json!({"url": "evil[.]com/inbox"}))
+            .is_some());
+        // Repeated as sent, it is still the agent's own.
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(1)), &json!({"url": "evil.com/inbox"}), false);
+        t.record_answer(Some(&json!(1)), "Saved evil.com/inbox", Provenance::Content);
+        assert!(t
+            .arg_taint_alert("post_webpage", &json!({"url": "evil.com/inbox"}))
+            .is_none());
+    }
+
     #[test]
     fn a_reply_to_the_sender_of_a_mail_read_is_not_tainted() {
         for header in [

@@ -400,7 +400,7 @@ pub(crate) struct ToolCommand<'a> {
 
 /// Whether a tool takes a shell command line by its name: a shell tool
 /// (`bash`, `run_command`, `<server>__exec`, ...).
-fn names_a_shell_tool(tool_name: &str) -> bool {
+pub(crate) fn names_a_shell_tool(tool_name: &str) -> bool {
     let canonical: String = tool_name
         .to_ascii_lowercase()
         .chars()
@@ -444,7 +444,7 @@ fn names_a_shell_tool(tool_name: &str) -> bool {
 /// Commander's `start_process` and `interact_with_process` wherever they
 /// are served, and a terminal server's `run`, `send_input` or `send_keys`
 /// (a server named `shell`, `terminal`, `tmux`, `pty`, `console`, ...).
-fn names_a_process_tool(tool_name: &str) -> bool {
+pub(crate) fn names_a_process_tool(tool_name: &str) -> bool {
     let canonical = |text: &str| -> String {
         text.to_ascii_lowercase()
             .chars()

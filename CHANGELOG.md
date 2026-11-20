@@ -68,6 +68,39 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Fixed
 
+- **The MCP proxy raises the verdict of a payment, a message, a share or a
+  delete that carries a value a server said.** Each listed tool is classed
+  once, from its input schema, its MCP annotations and its name as a hint
+  (money-movement, send-external, share, delete, read-secret, fetch-url,
+  read-only). A call of a class that acts, carrying a value that appeared in
+  anything a server sent this session (results and every block in them,
+  embedded resources, resource links, listings, errors, prompts,
+  notifications), gets `AG-EFFECT`: a payment to an account, address or link
+  a server named is refused, though no rule refuses the tool by name; any
+  other such call is forwarded with an alert. Every value counts, at any depth, as a
+  map key and joined from pieces. Nothing is lowered: a refusal by name
+  (ATR-2026-098, ATR-2026-040) stays, because a value found in no server's
+  text is not proof the person asked for it. Lowering waits for the person's
+  request as a source. A call judged on its own, outside a proxy session
+  (`innerwarden check`, the release suite), is judged as before.
+- **A value a server said is found in the spelling a call sends it.** The
+  provenance table and the taint tracker compare both sides in one spelling:
+  `[at]` and `[.]` put back, percent escapes, HTML entities and base64 runs
+  decoded, punycode decoded, NFKC and NFC, letters that pass for ASCII
+  letters made ASCII, a scheme or a trailing `/` more or less; accents are
+  dropped when only letters and digits are compared. Text that is not ASCII
+  is never cut inside a character.
+- **An address in quotes in a tool result taints the call that sends to it.**
+  `'someone@example.com'` was recorded with its opening quote, so a call to
+  `someone@example.com` was not found to carry it; nor was an address with
+  a quote on one side only or glued to the next word
+  (`'someone@example.com'.The`).
+- **The differential check replays whole MCP sessions.** A corpus line can be
+  a session (`surface: session`): client and server messages replayed
+  through the proxy's router with one taint tracker, judged by its last
+  message. `corpus/mcp-sessions` holds the first ones. A guard without the
+  `session` surface cannot judge them, so main against a branch holds for
+  them from the pull request after the one that adds them.
 - **A restarted MCP proxy still holds a tool the server never listed.** A
   server's pin record carries a mark written by its first listing, even an
   empty one, so the hold no longer depends on the record having pins.

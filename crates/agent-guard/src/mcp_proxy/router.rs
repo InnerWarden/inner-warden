@@ -141,6 +141,10 @@ fn route_client_to_server(
                 verdict.allowed = false;
                 verdict.alerts.push(alert);
             }
+            // What the tool does and where its sensitive values came from
+            // decide a refusal by name (`super::effect`).
+            let class = t.effect_of(&name, &args);
+            super::effect::apply_table(&name, &args, class, &t.seen, &mut verdict);
         }
         let safe_name = safe_tool_name(&name);
         return ProxyDecision {
@@ -192,9 +196,19 @@ fn route_server_to_client(
     env: &JsonRpcEnvelope,
     responded: Option<&PendingRequest>,
     engine: Option<&RuleEngine>,
-    taint: Option<&mut TaintTracker>,
+    mut taint: Option<&mut TaintTracker>,
 ) -> ProxyDecision {
     let dir = Direction::ServerToClient;
+    // Every text a server sends the client reaches the model or can: an
+    // error's message and data, a prompt (`prompts/get`), a completion, a
+    // notification, a request the server makes (sampling, elicitation). A
+    // value in any of it did not come from nowhere (`super::effect`), so it
+    // is kept before anything else is read. The answers read below
+    // (`tools/list`, listings, `tools/call`, `resources/read`) keep theirs
+    // where they are read.
+    if let Some(t) = taint.as_deref_mut() {
+        record_server_text(env, responded, t);
+    }
     match (responded.map(|r| r.method.as_str()), env.result.as_ref()) {
         (Some("tools/list"), Some(result)) => {
             // What the server says each tool does, so a call to a tool it
@@ -202,6 +216,7 @@ fn route_server_to_client(
             // `mcp::ToolDeclaration`).
             let mut verdict = inspect_tools_list_result(result, engine);
             if let Some(t) = taint {
+                t.seen.record(&json_leaves(result));
                 t.record_tools_list(result);
                 // A tool pinned before whose definition changed is reported
                 // field by field, and held in a mode that blocks
@@ -254,8 +269,11 @@ fn route_server_to_client(
         ) => {
             // A resource listing is also remembered: a later `resources/read`
             // is checked against what the server announced.
-            if let (Some(t), "resources/list" | "resources/templates/list") = (taint, method) {
-                t.resources.record_listing(method, result);
+            if let Some(t) = taint {
+                t.seen.record(&json_leaves(result));
+                if let "resources/list" | "resources/templates/list" = method {
+                    t.resources.record_listing(method, result);
+                }
             }
             ProxyDecision {
                 verdict: inspect_listing_result(method, result),
@@ -282,6 +300,9 @@ fn route_server_to_client(
             if let Some(t) = taint {
                 let is_error = result.get("isError").and_then(Value::as_bool) == Some(true);
                 let tool = responded.and_then(|r| r.tool.as_deref());
+                if read < length {
+                    t.seen.note_unread();
+                }
                 t.record_answer(
                     env.id.as_ref(),
                     &content,
@@ -309,6 +330,15 @@ fn route_server_to_client(
             let scanned = truncate_on_boundary(whole, MAX_SCANNED_RESULT_BYTES);
             let read = scanned.len();
             let content = crate::redact::redact_secrets(&scanned).text;
+            // What a resource holds reached the model: a value in it is not
+            // one that came from nowhere (`super::effect`).
+            if let Some(t) = taint {
+                if read < length {
+                    t.seen.note_unread();
+                } else {
+                    t.seen.record(&content);
+                }
+            }
             ProxyDecision {
                 verdict: inspect_answer(&content, (read, length), engine),
                 direction: dir.label(),
@@ -357,6 +387,64 @@ fn inspect_answer(
         ));
     }
     verdict
+}
+
+/// The text a JSON value holds, as a reader of it sees it: every string
+/// and number, and every key of a map below the top level (a key can be
+/// data: an address a map is keyed by), one per line, decoded (not the
+/// escaped JSON, where a line break is `\\n` glued to the next word).
+fn json_leaves(value: &Value) -> String {
+    fn walk(v: &Value, top: bool, out: &mut Vec<String>) {
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Number(n) => out.push(n.to_string()),
+            Value::Array(items) => items.iter().for_each(|i| walk(i, false, out)),
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if !top {
+                        out.push(key.clone());
+                    }
+                    walk(value, false, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, true, &mut out);
+    out.join("\n")
+}
+
+/// Keep, as said by a server (`super::effect::SeenText`), what a message
+/// from the server carries that the arms of [`route_server_to_client`] do
+/// not read themselves: an error, a result to any other request, the
+/// parameters of a notification or a request.
+fn record_server_text(
+    env: &JsonRpcEnvelope,
+    responded: Option<&PendingRequest>,
+    t: &mut TaintTracker,
+) {
+    if let Some(error) = env.error.as_ref() {
+        t.seen.record(&json_leaves(error));
+    }
+    if let Some(params) = env.params.as_ref() {
+        t.seen.record(&json_leaves(params));
+    }
+    let read_below = matches!(
+        responded.map(|r| r.method.as_str()),
+        Some(
+            "tools/list"
+                | "resources/list"
+                | "resources/templates/list"
+                | "prompts/list"
+                | "initialize"
+                | "tools/call"
+                | "resources/read"
+        )
+    );
+    if let (Some(result), false) = (env.result.as_ref(), read_below) {
+        t.seen.record(&json_leaves(result));
+    }
 }
 
 fn pass_through(dir: Direction) -> ProxyDecision {
@@ -720,10 +808,31 @@ fn concat_text_content(result: &Value) -> (String, usize) {
     let mut parts = Vec::new();
     if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
         for block in content {
-            if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                    parts.push(text.to_string());
+            match block.get("type").and_then(|t| t.as_str()) {
+                Some("text") => {
+                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                        parts.push(text.to_string());
+                    }
                 }
+                // An embedded resource reaches the model as text does, and
+                // a link's name, title and description are read by it too.
+                Some("resource") => {
+                    if let Some(resource) = block.get("resource") {
+                        let text =
+                            content::resource_text(&serde_json::json!({ "contents": [resource] }));
+                        if !text.is_empty() {
+                            parts.push(text);
+                        }
+                    }
+                }
+                Some("resource_link") => {
+                    for key in ["name", "title", "description", "uri"] {
+                        if let Some(text) = block.get(key).and_then(|t| t.as_str()) {
+                            parts.push(text.to_string());
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
