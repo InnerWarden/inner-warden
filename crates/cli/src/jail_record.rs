@@ -657,6 +657,12 @@ pub struct Limits {
     pub burst: u32,
     /// Reports written per second once the burst is spent.
     pub per_second: u32,
+    /// Refusals told beside the host's record at once
+    /// ([`Channel::mirror_blocks_to`], [`MIRROR_BURST`]).
+    pub mirror_burst: u32,
+    /// Refusals told there per second once that burst is spent
+    /// ([`MIRROR_PER_SECOND`]).
+    pub mirror_per_second: f64,
 }
 
 #[cfg(target_os = "linux")]
@@ -671,6 +677,8 @@ impl Default for Limits {
             abandon_after: HAND_TIMEOUT + std::time::Duration::from_secs(2),
             burst: 512,
             per_second: 64,
+            mirror_burst: MIRROR_BURST,
+            mirror_per_second: MIRROR_PER_SECOND,
         }
     }
 }
@@ -904,8 +912,9 @@ impl Shared {
         };
         let now = std::time::Instant::now();
         let (tokens, at) = *bucket;
-        let refilled = (tokens + now.duration_since(at).as_secs_f64() * MIRROR_PER_SECOND)
-            .min(f64::from(MIRROR_BURST));
+        let refilled = (tokens
+            + now.duration_since(at).as_secs_f64() * self.limits.mirror_per_second)
+            .min(f64::from(self.limits.mirror_burst));
         if refilled >= 1.0 {
             *bucket = (refilled - 1.0, now);
             true
@@ -988,7 +997,7 @@ impl Channel {
             held: Default::default(),
             turned_away: Mutex::new(std::collections::HashMap::new()),
             host_graph: std::sync::OnceLock::new(),
-            mirror_bucket: Mutex::new((f64::from(MIRROR_BURST), std::time::Instant::now())),
+            mirror_bucket: Mutex::new((f64::from(limits.mirror_burst), std::time::Instant::now())),
             mirror_dropped: Default::default(),
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -1975,7 +1984,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn the_hosts_record_hears_the_jails_word_cut_cleaned_and_at_its_own_rate() {
-        let (_base, record, channel, socket) = channel_with(Limits::default(), Stamp::default());
+        // No refill: the count is the burst's alone, however slow the host.
+        let limits = Limits {
+            mirror_per_second: 0.0,
+            ..Limits::default()
+        };
+        let (_base, record, channel, socket) = channel_with(limits, Stamp::default());
         let host = tempfile::TempDir::new().unwrap();
         channel.mirror_blocks_to(host.path().join("graph.json"));
         let mut odd = decision();
@@ -2001,11 +2015,7 @@ mod tests {
             .iter()
             .filter(|l| l["kind"] == "guard.blocked")
             .collect();
-        assert!(
-            blocked.len() <= MIRROR_BURST as usize + 2,
-            "{}",
-            blocked.len()
-        );
+        assert_eq!(blocked.len(), MIRROR_BURST as usize);
         let first = blocked[0];
         let detail = first["detail"].as_str().unwrap();
         assert!(!detail.chars().any(char::is_control), "{detail:?}");
