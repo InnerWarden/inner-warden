@@ -13,8 +13,14 @@ list, with every limit.
   once the server has pins, one it never listed before, until you run
   `innerwarden mcp approve`. In `guard` and `kill` it also refuses a
   resource read whose location names a credential (`internal://credentials`,
-  `vault://master_key`): reading it is your call, as reading a credentials
-  file in the shell is. In `advisory` and `warn` it is alerted and passes.
+  `config://auth_tokens`) or is a secret store by its scheme (`vault://`,
+  `env://`, `kv://`, `keyring://`, `keychain://`, `ssm://`, `secret://`,
+  `secrets://`, `secretsmanager://`, `creds://`, `credentials://`, any
+  location in it): reading it is your call, as reading a credentials file in
+  the shell is. A document, a source file, a count or a setting about a
+  credential (`docs://credentials-guide`, `file:///repo/src/auth/token.rs`,
+  `stats://tokens`) and a file in a folder that names one are read with an
+  alert. In `advisory` and `warn` every one of these is alerted and passes.
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather

@@ -1724,6 +1724,10 @@ const DOC_WORDS: &[&str] = &[
     "overview",
     "reference",
     "rotation",
+    "count",
+    "stats",
+    "ttl",
+    "settings",
 ];
 
 /// The words of a piece of a location: split on every character that is
@@ -1769,10 +1773,7 @@ fn credential_word(words: &[String]) -> Option<String> {
         "passwords",
         "passwd",
         "passphrase",
-        "pass",
         "pwd",
-        "token",
-        "tokens",
         "jwt",
         "jwts",
         "bearer",
@@ -1795,8 +1796,21 @@ fn credential_word(words: &[String]) -> Option<String> {
         "ssh",
         "auth",
     ];
+    // A word that names a credential only with its owner before it
+    // (`auth_tokens`, `admin/pass`): alone it is a count or a ticket
+    // (`stats://tokens`, `metrics://token_count`, `tickets://season-pass`).
+    const OWNED: &[&str] = &["token", "tokens", "pass"];
+    const TOKEN_OWNERS: &[&str] = &[
+        "api", "auth", "access", "refresh", "bearer", "session", "admin", "root", "user", "db",
+        "oauth", "id", "master", "private", "service", "deploy", "bot", "personal", "github",
+        "gitlab", "slack", "npm", "login",
+    ];
     for (i, word) in words.iter().enumerate() {
         if WORDS.contains(&word.as_str()) {
+            return Some(word.clone());
+        }
+        if OWNED.contains(&word.as_str()) && i > 0 && TOKEN_OWNERS.contains(&words[i - 1].as_str())
+        {
             return Some(word.clone());
         }
         if matches!(word.as_str(), "key" | "keys")
@@ -1845,7 +1859,8 @@ fn secret_location(decoded: &str) -> Option<SecretLocation> {
         || last_words
             .iter()
             .any(|word| DOC_WORDS.contains(&word.as_str()));
-    let named = if FILE_OR_WEB_SCHEMES.contains(&scheme.as_str()) {
+    let file_or_web = FILE_OR_WEB_SCHEMES.contains(&scheme.as_str());
+    let named = if file_or_web {
         credential_word(&last_words)
     } else {
         credential_word(&location_words(path))
@@ -1856,6 +1871,14 @@ fn secret_location(decoded: &str) -> Option<SecretLocation> {
         } else {
             SecretLocation::Credential(word)
         });
+    }
+    // A file or a page in a directory that names a credential
+    // (`file:///srv/credentials/app.conf`) is alerted: only its last
+    // segment says what is read.
+    if file_or_web {
+        if let Some(word) = credential_word(&location_words(path)) {
+            return Some(SecretLocation::Named(word));
+        }
     }
     PRIVATE_SCHEMES
         .contains(&scheme.as_str())
@@ -2409,6 +2432,41 @@ mod tests {
             let verdict = inspect_resource_read(uri, None, None);
             assert!(verdict.allowed, "{uri} refused: {:?}", verdict.alerts);
         }
+    }
+
+    /// A count, a statistic or a setting about a credential, and a ticket,
+    /// is read: `token`, `tokens` and `pass` name a credential only with
+    /// an owner before them (`auth_tokens`, `admin/pass`), and `count`,
+    /// `stats`, `ttl` and `settings` make the last segment about one.
+    /// A file in a directory that names a credential is alerted.
+    /// Second review of 2026-11-20: each of these was refused.
+    ///
+    /// FAILS ON REVERT of the owner rule in `credential_word`, of the new
+    /// words in `DOC_WORDS`, or of the directory alert for files and web
+    /// pages in `secret_location` (the last one).
+    #[test]
+    fn a_count_or_a_setting_about_a_credential_is_read() {
+        for uri in [
+            "stats://tokens",
+            "usage://tokens/today",
+            "llm://usage/tokens",
+            "metrics://token_count",
+            "config://jwt_settings",
+            "tickets://season-pass",
+            "config://session_ttl",
+            "file:///srv/credentials/app.conf",
+        ] {
+            let verdict = inspect_resource_read(uri, None, None);
+            assert!(verdict.allowed, "{uri} refused: {:?}", verdict.alerts);
+        }
+        let verdict = inspect_resource_read("file:///srv/credentials/app.conf", None, None);
+        assert!(
+            verdict.alerts.iter().any(|a| a.rule == RESOURCE_URI_RULE
+                && !a.block
+                && a.detail.contains("credentials")),
+            "{:?}",
+            verdict.alerts
+        );
     }
 
     #[test]

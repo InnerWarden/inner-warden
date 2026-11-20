@@ -2,12 +2,10 @@
 //! ordinary tool output: every benign text this repository holds as a tool
 //! result must reach the model, none held back.
 //!
-//! Added 2026-11-20 with two new readings of an answer
-//! (`description_poison`): a claim of authority with an order to do
-//! something else first, and a read ordered inside an `<IMPORTANT>`-style
-//! block. Both are matched only together with their other half, so a
-//! tutorial that says what to do first, a mail that calls itself important,
-//! or a block that warns without ordering a read passes.
+//! Added 2026-11-20 with the order to act after a step written as "do",
+//! "adhere to" or "comply with" (`description_poison`): a reading of an
+//! answer is added only when this count does not grow, so a new reading that
+//! holds back ordinary tool output fails here before it reaches a user.
 
 use innerwarden_agent_guard::benchmark::{Corpus, Label, Surface};
 use innerwarden_agent_guard::mcp::inspect_answer_orders;
