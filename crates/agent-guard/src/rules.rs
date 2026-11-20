@@ -582,6 +582,22 @@ pub struct AtrMatch {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub matched: String,
     pub references: AtrReferences,
+    /// A refusing rule (`critical`, `high`) whose pattern could not finish
+    /// on the input. Its severity reads `medium`, so a shell line is held for
+    /// review; an MCP call, which has no review, is refused
+    /// ([`AtrMatch::refuses_a_call`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub undecided_refusal: bool,
+}
+
+impl AtrMatch {
+    /// Whether this match refuses an MCP message: a `critical` or `high`
+    /// rule, including one whose pattern could not finish on it. An MCP
+    /// verdict is allow or block, so holding such a rule at `medium` there
+    /// would let the message through with an alert.
+    pub fn refuses_a_call(&self) -> bool {
+        self.undecided_refusal || matches!(self.severity.as_str(), "critical" | "high")
+    }
 }
 
 /// The ATR rule engine, holds compiled rules grouped by field type.
@@ -916,6 +932,7 @@ fn make_match(rule: &CompiledRule, description: String, matched: String) -> AtrM
         matched_condition: description,
         matched,
         references: rule.references.clone(),
+        undecided_refusal: false,
     }
 }
 
@@ -957,23 +974,26 @@ const UNDECIDED_SEVERITY: &str = "medium";
 
 /// A rule whose pattern could not finish on the text: it is held, not
 /// passed. A rule that refuses (`critical`, `high`) is held for review
-/// (`medium`); a lighter one is kept at its own severity, as if it had
-/// matched. Said in the match and in a warning, so it is seen.
+/// (`medium`) on a shell line and refused on an MCP message
+/// ([`AtrMatch::refuses_a_call`]); a lighter one is kept at its own
+/// severity, as if it had matched. Said in the match and in a warning, so it
+/// is seen.
 fn undecided_match(rule: &CompiledRule, condition: &CompiledCondition) -> AtrMatch {
     warn!(
         rule = %rule.id,
-        "an ATR pattern could not finish on this input; the rule holds it for review"
+        "an ATR pattern could not finish on this input; the rule holds it"
     );
     let mut held = make_match(
         rule,
         format!(
-            "{} (the pattern could not finish on this input: held for review)",
+            "{} (the pattern could not finish on this input: held)",
             condition.description
         ),
         field_words(condition.field).to_string(),
     );
     if matches!(rule.severity.as_str(), "critical" | "high") {
         held.severity = UNDECIDED_SEVERITY.to_string();
+        held.undecided_refusal = true;
     }
     held
 }
@@ -1494,7 +1514,8 @@ detection:
         assert_eq!(matches.len(), 2, "{matches:?}");
         for m in &matches {
             assert_eq!(m.severity, "medium", "{m:?}");
-            assert!(m.matched_condition.contains("held for review"), "{m:?}");
+            assert!(m.matched_condition.contains("could not finish"), "{m:?}");
+            assert!(m.undecided_refusal && m.refuses_a_call(), "{m:?}");
         }
         // A text the pattern reads to the end is judged as before.
         assert!(engine.check_user_input("nothing here").is_empty());

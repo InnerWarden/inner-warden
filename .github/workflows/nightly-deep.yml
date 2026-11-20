@@ -310,7 +310,7 @@ jobs:
       - name: Built lines for 60 seconds
         env:
           IW_SHELL_FUZZ_SECS: "60"
-        run: cargo test -p innerwarden-agent-guard --test shell_words_never_panic the_shell_reader_never_panics_on_built_lines -- --nocapture
+        run: bash scripts/cargo-test-at-least.sh 1 -p innerwarden-agent-guard --test shell_words_never_panic the_shell_reader_never_panics_on_built_lines -- --nocapture
 
   perf:
     name: performance budget

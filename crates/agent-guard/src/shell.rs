@@ -3971,9 +3971,14 @@ fn xargs_command_start(words: &[String]) -> Option<usize> {
             index += 1;
             break;
         }
+        // `-J`, `-R` and `-S` are the BSD (macOS) xargs's: the replace
+        // string of the first argument, and two counts.
         if matches!(
             argument.as_str(),
-            "-I" | "-E"
+            "-I" | "-J"
+                | "-R"
+                | "-S"
+                | "-E"
                 | "-L"
                 | "-n"
                 | "-P"
@@ -7875,15 +7880,18 @@ fn xargs_consumes_stdin_as_code(words: &[String]) -> bool {
             index += 1;
             break;
         }
+        // `-J` is the BSD (macOS) xargs's replace string: it stands where
+        // the arguments go, as `-I`'s does.
         if let Some(value) = argument
             .strip_prefix("-I")
+            .or_else(|| argument.strip_prefix("-J"))
             .filter(|value| !value.is_empty())
         {
             replacement = Some(value.to_owned());
             index += 1;
             continue;
         }
-        if argument == "-I" {
+        if argument == "-I" || argument == "-J" {
             replacement = words.get(index + 1).map(|value| shell_word(value));
             index += 2;
             continue;
@@ -7905,6 +7913,8 @@ fn xargs_consumes_stdin_as_code(words: &[String]) -> bool {
         if matches!(
             argument.as_str(),
             "-E" | "-L"
+                | "-R"
+                | "-S"
                 | "-n"
                 | "-P"
                 | "-s"
