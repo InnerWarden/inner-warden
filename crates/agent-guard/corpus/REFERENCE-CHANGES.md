@@ -7,6 +7,11 @@ continued on indented lines), that names every case whose line moved, as
 after and why the new one is right. CI refuses a reference change where a moved
 case is not named.
 
+The differential check (README, "Differential check") reads this file too: a
+benign line that main stops and a pull request no longer stops passes only when
+a dated entry names it after `harmless-proven:` (as `corpus/id`), with why it is
+harmless. A malicious or `must_refuse` line cannot be waived here.
+
 - 2026-11-19: first reference. proof 246/246 caught, 243/246 stopped for an
   agent, 0/160 false positives; attack-2026-11 377/377 caught, 313/377
   stopped, 0/138 false positives; real 4/5 caught, 25/31 false positives (the
