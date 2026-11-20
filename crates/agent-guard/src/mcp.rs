@@ -4121,9 +4121,14 @@ fn analyze_command_as_read(
                     "removal by xargs of what a listing of the filesystem root, a home \
                      or a credential store prints",
                 ),
+                // A recursive removal (or `shred`, `dd of=`) whose targets
+                // come from a file or from input the line does not show is
+                // a destruction the line does not name, as `rm -rf $VAR`
+                // with no value: refused, never only held.
                 crate::threats::XargsRemoval::Unread => (
-                    25,
-                    "removal by xargs of paths it reads from input the guard does not see",
+                    50,
+                    "recursive removal by xargs of paths it reads from a file or input the \
+                     guard does not see",
                 ),
             };
             signals.push(AnalysisSignal {

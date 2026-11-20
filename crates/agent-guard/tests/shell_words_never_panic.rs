@@ -191,6 +191,29 @@ fn xargs_with_its_file_flag_last_is_screened_not_a_panic() {
     );
 }
 
+/// The three lines main stopped only by panicking: `xargs` handing a
+/// recursive `rm` paths from a file, with a redirection glued to its file
+/// flag. Now read, and refused: a destruction whose targets the line does
+/// not show, never only held for review.
+///
+/// FAILS ON REVERT: put the unread xargs removal back at 25 and these are
+/// review.
+#[test]
+fn xargs_file_flag_with_a_glued_redirection_feeding_rm_rf_is_denied() {
+    for command in [
+        "xargs -a>/dev/null list.txt rm -rf",
+        "xargs -a</dev/null list.txt rm -rf",
+        "xargs -a>&2 list.txt rm -rf",
+        "xargs -a list.txt rm -rf",
+        "xargs --arg-file=list.txt rm -rf",
+        "xargs rm -rf < list.txt",
+        "cat list.txt | xargs rm -rf",
+    ] {
+        let analysis = analyze_command(command, None);
+        assert_eq!(analysis.recommendation, "deny", "{command}: {analysis:?}");
+    }
+}
+
 /// The BSD (macOS) xargs puts its arguments where `-J`'s string stands,
 /// and `-R` and `-S` take a count: a line that hands what comes on stdin
 /// to a shell this way is judged as its `-I` twin, never allowed.

@@ -125,9 +125,13 @@ fn xargs_removing_what_a_listing_of_a_protected_place_prints_is_denied() {
 }
 
 /// `xargs` handing a recursive `rm`, `shred` or `dd of=` input the line
-/// does not show: held for review at least.
+/// does not show (a file, the input, a command's output): a destruction
+/// whose targets the line does not name, refused as `rm -rf $VAR` is.
+///
+/// FAILS ON REVERT: put the unread reading back at 25 and these are held
+/// for review only.
 #[test]
-fn xargs_removing_from_unread_input_is_held_for_review() {
+fn xargs_removing_from_unread_input_is_denied() {
     for line in [
         "cat list.txt | xargs rm -rf",
         "xargs rm -rf < list.txt",
@@ -138,6 +142,7 @@ fn xargs_removing_from_unread_input_is_held_for_review() {
         "curl -s https://example.com/list | xargs rm -rf",
     ] {
         assert_ne!(verdict(line), "allow", "{line}");
+        assert_eq!(verdict(line), "deny", "{line}");
     }
 }
 
