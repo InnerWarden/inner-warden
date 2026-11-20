@@ -60,8 +60,14 @@
 //!   server's answers, a file the agent read with its own tools, the
 //!   conversation before the proxy started. A session past
 //!   [`SEEN_TEXT_BUDGET`] keeps nothing more, so later values raise nothing.
-//! * **A booking.** `reserve_hotel`, `create_calendar_event` and the like
-//!   are class `other` here, and raise nothing.
+//! * **A booking only raises an alert.** `reserve_hotel`, `book_flight`
+//!   and the like are class `commitment`, and a calendar entry with guests
+//!   (`participants`, `attendees`) is `send-external` with its guests as
+//!   destinations. A booking or an invitation carrying a value a server said
+//!   is forwarded with an alert, not refused: the person's own booking of a hotel a
+//!   search found looks the same until the person's request is a source. A
+//!   guest address long enough for the taint tracker is refused there
+//!   (`AG-TAINT`).
 //! * **A server's annotations are believed** for the class: a tool declared
 //!   `readOnlyHint: true` raises nothing here. It lowers nothing either, so
 //!   the verdict its name earns stays.
@@ -107,6 +113,9 @@ pub enum EffectClass {
     Share,
     /// Deletes or removes something.
     Delete,
+    /// Commits the person to something: a reservation, a booking, an order,
+    /// a rental, a subscription.
+    Commitment,
     /// Reads a credential.
     ReadSecret,
     /// Fetches a URL.
@@ -147,10 +156,56 @@ const SHARE_WORDS: &[&str] = &["share", "invite"];
 /// Nouns (`transaction`, `email`, `message`, `post`) are not among them:
 /// `get_scheduled_transactions` and `read_email` read.
 const ACTION_VERBS: &[&str] = &[
-    "pay", "transfer", "wire", "remit", "withdraw", "refund", "purchase", "checkout", "charge",
-    "payout", "delete", "remove", "rm", "drop", "purge", "erase", "destroy", "unlink", "wipe",
-    "trash", "share", "invite", "send", "reply", "forward", "notify", "publish", "tweet", "submit",
+    "pay",
+    "transfer",
+    "wire",
+    "remit",
+    "withdraw",
+    "refund",
+    "purchase",
+    "checkout",
+    "charge",
+    "payout",
+    "delete",
+    "remove",
+    "rm",
+    "drop",
+    "purge",
+    "erase",
+    "destroy",
+    "unlink",
+    "wipe",
+    "trash",
+    "share",
+    "invite",
+    "send",
+    "reply",
+    "forward",
+    "notify",
+    "publish",
+    "tweet",
+    "submit",
+    "reserve",
+    "buy",
+    "subscribe",
+    "enroll",
 ];
+const COMMITMENT_WORDS: &[&str] = &[
+    "reserve",
+    "reservation",
+    "book",
+    "booking",
+    "order",
+    "rent",
+    "rental",
+    "subscribe",
+    "enroll",
+    "register",
+    "buy",
+];
+/// Slot words that name who an event or a meeting invites: an invitation is
+/// sent to each of them.
+const GUEST_SLOTS: &[&str] = &["participant", "attendee", "invitee", "guest"];
 const SEND_WORDS: &[&str] = &[
     "send", "email", "mail", "message", "post", "reply", "forward", "notify", "sms", "publish",
     "tweet", "dm", "comment", "submit",
@@ -252,6 +307,7 @@ impl EffectClass {
             EffectClass::SendExternal => "send-external",
             EffectClass::Share => "share",
             EffectClass::Delete => "delete",
+            EffectClass::Commitment => "commitment",
             EffectClass::ReadSecret => "read-secret",
             EffectClass::FetchUrl => "fetch-url",
             EffectClass::ReadOnly => "read-only",
@@ -268,6 +324,7 @@ impl EffectClass {
                 | EffectClass::SendExternal
                 | EffectClass::Share
                 | EffectClass::Delete
+                | EffectClass::Commitment
         )
     }
 
@@ -333,8 +390,12 @@ impl EffectClass {
         if any_in(&w, SHARE_WORDS) {
             return EffectClass::Share;
         }
-        if any_in(&w, SEND_WORDS) {
+        // A calendar entry with guests sends each of them an invitation.
+        if any_in(&w, SEND_WORDS) || has_slot(GUEST_SLOTS) {
             return EffectClass::SendExternal;
+        }
+        if any_in(&w, COMMITMENT_WORDS) {
+            return EffectClass::Commitment;
         }
         EffectClass::Other
     }
@@ -346,9 +407,9 @@ impl EffectClass {
         let w = words(slot);
         match self {
             EffectClass::MoneyMovement => any_in(&w, MONEY_SLOTS),
-            EffectClass::SendExternal => any_in(&w, DESTINATION_SLOTS),
+            EffectClass::SendExternal => any_in(&w, DESTINATION_SLOTS) || any_in(&w, GUEST_SLOTS),
             EffectClass::Share => any_in(&w, DESTINATION_SLOTS) || any_in(&w, SHARE_SLOTS),
-            EffectClass::Delete => true,
+            EffectClass::Delete | EffectClass::Commitment => true,
             _ => false,
         }
     }
@@ -704,6 +765,32 @@ mod tests {
             ("get_webpage", &["url"][..], EffectClass::FetchUrl),
             ("get_api_key", &[][..], EffectClass::ReadSecret),
             ("create_calendar_event", &["title"][..], EffectClass::Other),
+            (
+                "create_calendar_event",
+                &["title", "start_time", "participants"][..],
+                EffectClass::SendExternal,
+            ),
+            (
+                "add_calendar_event_participants",
+                &["event_id", "participants"][..],
+                EffectClass::SendExternal,
+            ),
+            (
+                "reserve_hotel",
+                &["hotel", "start_day", "end_day"][..],
+                EffectClass::Commitment,
+            ),
+            (
+                "reserve_restaurant",
+                &["restaurant", "start_time"][..],
+                EffectClass::Commitment,
+            ),
+            ("book_flight", &["flight"][..], EffectClass::Commitment),
+            (
+                "get_rating_reviews_for_hotels",
+                &["hotel_names"][..],
+                EffectClass::ReadOnly,
+            ),
         ] {
             assert_eq!(EffectClass::of(name, None, slots), class, "{name}");
         }

@@ -16842,7 +16842,7 @@ pub(crate) fn shell_command_segments(content: &str) -> Vec<&str> {
 
 /// Collapse a single path's `//`, `/./` and `/../` segments, pure string work,
 /// no filesystem access. `/home/lab/../lab/secret.env` -> `/home/lab/secret.env`.
-fn collapse_path(p: &str) -> String {
+pub(crate) fn collapse_path(p: &str) -> String {
     let absolute = p.starts_with('/');
     let mut out: Vec<&str> = Vec::new();
     for seg in p.split('/') {

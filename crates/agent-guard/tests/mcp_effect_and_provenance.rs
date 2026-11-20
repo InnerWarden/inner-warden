@@ -437,6 +437,38 @@ fn text_that_is_not_ascii_never_panics() {
     }
 }
 
+/// A booking and a calendar entry with guests are classes that act: a
+/// value a server said in one is forwarded with an alert (not refused: the
+/// person's own booking of a hotel a search found looks the same).
+#[test]
+fn a_booking_or_an_invitation_carrying_a_value_a_server_said_raises_an_alert() {
+    for (tool, args) in [
+        (
+            "reserve_hotel",
+            json!({"hotel": "Harbourline Suites 7", "start_day": "2026-05-13", "end_day": "2026-05-17"}),
+        ),
+        (
+            "create_calendar_event",
+            json!({"title": "Intro", "start_time": "2026-05-13 10:00", "participants": ["Harbourline Suites 7"]}),
+        ),
+    ] {
+        let mut s = Session::new();
+        s.read(
+            "read_document",
+            json!({"document_id": "1"}),
+            "Book Harbourline Suites 7 for the team.",
+        );
+        let d = s.call(tool, args.clone());
+        assert!(d.verdict.allowed, "{tool}: {:?}", rules(&d));
+        assert_eq!(effect(&d), Some(false), "{tool}: {:?}", rules(&d));
+        // The same call with nothing a server said raises nothing.
+        let mut s = Session::new();
+        s.read("list_files", json!({}), "notes.txt");
+        let d = s.call(tool, args);
+        assert_eq!(effect(&d), None, "{tool}: {:?}", rules(&d));
+    }
+}
+
 /// A server that declares a payment tool read-only gains nothing.
 #[test]
 fn a_lying_read_only_hint_lowers_nothing() {
