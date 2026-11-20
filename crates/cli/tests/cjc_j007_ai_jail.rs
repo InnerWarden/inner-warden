@@ -646,10 +646,23 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
         let mode = std::fs::metadata(&records).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
     }
+    // This project's folder, and beside it the launcher's note of which of
+    // the project's Claude Code files were not there (final review of
+    // #352), out of the jail's reach.
     let projects: Vec<_> = std::fs::read_dir(state.join("jail-claude"))
         .expect("this project's folder for Claude Code's settings file")
+        .map(|e| e.unwrap().path())
         .collect();
-    assert_eq!(projects.len(), 1, "{projects:?}");
+    assert_eq!(projects.len(), 2, "{projects:?}");
+    let folder = projects.iter().find(|p| p.is_dir()).expect("the folder");
+    let mut note = folder.clone().into_os_string();
+    note.push(".absent");
+    assert!(
+        projects
+            .iter()
+            .any(|p| p.as_os_str() == note && p.is_file()),
+        "{projects:?}"
+    );
     let mut entries: Vec<String> = std::fs::read_dir(&state)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -2206,6 +2219,7 @@ fn claude_codes_settings_file_survives_between_identified_jails() {
     let folders: Vec<_> = std::fs::read_dir(h.join(".local/state/innerwarden/jail-claude"))
         .unwrap()
         .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir())
         .collect();
     assert_eq!(folders.len(), 1, "{folders:?}");
     let kept = std::fs::read_to_string(folders[0].join(".claude.json")).unwrap();
@@ -4302,10 +4316,16 @@ fn every_doubt_in_the_persons_claude_settings_refuses_the_start() {
 fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
-    let folders = |h: &std::path::Path| -> Vec<std::path::PathBuf> {
+    // The project's folder, and beside it, out of the jail's reach, the
+    // launcher's note of which of the project's Claude Code files were not
+    // there (`<folder>.absent`, final review of #352).
+    let entries = |h: &std::path::Path| -> Vec<std::path::PathBuf> {
         std::fs::read_dir(h.join(".local/state/innerwarden/jail-claude"))
             .map(|dir| dir.map(|e| e.unwrap().path()).collect())
             .unwrap_or_default()
+    };
+    let folders = |h: &std::path::Path| -> Vec<std::path::PathBuf> {
+        entries(h).into_iter().filter(|p| p.is_dir()).collect()
     };
     let nothing_in_the_hosts = |h: &std::path::Path, when: &str| {
         for name in ["sessions", "backups", ".claude.json"] {
@@ -4318,6 +4338,10 @@ fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     let made_one = |h: &std::path::Path, when: &str| {
         let made = folders(h);
         assert_eq!(made.len(), 1, "{when}: {made:?}");
+        let mut note = made[0].clone().into_os_string();
+        note.push(".absent");
+        assert_eq!(entries(h).len(), 2, "{when}: {:?}", entries(h));
+        assert!(std::path::Path::new(&note).is_file(), "{when}: {note:?}");
         let meta = std::fs::symlink_metadata(&made[0]).unwrap();
         assert!(meta.is_dir(), "{when}");
         assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{when}");
