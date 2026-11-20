@@ -350,9 +350,9 @@ Also not seen today, and not promised for any date:
   line on its own. The hook also knows the agent's session (an argument that
   came out of an earlier tool result) and the place the call reads, so some
   verdicts depend on what a folder holds when the call is made, such as a
-  read of the home. A download piped to a shell is held for review by
-  `check`, which an installer also looks like, and refused by the hook for
-  an agent. Read `check` as a preview, not as the hook's verdict.
+  read of the home. A download piped to a shell is refused by `check`
+  when it is fetched over `http://` and held for review over `https://`,
+  which an installer also looks like; the hook refuses it for an agent. Read `check` as a preview, not as the hook's verdict.
 
 These are the limits of a guard that reads text. InnerWarden Pro works below
 the text, at the host (Linux): armed for an agent, its Execution Gate decides
