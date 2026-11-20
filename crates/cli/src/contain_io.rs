@@ -2157,7 +2157,7 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         .flatten();
     let dry_filter = dry_bwrap.as_ref().map(|bwrap| {
         dry_run_filter(restriction_advice(bwrap, false), || {
-            filter_plan_here(bwrap, input.args.identity)
+            filter_plan_for_channel(bwrap, input.args.identity)
         })
     });
     let dry_rules = dry_filter.as_ref().and_then(DryRunFilter::filter);
@@ -2173,21 +2173,21 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
                 .then_some(crate::contain::launch::DRY_RUN_KEY_FD),
             close_userns: dry_rules == Some(Rules::Identified),
             seccomp_fd: dry_seccomp,
-            record_channel: Some(PathBuf::from(
-                crate::contain::launch::DRY_RUN_RECORD_CHANNEL,
-            )),
+            record_channel: (dry_rules == Some(Rules::Identified))
+                .then(|| PathBuf::from(crate::contain::launch::DRY_RUN_RECORD_CHANNEL)),
             ..input.clone()
         };
         &dry_identity
     } else if input.args.dry_run {
         // A plain jail shows the marker the real run hands in, and the
-        // terminal filter where the host takes it.
+        // identified filter where the host takes it (the terminal one where
+        // it takes only that); the record channel only with the first.
         dry_plain = JailInputs {
             profiles_marker_fd: marks.then_some(crate::contain::launch::DRY_RUN_MARKER_FD),
+            close_userns: dry_rules == Some(Rules::Identified),
             seccomp_fd: dry_seccomp,
-            record_channel: Some(PathBuf::from(
-                crate::contain::launch::DRY_RUN_RECORD_CHANNEL,
-            )),
+            record_channel: (dry_rules == Some(Rules::Identified))
+                .then(|| PathBuf::from(crate::contain::launch::DRY_RUN_RECORD_CHANNEL)),
             ..input.clone()
         };
         &dry_plain
@@ -2295,6 +2295,16 @@ fn with_record_channel(
             Ok((out.clone(), None))
         }
     };
+    // A program in a jail whose user namespaces are open can make one with
+    // a mount namespace of its own, mount a folder over the place the hook
+    // looks for the launcher's socket, and put its own there: the hook would
+    // hand it every decision and hear "ok". The channel holds only where
+    // the jail's filter keeps them closed.
+    if !input.close_userns {
+        return failed(
+            "user namespaces stay open in this jail, so a program there could put a socket of its own where the hook hands its decisions",
+        );
+    }
     let vet = |found: &std::fs::Metadata| {
         crate::contain::launch::vet_jail_graph_dir(
             &crate::contain::launch::GraphEntry {
@@ -2411,9 +2421,14 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     #[cfg(target_os = "linux")]
     let marker = marks.then(marker_pipe).flatten();
     #[cfg(target_os = "linux")]
-    let filter = unrecorded_filter(bwrap, input.args.identity);
+    let (filter, userns_closed) = unrecorded_filter(bwrap, input.args.identity);
     #[cfg(target_os = "linux")]
-    let (with_channel, channel) = match with_record_channel(input, None) {
+    let closed = JailInputs {
+        close_userns: userns_closed,
+        ..input.clone()
+    };
+    #[cfg(target_os = "linux")]
+    let (with_channel, channel) = match with_record_channel(&closed, None) {
         Ok(with_channel) => with_channel,
         Err(code) => return code,
     };
@@ -2454,18 +2469,25 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     code
 }
 
-/// The filter of a jail with no record, on a pipe for bwrap: the terminal
-/// one, or for an `--identity` launch that could not make its record the
-/// identified one (the terminal one where the host takes only that). What
-/// it lost is said once; `None` where the host took neither or the pipe
-/// could not be made.
+/// The filter of a jail with no instance record, on a pipe for bwrap, and
+/// whether it closes the jail's user namespaces: the identified one where
+/// the host takes it, plain jails included, since every jail may hold the
+/// launcher's record channel and a program in a jail with user namespaces
+/// open could mount a socket of its own where the hook looks for it (the
+/// channel is then not opened: [`with_record_channel`]). Else the terminal
+/// one where the host takes only that. What it lost is said once; `None`
+/// where the host took neither or the pipe could not be made.
 #[cfg(target_os = "linux")]
-fn unrecorded_filter(bwrap: &Path, identity: bool) -> Option<std::io::PipeReader> {
-    let plan = filter_plan_here(bwrap, identity);
+fn unrecorded_filter(bwrap: &Path, identity: bool) -> (Option<std::io::PipeReader>, bool) {
+    let plan = filter_plan_for_channel(bwrap, identity);
     for line in &plan.said {
         eprintln!("{line}");
     }
-    handed_filter(plan.filter)
+    let planned = plan.filter;
+    let reader = handed_filter(planned);
+    let closed =
+        planned == Some(innerwarden_agent_guard::seccomp::Rules::Identified) && reader.is_some();
+    (reader, closed)
 }
 
 /// The planned filter on a pipe for bwrap. One whose pipe cannot be made is
@@ -3881,6 +3903,21 @@ fn filter_plan_here(bwrap: &Path, identity: bool) -> crate::contain::launch::Fil
     crate::contain::launch::filter_plan(identity, host, |rules| {
         filter_probe(bwrap, rules, identity)
     })
+}
+
+/// [`filter_plan_here`] asking for the identified filter in every jail,
+/// a plain one included (probed under the plain jail's own options): a
+/// jail that holds the launcher's record channel keeps its user namespaces
+/// closed.
+#[cfg(target_os = "linux")]
+fn filter_plan_for_channel(bwrap: &Path, identity: bool) -> crate::contain::launch::FilterPlan {
+    let host = filter_host_here(Path::new(OSRELEASE));
+    crate::contain::launch::filter_plan(true, host, |rules| filter_probe(bwrap, rules, identity))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn filter_plan_for_channel(bwrap: &Path, identity: bool) -> crate::contain::launch::FilterPlan {
+    filter_plan_here(bwrap, identity)
 }
 
 #[cfg(not(target_os = "linux"))]

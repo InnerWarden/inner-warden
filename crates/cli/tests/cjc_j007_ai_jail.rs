@@ -462,6 +462,19 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
         .expect("run Linux AI Jail with --identity");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // A host that does not take the identified filter keeps the jail's user
+    // namespaces open: the launcher opens no record channel there (a program
+    // in the jail could mount its own), and an identified jail does not
+    // start without one. It ran before, with the record writable inside.
+    if filter_here() == FilterHere::NotTaken {
+        assert!(!output.status.success(), "{stdout} {stderr}");
+        assert!(
+            stderr.contains("innerwarden contain: user namespaces stay open (userns_probe_failed)"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("refusing to start"), "{stderr}");
+        return;
+    }
     assert!(output.status.success(), "AI Jail failed: {stderr}");
     assert!(stderr.contains("instance record:"), "{stderr}");
 
@@ -532,23 +545,6 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
             if !stdout.contains("NO-UNSHARE") {
                 assert!(stdout.contains("NESTED-REFUSED"), "{stdout}");
             }
-        }
-        FilterHere::NotTaken => {
-            assert_eq!(record["schema"], 1, "{record}");
-            assert!(record["jail"].get("userns_closed").is_none(), "{record}");
-            // Each thing the jail runs without is said: user namespaces,
-            // and the plain jail's rules (keystrokes, new subvolumes) the
-            // identified filter also carried.
-            assert!(
-                stderr.contains(
-                    "innerwarden contain: user namespaces stay open (userns_probe_failed)"
-                ),
-                "{stderr}"
-            );
-            assert!(
-                stderr.contains("innerwarden contain: no sandbox filter (filter_probe_failed)"),
-                "{stderr}"
-            );
         }
         other => panic!("the jail ran on a host where {other:?}: {record}"),
     }
@@ -643,17 +639,21 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
         std::path::Path::new(SYSTEM_PROFILES).exists(),
         "{stdout}"
     );
-    // The one change without the flag, on purpose: the jail's programs run
-    // under the terminal filter where the host takes it, which refuses the
-    // two terminal commands that push input (by every ABI the kernel runs,
-    // 32-bit ones included) and nothing else a plain jail could do before,
-    // user namespaces included.
+    // The changes without the flag, on purpose: the jail's programs run
+    // under the identified filter where the host takes it, which refuses the
+    // two terminal commands that push input, a new user namespace, joining
+    // one, and any call through another ABI. A plain jail holds the
+    // launcher's record channel, and with user namespaces open a program in
+    // it could mount a socket of its own where the hook hands its decisions.
+    // Before, a plain jail ran under the terminal filter and could make a
+    // user namespace.
     match filter_here() {
         FilterHere::Taken => {
             assert!(runs_under_one_more_filter(&stdout, true), "{stdout}");
             assert!(!stderr.contains("no sandbox filter"), "{stderr}");
-            if !stdout.contains("NO-UNSHARE") && unshare_works_here() {
-                assert!(stdout.contains("NESTED-USERNS"), "{stdout}");
+            assert!(!stdout.contains("NESTED-USERNS"), "{stdout}");
+            if !stdout.contains("NO-UNSHARE") {
+                assert!(stdout.contains("NESTED-REFUSED"), "{stdout}");
             }
         }
         FilterHere::NotTaken => {
@@ -692,32 +692,6 @@ fn runs_under_one_more_filter(inside: &str, filtered: bool) -> bool {
         (Some(own), Some(jail)) => jail == own + u32::from(filtered),
         _ => !filtered || inside.contains("Seccomp:\t2"),
     }
-}
-
-/// Whether a jail without any filter can make a user namespace here: the
-/// host's own answer, so the plain jail is held to what it could do before.
-#[cfg(target_os = "linux")]
-fn unshare_works_here() -> bool {
-    let Some(bwrap) = jail_bwrap() else {
-        return false;
-    };
-    Command::new(bwrap)
-        .args([
-            "--unshare-pid",
-            "--unshare-uts",
-            "--unshare-ipc",
-            "--ro-bind",
-            "/",
-            "/",
-            "unshare",
-            "-U",
-            "true",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
 }
 
 /// The host's system profiles file.
@@ -859,11 +833,18 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         !plain.contains("--disable-userns")
             && !identified.contains("--disable-userns")
             && !identified.contains("--unshare-user")
-            && !plain.contains(said)
             && !plain.contains(advice),
         "{plain}"
     );
     let here = filter_here();
+    // The plain jail asks for the identified filter too (it holds the
+    // record channel): where the host does not take it, it says its user
+    // namespaces stay open, as the identified one does.
+    assert_eq!(
+        plain.contains(said),
+        here == FilterHere::NotTaken,
+        "{here:?}: {plain}"
+    );
     assert_eq!(
         (
             filter_first,
@@ -5821,6 +5802,99 @@ fn a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers() {
         record.contains("evil.example/fake.sh"),
         "the decision is not in the record: {record} {err}"
     );
+}
+
+/// A program in a plain jail made a user and mount namespace of its own
+/// (`unshare -Urm`), mounted a tmpfs over the launcher's folder, put a
+/// socket of its own there that answers "ok", remounted it read-only, and
+/// ran the hook under it: the mount was the last at that place, read-only
+/// and on a device of its own, so the hook handed it the decision. Now a
+/// jail with the record channel runs under the filter that closes user
+/// namespaces: `unshare -U` is refused, and the hook's decisions reach the
+/// launcher. Where the host does not take that filter, no channel is
+/// opened and the launcher says the record stays writable.
+///
+/// FAILS ON REVERT: hand the plain jail the terminal filter again and the
+/// program's socket hears the hook (`HEARD`).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_mount_of_the_jails_own_never_takes_the_hooks_decisions() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".config")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let fake = project.path().join("fake.py");
+    std::fs::write(
+        &fake,
+        "import socket\n\
+         s = socket.socket(socket.AF_UNIX)\n\
+         s.bind('/run/innerwarden-record/graph.sock')\n\
+         s.listen(8)\n\
+         while True:\n    \
+             c, _ = s.accept()\n    \
+             d = c.recv(1 << 20)\n    \
+             open('/tmp/heard', 'ab').write(d)\n    \
+             c.sendall(b'ok')\n    \
+             c.close()\n",
+    )
+    .unwrap();
+    let inner = format!(
+        "mount -t tmpfs none /run/innerwarden-record || exit 3; \
+         python3 '{}' & i=0; \
+         while [ ! -S /run/innerwarden-record/graph.sock ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; \
+         mount -o remount,ro /run/innerwarden-record; \
+         {}; if [ -s /tmp/heard ]; then echo HEARD; fi; kill $! 2>/dev/null; true",
+        fake.display(),
+        jail_hook_line("inner"),
+    );
+    let script = format!(
+        "command -v unshare >/dev/null || {{ echo NO-UNSHARE; exit 0; }}; \
+         command -v python3 >/dev/null || {{ echo NO_PYTHON; exit 0; }}; \
+         if unshare -Urm /bin/sh -c '{}'; then echo UNSHARED; else echo UNSHARE-REFUSED; fi; {}",
+        inner.replace('\'', "'\\''"),
+        jail_hook_line("outer"),
+    );
+    let output = record_jail_sh(false, h, project.path(), &script)
+        .output()
+        .expect("run the jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{out} {err}");
+    assert!(!out.contains("NO_PYTHON"), "the jail needs python3: {out}");
+    assert!(
+        !out.contains("HEARD"),
+        "the program's socket heard the hook: {out} {err}"
+    );
+    match filter_here() {
+        FilterHere::Taken => {
+            assert!(
+                out.contains("UNSHARE-REFUSED") || out.contains("NO-UNSHARE"),
+                "{out} {err}"
+            );
+            assert!(
+                out.contains("hook-outer=2") || out.contains("NO-UNSHARE"),
+                "{out}"
+            );
+            if !out.contains("NO-UNSHARE") {
+                let record =
+                    std::fs::read_to_string(project.path().join(".innerwarden/graph.json"))
+                        .unwrap_or_default();
+                assert!(record.contains("evil.example/outer.sh"), "{record} {err}");
+                assert!(
+                    err.contains("is read-only inside the jail; the launcher writes"),
+                    "{err}"
+                );
+            }
+        }
+        FilterHere::NotTaken => {
+            assert!(
+                err.contains("stays writable inside the jail this run: user namespaces stay open"),
+                "{err}"
+            );
+        }
+        other => panic!("the jail ran on a host where {other:?}: {out} {err}"),
+    }
 }
 
 /// The hook line of a jail script: one refused command handed to the hook,

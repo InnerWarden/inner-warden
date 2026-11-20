@@ -21,6 +21,9 @@
 //! `/proc/self/mountinfo` shows that mount, read-only, on a device of its
 //! own. A folder of that name made on the jail's `/run` (a tmpfs the jail
 //! writes) is not taken for it: the hook then records as outside a jail.
+//! The launcher opens the channel only in a jail whose seccomp filter keeps
+//! user namespaces closed, plain jails included: with them open a program
+//! could make a mount namespace of its own and mount its own socket there.
 //!
 //! What the jail says is not taken as it says it. The launcher puts in its
 //! own instance id and project on every decision, never keeps a host's
@@ -313,6 +316,11 @@ fn decision_from(value: &Value) -> Option<Decision> {
 /// the jail writes, is not that mount and is never taken for it: the hook
 /// then records as it does outside a jail, and says so on stderr. Never
 /// read from the environment.
+///
+/// What a program in the jail cannot forge here rests on the launcher, not
+/// on this check: it opens the channel only in a jail whose filter keeps
+/// user namespaces closed (no new mount namespace, no mount over this
+/// place). The device and `ro` read here only refuse a plain folder.
 #[cfg(target_os = "linux")]
 pub fn in_record_jail() -> bool {
     static HERE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -523,15 +531,24 @@ fn connect_until(
     for (to, from) in addr.sun_path.iter_mut().zip(path) {
         *to = *from as libc::c_char;
     }
+    // Closed on exec from its making where the kernel takes the flag
+    // (Linux); elsewhere set right after, before anything is run.
+    #[cfg(target_os = "linux")]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
+    #[cfg(not(target_os = "linux"))]
+    let kind = libc::SOCK_STREAM;
     // SAFETY: plain socket(2); the descriptor is owned by the stream at once.
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    let fd = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
     if fd < 0 {
         return Err(UNREACHABLE);
     }
     // SAFETY: `fd` is a new descriptor of ours, owned by nothing else.
     let stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
     // SAFETY: fcntl on a descriptor we own.
-    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)
+    };
     stream.set_nonblocking(true).map_err(|_| UNREACHABLE)?;
     // SAFETY: `addr` is a live sockaddr_un of the size given.
     let rc = unsafe {
@@ -681,6 +698,11 @@ impl Lost {
 #[cfg(target_os = "linux")]
 const MAX_TURNED_AWAY: usize = 4096;
 
+/// The next id the launcher gives a report turned away before its id was
+/// seen ([`Shared::turn_away`]).
+#[cfg(target_os = "linux")]
+static ANONYMOUS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// What every thread of the channel shares.
 #[cfg(target_os = "linux")]
 struct Shared {
@@ -758,10 +780,17 @@ impl Shared {
     }
 
     /// A report turned away unread: its sender may send it again, so it is
-    /// counted only once it has not ([`Shared::given_up`]). One with no id,
-    /// or past [`MAX_TURNED_AWAY`] ids, is counted now.
+    /// counted only once it has not, by the same clock
+    /// ([`Shared::given_up`]). One whose id was not seen is kept under an id
+    /// of the launcher's, which never comes back: counted on that clock too.
+    /// Past [`MAX_TURNED_AWAY`] ids, one is counted now.
     fn turn_away(&self, id: Option<u64>) {
-        if let (Some(id), Ok(mut ids)) = (id, self.turned_away.lock()) {
+        let id = id.unwrap_or_else(|| {
+            // Ids the hook never makes: its own are random, these count up
+            // from the top bit.
+            ANONYMOUS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) | (1 << 63)
+        });
+        if let Ok(mut ids) = self.turned_away.lock() {
             if ids.len() < MAX_TURNED_AWAY || ids.contains_key(&id) {
                 ids.insert(id, std::time::Instant::now());
                 return;
@@ -1555,6 +1584,7 @@ mod tests {
         let limits = Limits {
             max_open: 1,
             deadline: std::time::Duration::from_millis(500),
+            abandon_after: std::time::Duration::from_millis(300),
             ..Limits::default()
         };
         let (_base, record, channel, socket) = channel_with(limits, Stamp::default());

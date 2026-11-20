@@ -45,17 +45,29 @@ list, with every limit.
   connections waiting and not sent again, a connection that sends no report
   within 2 seconds, over that rate, a write that failed) is counted in the
   record's health, which `innerwarden graph --stats` and the dashboard
-  show, and in one `guard.jail_record_lost` line when the jail ends. The
-  hook waits at most 3 seconds for its record to be taken; a record not
-  taken never changes the hook's verdict or its exit code (a refusal still
-  exits 2), it is said on the hook's stderr and, on the launcher's side,
-  counted. The hook takes the jail's record channel only where the
-  launcher's mount is there: a folder of that name made inside the jail is
-  not it, and the hook then records as outside a jail. The record's size cap
+  show, and in one `guard.jail_record_lost` line when the jail ends. That
+  count holds what reached `contain`. A report that never reached it (the
+  socket's queue full for the hook's whole wait, or the connect not done in
+  that time) is not in it: it is said on the hook's stderr only. The hook
+  waits at most 3 seconds for its record to be taken; a record not taken
+  never changes the hook's verdict or its exit code (a refusal still exits
+  2). The hook takes the jail's record channel only where the launcher's
+  mount is there: a folder of that name made inside the jail is not it,
+  and the hook then records as outside a jail. `contain` opens the channel
+  only in a jail whose seccomp filter keeps user namespaces closed, a jail
+  without `--identity` included: with them open a program there could
+  mount a socket of its own where the hook hands its decisions. Every
+  Linux jail therefore runs under the identified filter where the host
+  takes it (Linux 4.8 or later, bubblewrap able to hand it in): no new user
+  namespace, no joining one, and no call through another ABI (a 32-bit
+  program does not run), so a nested sandbox (bubblewrap, rootless Podman)
+  does not start inside the jail. Where the host does not take it, the
+  record channel is not opened. The record's size cap
   still pushes its oldest decisions out. An entry at `.innerwarden` that is
   not a folder of the launching account is moved aside first. Where the
-  folder or the socket cannot be had, `contain --identity` refuses to start;
-  a jail without `--identity` runs with the record writable and says so.
+  folder or the socket cannot be had, or the jail's user namespaces cannot
+  be closed, `contain --identity` refuses to start; a jail without
+  `--identity` runs with the record writable and says so.
   On macOS the sandbox gives no such folder. The guard refuses a shell
   command or a file tool that writes, moves or removes the project's
   `.innerwarden` only when the name is written literally (`.innerwarden`,
