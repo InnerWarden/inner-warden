@@ -4,15 +4,18 @@ The short version is in the [README](../README.md). This page holds the full
 list, with every limit.
 
 - Screens shell commands and MCP/tool calls before they run, and returns a
-  verdict: `allow`, `review`, or `deny` (advisory by default).
+  verdict: `allow`, `review`, or `deny`. `innerwarden check` only reports
+  it; the hook `innerwarden install` writes refuses a `deny` (and a
+  `review` with `--block-review`; nothing with `--monitor`), and the MCP
+  proxy starts in `guard`, which refuses a disallowed call.
 - Runs an MCP proxy: a man-in-the-middle in front of an MCP server that inspects
   every JSON-RPC message and can refuse a disallowed tool call inline. stdout
   stays pure MCP traffic, alerts go to stderr. It pins each tool's
   definition the first time a server lists it, and in `guard` and `kill`
   holds a tool whose definition changes, one that may be a rename, and,
   once the server has pins, one it never listed before, until you run
-  `innerwarden mcp approve`. In `guard` and `kill` it also refuses a
-  resource read whose location names a credential (`internal://credentials`,
+  `innerwarden mcp approve`. From the release after 1.6.15, in `guard` and
+  `kill` it also refuses a resource read whose location names a credential (`internal://credentials`,
   `config://auth_tokens`) or is a secret store by its scheme (`vault://`,
   `env://`, `kv://`, `keyring://`, `keychain://`, `ssm://`, `secret://`,
   `secrets://`, `secretsmanager://`, `creds://`, `credentials://`, the cloud
@@ -23,7 +26,8 @@ list, with every limit.
   credentials file in the shell is. A document, a source file, a count or a setting about a
   credential (`docs://credentials-guide`, `file:///repo/src/auth/token.rs`,
   `stats://tokens`) and a file in a folder that names one are read with an
-  alert. In `advisory` and `warn` every one of these is alerted and passes.
+  alert. In `advisory` and `warn` every one of these is alerted and passes,
+  and so is every one in 1.6.15, in any mode.
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
@@ -449,9 +453,9 @@ Also not seen today, and not promised for any date:
   line on its own. The hook also knows the agent's session (an argument that
   came out of an earlier tool result) and the place the call reads, so some
   verdicts depend on what a folder holds when the call is made, such as a
-  read of the home. A download piped to a shell is held for review by
-  `check`, which an installer also looks like, and refused by the hook for
-  an agent. Read `check` as a preview, not as the hook's verdict.
+  read of the home. A download piped to a shell is refused by `check`
+  when it is fetched over `http://` and held for review over `https://`,
+  which an installer also looks like; the hook refuses it for an agent. Read `check` as a preview, not as the hook's verdict.
 
 These are the limits of a guard that reads text. InnerWarden Pro works below
 the text, at the host (Linux): armed for an agent, its Execution Gate decides

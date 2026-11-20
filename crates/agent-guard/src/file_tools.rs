@@ -595,6 +595,8 @@ pub(crate) const HOME_SECRETS: &[&str] = &[
     ".config/gcloud/application_default_credentials.json",
     ".kube/config",
     ".vault-token",
+    ".pgpass",
+    ".my.cnf",
 ];
 
 /// How many entries of `~/.ssh` a read is compared with.
@@ -837,6 +839,8 @@ const HOME_PLACES: &[HomeGroup] = &[
             ".config/hub",
             ".config/git/credentials",
             ".vault-token",
+            ".pgpass",
+            ".my.cnf",
             ".terraform.d/credentials.tfrc.json",
         ],
         trees: &[
@@ -1263,6 +1267,12 @@ pub(crate) fn home_place(relative: &str) -> Option<&'static str> {
         .iter()
         .find(|group| {
             group.files.contains(&relative)
+                // A file known by its whole name, in any case: on a disk that
+                // ignores it (APFS) `.PGPASS` is `.pgpass`.
+                || group.files.iter().any(|file| {
+                    matches!(*file, ".pgpass" | ".my.cnf" | ".vault-token")
+                        && file.eq_ignore_ascii_case(relative)
+                })
                 || group.trees.iter().any(|tree| {
                     relative == *tree
                         || relative

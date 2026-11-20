@@ -510,9 +510,9 @@ mod tests {
     #[test]
     fn procargs2_gives_the_argv_and_never_the_environment() {
         let mut buf = 3i32.to_ne_bytes().to_vec();
-        buf.extend_from_slice(b"/usr/local/bin/node    ");
-        buf.extend_from_slice(b"node /x/openclaw/dist/index.js gateway ");
-        buf.extend_from_slice(b"HOME=/Users/a SECRET=s ");
+        buf.extend_from_slice(b"/usr/local/bin/node\0\0\0\0");
+        buf.extend_from_slice(b"node\0/x/openclaw/dist/index.js\0gateway\0");
+        buf.extend_from_slice(b"HOME=/Users/a\0SECRET=s\0");
         assert_eq!(
             parse_procargs2(&buf),
             vec!["node", "/x/openclaw/dist/index.js", "gateway"]

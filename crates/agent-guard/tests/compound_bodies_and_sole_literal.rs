@@ -167,9 +167,10 @@ fn a_shell_c_line_removing_what_a_search_hands_it_is_that_removal() {
     ] {
         refused(line);
     }
-    // An input the line does not show is held, as `xargs rm -rf` is.
+    // An input the line does not show is refused, as `xargs rm -rf` is:
+    // a recursive removal of targets the line does not name.
     let held = judged("cat list.txt | xargs sh -c 'rm -rf \"$@\"' _");
-    assert_eq!(held.recommendation, "review", "{held:#?}");
+    assert_eq!(held.recommendation, "deny", "{held:#?}");
     for line in [
         "find . -name \"*.o\" -print0 | xargs -0 sh -c 'for f; do rm -f \"$f\"; done' _",
         "find . -name \"*.pyc\" -exec sh -c 'for f; do rm -f \"$f\"; done' _ {} +",
