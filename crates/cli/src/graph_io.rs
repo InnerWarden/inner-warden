@@ -202,8 +202,9 @@ fn own_account_directory(_dir: &std::path::Path) -> bool {
 }
 
 /// [`resolve_and_report`] with the access check supplied, so a test can say
-/// "this account is refused" without a second account on the machine.
-#[cfg(test)]
+/// "this account is refused" without a second account on the machine. Its
+/// tests are Unix's alone (`#[cfg(all(test, unix))]`).
+#[cfg(all(test, unix))]
 fn resolve_report_and_place(
     config_path: &std::path::Path,
     get: impl Fn(&str) -> Option<String>,
@@ -1402,6 +1403,84 @@ pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Dec
         );
     }
     written
+}
+
+/// A refusal written for a jail, told beside the host's own record
+/// `host_graph` too ([`crate::jail_record::Channel::mirror_blocks_to`]): the
+/// same `guard.blocked` line [`persist`] writes beside the project's record,
+/// with the stamp the launcher put on the decision. Only a block or a
+/// would-block, never a demo call; whether a line was told.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn mirror_jail_block(
+    host_graph: &std::path::Path,
+    decision: &crate::jail_record::Decision,
+) -> bool {
+    let crate::jail_record::Decision {
+        session,
+        command,
+        verdict,
+        mode,
+        outcome,
+        origin,
+        ..
+    } = decision;
+    if origin.demo
+        || !matches!(
+            outcome,
+            DecisionOutcome::Blocked | DecisionOutcome::WouldBlock
+        )
+    {
+        return false;
+    }
+    // The jail's word, on the host's incident input: the command and the
+    // session cut and cleaned of control characters, the recommendation
+    // one of the verdict's words or none, the score a score.
+    let recommendation = verdict
+        .get("recommendation")
+        .and_then(Value::as_str)
+        .filter(|word| matches!(*word, "deny" | "review" | "allow"))
+        .unwrap_or("");
+    let risk_score = verdict
+        .get("risk_score")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(100);
+    emit_guard_event(
+        host_graph,
+        &mirrored_text(command, MAX_MIRRORED_COMMAND_CHARS),
+        &json!({"recommendation": recommendation, "risk_score": risk_score}),
+        DecisionContextParts {
+            mode: *mode,
+            outcome: *outcome,
+        },
+        &mirrored_text(session, MAX_MIRRORED_SESSION_CHARS),
+        origin,
+    );
+    true
+}
+
+/// The most characters of a jail's command told beside the host's record.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const MAX_MIRRORED_COMMAND_CHARS: usize = 1024;
+
+/// The most characters of a jail's session name told there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const MAX_MIRRORED_SESSION_CHARS: usize = 128;
+
+/// PURE. `text` as told beside the host's record: every control character
+/// (a newline, an escape, a NUL) a space, and cut to `max` characters with
+/// `[cut]` at the end where it was longer.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn mirrored_text(text: &str, max: usize) -> String {
+    let mut out: String = text
+        .chars()
+        .take(max)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if text.chars().nth(max).is_some() {
+        out.push_str("[cut]");
+    }
+    out
 }
 
 /// Append one BLOCKED / WOULD-BLOCK guard decision to `guard-events.jsonl`, an

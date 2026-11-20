@@ -49,6 +49,27 @@ the text of a command; what it does not see is written down, as measured:
   without `-f`.** It was refused only when also forced, so `rm -r /` passed.
   Recursion alone is now enough, whatever other letters the flag cluster
   holds.
+- **A jail without `--identity` keeps the launcher's records and Claude
+  Code's state out of its reach.** On Linux the launcher's records of its
+  instances, which the dashboard and the host's agents read, are read-only
+  in such a jail (before, a program there could plant one); on macOS the
+  sandbox denies writing them. Each refusal `contain` writes for a Linux
+  jail is also told beside your own record, as a `guard.blocked` line
+  marked `reported_by: jail`: on a host with InnerWarden Community alone a
+  refusal in the jail reached no file the host reads. On Linux Claude
+  Code's `~/.claude.json` is kept per project instead of lost at every
+  launch, cut before each run to Claude Code's own state (MCP servers,
+  allowed tools and the trust of a folder are never carried to the next
+  run), and each jail has `~/.claude/sessions` and `~/.claude/backups` of
+  its own. `~/.claude/settings.json`, which carries the guard's hook, is
+  read-only in every jail (on macOS the sandbox denies writing it, and your
+  own `~/.claude.json`). A jail does not start on a project whose own
+  `.claude/settings*.json` turns every hook off or sets `PreToolUse` hooks
+  without the guard's, and says why. A records folder that was already there is
+  checked, and what `contain` did not write is moved aside. The guard's
+  hook runs a copy of the CLI only root can replace where there is one, so
+  InnerWarden Pro's Execution Gate in enforce (Linux) does not refuse it in
+  the jail. [AI Jail](docs/features.md).
 - **What a pipe hands a shell on its input is its script.** Text that a pipe
   or a here-string hands a shell or an interpreter on its input is read as
   that program's script when the line writes it out (`echo`, `printf`, a
@@ -135,6 +156,18 @@ the text of a command; what it does not see is written down, as measured:
 
 ### AI Jail
 
+- **No jail shows your `~/.claude` writable any more.** That folder carries
+  the settings that wire the guard's hook, and a program in a jail could
+  take the hook out, turn hooks off with a `settings.local.json` of its
+  own, or swap a link there for a file. Each project now has a `~/.claude`
+  of its own, a folder of the launcher's beside its records: on Linux it is
+  bound at `~/.claude`, on macOS Claude Code is pointed at it with
+  `CLAUDE_CONFIG_DIR` and the sandbox denies writing yours, your
+  `~/.claude.json` and the CLI the guard's hook runs. Your settings are
+  read-only copies in it, and a jail does not start where yours or the
+  project's may turn the hook off or cannot be read (a link, not JSON, over
+  4 MiB, `disableAllHooks` other than `false`, hooks in a form it does
+  not read). [Claude Code's state in a jail](docs/features.md).
 - **The proxy settings are passed by their exact names.** `innerwarden
   contain` handed in any variable whose name ended in `_PROXY`. It now hands
   in `HTTP_PROXY`, `HTTPS_PROXY`, `FTP_PROXY`, `ALL_PROXY` and `NO_PROXY`,

@@ -6,8 +6,10 @@
 //!
 //! A test binary of its own: the home is read from the environment.
 
+#[cfg(unix)]
 use innerwarden_agent_guard::mcp::analyze_command;
 
+#[cfg(unix)]
 fn verdict(command: &str) -> String {
     analyze_command(command, None).recommendation
 }

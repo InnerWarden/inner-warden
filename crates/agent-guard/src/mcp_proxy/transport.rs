@@ -1374,8 +1374,9 @@ where
 }
 
 /// The proxy loop. `stop` resolving ends the session as a stop request does:
-/// the server is stopped and reaped, then this returns.
-#[cfg(test)]
+/// the server is stopped and reaped, then this returns. Its tests are
+/// Unix's alone.
+#[cfg(all(test, unix))]
 async fn run_proxy_until<R, W, F, S>(
     client_in: R,
     client_out: W,

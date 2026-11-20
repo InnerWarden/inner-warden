@@ -540,6 +540,8 @@ mod tests {
     use super::*;
     use rcgen::PublicKeyData;
     use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    // Only the Unix test of a missing key file counts connections.
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread::JoinHandle;
 
