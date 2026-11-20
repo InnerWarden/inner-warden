@@ -178,6 +178,186 @@ fn names_the_masks_trust(
     trusted
 }
 
+/// Whether every call of the function `name` on the line keeps what it
+/// prints in view: none sends it into a pipeline stage that is not data
+/// only (`f | at now`, `f | tcsh`, the pipe a here-document of the call
+/// holds), into a command or process substitution, or into a redirect
+/// other than a plain file the line never runs ([`redirects_keep_in_view`]).
+/// A data-only stage that writes files (`tee`) is held to the same rule.
+fn function_output_stays_in_view(root: tree_sitter::Node<'_>, source: &[u8], name: &str) -> bool {
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    commands
+        .into_iter()
+        .filter(|command| {
+            let effective = command_words(*command, source).and_then(|words| {
+                effective_command_words(&words, 0).map(|effective| effective[0].clone())
+            });
+            effective
+                .or_else(|| command_name(*command, source))
+                .is_some_and(|called| normalized_command_name(&called) == name)
+        })
+        .all(|call| call_output_stays_in_view(call, source))
+}
+
+/// [`function_output_stays_in_view`] for one call.
+fn call_output_stays_in_view(call: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    // Every command of a stage that reads what the call prints: data only,
+    // and writing no file the line runs.
+    let reads_as_data = |stage: tree_sitter::Node<'_>| {
+        let mut commands = Vec::new();
+        collect_all_commands(stage, &mut commands, 0);
+        let mut redirected = Vec::new();
+        collect_nodes_of_kind(stage, "redirected_statement", &mut redirected, 0);
+        if stage.kind() == "redirected_statement" {
+            redirected.push(stage);
+        }
+        !commands.is_empty()
+            && commands.into_iter().all(|command| {
+                classify_pipeline_command(command, source) == PipelineCommand::DataOnly
+                    && tee_targets_never_run(command, source)
+            })
+            && redirected
+                .into_iter()
+                .all(|statement| redirects_keep_in_view(statement, source))
+    };
+    let mut current = call;
+    for _ in 0..MAX_AST_DEPTH {
+        let Some(parent) = current.parent() else {
+            return true;
+        };
+        match parent.kind() {
+            "pipeline" => {
+                let mut cursor = parent.walk();
+                let later: Vec<_> = parent
+                    .named_children(&mut cursor)
+                    .filter(|stage| stage.kind() != "comment")
+                    .filter(|stage| stage.start_byte() >= current.end_byte())
+                    .collect();
+                if !later.into_iter().all(reads_as_data) {
+                    return false;
+                }
+            }
+            "redirected_statement" => {
+                let applies = statement_target(parent)
+                    .is_some_and(|target| within(call, target) || within(target, call));
+                if applies && !redirects_keep_in_view(parent, source) {
+                    return false;
+                }
+                // The grammar hangs the `| tcsh` of `f <<'EOF' | tcsh` inside
+                // the here-document: every stage of that pipe reads the call.
+                let mut cursor = parent.walk();
+                let piped: Vec<_> = parent
+                    .children(&mut cursor)
+                    .filter(|child| child.kind() == "heredoc_redirect")
+                    .filter(|redirect| {
+                        heredoc_owner(*redirect).is_some_and(|owner| within(owner, call))
+                    })
+                    .collect();
+                for redirect in piped {
+                    let mut cursor = redirect.walk();
+                    let stages: Vec<_> = redirect
+                        .named_children(&mut cursor)
+                        .filter(|child| child.kind() == "pipeline")
+                        .collect();
+                    for pipeline in stages {
+                        let mut cursor = pipeline.walk();
+                        let all: Vec<_> = pipeline
+                            .named_children(&mut cursor)
+                            .filter(|stage| stage.kind() != "comment")
+                            .collect();
+                        if !all.into_iter().all(reads_as_data) {
+                            return false;
+                        }
+                    }
+                }
+            }
+            "command_substitution" | "process_substitution" => return false,
+            "function_definition" | "program" => return true,
+            _ => {}
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Whether every output redirect of `redirected` keeps what it is handed
+/// in view: to `/dev/null`, to the standard output or error, or to a plain
+/// file the line never runs ([`file_never_runs`]). A redirect to another
+/// descriptor (`>&3`) is not.
+fn redirects_keep_in_view(redirected: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = redirected.walk();
+    let redirects: Vec<_> = redirected
+        .children_by_field_name("redirect", &mut cursor)
+        .collect();
+    redirects.into_iter().all(|redirect| {
+        if redirect.kind() != "file_redirect" {
+            return true;
+        }
+        let Some(destination) = redirect.child_by_field_name("destination") else {
+            return false;
+        };
+        let text = node_text(redirect, source);
+        let operator = text
+            .get(
+                ..destination
+                    .start_byte()
+                    .saturating_sub(redirect.start_byte()),
+            )
+            .unwrap_or_default()
+            .trim();
+        if !operator.contains('>') {
+            return true;
+        }
+        let target = shell_word(&node_text(destination, source));
+        if operator.ends_with(">&") {
+            return matches!(target.as_str(), "1" | "2");
+        }
+        file_never_runs(destination, source)
+    })
+}
+
+/// Whether the files a `tee` writes are plain files the line never runs.
+fn tee_targets_never_run(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if command_name(command, source).is_none_or(|name| !basename(&name).eq_ignore_ascii_case("tee"))
+    {
+        return true;
+    }
+    command_arguments(command)
+        .into_iter()
+        .filter(|argument| !shell_word(&node_text(*argument, source)).starts_with('-'))
+        .all(|argument| file_never_runs(argument, source))
+}
+
+/// Whether the file a word names is `/dev/null`, or a plain relative path
+/// written out (no expansion, no `~`, no part starting with a dot such as
+/// `.bashrc` or `.git/hooks`) that the line names nowhere else, so no
+/// later command of it runs or loads the file.
+fn file_never_runs(word: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if !word_is_written_out(word, source) {
+        return false;
+    }
+    let path = shell_word(&node_text(word, source));
+    if path == "/dev/null" {
+        return true;
+    }
+    if path.is_empty()
+        || path.starts_with('/')
+        || !path.chars().all(is_plain_path_character)
+        || path.split('/').any(|part| part.starts_with('.'))
+    {
+        return false;
+    }
+    let line = String::from_utf8_lossy(source);
+    let (before, after) = (&line[..word.start_byte()], &line[word.end_byte()..]);
+    !before.contains(path.as_str()) && !after.contains(path.as_str())
+}
+
+/// Whether `inner` lies within `outer`, by bytes.
+fn within(inner: tree_sitter::Node<'_>, outer: tree_sitter::Node<'_>) -> bool {
+    outer.start_byte() <= inner.start_byte() && inner.end_byte() <= outer.end_byte()
+}
+
 /// Builtins that give a name another meaning with no file at all: an alias,
 /// a builtin switched off, another path remembered for a name.
 const NAME_REBINDING_BUILTINS: [&str; 3] = ["alias", "enable", "hash"];
@@ -195,11 +375,17 @@ const DOUBT_MARKS: [&str; 2] = ["PATH", "$["];
 /// 2026-11-10 in the sandbox: guard lowerings ran behind these while the
 /// projection showed none of their text.
 ///
-/// A function defined on the line takes the trust from its own name only:
-/// one named as a command whose words or here-document a mask hid, or as a
-/// name a condition is read by ([`names_the_masks_trust`]), puts them in
-/// doubt; one under any other name (`f() { cat >> notes.md <<'EOF' ...`)
-/// leaves the masks of its body and of the line as they are.
+/// A function defined on the line puts the masks in doubt when its name, as
+/// written, holds a character a plain name never has (`$`, a backtick, `{`,
+/// `/`, a backslash, a quote: read before the name is normalized, which
+/// drops all but the first two), when it is named as a command whose words
+/// or here-document a mask hid or as a name a condition is read by
+/// ([`names_the_masks_trust`]), or when a call of it sends what it prints
+/// anywhere but into view ([`function_output_stays_in_view`]): into a
+/// pipeline stage that is not data only, a substitution, or a redirect that
+/// is not a plain file the line never runs. Otherwise (`f() { cat >>
+/// notes.md <<'EOF' ...; }; f`) the masks of its body and of the line stay
+/// as they are.
 fn masks_are_in_doubt(
     root: tree_sitter::Node<'_>,
     text: &str,
@@ -210,10 +396,16 @@ fn masks_are_in_doubt(
     collect_nodes_of_kind(root, "function_definition", &mut definitions, 0);
     if DOUBT_MARKS.iter().any(|mark| text.contains(mark))
         || definitions.into_iter().any(|definition| {
-            function_definition_name(definition, source).is_none_or(|name| {
-                name.contains(['$', '`', '{', '/', '\\', '\'', '"'])
-                    || trusted.contains(&normalized_command_name(&name))
-            })
+            let written = definition
+                .child_by_field_name("name")
+                .map(|name| node_text(name, source));
+            let Some(name) = function_definition_name(definition, source) else {
+                return true;
+            };
+            written.is_none_or(|written| written.contains(['$', '`', '{', '/', '\\', '\'', '"']))
+                || name.contains(['$', '`'])
+                || trusted.contains(&normalized_command_name(&name))
+                || !function_output_stays_in_view(root, source, &name)
         })
     {
         return true;
@@ -3242,7 +3434,14 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         if shell_code_input(&args) != CodeInput::Stdin {
             continue;
         }
-        if let Some(PipedInput::Text(text)) = piped_input(*command, bytes) {
+        // No pipe: a here-string or here-document of its own (`sh <<<
+        // '...'`), as the reading of unread parts takes it.
+        let script = match piped_input(*command, bytes) {
+            Some(PipedInput::Text(text)) => Some(text),
+            Some(PipedInput::Unread) => None,
+            None => stdin_text_of(*command, bytes),
+        };
+        if let Some(text) = script {
             handed.lines.push(text);
         }
     }
@@ -5996,24 +6195,50 @@ fn command_output_scope<'tree>(
     }
 }
 
-/// The redirected statement whose redirects apply to `node`, climbing only
-/// through `list` nodes (see [`command_output_scope`]). The grammar hangs
-/// the redirect of `a && b > f` on the list, and the shell gives it to `b`
-/// alone ([`statement_owner`]): `a` writes nothing there.
+/// The innermost redirected statement whose redirects apply to `node` (see
+/// [`command_output_scope`]). The grammar hangs the redirect of `a && b >
+/// f` on the list, and the shell gives it to the list's last member alone
+/// ([`statement_target`]): `a` writes nothing there. That member may be
+/// compound (`true && (echo "$f") > r.sh`, a group, an `if`, a loop): a
+/// command inside it, at any depth, writes there. The climb stops at a
+/// substitution or a function body, whose output goes elsewhere.
 fn redirect_owner(node: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
     let mut current = node;
-    while let Some(parent) = current.parent() {
+    for _ in 0..MAX_AST_DEPTH {
+        let parent = current.parent()?;
         match parent.kind() {
             "redirected_statement" => {
-                return statement_owner(parent)
-                    .is_some_and(|owner| {
-                        node.start_byte() <= owner.start_byte()
-                            && owner.end_byte() <= node.end_byte()
-                    })
-                    .then_some(parent);
+                if statement_target(parent)
+                    .is_some_and(|target| within(node, target) || within(target, node))
+                {
+                    return Some(parent);
+                }
             }
-            "list" => current = parent,
-            _ => return None,
+            "command_substitution" | "process_substitution" | "function_definition" | "program" => {
+                return None
+            }
+            _ => {}
+        }
+        current = parent;
+    }
+    None
+}
+
+/// The member of a redirected statement its redirects apply to: the last
+/// member of the list or pipeline the grammar hangs them on, as a node,
+/// whatever it is (a command, a subshell, a group, an `if`, a loop).
+fn statement_target(statement: tree_sitter::Node<'_>) -> Option<tree_sitter::Node<'_>> {
+    let mut node = statement.child_by_field_name("body")?;
+    for _ in 0..MAX_AST_DEPTH {
+        match node.kind() {
+            "list" | "pipeline" => {
+                let mut cursor = node.walk();
+                node = node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() != "comment")
+                    .last()?;
+            }
+            _ => return Some(node),
         }
     }
     None
