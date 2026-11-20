@@ -48,6 +48,13 @@
 //! passed (a call to it is refused). Past those ceilings nothing more is
 //! gathered, the rename check is skipped and the proxy says so
 //! ([`LISTING_CUT_RULE`]); the first listing of a session ends at the cut.
+//! A page is told from a new listing by the client's request, not by the
+//! answer before it: a `tools/list` that sends a `cursor` asks for the next
+//! page, one without asks for a new listing, which ends a listing still
+//! coming in pages unfinished (and with it the session's first listing).
+//! A server is listed before once the record has its listed mark
+//! ([`ServerPins::listed`]), written by its first listing even when that
+//! listing has no tools.
 //! A definition's size and hash are read from the listing as it is, without
 //! building its text or copying it.
 //! without a pin (over [`MAX_PINNED_TOOLS`], a name too long, a full record)
@@ -153,9 +160,21 @@ pub struct PinRecord {
 pub struct ServerPins {
     /// The command line the server is started with, as the proxy was given it.
     pub command: Vec<String>,
+    /// The server was listed before: set by its first listing, even one with
+    /// no tools, so a restarted proxy holds a tool the server never listed
+    /// whether or not the record has pins for it. An entry written before
+    /// this mark existed was written by a listing too, so it reads as listed.
+    #[serde(default = "listed_by_default")]
+    pub listed: bool,
     /// By tool name.
     #[serde(default)]
     pub tools: BTreeMap<String, ToolPin>,
+}
+
+/// An entry of the record without the [`ServerPins::listed`] mark: only a
+/// listing ever wrote one, so it was listed.
+fn listed_by_default() -> bool {
+    true
 }
 
 /// One tool's pinned definition.
@@ -657,9 +676,14 @@ impl PinRecord {
             check.dirty = true;
             ServerPins {
                 command: command.to_vec(),
+                listed: true,
                 tools: BTreeMap::new(),
             }
         });
+        if !pins.listed {
+            pins.listed = true;
+            check.dirty = true;
+        }
         // The pinned tools this listing no longer has, with the definition
         // kept for them: what a new tool is compared with for a rename.
         let listed: HashSet<&str> = tools
@@ -1069,8 +1093,13 @@ pub struct PinSession {
     /// transport to rewrite before the client sees them.
     holds: Vec<(Value, Vec<String>)>,
     /// A listing the server is sending in pages (the last answer carried a
-    /// `nextCursor`): the next answer is its next page.
+    /// `nextCursor`): the answer to a request that sends a cursor back is its
+    /// next page.
     paged: Option<PagedListing>,
+    /// The `tools/list` requests still waiting for an answer, by id: whether
+    /// each sent a cursor (asks for the next page of a listing) or not (asks
+    /// for a new listing). The request decides, not the answer.
+    requests: HashMap<String, ListRequest>,
     /// The session's first listing is over (its last page, or the cut of a
     /// paged one): from here a tool never pinned and never listed is new.
     first_done: bool,
@@ -1083,6 +1112,24 @@ pub struct PinSession {
     /// What the proxy says of a paged listing too long to gather
     /// ([`PinSession::take_cut_notices`]).
     cut_notices: Vec<String>,
+}
+
+/// Most `tools/list` requests kept waiting for their answer
+/// ([`PinSession::note_list_request`]).
+pub const MAX_PENDING_LISTINGS: usize = 256;
+
+/// What a `tools/list` request asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListRequest {
+    /// No cursor: a new listing.
+    New,
+    /// A cursor: the next page of the listing coming in pages.
+    NextPage,
+}
+
+/// A request id as a key: its JSON text.
+fn request_key(id: &Value) -> String {
+    id.to_string()
 }
 
 /// The pages of one listing heard so far.
@@ -1115,6 +1162,7 @@ impl PinSession {
             held: HashMap::new(),
             holds: Vec::new(),
             paged: None,
+            requests: HashMap::new(),
             first_done: false,
             seen: SeenNames::default(),
             notices: Vec::new(),
@@ -1167,6 +1215,13 @@ impl PinSession {
     /// of it ([`PinSession::take_holds`]).
     pub fn check_listing(&mut self, id: Option<&Value>, result: &Value) -> Vec<ToolChange> {
         self.reload();
+        let asked = id.and_then(|id| self.requests.remove(&request_key(id)));
+        // A request with no cursor asks for a new listing: a listing still
+        // coming in pages is over, unfinished, and the first listing of the
+        // session with it, so nothing in the new one passes as first heard.
+        if asked == Some(ListRequest::New) && self.paged.take().is_some() {
+            self.first_done = true;
+        }
         // An answer with no list of tools is not a listing: it changes
         // nothing the session heard.
         let Some(tools) = result.get("tools").and_then(Value::as_array) else {
@@ -1317,12 +1372,41 @@ impl PinSession {
         std::mem::take(&mut self.cut_notices)
     }
 
-    /// Whether the record has pins for this server: it was listed before.
+    /// Note a `tools/list` request the client sent, before its answer comes:
+    /// with a cursor it asks for the next page of a listing, without one for
+    /// a new listing ([`PinSession::check_listing`]). An id already waiting
+    /// is read as a new listing; past [`MAX_PENDING_LISTINGS`] requests the
+    /// answer is read by its own `nextCursor` alone.
+    pub fn note_list_request(&mut self, id: Option<&Value>, params: Option<&Value>) {
+        let Some(id) = id else {
+            return;
+        };
+        let cursor = params
+            .and_then(|p| p.get("cursor"))
+            .is_some_and(|c| !c.is_null());
+        let kind = if cursor {
+            ListRequest::NextPage
+        } else {
+            ListRequest::New
+        };
+        let key = request_key(id);
+        let room = self.requests.len() < MAX_PENDING_LISTINGS;
+        match self.requests.get_mut(&key) {
+            Some(waiting) => *waiting = ListRequest::New,
+            None if room => {
+                self.requests.insert(key, kind);
+            }
+            None => {}
+        }
+    }
+
+    /// Whether the record says this server was listed before: its listed
+    /// mark, or pins for it.
     fn record_has_pins(&self) -> bool {
         self.record
             .servers
             .get(&self.server)
-            .is_some_and(|s| !s.tools.is_empty())
+            .is_some_and(|s| s.listed || !s.tools.is_empty())
     }
 
     /// Whether `tool` has a pin in the record.

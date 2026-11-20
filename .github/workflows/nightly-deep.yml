@@ -313,10 +313,12 @@ jobs:
       - name: Wall-clock ceilings of the reading and the notification fan-out
         # The same switch: the 3 s ceiling of a line built to be slow to read,
         # the 1 s ceiling per line of inline code, and the one-budget ceiling
-        # of slow notification channels on the hook's exit. The push jobs assert their behaviour only.
+        # of slow notification channels on the hook's exit, and the 1 s ceiling
+        # of the inline code reader on the largest code it reads. The push jobs assert their behaviour only.
         env:
           IW_WALL_CLOCK_CEILINGS: "1"
         run: |
           cargo test -p innerwarden-agent-guard --test guard_lowering_parse -- --nocapture
           cargo test -p innerwarden-agent-guard --test inline_runtime_robustness -- --nocapture
           cargo test -p innerwarden --test cjc_j012_notifications -- --nocapture
+          cargo test -p innerwarden-agent-guard --lib shell::inline_calls::tests::the_largest_code_read_is_read_in_well_under_a_second -- --exact --nocapture
