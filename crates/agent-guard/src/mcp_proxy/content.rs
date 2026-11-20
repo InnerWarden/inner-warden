@@ -1672,7 +1672,42 @@ const SECRET_STORE_SCHEMES: &[&str] = &[
     "secretsmanager",
     "creds",
     "credentials",
+    // Cloud secret stores, by the scheme a server names them with.
+    "awssm",
+    "awssecretsmanager",
+    "azurekeyvault",
+    "keyvault",
+    "gcpsecret",
+    "gcpsecretmanager",
+    "secretmanager",
 ];
+
+/// Words that make a scheme a secret store wherever they sit in it
+/// (`x-vault://`, `gcp-secret://`, `azure-key-vault://`): a prefix or a
+/// vendor before the store's word does not make it another thing.
+const SECRET_STORE_WORDS: &[&str] = &[
+    "vault",
+    "keyvault",
+    "keyring",
+    "keychain",
+    "secret",
+    "secrets",
+    "secretsmanager",
+    "secretmanager",
+    "creds",
+    "credentials",
+];
+
+/// A fullwidth letter, digit or sign (`Ｃ`, `１`, `：`) as its ASCII
+/// form: `ＣＲＥＤＥＮＴＩＡＬＳ` names the same thing as `CREDENTIALS`, and the
+/// split into words dropped every fullwidth letter as a separator.
+fn narrow(c: char) -> char {
+    match c {
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+        '\u{3000}' => ' ',
+        _ => c,
+    }
+}
 
 /// Schemes that only say private.
 const PRIVATE_SCHEMES: &[&str] = &["internal", "private"];
@@ -1738,7 +1773,7 @@ fn location_words(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut previous_small = false;
-    for c in text.chars() {
+    for c in text.chars().map(narrow) {
         let small = c.is_lowercase();
         let folded: String = c
             .to_lowercase()
@@ -1837,12 +1872,19 @@ fn credential_word(words: &[String]) -> Option<String> {
 /// this check, and `kv://apiToken`, `vault://x` and `internal://сredentials`
 /// (Cyrillic `с`) were not.
 fn secret_location(decoded: &str) -> Option<SecretLocation> {
-    let (scheme, rest) = match decoded.split_once("://") {
-        Some((scheme, rest)) => (location_words(scheme).join(""), rest),
-        None => (String::new(), decoded),
+    let narrowed: String = decoded.chars().map(narrow).collect();
+    let decoded = narrowed.as_str();
+    let (written, scheme_words, rest) = match decoded.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_lowercase(), location_words(scheme), rest),
+        None => (String::new(), Vec::new(), decoded),
     };
-    if SECRET_STORE_SCHEMES.contains(&scheme.as_str()) {
-        return Some(SecretLocation::Store(format!("{scheme}://")));
+    let scheme = scheme_words.join("");
+    if SECRET_STORE_SCHEMES.contains(&scheme.as_str())
+        || scheme_words
+            .iter()
+            .any(|word| SECRET_STORE_WORDS.contains(&word.as_str()))
+    {
+        return Some(SecretLocation::Store(format!("{written}://")));
     }
     let path = rest.split(['?', '#']).next().unwrap_or_default();
     let last = path
@@ -2373,11 +2415,15 @@ mod tests {
     /// scheme, is refused in a mode that blocks (the person's call, as a
     /// credentials file read in the shell is): in any case and spelling the
     /// DVMCP challenges used, and in the ones a held-out set of 2026-11-20
-    /// added (camelCase, short words, store schemes, a Cyrillic `с`).
+    /// added (camelCase, short words, store schemes, a Cyrillic `с`), and
+    /// cloud secret stores (`aws-sm://`, `azure-keyvault://`,
+    /// `gcp-secret://`, `secret-manager://`, `x-vault://`) and a name in
+    /// fullwidth letters, which the second review of 2026-11-20 found read.
     ///
     /// FAILS ON REVERT of the `Store` or `Credential` arm in
     /// `inspect_resource_read`, of the camelCase split or the confusable
-    /// fold in `location_words`, or of the new words in `credential_word`.
+    /// fold in `location_words`, of the new words in `credential_word`,
+    /// of the cloud schemes or `SECRET_STORE_WORDS`, or of `narrow`.
     #[test]
     fn a_location_that_names_a_credential_is_refused() {
         for (uri, why) in [
@@ -2407,6 +2453,14 @@ mod tests {
             ("secrets://x", "secrets://"),
             ("secret://notes", "secret://"),
             ("internal://\u{0441}redentials", "credentials"),
+            ("aws-sm://prod/db", "aws-sm://"),
+            ("azure-keyvault://payments/stripe", "azure-keyvault://"),
+            ("gcp-secret://projects/p1/app", "gcp-secret://"),
+            ("secret-manager://app/db", "secret-manager://"),
+            ("x-vault://team/app", "x-vault://"),
+            ("AZURE-KEY-VAULT://payments", "azure-key-vault://"),
+            ("internal://\u{FF23}\u{FF32}\u{FF25}\u{FF24}\u{FF25}\u{FF2E}\u{FF34}\u{FF29}\u{FF21}\u{FF2C}\u{FF33}", "credentials"),
+            ("\u{FF56}\u{FF41}\u{FF55}\u{FF4C}\u{FF54}://x", "vault://"),
             ("file:///srv/app/db_password", "password"),
             ("https://intranet.example/ops/credentials", "credentials"),
         ] {
