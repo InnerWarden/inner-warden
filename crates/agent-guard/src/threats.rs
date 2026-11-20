@@ -12503,10 +12503,14 @@ fn rm_target_is_root_or_system(target: &str) -> bool {
 }
 
 /// One `rm` invocation read from a shell command segment: whether it is
-/// recursive AND forced, whether it carries `--no-preserve-root`, and its
-/// operands, all belonging to that one `rm` (behind sudo/env/timeout wrappers).
+/// recursive, whether it carries `--no-preserve-root`, and its operands, all
+/// belonging to that one `rm` (behind sudo/env/timeout wrappers). `-f` is not
+/// asked for: with no terminal on stdin, as an agent runs it, `rm -r` asks
+/// nothing and takes the same tree `rm -rf` does. A short-option group with
+/// `r` or `R` is recursive whatever other letters it holds (`-rm`, `-Rz`):
+/// the guard does not stake a verdict on which letters one `rm` rejects.
 struct RmInvocation {
-    recursive_force: bool,
+    recursive: bool,
     no_preserve: bool,
     targets: Vec<String>,
 }
@@ -12571,7 +12575,6 @@ fn segment_rm_invocation(segment: &str) -> Option<RmInvocation> {
     };
 
     let mut recursive = false;
-    let mut force = false;
     let mut no_preserve = false;
     let mut targets: Vec<String> = Vec::new();
     let mut opts_done = false;
@@ -12585,13 +12588,11 @@ fn segment_rm_invocation(segment: &str) -> Option<RmInvocation> {
             "--" => opts_done = true,
             "--no-preserve-root" => no_preserve = true,
             "--recursive" | "--dir" => recursive = true,
-            "--force" => force = true,
             _ if arg.starts_with("--") => {}
             _ if arg.starts_with('-') && arg.len() > 1 => {
                 for c in arg[1..].chars() {
                     match c {
                         'r' | 'R' => recursive = true,
-                        'f' => force = true,
                         _ => {}
                     }
                 }
@@ -12600,7 +12601,7 @@ fn segment_rm_invocation(segment: &str) -> Option<RmInvocation> {
         }
     }
     Some(RmInvocation {
-        recursive_force: recursive && force,
+        recursive,
         no_preserve,
         targets,
     })
@@ -12656,7 +12657,7 @@ fn find_rm_invocation(tokens: &[String]) -> Option<RmInvocation> {
         roots.push(".".to_string());
     }
     Some(RmInvocation {
-        recursive_force: true,
+        recursive: true,
         no_preserve,
         targets: roots,
     })
@@ -13033,21 +13034,20 @@ fn find_and_group_narrows(words: &[String]) -> bool {
 }
 
 /// Does a single shell command segment run `rm` (behind sudo/env/timeout wrappers)
-/// with recursive AND force flags AND a root/system target, all belonging to that
-/// one `rm` invocation? `--no-preserve-root` on the rm counts on its own.
+/// with a recursive flag AND a root/system target, both belonging to that one
+/// `rm` invocation? `--no-preserve-root` on the rm counts on its own.
 fn segment_is_root_wipe(segment: &str) -> bool {
     let Some(rm) = segment_rm_invocation(segment) else {
         return false;
     };
-    rm.no_preserve
-        || (rm.recursive_force && rm.targets.iter().any(|t| rm_target_is_root_or_system(t)))
+    rm.no_preserve || (rm.recursive && rm.targets.iter().any(|t| rm_target_is_root_or_system(t)))
 }
 
-/// Does a single shell command segment run a recursive, forced `rm` of a home
+/// Does a single shell command segment run a recursive `rm` of a home
 /// directory itself or all of its contents (see [`rm_target_is_home`])?
 fn segment_is_home_wipe(segment: &str) -> bool {
     segment_rm_invocation(segment)
-        .is_some_and(|rm| rm.recursive_force && rm.targets.iter().any(|t| rm_target_is_home(t)))
+        .is_some_and(|rm| rm.recursive && rm.targets.iter().any(|t| rm_target_is_home(t)))
 }
 
 /// Drop what makes an `rm` target mean "everything inside" rather than a path
@@ -13574,7 +13574,7 @@ pub fn destructive_rm_in_place(hay: &str, cwd: &str, home: Option<&str>) -> bool
             let Some(rm) = segment_rm_invocation(segment) else {
                 return false;
             };
-            rm.recursive_force
+            rm.recursive
                 && rm.targets.iter().any(|target| {
                     place
                         .resolve(target)
