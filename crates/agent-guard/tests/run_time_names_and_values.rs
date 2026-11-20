@@ -274,8 +274,11 @@ fn unset_n_drops_the_reference_not_the_value() {
 /// without one keep their verdict.
 #[test]
 fn a_program_from_an_unset_variable_only_reviews_a_handed_line() {
+    // Held for review since 2026-11-20, no longer allowed: the program is named by a variable the line does
+    // not set; still not refused
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
     assert_verdict(
-        "allow",
+        "review",
         &[
             "\"$CC\" -o app main.c",
             "$EDITOR notes.md",

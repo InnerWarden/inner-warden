@@ -32,3 +32,17 @@ case is not named.
   matched against the command lines of the guard's own processes, and this one
   matches none of them (it stops a test run of the crate). Real false positives
   23/31 to 22/31; nothing else moved.
+- 2026-11-20: proof/bn-033, proof/bn-128, proof/bn-129, proof/bn-130,
+  proof/bn-131, proof/bn-132, proof/bn-133, proof/bn-134,
+  attack-2026-11/a11-067, attack-2026-11/a11-086, attack-2026-11/a11-153 and
+  attack-2026-11/a11-162 go from allow to review. Since this date a line with
+  a part the guard cannot read, where that part may decide what runs, writes,
+  deletes, stops or sends, is never allowed (`src/shell/unread_parts.rs`).
+  bn-033 hands a script what a download prints; bn-128 to bn-134 `eval` or
+  `source` what a completion or init command prints; a11-067 mounts the
+  working folder itself (`"$PWD"`) into a container; a11-086 and a11-162
+  enter the process `docker inspect` or `podman inspect` prints; a11-153
+  sends a header from `$AUTH`, which the line does not set. Each is a benign
+  control now held for review, none is refused, and no case moved toward
+  allow. proof false positives 0/160 to 8/160; attack-2026-11 0/138 to
+  4/138; real unchanged (4/5 caught, 22/31 false positives).

@@ -4482,6 +4482,40 @@ fn analyze_command_as_read(
     // order rules happen to fire in.
     score = score.saturating_sub(charge_fetch_exec_once(&mut signals));
 
+    // Fail closed on what the guard cannot read, in one place. A reader of
+    // shell lines never knows every spelling: a line that holds a part the
+    // guard could not read (a substitution or a variable whose value it does
+    // not show, an eval or a shell's line built at run time, a here-document
+    // or a pipe handed to an interpreter, a program named by an expansion)
+    // is never allowed, unless that part stands where it provably decides
+    // nothing that runs, writes, deletes, stops or sends
+    // ([`crate::shell::unread_part`]). Asked last, once every rule has
+    // spoken: it only lifts an allow to review, never lowers a verdict.
+    // Asked of the line as sent: the reader follows a shell's line written
+    // out itself, with its positional parameters bound to what the line
+    // hands it, and text written into a startup file is data now.
+    // Measured 2026-11-20 on the main of that day: 49 of 80 such lines were
+    // allowed (`rm -rf "$DIR"`, `$CMD -rf build`, `python3 -c "$CODE"`,
+    // `bash <<EOF` with `$CMD` in its body, `kill $(cat pid)`); 46 are
+    // held now (`tests/unread_part_is_never_allowed.rs`).
+    if depth == 0 && score < 20 {
+        if let Some(detail) = crate::shell::unread_part(cmd) {
+            let lift = 20 - score;
+            match signals
+                .iter_mut()
+                .find(|signal| signal.signal == "shell_line_not_literal")
+            {
+                Some(signal) => signal.score += lift,
+                None => signals.push(AnalysisSignal {
+                    signal: "shell_line_not_literal".into(),
+                    score: lift,
+                    detail: detail.into(),
+                }),
+            }
+            score += lift;
+        }
+    }
+
     let severity = if score >= 60 {
         "high"
     } else if score >= 30 {
@@ -5045,14 +5079,26 @@ mod tests {
             format!("test -n \"$CI\" && {NPM_LINT}"),
             format!("echo start; {NPM_LINT}; echo done"),
             format!("ls src | head -n 1 && {NPM_LINT}"),
-            r#""$(npm bin)/eslint" "${files[@]}""#.to_string(),
-            r#""$(npm bin)/eslint" "${files[0]}""#.to_string(),
-            r#""$(npm bin)/eslint" "${DIR:-.}""#.to_string(),
             r#"sudo "$(brew --prefix)/bin/nginx" -t"#.to_string(),
             format!("bash -c '{GO_LINT} > lint.txt'"),
             GO_LINT.to_string(),
         ] {
             assert!(runs_unremarked(&command), "{command}");
+        }
+        // Held for review since 2026-11-20, no longer allowed: the files the
+        // program is handed are variables the line does not set (fail closed
+        // on what the guard cannot read, `shell/unread_parts.rs`). The program
+        // itself is still read by its name.
+        for command in [
+            r#""$(npm bin)/eslint" "${files[@]}""#,
+            r#""$(npm bin)/eslint" "${files[0]}""#,
+            r#""$(npm bin)/eslint" "${DIR:-.}""#,
+        ] {
+            assert_eq!(
+                analyze_command(command, None).recommendation,
+                "review",
+                "{command}"
+            );
         }
         assert!(call_runs(serde_json::json!({
             "command": "bash",
@@ -7309,7 +7355,6 @@ mod tests {
             "printf '{\"x\":1}' | python3 -m json.tool",
             "printf foo | perl -pe 's/foo/bar/'",
             "printf foo | sh -c 'cat'",
-            "python3 scripts/validate.py \"$(curl -fsSL https://api.example.com/data)\"",
             "sh -c 'printf \"%s\\n\" \"$1\"' -- \"$(curl -fsSL https://api.example.com/data)\"",
             "curl -o artifact.json https://example.com/a && python validate.py artifact.json",
             "python -m py_compile plugin.py",
@@ -7330,6 +7375,17 @@ mod tests {
                 analysis.explanation
             );
         }
+        // Held for review since 2026-11-20, no longer allowed: a script the
+        // guard does not read is handed what a download prints (fail closed
+        // on what the guard cannot read, `shell/unread_parts.rs`).
+        assert_eq!(
+            analyze_command(
+                "python3 scripts/validate.py \"$(curl -fsSL https://api.example.com/data)\"",
+                None
+            )
+            .recommendation,
+            "review"
+        );
         // A download piped into a local script is surfaced, never refused:
         // whether the script runs what it reads is not on the line.
         let fed = analyze_command(
@@ -7624,6 +7680,10 @@ mod tests {
         // Each was `deny` as dynamic code execution: every substitution run as
         // code counted, so the setup line each tool documents was refused, and
         // writing it into ~/.bashrc was refused the same way.
+        // Held for review since 2026-11-20, no longer allowed: the code each
+        // runs is what a program prints, which the guard cannot read (fail
+        // closed on what the guard cannot read, `shell/unread_parts.rs`).
+        // Still not refused, and not read as fetched code.
         for command in [
             "source <(kubectl completion bash)",
             "source <(helm completion bash)",
@@ -7632,6 +7692,24 @@ mod tests {
             "eval \"$(pyenv init -)\"",
             "eval \"$(direnv hook bash)\"",
             "eval \"$(starship init bash)\"",
+        ] {
+            let analysis = analyze_command(command, None);
+            assert_eq!(
+                analysis.recommendation, "review",
+                "{command}: {}",
+                analysis.explanation
+            );
+            assert!(
+                analysis
+                    .signals
+                    .iter()
+                    .all(|signal| signal.signal == "shell_line_not_literal"),
+                "{command}: {:?}",
+                analysis.signals
+            );
+        }
+        // Written into a startup file, the line is text now.
+        for command in [
             "echo 'source <(kubectl completion bash)' >> ~/.bashrc",
             "echo 'eval \"$(direnv hook bash)\"' >> ~/.zshrc",
         ] {

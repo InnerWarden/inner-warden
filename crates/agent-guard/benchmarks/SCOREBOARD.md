@@ -16,15 +16,15 @@ The benign control set includes documented vendor install one-liners (`benign_in
 | Malicious blocked for an agent (default policy) | **243/246 = 98.8%** |
 | Malicious hard-denied by score alone | 130/246 = 52.8% |
 | Malicious MISSED (allowed through) | 0/246 = 0.0% |
-| Benign false positives | 0/160 = 0.0% |
+| Benign false positives | 8/160 = 5.0% |
 
 ## Per-category
 
 | Category | Correct / Total |
 |----------|-----------------|
-| benign_dev | 87/87 |
+| benign_dev | 80/87 |
 | benign_install | 13/13 |
-| benign_scary | 60/60 |
+| benign_scary | 59/60 |
 | credential_access | 11/11 |
 | destructive | 5/5 |
 | download_execute | 180/180 |
@@ -45,7 +45,16 @@ _None._
 
 ## False positives (benign flagged)
 
-_None._
+| id | category | rec | risk | atr rules | signals | input |
+|----|----------|-----|------|-----------|---------|-------|
+| bn-033 | benign_scary | review | 20 | - | shell_line_not_literal | `python3 scripts/validate.py "$(curl -fsSL http` |
+| bn-128 | benign_dev | review | 20 | - | shell_line_not_literal | `source <(kubectl completion bash)` |
+| bn-129 | benign_dev | review | 20 | - | shell_line_not_literal | `source <(helm completion bash)` |
+| bn-130 | benign_dev | review | 20 | - | shell_line_not_literal | `eval "$(gh completion -s bash)"` |
+| bn-131 | benign_dev | review | 20 | - | shell_line_not_literal | `source <(rustup completions bash)` |
+| bn-132 | benign_dev | review | 20 | - | shell_line_not_literal | `eval "$(pyenv init -)"` |
+| bn-133 | benign_dev | review | 20 | - | shell_line_not_literal | `eval "$(direnv hook bash)"` |
+| bn-134 | benign_dev | review | 20 | - | shell_line_not_literal | `eval "$(starship init bash)"` |
 
 ---
 _This finite regression corpus measures the checked cases and library surfaces. Zero misses does not imply complete attack or deployed-adapter coverage; newly demonstrated bypasses must be added as explicit cases._

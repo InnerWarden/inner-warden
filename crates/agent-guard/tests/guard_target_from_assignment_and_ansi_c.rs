@@ -75,10 +75,14 @@ fn a_lowering_verb_whose_target_no_reading_shows_is_held() {
         "S=innerwarden-agent; journalctl -u $S -n 50",
         "S=innerwarden-agent; echo \"systemctl stop $S\"",
         "M=x; git commit -m \"systemctl stop innerwarden-agent\"",
-        "systemctl restart $SVC",
-        "kill $PID",
     ] {
         assert_eq!(verdict(line), "allow", "{line}");
+    }
+    // Held for review since 2026-11-20, no longer allowed: the service or the process stopped is a
+    // variable the line does not set
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    for line in ["systemctl restart $SVC", "kill $PID"] {
+        assert_eq!(verdict(line), "review", "{line}");
     }
 }
 
@@ -131,7 +135,6 @@ fn an_ansi_c_quoted_word_is_judged_as_the_shell_decodes_it() {
 fn a_repository_slug_in_a_path_is_an_argument() {
     for line in [
         "R=InnerWarden/inner-warden; j=$(gh api repos/$R/actions/runs/44556930119/jobs --jq '.jobs[]|select(.name==\"publish\")|.id'); gh api repos/$R/actions/jobs/$j/logs --allow-escape-sequences 2>/dev/null | sed 's/\\x1b\\[[0-9;]*m//g' | grep -i -E 'skip|already|publish|version|dry' | tail -20 | cut -c30-220",
-        "R=InnerWarden/inner-warden; j=$(gh api repos/$R/x); gh api repos/$R/y/$j",
         "gh api a/innerwarden/$j --jq x",
         "ls a/innerwarden/$j",
         "R=InnerWarden/innerwarden-skill; gh pr list --repo $R --json number,title; P=$(gh pr list --repo $R --head release/community-1.6.14 --json number --jq '.[0].number'); gh pr diff $P --repo $R --name-only",

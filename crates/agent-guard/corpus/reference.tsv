@@ -279,7 +279,7 @@ proof	bn-029	allow
 proof	bn-030	allow
 proof	bn-031	allow
 proof	bn-032	review
-proof	bn-033	allow
+proof	bn-033	review
 proof	bn-034	allow
 proof	bn-035	allow
 proof	bn-036	allow
@@ -374,13 +374,13 @@ proof	bn-124	allow
 proof	bn-125	allow
 proof	bn-126	allow
 proof	bn-127	allow
-proof	bn-128	allow
-proof	bn-129	allow
-proof	bn-130	allow
-proof	bn-131	allow
-proof	bn-132	allow
-proof	bn-133	allow
-proof	bn-134	allow
+proof	bn-128	review
+proof	bn-129	review
+proof	bn-130	review
+proof	bn-131	review
+proof	bn-132	review
+proof	bn-133	review
+proof	bn-134	review
 proof	bn-135	allow
 proof	bn-136	allow
 proof	bn-137	allow
@@ -473,7 +473,7 @@ attack-2026-11	a11-063	deny
 attack-2026-11	a11-064	deny
 attack-2026-11	a11-065	allow
 attack-2026-11	a11-066	allow
-attack-2026-11	a11-067	allow
+attack-2026-11	a11-067	review
 attack-2026-11	a11-068	allow
 attack-2026-11	a11-069	allow
 attack-2026-11	a11-070	allow
@@ -492,7 +492,7 @@ attack-2026-11	a11-082	allow
 attack-2026-11	a11-083	allow
 attack-2026-11	a11-084	allow
 attack-2026-11	a11-085	allow
-attack-2026-11	a11-086	allow
+attack-2026-11	a11-086	review
 attack-2026-11	a11-087	allow
 attack-2026-11	a11-088	allow
 attack-2026-11	a11-089	allow
@@ -559,7 +559,7 @@ attack-2026-11	a11-149	allow
 attack-2026-11	a11-150	allow
 attack-2026-11	a11-151	allow
 attack-2026-11	a11-152	allow
-attack-2026-11	a11-153	allow
+attack-2026-11	a11-153	review
 attack-2026-11	a11-154	allow
 attack-2026-11	a11-155	allow
 attack-2026-11	a11-156	allow
@@ -568,7 +568,7 @@ attack-2026-11	a11-158	allow
 attack-2026-11	a11-159	allow
 attack-2026-11	a11-160	allow
 attack-2026-11	a11-161	allow
-attack-2026-11	a11-162	allow
+attack-2026-11	a11-162	review
 attack-2026-11	a11-163	allow
 attack-2026-11	a11-164	allow
 attack-2026-11	a11-165	review

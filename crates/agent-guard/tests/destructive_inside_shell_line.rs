@@ -204,7 +204,10 @@ fn a_c_line_built_at_run_time_is_read_or_reviewed() {
     for line in ["sh -c \"$C\"", "sh -c \"$C\" _ x"] {
         assert_eq!(verdict(line), "review", "{line}");
     }
-    assert_allowed(&["C='make test'; sh -c \"$C\"", "bash -c \"cd $DIR && make\""]);
+    assert_allowed(&["C='make test'; sh -c \"$C\""]);
+    // Held for review since 2026-11-20, no longer allowed: `$DIR` is spliced into the line the shell runs
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_eq!(verdict("bash -c \"cd $DIR && make\""), "review");
 }
 
 /// Past four levels of `xargs` or `find -exec` the line is refused; and a
@@ -264,10 +267,10 @@ fn a_shell_named_by_a_variable_is_a_shell() {
         "$(command -v bash) -c 'rm -rf /'",
         "bash -c 'eval \"$X\"'",
     ]);
-    assert_allowed(&[
-        "$SHELL -c 'echo hi'",
-        "bash -c 'cargo test' && sh -c 'make'",
-    ]);
+    assert_allowed(&["bash -c 'cargo test' && sh -c 'make'"]);
+    // Held for review since 2026-11-20, no longer allowed: the program is named by a variable the line does not set
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_eq!(verdict("$SHELL -c 'echo hi'"), "review");
 }
 
 fn signals(command: &str) -> Vec<String> {
@@ -316,9 +319,11 @@ fn a_program_named_at_run_time_with_c_is_read_as_a_shell() {
     // for one the line does not name, is left to the other rules.
     assert_allowed(&[
         "CC=gcc; $CC -c main.c -o main.o",
-        "$EDITOR -c 'set nu' notes.txt",
         "X=bash; $X -c 'cargo test'",
     ]);
+    // Held for review since 2026-11-20, no longer allowed: the program is named by a variable the line does not set
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_eq!(verdict("$EDITOR -c 'set nu' notes.txt"), "review");
 }
 
 /// An assignment in a function's body runs when the function is called, not
@@ -367,7 +372,10 @@ fn a_program_named_at_run_time_with_an_unwritten_c_line_is_reviewed() {
             signals(line)
         );
     }
-    assert_allowed(&["CC=gcc; $CC -c main.c -o main.o", "$CC -c main.c -o main.o"]);
+    assert_allowed(&["CC=gcc; $CC -c main.c -o main.o"]);
+    // Held for review since 2026-11-20, no longer allowed: the program is named by a variable the line does not set
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_eq!(verdict("$CC -c main.c -o main.o"), "review");
 }
 
 /// A written-out value a function body may overwrite is still judged: the
@@ -463,5 +471,7 @@ fn a_function_body_reading_a_variable_from_outside_is_run_time() {
 #[test]
 fn a_compiler_c_flag_with_an_unwritten_source_is_reviewed() {
     assert_eq!(verdict("$CC -c \"$SRC\" -o out.o"), "review");
-    assert_allowed(&["$CC -c main.c -o main.o"]);
+    // Held for review since 2026-11-20, no longer allowed: the program is named by a variable the line does not set
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_eq!(verdict("$CC -c main.c -o main.o"), "review");
 }

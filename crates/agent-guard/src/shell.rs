@@ -9,8 +9,10 @@
 use std::ops::Range;
 
 mod inline_calls;
+mod unread_parts;
 
 pub(crate) use inline_calls::InlineReading;
+pub(crate) use unread_parts::unread_part;
 
 const MAX_AST_DEPTH: usize = 64;
 const MAX_AST_NODES: usize = 16_384;

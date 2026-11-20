@@ -218,11 +218,16 @@ fn the_guards_name_in_a_working_path_is_not_a_kernel_change() {
             "cd ~/innerwarden/inner-warden && cat >> crates/agent-guard/src/notes.rs <<'XEOF'\n/// a note on id_rsa\nXEOF",
             "D=~/innerwarden/inner-warden; cd \"$D\" && cargo test",
             "for d in ~/innerwarden/*/; do git -C \"$d\" status -s; done",
-            "kill $(pgrep -f vite); cd ~/innerwarden/site && npm run dev",
             "cd ~/innerwarden/inner-warden && for f in $(git diff --name-only); do wc -l \"$f\"; done",
             "cd /opt/innerwarden-src && X=$(ls) && make",
         ],
         "allow",
+    );
+    // Held for review since 2026-11-20, no longer allowed: what `kill` stops is what `pgrep` prints
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    assert_verdict(
+        &["kill $(pgrep -f vite); cd ~/innerwarden/site && npm run dev"],
+        "review",
     );
 }
 
@@ -316,12 +321,15 @@ fn a_search_pattern_after_a_pipe_is_data() {
 /// `is_local_tool_eval_idiom`. Any other eval on the line keeps it.
 #[test]
 fn direnv_export_is_the_hook_it_runs() {
+    // Held for review since 2026-11-20, no longer allowed: the code an `eval` runs is what `direnv` prints;
+    // it is still not refused
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
     assert_verdict(
         &[
             "eval \"$(direnv export bash)\"",
             "cd ~/work/app && eval \"$(direnv export bash)\" && cargo test",
         ],
-        "allow",
+        "review",
     );
     assert_verdict(
         &[

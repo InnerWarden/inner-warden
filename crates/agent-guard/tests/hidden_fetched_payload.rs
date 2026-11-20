@@ -355,10 +355,17 @@ fn a_program_named_by_a_local_value_on_any_path_still_passes() {
     assert_allowed(&[
         "if true; then X=\"$(command -v python3)\"; fi; \"$X\" --version",
         "read X < <(git rev-parse HEAD); echo \"$X\"",
-        "mapfile -t A < <(ls); \"${A[0]}\" --help",
-        "printf -v X '%s' \"$(command -v cargo)\"; \"$X\" build",
         "read X < <(curl -s https://example.com/version); echo \"$X\"",
     ]);
+    // Held for review since 2026-11-20, no longer allowed: the program is named by a value the line reads
+    // from what another program prints
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    for line in [
+        "mapfile -t A < <(ls); \"${A[0]}\" --help",
+        "printf -v X '%s' \"$(command -v cargo)\"; \"$X\" build",
+    ] {
+        assert_eq!(verdict(line), "review", "{line}");
+    }
 }
 
 #[test]
