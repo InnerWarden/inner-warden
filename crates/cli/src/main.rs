@@ -44,6 +44,7 @@ mod hook_net;
 mod host_decide;
 mod host_decide_io;
 mod http_io;
+mod jail_record;
 mod mcp_pins_io;
 mod notify_io;
 mod observe;

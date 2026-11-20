@@ -141,8 +141,10 @@ For command options, JSON output and exit codes, see the
 
 - **Screens** shell commands and MCP/tool calls and returns a verdict
   (`allow` / `review` / `deny`) with a risk score and the signals behind it.
-  Advisory by default; the hook and the proxy can refuse before the action
-  reaches its target.
+  `innerwarden check` only reports. The hook `innerwarden install` writes
+  refuses a `deny` before the action runs (`--block-review` adds `review`,
+  `--monitor` refuses nothing), and the proxy starts in `guard` mode, which
+  refuses a disallowed call before it reaches the server.
 - **MCP proxy**: `innerwarden proxy -- <server>` sits in front of an MCP
   server, reads every JSON-RPC message and refuses a disallowed tool call
   inline.

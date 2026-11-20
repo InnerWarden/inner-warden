@@ -2,6 +2,7 @@
 
 mod glob_names;
 mod guard_doubt;
+mod guard_lowering;
 mod words_after;
 
 /// Prompt injection markers in tool descriptions or responses.
@@ -359,6 +360,13 @@ pub const SENSITIVE_PATHS: &[&str] = &[
     // purpose is to hold a secret.
     ".netrc",
     ".config/gh/hosts.yml",
+    // A password kept in plain text for PostgreSQL (`.pgpass`) and MySQL
+    // (`.my.cnf`), HashiCorp Vault's token, and a KeePass database: files
+    // whose purpose is to hold a secret.
+    ".pgpass",
+    ".my.cnf",
+    ".vault-token",
+    ".kdbx",
     ".npmrc",
     ".pypirc",
     ".env",
@@ -3735,6 +3743,9 @@ fn guard_self_disable_after_patterns(content: &str) -> Option<(&'static str, u32
     if writes_guard_config(content, 0) {
         return Some((GUARD_CONFIG_WRITTEN, 60));
     }
+    if writes_jail_record(content) {
+        return Some((crate::file_tools::JAIL_RECORD_WRITTEN, 60));
+    }
     carrier()
 }
 
@@ -6992,6 +7003,7 @@ const GUARD_VERB_HEADS: &[&str] = &[
     "agent",
     "uninstall",
     "mcp",
+    "mcp-proxy",
 ];
 
 /// The arguments after `innerwarden`: whether they widen what is let through.
@@ -7043,6 +7055,12 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         // with the demo's marker a call that sends no alert. Only the agent's
         // wiring runs it.
         "hook" => !asks_for_help,
+        // `innerwarden mcp-proxy -- <server>`: the layout of older MCP
+        // wrappers. Today's CLI has no such verb, so where it still runs the
+        // proxy is an older guard's, started by an agent's wiring only: one
+        // the agent starts itself stands between it and a server on terms it
+        // chose (a monitor default of an older release).
+        "mcp-proxy" => !asks_for_help,
         // `innerwarden agents approve|profile|allow|revoke`: the decisions
         // about an agent are the person's, every one of them. Listing the
         // agents, connecting them and asking for help are not decisions.
@@ -8891,6 +8909,27 @@ fn home_spelled(target: &str) -> String {
         }
     }
     lower
+}
+
+/// Whether a path names the record folder of the project a command runs
+/// in, as far as the text says ([`crate::file_tools::names_jail_record`]
+/// with no working directory: a `cd` on the line is joined to a relative
+/// target by [`writes_place`]).
+fn names_jail_record_place(target: &str, _taken: bool) -> bool {
+    crate::file_tools::names_jail_record(target, None)
+}
+
+/// Whether a command line writes into, removes or moves a project's record
+/// of decisions ([`crate::file_tools::names_jail_record`]): a redirection,
+/// `rm`, `mv`, `cp`, `truncate`, `sed -i` and every other writer
+/// [`writes_place`] reads. On Linux the jail also shows the folder
+/// read-only; on macOS this refusal is what stands between the agent and
+/// its record.
+fn writes_jail_record(content: &str) -> bool {
+    content
+        .to_ascii_lowercase()
+        .contains(crate::file_tools::JAIL_RECORD_FOLDER)
+        && writes_place(content, 0, names_jail_record_place, false)
 }
 
 /// Whether a path names the guard's configuration directory or a file in it.
@@ -13867,6 +13906,14 @@ fn is_path_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// Secret files of [`SENSITIVE_PATHS`] known by their whole name, a part
+/// of a path on its own: another name that ends the same way
+/// (`backup.my.cnf`) is another file.
+const WHOLE_NAME_SECRETS: &[&str] = &[".pgpass", ".my.cnf", ".vault-token"];
+
+/// Secret files of [`SENSITIVE_PATHS`] matched in any case.
+const CASELESS_SECRETS: &[&str] = &[".pgpass", ".my.cnf", ".vault-token", ".kdbx"];
+
 /// Boundary-aware search for one sensitive pattern in `hay`.
 ///
 /// A plain `contains` fired `.key` inside `d.keys()`, `.env` inside
@@ -13894,6 +13941,21 @@ fn is_path_word_byte(b: u8) -> bool {
 fn sensitive_pattern_in(hay: &str, pat: &str, public: bool) -> bool {
     if pat.contains('/') {
         return hay.contains(pat);
+    }
+    // In any case: on a disk that ignores it (APFS) `~/.PGPASS` is the file.
+    if CASELESS_SECRETS.contains(&pat) && hay.bytes().any(|b| b.is_ascii_uppercase()) {
+        return sensitive_pattern_in(&hay.to_ascii_lowercase(), pat, public);
+    }
+    // A file known by its whole name: `.my.cnf`, not `backup.my.cnf`.
+    if WHOLE_NAME_SECRETS.contains(&pat) {
+        let hb = hay.as_bytes();
+        return hay.match_indices(pat).any(|(start, _)| {
+            let end = start + pat.len();
+            let before_ok = start == 0
+                || !(is_path_word_byte(hb[start - 1]) || matches!(hb[start - 1], b'.' | b'-'));
+            let after_ok = end >= hb.len() || !is_path_word_byte(hb[end]);
+            before_ok && after_ok
+        });
     }
     let hb = hay.as_bytes();
     let dot_anchored = pat.starts_with('.');
@@ -15777,6 +15839,10 @@ pub fn is_hard_sensitive_path(path: &str) -> bool {
             | ".pfx"
             | ".netrc"
             | ".config/gh/hosts.yml"
+            | ".pgpass"
+            | ".my.cnf"
+            | ".vault-token"
+            | ".kdbx"
             | ".cargo/credentials"
             // A tool's stored login, see `tool_credential_store`.
             | "auth.json"
@@ -15917,6 +15983,10 @@ fn is_stored_credential(path: &str, home: Option<&str>) -> bool {
                 | ".git-credentials"
                 | ".netrc"
                 | ".config/gh/hosts.yml"
+                | ".pgpass"
+                | ".my.cnf"
+                | ".vault-token"
+                | ".kdbx"
                 | ".gnupg/"
                 | "/etc/shadow"
                 | "/etc/gshadow"
@@ -16416,6 +16486,9 @@ const HARD_FILES_BY_PARTS: &[(&str, &str)] = &[
     ("/etc/gshadow", "/etc/gshadow"),
     ("~/.git-credentials", ".git-credentials"),
     ("~/.netrc", ".netrc"),
+    ("~/.pgpass", ".pgpass"),
+    ("~/.my.cnf", ".my.cnf"),
+    ("~/.vault-token", ".vault-token"),
     ("~/.aws/credentials", ".aws/credentials"),
     ("~/.config/gh/hosts.yml", ".config/gh/hosts.yml"),
 ];
@@ -18221,7 +18294,7 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     // none of its processes, whatever words it holds: `pkill -f 'cargo test
     // -p innerwarden-agent-guard'` stops a test run. Such a command is no
     // kill of the guard, and the two checks of one below do not read it.
-    let (kill_read, names_guard) = pkills_read(content, &lower);
+    let (kill_read, pkill) = pkills_read(content, &lower);
     // Direct verb+target phrases (service control / process kill / self-disable).
     if let Some(i) = SECURITY_TAMPER_INDICATORS
         .iter()
@@ -18244,11 +18317,32 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     if let Some(hit) = check_disable_verb_reaches_target(&kill_read) {
         return Some((hit, 60));
     }
-    if names_guard {
+    if pkill == PkillReach::NamesGuard {
         return Some((
-            "kill InnerWarden (a pkill -f pattern that matches its command line)",
+            "kill InnerWarden (a pkill pattern that matches its command line or its name)",
             60,
         ));
+    }
+    let fed = guard_lowering::pgrep_feeds_a_kill_of_the_guard(content);
+    if fed == PkillReach::NamesGuard {
+        return Some((
+            "kill InnerWarden (what a pgrep or pidof finds of its processes, handed to kill)",
+            60,
+        ));
+    }
+    let killall = guard_lowering::killall_reach(content);
+    if killall == PkillReach::NamesGuard {
+        return Some((
+            "kill InnerWarden (a killall name or pattern that is one of its processes)",
+            60,
+        ));
+    }
+    // The verb and the unit as the shell hands them to the program: a
+    // redirection glued to the verb (`stop>&2`) is no end of the command,
+    // and the unit counts wherever it stands. D-Bus calls of systemd's
+    // manager (`busctl`, `dbus-send`, `gdbus`) are read the same way.
+    if let Some(hit) = guard_lowering::service_lowered(content) {
+        return Some((hit, 60));
     }
     // Tearing down the host firewall is the same intent as stopping the monitor,
     // and nothing covered it: `ufw disable` and `iptables -F` both scored 0.
@@ -18304,56 +18398,50 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     if redirect_over_self || removal_of_self {
         return Some(("removing or altering InnerWarden files", 60));
     }
+    // A pattern broad enough to take the guard's processes with others
+    // (`pkill -f proxy`, `pkill -f /usr/local/bin`, `killall -r agent`): the
+    // guard goes down too, so a person decides.
+    if pkill.max(fed).max(killall) == PkillReach::Broad {
+        return Some((
+            "kill processes the guard's are among (a pattern that matches a whole word of its command line or name)",
+            25,
+        ));
+    }
     None
 }
 
-/// Command lines the guard's own processes run with: the Community CLI (its
-/// hook, its MCP proxy, its dashboard) and the Pro daemons, as their
-/// installers and units start them. A `pkill -f` pattern is matched against
-/// each, as `pkill` matches it against every process's command line.
-const GUARD_PROCESS_LINES: &[&str] = &[
-    "/usr/local/bin/innerwarden hook --agent claude-code",
-    "/usr/local/bin/innerwarden mcp-proxy -- npx -y server",
-    "/usr/local/bin/innerwarden dashboard",
-    "/usr/bin/innerwarden hook",
-    "/home/user/.local/bin/innerwarden hook",
-    "innerwarden",
-    "/usr/local/bin/innerwarden-sensor --config /etc/innerwarden/config.toml",
-    "/usr/local/bin/innerwarden-agent --config /etc/innerwarden/agent.toml --dashboard",
-    "/usr/bin/innerwarden-agent --dashboard",
-    "/usr/local/bin/innerwarden-watchdog",
-    "/usr/local/bin/innerwarden-supervisor",
-    "/usr/local/bin/innerwarden-ctl",
-    "/usr/local/bin/innerwarden-dns-guard --bind 127.0.0.2:53 --events /var/lib/innerwarden/dns_guard-events.jsonl",
-    "/usr/local/bin/innerwarden-sensor-esf",
-    "/usr/local/bin/innerwarden-esf-bridge",
-];
-
-/// What a `pkill -f PATTERN` does to the guard's processes.
-#[derive(Debug, PartialEq)]
+/// What a `pkill -f PATTERN` does to the guard's processes, weakest first.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 enum PkillReach {
-    /// The pattern matches none of [`GUARD_PROCESS_LINES`].
+    /// The pattern matches none of the command lines the guard's processes
+    /// run with ([`guard_lowering::guard_lines`]).
     Misses,
-    /// It matches one of them by the guard's name, which it spells some
-    /// way the plain words do not (`[i]nnerwarden`, `inner.arden`).
-    NamesGuard,
-    /// Not read surely, or it matches them by something else
-    /// (`dashboard`, `bin`): left to the checks of the words.
+    /// Not read surely, or it matches them only on another program's part
+    /// (the agent's id, the MCP server the proxy runs) or on letters inside
+    /// one word: left to the checks of the words.
     Unread,
+    /// It matches a whole word the guard wrote and not its name (`proxy`,
+    /// `hook`, the `local` of its folder): the kill takes the guard with
+    /// other programs, so a person decides.
+    Broad,
+    /// It touches the guard's name (`warden`, `inner.arden`), or matches
+    /// across the guard's words (`hook --agent claude-code`, `proxy --
+    /// npx`).
+    NamesGuard,
 }
 
 /// `lower` with every `pkill -f` command of `content` (its lowercase
-/// twin, byte for byte) blanked whose pattern matches none of
-/// [`GUARD_PROCESS_LINES`], and whether one matches them by the guard's
-/// name ([`PkillReach`]). Read from `content` as written: `-F` (a
+/// twin, byte for byte) blanked whose pattern matches none of the guard's
+/// command lines ([`guard_lowering::guard_lines`]), and whether one
+/// matches them on a part the guard wrote ([`PkillReach`]). Read from `content` as written: `-F` (a
 /// pidfile) is not `-f`. A command read any less surely (no `-f`, an
 /// option not known, more than one pattern, a pattern that is not a
 /// regular expression) is left as it stands.
-fn pkills_read(content: &str, lower: &str) -> (String, bool) {
+fn pkills_read(content: &str, lower: &str) -> (String, PkillReach) {
     if !lower.contains("pkill") || content.len() != lower.len() {
-        return (lower.to_owned(), false);
+        return (lower.to_owned(), PkillReach::Misses);
     }
-    let mut names_guard = false;
+    let mut reach = PkillReach::Misses;
     let mut out = lower.as_bytes().to_vec();
     let base = content.as_ptr() as usize;
     for segment in shell_command_segments(content) {
@@ -18369,12 +18457,12 @@ fn pkills_read(content: &str, lower: &str) -> (String, bool) {
                     *byte = b' ';
                 }
             }
-            PkillReach::NamesGuard => names_guard = true,
+            found @ (PkillReach::NamesGuard | PkillReach::Broad) => reach = reach.max(found),
             PkillReach::Unread => {}
         }
     }
     let read = String::from_utf8(out).unwrap_or_else(|_| lower.to_owned());
-    (read, names_guard)
+    (read, reach)
 }
 
 /// What `segment`, when it is one `pkill -f PATTERN`, does to the guard's
@@ -18388,7 +18476,11 @@ fn pkill_reach(segment: &str) -> PkillReach {
     }) else {
         return Unread;
     };
-    // Only a plain `pkill`, or one behind `sudo`, `nohup` or `timeout N`.
+    // A plain `pkill`, or one behind `sudo`, `nohup` or `timeout N`, is
+    // read whole. Behind any other launcher the shell reads (`env`,
+    // `command`, `exec`, `xargs`, `nice`) its pattern is read the same
+    // way, but one that misses the guard leaves the words to the checks.
+    let mut wrapped = false;
     let mut before = words[..at].iter().map(String::as_str);
     while let Some(word) = before.next() {
         let duration = |word: Option<&str>| {
@@ -18405,8 +18497,12 @@ fn pkill_reach(segment: &str) -> PkillReach {
             _ => false,
         };
         if !known {
-            return Unread;
+            wrapped = true;
+            break;
         }
+    }
+    if wrapped && launched_command_index(&words) != Some(at) {
+        return Unread;
     }
     let mut full = false;
     let mut patterns: Vec<&str> = Vec::new();
@@ -18465,30 +18561,18 @@ fn pkill_reach(segment: &str) -> PkillReach {
     let [pattern] = patterns.as_slice() else {
         return Unread;
     };
-    if !full || pattern.is_empty() {
+    if pattern.is_empty() {
         return Unread;
     }
-    // Matched with case ignored, `-i` or not: a pattern that may match the
-    // guard's line in any case counts.
-    let Ok(regex) = regex::RegexBuilder::new(pattern)
-        .case_insensitive(true)
-        .size_limit(1 << 20)
-        .build()
-    else {
-        return Unread;
-    };
-    // By the name when the line with the name spelled out of reach no
-    // longer matches.
-    let unnamed = |line: &str| line.replace("innerwarden", "xxxxxxxxxxx");
-    if GUARD_PROCESS_LINES
-        .iter()
-        .any(|line| regex.is_match(line) && !regex.is_match(&unnamed(line)))
-    {
-        NamesGuard
-    } else if GUARD_PROCESS_LINES.iter().any(|line| regex.is_match(line)) {
+    // Matched with case ignored, `-i` or not, in each dialect that may
+    // run it: with `-f` against the guard's command lines, without it
+    // against its process names. A pattern that misses the names leaves the
+    // words to the checks (`pkill auditd` is another control's).
+    let reach = guard_lowering::reach_of_pattern(pattern, full);
+    if (wrapped || !full) && reach == Misses {
         Unread
     } else {
-        Misses
+        reach
     }
 }
 
@@ -26846,6 +26930,67 @@ mod brq_evaluation_tests {
                 "a verb run through a program is still the agent running it: {cmd}"
             );
         }
+    }
+
+    /// The record of decisions an AI Jail keeps in the project
+    /// (`.innerwarden`) is refused to every shell writer: before, `rm -rf
+    /// .innerwarden`, a redirection onto its `graph.json` and a `mv` of the
+    /// folder were all allowed (no rule matched), and a jailed agent erased
+    /// what it had been refused. Reading it, and a folder of another name,
+    /// stay allowed.
+    ///
+    /// FAILS ON REVERT: drop the `writes_jail_record` call and these are
+    /// `None`.
+    #[test]
+    fn a_shell_write_into_the_jails_record_is_a_bypass() {
+        for cmd in [
+            "rm -rf .innerwarden",
+            "rm -rf /home/dev/proj/.innerwarden",
+            "rm .innerwarden/graph.json",
+            "echo {} > .innerwarden/graph.json",
+            "truncate -s0 .innerwarden/graph.json",
+            "mv .innerwarden /tmp/old",
+            "cp /tmp/forged.json .innerwarden/graph.json",
+            "cd /home/dev/proj && rm -rf .innerwarden",
+            "sed -i 's/blocked/allowed/' .innerwarden/graph.json",
+        ] {
+            assert_eq!(
+                check_guard_self_disable(cmd).map(|(why, _)| why),
+                Some(crate::file_tools::JAIL_RECORD_WRITTEN),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            "cat .innerwarden/graph.json",
+            "ls -la .innerwarden",
+            "cp .innerwarden/graph.json /tmp/copy.json",
+            "jq . .innerwarden/graph.json",
+            "rm -rf build/ .cache/",
+            "echo hi > notes.txt",
+        ] {
+            assert_eq!(check_guard_self_disable(cmd), None, "{cmd}");
+        }
+    }
+
+    /// A folder named `.innerwarden` that is not the project's
+    /// record (a dependency's, the system's) is the agent's to change; the
+    /// project's, named from a folder below it, is still refused.
+    ///
+    /// FAILS ON REVERT: refuse any component named `.innerwarden` and
+    /// the first three are refused.
+    #[test]
+    fn a_shell_write_into_another_innerwarden_folder_is_not_a_bypass() {
+        for cmd in [
+            "rm -rf node_modules/pkg/.innerwarden",
+            "rm -rf /opt/tool/.innerwarden",
+            "echo {} > fixtures/.innerwarden/graph.json",
+        ] {
+            assert_eq!(check_guard_self_disable(cmd), None, "{cmd}");
+        }
+        assert_eq!(
+            check_guard_self_disable("rm -rf ../.innerwarden").map(|(why, _)| why),
+            Some(crate::file_tools::JAIL_RECORD_WRITTEN)
+        );
     }
 
     /// A write into the guard's own configuration directory is the same

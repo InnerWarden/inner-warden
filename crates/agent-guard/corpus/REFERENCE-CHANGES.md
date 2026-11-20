@@ -93,3 +93,11 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   released guard gave each line with `innerwarden check` (1.6.15):
   9/26 denied, the false-positive baseline of this corpus, not a pass.
   No case of another corpus moved.
+- 2026-11-20: own-work grows by own-027..own-049, one group per family of
+  a week of refusals of ordinary work (interpreter code whose text names
+  the guard, messages, read-only `ssh`, text here-documents, read-only
+  `gh` and `jq`, CI wait loops, colour-code stripping, search patterns,
+  path names), all benign and meant to be allowed. The reference holds the
+  verdict of `innerwarden check` (1.6.15, empty home) for each: 7 deny and
+  1 review of 23, the false-positive baseline of these families, not a
+  pass. No case of another corpus moved.

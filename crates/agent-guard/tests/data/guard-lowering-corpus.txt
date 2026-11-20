@@ -1787,6 +1787,56 @@ DENY	unshare -U sudo innerwarden-config-sign lsm --mode disabled --apply
 DENY	watch -n 1 sudo innerwarden-config-sign lsm --mode disabled --apply
 DENY	nice sudo innerwarden-config-sign lsm --mode disabled --apply
 DENY	env -u CLAUDECODE -u CLAUDE_CODE_ENTRYPOINT sudo innerwarden-config-sign lsm --mode disabled --apply
+DENY	pkill -f 'hook --agent claude-code'
+DENY	sudo pkill -f 'hook --agent claude-code'
+DENY	pkill -f 'hook --agent codex'
+DENY	sudo pkill -f 'hook --agent codex'
+DENY	pkill -f 'proxy -- '
+DENY	sudo pkill -f 'proxy -- '
+DENY	pkill -f 'proxy --label claude-code --agent claude-code --mode guard'
+DENY	sudo pkill -f 'proxy --label claude-code --agent claude-code --mode guard'
+DENY	pgrep -f 'proxy -- npx' | xargs kill
+DENY	sudo pgrep -f 'proxy -- npx' | xargs kill
+DENY	kill $(pgrep -f 'hook --agent claude-code')
+DENY	sudo kill $(pgrep -f 'hook --agent claude-code')
+DENY	systemctl stop>&2 innerwarden-agent
+DENY	sudo systemctl stop>&2 innerwarden-agent
+DENY	systemctl stop>/dev/null innerwarden-sensor
+DENY	sudo systemctl stop>/dev/null innerwarden-sensor
+DENY	launchctl unload>/dev/null ~/Library/LaunchAgents/com.innerwarden.agent.plist
+DENY	sudo launchctl unload>/dev/null ~/Library/LaunchAgents/com.innerwarden.agent.plist
+DENY	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StopUnit ss innerwarden-agent.service replace
+DENY	sudo busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StopUnit ss innerwarden-agent.service replace
+DENY	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager KillUnit ssi innerwarden-agent.service all 9
+DENY	sudo busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager KillUnit ssi innerwarden-agent.service all 9
+DENY	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss innerwarden-sensor.service replace
+DENY	sudo busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss innerwarden-sensor.service replace
+DENY	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager MaskUnitFiles asbb 1 innerwarden-agent.service false true
+DENY	sudo busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager MaskUnitFiles asbb 1 innerwarden-agent.service false true
+DENY	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/innerwarden_2dagent_2eservice org.freedesktop.systemd1.Unit Stop s replace
+DENY	sudo busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/innerwarden_2dagent_2eservice org.freedesktop.systemd1.Unit Stop s replace
+DENY	dbus-send --system --print-reply --dest=org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager.StopUnit string:innerwarden-agent.service string:replace
+DENY	sudo dbus-send --system --print-reply --dest=org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager.StopUnit string:innerwarden-agent.service string:replace
+DENY	gdbus call --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 --method org.freedesktop.systemd1.Manager.StopUnit innerwarden-agent.service replace
+DENY	sudo gdbus call --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 --method org.freedesktop.systemd1.Manager.StopUnit innerwarden-agent.service replace
+DENY	pkill -f warden
+DENY	sudo pkill -f warden
+DENY	env pkill -f warden
+DENY	sudo env pkill -f warden
+DENY	pgrep -f warden | xargs kill
+DENY	sudo pgrep -f warden | xargs kill
+DENY	kill $(pidof innerwarden)
+DENY	sudo kill $(pidof innerwarden)
+DENY	pkill -f 'mcp-proxy -- npx'
+DENY	sudo pkill -f 'mcp-proxy -- npx'
+DENY	pkill -f 'innerwar\den'
+DENY	sudo pkill -f 'innerwar\den'
+DENY	killall -r warden
+DENY	sudo killall -r warden
+DENY	systemctl stop 'innerwar*'
+DENY	sudo systemctl stop 'innerwar*'
+DENY	systemctl stop '*warden*'
+DENY	sudo systemctl stop '*warden*'
 ALLOW	innerwarden --version
 ALLOW	innerwarden-ctl agent kernel status
 ALLOW	innerwarden mute --list
@@ -1807,3 +1857,14 @@ ALLOW	sudo innerwarden-ctl exec-gate status
 ALLOW	sudo innerwarden-config-sign exec-gate list
 ALLOW	sudo innerwarden-config-sign secret-guard status
 ALLOW	sudo innerwarden-config-sign secret-guard protect --path /etc/app/prod.key
+ALLOW	pkill -f claude
+ALLOW	pkill -f 'node server.js'
+ALLOW	pkill -f innerwarden-docs-server
+ALLOW	pkill node
+ALLOW	killall node
+ALLOW	systemctl stop 'nginx*'
+ALLOW	pgrep -f 'hook --agent claude-code'
+ALLOW	systemctl stop>&2 nginx
+ALLOW	systemctl status innerwarden-agent
+ALLOW	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager GetUnit s innerwarden-agent.service
+ALLOW	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss nginx.service replace
