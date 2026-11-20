@@ -4,15 +4,18 @@ The short version is in the [README](../README.md). This page holds the full
 list, with every limit.
 
 - Screens shell commands and MCP/tool calls before they run, and returns a
-  verdict: `allow`, `review`, or `deny` (advisory by default).
+  verdict: `allow`, `review`, or `deny`. `innerwarden check` only reports
+  it; the hook `innerwarden install` writes refuses a `deny` (and a
+  `review` with `--block-review`; nothing with `--monitor`), and the MCP
+  proxy starts in `guard`, which refuses a disallowed call.
 - Runs an MCP proxy: a man-in-the-middle in front of an MCP server that inspects
   every JSON-RPC message and can refuse a disallowed tool call inline. stdout
   stays pure MCP traffic, alerts go to stderr. It pins each tool's
   definition the first time a server lists it, and in `guard` and `kill`
   holds a tool whose definition changes, one that may be a rename, and,
   once the server has pins, one it never listed before, until you run
-  `innerwarden mcp approve`. In `guard` and `kill` it also refuses a
-  resource read whose location names a credential (`internal://credentials`,
+  `innerwarden mcp approve`. From the release after 1.6.15, in `guard` and
+  `kill` it also refuses a resource read whose location names a credential (`internal://credentials`,
   `config://auth_tokens`) or is a secret store by its scheme (`vault://`,
   `env://`, `kv://`, `keyring://`, `keychain://`, `ssm://`, `secret://`,
   `secrets://`, `secretsmanager://`, `creds://`, `credentials://`, the cloud
@@ -23,7 +26,8 @@ list, with every limit.
   credentials file in the shell is. A document, a source file, a count or a setting about a
   credential (`docs://credentials-guide`, `file:///repo/src/auth/token.rs`,
   `stats://tokens`) and a file in a folder that names one are read with an
-  alert. In `advisory` and `warn` every one of these is alerted and passes.
+  alert. In `advisory` and `warn` every one of these is alerted and passes,
+  and so is every one in 1.6.15, in any mode.
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
