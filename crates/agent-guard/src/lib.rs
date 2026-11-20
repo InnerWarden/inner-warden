@@ -62,6 +62,7 @@ pub mod file_update;
 pub mod hermes_hook;
 pub mod hook;
 pub mod hook_targets;
+pub mod json_order;
 // Contract types and pure decisions for agent identity.
 pub mod identity;
 pub mod interactive;

@@ -1681,6 +1681,44 @@ fn cursor_answer(exit: std::process::ExitCode) -> std::process::ExitCode {
     exit
 }
 
+/// A Cursor call that comes while ~/.cursor/hooks.json has lost part of the
+/// guard (`agent_hooks::cursor_wiring_lost`): refused in enforce mode until
+/// the entries are back, so an agent that edited one event's entry out of the
+/// file does not keep the others' calls running as if nothing happened. In
+/// monitor mode it is noted and screened as usual.
+fn cursor_wiring_lost(buf: &str, rest: &[String], monitor: bool) -> Option<std::process::ExitCode> {
+    let home = innerwarden_agent_guard::hook::home_dir().ok()?;
+    let why = innerwarden_agent_guard::agent_hooks::cursor_wiring_lost(&home)?;
+    if monitor {
+        eprintln!(
+            "InnerWarden hook: {why}. Run `innerwarden agents connect cursor` to put it back."
+        );
+        return None;
+    }
+    let reason = format!(
+        "InnerWarden refused this call: {why}. Every Cursor call is refused until it is put \
+         back. Run `innerwarden agents connect cursor` to restore it, or \
+         `innerwarden agents disconnect cursor` to take the guard out."
+    );
+    let label = "(Cursor hooks file lost the guard)".to_string();
+    let verdict = serde_json::json!({
+        "command": label,
+        "risk_score": 80,
+        "severity": "high",
+        "signals": [{
+            "signal": "hook_wiring_lost",
+            "score": 80,
+            "detail": why,
+        }],
+        "recommendation": "deny",
+        "explanation": reason,
+    });
+    record_shell(buf, rest, &label, &verdict, monitor, true, None, false);
+    eprintln!("{reason}");
+    note_refusal(reason);
+    Some(std::process::ExitCode::from(2))
+}
+
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let exit = cmd_hook_screen(rest);
     if agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::cursor_hook::AGENT) {
@@ -1717,9 +1755,17 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         match cursor_hook::read(&buf) {
             CursorCall::Call(event, call) => {
                 let _ = CURSOR_EVENT.set(event);
+                if let Some(exit) = cursor_wiring_lost(&buf, rest, monitor) {
+                    return exit;
+                }
                 call.to_string()
             }
-            CursorCall::Canonical => buf,
+            CursorCall::Canonical => {
+                if let Some(exit) = cursor_wiring_lost(&buf, rest, monitor) {
+                    return exit;
+                }
+                buf
+            }
             CursorCall::Other => return std::process::ExitCode::SUCCESS,
             CursorCall::Unreadable(why) => {
                 note_refusal(format!(

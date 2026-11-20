@@ -1470,6 +1470,61 @@ fn cursor_payloads_are_answered_in_cursors_words() {
     assert_eq!(cursor_json(&broken)["permission"], "deny");
 }
 
+/// A Cursor call that comes while ~/.cursor/hooks.json has lost one of the
+/// guard's entries (an agent's file edit, which Cursor does not screen, can
+/// take it out) is refused in enforce mode until the entry is back, and only
+/// noted in monitor mode.
+///
+/// FAILS ON REVERT of `cursor_wiring_lost` in `cmd_hook_screen`: the
+/// shell and MCP calls keep running with reads unscreened.
+#[cfg(unix)]
+#[test]
+fn cursor_refuses_while_its_hooks_file_has_lost_an_entry() {
+    let host = Host::new();
+    let line = CURSOR.command(bin(), false, false);
+    let whole = innerwarden_agent_guard::agent_hooks::merge(json!(null), &CURSOR, &line).unwrap();
+    let file = host.home().join(".cursor/hooks.json");
+    std::fs::create_dir_all(file.parent().unwrap()).expect("cursor dir");
+    let put = |value: &Value| std::fs::write(&file, value.to_string()).expect("hooks.json");
+    let run = |payload: Value| host.run("/bin/sh", &line, &payload);
+
+    put(&whole);
+    let ls = run(host.cursor_shell("ls -la"));
+    assert_eq!(cursor_reads(&ls, true), Call::Runs, "{}", ls.stderr);
+
+    let mut no_read = whole.clone();
+    no_read["hooks"]
+        .as_object_mut()
+        .unwrap()
+        .remove("beforeReadFile");
+    put(&no_read);
+    let ls = run(host.cursor_shell("ls -la"));
+    assert_eq!(cursor_reads(&ls, true), Call::Refused, "{}", ls.stderr);
+    let denied = cursor_json(&ls);
+    assert_eq!(denied["permission"], "deny");
+    assert!(
+        denied["agent_message"].as_str().is_some_and(
+            |m| m.contains(".cursor/hooks.json") && m.contains("agents connect cursor")
+        ),
+        "{denied}"
+    );
+    let mcp = run(host.cursor_mcp("weather", "forecast", json!({"city": "Leeds"})));
+    assert_eq!(cursor_reads(&mcp, true), Call::Refused, "{}", mcp.stderr);
+
+    let monitor = CURSOR.command(bin(), false, true);
+    let noted = host.run("/bin/sh", &monitor, &host.cursor_shell("ls -la"));
+    assert_eq!(cursor_reads(&noted, false), Call::Runs, "{}", noted.stderr);
+    assert!(
+        noted.stderr.contains(".cursor/hooks.json"),
+        "{}",
+        noted.stderr
+    );
+
+    put(&whole);
+    let ls = run(host.cursor_shell("ls -la"));
+    assert_eq!(cursor_reads(&ls, true), Call::Runs, "{}", ls.stderr);
+}
+
 /// `--block-review` refuses a review, and monitor lets every call run,
 /// answered `allow`, a deny included; a call it cannot read ends in 1 there,
 /// which Cursor runs (the monitor entry carries `failClosed: false`).

@@ -558,11 +558,35 @@ const FAIL_CLOSED_PROGRAM: &str = "\"$0\"";
 /// call it would make to mend the hook is refused too. A person who removed
 /// the program without `innerwarden uninstall` puts it back, or takes the
 /// hook out of the agent's settings by hand.
-const FAIL_CLOSED_TAIL: &str = "; s=$?; case $s in 0|2) exit $s;; esac; echo \"InnerWarden \
+pub(crate) const FAIL_CLOSED_TAIL: &str =
+    "; s=$?; case $s in 0|2) exit $s;; esac; echo \"InnerWarden \
+hook: the innerwarden program ended without an answer (exit $s); refusing this tool call rather \
+than letting it run unscreened. To stop this, put the innerwarden program back, or remove the \
+innerwarden hook from the agent settings by hand (~/.claude/settings.json, ~/.codex/hooks.json, \
+~/.gemini/settings.json or ~/.cursor/hooks.json).\" >&2; exit 2";
+
+/// [`FAIL_CLOSED_TAIL`] as 1.6.15 wrote it, before it named Cursor's file.
+/// A line that ends with it is still ours, to read, repair and take out, and
+/// it is the same entry as the one written today ([`with_current_tail`]):
+/// only the words of the refusal differ.
+pub(crate) const FAIL_CLOSED_TAIL_1615: &str =
+    "; s=$?; case $s in 0|2) exit $s;; esac; echo \"InnerWarden \
 hook: the innerwarden program ended without an answer (exit $s); refusing this tool call rather \
 than letting it run unscreened. To stop this, put the innerwarden program back, or remove the \
 innerwarden hook from the agent settings by hand (~/.claude/settings.json, ~/.codex/hooks.json \
 or ~/.gemini/settings.json).\" >&2; exit 2";
+
+/// PURE: a hook line with a fail-closed tail an earlier version wrote
+/// ([`FAIL_CLOSED_TAIL_1615`]) given today's, and any other line as it is.
+/// Two lines that differ only there run the guard the same way.
+pub fn with_current_tail(command: &str) -> std::borrow::Cow<'_, str> {
+    match command.find(FAIL_CLOSED_TAIL_1615) {
+        Some(at) if command[at + FAIL_CLOSED_TAIL_1615.len()..].starts_with('\'') => {
+            std::borrow::Cow::Owned(command.replacen(FAIL_CLOSED_TAIL_1615, FAIL_CLOSED_TAIL, 1))
+        }
+        _ => std::borrow::Cow::Borrowed(command),
+    }
+}
 
 /// What the Gemini monitor line runs after the guard ([`FAIL_CLOSED_TAIL`]
 /// turned the other way): every end but 0 becomes 1, with a note. Gemini CLI
@@ -1033,7 +1057,10 @@ fn guard_words(command: &str) -> Option<(Vec<String>, LineShape)> {
         return Some((words, LineShape::Plain));
     }
     let guard = script.strip_prefix(FAIL_CLOSED_PROGRAM)?;
-    let (guard, shape) = match guard.strip_suffix(FAIL_CLOSED_TAIL) {
+    let (guard, shape) = match guard
+        .strip_suffix(FAIL_CLOSED_TAIL)
+        .or_else(|| guard.strip_suffix(FAIL_CLOSED_TAIL_1615))
+    {
         Some(guard) => (guard, LineShape::FailClosed),
         None => (guard.strip_suffix(FAIL_OPEN_TAIL)?, LineShape::FailOpen),
     };
@@ -2007,6 +2034,37 @@ mod tests {
     /// The tail [`hook_command_for`] writes after a refusing hook on this
     /// platform: [`FAIL_CLOSED`] on unix, nothing elsewhere.
     const CLOSED: &str = if cfg!(unix) { FAIL_CLOSED } else { "" };
+
+    /// The refusal names every agent's hook file, Cursor's included, and a
+    /// line 1.6.15 wrote (its tail without Cursor's file) is still ours: read
+    /// as the same fail-closed line, and the same line as today's once its
+    /// tail is brought up to date. A line that merely carries the old words
+    /// somewhere else is left as it is.
+    ///
+    /// FAILS ON REVERT of the old tail in `guard_words`: the 1.6.15 line is
+    /// no longer read as ours, so uninstall and repair leave it behind.
+    #[test]
+    fn the_refusal_names_cursors_file_and_the_1615_line_is_still_ours() {
+        for file in [
+            "~/.claude/settings.json",
+            "~/.codex/hooks.json",
+            "~/.gemini/settings.json",
+            "~/.cursor/hooks.json",
+        ] {
+            assert!(FAIL_CLOSED_TAIL.contains(file), "{file}");
+        }
+        let today = hook_command_shaped(Path::new(GUARD), false, false, Some("codex"), true);
+        let old = today.replacen(FAIL_CLOSED_TAIL, FAIL_CLOSED_TAIL_1615, 1);
+        assert_ne!(old, today);
+        let line = |command: &str| read_hook_line(&json!({"type": "command", "command": command}));
+        let read = line(&old).expect("the 1.6.15 line is ours");
+        assert!(read.fail_closed);
+        assert_eq!(Some(read), line(&today));
+        assert_eq!(with_current_tail(&old), today);
+        assert_eq!(with_current_tail(&today), today);
+        let elsewhere = format!("echo '{FAIL_CLOSED_TAIL_1615} x' ");
+        assert_eq!(with_current_tail(&elsewhere), elsewhere);
+    }
 
     /// `innerwarden demo` sends each call only to the hooks Claude Code would
     /// run for that tool: ours, under a matcher that includes it, never an
@@ -4239,7 +4297,7 @@ mod tests {
                 stderr.contains(
                     "To stop this, put the innerwarden program back, or remove the innerwarden \
                      hook from the agent settings by hand (~/.claude/settings.json, \
-                     ~/.codex/hooks.json or ~/.gemini/settings.json)."
+                     ~/.codex/hooks.json, ~/.gemini/settings.json or ~/.cursor/hooks.json)."
                 ),
                 "a refusal must name the way out: {stderr}"
             );

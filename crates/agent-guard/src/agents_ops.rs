@@ -836,7 +836,8 @@ fn write_json(
     expected: &[u8],
     reject_symlinks: bool,
 ) -> Result<(), String> {
-    let body = serde_json::to_string_pretty(v).map_err(|e| e.to_string())? + "\n";
+    // The person's keys stay in their order: only what the guard changed moves.
+    let body = crate::json_order::pretty_in_order(Some(expected), v)?;
     if reject_symlinks {
         crate::file_update::replace_if_unchanged_no_symlinks(
             trusted_root,

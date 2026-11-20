@@ -29,6 +29,21 @@ the text of a command; what it does not see is written down, as measured:
   an edit). A shell command that rewrites or removes `~/.cursor/hooks.json` is
   refused. Judged only by the payloads Cursor's hooks documentation gives,
   not on a running Cursor.
+- **A Cursor hooks file that lost part of the guard is refused until it is put
+  back.** Cursor's file edits are not screened, so an edit can take one
+  event's entry out of `~/.cursor/hooks.json` (or turn `failClosed` off). On
+  every Cursor call it still sees, the hook reads the file again and, in
+  enforce mode, refuses the call with the reason until `innerwarden agents
+  connect cursor` restores it (monitor mode only says so). An edit that takes
+  every entry out at once is not seen: Cursor then starts no hook of ours.
+- **Connect keeps your keys in their order.** `agents connect` and
+  `disconnect` write `~/.cursor/hooks.json`, `~/.gemini/settings.json` and
+  the MCP configs back in the order you wrote them; only the guard's entries
+  move. They used to come back sorted.
+- The refusal of a hook whose program is gone now names `~/.cursor/hooks.json`
+  too. A hook line written by 1.6.15 is still read as the guard's (status,
+  repair and uninstall); `agents connect` brings it up to date, and Codex asks
+  to trust the new line once.
 
 ### Security
 

@@ -216,8 +216,11 @@ pub fn gaps() -> Vec<String> {
     vec![
         "Not screened: the agent's own file edits (Cursor has no hook before an edit, only \
          after it), Tab's reads and completions, and its other tools. An edit can change \
-         ~/.cursor/hooks.json itself and take the guard out; a shell command that does is \
-         refused."
+         ~/.cursor/hooks.json itself; a shell command that does is refused. While the file \
+         still lists the guard under some of its events but not all (an entry taken out, \
+         failClosed turned off), every Cursor call the guard still sees is refused until \
+         `innerwarden agents connect cursor` puts it back. An edit that takes out every \
+         entry at once is not seen: Cursor then starts no hook of ours."
             .to_string(),
         "A review asks you for a shell command or an MCP call (`permission: ask`). A read \
          cannot be asked about (`beforeReadFile` takes allow or deny only), so a read rated \
