@@ -627,10 +627,35 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
         !stderr.contains("scope"),
         "flag off: no scope, no word of one: {stderr}"
     );
+    // Flag off: no record. The launcher's records folder is made, empty and
+    // 0700, so the jail shows it read-only and never makes one of its own
+    // in the `~/.local` it writes (before, nothing was made, and a plain
+    // jail could plant a record there). Beside it, this project's folder
+    // for Claude Code's settings file, and nothing else.
+    let state = home.path().join(".local/state/innerwarden");
+    let records = state.join("instances");
     assert!(
-        !home.path().join(".local/state/innerwarden").exists(),
-        "flag off: no directory, no record"
+        std::fs::read_dir(&records)
+            .expect("flag off: the records folder is made")
+            .next()
+            .is_none(),
+        "flag off: no record"
     );
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&records).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+    let projects: Vec<_> = std::fs::read_dir(state.join("jail-claude"))
+        .expect("this project's folder for Claude Code's settings file")
+        .collect();
+    assert_eq!(projects.len(), 1, "{projects:?}");
+    let mut entries: Vec<String> = std::fs::read_dir(&state)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(entries, ["instances", "jail-claude"]);
     // The launcher's marker that the way to the system profiles file is
     // root's: only where the host has that file.
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -3951,17 +3976,18 @@ fn a_folder_the_jail_cannot_have_of_its_own_is_said_to_be_the_hosts() {
 }
 
 /// M30CW-2: Claude Code's folders of its runs are made on the host by a
-/// real identified launch alone, after every check: a plain jail, an
-/// identified dry run and an identified launch refused by the checks make
-/// nothing (a dry run must change nothing, a plain jail is the jail it
-/// was). The real identified launch makes both, empty and 0700.
+/// real launch alone, after every check: a dry run (plain or identified)
+/// and an identified launch refused by the checks make nothing (a dry run
+/// must change nothing). A real launch makes both, empty and 0700: an
+/// identified one, and since the plain jail has folders of its own too (two
+/// plain jails wrote the same `sessions/2.json`), a plain one.
 ///
 /// FAILS ON REVERT: make the folders while the launch is planned, before
-/// the checks, and the dry run and the refused launch make them; or make
-/// them for a plain jail too.
+/// the checks, and the dry runs and the refused launch make them; or make
+/// none for a plain jail.
 #[cfg(target_os = "linux")]
 #[test]
-fn claude_codes_folders_are_made_only_by_a_real_identified_launch() {
+fn claude_codes_folders_are_made_only_by_a_real_launch() {
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     let home = state_home();
@@ -3977,9 +4003,25 @@ fn claude_codes_folders_are_made_only_by_a_real_identified_launch() {
             );
         }
     };
+    let plain_dry = cli()
+        .args(["contain", "--dry-run", "--project", &p, "--", "/bin/true"])
+        .env("HOME", h)
+        .output()
+        .expect("a plain dry run");
+    assert!(
+        plain_dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain_dry.stderr)
+    );
+    assert!(String::from_utf8_lossy(&plain_dry.stdout).contains("/.claude/sessions"));
+    none_made("a plain dry run");
+    // A real plain jail, in a home of its own: it makes both.
+    let plain_home = state_home();
+    let ph = plain_home.path();
+    std::fs::create_dir_all(ph.join(".claude")).unwrap();
     let plain = cli()
         .args(["contain", "--project", &p, "--", "/bin/true"])
-        .env("HOME", h)
+        .env("HOME", ph)
         .output()
         .expect("run a plain jail");
     assert!(
@@ -3987,7 +4029,11 @@ fn claude_codes_folders_are_made_only_by_a_real_identified_launch() {
         "{}",
         String::from_utf8_lossy(&plain.stderr)
     );
-    none_made("a plain jail");
+    for name in ["sessions", "backups"] {
+        let meta = std::fs::symlink_metadata(ph.join(".claude").join(name)).unwrap();
+        assert!(meta.is_dir(), "plain {name}");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700, "plain {name}");
+    }
     let mut dry = cli();
     dry.args([
         "contain",
@@ -5493,6 +5539,17 @@ fn ordinary_dotdirs_are_hidden_as_before_and_nothing_is_added() {
         "Library/Mail",
         "Library/Messages",
         "Library/Safari",
+    ] {
+        expected.push(format!("{home_s}/{name}"));
+    }
+    // Added on purpose (a plain jail keeps Claude Code's state out of the
+    // host's and other jails' reach): the jail's own folders of Claude
+    // Code's runs, and the folder of every project's settings file, covered
+    // before this project's own is bound. The real run above made them.
+    for name in [
+        ".claude/sessions",
+        ".claude/backups",
+        ".local/state/innerwarden/jail-claude",
     ] {
         expected.push(format!("{home_s}/{name}"));
     }
