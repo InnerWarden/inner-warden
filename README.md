@@ -23,9 +23,9 @@ the agent is about to do, and gives a verdict a hook or a proxy can enforce.
 - **No account.** The guard itself sends nothing off the machine (a
   notification channel only if you set one up), and the dashboard is on
   loopback.
-- **Works with the agents you use:** a Claude Code hook, an MCP proxy for
-  Cursor, Codex CLI, Gemini CLI, OpenClaw or any MCP client, and an AI Jail
-  for anything else.
+- **Works with the agents you use:** a hook for Claude Code, Codex CLI,
+  Gemini CLI and Hermes Agent, an MCP proxy for Cursor, OpenClaw or any MCP
+  client, and an AI Jail for anything else.
 - **Open rules, open engine.** Written in Rust, Apache-2.0, with YAML rules
   you can read and extend.
 
@@ -125,7 +125,7 @@ Connect the agent you use:
 
 ```sh
 innerwarden install claude-code       # Claude Code's PreToolUse hook
-innerwarden agents connect cursor    # or: codex, gemini, openclaw
+innerwarden agents connect cursor    # or: codex, gemini, hermes, openclaw
 ```
 
 See what the guard refuses for each connected agent, without running anything:
@@ -162,10 +162,10 @@ The full list, with every limit, is in [docs/features.md](docs/features.md).
 ## How it works
 
 ```text
-  AI agent (Claude Code, Cursor, Codex CLI, Gemini CLI, OpenClaw, ...)
+  AI agent (Claude Code, Codex CLI, Gemini CLI, Hermes Agent, Cursor, ...)
         |  a shell command, a file change, an MCP tool call
         v
-  Claude Code hook  |  MCP proxy  |  innerwarden check  |  AI Jail (contain)
+  agent hooks       |  MCP proxy  |  innerwarden check  |  AI Jail (contain)
         \_______________________ | _______________________/
                                  v
                  agent-guard engine  <--  rules/ (YAML, ATR-derived)
@@ -190,19 +190,20 @@ Whatever agent you run, there is a mechanism and a command for it:
   The text a `Grep` searches for is not judged.
 - **Codex CLI, Gemini CLI** - their own pre-tool hooks (Codex `PreToolUse`
   in `~/.codex/hooks.json`, Gemini `BeforeTool` in `~/.gemini/settings.json`)
-  judge their shell commands and their file changes (`apply_patch`;
-  `write_file` and `replace`), and Gemini's reads (`read_file`,
-  `read_many_files`, `glob`, `grep_search`) by the same secret rules as
-  Claude Code's, and the MCP proxy carries their MCP servers:
+  judge their shell commands and their changes to privileged files
+  (`apply_patch`; `write_file` and `replace`), and Gemini's reads of secrets
+  (`read_file`, `read_many_files`, `glob`, `grep_search`) by the same secret
+  rules as Claude Code's, and the MCP proxy carries their MCP servers:
   `innerwarden agents connect codex` or `gemini`. Codex runs the hook only
   once it trusts it, and connect asks Codex to. Needs Codex CLI 0.166.0 or
   newer (older ones send the session's folder, not the command's) and Gemini
-  CLI 0.26.0 or newer (older ones run no hook unless switched on); measured
-  on macOS with Codex 0.167.2 and Gemini 0.68.0.
+  CLI 0.26.0 or newer (older ones run no hook unless switched on). Codex
+  was measured on Linux with Codex CLI 0.170.0 and on macOS with 0.167.2;
+  Gemini is judged only by its payload, not on a running Gemini.
 - **Hermes Agent** - its own shell hook, under `hooks.pre_tool_call` in
   `~/.hermes/config.yaml`, judges its `terminal` commands (in the `workdir`
-  they name), its file changes through `write_file` and `patch`, and its
-  reads through `read_file` and `search_files`:
+  they name), its changes to privileged files through `write_file` and
+  `patch`, and its reads of secrets through `read_file` and `search_files`:
   `innerwarden agents connect hermes`, which also records the hook's
   approval in `~/.hermes/shell-hooks-allowlist.json` (Hermes skips a hook
   nobody approved). In enforce mode the entry carries `fail_closed: true`, so
@@ -214,9 +215,9 @@ Whatever agent you run, there is a mechanism and a command for it:
   servers).
   Hermes keeps the folder a command `cd`s into for its next command but
   sends the folder it was started in, so a later relative path is judged
-  there. Needs Hermes Agent v0.22.5 or newer; read in its v0.23.1 source,
-  not yet measured on a running Hermes. Reversible with `agents disconnect
-  hermes`.
+  there. Needs Hermes Agent v0.22.5 or newer; measured through Hermes
+  Agent v0.23.1's own hook runner (`hermes hooks test`), not in a full chat.
+  Reversible with `agents disconnect hermes`.
 - **The hook line fails closed.** On Linux and macOS an enforcing hook line
   (Claude Code, Codex, Gemini) runs the guard inside a small `/bin/sh`
   script: if the innerwarden program is missing, cannot start, is killed or

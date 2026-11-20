@@ -7,18 +7,22 @@ list, with every limit.
   verdict: `allow`, `review`, or `deny` (advisory by default).
 - Runs an MCP proxy: a man-in-the-middle in front of an MCP server that inspects
   every JSON-RPC message and can refuse a disallowed tool call inline. stdout
-  stays pure MCP traffic, alerts go to stderr.
+  stays pure MCP traffic, alerts go to stderr. It pins each tool's
+  definition the first time a server lists it, and in `guard` and `kill`
+  holds a tool whose definition changes, one that may be a rename, and,
+  once the server has pins, one it never listed before, until you run
+  `innerwarden mcp approve`.
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
   than pretending to isolate. On Linux, where the host takes it, every jail
   starts its programs under a seccomp filter that refuses `TIOCSTI` and
   `TIOCLINUX`, the terminal commands that push input into your terminal, and
-  new btrfs or bcachefs subvolumes and snapshots. Exported variables whose
-  name says they hold a credential (`OPENAI_API_KEY`, names ending in
-  `_API_KEY`, `_TOKEN`, `_SECRET`, `_PASSWORD` and the like) are taken out of
-  the jailed command's environment, and `--pass-env NAME` hands one in. It
-  goes by the name: a secret under another name still reaches the jail.
+  new btrfs or bcachefs subvolumes and snapshots. The jailed command gets
+  only the variables a shell needs (`PATH`, `HOME`, `USER`, `LOGNAME`,
+  `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ`, `TMPDIR`, `COLORTERM` and the proxy
+  settings); `--pass-env NAME` hands in any other, and `contain` names every
+  variable it kept out, never a value.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
   tell one agent's runs apart. See [Agent identity and trust](agent-identity.md).
@@ -249,12 +253,21 @@ In the MCP proxy and in a line handed to a shell, the guard also does not see:
 - A `-c` variable whose value is set at run time. Such a line is held for
   review, not judged by the value it will hold.
 
+Under an enforcing hook, a line with a part the guard cannot read (a
+substitution, a variable the line does not set to text it writes out) is
+held for review where that part names the program, is code a shell or an
+interpreter runs, is the target of a write, sets what later programs load,
+or is an argument of a program not known to only read or print. A plain
+variable a known program takes only as data does not hold the line. A line
+the shell grammar cannot parse at all keeps the reading it had.
+
 An agent's hook lets a call run unless the guard answers with a refusal. A
 guard that takes too long answers with one, under an enforcing hook: after
 ten seconds of screening (time spent waiting for a CPU is not counted on
 Linux) or 25 seconds on the clock, 20 more with a second opinion from a model
 configured. A tool call longer than 1 MiB is not read and is refused the same
-way. `innerwarden install` writes a 50 second `timeout` on the Claude Code
+way; a tool result past it (PostToolUse) already ran and is recorded from
+its first 1 MiB. `innerwarden install` writes a 50 second `timeout` on the Claude Code
 hook line, so the guard's own refusal comes before Claude Code stops waiting;
 a call Claude Code stops waiting for runs. On macOS and Linux,
 an enforcing Claude Code hook line ends in a short shell tail, and an

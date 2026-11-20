@@ -12,8 +12,9 @@
 //! ```
 //!
 //! Read in Hermes Agent's own source (`agent/shell_hooks.py` and
-//! `hermes_cli/plugins_dispatch.py` at v0.22.5 and v0.23.1), not measured on a
-//! running Hermes:
+//! `hermes_cli/plugins_dispatch.py` at v0.22.5 and v0.23.1), and measured
+//! through Hermes Agent v0.23.1's own hook runner (`hermes hooks test`), not
+//! in a full chat:
 //!
 //! - The command is split into words and started without a shell, with the
 //!   call as JSON on stdin (`tool_name`, `tool_input`, `session_id`, `cwd`).
@@ -790,10 +791,9 @@ pub fn gaps() -> Vec<String> {
          command runs there, and the guard judges it as if it ran on this host."
             .to_string(),
         "`execute_code` keeps one Python kernel across calls, and each call is judged on its \
-         own: a name set in one call and used in the next, or code that builds a command from \
-         pieces, is not followed. In enforce mode a `terminal` command that starts a shell, a \
-         language or a database client with nothing to run is refused, so a process left \
-         waiting cannot be typed into past the guard."
+         own: a name set in one call and used in the next is not followed. In enforce mode a \
+         `terminal` command that starts a shell, a language or a database client with nothing \
+         to run is refused, so a process left waiting cannot be typed into past the guard."
             .to_string(),
         "In enforce mode the entry carries `fail_closed: true`: a guard that is missing, \
          cannot start, is killed, times out or ends without its answer refuses the call. In \

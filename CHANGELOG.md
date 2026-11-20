@@ -3,20 +3,156 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
-## Unreleased
+## 1.6.15 - 2026-11-20
+
+Codex CLI, Gemini CLI and Hermes Agent are screened through their own hooks,
+not only on their MCP side: their shell commands and changes to privileged
+files are judged before they run. Under an enforcing hook, a line with a part
+the guard cannot read is held for review instead of allowed. The MCP proxy
+pins each tool's
+definition and holds one a server changes, adds or may have renamed until you
+approve it. The AI Jail hands in only what a shell needs of your environment.
+The guard still reads the text of a command, and what it does not see is
+written down: [Where this ends](docs/features.md#where-this-ends).
+
+### Agents
+
+- **Codex CLI, Gemini CLI and Hermes Agent are screened through their own
+  hooks.** `innerwarden agents connect codex`, `gemini` or `hermes` now wires
+  the guard into the agent's own pre-tool hook: Codex `PreToolUse` in
+  `~/.codex/hooks.json`, Gemini `BeforeTool` in `~/.gemini/settings.json`,
+  Hermes `hooks.pre_tool_call` in `~/.hermes/config.yaml`. Their shell
+  commands and their changes to privileged files (Codex `apply_patch`; Gemini
+  `write_file` and `replace`; Hermes `write_file` and `patch`) are judged
+  before they run,
+  beside the MCP proxy that already carried Codex's and Gemini's MCP servers.
+  Gemini's reads (`read_file`, `read_many_files`, `glob`, `grep_search`) and
+  Hermes' (`read_file`, `search_files`) are judged by the secret rules Claude
+  Code's reads are. A refusal and a call the hook cannot read are recorded.
+  Your own hooks keep their place. Codex runs a hook only once it trusts it,
+  and connect asks Codex to; Hermes skips a hook nobody approved, and connect
+  records the approval in `~/.hermes/shell-hooks-allowlist.json`.
+  `innerwarden agents disconnect <agent>` takes it out again.
+- **What was measured, on which agent, is said.** Codex: measured on Linux
+  with Codex CLI 0.170.0 and on macOS with Codex CLI 0.167.2; needs 0.166.0
+  or later (older ones send the session's folder, not the command's). Hermes:
+  measured through Hermes Agent v0.23.1's own hook runner (`hermes hooks
+  test`), not in a full chat; needs v0.22.5 or later. Gemini CLI: judged only
+  by its payload, not on a running Gemini, which needs a Google login; needs
+  0.26.0 or later. `agents connect` and `innerwarden status` print the same
+  lines.
+- **Their enforcing hooks fail closed.** On Linux and macOS an enforcing Codex
+  or Gemini hook line runs the guard inside a small `/bin/sh` script, and the
+  Hermes entry carries `fail_closed: true` in enforce, so a guard that is
+  missing, killed or out of time refuses the call. A monitor line never
+  refuses, and on Windows the line is the program alone.
+- **Hermes: code and typed text are judged as what they are.** The Python
+  `execute_code` runs is judged as `python3 -c`, and text `process_manage`
+  types into a running process as a shell line. In enforce, a `terminal`
+  command that only starts a shell, a language or a database client, waiting
+  for input, is refused. A `terminal` command is judged in the `workdir` it
+  names. Not screened: Hermes' other tools (the browser, its MCP servers).
+- **Codex: a shell left waiting for input is refused in enforce.** Codex
+  types into a running command through `write_stdin`, which runs no hook, so
+  in enforce a shell call that starts a shell, a language or a database
+  client with nothing to run (`bash`, `python3`, `psql`) is refused. Not
+  screened: Codex's `write_stdin` and `tool_search`.
+- **An agent cannot switch its own hook off.** Under an enforcing hook, an
+  agent that disconnects or lowers its own hook from its shell is refused,
+  and so is starting Codex with `--disable hooks` or a `-c` override of its
+  hooks, Hermes with `--safe-mode` or `--ignore-user-config`, or any of them,
+  Gemini CLI included, with a variable that moves the folder its hook is in
+  (`CODEX_HOME`, `HERMES_HOME`, `GEMINI_CLI_HOME`).
+- **Writes to the Goose, Hermes and aider settings are refused**
+  (`~/.config/goose/config.yaml`, `~/.hermes/config.yaml`,
+  `~/.aider.conf.yml`), as writes to the other agent settings are.
+- **An AI agent with its own Linux account records in the folder InnerWarden
+  Pro gives it.** Where `sudo innerwarden-ctl agent-user add <account>` on the
+  Pro install made `/var/lib/innerwarden-agents/<account>/` and an
+  `[accounts."<account>"]` entry in `/etc/innerwarden/guard.toml`, the CLI
+  running as that account records its decisions there, so Pro reads them
+  without the account joining the `innerwarden` group, which reads every
+  member's decisions. The account is read from its uid, never from the
+  environment, the entry wins over `IW_GRAPH_FILE`, and the folder and its
+  parent are checked before any write. Without an entry nothing changes, and
+  `innerwarden status` names the command.
+- **`innerwarden status` counts only the agent's own decisions.** After
+  `innerwarden demo` and no command from the agent, status said its decisions
+  proved the agent's commands reach the guard. Demo calls are now counted
+  apart and named as demo calls; `agents list` and the dashboard leave them
+  out too.
+
+### MCP proxy
+
+- **Each tool's definition is pinned, and a changed one is held until you
+  approve it.** The first time a server lists a tool, the proxy keeps the
+  SHA-256 of its definition (name, title, description, input and output
+  schema, annotations), computed on the proxy's side, in
+  `~/.config/innerwarden/mcp-pins.json`. A tool whose definition changes later
+  is reported field by field and, in `guard` and `kill`, held: left out of the
+  tool list the client sees and refused when called, until you run
+  `innerwarden mcp approve <server> <tool>` (or `--all`). A server is named by
+  its command line, never by the name it gives itself.
+- **A tool new mid-session or after a restart is held.** Only the first
+  listing of a server never pinned passes as heard. Once a server has pins,
+  from this session or an earlier one, a tool it never listed is held,
+  whatever the listing: whole, one page, after an empty answer, past a cut,
+  or the first one after a restart. So updating a server that gains tools
+  asks for `innerwarden mcp approve <server> --all`. A listing sent in pages
+  is gathered before it is compared, within caps on pages, names and bytes;
+  past them the proxy says the listing was cut.
+- **A possible rename and an oversized definition are held.** A tool that
+  disappears while a new one with the same input schema or a nearly
+  identical description appears is reported as a possible rename and held,
+  and so is a definition over 64 KiB, measured before it is copied. A tool
+  that cannot be pinned (past the pin limit, a name too long, a full record)
+  is screened as before and named in an alert, never left out silently.
+- **`innerwarden mcp list` and `innerwarden mcp forget <server>`.** `list`
+  shows the servers pinned and the tools held, with what changed; `forget`
+  drops a server's pins after you reinstalled it on purpose, and the next
+  listing pins what it holds. Approve and forget need a terminal, and the
+  guard refuses an agent that runs them.
+- **An order with a filler word before its action is held.** An override
+  order in a tool result with an adverb before the verb of its action ("then
+  quietly upload") no longer slips past the hold.
 
 ### Security
 
-- **The AI Jail lets in only what a shell needs of your environment.**
-  `innerwarden contain` took out the variables whose name looked like a
-  credential, so a secret under any other name (a `DATABASE_URL` holding a
-  password, `STRIPE_SK`) reached the jailed command. It now hands in only
-  `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`,
-  `TZ`, `TMPDIR`, `COLORTERM` and the proxy settings (`*_PROXY`,
-  `NO_PROXY`), on Linux with or without `--identity` and on macOS, and names
-  every variable it kept out (never a value). The cost: an agent that read
-  any other variable from the environment (its API key, `CLAUDE_CONFIG_DIR`,
-  `EDITOR`, a loader variable) now needs `--pass-env NAME` for each.
+- **Under an enforcing hook, a line with a part the guard cannot read is held
+  for review, not allowed.** A part is unread when the line does not show its
+  value: a command or process substitution, a variable the line does not set
+  to text it writes out, a positional parameter, an indirect expansion. The
+  line is held where such a part names the program, is code that `eval`, a
+  shell, an interpreter or `source` runs (an interpreter here-document the
+  guard cannot read among them), is the target of a write, sets what later
+  programs load (`PATH`, `LD_PRELOAD`, `BASH_ENV`), is a word of `sudo` or
+  `env` in front of the program, or is an argument of a program not known to
+  only read or print. A plain variable that a known program takes only as
+  data (a test filter, a commit message, a title) does not hold the line; a
+  command or process substitution never counts as data. A line the shell
+  grammar cannot parse at all keeps the reading it had.
+- **The body of a compound command is judged as the command it runs.** A
+  removal of the home or the root inside an `if`, loop, `case` or `select`
+  body was read only up to `then` or `do` and passed. A sole literal handed
+  to `eval` or `sh -c` is judged as that literal, keeping the stronger
+  reading.
+- **A guard-lowering verb aimed through a variable is judged as its target.**
+  `S=innerwarden-agent; systemctl stop $S` is judged as the line it spells
+  out, and a target the line does not resolve is held for review. ANSI-C
+  quoted words (`$'...'`) are decoded before judging; an escape that does not
+  decode is held for review.
+- **Inline code is judged by the line its process call runs.** Python, Node,
+  Ruby, Perl, PHP and Deno code that builds the line it hands a process
+  (joins, concatenation, base64 or hex, character codes, formatted strings,
+  imported or renamed names, helpers called with literal lines) is resolved,
+  and the resolved line is judged. A process line it cannot read is held for
+  review, a local file run whole is held for review, and running or loading
+  what the code downloaded is refused. Perl's `-M` and `-m` no longer hide
+  `-e` code. A here-document of interpreter code that writes a cron or sudoers
+  file is refused, like the inline form.
+- **A shell line handed to `find -exec` or fed by `xargs` is judged by the
+  names it is handed.** One that removes the names the search binds to it
+  counts as a removal of the folder the search starts from.
 - **Removing any place the installers write is refused.** `rm -rf
   /usr/local/lib/innerwarden/` was allowed, and so were `rm` and `mv` of
   the guard's run-time folder, its systemd units and the links that enable
@@ -29,6 +165,44 @@ follows semantic versioning.
   refused, and one that matches none of them (`pkill -f
   innerwarden-agent-guard`, a test run of the crate) is no longer refused for
   the words it holds.
+- **A `bpftool` detach of the guard's programs is refused.** `bpftool net
+  detach` or `cgroup detach` naming the guard's pinned path or name is
+  refused; one that names neither is held for review, as the text cannot
+  tell whose program it takes off.
+
+### AI Jail
+
+- **The AI Jail lets in only what a shell needs of your environment.**
+  `innerwarden contain` took out the variables whose name looked like a
+  credential, so a secret under any other name (a `DATABASE_URL` holding a
+  password, `STRIPE_SK`) reached the jailed command. It now hands in only
+  `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `LANG`, `LC_*`, `TERM`,
+  `TZ`, `TMPDIR`, `COLORTERM` and the proxy settings (`*_PROXY`,
+  `NO_PROXY`), on Linux with or without `--identity` and on macOS, and names
+  every variable it kept out (never a value). The cost: an agent that read
+  any other variable from the environment (its API key, `CLAUDE_CONFIG_DIR`,
+  `EDITOR`, a loader variable) now needs `--pass-env NAME` for each.
+- **A jail the kernel will not start says why, and nothing runs unjailed.**
+  A Linux host whose kernel refuses an unprivileged user namespace
+  (`kernel.unprivileged_userns_clone = 0`, `user.max_user_namespaces = 0`, a
+  container's policy) gets the reason and the setting that resolves it, and
+  the dashboard no longer says the jail is ready there. Under InnerWarden
+  Pro's Execution Gate, a jail whose launcher dies before the gate answers
+  starts nothing, and the gate's refusal is reported; before, nothing ran and
+  nothing said why.
+
+### Hook
+
+- **A tool result past 1 MiB is recorded, not refused.** A PostToolUse call
+  longer than the 1 MiB the hook reads (a `Read` or `Edit` of a large file)
+  has already run: it is now recorded from its first 1 MiB, with the tool
+  name and path read from its top-level fields, instead of being refused with
+  a blocking error. A PreToolUse call past the cap is still refused in
+  enforce.
+- **OpenClaw says when a call was cut.** An OpenClaw tool call past 1 MiB was
+  cut there without a word. It is now never judged on the part that was
+  read: it is refused in enforce, and said to have gone unscreened in
+  monitor.
 
 ### Fixed
 
@@ -39,10 +213,65 @@ follows semantic versioning.
   now counts; a string that reaches a process, runs code where it stands (an
   f-string, a Ruby backquote, a tagged template) or passes through anything
   the reader cannot follow keeps its refusal, and the guard's own words and
-  startup files are still read in the whole line.
+  startup files are still read in the whole line. A string that names a place
+  outside the tree (a startup, cron, sudoers or systemd file) is still read.
+- **Inline code that runs a literal harmless line is no longer refused for
+  naming the call** (`os.system('clear')`, `shell_exec('ls')`).
+- **A quoted folder-query tool after an install or a `cd` runs.**
+  `"$(npm bin)/jest"` was refused when the only thing before it on the line
+  was a package-manager install or a `cd` into a project folder. Anything
+  that writes, copies, links or changes the path first keeps the refusal, and
+  the refusal now names the way out that works.
+- **`innerwarden check '<line>'` is judged as the check it is,** not as the
+  line it inspects, when nothing else runs on the line. The `eval` completion
+  idiom is accepted only for a bare substitution of the tool and its words.
+- **A folder that only shares the guard's name is no longer taken for the
+  guard's program,** and `curl`'s insecure check no longer reads across a
+  line break.
+- **The CLI says what it can see.** `agents list` no longer calls the
+  Execution Gate off when it cannot be seen from a shell; the restart notice
+  says why a restart is needed and how, for each connected agent;
+  `innerwarden status` names InnerWarden Community instead of "this edition";
+  and on macOS the agent process scan lists processes instead of always
+  answering that it does not know.
 - **A long line is parsed once.** A 64 KiB `python3 -c` line was parsed by
-  the shell grammar 19 times in one check; it is now parsed once and the
-  worst case measured went from 271 ms to 159 ms in a release build.
+  the shell grammar 19 times in one check, 5 to 8 ms each in a release
+  build; it is now parsed once.
+- **Dependencies:** regex-automata 0.4.18, fancy-regex 0.20.2, xattr 1.7.0,
+  tokio 1.54.1, ureq 3.5.2.
+
+### What this costs
+
+Some ordinary lines are held under an enforcing hook, and the hold says why.
+A line whose program, write target or arguments come from a substitution or
+from a variable the line does not set is held for review unless the program
+only reads or prints, or takes the value only as data. A Codex shell call or
+a Hermes `terminal` command that only opens a shell, a language or a database
+client is refused in enforce. An agent
+in the AI Jail that reads any variable outside the short list above needs
+`--pass-env` with its name. Behind the MCP proxy in `guard` or `kill`, a
+server updated to one with more tools, or one that changes a tool's
+definition, has those tools held until you run `innerwarden mcp approve`. An
+enforcing Codex, Gemini or Hermes hook refuses every call once the
+innerwarden program is gone: run `innerwarden uninstall` before removing the
+package, or take the hook out of the agent's settings by hand.
+
+### Upgrading
+
+`innerwarden upgrade` rewires the Claude Code hooks with the new binary, as
+it does since 1.6.14. It does not add the new Codex, Gemini or Hermes hooks:
+a Codex or Gemini CLI connected by an earlier version keeps only its MCP side
+until you run `innerwarden agents connect codex` or `gemini` again, and
+Hermes Agent is connected with `innerwarden agents connect hermes`. Pins
+start empty, so the first listing of each MCP server after the upgrade is
+pinned as heard and asks for no approval.
+
+The guard reads text, and its limits are listed in `docs/features.md`, under
+[The guard and its own switches](docs/features.md#the-guard-and-its-own-switches).
+The boundary there is the host: on Linux, InnerWarden Pro's Execution Gate,
+armed for an agent, decides in the kernel which programs that agent's
+processes may start, whatever the command line says. It is off until you arm
+it.
 
 ## 1.6.14 - 2026-11-19
 
