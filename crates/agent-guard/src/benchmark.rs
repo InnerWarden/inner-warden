@@ -308,7 +308,16 @@ pub fn run(corpus: &Corpus, engine: &RuleEngine) -> Vec<CaseResult> {
                     (a.recommendation, signals, charged, atr, a.risk_score)
                 }
                 Surface::ToolResult => {
-                    let v = inspect_response(&c.input, Some(engine));
+                    // As the proxy reads an answer: the injection screen and
+                    // the orders aimed at the model, which hold the answer
+                    // back in a mode that blocks (`router::inspect_answer`).
+                    // Until 2026-11-20 the suite ran the first only, so an
+                    // answer the proxy withholds was scored as surfaced at
+                    // best, and one it passes could not be told from it.
+                    let mut v = inspect_response(&c.input, Some(engine));
+                    let ordered = crate::mcp::inspect_answer_orders(&c.input);
+                    v.allowed &= ordered.allowed;
+                    v.alerts.extend(ordered.alerts);
                     verdict_fields(&v)
                 }
                 Surface::ToolDescription => {

@@ -52,7 +52,14 @@ impl VerdictAlert {
             .collect();
         Self {
             rule: m.rule_id.clone(),
-            detail: format!("{}: {}", m.title, m.matched_condition),
+            detail: if m.matched.is_empty() {
+                format!("{}: {}", m.title, m.matched_condition)
+            } else {
+                format!(
+                    "{}: {} (matched {})",
+                    m.title, m.matched_condition, m.matched
+                )
+            },
             block,
             category: Some(m.category.clone()),
             owasp: if owasp.is_empty() { None } else { Some(owasp) },

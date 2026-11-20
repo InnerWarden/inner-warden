@@ -72,6 +72,19 @@ impl CompiledRegex {
             Self::Fancy(re) => re.is_match(content).unwrap_or(false),
         }
     }
+
+    /// Where the first match is, as byte offsets.
+    fn find(&self, content: &str) -> Option<(usize, usize)> {
+        match self {
+            Self::Forward(re) => re.find(content),
+            Self::Fast(re) => re.find(content).map(|m| (m.start(), m.end())),
+            Self::Fancy(re) => re
+                .find(content)
+                .ok()
+                .flatten()
+                .map(|m| (m.start(), m.end())),
+        }
+    }
 }
 
 /// The `regex` crate's default size limit for one compiled pattern, kept here
@@ -146,6 +159,10 @@ struct ForwardRegex {
 /// PikeVM on text they decide today in the lazy DFA (three times slower on
 /// two of the hostile texts measured).
 const RETAINED_CACHE_BYTES: usize = 256 * 1024;
+
+/// How far before the end of a match [`ForwardRegex::find`] looks for its
+/// start.
+const FIND_WINDOW_BYTES: usize = 4096;
 
 /// One searcher's scratch space. The PikeVM's is created only the first time
 /// the lazy DFA hands a search over to it, so text the lazy DFA decides on its
@@ -224,6 +241,40 @@ impl ForwardRegex {
                 pikevm.is_match(cache, input)
             }
         };
+        self.trim(&mut caches);
+        found
+    }
+
+    /// Where the first match in `haystack` is, as byte offsets, to say what
+    /// matched in an alert ([`matched_words`]); only a condition that
+    /// matched asks. The lazy DFA finds where the leftmost match ends; the
+    /// PikeVM then looks for its start within [`FIND_WINDOW_BYTES`] before
+    /// that end, so the work is bounded whatever the text, and no other
+    /// automaton is built or kept. A match longer than the window is said
+    /// by the window's end of it.
+    fn find(&self, haystack: &str) -> Option<(usize, usize)> {
+        let mut caches = self.caches.get();
+        let input = regex_automata::Input::new(haystack);
+        let end = match self.dfa.try_search_fwd(&mut caches.dfa, &input) {
+            Ok(found) => found.map(|half| half.offset()),
+            Err(_) => {
+                let pikevm = &self.pikevm;
+                let cache = caches.pikevm.get_or_insert_with(|| pikevm.create_cache());
+                pikevm.find(cache, input).map(|m| m.end())
+            }
+        };
+        let found = end.map(|end| {
+            let mut lo = end.saturating_sub(FIND_WINDOW_BYTES);
+            while !haystack.is_char_boundary(lo) {
+                lo -= 1;
+            }
+            let pikevm = &self.pikevm;
+            let cache = caches.pikevm.get_or_insert_with(|| pikevm.create_cache());
+            let window = regex_automata::Input::new(haystack).range(lo..end);
+            pikevm
+                .find(cache, window)
+                .map_or((lo, end), |m| (m.start(), m.end()))
+        });
         self.trim(&mut caches);
         found
     }
@@ -504,6 +555,14 @@ pub struct AtrMatch {
     pub severity: String,
     pub category: String,
     pub matched_condition: String,
+    /// What of the input the condition matched: where (`the tool name`,
+    /// `the arguments`) and a short excerpt, secrets masked. Empty when not
+    /// known. Said beside the condition in an alert, so a refusal names what
+    /// happened and not only the rule's title: a direct message refused under
+    /// "Unauthorized Financial Action" said nothing of the `"recipient":` key
+    /// that matched (measured 2026-11-20, AgentDojo slack).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub matched: String,
     pub references: AtrReferences,
 }
 
@@ -830,15 +889,48 @@ fn context_value<'a>(context: AtrContext<'a>, field: AtrField) -> Option<&'a str
     }
 }
 
-fn make_match(rule: &CompiledRule, description: String) -> AtrMatch {
+fn make_match(rule: &CompiledRule, description: String, matched: String) -> AtrMatch {
     AtrMatch {
         rule_id: rule.id.clone(),
         title: rule.title.clone(),
         severity: rule.severity.clone(),
         category: rule.category.clone(),
         matched_condition: description,
+        matched,
         references: rule.references.clone(),
     }
+}
+
+/// Where a field is, as an alert names it.
+fn field_words(field: AtrField) -> &'static str {
+    match field {
+        AtrField::UserInput => "the user input",
+        AtrField::ToolArgs => "the arguments",
+        AtrField::ToolResponse => "the tool response",
+        AtrField::ToolName => "the tool name",
+        AtrField::Content => "the content",
+    }
+}
+
+/// Longest excerpt of a matched text said in an alert.
+const MAX_MATCHED_CHARS: usize = 60;
+
+/// [`AtrMatch::matched`] for a match of `regex` in `value`, found with the
+/// condition's own compiled matcher ([`CompiledRegex::find`]): nothing is
+/// compiled or kept for it. Building a `Regex` for each match said cost a
+/// compile per refusal, and keeping one per condition took the proxy's rules
+/// 9 MiB over their heap budget on hostile results
+/// (`tests/proxy_rule_heap_hostile.rs`, measured 2026-11-20).
+fn matched_words(field: AtrField, regex: &CompiledRegex, value: &str) -> String {
+    let found = regex
+        .find(value)
+        .map(|(start, end)| value[start..end].to_string());
+    let Some(found) = found else {
+        return field_words(field).to_string();
+    };
+    let bounded: String = found.chars().take(MAX_MATCHED_CHARS).collect();
+    let excerpt = crate::redact::redact_secrets(&bounded).text;
+    format!("{} `{}`", field_words(field), excerpt.replace('`', "'"))
 }
 
 fn eval_rule_context(rule: &CompiledRule, context: AtrContext<'_>) -> Option<AtrMatch> {
@@ -846,10 +938,13 @@ fn eval_rule_context(rule: &CompiledRule, context: AtrContext<'_>) -> Option<Atr
     match rule.logic {
         ConditionLogic::Any => conditions.iter().find_map(|condition| {
             let value = context_value(context, condition.field)?;
-            condition
-                .regex
-                .is_match(value)
-                .then(|| make_match(rule, condition.description.clone()))
+            condition.regex.is_match(value).then(|| {
+                make_match(
+                    rule,
+                    condition.description.clone(),
+                    matched_words(condition.field, &condition.regex, value),
+                )
+            })
         }),
         ConditionLogic::All => {
             let mut first = None;
@@ -860,7 +955,7 @@ fn eval_rule_context(rule: &CompiledRule, context: AtrContext<'_>) -> Option<Atr
                 }
                 first.get_or_insert_with(|| condition.description.clone());
             }
-            Some(make_match(rule, first.unwrap_or_default()))
+            Some(make_match(rule, first.unwrap_or_default(), String::new()))
         }
     }
 }

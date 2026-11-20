@@ -266,6 +266,9 @@ fn assert_masked(seen: &str, s: &Secrets) {
 /// REGRESSION ANCHOR (lab case: a resource the server keeps in memory, read
 /// with `resources/read`). Every secret in the contents is masked in `guard`,
 /// and the rest of the answer arrives: its id, its shape, its plain text.
+/// The resource was `vault://reporting` until 2026-11-20, when a read of a
+/// secret store scheme (`vault://`) began to be refused in `guard` before it
+/// reaches the server; the masking is proved on a location that is read.
 ///
 /// FAILS ON REVERT: without the server-side masking the contents reach the
 /// client byte for byte.
@@ -273,8 +276,8 @@ fn assert_masked(seen: &str, s: &Secrets) {
 fn guard_mode_masks_every_secret_class_in_a_resource_read() {
     let s = secrets();
     let table = json!({
-        "resources/read vault://reporting": {"result": {"contents": [
-            {"uri": "vault://reporting", "mimeType": "text/plain", "text": vault_text(&s)}
+        "resources/read config://reporting": {"result": {"contents": [
+            {"uri": "config://reporting", "mimeType": "text/plain", "text": vault_text(&s)}
         ]}},
     });
     let seen = run(
@@ -282,7 +285,7 @@ fn guard_mode_masks_every_secret_class_in_a_resource_read() {
         &[request(
             1,
             "resources/read",
-            json!({"uri": "vault://reporting"}),
+            json!({"uri": "config://reporting"}),
         )],
         ProxyMode::Guard,
     );
@@ -295,7 +298,7 @@ fn guard_mode_masks_every_secret_class_in_a_resource_read() {
     assert!(text.contains("Reporting service configuration"), "{text}");
     assert!(text.contains("Keep this page internal."), "{text}");
     assert!(text.contains("[REDACTED]"), "{text}");
-    assert_eq!(answer["result"]["contents"][0]["uri"], "vault://reporting");
+    assert_eq!(answer["result"]["contents"][0]["uri"], "config://reporting");
     assert!(
         seen.rules().iter().any(|rule| rule == "AG-SECRET-OUT"),
         "the masking must be reported: {:?}",
@@ -396,8 +399,8 @@ fn guard_mode_masks_secrets_in_prompts_structured_content_and_errors() {
 fn advisory_mode_reports_a_secret_bearing_result_and_forwards_it_unchanged() {
     let s = secrets();
     let table = json!({
-        "resources/read vault://reporting": {"result": {"contents": [
-            {"uri": "vault://reporting", "text": vault_text(&s)}
+        "resources/read config://reporting": {"result": {"contents": [
+            {"uri": "config://reporting", "text": vault_text(&s)}
         ]}},
     });
     let seen = run(
@@ -405,7 +408,7 @@ fn advisory_mode_reports_a_secret_bearing_result_and_forwards_it_unchanged() {
         &[request(
             6,
             "resources/read",
-            json!({"uri": "vault://reporting"}),
+            json!({"uri": "config://reporting"}),
         )],
         ProxyMode::Advisory,
     );

@@ -205,6 +205,24 @@ fn patterns() -> &'static [SecretPattern] {
                 SecretKind::CloudKey,
                 always,
             ),
+            // An AWS secret access key: 40 characters of base64 after its key
+            // (`aws_secret_access_key = `, `secret_key:`, `AWS Secret Key:`), or
+            // after an access key id on its line or the next one. Measured
+            // 2026-11-20: `AWS Secret Key: wJalr...` reached the client in clear
+            // while the key id beside it was masked. Which values count is
+            // [`aws_secret_shape`].
+            mk(
+                r#"(?i)\b(?:aws[ _\-]?)?secret[ _\-]?(?:access[ _\-]?)?key["']?[ \t]*[:=][ \t]*["']?([A-Za-z0-9/+]{40})(?:[^A-Za-z0-9/+=]|\z)"#,
+                1,
+                SecretKind::CloudKey,
+                aws_secret_shape,
+            ),
+            mk(
+                r"\b(?:AKIA|ASIA)[0-9A-Z]{16,}\b[^\n]{0,200}?(?:\n[^\n]{0,200}?)?[^A-Za-z0-9/+=]([A-Za-z0-9/+]{40})(?:[^A-Za-z0-9/+=]|\z)",
+                1,
+                SecretKind::CloudKey,
+                aws_secret_shape,
+            ),
             // Provider API keys and tokens by their prefix. A real one carries
             // digits; a hyphenated word that happens to start the same way
             // does not.
@@ -277,6 +295,20 @@ fn patterns() -> &'static [SecretPattern] {
 
 fn always(_: &str) -> bool {
     true
+}
+
+/// An AWS secret access key as it is written: 40 characters of base64 with
+/// capitals, small letters and a digit or a `/` or `+`. A word of prose or
+/// a run of one case is not one. The documentation's own sample key counts:
+/// it is shaped as a real one, and a server that hands it out hands out the
+/// shape a real one would take.
+fn aws_secret_shape(value: &str) -> bool {
+    value.len() == 40
+        && value.bytes().any(|b| b.is_ascii_uppercase())
+        && value.bytes().any(|b| b.is_ascii_lowercase())
+        && value
+            .bytes()
+            .any(|b| b.is_ascii_digit() || b == b'/' || b == b'+')
 }
 
 fn has_digit(value: &str) -> bool {
@@ -1611,34 +1643,147 @@ fn network_target(decoded: &str) -> Option<NetworkTarget> {
     }
 }
 
-/// The word that makes a location read as secret material
-/// (`internal://credentials`, `vault://master_key`), if any.
-fn secret_location_word(decoded: &str) -> Option<String> {
-    let lower = decoded.to_ascii_lowercase();
-    if let Some((scheme, _)) = lower.split_once("://") {
-        if matches!(scheme, "internal" | "private" | "secret" | "secrets") {
-            return Some(format!("{scheme}://"));
+/// What a location says about secret material ([`secret_location`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SecretLocation {
+    /// A scheme whose every location is a secret store (`vault://`,
+    /// `keyring://`, `secrets://`): refused in a mode that blocks.
+    Store(String),
+    /// A location that names a credential by its word, where a read is for
+    /// the credential (`internal://credentials`, `kv://apiToken`): refused
+    /// in a mode that blocks.
+    Credential(String),
+    /// A credential word in a document or source file about it
+    /// (`docs://credentials-guide`, `file:///repo/src/auth/token.rs`), or
+    /// a scheme that only says private (`internal://settings`): alerted.
+    Named(String),
+}
+
+/// Schemes whose every location is a secret store.
+const SECRET_STORE_SCHEMES: &[&str] = &[
+    "secret",
+    "secrets",
+    "vault",
+    "keyring",
+    "keychain",
+    "kv",
+    "env",
+    "ssm",
+    "secretsmanager",
+    "creds",
+    "credentials",
+];
+
+/// Schemes that only say private.
+const PRIVATE_SCHEMES: &[&str] = &["internal", "private"];
+
+/// Schemes of documentation: a credential word there names a topic.
+const DOC_SCHEMES: &[&str] = &[
+    "docs", "doc", "help", "man", "readme", "guide", "manual", "wiki", "kb",
+];
+
+/// Schemes whose locations are files or web pages: only the last segment
+/// says what is read (`/repo/src/auth/token.rs` is a source file).
+const FILE_OR_WEB_SCHEMES: &[&str] = &["file", "http", "https"];
+
+/// The extensions of a document or a source file. Not a configuration one
+/// (`.json`, `.yaml`, `.env`): `credentials.json` holds credentials.
+const DOC_EXTENSIONS: &[&str] = &[
+    "md", "markdown", "txt", "rst", "adoc", "html", "htm", "pdf", "ipynb", "rs", "py", "js", "jsx",
+    "ts", "tsx", "go", "java", "kt", "c", "h", "cc", "cpp", "hpp", "rb", "php", "cs", "swift",
+    "scala", "sh",
+];
+
+/// Words of a segment that make it a document about a credential, not the
+/// credential: `auth_tokens_schema`, `token-limits`, `password-reset`.
+const DOC_WORDS: &[&str] = &[
+    "guide",
+    "guides",
+    "doc",
+    "docs",
+    "documentation",
+    "schema",
+    "schemas",
+    "spec",
+    "reset",
+    "limit",
+    "limits",
+    "policy",
+    "policies",
+    "faq",
+    "help",
+    "howto",
+    "tutorial",
+    "readme",
+    "example",
+    "examples",
+    "template",
+    "templates",
+    "format",
+    "usage",
+    "overview",
+    "reference",
+    "rotation",
+];
+
+/// The words of a piece of a location: split on every character that is
+/// not a letter or digit and between a small letter and a capital
+/// (`adminCredentials` is `admin credentials`), lowercased, with letters
+/// drawn like Latin ones read as them (`сredentials`, Cyrillic `с`).
+fn location_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut previous_small = false;
+    for c in text.chars() {
+        let small = c.is_lowercase();
+        let folded: String = c
+            .to_lowercase()
+            .map(crate::description_poison::confusable)
+            .collect();
+        let letter = folded.chars().all(|f| f.is_ascii_alphanumeric());
+        if (!letter || (c.is_uppercase() && previous_small)) && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
         }
+        if letter {
+            word.push_str(&folded);
+        }
+        previous_small = small;
     }
-    let words: Vec<&str> = lower
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .collect();
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// The word of a location that names a credential (`credentials`,
+/// `tokens`, `master key`, `ssh key`), if any.
+fn credential_word(words: &[String]) -> Option<String> {
     const WORDS: &[&str] = &[
         "credential",
         "credentials",
+        "cred",
+        "creds",
         "secret",
         "secrets",
         "password",
         "passwords",
         "passwd",
         "passphrase",
+        "pass",
+        "pwd",
         "token",
         "tokens",
+        "jwt",
+        "jwts",
+        "bearer",
         "apikey",
         "apikeys",
+        "apitoken",
+        "authtoken",
+        "accesstoken",
         "privatekey",
         "masterkey",
+        "sshkey",
     ];
     const KEY_OWNERS: &[&str] = &[
         "api",
@@ -1647,16 +1792,74 @@ fn secret_location_word(decoded: &str) -> Option<String> {
         "signing",
         "encryption",
         "access",
+        "ssh",
+        "auth",
     ];
     for (i, word) in words.iter().enumerate() {
-        if WORDS.contains(word) {
-            return Some((*word).to_string());
+        if WORDS.contains(&word.as_str()) {
+            return Some(word.clone());
         }
-        if matches!(*word, "key" | "keys") && i > 0 && KEY_OWNERS.contains(&words[i - 1]) {
+        if matches!(word.as_str(), "key" | "keys")
+            && i > 0
+            && KEY_OWNERS.contains(&words[i - 1].as_str())
+        {
             return Some(format!("{} {word}", words[i - 1]));
         }
     }
     None
+}
+
+/// What a (decoded) location says about secret material, if anything.
+///
+/// A secret store scheme is a secret whatever the rest says. A credential
+/// word counts in the last segment of a file or a web page, and anywhere in
+/// a location of another scheme; it names a credential, refused, unless the
+/// scheme is one of documentation or the last segment is a document or a
+/// source file about it (by its extension or a word such as `guide`,
+/// `schema`, `limits`, `reset`). Measured 2026-11-20 against a held-out
+/// set: `docs://credentials-guide`, `config://auth_tokens_schema`,
+/// `file:///repo/src/auth/token.rs`, `file:///repo/docs/password-reset.md`
+/// and `https://.../token-limits` were refused by the first version of
+/// this check, and `kv://apiToken`, `vault://x` and `internal://сredentials`
+/// (Cyrillic `с`) were not.
+fn secret_location(decoded: &str) -> Option<SecretLocation> {
+    let (scheme, rest) = match decoded.split_once("://") {
+        Some((scheme, rest)) => (location_words(scheme).join(""), rest),
+        None => (String::new(), decoded),
+    };
+    if SECRET_STORE_SCHEMES.contains(&scheme.as_str()) {
+        return Some(SecretLocation::Store(format!("{scheme}://")));
+    }
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
+    let last = path
+        .split(['/', '\\'])
+        .rfind(|segment| !segment.is_empty())
+        .unwrap_or_default();
+    let extension = last
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+        .unwrap_or_default();
+    let last_words = location_words(last);
+    let about_it = DOC_SCHEMES.contains(&scheme.as_str())
+        || DOC_EXTENSIONS.contains(&extension.as_str())
+        || last_words
+            .iter()
+            .any(|word| DOC_WORDS.contains(&word.as_str()));
+    let named = if FILE_OR_WEB_SCHEMES.contains(&scheme.as_str()) {
+        credential_word(&last_words)
+    } else {
+        credential_word(&location_words(path))
+    };
+    if let Some(word) = named {
+        return Some(if about_it {
+            SecretLocation::Named(word)
+        } else {
+            SecretLocation::Credential(word)
+        });
+    }
+    PRIVATE_SCHEMES
+        .contains(&scheme.as_str())
+        .then(|| SecretLocation::Named(format!("{scheme}://")))
 }
 
 /// The credential stores of common tools, by the last segments of their
@@ -1725,12 +1928,15 @@ fn location_password(uri: &str, decoded: &str) -> bool {
 ///
 /// Refused (in guard and kill): a path that climbs out of its root (plain or
 /// percent-encoded), a secret store on disk or a tool's credential store, a
-/// password in the location's user info, the cloud metadata service, and
+/// password in the location's user info, the cloud metadata service, a
+/// location that names a credential by its word (`internal://credentials`,
+/// `vault://master_key`, `config://auth_tokens`: the person's call), and
 /// what the tool-call rules refuse in an argument. Alerted only: the host's
-/// own loopback or private network, a location that names secret material,
-/// and one the server never announced (`catalog`, after a listing was heard).
-/// Those are not refused because an ordinary server can name its resources
-/// that way, and whatever secret such a read returns is masked in the answer.
+/// own loopback or private network, a scheme that only says private
+/// (`internal://settings`), and one the server never announced (`catalog`,
+/// after a listing was heard). Those are not refused because an ordinary
+/// server can name its resources that way, and whatever secret such a read
+/// returns is masked in the answer.
 pub fn inspect_resource_read(
     uri: &str,
     catalog: Option<&ResourceCatalog>,
@@ -1780,11 +1986,35 @@ pub fn inspect_resource_read(
         ),
         None => {}
     }
-    if let Some(word) = secret_location_word(&decoded) {
-        push(
+    // A location that names a credential by its word (`credentials`,
+    // `auth_tokens`, `master_key`), or a secret store scheme (`vault://`),
+    // is the person's call in a mode that blocks, as a read of
+    // `~/.aws/credentials` in the shell is: the agent is refused and the
+    // person reads it if it is theirs to read. A document or a source file
+    // about a credential, and a scheme that only says private
+    // (`internal://settings`), stay an alert. Measured 2026-11-20 (DVMCP
+    // ch1, 2, 4, 5, 6, 14, 15): every such read passed with an alert and
+    // handed the client what the masking did not know as a secret.
+    match secret_location(&decoded) {
+        Some(SecretLocation::Store(scheme)) => push(
+            format!(
+                "the resource location is a secret store (`{scheme}`): reading it is the \
+                 person's call, as a read of a credentials file in the shell is"
+            ),
+            true,
+        ),
+        Some(SecretLocation::Credential(word)) => push(
+            format!(
+                "the resource location names a credential (`{word}`): reading it is the \
+                 person's call, as a read of a credentials file in the shell is"
+            ),
+            true,
+        ),
+        Some(SecretLocation::Named(word)) => push(
             format!("the resource location names secret material (`{word}`)"),
             false,
-        );
+        ),
+        None => {}
     }
     if catalog.and_then(|catalog| catalog.announced(uri)) == Some(false) {
         push(
@@ -1842,6 +2072,40 @@ mod tests {
         mask_text(text)
             .map(|(_, findings)| findings.kinds.into_iter().collect())
             .unwrap_or_default()
+    }
+
+    /// An AWS secret access key is masked after its key, in any of the ways
+    /// a file, a log or a page writes it, and after an access key id on its
+    /// line or the next. Measured 2026-11-20 (DVMCP ch14): the key id was
+    /// masked and `AWS Secret Key: <40 characters>` reached the client.
+    ///
+    /// FAILS ON REVERT of either AWS secret key pattern.
+    #[test]
+    fn an_aws_secret_access_key_is_masked() {
+        // The documentation's sample key, assembled so it is not a literal.
+        let secret = format!("{}/{}/{}", "wJalrXUtnFEMI", "K7MDENG", "bPxRfiCYEXAMPLEKEY");
+        let id = format!("AKIA{}", "1234567890EXAMPLE");
+        for text in [
+            format!("AWS Access Key: {id}\nAWS Secret Key: {secret}\n"),
+            format!("[default]\naws_secret_access_key = {secret}\n"),
+            format!("{{\"secret_key\": \"{secret}\"}}"),
+            format!("SECRET_ACCESS_KEY={secret}"),
+            format!("credentials {id} {secret}"),
+            format!("key id {id}\nthen {secret}\n"),
+        ] {
+            let out = masked(&text);
+            assert!(!out.contains(&secret), "{text:?} -> {out:?}");
+            assert!(kinds(&text).contains(&SecretKind::CloudKey), "{text:?}");
+        }
+        // Forty characters of one case, or with no digit, `/` or `+`, are
+        // not a key; nor is a 40-character run far from any key id or key.
+        for text in [
+            format!("secret_key: {}", "a".repeat(40)),
+            format!("secret_key: {}", "AbcdefghijAbcdefghijAbcdefghijAbcdefghij"),
+            format!("commit {}", "0123456789abcdef0123456789abcdef01234567"),
+        ] {
+            assert!(!kinds(&text).contains(&SecretKind::CloudKey), "{text:?}");
+        }
     }
 
     #[test]
@@ -2070,12 +2334,88 @@ mod tests {
         }
     }
 
+    /// A location that names a credential by its word, or a secret store
+    /// scheme, is refused in a mode that blocks (the person's call, as a
+    /// credentials file read in the shell is): in any case and spelling the
+    /// DVMCP challenges used, and in the ones a held-out set of 2026-11-20
+    /// added (camelCase, short words, store schemes, a Cyrillic `с`).
+    ///
+    /// FAILS ON REVERT of the `Store` or `Credential` arm in
+    /// `inspect_resource_read`, of the camelCase split or the confusable
+    /// fold in `location_words`, or of the new words in `credential_word`.
+    #[test]
+    fn a_location_that_names_a_credential_is_refused() {
+        for (uri, why) in [
+            ("internal://credentials", "credentials"),
+            ("vault://master_key", "vault://"),
+            ("config://auth_tokens", "tokens"),
+            ("system://admin_credentials", "credentials"),
+            ("internal://secret_config", "secret"),
+            ("INTERNAL://Credentials", "credentials"),
+            ("internal://%63redentials", "credentials"),
+            ("files://team/api-keys", "api key"),
+            ("internal://adminCredentials", "credentials"),
+            ("config://apiToken", "token"),
+            ("config://authToken", "token"),
+            ("store://creds", "creds"),
+            ("store://db_pwd", "pwd"),
+            ("store://admin/pass", "pass"),
+            ("session://jwt", "jwt"),
+            ("session://bearer", "bearer"),
+            ("host://deploy/ssh_key", "ssh key"),
+            ("keyring://login", "keyring://"),
+            ("keychain://github", "keychain://"),
+            ("kv://app/settings", "kv://"),
+            ("vault://x", "vault://"),
+            ("env://DATABASE_URL", "env://"),
+            ("ssm://prod/db", "ssm://"),
+            ("secrets://x", "secrets://"),
+            ("secret://notes", "secret://"),
+            ("internal://\u{0441}redentials", "credentials"),
+            ("file:///srv/app/db_password", "password"),
+            ("https://intranet.example/ops/credentials", "credentials"),
+        ] {
+            let verdict = inspect_resource_read(uri, None, None);
+            assert!(!verdict.allowed, "{uri} allowed: {:?}", verdict.alerts);
+            assert!(
+                verdict.alerts.iter().any(|a| a.rule == RESOURCE_URI_RULE
+                    && a.block
+                    && a.detail.contains(why)
+                    && a.detail.contains("person's call")),
+                "{uri}: {:?}",
+                verdict.alerts
+            );
+        }
+    }
+
+    /// A document or a source file about a credential is read, with an
+    /// alert: the held-out set's five URIs, which the first version of the
+    /// refusal took for credentials.
+    ///
+    /// FAILS ON REVERT of `about_it` or of the last-segment rule for files
+    /// and web pages in `secret_location`.
+    #[test]
+    fn a_document_about_a_credential_is_alerted_not_refused() {
+        for uri in [
+            "docs://credentials-guide",
+            "config://auth_tokens_schema",
+            "file:///repo/src/auth/token.rs",
+            "file:///repo/docs/password-reset.md",
+            "https://docs.example.com/api/token-limits",
+            "help://passwords",
+            "file:///repo/credentials/README.md",
+            "file:///repo/src/auth/tokens/mod_list.txt",
+        ] {
+            let verdict = inspect_resource_read(uri, None, None);
+            assert!(verdict.allowed, "{uri} refused: {:?}", verdict.alerts);
+        }
+    }
+
     #[test]
     fn a_secret_looking_or_local_location_is_alerted_not_refused() {
         for (uri, why) in [
-            ("internal://credentials", "internal://"),
-            ("vault://master_key", "master key"),
-            ("config://auth_tokens", "tokens"),
+            ("internal://settings", "internal://"),
+            ("docs://credentials-guide", "credentials"),
             ("http://127.0.0.1:8080/status", "loopback"),
         ] {
             let verdict = inspect_resource_read(uri, None, None);
