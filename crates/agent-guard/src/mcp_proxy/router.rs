@@ -196,9 +196,19 @@ fn route_server_to_client(
     env: &JsonRpcEnvelope,
     responded: Option<&PendingRequest>,
     engine: Option<&RuleEngine>,
-    taint: Option<&mut TaintTracker>,
+    mut taint: Option<&mut TaintTracker>,
 ) -> ProxyDecision {
     let dir = Direction::ServerToClient;
+    // Every text a server sends the client reaches the model or can: an
+    // error's message and data, a prompt (`prompts/get`), a completion, a
+    // notification, a request the server makes (sampling, elicitation). A
+    // value in any of it did not come from nowhere (`super::effect`), so it
+    // is kept before anything else is read. The answers read below
+    // (`tools/list`, listings, `tools/call`, `resources/read`) keep theirs
+    // where they are read.
+    if let Some(t) = taint.as_deref_mut() {
+        record_server_text(env, responded, t);
+    }
     match (responded.map(|r| r.method.as_str()), env.result.as_ref()) {
         (Some("tools/list"), Some(result)) => {
             // What the server says each tool does, so a call to a tool it
@@ -377,6 +387,38 @@ fn inspect_answer(
         ));
     }
     verdict
+}
+
+/// Keep, as said by a server (`super::effect::SeenText`), what a message
+/// from the server carries that the arms of [`route_server_to_client`] do
+/// not read themselves: an error, a result to any other request, the
+/// parameters of a notification or a request.
+fn record_server_text(
+    env: &JsonRpcEnvelope,
+    responded: Option<&PendingRequest>,
+    t: &mut TaintTracker,
+) {
+    if let Some(error) = env.error.as_ref() {
+        t.seen.record(&error.to_string());
+    }
+    if let Some(params) = env.params.as_ref() {
+        t.seen.record(&params.to_string());
+    }
+    let read_below = matches!(
+        responded.map(|r| r.method.as_str()),
+        Some(
+            "tools/list"
+                | "resources/list"
+                | "resources/templates/list"
+                | "prompts/list"
+                | "initialize"
+                | "tools/call"
+                | "resources/read"
+        )
+    );
+    if let (Some(result), false) = (env.result.as_ref(), read_below) {
+        t.seen.record(&result.to_string());
+    }
 }
 
 fn pass_through(dir: Direction) -> ProxyDecision {

@@ -38,22 +38,31 @@ the text of a command; what it does not see is written down, as measured:
   its values came from, not by its name.** Each listed tool is classed once,
   from its input schema, its MCP annotations and its name as a hint
   (money-movement, send-external, share, delete, read-secret, fetch-url,
-  read-only). A call that moves money, sends, shares or deletes, whose
-  recipient, account, amount or target appeared in nothing a server said this
-  session, is allowed and recorded: ATR-2026-098 and ATR-2026-040 stay in the
-  alert as labels when they matched only the tool's name or an argument's
-  name. The same value taken from a tool result, a resource or a listing
-  keeps the refusal it had. Measured through `innerwarden proxy --mode
-  guard` on AgentDojo v1.2.2: the user's own calls refused went from 25 of
-  339 to 0 (in that run every tool answered with a placeholder, so no user
-  value appeared in a result), and the injection tasks' attack calls refused
-  went from 22 of 47 to 27, with none refused before let through. A call
-  judged on its own, outside a proxy session (`innerwarden check`, the
-  release suite), has no provenance and is judged as before.
+  read-only). A call that moves money, sends, shares or deletes, where a
+  slot its class names (recipient, account, amount, target) appears and
+  every value it carries, at any depth and as a map key, appeared in nothing
+  a server said this session (results, resources, listings, errors, prompts,
+  notifications), is allowed and recorded: ATR-2026-098 and ATR-2026-040
+  stay in the alert as labels when they matched only the tool's name. A rule
+  that still matches without the name (an argument's name such as
+  `"recipient":`, or a value) keeps refusing, and so does any call carrying
+  a value a server said, or no recognised slot. A call judged on its own,
+  outside a proxy session (`innerwarden check`, the release suite), has no
+  provenance and is judged as before.
+- **A value a server said is found in the spelling a call sends it.** The
+  provenance table and the taint tracker compare both sides in one spelling:
+  `[at]` and `[.]` put back, percent escapes and HTML entities decoded,
+  punycode decoded, letters that pass for ASCII letters made ASCII, a scheme
+  or a trailing `/` more or less.
 - **An address in quotes in a tool result taints the call that sends to it.**
   `'someone@example.com'` was recorded with its opening quote, so a call to
-  `someone@example.com` was not found to carry it, while the same address
-  without quotes was.
+  `someone@example.com` was not found to carry it; nor was an address with
+  a quote on one side only or glued to the next word
+  (`'someone@example.com'.The`).
+- **The differential check replays whole MCP sessions.** A corpus line can be
+  a session (`surface: session`): client and server messages replayed
+  through the proxy's router with one taint tracker, judged by its last
+  message. `corpus/mcp-sessions` holds the first ones.
 - **Prose written with `cat` after a `cd` runs.** `cd repo && cat >>
   notes.md <<'EOF'` with words of the guard's rules in the text was refused
   as a line to run, while the same `cat` alone was allowed. It is now read

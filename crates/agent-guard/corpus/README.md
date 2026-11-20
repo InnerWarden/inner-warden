@@ -119,6 +119,16 @@ verb (`stop>/dev/null`), a word split with quotes or an escape (`st''op`,
 (`v=stop; systemctl $v ...`, `{stop,}`), and flags clustered differently
 (`-rf`, `-fr`, `-r -f`). They are generated in the job, not stored.
 
+A line can also be a whole MCP session (`surface: session`, the
+`mcp-sessions` corpus): client and server messages in order, replayed through
+the proxy's router with one taint tracker, as `innerwarden proxy` judges them,
+and judged by the verdict of the last message. What only a session shows (a
+value a call carries that an earlier result, error or prompt gave; a value no
+server said, which the provenance table lets through) is judged that way, so
+"main against the branch" holds for the proxy's session verdicts too. A guard
+older than the `session` surface records these lines as `unjudged` on its
+side, so they bind from the pull request after the one that adds them.
+
 Every line is judged in two places, both sides in the same. **empty**: an
 empty home, and a command judged by its text alone, as the release safety
 suite judges. **keys**: a developer's machine, a home holding an SSH key
@@ -133,8 +143,8 @@ Each judge's guard carries the revision the job built it from
 (`IW_JUDGE_REV`, compiled into `benchmark::JUDGE_REVISION`), and the job
 refuses a judge that reports none or another one: a "main" judge built from
 the branch would compare the branch with itself. The two judges' bytes are not
-compared. A change the judge does not link (the MCP proxy) leaves two judges
-that are the same binary but for that revision.
+compared. A change the judge does not link leaves two judges that are the
+same binary but for that revision.
 
 A line is **stopped** when it is denied, or reviewed with a signal that holds
 an agent. The job fails when main stops a line and the branch does not. The

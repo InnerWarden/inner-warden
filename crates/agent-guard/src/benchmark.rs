@@ -71,6 +71,15 @@ pub enum Surface {
     ToolCall,
     /// Text entering the model → `inspect_user_input`.
     UserInput,
+    /// A whole MCP session, client and server messages in order, replayed
+    /// through the proxy's router with one taint tracker
+    /// ([`crate::mcp_proxy::router::route_message`]), as `innerwarden proxy`
+    /// judges it; the verdict is the last message's. What only a session
+    /// shows (where a value came from, a token an earlier result carried)
+    /// is judged here and nowhere else in the corpora. The input is a JSON
+    /// array of `{"from": "client" | "server", "message": <JSON-RPC>}`; a
+    /// server answer is tied to its request by id.
+    Session,
 }
 
 /// One corpus entry.
@@ -295,6 +304,81 @@ fn tool_call_of(id: &str, input: &str) -> (String, serde_json::Value) {
     (name, args)
 }
 
+/// Replay a [`Surface::Session`] case and return the verdict of its last
+/// message. Panics on an input that is not a session, as [`tool_call_of`]
+/// does: a broken corpus line never scores.
+fn judge_session(id: &str, input: &str, engine: &RuleEngine) -> Verdict {
+    use crate::mcp_proxy::jsonrpc::{parse_line, ParsedLine};
+    use crate::mcp_proxy::router::{route_message, Direction, PendingRequest};
+    use crate::mcp_proxy::taint::TaintTracker;
+
+    let steps: Vec<serde_json::Value> = serde_json::from_str(input)
+        .unwrap_or_else(|e| panic!("case {id}: a session input must be a JSON array: {e}"));
+    assert!(!steps.is_empty(), "case {id}: a session needs a message");
+    let mut taint = TaintTracker::new();
+    let mut pending: std::collections::HashMap<String, PendingRequest> =
+        std::collections::HashMap::new();
+    let mut last = None;
+    for (n, step) in steps.iter().enumerate() {
+        let from = step.get("from").and_then(|v| v.as_str());
+        let message = step
+            .get("message")
+            .unwrap_or_else(|| panic!("case {id}: step {n} has no message"));
+        let env = match parse_line(&message.to_string()) {
+            ParsedLine::Message(env) => env,
+            other => panic!("case {id}: step {n} is not one JSON-RPC message: {other:?}"),
+        };
+        let decision = match from {
+            Some("client") => {
+                if let (Some(rid), Some(method)) = (env.id.as_ref(), env.method.as_ref()) {
+                    let tool = (method == "tools/call")
+                        .then(|| {
+                            env.params
+                                .as_ref()
+                                .and_then(|p| p.get("name"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .flatten();
+                    pending.insert(
+                        rid.to_string(),
+                        PendingRequest {
+                            method: method.clone(),
+                            tool,
+                        },
+                    );
+                }
+                route_message(
+                    &env,
+                    Direction::ClientToServer,
+                    None,
+                    Some(engine),
+                    Some(&mut taint),
+                )
+            }
+            Some("server") => {
+                let responded = if env.method.is_none() {
+                    env.id
+                        .as_ref()
+                        .and_then(|rid| pending.remove(&rid.to_string()))
+                } else {
+                    None
+                };
+                route_message(
+                    &env,
+                    Direction::ServerToClient,
+                    responded.as_ref(),
+                    Some(engine),
+                    Some(&mut taint),
+                )
+            }
+            _ => panic!("case {id}: step {n} needs \"from\": \"client\" or \"server\""),
+        };
+        last = Some(decision.verdict);
+    }
+    last.expect("a session has a message")
+}
+
 /// Run every case in `corpus` through the engine and return scored results in
 /// corpus order. Each case is routed to the inspector matching its
 /// [`Surface`], a poisoned tool result / description is NOT a command.
@@ -360,6 +444,10 @@ pub fn run_in(
                 }
                 Surface::UserInput => {
                     let v = inspect_user_input(&c.input, Some(engine));
+                    verdict_fields(&v)
+                }
+                Surface::Session => {
+                    let v = judge_session(&c.id, &c.input, engine);
                     verdict_fields(&v)
                 }
             };

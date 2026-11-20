@@ -512,7 +512,12 @@ impl TaintTracker {
         // them.
         let mut seen_again: Vec<usize> = Vec::new();
         let mut whole_cost = 0;
-        for raw in tokenize(text) {
+        // Recorded in one spelling (`super::canon`): a value read as
+        // `attacker[at]evil[.]com` or `attacker%40evil.com` is the value a
+        // call sends as `attacker@evil.com`. Arguments are searched in both
+        // spellings (`arg_taint_alert`).
+        let canon = super::canon::canonical(text);
+        for raw in tokenize(&canon) {
             let tok = kept_part(&raw, provenance);
             match self.find(tok) {
                 Some(slot) => {
@@ -585,6 +590,17 @@ impl TaintTracker {
             // sent in other capitals is the same address.
             if hit == Ok(None) && s.contains('@') && s.bytes().any(|b| b.is_ascii_uppercase()) {
                 hit = self.first_recorded_in(&s.to_ascii_lowercase(), &mut steps, exempt);
+            }
+            // The same value in another spelling: results are recorded in one
+            // (`super::canon`), and a destination with a scheme or a trailing
+            // `/` more or less is the same destination.
+            if hit == Ok(None) {
+                for form in spellings(s) {
+                    hit = self.first_recorded_in(&form, &mut steps, exempt);
+                    if hit != Ok(None) {
+                        break;
+                    }
+                }
             }
         });
         match hit {
@@ -1016,25 +1032,120 @@ fn tokenize(text: &str) -> Vec<Cow<'_, str>> {
     for raw in slice.split_whitespace() {
         // Trim only TRAILING sentence punctuation (`evil.com/x,` → `evil.com/x`);
         // keep leading chars so paths/URLs stay intact (`/etc/...`, `~/.ssh/...`).
-        let tok = raw.trim_end_matches(['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'']);
+        let tok = raw.trim_end_matches(TRAILING);
         // A word in quotes is the word: `'mark@example.com'` is the address
-        // a later call sends to without the quotes. Only a quote that also
-        // closes the word is taken off; an address on a header line
+        // a later call sends to without the quotes. A quote that also closes
+        // the word is taken off; an address on a header line
         // (`<alice@corp.com>`) keeps its bracket (see
         // `a_reply_to_the_sender_of_a_mail_read_is_not_tainted`).
         let tok = match tok.chars().next() {
             Some(q @ ('\'' | '"' | '`')) if raw[tok.len()..].starts_with(q) => &tok[1..],
             _ => tok,
         };
-        if tok.len() >= MIN_TOKEN_LEN {
-            if tok.contains('@') && tok.bytes().any(|b| b.is_ascii_uppercase()) {
-                out.push(Cow::Owned(tok.to_ascii_lowercase()));
-            } else {
-                out.push(Cow::Borrowed(tok));
+        // An address, a link or an account number with a quote on one side
+        // only, or glued to the next word (`'mark@example.com'.The`,
+        // `to:'mark@example.com'`, `"a@b.com'`): the piece between quotes
+        // is kept in its place. Each piece is part of the word, so an
+        // argument that holds the word holds the piece: nothing the word
+        // matched is lost, and the result costs no more than before. Other
+        // words keep their quotes (a quoted tool name a package lists,
+        // `['generate_report',`, is not taken for the value it names).
+        let pieces = tok
+            .split(QUOTES)
+            .map(|piece| piece.trim_end_matches(TRAILING))
+            .filter(|piece| piece.len() >= MIN_TOKEN_LEN && is_value_shaped(piece));
+        if tok.contains(QUOTES) && pieces.clone().next().is_some() {
+            for piece in pieces {
+                push_token(&mut out, piece);
+            }
+        } else {
+            push_token(&mut out, tok);
+        }
+    }
+    out
+}
+
+/// The longest argument whose other spellings are searched too: an address
+/// or a link, not a document.
+const MAX_SPELLED_ARG_BYTES: usize = 2048;
+
+/// The other spellings an argument is searched in ([`TaintTracker::arg_taint_alert`]):
+/// in one spelling ([`super::canon::canonical`], lower-cased when it holds
+/// `@`), and, for one word up to [`MAX_SPELLED_ARG_BYTES`], with no scheme,
+/// `https://`, `http://` or `mailto:` in front, each with and without a
+/// trailing `/`. Not the argument as written, which is searched first.
+fn spellings(s: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |form: String| {
+        if form != s && !out.contains(&form) {
+            out.push(form);
+        }
+    };
+    let canon = super::canon::canonical(s);
+    let canon = if canon.contains('@') {
+        canon.to_lowercase()
+    } else {
+        canon.into_owned()
+    };
+    push(canon.clone());
+    if canon.len() <= MAX_SPELLED_ARG_BYTES && !canon.trim().contains(char::is_whitespace) {
+        let bare = super::canon::without_scheme(canon.trim()).trim_end_matches('/');
+        if !bare.is_empty() {
+            for scheme in ["", "https://", "http://", "mailto:"] {
+                push(format!("{scheme}{bare}"));
+                push(format!("{scheme}{bare}/"));
             }
         }
     }
     out
+}
+
+/// Whether a word is an address, a link or an account number: a
+/// destination ([`is_destination`]), a link without its scheme
+/// (`www.example.com`, `example.com/path`), or an IBAN-shaped word (two
+/// letters, two digits, then 11 to 30 letters and digits).
+fn is_value_shaped(word: &str) -> bool {
+    if is_destination(word)
+        || word
+            .get(..4)
+            .is_some_and(|w| w.eq_ignore_ascii_case("www."))
+    {
+        return true;
+    }
+    if let Some((host, _)) = word.split_once('/') {
+        let labels: Vec<&str> = host.split('.').collect();
+        if labels.len() >= 2
+            && labels
+                .iter()
+                .all(|l| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+            && labels
+                .last()
+                .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_alphabetic()))
+        {
+            return true;
+        }
+    }
+    let b = word.as_bytes();
+    (15..=34).contains(&b.len())
+        && b[..2].iter().all(u8::is_ascii_alphabetic)
+        && b[2..4].iter().all(u8::is_ascii_digit)
+        && b[4..].iter().all(u8::is_ascii_alphanumeric)
+}
+
+/// The quotes a word can be wrapped in.
+const QUOTES: [char; 3] = ['\'', '"', '`'];
+/// What is taken off the end of a word: sentence punctuation and quotes.
+const TRAILING: [char; 12] = ['.', ',', ';', ':', '!', '?', ')', ']', '}', '"', '\'', '`'];
+
+/// Keep `tok` when it is long enough; one with `@` lower-cased.
+fn push_token<'a>(out: &mut Vec<Cow<'a, str>>, tok: &'a str) {
+    if tok.len() >= MIN_TOKEN_LEN {
+        if tok.contains('@') && tok.bytes().any(|b| b.is_ascii_uppercase()) {
+            out.push(Cow::Owned(tok.to_ascii_lowercase()));
+        } else {
+            out.push(Cow::Borrowed(tok));
+        }
+    }
 }
 
 /// Visit every string leaf in a JSON value (recursively through objects/arrays).
