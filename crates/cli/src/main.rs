@@ -792,11 +792,229 @@ pub(crate) const TOOL_CALL_TOO_LONG: &str =
 /// `Ok(None)` for a call longer than that: the rest is never read, so a
 /// caller that sends without end does not grow the hook either.
 pub(crate) fn read_tool_call(reader: impl std::io::Read) -> std::io::Result<Option<String>> {
-    let mut buf = String::new();
-    reader
-        .take(MAX_TOOL_CALL_BYTES + 1)
-        .read_to_string(&mut buf)?;
-    Ok((buf.len() as u64 <= MAX_TOOL_CALL_BYTES).then_some(buf))
+    Ok(match read_tool_call_or_head(reader)? {
+        ToolCallRead::Whole(buf) => Some(buf),
+        ToolCallRead::TooLong(_) => None,
+    })
+}
+
+/// One tool call as the hook read it: whole, or only its first
+/// [`MAX_TOOL_CALL_BYTES`] for a call longer than that.
+pub(crate) enum ToolCallRead {
+    Whole(String),
+    /// The head of a call past the cap. Never judged as a call: only the
+    /// fields [`TooLongCall::read`] finds whole in it are used.
+    TooLong(Vec<u8>),
+}
+
+/// Read one tool call, keeping the head of one past the cap. The rest is
+/// never read, as in [`read_tool_call`].
+pub(crate) fn read_tool_call_or_head(reader: impl std::io::Read) -> std::io::Result<ToolCallRead> {
+    let mut buf = Vec::new();
+    reader.take(MAX_TOOL_CALL_BYTES + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_TOOL_CALL_BYTES {
+        buf.truncate(MAX_TOOL_CALL_BYTES as usize);
+        return Ok(ToolCallRead::TooLong(buf));
+    }
+    String::from_utf8(buf)
+        .map(ToolCallRead::Whole)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// What the head of a tool call past the cap says about it, read from its
+/// top-level fields only. A field counts only when its whole value is in the
+/// head; text inside a string (a file's content, a command) is never read as
+/// a field, so a call cannot pass for another by what it carries.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct TooLongCall {
+    pub(crate) event: Option<String>,
+    pub(crate) tool: Option<String>,
+    pub(crate) session: Option<String>,
+    /// The file the tool worked on (`file_path`, `notebook_path` or `path`
+    /// of `tool_input`), when it is in the head.
+    pub(crate) path: Option<String>,
+}
+
+impl TooLongCall {
+    pub(crate) fn read(head: &[u8]) -> Self {
+        let mut call = Self::default();
+        let mut at = 0;
+        json_head::object(head, &mut at, &mut |key, value, head, at| {
+            match (key.as_str(), value) {
+                ("hook_event_name" | "hookEventName", json_head::Value::Str(s)) => {
+                    call.event = Some(s)
+                }
+                ("tool_name" | "toolName", json_head::Value::Str(s)) => call.tool = Some(s),
+                ("session_id" | "sessionId", json_head::Value::Str(s)) => call.session = Some(s),
+                ("tool_input" | "toolInput", json_head::Value::Object) => {
+                    let mut path = None;
+                    json_head::object(head, at, &mut |key, value, _, _| {
+                        if let ("file_path" | "notebook_path" | "path", json_head::Value::Str(s)) =
+                            (key.as_str(), value)
+                        {
+                            path.get_or_insert(s);
+                        }
+                        true
+                    });
+                    if path.is_some() {
+                        call.path = path;
+                    }
+                }
+                _ => {}
+            }
+            true
+        });
+        call
+    }
+
+    /// A tool call that already ran: its result is what is past the cap,
+    /// and there is nothing left to permit or refuse.
+    pub(crate) fn already_ran(&self) -> bool {
+        self.event.as_deref() == Some("PostToolUse")
+    }
+}
+
+/// A reader of the fields of a JSON object cut short. Each function returns
+/// `None` when the head ends before the value does.
+mod json_head {
+    pub(crate) enum Value {
+        Str(String),
+        /// An object starts at the position the visitor is handed; it may
+        /// read it from there.
+        Object,
+        Other,
+    }
+
+    fn ws(head: &[u8], at: &mut usize) {
+        while head.get(*at).is_some_and(|b| b.is_ascii_whitespace()) {
+            *at += 1;
+        }
+    }
+
+    /// A JSON string starting at `at`, decoded.
+    fn string(head: &[u8], at: &mut usize) -> Option<String> {
+        if head.get(*at) != Some(&b'"') {
+            return None;
+        }
+        let start = *at;
+        let mut i = start + 1;
+        loop {
+            match head.get(i)? {
+                b'\\' => i += 2,
+                b'"' => break,
+                _ => i += 1,
+            }
+        }
+        *at = i + 1;
+        serde_json::from_slice(&head[start..=i]).ok()
+    }
+
+    /// Skip one value of any kind.
+    fn skip(head: &[u8], at: &mut usize) -> Option<()> {
+        ws(head, at);
+        match head.get(*at)? {
+            b'"' => string(head, at).map(|_| ()),
+            b'{' | b'[' => {
+                let mut depth = 0usize;
+                loop {
+                    match head.get(*at)? {
+                        b'"' => {
+                            string(head, at)?;
+                            continue;
+                        }
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth = depth.checked_sub(1)?;
+                            if depth == 0 {
+                                *at += 1;
+                                return Some(());
+                            }
+                        }
+                        _ => {}
+                    }
+                    *at += 1;
+                }
+            }
+            _ => {
+                while !matches!(head.get(*at)?, b',' | b'}' | b']') {
+                    *at += 1;
+                }
+                Some(())
+            }
+        }
+    }
+
+    /// What [`object`] hands each field to.
+    pub(crate) type Visit<'v> = dyn FnMut(String, Value, &[u8], &mut usize) -> bool + 'v;
+
+    /// Walk the object at `at`, handing each field whose key is whole to
+    /// `visit` (key, value, head, where the value starts). A string value is
+    /// handed only when it is whole too. A false from `visit` ends the walk.
+    pub(crate) fn object(head: &[u8], at: &mut usize, visit: &mut Visit<'_>) -> Option<()> {
+        ws(head, at);
+        if head.get(*at) != Some(&b'{') {
+            return None;
+        }
+        *at += 1;
+        loop {
+            ws(head, at);
+            match head.get(*at)? {
+                b'}' => return Some(()),
+                b',' => {
+                    *at += 1;
+                    continue;
+                }
+                _ => {}
+            }
+            let key = string(head, at)?;
+            ws(head, at);
+            if head.get(*at) != Some(&b':') {
+                return None;
+            }
+            *at += 1;
+            ws(head, at);
+            let value = match head.get(*at)? {
+                b'"' => Value::Str(string(head, at)?),
+                b'{' => Value::Object,
+                _ => Value::Other,
+            };
+            let is_str = matches!(value, Value::Str(_));
+            let mut probe = *at;
+            if !visit(key, value, head, &mut probe) {
+                return Some(());
+            }
+            if !is_str {
+                skip(head, at)?;
+            }
+        }
+    }
+}
+
+/// A tool call past the cap. One that is about to run was not read, so it
+/// is refused (enforce) or said to be unscreened (monitor), as before. One
+/// that already ran (PostToolUse: a large file read, edited or written, a
+/// command with a long output) has nothing left to refuse: its head is
+/// recorded as a result not read whole, and the agent carries on.
+fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::ExitCode {
+    let call = TooLongCall::read(head);
+    if !call.already_ran() {
+        return hook_unreadable(TOOL_CALL_TOO_LONG, monitor);
+    }
+    let tool = call.tool.as_deref().unwrap_or("a tool");
+    let on = call
+        .path
+        .as_deref()
+        .map(|path| format!(" on {path}"))
+        .unwrap_or_default();
+    let identity = hook_identity::current(agent_flag(rest).as_deref(), call.session.as_deref());
+    let key = hook_identity::behaviour_key(identity.as_ref(), call.session.as_deref());
+    session_store::record_tool_result(key.as_deref(), tool, &String::from_utf8_lossy(head));
+    eprintln!(
+        "InnerWarden hook: the result of {tool}{on} is longer than the 1 MiB the hook reads; \
+         it already ran, so it was not refused, and only its first 1 MiB was recorded (not \
+         read whole)."
+    );
+    std::process::ExitCode::SUCCESS
 }
 
 fn unreadable_exit_code(monitor: bool) -> u8 {
@@ -1227,9 +1445,9 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // the first hook of this version brings it up to this one's.
     agents_io::rewire_once_per_version();
 
-    let buf = match read_tool_call(std::io::stdin()) {
-        Ok(Some(buf)) => buf,
-        Ok(None) => return hook_unreadable(TOOL_CALL_TOO_LONG, monitor),
+    let buf = match read_tool_call_or_head(std::io::stdin()) {
+        Ok(ToolCallRead::Whole(buf)) => buf,
+        Ok(ToolCallRead::TooLong(head)) => return hook_too_long(&head, rest, monitor),
         Err(_) => return hook_unreadable("stdin could not be read", monitor),
     };
     // A call `innerwarden demo` sent: judged exactly as an agent's and
