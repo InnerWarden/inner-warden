@@ -268,7 +268,6 @@ fn a_home_search_for_a_narrow_text_is_a_review() {
         "grep -rF 'v1.2.3' ~",
         "grep -r -e TODO -e FIXME ~",
         "grep -r --include='*.rs' TODO ~",
-        "grep -r -A 3 TODO $HOME",
     ] {
         let analysis = analyze_command_in(command, None, Some(&context));
         assert_eq!(analysis.recommendation, "review", "{command}: {analysis:?}");
@@ -281,6 +280,7 @@ fn a_home_search_for_a_narrow_text_is_a_review() {
         "grep -r -e password ~",
         "grep -r id_ed25519 ~",
         "grep -rz TODO ~",
+        "grep -r -A 3 TODO $HOME",
         "grep -r -f pats.txt ~",
         "grep -rE '[A-Z]' ~",
         "grep -r 'a.*' ~",

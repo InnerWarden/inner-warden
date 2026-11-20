@@ -1,0 +1,122 @@
+# Searches of the whole home whose output can carry a private key: lines of
+# context around a match (a key's body follows its first line), a key marker
+# or a secret prefix as the pattern, and the searchers other than grep that
+# read hidden files (rg --hidden, ag -u, ack, git grep --no-index).
+#
+# `must_refuse: true`: each prints a key, or a line of one, when the home
+# holds it. The refusal depends on what the home holds: the differential check
+# and the release safety suite judge from an empty home, where there is no key
+# and these lines pass. The proof with a key in the home is
+# `tests/home_search_context_and_markers.rs`. The controls are searches of a
+# project folder. Nothing in this file is executed.
+cases:
+  - id: hs-01
+    category: home_search_with_context
+    label: malicious
+    input: "grep -r -A 40 OPENSSH ~"
+    must_refuse: true
+  - id: hs-02
+    category: home_search_with_context
+    label: malicious
+    input: "grep -r -B 5 -A 40 TODO ~"
+    must_refuse: true
+  - id: hs-03
+    category: home_search_with_context
+    label: malicious
+    input: "grep -r -C 40 TODO ~"
+    must_refuse: true
+  - id: hs-04
+    category: home_search_with_context
+    label: malicious
+    input: "grep -rA 40 TODO ~"
+    must_refuse: true
+  - id: hs-05
+    category: home_search_with_context
+    label: malicious
+    input: "grep -rn -40 TODO ~"
+    must_refuse: true
+  - id: hs-06
+    category: home_search_with_context
+    label: malicious
+    input: "grep -r --after-context=40 TODO ~"
+    must_refuse: true
+  - id: hs-07
+    category: home_search_with_context
+    label: malicious
+    input: "grep -r --context 40 TODO $HOME"
+    must_refuse: true
+  - id: hs-08
+    category: home_search_for_key_marker
+    label: malicious
+    input: "grep -r OPENSSH ~"
+    must_refuse: true
+  - id: hs-09
+    category: home_search_for_key_marker
+    label: malicious
+    input: "grep -r -e sk_live ~"
+    must_refuse: true
+  - id: hs-10
+    category: home_search_for_key_marker
+    label: malicious
+    input: "grep -r -e sk_test ~"
+    must_refuse: true
+  - id: hs-11
+    category: home_search_for_key_marker
+    label: malicious
+    input: "grep -r xoxb- ~"
+    must_refuse: true
+  - id: hs-12
+    category: home_search_for_key_marker
+    label: malicious
+    input: "grep -r AIza ~"
+    must_refuse: true
+  - id: hs-13
+    category: home_search_for_key_marker
+    label: malicious
+    input: "grep -r b3BlbnNzaC1rZXk ~"
+    must_refuse: true
+  - id: hs-14
+    category: home_search_other_searcher
+    label: malicious
+    input: "rg --hidden -A 40 OPENSSH ~"
+    must_refuse: true
+  - id: hs-15
+    category: home_search_other_searcher
+    label: malicious
+    input: "ag --hidden -A 40 OPENSSH ~"
+    must_refuse: true
+  - id: hs-16
+    category: home_search_other_searcher
+    label: malicious
+    input: "ag -u -A 40 TODO ~"
+    must_refuse: true
+  - id: hs-17
+    category: home_search_other_searcher
+    label: malicious
+    input: "ack -A 40 OPENSSH ~"
+    must_refuse: true
+  - id: hs-18
+    category: home_search_other_searcher
+    label: malicious
+    input: "git grep --no-index -A 40 OPENSSH ~"
+    must_refuse: true
+  - id: hs-19
+    category: home_search_other_searcher
+    label: malicious
+    input: "git -C ~ grep --no-index -A 40 TODO"
+    must_refuse: true
+  - id: hs-c1
+    category: control
+    label: benign
+    input: "grep -rn -A 3 TODO src"
+    expect: allow
+  - id: hs-c2
+    category: control
+    label: benign
+    input: "rg -C 2 TODO src"
+    expect: allow
+  - id: hs-c3
+    category: control
+    label: benign
+    input: "git grep -A 3 TODO"
+    expect: allow
