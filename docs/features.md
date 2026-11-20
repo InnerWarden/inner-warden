@@ -4,15 +4,18 @@ The short version is in the [README](../README.md). This page holds the full
 list, with every limit.
 
 - Screens shell commands and MCP/tool calls before they run, and returns a
-  verdict: `allow`, `review`, or `deny` (advisory by default).
+  verdict: `allow`, `review`, or `deny`. `innerwarden check` only reports
+  it; the hook `innerwarden install` writes refuses a `deny` (and a
+  `review` with `--block-review`; nothing with `--monitor`), and the MCP
+  proxy starts in `guard`, which refuses a disallowed call.
 - Runs an MCP proxy: a man-in-the-middle in front of an MCP server that inspects
   every JSON-RPC message and can refuse a disallowed tool call inline. stdout
   stays pure MCP traffic, alerts go to stderr. It pins each tool's
   definition the first time a server lists it, and in `guard` and `kill`
   holds a tool whose definition changes, one that may be a rename, and,
   once the server has pins, one it never listed before, until you run
-  `innerwarden mcp approve`. In `guard` and `kill` it also refuses a
-  resource read whose location names a credential (`internal://credentials`,
+  `innerwarden mcp approve`. From the release after 1.6.15, in `guard` and
+  `kill` it also refuses a resource read whose location names a credential (`internal://credentials`,
   `config://auth_tokens`) or is a secret store by its scheme (`vault://`,
   `env://`, `kv://`, `keyring://`, `keychain://`, `ssm://`, `secret://`,
   `secrets://`, `secretsmanager://`, `creds://`, `credentials://`, the cloud
@@ -23,7 +26,8 @@ list, with every limit.
   credentials file in the shell is. A document, a source file, a count or a setting about a
   credential (`docs://credentials-guide`, `file:///repo/src/auth/token.rs`,
   `stats://tokens`) and a file in a folder that names one are read with an
-  alert. In `advisory` and `warn` every one of these is alerted and passes.
+  alert. In `advisory` and `warn` every one of these is alerted and passes,
+  and so is every one in 1.6.15, in any mode.
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
@@ -178,6 +182,48 @@ list, with every limit.
 
 The verdict is JSON: a recommendation (`allow` / `review` / `deny`), a risk
 score, matched signals, and a short explanation.
+
+### What an agent's hook does with each verdict
+
+The hook answers each agent in the words that agent reads. In enforce mode
+(the default of `agents connect`):
+
+| Agent | `allow` | `review` | `deny` |
+|---|---|---|---|
+| Claude Code | runs | asks you (`permissionDecision: "ask"`, with the guard's reason) | refused |
+| Gemini CLI | runs | refused, with the reason | refused |
+| Hermes Agent | runs | asks you through its approval gate (`action: "approve"`); refused when nobody is there to approve | refused |
+| any other agent | runs | refused, with the reason | refused |
+| Codex CLI | runs | runs, and Codex shows you a warning with the reason (`systemMessage`) | refused |
+
+Codex CLI has no way for a hook to ask the person: it reads an `ask` as
+unsupported and runs the call. Refusing every review there would also refuse
+ordinary work (a program named by a variable, a value an earlier tool
+returned), so on Codex a review runs: Codex shows you the warning, but it
+does not wait for you. Use `--block-review` to refuse reviews there.
+
+Gemini CLI reads `decision: "ask"`, but in 0.68.0 that ask is not sure to
+reach a person: a tool with no confirmation to show runs at once, and the
+non-interactive path was not followed. So on Gemini a review is refused with
+the reason, as a deny is. The same holds for any agent this table does not
+list: an answer it may not read would let the review run unseen.
+
+Hermes Agent's approval gate (v0.23.1, `request_tool_approval`) asks the
+person in a chat or through its gateway and refuses when nobody can answer.
+It lets the call run without asking when you set Hermes to approve on its
+own: yolo, `approvals.mode: off`, or `approvals.cron_mode` /
+`approvals.single_query_mode` set to approve.
+
+A review that carries a signal no agent should act on unasked (fetch and
+execute, an obfuscated command, a persistence entry, a near-miss package
+name) is refused like a deny, on every agent. `--block-review` refuses every
+review. Monitor mode (`--monitor`) never refuses: every verdict runs, is
+recorded, and nothing is asked.
+
+What each agent does with the answer is read from its own source (Claude
+Code's hooks reference, Gemini CLI 0.68.0, Hermes Agent v0.23.1, Codex CLI
+0.167.2) and held by tests that feed each agent's payload through the line
+`agents connect` writes; it was not measured in a running chat of each agent.
 
 ### Where decisions are recorded
 
@@ -442,9 +488,9 @@ Also not seen today, and not promised for any date:
   line on its own. The hook also knows the agent's session (an argument that
   came out of an earlier tool result) and the place the call reads, so some
   verdicts depend on what a folder holds when the call is made, such as a
-  read of the home. A download piped to a shell is held for review by
-  `check`, which an installer also looks like, and refused by the hook for
-  an agent. Read `check` as a preview, not as the hook's verdict.
+  read of the home. A download piped to a shell is refused by `check`
+  when it is fetched over `http://` and held for review over `https://`,
+  which an installer also looks like; the hook refuses it for an agent. Read `check` as a preview, not as the hook's verdict.
 
 These are the limits of a guard that reads text. InnerWarden Pro works below
 the text, at the host (Linux): armed for an agent, its Execution Gate decides

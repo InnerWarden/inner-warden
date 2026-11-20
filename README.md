@@ -141,8 +141,10 @@ For command options, JSON output and exit codes, see the
 
 - **Screens** shell commands and MCP/tool calls and returns a verdict
   (`allow` / `review` / `deny`) with a risk score and the signals behind it.
-  Advisory by default; the hook and the proxy can refuse before the action
-  reaches its target.
+  `innerwarden check` only reports. The hook `innerwarden install` writes
+  refuses a `deny` before the action runs (`--block-review` adds `review`,
+  `--monitor` refuses nothing), and the proxy starts in `guard` mode, which
+  refuses a disallowed call before it reaches the server.
 - **MCP proxy**: `innerwarden proxy -- <server>` sits in front of an MCP
   server, reads every JSON-RPC message and refuses a disallowed tool call
   inline.
@@ -218,6 +220,14 @@ Whatever agent you run, there is a mechanism and a command for it:
   there. Needs Hermes Agent v0.22.5 or newer; measured through Hermes
   Agent v0.23.1's own hook runner (`hermes hooks test`), not in a full chat.
   Reversible with `agents disconnect hermes`.
+- **What the hook does with a verdict.** In enforce mode a `deny` is
+  refused and an `allow` runs on every agent. A `review` asks you on
+  Claude Code and Hermes Agent, with the guard's reason. Codex CLI has no
+  way for a hook to ask, so there a review runs with a warning Codex shows
+  you. On Gemini CLI and every other agent a review is refused with the
+  reason. `--block-review` refuses every review; monitor mode never
+  refuses: every call runs and nothing is asked. Details:
+  [docs/features.md](docs/features.md).
 - **The hook line fails closed.** On Linux and macOS an enforcing hook line
   (Claude Code, Codex, Gemini) runs the guard inside a small `/bin/sh`
   script: if the innerwarden program is missing, cannot start, is killed or

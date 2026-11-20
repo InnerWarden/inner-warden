@@ -42,6 +42,8 @@ fn bin() -> &'static Path {
 enum Call {
     Refused,
     Runs,
+    /// The agent stops and asks the person whether the call may run.
+    Asks,
 }
 
 /// One run of a hook line: the exit code (none for a signal), stdout and
@@ -76,7 +78,8 @@ fn codex_reads(answer: &Answer) -> Call {
 /// is stdout, else stderr; JSON is read as the hook's decision; plain text
 /// refuses on any exit but 0 and 1. A process ended by a signal has no exit
 /// code, which `exitCode || 0` reads as 0. No text at all is no decision,
-/// and the tool runs.
+/// and the tool runs. `decision: "ask"` makes the scheduler ask the person
+/// (`scheduler/hook-utils.ts`, `scheduler/scheduler.ts`: `ASK_USER`, forced).
 fn gemini_reads(answer: &Answer) -> Call {
     let code = answer.code.unwrap_or(0);
     let text = match answer.stdout.trim() {
@@ -89,6 +92,7 @@ fn gemini_reads(answer: &Answer) -> Call {
     if let Ok(Value::Object(out)) = serde_json::from_str::<Value>(text) {
         return match out.get("decision").and_then(Value::as_str) {
             Some("block" | "deny") => Call::Refused,
+            Some("ask") => Call::Asks,
             _ => Call::Runs,
         };
     }
@@ -102,10 +106,20 @@ fn gemini_reads(answer: &Answer) -> Call {
 /// Claude Code, its hooks reference: exit 2 blocks a `PreToolUse` call;
 /// any other exit, a hook that does not start and a timeout are non-blocking
 /// errors, and the action goes ahead (unless `onFailure` is `block`, which
-/// the guard does not write).
+/// the guard does not write). On exit 0, JSON on stdout is read for
+/// `hookSpecificOutput.permissionDecision`: `deny` refuses, `ask` asks the
+/// person.
 fn claude_reads(answer: &Answer) -> Call {
     match answer.code {
         Some(2) => Call::Refused,
+        Some(0) => match serde_json::from_str::<Value>(answer.stdout.trim()) {
+            Ok(out) => match out["hookSpecificOutput"]["permissionDecision"].as_str() {
+                Some("deny") => Call::Refused,
+                Some("ask") => Call::Asks,
+                _ => Call::Runs,
+            },
+            Err(_) => Call::Runs,
+        },
         _ => Call::Runs,
     }
 }
@@ -328,7 +342,6 @@ fn codex_patch_program_named_another_way_is_refused_before_it_runs() {
         "cat src/apply_patch.rs",
         "cat ${DIR}_patch.rs",
         "python3 scripts/apply_patch.py",
-        "./${NAME}_patch.sh",
         "ls -la",
     ] {
         assert_runs_on(
@@ -337,6 +350,23 @@ fn codex_patch_program_named_another_way_is_refused_before_it_runs() {
             command,
         );
     }
+    // A program named by a variable is a review, not a patch: it runs, and
+    // Codex shows the person the review (it has no way to ask first).
+    let command = "./${NAME}_patch.sh";
+    let answer = host.run("/bin/sh", &enforce, &shell(command));
+    assert_eq!(answer.code, Some(0), "{command}: {}", answer.stderr);
+    assert_eq!(codex_reads(&answer), Call::Runs, "{command}");
+    assert!(
+        !answer.stderr.contains("the shell rewrites first"),
+        "{command}: not read as a patch: {}",
+        answer.stderr
+    );
+    let warning: Value = serde_json::from_str(answer.stdout.trim()).expect("one JSON line");
+    assert!(
+        warning["systemMessage"].as_str().is_some(),
+        "{command}: {}",
+        answer.stdout
+    );
 }
 
 /// Gemini CLI's and Hermes Agent's read tools, in the payloads their
@@ -730,6 +760,19 @@ fn each_agents_reading_of_a_hook_answer_is_its_own_rule() {
     );
     // Claude Code: only 2 blocks.
     assert_eq!(claude_reads(&answer(Some(2), "", "")), Call::Refused);
+    // An ask on stdout, in each agent's words, and what Codex makes of one.
+    let claude_ask =
+        r#"{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"ask"}}"#;
+    assert_eq!(claude_reads(&answer(Some(0), claude_ask, "")), Call::Asks);
+    assert_eq!(codex_reads(&answer(Some(0), claude_ask, "")), Call::Runs);
+    assert_eq!(
+        gemini_reads(&answer(Some(0), r#"{"decision":"ask"}"#, "")),
+        Call::Asks
+    );
+    assert_eq!(
+        hermes_reads(true, &answer(Some(0), r#"{"action":"approve"}"#, ""), true),
+        Call::Asks
+    );
     assert_eq!(claude_reads(&answer(Some(127), "", "x")), Call::Runs);
     assert_eq!(claude_reads(&answer(None, "", "")), Call::Runs);
 }
@@ -739,7 +782,8 @@ fn each_agents_reading_of_a_hook_answer_is_its_own_rule() {
 /// only with `fail_closed`; exit 2 refuses; any other exit is read for a
 /// JSON block on stdout, and with `fail_closed` a non-zero exit (a signal
 /// included: Python reports it as a negative code) or stdout that is not a
-/// JSON object refuses.
+/// JSON object refuses. `action: "approve"` (`_parse_pre_tool_call`) goes to
+/// the human approval gate (`tools/approval.py`, `request_tool_approval`).
 fn hermes_reads(started: bool, answer: &Answer, fail_closed: bool) -> Call {
     if !started {
         return if fail_closed {
@@ -757,6 +801,9 @@ fn hermes_reads(started: bool, answer: &Answer, fail_closed: bool) -> Call {
             || out.get("decision").and_then(Value::as_str) == Some("block")
         {
             return Call::Refused;
+        }
+        if out.get("action").and_then(Value::as_str) == Some("approve") {
+            return Call::Asks;
         }
         return Call::Runs;
     }
@@ -1004,4 +1051,260 @@ fn a_missing_program_is_a_refusal_on_hermes_in_enforce() {
         Call::Refused
     );
     assert_eq!(hermes_reads(false, &none, fail_closed(true)), Call::Runs);
+}
+
+/// A call the guard rates `review` (`chmod 777` on a project file: "world-
+/// writable permissions") under the enforcing line `agents connect` writes,
+/// started as each agent starts it, read as each agent reads the answer:
+///
+/// - Claude Code and Hermes Agent ask the person, with the guard's reason,
+///   and the call runs only if they approve it;
+/// - Gemini CLI refuses it with the reason: its `ask` is not proven to
+///   reach a person on every path;
+/// - Codex CLI has no ask (an `ask` is read as unsupported and the call
+///   runs), so the call runs with a `systemMessage` Codex shows the person;
+/// - `--block-review` refuses it everywhere, and monitor lets it run with
+///   nothing on stdout.
+///
+/// A deny is still a refusal and an allow still runs with nothing on stdout.
+///
+/// FAILS ON REVERT: take the `is_review` arm out of `cmd_hook` and Claude
+/// Code and Hermes run the call without asking, Gemini runs it, and Codex
+/// shows nothing.
+#[cfg(unix)]
+#[test]
+fn a_review_asks_the_person_where_the_agent_can_and_is_shown_where_it_cannot() {
+    use innerwarden_agent_guard::hermes_hook;
+    let host = Host::new();
+    let review = "chmod 777 ./build.sh";
+    let claude = |command: &str| {
+        json!({
+            "session_id": "s-claude",
+            "transcript_path": host.home().join(".claude/projects/p/s.jsonl"),
+            "cwd": host.project(),
+            "permission_mode": "default",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command, "description": "d"},
+            "tool_use_id": "toolu_1",
+        })
+    };
+    let asks = |reads: fn(&Answer) -> Call, answer: &Answer, what: &str| {
+        assert_eq!(answer.code, Some(0), "{what}: {}", answer.stderr);
+        assert_eq!(reads(answer), Call::Asks, "{what}: {}", answer.stdout);
+        assert!(
+            answer.stdout.contains("world-writable permissions"),
+            "{what}: the person is told why: {}",
+            answer.stdout
+        );
+    };
+
+    // Claude Code, the line connect writes and the plain line of older installs.
+    for line in [
+        hook_command_for(bin(), false, false, Some("claude-code")),
+        hook_command_for(bin(), false, false, None),
+    ] {
+        asks(
+            claude_reads,
+            &host.run("/bin/sh", &line, &claude(review)),
+            &line,
+        );
+        assert_refused_by(
+            claude_reads,
+            &host.run("/bin/sh", &line, &claude("rm -rf ~")),
+            "rm",
+        );
+        assert_runs_on(
+            claude_reads,
+            &host.run("/bin/sh", &line, &claude("ls")),
+            "ls",
+        );
+    }
+    let block = hook_command_for(bin(), true, false, Some("claude-code"));
+    assert_refused_by(
+        claude_reads,
+        &host.run("/bin/sh", &block, &claude(review)),
+        "--block-review",
+    );
+    let monitor = hook_command_for(bin(), false, true, Some("claude-code"));
+    assert_runs_on(
+        claude_reads,
+        &host.run("/bin/sh", &monitor, &claude(review)),
+        "monitor",
+    );
+
+    // Gemini CLI: its `ask` is not proven to reach a person, so a review is
+    // refused with the reason, as a deny is. Monitor lets it run.
+    let gemini = |command: &str| host.gemini("run_shell_command", json!({"command": command}));
+    let line = GEMINI.command(bin(), false, false);
+    let answer = host.run("bash", &line, &gemini(review));
+    assert_refused_by(gemini_reads, &answer, "gemini review");
+    assert!(
+        answer.stderr.contains("world-writable permissions"),
+        "gemini: the refusal says why: {}",
+        answer.stderr
+    );
+    assert_refused_by(
+        gemini_reads,
+        &host.run("bash", &line, &gemini("rm -rf ~")),
+        "gemini rm",
+    );
+    assert_runs_on(
+        gemini_reads,
+        &host.run("bash", &line, &gemini("ls")),
+        "gemini ls",
+    );
+    let block = GEMINI.command(bin(), true, false);
+    assert_refused_by(
+        gemini_reads,
+        &host.run("bash", &block, &gemini(review)),
+        "gemini --block-review",
+    );
+    let monitor = GEMINI.command(bin(), false, true);
+    assert_runs_on(
+        gemini_reads,
+        &host.run("bash", &monitor, &gemini(review)),
+        "gemini monitor",
+    );
+
+    // Hermes Agent, started without a shell, its enforce entry fail-closed.
+    assert_eq!(
+        hermes_hook::command(bin(), false, false),
+        format!("\"{}\" hook --agent hermes", bin().display())
+    );
+    let argv: Vec<String> = vec![
+        bin().display().to_string(),
+        "hook".into(),
+        "--agent".into(),
+        "hermes".into(),
+    ];
+    let hermes = |command: &str| {
+        host.run_words(&argv, &host.hermes("terminal", json!({"command": command})))
+            .expect("the guard starts")
+    };
+    let answer = hermes(review);
+    assert_eq!(answer.code, Some(0), "hermes: {}", answer.stderr);
+    assert_eq!(
+        hermes_reads(true, &answer, true),
+        Call::Asks,
+        "{}",
+        answer.stdout
+    );
+    assert!(
+        answer.stdout.contains("world-writable permissions"),
+        "{}",
+        answer.stdout
+    );
+    assert_eq!(hermes_reads(true, &hermes("rm -rf ~"), true), Call::Refused);
+    let ls = hermes("ls");
+    assert_eq!(hermes_reads(true, &ls, true), Call::Runs);
+    assert!(ls.stdout.is_empty(), "{}", ls.stdout);
+    // --block-review refuses the review; monitor lets it run and asks nothing.
+    let hermes_with = |flag: &str, command: &str| {
+        let argv: Vec<String> = vec![
+            bin().display().to_string(),
+            "hook".into(),
+            flag.into(),
+            "--agent".into(),
+            "hermes".into(),
+        ];
+        host.run_words(&argv, &host.hermes("terminal", json!({"command": command})))
+            .expect("the guard starts")
+    };
+    assert_eq!(
+        hermes_hook::command(bin(), true, false),
+        format!("\"{}\" hook --block-review --agent hermes", bin().display())
+    );
+    let blocked = hermes_with("--block-review", review);
+    assert_eq!(
+        blocked.code,
+        Some(2),
+        "hermes --block-review: {}",
+        blocked.stderr
+    );
+    assert_eq!(hermes_reads(true, &blocked, true), Call::Refused);
+    assert!(blocked.stdout.is_empty(), "{}", blocked.stdout);
+    assert_eq!(
+        hermes_hook::command(bin(), false, true),
+        format!("\"{}\" hook --monitor --agent hermes", bin().display())
+    );
+    let watched = hermes_with("--monitor", review);
+    assert_eq!(watched.code, Some(0), "hermes monitor: {}", watched.stderr);
+    assert_eq!(hermes_reads(true, &watched, false), Call::Runs);
+    assert!(watched.stdout.is_empty(), "{}", watched.stdout);
+
+    // Codex CLI: no ask to give, so the review runs with a warning the
+    // person sees, and `--block-review` refuses it.
+    let codex = |command: &str| host.codex("Bash", json!({"command": command}));
+    let line = CODEX.command(bin(), false, false);
+    let answer = host.run("/bin/sh", &line, &codex(review));
+    assert_eq!(answer.code, Some(0), "codex: {}", answer.stderr);
+    assert_eq!(codex_reads(&answer), Call::Runs, "{}", answer.stdout);
+    let warning: Value = serde_json::from_str(answer.stdout.trim()).expect("one JSON line");
+    assert!(
+        warning["systemMessage"]
+            .as_str()
+            .is_some_and(|m| m.contains("world-writable permissions")),
+        "codex: the person is shown the review: {}",
+        answer.stdout
+    );
+    assert_runs_on(
+        codex_reads,
+        &host.run("/bin/sh", &line, &codex("ls")),
+        "codex ls",
+    );
+    let block = CODEX.command(bin(), true, false);
+    assert_refused_by(
+        codex_reads,
+        &host.run("/bin/sh", &block, &codex(review)),
+        "codex --block-review",
+    );
+    let monitor = CODEX.command(bin(), false, true);
+    assert_runs_on(
+        codex_reads,
+        &host.run("/bin/sh", &monitor, &codex(review)),
+        "codex monitor",
+    );
+}
+
+/// An agent the hook has no review answer for (any `--agent` id but
+/// Claude Code's, Codex's and Hermes's) is refused a review in enforce mode,
+/// with the reason on stderr, exactly as a deny is. Before, the hook printed
+/// nothing and exited 0, so the review ran unseen. Monitor still lets it run.
+///
+/// FAILS ON REVERT: answer `None` again for an unknown agent and the review
+/// exits 0 with nothing said.
+#[cfg(unix)]
+#[test]
+fn a_review_for_an_agent_with_no_way_to_ask_is_refused_with_the_reason() {
+    let host = Host::new();
+    let review = "chmod 777 ./build.sh";
+    let payload = |command: &str| {
+        json!({
+            "session_id": "s-other",
+            "cwd": host.project(),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        })
+    };
+    let line = hook_command_for(bin(), false, false, Some("some-agent"));
+    let answer = host.run("/bin/sh", &line, &payload(review));
+    assert_refused_by(claude_reads, &answer, "unknown agent review");
+    assert!(
+        answer.stderr.contains("world-writable permissions"),
+        "the refusal says why: {}",
+        answer.stderr
+    );
+    assert_runs_on(
+        claude_reads,
+        &host.run("/bin/sh", &line, &payload("ls")),
+        "unknown agent ls",
+    );
+    let monitor = hook_command_for(bin(), false, true, Some("some-agent"));
+    assert_runs_on(
+        claude_reads,
+        &host.run("/bin/sh", &monitor, &payload(review)),
+        "unknown agent monitor",
+    );
 }

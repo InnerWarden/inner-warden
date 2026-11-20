@@ -364,7 +364,7 @@ pub(crate) fn inspect_declared_tool_call(
                 .as_ref()
                 .is_none_or(|kept| kept.iter().any(|k| k.rule_id == m.rule_id))
         }) {
-            let block = m.severity == "critical" || m.severity == "high";
+            let block = m.refuses_a_call();
             alerts.push(VerdictAlert::from_atr(&m, block));
         }
     }
@@ -2222,7 +2222,7 @@ pub fn inspect_user_input(content: &str, rule_engine: Option<&RuleEngine>) -> Ve
             );
         }
         for m in matches {
-            let block = m.severity == "critical" || m.severity == "high";
+            let block = m.refuses_a_call();
             alerts.push(VerdictAlert::from_atr(&m, block));
         }
     }
@@ -2334,7 +2334,7 @@ pub fn inspect_tool_description(
         for m in atr_scan_deob(description, &deob, |t| {
             engine.check_context(AtrContext::tool_description(tool_name, t))
         }) {
-            let block = m.severity == "critical" || m.severity == "high";
+            let block = m.refuses_a_call();
             alerts.push(VerdictAlert::from_atr(&m, block));
         }
     }
@@ -3867,6 +3867,7 @@ fn analyze_command_as_read(
         let as_written = crate::shell::handed_shell_lines(cmd);
         handed_to_shell.over_budget |= as_written.over_budget;
         handed_to_shell.not_literal |= as_written.not_literal;
+        handed_to_shell.file_not_shown |= as_written.file_not_shown;
         for line in as_written.lines {
             if !handed_to_shell.lines.contains(&line) {
                 handed_to_shell.lines.push(line);
@@ -3890,6 +3891,22 @@ fn analyze_command_as_read(
             },
         );
         score += 40;
+    }
+    // A file the line prints into without showing the text, then runs: held
+    // as a line it cannot read is, unless the download rules already hold
+    // the same file (a download staged and then run).
+    if handed_to_shell.file_not_shown
+        && !signals.iter().any(|s| {
+            s.signal == "shell_line_not_literal"
+                || s.detail.contains("staged to a file and then executed")
+        })
+    {
+        signals.push(AnalysisSignal {
+            signal: "shell_line_not_literal".into(),
+            score: 20,
+            detail: "runs a file the line writes with text it does not show (a variable or a substitution), which the guard cannot read".into(),
+        });
+        score += 20;
     }
     if handed_to_shell.not_literal && !signals.iter().any(|s| s.signal == "shell_line_not_literal")
     {
@@ -4121,9 +4138,14 @@ fn analyze_command_as_read(
                     "removal by xargs of what a listing of the filesystem root, a home \
                      or a credential store prints",
                 ),
+                // A recursive removal (or `shred`, `dd of=`) whose targets
+                // come from a file or from input the line does not show is
+                // a destruction the line does not name, as `rm -rf $VAR`
+                // with no value: refused, never only held.
                 crate::threats::XargsRemoval::Unread => (
-                    25,
-                    "removal by xargs of paths it reads from input the guard does not see",
+                    50,
+                    "recursive removal by xargs of paths it reads from a file or input the \
+                     guard does not see",
                 ),
             };
             signals.push(AnalysisSignal {
@@ -4698,6 +4720,79 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refusing ATR rule whose pattern cannot finish on the input (the
+    /// fancy-regex backtrack limit) refuses the MCP message on each path
+    /// that reads rules: a user input, a tool description and a tool call.
+    /// A shell line holds such a rule for review; MCP has no review, and
+    /// `medium` there let the message through with an alert. A lighter
+    /// rule keeps its own severity and refuses nothing.
+    ///
+    /// FAILS ON REVERT: `m.severity == "critical" || m.severity == "high"`
+    /// at the three sites again and all three verdicts allow.
+    #[test]
+    fn a_refusing_rule_that_cannot_finish_refuses_the_mcp_message() {
+        let pattern = "(a*)*\\1b";
+        let text = format!("{}c", "a".repeat(40));
+        let rule = |id: &str, severity: &str, field: &str| {
+            format!(
+                "title: \"slow\"\nid: {id}\nseverity: {severity}\ndetection_tier: pattern\ntags:\n  category: test\ndetection:\n  conditions:\n    - field: {field}\n      operator: regex\n      value: '{pattern}'\n      description: \"slow pattern\"\n"
+            )
+        };
+        let load = |rules: &[String]| {
+            let dir = tempfile::tempdir().unwrap();
+            for (i, yaml) in rules.iter().enumerate() {
+                std::fs::write(dir.path().join(format!("rule-{i}.yaml")), yaml).unwrap();
+            }
+            let engine = RuleEngine::load(dir.path()).unwrap();
+            assert_eq!(engine.rule_count(), rules.len());
+            engine
+        };
+        let args = serde_json::json!({ "q": text });
+        let verdicts = |engine: &RuleEngine| {
+            [
+                inspect_user_input(&text, Some(engine)),
+                inspect_tool_description("lookup", &text, Some(engine)),
+                inspect_tool_call("lookup", &args, Some(engine)),
+            ]
+        };
+
+        let refusing = load(&[
+            rule("ATR-TEST-SLOW-INPUT", "critical", "user_input"),
+            rule("ATR-TEST-SLOW-ARGS", "high", "tool_args"),
+        ]);
+        for (path, v) in ["user input", "description", "tool call"]
+            .iter()
+            .zip(verdicts(&refusing))
+        {
+            assert!(!v.allowed, "{path}: {:?}", v.alerts);
+            assert!(
+                v.alerts
+                    .iter()
+                    .any(|a| a.rule.starts_with("ATR-TEST-SLOW") && a.block),
+                "{path}: {:?}",
+                v.alerts
+            );
+        }
+
+        let lighter = load(&[
+            rule("ATR-TEST-SLOW-INPUT", "medium", "user_input"),
+            rule("ATR-TEST-SLOW-ARGS", "low", "tool_args"),
+        ]);
+        for (path, v) in ["user input", "description", "tool call"]
+            .iter()
+            .zip(verdicts(&lighter))
+        {
+            assert!(
+                v.alerts
+                    .iter()
+                    .filter(|a| a.rule.starts_with("ATR-TEST-SLOW"))
+                    .all(|a| !a.block),
+                "{path}: {:?}",
+                v.alerts
+            );
+        }
+    }
 
     /// A line that leaves its program to an expansion is refused with its
     /// own reason and the way to write it. The same line with the path in

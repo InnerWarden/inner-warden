@@ -64,12 +64,30 @@ enum CompiledRegex {
     Fancy(FancyRegex),
 }
 
+/// What one condition's pattern said of a text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    Matched,
+    NotMatched,
+    /// The pattern could not finish on this text (a fancy-regex runtime
+    /// error, such as its backtrack limit): neither a match nor its absence.
+    Undecided,
+}
+
 impl CompiledRegex {
-    fn is_match(&self, content: &str) -> bool {
-        match self {
+    fn read(&self, content: &str) -> Reading {
+        let matched = match self {
             Self::Forward(re) => re.is_match(content),
             Self::Fast(re) => re.is_match(content),
-            Self::Fancy(re) => re.is_match(content).unwrap_or(false),
+            Self::Fancy(re) => match re.is_match(content) {
+                Ok(matched) => matched,
+                Err(_) => return Reading::Undecided,
+            },
+        };
+        if matched {
+            Reading::Matched
+        } else {
+            Reading::NotMatched
         }
     }
 
@@ -564,6 +582,22 @@ pub struct AtrMatch {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub matched: String,
     pub references: AtrReferences,
+    /// A refusing rule (`critical`, `high`) whose pattern could not finish
+    /// on the input. Its severity reads `medium`, so a shell line is held for
+    /// review; an MCP call, which has no review, is refused
+    /// ([`AtrMatch::refuses_a_call`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub undecided_refusal: bool,
+}
+
+impl AtrMatch {
+    /// Whether this match refuses an MCP message: a `critical` or `high`
+    /// rule, including one whose pattern could not finish on it. An MCP
+    /// verdict is allow or block, so holding such a rule at `medium` there
+    /// would let the message through with an alert.
+    pub fn refuses_a_call(&self) -> bool {
+        self.undecided_refusal || matches!(self.severity.as_str(), "critical" | "high")
+    }
 }
 
 /// The ATR rule engine, holds compiled rules grouped by field type.
@@ -898,6 +932,7 @@ fn make_match(rule: &CompiledRule, description: String, matched: String) -> AtrM
         matched_condition: description,
         matched,
         references: rule.references.clone(),
+        undecided_refusal: false,
     }
 }
 
@@ -933,27 +968,77 @@ fn matched_words(field: AtrField, regex: &CompiledRegex, value: &str) -> String 
     format!("{} `{}`", field_words(field), excerpt.replace('`', "'"))
 }
 
+/// The severity a rule that could not be read to the end is held at: a
+/// review, never an allow and never a refusal the rule did not make.
+const UNDECIDED_SEVERITY: &str = "medium";
+
+/// A rule whose pattern could not finish on the text: it is held, not
+/// passed. A rule that refuses (`critical`, `high`) is held for review
+/// (`medium`) on a shell line and refused on an MCP message
+/// ([`AtrMatch::refuses_a_call`]); a lighter one is kept at its own
+/// severity, as if it had matched. Said in the match and in a warning, so it
+/// is seen.
+fn undecided_match(rule: &CompiledRule, condition: &CompiledCondition) -> AtrMatch {
+    warn!(
+        rule = %rule.id,
+        "an ATR pattern could not finish on this input; the rule holds it"
+    );
+    let mut held = make_match(
+        rule,
+        format!(
+            "{} (the pattern could not finish on this input: held)",
+            condition.description
+        ),
+        field_words(condition.field).to_string(),
+    );
+    if matches!(rule.severity.as_str(), "critical" | "high") {
+        held.severity = UNDECIDED_SEVERITY.to_string();
+        held.undecided_refusal = true;
+    }
+    held
+}
+
 fn eval_rule_context(rule: &CompiledRule, context: AtrContext<'_>) -> Option<AtrMatch> {
     let conditions = rule.conditions.get(&rule.id);
     match rule.logic {
-        ConditionLogic::Any => conditions.iter().find_map(|condition| {
-            let value = context_value(context, condition.field)?;
-            condition.regex.is_match(value).then(|| {
-                make_match(
-                    rule,
-                    condition.description.clone(),
-                    matched_words(condition.field, &condition.regex, value),
-                )
-            })
-        }),
+        ConditionLogic::Any => {
+            let mut undecided = None;
+            for condition in conditions {
+                let Some(value) = context_value(context, condition.field) else {
+                    continue;
+                };
+                match condition.regex.read(value) {
+                    Reading::Matched => {
+                        return Some(make_match(
+                            rule,
+                            condition.description.clone(),
+                            matched_words(condition.field, &condition.regex, value),
+                        ))
+                    }
+                    Reading::Undecided => {
+                        undecided.get_or_insert(condition);
+                    }
+                    Reading::NotMatched => {}
+                }
+            }
+            undecided.map(|condition| undecided_match(rule, condition))
+        }
         ConditionLogic::All => {
             let mut first = None;
+            let mut undecided = None;
             for condition in conditions {
                 let value = context_value(context, condition.field)?;
-                if !condition.regex.is_match(value) {
-                    return None;
+                match condition.regex.read(value) {
+                    Reading::NotMatched => return None,
+                    Reading::Undecided => {
+                        undecided.get_or_insert(condition);
+                    }
+                    Reading::Matched => {}
                 }
                 first.get_or_insert_with(|| condition.description.clone());
+            }
+            if let Some(condition) = undecided {
+                return Some(undecided_match(rule, condition));
             }
             Some(make_match(rule, first.unwrap_or_default(), String::new()))
         }
@@ -1367,6 +1452,80 @@ detection:
             f.write_all(yaml.as_bytes()).unwrap();
         }
         dir
+    }
+
+    /// A refusing rule whose pattern cannot finish on the input (fancy-regex
+    /// past its backtrack limit) held nothing: the runtime error read as "no
+    /// match", so the rule let the input through. Now it is held for review
+    /// (`medium`), named as such, whichever way the rule joins its
+    /// conditions.
+    ///
+    /// FAILS ON REVERT: `unwrap_or(false)` on the fancy match again and both
+    /// rules return no match.
+    #[test]
+    fn a_pattern_that_cannot_finish_holds_the_input_for_review() {
+        let pattern = "(a*)*\\1b";
+        let text = format!("{}c", "a".repeat(40));
+        assert!(
+            FancyRegex::new(pattern).unwrap().is_match(&text).is_err(),
+            "the pattern no longer fails at run time; pick another"
+        );
+        let any = format!(
+            r#"
+title: "Refuses on a slow pattern"
+id: ATR-TEST-SLOW-ANY
+severity: critical
+detection_tier: pattern
+tags:
+  category: test
+detection:
+  conditions:
+    - field: user_input
+      operator: regex
+      value: '{pattern}'
+      description: "slow pattern"
+"#
+        );
+        let all = format!(
+            r#"
+title: "Refuses on a slow pattern and a word"
+id: ATR-TEST-SLOW-ALL
+severity: high
+detection_tier: pattern
+tags:
+  category: test
+detection:
+  condition: all
+  conditions:
+    - field: user_input
+      operator: regex
+      value: '{pattern}'
+      description: "slow pattern"
+    - field: user_input
+      operator: regex
+      value: "aaa"
+      description: "a word"
+"#
+        );
+        let dir = create_temp_rules(&[&any, &all]);
+        let engine = RuleEngine::load(dir.path()).unwrap();
+        assert_eq!(engine.rule_count(), 2);
+        let matches = engine.check_user_input(&text);
+        assert_eq!(matches.len(), 2, "{matches:?}");
+        for m in &matches {
+            assert_eq!(m.severity, "medium", "{m:?}");
+            assert!(m.matched_condition.contains("could not finish"), "{m:?}");
+            assert!(m.undecided_refusal && m.refuses_a_call(), "{m:?}");
+        }
+        // A text the pattern reads to the end is judged as before.
+        assert!(engine.check_user_input("nothing here").is_empty());
+        let matched = engine.check_user_input("aab");
+        assert!(
+            matched
+                .iter()
+                .any(|m| m.rule_id == "ATR-TEST-SLOW-ANY" && m.severity == "critical"),
+            "{matched:?}"
+        );
     }
 
     #[test]

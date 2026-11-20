@@ -1768,6 +1768,7 @@ mod tests {
             matched_condition: "ignore previous instructions".into(),
             matched: String::new(),
             references: AtrReferences::default(),
+            undecided_refusal: false,
         }
     }
 

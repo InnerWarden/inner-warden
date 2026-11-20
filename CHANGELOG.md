@@ -15,6 +15,40 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Security
 
+- **A review asks you instead of passing unseen.** In enforce mode the hook
+  used to refuse a `deny` and let a `review` run without a word (`chmod 777`
+  on a folder, for one). It now hands a review to the person: Claude Code
+  gets `permissionDecision: "ask"` with the reason, and Hermes Agent
+  `action: "approve"`, which its approval gate refuses when nobody is there.
+  Codex CLI has no way for a hook to ask, so there a review runs with a
+  warning Codex shows you. Gemini CLI, whose ask is not sure to reach a
+  person, and any other agent refuse a review with the reason.
+  `--block-review` still refuses every review, and monitor mode still never
+  refuses. [What the hook does with each verdict](docs/features.md#what-an-agents-hook-does-with-each-verdict).
+- **The MCP proxy refuses a read of a named credential store.** In `guard`
+  and `kill`, a resource read whose location names a credential
+  (`internal://credentials`, `config://auth_tokens`) or a secret store by
+  its scheme (`vault://`, `keyring://`, `keychain://`, `kv://`, `env://`,
+  `ssm://`, `secrets://`, the cloud stores `aws-sm://`, `azure-keyvault://`,
+  `gcp-secret://`, `secret-manager://`, and `x-vault://`) is refused, also
+  when the name is written in fullwidth letters. A document, a source file, a
+  count or a setting about a credential is not; a file in a folder that names
+  one is read with an alert. 1.6.15 alerts on these reads and passes them in
+  every mode (measured: `vault://`, `internal://credentials`, `aws-sm://`
+  and `x-vault://` reach the server under `--mode guard`). A refusal now
+  says which words of the call matched, and an AWS secret access key next to
+  its key id is masked in an answer.
+- **An order to drop your earlier rules is read by its structure.** A tool
+  result that tells the reader to ignore, disregard or forget your previous
+  rules, instructions or context and then act is held in `guard` and `kill`,
+  whatever the noun or spelling; "ignore all previous versions" is not. Text
+  that tells the assistant to adhere to or comply with an instruction is read
+  like the other orders to act. On held-out sets, attacks held went from 4 to
+  5 of 31, and benign texts held stayed at 0 of 38.
+- **A recursive `rm` of the root, a home or a system folder is refused
+  without `-f`.** It was refused only when also forced, so `rm -r /` passed.
+  Recursion alone is now enough, whatever other letters the flag cluster
+  holds.
 - **A jail without `--identity` keeps the launcher's records and Claude
   Code's state out of its reach.** On Linux the launcher's records of its
   instances, which the dashboard and the host's agents read, are read-only
@@ -47,6 +81,12 @@ the text of a command; what it does not see is written down, as measured:
   a download that code runs is refused for an agent.
 
 ### Fixed
+
+- **A restarted MCP proxy still holds a tool the server never listed.** A
+  server's pin record carries a mark written by its first listing, even an
+  empty one, so the hold no longer depends on the record having pins.
+  Whether a `tools/list` answer is the next page or a new listing is decided
+  by the client's request (a cursor or not), not by the answer before it.
 
 - **Prose written with `cat` after a `cd` runs.** `cd repo && cat >>
   notes.md <<'EOF'` with words of the guard's rules in the text was refused
@@ -86,6 +126,10 @@ the text of a command; what it does not see is written down, as measured:
   entry saying why it is harmless.
 
 ### What this costs
+
+In `guard` and `kill`, an MCP server that keeps ordinary data at a location
+named like a credential store has that read refused; reading it is your
+call, as reading a credentials file in the shell is.
 
 A line that pipes text it does not write out into a shell is held for
 review. A jailed agent that needs a proxy variable under any name other than

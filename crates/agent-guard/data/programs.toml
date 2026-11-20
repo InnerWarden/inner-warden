@@ -1,0 +1,131 @@
+# Programs that run what they are handed, and where they take it from.
+#
+# Read by `src/shell/runners.rs` into the guard's readings of a line:
+# `shell` names a shell (its `-c` line, a script file, its standard input);
+# `sink` a program whose input or arguments become code, so a part of the
+# line it is handed is never trusted as data; `stdin_code` one that runs
+# what it reads on standard input as code when it is given none other.
+# `language` is how what it runs is read (shell, python, node, ruby, perl,
+# php, lua, make, awk). `inline` is the option that takes code on the
+# command line, `file_option` the one that names a file it runs.
+#
+# Nothing here is executed.
+
+# Shells: the -c line, the first operand as a script file, or stdin.
+[[program]]
+names = ["sh", "bash", "zsh", "dash", "ksh", "fish"]
+language = "shell"
+shell = true
+sink = true
+stdin_code = true
+inline = "-c"
+
+# More shells: the Bourne family's others, busybox's (`busybox ash` and
+# `busybox sh` are read past `busybox`), and the C shells, which read
+# `-c`, a script file and stdin the same way.
+[[program]]
+names = ["ash", "mksh", "pdksh", "oksh", "yash", "posh", "rbash", "tcsh", "csh"]
+language = "shell"
+shell = true
+sink = true
+stdin_code = true
+inline = "-c"
+
+[[program]]
+names = ["python", "pypy"]
+language = "python"
+sink = true
+stdin_code = true
+inline = "-c"
+
+[[program]]
+names = ["node"]
+language = "node"
+sink = true
+stdin_code = true
+inline = "-e"
+
+[[program]]
+names = ["nodejs", "bun", "deno"]
+language = "node"
+stdin_code = true
+inline = "-e"
+
+[[program]]
+names = ["perl"]
+language = "perl"
+sink = true
+stdin_code = true
+inline = "-e"
+
+[[program]]
+names = ["ruby"]
+language = "ruby"
+sink = true
+stdin_code = true
+inline = "-e"
+
+[[program]]
+names = ["php"]
+language = "php"
+sink = true
+stdin_code = true
+inline = "-r"
+
+[[program]]
+names = ["lua"]
+language = "lua"
+sink = true
+stdin_code = true
+inline = "-e"
+
+# A file run in the shell itself.
+[[program]]
+names = ["source", "."]
+language = "shell"
+sink = true
+stdin_code = true
+
+# Their arguments are a command: the shell's own, and the remote shell.
+[[program]]
+names = ["eval", "exec", "xargs", "ssh"]
+language = "shell"
+sink = true
+
+# Their arguments are a command the guard reads after them (a test holds
+# that each one is read through).
+[[program]]
+names = ["env", "sudo", "doas", "nice", "nohup", "timeout", "setsid", "stdbuf", "busybox", "find", "watch", "su", "systemd-run"]
+language = "shell"
+launcher = true
+
+# A crontab file, or `-` for stdin: each entry's command runs in a shell.
+[[program]]
+names = ["crontab"]
+language = "crontab"
+
+# A job for later: what they read on stdin, or the file after -f, is a
+# script for /bin/sh.
+[[program]]
+names = ["at", "batch"]
+language = "shell"
+file_option = "-f"
+stdin_script = true
+
+# A makefile from stdin (`-f -`), or the file after -f (Makefile when none
+# is named): its recipe lines run in a shell.
+[[program]]
+names = ["make", "gmake", "bmake"]
+language = "make"
+file_option = "-f"
+
+# Each line of its input runs in a shell when its program calls system()
+# or prints to a shell.
+[[program]]
+names = ["awk", "gawk", "mawk", "nawk"]
+language = "awk"
+
+# With no command of its own, each line of its input is a command.
+[[program]]
+names = ["parallel"]
+language = "shell"
