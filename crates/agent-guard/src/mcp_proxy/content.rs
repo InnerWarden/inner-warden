@@ -2115,10 +2115,22 @@ mod tests {
             format!("SECRET_ACCESS_KEY={secret}"),
             format!("credentials {id} {secret}"),
             format!("key id {id}\nthen {secret}\n"),
-        ] {
-            let out = masked(&text);
-            assert!(!out.contains(&secret), "{text:?} -> {out:?}");
-            assert!(kinds(&text).contains(&SecretKind::CloudKey), "{text:?}");
+        ]
+        .iter()
+        .enumerate()
+        {
+            // The case is named by its index, never printed: a failing
+            // assertion must not write the sample key to the test log.
+            let (case, text) = text;
+            let out = masked(text);
+            assert!(
+                !out.contains(&secret),
+                "case {case}: the key was not masked"
+            );
+            assert!(
+                kinds(text).contains(&SecretKind::CloudKey),
+                "case {case}: not read as a cloud key"
+            );
         }
         // Forty characters of one case, or with no digit, `/` or `+`, are
         // not a key; nor is a 40-character run far from any key id or key.
