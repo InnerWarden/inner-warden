@@ -31,6 +31,7 @@ is allowed. The guard reads the home from the process environment, so
 | attack-2026-11 | `attack-2026-11/cases.yml` | the lines the guard's tests fixed on 2026-11-18 and 19 (removals, including through xargs and find -exec, persistence files, SSH keys and their use, the guard's own files, secret reads, shell runner forms), with the verdict each test asserts; a test that only asserts "not allow" gives `expect: review` |
 | real | `real/cases.yml` | lines agents really ran while building the guard, refused or held, then labelled by a person |
 | external-2026-11 | `external-2026-11/cases.yml` | attacks the guard's authors did not write: AgentDojo's injection tasks (the text injected into a tool result and the tool calls the attack wants) and the shell calls of a model poisoned with a public recipe, with benign controls from the same sources; sources and licences in `external-2026-11/SOURCES.md`, the end-to-end result through the proxy and the hook in `external-2026-11/RESULTS.md` |
+| adversarial-323 | `adversarial-323/cases.yml` | the attack lines of the adversarial review of pull request #323 (`must_refuse: true`) and its print-only and ordinary controls; read by the differential check below, not by the release safety suite |
 
 In `real`, `right_block` means the refusal was right (`expect: deny`: only a
 deny counts); `legit_work` and `guard_bug` mean the line should pass, at most
@@ -71,3 +72,46 @@ IW_RELEASE_EVAL_WRITE=1 cargo test -p innerwarden-agent-guard --test release_eva
 
 A new case enters the same way: add it to a corpus, rewrite the reference, and
 say so in `REFERENCE-CHANGES.md`.
+
+## Differential check
+
+```
+CARGO_PROFILE_RELEASE_PANIC=unwind cargo build --release -p innerwarden-agent-guard --example differential_guard
+J=target/release/examples/differential_guard
+$J cases . > cases.jsonl
+$J judge cases.jsonl --place /some/empty/dir > head.jsonl
+```
+
+The release safety suite holds the guard to a reference total. The
+differential check, a CI job on every pull request that touches the guard,
+judges every line twice: with the guard of the merge base and with the guard of
+the branch (`examples/differential_guard.rs`, the branch's copy built on both
+sides). It reads every corpus here, `corpus/*/cases.yml` and the proof corpus,
+so a corpus added later is judged without touching the job.
+
+It also generates metamorphic variants of every malicious shell line: rewrites
+the shell runs as the same command, so the verdict should not move. A wrapper
+(`sudo`, `env A=1`, `timeout 5`, `nice -n 5`, `nohup`, `bash -c '...'`,
+`xargs`, `find . -exec`), the line moved into a body (`if`, `for`, `{ }`,
+`( )`, a function), and, on a line of plain words, a redirect glued to the
+verb (`stop>/dev/null`), a word split with quotes or an escape (`st''op`,
+`s\top`, `$'stop'`), the verb routed through a variable or a brace
+(`v=stop; systemctl $v ...`, `{stop,}`), and flags clustered differently
+(`-rf`, `-fr`, `-r -f`). They are generated in the job, not stored.
+
+A line is **stopped** when it is denied, or reviewed with a signal that holds
+an agent. The job fails when main stops a line and the branch does not. The
+only way past it is for a **benign** line, named in a dated entry of
+`REFERENCE-CHANGES.md` after `harmless-proven:` (as `corpus/id`), with the
+reason it is harmless. A malicious line is never waived, a line marked
+`must_refuse: true` never, and neither is any variant of one.
+
+Every other change of verdict is listed too, in both directions, with what main
+itself does not stop (must-refuse lines and variants, a baseline rather than a
+failure), the time per line (p50, p99) and the size of both judge binaries.
+
+A line that makes the guard panic is recorded as `panic` and listed. It counts
+as stopped, because the hook refuses a call whose screening panicked (in
+enforce). The judges are built with `CARGO_PROFILE_RELEASE_PANIC=unwind` so the
+run goes on past such a line: the release profile aborts.
+
