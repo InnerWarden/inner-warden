@@ -2107,6 +2107,37 @@ fn sensitive_path_in_arguments(args: &serde_json::Value) -> Option<&'static str>
         .or_else(|| found.first().copied())
 }
 
+/// No path a system opens is longer than this (Linux's `PATH_MAX`).
+const MAX_TARGET_PATH_BYTES: usize = 4096;
+
+/// What a string longer than [`MAX_TARGET_PATH_BYTES`] where a call writes
+/// is: the file its lexical form names, read like any target, when `.` and
+/// `..` bring it under the cap (`/etc/././.../sudoers`, which a server
+/// normalises before it opens it); still too long, on one line, a path the
+/// guard cannot read, refused rather than passed unread. Text over several
+/// lines is content, not a path.
+enum LongTarget {
+    Judged(Option<threats::PrivilegedTarget>),
+    Unread(usize),
+}
+
+fn long_target(text: &str, named: Named) -> Option<LongTarget> {
+    let trimmed = text.trim();
+    if named != Named::Target || trimmed.len() <= MAX_TARGET_PATH_BYTES {
+        return None;
+    }
+    let collapsed = threats::collapse_path(trimmed.trim_matches(['"', '\'']));
+    if collapsed.len() <= MAX_TARGET_PATH_BYTES {
+        return Some(LongTarget::Judged(threats::privileged_write_target(
+            &collapsed,
+        )));
+    }
+    if trimmed.contains(['\n', '\r']) {
+        return None;
+    }
+    Some(LongTarget::Unread(trimmed.len()))
+}
+
 /// Refuse a tool call that would change a file granting privilege or a login,
 /// holding code that runs as root, or carrying the guard itself
 /// (`AG-PRIV-WRITE`).
@@ -2150,10 +2181,38 @@ fn privileged_write_alert(
     if read_only {
         return None;
     }
+    let unread = |len: usize| {
+        VerdictAlert::builtin(
+            "AG-PRIV-WRITE",
+            format!(
+                "names a path of {len} bytes where it writes, longer than any path a \
+                 system opens ({MAX_TARGET_PATH_BYTES}), even with `.` and `..` taken out: \
+                 not read, so refused rather than passed unread"
+            ),
+            true,
+        )
+    };
     let mut pending = vec![(args, Named::InPassing)];
     while let Some((value, named)) = pending.pop() {
+        // A key of a map held where the call writes is a path too
+        // (`write_files`' `{"files": {path: text}}`).
+        if let serde_json::Value::Object(map) = value {
+            for key in map.keys() {
+                match long_target(key, named) {
+                    Some(LongTarget::Unread(len)) => return Some(unread(len)),
+                    Some(LongTarget::Judged(Some(found))) => {
+                        return Some(found_alert(&found, named, tool_name, declared));
+                    }
+                    _ => {}
+                }
+            }
+        }
         let found = match value {
-            serde_json::Value::String(s) => judged(s, named),
+            serde_json::Value::String(s) => match long_target(s, named) {
+                Some(LongTarget::Unread(len)) => return Some(unread(len)),
+                Some(LongTarget::Judged(found)) => found,
+                None => judged(s, named),
+            },
             serde_json::Value::Array(items) => {
                 pending.extend(items.iter().map(|item| (item, named)));
                 None
@@ -2172,27 +2231,35 @@ fn privileged_write_alert(
             _ => None,
         };
         if let Some(found) = found {
-            let shown: String = crate::redact::redact_secrets(&found.path)
-                .text
-                .chars()
-                .take(160)
-                .collect();
-            let what = found.group.what;
-            let writes = match declared {
-                ToolDeclaration::Writes => true,
-                _ => WRITE_TOOLS.contains(&tool_name),
-            };
-            let detail = if writes && named == Named::Target {
-                format!("may change `{shown}`, part of {what}")
-            } else {
-                format!(
-                    "names `{shown}`, part of {what}, and its server does not say this tool only reads"
-                )
-            };
-            return Some(VerdictAlert::builtin("AG-PRIV-WRITE", detail, true));
+            return Some(found_alert(&found, named, tool_name, declared));
         }
     }
     None
+}
+
+/// The `AG-PRIV-WRITE` refusal of a call that names `found` at `named`.
+fn found_alert(
+    found: &threats::PrivilegedTarget,
+    named: Named,
+    tool_name: &str,
+    declared: ToolDeclaration,
+) -> VerdictAlert {
+    let shown: String = crate::redact::redact_secrets(&found.path)
+        .text
+        .chars()
+        .take(160)
+        .collect();
+    let what = found.group.what;
+    let writes = match declared {
+        ToolDeclaration::Writes => true,
+        _ => WRITE_TOOLS.contains(&tool_name),
+    };
+    let detail = if writes && named == Named::Target {
+        format!("may change `{shown}`, part of {what}")
+    } else {
+        format!("names `{shown}`, part of {what}, and its server does not say this tool only reads")
+    };
+    VerdictAlert::builtin("AG-PRIV-WRITE", detail, true)
 }
 
 /// Inspect direct LLM/user input on the correct surface. This is deliberately
@@ -6970,6 +7037,73 @@ mod tests {
     ///
     /// FAILS ON REVERT: drop the `privileged_write_alert` call and every one
     /// of these is allowed.
+    /// A path over the length a system opens, where a call writes, is not
+    /// passed unread: padded with `./` it is read as the file it names once
+    /// `.` and `..` are taken out (a server normalises it before it opens
+    /// it); still too long, it is refused. Before, a target over 4096 bytes
+    /// was not looked at, and `/etc/././.../sudoers` passed.
+    ///
+    /// FAILS ON REVERT of `long_target` in `privileged_write_alert`: the
+    /// padded paths raise nothing.
+    #[test]
+    fn a_target_path_over_the_cap_is_read_or_refused_not_passed() {
+        let padded = format!("/etc/{}sudoers", "./".repeat(2100));
+        assert!(padded.len() > MAX_TARGET_PATH_BYTES);
+        let v = inspect_tool_call(
+            "write_file",
+            &serde_json::json!({"path": padded, "content": "x"}),
+            None,
+        );
+        let alert = priv_write(&v).expect("a padded path to sudoers is read");
+        assert!(alert.detail.contains("/etc/sudoers"), "{}", alert.detail);
+        assert!(!v.allowed);
+
+        let walked = format!("/srv/{}../etc/cron.d/agent", "a/../".repeat(900));
+        assert!(walked.len() > MAX_TARGET_PATH_BYTES);
+        let v = inspect_tool_call(
+            "edit_file",
+            &serde_json::json!({"path": walked, "edits": []}),
+            None,
+        );
+        assert!(priv_write(&v).is_some(), "{:?}", v.alerts);
+
+        let unread = format!("/home/dev/proj/{}notes.md", "a/".repeat(2100));
+        let v = inspect_tool_call(
+            "write_file",
+            &serde_json::json!({"path": unread, "content": "x"}),
+            None,
+        );
+        let alert = priv_write(&v).expect("a path too long to read is refused");
+        assert!(alert.detail.contains("not read"), "{}", alert.detail);
+
+        let as_key = format!("/etc/{}sudoers", "./".repeat(2100));
+        let v = inspect_tool_call(
+            "write_files",
+            &serde_json::json!({"files": {as_key: "agent ALL=(ALL) NOPASSWD: ALL"}}),
+            None,
+        );
+        assert!(priv_write(&v).is_some(), "{:?}", v.alerts);
+
+        // Text over several lines where a path may sit is content, and a
+        // read names what it likes.
+        let code = "print('x')\n".repeat(600);
+        let v = inspect_tool_call("compile", &serde_json::json!({"source": code}), None);
+        assert!(priv_write(&v).is_none(), "{:?}", v.alerts);
+        let v = inspect_tool_call(
+            "read_file",
+            &serde_json::json!({"path": format!("/home/dev/proj/{}notes.md", "a/".repeat(2100))}),
+            None,
+        );
+        assert!(priv_write(&v).is_none(), "{:?}", v.alerts);
+        // Under the cap nothing changes.
+        let v = inspect_tool_call(
+            "write_file",
+            &serde_json::json!({"path": "/home/dev/proj/notes.md", "content": "x"}),
+            None,
+        );
+        assert!(priv_write(&v).is_none(), "{:?}", v.alerts);
+    }
+
     #[test]
     fn a_change_to_a_privileged_file_is_refused_by_any_tool_in_any_spelling() {
         let cases = [

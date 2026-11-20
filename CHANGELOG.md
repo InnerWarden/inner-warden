@@ -95,6 +95,20 @@ the text of a command; what it does not see is written down, as measured:
   `someone@example.com` was not found to carry it; nor was an address with
   a quote on one side only or glued to the next word
   (`'someone@example.com'.The`).
+- **A write to a path longer than any path a system opens is read, not
+  passed.** The MCP proxy's check of a change to a privileged file gave up on
+  a target over 4096 bytes, so `/etc/` padded with `./` up to `sudoers`
+  went unread. It now reads the path with `.` and `..` taken out, as a
+  server opens it, and refuses one still too long on one line.
+- **A refusal names the rule that decided it.** When a rule of the hard layer
+  (a revoked agent, a call reaching the guard's LLM key, a change to a
+  privileged file) and a general rule both refused an MCP call, the reply
+  named the general rule, and a revoked agent's refusal did not say it was
+  revoked. The hard rule is now the reason, as it is the one that decides.
+- **Bookings and calendar guests are classed.** `reserve_hotel`,
+  `book_flight` and the like are class `commitment`, and a calendar entry
+  with guests is `send-external` with its guests as destinations; the
+  provenance table reads every value they carry.
 - **The differential check replays whole MCP sessions.** A corpus line can be
   a session (`surface: session`): client and server messages replayed
   through the proxy's router with one taint tracker, judged by its last

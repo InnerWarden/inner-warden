@@ -111,6 +111,10 @@ pub fn apply_mode(d: &ProxyDecision, mode: ProxyMode, as_protocol_error: bool) -
 /// privileged file, and (when it blocks) a read of a secret store.
 const HARD_RULES: &[&str] = &["AG-PRIV-WRITE", "AG-FILE"];
 
+/// The rules of the hard layer, which decide a refusal before any other
+/// (`identity::decide`): the reason a refusal gives when one of them blocks.
+const DECIDES_FIRST: &[&str] = &[REVOKED_RULE, LLM_KEY_RULE, "AG-PRIV-WRITE", "AG-FILE"];
+
 /// The rule a profile's refusal of a tool call is reported under.
 pub const PROFILE_DENY_RULE: &str = "AG-PROFILE-DENY";
 
@@ -229,14 +233,21 @@ fn apply_profile(
     };
     let named = agent_type.as_deref().zip(profile.as_ref());
     let (decision, note) = decide_tool_call_in(&facts, named, revoked, trust);
-    if decision.verdict == Verdict::Deny && d.verdict.allowed {
-        let rule = if decision.deciding_layer == RuleLayer::Hard && revoked.is_some() {
-            REVOKED_RULE
-        } else if decision.deciding_layer == RuleLayer::Hard {
-            LLM_KEY_RULE
-        } else {
-            PROFILE_DENY_RULE
-        };
+    // The hard layer's own reasons, which decide before the general rules
+    // (`identity::decide`): said even when those rules refused the call
+    // too, so the refusal names the rule that decided it.
+    let hard_rule = if decision.deciding_layer != RuleLayer::Hard {
+        None
+    } else if revoked.is_some() {
+        Some(REVOKED_RULE)
+    } else if names_llm_key || d.verdict.allowed {
+        Some(LLM_KEY_RULE)
+    } else {
+        // A hard alert the call already carries (`HARD_RULES`) decided.
+        None
+    };
+    if decision.verdict == Verdict::Deny && (d.verdict.allowed || hard_rule.is_some()) {
+        let rule = hard_rule.unwrap_or(PROFILE_DENY_RULE);
         d.verdict.allowed = false;
         d.verdict.alerts.push(VerdictAlert::builtin(
             rule,
@@ -257,11 +268,14 @@ pub fn synthesize_denial(d: &ProxyDecision, as_protocol_error: bool) -> String {
     // its client can read as a refusal.
     let as_protocol_error = as_protocol_error || d.method.as_deref() != Some("tools/call");
     let id = d.request_id.clone();
+    // The rule that decided: one of the hard layer's, which decides before
+    // the general rules, else the first that blocks.
     let reason = d
         .verdict
         .alerts
         .iter()
-        .find(|a| a.block)
+        .find(|a| a.block && DECIDES_FIRST.contains(&a.rule.as_str()))
+        .or_else(|| d.verdict.alerts.iter().find(|a| a.block))
         .map(|a| format!("{}: {}", a.rule, a.detail))
         .unwrap_or_else(|| "blocked by agent-guard policy".to_string());
     let alerts_json = serde_json::to_value(&d.verdict.alerts).unwrap_or(Value::Null);
@@ -684,6 +698,111 @@ mod tests {
         let (mut d, e) = call(WEATHER);
         let action = apply_layers(&mut d, &e, Some(&revoked), None, ProxyMode::Advisory, false);
         assert!(!matches!(action, ProxyAction::Block { .. }), "{action:?}");
+    }
+
+    /// The reason a refusal gives is the rule that decided it. A rule of the
+    /// hard layer decides before the general rules (`identity::decide`), so
+    /// when both refuse a call the hard one is the reason: a revoked agent,
+    /// a call reaching the guard's LLM key, a change to a privileged file.
+    /// Before, the first blocking alert was shown, an ATR rule the call also
+    /// matched, and a revoked agent's refusal did not name the revocation.
+    ///
+    /// FAILS ON REVERT: push the hard layer's alert only when the call was
+    /// still allowed, or take the first blocking alert as the reason, and
+    /// the reason names the general rule.
+    #[test]
+    fn the_reason_of_a_refusal_is_the_rule_that_decided_it() {
+        let reason = |line: &str| {
+            line.split("blocked this tool call, ")
+                .nth(1)
+                .map(|rest| rest.split(':').next().unwrap_or("").to_string())
+                .unwrap_or_default()
+        };
+        let engine = crate::rules::RuleEngine::load_embedded();
+        let routed = |line: &str| {
+            let e = env(line);
+            let d = route_message(&e, Direction::ClientToServer, None, Some(&engine), None);
+            (d, e)
+        };
+        const WIPE: &str = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_command","arguments":{"command":"rm -rf ~"}}}"#;
+        const WIPE_AND_KEY: &str = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"run_command","arguments":{"command":"cat /home/dev/.config/innerwarden/llm-key; rm -rf ~"}}}"#;
+        const SUDOERS: &str = r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"write_file","arguments":{"path":"/etc/sudoers","content":"dev ALL=(ALL) NOPASSWD: ALL"}}}"#;
+
+        // Refused by the rules already, and the agent is revoked.
+        let revoked = ProxyProfile::Active {
+            agent_type: Some("claude-code".into()),
+            profile: None,
+            trust: Trust::Confined,
+            revoked: Some(crate::profiles::Revocation::AgentType),
+        };
+        let (mut d, e) = routed(WIPE);
+        assert!(!d.verdict.allowed, "the rules refuse it on their own");
+        let action = apply_layers(
+            &mut d,
+            &e,
+            Some(&revoked),
+            Some(&engine),
+            ProxyMode::Guard,
+            false,
+        );
+        let ProxyAction::Block { response_line } = action else {
+            panic!("{action:?}");
+        };
+        assert_eq!(d.deciding_layer, Some(RuleLayer::Hard));
+        assert_eq!(reason(&response_line), REVOKED_RULE, "{response_line}");
+
+        // Refused by the rules already, and it reaches the LLM key.
+        let declared = ProxyProfile::Active {
+            agent_type: None,
+            profile: None,
+            trust: Trust::Declared,
+            revoked: None,
+        };
+        let (mut d, e) = routed(WIPE_AND_KEY);
+        assert!(!d.verdict.allowed);
+        let action = apply_layers(
+            &mut d,
+            &e,
+            Some(&declared),
+            Some(&engine),
+            ProxyMode::Guard,
+            false,
+        );
+        let ProxyAction::Block { response_line } = action else {
+            panic!("{action:?}");
+        };
+        assert_eq!(d.deciding_layer, Some(RuleLayer::Hard));
+        assert_eq!(reason(&response_line), LLM_KEY_RULE, "{response_line}");
+
+        // No profile at all: a change to a privileged file is the hard
+        // layer's refusal, whatever ATR rule the same arguments match.
+        let (mut d, e) = routed(SUDOERS);
+        assert!(
+            d.verdict.alerts.iter().filter(|a| a.block).count() > 1,
+            "{:?}",
+            d.verdict.alerts
+        );
+        let action = apply_layers(&mut d, &e, None, Some(&engine), ProxyMode::Guard, false);
+        let ProxyAction::Block { response_line } = action else {
+            panic!("{action:?}");
+        };
+        assert_eq!(reason(&response_line), "AG-PRIV-WRITE", "{response_line}");
+
+        // A refusal by the general rules alone keeps its first rule.
+        let (mut d, e) = routed(WIPE);
+        let first = d
+            .verdict
+            .alerts
+            .iter()
+            .find(|a| a.block)
+            .unwrap()
+            .rule
+            .clone();
+        let action = apply_layers(&mut d, &e, None, Some(&engine), ProxyMode::Guard, false);
+        let ProxyAction::Block { response_line } = action else {
+            panic!("{action:?}");
+        };
+        assert_eq!(reason(&response_line), first, "{response_line}");
     }
 
     /// A file that cannot be used refuses every tool call, which the mode
