@@ -595,6 +595,8 @@ pub(crate) const HOME_SECRETS: &[&str] = &[
     ".config/gcloud/application_default_credentials.json",
     ".kube/config",
     ".vault-token",
+    ".pgpass",
+    ".my.cnf",
 ];
 
 /// How many entries of `~/.ssh` a read is compared with.
@@ -837,6 +839,8 @@ const HOME_PLACES: &[HomeGroup] = &[
             ".config/hub",
             ".config/git/credentials",
             ".vault-token",
+            ".pgpass",
+            ".my.cnf",
             ".terraform.d/credentials.tfrc.json",
         ],
         trees: &[

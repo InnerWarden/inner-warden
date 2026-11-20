@@ -2,6 +2,7 @@
 
 mod glob_names;
 mod guard_doubt;
+mod guard_lowering;
 mod words_after;
 
 /// Prompt injection markers in tool descriptions or responses.
@@ -359,6 +360,13 @@ pub const SENSITIVE_PATHS: &[&str] = &[
     // purpose is to hold a secret.
     ".netrc",
     ".config/gh/hosts.yml",
+    // A password kept in plain text for PostgreSQL (`.pgpass`) and MySQL
+    // (`.my.cnf`), HashiCorp Vault's token, and a KeePass database: files
+    // whose purpose is to hold a secret.
+    ".pgpass",
+    ".my.cnf",
+    ".vault-token",
+    ".kdbx",
     ".npmrc",
     ".pypirc",
     ".env",
@@ -15777,6 +15785,10 @@ pub fn is_hard_sensitive_path(path: &str) -> bool {
             | ".pfx"
             | ".netrc"
             | ".config/gh/hosts.yml"
+            | ".pgpass"
+            | ".my.cnf"
+            | ".vault-token"
+            | ".kdbx"
             | ".cargo/credentials"
             // A tool's stored login, see `tool_credential_store`.
             | "auth.json"
@@ -15917,6 +15929,10 @@ fn is_stored_credential(path: &str, home: Option<&str>) -> bool {
                 | ".git-credentials"
                 | ".netrc"
                 | ".config/gh/hosts.yml"
+                | ".pgpass"
+                | ".my.cnf"
+                | ".vault-token"
+                | ".kdbx"
                 | ".gnupg/"
                 | "/etc/shadow"
                 | "/etc/gshadow"
@@ -16416,6 +16432,9 @@ const HARD_FILES_BY_PARTS: &[(&str, &str)] = &[
     ("/etc/gshadow", "/etc/gshadow"),
     ("~/.git-credentials", ".git-credentials"),
     ("~/.netrc", ".netrc"),
+    ("~/.pgpass", ".pgpass"),
+    ("~/.my.cnf", ".my.cnf"),
+    ("~/.vault-token", ".vault-token"),
     ("~/.aws/credentials", ".aws/credentials"),
     ("~/.config/gh/hosts.yml", ".config/gh/hosts.yml"),
 ];
@@ -18250,6 +18269,19 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
             60,
         ));
     }
+    if guard_lowering::pgrep_feeds_a_kill_of_the_guard(content) {
+        return Some((
+            "kill InnerWarden (what a pgrep -f pattern finds on its command line, handed to kill)",
+            60,
+        ));
+    }
+    // The verb and the unit as the shell hands them to the program: a
+    // redirection glued to the verb (`stop>&2`) is no end of the command,
+    // and the unit counts wherever it stands. D-Bus calls of systemd's
+    // manager (`busctl`, `dbus-send`, `gdbus`) are read the same way.
+    if let Some(hit) = guard_lowering::service_lowered(content) {
+        return Some((hit, 60));
+    }
     // Tearing down the host firewall is the same intent as stopping the monitor,
     // and nothing covered it: `ufw disable` and `iptables -F` both scored 0.
     if let Some(hit) = check_firewall_teardown(&lower) {
@@ -18307,45 +18339,26 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     None
 }
 
-/// Command lines the guard's own processes run with: the Community CLI (its
-/// hook, its MCP proxy, its dashboard) and the Pro daemons, as their
-/// installers and units start them. A `pkill -f` pattern is matched against
-/// each, as `pkill` matches it against every process's command line.
-const GUARD_PROCESS_LINES: &[&str] = &[
-    "/usr/local/bin/innerwarden hook --agent claude-code",
-    "/usr/local/bin/innerwarden mcp-proxy -- npx -y server",
-    "/usr/local/bin/innerwarden dashboard",
-    "/usr/bin/innerwarden hook",
-    "/home/user/.local/bin/innerwarden hook",
-    "innerwarden",
-    "/usr/local/bin/innerwarden-sensor --config /etc/innerwarden/config.toml",
-    "/usr/local/bin/innerwarden-agent --config /etc/innerwarden/agent.toml --dashboard",
-    "/usr/bin/innerwarden-agent --dashboard",
-    "/usr/local/bin/innerwarden-watchdog",
-    "/usr/local/bin/innerwarden-supervisor",
-    "/usr/local/bin/innerwarden-ctl",
-    "/usr/local/bin/innerwarden-dns-guard --bind 127.0.0.2:53 --events /var/lib/innerwarden/dns_guard-events.jsonl",
-    "/usr/local/bin/innerwarden-sensor-esf",
-    "/usr/local/bin/innerwarden-esf-bridge",
-];
-
 /// What a `pkill -f PATTERN` does to the guard's processes.
 #[derive(Debug, PartialEq)]
 enum PkillReach {
-    /// The pattern matches none of [`GUARD_PROCESS_LINES`].
+    /// The pattern matches none of the command lines the guard's processes
+    /// run with ([`guard_lowering::guard_lines`]).
     Misses,
-    /// It matches one of them by the guard's name, which it spells some
-    /// way the plain words do not (`[i]nnerwarden`, `inner.arden`).
+    /// It matches one of them on a part the guard wrote: its program, its
+    /// subcommand, its options (`hook --agent claude-code`, `proxy -- npx`,
+    /// `inner.arden`).
     NamesGuard,
-    /// Not read surely, or it matches them by something else
-    /// (`dashboard`, `bin`): left to the checks of the words.
+    /// Not read surely, or it matches them only on another program's part
+    /// (the agent's id, the MCP server the proxy runs): left to the checks
+    /// of the words.
     Unread,
 }
 
 /// `lower` with every `pkill -f` command of `content` (its lowercase
-/// twin, byte for byte) blanked whose pattern matches none of
-/// [`GUARD_PROCESS_LINES`], and whether one matches them by the guard's
-/// name ([`PkillReach`]). Read from `content` as written: `-F` (a
+/// twin, byte for byte) blanked whose pattern matches none of the guard's
+/// command lines ([`guard_lowering::guard_lines`]), and whether one
+/// matches them on a part the guard wrote ([`PkillReach`]). Read from `content` as written: `-F` (a
 /// pidfile) is not `-f`. A command read any less surely (no `-f`, an
 /// option not known, more than one pattern, a pattern that is not a
 /// regular expression) is left as it stands.
@@ -18477,19 +18490,7 @@ fn pkill_reach(segment: &str) -> PkillReach {
     else {
         return Unread;
     };
-    // By the name when the line with the name spelled out of reach no
-    // longer matches.
-    let unnamed = |line: &str| line.replace("innerwarden", "xxxxxxxxxxx");
-    if GUARD_PROCESS_LINES
-        .iter()
-        .any(|line| regex.is_match(line) && !regex.is_match(&unnamed(line)))
-    {
-        NamesGuard
-    } else if GUARD_PROCESS_LINES.iter().any(|line| regex.is_match(line)) {
-        Unread
-    } else {
-        Misses
-    }
+    guard_lowering::pattern_reach(&regex)
 }
 
 /// Check for download-and-execute via pipe. Returns score.
