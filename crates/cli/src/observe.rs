@@ -1766,6 +1766,7 @@ mod tests {
             severity: severity.into(),
             category: "prompt-injection".into(),
             matched_condition: "ignore previous instructions".into(),
+            matched: String::new(),
             references: AtrReferences::default(),
         }
     }

@@ -11,7 +11,16 @@ list, with every limit.
   definition the first time a server lists it, and in `guard` and `kill`
   holds a tool whose definition changes, one that may be a rename, and,
   once the server has pins, one it never listed before, until you run
-  `innerwarden mcp approve`.
+  `innerwarden mcp approve`. In `guard` and `kill` it also refuses a
+  resource read whose location names a credential (`internal://credentials`,
+  `config://auth_tokens`) or is a secret store by its scheme (`vault://`,
+  `env://`, `kv://`, `keyring://`, `keychain://`, `ssm://`, `secret://`,
+  `secrets://`, `secretsmanager://`, `creds://`, `credentials://`, any
+  location in it): reading it is your call, as reading a credentials file in
+  the shell is. A document, a source file, a count or a setting about a
+  credential (`docs://credentials-guide`, `file:///repo/src/auth/token.rs`,
+  `stats://tokens`) and a file in a folder that names one are read with an
+  alert. In `advisory` and `warn` every one of these is alerted and passes.
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
@@ -253,6 +262,16 @@ In the MCP proxy and in a line handed to a shell, the guard also does not see:
   from the names a search finds when it runs.
 - A `-c` variable whose value is set at run time. Such a line is held for
   review, not judged by the value it will hold.
+
+The MCP proxy does not fix an MCP server that is itself vulnerable. A flaw in
+the server's own logic happens inside the server, where the proxy does not
+look: a forged token the server accepts (a JWT whose role it does not check),
+a record of another person it hands back (an IDOR), or a path that escapes a
+folder inside the server's own code. The proxy sees the call and the answer:
+it refuses a call by what the call says, masks the secrets it knows by their
+shape in the answer, and holds an answer that carries orders for the model in
+`guard` and `kill`. A secret it does not know by shape, or data that is not
+a secret (a salary, an address), reaches the model as the server sent it.
 
 Under an enforcing hook, a line with a part the guard cannot read (a
 substitution, a variable the line does not set to text it writes out) is
