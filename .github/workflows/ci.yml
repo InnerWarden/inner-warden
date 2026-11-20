@@ -595,6 +595,7 @@ jobs:
         run: |
           base=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
           echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           if git diff --quiet "$base" HEAD -- crates/agent-guard .github/workflows/ci.yml Cargo.lock; then
             echo "guard=false" >> "$GITHUB_OUTPUT"
             echo "Nothing under crates/agent-guard changed: no verdict can move." >> "$GITHUB_STEP_SUMMARY"
@@ -617,11 +618,15 @@ jobs:
       # When this branch changes the file, its own build is kept too, to check
       # that its generator drops no line the base's makes. The branch's builds
       # share `target` (each binary is copied out before the next build
-      # replaces it); the merge base builds in a directory of its own.
+      # replaces it); the merge base builds in a directory of its own. Each
+      # judge's guard carries the revision it is built from (`IW_JUDGE_REV`,
+      # compiled into `benchmark::JUDGE_REVISION`).
       - name: Build the judges
+        id: judges
         if: steps.scope.outputs.guard == 'true'
         env:
           BASE: ${{ steps.scope.outputs.base }}
+          HEAD_REV: ${{ steps.scope.outputs.head }}
           # The release profile aborts on a panic. The judges unwind, so a line
           # that crashes the guard is recorded (as stopped, which is what the
           # hook does with it) and the run goes on to the next line.
@@ -629,7 +634,7 @@ jobs:
         run: |
           set -euo pipefail
           ex=crates/agent-guard/examples/differential_guard.rs
-          build() { cargo build --release -p innerwarden-agent-guard --example differential_guard; }
+          build() { IW_JUDGE_REV="$HEAD_REV" cargo build --release -p innerwarden-agent-guard --example differential_guard; }
           cp "$ex" "$RUNNER_TEMP/branch-judge.rs"
           git worktree add --detach "$RUNNER_TEMP/base" "$BASE"
           if [ -f "$RUNNER_TEMP/base/$ex" ]; then
@@ -656,25 +661,51 @@ jobs:
           # merge base checked out before the branch's build looked up to date
           # and the "main" judge was this branch's binary, comparing the branch
           # with itself.
-          (cd "$RUNNER_TEMP/base" && CARGO_TARGET_DIR="$RUNNER_TEMP/target-base" \
-            cargo build --release -p innerwarden-agent-guard --example differential_guard)
+          (cd "$RUNNER_TEMP/base" && IW_JUDGE_REV="$BASE" CARGO_TARGET_DIR="$RUNNER_TEMP/target-base" \
+            cargo build --release -p innerwarden-agent-guard --example differential_guard \
+              --message-format=json-render-diagnostics > "$RUNNER_TEMP/base-build.jsonl")
           cp "$RUNNER_TEMP/target-base/release/examples/differential_guard" "$RUNNER_TEMP/judge-base"
-          # A tripwire for the same failure: when the guard's sources differ,
-          # the two judges cannot be the same binary.
-          if ! git diff --quiet "$BASE" HEAD -- crates/agent-guard/src crates/agent-guard/Cargo.toml Cargo.lock \
-            && cmp -s "$RUNNER_TEMP/judge-base" "$RUNNER_TEMP/judge-head"; then
-            echo "The guard differs between the merge base and this branch, and both judges are the same binary: the base build did not run." >&2
-            exit 1
+          # A tripwire for the same failure: each judge must report the
+          # revision the job built its guard from. The bytes are not compared:
+          # a change the judge does not link (the MCP proxy) leaves two judges
+          # that are the same binary but for that revision.
+          if grep -q 'Some("tripwire")' "$RUNNER_TEMP/judge.rs"; then
+            "$RUNNER_TEMP/judge-base" tripwire \
+              --base-bin "$RUNNER_TEMP/judge-base" --base-rev "$BASE" \
+              --head-bin "$RUNNER_TEMP/judge-head" --head-rev "$HEAD_REV" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            # A merge base whose judge reports no revision: cargo's own report
+            # of the base build must show the guard compiled, in that build,
+            # from the merge base's tree.
+            echo "Tripwire: the merge base's judge reports no revision; cargo's report of the base build is read instead." >> "$GITHUB_STEP_SUMMARY"
+            if ! jq -e --arg src "$RUNNER_TEMP/base/" \
+              'select(.reason == "compiler-artifact" and .target.name == "innerwarden_agent_guard"
+                and (.target.kind | index("lib")) and .fresh == false
+                and (.target.src_path | startswith($src)))' \
+              "$RUNNER_TEMP/base-build.jsonl" > /dev/null; then
+              echo "The base build did not compile the guard from the merge base's tree: the main judge would not be main's guard." >&2
+              exit 1
+            fi
           fi
+          # Every line is judged in each place the merge base's judge knows.
+          if grep -q '"keys" => Some' "$RUNNER_TEMP/judge.rs"; then homes="empty keys"; else homes="empty"; fi
+          echo "homes=$homes" >> "$GITHUB_OUTPUT"
+          echo "Places each line is judged in: $homes." >> "$GITHUB_STEP_SUMMARY"
 
       # The lines: the union of the merge base's corpora and this branch's,
       # with the variants of the base's generator. A line this branch deleted
-      # is still judged, and the stronger label wins.
+      # is still judged, and the stronger label wins. Each line is judged in
+      # each place: an empty home with a command judged by its text alone, and
+      # a home holding an SSH key and cloud credentials with a command judged
+      # where it runs, as the hook judges it (some verdicts read the home).
       - name: Judge every line with both guards
         if: steps.scope.outputs.guard == 'true'
+        env:
+          HOMES: ${{ steps.judges.outputs.homes }}
         run: |
           set -euo pipefail
           J="$RUNNER_TEMP"
+          [ -n "$HOMES" ] || { echo "No home to judge in." >&2; exit 1; }
           "$J/judge-base" cases "$J/base" > "$J/cases-base-tree.jsonl"
           "$J/judge-base" cases . > "$J/cases-branch-tree.jsonl"
           # A must-refuse line of main's corpora stays in this branch's as it is.
@@ -688,22 +719,35 @@ jobs:
             lists+=("$J/cases-branch-generator.jsonl")
           fi
           "$J/judge-base" union "${lists[@]}" > "$J/cases.jsonl"
-          "$J/judge-base" judge "$J/cases.jsonl" --place "$J/place" > "$J/base.jsonl"
-          "$J/judge-head" judge "$J/cases.jsonl" --place "$J/place" > "$J/head.jsonl"
-          wc -l "$J/cases.jsonl" "$J/base.jsonl" "$J/head.jsonl"
+          for home in $HOMES; do
+            "$J/judge-base" judge "$J/cases.jsonl" --place "$J/place" --home "$home" > "$J/base-$home.jsonl"
+            "$J/judge-head" judge "$J/cases.jsonl" --place "$J/place" --home "$home" > "$J/head-$home.jsonl"
+          done
+          wc -l "$J/cases.jsonl" "$J"/base-*.jsonl "$J"/head-*.jsonl
 
       - name: No line main stops goes unstopped
         if: steps.scope.outputs.guard == 'true'
+        env:
+          HOMES: ${{ steps.judges.outputs.homes }}
         run: |
           set +e
-          "$RUNNER_TEMP/judge-base" compare --cases "$RUNNER_TEMP/cases.jsonl" \
-            --base "$RUNNER_TEMP/base.jsonl" --head "$RUNNER_TEMP/head.jsonl" \
-            --changes crates/agent-guard/corpus/REFERENCE-CHANGES.md \
-            --base-bin "$RUNNER_TEMP/judge-base" --head-bin "$RUNNER_TEMP/judge-head" \
-            > "$RUNNER_TEMP/report.md"
-          rc=$?
-          cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
-          cat "$RUNNER_TEMP/report.md"
+          J="$RUNNER_TEMP"
+          [ -n "$HOMES" ] || { echo "No home to compare in." >&2; exit 1; }
+          rc=0
+          # The rule holds in each home.
+          for home in $HOMES; do
+            {
+              printf '## Home: %s\n\n' "$home"
+              "$J/judge-base" compare --cases "$J/cases.jsonl" \
+                --base "$J/base-$home.jsonl" --head "$J/head-$home.jsonl" \
+                --changes crates/agent-guard/corpus/REFERENCE-CHANGES.md \
+                --base-bin "$J/judge-base" --head-bin "$J/judge-head"
+            } > "$J/report-$home.md"
+            r=$?
+            [ "$r" -gt "$rc" ] && rc=$r
+            cat "$J/report-$home.md" >> "$GITHUB_STEP_SUMMARY"
+            cat "$J/report-$home.md"
+          done
           exit $rc
 
   supply-chain:

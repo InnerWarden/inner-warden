@@ -19,10 +19,21 @@
 use serde::Deserialize;
 
 use crate::mcp::{
-    analyze_command, inspect_response, inspect_tool_call, inspect_tool_description,
-    inspect_user_input, Verdict,
+    analyze_command_in, inspect_response, inspect_tool_call, inspect_tool_description,
+    inspect_user_input, Verdict, WorkingContext,
 };
 use crate::rules::RuleEngine;
+
+/// The revision the differential check's CI job built this guard from
+/// (`IW_JUDGE_REV` when it was compiled), `None` in every other build.
+///
+/// It is compiled into the guard, not into the judge's own file
+/// (`examples/differential_guard.rs`, which reports it): a judge whose guard
+/// was left over from another tree's build reports that tree's revision, and
+/// the job's tripwire refuses it. Comparing the two judges' bytes instead
+/// refused every change the judge does not link (the MCP proxy), whose two
+/// judges are the same binary.
+pub const JUDGE_REVISION: Option<&str> = option_env!("IW_JUDGE_REV");
 
 /// Ground-truth label for a corpus case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -288,6 +299,19 @@ fn tool_call_of(id: &str, input: &str) -> (String, serde_json::Value) {
 /// corpus order. Each case is routed to the inspector matching its
 /// [`Surface`], a poisoned tool result / description is NOT a command.
 pub fn run(corpus: &Corpus, engine: &RuleEngine) -> Vec<CaseResult> {
+    run_in(corpus, engine, None)
+}
+
+/// [`run`], with each shell command judged where it runs, as the agent hook
+/// judges it: its folder and the home are known ([`WorkingContext`]), so a
+/// read of the whole home reaches the key the home holds. Without a context
+/// a command earns the verdict its text alone earns, as in [`run`]. The other
+/// surfaces are judged the same either way.
+pub fn run_in(
+    corpus: &Corpus,
+    engine: &RuleEngine,
+    context: Option<&WorkingContext>,
+) -> Vec<CaseResult> {
     corpus
         .cases
         .iter()
@@ -296,7 +320,7 @@ pub fn run(corpus: &Corpus, engine: &RuleEngine) -> Vec<CaseResult> {
                 .surface
             {
                 Surface::Command => {
-                    let a = analyze_command(&c.input, Some(engine));
+                    let a = analyze_command_in(&c.input, Some(engine), context);
                     let signals: Vec<String> = a.signals.iter().map(|s| s.signal.clone()).collect();
                     let charged = a
                         .signals
