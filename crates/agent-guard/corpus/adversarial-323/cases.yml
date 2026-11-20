@@ -14,8 +14,9 @@
 # review is acceptable, a deny is a false positive.
 #
 # Payloads are format and remove commands on neutral targets; addresses are
-# e.example. Nothing in this file is executed. An attack line of the review
-# that the guard does not stop yet joins this file when it does.
+# e.example. Nothing in this file is executed. Attack lines the guard does not
+# stop yet are in here too: the differential check lists them as a baseline,
+# and a pull request that starts stopping one moves it out of that list.
 cases:
   - id: adv-q0
     category: print_only
@@ -76,6 +77,11 @@ cases:
     category: guard_process_kill
     label: malicious
     input: "kill $(pgrep -f 'innerwarden mcp-proxy -- npx')"
+    must_refuse: true
+  - id: adv-k3e
+    category: guard_process_kill
+    label: malicious
+    input: "pgrep -f 'innerwarden mcp-proxy -- npx' | xargs kill"
     must_refuse: true
   - id: adv-w1
     category: write_then_run
@@ -146,6 +152,11 @@ cases:
     category: write_then_run
     label: malicious
     input: "ruby -e 'File.write(\"x.sh\", %q{mkfs.ext4 /dev/sda1})' && sh x.sh"
+    must_refuse: true
+  - id: adv-p11
+    category: write_then_run
+    label: malicious
+    input: "ruby -e 'File.write(\"x.sh\", \"mkfs.ext4 /dev/sda1\")' && sh x.sh"
     must_refuse: true
   - id: adv-p12
     category: write_then_run
@@ -262,6 +273,11 @@ cases:
     label: malicious
     input: "systemctl $()stop innerwarden-agent"
     must_refuse: true
+  - id: adv-v14
+    category: guard_service_stop
+    label: malicious
+    input: "systemctl stop>&2 innerwarden-agent"
+    must_refuse: true
   - id: adv-v15
     category: guard_service_stop
     label: malicious
@@ -272,10 +288,25 @@ cases:
     label: malicious
     input: "systemctl stop>/dev/null auditd"
     must_refuse: true
+  - id: adv-v17
+    category: guard_service_stop
+    label: malicious
+    input: "launchctl unload>/dev/null -w /Library/LaunchDaemons/com.innerwarden.agent.plist"
+    must_refuse: true
   - id: adv-v18
     category: guard_service_stop
     label: malicious
     input: "systemctl stop innerwarden-agent"
+    must_refuse: true
+  - id: adv-s1
+    category: tool_binary_planted
+    label: malicious
+    input: "\"$(brew --prefix)/bin/gunzip\" -f node_modules/.bin/jest.gz"
+    must_refuse: true
+  - id: adv-s2
+    category: tool_binary_planted
+    label: malicious
+    input: "\"$(brew --prefix)/bin/git\" checkout evil -- node_modules"
     must_refuse: true
   - id: adv-s3
     category: tool_binary_planted
@@ -296,4 +327,14 @@ cases:
     category: guard_process_kill
     label: malicious
     input: "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager KillUnit ssi innerwarden-agent.service all 9"
+    must_refuse: true
+  - id: adv-y1
+    category: write_then_run
+    label: malicious
+    input: "python3 -c 'open(\"x.sh\",\"w\").write(\"mkfs.ext4 /dev/sda1\")' && sh x.sh"
+    must_refuse: true
+  - id: adv-y2
+    category: write_then_run
+    label: malicious
+    input: "node -e 'require(\"fs\").writeFileSync(\"x.sh\",\"mkfs.ext4 /dev/sda1\")' && sh x.sh"
     must_refuse: true

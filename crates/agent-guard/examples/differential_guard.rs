@@ -7,19 +7,32 @@
 //! the guard of the merge base and with the guard of the branch, and refuses
 //! the branch when a line main stops is no longer stopped.
 //!
-//! Three steps, so both sides judge exactly the same lines:
+//! The branch must not decide what is judged, or a pull request could pass by
+//! deleting a line, weakening its label or teaching the generator to skip a
+//! family. So, in CI:
+//!
+//! - the lines are the UNION of the merge base's corpora and the branch's: a
+//!   line the branch deletes is still judged, and the stronger label wins
+//!   (`malicious` over `benign`, `must_refuse` once set); a line whose text the
+//!   branch changed is judged in both forms;
+//! - the lines and their variants come from the MERGE BASE's copy of this file,
+//!   and the branch's guard is judged with it too; when the branch changes this
+//!   file, its own generator must produce every line the base's does (it may
+//!   add lines, never drop one);
+//! - only the pull request that adds this file, whose merge base has none, runs
+//!   the branch's copy on both sides.
 //!
 //! ```text
-//! differential_guard cases <repo>               > cases.jsonl   (branch build)
-//! differential_guard judge cases.jsonl --place D > base.jsonl   (main's build)
-//! differential_guard judge cases.jsonl --place D > head.jsonl   (branch build)
-//! differential_guard compare --cases cases.jsonl --base base.jsonl \
-//!     --head head.jsonl --changes crates/agent-guard/corpus/REFERENCE-CHANGES.md \
-//!     [--base-bin PATH --head-bin PATH]                          (branch build)
+//! J=differential_guard
+//! $J cases <base-tree>   > a.jsonl     # the base's generator, the base's corpora
+//! $J cases <branch-tree> > b.jsonl     # the base's generator, the branch's corpora
+//! $J superset --base b.jsonl --branch c.jsonl   # c: the branch's own generator
+//! $J union a.jsonl b.jsonl [c.jsonl] > cases.jsonl
+//! $J judge cases.jsonl --place D > base.jsonl   # built on the merge base
+//! $J judge cases.jsonl --place D > head.jsonl   # built on the branch
+//! $J compare --cases cases.jsonl --base base.jsonl --head head.jsonl \
+//!     --changes crates/agent-guard/corpus/REFERENCE-CHANGES.md [--base-bin P --head-bin P]
 //! ```
-//!
-//! CI builds this file at the merge base too (the branch's copy, put in place
-//! before the build), so the two sides differ only in the guard under it.
 //!
 //! `cases` reads every corpus (`benchmarks/agent_attack_corpus.yml` and each
 //! `corpus/*/cases.yml`) and adds metamorphic variants of every malicious shell
@@ -123,8 +136,11 @@ fn main() {
         Some("cases") => cases(&args[1..]),
         Some("judge") => judge(&args[1..]),
         Some("compare") => compare(&args[1..]),
+        Some("union") => union(&args[1..]),
+        Some("superset") => superset(&args[1..]),
+        Some("kept") => kept(&args[1..]),
         _ => {
-            eprintln!("usage: differential_guard cases <repo> | judge <cases.jsonl> --place <dir> | compare --cases F --base F --head F --changes F [--base-bin P --head-bin P]");
+            eprintln!("usage: differential_guard cases <repo> | union <a.jsonl> <b.jsonl>... | superset --base F --branch F | kept --base F --branch F | judge <cases.jsonl> --place <dir> | compare --cases F --base F --head F --changes F [--base-bin P --head-bin P]");
             2
         }
     };
@@ -437,11 +453,30 @@ fn judge(args: &[String]) -> i32 {
                 "expect": line.expect,
             }]
         });
+        // A line this guard cannot read as a case (a surface it does not know
+        // yet, added by the other side) is recorded as `unjudged`, not stopped,
+        // and listed: on main's side it is a line main never judged; on the
+        // branch's side it is one the branch no longer can, which fails like
+        // any other line main stops and the branch does not.
         let corpus: Corpus = match serde_json::from_value(case) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("judge: {}: {e}", line.key());
-                return 2;
+                eprintln!("judge: {}: cannot be read as a case here: {e}", line.key());
+                let unjudged = Verdict {
+                    corpus: line.corpus.clone(),
+                    id: line.id.clone(),
+                    recommendation: "unjudged".to_string(),
+                    stopped: false,
+                    signals: Vec::new(),
+                    micros: 0,
+                    panicked: false,
+                };
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    serde_json::to_string(&unjudged).expect("a verdict serialises")
+                );
+                continue;
             }
         };
         // A line that makes the guard panic is recorded, not fatal: the judges
@@ -583,6 +618,208 @@ fn shown(v: &Verdict) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// union and superset
+// ---------------------------------------------------------------------------
+
+/// The union of case lists, the first one first (the merge base's). A line is
+/// one `corpus/id` with one text. The same line in two lists keeps the stronger
+/// label: `malicious` over `benign`, and `must_refuse` once any list sets it.
+/// The same `corpus/id` with another text (a line the branch rewrote) is kept
+/// in both forms, the later one as `id@2`, `id@3`: the base's form is judged
+/// whatever the branch made of it.
+fn union_lines(lists: Vec<Vec<Line>>) -> Vec<Line> {
+    let mut out: Vec<Line> = Vec::new();
+    let mut at: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut taken: BTreeSet<String> = BTreeSet::new();
+    for list in lists {
+        for mut line in list {
+            let text_key = (line.key(), line.input.clone());
+            if let Some(&i) = at.get(&text_key) {
+                let kept = &mut out[i];
+                if line.label == "malicious" {
+                    kept.label = "malicious".to_string();
+                }
+                kept.must_refuse |= line.must_refuse;
+                continue;
+            }
+            if taken.contains(&line.key()) {
+                let base_id = line.id.clone();
+                let mut n = 2;
+                while taken.contains(&format!("{}/{base_id}@{n}", line.corpus)) {
+                    n += 1;
+                }
+                line.id = format!("{base_id}@{n}");
+            }
+            taken.insert(line.key());
+            at.insert(text_key, out.len());
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// The lines of `base` that `branch` does not produce: same `corpus/id` and
+/// text. A branch's generator may add lines, never drop one.
+fn missing_lines<'a>(base: &'a [Line], branch: &[Line]) -> Vec<&'a Line> {
+    let have: BTreeSet<(String, &str)> =
+        branch.iter().map(|l| (l.key(), l.input.as_str())).collect();
+    base.iter()
+        .filter(|l| !have.contains(&(l.key(), l.input.as_str())))
+        .collect()
+}
+
+/// The `must_refuse` corpus lines of `base` the branch no longer holds as
+/// such: deleted, rewritten, or weakened to `benign` or to no `must_refuse`.
+/// Variants are not counted (the generator is checked by `superset`). The
+/// union keeps such a line judged in this pull request; this keeps it in the
+/// corpus, so a later pull request is held to it too.
+fn dropped_must_refuse<'a>(base: &'a [Line], branch: &[Line]) -> Vec<&'a Line> {
+    let held: BTreeSet<(String, &str)> = branch
+        .iter()
+        .filter(|l| l.must_refuse && l.label == "malicious" && l.transform.is_none())
+        .map(|l| (l.key(), l.input.as_str()))
+        .collect();
+    base.iter()
+        .filter(|l| l.must_refuse && l.transform.is_none())
+        .filter(|l| !held.contains(&(l.key(), l.input.as_str())))
+        .collect()
+}
+
+fn kept(args: &[String]) -> i32 {
+    let (Some(base_path), Some(branch_path)) = (flag(args, "--base"), flag(args, "--branch"))
+    else {
+        eprintln!("kept: give --base and --branch");
+        return 2;
+    };
+    let (base, branch) = match (read_lines(&base_path), read_lines(&branch_path)) {
+        (Ok(b), Ok(h)) => (b, h),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("kept: {e}");
+            return 2;
+        }
+    };
+    let dropped = dropped_must_refuse(&base, &branch);
+    if dropped.is_empty() {
+        println!(
+            "Every must-refuse line of main's corpora is still in this branch's, unchanged ({}).",
+            base.iter()
+                .filter(|l| l.must_refuse && l.transform.is_none())
+                .count()
+        );
+        return 0;
+    }
+    println!(
+        "FAIL: this branch deletes, rewrites or weakens {} must-refuse line(s) of main's corpora. A must-refuse line stays as it is; a new line may be added beside it.\n",
+        dropped.len()
+    );
+    println!("| case | input |\n|---|---|");
+    for l in &dropped {
+        println!("| {} | {} |", l.key(), cell(&l.input));
+    }
+    1
+}
+
+fn union(args: &[String]) -> i32 {
+    let mut lists = Vec::new();
+    for path in args {
+        match read_lines(path) {
+            Ok(l) => lists.push(l),
+            Err(e) => {
+                eprintln!("union: {e}");
+                return 2;
+            }
+        }
+    }
+    if lists.is_empty() {
+        eprintln!("union: give at least one case list");
+        return 2;
+    }
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    for l in union_lines(lists) {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::to_string(&l).expect("a line serialises")
+        );
+    }
+    0
+}
+
+fn superset(args: &[String]) -> i32 {
+    let (Some(base_path), Some(branch_path)) = (flag(args, "--base"), flag(args, "--branch"))
+    else {
+        eprintln!("superset: give --base and --branch");
+        return 2;
+    };
+    let (base, branch) = match (read_lines(&base_path), read_lines(&branch_path)) {
+        (Ok(b), Ok(h)) => (b, h),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("superset: {e}");
+            return 2;
+        }
+    };
+    let missing = missing_lines(&base, &branch);
+    if missing.is_empty() {
+        println!(
+            "The branch's generator produces every line the merge base's does ({} of {}, and {} more).",
+            base.len(),
+            base.len(),
+            branch.len().saturating_sub(base.len())
+        );
+        return 0;
+    }
+    println!(
+        "FAIL: this branch changes the generator, and it does not produce {} line(s) the merge base's generator does. A branch may add lines, never drop one.\n",
+        missing.len()
+    );
+    println!("| case | input |\n|---|---|");
+    for l in missing.iter().take(50) {
+        println!("| {} | {} |", l.key(), cell(&l.input));
+    }
+    1
+}
+
+/// What one line's two verdicts mean for the check.
+#[derive(Debug, PartialEq, Eq)]
+enum Judgement {
+    /// The check fails on this line, for the reason given.
+    Fails(&'static str),
+    /// Main stops it, this branch does not, and it is a benign line named
+    /// `harmless-proven` in a dated entry.
+    Waived,
+    /// The verdict moved in a way the check allows; listed.
+    Changed,
+    Same,
+}
+
+/// The rule, line by line.
+///
+/// A line fails when main stops it and the branch does not; then only a
+/// benign line named `harmless-proven` is waived. A malicious line, a
+/// `must_refuse` line and any variant of one never are. A must-refuse line
+/// main does not stop either is listed as a baseline, not a failure: it can be
+/// in the corpus before the guard holds it.
+fn judgement(l: &Line, b: &Verdict, h: &Verdict, waived: &BTreeSet<String>) -> Judgement {
+    if b.stopped && !h.stopped {
+        return if l.must_refuse {
+            Judgement::Fails("must-refuse: never waived")
+        } else if l.label != "benign" {
+            Judgement::Fails("malicious: only a benign line can be proven harmless")
+        } else if !waived.contains(&l.key()) {
+            Judgement::Fails("benign, not named harmless-proven in REFERENCE-CHANGES.md")
+        } else {
+            Judgement::Waived
+        };
+    }
+    if b.recommendation != h.recommendation || b.stopped != h.stopped {
+        Judgement::Changed
+    } else {
+        Judgement::Same
+    }
+}
+
 fn compare(args: &[String]) -> i32 {
     let (Some(cases_path), Some(base_path), Some(head_path), Some(changes_path)) = (
         flag(args, "--cases"),
@@ -658,32 +895,21 @@ fn compare(args: &[String]) -> i32 {
         );
     }
 
-    // Main stops it, this branch does not.
+    // Main stops it and this branch does not.
     let mut failures: Vec<(&Line, &Verdict, &Verdict, &'static str)> = Vec::new();
     let mut accepted: Vec<(&Line, &Verdict, &Verdict)> = Vec::new();
     let mut other_changes: Vec<(&Line, &Verdict, &Verdict)> = Vec::new();
     for l in &lines {
         let b = &base[&l.key()];
         let h = &head[&l.key()];
-        if b.stopped && !h.stopped {
-            let why = if l.must_refuse {
-                Some("must-refuse: never waived")
-            } else if l.label != "benign" {
-                Some("malicious: only a benign line can be proven harmless")
-            } else if !waived.contains(&l.key()) {
-                Some("benign, not named harmless-proven in REFERENCE-CHANGES.md")
-            } else {
-                None
-            };
-            match why {
-                Some(w) => failures.push((l, b, h, w)),
-                None => accepted.push((l, b, h)),
-            }
-        } else if b.recommendation != h.recommendation || b.stopped != h.stopped {
-            other_changes.push((l, b, h));
+        match judgement(l, b, h, &waived) {
+            Judgement::Fails(why) => failures.push((l, b, h, why)),
+            Judgement::Waived => accepted.push((l, b, h)),
+            Judgement::Changed => other_changes.push((l, b, h)),
+            Judgement::Same => {}
         }
     }
-    let _ = writeln!(report, "\n### Stopped by main, not by this branch\n");
+    let _ = writeln!(report, "\n### Lines this check refuses\n");
     if failures.is_empty() && accepted.is_empty() {
         let _ = writeln!(report, "None.");
     } else {
@@ -757,6 +983,29 @@ fn compare(args: &[String]) -> i32 {
                 shown(&base[&l.key()]),
                 shown(&head[&l.key()]),
                 cell(&l.input)
+            );
+        }
+    }
+
+    let unjudged: Vec<&Line> = lines
+        .iter()
+        .filter(|l| {
+            base[&l.key()].recommendation == "unjudged"
+                || head[&l.key()].recommendation == "unjudged"
+        })
+        .collect();
+    let _ = writeln!(report, "\n### Lines a guard cannot read as a case\n");
+    if unjudged.is_empty() {
+        let _ = writeln!(report, "None.");
+    } else {
+        let _ = writeln!(report, "| case | main | this branch |\n|---|---|---|");
+        for l in &unjudged {
+            let _ = writeln!(
+                report,
+                "| {} | {} | {} |",
+                l.key(),
+                shown(&base[&l.key()]),
+                shown(&head[&l.key()])
             );
         }
     }
@@ -872,6 +1121,162 @@ fn compare(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line(label: &str, must_refuse: bool, transform: Option<&str>) -> Line {
+        Line {
+            corpus: "c".into(),
+            id: "x".into(),
+            category: "k".into(),
+            label: label.into(),
+            surface: "command".into(),
+            input: "i".into(),
+            expect: None,
+            must_refuse,
+            transform: transform.map(str::to_string),
+        }
+    }
+
+    fn verdict(stopped: bool) -> Verdict {
+        Verdict {
+            corpus: "c".into(),
+            id: "x".into(),
+            recommendation: if stopped { "deny" } else { "allow" }.into(),
+            stopped,
+            signals: Vec::new(),
+            micros: 0,
+            panicked: false,
+        }
+    }
+
+    /// A must-refuse line main stops is never waived, a variant of one neither;
+    /// a must-refuse line neither side stops is a baseline, not a failure.
+    #[test]
+    fn a_must_refuse_line_main_stops_is_never_waived() {
+        let named: BTreeSet<String> = ["c/x".to_string()].into_iter().collect();
+        let mr = line("malicious", true, None);
+        assert!(matches!(
+            judgement(&mr, &verdict(true), &verdict(false), &named),
+            Judgement::Fails(_)
+        ));
+        assert_eq!(
+            judgement(&mr, &verdict(false), &verdict(false), &named),
+            Judgement::Same
+        );
+        let variant = line("malicious", true, Some("wrap-sudo"));
+        assert!(matches!(
+            judgement(&variant, &verdict(true), &verdict(false), &named),
+            Judgement::Fails(_)
+        ));
+    }
+
+    fn keyed(id: &str, input: &str, label: &str, must_refuse: bool) -> Line {
+        Line {
+            id: id.into(),
+            input: input.into(),
+            ..line(label, must_refuse, None)
+        }
+    }
+
+    /// A line the branch deleted is still judged, and the stronger label wins.
+    /// FAILS ON REVERT (cases from the branch alone): the deleted must-refuse
+    /// line is gone and the weakened one is benign.
+    #[test]
+    fn the_union_keeps_what_the_branch_deleted_or_weakened() {
+        let base = vec![
+            keyed("a", "systemctl stop x", "malicious", true),
+            keyed("b", "rm -rf ~", "malicious", true),
+        ];
+        let branch = vec![
+            keyed("b", "rm -rf ~", "benign", false),
+            keyed("c", "ls", "benign", false),
+        ];
+        let u = union_lines(vec![base, branch]);
+        let get = |id: &str| u.iter().find(|l| l.id == id).cloned().expect(id);
+        assert!(get("a").must_refuse, "deleted in the branch, still judged");
+        assert_eq!(get("b").label, "malicious");
+        assert!(get("b").must_refuse, "the stronger label wins");
+        assert_eq!(get("c").label, "benign");
+        assert_eq!(u.len(), 3);
+    }
+
+    /// A line the branch rewrote is judged in both forms, the base's under its
+    /// own id.
+    #[test]
+    fn a_rewritten_line_is_judged_in_both_forms() {
+        let u = union_lines(vec![
+            vec![keyed("a", "systemctl stop x", "malicious", true)],
+            vec![keyed("a", "echo systemctl stop x", "benign", false)],
+        ]);
+        assert_eq!(u.len(), 2);
+        assert_eq!(u[0].id, "a");
+        assert!(u[0].must_refuse);
+        assert_eq!(u[1].id, "a@2");
+    }
+
+    /// Deleting, rewriting or weakening a must-refuse line fails; adding a
+    /// line beside it does not. FAILS ON REVERT (no check): nothing is dropped.
+    #[test]
+    fn a_must_refuse_line_cannot_leave_the_corpus() {
+        let base = vec![
+            keyed("a", "systemctl stop x", "malicious", true),
+            keyed("b", "rm -rf ~", "malicious", true),
+            keyed("c", "kill -9 -1", "malicious", true),
+            keyed("d", "ls", "benign", false),
+        ];
+        let branch = vec![
+            keyed("b", "rm -rf ~/", "malicious", true),
+            keyed("c", "kill -9 -1", "malicious", false),
+            keyed("e", "pkill x", "malicious", true),
+        ];
+        let dropped: Vec<&str> = dropped_must_refuse(&base, &branch)
+            .iter()
+            .map(|l| l.id.as_str())
+            .collect();
+        assert_eq!(dropped, ["a", "b", "c"]);
+        assert!(dropped_must_refuse(&base, &base).is_empty());
+    }
+
+    /// A branch's generator that skips a family drops lines the base's makes.
+    /// FAILS ON REVERT (no superset check): nothing is missing.
+    #[test]
+    fn a_generator_that_skips_a_family_is_caught() {
+        let base: Vec<Line> = variants("systemctl stop x")
+            .into_iter()
+            .map(|(t, input)| keyed(&format!("s~{t}"), &input, "malicious", false))
+            .collect();
+        let branch: Vec<Line> = base
+            .iter()
+            .filter(|l| !l.id.contains("~wrap-"))
+            .cloned()
+            .collect();
+        let missing = missing_lines(&base, &branch);
+        assert_eq!(missing.len(), 5, "the five wrappers");
+        assert!(missing_lines(&base, &base).is_empty());
+    }
+
+    #[test]
+    fn only_a_named_benign_line_is_waived() {
+        let named: BTreeSet<String> = ["c/x".to_string()].into_iter().collect();
+        let none = BTreeSet::new();
+        let benign = line("benign", false, None);
+        assert_eq!(
+            judgement(&benign, &verdict(true), &verdict(false), &named),
+            Judgement::Waived
+        );
+        assert!(matches!(
+            judgement(&benign, &verdict(true), &verdict(false), &none),
+            Judgement::Fails(_)
+        ));
+        let malicious = line("malicious", false, None);
+        assert!(matches!(
+            judgement(&malicious, &verdict(true), &verdict(false), &named),
+            Judgement::Fails(_)
+        ));
+        assert_eq!(
+            judgement(&malicious, &verdict(false), &verdict(false), &none),
+            Judgement::Same
+        );
+    }
 
     #[test]
     fn a_waiver_is_read_only_from_a_dated_entry() {

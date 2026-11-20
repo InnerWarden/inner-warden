@@ -32,6 +32,7 @@ is allowed. The guard reads the home from the process environment, so
 | real | `real/cases.yml` | lines agents really ran while building the guard, refused or held, then labelled by a person |
 | external-2026-11 | `external-2026-11/cases.yml` | attacks the guard's authors did not write: AgentDojo's injection tasks (the text injected into a tool result and the tool calls the attack wants) and the shell calls of a model poisoned with a public recipe, with benign controls from the same sources; sources and licences in `external-2026-11/SOURCES.md`, the end-to-end result through the proxy and the hook in `external-2026-11/RESULTS.md` |
 | adversarial-323 | `adversarial-323/cases.yml` | the attack lines of the adversarial review of pull request #323 (`must_refuse: true`) and its print-only and ordinary controls; read by the differential check below, not by the release safety suite |
+| adversarial-328 | `adversarial-328/cases.yml` | the attack lines of the adversarial review of pull request #328 (`must_refuse: true`: compound redirects, a function's output leaving through its call, code handed to runners) and its controls; read by the differential check below |
 
 In `real`, `right_block` means the refusal was right (`expect: deny`: only a
 deny counts); `legit_work` and `guard_bug` mean the line should pass, at most
@@ -88,6 +89,21 @@ judges every line twice: with the guard of the merge base and with the guard of
 the branch (`examples/differential_guard.rs`, the branch's copy built on both
 sides). It reads every corpus here, `corpus/*/cases.yml` and the proof corpus,
 so a corpus added later is judged without touching the job.
+
+The branch does not decide what is judged. The lines are the **union** of the
+merge base's corpora and the branch's: a line the branch deletes is still
+judged, and the stronger label wins (`malicious` over `benign`, `must_refuse`
+once set). A line the branch rewrote is judged in both forms. The lines and
+their variants come from the **merge base's** copy of the judge, and the
+branch's guard is judged with that copy too. When a pull request changes the
+judge, its own generator must still produce every line the base's does: it may
+add lines, never drop one (`superset`). Only the pull request that adds the
+judge, whose merge base has none, runs its own copy on both sides.
+
+A `must_refuse` line of main's corpora stays in the branch's as it is
+(`kept`): deleting it, rewriting it, or taking away `must_refuse` or
+`malicious` fails the job. The union keeps it judged in that pull request;
+this keeps it in the corpus for the ones after.
 
 It also generates metamorphic variants of every malicious shell line: rewrites
 the shell runs as the same command, so the verdict should not move. A wrapper
