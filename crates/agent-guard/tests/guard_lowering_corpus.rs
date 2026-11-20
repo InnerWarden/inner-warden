@@ -247,6 +247,15 @@ const SERVICE_AND_PROCESS_LINES: &[&str] = &[
     "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/innerwarden_2dagent_2eservice org.freedesktop.systemd1.Unit Stop s replace",
     "dbus-send --system --print-reply --dest=org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager.StopUnit string:innerwarden-agent.service string:replace",
     "gdbus call --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 --method org.freedesktop.systemd1.Manager.StopUnit innerwarden-agent.service replace",
+    "pkill -f warden",
+    "env pkill -f warden",
+    "pgrep -f warden | xargs kill",
+    "kill $(pidof innerwarden)",
+    "pkill -f 'mcp-proxy -- npx'",
+    r"pkill -f 'innerwar\den'",
+    "killall -r warden",
+    "systemctl stop 'innerwar*'",
+    "systemctl stop '*warden*'",
 ];
 
 /// Every command the corpus denies, with a short label of how it was built.
@@ -566,6 +575,10 @@ fn allow_cases() -> Vec<(String, String)> {
         // guard's behind a glued redirection, and a D-Bus read of a unit.
         ("pkill -f claude".into(), "control|pkill-agent-name".into()),
         ("pkill -f 'node server.js'".into(), "control|pkill-server".into()),
+        ("pkill -f innerwarden-docs-server".into(), "control|pkill-longer-name".into()),
+        ("pkill node".into(), "control|pkill-name".into()),
+        ("killall node".into(), "control|killall-other".into()),
+        ("systemctl stop 'nginx*'".into(), "control|stop-glob-other".into()),
         ("pgrep -f 'hook --agent claude-code'".into(), "read|pgrep-hook".into()),
         ("systemctl stop>&2 nginx".into(), "control|stop-glued-other".into()),
         ("systemctl status innerwarden-agent".into(), "read|status".into()),

@@ -1183,6 +1183,12 @@ pub(crate) fn home_place(relative: &str) -> Option<&'static str> {
         .iter()
         .find(|group| {
             group.files.contains(&relative)
+                // A file known by its whole name, in any case: on a disk that
+                // ignores it (APFS) `.PGPASS` is `.pgpass`.
+                || group.files.iter().any(|file| {
+                    matches!(*file, ".pgpass" | ".my.cnf" | ".vault-token")
+                        && file.eq_ignore_ascii_case(relative)
+                })
                 || group.trees.iter().any(|tree| {
                     relative == *tree
                         || relative

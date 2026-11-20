@@ -1819,6 +1819,24 @@ DENY	dbus-send --system --print-reply --dest=org.freedesktop.systemd1 /org/freed
 DENY	sudo dbus-send --system --print-reply --dest=org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager.StopUnit string:innerwarden-agent.service string:replace
 DENY	gdbus call --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 --method org.freedesktop.systemd1.Manager.StopUnit innerwarden-agent.service replace
 DENY	sudo gdbus call --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 --method org.freedesktop.systemd1.Manager.StopUnit innerwarden-agent.service replace
+DENY	pkill -f warden
+DENY	sudo pkill -f warden
+DENY	env pkill -f warden
+DENY	sudo env pkill -f warden
+DENY	pgrep -f warden | xargs kill
+DENY	sudo pgrep -f warden | xargs kill
+DENY	kill $(pidof innerwarden)
+DENY	sudo kill $(pidof innerwarden)
+DENY	pkill -f 'mcp-proxy -- npx'
+DENY	sudo pkill -f 'mcp-proxy -- npx'
+DENY	pkill -f 'innerwar\den'
+DENY	sudo pkill -f 'innerwar\den'
+DENY	killall -r warden
+DENY	sudo killall -r warden
+DENY	systemctl stop 'innerwar*'
+DENY	sudo systemctl stop 'innerwar*'
+DENY	systemctl stop '*warden*'
+DENY	sudo systemctl stop '*warden*'
 ALLOW	innerwarden --version
 ALLOW	innerwarden-ctl agent kernel status
 ALLOW	innerwarden mute --list
@@ -1841,6 +1859,10 @@ ALLOW	sudo innerwarden-config-sign secret-guard status
 ALLOW	sudo innerwarden-config-sign secret-guard protect --path /etc/app/prod.key
 ALLOW	pkill -f claude
 ALLOW	pkill -f 'node server.js'
+ALLOW	pkill -f innerwarden-docs-server
+ALLOW	pkill node
+ALLOW	killall node
+ALLOW	systemctl stop 'nginx*'
 ALLOW	pgrep -f 'hook --agent claude-code'
 ALLOW	systemctl stop>&2 nginx
 ALLOW	systemctl status innerwarden-agent

@@ -15,7 +15,9 @@
 //!   `qdbus`), asked to stop, kill, restart, freeze, mask or disable a unit of
 //!   the guard.
 
-use super::{effective_command_index, program_name, PkillReach, PROTECTED_TARGETS};
+use super::{
+    effective_command_index, launched_command_index, program_name, PkillReach, PROTECTED_TARGETS,
+};
 use crate::shell_words::{read_line, Command};
 use std::ops::Range;
 use std::path::Path;
@@ -32,23 +34,54 @@ const NESTED_DEPTH: u8 = 4;
 pub(super) struct GuardLine {
     pub(super) text: String,
     shared: Vec<Range<usize>>,
+    /// Where the folder of the program ends: the bytes before it are its
+    /// install path (`/usr/local/bin/`), words many programs share.
+    folder_end: usize,
+}
+
+/// The guard's name, as each of its programs and folders carries it.
+const GUARD_NAME: &str = "innerwarden";
+
+/// How many bytes of [`GUARD_NAME`] a match covers to touch it: `warden`,
+/// `inner`, `den` do; one or two letters (`e`, `ar`) are in too many
+/// other names to aim at this one.
+const NAME_PIECE: usize = 3;
+
+/// Whether `range` of `text` covers [`NAME_PIECE`] bytes or more of one
+/// [`GUARD_NAME`] in it.
+fn touches_name(text: &str, range: &Range<usize>) -> bool {
+    text.match_indices(GUARD_NAME).any(|(at, name)| {
+        let start = range.start.max(at);
+        let end = range.end.min(at + name.len());
+        end >= start + NAME_PIECE
+    })
 }
 
 impl GuardLine {
-    /// Whether a match over `range` aims at the guard's part of the line:
-    /// it covers one of the guard's words whole (`proxy`, `hook`, the
-    /// program's name), or reaches across the end of one of them (`roxy
-    /// --mod`). A letter or two inside a word (`x` of `proxy`) aims at no
-    /// program in particular.
-    fn aims_at_guard(&self, range: Range<usize>) -> bool {
+    /// What a match over `range` does to the guard:
+    ///
+    /// * [`PkillReach::NamesGuard`] when it touches the guard's name
+    ///   ([`touches_name`]), or reaches across a space between two of the
+    ///   guard's words (`hook --agent`, `roxy --mod`): a pattern written
+    ///   for this line;
+    /// * [`PkillReach::Broad`] when it covers a whole word the guard wrote
+    ///   and nothing more (`proxy`, `hook`, `dashboard`, the `local` or
+    ///   `bin` of its folder): the kill takes the guard with other
+    ///   programs, and a person decides;
+    /// * [`PkillReach::Unread`] for letters inside one word (`x` of
+    ///   `proxy`) or another program's part (the agent's id, the server).
+    fn reach_of(&self, range: Range<usize>) -> PkillReach {
         let bytes = self.text.as_bytes();
-        let owned = |at: usize| !self.shared.iter().any(|shared| shared.contains(&at));
         let range = range.start..range.end.min(bytes.len());
+        if touches_name(&self.text, &range) {
+            return PkillReach::NamesGuard;
+        }
+        let owned = |at: usize| !self.shared.iter().any(|shared| shared.contains(&at));
         if range
             .clone()
-            .any(|at| owned(at) && matches!(bytes[at], b' ' | b'/'))
+            .any(|at| owned(at) && at >= self.folder_end && bytes[at] == b' ')
         {
-            return true;
+            return PkillReach::NamesGuard;
         }
         let mut start = 0usize;
         for (at, byte) in bytes
@@ -63,22 +96,62 @@ impl GuardLine {
                     && word.end <= range.end
                     && word.clone().all(owned)
                 {
-                    return true;
+                    return PkillReach::Broad;
                 }
                 start = at + 1;
             }
         }
-        false
+        PkillReach::Unread
     }
 }
 
 /// The install paths the guard's CLI is written under in a hook or an MCP
 /// wrapper: the installer's, a package's, a user install and Homebrew's.
+/// [`guard_programs`] adds the ones of this machine.
 const GUARD_PROGRAMS: &[&str] = &[
     "/usr/local/bin/innerwarden",
     "/usr/bin/innerwarden",
     "/home/user/.local/bin/innerwarden",
     "/opt/homebrew/bin/innerwarden",
+    "innerwarden",
+];
+
+/// [`GUARD_PROGRAMS`], and where the CLI is on this machine: the binary
+/// running now when it is the CLI (the path the CLI wrote into the hooks it
+/// installed), and the user installs under this home.
+fn guard_programs() -> Vec<String> {
+    let mut programs: Vec<String> = GUARD_PROGRAMS.iter().map(|p| (*p).to_owned()).collect();
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim_end_matches('/');
+        if !home.is_empty() {
+            for folder in [".local/bin", ".cargo/bin", "bin"] {
+                programs.push(format!("{home}/{folder}/innerwarden"));
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let name = exe.file_name().and_then(|name| name.to_str());
+        if matches!(name, Some("innerwarden" | "innerwarden.exe")) {
+            if let Some(path) = exe.to_str() {
+                programs.push(path.to_owned());
+            }
+        }
+    }
+    programs.sort();
+    programs.dedup();
+    programs
+}
+
+/// The command lines the guard's list held before it was built from what
+/// the CLI writes, kept as they were: `innerwarden mcp-proxy -- <server>`
+/// is the layout of older wrappers and of the Pro CLI's label, and a pattern
+/// written for it stops the guard where that layout still runs.
+const LEGACY_LINES: &[&str] = &[
+    "/usr/local/bin/innerwarden hook --agent claude-code",
+    "/usr/local/bin/innerwarden mcp-proxy -- npx -y server",
+    "/usr/local/bin/innerwarden dashboard",
+    "/usr/bin/innerwarden hook",
+    "/home/user/.local/bin/innerwarden hook",
     "innerwarden",
 ];
 
@@ -117,8 +190,12 @@ pub(super) fn guard_lines() -> &'static [GuardLine] {
 
 fn build_guard_lines() -> Vec<GuardLine> {
     let mut lines = Vec::new();
-    for program in GUARD_PROGRAMS {
+    for program in &guard_programs() {
+        let program = program.as_str();
         let bin = Path::new(program);
+        // The program alone, and its hook with no option.
+        lines.push(guard_line(&[program.to_owned()], None));
+        lines.push(guard_line(&[program.to_owned(), "hook".into()], None));
         // The hook lines the CLI writes for each agent and mode, read as the
         // shell reads them down to the program it starts.
         for (block_review, monitor) in [(false, false), (true, false), (false, true)] {
@@ -165,9 +242,12 @@ fn build_guard_lines() -> Vec<GuardLine> {
                 }
                 lines.push(guard_line(&words, words.iter().position(|w| w == "--")));
             }
-            let mut legacy: Vec<String> = vec![(*program).to_owned(), "proxy".into(), "--".into()];
-            legacy.extend(server.iter().map(|word| (*word).to_owned()));
-            lines.push(guard_line(&legacy, Some(2)));
+            for subcommand in ["proxy", "mcp-proxy"] {
+                let mut legacy: Vec<String> =
+                    vec![program.to_owned(), subcommand.into(), "--".into()];
+                legacy.extend(server.iter().map(|word| (*word).to_owned()));
+                lines.push(guard_line(&legacy, Some(2)));
+            }
             let mut pro: Vec<String> = [
                 "/usr/local/bin/innerwarden-ctl",
                 "agent",
@@ -182,16 +262,16 @@ fn build_guard_lines() -> Vec<GuardLine> {
             pro.extend(server.iter().map(|word| (*word).to_owned()));
             lines.push(guard_line(&pro, Some(5)));
         }
-        lines.push(guard_line(
-            &[(*program).to_owned(), "dashboard".into()],
-            None,
-        ));
+        lines.push(guard_line(&[program.to_owned(), "dashboard".into()], None));
     }
     for line in PRO_LINES {
-        lines.push(GuardLine {
-            text: (*line).to_owned(),
-            shared: Vec::new(),
-        });
+        let words: Vec<String> = line.split(' ').map(str::to_owned).collect();
+        lines.push(guard_line(&words, None));
+    }
+    for line in LEGACY_LINES {
+        let words: Vec<String> = line.split(' ').map(str::to_owned).collect();
+        let separator = words.iter().position(|word| word == "--");
+        lines.push(guard_line(&words, separator));
     }
     lines
 }
@@ -253,31 +333,42 @@ fn guard_line(words: &[String], separator: Option<usize>) -> GuardLine {
         // The proxy's `--label` names the agent as its `--agent` does.
         names_agent = word == "--agent" || word == "--label";
     }
-    GuardLine { text, shared }
+    let folder_end = words
+        .first()
+        .and_then(|program| program.rfind('/'))
+        .map_or(0, |slash| slash + 1);
+    GuardLine {
+        text,
+        shared,
+        folder_end,
+    }
 }
 
-/// What a `pkill -f` or `pgrep -f` pattern does to the guard's processes:
-/// [`PkillReach::NamesGuard`] when it matches one of [`guard_lines`] on
-/// bytes the guard wrote, [`PkillReach::Unread`] when it matches one only
-/// on another program's part (the agent's id, the MCP server: `pkill -f
-/// npx` stops the servers as much as the proxies), and
-/// [`PkillReach::Misses`] when it matches none.
+/// What a `pkill -f` or `pgrep -f` pattern does to the guard's processes,
+/// the strongest of what each match on each of [`guard_lines`] does
+/// ([`GuardLine::reach_of`]): [`PkillReach::Misses`] when it matches none.
+/// A pattern that matches a line only where the guard's name stands (the
+/// line with the name spelled out of reach no longer matches) names it.
 pub(super) fn pattern_reach(regex: &regex::Regex) -> PkillReach {
     if names_the_cli(regex.as_str()) {
         return PkillReach::NamesGuard;
     }
-    let mut matched = false;
+    let unnamed = |line: &str| line.replace(GUARD_NAME, "xxxxxxxxxxx");
+    let mut reach = PkillReach::Misses;
     for line in guard_lines() {
         let text = line.text.as_str();
+        if regex.is_match(text) && !regex.is_match(&unnamed(text)) {
+            return PkillReach::NamesGuard;
+        }
         let mut from = 0usize;
         // Every place a match starts, each with its leftmost-first length.
         while from <= text.len() {
             let Some(found) = regex.find_at(text, from) else {
                 break;
             };
-            matched = true;
-            if line.aims_at_guard(found.range()) {
-                return PkillReach::NamesGuard;
+            reach = reach.max(line.reach_of(found.range()));
+            if reach == PkillReach::NamesGuard {
+                return reach;
             }
             let mut next = found.start() + 1;
             while next < text.len() && !text.is_char_boundary(next) {
@@ -286,11 +377,132 @@ pub(super) fn pattern_reach(regex: &regex::Regex) -> PkillReach {
             from = next;
         }
     }
-    if matched {
-        PkillReach::Unread
-    } else {
-        PkillReach::Misses
+    reach
+}
+
+/// The names the kernel keeps for the guard's processes, which `pkill` and
+/// `pgrep` without `-f`, `killall` and `pidof` match: each program's file
+/// name, and the first 15 bytes of it (`comm`).
+fn guard_process_names() -> &'static [String] {
+    static NAMES: LazyLock<Vec<String>> = LazyLock::new(|| {
+        let mut names: Vec<String> = Vec::new();
+        for line in guard_lines() {
+            let program = line.text.split(' ').next().unwrap_or_default();
+            let name = program.rsplit('/').next().unwrap_or(program);
+            if name.contains(GUARD_NAME) {
+                names.push(name.to_owned());
+                names.push(name.chars().take(15).collect());
+            }
+        }
+        names.sort();
+        names.dedup();
+        names
+    });
+    &NAMES
+}
+
+/// What a pattern matched against process names (`pkill` or `pgrep`
+/// without `-f`, `killall -r`) does to the guard's processes:
+/// [`PkillReach::NamesGuard`] when a match touches the guard's name in one
+/// of [`guard_process_names`], [`PkillReach::Broad`] when it matches one
+/// elsewhere (`agent` of `innerwarden-agent`: the kill takes other
+/// programs too, and a person decides).
+fn name_reach(regex: &regex::Regex) -> PkillReach {
+    let mut reach = PkillReach::Misses;
+    for name in guard_process_names() {
+        let mut from = 0usize;
+        while from <= name.len() {
+            let Some(found) = regex.find_at(name, from) else {
+                break;
+            };
+            if touches_name(name, &found.range()) {
+                return PkillReach::NamesGuard;
+            }
+            reach = PkillReach::Broad;
+            from = found.start() + 1;
+        }
     }
+    reach
+}
+
+/// Whether `name`, matched whole as `killall` and `pidof` match a name,
+/// is one of the guard's processes: its file name, its `comm`, or with a
+/// folder its program's path.
+fn names_a_guard_process(name: &str, ignore_case: bool) -> bool {
+    let same = |a: &str, b: &str| {
+        if ignore_case {
+            a.eq_ignore_ascii_case(b)
+        } else {
+            a == b
+        }
+    };
+    if name.contains('/') {
+        return guard_lines()
+            .iter()
+            .any(|line| same(line.text.split(' ').next().unwrap_or_default(), name));
+    }
+    guard_process_names().iter().any(|own| same(own, name))
+}
+
+/// The readings of a process pattern by each regular expression dialect
+/// that may run it: this crate's, the ERE of glibc (`\w`, `\s`, `\b` and
+/// their capitals mean what they mean here, any other letter after a
+/// backslash is that letter: `\d` is `d`) and the ERE of the BSDs and
+/// macOS (every letter after a backslash is that letter). `pkill -f
+/// 'innerwar\den'` matches `innerwarden` on Linux and nothing here.
+fn dialect_readings(pattern: &str) -> Vec<String> {
+    let mut readings = vec![pattern.to_owned()];
+    if !pattern.contains('\\') {
+        return readings;
+    }
+    for keeps in ["wWsSbB", ""] {
+        let mut out = String::with_capacity(pattern.len());
+        let mut chars = pattern.chars();
+        while let Some(character) = chars.next() {
+            if character != '\\' {
+                out.push(character);
+                continue;
+            }
+            match chars.next() {
+                Some(letter) if letter.is_ascii_alphabetic() && !keeps.contains(letter) => {
+                    out.push(letter);
+                }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        }
+        if !readings.contains(&out) {
+            readings.push(out);
+        }
+    }
+    readings
+}
+
+/// What a `pkill` or `pgrep` pattern does to the guard's processes, in the
+/// strongest of its [`dialect_readings`], case ignored: matched against the
+/// command lines with `-f` ([`pattern_reach`]), against the names without
+/// ([`name_reach`]). [`PkillReach::Unread`] when no reading compiles.
+pub(super) fn reach_of_pattern(pattern: &str, full: bool) -> PkillReach {
+    let mut reach: Option<PkillReach> = None;
+    for reading in dialect_readings(pattern) {
+        let Ok(regex) = regex::RegexBuilder::new(&reading)
+            .case_insensitive(true)
+            .size_limit(1 << 20)
+            .build()
+        else {
+            continue;
+        };
+        let this = if full {
+            pattern_reach(&regex)
+        } else {
+            name_reach(&regex)
+        };
+        reach = Some(reach.map_or(this, |before| before.max(this)));
+    }
+    reach.unwrap_or(PkillReach::Unread)
 }
 
 /// Whether `pattern` spells the guard's CLI as a program followed by its
@@ -320,26 +532,42 @@ fn quoted(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// Whether `command` is a `pgrep -f` whose pattern reaches the guard
-/// ([`pattern_reach`]).
-fn pgrep_reaches_guard(command: &Command) -> bool {
+/// What the processes `command` lists do to the guard, when it is a
+/// `pgrep` (its pattern read as `pkill` reads it, [`super::pkill_reach`])
+/// or a `pidof` (each name matched whole, [`names_a_guard_process`]),
+/// behind any launcher the shell reads (`env`, `command`, `exec`, `sudo`).
+fn listed_reach(command: &Command) -> PkillReach {
     let Some(words) = plain_words(command) else {
-        return false;
+        return PkillReach::Unread;
     };
-    let Some(at) = effective_command_index(&words) else {
-        return false;
+    let Some(at) = launched_command_index(&words) else {
+        return PkillReach::Unread;
     };
-    if program_name(&words[at]) != "pgrep" {
-        return false;
+    match program_name(&words[at]).as_str() {
+        "pgrep" => {
+            let segment: Vec<String> = std::iter::once("pkill".to_owned())
+                .chain(words[at + 1..].iter().map(|word| quoted(word)))
+                .collect();
+            super::pkill_reach(&segment.join(" "))
+        }
+        "pidof" => {
+            let mut reach = PkillReach::Misses;
+            let mut rest = words[at + 1..].iter();
+            while let Some(word) = rest.next() {
+                if word == "-o" || word == "--omit-pid" {
+                    rest.next();
+                } else if !word.starts_with('-') && names_a_guard_process(word, false) {
+                    reach = PkillReach::NamesGuard;
+                }
+            }
+            reach
+        }
+        _ => PkillReach::Misses,
     }
-    let segment: Vec<String> = std::iter::once("pkill".to_owned())
-        .chain(words[at + 1..].iter().map(|word| quoted(word)))
-        .collect();
-    super::pkill_reach(&segment.join(" ")) == PkillReach::NamesGuard
 }
 
 /// Whether `command` runs `kill` on what it is handed: `kill` itself, or
-/// `xargs` starting it.
+/// `xargs` starting it, behind any launcher the shell reads.
 fn runs_kill(command: &Command) -> bool {
     let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
     let Some(at) = effective_command_index(&words) else {
@@ -354,36 +582,138 @@ fn runs_kill(command: &Command) -> bool {
     }
 }
 
-/// A `pgrep -f` that finds the guard's processes ([`pattern_reach`]) and
-/// hands what it prints to `kill`: through a pipe into `kill` or `xargs
-/// kill`, or as a substitution in a `kill`'s words.
-pub(super) fn pgrep_feeds_a_kill_of_the_guard(text: &str) -> bool {
+/// What a `pgrep` or `pidof` that finds the guard's processes
+/// ([`listed_reach`]) does when it hands what it prints to `kill`: through
+/// a pipe into `kill` or `xargs kill`, or as a substitution in a `kill`'s
+/// words. The strongest such hand-over of the line.
+pub(super) fn pgrep_feeds_a_kill_of_the_guard(text: &str) -> PkillReach {
+    if !text.contains("pgrep") && !text.contains("pidof") {
+        return PkillReach::Misses;
+    }
     feeds_kill(text, 0)
 }
 
-fn feeds_kill(text: &str, depth: u8) -> bool {
-    if !text.contains("pgrep") {
-        return false;
-    }
+fn feeds_kill(text: &str, depth: u8) -> PkillReach {
     let line = read_line(text);
+    let mut reach = PkillReach::Misses;
     for (index, command) in line.commands.iter().enumerate() {
-        if command.piped
-            && pgrep_reaches_guard(command)
-            && line.commands.get(index + 1).is_some_and(runs_kill)
-        {
-            return true;
+        if command.piped && line.commands.get(index + 1).is_some_and(runs_kill) {
+            reach = reach.max(listed_reach(command));
         }
-        if runs_kill(command)
-            && command
-                .words
-                .iter()
-                .flat_map(|word| &word.substitutions)
-                .any(|inner| read_line(inner).commands.iter().any(pgrep_reaches_guard))
-        {
-            return true;
+        if runs_kill(command) {
+            for inner in command.words.iter().flat_map(|word| &word.substitutions) {
+                for listed in &read_line(inner).commands {
+                    reach = reach.max(listed_reach(listed));
+                }
+            }
         }
     }
-    depth < NESTED_DEPTH && line.nested.iter().any(|inner| feeds_kill(inner, depth + 1))
+    if depth < NESTED_DEPTH {
+        for inner in &line.nested {
+            reach = reach.max(feeds_kill(inner, depth + 1));
+        }
+    }
+    // What a list misses or reads less surely kills nothing of the guard.
+    if reach < PkillReach::Broad {
+        PkillReach::Misses
+    } else {
+        reach
+    }
+}
+
+/// The options of `killall` (psmisc, and the BSDs' and macOS's) that take
+/// the next word as their value.
+const KILLALL_VALUED: &[&str] = &[
+    "-s",
+    "--signal",
+    "-u",
+    "--user",
+    "-y",
+    "--younger-than",
+    "-o",
+    "--older-than",
+    "-n",
+    "--ns",
+    "-Z",
+    "--context",
+    "-t",
+    "-c",
+];
+
+/// What a `killall` of the line does to the guard's processes: each name
+/// matched whole ([`names_a_guard_process`]), or with `-r` (psmisc) or `-m`
+/// (the BSDs, macOS) read as a pattern over the names ([`name_reach`], in
+/// every dialect). Behind any launcher the shell reads.
+pub(super) fn killall_reach(text: &str) -> PkillReach {
+    if !text.contains("killall") {
+        return PkillReach::Misses;
+    }
+    killall_in(text, 0)
+}
+
+fn killall_in(text: &str, depth: u8) -> PkillReach {
+    let line = read_line(text);
+    let mut reach = PkillReach::Misses;
+    for command in &line.commands {
+        let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+        let Some(at) = launched_command_index(&words) else {
+            continue;
+        };
+        if program_name(&words[at]) != "killall" {
+            continue;
+        }
+        let mut pattern = false;
+        let mut ignore_case = false;
+        let mut names = Vec::new();
+        let mut rest = words[at + 1..].iter();
+        let mut options_done = false;
+        while let Some(word) = rest.next() {
+            if options_done || !word.starts_with('-') || word == "-" {
+                names.push(word.as_str());
+                continue;
+            }
+            match word.as_str() {
+                "--" => options_done = true,
+                "--regexp" => pattern = true,
+                "--ignore-case" => ignore_case = true,
+                valued if KILLALL_VALUED.contains(&valued) => {
+                    rest.next();
+                }
+                long if long.starts_with("--") => {}
+                short => {
+                    let flags = &short[1..];
+                    // A signal: `-9`, `-KILL`, `-SIGTERM`.
+                    if flags.bytes().all(|b| b.is_ascii_digit())
+                        || (flags.len() >= 3 && flags.bytes().all(|b| b.is_ascii_uppercase()))
+                    {
+                        continue;
+                    }
+                    pattern |= flags.contains('r') || flags.contains('m');
+                    ignore_case |= flags.contains('I');
+                }
+            }
+        }
+        for name in names {
+            let this = if pattern {
+                reach_of_pattern(name, false)
+            } else if names_a_guard_process(name, ignore_case) {
+                PkillReach::NamesGuard
+            } else {
+                PkillReach::Misses
+            };
+            reach = reach.max(this);
+        }
+    }
+    if depth < NESTED_DEPTH {
+        for inner in &line.nested {
+            reach = reach.max(killall_in(inner, depth + 1));
+        }
+    }
+    if reach < PkillReach::Broad {
+        PkillReach::Misses
+    } else {
+        reach
+    }
 }
 
 /// What [`service_lowered`] says when the unit is the guard's.
@@ -531,7 +861,139 @@ fn systemctl_lowers(rest: &[String]) -> Option<&'static str> {
     if !matches!(*verb, "stop" | "disable" | "mask" | "kill" | "freeze") {
         return None;
     }
-    units.iter().find_map(|unit| protected_target(unit))
+    units
+        .iter()
+        .find_map(|unit| protected_target(unit).or_else(|| glob_target(unit)))
+}
+
+/// The units of the guard, as its installers name them.
+const GUARD_UNITS: &[&str] = &[
+    "innerwarden",
+    "innerwarden-sensor",
+    "innerwarden-agent",
+    "innerwarden-watchdog",
+    "innerwarden-supervisor",
+    "innerwarden-dns-guard",
+];
+
+/// The protected target a unit pattern reaches: systemd expands a glob in
+/// `stop`, `disable`, `mask` and `kill` over the units it knows, so the
+/// pattern is matched (as `fnmatch` matches it) against the guard's units
+/// and each [`PROTECTED_TARGETS`] name, with and without `.service`. A
+/// pattern that cannot be read (an unclosed `[`) is taken as reaching the
+/// guard.
+fn glob_target(unit: &str) -> Option<&'static str> {
+    if !unit.contains(['*', '?', '[']) {
+        return None;
+    }
+    let Some(tokens) = glob_tokens(unit.as_bytes()) else {
+        return Some("innerwarden");
+    };
+    let names = GUARD_UNITS
+        .iter()
+        .map(|unit| (*unit, "innerwarden"))
+        .chain(PROTECTED_TARGETS.iter().map(|target| (*target, *target)));
+    for (name, target) in names {
+        for full in [name.to_owned(), format!("{name}.service")] {
+            if glob_matches(&tokens, full.as_bytes()) {
+                return Some(target);
+            }
+        }
+    }
+    None
+}
+
+/// One part of a glob pattern.
+enum GlobToken {
+    /// `*`: any run of bytes.
+    Any,
+    /// `?`: one byte.
+    One,
+    /// A byte as written, or after a backslash.
+    Byte(u8),
+    /// A bracket expression: its byte ranges, and whether it is negated.
+    Set(Vec<(u8, u8)>, bool),
+}
+
+/// `pattern` as [`GlobToken`]s; none when a bracket is never closed or a
+/// backslash ends it.
+fn glob_tokens(pattern: &[u8]) -> Option<Vec<GlobToken>> {
+    let mut tokens = Vec::new();
+    let mut at = 0usize;
+    while at < pattern.len() {
+        match pattern[at] {
+            b'*' => tokens.push(GlobToken::Any),
+            b'?' => tokens.push(GlobToken::One),
+            b'\\' => {
+                at += 1;
+                tokens.push(GlobToken::Byte(*pattern.get(at)?));
+            }
+            b'[' => {
+                at += 1;
+                let negated = matches!(pattern.get(at), Some(b'!' | b'^'));
+                if negated {
+                    at += 1;
+                }
+                let mut ranges = Vec::new();
+                let mut first = true;
+                loop {
+                    let byte = *pattern.get(at)?;
+                    if byte == b']' && !first {
+                        break;
+                    }
+                    first = false;
+                    if byte == b'[' && pattern.get(at + 1) == Some(&b':') {
+                        // A class (`[:alpha:]`): every letter, digit and mark
+                        // it may hold, read as any byte.
+                        let close = pattern[at + 2..].windows(2).position(|w| w == b":]")?;
+                        at += close + 4;
+                        ranges.push((0u8, u8::MAX));
+                        continue;
+                    }
+                    if pattern.get(at + 1) == Some(&b'-')
+                        && pattern.get(at + 2).is_some_and(|end| *end != b']')
+                    {
+                        ranges.push((byte, pattern[at + 2]));
+                        at += 3;
+                    } else {
+                        ranges.push((byte, byte));
+                        at += 1;
+                    }
+                }
+                tokens.push(GlobToken::Set(ranges, negated));
+            }
+            byte => tokens.push(GlobToken::Byte(byte)),
+        }
+        at += 1;
+    }
+    Some(tokens)
+}
+
+/// Whether `tokens` match all of `name`, by the table of which prefix of
+/// the pattern matches which prefix of the name.
+fn glob_matches(tokens: &[GlobToken], name: &[u8]) -> bool {
+    let mut row = vec![false; name.len() + 1];
+    row[0] = true;
+    for token in tokens {
+        let mut next = vec![false; name.len() + 1];
+        for at in 0..=name.len() {
+            next[at] = match token {
+                GlobToken::Any => row[at] || (at > 0 && next[at - 1]),
+                _ if at == 0 => false,
+                GlobToken::One => row[at - 1],
+                GlobToken::Byte(byte) => row[at - 1] && name[at - 1] == *byte,
+                GlobToken::Set(ranges, negated) => {
+                    let byte = name[at - 1];
+                    let inside = ranges
+                        .iter()
+                        .any(|(low, high)| (*low..=*high).contains(&byte));
+                    row[at - 1] && inside != *negated
+                }
+            };
+        }
+        row = next;
+    }
+    row[name.len()]
 }
 
 fn dbus_lowers(rest: &[String]) -> Option<&'static str> {
@@ -602,10 +1064,27 @@ mod tests {
             "inner.arden",
             "agent clau",
             "roxy --mod",
-            "proxy",
             "innerwarden mcp-proxy",
+            // A piece of the name, or the legacy proxy layout.
+            "warden",
+            "inner",
+            "innerwar",
+            "den",
+            "mcp-proxy -- npx",
         ] {
             assert_eq!(reach(pattern), PkillReach::NamesGuard, "{pattern}");
+        }
+        // A whole word of the guard's, its name untouched: the kill takes
+        // the guard with others, a person decides.
+        for pattern in [
+            "proxy",
+            "hook",
+            "dashboard",
+            "guard",
+            "local",
+            "/usr/local/bin",
+        ] {
+            assert_eq!(reach(pattern), PkillReach::Broad, "{pattern}");
         }
         for pattern in [
             "claude",
@@ -620,8 +1099,58 @@ mod tests {
         ] {
             assert_eq!(reach(pattern), PkillReach::Unread, "{pattern}");
         }
-        for pattern in ["mcp-proxy -- npx", "cargo build", "vite --port"] {
+        for pattern in ["innerwarden-docs-server", "cargo build", "vite --port"] {
             assert_eq!(reach(pattern), PkillReach::Misses, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn every_dialect_that_may_run_a_pattern_is_read() {
+        // `\d` is a digit here and `d` in glibc's and the BSDs' ERE.
+        assert_eq!(
+            reach_of_pattern(r"innerwar\den", true),
+            PkillReach::NamesGuard
+        );
+        assert_eq!(
+            reach_of_pattern(r"inner\warden", true),
+            PkillReach::NamesGuard
+        );
+        assert_eq!(
+            reach_of_pattern(r"node\s+server\.js", true),
+            PkillReach::Unread
+        );
+        assert_eq!(reach_of_pattern(r"cargo\d", true), PkillReach::Misses);
+    }
+
+    #[test]
+    fn process_names_are_matched_as_pkill_and_killall_match_them() {
+        assert_eq!(reach_of_pattern("warden", false), PkillReach::NamesGuard);
+        assert_eq!(reach_of_pattern("agent", false), PkillReach::Broad);
+        assert_eq!(reach_of_pattern("node", false), PkillReach::Misses);
+        assert!(names_a_guard_process("innerwarden", false));
+        assert!(names_a_guard_process("innerwarden-sen", false));
+        assert!(names_a_guard_process("/usr/local/bin/innerwarden", false));
+        assert!(names_a_guard_process("INNERWARDEN", true));
+        assert!(!names_a_guard_process("INNERWARDEN", false));
+        assert!(!names_a_guard_process("innerwarden-docs-server", false));
+    }
+
+    #[test]
+    fn a_unit_glob_is_matched_against_the_guards_units() {
+        for unit in [
+            "innerwar*",
+            "*warden*",
+            "inner?arden-agent",
+            "innerwarden-[a-z]*",
+            "*",
+        ] {
+            assert_eq!(glob_target(unit), Some("innerwarden"), "{unit}");
+        }
+        // Not read: closes.
+        assert_eq!(glob_target("inner[warden"), Some("innerwarden"));
+        assert_eq!(glob_target("fal*"), Some("falco"));
+        for unit in ["nginx*", "php*-fpm", "user@*.service"] {
+            assert_eq!(glob_target(unit), None, "{unit}");
         }
     }
 }

@@ -36,9 +36,8 @@ fn a_process_pattern_that_matches_a_line_the_guard_runs_is_refused() {
 
 #[test]
 fn a_pattern_on_another_programs_part_or_on_none_is_not_the_guards() {
-    // The agent's own name, the MCP server the proxy runs, a listing, and a
-    // pattern that matches no line the guard runs (its proxy is `proxy`,
-    // not `mcp-proxy`).
+    // The agent's own name, the MCP server the proxy runs, a listing, and
+    // patterns that match no line the guard runs.
     for command in [
         "pkill -f claude",
         "pkill -f npx",
@@ -46,8 +45,96 @@ fn a_pattern_on_another_programs_part_or_on_none_is_not_the_guards() {
         "pkill -f 'vite --port 5173'",
         "pgrep -f 'hook --agent claude-code'",
         "pgrep -f 'cargo build' | xargs kill",
+        "pkill -f innerwarden-docs-server",
+        "pkill node",
+        "pkill -f x",
+        "killall node",
+        "killall -r nginx",
+    ] {
+        assert_eq!(verdict(command), "allow", "{command}");
+    }
+}
+
+#[test]
+fn a_piece_of_the_name_reaches_the_guard_through_any_launcher_and_reader() {
+    // Main refused these; the first reading of this change let them through.
+    for command in [
+        "pkill -f warden",
+        "pkill -f inner",
+        "pkill -f innerwar",
+        "env pkill -f warden",
+        "command pkill -f warden",
+        "exec pkill -f warden",
+        "nice pkill -f warden",
+        "echo x | xargs pkill -f warden",
+        "pgrep -f warden | xargs kill",
+        "kill $(pgrep -f warden)",
+        "pkill warden",
+        "pgrep warden | xargs kill -9",
+        "kill $(pidof innerwarden)",
+        "pidof innerwarden | xargs kill",
+        // The layout older wrappers ran with.
         "pkill -f 'mcp-proxy -- npx'",
     ] {
+        assert_eq!(verdict(command), "deny", "{command}");
+    }
+}
+
+#[test]
+fn a_backslash_before_a_letter_is_read_in_every_dialect() {
+    // glibc's and the BSDs' ERE read `\d` as `d`.
+    for command in [
+        r"pkill -f 'innerwar\den'",
+        r"pkill -f 'inner\warden'",
+        r"pgrep -f 'innerwar\den' | xargs kill",
+        r"killall -r 'innerwar\den'",
+    ] {
+        assert_eq!(verdict(command), "deny", "{command}");
+    }
+}
+
+#[test]
+fn killall_by_name_or_by_pattern_is_read_as_pkill_is() {
+    for command in [
+        "killall -r warden",
+        "killall -r 'inner.arden'",
+        "killall -m warden",
+        "killall -I INNERWARDEN",
+        "killall -9 innerwarden-agent",
+        "sudo killall -r warden",
+    ] {
+        assert_eq!(verdict(command), "deny", "{command}");
+    }
+    assert_eq!(verdict("killall -r agent"), "review");
+}
+
+#[test]
+fn a_whole_word_of_the_guard_without_its_name_is_left_to_a_person() {
+    for command in [
+        "pkill -f proxy",
+        "pkill -f hook",
+        "pkill -f dashboard",
+        "pkill -f guard",
+        "pkill -f /usr/local/bin",
+        "pgrep -f proxy | xargs kill",
+    ] {
+        assert_eq!(verdict(command), "review", "{command}");
+    }
+}
+
+#[test]
+fn a_unit_glob_that_matches_a_guard_unit_is_stopping_the_guard() {
+    for command in [
+        "systemctl stop 'innerwar*'",
+        "systemctl stop '*warden*'",
+        "systemctl disable --now 'inner?arden-agent'",
+        "systemctl mask 'innerwarden-[a-z]*'",
+        "systemctl kill 'inner[warden'",
+        "sudo systemctl stop 'innerwarden-*.service'",
+    ] {
+        assert_eq!(verdict(command), "deny", "{command}");
+    }
+    for command in ["systemctl stop 'nginx*'", "systemctl restart 'php*-fpm'"] {
         assert_eq!(verdict(command), "allow", "{command}");
     }
 }
@@ -110,7 +197,24 @@ fn files_that_hold_a_password_or_a_token_are_secret() {
     ] {
         assert_eq!(verdict(command), "deny", "{command}");
     }
-    for command in ["grep -r kdbx docs/", "ls ~/projects", "psql -h db -U app"] {
+    // In any case: on a disk that ignores it (APFS) these are the same files.
+    for command in [
+        "cat ~/.PGPASS",
+        "cat ~/.My.Cnf",
+        "cat ~/.Vault-Token",
+        "cat ~/Passwords.KDBX",
+    ] {
+        assert_eq!(verdict(command), "deny", "{command}");
+    }
+    // Another file whose name ends the same way.
+    for command in [
+        "cat backup.my.cnf",
+        "cat ~/backup.pgpass",
+        "cat notes/my.cnf",
+        "grep -r kdbx docs/",
+        "ls ~/projects",
+        "psql -h db -U app",
+    ] {
         assert_eq!(verdict(command), "allow", "{command}");
     }
 }
