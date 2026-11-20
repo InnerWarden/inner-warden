@@ -7466,6 +7466,13 @@ fn expansion_gives_one_word(text: &str) -> bool {
 /// ([`every_substitution_only_prints_a_folder`]) runs that code before the
 /// program, whatever name it ends in. None of those is read as a name.
 fn runtime_word_ends_in_literal_program(word: &str) -> bool {
+    word_ends_in_literal_program(word, true)
+}
+
+/// [`runtime_word_ends_in_literal_program`], with the test of what its
+/// substitutions run left out where `queries` is false: whether the word
+/// is already written the way that rule reads a name from.
+fn word_ends_in_literal_program(word: &str, queries: bool) -> bool {
     let Some(tree) = parse_complete_tree(word) else {
         return false;
     };
@@ -7530,7 +7537,55 @@ fn runtime_word_ends_in_literal_program(word: &str) -> bool {
                 .chars()
                 .any(|character| character.is_ascii_alphanumeric())
         })
-        && every_substitution_only_prints_a_folder(tree.root_node(), source)
+        && (!queries || every_substitution_only_prints_a_folder(tree.root_node(), source))
+}
+
+/// Why the guard could not read a line's program by its name, for the way
+/// out a refusal gives ([`runtime_program_why`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeProgramWhy {
+    /// The program word is not one pair of double quotes ending in the
+    /// program's name: quoting it is the way out.
+    Unquoted,
+    /// It is, but a substitution in it runs a command that is not one of
+    /// the folder queries the guard knows ([`is_folder_printer`]).
+    QueryNotRead,
+    /// It is, under folder queries the guard knows, but the line puts them
+    /// in doubt ([`program_names_in_doubt`]).
+    LineInDoubt,
+}
+
+/// Why a line refused for a program named at run time was refused, read
+/// from the first program word that holds a substitution or an expansion.
+/// Asked while the line's doubt is held ([`hold_names_in_doubt`]).
+pub(crate) fn runtime_program_why(source: &str) -> RuntimeProgramWhy {
+    let Some(tree) = parse_complete_tree(source) else {
+        return RuntimeProgramWhy::Unquoted;
+    };
+    let mut commands = Vec::new();
+    collect_all_commands(tree.root_node(), &mut commands, 0);
+    for command in commands {
+        let Some(words) = command_words(command, source.as_bytes()) else {
+            continue;
+        };
+        let Some(effective) = effective_command_words(&words, 0) else {
+            continue;
+        };
+        let program = &effective[0];
+        if !shell_word(program).contains(['$', '`']) {
+            continue;
+        }
+        if !word_ends_in_literal_program(program, false) {
+            return RuntimeProgramWhy::Unquoted;
+        }
+        if NAMES_IN_DOUBT.with(std::cell::Cell::get) {
+            return RuntimeProgramWhy::LineInDoubt;
+        }
+        if !word_ends_in_literal_program(program, true) {
+            return RuntimeProgramWhy::QueryNotRead;
+        }
+    }
+    RuntimeProgramWhy::Unquoted
 }
 
 /// Whether every command substitution in a program word, nested ones too,
@@ -7810,17 +7865,25 @@ fn line_gives_folder_queries_cause(root: tree_sitter::Node<'_>, text: &str, dept
     }) {
         return true;
     }
+    // A tool that is handed no code and no input stream does with the
+    // folder the query prints what the same tool written out does with its
+    // path: what another program on the line installs, writes or moves, or
+    // a folder the line moves to, is there for the written path just as
+    // much, and the guard reads that path by its name. Only what changes
+    // this shell itself keeps the query in doubt.
+    let plain_tool = built.is_some_and(|built| built_program_is_a_plain_tool(built, source));
     let mut commands = Vec::new();
     collect_all_commands(root, &mut commands, 0);
     if commands.into_iter().any(|command| {
         built.is_none_or(|built| built.id() != command.id())
             && !command_writes_and_runs_nothing(command, source)
+            && (!plain_tool || command_changes_this_shell(command, source))
     }) {
         return true;
     }
-    if line_sets_what_a_query_may_read(root, source, built)
+    if line_sets_what_a_query_may_read(root, source, built, plain_tool)
         || line_reads_what_a_command_set(root, source)
-        || line_writes_a_file(root, source, built)
+        || line_writes_a_file(root, source, built, plain_tool)
         || line_reckons_arithmetic(root, text)
     {
         return true;
@@ -7833,6 +7896,173 @@ fn line_gives_folder_queries_cause(root: tree_sitter::Node<'_>, text: &str, dept
             || text
                 .split_once('=')
                 .is_some_and(|(name, _)| SHELL_START_VARIABLES.contains(&name))
+    })
+}
+
+/// Whether the program a folder query builds is a tool like any other: no
+/// shell, interpreter or runner ([`built_program_runs_code`]), and handed
+/// no input stream (a pipe into it, a file, a here-document or a
+/// here-string on its input), which such a program could read as code.
+fn built_program_is_a_plain_tool(built: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    !built_program_runs_code(built, source) && !built_program_reads_a_stream(built, source)
+}
+
+/// Whether the program a folder query builds reads an input stream: it is
+/// not the first command of a pipe, or it, or a group, list or pipe it is
+/// part of, has its input redirected.
+fn built_program_reads_a_stream(built: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let reads_on_its_input = |node: tree_sitter::Node<'_>| {
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .any(|part| match part.kind() {
+                "heredoc_redirect" | "herestring_redirect" => true,
+                "file_redirect" => node_text(part, source)
+                    .trim_start_matches(|character: char| character.is_ascii_digit())
+                    .starts_with('<'),
+                _ => false,
+            });
+        found
+    };
+    if reads_on_its_input(built) {
+        return true;
+    }
+    let mut child = built;
+    let mut at = built.parent();
+    while let Some(node) = at {
+        if node.kind() == "pipeline" {
+            let mut cursor = node.walk();
+            let first = node.named_children(&mut cursor).next();
+            if first.is_some_and(|first| first.id() != child.id()) {
+                return true;
+            }
+        }
+        if reads_on_its_input(node) {
+            return true;
+        }
+        child = node;
+        at = node.parent();
+    }
+    false
+}
+
+/// The builtins and reserved words of bash and zsh, the commands that run
+/// inside the shell that reads the line rather than as a program of their
+/// own. A whole list: a shell has no others.
+const SHELL_BUILTINS: [&str; 75] = [
+    ".",
+    ":",
+    "[",
+    "alias",
+    "bg",
+    "bind",
+    "break",
+    "builtin",
+    "caller",
+    "cd",
+    "command",
+    "compgen",
+    "complete",
+    "compopt",
+    "continue",
+    "declare",
+    "dirs",
+    "disown",
+    "echo",
+    "enable",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "false",
+    "fc",
+    "fg",
+    "getopts",
+    "hash",
+    "help",
+    "history",
+    "jobs",
+    "kill",
+    "let",
+    "local",
+    "logout",
+    "mapfile",
+    "popd",
+    "printf",
+    "pushd",
+    "pwd",
+    "read",
+    "readarray",
+    "readonly",
+    "return",
+    "set",
+    "shift",
+    "shopt",
+    "source",
+    "suspend",
+    "test",
+    "times",
+    "trap",
+    "true",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "unset",
+    "wait",
+    "print",
+    "autoload",
+    "emulate",
+    "setopt",
+    "unsetopt",
+    "zmodload",
+    "functions",
+    "whence",
+    "rehash",
+    "noglob",
+    "time",
+    "coproc",
+    "function",
+    "select",
+];
+
+/// Whether a command, beside a plain tool a folder query builds, may change
+/// the shell that reads the line rather than files and folders: a builtin
+/// ([`SHELL_BUILTINS`]) but a move to another folder (`cd`, `pushd`,
+/// `popd`, as plain as the tool's own folder change would be), a program
+/// whose name is not written out plain (it may be any of those), a fetch,
+/// and a setting of what a shell reads before its commands handed to a
+/// program. Every other program runs in a process of its own: what it
+/// writes is there for a path written out just as much.
+fn command_changes_this_shell(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let Some(name) = command.child_by_field_name("name") else {
+        return true;
+    };
+    let name = node_text(name, source);
+    if !name.chars().all(|character| {
+        character.is_ascii_alphanumeric()
+            || matches!(character, '.' | '_' | '+' | '/' | '-' | '[' | ':')
+    }) {
+        return true;
+    }
+    if matches!(name.as_str(), "cd" | "pushd" | "popd") {
+        return false;
+    }
+    if SHELL_BUILTINS.contains(&name.as_str()) {
+        return true;
+    }
+    let Some(words) = command_words(command, source) else {
+        return true;
+    };
+    let plain: Vec<String> = words.iter().map(|word| shell_word(word)).collect();
+    plain.iter().skip(1).any(|word| {
+        word.split_once('=').is_some_and(|(variable, _)| {
+            SHELL_START_VARIABLES.contains(&variable) || variable.starts_with("BASH_FUNC_")
+        })
+    }) || effective_command_words(&plain, 0).is_none_or(|effective| {
+        produces_downloaded_bytes(effective)
+            || SHELL_BUILTINS.contains(&normalized_command_name(&effective[0]).as_str())
     })
 }
 
@@ -8483,6 +8713,7 @@ fn line_sets_what_a_query_may_read(
     root: tree_sitter::Node<'_>,
     source: &[u8],
     built: Option<tree_sitter::Node<'_>>,
+    plain_tool: bool,
 ) -> bool {
     let program_runs_code = built.is_some_and(|built| built_program_runs_code(built, source));
     let mut assignments = Vec::new();
@@ -8510,6 +8741,11 @@ fn line_sets_what_a_query_may_read(
         });
         if in_front_of_the_program {
             program_runs_code || !setting_in_front_of_the_program(&name, value.as_deref())
+        } else if plain_tool {
+            // Set earlier on the line, the value reaches the tool as one set
+            // in front of it does, and the path its query prints is one a
+            // path written out could name as well.
+            !setting_in_front_of_the_program(&name, value.as_deref())
         } else {
             !setting_no_query_reads(&name, value.as_deref())
         }
@@ -8653,6 +8889,7 @@ fn line_writes_a_file(
     root: tree_sitter::Node<'_>,
     source: &[u8],
     built: Option<tree_sitter::Node<'_>>,
+    plain_tool: bool,
 ) -> bool {
     let named_descriptor = ["file_redirect", "heredoc_redirect", "herestring_redirect"]
         .iter()
@@ -8669,6 +8906,10 @@ fn line_writes_a_file(
         });
     if named_descriptor {
         return true;
+    }
+    // A plain tool reads the file a written path leads to as well.
+    if plain_tool {
+        return false;
     }
     let mut redirects = Vec::new();
     collect_nodes_of_kind(root, "file_redirect", &mut redirects, 0);

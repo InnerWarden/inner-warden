@@ -634,6 +634,9 @@ const HOME_GUARD_FILES: &[&str] = &[
     ".codex/config.toml",
     ".gemini/settings.json",
     ".openclaw/openclaw.json",
+    ".config/goose/config.yaml",
+    ".hermes/config.yaml",
+    ".aider.conf.yml",
     "library/application support/claude/claude_desktop_config.json",
     ".git-credentials",
 ];

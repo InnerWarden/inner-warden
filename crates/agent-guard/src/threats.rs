@@ -3086,6 +3086,9 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
         ".cursor",
         ".codex",
         ".gemini",
+        ".hermes",
+        "goose",
+        ".aider.conf",
         "claude_desktop_config",
         // The settings name as a quoted piece of a path built at run time,
         // `.claude` built from pieces too.
@@ -8351,6 +8354,9 @@ const GUARD_FIND_PLACES: &[(&str, &[&str])] = &[
     ("~/.cursor/mcp.json", &[]),
     ("~/.gemini/settings.json", &[]),
     ("~/.openclaw/openclaw.json", &[]),
+    ("~/.config/goose/config.yaml", &[]),
+    ("~/.hermes/config.yaml", &[]),
+    ("~/.aider.conf.yml", &[]),
     ("~/.openclaw/extensions/innerwarden-guard", &[]),
     ("~/.openclaw/extensions/innerwarden-replies", &[]),
     ("~/.openclaw/hooks/innerwarden-attempts", &[]),
@@ -19324,6 +19330,12 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
             Place::Components(".codex/config.toml"),
             Place::Components(".gemini/settings.json"),
             Place::Components("openclaw.json"),
+            // The settings of the other agents `agents` knows (`KNOWN` in
+            // agents.rs): each says which tools and servers its agent loads
+            // and what it may run without asking.
+            Place::Components(".config/goose/config.yaml"),
+            Place::Components(".hermes/config.yaml"),
+            Place::Components(".aider.conf.yml"),
             // The OpenClaw message hook and reply plugin `innerwarden observe
             // install` lays down (`HOOK_NAME` and `PLUGIN_ID` in the CLI's
             // observe_io.rs), and the guard plugin `agents connect openclaw`
