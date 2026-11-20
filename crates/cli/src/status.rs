@@ -1415,11 +1415,11 @@ mod tests {
                 assert!(what.contains("edited or deleted"), "{what}");
                 assert!(
                     next.starts_with("sudo innerwarden-ctl agent-user add agent"),
-                    "the command first: {next}"
+                    "the command comes first"
                 );
-                assert!(!next.contains("usermod"), "never the group: {next}");
+                assert!(!next.contains("usermod"), "never the group");
             }
-            other => panic!("{other:?}"),
+            _ => panic!("not a NotWorking finding"),
         }
     }
 
