@@ -82,7 +82,7 @@ it("the remedy that needs no root is the one offered first", () => {
     ["linux", "x64", "curl -fsSL https://innerwarden.com/free | sh"],
     ["linux", "arm64", "curl -fsSL https://innerwarden.com/free | sh"],
     ["darwin", "arm64", "curl -fsSL https://innerwarden.com/free | sh"],
-    ["win32", "x64", "irm https://innerwarden.com/free.ps1 | iex"],
+    ["win32", "x64", "irm https://www.innerwarden.com/free.ps1 | iex"],
   ]) {
     const msg = binaryMissingMessage(platform, arch);
     assert.ok(

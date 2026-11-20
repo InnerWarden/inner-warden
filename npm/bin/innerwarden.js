@@ -53,7 +53,7 @@ function binaryMissingMessage(platform, arch) {
     // binary and installs into the user's own ~/.local/bin.
     const rootless =
       platform === "win32"
-        ? `  irm https://innerwarden.com/free.ps1 | iex\n`
+        ? `  irm https://www.innerwarden.com/free.ps1 | iex\n`
         : `  curl -fsSL https://innerwarden.com/free | sh\n`;
     return (
       `InnerWarden: ${here} IS supported, but its binary is not installed.\n` +

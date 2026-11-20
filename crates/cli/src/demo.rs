@@ -371,8 +371,8 @@ pub(crate) fn connected_finding(agent: &str, via: Via, mode: Option<&str>) -> Fi
     let path = match via {
         Via::Hook => "its hook",
         Via::Proxy => {
-            "the MCP proxy (judged here by the proxy's own rules, without agent profiles \
-             or identity; no server was started)"
+            "the MCP proxy (judged here by the proxy's own rules and this host's agent \
+             profiles, without the instance identity; no server was started)"
         }
     };
     let mode = match (via, mode) {
@@ -777,10 +777,8 @@ mod tests {
     #[test]
     fn the_mcp_line_names_what_it_leaves_out_and_reads_mixed_honestly() {
         let line = connected_finding("cursor", Via::Proxy, Some("MIXED")).to_string();
-        assert!(
-            line.contains("without agent profiles or identity"),
-            "{line}"
-        );
+        assert!(line.contains("and this host's agent profiles"), "{line}");
+        assert!(line.contains("without the instance identity"), "{line}");
         assert!(!line.contains("part refuses"), "{line}");
         assert!(line.contains("some servers only record"), "{line}");
         let hook = connected_finding("claude-code", Via::Hook, Some("MIXED")).to_string();

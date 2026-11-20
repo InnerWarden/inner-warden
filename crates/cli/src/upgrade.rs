@@ -69,7 +69,11 @@ pub(crate) fn help_text(verb: &str) -> String {
          release. It downloads the release asset and verifies its SHA-256 and its\n  \
          Ed25519 signature against the key compiled into this binary before replacing\n  \
          anything. The `iw` and `iw-guard` copies the installer laid beside it are\n  \
-         replaced too. Hooks and config are left untouched.\n\
+         replaced too. The new binary then rewires Claude Code's InnerWarden hook\n  \
+         if it has one, adding a half this version screens and the old one did not\n  \
+         (in the mode of its Bash half). It does not add or rewire the hooks of\n  \
+         Codex CLI, Gemini CLI or Hermes Agent: run `innerwarden agents connect\n  \
+         <agent>` for those. Config is left untouched.\n\
          \n  \
          --check   report which version is published, and change nothing\n  \
          --yes     replace a copy npm, apt or dnf installed anyway (see the refusal\n  \
@@ -969,6 +973,33 @@ fn fetch_text(url: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The help says what the upgrade does to hooks: it rewires Claude
+    /// Code's (`rewire_agents_after_upgrade`, `agents rewire`) and does not
+    /// add Codex CLI's, Gemini CLI's or Hermes Agent's. It used to say hooks
+    /// were left untouched.
+    ///
+    /// FAILS ON REVERT of the hook sentences in `help_text`.
+    #[test]
+    fn the_help_says_what_the_upgrade_does_to_hooks() {
+        let help = help_text("upgrade").replace("\n  ", " ");
+        assert!(
+            !help.contains("Hooks and config are left untouched"),
+            "{help}"
+        );
+        assert!(
+            help.contains("rewires Claude Code's InnerWarden hook"),
+            "{help}"
+        );
+        assert!(
+            help.contains("Codex CLI, Gemini CLI or Hermes Agent"),
+            "{help}"
+        );
+        assert!(
+            help.contains("innerwarden agents connect <agent>"),
+            "{help}"
+        );
+    }
 
     /// REGRESSION ANCHOR for SEC-01. The updater must not fetch a script and run
     /// it: that is what put the trust anchor inside the artifact. This asserts

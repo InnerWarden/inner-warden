@@ -39,7 +39,7 @@ into `~/.local/bin` with no elevation on any platform:
 
 ```sh
 curl -fsSL https://innerwarden.com/free | sh          # macOS and Linux
-irm https://innerwarden.com/free.ps1 | iex            # Windows PowerShell
+irm https://www.innerwarden.com/free.ps1 | iex        # Windows PowerShell
 ```
 
 Or run it without installing anything:
