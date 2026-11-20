@@ -26858,7 +26858,7 @@ mod brq_evaluation_tests {
         }
     }
 
-    /// T-067: the record of decisions an AI Jail keeps in the project
+    /// The record of decisions an AI Jail keeps in the project
     /// (`.innerwarden`) is refused to every shell writer: before, `rm -rf
     /// .innerwarden`, a redirection onto its `graph.json` and a `mv` of the
     /// folder were all allowed (no rule matched), and a jailed agent erased
@@ -26898,7 +26898,7 @@ mod brq_evaluation_tests {
         }
     }
 
-    /// T-078 (9): a folder named `.innerwarden` that is not the project's
+    /// A folder named `.innerwarden` that is not the project's
     /// record (a dependency's, the system's) is the agent's to change; the
     /// project's, named from a folder below it, is still refused.
     ///

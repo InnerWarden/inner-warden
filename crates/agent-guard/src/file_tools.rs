@@ -1918,7 +1918,7 @@ mod tests {
         }
     }
 
-    /// T-067: a file tool never writes the record of decisions an AI Jail
+    /// A file tool never writes the record of decisions an AI Jail
     /// keeps in the project (`.innerwarden`), however the path is spelled;
     /// a file of another name in the project stays the agent's.
     ///
@@ -1949,7 +1949,7 @@ mod tests {
         }
     }
 
-    /// T-078 (9): only the record of the project the agent works in is
+    /// Only the record of the project the agent works in is
     /// refused. Before, a folder named `.innerwarden` anywhere (a
     /// dependency's, another tree's, the system's) was refused to every
     /// file tool on every host.

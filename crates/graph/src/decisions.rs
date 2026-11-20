@@ -100,6 +100,12 @@ pub struct DecisionOrigin {
     /// A call `innerwarden demo` sent, as the hook read it: recorded like
     /// any other, with this label beside it. Written only when true.
     pub demo: bool,
+    /// Who handed the decision to the process that wrote it: `jail` when
+    /// an AI Jail's launcher wrote what came through its record socket
+    /// (the hook's decisions and any a program in the jail sent alike).
+    /// None for a decision written by the process that made it. Only a
+    /// known word is kept.
+    pub reported_by: Option<String>,
 }
 
 const MAX_AGENT_CHARS: usize = 64;
@@ -118,6 +124,7 @@ const LAYER_WORDS: [&str; 4] = ["hard", "general", "agent_type", "instance"];
 
 /// The words a trust source may hold.
 const TRUST_SOURCE_WORDS: [&str; 2] = ["jail", "host"];
+const REPORTED_BY_WORDS: [&str; 1] = ["jail"];
 
 /// A host decision id: 32 lowercase hex characters.
 fn valid_host_decision(id: &str) -> bool {
@@ -280,6 +287,13 @@ impl DecisionOrigin {
         }
         if self.demo {
             attrs.insert("demo".into(), "true".into());
+        }
+        if let Some(word) = self
+            .reported_by
+            .as_deref()
+            .filter(|word| REPORTED_BY_WORDS.contains(word))
+        {
+            attrs.insert("reported_by".into(), word.into());
         }
     }
 }
@@ -1535,6 +1549,26 @@ mod tests {
             outcome,
             recorded_at_ms: Some(ms),
         }
+    }
+
+    /// The mark of a decision a jail handed over is written as it came, a
+    /// known word only; a word that is not one is dropped.
+    #[test]
+    fn reported_by_is_written_as_a_known_word_only() {
+        let mut attrs = BTreeMap::new();
+        DecisionOrigin {
+            reported_by: Some("jail".into()),
+            ..Default::default()
+        }
+        .write_attrs(&mut attrs);
+        assert_eq!(attrs.get("reported_by").map(String::as_str), Some("jail"));
+        let mut attrs = BTreeMap::new();
+        DecisionOrigin {
+            reported_by: Some("host".into()),
+            ..Default::default()
+        }
+        .write_attrs(&mut attrs);
+        assert!(!attrs.contains_key("reported_by"));
     }
 
     fn origin(rules: &[&str]) -> DecisionOrigin {

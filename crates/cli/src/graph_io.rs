@@ -1694,6 +1694,11 @@ fn guard_blocked_line(
     if let Some(layer) = origin.layer_label() {
         line["layer"] = json!(layer);
     }
+    // Handed over by a jail's hook (or by any program in the jail): the
+    // same mark the jail's other lines carry.
+    if origin.reported_by.as_deref() == Some("jail") {
+        line["reported_by"] = json!("jail");
+    }
     line
 }
 

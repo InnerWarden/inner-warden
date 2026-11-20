@@ -35,12 +35,23 @@ list, with every limit.
   in the jail can still add records of its own through that socket: the
   record says what the jail reported, not what the host saw. `contain`
   writes its own instance id and project name on each one, never a host
-  decision the jail names, and writes at most 512 at once and 64 a second
-  after that. What it does not write (too many connections waiting, a
-  connection that sends no report within 2 seconds, over that rate, a write
-  that failed) is counted in the record's health, which
-  `innerwarden graph --stats` and the dashboard show, and in one
-  `guard.jail_record_lost` line when the jail ends. The record's size cap
+  decision the jail names, and marks every decision and line it writes for
+  the jail `reported_by: jail`: the hook's and a program's cannot be told
+  apart. It writes at most 512 at once and 64 a second after that, and that
+  rate is shared: a program in the jail that sends decisions of its own can
+  spend it, and the hook's next decision is then not written (counted, and
+  said on the hook's stderr). It holds at most 64 MiB of reports being read
+  at once. What it does not write (a report turned away with too many
+  connections waiting and not sent again, a connection that sends no report
+  within 2 seconds, over that rate, a write that failed) is counted in the
+  record's health, which `innerwarden graph --stats` and the dashboard
+  show, and in one `guard.jail_record_lost` line when the jail ends. The
+  hook waits at most 3 seconds for its record to be taken; a record not
+  taken never changes the hook's verdict or its exit code (a refusal still
+  exits 2), it is said on the hook's stderr and, on the launcher's side,
+  counted. The hook takes the jail's record channel only where the
+  launcher's mount is there: a folder of that name made inside the jail is
+  not it, and the hook then records as outside a jail. The record's size cap
   still pushes its oldest decisions out. An entry at `.innerwarden` that is
   not a folder of the launching account is moved aside first. Where the
   folder or the socket cannot be had, `contain --identity` refuses to start;

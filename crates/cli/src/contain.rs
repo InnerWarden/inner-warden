@@ -5750,7 +5750,7 @@ mod tests {
         }
     }
 
-    /// T-067: where the launcher keeps the record, the project's record
+    /// Where the launcher keeps the record, the project's record
     /// folder is read-only in the jail, laid right after the project's
     /// bind (so the bind does not cover it), and the launcher's folder with
     /// the socket is read-only at its fixed place, after the `/run` tmpfs.

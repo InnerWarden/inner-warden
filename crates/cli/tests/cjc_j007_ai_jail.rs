@@ -5675,7 +5675,7 @@ fn a_suppression_planted_in_the_jail_never_lifts_the_hooks_verdict() {
     );
 }
 
-/// T-067: the hook inside a jail kept its record in the project, as the
+/// The hook inside a jail kept its record in the project, as the
 /// agent's own account: measured on Linux (plain and `--identity`), a
 /// program in the jail rewrote `.innerwarden/graph.json`, removed the
 /// folder, and with `IW_GRAPH_FILE` had the hook write elsewhere; of three
@@ -5753,6 +5753,76 @@ fn the_jails_record_of_decisions_is_out_of_the_agents_reach() {
     }
 }
 
+/// A folder named like the launcher's, made by a program in the jail on
+/// the jail's own `/run`, with a socket of its own in it that answers "ok":
+/// the hook took the folder for the launcher's mount, handed its decision
+/// to that socket, and kept no record. Now only the launcher's real mount
+/// is taken for it: the hook records as outside a jail (the record is
+/// writable in this jail, which has no channel) and the program's socket
+/// hears nothing.
+///
+/// FAILS ON REVERT: read the folder's presence again (`in_record_jail`)
+/// and the program's socket hears the decision and the record has none.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".config")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    // A `$TMPDIR` the jail can write: the launcher opens no channel, and
+    // the plain jail runs with the record writable.
+    let tmp = project.path().join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let fake = project.path().join("fake.py");
+    std::fs::write(
+        &fake,
+        "import socket\n\
+         s = socket.socket(socket.AF_UNIX)\n\
+         s.bind('/run/innerwarden-record/graph.sock')\n\
+         s.listen(8)\n\
+         while True:\n    \
+             c, _ = s.accept()\n    \
+             d = c.recv(1 << 20)\n    \
+             open('/tmp/heard', 'ab').write(d)\n    \
+             c.sendall(b'ok')\n    \
+             c.close()\n",
+    )
+    .unwrap();
+    let script = format!(
+        "command -v python3 >/dev/null || {{ echo NO_PYTHON; exit 0; }}; \
+         mkdir -p /run/innerwarden-record && python3 '{}' & FAKE=$!; \
+         i=0; while [ ! -S /run/innerwarden-record/graph.sock ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; \
+         [ -S /run/innerwarden-record/graph.sock ] && echo FAKE_UP; \
+         {}; \
+         if [ -s /tmp/heard ]; then echo HEARD; fi; kill $FAKE 2>/dev/null; true",
+        fake.display(),
+        jail_hook_line("fake"),
+    );
+    let output = record_jail_sh(false, h, project.path(), &script)
+        .env("TMPDIR", &tmp)
+        .env_remove("XDG_RUNTIME_DIR")
+        .output()
+        .expect("run the jail");
+    let out = String::from_utf8_lossy(&output.stdout);
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!out.contains("NO_PYTHON"), "the jail needs python3: {out}");
+    assert!(output.status.success(), "{out} {err}");
+    assert!(out.contains("FAKE_UP"), "{out} {err}");
+    assert!(out.contains("hook-fake=2"), "{out} {err}");
+    assert!(
+        !out.contains("HEARD"),
+        "the program's socket heard the hook: {out}"
+    );
+    let record =
+        std::fs::read_to_string(project.path().join(".innerwarden/graph.json")).unwrap_or_default();
+    assert!(
+        record.contains("evil.example/fake.sh"),
+        "the decision is not in the record: {record} {err}"
+    );
+}
+
 /// The hook line of a jail script: one refused command handed to the hook,
 /// its exit said as `hook-<n>=<code>`.
 #[cfg(target_os = "linux")]
@@ -5784,7 +5854,7 @@ fn record_jail_sh(
     }
 }
 
-/// T-078 (3): an entry planted at `.innerwarden` before the jail (a link
+/// An entry planted at `.innerwarden` before the jail (a link
 /// to a folder of the agent's choosing) made the launcher give up its
 /// channel and run the jail with the record writable, said on one stderr
 /// line. Now it is moved aside, the folder made again, and the record is
@@ -5844,7 +5914,7 @@ fn a_planted_record_entry_is_moved_aside_and_the_record_kept_out_of_reach() {
     }
 }
 
-/// T-078 (4): the socket's folder was made under `$TMPDIR` unchecked; a
+/// The socket's folder was made under `$TMPDIR` unchecked; a
 /// `$TMPDIR` inside the project put it in a folder the jail writes, where
 /// a program in the jail could remove the socket or put its own. Now such
 /// a folder is refused: an `--identity` jail does not start, a plain one
@@ -5898,7 +5968,7 @@ fn a_socket_folder_the_jail_can_write_is_refused() {
     }
 }
 
-/// T-078 (7): the lines the hook keeps beside the record (here an
+/// The lines the hook keeps beside the record (here an
 /// OpenClaw call that ran other than as screened, `openclaw ran`, which
 /// needs no terminal as `allow` does) went to the folder
 /// `IW_GRAPH_FILE` names, which a program in the jail sets, or hit the
