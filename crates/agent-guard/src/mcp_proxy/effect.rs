@@ -1,90 +1,85 @@
-//! What a tool does, read from its definition, and where the values that
-//! steer it came from: the policy table that decides a call to a tool that
-//! moves money, sends something out, shares, or deletes.
+//! What a tool does, read from its definition, and where the values it
+//! carries came from: a policy table that RAISES the verdict of a call that
+//! moves money, sends something out, shares or deletes, when a value it
+//! carries is one a server said this session.
+//!
+//! # It only raises
 //!
 //! An ATR rule that matches a tool by its name (ATR-2026-098 refuses every
-//! `send_money`, ATR-2026-040 every `delete_file`) or by the name of an
-//! argument (`"recipient":`) refuses the user's own payment as it refuses an
-//! injected one. The name says what the tool can do, not who wanted it done.
+//! `send_money`, ATR-2026-040 every `delete_file`) refuses the person's own
+//! payment as it refuses an injected one. Telling them apart takes positive
+//! proof of where the value came from: that it is in the person's request.
+//! The proxy does not see the request (no agent hands it the prompt; that
+//! channel is still to come), and the absence of a value from what servers
+//! said is not proof: it can arrive in a spelling not undone here, in a
+//! channel this proxy does not carry, or as a fragment. So nothing here
+//! lowers a verdict. A refusal the rules give stays a refusal; lowering waits
+//! for the person's request as a source, and will be its only row.
 //!
-//! What separates the two is where the value that matters came from: the
-//! account a payment goes to, the address a message goes to, the file a
-//! delete removes. An injected order hands the model that value inside a tool
-//! result; the user's own request does not. So:
+//! What it raises, for a call of a class that acts ([`EffectClass::acts`]):
+//!
+//! * a payment (`money-movement`) carrying an account, an IBAN, an address
+//!   or a link a server said is **refused** (`AG-EFFECT`, blocking): the shape
+//!   of an injected payment. A payment the person asked for from a bill a
+//!   tool read is refused too, as `send_money` already was by name;
+//! * any other acting call carrying a value a server said is **held for
+//!   review** (`AG-EFFECT`, an alert that does not block), naming the
+//!   argument and the value.
 //!
 //! 1. **Effect class, once per tool, at `tools/list`** ([`EffectClass::of_tool`]):
 //!    from the input schema's slot names, the MCP annotations
 //!    (`readOnlyHint`, `destructiveHint`) and the words of the tool's name as a
 //!    hint. A tool not listed is classed at its call, from its name and the
-//!    call's argument names. Each class names its **sensitive slots**
-//!    ([`EffectClass::is_sensitive_slot`]).
-//! 2. **Provenance of each sensitive value** ([`SeenText`]): did it appear in
-//!    anything a server said this session (a tool result, a resource, a
-//!    listing), or nowhere? A value found nowhere was written by the model or
-//!    the person. The proxy does not see the person's request (no agent hands
-//!    it the prompt), so "the user asked for it" and "the model wrote it" are
-//!    one row here; the table gives both the same verdict.
-//! 3. **The table** ([`apply_table`]): a call that moves money, sends, shares or
-//!    deletes, whose every value came from nowhere, is allowed and recorded:
-//!    an ATR rule that matched only the tool's name stays in the alert as a
-//!    label and no longer refuses. Any value found in what a server said keeps
-//!    the verdict the call had (an ATR refusal, `AG-TAINT`), so nothing that
-//!    was refused before passes when the value came from a result.
+//!    call's argument names.
+//! 2. **What servers said** ([`SeenText`]): every text a server sent this
+//!    session, as the JSON leaves it holds (strings, and the keys of maps
+//!    below the top), the text of a tool result's every block (text, an
+//!    embedded resource, a resource link's name and description), errors,
+//!    prompts, notifications, listings.
+//! 3. **What the call carries** ([`carried`]): every string and number, at
+//!    any depth, every key below the top level, the address-, link- and
+//!    account-shaped words inside a longer string, and each argument's
+//!    strings joined, so a destination sent in pieces is also read whole.
 //!
-//! Which values count ([`carried`]): for a class that acts, every string
-//! and number the call carries, at any depth, and every key below the top
-//! level that is not a plain field name (a map keyed by address,
-//! `{"recipients": {"x@example.com": true}}`), plus the address, link and
-//! account-shaped words inside a longer string. A slot name the class
-//! names (`to`, `recipient`, `iban`, ...) only has to appear somewhere,
-//! nested or not; a call where none appears (`counterparty`, `chat_id`,
-//! `dst`) is not lowered, nor one that carries no value at all.
-//!
-//! Both sides are compared in one spelling ([`super::canon`]): a value
-//! written `attacker[at]evil[.]com`, `attacker%40evil.com`, with a scheme or a
-//! trailing `/` more or less, in punycode or with letters that pass for
-//! ASCII letters, is the value it spells.
-//!
-//! What never changes here: an alert that is not an ATR rule, an ATR rule
-//! that still matches the call without the tool's name (a condition on an
-//! argument's name, `"recipient":`, or on its value, a `DROP TABLE`, a
-//! `--privileged`), a shell or process tool (its command line is judged as
-//! the line it runs), and a call to any other class. A session whose server
-//! text could not all be kept ([`SEEN_TEXT_BUDGET`]) or was read only in
-//! part can no longer say "nowhere", so no call in it is lowered: the
-//! cautious side.
+//! Both sides are compared in one spelling ([`super::canon`]): defanged,
+//! percent and entity escapes, base64, punycode, NFKC and NFC, letters that
+//! pass for ASCII letters, a scheme or a trailing `/` more or less; the
+//! squeezed form (letters and digits only) also drops accents.
 //!
 //! # What this does not see
 //!
-//! * **The person's request.** No agent hands the proxy the prompt, so a
-//!   value the person typed and a value the model made up are one row. A
-//!   value the model was told by an injected order and rewrote in a way
-//!   [`super::canon`] does not undo (translated, spelled out, split in two,
-//!   base64) reads as "from nowhere".
+//! * **The person's request**, so it cannot lower (above).
+//! * **A value rewritten in a way [`super::canon`] does not undo**:
+//!   translated, spelled out in words, hex, split so that no piece and no
+//!   join of the pieces is the value. Such a call keeps the verdict the
+//!   rules give it.
 //! * **What a server said that never passed through this proxy**: another
 //!   server's answers, a file the agent read with its own tools, the
-//!   conversation before the proxy started.
-//! * **Bookings and calendar entries.** `reserve_hotel`,
-//!   `create_calendar_event` and the like are class `other`: the table
-//!   neither lowers nor raises them, and their guests are not a destination.
-//! * **A server's annotations are believed.** A tool declared
-//!   `readOnlyHint: true` is class `read-only`, which lowers nothing: a lying
-//!   server keeps the verdict the name earns, it gains no allow.
-//! * **A value short and common enough to be anywhere** (`"7"`, `"Hi"`) is
-//!   found in what servers said more often than not, which keeps the refusal:
-//!   the cautious side, and the reason a benign call can still be refused.
+//!   conversation before the proxy started. A session past
+//!   [`SEEN_TEXT_BUDGET`] keeps nothing more, so later values raise nothing.
+//! * **A booking.** `reserve_hotel`, `create_calendar_event` and the like
+//!   are class `other` here, and raise nothing.
+//! * **A server's annotations are believed** for the class: a tool declared
+//!   `readOnlyHint: true` raises nothing here. It lowers nothing either, so
+//!   the verdict its name earns stays.
+//! * **A short value** (fewer than [`RAISING_MIN_CHARS`] characters and no
+//!   digit, `@`, `.` or `/`) raises nothing: `"7"` or `"Hi"` is in
+//!   almost anything a server says.
 
 use serde_json::Value;
 
 use crate::mcp::{Verdict, VerdictAlert};
-use crate::rules::{AtrContext, RuleEngine};
 
-/// The rule an allowed-and-recorded call is reported under.
+/// The rule a raised verdict is reported under.
 pub const EFFECT_RULE: &str = "AG-EFFECT";
 
+/// A value shorter than this (in characters) raises nothing unless it holds
+/// a digit, `@`, `.` or `/`: a short plain word is in almost any text.
+pub(crate) const RAISING_MIN_CHARS: usize = 12;
+
 /// How much of what servers said in one session is kept to answer "did this
-/// value appear before". Past it the session can no longer say a value came
-/// from nowhere, and no call is lowered for the rest of it.
+/// value appear before". Past it nothing more is kept, so a value said later
+/// raises nothing.
 pub(crate) const SEEN_TEXT_BUDGET: usize = 2 * 1024 * 1024;
 
 /// A value at least this long is also looked for with every character but
@@ -387,8 +382,7 @@ impl SeenText {
             self.text.push('\n');
             self.text.push_str(&lower);
             self.squeezed.push('\n');
-            self.squeezed
-                .extend(lower.chars().filter(|c| c.is_alphanumeric()));
+            self.squeezed.push_str(&super::canon::squeezed(&lower));
         }
     }
 
@@ -402,6 +396,7 @@ impl SeenText {
 
     /// Whether every server text of the session is kept, so a value not in
     /// it came from nowhere.
+    #[cfg(test)]
     pub(crate) fn is_whole(&self) -> bool {
         self.whole
     }
@@ -435,29 +430,13 @@ impl SeenText {
             }
             from = start + value.chars().next().map_or(1, char::len_utf8);
         }
-        let squeezed: String = value.chars().filter(|c| c.is_alphanumeric()).collect();
+        let squeezed = super::canon::squeezed(&value);
         squeezed.chars().count() >= SQUEEZED_MIN_LEN && self.squeezed.contains(&squeezed)
     }
 }
 
-/// What a call carries, as the table reads it (see "Which values count" in
-/// the module docs).
-#[derive(Debug, Default)]
-struct Carried {
-    /// A slot the class names sensitive appears, at any depth.
-    recognized: bool,
-    /// `(top-level argument, value)`, in the order met.
-    values: Vec<(String, String)>,
-}
-
-/// A key below the top level that is a field name (`to`, `emailAddress`,
-/// `user_id`), not data: ASCII letters, digits and `_`, starting with a
-/// letter, at most 32 bytes.
-fn is_field_name(key: &str) -> bool {
-    key.len() <= 32
-        && key.bytes().next().is_some_and(|b| b.is_ascii_alphabetic())
-        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-}
+/// What a call carries: `(top-level argument, value)`, in the order met.
+type Carried = Vec<(String, String)>;
 
 /// The words of a longer string that look like a destination or an account:
 /// they hold `@`, `://`, a `.` between letters or digits, or at least four
@@ -476,148 +455,140 @@ fn shaped_words(s: &str) -> impl Iterator<Item = &str> {
         })
 }
 
-/// Every value a call to a tool of `class` carries, and whether a slot
-/// the class names sensitive appears anywhere in it.
-fn carried(class: EffectClass, args: &Value) -> Carried {
+/// Every value a call carries (see "What the call carries" in the module
+/// docs): every string and number at any depth, every key below the top
+/// level, the shaped words of a longer string, and each argument's strings
+/// joined end to end when it holds more than one.
+fn carried(args: &Value) -> Carried {
     fn push_string(top: &str, s: &str, out: &mut Carried) {
-        out.values.push((top.to_string(), s.to_string()));
+        out.push((top.to_string(), s.to_string()));
         if s.split_whitespace().nth(1).is_some() {
             for w in shaped_words(s) {
-                out.values.push((top.to_string(), w.to_string()));
+                out.push((top.to_string(), w.to_string()));
             }
         }
     }
-    fn walk(class: EffectClass, top: &str, v: &Value, out: &mut Carried) {
+    fn walk(top: &str, v: &Value, out: &mut Carried, pieces: &mut Vec<String>) {
         match v {
-            Value::String(s) => push_string(top, s, out),
+            Value::String(s) => {
+                push_string(top, s, out);
+                pieces.push(s.clone());
+            }
             Value::Number(n) => {
-                out.values.push((top.to_string(), n.to_string()));
+                out.push((top.to_string(), n.to_string()));
                 if let Some(f) = n.as_f64() {
                     if f.fract() == 0.0 && f.abs() < 1e15 {
-                        out.values.push((top.to_string(), format!("{}", f as i64)));
+                        out.push((top.to_string(), format!("{}", f as i64)));
                     }
                 }
             }
-            Value::Array(items) => items.iter().for_each(|i| walk(class, top, i, out)),
+            Value::Array(items) => items.iter().for_each(|i| walk(top, i, out, pieces)),
             Value::Object(map) => {
                 for (key, value) in map {
-                    if class.is_sensitive_slot(key) {
-                        out.recognized = true;
-                    }
-                    // A key that is not a field name is data: an address,
-                    // a handle, an account a map is keyed by.
-                    if !is_field_name(key) {
-                        push_string(top, key, out);
-                    }
-                    walk(class, top, value, out);
+                    // Below the top level a key can be data: an address, a
+                    // handle, an account a map is keyed by.
+                    push_string(top, key, out);
+                    pieces.push(key.clone());
+                    walk(top, value, out, pieces);
                 }
             }
             _ => {}
         }
     }
-    let mut out = Carried::default();
+    let mut out = Carried::new();
+    let each = |top: &str, value: &Value, out: &mut Carried| {
+        let mut pieces = Vec::new();
+        walk(top, value, out, &mut pieces);
+        // A destination sent in pieces (`["payee", "@example.net"]`).
+        if pieces.len() > 1 {
+            out.push((top.to_string(), pieces.concat()));
+        }
+    };
     match args {
         Value::Object(map) => {
             for (slot, value) in map {
-                if class.is_sensitive_slot(slot) {
-                    out.recognized = true;
-                }
-                walk(class, slot, value, &mut out);
+                each(slot, value, &mut out);
             }
         }
-        other => walk(class, "", other, &mut out),
+        other => each("", other, &mut out),
     }
     out
 }
 
+/// Whether a value is specific enough that finding it in what a server said
+/// means something: at least four letters or digits, and either
+/// [`RAISING_MIN_CHARS`] characters or a digit, `@`, `.` or `/`.
+fn raises(value: &str) -> bool {
+    let value = value.trim();
+    value.chars().filter(|c| c.is_alphanumeric()).count() >= 4
+        && (value.chars().count() >= RAISING_MIN_CHARS
+            || value.contains(|c: char| c.is_ascii_digit() || matches!(c, '@' | '.' | '/')))
+}
+
+/// Whether a value names where money or a message goes: an address, a
+/// link, or an account number (at least six digits among eight letters and
+/// digits).
+fn names_a_destination(value: &str) -> bool {
+    let canon = super::canon::canonical(value);
+    let squeezed = super::canon::squeezed(&canon);
+    canon.contains('@')
+        || canon.contains("://")
+        || canon.to_ascii_lowercase().starts_with("www.")
+        || (squeezed.len() >= 8 && squeezed.bytes().filter(u8::is_ascii_digit).count() >= 6)
+}
+
 /// Apply the table to the verdict of one `tools/call` (see the module docs).
-/// Lowers, to a label, each blocking ATR alert that matched only the tool's
-/// name, when the call's class acts, a slot the class names appears, and
-/// every value the call carries came from nowhere; adds an [`EFFECT_RULE`]
-/// record when it lowers one. Anything else is left as it was.
+/// It only raises: a call of a class that acts, carrying a value a server
+/// said this session, gets an [`EFFECT_RULE`] alert, which refuses a
+/// payment that carries a destination a server said and holds anything
+/// else for review. Nothing the call's verdict holds is lowered.
 pub(crate) fn apply_table(
     tool: &str,
     args: &Value,
     class: EffectClass,
     seen: &SeenText,
-    engine: Option<&RuleEngine>,
     verdict: &mut Verdict,
 ) {
-    let Some(engine) = engine else { return };
     if !class.acts()
         || crate::mcp::names_a_shell_tool(tool)
         || crate::mcp::names_a_process_tool(tool)
-        || !seen.is_whole()
     {
         return;
     }
-    if !verdict
-        .alerts
-        .iter()
-        .any(|a| a.block && a.rule.starts_with("ATR-"))
-    {
-        return;
-    }
-    let carried = carried(class, args);
-    // No slot the class names (a destination called `counterparty` or
-    // `dst`), or nothing carried at all: nothing to tell where it came
-    // from, so the verdict stays.
-    if !carried.recognized || carried.values.is_empty() {
-        return;
-    }
-    let values = carried.values;
-    if values.iter().any(|(_, value)| seen.contains_value(value)) {
-        return;
-    }
-    // What still matches without the tool's name, with the arguments as
-    // sent (their names and their values), is not a match by name.
-    let args_text = args.to_string();
-    let kept: Vec<String> = engine
-        .check_context(AtrContext {
-            tool_name: None,
-            ..AtrContext::tool_call(tool, &args_text)
-        })
+    let said: Vec<(String, String)> = carried(args)
         .into_iter()
-        .map(|m| m.rule_id)
+        .filter(|(_, value)| raises(value) && seen.contains_value(value))
         .collect();
-    let mut slots: Vec<&str> = values.iter().map(|(slot, _)| slot.as_str()).collect();
-    slots.sort_unstable();
-    slots.dedup();
-    let origin = format!(
-        "its {} came from nothing a server said this session",
-        slots
-            .iter()
-            .map(|s| format!("`{s}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let mut lowered: Vec<String> = Vec::new();
-    for alert in verdict.alerts.iter_mut() {
-        if alert.block && alert.rule.starts_with("ATR-") && !kept.contains(&alert.rule) {
-            alert.block = false;
-            alert.detail.push_str(&format!(
-                " [a label, not a refusal: a {} call and {origin}]",
-                class.label()
-            ));
-            if !lowered.contains(&alert.rule) {
-                lowered.push(alert.rule.clone());
-            }
-        }
-    }
-    if lowered.is_empty() {
+    let Some(first) = said.first() else {
         return;
-    }
+    };
+    let refuses = class == EffectClass::MoneyMovement
+        && said.iter().any(|(_, value)| names_a_destination(value));
+    let (slot, value) = said
+        .iter()
+        .find(|(_, value)| refuses && names_a_destination(value))
+        .unwrap_or(first);
+    let shown: String = crate::redact::redact_secrets(value)
+        .text
+        .chars()
+        .take(64)
+        .collect();
+    let what = if refuses {
+        "refused: a payment to a destination a server named is the shape of an injected one"
+    } else {
+        "held for review"
+    };
     verdict.alerts.push(VerdictAlert::builtin(
         EFFECT_RULE,
         format!(
-            "{} call allowed and recorded: {origin} (written by the model or the person); \
-             {} matched only a name and is kept as a label",
+            "{} call carries in `{slot}` a value a server said this session (`{shown}`): {what}",
             class.label(),
-            lowered.join(", ")
         ),
-        false,
+        refuses,
     ));
-    verdict.allowed = !verdict.alerts.iter().any(|a| a.block);
+    if refuses {
+        verdict.allowed = false;
+    }
 }
 
 #[cfg(test)]

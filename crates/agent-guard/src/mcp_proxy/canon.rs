@@ -9,19 +9,33 @@
 //! they are compared, so a value read in one spelling and sent in another is
 //! the same value.
 //!
+//! Also undone: a run of base64 or base64url that decodes to printable ASCII
+//! (`cGF5ZWVAZXhhbXBsZS5uZXQ=`), and Unicode compatibility forms (NFKC, then
+//! NFC: mathematical letters, ligatures, a letter and its accent written as
+//! two characters). [`squeezed`] also drops combining marks, so `Ação` and
+//! `Acao` squeeze alike.
+//!
 //! What this does not undo: a confusable that is not in [`confusable`] (the
 //! table covers the Cyrillic, Greek and Latin letters that pass for ASCII
 //! letters, and fullwidth forms, not every entry of Unicode's list), a value
 //! the model rewrote (translated, split, spelled out in words), and an
-//! encoding other than percent, HTML entities and punycode (base64, a
+//! encoding other than percent, HTML entities, punycode and base64 (hex, a
 //! homemade one).
 
 use std::borrow::Cow;
 
+use base64::Engine as _;
+use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::UnicodeNormalization;
+
 /// The longest punycode label decoded (DNS allows 63 bytes).
 const MAX_LABEL: usize = 63;
 
-/// `text` in one spelling: percent escapes and HTML entities decoded,
+/// The shortest run of base64 characters tried as base64.
+const MIN_BASE64_RUN: usize = 16;
+
+/// `text` in one spelling: base64 runs that hold printable text decoded,
+/// percent escapes and HTML entities decoded, NFKC then NFC,
 /// punycode labels decoded, letters that pass for ASCII letters (and
 /// fullwidth forms) made ASCII, zero-width characters taken out, and a
 /// defanged address or link (`[at]`, `[.]`, `(dot)`, `hxxp`) put back.
@@ -30,8 +44,12 @@ pub(crate) fn canonical(text: &str) -> Cow<'_, str> {
     if !needs_work(text) {
         return Cow::Borrowed(text);
     }
-    let mut s: String = percent_decoded(text);
+    let mut s: String = base64_decoded(text);
+    s = percent_decoded(&s);
     s = entities_decoded(&s);
+    if !s.is_ascii() {
+        s = s.nfkc().collect::<String>().nfc().collect();
+    }
     s = punycode_decoded(&s);
     s = s.chars().filter_map(confusable).collect();
     s = undefanged(&s);
@@ -53,7 +71,88 @@ fn needs_work(text: &str) -> bool {
     {
         return true;
     }
-    contains_ci(text, "xn--") || contains_ci(text, "hxxp")
+    contains_ci(text, "xn--") || contains_ci(text, "hxxp") || has_base64_run(text)
+}
+
+fn is_base64_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'-' | b'_' | b'=')
+}
+
+fn has_base64_run(text: &str) -> bool {
+    let mut run = 0;
+    for b in text.bytes() {
+        if is_base64_byte(b) {
+            run += 1;
+            if run >= MIN_BASE64_RUN {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+/// What a run of base64 or base64url decodes to, when it is printable ASCII
+/// (letters, digits, punctuation, spaces and line breaks): the text an
+/// injected order hides an address or a link in. A run that decodes to
+/// anything else (an identifier, a path, a binary blob) is not one.
+fn base64_text(run: &str) -> Option<String> {
+    use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
+    let bytes = [STANDARD, URL_SAFE]
+        .iter()
+        .find_map(|engine| engine.decode(run).ok())
+        .or_else(|| {
+            let bare = run.trim_end_matches('=');
+            [STANDARD_NO_PAD, URL_SAFE_NO_PAD]
+                .iter()
+                .find_map(|engine| engine.decode(bare).ok())
+        })?;
+    let printable = !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|&b| (0x20..0x7f).contains(&b) || matches!(b, b'\n' | b'\r' | b'\t'));
+    printable.then(|| String::from_utf8(bytes).ok()).flatten()
+}
+
+/// Every run of at least [`MIN_BASE64_RUN`] base64 characters that decodes to
+/// printable text ([`base64_text`]) replaced by that text.
+fn base64_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if !is_base64_byte(bytes[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && is_base64_byte(bytes[i]) {
+            i += 1;
+        }
+        // Base64 bytes are ASCII, so both ends are character boundaries.
+        if i - start >= MIN_BASE64_RUN {
+            if let Some(decoded) = base64_text(&text[start..i]) {
+                out.push_str(&text[last..start]);
+                out.push_str(&decoded);
+                last = i;
+            }
+        }
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
+/// `text` with only its letters and digits, lower-cased, compatibility
+/// forms and accents taken apart (NFKD) and the accents dropped: what two
+/// spellings of one account number or name have in common.
+pub(crate) fn squeezed(text: &str) -> String {
+    text.nfkd()
+        .filter(|c| !is_combining_mark(*c))
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn contains_ci(hay: &str, needle: &str) -> bool {
@@ -377,7 +476,13 @@ pub(crate) fn value_forms(value: &str) -> Vec<String> {
 /// `text` without a leading `mailto:`, `tel:` or `<scheme>://`.
 pub(crate) fn without_scheme(text: &str) -> &str {
     for scheme in ["mailto:", "tel:", "sms:"] {
-        if text.len() > scheme.len() && text[..scheme.len()].eq_ignore_ascii_case(scheme) {
+        // `get`: a text that starts with a letter of more than one byte
+        // (`Ação`) has no boundary where the scheme would end.
+        if text.len() > scheme.len()
+            && text
+                .get(..scheme.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(scheme))
+        {
             return &text[scheme.len()..];
         }
     }
@@ -441,6 +546,58 @@ mod tests {
         // Not a label start, or not punycode: kept.
         assert_eq!(canonical("abcxn--80ak6aa92e"), "abcxn--80ak6aa92e");
         assert_eq!(canonical("xn--!!"), "xn--!!");
+    }
+
+    #[test]
+    fn base64_and_compatibility_forms_are_undone() {
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("payee.two-5521@example.net");
+        assert_eq!(
+            canonical(&format!("send to {encoded} now")),
+            "send to payee.two-5521@example.net now"
+        );
+        let url = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode("https://pay.example.net/a?b=c");
+        assert_eq!(canonical(&url), "https://pay.example.net/a?b=c");
+        // Mathematical letters and a decomposed accent.
+        assert_eq!(
+            canonical("\u{1D429}\u{1D41A}\u{1D432}\u{1D41E}\u{1D41E}@example.net"),
+            "payee@example.net"
+        );
+        assert_eq!(canonical("Ac\u{327}a\u{303}o"), "Ação");
+        assert_eq!(squeezed("Ação 12"), "acao12");
+        // Identifiers and paths are not base64 text.
+        for kept in [
+            "internationalization_layer",
+            "/usr/share/initramfs-tools/hooks/x",
+            "averyLongIdentifierNameHere",
+        ] {
+            assert_eq!(canonical(kept), kept);
+        }
+    }
+
+    /// Text that starts with, or holds, characters of more than one byte is
+    /// never cut inside one (a panic aborts the proxy in a release build).
+    #[test]
+    fn text_that_is_not_ascii_never_panics() {
+        for text in [
+            "Ação",
+            "avaliação",
+            "ação://x",
+            "mailtoção",
+            "çmailto:x",
+            "📧 mail@example.net",
+            "📧📧📧📧📧📧📧📧📧📧📧📧📧📧📧📧",
+            "xn--ação",
+            "%E2%82",
+            "&#x1F4E7;",
+            "Ação[at]exemplo[.]com.br/",
+        ] {
+            let _ = canonical(text);
+            let _ = value_forms(text);
+            let _ = without_scheme(text);
+            let _ = squeezed(text);
+        }
     }
 
     #[test]
