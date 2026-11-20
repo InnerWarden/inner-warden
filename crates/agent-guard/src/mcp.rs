@@ -2574,6 +2574,7 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "download_and_execute",
     "download_chmod_execute",
     "download_fed_to_script",
+    "download_run_in_text_argument",
     "dynamic_code_execution",
     "fetch_exec_unanalyzable",
     "fetch_exec_unparsed",
@@ -2976,6 +2977,10 @@ pub fn analyze_command_in(
 /// How many startup-file payloads deep [`analyze_command_at`] follows: a
 /// payload that itself writes a startup file is analysed once more, no further.
 const STARTUP_PAYLOAD_DEPTH: u8 = 2;
+
+/// How a finding of a line a substitution runs is named
+/// ([`crate::shell::lines_substitutions_run`]).
+const SUBSTITUTION_HANDS_ON: &str = "in a line a substitution runs";
 
 /// The command as bash reads it and, where sh and dash read it differently,
 /// as they do: the reading that scores higher is the verdict.
@@ -3968,6 +3973,12 @@ fn analyze_command_as_read(
     // The fetch-and-execute findings of the lines handed on, charged at the
     // end only when the line itself charged none.
     let mut handed_fetch_exec: Vec<AnalysisSignal> = Vec::new();
+    // The other findings of the lines the line's substitutions run, charged
+    // at the end under each name the line around them did not charge as
+    // high: the line as written shows the substitution's text to the outer
+    // rules too, so `git commit -m "$(cat ~/.ssh/id_ed25519)"` would
+    // otherwise count the read twice.
+    let mut substituted: Vec<AnalysisSignal> = Vec::new();
     if depth < STARTUP_PAYLOAD_DEPTH {
         // A line handed over again says nothing new: each is judged once,
         // where it is first handed over.
@@ -3987,6 +3998,10 @@ fn analyze_command_as_read(
             (
                 crate::shell::lines_xargs_builds(cmd),
                 "in a line xargs builds from the words handed to it",
+            ),
+            (
+                crate::shell::lines_substitutions_run(cmd),
+                SUBSTITUTION_HANDS_ON,
             ),
         ] {
             lines.retain(|line| seen.insert(line.clone()));
@@ -4019,6 +4034,15 @@ fn analyze_command_as_read(
                         .any(|s: &AnalysisSignal| s.signal == handed.signal)
                     {
                         handed_fetch_exec.push(AnalysisSignal { detail, ..handed });
+                    }
+                    continue;
+                }
+                if handed_by == SUBSTITUTION_HANDS_ON {
+                    if !substituted
+                        .iter()
+                        .any(|s| s.signal == handed.signal && s.detail == detail)
+                    {
+                        substituted.push(AnalysisSignal { detail, ..handed });
                     }
                     continue;
                 }
@@ -4535,6 +4559,44 @@ fn analyze_command_as_read(
         for handed in handed_fetch_exec {
             score += handed.score;
             signals.push(handed);
+        }
+    }
+    // A download handed to a shell inside a substitution that stands in an
+    // argument of a program (`--body`, `-m`, `--title`, `--changelog`,
+    // `pytest -k`, any text a program is handed): that slot exists to
+    // produce text, and nobody installs software through it. Refused,
+    // whatever the source; the same download run on its own, or as a
+    // variable's value, is reviewed as before (an installer looks like it).
+    if crate::shell::lines_substitutions_in_arguments(cmd)
+        .iter()
+        .any(|line| {
+            threats::check_download_execute_pipe(&threats::strip_shell_noops(line)).is_some()
+        })
+        && !signals
+            .iter()
+            .any(|s| s.signal == "download_run_in_text_argument")
+    {
+        signals.push(AnalysisSignal {
+            signal: "download_run_in_text_argument".into(),
+            score: 40,
+            detail: "a download piped to a shell inside a substitution that stands in a program's \
+                     argument, a slot that produces text: nobody installs through it"
+                .into(),
+        });
+        score += 40;
+    }
+    // A substitution is a program of its own, in whatever slot it stands
+    // (`--body`, `-m`, `pytest -k`, any argument): what it runs is charged
+    // here when the line around it did not charge the same finding at least
+    // as high, so the line is never judged below the line the substitution
+    // holds, run on its own.
+    for found in substituted {
+        if !signals
+            .iter()
+            .any(|s| s.signal == found.signal && s.score >= found.score)
+        {
+            score += found.score;
+            signals.push(found);
         }
     }
 
