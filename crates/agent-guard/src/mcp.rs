@@ -5057,7 +5057,7 @@ mod tests {
     /// `line_gives_folder_queries_cause`, of the `echo` entry of
     /// `command_writes_and_runs_nothing`, of the `[@]`, `[*]` and number
     /// test in `expansion_takes_text_as_it_stands`, of the wrappers in
-    /// `only_command_built_by_a_substitution` or of `lone_shell_line`.
+    /// `commands_built_by_a_substitution` or of `lone_shell_line`.
     #[test]
     fn a_folder_query_beside_what_reaches_no_query_still_runs() {
         for command in [

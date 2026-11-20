@@ -2,6 +2,7 @@
 
 mod glob_names;
 mod guard_doubt;
+mod kill_targets;
 mod words_after;
 
 /// Prompt injection markers in tool descriptions or responses.
@@ -17876,6 +17877,52 @@ fn check_disable_verb_reaches_target(lower: &str) -> Option<&'static str> {
     None
 }
 
+/// Whether the word at `at` (`len` bytes) of `lower` stands as a word of
+/// a command, not as part of a longer one: a name, a path's last part
+/// (`/usr/bin/pkill`) or an option spelled with it (`--stop`), with a
+/// space, a quote or an operator around it. A verb inside a file name
+/// (`probe-kill.json`, `stop-words.txt`) is no command: measured
+/// 2026-11-20, `PROBE_LINES=~/innerwarden/scripts-local/probe-kill.json
+/// cargo test` was refused as `disable InnerWarden`.
+fn verb_stands_as_a_word(lower: &str, at: usize, len: usize) -> bool {
+    let bytes = lower.as_bytes();
+    let mut start = at;
+    // `-kill`, `--stop`: an option, when the dashes start the word.
+    while start > 0 && at - start < 2 && bytes[start - 1] == b'-' {
+        start -= 1;
+    }
+    let opens = |byte: u8| {
+        byte.is_ascii_whitespace()
+            || matches!(
+                byte,
+                b'(' | b'`' | b';' | b'|' | b'&' | b'\'' | b'"' | b'{' | b'!' | b'\\'
+            )
+    };
+    let before = match start.checked_sub(1).map(|i| bytes[i]) {
+        None => true,
+        Some(byte) if start < at => opens(byte),
+        Some(byte) => opens(byte) || byte == b'/',
+    };
+    let after = match bytes.get(at + len) {
+        None => true,
+        Some(byte) => {
+            byte.is_ascii_whitespace()
+                || matches!(byte, b')' | b'`' | b';' | b'|' | b'&' | b'\'' | b'"' | b'}')
+        }
+    };
+    before && after
+}
+
+/// Whether `phrase` (a verb and what it reaches, `kill innerwarden`)
+/// appears in `lower` with its first word standing as a word
+/// ([`verb_stands_as_a_word`]).
+fn phrase_starts_a_word(lower: &str, phrase: &str) -> bool {
+    let first = phrase.split(' ').next().unwrap_or(phrase).len();
+    lower
+        .match_indices(phrase)
+        .any(|(at, _)| verb_stands_as_a_word(lower, at, first))
+}
+
 /// The finding of [`check_disable_verb_reaches_target`] for one mention of
 /// `target` at `target_at`: a disable verb before it, close, in the same
 /// command (no end of a command, [`command_ends`], between the two).
@@ -17896,6 +17943,7 @@ fn disable_verb_before(
             // enters a folder whose name holds the guard's.
             if verb_at < target_at
                 && target_at - verb_at <= 40
+                && verb_stands_as_a_word(lower, verb_at, verb.len())
                 && !ends.iter().any(|end| (verb_at..target_at).contains(end))
             {
                 return Some(match target {
@@ -18100,11 +18148,25 @@ pub fn check_security_tamper(content: &str) -> Option<(&'static str, u32)> {
     }
     // A verb that stops a service or a process, given a name no reading
     // shows: it may be the guard's.
-    readings
+    if readings
         .last()
         .is_some_and(|reading| lowering_verb_target_unread(reading))
-        .then_some((LOWERING_TARGET_UNREAD, 25))
+    {
+        return Some((LOWERING_TARGET_UNREAD, 25));
+    }
+    // A kill whose processes the line does not resolve (`kill $PID`,
+    // `kill $(cat app.pid)`, `xargs kill < pids.txt`): they may be the
+    // guard's.
+    readings
+        .last()
+        .is_some_and(|reading| kill_targets::kill_reach(reading) == kill_targets::KillReach::Unread)
+        .then_some((KILL_TARGET_UNREAD, 25))
 }
+
+/// What [`check_security_tamper`] says of a kill whose processes the line
+/// does not resolve.
+pub const KILL_TARGET_UNREAD: &str =
+    "kills processes the line does not name (a number or a list it does not show), which may be the guard's";
 
 /// What [`check_security_tamper`] says of a service or process stopped by a
 /// name the line does not show.
@@ -18168,10 +18230,19 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
     // -p innerwarden-agent-guard'` stops a test run. Such a command is no
     // kill of the guard, and the two checks of one below do not read it.
     let (kill_read, names_guard) = pkills_read(content, &lower);
+    // Any form of kill whose target resolves to one of the guard's
+    // processes: a pattern, a name, or the numbers another program prints
+    // ([`kill_targets`]).
+    if kill_targets::kill_reach(content) == kill_targets::KillReach::Guard {
+        return Some((
+            "kill InnerWarden (the processes the kill reaches are the guard's)",
+            60,
+        ));
+    }
     // Direct verb+target phrases (service control / process kill / self-disable).
     if let Some(i) = SECURITY_TAMPER_INDICATORS
         .iter()
-        .find(|i| kill_read.contains(*i))
+        .find(|i| phrase_starts_a_word(&kill_read, i))
         .filter(|i| !(**i == "innerwarden uninstall" && uninstall_only_asks(&lower)))
     {
         return Some((*i, 60));
@@ -18258,12 +18329,18 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
 /// installers and units start them. A `pkill -f` pattern is matched against
 /// each, as `pkill` matches it against every process's command line.
 const GUARD_PROCESS_LINES: &[&str] = &[
-    "/usr/local/bin/innerwarden hook --agent claude-code",
-    "/usr/local/bin/innerwarden mcp-proxy -- npx -y server",
+    // The values a person gives (the agent's name, the server the proxy
+    // runs) are not the guard's: `pkill -f npx` is not read as a kill of
+    // the proxy for the server it fronts.
+    "/usr/local/bin/innerwarden hook --agent",
+    "/usr/local/bin/innerwarden mcp-proxy --",
     "/usr/local/bin/innerwarden dashboard",
     "/usr/bin/innerwarden hook",
     "/home/user/.local/bin/innerwarden hook",
     "innerwarden",
+    "/usr/local/bin/iw-guard hook --agent",
+    "/home/user/.local/bin/iw-guard hook",
+    "iw-guard",
     "/usr/local/bin/innerwarden-sensor --config /etc/innerwarden/config.toml",
     "/usr/local/bin/innerwarden-agent --config /etc/innerwarden/agent.toml --dashboard",
     "/usr/bin/innerwarden-agent --dashboard",
@@ -18296,7 +18373,7 @@ enum PkillReach {
 /// option not known, more than one pattern, a pattern that is not a
 /// regular expression) is left as it stands.
 fn pkills_read(content: &str, lower: &str) -> (String, bool) {
-    if !lower.contains("pkill") || content.len() != lower.len() {
+    if !lower.contains("kill") || content.len() != lower.len() {
         return (lower.to_owned(), false);
     }
     let mut names_guard = false;
@@ -18309,7 +18386,23 @@ fn pkills_read(content: &str, lower: &str) -> (String, bool) {
         if offset + segment.len() > out.len() {
             continue;
         }
-        match pkill_reach(segment) {
+        let reach = match pkill_reach(segment) {
+            // Any other kill whose every target resolves to processes not
+            // the guard's: `kill $(pgrep -f innerwarden-agent-guard)`.
+            // The host's other monitors are read by their words still
+            // (`pkill -9 falco`).
+            PkillReach::Unread
+                if kill_targets::resolved_kill_misses(segment)
+                    && !PROTECTED_TARGETS
+                        .iter()
+                        .filter(|target| **target != "innerwarden")
+                        .any(|target| segment.to_ascii_lowercase().contains(target)) =>
+            {
+                PkillReach::Misses
+            }
+            reach => reach,
+        };
+        match reach {
             PkillReach::Misses => {
                 for byte in &mut out[offset..offset + segment.len()] {
                     *byte = b' ';
