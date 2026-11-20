@@ -153,6 +153,15 @@ fn route_client_to_server(
             deciding_layer: None,
         };
     }
+    if env.method.as_deref() == Some("tools/list") {
+        // Whether it asks for a new listing or the next page of one is read
+        // from the request, so the answer is gathered as what it is
+        // (`super::pins`).
+        if let Some(pins) = taint.and_then(|t| t.pins.as_mut()) {
+            pins.note_list_request(env.id.as_ref(), env.params.as_ref());
+        }
+        return pass_through(Direction::ClientToServer);
+    }
     if env.method.as_deref() == Some("resources/read") {
         // The location is the read's only argument: screened like one, and
         // against what the server announced this session.

@@ -3202,9 +3202,23 @@ mod tests {
     /// copied the whole list at each step. FAILS ON REVERT of the first two
     /// (about 65 s each in a debug build, measured 2026-11-19); the list,
     /// now capped at MAX_LIST, stayed under the second before.
+    ///
+    /// The 1 s ceiling is asserted only where it is asked for
+    /// (`IW_WALL_CLOCK_CEILINGS=1`: the `perf` job of
+    /// `.github/workflows/nightly-deep.yml`, which runs this test alone on a
+    /// machine doing nothing else). Beside the whole suite on a loaded runner
+    /// a debug build took 1.23 s (2026-11-20) with nothing wrong in the code,
+    /// so there every case still has to be read within [`HANG_BOUND`], far
+    /// above a loaded runner and far below the minute a reverted fold takes.
     #[test]
     fn the_largest_code_read_is_read_in_well_under_a_second() {
-        let limit = std::time::Duration::from_secs(1);
+        /// The bound every run holds: a reverted fold takes about 65 s.
+        const HANG_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
+        let limit = if std::env::var_os("IW_WALL_CLOCK_CEILINGS").is_some_and(|v| v == "1") {
+            std::time::Duration::from_secs(1)
+        } else {
+            HANG_BOUND
+        };
         let mut cases = Vec::new();
 
         let filler = "é".repeat(4 * 1024);
