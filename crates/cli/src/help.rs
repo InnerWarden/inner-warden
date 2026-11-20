@@ -756,7 +756,10 @@ mod tests {
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
-        for unsaid in ["stays outside", "with --identity, Claude Code's settings file is kept in ~/.claude/.claude.json"] {
+        for unsaid in [
+            "stays outside",
+            "with --identity, Claude Code's settings file is kept in ~/.claude/.claude.json",
+        ] {
             assert!(!help.contains(unsaid), "{help}");
         }
         // The README and the two pages its detail moved to: the user docs.

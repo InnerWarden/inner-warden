@@ -2146,8 +2146,9 @@ echo SAVED
 /// M30: Claude Code keeps its settings file in the home, and an identified
 /// jail's home is an empty folder of its own, so the file was gone at every
 /// launch (and Claude Code warned twice, from the second launch on, that it
-/// was missing). It is a link to the same name in the shared `~/.claude`
-/// now: a save as Claude Code makes it lands on the host, the next jail
+/// was missing). It is a link into the jail's own `~/.claude` now (since
+/// the second review of #352, the project's folder of the launcher's, never
+/// the host's): a save as Claude Code makes it is kept, the next jail
 /// reads it, and the person's own `~/.claude.json` is never shown in the
 /// jail nor changed. Nor is the copy of it the host's Claude Code keeps in
 /// `~/.claude/backups` (M30CW-1), and the jail's own copy stays in the
@@ -2200,26 +2201,28 @@ fn claude_codes_settings_file_survives_between_identified_jails() {
     assert!(out.contains("JAIL-STATE"), "the next jail lost it: {out}");
     assert!(!out.contains(".tmp."), "a temporary file was left: {out}");
 
-    let kept = std::fs::read_to_string(h.join(".claude/.claude.json")).unwrap();
+    // Kept in the project's own folder of the launcher's, never in the
+    // host's `~/.claude` (second review of #352).
+    let folders: Vec<_> = std::fs::read_dir(h.join(".local/state/innerwarden/jail-claude"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(folders.len(), 1, "{folders:?}");
+    let kept = std::fs::read_to_string(folders[0].join(".claude.json")).unwrap();
     assert!(kept.contains("JAIL-STATE"), "{kept}");
+    assert!(
+        !h.join(".claude/.claude.json").exists(),
+        "the host's ~/.claude"
+    );
     let own = std::fs::read_to_string(h.join(".claude.json")).unwrap();
     assert_eq!(
         own, "{\"own\":\"HOST-OWN-STATE\"}\n",
         "the person's own file"
     );
     assert_eq!(names(h), before, "nothing new in the home itself");
-    // The sessions folder the jail covers, made by the launcher as Claude
-    // Code makes it, and left empty on the host.
-    use std::os::unix::fs::PermissionsExt;
-    let sessions = std::fs::symlink_metadata(h.join(".claude/sessions")).unwrap();
-    assert!(sessions.is_dir());
-    assert_eq!(sessions.permissions().mode() & 0o777, 0o700);
-    assert_eq!(
-        std::fs::read_dir(h.join(".claude/sessions"))
-            .unwrap()
-            .count(),
-        0
-    );
+    // Nothing is made in the host's `~/.claude`: the jail's sessions are
+    // its own.
+    assert!(!h.join(".claude/sessions").exists());
     // The host's copy is as it was, and the jail's own copy never reached
     // the host.
     assert_eq!(
