@@ -2532,9 +2532,18 @@ mod tests {
     /// a connect a person runs: automatic setup records no approval in
     /// Hermes's allowlist, which is the person's to give.
     ///
+    /// Changed on purpose on 2026-11-15 (main's
+    /// `process_evidence_detects_hermes_without_granting_guardability` held
+    /// `!hermes.guardable()`): Hermes now has a hook of its own, so it can be
+    /// connected (`guardable`). What it does not get until that hook is on is
+    /// counted as screened: `status_is_effectively_guarded` is false before
+    /// the person's connect and true after it (pinned below, 2026-11-20).
+    ///
     /// FAILS ON REVERT: drop the `reject_symlinks` arm of the Hermes branch
     /// in `connect_one_result_with_link_policy` and automatic setup writes the
-    /// hook and its approval.
+    /// hook and its approval; count Hermes as screened by its name alone in
+    /// `status_is_effectively_guarded` and the first check below fails.
+    #[cfg(unix)]
     #[test]
     fn process_evidence_detects_hermes_and_automatic_setup_never_wires_it() {
         let home = tempfile::TempDir::new().unwrap();
@@ -2556,6 +2565,28 @@ mod tests {
             automatic.line
         );
         assert!(!home.path().join(".hermes").exists());
+        assert!(
+            !status_is_effectively_guarded(home.path(), hermes),
+            "screened before any hook is on"
+        );
+
+        // The person's connect, with the guard's program there to run.
+        use std::os::unix::fs::PermissionsExt;
+        let bin = home.path().join("guard-bin/innerwarden");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(home.path().join(".hermes")).unwrap();
+        let args = ["connect".to_string(), "hermes".to_string()];
+        let outcome = run_with_guard_bin_outcome(home.path(), &args, &bin.display().to_string());
+        assert_eq!(outcome.configured, 1, "{:?}", outcome.lines);
+        let (rows, _) = rows_from_sources(home.path(), &running, None);
+        let hermes = rows.iter().find(|row| row.name == "hermes").unwrap();
+        assert!(hermes.guardable());
+        assert!(
+            status_is_effectively_guarded(home.path(), hermes),
+            "screened once its hook is on"
+        );
     }
 
     /// The listing and the repair checks read Hermes from its hook: a hook

@@ -515,6 +515,49 @@ fn a_refused_waiting_interpreter_is_recorded() {
     );
 }
 
+/// A call the hook cannot read is refused in enforce and recorded as a
+/// refusal, with its reason, so the operator sees it: one whose patch
+/// program the shell names when it runs, and one past the 1 MiB read.
+///
+/// FAILS ON REVERT: take the `record_shell` call out of `hook_unreadable`
+/// and neither is in the record (it held only the calls that were read).
+#[test]
+fn an_unreadable_call_is_recorded_as_a_refusal() {
+    let host = Host::new();
+    let enforce = CODEX.command(bin(), false, false);
+    let filled_in = "${A}_patch < /tmp/change.patch";
+    let answer = host.run(
+        "/bin/sh",
+        &enforce,
+        &host.codex("Bash", json!({"command": filled_in})),
+    );
+    assert_refused_by(codex_reads, &answer, filled_in);
+    let long = host.codex(
+        "Bash",
+        json!({"command": format!("echo {}", "a".repeat(1024 * 1024 + 16))}),
+    );
+    let answer = host.run("/bin/sh", &enforce, &long);
+    assert_refused_by(codex_reads, &answer, "a call past the 1 MiB read");
+    let record = std::fs::read_to_string(host.dir.path().join("graph.json"))
+        .expect("the refusals are recorded");
+    let record: Value = serde_json::from_str(&record).expect("the record is JSON");
+    let unreadable: Vec<&Value> = record["nodes"]
+        .as_array()
+        .expect("nodes")
+        .iter()
+        .filter(|node| {
+            node["attrs"]["explanation"]
+                .as_str()
+                .is_some_and(|why| why.starts_with("unreadable:"))
+        })
+        .collect();
+    assert_eq!(unreadable.len(), 2, "{record}");
+    for node in unreadable {
+        assert_eq!(node["attrs"]["outcome"], "blocked", "{node}");
+        assert_eq!(node["attrs"]["recommendation"], "deny", "{node}");
+    }
+}
+
 /// Gemini CLI: its shell tool (with the folder it names), `write_file`,
 /// `replace` and a call to an MCP tool, in the payload its source writes,
 /// through the line `agents connect gemini` writes.

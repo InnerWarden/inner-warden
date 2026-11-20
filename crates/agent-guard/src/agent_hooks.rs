@@ -86,7 +86,7 @@ pub struct HookSpec {
     pub mcp_config: &'static str,
     /// The agent's own tools that change files, as it names them.
     pub file_tools: &'static str,
-    /// The release the behaviour stated here was measured on.
+    /// The line that says how the behaviour stated here was measured.
     pub measured: &'static str,
     /// The oldest release that runs this hook as written, and why, in the
     /// words that follow "Needs ". Read in the agent's own source at its
@@ -104,7 +104,7 @@ pub static CODEX: HookSpec = HookSpec {
     timeout: 60,
     mcp_config: CODEX_CONFIG,
     file_tools: "`apply_patch`",
-    measured: "Codex CLI 0.167.2",
+    measured: "Measured on Linux with Codex CLI 0.170.0 and on macOS with Codex CLI 0.167.2.",
     minimum: "Codex CLI 0.166.0 or later. Codex runs a PreToolUse hook for its shell and \
               `apply_patch` from 0.124.0 and asks for trust from 0.129.0, but before 0.166.0 \
               the folder it sends is the session's, not the command's, so a command run in \
@@ -121,7 +121,7 @@ pub static GEMINI: HookSpec = HookSpec {
     timeout: 60_000,
     mcp_config: ".gemini/settings.json",
     file_tools: "`write_file` and `replace`",
-    measured: "Gemini CLI 0.68.0",
+    measured: "Judged only by its payload, not on a running Gemini, which needs a Google login.",
     minimum: "Gemini CLI 0.26.0 or later: before it, Gemini runs no hook unless \
               `hooks.enabled` is set. From 0.30.0 Gemini refuses a tool call on any hook exit \
               but 0 and 1, so on Linux and macOS the monitor line turns every other end of \
@@ -300,11 +300,7 @@ impl HookSpec {
             self.product
         ));
         lines.push(format!("Needs {}", self.minimum));
-        lines.push(format!(
-            "Measured on macOS with {}, except where a line says otherwise. Not measured \
-             on Linux yet.",
-            self.measured
-        ));
+        lines.push(self.measured.to_string());
         lines
     }
 }
@@ -3339,8 +3335,7 @@ mod tests {
                  0.166.0 the folder it sends is the session's, not the command's, so a command \
                  run in another folder is judged in the wrong one."
                     .to_string(),
-                "Measured on macOS with Codex CLI 0.167.2, except where a line says otherwise. \
-                 Not measured on Linux yet."
+                "Measured on Linux with Codex CLI 0.170.0 and on macOS with Codex CLI 0.167.2."
                     .to_string(),
             ]
         );
@@ -3367,8 +3362,7 @@ mod tests {
                  but 0 and 1, so on Linux and macOS the monitor line turns every other end of \
                  the guard into 1."
                     .to_string(),
-                "Measured on macOS with Gemini CLI 0.68.0, except where a line says otherwise. \
-                 Not measured on Linux yet."
+                "Judged only by its payload, not on a running Gemini, which needs a Google login."
                     .to_string(),
             ]
         );

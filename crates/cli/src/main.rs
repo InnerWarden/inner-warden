@@ -1057,7 +1057,7 @@ mod json_head {
 fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::ExitCode {
     let call = TooLongCall::read(head);
     if !call.already_ran() {
-        return hook_unreadable(TOOL_CALL_TOO_LONG, monitor);
+        return hook_unreadable("", rest, TOOL_CALL_TOO_LONG, monitor);
     }
     let tool = call.tool.as_deref().unwrap_or("a tool");
     let on = call
@@ -1084,7 +1084,27 @@ fn unreadable_exit_code(monitor: bool) -> u8 {
     }
 }
 
-fn hook_unreadable(why: &str, monitor: bool) -> std::process::ExitCode {
+/// The hook's answer to a tool call it could not read: refused in enforce,
+/// let through unscreened in monitor, and in both recorded, with the reason,
+/// as a refusal (`unreadable`), so the operator sees it beside the others.
+/// `buf` is what was read of the call, empty when nothing was.
+fn hook_unreadable(buf: &str, rest: &[String], why: &str, monitor: bool) -> std::process::ExitCode {
+    let explanation = format!("unreadable: could not read this tool call ({why})");
+    let label = format!("(unreadable tool call: {why})");
+    let verdict = serde_json::json!({
+        "command": label,
+        "risk_score": 60,
+        "severity": "high",
+        "signals": [{
+            "signal": "unreadable",
+            "score": 60,
+            "detail": explanation,
+        }],
+        "recommendation": "deny",
+        "explanation": explanation,
+        "unreadable": true,
+    });
+    record_shell(buf, rest, &label, &verdict, monitor, true, None, false);
     if monitor {
         eprintln!(
             "InnerWarden hook: could not read this tool call ({why}); it was NOT screened \
@@ -1502,7 +1522,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // Before stdin is read: a caller that never closes it is one of the
     // ends the net is for.
     if let Err(why) = hook_net::arm(monitor) {
-        return hook_unreadable(why, monitor);
+        return hook_unreadable("", rest, why, monitor);
     }
     // A host upgraded by an older binary still runs that binary's wiring:
     // the first hook of this version brings it up to this one's.
@@ -1511,7 +1531,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let buf = match read_tool_call_or_head(std::io::stdin()) {
         Ok(ToolCallRead::Whole(buf)) => buf,
         Ok(ToolCallRead::TooLong(head)) => return hook_too_long(&head, rest, monitor),
-        Err(_) => return hook_unreadable("stdin could not be read", monitor),
+        Err(_) => return hook_unreadable("", rest, "stdin could not be read", monitor),
     };
     // A call `innerwarden demo` sent: judged exactly as an agent's and
     // recorded like one, with `demo: true` beside it. It is not alerted on
@@ -1562,7 +1582,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     };
     let screened = match screen_shell(&buf, rest, &options) {
         ShellScreen::Nothing => return std::process::ExitCode::SUCCESS,
-        ShellScreen::Unreadable(why) => return hook_unreadable(why, monitor),
+        ShellScreen::Unreadable(why) => return hook_unreadable(&buf, rest, why, monitor),
         ShellScreen::ProfilesInvalid(why) => return hook_profiles_invalid(&why),
         ShellScreen::Screened(screened) => screened,
     };
@@ -2058,16 +2078,18 @@ fn screen_file_tool(
     let payload = serde_json::from_str::<serde_json::Value>(buf).ok()?;
     let (tool, paths) = match file_tools::file_tool_call(&payload) {
         FileToolCall::NotAFileTool => return None,
-        FileToolCall::Unreadable(why) => return Some(hook_unreadable(why, monitor)),
+        FileToolCall::Unreadable(why) => return Some(hook_unreadable(buf, rest, why, monitor)),
         FileToolCall::Writes { tool, paths } => (tool, paths),
     };
     let screen = screen_file_writes(buf, rest, monitor, demo, &tool, &paths);
-    Some(file_screen_exit(screen, monitor, demo).unwrap_or_else(|| {
-        if demo {
-            println!("{}", demo::hook_report(Some("allow"), false, None));
-        }
-        std::process::ExitCode::SUCCESS
-    }))
+    Some(
+        file_screen_exit(buf, rest, screen, monitor, demo).unwrap_or_else(|| {
+            if demo {
+                println!("{}", demo::hook_report(Some("allow"), false, None));
+            }
+            std::process::ExitCode::SUCCESS
+        }),
+    )
 }
 
 /// Screen a patch handed to the patch program on a shell line (see
@@ -2088,23 +2110,25 @@ fn screen_shell_patch(
     let command = payload.get("tool_input")?.get("command")?.as_str()?;
     let paths = match shell_patch(command) {
         ShellPatch::NotAPatch => return None,
-        ShellPatch::Unreadable(why) => return Some(hook_unreadable(why, monitor)),
+        ShellPatch::Unreadable(why) => return Some(hook_unreadable(buf, rest, why, monitor)),
         ShellPatch::Writes(paths) => paths,
     };
     let screen = screen_file_writes(buf, rest, monitor, demo, file_tools::PATCH_TOOL, &paths);
-    file_screen_exit(screen, monitor, demo)
+    file_screen_exit(buf, rest, screen, monitor, demo)
 }
 
 /// The hook's answer to what [`screen_file_writes`] decided: `None` when the
 /// call passes. A `demo` call also prints the report of a refusal.
 fn file_screen_exit(
+    buf: &str,
+    rest: &[String],
     screen: FileScreen,
     monitor: bool,
     demo: bool,
 ) -> Option<std::process::ExitCode> {
     match screen {
         FileScreen::Pass => None,
-        FileScreen::Unreadable(why) => Some(hook_unreadable(why, monitor)),
+        FileScreen::Unreadable(why) => Some(hook_unreadable(buf, rest, why, monitor)),
         FileScreen::Refused { explanation } => {
             if demo {
                 println!(

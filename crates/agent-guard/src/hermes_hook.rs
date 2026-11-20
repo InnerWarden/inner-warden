@@ -805,7 +805,7 @@ pub fn gaps() -> Vec<String> {
         "Needs Hermes Agent v0.22.5 or later: `fail_closed` exists from v0.20.1, and what is \
          stated here was read in v0.22.5 and v0.23.1."
             .to_string(),
-        "Read in Hermes Agent v0.23.1's source. Not measured on a running Hermes yet.".to_string(),
+        "Measured through Hermes Agent v0.23.1's own hook runner (`hermes hooks test`), not in a full chat.".to_string(),
     ]
 }
 
