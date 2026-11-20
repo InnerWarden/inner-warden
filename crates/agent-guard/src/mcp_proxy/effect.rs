@@ -65,10 +65,10 @@
 //!   (`search_and_book_hotel`), and a calendar entry with guests
 //!   (`participants`, `attendees`, at any depth, as a list or as a map's
 //!   keys) is `send-external` with its guests as destinations. A guest count
-//!   (`"guests": 2`, or a property typed a number) is not a guest. A reader
-//!   whose name holds a booking word (`list_appointments`,
-//!   `get_order_status`) is classed `commitment` too: an alert, never a
-//!   refusal, is its cost. A booking or an invitation carrying a value a server said
+//!   (`"guests": 2`, or a property typed a number) is not a guest. Behind a
+//!   reading verb a booking word books only where a verb stands, right after
+//!   `and` or `then`: `list_appointments`, `get_order_status`,
+//!   `get_schedule` and `check_hold` read. A booking or an invitation carrying a value a server said
 //!   is forwarded with an alert, not refused: the person's own booking of a hotel a
 //!   search found looks the same until the person's request is a source. A
 //!   guest address long enough for the taint tracker is refused there
@@ -169,11 +169,11 @@ const ACTION_VERBS: &[&str] = &[
     "payout", "delete", "remove", "rm", "drop", "purge", "erase", "destroy", "unlink", "wipe",
     "trash", "share", "invite", "send", "reply", "forward", "notify", "publish", "tweet", "submit",
 ];
-/// Words that commit the person to something, and act behind a reading
-/// verb as [`ACTION_VERBS`] do. `appointment` and `ticket` are nouns kept
-/// here on purpose: `check_and_get_appointment` is read as a booking, and a
-/// reader so named (`list_appointments`) gets an alert, never a refusal.
-/// `sign_up` is matched as the two words in a row (see [`commits`]).
+/// Words that commit the person to something. Behind a reading verb they
+/// act only where a verb stands, right after `and` or `then`
+/// (`search_and_book_hotel`, `check_then_order`); a noun after a reading
+/// verb reads (`list_appointments`, `get_order_status`, `check_hold`).
+/// `sign_up` is matched as the two words in a row (see [`commits_at`]).
 const COMMITMENT_WORDS: &[&str] = &[
     "reserve",
     "book",
@@ -291,19 +291,27 @@ fn any_in(words: &[String], set: &[&str]) -> bool {
     words.iter().any(|w| set.contains(&w.as_str()))
 }
 
-/// Whether the words hold one of [`COMMITMENT_WORDS`], `sign_up` and
-/// `signUp` as one word.
-fn commits(words: &[String]) -> bool {
-    any_in(words, COMMITMENT_WORDS)
-        || words
-            .windows(2)
-            .any(|pair| pair[0] == "sign" && pair[1] == "up")
+/// Whether the word at `i` is one of [`COMMITMENT_WORDS`], or starts
+/// `sign_up` (`signUp`) as the two words in a row.
+fn commits_at(words: &[String], i: usize) -> bool {
+    COMMITMENT_WORDS.contains(&words[i].as_str())
+        || (words[i] == "sign" && words.get(i + 1).is_some_and(|next| next == "up"))
 }
 
-/// Whether a word of action (one list: [`ACTION_VERBS`] and
-/// [`COMMITMENT_WORDS`]) is among the words.
-fn acts_by_word(words: &[String]) -> bool {
-    any_in(words, ACTION_VERBS) || commits(words)
+/// Whether the words hold a booking word anywhere.
+fn commits(words: &[String]) -> bool {
+    (0..words.len()).any(|i| commits_at(words, i))
+}
+
+/// Whether a name that starts with a reading verb acts: one of
+/// [`ACTION_VERBS`] anywhere after it, or a booking word where a verb
+/// stands, right after `and` or `then` (`search_and_book_hotel`). A
+/// booking noun after the reading verb (`list_appointments`,
+/// `get_order_status`) does not act.
+fn reader_acts(words: &[String]) -> bool {
+    any_in(&words[1..], ACTION_VERBS)
+        || (1..words.len())
+            .any(|i| matches!(words[i - 1].as_str(), "and" | "then") && commits_at(words, i))
 }
 
 /// Whether a slot name names who an event invites ([`GUEST_SLOTS`]).
@@ -345,14 +353,17 @@ fn call_has_guests(args: &Value) -> bool {
 }
 
 /// Whether an input schema, at any depth, has a guest property that is not
-/// declared a number (`{"guests": {"type": "integer"}}` is a count).
+/// declared a number (`{"guests": {"type": "integer"}}` is a count). A
+/// schema too large to read whole within its budget is taken to have guests.
 fn schema_has_guests(schema: &Value) -> bool {
     let mut pending = vec![schema];
     let mut budget = 4096usize;
     while let Some(schema) = pending.pop() {
         budget = match budget.checked_sub(1) {
             Some(left) => left,
-            None => return false,
+            // Past the budget the rest of the schema is not read: it comes
+            // from the server, so its guests are taken to be there.
+            None => return true,
         };
         if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
             for (key, property) in properties {
@@ -454,7 +465,7 @@ impl EffectClass {
         // a word of action anywhere in the name wins over one of reading.
         if w.first()
             .is_some_and(|first| READ_VERBS.contains(&first.as_str()))
-            && !acts_by_word(&w[1..])
+            && !reader_acts(&w)
         {
             if any_in(&w, SECRET_WORDS) {
                 return EffectClass::ReadSecret;
@@ -893,13 +904,30 @@ mod tests {
         }
     }
 
+    /// A schema too large to read whole is taken to have guests: it comes
+    /// from the server, which could hide its guest list past the budget.
+    /// FAILS ON REVERT of the budget arm in `schema_has_guests` back to
+    /// `false`: the tool is `other`.
+    #[test]
+    fn a_schema_past_its_budget_is_taken_to_have_guests() {
+        let properties: serde_json::Map<String, Value> = (0..5000)
+            .map(|i| (format!("field_{i}"), json!({"type": "string"})))
+            .collect();
+        let tool = json!({"name": "create_entry", "inputSchema": {"properties": properties}});
+        assert_eq!(EffectClass::of_tool(&tool), EffectClass::SendExternal);
+        let small = json!({"name": "create_entry", "inputSchema": {"properties": {"title": {"type": "string"}}}});
+        assert_eq!(EffectClass::of_tool(&small), EffectClass::Other);
+    }
+
     /// A booking behind a reading verb books (one list of action words), a
     /// guest count is no guest, and guests are read at any depth and as a
     /// map's keys. A server's `readOnlyHint` is believed even for a booking.
     ///
-    /// FAILS ON REVERT of `acts_by_word` in the reader test: the first three
+    /// FAILS ON REVERT of `reader_acts` in the reader test: the first three
     /// are `read-only`; of the commitment test before guests: `reserve_hotel`
-    /// with `guests` is `send-external`.
+    /// with `guests` is `send-external`. A booking noun after a reading verb
+    /// reads: FAILS ON REVERT to a booking word anywhere after the reading
+    /// verb (`list_appointments` and the rest are `commitment`).
     #[test]
     fn a_booking_behind_a_reading_verb_books_and_a_guest_count_is_no_guest() {
         for (name, slots, class) in [
@@ -962,6 +990,17 @@ mod tests {
                 &["company_name"][..],
                 EffectClass::ReadOnly,
             ),
+            ("list_appointments", &["day"][..], EffectClass::ReadOnly),
+            ("get_order_status", &["order_id"][..], EffectClass::ReadOnly),
+            ("get_schedule", &["day"][..], EffectClass::ReadOnly),
+            ("check_hold", &["hold_id"][..], EffectClass::ReadOnly),
+            ("listUpcomingTickets", &["user"][..], EffectClass::ReadOnly),
+            (
+                "check_and_get_appointment",
+                &["day"][..],
+                EffectClass::ReadOnly,
+            ),
+            ("check_then_order", &["item"][..], EffectClass::Commitment),
         ] {
             assert_eq!(EffectClass::of(name, None, slots), class, "{name}");
         }

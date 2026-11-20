@@ -2147,8 +2147,12 @@ fn long_target(text: &str, named: Named) -> Option<LongTarget> {
         return None;
     }
     let one_word = !token.contains(|c: char| c.is_whitespace() && c != '\n' && c != '\r');
-    let shrinks = token.contains(['.', '%']);
-    if token.contains(['\n', '\r']) {
+    // Padding that shrinks, in a token with folder separators past its
+    // first segment: what a long path looks like, not a long body that
+    // happens to start with `/`.
+    let padded_path = token.contains(['.', '%']) && has_folders(token);
+    let multiline = token.contains(['\n', '\r']);
+    if multiline {
         let reads_as_path = spelled_as_path(token)
             || token.contains("/./")
             || token.contains("/../")
@@ -2158,9 +2162,16 @@ fn long_target(text: &str, named: Named) -> Option<LongTarget> {
             && reads_as_path
             && match named {
                 Named::Target => true,
-                Named::InPassing => spelled_as_path(token) && shrinks,
+                Named::InPassing => spelled_as_path(token) && padded_path,
             };
-        return refused.then_some(LongTarget::Unread(token.len()));
+        if refused {
+            return Some(LongTarget::Unread(token.len()));
+        }
+        if named == Named::InPassing {
+            return None;
+        }
+        // A target over several lines with a space in it is still read
+        // in its collapsed form, as before: `/etc/sudoers.d/a b\n/./.../c`.
     }
     if named == Named::InPassing && !(one_word && spelled_as_path(token)) {
         return None;
@@ -2169,10 +2180,37 @@ fn long_target(text: &str, named: Named) -> Option<LongTarget> {
     if collapsed.len() <= MAX_TARGET_PATH_BYTES {
         return Some(LongTarget::Judged(judged(&collapsed, named)));
     }
-    if named == Named::InPassing && !shrinks {
+    // Still too long: text over several lines is content; anywhere but a
+    // target, only a padded path is refused unread.
+    if multiline || (named == Named::InPassing && !padded_path) {
         return None;
     }
     Some(LongTarget::Unread(token.len()))
+}
+
+/// Whether a token spelled as a path ([`spelled_as_path`]) has a folder
+/// separator after its first segment: `/etc/x`, `~/a/b`, `file:///etc/x`.
+/// `/abc.def...` with no other `/` is one long name, not a path to a file
+/// in a folder.
+fn has_folders(token: &str) -> bool {
+    let rest = if token
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
+        let rest = &token[5..];
+        let rest = rest.strip_prefix("//").unwrap_or(rest);
+        match rest.get(..9) {
+            Some(host) if host.eq_ignore_ascii_case("localhost") => &rest[9..],
+            _ => rest,
+        }
+    } else {
+        token
+    };
+    let rest = rest.trim_start_matches('/');
+    let rest = rest
+        .strip_prefix('~')
+        .map_or(rest, |r| r.split_once('/').map_or("", |(_, after)| after));
+    rest.trim_start_matches('/').contains('/')
 }
 
 /// A long path with `.`, `..` and `//` taken out, read the way
@@ -7091,19 +7129,6 @@ mod tests {
         }
     }
 
-    /// What the tool-name match stood in for, judged on the target instead:
-    /// a call that would change a file granting privilege or a login is
-    /// refused, whichever tool makes it and however the path is spelled. The
-    /// raw-text conditions of ATR-2026-040 miss `/etc//sudoers`, and they
-    /// never covered cron, the dynamic linker, PAM or `/etc/group`; the name
-    /// match had refused those for `write_file` only, and `edit_file` /
-    /// `move_file` reached them unchallenged.
-    ///
-    /// Checked with no rule engine, so the refusal is this check's own and no
-    /// ATR rule is standing in for it.
-    ///
-    /// FAILS ON REVERT: drop the `privileged_write_alert` call and every one
-    /// of these is allowed.
     /// A path over the length a system opens, where a call writes, is not
     /// passed unread: padded with `./` it is read as the file it names once
     /// `.` and `..` are taken out (a server normalises it before it opens
@@ -7270,8 +7295,45 @@ mod tests {
             let v = call("upload_image", "image", data);
             assert!(priv_write(&v).is_none(), "{:?}", v.alerts);
         }
+
+        // A target over several lines with a space in it is still read in
+        // its collapsed form, as main reads it, and refused for the file it
+        // names. FAILS ON REVERT of the fall-through after the several-lines
+        // arm in `long_target`: it passes unread.
+        let spaced = format!("/etc/sudoers.d/a b\n{}c", "/./".repeat(1500));
+        assert!(spaced.len() > MAX_TARGET_PATH_BYTES);
+        let v = call("write_file", "path", spaced);
+        assert!(priv_write(&v).is_some(), "{:?}", v.alerts);
+        assert!(!v.allowed);
+
+        // A long body that starts with `/` and holds dots, but has no folder
+        // past its first segment, is no path under a key outside the list.
+        // FAILS ON REVERT of `has_folders` in `long_target`: refused unread.
+        let body = format!("/{}", "a.b%c".repeat(1000));
+        for key in ["note", "save_to"] {
+            let v = call("export_report", key, body.clone());
+            assert!(priv_write(&v).is_none(), "{key}: {:?}", v.alerts);
+        }
+        // With folders it is a padded path, refused unread as before.
+        let padded = format!("/srv/data/{}", "a.b%c/".repeat(1000));
+        let v = call("export_report", "save_to", padded);
+        let alert = priv_write(&v).expect("a padded path too long to read");
+        assert!(alert.detail.contains("not read"), "{}", alert.detail);
     }
 
+    /// What the tool-name match stood in for, judged on the target instead:
+    /// a call that would change a file granting privilege or a login is
+    /// refused, whichever tool makes it and however the path is spelled. The
+    /// raw-text conditions of ATR-2026-040 miss `/etc//sudoers`, and they
+    /// never covered cron, the dynamic linker, PAM or `/etc/group`; the name
+    /// match had refused those for `write_file` only, and `edit_file` /
+    /// `move_file` reached them unchallenged.
+    ///
+    /// Checked with no rule engine, so the refusal is this check's own and no
+    /// ATR rule is standing in for it.
+    ///
+    /// FAILS ON REVERT: drop the `privileged_write_alert` call and every one
+    /// of these is allowed.
     #[test]
     fn a_change_to_a_privileged_file_is_refused_by_any_tool_in_any_spelling() {
         let cases = [
