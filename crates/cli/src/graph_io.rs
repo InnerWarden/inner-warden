@@ -202,8 +202,9 @@ fn own_account_directory(_dir: &std::path::Path) -> bool {
 }
 
 /// [`resolve_and_report`] with the access check supplied, so a test can say
-/// "this account is refused" without a second account on the machine.
-#[cfg(test)]
+/// "this account is refused" without a second account on the machine. Its
+/// tests are Unix's alone (`#[cfg(all(test, unix))]`).
+#[cfg(all(test, unix))]
 fn resolve_report_and_place(
     config_path: &std::path::Path,
     get: impl Fn(&str) -> Option<String>,
