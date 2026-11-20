@@ -1186,8 +1186,17 @@ fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCall
         let moved: Vec<ToolCommand<'a>> = commands
             .iter()
             .filter(|command| command.line.contains("$(") || command.line.contains('`'))
+            // The variables such a field may set are named for what they
+            // are, a name and a value the line does not show: a move into a
+            // folder of the project alone does not put a plain tool's query
+            // in doubt, and a variable can (`BASH_FUNC_go%%` is the
+            // function `go` the query would run).
             .map(|command| ToolCommand {
-                line: Cow::Owned(format!("cd {} && {}", shell_quoted(&folder), command.line)),
+                line: Cow::Owned(format!(
+                    "export \"$CALL_VARIABLE\"=\"$CALL_VALUE\"; cd {} && {}",
+                    shell_quoted(&folder),
+                    command.line
+                )),
                 exclusive: command.exclusive,
             })
             .collect();
@@ -1454,7 +1463,12 @@ fn command_string_moved(args: &serde_json::Value) -> ToolCallReading {
         })
         .unwrap_or(std::borrow::Cow::Borrowed("."));
     ToolCallReading {
-        lines: vec![format!("cd {} && {line}", shell_quoted(&folder))],
+        // As in `read_tool_call`: the field may set variables the line does
+        // not show, not only move it to another folder.
+        lines: vec![format!(
+            "export \"$CALL_VARIABLE\"=\"$CALL_VALUE\"; cd {} && {line}",
+            shell_quoted(&folder)
+        )],
         unreadable: None,
         unread_field: false,
     }
@@ -2716,6 +2730,28 @@ pub const NO_MATCH_EXPLANATION: &str =
 /// against its opening words, so it is one constant.
 const PROGRAM_NAMED_AT_RUN_TIME: &str = "the program this line runs is named by an expansion, so the guard cannot tell whether it is an interpreter: put the path in one pair of double quotes that ends in the program's name, as in \"$(npm bin)/eslint\", or write the path out";
 
+/// The reason for a program already written as one pair of double quotes
+/// ending in its name, under a command the guard does not know as a folder
+/// query: quoting it again frees nothing, the path written out does.
+const PROGRAM_UNDER_UNREAD_QUERY: &str = "the program this line runs is in a folder a command prints when the line runs, and that command is not one of the folder queries the guard reads (such as $(npm bin), $(go env GOPATH), $(pwd) or $(git rev-parse --show-toplevel)), so the guard cannot tell whether it is an interpreter: write the path out, as in ~/go/bin/golangci-lint";
+
+/// The reason for a program already written as one pair of double quotes
+/// under a folder query the guard reads, where something else on the line
+/// could plant or move the program, changes this shell, fetches, loops or
+/// hands the program an input stream: quoting frees nothing, a line of its
+/// own or the path written out does.
+const PROGRAM_UNDER_QUERY_IN_DOUBT: &str = "the program this line runs is in a folder a command prints when the line runs, and another part of this line can change what that folder holds or how this shell runs it (a copy, link or write, a setting, a builtin that sets or runs code, a function, a fetch, a loop, or code or input handed to the program; only a package manager's install from its registry or a move into a folder of the project is not), so the guard cannot tell whether it is an interpreter: write the path out, as in ./node_modules/.bin/eslint, or run the tool on a line of its own";
+
+/// The reason a refusal for a program named at run time gives, by why the
+/// name could not be read.
+fn runtime_program_reason(why: crate::shell::RuntimeProgramWhy) -> &'static str {
+    match why {
+        crate::shell::RuntimeProgramWhy::Unquoted => PROGRAM_NAMED_AT_RUN_TIME,
+        crate::shell::RuntimeProgramWhy::QueryNotRead => PROGRAM_UNDER_UNREAD_QUERY,
+        crate::shell::RuntimeProgramWhy::LineInDoubt => PROGRAM_UNDER_QUERY_IN_DOUBT,
+    }
+}
+
 /// Analyze a command for dangerous patterns. Unifies all threat detection
 /// (builtin patterns + ATR rules) into a single scored result.
 pub fn analyze_command(command: &str, rule_engine: Option<&RuleEngine>) -> CommandAnalysis {
@@ -3421,7 +3457,9 @@ fn analyze_command_as_read(
                 crate::shell::DataFlow::Fed => {
                     "shell data is structurally fed into a code interpreter".into()
                 }
-                crate::shell::DataFlow::RuntimeProgram => PROGRAM_NAMED_AT_RUN_TIME.into(),
+                crate::shell::DataFlow::RuntimeProgram => {
+                    runtime_program_reason(crate::shell::runtime_program_why(scan_cmd)).into()
+                }
                 crate::shell::DataFlow::EvaluatedFetch => {
                     "a value fetched from the network is read as arithmetic or as a variable name, where the shell runs the commands in its array subscripts".into()
                 }
@@ -4631,10 +4669,18 @@ mod tests {
     }
 
     /// Whether a line is refused because its program is named at run time,
-    /// the reason and nothing else.
+    /// the reason and nothing else. The reason is one of the three ways out
+    /// (`runtime_program_reason`): quote the path, or, where it is quoted
+    /// already, write it out.
     fn refused_for_its_program_name(command: &str) -> bool {
         let analysis = analyze_command(command, None);
-        analysis.recommendation == "deny" && analysis.explanation == PROGRAM_NAMED_AT_RUN_TIME
+        analysis.recommendation == "deny"
+            && [
+                PROGRAM_NAMED_AT_RUN_TIME,
+                PROGRAM_UNDER_UNREAD_QUERY,
+                PROGRAM_UNDER_QUERY_IN_DOUBT,
+            ]
+            .contains(&analysis.explanation.as_str())
     }
 
     /// Whether a line runs with no signal at all.
@@ -4684,10 +4730,7 @@ mod tests {
             format!("xxd -r ./t go.mod && {GO_LINT}"),
             format!("go env -w GOTOOLCHAIN=go1.99.0 && {GO_LINT}"),
             format!("rustup override set nightly && {RUST_FMT}"),
-            format!("npm install && {NPM_LINT}"),
-            format!("npm ci && {NPM_LINT}"),
             format!("cargo build && {RUST_FMT}"),
-            r#"gem install rubocop && "$(gem env gemdir)/bin/rubocop""#.to_string(),
             r#"git config core.worktree ./w && "$(git rev-parse --show-toplevel)/scripts/test.sh""#
                 .to_string(),
             r#"chmod +x ./x && "$(pwd)/x""#.to_string(),
@@ -4708,8 +4751,6 @@ mod tests {
             format!("npx some-tool && {NPM_LINT}"),
             format!("uvx some-tool && {NPM_LINT}"),
             format!("go run example.com/gen@v1.0.0 && {GO_LINT}"),
-            format!("cd ./vendor && {RUST_FMT}"),
-            format!("pushd ./vendor; {RUST_FMT}"),
             format!("builtin cd ./vendor; {RUST_FMT}"),
             format!("read -r GOPATH < ./gopath.txt; {GO_LINT}"),
             format!("printf -v GOPATH %s ./vendor/go; {GO_LINT}"),
@@ -4723,6 +4764,23 @@ mod tests {
             format!("sleep 0 & wait -n -p 'a[X]'; {GO_LINT}"),
         ] {
             assert!(refused_for_its_program_name(&command), "{command}");
+        }
+        // Read by its name since 2026-11-19, on purpose: a package manager's
+        // install from its registry, or a move into a folder of the project,
+        // before a plain tool (no shell, interpreter or runner, no input
+        // stream). Everything else above stays refused.
+        for command in [
+            format!("npm install && {NPM_LINT}"),
+            format!("npm ci && {NPM_LINT}"),
+            r#"gem install rubocop && "$(gem env gemdir)/bin/rubocop""#.to_string(),
+            format!("cd ./vendor && {RUST_FMT}"),
+            format!("pushd ./vendor; {RUST_FMT}"),
+        ] {
+            assert_eq!(
+                analyze_command(&command, None).recommendation,
+                "allow",
+                "{command}"
+            );
         }
     }
 
@@ -4856,8 +4914,14 @@ mod tests {
         assert!(!call_runs(serde_json::json!({
             "commands": ["export GOPATH=./vendor/go", GO_LINT]
         })));
-        assert!(!call_runs(
+        // A move into a folder of the project before a plain tool is read
+        // by the tool's name since 2026-11-19; the joined reading still
+        // refuses what only the two entries together say.
+        assert!(call_runs(
             serde_json::json!({"commands": ["cd ./vendor", RUST_FMT]})
+        ));
+        assert!(!call_runs(
+            serde_json::json!({"commands": ["cd ./vendor", "cp ./lint ~/go/bin/golangci-lint", GO_LINT]})
         ));
         assert!(call_runs(
             serde_json::json!({"commands": ["echo start", GO_LINT]})

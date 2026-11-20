@@ -7541,6 +7541,13 @@ fn expansion_gives_one_word(text: &str) -> bool {
 /// ([`every_substitution_only_prints_a_folder`]) runs that code before the
 /// program, whatever name it ends in. None of those is read as a name.
 fn runtime_word_ends_in_literal_program(word: &str) -> bool {
+    word_ends_in_literal_program(word, true)
+}
+
+/// [`runtime_word_ends_in_literal_program`], with the test of what its
+/// substitutions run left out where `queries` is false: whether the word
+/// is already written the way that rule reads a name from.
+fn word_ends_in_literal_program(word: &str, queries: bool) -> bool {
     let Some(tree) = parse_complete_tree(word) else {
         return false;
     };
@@ -7605,7 +7612,62 @@ fn runtime_word_ends_in_literal_program(word: &str) -> bool {
                 .chars()
                 .any(|character| character.is_ascii_alphanumeric())
         })
-        && every_substitution_only_prints_a_folder(tree.root_node(), source)
+        && (!queries || every_substitution_only_prints_a_folder(tree.root_node(), source))
+}
+
+/// Why the guard could not read a line's program by its name, for the way
+/// out a refusal gives ([`runtime_program_why`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeProgramWhy {
+    /// The program word is not one pair of double quotes ending in the
+    /// program's name: quoting it is the way out.
+    Unquoted,
+    /// It is, but a substitution in it runs a command that is not one of
+    /// the folder queries the guard knows ([`is_folder_printer`]).
+    QueryNotRead,
+    /// It is, under folder queries the guard knows, but the line puts them
+    /// in doubt ([`program_names_in_doubt`]).
+    LineInDoubt,
+}
+
+/// Why a line refused for a program named at run time was refused, read
+/// from the first program word that holds a substitution or an expansion.
+/// Asked while the line's doubt is held ([`hold_names_in_doubt`]).
+pub(crate) fn runtime_program_why(source: &str) -> RuntimeProgramWhy {
+    let Some(tree) = parse_complete_tree(source) else {
+        return RuntimeProgramWhy::Unquoted;
+    };
+    let mut commands = Vec::new();
+    collect_all_commands(tree.root_node(), &mut commands, 0);
+    for command in commands {
+        let Some(words) = command_words(command, source.as_bytes()) else {
+            continue;
+        };
+        let Some(effective) = effective_command_words(&words, 0) else {
+            continue;
+        };
+        let program = &effective[0];
+        if !shell_word(program).contains(['$', '`']) {
+            continue;
+        }
+        if !word_ends_in_literal_program(program, false) {
+            return RuntimeProgramWhy::Unquoted;
+        }
+        // Whether the guard knows the query at all is asked first, with the
+        // line's doubt set aside for the asking: a query it does not know is
+        // refused on any line, and writing the path out is the way out.
+        let in_doubt = NAMES_IN_DOUBT.with(std::cell::Cell::get);
+        NAMES_IN_DOUBT.with(|doubt| doubt.set(false));
+        let known = word_ends_in_literal_program(program, true);
+        NAMES_IN_DOUBT.with(|doubt| doubt.set(in_doubt));
+        if !known {
+            return RuntimeProgramWhy::QueryNotRead;
+        }
+        if in_doubt {
+            return RuntimeProgramWhy::LineInDoubt;
+        }
+    }
+    RuntimeProgramWhy::Unquoted
 }
 
 /// Whether every command substitution in a program word, nested ones too,
@@ -7885,11 +7947,17 @@ fn line_gives_folder_queries_cause(root: tree_sitter::Node<'_>, text: &str, dept
     }) {
         return true;
     }
+    // A tool that is handed no code and no input stream is read by its name
+    // beside a registry install or a move into a folder of the project
+    // ([`command_installs_or_enters_the_project`]); nothing else on the line
+    // is let change that.
+    let plain_tool = built.is_some_and(|built| built_program_is_a_plain_tool(built, source));
     let mut commands = Vec::new();
     collect_all_commands(root, &mut commands, 0);
     if commands.into_iter().any(|command| {
         built.is_none_or(|built| built.id() != command.id())
             && !command_writes_and_runs_nothing(command, source)
+            && !(plain_tool && command_installs_or_enters_the_project(command, source))
     }) {
         return true;
     }
@@ -7909,6 +7977,192 @@ fn line_gives_folder_queries_cause(root: tree_sitter::Node<'_>, text: &str, dept
                 .split_once('=')
                 .is_some_and(|(name, _)| SHELL_START_VARIABLES.contains(&name))
     })
+}
+
+/// Whether the program a folder query builds is a tool like any other: no
+/// shell, interpreter or runner ([`built_program_runs_code`]), and handed
+/// no input stream (a pipe into it, a file, a here-document or a
+/// here-string on its input), which such a program could read as code.
+fn built_program_is_a_plain_tool(built: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    !built_program_runs_code(built, source) && !built_program_reads_a_stream(built, source)
+}
+
+/// Whether the program a folder query builds reads an input stream: it is
+/// not the first command of a pipe, or it, or a group, list or pipe it is
+/// part of, has its input redirected.
+fn built_program_reads_a_stream(built: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let reads_on_its_input = |node: tree_sitter::Node<'_>| {
+        let mut cursor = node.walk();
+        let found = node
+            .named_children(&mut cursor)
+            .any(|part| match part.kind() {
+                "heredoc_redirect" | "herestring_redirect" => true,
+                "file_redirect" => node_text(part, source)
+                    .trim_start_matches(|character: char| character.is_ascii_digit())
+                    .starts_with('<'),
+                _ => false,
+            });
+        found
+    };
+    if reads_on_its_input(built) {
+        return true;
+    }
+    let mut child = built;
+    let mut at = built.parent();
+    while let Some(node) = at {
+        if node.kind() == "pipeline" {
+            let mut cursor = node.walk();
+            let first = node.named_children(&mut cursor).next();
+            if first.is_some_and(|first| first.id() != child.id()) {
+                return true;
+            }
+        }
+        if reads_on_its_input(node) {
+            return true;
+        }
+        child = node;
+        at = node.parent();
+    }
+    false
+}
+
+/// Whether a command, beside a plain tool a folder query builds, only
+/// installs packages with its package manager from their registry, or moves
+/// into a folder of the project. Those are what a line runs before such a
+/// tool (`npm ci && "$(npm bin)/jest"`, `cd web && "$(npm bin)/eslint" .`),
+/// and neither picks the program the query leads to: a registry install
+/// puts the package's own program where the query prints, and a folder of
+/// the project is one the tool would be run in anyway. Anything else keeps
+/// the query in doubt: a copy, a link or a write that could plant the
+/// program, a setting or a value read from a file that could move it, a
+/// builtin, a wrapper, an install from a path, a folder or a URL, or one
+/// told to put its programs somewhere else.
+fn command_installs_or_enters_the_project(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let Some(name) = command.child_by_field_name("name") else {
+        return false;
+    };
+    let name = node_text(name, source);
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+    {
+        return false;
+    }
+    let mut cursor = command.walk();
+    if command
+        .named_children(&mut cursor)
+        .any(|part| part.kind() == "variable_assignment" || part.kind().ends_with("redirect"))
+    {
+        return false;
+    }
+    let arguments = command_arguments(command);
+    let Some(words) = arguments
+        .iter()
+        .map(|argument| literal_value(*argument, source))
+        .collect::<Option<Vec<String>>>()
+    else {
+        return false;
+    };
+    match name.as_str() {
+        "cd" | "pushd" => matches!(words.as_slice(), [folder] if is_project_folder(folder)),
+        _ => installs_from_the_registry(&name, &words),
+    }
+}
+
+/// Whether a folder named to `cd` is one of the project: a plain path
+/// below the folder the line starts in, with no `..`, no root, no home and
+/// nothing expanded.
+fn is_project_folder(folder: &str) -> bool {
+    !folder.is_empty()
+        && !folder.starts_with(['/', '~', '-'])
+        && folder.chars().all(is_plain_path_character)
+        && folder.split('/').all(|part| part != "..")
+}
+
+/// Options of the package managers that put what they install somewhere
+/// else than where their folder query looks, or install from a path.
+const INSTALL_ELSEWHERE: [&str; 22] = [
+    "-g",
+    "--global",
+    "--location",
+    "--prefix",
+    "--root",
+    "--path",
+    "--target",
+    "-t",
+    "--install-dir",
+    "-i",
+    "--bindir",
+    "-n",
+    "-C",
+    "--dir",
+    "--cwd",
+    "--modules-folder",
+    "--global-folder",
+    "-e",
+    "--editable",
+    "--src",
+    "--force-reinstall",
+    "--git",
+];
+
+/// Whether a package manager's command line installs from its registry:
+/// `npm`, `pnpm`, `yarn` and `bun` install or clean install, `go install
+/// module@version`, `pip install` (also as `python -m pip`), `cargo
+/// install`, `gem install`, `bundle install`, `composer install`. No
+/// option from [`INSTALL_ELSEWHERE`], and no operand that is a path, a
+/// URL or a file (`./lint`, `file:`, `git+`).
+fn installs_from_the_registry(name: &str, words: &[String]) -> bool {
+    let operands: Vec<&str> = words
+        .iter()
+        .map(String::as_str)
+        .filter(|word| !word.starts_with('-'))
+        .collect();
+    let elsewhere = words.iter().any(|word| {
+        let option = word
+            .split_once('=')
+            .map_or(word.as_str(), |(option, _)| option);
+        INSTALL_ELSEWHERE.contains(&option)
+    });
+    let from_a_path = operands.iter().any(|operand| {
+        operand.starts_with(['.', '/', '~'])
+            || operand.contains(':')
+            || operand.contains("git+")
+            || operand.ends_with(".tgz")
+            || operand.ends_with(".whl")
+            || operand.ends_with(".gem")
+    });
+    if elsewhere || from_a_path {
+        return false;
+    }
+    let first = operands.first().copied();
+    match name {
+        "npm" | "pnpm" | "bun" => matches!(
+            first,
+            Some("install" | "i" | "ci" | "clean-install" | "add")
+        ),
+        "yarn" => matches!(first, None | Some("install" | "add")),
+        "go" => {
+            first == Some("install")
+                && operands.len() > 1
+                && operands[1..].iter().all(|module| module.contains('@'))
+        }
+        "pip" | "pip3" => first == Some("install"),
+        "python" | "python3" => {
+            matches!(
+                words
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["-m", "pip", "install", ..]
+            ) && !words[3..]
+                .iter()
+                .any(|word| word.starts_with(['.', '/', '~']))
+        }
+        "cargo" | "gem" | "bundle" | "composer" => first == Some("install"),
+        _ => false,
+    }
 }
 
 /// The line a shell is handed where the whole line is that shell and that
