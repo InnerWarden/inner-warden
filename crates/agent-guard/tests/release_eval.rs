@@ -7,8 +7,9 @@
 //! - `corpus/attack-2026-11/cases.yml`: the lines the guard's own tests fixed;
 //! - `corpus/real/cases.yml`: lines agents really ran, labelled after review;
 //! - `corpus/external-2026-11/cases.yml`: attacks the guard's authors did not
-//!   write (DVMCP, AgentDojo, a poisoned model), with benign controls from the
-//!   same sources.
+//!   write: AgentDojo and a poisoned model (DVMCP results only in RESULTS.md,
+//!   its cases stay out for licence), with benign controls from the same
+//!   sources.
 //!
 //! It prints, per corpus, attacks caught / total, attacks stopped for an agent,
 //! false positives / benign total, and every case whose verdict differs from
