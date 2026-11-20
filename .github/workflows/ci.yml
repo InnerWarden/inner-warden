@@ -133,6 +133,16 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/no-em-dash-in-new-lines.sh "origin/${{ github.base_ref || 'main' }}"
 
+      # A raw control byte in the code or the rules is invisible in review: two
+      # backspace bytes sat inside a regex and changed what it matched. The
+      # whole tree, not the diff (there are none). The self-test first, so a
+      # scan that stopped refusing is seen.
+      - name: No raw control byte in the code and the rules
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          bash scripts/tests/check-control-bytes.sh
+          bash scripts/check-control-bytes.sh
+
       - name: Format
         run: cargo fmt --all --check
 

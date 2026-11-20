@@ -7927,7 +7927,10 @@ fn xargs_consumes_stdin_as_code(words: &[String]) -> bool {
         }
         break;
     }
-    let invoked = &words[index..];
+    // A flag that takes a value can be the last word (`xargs -a`, its file
+    // given only through a redirection the words do not hold): the index
+    // then runs past the end, and nothing is invoked.
+    let invoked = words.get(index..).unwrap_or_default();
     if invoked.is_empty() {
         return false;
     }
