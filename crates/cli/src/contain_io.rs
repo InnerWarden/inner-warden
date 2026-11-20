@@ -2445,10 +2445,9 @@ fn trim_project_claude(claude: &crate::contain::ProjectClaude, uid: u32) {
     if kept == left {
         return;
     }
-    let temp = ".claude.json.innerwarden.tmp";
-    let _ = std::fs::remove_file(claude.source.join(temp));
+    let temp = launch_temp_name(&file);
     let bytes = serde_json::to_vec(&kept).unwrap_or_else(|_| b"{}".to_vec());
-    if let Err(e) = write_private_file(&claude.source, &file, temp, &bytes, uid) {
+    if let Err(e) = write_private_file(&claude.source, &file, &temp, &bytes, uid) {
         gone(&format!(
             "could not be cut to Claude Code's own state ({e})"
         ));
@@ -2529,11 +2528,7 @@ fn prepare_project_claude(input: &JailInputs) -> Result<JailInputs, String> {
         let (bytes, value) = claude_settings_value(&from, false)?
             .unwrap_or_else(|| (b"{}".to_vec(), serde_json::json!({})));
         let to = crate::contain::claude_copy_of(&source, &from);
-        let temp = format!(
-            ".{}.innerwarden.tmp",
-            to.file_name().unwrap_or_default().to_string_lossy()
-        );
-        let _ = std::fs::remove_file(source.join(&temp));
+        let temp = launch_temp_name(&to);
         write_private_file(&source, &to, &temp, &bytes, uid).map_err(|e| {
             format!(
                 "the copy of {} for the jail cannot be made ({e})",
@@ -2560,6 +2555,23 @@ fn prepare_project_claude(input: &JailInputs) -> Result<JailInputs, String> {
     }
     out.project_claude = Some(claude);
     Ok(out)
+}
+
+/// The temporary name, beside `target`, a launch writes it under before
+/// the rename: of this launch alone (its pid and the time), so two launches
+/// on one project at once never take or remove each other's (measured: a
+/// second identified jail started at the same moment did not start).
+#[cfg(unix)]
+fn launch_temp_name(target: &Path) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!(
+        ".{}.innerwarden.{}.{nanos}.tmp",
+        target.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    )
 }
 
 /// Linux: the person's Claude Code login (`~/.claude/.credentials.json`),
@@ -2590,9 +2602,9 @@ fn copy_claude_login(home: &Path, source: &Path, uid: u32) -> Result<(), String>
     {
         return Ok(());
     }
-    let temp = ".credentials.json.innerwarden.tmp";
-    let _ = std::fs::remove_file(source.join(temp));
-    write_private_file(source, &source.join(".credentials.json"), temp, &bytes, uid)
+    let to = source.join(".credentials.json");
+    let temp = launch_temp_name(&to);
+    write_private_file(source, &to, &temp, &bytes, uid)
         .map(|_| ())
         .map_err(|e| format!("Claude Code's login cannot be copied for the jail ({e})"))
 }
@@ -6198,6 +6210,24 @@ mod tests {
         .unwrap();
         let why = prepare_project_claude(&input).unwrap_err();
         assert!(why.contains("disableAllHooks"), "{why}");
+    }
+
+    /// Measured on the lab host (#352, second review): two identified jails
+    /// started at once on one project each removed and made the same
+    /// temporary name for the copies, and the second did not start. Each
+    /// launch's temporary name is its own now.
+    ///
+    /// FAILS ON REVERT: a fixed temporary name.
+    #[cfg(unix)]
+    #[test]
+    fn each_launch_writes_under_a_temporary_name_of_its_own() {
+        let target = Path::new("/s/settings.json");
+        let a = launch_temp_name(target);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let b = launch_temp_name(target);
+        assert_ne!(a, b);
+        assert!(a.starts_with(".settings.json.innerwarden."), "{a}");
+        assert!(a.contains(&std::process::id().to_string()), "{a}");
     }
 
     /// Review of #352, item 3, as the launcher does it before a plain jail

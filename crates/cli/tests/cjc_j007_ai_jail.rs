@@ -2136,7 +2136,7 @@ const SAVE_AS_CLAUDE_CODE_DOES: &str = r#"target=$(readlink "$HOME/.claude.json"
 if grep -qs HOST-OWN "$HOME/.claude.json"; then exit 73; fi
 if grep -rqs HOST-OWN "$HOME/.claude/backups"; then exit 73; fi
 tmp="$target.tmp.$$.0a1b2c3d4e5f"
-set -C; printf '{"kept":"JAIL-STATE"}\n' > "$tmp" || exit 72; set +C
+set -C; printf '{"theme":"JAIL-STATE"}\n' > "$tmp" || exit 72; set +C
 mv "$tmp" "$target" || exit 72
 mkdir -p "$HOME/.claude/backups" || exit 77
 printf JAIL-COPY > "$HOME/.claude/backups/.claude.json.backup.1" || exit 77
@@ -6511,15 +6511,20 @@ fn a_deny_read_link_never_empties_the_hook_or_the_system() {
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
-    std::fs::create_dir_all(h.join(".claude")).unwrap();
-    std::fs::write(h.join(".claude/marker.txt"), "CJC-J007-SETTINGS").unwrap();
-    std::fs::write(h.join(".claude/hook.json"), "CJC-J007-HOOK-FILE").unwrap();
+    // What the jail shows of the person's `~/.claude` since the second
+    // review of #352: their instructions and agents, read-only, in a
+    // `~/.claude` of its own, with the settings that carry the hook.
+    std::fs::create_dir_all(h.join(".claude/agents")).unwrap();
+    std::fs::write(h.join(".claude/CLAUDE.md"), "CJC-J007-SETTINGS").unwrap();
+    std::fs::write(h.join(".claude/agents/hook.json"), "CJC-J007-HOOK-FILE").unwrap();
     let project = tempfile::TempDir::new().unwrap();
     let p = project.path();
     std::os::unix::fs::symlink(h.join(".claude"), p.join(".env")).unwrap();
-    std::os::unix::fs::symlink(h.join(".claude/hook.json"), p.join(".env.hook")).unwrap();
+    std::os::unix::fs::symlink(h.join(".claude/agents/hook.json"), p.join(".env.hook")).unwrap();
     std::os::unix::fs::symlink("/etc/passwd", p.join(".env.local")).unwrap();
-    let script = "cat \"$HOME/.claude/marker.txt\"; echo; cat \"$HOME/.claude/hook.json\"; echo; \
+    let script =
+        "cat \"$HOME/.claude/CLAUDE.md\"; echo; cat \"$HOME/.claude/agents/hook.json\"; echo; \
+                  grep -q 'hook --' \"$HOME/.claude/settings.json\" && echo HOOKED; \
                   echo \"name=$(head -c 4 /etc/passwd 2>/dev/null)\"; echo DONE";
     let output = jail_sh(false, &h, p, script);
     let out = String::from_utf8_lossy(&output.stdout);
@@ -6527,7 +6532,7 @@ fn a_deny_read_link_never_empties_the_hook_or_the_system() {
     assert!(output.status.success(), "{out} {err}");
     assert!(out.contains("DONE"), "{out} {err}");
     assert!(
-        out.contains("CJC-J007-SETTINGS"),
+        out.contains("CJC-J007-SETTINGS") && out.contains("HOOKED"),
         "the hook's folder was emptied: {out}"
     );
     assert!(
@@ -6538,7 +6543,7 @@ fn a_deny_read_link_never_empties_the_hook_or_the_system() {
         err.contains(&format!(
             "{} leads to {}, where the jail keeps what it needs",
             p.join(".env.hook").display(),
-            h.join(".claude/hook.json").display()
+            h.join(".claude/agents/hook.json").display()
         )),
         "the link into the hook's folder is said: {err}"
     );

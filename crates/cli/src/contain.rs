@@ -3578,11 +3578,15 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     if input.project_claude.is_some() {
         let kept = input.home.join(CLAUDE_SETTINGS_KEPT);
         let link = input.home.join(CLAUDE_SETTINGS);
+        // A profile's hidden home path names the place in the jail too
+        // (`~/.claude/.claude.json`, a place the host's folder had): no
+        // link leads there, though the jail's own folder holds it.
         let covered = input
             .hide_paths
             .iter()
             .chain(&input.deny_paths)
             .map(|hidden| hidden.abs.as_path())
+            .chain(input.args.hide_home.iter().map(PathBuf::as_path))
             .chain(input.args.extra_ro.iter().map(PathBuf::as_path))
             .any(|other| paths_overlap(other, &kept) || paths_overlap(other, &link));
         if !covered {
@@ -8798,6 +8802,27 @@ mod tests {
             plan_project_claude(&[], Path::new("/x"), Path::new("/p")),
             None
         );
+    }
+
+    /// Measured on the lab host (#352, second review): a profile that hides
+    /// `~/.claude/.claude.json` still got the jail's `~/.claude.json` as a
+    /// link there, since the host's folder is no longer shown and so the
+    /// hidden path laid no cover. The profile's hidden home path keeps the
+    /// link out, as a cover did.
+    ///
+    /// FAILS ON REVERT: check only the covers before the link.
+    #[test]
+    fn no_link_where_a_profile_hides_the_settings_file() {
+        let mut input = identified_inputs();
+        input.args.hide_home = vec![PathBuf::from("/home/dev/.claude/.claude.json")];
+        let got = build_linux_jail(&input).unwrap().bwrap_args.join("\n");
+        assert!(!got.contains(CLAUDE_STATE_LINES), "{got}");
+        input.args.hide_home = vec![PathBuf::from("/home/dev/.claude.json")];
+        let got = build_linux_jail(&input).unwrap().bwrap_args.join("\n");
+        assert!(!got.contains(CLAUDE_STATE_LINES), "{got}");
+        input.args.hide_home = vec![PathBuf::from("/home/dev/.aws")];
+        let got = build_linux_jail(&input).unwrap().bwrap_args.join("\n");
+        assert_eq!(got.matches(CLAUDE_STATE_LINES).count(), 1, "{got}");
     }
 
     /// Second review of #352: a hook of the person's that runs a file in
