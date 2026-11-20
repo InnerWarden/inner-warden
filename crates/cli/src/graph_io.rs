@@ -1432,18 +1432,52 @@ pub(crate) fn mirror_jail_block(
     {
         return false;
     }
+    // The jail's word, on the host's incident input: the command and the
+    // session cut and cleaned of control characters, the recommendation
+    // one of the verdict's words or none, the score a score.
+    let recommendation = verdict
+        .get("recommendation")
+        .and_then(Value::as_str)
+        .filter(|word| matches!(*word, "deny" | "review" | "allow"))
+        .unwrap_or("");
+    let risk_score = verdict
+        .get("risk_score")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(100);
     emit_guard_event(
         host_graph,
-        command,
-        verdict,
+        &mirrored_text(command, MAX_MIRRORED_COMMAND_CHARS),
+        &json!({"recommendation": recommendation, "risk_score": risk_score}),
         DecisionContextParts {
             mode: *mode,
             outcome: *outcome,
         },
-        session,
+        &mirrored_text(session, MAX_MIRRORED_SESSION_CHARS),
         origin,
     );
     true
+}
+
+/// The most characters of a jail's command told beside the host's record.
+pub(crate) const MAX_MIRRORED_COMMAND_CHARS: usize = 1024;
+
+/// The most characters of a jail's session name told there.
+pub(crate) const MAX_MIRRORED_SESSION_CHARS: usize = 128;
+
+/// PURE. `text` as told beside the host's record: every control character
+/// (a newline, an escape, a NUL) a space, and cut to `max` characters with
+/// `[cut]` at the end where it was longer.
+pub(crate) fn mirrored_text(text: &str, max: usize) -> String {
+    let mut out: String = text
+        .chars()
+        .take(max)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if text.chars().nth(max).is_some() {
+        out.push_str("[cut]");
+    }
+    out
 }
 
 /// Append one BLOCKED / WOULD-BLOCK guard decision to `guard-events.jsonl`, an

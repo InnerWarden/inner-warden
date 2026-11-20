@@ -3975,6 +3975,55 @@ fn a_folder_the_jail_cannot_have_of_its_own_is_said_to_be_the_hosts() {
         .is_symlink());
 }
 
+/// Review of #352, item 2: `~/.claude/settings.json` carries the guard's
+/// hook and `~/.claude` is writable in a jail; a program there rewrote it
+/// (hooks off, the hook taken out) for every run after. Now the file is
+/// read-only in every Linux jail, plain and identified: a write, a removal
+/// and a rename over it are refused, and the host's file is as it was.
+///
+/// FAILS ON REVERT: drop the read-only binds of Claude Code's settings.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_jail_cannot_change_the_settings_that_carry_the_guards_hook() {
+    require_bwrap();
+    let script = "s=\"$HOME/.claude/settings.json\"; \
+                  (echo '{\"disableAllHooks\":true}' > \"$s\") 2>/dev/null && echo WROTE; \
+                  echo '{}' > \"$HOME/.claude/forged.json\" && \
+                  mv \"$HOME/.claude/forged.json\" \"$s\" 2>/dev/null && echo REPLACED; \
+                  rm -f \"$s\" 2>/dev/null; [ -f \"$s\" ] || echo REMOVED; echo DONE";
+    for identity in [false, true] {
+        let home = state_home();
+        let h = home.path();
+        let project = tempfile::TempDir::new().unwrap();
+        let output = if identity {
+            identified_sh(h, project.path(), script).output()
+        } else {
+            cli()
+                .args([
+                    "contain",
+                    "--project",
+                    project.path().to_str().unwrap(),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    script,
+                ])
+                .env("HOME", h)
+                .output()
+        }
+        .expect("run the jail");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(out.contains("DONE"), "identity={identity}: {out} {err}");
+        for done in ["WROTE", "REPLACED", "REMOVED"] {
+            assert!(!out.contains(done), "identity={identity}: {done}: {out}");
+        }
+        let settings = std::fs::read_to_string(h.join(".claude/settings.json")).unwrap();
+        assert!(settings.contains("hook"), "identity={identity}: {settings}");
+        assert!(!settings.contains("disableAllHooks"), "{settings}");
+    }
+}
+
 /// M30CW-2: Claude Code's folders of its runs are made on the host by a
 /// real launch alone, after every check: a dry run (plain or identified)
 /// and an identified launch refused by the checks make nothing (a dry run

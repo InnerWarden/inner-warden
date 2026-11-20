@@ -100,17 +100,39 @@ list, with every limit.
   `guard.blocked` line marked `reported_by: jail`. The jail hides that
   folder, so on a host with InnerWarden Community alone a refusal inside
   the jail was in the project's record only, which nothing on the host
-  reads. Only refusals are told, and only where the record channel is open;
-  a program in the jail can add refusals of its own there too, within the
-  same rate.
+  reads. Only refusals are told, and only where the record channel is open.
+  That line is the jail's word: its command is cut to 1024 characters and
+  its session to 128, each control character a space, and its
+  recommendation is `deny`, `review`, `allow` or empty. The host's record
+  takes at most 32 of one jail's refusals at once and one a second after
+  that; the rest are counted and told as one `guard.jail_blocks_not_told`
+  line when the jail ends (the project's record still holds every one). A
+  program in the jail can add refusals of its own there too, within that
+  rate.
   The launcher's records of its instances
   (`$XDG_STATE_HOME/innerwarden/instances`, else
   `~/.local/state/innerwarden/instances`), which the dashboard and the
   host's agents read, are out of every jail's writing: hidden in a jail
   with `--identity`, read-only in one without (made first where they are
   not there yet, and the folders above them in `~/.local` held in place).
-  On macOS the sandbox denies writing them and keeps the folders above
-  them in place; reading them stays allowed.
+  Before a jail without `--identity` starts, `contain` checks that folder:
+  one another account owns or others may write is moved aside whole
+  (`instances.set-aside-...`) and made again, and every entry in it that is
+  not one `contain` writes (an instance's record that parses and names its
+  own id and your account, the project path beside it, or a temporary file
+  of a launch writing now) is moved to such a folder beside it, and said. A
+  record that is well formed but was not written by `contain` cannot be
+  told from one that was, and is kept. On macOS the sandbox denies writing
+  them and keeps the folders above them in place; reading them stays
+  allowed.
+  Claude Code's settings that carry the guard's hook,
+  `~/.claude/settings.json` (and `~/.claude/settings.local.json` where one
+  is there), are read-only in every Linux jail, and on macOS the sandbox
+  denies writing them and keeps `~/.claude` in place: before, a program in
+  the jail could take the hook out, or turn hooks off, for every run after.
+  Where one is a link, the jail cannot lay it read-only, and `contain` says
+  so as it starts. The project's own `.claude/settings*.json` stay
+  writable in the project, as the rest of the project is.
   Claude Code's settings file, `~/.claude.json`, was gone at every launch
   of a Linux jail without `--identity` (the jail's home is an empty folder
   of its own), and two such jails wrote the same session file in
@@ -123,16 +145,28 @@ list, with every limit.
   folders of its own, so two jails no longer share them, and neither sees
   yours. Two jails on the same project share that project's file, as two
   Claude Code runs on the host share yours. The file starts empty: the
-  first run in a project asks what Claude Code asks on a new account. On
-  macOS the sandbox cannot point a name elsewhere: a jail there writes
-  your own `~/.claude.json` and `~/.claude/sessions`, as before.
+  first run in a project asks what Claude Code asks on a new account.
+  Before each run `contain` cuts that file to Claude Code's own state and
+  preferences (start counts, theme, onboarding, the account it shows, and
+  per project its history and last session's counts): MCP servers, the
+  project's MCP servers turned on or off, allowed tools, the trust of a
+  folder, approved keys and a bypass of permissions are never carried from
+  one run to the next, so every run asks again to trust the folder. A file
+  that is not JSON, or a link, is removed. Within one run the file is the
+  jail's: a second Claude Code started inside the same jail reads what the
+  first wrote. On macOS the sandbox cannot point a name elsewhere, and a
+  jail no longer writes your own `~/.claude.json` (Claude Code outside the
+  jail loads it): Claude Code in a macOS jail cannot save that file. How it
+  behaves then is not measured yet. A macOS jail still writes
+  `~/.claude/sessions`.
   The guard's hook in a jail runs a copy of the CLI only root can replace:
   the launcher itself where it is one, else root's copy at
   `/usr/local/bin/innerwarden` or `/usr/bin/innerwarden` (said as the jail
   starts). A copy in your home (`~/.local/bin/innerwarden`) is one a
-  program in the jail can replace, and InnerWarden Pro's Execution Gate in
-  enforce refuses it there; the hook's wiring then holds every call. With
-  no copy of root's, the hook runs the launcher and the start says so. The
+  program in the jail can replace, and on Linux InnerWarden Pro's
+  Execution Gate in enforce refuses it there; the hook's wiring then holds
+  every call. With no copy of root's, the hook runs the launcher and the
+  start says so. The
   hook's wiring is the same for your agent outside the jail. A launcher
   under `/usr` is shown as `/usr` is, not bound on its own, so an upgrade
   that replaces it reaches a jail that is running.

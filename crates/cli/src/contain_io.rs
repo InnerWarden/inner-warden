@@ -51,8 +51,10 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // bind list must be the real (symlink-resolved) path, or a deny of the secret
     // dir silently misses. Canonicalize the home root here.
     let home = std::fs::canonicalize(&home).unwrap_or(home);
+    // Resolved: what `/usr` holds is told by where the file is, not by the
+    // name it was started by.
     let iw_binary = match std::env::current_exe() {
-        Ok(p) => p,
+        Ok(p) => std::fs::canonicalize(&p).unwrap_or(p),
         Err(e) => {
             eprintln!("innerwarden contain: cannot resolve own path: {e}");
             return ExitCode::from(1);
@@ -61,15 +63,18 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // The CLI the guard's hook runs: root's copy where this launcher is
     // one the account can replace ([`crate::contain::hook_cli_for`]).
     #[cfg(unix)]
-    let (hook_cli, hook_said) = crate::contain::hook_cli_for(&iw_binary, &|path: &Path| {
-        backend_facts(path).is_some_and(|facts| backend_trusted(&facts))
-    });
+    let (hook_cli, hook_said) = crate::contain::hook_cli_for(
+        &iw_binary,
+        &|path: &Path| backend_facts(path).is_some_and(|facts| backend_trusted(&facts)),
+        cfg!(target_os = "linux"),
+    );
     #[cfg(not(unix))]
     let (hook_cli, hook_said): (PathBuf, Option<String>) = (iw_binary.clone(), None);
     if !args.dry_run {
         if let Some(said) = &hook_said {
             eprintln!("innerwarden contain: {said}");
         }
+        say_linked_guard_settings(&home);
     }
 
     // --setup intentionally only arms the hook and therefore needs no project.
@@ -383,7 +388,32 @@ fn existing_home_paths(home: &Path) -> Vec<PathBuf> {
     .iter()
     .map(|name| home.join(name))
     .filter(|path| path.exists())
+    // Claude Code's settings that carry the guard's hook, laid read-only
+    // over themselves: only a file of its own, never through a link.
+    .chain(
+        crate::contain::CLAUDE_GUARD_SETTINGS
+            .iter()
+            .map(|name| home.join(name))
+            .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())),
+    )
     .collect()
+}
+
+/// Said where one of Claude Code's settings that carry the guard's hook
+/// is a link: the jail does not lay it read-only, so a program there can
+/// write where it leads.
+fn say_linked_guard_settings(home: &Path) {
+    for name in crate::contain::CLAUDE_GUARD_SETTINGS {
+        let path = home.join(name);
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
+            eprintln!(
+                "innerwarden contain: {} is a link, so the jail cannot lay it read-only and a \
+                 program in the jail can change the guard's hook through it; replace the link \
+                 with the file it leads to",
+                crate::contain::printable(&path)
+            );
+        }
+    }
 }
 
 /// What the jail is, from what is on the host now: the worktree the
@@ -2292,10 +2322,224 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     #[cfg(target_os = "linux")]
     let prepared = with_claude_folders_made(input);
     #[cfg(target_os = "linux")]
+    trim_project_claude(&prepared);
+    #[cfg(target_os = "linux")]
     let input = &prepared;
     announce(input);
     run_unrecorded(&bwrap, input, marks)
 }
+
+/// Linux: the launcher's records folder `dir` as the launcher keeps it,
+/// whether anything was made or moved. A folder at that name that is not
+/// this account's own, or that others may write, is moved aside whole and
+/// made again; one that is not there is made, `0700`. In it, every entry
+/// that is not one the launcher writes ([`record_entry_kept`]) is moved to
+/// a folder beside it (`instances.set-aside-<seconds>-<pid>`), which the
+/// host's readers never read, and said.
+#[cfg(target_os = "linux")]
+fn vet_records_dir(dir: &Path, uid: u32) -> std::io::Result<bool> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    // Seconds, nanoseconds and the launcher's pid: two set-asides in one
+    // second never meet at one name.
+    let stamp = || {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!(
+            "{}-{:09}-{}",
+            now.as_secs(),
+            now.subsec_nanos(),
+            std::process::id()
+        )
+    };
+    let mut changed = false;
+    match std::fs::symlink_metadata(dir) {
+        Ok(found) if !(found.is_dir() && found.uid() == uid && found.mode() & 0o022 == 0) => {
+            let aside = dir.with_file_name(format!(
+                "{}.set-aside-{}",
+                dir.file_name().unwrap_or_default().to_string_lossy(),
+                stamp()
+            ));
+            std::fs::rename(dir, &aside)?;
+            eprintln!(
+                "innerwarden contain: {} was not a folder of this account that only it can \
+                 write; moved aside to {} and made again.",
+                crate::contain::printable(dir),
+                crate::contain::printable(&aside)
+            );
+            changed = true;
+        }
+        Ok(_) => {}
+        Err(_) => changed = true,
+    }
+    own_records_dir(dir, uid)?;
+    let mut aside: Option<PathBuf> = None;
+    let mut moved = 0usize;
+    for entry in std::fs::read_dir(dir)?.flatten().take(MAX_VETTED_ENTRIES) {
+        let path = entry.path();
+        if record_entry_kept(dir, &path, uid) {
+            continue;
+        }
+        let to = match &aside {
+            Some(to) => to.clone(),
+            None => {
+                let to = dir.with_file_name(format!(
+                    "{}.set-aside-{}",
+                    dir.file_name().unwrap_or_default().to_string_lossy(),
+                    stamp()
+                ));
+                std::fs::DirBuilder::new().mode(0o700).create(&to)?;
+                aside = Some(to.clone());
+                to
+            }
+        };
+        std::fs::rename(&path, to.join(entry.file_name()))?;
+        moved += 1;
+    }
+    if let (true, Some(to)) = (moved > 0, &aside) {
+        eprintln!(
+            "innerwarden contain: {moved} entr{} in {} the launcher does not write moved aside to {}.",
+            if moved == 1 { "y" } else { "ies" },
+            crate::contain::printable(dir),
+            crate::contain::printable(to)
+        );
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// The most entries of the records folder looked at in one launch.
+#[cfg(target_os = "linux")]
+const MAX_VETTED_ENTRIES: usize = 4096;
+
+/// Linux: whether `path`, in the launcher's records folder `dir`, is an
+/// entry the launcher writes: a regular file of `uid`'s with one name
+/// that no one else may write, no larger than a record, named
+/// `<id>.json` and holding the record of that id and account, `<id>.project`
+/// beside such a record and holding a path of its project, or a temporary
+/// file a launcher writing now has not renamed yet (`.<id>.tmp`,
+/// `.<id>.project.tmp`), which no reader takes.
+#[cfg(target_os = "linux")]
+fn record_entry_kept(dir: &Path, path: &Path, uid: u32) -> bool {
+    use innerwarden_agent_guard::identity::{is_instance_id, parse_launch_record};
+    use std::os::unix::fs::MetadataExt;
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let sound = |at: &Path| {
+        std::fs::symlink_metadata(at).is_ok_and(|m| {
+            m.is_file()
+                && m.uid() == uid
+                && m.nlink() == 1
+                && m.mode() & 0o022 == 0
+                && m.len() <= MAX_RECORD_ENTRY_BYTES
+        })
+    };
+    if !sound(path) {
+        return false;
+    }
+    let record = |id: &str| {
+        let bytes = std::fs::read(dir.join(format!("{id}.json"))).ok()?;
+        parse_launch_record(&bytes)
+            .ok()
+            .filter(|record| record.uid == uid && record.instance_id == id)
+    };
+    if let Some(id) = name.strip_suffix(".json") {
+        return is_instance_id(id) && record(id).is_some();
+    }
+    if let Some(id) = name.strip_suffix(".project") {
+        return is_instance_id(id)
+            && sound(&dir.join(format!("{id}.json")))
+            && record(id).is_some_and(|record| {
+                std::fs::read(path).ok().is_some_and(|bytes| {
+                    crate::contain::launch::parse_project_path(&bytes, &record.project).is_some()
+                })
+            });
+    }
+    let temp = name
+        .strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .map(|rest| rest.strip_suffix(".project").unwrap_or(rest));
+    temp.is_some_and(is_instance_id)
+}
+
+/// The largest entry of the records folder taken as one the launcher
+/// writes.
+#[cfg(target_os = "linux")]
+const MAX_RECORD_ENTRY_BYTES: u64 = 64 * 1024;
+
+/// Linux, before a plain jail runs: this project's `.claude.json` kept by
+/// the last run ([`crate::contain::ProjectClaude`]) cut to what Claude
+/// Code's own state and preferences are
+/// ([`crate::contain::kept_claude_settings`]): MCP servers, allowed
+/// tools, the trust of a folder and the rest the jail wrote are never
+/// carried into the next run. A file that is not a plain file of this
+/// account's with one name, is larger than [`MAX_CLAUDE_SETTINGS_BYTES`],
+/// or is not JSON is removed, and said. Best effort: a write that fails is
+/// said, and the file is removed.
+#[cfg(target_os = "linux")]
+fn trim_project_claude(input: &JailInputs) {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    let Some(claude) = &input.project_claude else {
+        return;
+    };
+    // SAFETY: getuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let file = claude.source.join(crate::contain::CLAUDE_SETTINGS);
+    let Ok(meta) = std::fs::symlink_metadata(&file) else {
+        return;
+    };
+    let read = (meta.is_file()
+        && meta.uid() == uid
+        && meta.nlink() == 1
+        && meta.len() <= MAX_CLAUDE_SETTINGS_BYTES)
+        .then(|| {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true);
+            innerwarden_safe_io::harden(&mut options);
+            let mut bytes = Vec::new();
+            options
+                .open(&file)
+                .and_then(|f| {
+                    f.take(MAX_CLAUDE_SETTINGS_BYTES + 1)
+                        .read_to_end(&mut bytes)
+                })
+                .ok()
+                .map(|_| bytes)
+        })
+        .flatten();
+    let left: Option<serde_json::Value> =
+        read.and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let gone = |why: &str| {
+        let _ = std::fs::remove_file(&file);
+        eprintln!(
+            "innerwarden contain: Claude Code's settings file kept for this project ({}) {why}; \
+             removed, and the jail starts with none.",
+            crate::contain::printable(&file)
+        );
+    };
+    let Some(left) = left else {
+        gone("is not a plain JSON file of this account");
+        return;
+    };
+    let kept = crate::contain::kept_claude_settings(&left);
+    if kept == left {
+        return;
+    }
+    let temp = ".claude.json.innerwarden.tmp";
+    let _ = std::fs::remove_file(claude.source.join(temp));
+    let bytes = serde_json::to_vec(&kept).unwrap_or_else(|_| b"{}".to_vec());
+    if let Err(e) = write_private_file(&claude.source, &file, temp, &bytes, uid) {
+        gone(&format!(
+            "could not be cut to Claude Code's own state ({e})"
+        ));
+    }
+}
+
+/// The largest `.claude.json` a plain jail's next run starts from.
+#[cfg(target_os = "linux")]
+const MAX_CLAUDE_SETTINGS_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Linux, the real run of a plain jail, once the jail was planned with
 /// every check passed: the launcher's records folder made (0700, this
@@ -2314,19 +2558,19 @@ fn make_plain_records(input: &JailInputs) -> bool {
         std::env::var("XDG_STATE_HOME").ok().as_deref(),
         &input.home,
     );
-    let mut made = false;
-    if std::fs::symlink_metadata(&nominal).is_err() {
-        match own_records_dir(&nominal, uid) {
-            Ok(()) => made = true,
-            Err(e) => {
-                eprintln!(
-                    "innerwarden contain: the launcher's records folder cannot be made ({e}); \
-                     the jail may write there this run"
-                );
-                return false;
-            }
+    // Made where it is not there; where it is, it and what is in it vetted
+    // ([`vet_records_dir`]): a jail before this one could plant what the
+    // host reads.
+    let mut made = match vet_records_dir(&nominal, uid) {
+        Ok(changed) => changed,
+        Err(e) => {
+            eprintln!(
+                "innerwarden contain: the launcher's records folder cannot be used ({e}); \
+                 the jail may write there this run"
+            );
+            return false;
         }
-    }
+    };
     // This project's folder for Claude Code's settings file, beside it.
     let real = std::fs::canonicalize(&nominal).unwrap_or(nominal.clone());
     if input.project_claude.is_none() {
@@ -5908,6 +6152,135 @@ mod tests {
         std::fs::remove_dir(&folder).unwrap();
         assert!(!make_plain_records(&plan(&identified)));
         assert!(!folder.exists());
+    }
+
+    /// Review of #352, item 3, as the launcher does it before a plain jail
+    /// runs: the project's kept `.claude.json` is cut to Claude Code's own
+    /// state in place, 0600; a file that is not JSON, or a link, is removed.
+    ///
+    /// FAILS ON REVERT: leave `trim_project_claude` doing nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_projects_claude_json_is_cut_before_a_plain_jail_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let folder = r.join("jail-claude/proj-0123456789abcdef");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut input = resolve_inputs(
+            parse_contain_args(&["--".to_string(), "true".to_string()]).unwrap(),
+            r.join("home"),
+            PathBuf::from("/usr/bin/true"),
+        )
+        .unwrap();
+        input.project_claude = Some(crate::contain::ProjectClaude {
+            covered: vec![r.join("jail-claude")],
+            folder: folder.clone(),
+            source: folder.clone(),
+        });
+        let file = folder.join(".claude.json");
+        std::fs::write(
+            &file,
+            r#"{"theme":"dark","mcpServers":{"evil":{"command":"nc"}},"projects":{"/p":{"allowedTools":["Bash(*)"],"history":[]}}}"#,
+        )
+        .unwrap();
+        trim_project_claude(&input);
+        let kept: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(
+            kept,
+            serde_json::json!({"theme": "dark", "projects": {"/p": {"history": []}}})
+        );
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // Not JSON: removed.
+        std::fs::write(&file, "mcpServers = evil").unwrap();
+        trim_project_claude(&input);
+        assert!(!file.exists());
+        // A link: removed, never followed.
+        let elsewhere = r.join("elsewhere.json");
+        std::fs::write(&elsewhere, r#"{"mcpServers":{}}"#).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+        trim_project_claude(&input);
+        assert!(std::fs::symlink_metadata(&file).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&elsewhere).unwrap(),
+            r#"{"mcpServers":{}}"#
+        );
+    }
+
+    /// Review of #352, item 1: a records folder that was already there was
+    /// taken as it was. Now a plain launch checks it: one that others may
+    /// write is moved aside whole and made again, 0700; in it, every entry
+    /// the launcher does not write (a file of another name, a record that
+    /// does not parse or names another id, a link, a folder) is moved aside;
+    /// a record of the launcher's, its project file and a temporary file of
+    /// a launcher writing now are kept.
+    ///
+    /// FAILS ON REVERT: check the folder only where it is made.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_records_folder_already_there_is_checked_and_what_was_planted_moved_aside() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let dir = r.join("state/innerwarden/instances");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = own_uid();
+        let id = "07070707070707070707070707070707";
+        let record = format!(
+            r#"{{"schema":1,"instance_id":"{id}","agent_type":"claude-code","launcher":{{"path":"/usr/local/bin/innerwarden","version":"1.5.5","root_owned":true}},"uid":{uid},"project":"my-app","mode":"enforce","started_at":"2026-10-16T12:00:00Z","jail":{{"backend":"bwrap","pid":2778,"start_ticks":123456,"pid_ns":4026532220,"mnt_ns":4026532218}}}}"#
+        );
+        let private = |path: &Path, text: &str| {
+            std::fs::write(path, text).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        private(&dir.join(format!("{id}.json")), &record);
+        private(&dir.join(format!("{id}.project")), "/home/dev/my-app\n");
+        private(&dir.join(format!(".{id}.tmp")), "{");
+        let forged = "08080808080808080808080808080808";
+        private(&dir.join(format!("{forged}.json")), &record);
+        private(&dir.join("notes.txt"), "x");
+        private(
+            &dir.join("09090909090909090909090909090909.json"),
+            "not json",
+        );
+        std::os::unix::fs::symlink(&r, dir.join("0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a.json")).unwrap();
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        assert!(vet_records_dir(&dir, uid).unwrap());
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            [
+                format!(".{id}.tmp"),
+                format!("{id}.json"),
+                format!("{id}.project")
+            ]
+        );
+        let aside: Vec<_> = std::fs::read_dir(dir.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("instances.set-aside-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        let moved = std::fs::read_dir(dir.with_file_name(&aside[0]))
+            .unwrap()
+            .count();
+        assert_eq!(moved, 5);
+        // Nothing more to move: unchanged.
+        assert!(!vet_records_dir(&dir, uid).unwrap());
+        // A folder others may write: moved aside whole and made again.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(vet_records_dir(&dir, uid).unwrap());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     /// CWNF-1 (Linux): the real run opens each pin and each read-only path
