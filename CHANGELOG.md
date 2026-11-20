@@ -3,6 +3,80 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
+## Unreleased
+
+A here-document is read as the input of the command it is written after, and
+what a pipe hands a shell on its input is read as that shell's script. A
+narrow `Grep` of the home is held for review instead of refused. Every pull
+request that touches the guard is now judged line by line against main's
+guard, and refused if it lets through a line main stops. The guard still reads
+the text of a command; what it does not see is written down, as measured:
+[Where this ends](docs/features.md#where-this-ends).
+
+### Security
+
+- **What a pipe hands a shell on its input is its script.** Text that a pipe
+  or a here-string hands a shell or an interpreter on its input is read as
+  that program's script when the line writes it out (`echo`, `printf`, a
+  `cat` here-document, a file written earlier on the line). `cat <<'EOF' |
+  sh` with a download piped to a shell inside was allowed; it is now refused,
+  and `sh <<< '...'` is read. Text the line does not show (`cat <<EOF | sh`
+  holding `$X`) is held for review.
+- **An output redirect belongs to the commands it wraps.** A redirect hung on
+  a list or a compound command is read as a write by every command inside
+  it, so an inner `2>/dev/null` no longer hides an outer `> r.sh` that a
+  later `sh r.sh` runs.
+- **A here-document belongs to the command it is written after.** In `a &&
+  b <<EOF` (and after `;`, `||`, `|`, in a subshell or a function body)
+  bash hands the here-document to `b`; the guard gave it to the first command
+  of the list. So `cd x && python3 - <<'EOF'` is now read as Python code, and
+  a download that code runs is refused for an agent.
+
+### Fixed
+
+- **Prose written with `cat` after a `cd` runs.** `cd repo && cat >>
+  notes.md <<'EOF'` with words of the guard's rules in the text was refused
+  as a line to run, while the same `cat` alone was allowed. It is now read
+  as the `cat` alone is.
+- **A narrow `Grep` of the home is held for review, not refused.** A Claude
+  Code `Grep` of the whole home for an ordinary text (`fn main`, `TODO`) is
+  judged as the `grep -r <text> ~` line it equals: held for review. One with
+  lines of context, a match across lines, a key or token marker, or a glob
+  aimed at `.ssh`, `.aws` or key files keeps the refusal.
+- **A credential marker is matched on word boundaries.** Its pattern held two
+  raw backspace bytes where it meant word boundaries.
+
+### AI Jail
+
+- **The proxy settings are passed by their exact names.** `innerwarden
+  contain` handed in any variable whose name ended in `_PROXY`. It now hands
+  in `HTTP_PROXY`, `HTTPS_PROXY`, `FTP_PROXY`, `ALL_PROXY` and `NO_PROXY`,
+  in capitals or lowercase, and no other `*_PROXY` name.
+
+### Release checks
+
+- **A corpus of attacks the guard's authors did not write.** The release
+  suite now judges the injected text and attack calls of AgentDojo v1.2.2's
+  `important_instructions` tasks, the shell lines of small models poisoned
+  with a public recipe, and benign controls from the same sources. Its first
+  reference records today's misses and false positives as they are: most of
+  the injected AgentDojo text is allowed when judged on its own, and most
+  false positives are payments and direct messages the user asked for. The
+  end to end results through the proxy and the hook are in
+  `crates/agent-guard/corpus/external-2026-11/RESULTS.md`.
+- **A pull request cannot loosen the guard against main.** On a pull request
+  that touches the guard, CI judges every corpus line, plus rewritten
+  variants of each malicious shell line, with main's guard and the branch's,
+  and fails when main stops a line the branch does not. A line marked
+  `must_refuse` can never be waived; a benign line passes only with a dated
+  entry saying why it is harmless.
+
+### What this costs
+
+A line that pipes text it does not write out into a shell is held for
+review. A jailed agent that needs a proxy variable under any name other than
+the five above needs `--pass-env` with its name.
+
 ## 1.6.15 - 2026-11-20
 
 Codex CLI, Gemini CLI and Hermes Agent are screened through their own hooks,
