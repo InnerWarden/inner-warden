@@ -15,9 +15,12 @@ list, with every limit.
   resource read whose location names a credential (`internal://credentials`,
   `config://auth_tokens`) or is a secret store by its scheme (`vault://`,
   `env://`, `kv://`, `keyring://`, `keychain://`, `ssm://`, `secret://`,
-  `secrets://`, `secretsmanager://`, `creds://`, `credentials://`, any
-  location in it): reading it is your call, as reading a credentials file in
-  the shell is. A document, a source file, a count or a setting about a
+  `secrets://`, `secretsmanager://`, `creds://`, `credentials://`, the cloud
+  stores `aws-sm://`, `azure-keyvault://`, `gcp-secret://`,
+  `secret-manager://`, and any scheme with `vault`, `secret` or `keyring`
+  as a word of it, such as `x-vault://`; any location in it), also when the
+  name is written in fullwidth letters: reading it is your call, as reading a
+  credentials file in the shell is. A document, a source file, a count or a setting about a
   credential (`docs://credentials-guide`, `file:///repo/src/auth/token.rs`,
   `stats://tokens`) and a file in a folder that names one are read with an
   alert. In `advisory` and `warn` every one of these is alerted and passes.
