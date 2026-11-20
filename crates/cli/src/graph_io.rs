@@ -114,18 +114,132 @@ fn resolve_and_report(
     get: impl Fn(&str) -> Option<String>,
     reported: &std::sync::Once,
 ) -> innerwarden_graph::GraphPathResolution {
-    resolve_report_and_place(config_path, get, reported, shared_record_refused)
+    let account = effective_account();
+    resolve_report_and_place_as(
+        config_path,
+        get,
+        reported,
+        shared_record_refused,
+        &Account {
+            name: account.as_deref(),
+            root: std::path::Path::new(innerwarden_graph::AGENT_RECORDS_ROOT),
+            root_owner: 0,
+            owns: own_account_directory,
+        },
+    )
+}
+
+/// The account this process runs as, for the `[accounts."<name>"]` entry of
+/// the product config, and how to tell that a directory is its own.
+pub(crate) struct Account<'a, F: Fn(&std::path::Path) -> bool> {
+    /// The effective account's name from the account database. `None` reads
+    /// no entry at all.
+    pub name: Option<&'a str>,
+    /// Where the per-account directories are:
+    /// [`innerwarden_graph::AGENT_RECORDS_ROOT`] outside tests.
+    pub root: &'a std::path::Path,
+    /// Who must own [`Account::root`]: `0` outside tests. A root another
+    /// account owns or may write is one where that account could swap the
+    /// per-account folder (rename it, plant a link), so it is never trusted.
+    pub root_owner: u32,
+    /// Whether a directory is this account's own: a directory, not a link,
+    /// owned by the effective uid, that no other account may write.
+    pub owns: F,
+}
+
+/// The name of the EFFECTIVE account, from the account database by uid.
+///
+/// Never `USER`, `LOGNAME` or `HOME`: a hook runs with the AI agent's
+/// environment, and an agent that could name the account would choose whose
+/// directory its decisions land in. The uid is what the kernel says.
+#[cfg(unix)]
+pub(crate) fn effective_account() -> Option<String> {
+    use std::ffi::CStr;
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: a zeroed passwd is a valid out-parameter for getpwuid_r.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: geteuid cannot fail; every pointer is to memory owned here and
+    // sized as passed, and the result is read only when the call filled it.
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() || entry.pw_name.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_name` points into `buffer`, NUL-terminated by the call.
+    let name = unsafe { CStr::from_ptr(entry.pw_name) };
+    name.to_str().ok().map(str::to_string)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn effective_account() -> Option<String> {
+    None
+}
+
+/// Whether `dir` is this process's own record directory: a directory and not
+/// a link, owned by the effective uid, with no write bit for anyone else.
+/// The paid installer makes it `<name>:innerwarden 2750`.
+#[cfg(unix)]
+fn own_account_directory(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    std::fs::symlink_metadata(dir).is_ok_and(|metadata| {
+        metadata.is_dir() && metadata.uid() == euid && metadata.mode() & 0o022 == 0
+    })
+}
+
+#[cfg(not(unix))]
+fn own_account_directory(_dir: &std::path::Path) -> bool {
+    false
 }
 
 /// [`resolve_and_report`] with the access check supplied, so a test can say
 /// "this account is refused" without a second account on the machine.
+#[cfg(test)]
 fn resolve_report_and_place(
     config_path: &std::path::Path,
     get: impl Fn(&str) -> Option<String>,
     reported: &std::sync::Once,
     denied: impl Fn(&std::path::Path) -> bool,
 ) -> innerwarden_graph::GraphPathResolution {
-    let mut resolved = raw_resolution(config_path, &get);
+    resolve_report_and_place_as(
+        config_path,
+        get,
+        reported,
+        denied,
+        &Account {
+            name: None,
+            root: std::path::Path::new(innerwarden_graph::AGENT_RECORDS_ROOT),
+            root_owner: 0,
+            owns: |_: &std::path::Path| false,
+        },
+    )
+}
+
+/// [`resolve_report_and_place`] for a given account, so a test can be an
+/// account with an entry (and a directory of its own, or not) without a
+/// second account on the machine.
+fn resolve_report_and_place_as(
+    config_path: &std::path::Path,
+    get: impl Fn(&str) -> Option<String>,
+    reported: &std::sync::Once,
+    denied: impl Fn(&std::path::Path) -> bool,
+    account: &Account<'_, impl Fn(&std::path::Path) -> bool>,
+) -> innerwarden_graph::GraphPathResolution {
+    let mut resolved = raw_resolution_as(config_path, &get, account);
+    if resolved.source == innerwarden_graph::GraphPathSource::AccountEntry {
+        if let Some(dir) = resolved.path.as_deref().and_then(std::path::Path::parent) {
+            keep_own(dir);
+        }
+    }
     if let Some(problem) = resolved.config_problem.as_ref() {
         let message = problem.message.clone();
         reported.call_once(move || eprintln!("innerwarden: {message}"));
@@ -146,6 +260,84 @@ fn raw_resolution(
 ) -> innerwarden_graph::GraphPathResolution {
     innerwarden_graph::graph_path(get, || read_product_config_at(config_path))
 }
+
+/// [`raw_resolution`] for an account: its `[accounts."<name>"]` entry first,
+/// honoured only when the parent of the per-account folders is root's and
+/// nobody else may write it ([`trusted_records_root`]), and the directory it
+/// names is the account's own ([`Account::owns`]). One that is missing, a link, someone else's or
+/// writable by others is never written: the record is where it would be
+/// without the entry, and `account_problem` says why, for `status`.
+fn raw_resolution_as(
+    config_path: &std::path::Path,
+    get: impl Fn(&str) -> Option<String>,
+    account: &Account<'_, impl Fn(&std::path::Path) -> bool>,
+) -> innerwarden_graph::GraphPathResolution {
+    let resolved =
+        innerwarden_graph::graph_path_for_account_under(&get, account.name, account.root, || {
+            read_product_config_at(config_path)
+        });
+    if resolved.source != innerwarden_graph::GraphPathSource::AccountEntry {
+        return resolved;
+    }
+    let problem = if !trusted_records_root(account.root, account.root_owner) {
+        "account_records_root_not_root_owned"
+    } else if resolved
+        .path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .is_some_and(|dir| (account.owns)(dir))
+    {
+        return resolved;
+    } else {
+        "account_directory_not_its_own"
+    };
+    let mut without = raw_resolution(config_path, &get);
+    without.account_problem = Some(problem);
+    without
+}
+
+/// Whether the parent of the per-account folders can be trusted: a real
+/// directory (not a link), owned by `owner` (root outside tests), with no
+/// write bit for its group or for others. The paid installer makes it
+/// `root:root 0711`. Anything else, and the account's folder under it could
+/// be renamed or replaced by whoever may write it.
+#[cfg(unix)]
+fn trusted_records_root(root: &std::path::Path, owner: u32) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(root).is_ok_and(|metadata| {
+        metadata.is_dir() && metadata.uid() == owner && metadata.mode() & 0o022 == 0
+    })
+}
+
+#[cfg(not(unix))]
+fn trusted_records_root(_root: &std::path::Path, _owner: u32) -> bool {
+    false
+}
+
+/// Keep the records in this account's own directory as the paid product
+/// reads them: `0640`, never wider. A file created there later gets that
+/// from the directory (`file_update::new_file_ownership`, setgid and group
+/// readable); this narrows what an earlier run left wider, only for regular
+/// files this account owns, never through a link. Best-effort: the decision
+/// is already made.
+#[cfg(unix)]
+fn keep_own(dir: &std::path::Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    for name in ["graph.json", "guard-events.jsonl"] {
+        let path = dir.join(name);
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_file() && metadata.uid() == euid && metadata.mode() & 0o137 != 0 {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640));
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn keep_own(_dir: &std::path::Path) {}
 
 /// The shared record this account may not write, and the record in its own
 /// home it writes instead.
@@ -176,7 +368,11 @@ fn shared_record_denied_for(
     get: impl Fn(&str) -> Option<String>,
     denied: impl Fn(&std::path::Path) -> bool,
 ) -> Option<SharedRecordDenied> {
-    if resolved.source != innerwarden_graph::GraphPathSource::ProductConfigFile {
+    if !matches!(
+        resolved.source,
+        innerwarden_graph::GraphPathSource::ProductConfigFile
+            | innerwarden_graph::GraphPathSource::AccountEntry
+    ) {
         return None;
     }
     let shared = resolved.path.as_deref()?;
@@ -329,11 +525,94 @@ fn shared_record_refused(_record: &std::path::Path) -> bool {
 /// its decisions are being kept in its own home instead.
 pub(crate) fn shared_record_denied() -> Option<SharedRecordDenied> {
     let get = |key: &str| std::env::var(key).ok();
-    let resolved = raw_resolution(
+    let resolved = this_account_resolution(get);
+    shared_record_denied_for(&resolved, get, shared_record_refused)
+}
+
+/// The resolution for the account this process runs as, without the report
+/// or any change to a file: what `status` reads.
+fn this_account_resolution(
+    get: impl Fn(&str) -> Option<String>,
+) -> innerwarden_graph::GraphPathResolution {
+    let account = effective_account();
+    raw_resolution_as(
         std::path::Path::new(innerwarden_graph::GUARD_CONFIG_PATH),
         get,
-    );
-    shared_record_denied_for(&resolved, get, shared_record_refused)
+        &Account {
+            name: account.as_deref(),
+            root: std::path::Path::new(innerwarden_graph::AGENT_RECORDS_ROOT),
+            root_owner: 0,
+            owns: own_account_directory,
+        },
+    )
+}
+
+/// For `innerwarden status`: where this account's decisions are recorded,
+/// and whether InnerWarden Pro reads them there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecordPlace {
+    /// The folder the record is in.
+    pub dir: std::path::PathBuf,
+    /// The account name, when the product config has an entry for it.
+    pub account: Option<String>,
+    /// Set when this account has an entry that was not honoured.
+    pub account_problem: Option<&'static str>,
+    /// Whether the record is one the paid product reads: the shared record,
+    /// or this account's own directory under its entry.
+    pub pro_reads: bool,
+}
+
+/// [`RecordPlace`] for this process.
+pub(crate) fn record_place() -> Option<RecordPlace> {
+    let account = effective_account();
+    record_place_for(
+        std::path::Path::new(innerwarden_graph::GUARD_CONFIG_PATH),
+        |key| std::env::var(key).ok(),
+        &Account {
+            name: account.as_deref(),
+            root: std::path::Path::new(innerwarden_graph::AGENT_RECORDS_ROOT),
+            root_owner: 0,
+            owns: own_account_directory,
+        },
+        shared_record_refused,
+    )
+}
+
+/// [`record_place`] with every input supplied.
+fn record_place_for(
+    config_path: &std::path::Path,
+    get: impl Fn(&str) -> Option<String>,
+    account: &Account<'_, impl Fn(&std::path::Path) -> bool>,
+    denied: impl Fn(&std::path::Path) -> bool,
+) -> Option<RecordPlace> {
+    use innerwarden_graph::GraphPathSource;
+    let resolved = raw_resolution_as(config_path, &get, account);
+    let path = resolved.path.as_deref()?;
+    let read_by_pro = |resolved: &innerwarden_graph::GraphPathResolution| match resolved.source {
+        GraphPathSource::AccountEntry => true,
+        GraphPathSource::ProductConfigFile => resolved.path.as_deref().is_some_and(|p| !denied(p)),
+        _ => false,
+    };
+    // An override is read by the paid product only when it names the very
+    // file the product config gives this account.
+    let pro_reads = if resolved.source == GraphPathSource::EnvironmentOverride {
+        let without = raw_resolution_as(
+            config_path,
+            |key: &str| (key != "IW_GRAPH_FILE").then(|| get(key)).flatten(),
+            account,
+        );
+        without.path.as_deref() == Some(path) && read_by_pro(&without)
+    } else {
+        read_by_pro(&resolved)
+    };
+    let entry =
+        resolved.source == GraphPathSource::AccountEntry || resolved.account_problem.is_some();
+    Some(RecordPlace {
+        dir: path.parent().unwrap_or(path).to_path_buf(),
+        account: entry.then(|| account.name.map(str::to_string)).flatten(),
+        account_problem: resolved.account_problem,
+        pro_reads,
+    })
 }
 
 /// For `innerwarden status`, once the shared record takes this account
@@ -341,10 +620,7 @@ pub(crate) fn shared_record_denied() -> Option<SharedRecordDenied> {
 /// was refused. Said once: [`forget_kept_apart`] drops the note after.
 pub(crate) fn kept_apart_before() -> Option<std::path::PathBuf> {
     let get = |key: &str| std::env::var(key).ok();
-    let resolved = raw_resolution(
-        std::path::Path::new(innerwarden_graph::GUARD_CONFIG_PATH),
-        get,
-    );
+    let resolved = this_account_resolution(get);
     kept_apart_before_for(&resolved, get, shared_record_refused)
 }
 
@@ -354,7 +630,11 @@ fn kept_apart_before_for(
     get: impl Fn(&str) -> Option<String>,
     denied: impl Fn(&std::path::Path) -> bool,
 ) -> Option<std::path::PathBuf> {
-    if resolved.source != innerwarden_graph::GraphPathSource::ProductConfigFile {
+    if !matches!(
+        resolved.source,
+        innerwarden_graph::GraphPathSource::ProductConfigFile
+            | innerwarden_graph::GraphPathSource::AccountEntry
+    ) {
         return None;
     }
     if denied(resolved.path.as_deref()?) {
@@ -4165,5 +4445,458 @@ mod shared_record_denied_tests {
             shared_record_denied_for(&resolved, env(&host.home), |_| false),
             None
         );
+    }
+}
+
+/// An AI agent that runs as its own Linux account and has an
+/// `[accounts."<name>"]` entry in the product config. Every test is a fake
+/// account (`bot`) in a throwaway tree: a config file, a per-account root
+/// and a home, none of them the machine's.
+#[cfg(all(test, unix))]
+mod account_record_tests {
+    use super::*;
+    use innerwarden_graph::GraphPathSource;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    struct Host {
+        dir: tempfile::TempDir,
+    }
+
+    impl Host {
+        /// A config declaring a shared record and an entry for `bot` under
+        /// this host's root, a root, and an empty home.
+        fn new() -> Self {
+            let host = Self {
+                dir: tempfile::TempDir::new().unwrap(),
+            };
+            std::fs::create_dir_all(host.root()).unwrap();
+            // As the paid installer makes it: `0711`, nobody else writes.
+            std::fs::set_permissions(host.root(), std::fs::Permissions::from_mode(0o711)).unwrap();
+            std::fs::create_dir_all(host.shared()).unwrap();
+            std::fs::create_dir_all(host.home()).unwrap();
+            host.config_for("bot", &host.root());
+            host
+        }
+        fn root(&self) -> PathBuf {
+            self.dir.path().join("agents")
+        }
+        fn shared(&self) -> PathBuf {
+            self.dir.path().join("guard")
+        }
+        fn home(&self) -> PathBuf {
+            self.dir.path().join("home")
+        }
+        fn config(&self) -> PathBuf {
+            self.dir.path().join("guard.toml")
+        }
+        /// The entry as the paid installer writes it, for `name` under `root`.
+        fn config_for(&self, name: &str, root: &Path) {
+            let own = root.join(name);
+            let text = format!(
+                "graph_file = \"{}\"\nevents_file = \"{}\"\n\n[accounts.\"{name}\"]\n\
+                 graph_file = \"{}\"\nevents_file = \"{}\"\n",
+                self.shared().join("graph.json").display(),
+                self.shared().join("guard-events.jsonl").display(),
+                own.join("graph.json").display(),
+                own.join("guard-events.jsonl").display(),
+            );
+            std::fs::write(self.config(), text).unwrap();
+            std::fs::set_permissions(self.config(), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        /// `bot`'s directory as the paid installer makes it: `2750`.
+        fn own_dir(&self) -> PathBuf {
+            let own = self.root().join("bot");
+            std::fs::create_dir_all(&own).unwrap();
+            std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o2750)).unwrap();
+            own
+        }
+        fn get(&self) -> impl Fn(&str) -> Option<String> + '_ {
+            move |key| (key == "HOME").then(|| self.home().display().to_string())
+        }
+        fn resolve_as(
+            &self,
+            name: &str,
+            denied: impl Fn(&Path) -> bool,
+        ) -> innerwarden_graph::GraphPathResolution {
+            let root = self.root();
+            resolve_report_and_place_as(
+                &self.config(),
+                self.get(),
+                &std::sync::Once::new(),
+                denied,
+                &Account {
+                    name: Some(name),
+                    root: &root,
+                    root_owner: this_uid(),
+                    owns: own_account_directory,
+                },
+            )
+        }
+    }
+
+    /// The throwaway root stands in for root's own `/var/lib/innerwarden-agents`,
+    /// so in these tests its owner is this uid.
+    fn this_uid() -> u32 {
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        unsafe { libc::geteuid() }
+    }
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    /// The account with an entry records in its own directory, both files
+    /// `0640` in the directory's group, and nothing lands in its home or the
+    /// shared record. A record an earlier run left wider is narrowed.
+    ///
+    /// FAILS ON REVERT: drop the `AccountEntry` arm and `bot` writes the shared
+    /// record; drop `keep_own` and the `0666` record stays `0666`.
+    #[test]
+    fn an_agent_account_records_in_its_own_directory_0640() {
+        let host = Host::new();
+        let own = host.own_dir();
+        std::fs::write(own.join("graph.json"), b"").unwrap();
+        std::fs::set_permissions(
+            own.join("graph.json"),
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+
+        let resolved = host.resolve_as("bot", |_| false);
+        assert_eq!(resolved.source, GraphPathSource::AccountEntry);
+        assert_eq!(resolved.path, Some(own.join("graph.json")));
+        assert_eq!(resolved.account_problem, None);
+        assert_eq!(mode(&own.join("graph.json")), 0o640, "narrowed");
+
+        let path = resolved.path.unwrap();
+        record_at_with_options(
+            &path,
+            "s",
+            "rm -rf /",
+            &serde_json::json!({"recommendation": "deny"}),
+            DecisionMode::Enforce,
+            DecisionOutcome::Blocked,
+            None,
+            GRAPH_LOCK_TIMEOUT,
+            || {},
+        )
+        .expect("recorded");
+        append_guard_event_at(&own, &serde_json::json!({"kind": "guard.blocked"}));
+        assert_eq!(mode(&own.join("graph.json")), 0o640);
+        assert_eq!(mode(&own.join("guard-events.jsonl")), 0o640);
+        assert!(!host.home().join(".config").exists(), "nothing in the home");
+        assert!(!host.shared().join("graph.json").exists(), "nothing shared");
+    }
+
+    /// Every other account resolves exactly as before: the shared record, or
+    /// its own home when refused that (#283). No entry, no change.
+    ///
+    /// FAILS ON REVERT: match the entry by anything but the exact account name
+    /// and `maicon` lands in `bot`'s directory.
+    #[test]
+    fn an_account_without_an_entry_resolves_as_before() {
+        let host = Host::new();
+        host.own_dir();
+        let shared = host.resolve_as("maicon", |_| false);
+        assert_eq!(shared.source, GraphPathSource::ProductConfigFile);
+        assert_eq!(shared.path, Some(host.shared().join("graph.json")));
+        assert_eq!(shared.account_problem, None);
+
+        let apart = host.resolve_as("maicon", |_| true);
+        assert_eq!(apart.source, GraphPathSource::OperatorHome);
+        assert_eq!(
+            apart.path,
+            Some(host.home().join(".config/innerwarden/graph.json"))
+        );
+    }
+
+    /// A directory that is not the account's own is never written: missing, a
+    /// link (even to a folder the account owns), writable by others, or owned
+    /// by another uid. The record is where it would be without the entry, and
+    /// the reason is kept for `status`.
+    ///
+    /// FAILS ON REVERT: drop the `owns` check from [`raw_resolution_as`] and
+    /// each of these resolves into the folder the entry names.
+    #[test]
+    fn a_directory_that_is_not_its_own_is_never_written() {
+        // Missing.
+        let host = Host::new();
+        let missing = host.resolve_as("bot", |_| false);
+        assert_eq!(missing.source, GraphPathSource::ProductConfigFile);
+        assert_eq!(
+            missing.account_problem,
+            Some("account_directory_not_its_own")
+        );
+        assert!(!host.root().join("bot").exists(), "never created here");
+
+        // A link to a folder this account owns.
+        let host = Host::new();
+        let elsewhere = host.dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, host.root().join("bot")).unwrap();
+        let linked = host.resolve_as("bot", |_| false);
+        assert_eq!(linked.path, Some(host.shared().join("graph.json")));
+        assert_eq!(
+            linked.account_problem,
+            Some("account_directory_not_its_own")
+        );
+
+        // Writable by others.
+        let host = Host::new();
+        let own = host.own_dir();
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let open = host.resolve_as("bot", |_| false);
+        assert_eq!(open.account_problem, Some("account_directory_not_its_own"));
+
+        // Another uid's directory: `/usr`, root's, named by an entry for
+        // the account `usr` under the root `/`.
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            let host = Host::new();
+            host.config_for("usr", Path::new("/"));
+            let root = PathBuf::from("/");
+            let other = resolve_report_and_place_as(
+                &host.config(),
+                host.get(),
+                &std::sync::Once::new(),
+                |_: &Path| false,
+                &Account {
+                    name: Some("usr"),
+                    root: &root,
+                    root_owner: 0,
+                    owns: own_account_directory,
+                },
+            );
+            assert_eq!(other.source, GraphPathSource::ProductConfigFile);
+            assert_eq!(other.account_problem, Some("account_directory_not_its_own"));
+        }
+    }
+
+    /// `IW_GRAPH_FILE` cannot move the record of an account with an entry
+    /// out of its own folder; an account without one is redirected by it as
+    /// before (the tests and `contain` rely on that).
+    ///
+    /// FAILS ON REVERT: look at the override before the entry in
+    /// `graph_path_for_account_under` and `bot` records in `elsewhere`, a
+    /// file the paid product never reads.
+    #[test]
+    fn the_override_cannot_move_an_account_with_an_entry() {
+        let host = Host::new();
+        let own = host.own_dir();
+        let root = host.root();
+        let elsewhere = host.dir.path().join("elsewhere/graph.json");
+        let elsewhere_text = elsewhere.display().to_string();
+        let home = host.home().display().to_string();
+        let get = |key: &str| match key {
+            "IW_GRAPH_FILE" => Some(elsewhere_text.clone()),
+            "HOME" => Some(home.clone()),
+            _ => None,
+        };
+        let resolve = |name: &str| {
+            resolve_report_and_place_as(
+                &host.config(),
+                get,
+                &std::sync::Once::new(),
+                |_: &Path| false,
+                &Account {
+                    name: Some(name),
+                    root: &root,
+                    root_owner: this_uid(),
+                    owns: own_account_directory,
+                },
+            )
+        };
+        let bot = resolve("bot");
+        assert_eq!(bot.source, GraphPathSource::AccountEntry);
+        assert_eq!(bot.path, Some(own.join("graph.json")));
+
+        let maicon = resolve("maicon");
+        assert_eq!(maicon.source, GraphPathSource::EnvironmentOverride);
+        assert_eq!(maicon.path, Some(elsewhere.clone()));
+
+        // `bot`'s folder not its own: the entry is not used, so the override
+        // wins as it would without one.
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let open = resolve("bot");
+        assert_eq!(open.source, GraphPathSource::EnvironmentOverride);
+        assert_eq!(open.path, Some(elsewhere));
+    }
+
+    /// The parent of the per-account folders must be a real directory, root's,
+    /// that no group or other account may write: whoever may write it can
+    /// rename `bot`'s folder or plant a link in its place. Otherwise the entry
+    /// is not used, as if there were none, and the reason is kept for `status`.
+    ///
+    /// FAILS ON REVERT: drop [`trusted_records_root`] from
+    /// [`raw_resolution_as`] and each case below records in `bot`'s folder.
+    #[test]
+    fn a_parent_the_account_or_others_may_write_is_never_trusted() {
+        let resolve = |host: &Host, root: &Path, owner: u32| {
+            resolve_report_and_place_as(
+                &host.config(),
+                host.get(),
+                &std::sync::Once::new(),
+                |_: &Path| false,
+                &Account {
+                    name: Some("bot"),
+                    root,
+                    root_owner: owner,
+                    owns: own_account_directory,
+                },
+            )
+        };
+        let untrusted = |resolved: innerwarden_graph::GraphPathResolution, host: &Host, case| {
+            assert_eq!(
+                resolved.source,
+                GraphPathSource::ProductConfigFile,
+                "{case}"
+            );
+            assert_eq!(
+                resolved.path,
+                Some(host.shared().join("graph.json")),
+                "{case}"
+            );
+            assert_eq!(
+                resolved.account_problem,
+                Some("account_records_root_not_root_owned"),
+                "{case}"
+            );
+        };
+
+        // The control: the same tree, trusted, is used.
+        let host = Host::new();
+        host.own_dir();
+        let root = host.root();
+        assert_eq!(
+            resolve(&host, &root, this_uid()).source,
+            GraphPathSource::AccountEntry,
+            "precondition"
+        );
+
+        // Owned and writable by the account itself, not by root.
+        // SAFETY: geteuid takes no arguments and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            untrusted(resolve(&host, &root, 0), &host, "the account's own parent");
+        }
+
+        // Writable by its group, or by anyone.
+        for wide in [0o731, 0o713, 0o777] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(wide)).unwrap();
+            untrusted(
+                resolve(&host, &root, this_uid()),
+                &host,
+                "a parent others write",
+            );
+        }
+
+        // A link to a trusted directory, even one holding `bot`'s folder.
+        let host = Host::new();
+        host.own_dir();
+        let link = host.dir.path().join("agents-link");
+        std::os::unix::fs::symlink(host.root(), &link).unwrap();
+        host.config_for("bot", &link);
+        untrusted(
+            resolve(&host, &link, this_uid()),
+            &host,
+            "a parent that is a link",
+        );
+    }
+
+    /// The account is the effective uid's, from the account database. An
+    /// environment that names `bot` (the AI agent's, inherited by a hook)
+    /// picks nothing.
+    ///
+    /// FAILS ON REVERT: read the name from `USER` or `LOGNAME` in
+    /// [`resolve_and_report`] and `bot`'s entry is looked up: its directory
+    /// is missing on this machine, so the account problem is set.
+    #[test]
+    fn the_account_is_the_uid_s_never_the_environment_s() {
+        assert_ne!(effective_account().as_deref(), Some("bot"), "precondition");
+        let host = Host::new();
+        host.config_for("bot", Path::new(innerwarden_graph::AGENT_RECORDS_ROOT));
+        let home = host.home().display().to_string();
+        let resolved = resolve_and_report(
+            &host.config(),
+            |key| match key {
+                "USER" | "LOGNAME" | "SUDO_USER" => Some("bot".to_string()),
+                "HOME" => Some(home.clone()),
+                _ => None,
+            },
+            &std::sync::Once::new(),
+        );
+        assert_ne!(resolved.source, GraphPathSource::AccountEntry);
+        assert_eq!(resolved.account_problem, None);
+    }
+
+    /// What `status` is told: where, and whether the paid product reads it.
+    ///
+    /// FAILS ON REVERT: count an override as read by the paid product
+    /// whatever it names, and the last case says Pro reads a folder it never
+    /// opens.
+    #[test]
+    fn status_is_told_where_and_whether_the_pro_reads_it() {
+        let host = Host::new();
+        let own = host.own_dir();
+        let root = host.root();
+        let place = |get: &dyn Fn(&str) -> Option<String>, name: &str| {
+            record_place_for(
+                &host.config(),
+                get,
+                &Account {
+                    name: Some(name),
+                    root: &root,
+                    root_owner: this_uid(),
+                    owns: own_account_directory,
+                },
+                |_: &Path| false,
+            )
+            .unwrap()
+        };
+        let get = host.get();
+        let bot = place(&get, "bot");
+        assert_eq!(
+            bot,
+            RecordPlace {
+                dir: own.clone(),
+                account: Some("bot".into()),
+                account_problem: None,
+                pro_reads: true,
+            }
+        );
+        let maicon = place(&get, "maicon");
+        assert_eq!(maicon.dir, host.shared());
+        assert_eq!((maicon.account, maicon.pro_reads), (None, true));
+
+        // `bot` has an entry: an override elsewhere does not move it.
+        let other_get = |key: &str| (key == "IW_GRAPH_FILE").then(|| "/x/graph.json".to_string());
+        let pinned = place(&other_get, "bot");
+        assert_eq!((pinned.dir.clone(), pinned.pro_reads), (own.clone(), true));
+
+        // `maicon` has none: the override wins, read by Pro only when it names
+        // the shared record.
+        let same = host.shared().join("graph.json").display().to_string();
+        let same_get = |key: &str| (key == "IW_GRAPH_FILE").then(|| same.clone());
+        assert!(
+            place(&same_get, "maicon").pro_reads,
+            "the override names the shared record"
+        );
+        let moved = place(&other_get, "maicon");
+        assert_eq!(moved.dir, PathBuf::from("/x"));
+        assert!(!moved.pro_reads, "an override elsewhere");
+
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = place(&get, "bot");
+        assert_eq!(refused.account.as_deref(), Some("bot"));
+        assert_eq!(
+            refused.account_problem,
+            Some("account_directory_not_its_own")
+        );
+        assert_eq!(refused.dir, host.shared());
     }
 }

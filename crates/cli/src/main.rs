@@ -404,10 +404,17 @@ fn status_io_cmd_rest(
                 .unwrap_or(&denied.own)
                 .display()
                 .to_string(),
+            user_name: status::LinuxUserName(graph_io::effective_account().unwrap_or_default()),
         }),
         kept_apart_before: kept_apart_before
             .as_deref()
             .map(|dir| dir.display().to_string()),
+        record_place: graph_io::record_place().map(|place| status::RecordPlace {
+            dir: place.dir.display().to_string(),
+            account: place.account,
+            account_problem: place.account_problem,
+            pro_reads: place.pro_reads,
+        }),
     };
     print!("{}", status::render(&facts));
     // Said once: the note that made this line is dropped once it is printed.

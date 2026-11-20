@@ -496,6 +496,76 @@ pub struct Facts {
     /// account again: the folder in its home that still holds what it
     /// recorded while it was refused.
     pub kept_apart_before: Option<String>,
+    /// Where this account's decisions are recorded and whether InnerWarden
+    /// Pro reads them there. `None` when nothing names a record.
+    pub record_place: Option<RecordPlace>,
+}
+
+/// Where this account records, as `status` says it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordPlace {
+    /// The folder the record is in.
+    pub dir: String,
+    /// The account named by an `[accounts."<name>"]` entry for this account.
+    pub account: Option<String>,
+    /// Why this account's entry was not honoured, as a stable code.
+    pub account_problem: Option<&'static str>,
+    /// Whether InnerWarden Pro reads the record in `dir`.
+    pub pro_reads: bool,
+}
+
+/// The one line that says where decisions are recorded and whether
+/// InnerWarden Pro reads them there. An entry this account has and that
+/// could not be honoured is a fault with one fix, in the `try:` line.
+pub fn record_place_finding(place: &RecordPlace) -> Finding {
+    let account = place.account.as_deref().unwrap_or("this account");
+    if let Some(code) = place.account_problem {
+        let why = match code {
+            "account_entry_not_its_own_directory" => {
+                format!("it names a folder other than /var/lib/innerwarden-agents/{account}/")
+            }
+            "account_directory_not_its_own" => format!(
+                "/var/lib/innerwarden-agents/{account} is missing, is a link, or is not a \
+                 folder only {account} writes"
+            ),
+            "account_records_root_not_root_owned" => {
+                "/var/lib/innerwarden-agents is a link, is not root's, or may be written by \
+                 an account other than root"
+                    .to_string()
+            }
+            "config_accounts_not_a_table" => "its [accounts] section is not a table".to_string(),
+            other => format!("it could not be used ({other})"),
+        };
+        let where_to = if place.pro_reads {
+            format!("{} instead", place.dir)
+        } else {
+            format!("{} instead, which InnerWarden Pro does not read", place.dir)
+        };
+        return Finding::NotWorking {
+            what: format!(
+                "Record: /etc/innerwarden/guard.toml has an entry for {account}, but {why}, \
+                 so its decisions go to {where_to}."
+            ),
+            next: format!(
+                "sudo innerwarden-ctl agent-user add {account} (on the InnerWarden Pro \
+                 install), then run innerwarden status again"
+            ),
+        };
+    }
+    let given = place
+        .account
+        .as_deref()
+        .map(|name| format!(", the folder /etc/innerwarden/guard.toml gives this account ({name})"))
+        .unwrap_or_default();
+    let read = if place.pro_reads {
+        "InnerWarden Pro reads them there"
+    } else {
+        "InnerWarden Pro does not read them there"
+    };
+    Finding::Working(format!(
+        "Decisions are recorded in {}{given}; {read}.",
+        place.dir
+    ))
 }
 
 /// The shared record directory this account may not write, and the folder
@@ -504,7 +574,15 @@ pub struct Facts {
 pub struct RecordKeptApart {
     pub shared_dir: String,
     pub own_dir: String,
+    /// This account's Linux user name, from the user database by uid, for
+    /// the command the person runs. Empty when it could not be read.
+    pub user_name: LinuxUserName,
 }
+
+/// A Linux user name, as `id -un` prints it: a public identifier the person
+/// types into a command, never a credential.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinuxUserName(pub String);
 
 /// The one line that says a record was kept apart. Every screened call is
 /// still judged and recorded; the hook says nothing about this on each call,
@@ -513,8 +591,16 @@ pub struct RecordKeptApart {
 /// It is an integrity failure, not a placement detail: every call is still
 /// screened, but the record of it sits in a file this account, and so the
 /// agent running as it, can edit or delete, and InnerWarden Pro does not
-/// read. The fix is one command, and it is the `try:` line.
+/// read. The fix is one command, and it is the `try:` line: a folder of the
+/// account's own that InnerWarden Pro makes and reads, never the
+/// `innerwarden` group, which reads every member's decisions and
+/// InnerWarden's own state.
 pub fn record_kept_apart_finding(apart: &RecordKeptApart) -> Finding {
+    let user = if apart.user_name.0.is_empty() {
+        "\"$(id -un)\"".to_string()
+    } else {
+        apart.user_name.0.clone()
+    };
     Finding::NotWorking {
         what: format!(
             "Record integrity: this account may not write the shared record in {}, \
@@ -525,9 +611,10 @@ pub fn record_kept_apart_finding(apart: &RecordKeptApart) -> Finding {
             apart.shared_dir, apart.own_dir
         ),
         next: format!(
-            "sudo usermod -aG innerwarden \"$USER\" (the group that owns {} on a \
-             Pro install), then start the agent again from a new login",
-            apart.shared_dir
+            "sudo innerwarden-ctl agent-user add {user} (on the InnerWarden Pro \
+             install: a folder of its own for this account that Pro reads; never add \
+             an AI agent's account to the innerwarden group), then run innerwarden \
+             status again"
         ),
     }
 }
@@ -682,6 +769,12 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     }
     if let Some(own_dir) = facts.kept_apart_before.as_deref() {
         out.push(kept_apart_before_finding(own_dir));
+    }
+    // Where the count below is read from, unless the line above already said.
+    if facts.record_kept_apart.is_none() {
+        if let Some(place) = facts.record_place.as_ref() {
+            out.push(record_place_finding(place));
+        }
     }
     // A demo call is named apart, never counted: it went through the hook,
     // but the agent did not send it.
@@ -1243,6 +1336,7 @@ mod tests {
             dashboard_reachable: Some(true),
             record_kept_apart: None,
             kept_apart_before: None,
+            record_place: None,
         }
     }
 
@@ -1261,6 +1355,7 @@ mod tests {
         facts.record_kept_apart = Some(RecordKeptApart {
             shared_dir: "/var/lib/innerwarden/guard".into(),
             own_dir: "/home/agent/.config/innerwarden".into(),
+            user_name: LinuxUserName("agent".into()),
         });
         let findings = assess(&facts);
         let apart: Vec<usize> = findings
@@ -1280,26 +1375,35 @@ mod tests {
                 assert!(what.contains("/var/lib/innerwarden/guard"), "{what}");
                 assert!(what.contains("/home/agent/.config/innerwarden"), "{what}");
                 assert!(what.contains("does not see them"), "{what}");
-                assert!(next.contains("usermod -aG innerwarden"), "{next}");
+                assert!(
+                    next.contains("innerwarden-ctl agent-user add agent"),
+                    "{next}"
+                );
+                assert!(!next.contains("usermod"), "never the group: {next}");
             }
             other => panic!("the Pro side missing these is a fault to fix: {other:?}"),
         }
     }
 
-    /// The line is an integrity failure, and the group step leads the fix.
+    /// The line is an integrity failure, and the command that gives the
+    /// account a folder of its own leads the fix. It never says to join the
+    /// `innerwarden` group, which reads every member's decisions.
     ///
     /// FAILS ON REVERT: the line said only that decisions were "kept" in the
-    /// home, with the command after a description of the group.
+    /// home, with the command after a description of the group; then it led
+    /// with `usermod -aG innerwarden`.
     #[test]
-    fn a_record_kept_apart_is_an_integrity_failure_with_the_group_step_first() {
+    fn a_record_kept_apart_is_an_integrity_failure_with_the_own_folder_step_first() {
         let finding = record_kept_apart_finding(&RecordKeptApart {
             shared_dir: "/var/lib/innerwarden/guard".into(),
             own_dir: "/home/agent/.config/innerwarden".into(),
+            user_name: LinuxUserName("agent".into()),
         });
         let mut facts = healthy();
         facts.record_kept_apart = Some(RecordKeptApart {
             shared_dir: "/var/lib/innerwarden/guard".into(),
             own_dir: "/home/agent/.config/innerwarden".into(),
+            user_name: LinuxUserName("agent".into()),
         });
         assert_eq!(
             headline(&assess(&facts)),
@@ -1310,12 +1414,96 @@ mod tests {
                 assert!(what.starts_with("Record integrity:"), "{what}");
                 assert!(what.contains("edited or deleted"), "{what}");
                 assert!(
-                    next.starts_with("sudo usermod -aG innerwarden"),
-                    "the command first: {next}"
+                    next.starts_with("sudo innerwarden-ctl agent-user add agent"),
+                    "the command comes first"
+                );
+                assert!(!next.contains("usermod"), "never the group");
+            }
+            _ => panic!("not a NotWorking finding"),
+        }
+    }
+
+    /// `status` says where decisions are recorded and whether InnerWarden Pro
+    /// reads them, before the count; an entry this account has and that was
+    /// not honoured is a fault with the Pro command that makes the folder.
+    ///
+    /// FAILS ON REVERT: drop the finding from `assess` and nothing says where
+    /// an agent account's decisions go or that the paid product misses them.
+    #[test]
+    fn status_says_where_decisions_go_and_whether_the_pro_reads_them() {
+        let mut facts = healthy();
+        facts.record_place = Some(RecordPlace {
+            dir: "/var/lib/innerwarden-agents/bot".into(),
+            account: Some("bot".into()),
+            account_problem: None,
+            pro_reads: true,
+        });
+        let findings = assess(&facts);
+        let at = findings
+            .iter()
+            .position(|f| f.to_string().contains("Decisions are recorded in"))
+            .expect("said");
+        let line = findings[at].to_string();
+        assert!(line.contains("/var/lib/innerwarden-agents/bot"), "{line}");
+        assert!(line.contains("(bot)"), "{line}");
+        assert!(line.contains("InnerWarden Pro reads them there"), "{line}");
+        let count = findings
+            .iter()
+            .position(|f| f.to_string().contains("screening decision(s) recorded"))
+            .expect("the count is still there");
+        assert!(at < count, "{findings:?}");
+
+        facts.record_place = Some(RecordPlace {
+            dir: "/home/op/.config/innerwarden".into(),
+            account: None,
+            account_problem: None,
+            pro_reads: false,
+        });
+        assert!(assess(&facts).iter().any(|f| f
+            .to_string()
+            .contains("InnerWarden Pro does not read them there")));
+
+        facts.record_place = Some(RecordPlace {
+            dir: "/var/lib/innerwarden/guard".into(),
+            account: Some("bot".into()),
+            account_problem: Some("account_directory_not_its_own"),
+            pro_reads: false,
+        });
+        match assess(&facts)
+            .into_iter()
+            .find(|f| f.to_string().contains("has an entry for bot"))
+            .expect("said")
+        {
+            Finding::NotWorking { what, next } => {
+                assert!(
+                    what.contains("/var/lib/innerwarden-agents/bot is missing"),
+                    "{what}"
+                );
+                assert!(what.contains("does not read"), "{what}");
+                assert!(
+                    next.starts_with("sudo innerwarden-ctl agent-user add bot"),
+                    "{next}"
                 );
             }
             other => panic!("{other:?}"),
         }
+
+        // The parent of the per-account folders not trusted: said why.
+        facts.record_place = Some(RecordPlace {
+            dir: "/var/lib/innerwarden/guard".into(),
+            account: Some("bot".into()),
+            account_problem: Some("account_records_root_not_root_owned"),
+            pro_reads: true,
+        });
+        let line = assess(&facts)
+            .into_iter()
+            .find(|f| f.to_string().contains("has an entry for bot"))
+            .expect("said")
+            .to_string();
+        assert!(
+            line.contains("/var/lib/innerwarden-agents is a link, is not root's"),
+            "{line}"
+        );
     }
 
     /// Once the shared record takes the account again, `status` says once
@@ -1556,6 +1744,7 @@ mod tests {
             dashboard_reachable: None,
             record_kept_apart: None,
             kept_apart_before: None,
+            record_place: None,
         };
         for finding in assess(&facts) {
             assert!(

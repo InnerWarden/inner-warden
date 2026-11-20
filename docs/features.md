@@ -86,18 +86,23 @@ see those refusals, and the account, so the agent running as it, can edit or
 delete them. The same happens when the shared directory is writable but the
 graph or `guard-events.jsonl` in it is a file the account may not open.
 `innerwarden status`, run as that account, says so in one line; the hook
-says nothing about it on each call. To let Pro see them, add the agent's
-account to the group, then start the agent again from a new login so the
-group applies:
+says nothing about it on each call. Do not add the agent's account to the
+`innerwarden` group: that group reads every member's decisions and
+InnerWarden's own state. Give the account a folder of its own instead, on
+the InnerWarden Pro install:
 
-    sudo usermod -aG innerwarden <agent-account>
+    sudo innerwarden-ctl agent-user add <agent-account>
 
-The first `innerwarden status` after that says once that the decisions of
-the meantime are still in the home, and how to read them.
-
-The account can then write the shared record, the same as the operator, and
-so it can also change what others recorded there. A folder of its own that
-only that account writes would avoid that, but Pro does not read one today.
+That makes `/var/lib/innerwarden-agents/<agent-account>/`
+(`<agent-account>:innerwarden 2750`, which only that account writes and Pro
+reads) and adds an `[accounts."<agent-account>"]` entry to
+`/etc/innerwarden/guard.toml`. The CLI, run as that account, then records
+there, `0640`, and `IW_GRAPH_FILE` cannot move that record elsewhere.
+The account is read from its uid, never from the environment.
+`innerwarden status` says where decisions are recorded and whether Pro
+reads them there. The first `innerwarden status` after the change says once
+that the decisions of the meantime are still in the home, and how to read
+them.
 
 ## The guard and its own switches
 
