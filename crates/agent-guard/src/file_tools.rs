@@ -315,6 +315,27 @@ const FOLDER_KEYS: &[&str] = &["path", "dir_path"];
 /// (Claude Code's `Grep` `glob`, Gemini CLI's `grep_search` `include`).
 const GLOB_KEYS: [&str; 2] = ["glob", "include"];
 
+/// The keys of a search call that print more than the matching line: lines
+/// of context around it (Claude Code's `Grep` `-A`, `-B`, `-C`, `context`),
+/// or a match that runs across lines (`multiline`).
+const WIDENING_KEYS: &[&str] = &["-A", "-B", "-C", "context", "multiline"];
+
+/// Whether a search call prints more than the matching lines
+/// ([`WIDENING_KEYS`]): any of those keys set to anything but zero,
+/// `false`, `null` or an empty or `"0"` string. A value of another shape
+/// counts as set.
+fn widens_the_match(input: Option<&Value>) -> bool {
+    let Some(input) = input else {
+        return false;
+    };
+    WIDENING_KEYS.iter().any(|key| match input.get(*key) {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+        Some(Value::Number(n)) => n.as_f64() != Some(0.0),
+        Some(Value::String(s)) => !matches!(s.trim(), "" | "0"),
+        Some(_) => true,
+    })
+}
+
 /// The pattern of a search of the whole home that looks for a narrow text
 /// ([`crate::threats::pattern_is_narrow`]), with no glob that aims at
 /// secrets ([`crate::threats::glob_aims_at_secrets`]): said in the line, so
@@ -329,12 +350,22 @@ const GLOB_KEYS: [&str; 2] = ["glob", "include"];
 /// Only the home itself, as written (`~`, `$HOME`, its path): a search of a
 /// folder the home is in (`/`, `/home`) keeps the empty pattern. The
 /// search pattern of a tool is a regular expression, never a fixed string.
+///
+/// Only a search that prints the matching lines alone: one with lines of
+/// context (`-A`, `-B`, `-C`, `context`) or across lines (`multiline`)
+/// keeps the empty pattern. `Grep {pattern: "b3BlbnNzaC1rZXk", -A: 40}`
+/// prints a private key whole from the lines after its first, which
+/// `grep -r <text> ~` never does ([`widens_the_match`]).
 fn narrow_search_of_the_home<'a>(
     pattern: Option<&'a str>,
     globs: &[Option<&str>],
+    widened: bool,
     folder: &str,
     context: &WriteContext<'_>,
 ) -> Option<&'a str> {
+    if widened {
+        return None;
+    }
     let pattern = pattern.filter(|pattern| crate::threats::pattern_is_narrow(pattern, false))?;
     if globs
         .iter()
@@ -524,6 +555,7 @@ pub fn file_read_call_in(payload: &Value, context: &WriteContext<'_>) -> FileRea
                     narrow_search_of_the_home(
                         text("pattern"),
                         &GLOB_KEYS.map(text),
+                        widens_the_match(input),
                         folder(),
                         context,
                     )
@@ -1468,10 +1500,28 @@ mod tests {
     /// files where secrets are kept, and one of a folder the home is in keep
     /// the empty pattern, the read of the whole home.
     ///
-    /// FAILS ON REVERT of `narrow_search_of_the_home` in the search arm:
-    /// the first lines hold `''`.
+    /// FAILS ON REVERT of `narrow_search_of_the_home` in the search arm
+    /// (the first lines hold `''`), or of `widens_the_match` in it (the
+    /// searches with lines of context or across lines keep their text), or
+    /// of the `\b` and the base64 markers in `names_credential_marker`
+    /// (`BEGIN` and `b3BlbnNzaC1rZXk` keep their text).
     #[test]
     fn a_narrow_search_of_the_home_keeps_its_text() {
+        // A key marker is never a narrow text, a base64 key body included.
+        for marker in [
+            "BEGIN",
+            "begin",
+            "pass",
+            "b3BlbnNzaC1rZXk",
+            "AAAAC3NzaC1lZDI1NTE5",
+            "MIIEvQIBADAN",
+        ] {
+            assert!(
+                !crate::threats::pattern_is_narrow(marker, false),
+                "{marker}"
+            );
+        }
+        assert!(crate::threats::pattern_is_narrow("TODO", false));
         let home = Path::new("/home/dev");
         let project = home.join("proj");
         let ctx = context(home, &project);
@@ -1544,6 +1594,51 @@ mod tests {
             ),
             (
                 json!({"pattern": "TODO", "path": "/home/dev", "include": "*.env"}),
+                "grep -r '' /home/dev",
+            ),
+            // Lines of context or a match across lines: the whole home, the
+            // text searched for whatever it is.
+            (
+                json!({"pattern": "BEGIN", "path": "~", "-A": 40}),
+                "grep -r '' ~",
+            ),
+            (
+                json!({"pattern": "PRIVATE KEY", "path": "~", "-C": 20}),
+                "grep -r -e private_key ~",
+            ),
+            (
+                json!({"pattern": "b3BlbnNzaC1rZXk", "path": "/home/dev", "-A": 40}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "-B": 1}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "context": 3}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "-A": "5"}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "multiline": true}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "b3BlbnNzaC1rZXk", "path": "/home/dev", "multiline": true}),
+                "grep -r '' /home/dev",
+            ),
+            // Zero lines of context, or none across lines, widen nothing.
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "-A": 0, "multiline": false, "output_mode": "content"}),
+                "grep -r -e 'TODO' /home/dev",
+            ),
+            // A key marker with no context: the whole home too.
+            (json!({"pattern": "BEGIN", "path": "~"}), "grep -r '' ~"),
+            (
+                json!({"pattern": "b3BlbnNzaC1rZXk", "path": "/home/dev"}),
                 "grep -r '' /home/dev",
             ),
             // Not the home itself: as before.

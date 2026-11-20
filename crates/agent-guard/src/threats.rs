@@ -16309,13 +16309,18 @@ pub fn glob_aims_at_secrets(glob: &str) -> bool {
 /// character that is not a letter or digit. A recursive search of a home or
 /// a wide root for one of these is a hunt for keys, never a narrow text: it
 /// keeps the hard refusal (`grep -r AKIA ~` is `deny`, as before
-/// `searches_home_for_narrow_text`).
+/// `searches_home_for_narrow_text`). The base64 a key's body starts with
+/// is one too (`b3BlbnNzaC1rZXk`, `openssh-key`; `AAAAB3NzaC1`,
+/// `AAAAC3NzaC1`; `MII` and a letter, a DER key): a search for it prints a
+/// line of the key. The word boundaries are the regex's `\b`: until
+/// 2026-11-20 two of them were backspace characters in the source, and
+/// `BEGIN` and `pass` alone were taken for narrow text.
 fn names_credential_marker(pattern: &str) -> bool {
     static MARKER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     MARKER
         .get_or_init(|| {
             regex::Regex::new(
-                r"(?i)(^|[^a-z0-9])(akia|asia|aroa|aida|gh[pousr]_|github_pat_|glpat-|sk-|sk_(live|test)_|rk_live_|xox[abposr]-|aiza|ya29.|npm_[a-z0-9]|pypi-|hf_[a-z0-9]|-{3,}|begin|private|ssh-(rsa|ed25519|dss)|ecdsa-sha2|bearer|auth|cred|passw|pwd|pass|key|jwt|eyj)",
+                r"(?i)(^|[^a-z0-9])(akia|asia|aroa|aida|gh[pousr]_|github_pat_|glpat-|sk-|sk_(live|test)_|rk_live_|xox[abposr]-|aiza|ya29.|npm_[a-z0-9]|pypi-|hf_[a-z0-9]|-{3,}|begin\b|private|ssh-(rsa|ed25519|dss)|ecdsa-sha2|bearer|auth|cred|passw|pwd|pass\b|key|jwt|eyj|b3blbnnzac1rzxk|aaaa[bc]3nzac1|mii[a-z][a-z0-9+/])",
             )
             .expect("static credential marker regex")
         })

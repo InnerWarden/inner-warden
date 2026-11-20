@@ -528,6 +528,8 @@ fn a_search_is_judged_as_its_shell_twin() {
 ///
 /// FAILS ON REVERT of `narrow_search_of_the_home` in the search arm of
 /// `file_read_call_in`: the narrow searches are denied in an enforcing hook.
+/// FAILS ON REVERT of `widens_the_match` in it: a search with lines of
+/// context for a text in the body of a key (`b3BlbnNzaC1rZXk`) is let run.
 #[test]
 fn a_grep_of_the_home_is_refused_only_when_it_aims_at_a_secret() {
     let host = Host::new();
@@ -558,6 +560,25 @@ fn a_grep_of_the_home_is_refused_only_when_it_aims_at_a_secret() {
         grep(serde_json::json!({ "pattern": "TODO", "path": home, "glob": "**/.ssh/*" })),
         grep(serde_json::json!({ "pattern": "TODO", "path": home, "glob": ".aws/**" })),
         grep(serde_json::json!({ "pattern": "TODO", "path": home, "glob": "*.pem" })),
+        // Lines of context or a match across lines print the key whole.
+        grep(serde_json::json!({ "pattern": "BEGIN", "path": "~", "-A": 40 })),
+        grep(serde_json::json!({ "pattern": "PRIVATE KEY", "path": home, "-C": 20 })),
+        grep(serde_json::json!({ "pattern": "b3BlbnNzaC1rZXk", "path": home, "-A": 40 })),
+        grep(serde_json::json!({ "pattern": "b3BlbnNzaC1rZXk", "path": home, "multiline": true })),
+        grep(
+            serde_json::json!({ "pattern": "TODO", "path": home, "context": 3, "output_mode": "content" }),
+        ),
+        // A key marker, with no context: the shell twin is refused too.
+        grep(serde_json::json!({ "pattern": "BEGIN", "path": "~" })),
+        grep(serde_json::json!({ "pattern": "b3BlbnNzaC1rZXk", "path": home })),
+        host.call(
+            "Bash",
+            serde_json::json!({ "command": "grep -r -e BEGIN ~" }),
+        ),
+        host.call(
+            "Bash",
+            serde_json::json!({ "command": format!("grep -r b3BlbnNzaC1rZXk {home}") }),
+        ),
         host.call(
             "Bash",
             serde_json::json!({ "command": format!("grep -r AKIA {home}") }),
