@@ -7,6 +7,10 @@
 //! hook that screens it, add an allow rule to the guard's own configuration,
 //! or plant a line in a shell startup file, and nothing said so.
 //!
+//! The same holds for the other agents whose hook runs before their own
+//! tools: Gemini CLI writes through `write_file` and `replace`, and Codex CLI
+//! through `apply_patch`, whose one argument is a patch that names its files.
+//!
 //! What is judged is WHERE a call writes, never what it writes, and only
 //! against a short list of privileged places:
 //!
@@ -51,21 +55,58 @@ pub const FILE_TOOLS: &[&str] = &["Write", "Edit", "MultiEdit", "NotebookEdit"];
 /// `|` list, which every Claude Code version reads as that exact set.
 pub const FILE_TOOLS_MATCHER: &str = "Write|Edit|MultiEdit|NotebookEdit";
 
+/// Gemini CLI's tools that change a file, by name. Both name their target in
+/// `file_path`. Kept apart from [`FILE_TOOLS`], which is also the matcher
+/// Claude Code is given: Gemini's hook is written with no matcher at all.
+pub const GEMINI_FILE_TOOLS: &[&str] = &["write_file", "replace"];
+
+/// Codex CLI's tool that changes files. It names no path field: its one
+/// argument is the text of a patch, and the files are named inside it.
+pub const PATCH_TOOL: &str = "apply_patch";
+
+/// Hermes Agent's tool that changes files in place (v0.23.1,
+/// `tools/file_tools.py`): in `replace` mode (its default) it names its file
+/// in `path`; in `patch` mode it carries a V4A patch in `patch`, and the
+/// files are named inside it. Both are read, whatever the mode says.
+/// Hermes's `write_file` names its file in `path`, which [`PATH_KEYS`] reads.
+pub const HERMES_PATCH_TOOL: &str = "patch";
+
 /// Where a file tool names its target: `file_path` for `Write`, `Edit` and
 /// `MultiEdit`, `notebook_path` for `NotebookEdit`. `path` is read too, so a
 /// renamed field is still judged rather than skipped.
 const PATH_KEYS: &[&str] = &["file_path", "notebook_path", "path"];
 
+/// Where [`PATCH_TOOL`] carries the patch text: `command` in Codex CLI. The
+/// other two are read too, so a renamed field is still judged.
+const PATCH_TEXT_KEYS: &[&str] = &["command", "input", "patch"];
+
+/// The lines of a patch that name a file it changes.
+const PATCH_PATH_MARKERS: &[&str] = &[
+    "*** Add File:",
+    "*** Update File:",
+    "*** Delete File:",
+    "*** Move to:",
+];
+
 /// How many links are followed before a path is judged as it stands.
 const MAX_LINK_STEPS: u8 = 40;
 
-/// Longest path judged. A longer one is not a path any system opens.
+/// Longest path judged. A longer one is not read, and is not passed either:
+/// [`privileged_file_write`] answers [`PATH_TOO_LONG`] for it.
 const MAX_PATH_BYTES: usize = 4096;
+
+/// What [`privileged_file_write`] says of a path over the cap. Such a path
+/// is not known to be privileged: it was not read, and `./` repeated in it
+/// can put any file past the cap. The hook treats the call as one it could
+/// not read.
+pub const PATH_TOO_LONG: &str = "a path too long to be read";
 
 /// One tool call, read for what it writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileToolCall {
-    /// Not one of [`FILE_TOOLS`]: none of this module's business.
+    /// Not a tool that changes a file ([`FILE_TOOLS`], [`GEMINI_FILE_TOOLS`],
+    /// [`PATCH_TOOL`] or [`HERMES_PATCH_TOOL`]): none of this module's
+    /// business.
     NotAFileTool,
     /// A file tool, and every path it names.
     Writes { tool: String, paths: Vec<String> },
@@ -81,10 +122,16 @@ pub fn file_tool_call(payload: &Value) -> FileToolCall {
         .or_else(|| payload.get("tool"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if !FILE_TOOLS.contains(&tool) {
+    let input = payload.get("tool_input");
+    if tool == PATCH_TOOL {
+        return patch_call(input);
+    }
+    if tool == HERMES_PATCH_TOOL {
+        return hermes_patch_call(input);
+    }
+    if !FILE_TOOLS.contains(&tool) && !GEMINI_FILE_TOOLS.contains(&tool) {
         return FileToolCall::NotAFileTool;
     }
-    let input = payload.get("tool_input");
     let paths: Vec<String> = PATH_KEYS
         .iter()
         .filter_map(|key| input.and_then(|input| input.get(*key)))
@@ -99,6 +146,141 @@ pub fn file_tool_call(payload: &Value) -> FileToolCall {
         tool: tool.to_string(),
         paths,
     }
+}
+
+/// A [`PATCH_TOOL`] call, read for every file its patch names. The patch is
+/// never handed on as a shell line: it is text for the patch tool, and what
+/// matters about it is where it writes.
+///
+/// A patch that names no file, or names one with nothing after the marker,
+/// could not be read: the tool would still change something, so the call is
+/// unreadable and not empty.
+fn patch_call(input: Option<&Value>) -> FileToolCall {
+    let Some(patch) = patch_text(input) else {
+        return FileToolCall::Unreadable("a patch tool call with no patch text");
+    };
+    let Some(paths) = patch_paths(&patch) else {
+        return FileToolCall::Unreadable("a patch that names a file with no path");
+    };
+    if paths.is_empty() {
+        return FileToolCall::Unreadable("a patch that names no file");
+    }
+    FileToolCall::Writes {
+        tool: PATCH_TOOL.to_string(),
+        paths,
+    }
+}
+
+/// A [`HERMES_PATCH_TOOL`] call, read for the file it names in `path` and
+/// every file its V4A patch names ([`hermes_patch_paths`]).
+fn hermes_patch_call(input: Option<&Value>) -> FileToolCall {
+    let mut paths: Vec<String> = Vec::new();
+    if let Some(path) = input
+        .and_then(|input| input.get("path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+    {
+        paths.push(path.to_string());
+    }
+    if let Some(patch) = input
+        .and_then(|input| input.get("patch"))
+        .and_then(Value::as_str)
+    {
+        let Some(named) = hermes_patch_paths(patch) else {
+            return FileToolCall::Unreadable("a patch that names a file with no path");
+        };
+        for path in named {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    if paths.is_empty() {
+        return FileToolCall::Unreadable("a patch tool call with no file path");
+    }
+    FileToolCall::Writes {
+        tool: HERMES_PATCH_TOOL.to_string(),
+        paths,
+    }
+}
+
+/// Every file a V4A patch names as Hermes Agent reads one
+/// (`tools/patch_parser.py`, v0.23.1): `*** Update File:`, `*** Add File:`,
+/// `*** Delete File:`, and `*** Move File: a -> b`, both ends of a move, with
+/// any run of blanks between the words and none needed after `***`. A line
+/// is read with the blanks around it removed and outside the `Begin`/`End`
+/// markers too: one path too many is the safe side. `None` when a marker
+/// names nothing.
+pub(crate) fn hermes_patch_paths(patch: &str) -> Option<Vec<String>> {
+    static MARKERS: std::sync::OnceLock<(regex::Regex, regex::Regex)> = std::sync::OnceLock::new();
+    let (moved, named) = MARKERS.get_or_init(|| {
+        (
+            regex::Regex::new(r"^\*\*\*\s*Move\s+File:\s*(.*?)\s*->\s*(.*)$").expect("move marker"),
+            regex::Regex::new(r"^\*\*\*\s*(?:Update|Add|Delete|Move)\s+File:(.*)$")
+                .expect("file marker"),
+        )
+    });
+    let mut paths: Vec<String> = Vec::new();
+    for line in patch.split('\n') {
+        let line = line.trim();
+        let found: Vec<&str> = if let Some(caps) = moved.captures(line) {
+            vec![caps.get(1)?.as_str(), caps.get(2)?.as_str()]
+        } else if let Some(caps) = named.captures(line) {
+            vec![caps.get(1)?.as_str()]
+        } else {
+            continue;
+        };
+        for path in found {
+            let path = path.trim();
+            if path.is_empty() {
+                return None;
+            }
+            if !paths.iter().any(|seen| seen == path) {
+                paths.push(path.to_string());
+            }
+        }
+    }
+    Some(paths)
+}
+
+/// The patch text of a [`PATCH_TOOL`] call: one of [`PATCH_TEXT_KEYS`], or
+/// the whole input when the tool was handed bare text.
+fn patch_text(input: Option<&Value>) -> Option<String> {
+    let input = input?;
+    let text = match input.as_str() {
+        Some(text) => text,
+        None => PATCH_TEXT_KEYS
+            .iter()
+            .find_map(|key| input.get(*key).and_then(Value::as_str))?,
+    };
+    (!text.trim().is_empty()).then(|| text.to_string())
+}
+
+/// Every file a patch names, in the order named, each once. `None` when a
+/// marker line names nothing.
+///
+/// A line is read with the blanks around it removed, as the patch tool reads
+/// its markers. That also reads a marker quoted inside the body of a patch
+/// as a file: judging one path too many is the safe side.
+pub(crate) fn patch_paths(patch: &str) -> Option<Vec<String>> {
+    let mut paths: Vec<String> = Vec::new();
+    for line in patch.lines() {
+        let line = line.trim();
+        let named = PATCH_PATH_MARKERS
+            .iter()
+            .find_map(|marker| line.strip_prefix(marker));
+        let Some(path) = named else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            return None;
+        }
+        if !paths.iter().any(|seen| seen == path) {
+            paths.push(path.to_string());
+        }
+    }
+    Some(paths)
 }
 
 /// Claude Code's tools that read a file or search files, by name. They
@@ -539,6 +721,15 @@ const HOME_PLACES: &[HomeGroup] = &[
         ],
         trees: &[".config/fish"],
     },
+    // Codex CLI reads its hooks from this file. [`crate::threats`] holds it by
+    // name wherever it is, beside Codex's `config.toml`, and that list is
+    // asked first. This row holds it under the home, in the same words, for
+    // a path that list does not judge (a Windows one).
+    HomeGroup {
+        what: AGENT_HOOK_SETTINGS,
+        files: &[".codex/hooks.json"],
+        trees: &[],
+    },
     HomeGroup {
         what: "the services, jobs and login items your account starts on its own",
         files: &[],
@@ -580,12 +771,21 @@ const HOME_PLACES: &[HomeGroup] = &[
 
 const GUARD_PROGRAM: &str = "the guard's own program";
 
+/// What an agent's hook file is, in the words [`crate::threats`] uses for the
+/// agent settings it holds by name (a test keeps the two the same).
+const AGENT_HOOK_SETTINGS: &str =
+    "the guard's own configuration, or the agent settings that load it";
+
 /// What the file at `path` is, when a file tool may not change it: the
-/// group's words, to show the person. `None` for every other file.
+/// group's words, to show the person. `None` for every other file, and
+/// [`PATH_TOO_LONG`] for a path over the cap, which is not read.
 pub fn privileged_file_write(path: &str, context: &WriteContext<'_>) -> Option<&'static str> {
     let trimmed = path.trim();
-    if trimmed.is_empty() || trimmed.len() > MAX_PATH_BYTES {
+    if trimmed.is_empty() {
         return None;
+    }
+    if trimmed.len() > MAX_PATH_BYTES {
+        return Some(PATH_TOO_LONG);
     }
     // With `HOME` unset the account's home still exists; the list in it is
     // judged against the home the account database names.
@@ -620,10 +820,12 @@ pub fn privileged_file_write(path: &str, context: &WriteContext<'_>) -> Option<&
     same_as_a_privileged_file(real.as_deref().unwrap_or(&written), context)
 }
 
-/// Privileged files in the account's home, relative to it, outside
-/// [`HOME_PLACES`]: the ones [`crate::threats`] holds by name wherever they
-/// are. Compared by identity in [`same_as_a_privileged_file`] (Unix only:
-/// identity is a device and inode pair).
+/// Privileged files in the account's home, relative to it, that
+/// [`crate::threats`] holds by name wherever they are (Codex's hooks file and
+/// `.zshenv` are in [`HOME_PLACES`] as well). Compared by identity in
+/// [`same_as_a_privileged_file`] (Unix only: identity is a device and inode
+/// pair), so each is written as the agent writes it: the name of a missing
+/// one is compared without case.
 #[cfg(unix)]
 const HOME_GUARD_FILES: &[&str] = &[
     ".claude/settings.json",
@@ -632,7 +834,12 @@ const HOME_GUARD_FILES: &[&str] = &[
     ".mcp.json",
     ".cursor/mcp.json",
     ".codex/config.toml",
+    ".codex/hooks.json",
+    // zsh runs it before the hook line Codex starts.
+    ".zshenv",
     ".gemini/settings.json",
+    // A folder Gemini is told not to trust loads no hook from settings.
+    ".gemini/trustedFolders.json",
     ".openclaw/openclaw.json",
     ".config/goose/config.yaml",
     ".hermes/config.yaml",
@@ -721,7 +928,7 @@ fn same_as_a_privileged_file(path: &Path, context: &WriteContext<'_>) -> Option<
         let same_file = target.is_some() && target == identity(&place);
         let same_slot = parent.is_some()
             && parent == place.parent().and_then(identity)
-            && name.as_deref() == relative.rsplit('/').next();
+            && name == relative.rsplit('/').next().map(str::to_lowercase);
         if same_file || same_slot {
             return judge(&place, context);
         }
@@ -1579,7 +1786,11 @@ mod tests {
     /// and a hard link to the guard's own program.
     ///
     /// FAILS ON REVERT: drop `same_as_a_privileged_file` from
-    /// `privileged_file_write` and every path here is allowed.
+    /// `privileged_file_write` and every path here is allowed; read `==` as
+    /// `!=` in the test of the folder there and a file in another folder
+    /// that only shares its name with a startup file is refused; read `==`
+    /// as `!=` in the test of the name and a new file of any other name in
+    /// the home is refused.
     #[cfg(unix)]
     #[test]
     fn the_same_file_under_another_name_is_refused() {
@@ -1618,8 +1829,15 @@ mod tests {
         }
         // A plain file beside them, and a dotfile that is no link, are not.
         std::fs::write(dotfiles.join("README.md"), "").unwrap();
+        std::fs::write(dotfiles.join(".bashrc"), "").unwrap();
         std::fs::write(proj.join("plain.json"), "{}").unwrap();
-        for path in ["plain.json", "../dotfiles/README.md", "new.txt"] {
+        for path in [
+            "plain.json",
+            "../dotfiles/README.md",
+            "new.txt",
+            "../dotfiles/.bashrc",
+            "../todo.txt",
+        ] {
             assert_eq!(privileged_file_write(path, &ctx), None, "{path}");
         }
     }
@@ -1701,5 +1919,403 @@ mod tests {
         let text = verdict["explanation"].as_str().unwrap();
         assert!(text.contains("Edit would change `/h/.claude/settings.json`"));
         assert!(text.contains("make it yourself"));
+    }
+
+    /// Gemini CLI's two file tools are read as file tools, by their exact
+    /// names, so a write through either is judged by where it lands.
+    ///
+    /// FAILS ON REVERT: take [`GEMINI_FILE_TOOLS`] out of `file_tool_call`
+    /// and both read as `NotAFileTool`, which the hook lets through.
+    #[test]
+    fn geminis_file_tools_are_read_as_file_tools() {
+        assert_eq!(
+            file_tool_call(&json!({
+                "tool_name": "write_file",
+                "tool_input": {"file_path": "/x/y", "content": "z"},
+            })),
+            FileToolCall::Writes {
+                tool: "write_file".into(),
+                paths: vec!["/x/y".into()],
+            }
+        );
+        assert_eq!(
+            file_tool_call(&json!({
+                "tool_name": "replace",
+                "tool_input": {
+                    "file_path": "notes.md",
+                    "instruction": "i",
+                    "old_string": "a",
+                    "new_string": "b",
+                },
+            })),
+            FileToolCall::Writes {
+                tool: "replace".into(),
+                paths: vec!["notes.md".into()],
+            }
+        );
+        assert_eq!(
+            file_tool_call(&json!({"tool_name": "replace", "tool_input": {"old_string": "a"}})),
+            FileToolCall::Unreadable("a file tool call with no file path")
+        );
+        // An MCP server's tool of the same name is the proxy's to screen.
+        assert_eq!(
+            file_tool_call(&json!({
+                "tool_name": "mcp_fs_write_file",
+                "tool_input": {"file_path": "/x"},
+            })),
+            FileToolCall::NotAFileTool
+        );
+        let ctx = context(Path::new("/home/dev"), Path::new("/home/dev/proj"));
+        assert_eq!(
+            privileged_file_write("~/.gemini/settings.json", &ctx),
+            Some(AGENT_HOOK_SETTINGS)
+        );
+    }
+
+    /// A path over the length cap is not read, and is not passed for that:
+    /// `./` repeated in it puts any file past the cap. The empty path alone
+    /// names nothing.
+    ///
+    /// FAILS ON REVERT: put `|| trimmed.len() > MAX_PATH_BYTES` back in the
+    /// test of the empty path in `privileged_file_write` and the padded path
+    /// to Gemini's settings is `None`, which the hook lets through; read `>`
+    /// as `>=` in the test of the cap and a path at the cap is not read.
+    #[test]
+    fn a_path_over_the_cap_is_not_passed_as_ordinary() {
+        let ctx = context(Path::new("/home/dev"), Path::new("/home/dev/proj"));
+        let padded = format!("/home/dev/{}.gemini/settings.json", "./".repeat(2100));
+        assert!(padded.len() > MAX_PATH_BYTES);
+        assert_eq!(privileged_file_write(&padded, &ctx), Some(PATH_TOO_LONG));
+        // The same file under the cap is read for what it is.
+        let short = format!("/home/dev/{}.gemini/settings.json", "./".repeat(20));
+        assert_eq!(
+            privileged_file_write(&short, &ctx),
+            Some(AGENT_HOOK_SETTINGS)
+        );
+        // A long path to an ordinary file is not read either.
+        let ordinary = format!("/home/dev/proj/{}notes.md", "a/".repeat(2100));
+        assert_eq!(privileged_file_write(&ordinary, &ctx), Some(PATH_TOO_LONG));
+        // At the cap a path is read; one byte past it, it is not.
+        let at_cap = format!("/home/dev/proj/{}b", "a/".repeat(2040));
+        assert_eq!(at_cap.len(), MAX_PATH_BYTES);
+        assert_eq!(privileged_file_write(&at_cap, &ctx), None);
+        assert_eq!(
+            privileged_file_write(&format!("{at_cap}c"), &ctx),
+            Some(PATH_TOO_LONG)
+        );
+        assert_eq!(privileged_file_write("  ", &ctx), None);
+    }
+
+    fn hermes_patch_of(input: serde_json::Value) -> FileToolCall {
+        file_tool_call(&json!({"tool_name": "patch", "tool_input": input}))
+    }
+
+    /// Hermes Agent's `patch` is read for the file it names in `path` and
+    /// for every file its V4A patch names, as loosely as Hermes reads its
+    /// markers: no blank after `***`, a run of blanks between the words, and
+    /// both ends of a `Move File: a -> b`.
+    ///
+    /// FAILS ON REVERT: drop the `HERMES_PATCH_TOOL` branch in
+    /// `file_tool_call` and every call below is `NotAFileTool`; read the
+    /// markers by their exact text and the loose ones name nothing.
+    #[test]
+    fn hermes_patch_is_read_for_its_path_and_every_file_its_patch_names() {
+        let writes = |paths: &[&str]| FileToolCall::Writes {
+            tool: "patch".into(),
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+        };
+        assert_eq!(
+            hermes_patch_of(json!({"path": "~/.bashrc", "old_string": "a", "new_string": "b"})),
+            writes(&["~/.bashrc"])
+        );
+        let patch = "*** Begin Patch\n***Update File: src/a.rs\n@@\n-a\n+b\n\
+                     ***  Add   File:  ~/.hermes/config.yaml \n+x\n\
+                     *** Delete File: notes.md\n\
+                     *** Move File: src/b.rs -> ~/.ssh/authorized_keys\n*** End Patch";
+        assert_eq!(
+            hermes_patch_of(json!({"mode": "patch", "patch": patch})),
+            writes(&[
+                "src/a.rs",
+                "~/.hermes/config.yaml",
+                "notes.md",
+                "src/b.rs",
+                "~/.ssh/authorized_keys"
+            ])
+        );
+        assert_eq!(
+            hermes_patch_of(json!({"mode": "patch", "patch": "*** Update File:   \n"})),
+            FileToolCall::Unreadable("a patch that names a file with no path")
+        );
+        assert_eq!(
+            hermes_patch_of(json!({"mode": "patch"})),
+            FileToolCall::Unreadable("a patch tool call with no file path")
+        );
+        assert_eq!(
+            hermes_patch_of(json!({"mode": "patch", "patch": "*** Begin Patch\n*** End Patch"})),
+            FileToolCall::Unreadable("a patch tool call with no file path")
+        );
+    }
+
+    fn patch_call_of(patch: &str) -> FileToolCall {
+        file_tool_call(&json!({"tool_name": "apply_patch", "tool_input": {"command": patch}}))
+    }
+
+    /// Every file a patch names is read: added, updated, deleted and moved
+    /// to, in the order named and each once.
+    ///
+    /// FAILS ON REVERT: drop any one marker from [`PATCH_PATH_MARKERS`] and
+    /// its file is missing from the list, so it is never judged.
+    #[test]
+    fn a_patch_is_read_for_every_file_it_names() {
+        let patch = "*** Begin Patch\n\
+                     *** Add File: notes/new.md\n\
+                     +hello\n\
+                     *** Update File: src/lib.rs\n\
+                     *** Move to: src/moved.rs\n\
+                     @@\n\
+                     -old\n\
+                     +new\n\
+                     *** Delete File: /abs/gone.txt\n\
+                     *** Update File: src/lib.rs\n\
+                     @@\n\
+                     -a\n\
+                     +b\n\
+                     *** End Patch\n";
+        assert_eq!(
+            patch_call_of(patch),
+            FileToolCall::Writes {
+                tool: "apply_patch".into(),
+                paths: vec![
+                    "notes/new.md".into(),
+                    "src/lib.rs".into(),
+                    "src/moved.rs".into(),
+                    "/abs/gone.txt".into(),
+                ],
+            }
+        );
+        for marker in [
+            "*** Add File:",
+            "*** Update File:",
+            "*** Delete File:",
+            "*** Move to:",
+        ] {
+            // Carriage returns and padding around a marker are the patch
+            // tool's to forgive, so they are forgiven here too.
+            let patch = format!("*** Begin Patch\r\n  {marker}   a b/c.txt  \r\n*** End Patch\r\n");
+            assert_eq!(
+                patch_call_of(&patch),
+                FileToolCall::Writes {
+                    tool: "apply_patch".into(),
+                    paths: vec!["a b/c.txt".into()],
+                },
+                "{marker}"
+            );
+        }
+        // The same text under another field, or handed over bare.
+        let patch = "*** Begin Patch\n*** Add File: a.txt\n+x\n*** End Patch";
+        for input in [
+            json!({"input": patch}),
+            json!({"patch": patch}),
+            json!(patch),
+        ] {
+            assert_eq!(
+                file_tool_call(&json!({"tool_name": "apply_patch", "tool_input": input})),
+                FileToolCall::Writes {
+                    tool: "apply_patch".into(),
+                    paths: vec!["a.txt".into()],
+                }
+            );
+        }
+    }
+
+    /// A patch whose files cannot be read is unreadable, never empty: the
+    /// hook refuses an unreadable call in enforce, and an empty list of
+    /// paths would have let the patch through unjudged.
+    ///
+    /// FAILS ON REVERT: return `Writes` with no paths, or `NotAFileTool`,
+    /// for any of these and the patch runs unscreened.
+    #[test]
+    fn a_patch_with_no_readable_path_is_unreadable() {
+        assert_eq!(
+            patch_call_of("*** Begin Patch\n*** End Patch\n"),
+            FileToolCall::Unreadable("a patch that names no file")
+        );
+        assert_eq!(
+            patch_call_of("some text that is not a patch"),
+            FileToolCall::Unreadable("a patch that names no file")
+        );
+        // One marker names nothing: the rest of the list cannot be trusted
+        // to be all of it.
+        assert_eq!(
+            patch_call_of(
+                "*** Begin Patch\n*** Update File: a.txt\n*** Add File:   \n+x\n*** End Patch"
+            ),
+            FileToolCall::Unreadable("a patch that names a file with no path")
+        );
+        for input in [
+            json!({}),
+            json!({"command": "  \n"}),
+            json!({"command": 7}),
+            json!(null),
+        ] {
+            assert_eq!(
+                file_tool_call(&json!({"tool_name": "apply_patch", "tool_input": input})),
+                FileToolCall::Unreadable("a patch tool call with no patch text")
+            );
+        }
+        assert_eq!(
+            file_tool_call(&json!({"tool_name": "apply_patch"})),
+            FileToolCall::Unreadable("a patch tool call with no patch text")
+        );
+    }
+
+    /// A relative path in a patch is judged from the directory in the
+    /// context, as every file tool's path is: `../.zshrc` from a project in
+    /// the home is the home's startup file. Only the paths are judged here.
+    /// That the hook puts the payload's directory in the context is run in
+    /// `crates/cli/tests/hook_file_tools.rs`
+    /// (`a_patchs_relative_path_is_judged_from_the_payloads_directory`).
+    #[test]
+    fn a_patchs_relative_path_is_judged_from_the_calls_directory() {
+        let ctx = context(Path::new("/home/dev"), Path::new("/home/dev/proj"));
+        let call = patch_call_of(
+            "*** Begin Patch\n\
+             *** Update File: src/main.rs\n\
+             *** Add File: ../.zshrc\n\
+             +x\n\
+             *** End Patch\n",
+        );
+        let paths = match call {
+            FileToolCall::Writes { paths, .. } => paths,
+            other => panic!("the patch names two files: {other:?}"),
+        };
+        let judged: Vec<Option<&str>> = paths
+            .iter()
+            .map(|path| privileged_file_write(path, &ctx))
+            .collect();
+        assert_eq!(
+            judged,
+            vec![
+                None,
+                Some("your shell's startup files, which run in every new shell"),
+            ]
+        );
+    }
+
+    /// Codex CLI's hooks file is held in the words of the agent settings
+    /// that load the guard, however it is spelled and wherever a `.codex`
+    /// folder is, and a file of the same name outside one is the project's.
+    ///
+    /// FAILS ON REVERT: take `Place::Components(".codex/hooks.json")` out of
+    /// `GUARD_SETTINGS` in threats.rs and the hooks file of a `.codex` folder
+    /// outside the home is no longer held; drop the `.codex/hooks.json` row
+    /// from [`HOME_PLACES`] and `home_place` no longer knows it.
+    #[test]
+    fn codexs_hooks_file_is_held_like_the_settings_that_load_the_guard() {
+        assert_eq!(
+            privileged_write_target("/home/dev/.codex/config.toml").map(|target| target.group.what),
+            Some(AGENT_HOOK_SETTINGS),
+            "the two lists must describe an agent's settings in the same words"
+        );
+        assert_eq!(
+            privileged_write_target("/srv/work/.codex/hooks.json").map(|target| target.group.what),
+            Some(AGENT_HOOK_SETTINGS),
+            "the list the shell side reads holds the hooks file by name"
+        );
+        assert_eq!(home_place(".codex/hooks.json"), Some(AGENT_HOOK_SETTINGS));
+        let ctx = context(Path::new("/home/dev"), Path::new("/home/dev/proj"));
+        for path in [
+            "/home/dev/.codex/hooks.json",
+            "~/.codex/hooks.json",
+            "../.codex/hooks.json",
+            "/home/dev/proj/../.codex/./hooks.json",
+            "/home/dev/.CODEX/Hooks.json",
+        ] {
+            assert_eq!(
+                privileged_file_write(path, &ctx),
+                Some(AGENT_HOOK_SETTINGS),
+                "{path}"
+            );
+        }
+        assert_eq!(
+            privileged_file_write("/home/dev/proj/hooks.json", &ctx),
+            None
+        );
+        let call =
+            patch_call_of("*** Begin Patch\n*** Delete File: ~/.codex/hooks.json\n*** End Patch\n");
+        let paths = match call {
+            FileToolCall::Writes { paths, .. } => paths,
+            other => panic!("the patch names one file: {other:?}"),
+        };
+        assert_eq!(paths, vec!["~/.codex/hooks.json".to_string()]);
+        assert_eq!(
+            privileged_file_write(&paths[0], &ctx),
+            Some(AGENT_HOOK_SETTINGS)
+        );
+    }
+
+    /// The file zsh runs before the hook line Codex starts, and Gemini's
+    /// record of the folders it trusts, are held in the words of the agent
+    /// settings that load the guard, however they are spelled.
+    ///
+    /// FAILS ON REVERT: take `Place::HomeFile(".zshenv")` out of
+    /// `GUARD_SETTINGS` in threats.rs and `~/.zshenv` is held as a shell
+    /// startup file only, in those words; take
+    /// `Place::Components(".gemini/trustedfolders.json")` out and Gemini's
+    /// file is not held at all.
+    #[test]
+    fn zshenv_and_geminis_trusted_folders_are_held_as_guard_settings() {
+        let ctx = context(Path::new("/home/dev"), Path::new("/home/dev/proj"));
+        for path in [
+            "~/.zshenv",
+            "/home/dev/.zshenv",
+            "../.zshenv",
+            "~/.gemini/trustedFolders.json",
+            "/home/dev/.gemini/trustedfolders.json",
+            "../.gemini/trustedFolders.json",
+        ] {
+            assert_eq!(
+                privileged_file_write(path, &ctx),
+                Some(AGENT_HOOK_SETTINGS),
+                "{path}"
+            );
+        }
+        assert_eq!(privileged_file_write("/home/dev/proj/zshenv", &ctx), None);
+        // A dotfiles repository's copy is no file zsh reads.
+        for path in [
+            "/home/dev/dotfiles/.zshenv",
+            "~/dotfiles/zsh/.zshenv",
+            "roles/zsh/files/.zshenv",
+        ] {
+            assert_eq!(privileged_file_write(path, &ctx), None, "{path}");
+        }
+    }
+
+    /// A hard link to Gemini's record of trusted folders, under a name of
+    /// its own, is that file.
+    ///
+    /// FAILS ON REVERT: take `.gemini/trustedFolders.json` out of
+    /// `HOME_GUARD_FILES` and the link is a project file.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_geminis_trusted_folders_is_that_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let proj = home.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::create_dir_all(home.join(".gemini")).unwrap();
+        std::fs::write(home.join(".gemini/trustedFolders.json"), "{}").unwrap();
+        std::fs::hard_link(
+            home.join(".gemini/trustedFolders.json"),
+            proj.join("folders.json"),
+        )
+        .unwrap();
+        std::fs::write(proj.join("plain.json"), "{}").unwrap();
+        let ctx = context(&home, &proj);
+        assert_eq!(
+            privileged_file_write("folders.json", &ctx),
+            Some(AGENT_HOOK_SETTINGS)
+        );
+        assert_eq!(privileged_file_write("plain.json", &ctx), None);
     }
 }

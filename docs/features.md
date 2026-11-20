@@ -134,13 +134,17 @@ following, and says they are the person's to run, from their own terminal.
 - Starting another agent with the hook that screens it switched off or moved
   away, so the child would run every tool call unscreened: Claude Code
   started with `--bare`, `--safe-mode` or `--restricted`, with setting
-  sources that leave out the user's, with settings that switch hooks off or
-  empty the events the guard's hook sits under, or with a variable it reads
-  that moves the folder its hook is in or switches its hooks off (`HOME`,
-  `CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_SIMPLE` and the others it reads). `HOME`
+  sources that leave out the user's, or with settings that switch hooks off
+  or empty the events the guard's hook sits under; Codex CLI with `--disable
+  hooks` or a `-c` override of its hooks; Hermes Agent with `--safe-mode` or
+  `--ignore-user-config`; or any of them, Gemini CLI included, with a
+  variable it reads that moves the folder its hook is in or switches its
+  hooks off (`HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`,
+  `GEMINI_CLI_HOME`, `CLAUDE_CODE_SIMPLE` and the others they read). `HOME`
   set to the home folder the shell itself puts in, and `CLAUDE_CONFIG_DIR` set
   to the folder Claude Code already uses, move nothing and run; another
-  folder is refused in words that say how to install the hook there. A tool
+  folder for Claude Code is refused in words that say how to install the
+  hook there. A tool
   call is judged by every command line it carries (a command string, an argv
   list, `args`, its environment as an object or a list, text typed into a
   terminal or handed to a shell). Each line goes through the person's allows
@@ -253,11 +257,21 @@ configured. A tool call longer than 1 MiB is not read and is refused the same
 way. `innerwarden install` writes a 50 second `timeout` on the Claude Code
 hook line, so the guard's own refusal comes before Claude Code stops waiting;
 a call Claude Code stops waiting for runs. On macOS and Linux,
-an enforcing Claude Code hook line ends in a short shell tail, so a guard
-whose program is gone or dies refuses the call too. In monitor, on Windows,
+an enforcing Claude Code hook line ends in a short shell tail, and an
+enforcing Codex CLI or Gemini CLI line runs the guard inside a small `/bin/sh`
+script (Codex starts the line with the login shell, which may not read that
+tail), so a guard whose program is gone or dies refuses the call too. Hermes
+Agent gets the same from its own `fail_closed: true`. In monitor, on Windows,
 and for an agent whose hook line has no such tail, a guard that cannot start
 answers nothing and the call runs: that is why a write to the guard's program
-is refused above.
+is refused above. Gemini CLI refuses a call on any hook exit but 0 and 1, so
+its monitor line is a script too, which ends every other way with 1.
+
+The same tail and script mean a program removed by the package manager (`npm
+uninstall -g`, `apt remove`) before `innerwarden uninstall` leaves every tool
+call of an enforcing agent refused, and the agent cannot mend it. Run
+`innerwarden uninstall` first; the refusal names the settings files to edit
+by hand if it is too late.
 
 Some ordinary lines are refused by the same rules, and the refusal says so: a
 program run from a variable on a line that also names the guard, an agent

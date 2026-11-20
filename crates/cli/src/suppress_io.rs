@@ -169,6 +169,10 @@ pub(crate) const AGENT_SHELL_MARKERS: &[&str] = &[
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "GEMINI_CLI",
     "OPENCLAW_SHELL",
+    // Hermes Agent v0.23.1 sets it (`true`) for every program it starts,
+    // its `terminal` shell included (`hermes_cli/main.py`), measured with
+    // its terminal tool on 2026-11-20.
+    "HERMES_AGENT",
 ];
 
 /// Whether this process runs in an AI agent's shell, by its markers.

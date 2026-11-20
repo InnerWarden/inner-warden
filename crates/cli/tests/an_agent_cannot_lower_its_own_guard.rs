@@ -14,13 +14,14 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
 }
 
-const AGENT_SHELL_MARKERS: [&str; 6] = [
+const AGENT_SHELL_MARKERS: [&str; 7] = [
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "GEMINI_CLI",
     "OPENCLAW_SHELL",
+    "HERMES_AGENT",
 ];
 
 /// A home whose Claude Code runs an enforcing hook.
@@ -41,12 +42,25 @@ fn enforced_home() -> tempfile::TempDir {
     home
 }
 
+/// The suite's PATH less every folder that holds a `codex`. `agents connect`
+/// and a mode switch ask the Codex they find there to trust the hook they
+/// wrote, and a test never starts the real one.
+fn path_without_codex() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept = std::env::split_paths(&path)
+        .filter(|dir| !dir.join("codex").exists() && !dir.join("codex.exe").exists());
+    std::env::join_paths(kept).expect("folders split from PATH join back")
+}
+
 fn run(home: &Path, args: &[&str], marker: Option<&str>) -> Output {
     let mut command = Command::new(bin());
     command
         .env("HOME", home)
         .env("IW_GRAPH_FILE", home.join("graph.json"))
         .env("INNERWARDEN_AGENT_URL", "off")
+        // No real Codex: none on PATH to ask, no other folder for it to read.
+        .env("PATH", path_without_codex())
+        .env_remove("CODEX_HOME")
         .stdin(Stdio::null());
     for name in AGENT_SHELL_MARKERS {
         command.env_remove(name);
@@ -104,6 +118,51 @@ fn inside_an_agents_shell_wiring_that_lowers_the_guard_is_refused() {
                 "{marker} {args:?} wrote"
             );
         }
+    }
+}
+
+/// Inside a Hermes Agent `terminal` shell (`HERMES_AGENT=true`, which Hermes
+/// v0.23.1 sets for every program it starts), taking Hermes's own hook off or
+/// down to monitor is refused and its config is left as it was.
+///
+/// FAILS ON REVERT: take `HERMES_AGENT` out of `AGENT_SHELL_MARKERS` in
+/// `suppress_io` and both run: the hook entry goes, or turns to monitor.
+#[test]
+fn inside_a_hermes_shell_its_hook_is_not_lowered() {
+    let home = tempfile::TempDir::new().expect("scratch home");
+    std::fs::create_dir_all(home.path().join(".hermes")).unwrap();
+    let out = run(home.path(), &["agents", "connect", "hermes"], None);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    let config = home.path().join(".hermes/config.yaml");
+    let before = std::fs::read(&config).expect("connect wrote the hook");
+    assert!(String::from_utf8_lossy(&before).contains("hook --agent hermes"));
+    for args in [
+        &["agents", "disconnect", "hermes"][..],
+        &["agents", "connect", "hermes", "--monitor"],
+    ] {
+        let mut command = Command::new(bin());
+        command
+            .env("HOME", home.path())
+            .env("IW_GRAPH_FILE", home.path().join("graph.json"))
+            .env("INNERWARDEN_AGENT_URL", "off")
+            .env("PATH", path_without_codex())
+            .env_remove("CODEX_HOME")
+            .stdin(Stdio::null());
+        for name in AGENT_SHELL_MARKERS {
+            command.env_remove(name);
+        }
+        let out = command
+            .env("HERMES_AGENT", "true")
+            .args(args)
+            .output()
+            .expect("run innerwarden");
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("refused inside an AI agent's shell"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), before, "{args:?} wrote");
     }
 }
 

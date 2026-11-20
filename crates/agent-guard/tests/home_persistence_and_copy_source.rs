@@ -46,16 +46,21 @@ fn unseen_writes(file: &str) -> Vec<String> {
 /// held for review, not allowed and not refused.
 #[test]
 fn a_startup_file_replaced_from_unseen_content_is_held_for_review() {
-    for file in [
-        "~/.bashrc",
-        "~/.profile",
-        "~/.zshrc",
-        "~/.bash_profile",
-        "~/.zshenv",
-    ] {
+    for file in ["~/.bashrc", "~/.profile", "~/.zshrc", "~/.bash_profile"] {
         for line in unseen_writes(file) {
             assert_eq!(verdict(&line), "review", "{line}");
         }
+    }
+}
+
+/// `~/.zshenv` is more than a startup file: zsh reads it before the hook
+/// line Codex starts with the login shell, so a line in it can end the hook
+/// before the guard answers. Replaced from content it does not show, it is
+/// refused, not held for review.
+#[test]
+fn zshenv_replaced_from_unseen_content_is_refused() {
+    for line in unseen_writes("~/.zshenv") {
+        assert_eq!(verdict(&line), "deny", "{line}");
     }
 }
 

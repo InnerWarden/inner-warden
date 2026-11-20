@@ -19,6 +19,16 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
 }
 
+/// The suite's PATH less every folder that holds a `codex`. `agents connect`
+/// and a mode switch ask the Codex they find there to trust the hook they
+/// wrote, and a test never starts the real one.
+fn path_without_codex() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept = std::env::split_paths(&path)
+        .filter(|dir| !dir.join("codex").exists() && !dir.join("codex.exe").exists());
+    std::env::join_paths(kept).expect("folders split from PATH join back")
+}
+
 /// The CLI under test over a disposable HOME.
 ///
 /// `IW_GRAPH_FILE` is deliberately pointed at the REAL relative layout
@@ -30,7 +40,10 @@ fn cli(home: &Path) -> Command {
     command
         .env("HOME", home)
         .env("USERPROFILE", home)
-        .env("IW_GRAPH_FILE", home.join(".config/innerwarden/graph.json"));
+        .env("IW_GRAPH_FILE", home.join(".config/innerwarden/graph.json"))
+        // No real Codex: none on PATH to ask, no other folder for it to read.
+        .env("PATH", path_without_codex())
+        .env_remove("CODEX_HOME");
     // The person's shell, even when the suite runs under an AI agent's: the
     // wiring that lowers a guard is refused inside one.
     for marker in [
@@ -186,6 +199,88 @@ fn a_mode_switch_says_how_to_restart_each_connected_agent() {
             "{verb} must say how to restart each agent it switched, got:\n{out}"
         );
     }
+}
+
+/// A mode switch rewrites Codex's hook line, and Codex runs a hook only while
+/// it trusts the line it has. With no Codex to ask (the PATH of [`cli`] holds
+/// none), the switch leaves a hook Codex skips: `enforce` exits 1 and its
+/// summary names the agent and the one step. A second `enforce` rewrites
+/// nothing, and Codex still skips the hook: it fails the same way, and never
+/// says enforcement is configured.
+///
+/// FAILS ON REVERT: drop `stopped.extend(result.hook_stopped)` from
+/// `cmd_mode` and the summary does not name the agent; drop the `NotActive`
+/// arm guarded by `mode_switch` in `connect_hook_and_proxy` and the first
+/// `enforce` exits 0; guard that arm on this run having written the line and
+/// the second `enforce` exits 0.
+#[test]
+fn a_mode_switch_that_stops_codexs_hook_exits_1_and_names_the_step() {
+    let home = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+    let connected = run(home.path(), &["agents", "connect", "codex", "--monitor"]);
+    assert!(
+        home.path().join(".codex/hooks.json").is_file(),
+        "the connect wrote no Codex hook, so the rest of this test proves \
+         nothing:\n{connected}"
+    );
+
+    for run in ["first", "second"] {
+        let switched = cli(home.path())
+            .arg("enforce")
+            .output()
+            .expect("run innerwarden enforce");
+        let said = String::from_utf8_lossy(&switched.stderr);
+        let out = String::from_utf8_lossy(&switched.stdout);
+        assert_eq!(switched.status.code(), Some(1), "{run}: {said}");
+        assert!(
+            said.contains(
+                "  codex - its PreToolUse hook is not active after this switch. Run `/hooks` \
+                 inside Codex and trust the innerwarden hook"
+            ),
+            "{run}: {said}"
+        );
+        assert!(!out.contains("ENFORCEMENT configured"), "{run}: {out}");
+    }
+}
+
+/// Taking the hook out of a group it shares with a hook of the person's
+/// moves that hook inside the group (a group cannot hold an empty hook), and
+/// the note that says so names its program only. Its command says
+/// `failed:`, and the disconnect did not fail.
+///
+/// FAILS ON REVERT: name a moved hook by its whole command in
+/// `agent_hooks::theirs_at` and the note holds `failed:`, which `agents
+/// disconnect` reads as a failed agent: it exits 1.
+#[test]
+fn a_moved_hook_whose_command_says_failed_does_not_fail_the_disconnect() {
+    let home = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+    let connected = run(home.path(), &["agents", "connect", "codex", "--monitor"]);
+    let file = home.path().join(".codex/hooks.json");
+    let mut settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&file)
+            .unwrap_or_else(|_| panic!("the connect wrote no Codex hook:\n{connected}")),
+    )
+    .expect("the hooks file is JSON");
+    settings["hooks"]["PreToolUse"][0]["hooks"]
+        .as_array_mut()
+        .expect("the connect wrote one group with our hook")
+        .push(serde_json::json!({"type": "command", "command": "echo \"audit failed: x\""}));
+    std::fs::write(&file, settings.to_string()).unwrap();
+
+    let out = cli(home.path())
+        .args(["agents", "disconnect", "codex"])
+        .output()
+        .expect("run innerwarden agents disconnect");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{said}");
+    assert!(said.contains("of your own moved"), "{said}");
+    assert!(said.contains("`echo`"), "{said}");
+    assert!(!said.contains("failed:"), "{said}");
 }
 
 /// `install` wires Claude Code's hook: it says how to restart Claude Code,

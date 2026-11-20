@@ -7,9 +7,11 @@
 //! files find configured agents even when idle. A bare dot-directory is only a
 //! possible leftover, never proof of installation. Connecting = wiring the
 //! Community guardrail by a reviewed, agent-specific mechanism. Claude Code
-//! gets the blocking PreToolUse hook (blocking on a deny, not fail-closed: see
-//! `cmd_install`);
+//! gets the blocking PreToolUse hook (in enforce it refuses a deny and a call
+//! it could not screen: see `cmd_install`);
 //! Cursor and Gemini use their JSON MCP configuration, and Codex uses TOML.
+//! Codex and Gemini also get their own blocking hook beside the proxy, on a
+//! connect a person ran (see [`crate::agent_hooks`]).
 //! Other detected agents remain visible but are not modified automatically until
 //! InnerWarden has an integration for their real configuration format.
 //!
@@ -168,8 +170,9 @@ pub const KNOWN: &[Known] = &[
         config_files: &[(".hermes/config.yaml", ConfigFormat::YamlMapping)],
         profile_config: None,
         hookable: false,
-        // Hermes has a native hook surface, but it is fail-open on hook errors.
-        // Keep it visible and manual until InnerWarden has a reviewed adapter.
+        // Hermes is wired through its own shell hook, written fail-closed in
+        // enforce mode ([`crate::hermes_hook`]), not through this flag (which
+        // is Claude Code's settings hook) or an MCP config.
         mcp_json: None,
         mcp_toml: None,
     },
@@ -300,7 +303,10 @@ impl GuardMode {
 impl AgentStatus {
     /// Can we wire this agent (hook, an mcp.json, or a TOML config)?
     pub fn guardable(&self) -> bool {
-        self.hookable || self.mcp_json.is_some() || self.mcp_toml.is_some()
+        self.hookable
+            || self.mcp_json.is_some()
+            || self.mcp_toml.is_some()
+            || self.name == crate::hermes_hook::AGENT
     }
 
     pub fn has_evidence(&self, evidence: DiscoveryEvidence) -> bool {

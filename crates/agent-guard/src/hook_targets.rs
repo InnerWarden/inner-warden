@@ -38,9 +38,11 @@ pub enum Mechanism {
     /// A settings file with a pre-tool hook that blocks on a non-zero exit.
     /// `settings_rel` is the home-relative path.
     SettingsHook { settings_rel: &'static str },
-    /// No hook surface, but its MCP configuration can be rewritten to run
-    /// through the proxy. `innerwarden agents connect` does that automatically;
-    /// `why` explains why a hook is not the mechanism.
+    /// Its MCP configuration can be rewritten to run through the proxy, and
+    /// `innerwarden agents connect` does that automatically, with whatever
+    /// else the agent has to hang a guard on (OpenClaw's plugin, the hook of
+    /// Codex and of Gemini). `why` says what that command puts in front of the
+    /// agent, or why a hook is not the mechanism.
     ///
     /// `connect` is the name `agents connect` accepts, which is NOT always this
     /// target's id: the ids here follow the product names a user recognises
@@ -127,8 +129,12 @@ pub static TARGETS: &[HookTarget] = &[
         id: "codex-cli",
         display: "Codex CLI",
         aliases: &["codex", "openai-codex"],
+        // Codex and Gemini have a blocking hook of their own
+        // ([`crate::agent_hooks`]) beside the MCP proxy, and `agents connect`
+        // wires the two in one go. So the answer to `install` stays that one
+        // command, and the words say what it puts in front of the agent.
         mechanism: Mechanism::McpProxy {
-            why: "its `notify` hook fires AFTER a command runs, so it cannot block one",
+            why: "its shell commands and its changes to privileged files are screened by the hook `agents connect` installs, and its MCP servers through the proxy",
             connect: "codex",
         },
         markers: &[".codex"],
@@ -138,7 +144,7 @@ pub static TARGETS: &[HookTarget] = &[
         display: "Gemini CLI",
         aliases: &["gemini"],
         mechanism: Mechanism::McpProxy {
-            why: "no pre-execution command hook is exposed",
+            why: "its shell commands and its changes to privileged files are screened by the hook `agents connect` installs, and its MCP servers through the proxy",
             connect: "gemini",
         },
         markers: &[".gemini"],
@@ -432,5 +438,30 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), n, "duplicate install id");
+    }
+
+    /// Codex and Gemini have a hook that runs before a tool call, and
+    /// `agents connect` installs it with the proxy. The answer to
+    /// `install codex-cli` and `install gemini-cli` says so.
+    ///
+    /// FAILS ON REVERT: the old words told a person that Codex "cannot block"
+    /// a command and that Gemini has "no pre-execution command hook", which
+    /// is no longer what the command they are sent to does.
+    #[test]
+    fn codex_and_gemini_are_told_their_hook_comes_with_the_connect() {
+        for (id, display, connect) in [
+            ("codex-cli", "Codex CLI", "codex"),
+            ("gemini-cli", "Gemini CLI", "gemini"),
+        ] {
+            assert_eq!(
+                guidance(by_id(id).unwrap()),
+                format!(
+                    "{display}: its shell commands and its changes to privileged files are \
+                     screened by the hook `agents connect` installs, and its MCP servers \
+                     through the proxy. Guard it with:  innerwarden agents connect {connect}"
+                ),
+            );
+            assert!(crate::agent_hooks::spec_for(connect).is_some(), "{connect}");
+        }
     }
 }

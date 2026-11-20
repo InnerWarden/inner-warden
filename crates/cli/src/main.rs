@@ -27,6 +27,7 @@ mod agent_profiles_io;
 mod agent_report;
 mod agents_io;
 mod binary_freshness;
+mod command_dir;
 mod concern;
 mod contain;
 mod contain_io;
@@ -238,15 +239,26 @@ fn status_wiring(
         })
         .unwrap_or_default();
 
-    let wired_agents: Vec<String> = rows
+    let mut wired_agents: Vec<String> = rows
         .iter()
         .filter(|r| r.guarded && !hook_trouble.iter().any(|t| t.agent == r.name))
         .map(|r| r.name.clone())
         .collect();
+    // OpenClaw's own tools screened by its plugin are wiring too, with or
+    // without MCP servers behind the proxy, in the plugin's own mode.
+    let openclaw_plugin = home.and_then(status::openclaw_plugin_mode);
+    let openclaw = openclaw_guard::AGENT;
+    if openclaw_plugin.is_some()
+        && rows.iter().any(|r| r.name == openclaw)
+        && !wired_agents.iter().any(|agent| agent == openclaw)
+    {
+        wired_agents.push(openclaw.to_string());
+    }
 
     // What each wired agent's wiring judges before a call runs: a hook says
     // whether it covers the agent's own file tools, which wiring written by an
-    // earlier version does not.
+    // earlier version does not. A Codex or Gemini whose hook is in its file
+    // and is not on is said here as well, wired or not.
     let tool_classes: Vec<status::ToolClasses> = home
         .map(|home| {
             // An agent with a hook that cannot start is described by its
@@ -255,7 +267,7 @@ fn status_wiring(
             status::tool_classes_for(
                 home,
                 rows.iter().filter(|r| {
-                    wired_agents.contains(&r.name)
+                    status::reports_what_is_judged(home, r, &wired_agents)
                         && !partly_unscreened.iter().any(|p| p.agent == r.name)
                 }),
             )
@@ -320,7 +332,11 @@ fn status_io_cmd_rest(
     // was hardcoded to `None`, so the mode line read [unknown] on every install
     // in the world, including the one a beginner sees the moment after
     // `innerwarden enforce` prints success.
-    let modes: Vec<_> = rows.iter().filter(|r| r.guarded).map(|r| r.mode).collect();
+    let mut modes: Vec<_> = rows.iter().filter(|r| r.guarded).map(|r| r.mode).collect();
+    let openclaw_plugin = home.as_deref().and_then(status::openclaw_plugin_mode);
+    if openclaw_plugin.is_some() && rows.iter().any(|r| r.name == openclaw_guard::AGENT) {
+        modes.push(openclaw_plugin);
+    }
     let mode = status::aggregate_mode(&modes);
 
     // The record is the GRAPH: every screened command lands there, allows
@@ -699,11 +715,13 @@ enum HookInput {
     Unreadable(&'static str),
 }
 
-/// Tool names that carry a shell command in `tool_input.command`.
+/// Tool names that carry a shell command in `tool_input.command`. `Bash` is
+/// Claude Code's and Codex CLI's, `run_shell_command` Gemini CLI's.
 const SHELL_TOOLS: &[&str] = &[
     "Bash",
     "shell",
     "run_shell",
+    "run_shell_command",
     "run_command",
     "execute_command",
     "terminal",
@@ -715,12 +733,28 @@ const UNREAD_FIELD: &str =
     "a shell tool call with no command string and a field the hook does not read";
 
 fn classify_hook_input(buf: &str) -> HookInput {
+    use innerwarden_agent_guard::file_tools::{file_tool_call, FileToolCall};
     if buf.trim().is_empty() {
         return HookInput::Unreadable("empty stdin");
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(buf) else {
         return HookInput::Unreadable("not JSON");
     };
+    // A file tool's input is never a shell line, whatever its fields are
+    // called: Codex CLI's `apply_patch` carries the text of its patch in
+    // `command`. The file side judges it by where it writes
+    // ([`screen_file_tool`]); screened here as well, the patch text would be
+    // read as a command nobody runs.
+    if file_tool_call(&v) != FileToolCall::NotAFileTool {
+        return HookInput::NotAShellCall;
+    }
+    // Hermes runs code outside its `terminal` too: Python in its own kernel,
+    // and text typed into a process a background `terminal` left running.
+    match innerwarden_agent_guard::hermes_hook::shell_line_of(&v) {
+        Some(Ok(command)) => return HookInput::Command(command),
+        Some(Err(why)) => return HookInput::Unreadable(why),
+        None => {}
+    }
     // A read tool by its name first: it carries a path, never a command.
     {
         use innerwarden_agent_guard::file_tools::{file_read_call, FileReadCall};
@@ -773,10 +807,28 @@ fn classify_hook_input(buf: &str) -> HookInput {
             lines.push(line.to_string());
         }
     }
-    match lines.len() {
-        0 => {}
-        1 => return HookInput::Command(lines.remove(0)),
-        _ => return HookInput::Commands(lines),
+    if !lines.is_empty() {
+        // Gemini CLI's shell tool, and Hermes's `terminal`, can name the
+        // folder their command runs in. Each line is judged as the line
+        // that goes there first, so the rules that follow a `cd` read a
+        // relative target in that folder.
+        let folder = match command_dir::of(&v, own_dir) {
+            command_dir::CommandDir::Unnamed => None,
+            command_dir::CommandDir::Named(folder) => Some(folder),
+            command_dir::CommandDir::Unreadable(why) => return HookInput::Unreadable(why),
+        };
+        let mut lines: Vec<String> = lines
+            .into_iter()
+            .map(|line| match &folder {
+                Some(folder) => command_dir::in_folder(&line, folder),
+                None => line,
+            })
+            .collect();
+        return if lines.len() == 1 {
+            HookInput::Command(lines.remove(0))
+        } else {
+            HookInput::Commands(lines)
+        };
     }
     if shell_tool {
         return HookInput::Unreadable("a shell tool call with no command string");
@@ -1005,7 +1057,7 @@ mod json_head {
 fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::ExitCode {
     let call = TooLongCall::read(head);
     if !call.already_ran() {
-        return hook_unreadable(TOOL_CALL_TOO_LONG, monitor);
+        return hook_unreadable("", rest, TOOL_CALL_TOO_LONG, monitor);
     }
     let tool = call.tool.as_deref().unwrap_or("a tool");
     let on = call
@@ -1032,7 +1084,27 @@ fn unreadable_exit_code(monitor: bool) -> u8 {
     }
 }
 
-fn hook_unreadable(why: &str, monitor: bool) -> std::process::ExitCode {
+/// The hook's answer to a tool call it could not read: refused in enforce,
+/// let through unscreened in monitor, and in both recorded, with the reason,
+/// as a refusal (`unreadable`), so the operator sees it beside the others.
+/// `buf` is what was read of the call, empty when nothing was.
+fn hook_unreadable(buf: &str, rest: &[String], why: &str, monitor: bool) -> std::process::ExitCode {
+    let explanation = format!("unreadable: could not read this tool call ({why})");
+    let label = format!("(unreadable tool call: {why})");
+    let verdict = serde_json::json!({
+        "command": label,
+        "risk_score": 60,
+        "severity": "high",
+        "signals": [{
+            "signal": "unreadable",
+            "score": 60,
+            "detail": explanation,
+        }],
+        "recommendation": "deny",
+        "explanation": explanation,
+        "unreadable": true,
+    });
+    record_shell(buf, rest, &label, &verdict, monitor, true, None, false);
     if monitor {
         eprintln!(
             "InnerWarden hook: could not read this tool call ({why}); it was NOT screened \
@@ -1127,18 +1199,26 @@ fn hook_session(payload: &str) -> Option<String> {
         .filter(|session| !session.trim().is_empty())
 }
 
-/// The folder the agent ran the command in (`cwd` in the hook payload). Only
-/// its basename is ever recorded (`graph_io::project_name`).
+/// The folder the agent ran the command in: `cwd` in the hook payload, or the
+/// folder a shell call names for its command (see [`command_dir`]), joined to
+/// it. Only its basename is ever recorded (`graph_io::project_name`).
 fn hook_cwd(payload: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(payload)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("cwd")
-                .and_then(|cwd| cwd.as_str())
-                .map(str::to_string)
-        })
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    if let command_dir::CommandDir::Named(folder) = command_dir::of(&value, own_dir) {
+        return Some(folder);
+    }
+    value
+        .get("cwd")
+        .and_then(|cwd| cwd.as_str())
+        .map(str::to_string)
         .filter(|cwd| !cwd.trim().is_empty())
+}
+
+/// The hook process's own directory, which is where the agent starts it.
+fn own_dir() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|dir| dir.to_string_lossy().into_owned())
 }
 
 /// The agent a hook or proxy line names (`--agent <id>`), when it names a
@@ -1268,11 +1348,7 @@ fn screen_weight(screened: &ShellScreened) -> (bool, u8, bool, u64) {
 /// `cat ../.env` mean different things in different places, and only the hook
 /// knows the place.
 fn hook_context(payload: &str) -> Option<innerwarden_agent_guard::mcp::WorkingContext> {
-    let cwd = hook_cwd(payload).or_else(|| {
-        std::env::current_dir()
-            .ok()
-            .map(|dir| dir.to_string_lossy().into_owned())
-    })?;
+    let cwd = hook_cwd(payload).or_else(own_dir)?;
     let home = hook::home_dir()
         .ok()
         .map(|home| home.to_string_lossy().into_owned());
@@ -1446,7 +1522,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     // Before stdin is read: a caller that never closes it is one of the
     // ends the net is for.
     if let Err(why) = hook_net::arm(monitor) {
-        return hook_unreadable(why, monitor);
+        return hook_unreadable("", rest, why, monitor);
     }
     // A host upgraded by an older binary still runs that binary's wiring:
     // the first hook of this version brings it up to this one's.
@@ -1455,7 +1531,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let buf = match read_tool_call_or_head(std::io::stdin()) {
         Ok(ToolCallRead::Whole(buf)) => buf,
         Ok(ToolCallRead::TooLong(head)) => return hook_too_long(&head, rest, monitor),
-        Err(_) => return hook_unreadable("stdin could not be read", monitor),
+        Err(_) => return hook_unreadable("", rest, "stdin could not be read", monitor),
     };
     // A call `innerwarden demo` sent: judged exactly as an agent's and
     // recorded like one, with `demo: true` beside it. It is not alerted on
@@ -1487,6 +1563,15 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     if let Some(exit) = screen_file_tool(&buf, rest, monitor, demo) {
         return exit;
     }
+    // A patch handed to the patch program on a shell line changes files the
+    // same way, so the files it names are judged the same way first. One
+    // that names no privileged file goes on to the shell rules below.
+    if let Some(exit) = screen_shell_patch(&buf, rest, monitor, demo) {
+        return exit;
+    }
+    if let Some(exit) = refuse_a_waiting_interpreter(&buf, rest, monitor, demo) {
+        return exit;
+    }
 
     let options = ShellScreenOptions {
         monitor,
@@ -1497,7 +1582,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     };
     let screened = match screen_shell(&buf, rest, &options) {
         ShellScreen::Nothing => return std::process::ExitCode::SUCCESS,
-        ShellScreen::Unreadable(why) => return hook_unreadable(why, monitor),
+        ShellScreen::Unreadable(why) => return hook_unreadable(&buf, rest, why, monitor),
         ShellScreen::ProfilesInvalid(why) => return hook_profiles_invalid(&why),
         ShellScreen::Screened(screened) => screened,
     };
@@ -1555,6 +1640,63 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     } else {
         std::process::ExitCode::SUCCESS
     }
+}
+
+/// The agents that type into a running command in a call their hook never
+/// sees: Codex (`write_stdin`) and Hermes (`process_manage`, which the hook
+/// does see, but which a guard reading `data` as a shell line cannot follow
+/// into a language's own prompt).
+const AGENTS_THAT_TYPE_INTO_A_COMMAND: &[&str] = &["codex", "hermes"];
+
+/// In enforce mode, for [`AGENTS_THAT_TYPE_INTO_A_COMMAND`], refuse a shell
+/// call that starts an interpreter with nothing to run
+/// ([`innerwarden_agent_guard::interactive`]): whatever is typed into it
+/// next is not screened, so the bare word is the call that hands it over.
+/// `None` lets the call on to the shell rules.
+fn refuse_a_waiting_interpreter(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    demo: bool,
+) -> Option<std::process::ExitCode> {
+    use innerwarden_agent_guard::interactive::{interactive_interpreter, INTERACTIVE_REFUSAL};
+    if monitor {
+        return None;
+    }
+    let agent = agent_flag(rest)?;
+    if !AGENTS_THAT_TYPE_INTO_A_COMMAND.contains(&agent.as_str()) {
+        return None;
+    }
+    let lines = match classify_hook_input(buf) {
+        HookInput::Command(command) => vec![command],
+        HookInput::Commands(lines) => lines,
+        _ => return None,
+    };
+    let (command, program) = lines.iter().find_map(|command| {
+        interactive_interpreter(command).map(|program| (command.as_str(), program))
+    })?;
+    let explanation = format!("`{program}` {INTERACTIVE_REFUSAL}");
+    // Recorded as every refusal of the hook is, so the record, `status` and
+    // the dashboard show it: a refusal said only to the agent was not there.
+    let verdict = serde_json::json!({
+        "command": command,
+        "risk_score": 60,
+        "severity": "high",
+        "signals": [{
+            "signal": "interactive_interpreter",
+            "score": 60,
+            "detail": explanation,
+        }],
+        "recommendation": "deny",
+        "explanation": explanation,
+    });
+    record_shell(buf, rest, command, &verdict, false, true, None, demo);
+    eprintln!(
+        "InnerWarden blocked this command (recommendation=deny): {explanation}.\n  \
+         Give it its script or its code on the same line (`{program} script`, `{program} -c '...'`) \
+         so the guard reads what runs."
+    );
+    Some(std::process::ExitCode::from(2))
 }
 
 /// How a caller of [`screen_shell`] wants one shell command screened.
@@ -1936,35 +2078,72 @@ fn screen_file_tool(
     let payload = serde_json::from_str::<serde_json::Value>(buf).ok()?;
     let (tool, paths) = match file_tools::file_tool_call(&payload) {
         FileToolCall::NotAFileTool => return None,
-        FileToolCall::Unreadable(why) => return Some(hook_unreadable(why, monitor)),
+        FileToolCall::Unreadable(why) => return Some(hook_unreadable(buf, rest, why, monitor)),
         FileToolCall::Writes { tool, paths } => (tool, paths),
     };
+    let screen = screen_file_writes(buf, rest, monitor, demo, &tool, &paths);
     Some(
-        match screen_file_writes(buf, rest, monitor, demo, &tool, &paths) {
-            FileScreen::Pass => {
-                if demo {
-                    println!("{}", demo::hook_report(Some("allow"), false, None));
-                }
-                std::process::ExitCode::SUCCESS
+        file_screen_exit(buf, rest, screen, monitor, demo).unwrap_or_else(|| {
+            if demo {
+                println!("{}", demo::hook_report(Some("allow"), false, None));
             }
-            FileScreen::Refused { explanation } => {
-                if demo {
-                    println!(
-                        "{}",
-                        demo::hook_report(Some("deny"), true, Some(&explanation))
-                    );
-                }
-                if monitor {
-                    return Some(std::process::ExitCode::SUCCESS);
-                }
-                eprintln!(
-                    "InnerWarden blocked this file change (recommendation=deny): {explanation}"
-                );
-                eprintln!("{}", FILE_BLOCK_REMEDY);
-                std::process::ExitCode::from(2)
-            }
-        },
+            std::process::ExitCode::SUCCESS
+        }),
     )
+}
+
+/// Screen a patch handed to the patch program on a shell line (see
+/// `innerwarden_agent_guard::shell_patch`): Codex CLI applies it as it
+/// applies its patch tool's, so the files it names are judged the same way.
+/// `None` when the command hands the patch program nothing, or its patch
+/// names no file that is refused: the shell rules then judge the command as
+/// they judge any other. A patch that cannot be read here is unreadable.
+fn screen_shell_patch(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    demo: bool,
+) -> Option<std::process::ExitCode> {
+    use innerwarden_agent_guard::file_tools;
+    use innerwarden_agent_guard::shell_patch::{shell_patch, ShellPatch};
+    let payload = serde_json::from_str::<serde_json::Value>(buf).ok()?;
+    let command = payload.get("tool_input")?.get("command")?.as_str()?;
+    let paths = match shell_patch(command) {
+        ShellPatch::NotAPatch => return None,
+        ShellPatch::Unreadable(why) => return Some(hook_unreadable(buf, rest, why, monitor)),
+        ShellPatch::Writes(paths) => paths,
+    };
+    let screen = screen_file_writes(buf, rest, monitor, demo, file_tools::PATCH_TOOL, &paths);
+    file_screen_exit(buf, rest, screen, monitor, demo)
+}
+
+/// The hook's answer to what [`screen_file_writes`] decided: `None` when the
+/// call passes. A `demo` call also prints the report of a refusal.
+fn file_screen_exit(
+    buf: &str,
+    rest: &[String],
+    screen: FileScreen,
+    monitor: bool,
+    demo: bool,
+) -> Option<std::process::ExitCode> {
+    match screen {
+        FileScreen::Pass => None,
+        FileScreen::Unreadable(why) => Some(hook_unreadable(buf, rest, why, monitor)),
+        FileScreen::Refused { explanation } => {
+            if demo {
+                println!(
+                    "{}",
+                    demo::hook_report(Some("deny"), true, Some(&explanation))
+                );
+            }
+            if monitor {
+                return Some(std::process::ExitCode::SUCCESS);
+            }
+            eprintln!("InnerWarden blocked this file change (recommendation=deny): {explanation}");
+            eprintln!("{}", FILE_BLOCK_REMEDY);
+            Some(std::process::ExitCode::from(2))
+        }
+    }
 }
 
 /// What [`screen_file_writes`] decided about one file tool call.
@@ -1975,6 +2154,10 @@ pub(crate) enum FileScreen {
     /// Refused (in enforce; recorded as `would_block` in monitor), with the
     /// person's words for why.
     Refused { explanation: String },
+    /// A path of the call could not be read, so what it changes is not
+    /// known. Refused in enforce, said in monitor, and not recorded, as
+    /// every call the hook cannot read.
+    Unreadable(&'static str),
 }
 
 /// The file side of the hook, for the paths one call writes (`tool` is the
@@ -2000,13 +2183,39 @@ pub(crate) fn screen_file_writes(
         home: home.as_deref(),
         guard_program: guard_program.as_deref(),
     };
-    let Some((path, what)) = paths.iter().find_map(|path| {
-        file_tools::privileged_file_write(path, &context).map(|what| (path, what))
-    }) else {
-        // A revoked agent is refused every file change too, where profiles
-        // are in force. With no profiles file this is one failed open of
-        // each file and the edit goes through, as before.
-        return file_tool_revoked(buf, rest, monitor, demo, tool, paths);
+    // A patch names its files from where it runs, and its program reads a
+    // leading `~` as a folder of that name: `~/../.codex/hooks.json` run from
+    // the home is the home's own `.codex/hooks.json`. Both readings are
+    // judged, the expanded one first.
+    let literal = |path: &str| {
+        let path = path.trim_start();
+        (tool == file_tools::PATCH_TOOL && path.starts_with('~')).then(|| format!("./{path}"))
+    };
+    let judged: Vec<(&String, &'static str)> = paths
+        .iter()
+        .filter_map(|path| {
+            file_tools::privileged_file_write(path, &context)
+                .or_else(|| {
+                    literal(path)
+                        .and_then(|path| file_tools::privileged_file_write(&path, &context))
+                })
+                .map(|what| (path, what))
+        })
+        .collect();
+    // A privileged file is refused by name, with its record, before a path
+    // too long to read makes the whole call unreadable.
+    let named = judged
+        .iter()
+        .copied()
+        .find(|(_, what)| *what != file_tools::PATH_TOO_LONG);
+    let Some((path, what)) = named else {
+        if judged.is_empty() {
+            // A revoked agent is refused every file change too, where
+            // profiles are in force. With no profiles file this is one
+            // failed open of each file and the edit goes through, as before.
+            return file_tool_revoked(buf, rest, monitor, demo, tool, paths);
+        }
+        return FileScreen::Unreadable(file_tools::PATH_TOO_LONG);
     };
     let verdict = file_tools::refusal_verdict(tool, path, what);
     let command = format!("{tool} {}", path.trim());
@@ -2178,12 +2387,17 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
         let mut attempted = 0usize;
         let mut failed = 0usize;
         let mut configured: Vec<String> = Vec::new();
+        // The hooks a switch rewrote and the agent no longer runs, each as the
+        // line that names the agent and the step left.
+        let mut stopped: Vec<String> = Vec::new();
         for agent in &agents {
             if !innerwarden_agent_guard::agents_ops::status_has_guard_wiring(&home, agent) {
                 continue;
             }
             attempted += 1;
-            let result = innerwarden_agent_guard::agents_ops::connect_one_result(
+            // A switch rewrites the wiring that is there. It installs no hook
+            // an agent did not have: that is `agents connect` and setup.
+            let result = innerwarden_agent_guard::agents_ops::switch_mode_one_result(
                 &home, agent, &guard_bin, false, monitor,
             );
             if result.configured() {
@@ -2194,6 +2408,7 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
                 failed += 1;
             }
             println!("{}", result.line);
+            stopped.extend(result.hook_stopped);
         }
         // OpenClaw's own tools: the guard plugin's mode follows, where it is
         // installed. Its entry is in the same `openclaw.json`.
@@ -2222,9 +2437,9 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
                 println!("  openclaw - failed: the guard plugin's mode could not be set ({error})");
             }
         }
-        Ok((attempted, failed, flipped, configured))
+        Ok((attempted, failed, flipped, configured, stopped))
     });
-    let (attempted, failed, flipped, configured) = match mode_result {
+    let (attempted, failed, flipped, configured, stopped) = match mode_result {
         Ok(counts) => counts,
         Err(error) => {
             eprintln!(
@@ -2247,6 +2462,9 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
             "innerwarden {} - {failed} of {attempted} guarded integration update(s) failed; {flipped} configured successfully.",
             if monitor { "dry-run" } else { "enforce" }
         );
+        for line in &stopped {
+            eprintln!("  {line}");
+        }
         return std::process::ExitCode::from(1);
     }
     if monitor {
@@ -2265,12 +2483,16 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
 }
 
 /// `innerwarden install [claude-code] [--settings PATH] [--block-review]` - wire the
-/// guardrail into Claude Code as a blocking PreToolUse:Bash hook in one command.
-/// The hook runs `innerwarden hook`, which screens each proposed shell command
-/// in-process before it executes and exits non-zero on a deny. It is NOT
-/// fail-closed and must not be described as such: unparseable input, or a tool
-/// call with no shell command in it, is allowed through, because wedging every
-/// non-Bash tool call would get the guardrail uninstalled within the hour.
+/// guardrail into Claude Code as a blocking PreToolUse hook (on `Bash` and on
+/// its file tools) in one command. The hook runs `innerwarden hook`, which
+/// screens each proposed shell command and file change in-process before it
+/// executes and exits 2 on a deny. In enforce it also refuses what it could
+/// not screen: a call it cannot read, and a screening that panicked, faulted
+/// or ran past its deadline. In monitor it refuses nothing. A well-formed call
+/// to a tool it does not screen is let through in both, because wedging every
+/// other tool call would get the guardrail uninstalled within the hour. What
+/// the hook cannot answer for is a run the agent never started or stopped from
+/// outside: the agent runs the tool then.
 /// Idempotent; preserves existing settings.
 /// Parsed `install` arguments (agent target, optional settings path, block-review
 /// flag). `Err` carries a message for an unexpected flag.
@@ -2710,6 +2932,47 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     if disconnected == std::process::ExitCode::SUCCESS {
         println!("  agents  : disconnected every wired agent");
     } else {
+        // A Codex or Gemini hook the disconnect left behind still runs this
+        // binary, and Gemini refuses every tool call while its hook names a
+        // program that is gone. Stop here, with the binary and the
+        // configuration still in place, and name the file to fix.
+        let left = verdict
+            .as_ref()
+            .map(|verdict| innerwarden_agent_guard::agent_hooks::left_behind(&home, &verdict.exe))
+            .unwrap_or_default();
+        // Hermes's hook is fail-closed in enforce: with its program gone,
+        // Hermes refuses every tool call.
+        let hermes = verdict.as_ref().and_then(|verdict| {
+            innerwarden_agent_guard::hermes_hook::still_runs(&home, &verdict.exe)
+        });
+        if !left.is_empty() || hermes.is_some() {
+            let mut lines = if left.is_empty() {
+                vec![
+                    "disconnect reported a problem, and a hook would outlive the binary."
+                        .to_string(),
+                    "The configuration and the binary were left in place.".to_string(),
+                ]
+            } else {
+                innerwarden_agent_guard::agent_hooks::left_behind_lines(&left)
+            };
+            if let Some(seen) = hermes {
+                lines.extend(innerwarden_agent_guard::hermes_hook::left_behind_lines(
+                    seen,
+                ));
+            }
+            for (at, line) in lines.iter().enumerate() {
+                let lead = if at == 0 {
+                    "  agents  : "
+                } else {
+                    "            "
+                };
+                println!("{lead}{line}");
+            }
+            println!();
+            println!("{COMMUNITY_NAME} not removed. Follow the lines above, then run");
+            println!("`innerwarden uninstall` again.");
+            return std::process::ExitCode::from(1);
+        }
         println!("  agents  : disconnect reported a problem; check `innerwarden agents list`");
         println!("            before removing the binary, or MCP-wired agents will");
         println!("            keep calling a path that is about to disappear.");
@@ -2724,6 +2987,27 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
         ),
         Ok(_) => println!("  hook    : none wired"),
         Err(e) => eprintln!("  hook    : could not remove ({e})"),
+    }
+    // A Claude Code hook still here runs this binary, and the enforcing line
+    // is the fail-closed script: once the binary is gone, Claude Code refuses
+    // every tool call, the one that would mend the file included. Stop with
+    // the binary and the configuration in place, as for the other agents.
+    if let Some(seen) = verdict
+        .as_ref()
+        .and_then(|verdict| hook::claude_code_hook_still_runs(&home, &verdict.exe))
+    {
+        for (at, line) in hook::claude_code_left_behind_lines(seen).iter().enumerate() {
+            let lead = if at == 0 {
+                "  hook    : "
+            } else {
+                "            "
+            };
+            println!("{lead}{line}");
+        }
+        println!();
+        println!("{COMMUNITY_NAME} not removed. Follow the lines above, then run");
+        println!("`innerwarden uninstall` again.");
+        return std::process::ExitCode::from(1);
     }
 
     // 2. Remove the config directory (guard config + API key + local state).
@@ -4536,6 +4820,86 @@ mod install_target_tests {
             ),
             HookInput::Command("ls -la".into())
         );
+    }
+
+    /// Gemini CLI names its shell tool `run_shell_command`: its command is
+    /// screened, and a call with none is unreadable, not a call to let run.
+    ///
+    /// FAILS ON REVERT: without the name in [`SHELL_TOOLS`] the second call
+    /// reads as `NotAShellCall` and exits 0.
+    #[test]
+    fn geminis_shell_tool_is_a_shell_tool() {
+        assert_eq!(
+            classify_hook_input(
+                r#"{"hook_event_name":"BeforeTool","tool_name":"run_shell_command","tool_input":{"command":"ls -la","description":"list"}}"#
+            ),
+            HookInput::Command("ls -la".into())
+        );
+        assert_eq!(
+            classify_hook_input(
+                r#"{"hook_event_name":"BeforeTool","tool_name":"run_shell_command","tool_input":{"description":"list"}}"#
+            ),
+            HookInput::Unreadable("a shell tool call with no command string")
+        );
+    }
+
+    /// Gemini's shell call can name the folder its command runs in. The
+    /// command is judged as the line that goes there first, the place it is
+    /// judged and recorded in is that folder, and a folder that cannot be
+    /// read makes the call one that cannot be read.
+    ///
+    /// FAILS ON REVERT: answer `HookInput::Command(command.to_string())` for
+    /// `CommandDir::Named` in `classify_hook_input` and the line is the bare
+    /// removal, which names no file the guard holds and is not refused; take
+    /// the `command_dir::of` test out of `hook_cwd` and the place is
+    /// `/work/app`.
+    #[test]
+    fn geminis_shell_call_is_judged_in_the_folder_it_names() {
+        let payload = r#"{"cwd":"/work/app","tool_name":"run_shell_command","tool_input":{"command":"rm settings.json","dir_path":"../.gemini"}}"#;
+        let HookInput::Command(line) = classify_hook_input(payload) else {
+            panic!("a shell call with a command and a folder");
+        };
+        assert_eq!(line, "cd -- '/work/.gemini' && rm settings.json");
+        assert_eq!(hook_cwd(payload).as_deref(), Some("/work/.gemini"));
+        let (_, verdict) = hook_verdict_for(&line, None).expect("verdict");
+        assert!(hook_blocks(&verdict, false), "{verdict}");
+
+        // The same removal in a project folder is the project's own business.
+        let benign = r#"{"cwd":"/work/app","tool_name":"run_shell_command","tool_input":{"command":"rm settings.json","dir_path":"config"}}"#;
+        let HookInput::Command(line) = classify_hook_input(benign) else {
+            panic!("a shell call with a command and a folder");
+        };
+        let (_, verdict) = hook_verdict_for(&line, None).expect("verdict");
+        assert!(!hook_blocks(&verdict, false), "{verdict}");
+
+        assert_eq!(
+            classify_hook_input(
+                r#"{"cwd":"/work/app","tool_name":"run_shell_command","tool_input":{"command":"ls","dir_path":7}}"#
+            ),
+            HookInput::Unreadable("a folder for the command that is not a string")
+        );
+    }
+
+    /// Codex CLI's `apply_patch` carries the patch text in `command`. It is
+    /// a file change, judged by the files it names, and never a shell line;
+    /// neither is any other file tool that happens to carry a `command`.
+    ///
+    /// FAILS ON REVERT: without the file tool check the patch text comes
+    /// back as `Command` and is screened as a line of shell.
+    #[test]
+    fn a_file_tool_call_is_never_a_shell_line() {
+        for payload in [
+            r#"{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch\n*** Add File: a.sh\n+echo hi\n*** End Patch\n"}}"#,
+            r#"{"tool_name":"apply_patch","tool_input":{"command":"echo hi"}}"#,
+            r#"{"tool_name":"write_file","tool_input":{"file_path":"a.sh","command":"echo hi"}}"#,
+            r#"{"tool_name":"Write","tool_input":{"file_path":"a.sh","command":"echo hi"}}"#,
+        ] {
+            assert_eq!(
+                classify_hook_input(payload),
+                HookInput::NotAShellCall,
+                "{payload}"
+            );
+        }
     }
 
     /// Claude Code: 2 blocks and shows stderr; any other non-zero shows stderr

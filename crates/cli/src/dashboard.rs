@@ -559,6 +559,57 @@ fn display_agent_name(name: &str) -> String {
     }
 }
 
+/// The mode of the agent's own hook when the agent runs it: Codex's and
+/// Gemini's, read back from their files by the same `hook_state` `status`
+/// reads. `None` for every other agent, and for a hook that is absent, cannot
+/// be read or is in the file without being on.
+fn own_hook_mode(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+) -> Option<&'static str> {
+    use innerwarden_agent_guard::agent_hooks::HookState;
+    match innerwarden_agent_guard::agents_ops::hook_state(home, agent)?.1 {
+        HookState::On { monitor: true, .. } => Some("monitor"),
+        HookState::On { .. } => Some("enforce"),
+        _ => None,
+    }
+}
+
+/// Whether the dashboard counts this agent as screened: the wiring `status`
+/// counts, which for Codex and Gemini is their own hook as well as the MCP
+/// proxy.
+fn dashboard_guarded(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+) -> bool {
+    innerwarden_agent_guard::agents_ops::status_is_effectively_guarded(home, agent)
+        || own_hook_mode(home, agent).is_some()
+}
+
+/// The mode the dashboard shows for a screened agent. With its own hook on,
+/// Codex and Gemini read the hook's mode, put together with the proxy's
+/// when the proxy wraps servers too; MCP servers left unwrapped beside the
+/// hook keep the row partial.
+fn dashboard_mode(
+    home: &std::path::Path,
+    agent: &innerwarden_agent_guard::agents::AgentStatus,
+) -> &'static str {
+    let proxy = agent_mode(home, agent);
+    let Some(hook) = own_hook_mode(home, agent) else {
+        return proxy;
+    };
+    let unwrapped =
+        agent_server_counts(home, agent).is_some_and(|counts| counts.wrapped < counts.stdio);
+    if unwrapped {
+        return "partial";
+    }
+    match proxy {
+        "monitor" | "enforce" | "mixed" if proxy != hook => "mixed",
+        "partial" => "partial",
+        _ => hook,
+    }
+}
+
 fn agent_mechanism(agent: &innerwarden_agent_guard::agents::AgentStatus) -> Option<&'static str> {
     if agent.hookable {
         Some("pretooluse_hook")
@@ -599,8 +650,7 @@ fn agents_json_with_status(
     let agents = rows
         .iter()
         .map(|agent| {
-            let effectively_guarded =
-                innerwarden_agent_guard::agents_ops::status_is_effectively_guarded(home, agent);
+            let effectively_guarded = dashboard_guarded(home, agent);
             let known = crate::agent_policy::is_reviewed_integration(agent);
             let detected_by = agent
                 .evidence
@@ -608,7 +658,7 @@ fn agents_json_with_status(
                 .map(|evidence| evidence.api_name())
                 .collect();
             let mode = if effectively_guarded {
-                agent_mode(home, agent).to_string()
+                dashboard_mode(home, agent).to_string()
             } else {
                 "not_configured".into()
             };
@@ -658,7 +708,11 @@ fn agents_json_with_status(
                 mcp: agent_server_counts(home, agent),
                 guardrail: AgentGuardrailView {
                     mode,
-                    mechanism: agent_mechanism(agent),
+                    // Codex and Gemini with their own hook on are screened
+                    // by that hook, as `status` says, beside the proxy.
+                    mechanism: own_hook_mode(home, agent)
+                        .map(|_| "pretooluse_hook")
+                        .or_else(|| agent_mechanism(agent)),
                     setup_support,
                     config_changed_at,
                 },
@@ -1087,10 +1141,7 @@ fn guardrail_status_from_rows(
 ) -> GuardrailStatus {
     let guarded: Vec<_> = rows
         .iter()
-        .filter(|agent| {
-            agent.guardable()
-                && innerwarden_agent_guard::agents_ops::status_is_effectively_guarded(home, agent)
-        })
+        .filter(|agent| agent.guardable() && dashboard_guarded(home, agent))
         .collect();
     if guarded.is_empty() {
         return GuardrailStatus {
@@ -1101,7 +1152,7 @@ fn guardrail_status_from_rows(
 
     let modes: Vec<&str> = guarded
         .iter()
-        .map(|agent| agent_mode(home, agent))
+        .map(|agent| dashboard_mode(home, agent))
         .collect();
     GuardrailStatus {
         mode: aggregate_modes(&modes).into(),
@@ -2857,6 +2908,71 @@ mod tests {
             row_of(&payload, "codex")["restart"]["how"],
             "Quit Codex and start it again."
         );
+    }
+
+    /// An agent with its own hook on (Gemini here; Codex reads through the
+    /// same `hook_state`, behind its trust record) reads as screened by that
+    /// hook, as `status` says: the mechanism, the mode and the count of
+    /// screened agents. Gemini here has no MCP server, so the hook is all
+    /// there is.
+    ///
+    /// FAILS ON REVERT: count only `status_is_effectively_guarded` in
+    /// `dashboard_guarded` and the Gemini whose hook screens it reads
+    /// `not_configured`, with no mechanism and no agent counted.
+    #[cfg(unix)]
+    #[test]
+    fn an_agent_with_its_own_hook_on_reads_as_screened_by_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("guard-bin/innerwarden");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = bin.display().to_string();
+        std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
+        std::fs::write(home.path().join(".gemini/settings.json"), "{}").unwrap();
+        let connect = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+            let outcome = innerwarden_agent_guard::agents_ops::run_with_guard_bin_outcome(
+                home.path(),
+                &args,
+                &bin,
+            );
+            assert_eq!(outcome.configured, 1, "{:?}", outcome.lines);
+        };
+        let gemini = || {
+            let rows = innerwarden_agent_guard::agents_ops::rows(home.path());
+            let payload: serde_json::Value = serde_json::from_str(&agents_json_with_status(
+                home.path(),
+                &rows,
+                false,
+                None,
+                &bin,
+                None,
+            ))
+            .unwrap();
+            (
+                row_of(&payload, "gemini").clone(),
+                guardrail_status_from_rows(home.path(), &rows),
+            )
+        };
+
+        let (before, host) = gemini();
+        assert_eq!(before["guardrail"]["mode"], "not_configured", "{before}");
+        assert_eq!(host.guarded_agents, 0);
+
+        connect(&["connect", "gemini"]);
+        let (row, host) = gemini();
+        assert_eq!(row["guardrail"]["mechanism"], "pretooluse_hook", "{row}");
+        assert_eq!(row["guardrail"]["mode"], "enforce", "{row}");
+        assert_eq!(host.guarded_agents, 1);
+        assert_eq!(host.mode, "enforce");
+
+        connect(&["connect", "gemini", "--monitor"]);
+        let (row, host) = gemini();
+        assert_eq!(row["guardrail"]["mechanism"], "pretooluse_hook", "{row}");
+        assert_eq!(row["guardrail"]["mode"], "monitor", "{row}");
+        assert_eq!(host.mode, "monitor");
     }
 
     #[test]

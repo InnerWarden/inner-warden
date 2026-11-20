@@ -13,6 +13,16 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_innerwarden")
 }
 
+/// The suite's PATH less every folder that holds a `codex`. `agents connect`
+/// and a mode switch ask the Codex they find there to trust the hook they
+/// wrote, and a test never starts the real one.
+fn path_without_codex() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let kept = std::env::split_paths(&path)
+        .filter(|dir| !dir.join("codex").exists() && !dir.join("codex.exe").exists());
+    std::env::join_paths(kept).expect("folders split from PATH join back")
+}
+
 /// The CLI under test, pointed at a disposable HOME and a disposable record.
 ///
 /// Both matter. Without the record redirect, `cargo test` writes the suite's
@@ -25,7 +35,10 @@ fn cli(home: &Path) -> Command {
         // What `hook::home_dir` reads on Windows, so the same temp home is in
         // force on every platform this binary ships to.
         .env("USERPROFILE", home)
-        .env("IW_GRAPH_FILE", home.join("graph.json"));
+        .env("IW_GRAPH_FILE", home.join("graph.json"))
+        // No real Codex: none on PATH to ask, no other folder for it to read.
+        .env("PATH", path_without_codex())
+        .env_remove("CODEX_HOME");
     // Run as the person, not from inside an AI agent's shell: the suite may
     // itself run under one, whose markers the CLI reads.
     for marker in [
@@ -336,6 +349,74 @@ fn status_names_the_tool_classes_an_agent_hook_judges() {
         "{after}"
     );
     assert!(!after.contains("only shell commands are judged"), "{after}");
+}
+
+/// A Codex hook that is in its file and that Codex does not run is named in
+/// the real report, with the step, though Codex has no MCP server and is
+/// wired into nothing.
+///
+/// FAILS ON REVERT: hand `tool_classes_for` in `status_io_cmd` the wired
+/// agents alone, as before, and the report says nothing of Codex's hook.
+#[test]
+fn status_names_a_codex_hook_that_codex_does_not_run() {
+    let home = tempfile::TempDir::new().expect("temp home");
+    std::fs::create_dir_all(home.path().join(".codex")).expect("codex dir");
+    let connected = run(home.path(), &["agents", "connect", "codex", "--monitor"]);
+    assert!(
+        home.path().join(".codex/hooks.json").is_file(),
+        "the connect wrote no Codex hook, so the rest of this test proves \
+         nothing:\n{connected}"
+    );
+
+    let report = run(home.path(), &["status"]);
+    assert!(
+        report.contains(
+            "codex: its shell commands and file changes run unchecked. Its PreToolUse hook is \
+             installed, but Codex skips it: it is not trusted yet"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("try: innerwarden agents connect codex"),
+        "{report}"
+    );
+}
+
+/// With `CODEX_HOME` naming another folder, the Codex started from this
+/// environment reads its hooks there: the hook in ~/.codex is reported as
+/// one Codex does not read, with the folder it reads instead.
+///
+/// FAILS ON REVERT: hand the state back unchanged from
+/// `agent_hooks::where_codex_reads` and the report says only that the hook
+/// is not trusted yet.
+#[test]
+fn status_names_the_folder_codex_home_sends_codex_to() {
+    let home = tempfile::TempDir::new().expect("temp home");
+    std::fs::create_dir_all(home.path().join(".codex")).expect("codex dir");
+    let connected = run(home.path(), &["agents", "connect", "codex", "--monitor"]);
+    assert!(
+        home.path().join(".codex/hooks.json").is_file(),
+        "the connect wrote no Codex hook, so the rest of this test proves \
+         nothing:\n{connected}"
+    );
+    let elsewhere = home.path().join("codex-home");
+    std::fs::create_dir_all(&elsewhere).expect("other codex home");
+
+    let out = cli(home.path())
+        .env("CODEX_HOME", &elsewhere)
+        .arg("status")
+        .output()
+        .expect("run innerwarden status");
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        report.contains(&format!("CODEX_HOME is set to {}", elsewhere.display())),
+        "{report}"
+    );
+    assert!(!report.contains("it is not trusted yet"), "{report}");
 }
 
 /// Wiring with the shell and file entries but no read entry (written by
