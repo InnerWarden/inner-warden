@@ -1,11 +1,14 @@
 //! The release safety suite: one measure of the guard per release.
 //!
-//! Runs three corpora through the same inspectors as the proof benchmark
+//! Runs four corpora through the same inspectors as the proof benchmark
 //! (`benchmark::run`, embedded rules):
 //!
 //! - `benchmarks/agent_attack_corpus.yml`: the curated proof corpus;
 //! - `corpus/attack-2026-11/cases.yml`: the lines the guard's own tests fixed;
-//! - `corpus/real/cases.yml`: lines agents really ran, labelled after review.
+//! - `corpus/real/cases.yml`: lines agents really ran, labelled after review;
+//! - `corpus/external-2026-11/cases.yml`: attacks the guard's authors did not
+//!   write (DVMCP, AgentDojo, a poisoned model), with benign controls from the
+//!   same sources.
 //!
 //! It prints, per corpus, attacks caught / total, attacks stopped for an agent,
 //! false positives / benign total, and every case whose verdict differs from
@@ -30,7 +33,7 @@ use std::fmt::Write as _;
 use innerwarden_agent_guard::benchmark::{run, CaseResult, Corpus, Label, Outcome, Scoreboard};
 use innerwarden_agent_guard::rules::RuleEngine;
 
-const CORPORA: [(&str, &str); 3] = [
+const CORPORA: [(&str, &str); 4] = [
     (
         "proof",
         include_str!("../benchmarks/agent_attack_corpus.yml"),
@@ -40,6 +43,10 @@ const CORPORA: [(&str, &str); 3] = [
         include_str!("../corpus/attack-2026-11/cases.yml"),
     ),
     ("real", include_str!("../corpus/real/cases.yml")),
+    (
+        "external-2026-11",
+        include_str!("../corpus/external-2026-11/cases.yml"),
+    ),
 ];
 
 const REFERENCE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/reference.tsv");

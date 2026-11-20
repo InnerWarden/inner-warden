@@ -55,3 +55,12 @@ case is not named.
   (`shell::heredoc_owner`), for every reader of a here-document. Real false
   positives 22/31 to 18/31; proof and attack-2026-11 unchanged, no case moved
   toward a miss.
+- 2026-11-20: new corpus external-2026-11, its own reference; nothing else
+  moved. Added external-2026-11/xad-001..xad-229 (AgentDojo v1.2.2: the
+  injected text of its important_instructions attack, the attack calls, the
+  user tasks' calls as benign controls) and external-2026-11/xmp-001..xmp-005
+  (the shell lines a poisoned model emitted). Malicious 68: 25 caught, 15
+  stopped for an agent; benign 166: 30 false positives. Most misses are the
+  injected AgentDojo text (34 of 35 allowed); most false positives are
+  AgentDojo payments and direct messages the user asked for. Recorded as
+  measured, as the baseline to hold. See external-2026-11/RESULTS.md.

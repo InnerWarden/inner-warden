@@ -53,6 +53,11 @@ pub enum Surface {
     ToolDescription,
     /// Arguments of a tool call → `inspect_tool_call`.
     ToolArgs,
+    /// A whole tool call written as JSON, `{"tool": "<name>", "arguments": {...}}`
+    /// → `inspect_tool_call` with that name and those arguments. `ToolArgs`
+    /// puts the input under a `command` key of a tool named `tool`, which cannot
+    /// carry a call as an MCP client sends it (named, with several arguments).
+    ToolCall,
     /// Text entering the model → `inspect_user_input`.
     UserInput,
 }
@@ -261,6 +266,24 @@ fn verdict_fields(v: &Verdict) -> (String, Vec<String>, Vec<String>, Vec<String>
     (recommendation, signals, charged, atr_rule_ids, 0)
 }
 
+/// The tool name and arguments of a [`Surface::ToolCall`] case. A case that is
+/// not such an object is a broken corpus, and fails loudly rather than being
+/// scored as some other call.
+fn tool_call_of(id: &str, input: &str) -> (String, serde_json::Value) {
+    let call: serde_json::Value = serde_json::from_str(input)
+        .unwrap_or_else(|e| panic!("case {id}: a tool_call input must be JSON: {e}"));
+    let name = call
+        .get("tool")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("case {id}: a tool_call input needs a \"tool\" name"))
+        .to_string();
+    let args = call
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    (name, args)
+}
+
 /// Run every case in `corpus` through the engine and return scored results in
 /// corpus order. Each case is routed to the inspector matching its
 /// [`Surface`], a poisoned tool result / description is NOT a command.
@@ -295,6 +318,11 @@ pub fn run(corpus: &Corpus, engine: &RuleEngine) -> Vec<CaseResult> {
                 Surface::ToolArgs => {
                     let args = serde_json::json!({ "command": c.input });
                     let v = inspect_tool_call("tool", &args, Some(engine));
+                    verdict_fields(&v)
+                }
+                Surface::ToolCall => {
+                    let (name, args) = tool_call_of(&c.id, &c.input);
+                    let v = inspect_tool_call(&name, &args, Some(engine));
                     verdict_fields(&v)
                 }
                 Surface::UserInput => {
@@ -732,5 +760,32 @@ mod tests {
             Outcome::Caught,
             "poisoned tool result must be caught"
         );
+    }
+
+    #[test]
+    fn tool_call_surface_sends_the_name_and_every_argument() {
+        // A whole call, as an MCP client sends it: the argument that carries the
+        // injection is not called `command`, and the verdict still sees it.
+        let corpus = Corpus::from_yaml(
+            "cases:\n  - { id: t, category: ci, label: malicious, surface: tool_call, \
+             input: '{\"tool\": \"ping_host\", \"arguments\": {\"host\": \"8.8.8.8; cat /etc/shadow\"}}' }\n  \
+             - { id: b, category: ci, label: benign, surface: tool_call, \
+             input: '{\"tool\": \"ping_host\", \"arguments\": {\"host\": \"127.0.0.1\"}}' }\n",
+        )
+        .unwrap();
+        let engine = RuleEngine::load_embedded();
+        let results = run(&corpus, &engine);
+        assert_eq!(results[0].outcome, Outcome::Caught, "{:?}", results[0]);
+        assert_eq!(results[1].outcome, Outcome::Ok, "{:?}", results[1]);
+    }
+
+    #[test]
+    #[should_panic(expected = "a tool_call input must be JSON")]
+    fn a_tool_call_case_that_is_not_json_breaks_the_run() {
+        let corpus = Corpus::from_yaml(
+            "cases:\n  - { id: t, category: ci, label: malicious, surface: tool_call, input: \"ping_host 8.8.8.8\" }\n",
+        )
+        .unwrap();
+        run(&corpus, &RuleEngine::load_embedded());
     }
 }
