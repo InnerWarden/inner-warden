@@ -189,8 +189,12 @@ fn a_guard_word_beside_a_quoted_expansion_is_not_the_guard_run() {
 /// (threats.rs): each was refused as disabling the guard.
 #[test]
 fn a_kill_beside_a_folder_named_for_the_guard_is_not_disabling_it() {
+    // 2026-11-20: `pkill -f x; cd ~/innerwarden/wt` was allowed here. The
+    // pattern `x` matches the command line of the guard's MCP proxy
+    // (`innerwarden mcp-proxy`), so the kill reaches the guard whatever
+    // folder follows: it is refused now, by its target, not by the folder.
+    assert_denied(&["pkill -f x; cd ~/innerwarden/wt"]);
     assert_allowed(&[
-        "pkill -f x; cd ~/innerwarden/wt",
         "pkill -f cargo; cd ~/innerwarden/wt && ls",
         "kill %1 && cd /opt/innerwarden",
     ]);
