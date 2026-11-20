@@ -1236,9 +1236,7 @@ fn record(
     source_event_id: Option<&str>,
     origin: DecisionOrigin,
 ) {
-    let Some(path) = graph_path() else { return };
-    record_to(
-        &path,
+    let decision = prepare(
         command,
         verdict,
         mode,
@@ -1247,13 +1245,22 @@ fn record(
         source_event_id,
         origin,
     );
+    // Inside a jail whose launcher keeps the record, the decision goes to
+    // the launcher and nowhere else: the record folder is read-only here,
+    // and a path from the environment (`IW_GRAPH_FILE`, which a program in
+    // the jail can set) never takes it elsewhere.
+    if let Some(socket) = crate::jail_record::socket_here() {
+        if let Err(code) = crate::jail_record::hand_over(&socket, &decision) {
+            eprintln!("innerwarden: graph record skipped ({code})");
+        }
+        return;
+    }
+    let Some(path) = graph_path() else { return };
+    persist(&path, &decision);
 }
 
 /// [`record`] into the graph at `path` (and `guard-events.jsonl` beside it).
-/// One mask, [`redact_secrets`](innerwarden_agent_guard::redact::redact_secrets),
-/// runs once on the command here, before anything is kept: the node's short
-/// label, its `command_full` and the `guard.blocked` line's `detail` are all
-/// cut from that one masked text, so no copy can hold what another hides.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn record_to(
     path: &std::path::Path,
@@ -1265,6 +1272,32 @@ fn record_to(
     source_event_id: Option<&str>,
     origin: DecisionOrigin,
 ) {
+    let decision = prepare(
+        command,
+        verdict,
+        mode,
+        outcome,
+        source_session,
+        source_event_id,
+        origin,
+    );
+    persist(path, &decision);
+}
+
+/// One decision as it is kept: one mask,
+/// [`redact_secrets`](innerwarden_agent_guard::redact::redact_secrets), runs
+/// once on the command here, before anything is kept: the node's short
+/// label, its `command_full` and the `guard.blocked` line's `detail` are all
+/// cut from that one masked text, so no copy can hold what another hides.
+fn prepare(
+    command: &str,
+    verdict: &Value,
+    mode: DecisionMode,
+    outcome: DecisionOutcome,
+    source_session: Option<&str>,
+    source_event_id: Option<&str>,
+    origin: DecisionOrigin,
+) -> crate::jail_record::Decision {
     // Redact secrets from the command BEFORE it is persisted. A secret in a
     // screened command (`export API_KEY=…`, `curl -H "Authorization: sk-…"`)
     // must never be written to the local Community record. Detection already ran
@@ -1277,13 +1310,39 @@ fn record_to(
     let verdict = innerwarden_agent_guard::redact::redact_json_secrets(verdict);
     let session = session_id(source_session);
     let event_hash = source_event_id.and_then(|event_id| hook_event_hash(&session, event_id));
+    crate::jail_record::Decision {
+        session,
+        command,
+        verdict,
+        mode,
+        outcome,
+        origin,
+        event_hash,
+    }
+}
+
+/// Write one prepared decision into the graph at `path` (and
+/// `guard-events.jsonl` beside it): the hook's own write, and the
+/// launcher's write of what the hook in a jail handed it
+/// ([`crate::jail_record`]).
+pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Decision) {
+    let crate::jail_record::Decision {
+        session,
+        command,
+        verdict,
+        mode,
+        outcome,
+        origin,
+        event_hash,
+    } = decision;
+    let (mode, outcome) = (*mode, *outcome);
     if let Err(error) = record_at_with_origin(
         path,
-        &session,
-        &command,
-        &verdict,
+        session,
+        command,
+        verdict,
         DecisionContextParts { mode, outcome },
-        &origin,
+        origin,
         event_hash.as_deref(),
         GRAPH_LOCK_TIMEOUT,
         || {},
@@ -1327,11 +1386,11 @@ fn record_to(
     {
         emit_guard_event(
             path,
-            &command,
-            &verdict,
+            command,
+            verdict,
             DecisionContextParts { mode, outcome },
-            &session,
-            &origin,
+            session,
+            origin,
         );
     }
 }

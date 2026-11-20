@@ -851,6 +851,25 @@ const HOME_PLACES: &[HomeGroup] = &[
 
 const GUARD_PROGRAM: &str = "the guard's own program";
 
+/// What a write into an AI Jail's record of decisions is, in the words the
+/// file tools and the shell side ([`crate::threats`]) both say.
+pub const JAIL_RECORD_WRITTEN: &str =
+    "writes into the record of decisions InnerWarden keeps in a project (.innerwarden), \
+     which the agent must not change";
+
+/// The folder, in a project, where InnerWarden keeps an AI Jail's record of
+/// decisions (the CLI's `contain::JAIL_GRAPH_DIR`).
+pub const JAIL_RECORD_FOLDER: &str = ".innerwarden";
+
+/// Whether `path` is in, or is, a project's [`JAIL_RECORD_FOLDER`]:
+/// a component of that name anywhere, in any case (a macOS disk ignores
+/// case). Where the jail cannot make the folder read-only (macOS), this is
+/// what keeps an agent from changing the record with a file tool.
+pub fn names_jail_record(path: &str) -> bool {
+    path.split(['/', '\\'])
+        .any(|part| part.eq_ignore_ascii_case(JAIL_RECORD_FOLDER))
+}
+
 /// What an agent's hook file is, in the words [`crate::threats`] uses for the
 /// agent settings it holds by name (a test keeps the two the same).
 const AGENT_HOOK_SETTINGS: &str =
@@ -879,6 +898,9 @@ pub fn privileged_file_write(path: &str, context: &WriteContext<'_>) -> Option<&
     } else {
         *context
     };
+    if names_jail_record(trimmed) {
+        return Some(JAIL_RECORD_WRITTEN);
+    }
     let Some(absolute) = absolute_path(trimmed, context) else {
         // Relative, with no working directory to place it: only the places
         // that are the same wherever they start can be judged.
@@ -1833,6 +1855,37 @@ mod tests {
             ("src/**/*.rs", "'src/**/*.rs'"),
         ] {
             assert_eq!(shell_path_word(path), word, "{path}");
+        }
+    }
+
+    /// T-067: a file tool never writes the record of decisions an AI Jail
+    /// keeps in the project (`.innerwarden`), however the path is spelled;
+    /// a file of another name in the project stays the agent's.
+    ///
+    /// FAILS ON REVERT: drop the `names_jail_record` check from
+    /// `privileged_file_write` and these are allowed.
+    #[test]
+    fn the_jails_record_is_refused_to_every_file_tool() {
+        let ctx = context(Path::new("/home/dev"), Path::new("/home/dev/proj"));
+        for path in [
+            "/home/dev/proj/.innerwarden/graph.json",
+            ".innerwarden/graph.json",
+            "./.innerwarden/guard-events.jsonl",
+            "/home/dev/proj/.INNERWARDEN/graph.json",
+            "sub/../.innerwarden/graph.json",
+        ] {
+            assert_eq!(
+                privileged_file_write(path, &ctx),
+                Some(JAIL_RECORD_WRITTEN),
+                "{path}"
+            );
+        }
+        for path in [
+            "/home/dev/proj/innerwarden/notes.md",
+            "/home/dev/proj/.innerwarden-old.txt",
+            "src/main.rs",
+        ] {
+            assert_eq!(privileged_file_write(path, &ctx), None, "{path}");
         }
     }
 

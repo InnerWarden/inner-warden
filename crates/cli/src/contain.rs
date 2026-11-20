@@ -2174,6 +2174,14 @@ pub struct JailInputs {
     /// dry run and where bwrap binds no descriptor: each is bound by name,
     /// as before.
     pub bind_fds: Vec<(PathBuf, i32)>,
+    /// Linux: the launcher's folder with the record socket
+    /// ([`crate::jail_record::Channel`]), mounted read-only in the jail at
+    /// [`crate::jail_record::JAIL_RECORD_DIR`]; the project's record folder
+    /// ([`JAIL_GRAPH_DIR`]) is then read-only in the jail, and the launcher
+    /// writes each decision the hook hands it. `None` where the launcher
+    /// could not open it (said as the jail starts): the hook then writes the
+    /// record in the project itself, as it did before.
+    pub record_channel: Option<PathBuf>,
 }
 
 impl JailInputs {
@@ -2899,6 +2907,12 @@ pub fn places_bound_from_descriptors(input: &JailInputs) -> Vec<(PathBuf, PathBu
             ));
         }
     }
+    if input.record_channel.is_some() {
+        let record = jail_graph_dir(&input.args.project);
+        if !out.iter().any(|(at, _, _)| *at == record) {
+            out.push((record.clone(), record, true));
+        }
+    }
     out
 }
 
@@ -3245,6 +3259,19 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // folders down) or above a read-only path in it.
     let project_pins = pins_of(PinRoot::Project);
     push(&project_pins.iter().map(String::as_str).collect::<Vec<_>>());
+    // The project's record folder, read-only, where the launcher keeps the
+    // record ([`JailInputs::record_channel`]): a mount point of its own, so
+    // a program in the jail can neither write in it nor remove, rename or
+    // replace it. In the real run from the descriptor the launcher opened
+    // just before bwrap starts.
+    if input.record_channel.is_some() {
+        let record = jail_graph_dir(&input.args.project);
+        let at = record.to_string_lossy().to_string();
+        match held_fd(input, &record) {
+            Some(fd) => push(&["--ro-bind-fd", &fd.to_string(), &at]),
+            None => push(&["--ro-bind", &at, &at]),
+        }
+    }
     let project_read_only = read_only_binds(Some(PinRoot::Project));
     push(
         &project_read_only
@@ -3351,6 +3378,18 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         } else {
             push(&["--ro-bind", "/dev/null", &dest]);
         }
+    }
+
+    // --- the launcher's folder with the record socket, read-only, on the
+    // `/run` tmpfs among the last mounts, so nothing the agent can write
+    // covers it: the hook hands each decision there
+    // ([`crate::jail_record`]). ---
+    if let Some(dir) = &input.record_channel {
+        push(&[
+            "--ro-bind",
+            &dir.to_string_lossy(),
+            crate::jail_record::JAIL_RECORD_DIR,
+        ]);
     }
 
     // --- the launcher's marker that the way to the system profiles file is
@@ -4040,6 +4079,11 @@ pub mod launch {
 
     /// The record descriptor a dry run shows. A real run uses the pipe's own.
     pub const DRY_RUN_RECORD_FD: i32 = 10;
+
+    /// The launcher's record folder a dry run shows
+    /// ([`crate::contain::JailInputs::record_channel`]). A real run makes a
+    /// new one of its own each time.
+    pub const DRY_RUN_RECORD_CHANNEL: &str = "/tmp/innerwarden-record-<launcher's own>";
 
     /// The key descriptor a dry run shows, when the host has a key the
     /// launcher believes. A real run uses the pipe's own.
@@ -5701,7 +5745,61 @@ mod tests {
             claude_state: ClaudeState::default(),
             jail_writes: vec![],
             bind_fds: vec![],
+            record_channel: None,
         }
+    }
+
+    /// T-067: where the launcher keeps the record, the project's record
+    /// folder is read-only in the jail, laid right after the project's
+    /// bind (so the bind does not cover it), and the launcher's folder with
+    /// the socket is read-only at its fixed place, after the `/run` tmpfs.
+    /// In the real run the record folder is bound from the descriptor the
+    /// launcher opened. Without a channel neither is there.
+    ///
+    /// FAILS ON REVERT: drop either bind from `build_linux_jail` and the
+    /// jail can rewrite or remove the record, or the hook finds no socket.
+    #[test]
+    fn the_jails_record_folder_is_read_only_where_the_launcher_keeps_it() {
+        let windows = |a: &[String], w: [&str; 3]| a.windows(3).position(|x| x == w);
+        let mut i = inputs(&["claude"]);
+        let plain = build_linux_jail(&i).unwrap().bwrap_args;
+        assert!(!plain
+            .iter()
+            .any(|a| a.contains(".innerwarden") || a.contains("innerwarden-record")));
+        i.record_channel = Some(PathBuf::from("/tmp/innerwarden-record-1-0"));
+        assert!(places_bound_from_descriptors(&i)
+            .iter()
+            .any(
+                |(at, host, exact)| at == Path::new("/home/dev/proj/.innerwarden")
+                    && host == at
+                    && *exact
+            ));
+        let a = build_linux_jail(&i).unwrap().bwrap_args;
+        let project = windows(&a, ["--bind", "/home/dev/proj", "/home/dev/proj"]).unwrap();
+        let record = windows(
+            &a,
+            [
+                "--ro-bind",
+                "/home/dev/proj/.innerwarden",
+                "/home/dev/proj/.innerwarden",
+            ],
+        )
+        .expect("the record folder is read-only");
+        assert!(record > project, "laid after the project's bind");
+        let run = a.windows(2).position(|w| w == ["--tmpfs", "/run"]).unwrap();
+        let socket = windows(
+            &a,
+            [
+                "--ro-bind",
+                "/tmp/innerwarden-record-1-0",
+                crate::jail_record::JAIL_RECORD_DIR,
+            ],
+        )
+        .expect("the socket folder is in the jail");
+        assert!(socket > run, "after the /run tmpfs");
+        i.bind_fds = vec![(PathBuf::from("/home/dev/proj/.innerwarden"), 42)];
+        let held = build_linux_jail(&i).unwrap().bwrap_args;
+        assert!(windows(&held, ["--ro-bind-fd", "42", "/home/dev/proj/.innerwarden"]).is_some());
     }
 
     /// The whole bwrap argument vector of today's jail, one token per line.

@@ -653,6 +653,7 @@ fn resolve_planned(
         claude_state,
         jail_writes: facts.writable.clone(),
         bind_fds: Vec::new(),
+        record_channel: None,
     })
 }
 
@@ -2172,6 +2173,9 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
                 .then_some(crate::contain::launch::DRY_RUN_KEY_FD),
             close_userns: dry_rules == Some(Rules::Identified),
             seccomp_fd: dry_seccomp,
+            record_channel: Some(PathBuf::from(
+                crate::contain::launch::DRY_RUN_RECORD_CHANNEL,
+            )),
             ..input.clone()
         };
         &dry_identity
@@ -2181,6 +2185,9 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         dry_plain = JailInputs {
             profiles_marker_fd: marks.then_some(crate::contain::launch::DRY_RUN_MARKER_FD),
             seccomp_fd: dry_seccomp,
+            record_channel: Some(PathBuf::from(
+                crate::contain::launch::DRY_RUN_RECORD_CHANNEL,
+            )),
             ..input.clone()
         };
         &dry_plain
@@ -2249,6 +2256,65 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     run_unrecorded(&bwrap, input, marks)
 }
 
+/// Linux: the project's record folder ([`crate::contain::jail_graph_dir`])
+/// made where it is not there, and the launcher's record channel opened
+/// ([`crate::jail_record::Channel`]): the jail then shows the folder
+/// read-only and the hook hands each decision to the launcher. Where the
+/// folder is not a real folder of this account, or the channel cannot be
+/// opened, the jail runs as before (the hook writes the record in the
+/// project, where the jail can change it), and the launcher says so.
+#[cfg(target_os = "linux")]
+fn with_record_channel(input: &JailInputs) -> (JailInputs, Option<crate::jail_record::Channel>) {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let dir = crate::contain::jail_graph_dir(&input.args.project);
+    let mut out = input.clone();
+    out.record_channel = None;
+    let said = |why: &str| {
+        eprintln!(
+            "innerwarden contain: the jail's record ({}) stays writable inside the jail this run: {why}",
+            crate::contain::printable(&dir)
+        );
+    };
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    let found = match std::fs::symlink_metadata(&dir) {
+        Ok(m) => m,
+        Err(e) => {
+            said(&format!("it cannot be made ({e})"));
+            return (out, None);
+        }
+    };
+    let entry = crate::contain::launch::GraphEntry {
+        symlink: found.file_type().is_symlink(),
+        dir: found.is_dir(),
+        regular: false,
+        uid: found.uid(),
+        len: 0,
+    };
+    if let Err(why) = crate::contain::launch::vet_jail_graph_dir(&entry, own_uid()) {
+        said(why);
+        return (out, None);
+    }
+    match crate::jail_record::Channel::open(
+        &launcher_tmpdir(),
+        dir.join(crate::contain::JAIL_GRAPH_NAME),
+    ) {
+        Ok(channel) => {
+            out.record_channel = Some(channel.dir().to_path_buf());
+            eprintln!(
+                "  the jail's record ({}) is read-only inside the jail; the launcher writes each decision the hook hands it.",
+                crate::contain::printable(&dir)
+            );
+            (out, Some(channel))
+        }
+        Err(why) => {
+            said(&format!(
+                "the launcher's record channel did not open ({why})"
+            ));
+            (out, None)
+        }
+    }
+}
+
 /// A jail with no launch record, as it runs: under the jail's seccomp filter
 /// where the host takes it, and with the marker that the way to the system
 /// profiles file was proven root's when `marks`. A marker that cannot be
@@ -2261,10 +2327,12 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     #[cfg(target_os = "linux")]
     let filter = unrecorded_filter(bwrap, input.args.identity);
     #[cfg(target_os = "linux")]
+    let (with_channel, channel) = with_record_channel(input);
+    #[cfg(target_os = "linux")]
     let input = &JailInputs {
         profiles_marker_fd: marker.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         seccomp_fd: filter.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
-        ..input.clone()
+        ..with_channel
     };
     #[cfg(not(target_os = "linux"))]
     let _ = marks;
@@ -2290,6 +2358,10 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     // Ours close only once bwrap has read them.
     #[cfg(target_os = "linux")]
     drop((marker, filter, held));
+    // Every decision the hook handed over is written before the launcher
+    // ends.
+    #[cfg(target_os = "linux")]
+    drop(channel);
     code
 }
 
@@ -2801,6 +2873,7 @@ fn launch_identified(
     // the launcher writes only after the admission: a launcher that dies
     // before the host answered leaves the jail an empty record.
     identified.gate_instance = crate::contain::launch::gate_for(input.args.start, instance_id);
+    let (identified, channel) = with_record_channel(&identified);
     // Each pin and read-only path from a descriptor opened now, after every
     // check ([`with_held_binds`]); bwrap holds its own copies once started.
     let (identified, held) = match with_held_binds(&identified) {
@@ -2948,6 +3021,9 @@ fn launch_identified(
     drop(record_writer);
     RecordHolder::release(holder);
     let code = exit_from(child.wait());
+    // Every decision the hook handed over is written before the record is
+    // read.
+    drop(channel);
     if identified {
         report_contained_run(input, instance_id, started_ms, now_ms());
     }

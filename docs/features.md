@@ -23,6 +23,18 @@ list, with every limit.
   `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ`, `TMPDIR`, `COLORTERM` and the proxy
   settings); `--pass-env NAME` hands in any other, and `contain` names every
   variable it kept out, never a value.
+  The hook inside the jail keeps its record of decisions in the project, in
+  `<project>/.innerwarden/graph.json`. On Linux that folder is read-only
+  inside the jail: the hook hands each decision over a socket to `contain`,
+  which runs outside the jail and writes it. A program in the jail cannot
+  change or remove a decision already written, and `IW_GRAPH_FILE` does not
+  send the hook's decisions anywhere else. It can still add records of its
+  own through that socket: the record says what the jail reported, not what
+  the host saw, and enough of them push the oldest out of the record's size
+  cap. On macOS the sandbox gives no such folder: the guard refuses a shell
+  command or a file tool that writes, moves or removes `.innerwarden`, but a
+  program run there (for example `python3 -c` code that opens the file) can
+  still change it. On macOS the record is not tamper-proof.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
   tell one agent's runs apart. See [Agent identity and trust](agent-identity.md).
