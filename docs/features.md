@@ -21,7 +21,8 @@ list, with every limit.
   new btrfs or bcachefs subvolumes and snapshots. The jailed command gets
   only the variables a shell needs (`PATH`, `HOME`, `USER`, `LOGNAME`,
   `SHELL`, `LANG`, `LC_*`, `TERM`, `TZ`, `TMPDIR`, `COLORTERM` and the proxy
-  settings); `--pass-env NAME` hands in any other, and `contain` names every
+  settings `HTTP_PROXY`, `HTTPS_PROXY`, `FTP_PROXY`, `ALL_PROXY` and
+  `NO_PROXY`, in capitals or lowercase); `--pass-env NAME` hands in any other, and `contain` names every
   variable it kept out, never a value.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
@@ -299,6 +300,33 @@ tool call in a shape other than a command string (an argv list, `args`, a
 second key) keeps the file checks on its arguments, so a private key's path
 among them (`ssh -i ~/.ssh/id_ed25519` given with `args`) is refused there. Those
 are yours to run.
+
+Also not seen today, and not promised for any date:
+
+- Code handed to a runner in forms the guard does not read. For `tcsh`,
+  `at`, awk's `system()`, `make -f -` and `busybox`, some forms where the
+  line writes the text and hands it over are read; other forms of the same
+  runners pass.
+- The writes that follow an `exec > file` (or `exec 3> file`): every later
+  command of the line writes that file without a redirect of its own, and
+  the guard does not count those writes.
+- A script that Python, Node or Ruby code writes and the same line then runs.
+  The guard does not read what the code put in the file.
+- Some ways of stopping the guard: a `pkill` pattern that matches only part
+  of the guard's command line, and a stop or kill of its service sent over
+  D-Bus (`busctl`, `gdbus`, `dbus-send`) instead of through `systemctl`.
+- A flaw in an MCP server's own logic. The proxy sees the calls, not what the
+  server does with them: a forged token the server accepts, or a parameter
+  that returns another user's record, looks like any other call. What is
+  left is the proxy's outbound filter, which masks the secrets it knows in
+  the answer.
+- Everything the hook decides, from `innerwarden check`. `check` judges one
+  line on its own. The hook also knows the agent's session (an argument that
+  came out of an earlier tool result) and the place the call reads, so some
+  verdicts depend on what a folder holds when the call is made, such as a
+  read of the home. A download piped to a shell is held for review by
+  `check`, which an installer also looks like, and refused by the hook for
+  an agent. Read `check` as a preview, not as the hook's verdict.
 
 These are the limits of a guard that reads text. InnerWarden Pro works below
 the text, at the host (Linux): armed for an agent, its Execution Gate decides
