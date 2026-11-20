@@ -418,7 +418,7 @@ const READ_THE_RECORD: &str = "readlink /proc/self/ns/pid; \
     fi; \
     exit 0";
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn state_home() -> tempfile::TempDir {
     let home = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(home.path().join(".local/state")).unwrap();
@@ -2317,12 +2317,12 @@ fn two_identified_jails_at_once_keep_separate_session_files() {
 }
 
 /// Where `~/.claude/.claude.json` is a link of the person's (a dotfiles
-/// manager's), or anything but a file, the jail makes no link to it: a save
-/// through two links would replace the person's link with a file. The jail
-/// keeps Claude Code's file in its own home then, as before, and the
-/// person's link is left as it was.
+/// manager's), the jail never saves through it: a save through two links
+/// would replace the person's link with a file. Since the second review of
+/// #352 the jail's `~/.claude` is a folder of its own, so its Claude Code
+/// saves its own file there, and the person's link is left as it was.
 ///
-/// FAILS ON REVERT: let the launcher take a link there as a kept file, and
+/// FAILS ON REVERT: show the host's `~/.claude` in the jail again and
 /// the save replaces the person's link.
 #[cfg(target_os = "linux")]
 #[test]
@@ -2343,12 +2343,12 @@ fn a_link_in_place_of_the_kept_settings_file_is_left_alone() {
     .output()
     .expect("run the jail");
     let out = String::from_utf8_lossy(&output.stdout);
-    assert_eq!(
-        output.status.code(),
-        Some(71),
-        "no link to save through: {out}"
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{:?}: {out} {err}", output.status);
+    assert!(
+        out.contains("LINKED") && out.contains("SAVED"),
+        "{out} {err}"
     );
-    assert!(!out.contains("LINKED"), "{out}");
     let link = std::fs::symlink_metadata(h.join(".claude/.claude.json")).unwrap();
     assert!(
         link.file_type().is_symlink(),
@@ -2398,11 +2398,12 @@ fn a_kept_settings_file_a_profile_hides_stays_hidden() {
 
 /// M30CW-SEC-2: the person's own `~/.claude.json` is a link to
 /// `.claude/.claude.json` (settings kept with dotfiles), or a hard link to
-/// it: the jail makes no link to that file, so its Claude Code never loads
-/// or rewrites the person's own settings, and the file is as it was.
+/// it: the jail's Claude Code never loads or rewrites the person's own
+/// settings, and the file is as it was. Since the second review of #352 the
+/// jail's `~/.claude` is a folder of its own: it saves its own file there.
 ///
-/// FAILS ON REVERT: drop the launcher's check of the person's own file, and
-/// the jail saves through the link onto it.
+/// FAILS ON REVERT: show the host's `~/.claude` in the jail again, and the
+/// jail saves onto the person's file.
 #[cfg(target_os = "linux")]
 #[test]
 fn the_persons_own_settings_file_in_claudes_folder_is_never_the_jails() {
@@ -2428,8 +2429,8 @@ fn the_persons_own_settings_file_in_claudes_folder_is_never_the_jails() {
         .expect("run the jail");
         let out = String::from_utf8_lossy(&output.stdout);
         let err = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(71), "hard={hard}: {out} {err}");
-        assert!(!out.contains("LINKED"), "hard={hard}: {out}");
+        assert!(output.status.success(), "hard={hard}: {out} {err}");
+        assert!(out.contains("SAVED"), "hard={hard}: {out} {err}");
         assert_eq!(
             std::fs::read_to_string(&kept).unwrap(),
             "{\"own\":\"HOST-OWN-STATE\"}\n",
@@ -2438,15 +2439,15 @@ fn the_persons_own_settings_file_in_claudes_folder_is_never_the_jails() {
     }
 }
 
-/// M30CW-SEC-4: `~/.claude` is a link to `~/.config/claude`, so the jail
-/// shows the folder twice, through the `.claude` bind and through the
-/// `.config` bind. The jail's own sessions and backups folders cover both:
-/// neither place lists the host's sessions or the copy of the person's
-/// file, and what the jail writes at the second place never reaches the
-/// host.
+/// M30CW-SEC-4: `~/.claude` is a link to `~/.config/claude`, which the
+/// `.config` bind shows. The host's `~/.claude` is never shown writable
+/// in a jail (second review of #352): it is covered with an empty folder
+/// where it leads, too, and the jail's `~/.claude` is its own. Neither
+/// place lists the host's sessions or the copy of the person's file, and
+/// nothing the jail writes there reaches the host.
 ///
-/// FAILS ON REVERT: cover only the place the most specific bind shows, and
-/// the jail lists the host's `999.json` through `~/.config/claude`.
+/// FAILS ON REVERT: leave out the place the host's `~/.claude` leads to,
+/// and the jail lists the host's `999.json` through `~/.config/claude`.
 #[cfg(target_os = "linux")]
 #[test]
 fn claude_codes_folders_are_the_jails_own_through_a_linked_claude_folder() {
@@ -2460,10 +2461,11 @@ fn claude_codes_folders_are_the_jails_own_through_a_linked_claude_folder() {
     std::fs::write(real.join("backups/.claude.json.backup.1"), "HOST-OWN-STATE").unwrap();
     std::os::unix::fs::symlink(".config/claude", h.join(".claude")).unwrap();
     let project = tempfile::TempDir::new().unwrap();
-    let script = "for d in .claude/sessions .config/claude/sessions .claude/backups \
-                  .config/claude/backups; do echo \"== $d\"; ls -A \"$HOME/$d\" || exit 75; done; \
+    let script = "for d in .claude/sessions .claude/backups .config/claude; do \
+                  echo \"== $d\"; ls -A \"$HOME/$d\" || exit 75; done; \
                   grep -rs HOST-OWN \"$HOME/.claude/\" \"$HOME/.config/claude/\"; \
-                  printf x > \"$HOME/.config/claude/sessions/7.json\" || exit 76; echo DONE";
+                  mkdir -p \"$HOME/.config/claude/sessions\" && \
+                  printf x > \"$HOME/.config/claude/sessions/7.json\"; echo DONE";
     let output = identified_sh(h, project.path(), script)
         .output()
         .expect("run the jail");
@@ -3905,53 +3907,43 @@ fn a_profile_that_shows_the_persons_settings_file_read_only_still_starts() {
 }
 
 /// M30CW-BRK-2: `--project ~/.claude` (to have the agent edit its own
-/// CLAUDE.md) shows the folder once more, after the jail's own sessions
-/// folder used to be laid. The jail's own folders come after the project
-/// now: it does not list the host's sessions, and its `2.json` stays in it.
+/// CLAUDE.md) showed the host's `~/.claude` writable in the jail. Since the
+/// second review of #352 no jail shows that folder writable, the project
+/// included: such a launch is refused, says why, and changes nothing there.
 ///
-/// FAILS ON REVERT: lay the jail's own folders before the project, and the
-/// project brings the host's back.
+/// FAILS ON REVERT: let a project be the host's `~/.claude` again, and the
+/// jail starts there.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_project_that_is_claudes_folder_keeps_the_jails_own_sessions() {
-    require_bwrap();
+fn a_project_that_is_claudes_folder_is_refused() {
     let home = state_home();
     let h = home.path();
     std::fs::create_dir_all(h.join(".claude/sessions")).unwrap();
-    std::fs::write(h.join(".claude/sessions/999.json"), "HOST-OWN-SESSION").unwrap();
     std::fs::write(h.join(".claude/CLAUDE.md"), "PROJECT-OK").unwrap();
-    let output = identified_sh(
-        h,
-        &h.join(".claude"),
-        "cat CLAUDE.md; echo; ls -A \"$HOME/.claude/sessions\"; \
-         printf x > \"$HOME/.claude/sessions/2.json\" || exit 75; echo DONE",
-    )
-    .output()
-    .expect("run the jail");
+    let output = identified_sh(h, &h.join(".claude"), "echo STARTED")
+        .output()
+        .expect("run the launcher");
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
-    assert!(output.status.success(), "{:?}: {out} {err}", output.status);
+    assert_eq!(output.status.code(), Some(2), "{out} {err}");
+    assert!(!out.contains("STARTED"), "{out}");
+    assert!(err.contains(".claude"), "{err}");
     assert!(
-        out.contains("PROJECT-OK") && out.contains("DONE"),
-        "{out} {err}"
-    );
-    assert!(!out.contains("999.json"), "the host's sessions: {out}");
-    assert!(
-        !h.join(".claude/sessions/2.json").exists(),
-        "reached the host"
+        !h.join(".claude/settings.json").exists(),
+        "the hook was armed"
     );
 }
-
-/// M30CW-BRK-2: where a folder of Claude Code's runs cannot be the jail's
-/// own (`~/.claude/sessions` is a link of the person's), the launcher says
-/// the jail shows the host's, once, and leaves the link as it was; the jail
-/// starts. A jail whose folders are its own says nothing of it.
+/// M30CW-BRK-2: `~/.claude/sessions` was a link of the person's, so the
+/// jail could not have a folder of its own there and shared the host's.
+/// Since the second review of #352 the jail's `~/.claude` is its own: the
+/// person's link is left as it was, the jail writes its own session list,
+/// and nothing reaches where the link leads.
 ///
-/// FAILS ON REVERT: drop the sentence, and the jail shares the host's
-/// session list with no word.
+/// FAILS ON REVERT: show the host's `~/.claude` in the jail again, and the
+/// jail's `2.json` lands where the person's link leads.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_folder_the_jail_cannot_have_of_its_own_is_said_to_be_the_hosts() {
+fn a_link_in_the_hosts_claude_folder_never_leads_the_jails_sessions() {
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -3959,22 +3951,23 @@ fn a_folder_the_jail_cannot_have_of_its_own_is_said_to_be_the_hosts() {
     std::fs::create_dir_all(h.join("elsewhere")).unwrap();
     std::os::unix::fs::symlink("../elsewhere", h.join(".claude/sessions")).unwrap();
     let project = tempfile::TempDir::new().unwrap();
-    let output = identified_sh(h, project.path(), "echo DONE")
-        .output()
-        .expect("run the jail");
+    let output = identified_sh(
+        h,
+        project.path(),
+        "printf x > \"$HOME/.claude/sessions/2.json\" || exit 75; echo DONE",
+    )
+    .output()
+    .expect("run the jail");
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{out} {err}");
     assert!(out.contains("DONE"), "{out} {err}");
-    let said = "innerwarden contain: Claude Code's ~/.claude/sessions or ~/.claude/backups is \
-                the host's in this jail, not one of its own";
-    assert_eq!(err.matches(said).count(), 1, "{err}");
+    assert_eq!(std::fs::read_dir(h.join("elsewhere")).unwrap().count(), 0);
     assert!(std::fs::symlink_metadata(h.join(".claude/sessions"))
         .unwrap()
         .file_type()
         .is_symlink());
 }
-
 /// Decision on the project's own settings (review of #352): a project
 /// whose `.claude/settings.json` turns every hook off keeps the jail from
 /// starting, says why, exits 2, and changes nothing on the host (the
@@ -4021,22 +4014,29 @@ fn a_project_whose_settings_turn_the_hooks_off_never_starts_a_jail() {
     );
 }
 
-/// Review of #352, item 2: `~/.claude/settings.json` carries the guard's
-/// hook and `~/.claude` is writable in a jail; a program there rewrote it
-/// (hooks off, the hook taken out) for every run after. Now the file is
-/// read-only in every Linux jail, plain and identified: a write, a removal
-/// and a rename over it are refused, and the host's file is as it was.
+/// Review of #352, item 2, and its second review: `~/.claude/settings.json`
+/// carries the guard's hook, and a program in the jail rewrote it (hooks
+/// off, the hook taken out), or made a `settings.local.json` there that
+/// turned hooks off, for every run after. Now no jail shows the host's
+/// `~/.claude`: its own has the launcher's copies of the settings,
+/// read-only, an empty `settings.local.json` among them. A write, a new
+/// local settings file, a removal and a rename over either are refused,
+/// the host's files are as they were, and the next run has the hook.
 ///
-/// FAILS ON REVERT: drop the read-only binds of Claude Code's settings.
+/// FAILS ON REVERT: bind the host's `~/.claude` again, or drop the
+/// read-only copies.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_jail_cannot_change_the_settings_that_carry_the_guards_hook() {
     require_bwrap();
-    let script = "s=\"$HOME/.claude/settings.json\"; \
+    let script = "s=\"$HOME/.claude/settings.json\"; l=\"$HOME/.claude/settings.local.json\"; \
                   (echo '{\"disableAllHooks\":true}' > \"$s\") 2>/dev/null && echo WROTE; \
+                  (echo '{\"disableAllHooks\":true}' > \"$l\") 2>/dev/null && echo LOCAL; \
                   echo '{}' > \"$HOME/.claude/forged.json\" && \
                   mv \"$HOME/.claude/forged.json\" \"$s\" 2>/dev/null && echo REPLACED; \
-                  rm -f \"$s\" 2>/dev/null; [ -f \"$s\" ] || echo REMOVED; echo DONE";
+                  mv \"$HOME/.claude/forged.json\" \"$l\" 2>/dev/null && echo REPLACED; \
+                  rm -f \"$s\" \"$l\" 2>/dev/null; [ -f \"$s\" ] && [ -f \"$l\" ] || echo REMOVED; \
+                  grep -q 'hook --' \"$s\" && echo HOOKED; echo DONE";
     for identity in [false, true] {
         let home = state_home();
         let h = home.path();
@@ -4060,44 +4060,168 @@ fn a_jail_cannot_change_the_settings_that_carry_the_guards_hook() {
         .expect("run the jail");
         let out = String::from_utf8_lossy(&output.stdout);
         let err = String::from_utf8_lossy(&output.stderr);
-        assert!(out.contains("DONE"), "identity={identity}: {out} {err}");
-        for done in ["WROTE", "REPLACED", "REMOVED"] {
+        assert!(
+            out.contains("DONE") && out.contains("HOOKED"),
+            "identity={identity}: {out} {err}"
+        );
+        for done in ["WROTE", "LOCAL", "REPLACED", "REMOVED"] {
             assert!(!out.contains(done), "identity={identity}: {done}: {out}");
         }
         let settings = std::fs::read_to_string(h.join(".claude/settings.json")).unwrap();
         assert!(settings.contains("hook"), "identity={identity}: {settings}");
         assert!(!settings.contains("disableAllHooks"), "{settings}");
+        assert!(
+            !h.join(".claude/settings.local.json").exists(),
+            "identity={identity}"
+        );
+        // The next run on the project still has the hook.
+        let again = if identity {
+            identified_sh(
+                h,
+                project.path(),
+                "grep -q 'hook --' \"$HOME/.claude/settings.json\" && echo HOOKED",
+            )
+            .output()
+        } else {
+            cli()
+                .args([
+                    "contain",
+                    "--project",
+                    project.path().to_str().unwrap(),
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "grep -q 'hook --' \"$HOME/.claude/settings.json\" && echo HOOKED",
+                ])
+                .env("HOME", h)
+                .output()
+        }
+        .expect("run the jail again");
+        assert!(
+            String::from_utf8_lossy(&again.stdout).contains("HOOKED"),
+            "identity={identity}"
+        );
     }
 }
 
-/// M30CW-2: Claude Code's folders of its runs are made on the host by a
-/// real launch alone, after every check: a dry run (plain or identified)
-/// and an identified launch refused by the checks make nothing (a dry run
-/// must change nothing). A real launch makes both, empty and 0700: an
-/// identified one, and since the plain jail has folders of its own too (two
-/// plain jails wrote the same `sessions/2.json`), a plain one.
+/// Second review of #352, item 3: a start that could not read the person's
+/// Claude Code settings went on as if nothing turned the hook off. Now each
+/// doubt refuses the start (exit 2), names the file, and arms nothing: the
+/// person's `settings.json` a link, a `settings.local.json` with
+/// `disableAllHooks` set to `"true"`, `1` or `"yes"`, JSON with a
+/// comment, one over 4 MiB. Refused before the jail is built, so no
+/// bubblewrap is needed.
 ///
-/// FAILS ON REVERT: make the folders while the launch is planned, before
-/// the checks, and the dry runs and the refused launch make them; or make
-/// none for a plain jail.
+/// FAILS ON REVERT: skip what does not read, or read only `true`.
+#[cfg(unix)]
+#[test]
+fn every_doubt_in_the_persons_claude_settings_refuses_the_start() {
+    let mut big = br#"{"model":""#.to_vec();
+    big.extend(std::iter::repeat_n(b'x', 5 * 1024 * 1024));
+    big.extend(br#""}"#);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "settings.local.json",
+            br#"{"disableAllHooks":"true"}"#.to_vec(),
+        ),
+        ("settings.local.json", br#"{"disableAllHooks":1}"#.to_vec()),
+        (
+            "settings.local.json",
+            br#"{"disableAllHooks":"yes"}"#.to_vec(),
+        ),
+        ("settings.json", b"{\"model\":\"x\" // comment\n}".to_vec()),
+        ("settings.json", big),
+        ("link", Vec::new()),
+    ];
+    for (name, bytes) in cases {
+        let home = state_home();
+        let h = home.path();
+        std::fs::create_dir_all(h.join(".claude")).unwrap();
+        let shown = if name == "link" {
+            std::fs::write(h.join("dot-settings.json"), "{}").unwrap();
+            std::os::unix::fs::symlink("../dot-settings.json", h.join(".claude/settings.json"))
+                .unwrap();
+            "settings.json".to_string()
+        } else {
+            std::fs::write(h.join(".claude").join(name), &bytes).unwrap();
+            name.to_string()
+        };
+        let before = std::fs::read(h.join(".claude/settings.json")).ok();
+        let project = tempfile::TempDir::new().unwrap();
+        let output = cli()
+            .args([
+                "contain",
+                "--project",
+                project.path().to_str().unwrap(),
+                "--",
+                "/bin/sh",
+                "-c",
+                "echo STARTED",
+            ])
+            .env("HOME", h)
+            .output()
+            .expect("run the launcher");
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{name}: {out} {err}");
+        assert!(!out.contains("STARTED"), "{name}: {out}");
+        assert!(
+            err.contains("refusing to start") && err.contains(&shown),
+            "{name}: {err}"
+        );
+        assert_eq!(
+            std::fs::read(h.join(".claude/settings.json")).ok(),
+            before,
+            "{name}: the hook was armed"
+        );
+    }
+}
+
+/// M30CW-2: what a jail keeps of Claude Code's is made on the host by a
+/// real launch alone, after every check: a dry run (plain or identified)
+/// and a launch refused by the checks make nothing. Since the second review
+/// of #352 that is the jail's own `~/.claude` for the project, beside the
+/// launcher's records, 0700, with the launcher's copies of the person's
+/// settings in it, 0600; nothing is ever made in the host's `~/.claude`.
+///
+/// FAILS ON REVERT: make the folder while the launch is planned, before the
+/// checks, and the dry runs and the refused launch make it; or make none.
 #[cfg(target_os = "linux")]
 #[test]
-fn claude_codes_folders_are_made_only_by_a_real_launch() {
+fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
-    let home = state_home();
-    let h = home.path();
-    std::fs::create_dir_all(h.join(".claude")).unwrap();
-    let project = tempfile::TempDir::new().unwrap();
-    let p = project.path().to_str().unwrap().to_string();
-    let none_made = |when: &str| {
-        for name in ["sessions", "backups"] {
+    let folders = |h: &std::path::Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(h.join(".local/state/innerwarden/jail-claude"))
+            .map(|dir| dir.map(|e| e.unwrap().path()).collect())
+            .unwrap_or_default()
+    };
+    let nothing_in_the_hosts = |h: &std::path::Path, when: &str| {
+        for name in ["sessions", "backups", ".claude.json"] {
             assert!(
                 std::fs::symlink_metadata(h.join(".claude").join(name)).is_err(),
                 "{when} made ~/.claude/{name}"
             );
         }
     };
+    let made_one = |h: &std::path::Path, when: &str| {
+        let made = folders(h);
+        assert_eq!(made.len(), 1, "{when}: {made:?}");
+        let meta = std::fs::symlink_metadata(&made[0]).unwrap();
+        assert!(meta.is_dir(), "{when}");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{when}");
+        for name in ["settings.json", "settings.local.json"] {
+            let copy = std::fs::symlink_metadata(made[0].join(name)).unwrap();
+            assert!(copy.is_file(), "{when}: {name}");
+            assert_eq!(copy.permissions().mode() & 0o777, 0o600, "{when}: {name}");
+        }
+        nothing_in_the_hosts(h, when);
+    };
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = project.path().to_str().unwrap().to_string();
     let plain_dry = cli()
         .args(["contain", "--dry-run", "--project", &p, "--", "/bin/true"])
         .env("HOME", h)
@@ -4108,27 +4232,7 @@ fn claude_codes_folders_are_made_only_by_a_real_launch() {
         "{}",
         String::from_utf8_lossy(&plain_dry.stderr)
     );
-    assert!(String::from_utf8_lossy(&plain_dry.stdout).contains("/.claude/sessions"));
-    none_made("a plain dry run");
-    // A real plain jail, in a home of its own: it makes both.
-    let plain_home = state_home();
-    let ph = plain_home.path();
-    std::fs::create_dir_all(ph.join(".claude")).unwrap();
-    let plain = cli()
-        .args(["contain", "--project", &p, "--", "/bin/true"])
-        .env("HOME", ph)
-        .output()
-        .expect("run a plain jail");
-    assert!(
-        plain.status.success(),
-        "{}",
-        String::from_utf8_lossy(&plain.stderr)
-    );
-    for name in ["sessions", "backups"] {
-        let meta = std::fs::symlink_metadata(ph.join(".claude").join(name)).unwrap();
-        assert!(meta.is_dir(), "plain {name}");
-        assert_eq!(meta.permissions().mode() & 0o777, 0o700, "plain {name}");
-    }
+    assert!(folders(h).is_empty(), "a plain dry run made one");
     let mut dry = cli();
     dry.args([
         "contain",
@@ -4148,8 +4252,7 @@ fn claude_codes_folders_are_made_only_by_a_real_launch() {
         "{}",
         String::from_utf8_lossy(&dry.stderr)
     );
-    assert!(String::from_utf8_lossy(&dry.stdout).contains("/.claude/sessions"));
-    none_made("an identified dry run");
+    assert!(folders(h).is_empty(), "an identified dry run made one");
     let refused = identified_sh(h, h, "true")
         .output()
         .expect("refused launch");
@@ -4159,7 +4262,7 @@ fn claude_codes_folders_are_made_only_by_a_real_launch() {
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
-    none_made("a refused launch");
+    assert!(folders(h).is_empty(), "a refused launch made one");
     let real = identified_sh(h, project.path(), "true")
         .output()
         .expect("real launch");
@@ -4168,13 +4271,23 @@ fn claude_codes_folders_are_made_only_by_a_real_launch() {
         "{}",
         String::from_utf8_lossy(&real.stderr)
     );
-    for name in ["sessions", "backups"] {
-        let meta = std::fs::symlink_metadata(h.join(".claude").join(name)).unwrap();
-        assert!(meta.is_dir(), "{name}");
-        assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{name}");
-    }
+    made_one(h, "an identified launch");
+    // A real plain jail, in a home of its own.
+    let plain_home = state_home();
+    let ph = plain_home.path();
+    std::fs::create_dir_all(ph.join(".claude")).unwrap();
+    let plain = cli()
+        .args(["contain", "--project", &p, "--", "/bin/true"])
+        .env("HOME", ph)
+        .output()
+        .expect("run a plain jail");
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    made_one(ph, "a plain launch");
 }
-
 /// M30CW-C2: on an account where Claude Code never ran there is no
 /// `~/.claude` when the jail is planned, and arming the hook makes it, with
 /// the settings file that carries the hook. The jail is planned again on
@@ -5641,7 +5754,10 @@ fn ordinary_dotdirs_are_hidden_as_before_and_nothing_is_added() {
     // host's and other jails' reach): the jail's own folders of Claude
     // Code's runs, and the folder of every project's settings file, covered
     // before this project's own is bound. The real run above made them.
+    // Since the second review of #352, the host's `~/.claude` too: no jail
+    // shows it writable (the jail's own is bound over it).
     for name in [
+        ".claude",
         ".claude/sessions",
         ".claude/backups",
         ".local/state/innerwarden/jail-claude",

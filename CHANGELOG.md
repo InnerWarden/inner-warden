@@ -109,6 +109,18 @@ the text of a command; what it does not see is written down, as measured:
 
 ### AI Jail
 
+- **No jail shows your `~/.claude` writable any more.** That folder carries
+  the settings that wire the guard's hook, and a program in a jail could
+  take the hook out, turn hooks off with a `settings.local.json` of its
+  own, or swap a link there for a file. Each project now has a `~/.claude`
+  of its own, a folder of the launcher's beside its records: on Linux it is
+  bound at `~/.claude`, on macOS Claude Code is pointed at it with
+  `CLAUDE_CONFIG_DIR` and the sandbox denies writing yours, your
+  `~/.claude.json` and the CLI the guard's hook runs. Your settings are
+  read-only copies in it, and a jail does not start where yours or the
+  project's may turn the hook off or cannot be read (a link, not JSON, over
+  4 MiB, `disableAllHooks` other than `false`, hooks in a form it does
+  not read). [Claude Code's state in a jail](docs/features.md).
 - **The proxy settings are passed by their exact names.** `innerwarden
   contain` handed in any variable whose name ended in `_PROXY`. It now hands
   in `HTTP_PROXY`, `HTTPS_PROXY`, `FTP_PROXY`, `ALL_PROXY` and `NO_PROXY`,

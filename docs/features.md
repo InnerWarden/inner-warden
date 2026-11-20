@@ -125,48 +125,68 @@ list, with every limit.
   told from one that was, and is kept. On macOS the sandbox denies writing
   them and keeps the folders above them in place; reading them stays
   allowed.
-  Claude Code's settings that carry the guard's hook,
-  `~/.claude/settings.json` (and `~/.claude/settings.local.json` where one
-  is there), are read-only in every Linux jail, and on macOS the sandbox
-  denies writing them and keeps `~/.claude` in place: before, a program in
-  the jail could take the hook out, or turn hooks off, for every run after.
-  Where one is a link, the jail cannot lay it read-only, and `contain` says
-  so as it starts. The project's own `.claude/settings.json` and
-  `.claude/settings.local.json` stay writable in the project, as the rest
-  of the project is, and Claude Code keeps saving there what you allow.
-  But a jail does not start on a project where one of them turns every
-  hook off (`"disableAllHooks": true`) or sets `PreToolUse` hooks with
-  none of InnerWarden's in them: `contain` says which file and why, exits
-  2 and changes nothing. Hooks on other events, and `PreToolUse` hooks
-  beside the guard's, start as before. This is read as the jail starts: a
-  change a program in the jail makes there holds back the next start, not
-  the run it is made in.
-  Claude Code's settings file, `~/.claude.json`, was gone at every launch
-  of a Linux jail without `--identity` (the jail's home is an empty folder
-  of its own), and two such jails wrote the same session file in
-  `~/.claude/sessions` (Claude Code is process 2 in each). Now each project
-  keeps its own file in `$XDG_STATE_HOME/innerwarden/jail-claude/<project
-  name>-<hash of its path>` (else under `~/.local/state`), made 0700 by
-  `contain`; the jail's `~/.claude.json` is a link to it, every other
-  project's folder is hidden, and your own `~/.claude.json` is not shown.
-  Each jail covers `~/.claude/sessions` and `~/.claude/backups` with empty
-  folders of its own, so two jails no longer share them, and neither sees
-  yours. Two jails on the same project share that project's file, as two
-  Claude Code runs on the host share yours. The file starts empty: the
-  first run in a project asks what Claude Code asks on a new account.
-  Before each run `contain` cuts that file to Claude Code's own state and
-  preferences (start counts, theme, onboarding, the account it shows, and
-  per project its history and last session's counts): MCP servers, the
-  project's MCP servers turned on or off, allowed tools, the trust of a
-  folder, approved keys and a bypass of permissions are never carried from
-  one run to the next, so every run asks again to trust the folder. A file
-  that is not JSON, or a link, is removed. Within one run the file is the
-  jail's: a second Claude Code started inside the same jail reads what the
-  first wrote. On macOS the sandbox cannot point a name elsewhere, and a
-  jail no longer writes your own `~/.claude.json` (Claude Code outside the
-  jail loads it): Claude Code in a macOS jail cannot save that file. How it
-  behaves then is not measured yet. A macOS jail still writes
-  `~/.claude/sessions`.
+  Claude Code's state in a jail. No jail shows your `~/.claude` writable.
+  That folder carries the settings that wire the guard's hook, and before,
+  a program in a jail could take the hook out, turn hooks off with a
+  `settings.local.json` of its own, or swap a link there for a file, for
+  every run after. Now each project has a folder of the launcher's,
+  `$XDG_STATE_HOME/innerwarden/jail-claude/<project name>-<hash of its
+  path>` (else under `~/.local/state`), made 0700 by `contain`. On Linux
+  that folder is the jail's `~/.claude` (your `~/.claude` is covered with
+  an empty folder, as named and where it leads, and the jail's
+  `~/.claude.json` is a link into it); on macOS the jail starts Claude Code
+  with `CLAUDE_CONFIG_DIR` naming it, and the sandbox lets the jail write
+  there and denies writing your `~/.claude`, your `~/.claude.json`, and
+  the CLI the guard's hook runs with the folder it is in (a CLI in a folder
+  the jail must write, the home, the project or the temporary folder,
+  refuses the start). Before each run `contain` puts in it read-only copies
+  of your `~/.claude/settings.json` and `~/.claude/settings.local.json`
+  (an empty one where you have none, so a program in the jail cannot make
+  one), and on Linux shows your `CLAUDE.md`, agents, commands, skills,
+  plugins, output styles, Claude Code's local install and each file a hook
+  there runs from `~/.claude`, read-only from yours, and copies your
+  Claude Code login (`.credentials.json`) in, so the jail's Claude Code is
+  logged in and what it refreshes stays the jail's. Claude Code saves what
+  it keeps (sessions, projects, `.claude.json`) in that folder, never in
+  yours, and each jail covers `~/.claude/sessions` and `~/.claude/backups`
+  with empty folders of its own, so two jails at once do not write the same
+  session file. Two jails on the same project share that project's folder,
+  as two Claude Code runs on the host share yours. The folder starts empty:
+  the first run in a project asks what Claude Code asks on a new account.
+  Before each run `contain` cuts its `.claude.json` to Claude Code's own
+  state and preferences (start counts, theme, onboarding, the account it
+  shows, and per project its history and last session's counts): MCP
+  servers, the project's MCP servers turned on or off, allowed tools, the
+  trust of a folder, approved keys and a bypass of permissions are never
+  carried from one run to the next, so every run asks again to trust the
+  folder. A file that is not JSON, or a link, is removed, and what a
+  program in an earlier jail put there as a link at a name `contain`
+  writes is removed without being followed.
+  A jail does not start where Claude Code's settings may turn the guard's
+  hook off or cannot be read: your `~/.claude/settings.json` and
+  `~/.claude/settings.local.json` and the project's
+  `.claude/settings.json` and `.claude/settings.local.json`, each a link,
+  anything but a file, over 4 MiB, not JSON (a comment in it included), not
+  a JSON object, with `disableAllHooks` set to anything but `false`, or
+  with hooks in a form other than Claude Code's; and the project's where it
+  sets `PreToolUse` hooks with none of InnerWarden's in them. `contain`
+  says which file and why, exits 2 and changes nothing. Hooks on other
+  events, and `PreToolUse` hooks beside the guard's, start as before. The
+  project's own settings files stay writable in the project, as the rest of
+  the project is, and Claude Code keeps saving there what you allow.
+  Limit: the settings are read and copied as the jail starts. A change a
+  program in the jail makes to the project's settings during a run holds
+  back the next start, not the run it is made in (the guard's part of that
+  is separate work), and a change you make to yours during a run reaches
+  the jail at its next start.
+  Limit: a second Claude Code an agent starts in the jail with another
+  `CLAUDE_CONFIG_DIR` reads the settings in that folder, not the jail's
+  copies, so it may run without the guard's hook; the guard refuses such a
+  command where it sees it.
+  Limit: how Claude Code behaves with the login copied into a jail when it
+  refreshes it there (whether your own login on the host stays valid), and
+  with `CLAUDE_CONFIG_DIR` on macOS (where it keeps the login in the
+  keychain), is not measured yet.
   The guard's hook in a jail runs a copy of the CLI only root can replace:
   the launcher itself where it is one, else root's copy at
   `/usr/local/bin/innerwarden` or `/usr/bin/innerwarden` (said as the jail

@@ -1460,14 +1460,17 @@ pub(crate) fn mirror_jail_block(
 }
 
 /// The most characters of a jail's command told beside the host's record.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const MAX_MIRRORED_COMMAND_CHARS: usize = 1024;
 
 /// The most characters of a jail's session name told there.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const MAX_MIRRORED_SESSION_CHARS: usize = 128;
 
 /// PURE. `text` as told beside the host's record: every control character
 /// (a newline, an escape, a NUL) a space, and cut to `max` characters with
 /// `[cut]` at the end where it was longer.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn mirrored_text(text: &str, max: usize) -> String {
     let mut out: String = text
         .chars()

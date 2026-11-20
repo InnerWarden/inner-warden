@@ -332,13 +332,16 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              Linux jail binds the others from\n  \
              descriptors too where bwrap can (an older bwrap binds them by name).\n  \
              A repository made with --separate-git-dir is not shown, unless the jail\n  \
-             shows its folder anyway. On Linux, with --identity, Claude\n  \
-             Code's settings file is kept in ~/.claude/.claude.json\n  \
-             between launches (your own ~/.claude.json is not shown), and each jail has\n  \
-             an empty ~/.claude/sessions and ~/.claude/backups of its own, so two jails\n  \
-             at once do not write the same session file. That is for Claude Code's\n  \
-             folder at ~/.claude; where a jail cannot have them of its own, contain\n  \
-             says so.\n\
+             shows its folder anyway. Every jail has a ~/.claude of its own for\n  \
+             the project: your ~/.claude, which carries the guard's hook, is never\n  \
+             shown writable. Your Claude Code settings are read-only copies in it\n  \
+             (on macOS Claude Code is pointed at it with CLAUDE_CONFIG_DIR), what\n  \
+             Claude Code saves stays there, and each jail has an empty\n  \
+             ~/.claude/sessions and ~/.claude/backups of its own, so two jails at\n  \
+             once do not write the same session file. A jail does not start where\n  \
+             your or the project's Claude Code settings may turn the hook off or\n  \
+             cannot be read (a link, not JSON, over 4 MiB, disableAllHooks other\n  \
+             than false, hooks in a form it does not read).\n\
              \n  \
              On Linux, where the host takes it, every jail starts its programs under\n  \
              a seccomp filter in the style of Flatpak that refuses TIOCSTI and\n  \
@@ -730,31 +733,32 @@ mod tests {
         assert!(!help.contains("still reaches the jail"), "{help}");
     }
 
-    /// The contain help and the README say where an identified jail keeps
-    /// Claude Code's own state, and only what the launcher makes true: on
-    /// Linux only, the person's own settings file not shown, nor its copies
-    /// in `~/.claude/backups`, each jail with its own sessions and backups,
-    /// only for Claude Code's folder at `~/.claude`, the cases it shares,
-    /// the limit of two jails sharing the one file, that what any jail
-    /// writes to the kept file is what the next identified launch loads,
-    /// and that a jail without `--identity` still loses the file. The
-    /// CHANGELOG says the same cases the README does (M30CW-C6).
+    /// The contain help and the README say where a jail keeps Claude Code's
+    /// own state, and only what the launcher makes true (second review of
+    /// #352): a `~/.claude` of the jail's own, the host's never writable,
+    /// the settings read-only copies, `CLAUDE_CONFIG_DIR` on macOS, each jail
+    /// with its own sessions and backups, the start refused on settings it
+    /// cannot read or that may turn the hook off, and the limits. The
+    /// CHANGELOG keeps what it said of the release that shipped before
+    /// (M30CW-C6).
     ///
-    /// FAILS ON REVERT: drop the sentence from the contain help or its
-    /// "On Linux", or a sentence of the README's paragraphs or its limit, or
-    /// put back the CHANGELOG's "not shown" with no case where it is.
+    /// FAILS ON REVERT: drop a sentence from the contain help or from the
+    /// README's paragraphs or limits, or put back the shared `~/.claude`.
     #[test]
     fn the_contain_help_and_the_readme_say_where_claude_codes_state_is_kept() {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let help = flat(&usage("contain", &[]).expect("contain has usage"));
         for said in [
-            "On Linux, with --identity, Claude Code's settings file is kept in ~/.claude/.claude.json between launches (your own ~/.claude.json is not shown)",
+            "Every jail has a ~/.claude of its own for the project: your ~/.claude, which carries the guard's hook, is never shown writable.",
+            "Your Claude Code settings are read-only copies in it (on macOS Claude Code is pointed at it with CLAUDE_CONFIG_DIR)",
             "each jail has an empty ~/.claude/sessions and ~/.claude/backups of its own, so two jails at once do not write the same session file.",
-            "That is for Claude Code's folder at ~/.claude; where a jail cannot have them of its own, contain says so.",
+            "A jail does not start where your or the project's Claude Code settings may turn the hook off or cannot be read",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
-        assert!(!help.contains("stays outside"), "{help}");
+        for unsaid in ["stays outside", "with --identity, Claude Code's settings file is kept in ~/.claude/.claude.json"] {
+            assert!(!help.contains(unsaid), "{help}");
+        }
         // The README and the two pages its detail moved to: the user docs.
         let readme = flat(
             &[
@@ -765,26 +769,21 @@ mod tests {
             .join("\n"),
         );
         for said in [
-            "An identified Linux jail keeps Claude Code's own state in the `~/.claude` it already shares with you.",
-            "In the jail it now leads to `~/.claude/.claude.json`",
-            "Your own `~/.claude.json` is not shown in the jail, and the jail's Claude Code never uses it. Nor are the copies Claude Code keeps of it in `~/.claude/backups`: each identified jail has an empty `~/.claude/backups` of its own",
-            "Where your own `~/.claude.json` is a link, or a hard link, to a file in `~/.claude`, that file is shared with the jail like the rest of the folder, and the jail makes no link to it.",
-            "each identified jail also has an empty `~/.claude/sessions` of its own: two jails at once do not write the same session file",
-            "Both folders are covered at every place the jail shows them",
-            "All of this is for Claude Code's own folder at `~/.claude`, where it is unless `CLAUDE_CONFIG_DIR` names another",
-            "where a read-only path of the profile shows it, `~/.claude` or `~/.claude.json`",
-            "or where your own `~/.claude.json` is that file or leads into `~/.claude` or to nothing.",
-            "Where one of the two folders cannot be the jail's own (a link is there, the project is inside it, or it could not be made), the jail shows the host's, and `innerwarden contain` says so.",
-            "Limit: two jails at once share the one settings file, and Claude Code's lock on it is each jail's own",
-            "Every jail, with `--identity` or without, shares `~/.claude` with you, so what a program in any jail writes to `~/.claude/.claude.json` is what the next identified Claude Code loads, as with `~/.claude/settings.json`: an MCP server listed there starts with it, outside `innerwarden proxy` unless the entry runs through it",
-            "A jail started without `--identity` is unchanged: Claude Code's settings file is still gone at every launch there, and two such jails at once still share `~/.claude/sessions` and see the host's.",
-            "On macOS the jail lets Claude Code use your own `~/.claude.json`, as before.",
+            "No jail shows your `~/.claude` writable.",
+            "On Linux that folder is the jail's `~/.claude`",
+            "on macOS the jail starts Claude Code with `CLAUDE_CONFIG_DIR` naming it",
+            "read-only copies of your `~/.claude/settings.json` and `~/.claude/settings.local.json`",
+            "Limit: a second Claude Code an agent starts in the jail with another `CLAUDE_CONFIG_DIR`",
+            "Limit: the settings are read and copied as the jail starts",
+            "Two jails on the same project share that project's folder",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
         }
         for unsaid in [
             "stays outside the jail",
             "never write the same session file",
+            "shares `~/.claude` with you",
+            "A macOS jail still writes `~/.claude/sessions`",
         ] {
             assert!(!readme.contains(unsaid), "README still says {unsaid:?}");
         }
@@ -793,6 +792,7 @@ mod tests {
             "Where your own `~/.claude.json` is a link, or a hard link, to a file in `~/.claude`, that file is shared with the jail like the rest of the folder, and where `~/.claude/backups` is a link of yours the jail shows the host's copies (`innerwarden contain` says so).",
             "or where your own `~/.claude.json` is that file or leads into `~/.claude` or to nothing:",
             "what a program in any jail writes to `~/.claude/.claude.json` is what the next identified Claude Code loads, as with `~/.claude/settings.json`",
+            "No jail shows your `~/.claude` writable any more",
         ] {
             assert!(changelog.contains(said), "CHANGELOG lacks {said:?}");
         }
