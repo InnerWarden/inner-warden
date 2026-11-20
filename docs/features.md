@@ -36,6 +36,60 @@ list, with every limit.
   settings `HTTP_PROXY`, `HTTPS_PROXY`, `FTP_PROXY`, `ALL_PROXY` and
   `NO_PROXY`, in capitals or lowercase); `--pass-env NAME` hands in any other, and `contain` names every
   variable it kept out, never a value.
+  The hook inside the jail keeps its record of decisions in the project, in
+  `<project>/.innerwarden/graph.json`. On Linux that folder is read-only
+  inside the jail: the hook hands each decision, and each line it keeps
+  beside the record (a suppression or rule changed, an agent's decision),
+  over a socket to `contain`, which runs outside the jail and writes it. A
+  program in the jail cannot change or remove a decision already written,
+  and `IW_GRAPH_FILE` does not send the hook's decisions or those lines
+  anywhere else. The socket's folder is in `$XDG_RUNTIME_DIR`, else in
+  `$TMPDIR`; one inside a folder the jail can write is refused. A program
+  in the jail can still add records of its own through that socket: the
+  record says what the jail reported, not what the host saw. `contain`
+  writes its own instance id and project name on each one, never a host
+  decision the jail names, and marks every decision and line it writes for
+  the jail `reported_by: jail`: the hook's and a program's cannot be told
+  apart. It writes at most 512 at once and 64 a second after that, and that
+  rate is shared: a program in the jail that sends decisions of its own can
+  spend it, and the hook's next decision is then not written (counted, and
+  said on the hook's stderr). It holds at most 64 MiB of reports being read
+  at once. What it does not write (a report turned away with too many
+  connections waiting and not sent again, a connection that sends no report
+  within 2 seconds, over that rate, a write that failed) is counted in the
+  record's health, which `innerwarden graph --stats` and the dashboard
+  show, and in one `guard.jail_record_lost` line when the jail ends. That
+  count holds what reached `contain`. A report that never reached it (the
+  socket's queue full for the hook's whole wait, or the connect not done in
+  that time) is not in it: it is said on the hook's stderr only. The hook
+  waits at most 3 seconds for its record to be taken; a record not taken
+  never changes the hook's verdict or its exit code (a refusal still exits
+  2). The hook takes the jail's record channel only where the launcher's
+  mount is there: a folder of that name made inside the jail is not it,
+  and the hook then records as outside a jail. `contain` opens the channel
+  only in a jail whose seccomp filter keeps user namespaces closed, a jail
+  without `--identity` included: with them open a program there could
+  mount a socket of its own where the hook hands its decisions. Every
+  Linux jail therefore runs under the identified filter where the host
+  takes it (Linux 4.8 or later, bubblewrap able to hand it in): no new user
+  namespace, no joining one, and no call through another ABI (a 32-bit
+  program does not run), so a nested sandbox (bubblewrap, rootless Podman)
+  does not start inside the jail. Where the host does not take it, the
+  record channel is not opened. The record's size cap
+  still pushes its oldest decisions out. An entry at `.innerwarden` that is
+  not a folder of the launching account is moved aside first. Where the
+  folder or the socket cannot be had, or the jail's user namespaces cannot
+  be closed, `contain --identity` refuses to start; a jail without
+  `--identity` runs with the record writable and says so.
+  On macOS the sandbox gives no such folder. The guard refuses a shell
+  command or a file tool that writes, moves or removes the project's
+  `.innerwarden` only when the name is written literally (`.innerwarden`,
+  `../.innerwarden`, an absolute path to it). These still pass: a glob
+  (`rm -rf .inner*`, `mv .[i]nnerwarden x`), a link made to the folder
+  (`ln -s .innerwarden r && rm r/graph.json`), removing the project around
+  it (`cd .. && rm -rf proj`, `rm -rf "$PWD"`), and a program run there
+  (for example `python3 -c` code that opens the file). On macOS the record
+  is not tamper-proof.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
   tell one agent's runs apart. See [Agent identity and trust](agent-identity.md).

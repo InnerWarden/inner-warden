@@ -851,6 +851,85 @@ const HOME_PLACES: &[HomeGroup] = &[
 
 const GUARD_PROGRAM: &str = "the guard's own program";
 
+/// What a write into an AI Jail's record of decisions is, in the words the
+/// file tools and the shell side ([`crate::threats`]) both say.
+pub const JAIL_RECORD_WRITTEN: &str =
+    "writes into the record of decisions InnerWarden keeps in a project (.innerwarden), \
+     which the agent must not change";
+
+/// The folder, in a project, where InnerWarden keeps an AI Jail's record of
+/// decisions (the CLI's `contain::JAIL_GRAPH_DIR`).
+pub const JAIL_RECORD_FOLDER: &str = ".innerwarden";
+
+/// Trees no project's record is in: what the system and package managers
+/// keep. A `.innerwarden` there is someone else's folder of that name.
+const NOT_A_PROJECT: &[&str] = &[
+    "/usr/",
+    "/opt/",
+    "/etc/",
+    "/var/",
+    "/nix/",
+    "/proc/",
+    "/sys/",
+    "/snap/",
+    "/system/",
+    "/library/",
+];
+
+/// Folders inside a project that hold other people's code, not the project.
+const NOT_THE_PROJECTS: &[&str] = &["node_modules", "vendor", "site-packages", ".git"];
+
+/// Whether `path` is in, or is, the [`JAIL_RECORD_FOLDER`] of the project
+/// the agent works in, in any case (a macOS disk ignores case). Where the
+/// jail cannot make the folder read-only (macOS), this is what keeps an
+/// agent from changing the record with a file tool or a shell command.
+///
+/// The project's folder only, as far as the path says it: relative, the
+/// folder is the first one named (`.innerwarden/graph.json`,
+/// `../.innerwarden`), never one deeper (`node_modules/x/.innerwarden`).
+/// With the working directory `cwd`, the folder sits in `cwd` or in a
+/// folder above it. With none, an absolute path counts unless it is in a
+/// system tree or a dependency folder. The path as written: a glob, a
+/// variable, `$PWD` or a link to the folder is not read.
+pub fn names_jail_record(path: &str, cwd: Option<&Path>) -> bool {
+    let trimmed = path.trim().trim_matches(['"', '\'']);
+    let mut parts: Vec<&str> = Vec::new();
+    for part in trimmed.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|last| *last != "..") => {
+                parts.pop();
+            }
+            other => parts.push(other),
+        }
+    }
+    let Some(at) = parts
+        .iter()
+        .position(|part| part.eq_ignore_ascii_case(JAIL_RECORD_FOLDER))
+    else {
+        return false;
+    };
+    let before = &parts[..at];
+    let rooted = trimmed.starts_with(['/', '\\', '~']);
+    if !rooted {
+        // Relative: the folder of the directory it runs in, or one above.
+        return before.iter().all(|part| *part == "..");
+    }
+    if before.iter().any(|part| {
+        NOT_THE_PROJECTS
+            .iter()
+            .any(|not| part.eq_ignore_ascii_case(not))
+    }) {
+        return false;
+    }
+    if let (Some(cwd), false) = (cwd, trimmed.starts_with('~')) {
+        let parent: PathBuf = std::iter::once("/").chain(before.iter().copied()).collect();
+        return parent != Path::new("/") && lexical(cwd).starts_with(&parent);
+    }
+    let parent = format!("/{}/", before.join("/")).to_ascii_lowercase();
+    !before.is_empty() && !NOT_A_PROJECT.iter().any(|tree| parent.starts_with(tree))
+}
+
 /// What an agent's hook file is, in the words [`crate::threats`] uses for the
 /// agent settings it holds by name (a test keeps the two the same).
 const AGENT_HOOK_SETTINGS: &str =
@@ -879,6 +958,9 @@ pub fn privileged_file_write(path: &str, context: &WriteContext<'_>) -> Option<&
     } else {
         *context
     };
+    if names_jail_record(trimmed, context.cwd) {
+        return Some(JAIL_RECORD_WRITTEN);
+    }
     let Some(absolute) = absolute_path(trimmed, context) else {
         // Relative, with no working directory to place it: only the places
         // that are the same wherever they start can be judged.
@@ -1834,6 +1916,74 @@ mod tests {
         ] {
             assert_eq!(shell_path_word(path), word, "{path}");
         }
+    }
+
+    /// A file tool never writes the record of decisions an AI Jail
+    /// keeps in the project (`.innerwarden`), however the path is spelled;
+    /// a file of another name in the project stays the agent's.
+    ///
+    /// FAILS ON REVERT: drop the `names_jail_record` check from
+    /// `privileged_file_write` and these are allowed.
+    #[test]
+    fn the_jails_record_is_refused_to_every_file_tool() {
+        let ctx = context(Path::new("/home/dev"), Path::new("/home/dev/proj"));
+        for path in [
+            "/home/dev/proj/.innerwarden/graph.json",
+            ".innerwarden/graph.json",
+            "./.innerwarden/guard-events.jsonl",
+            "/home/dev/proj/.INNERWARDEN/graph.json",
+            "sub/../.innerwarden/graph.json",
+        ] {
+            assert_eq!(
+                privileged_file_write(path, &ctx),
+                Some(JAIL_RECORD_WRITTEN),
+                "{path}"
+            );
+        }
+        for path in [
+            "/home/dev/proj/innerwarden/notes.md",
+            "/home/dev/proj/.innerwarden-old.txt",
+            "src/main.rs",
+        ] {
+            assert_eq!(privileged_file_write(path, &ctx), None, "{path}");
+        }
+    }
+
+    /// Only the record of the project the agent works in is
+    /// refused. Before, a folder named `.innerwarden` anywhere (a
+    /// dependency's, another tree's, the system's) was refused to every
+    /// file tool on every host.
+    ///
+    /// FAILS ON REVERT: refuse any component named `.innerwarden` and
+    /// each of these is refused.
+    #[test]
+    fn only_the_projects_record_is_refused_to_a_file_tool() {
+        let ctx = context(Path::new("/home/dev"), Path::new("/home/dev/proj/src"));
+        for path in [
+            "/home/dev/proj/.innerwarden/graph.json",
+            "../.innerwarden/graph.json",
+            ".innerwarden/graph.json",
+        ] {
+            assert_eq!(
+                privileged_file_write(path, &ctx),
+                Some(JAIL_RECORD_WRITTEN),
+                "{path}"
+            );
+        }
+        for path in [
+            "node_modules/pkg/.innerwarden/notes.json",
+            "/home/dev/other/.innerwarden/graph.json",
+            "/opt/tool/.innerwarden/cache.json",
+            "/home/dev/proj/src/vendor/x/.innerwarden/a.json",
+            "fixtures/.innerwarden/graph.json",
+        ] {
+            assert_eq!(privileged_file_write(path, &ctx), None, "{path}");
+        }
+        // With no working directory, an absolute path outside the system
+        // trees still counts; one in them does not.
+        assert!(names_jail_record("/home/dev/proj/.innerwarden", None));
+        assert!(!names_jail_record("/usr/share/x/.innerwarden/a", None));
+        assert!(!names_jail_record("/", None));
     }
 
     /// The per-agent profiles, the user's and the system's, are the person's:

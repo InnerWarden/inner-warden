@@ -653,6 +653,7 @@ fn resolve_planned(
         claude_state,
         jail_writes: facts.writable.clone(),
         bind_fds: Vec::new(),
+        record_channel: None,
     })
 }
 
@@ -2156,7 +2157,7 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
         .flatten();
     let dry_filter = dry_bwrap.as_ref().map(|bwrap| {
         dry_run_filter(restriction_advice(bwrap, false), || {
-            filter_plan_here(bwrap, input.args.identity)
+            filter_plan_for_channel(bwrap, input.args.identity)
         })
     });
     let dry_rules = dry_filter.as_ref().and_then(DryRunFilter::filter);
@@ -2172,15 +2173,21 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
                 .then_some(crate::contain::launch::DRY_RUN_KEY_FD),
             close_userns: dry_rules == Some(Rules::Identified),
             seccomp_fd: dry_seccomp,
+            record_channel: (dry_rules == Some(Rules::Identified))
+                .then(|| PathBuf::from(crate::contain::launch::DRY_RUN_RECORD_CHANNEL)),
             ..input.clone()
         };
         &dry_identity
     } else if input.args.dry_run {
         // A plain jail shows the marker the real run hands in, and the
-        // terminal filter where the host takes it.
+        // identified filter where the host takes it (the terminal one where
+        // it takes only that); the record channel only with the first.
         dry_plain = JailInputs {
             profiles_marker_fd: marks.then_some(crate::contain::launch::DRY_RUN_MARKER_FD),
+            close_userns: dry_rules == Some(Rules::Identified),
             seccomp_fd: dry_seccomp,
+            record_channel: (dry_rules == Some(Rules::Identified))
+                .then(|| PathBuf::from(crate::contain::launch::DRY_RUN_RECORD_CHANNEL)),
             ..input.clone()
         };
         &dry_plain
@@ -2249,6 +2256,161 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     run_unrecorded(&bwrap, input, marks)
 }
 
+/// Linux: the project's record folder ([`crate::contain::jail_graph_dir`])
+/// made where it is not there, and the launcher's record channel opened
+/// ([`crate::jail_record::Channel`]): the jail then shows the folder
+/// read-only and the hook hands each decision to the launcher, which puts
+/// `instance` and the project's name on it.
+///
+/// An entry at the folder's name that is not a real folder of this account
+/// (a link, a file, a folder of another account, left there by an earlier
+/// jail, say) is moved aside and the folder made again, and contain says
+/// so. Where the folder or the channel still cannot be had, an
+/// `--identity` jail is refused (`Err`, said): its record is what the
+/// host reads of the instance. A plain jail runs as before (the hook
+/// writes the record in the project, where the jail can change it), and
+/// the launcher says so.
+#[cfg(target_os = "linux")]
+fn with_record_channel(
+    input: &JailInputs,
+    instance: Option<&str>,
+) -> Result<(JailInputs, Option<crate::jail_record::Channel>), ExitCode> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    let dir = crate::contain::jail_graph_dir(&input.args.project);
+    let mut out = input.clone();
+    out.record_channel = None;
+    let identity = input.args.identity;
+    let failed = |why: &str| {
+        if identity {
+            eprintln!(
+                "innerwarden contain: refusing to start: the jail's record ({}) would stay writable inside the jail: {why}",
+                crate::contain::printable(&dir)
+            );
+            Err(ExitCode::from(2))
+        } else {
+            eprintln!(
+                "innerwarden contain: the jail's record ({}) stays writable inside the jail this run: {why}",
+                crate::contain::printable(&dir)
+            );
+            Ok((out.clone(), None))
+        }
+    };
+    // A program in a jail whose user namespaces are open can make one with
+    // a mount namespace of its own, mount a folder over the place the hook
+    // looks for the launcher's socket, and put its own there: the hook would
+    // hand it every decision and hear "ok". The channel holds only where
+    // the jail's filter keeps them closed.
+    if !input.close_userns {
+        return failed(
+            "user namespaces stay open in this jail, so a program there could put a socket of its own where the hook hands its decisions",
+        );
+    }
+    let vet = |found: &std::fs::Metadata| {
+        crate::contain::launch::vet_jail_graph_dir(
+            &crate::contain::launch::GraphEntry {
+                symlink: found.file_type().is_symlink(),
+                dir: found.is_dir(),
+                regular: false,
+                uid: found.uid(),
+                len: 0,
+            },
+            own_uid(),
+        )
+    };
+    if let Ok(found) = std::fs::symlink_metadata(&dir) {
+        if let Err(why) = vet(&found) {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let aside = dir.with_file_name(format!(
+                "{}.set-aside-{secs}-{}",
+                crate::contain::JAIL_GRAPH_DIR,
+                std::process::id()
+            ));
+            match std::fs::rename(&dir, &aside) {
+                Ok(()) => eprintln!(
+                    "innerwarden contain: {} was not a folder of this account ({why}); moved aside to {} and made again.",
+                    crate::contain::printable(&dir),
+                    crate::contain::printable(&aside)
+                ),
+                Err(e) => return failed(&format!("{why}, and it could not be moved aside ({e})")),
+            }
+        }
+    }
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    let found = match std::fs::symlink_metadata(&dir) {
+        Ok(m) => m,
+        Err(e) => return failed(&format!("it cannot be made ({e})")),
+    };
+    if let Err(why) = vet(&found) {
+        return failed(why);
+    }
+    let base = match record_base(input) {
+        Ok(base) => base,
+        Err(why) => return failed(&why),
+    };
+    let stamp = crate::jail_record::Stamp {
+        instance_id: instance.map(str::to_string),
+        project: input
+            .args
+            .project
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+    };
+    match crate::jail_record::Channel::open(&base, dir.join(crate::contain::JAIL_GRAPH_NAME), stamp)
+    {
+        Ok(channel) => {
+            out.record_channel = Some(channel.dir().to_path_buf());
+            eprintln!(
+                "  the jail's record ({}) is read-only inside the jail; the launcher writes each decision the hook hands it.",
+                crate::contain::printable(&dir)
+            );
+            Ok((out, Some(channel)))
+        }
+        Err(why) => failed(&format!(
+            "the launcher's record channel did not open ({why})"
+        )),
+    }
+}
+
+/// Linux: the folder the launcher's record channel is made in. The
+/// account's `XDG_RUNTIME_DIR` where it is a folder of this account that
+/// no one else may enter (the jail hides `/run` under a folder of its
+/// own), else the launcher's temporary folder. Never a folder the jail
+/// shows writable (the project, a home folder it binds, `--rw`): from
+/// there a program in the jail could remove the socket or put one of its
+/// own in its place; such a folder is refused, with what to set instead.
+#[cfg(target_os = "linux")]
+fn record_base(input: &JailInputs) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .filter(|dir| {
+            std::fs::symlink_metadata(dir)
+                .is_ok_and(|m| m.is_dir() && m.uid() == own_uid() && m.mode() & 0o077 == 0)
+        });
+    let base = runtime.unwrap_or_else(launcher_tmpdir);
+    let base = std::fs::canonicalize(&base).unwrap_or(base);
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let writable = std::iter::once(&input.args.project)
+        .chain(&input.jail_writes)
+        .chain(&input.args.extra_rw)
+        .map(|path| real(path));
+    for place in writable {
+        if base.starts_with(&place) {
+            return Err(format!(
+                "the folder for its socket ({}) is inside {}, which the jail can write; \
+                 set XDG_RUNTIME_DIR or TMPDIR to a folder the jail does not show",
+                crate::contain::printable(&base),
+                crate::contain::printable(&place)
+            ));
+        }
+    }
+    Ok(base)
+}
+
 /// A jail with no launch record, as it runs: under the jail's seccomp filter
 /// where the host takes it, and with the marker that the way to the system
 /// profiles file was proven root's when `marks`. A marker that cannot be
@@ -2259,12 +2421,22 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     #[cfg(target_os = "linux")]
     let marker = marks.then(marker_pipe).flatten();
     #[cfg(target_os = "linux")]
-    let filter = unrecorded_filter(bwrap, input.args.identity);
+    let (filter, userns_closed) = unrecorded_filter(bwrap, input.args.identity);
+    #[cfg(target_os = "linux")]
+    let closed = JailInputs {
+        close_userns: userns_closed,
+        ..input.clone()
+    };
+    #[cfg(target_os = "linux")]
+    let (with_channel, channel) = match with_record_channel(&closed, None) {
+        Ok(with_channel) => with_channel,
+        Err(code) => return code,
+    };
     #[cfg(target_os = "linux")]
     let input = &JailInputs {
         profiles_marker_fd: marker.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
         seccomp_fd: filter.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
-        ..input.clone()
+        ..with_channel
     };
     #[cfg(not(target_os = "linux"))]
     let _ = marks;
@@ -2290,21 +2462,32 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     // Ours close only once bwrap has read them.
     #[cfg(target_os = "linux")]
     drop((marker, filter, held));
+    // Every decision the hook handed over is written before the launcher
+    // ends.
+    #[cfg(target_os = "linux")]
+    drop(channel);
     code
 }
 
-/// The filter of a jail with no record, on a pipe for bwrap: the terminal
-/// one, or for an `--identity` launch that could not make its record the
-/// identified one (the terminal one where the host takes only that). What
-/// it lost is said once; `None` where the host took neither or the pipe
-/// could not be made.
+/// The filter of a jail with no instance record, on a pipe for bwrap, and
+/// whether it closes the jail's user namespaces: the identified one where
+/// the host takes it, plain jails included, since every jail may hold the
+/// launcher's record channel and a program in a jail with user namespaces
+/// open could mount a socket of its own where the hook looks for it (the
+/// channel is then not opened: [`with_record_channel`]). Else the terminal
+/// one where the host takes only that. What it lost is said once; `None`
+/// where the host took neither or the pipe could not be made.
 #[cfg(target_os = "linux")]
-fn unrecorded_filter(bwrap: &Path, identity: bool) -> Option<std::io::PipeReader> {
-    let plan = filter_plan_here(bwrap, identity);
+fn unrecorded_filter(bwrap: &Path, identity: bool) -> (Option<std::io::PipeReader>, bool) {
+    let plan = filter_plan_for_channel(bwrap, identity);
     for line in &plan.said {
         eprintln!("{line}");
     }
-    handed_filter(plan.filter)
+    let planned = plan.filter;
+    let reader = handed_filter(planned);
+    let closed =
+        planned == Some(innerwarden_agent_guard::seccomp::Rules::Identified) && reader.is_some();
+    (reader, closed)
 }
 
 /// The planned filter on a pipe for bwrap. One whose pipe cannot be made is
@@ -2801,6 +2984,10 @@ fn launch_identified(
     // the launcher writes only after the admission: a launcher that dies
     // before the host answered leaves the jail an empty record.
     identified.gate_instance = crate::contain::launch::gate_for(input.args.start, instance_id);
+    let (identified, channel) = match with_record_channel(&identified, Some(instance_id)) {
+        Ok(with_channel) => with_channel,
+        Err(code) => return Attempt::Done(code),
+    };
     // Each pin and read-only path from a descriptor opened now, after every
     // check ([`with_held_binds`]); bwrap holds its own copies once started.
     let (identified, held) = match with_held_binds(&identified) {
@@ -2948,6 +3135,9 @@ fn launch_identified(
     drop(record_writer);
     RecordHolder::release(holder);
     let code = exit_from(child.wait());
+    // Every decision the hook handed over is written before the record is
+    // read.
+    drop(channel);
     if identified {
         report_contained_run(input, instance_id, started_ms, now_ms());
     }
@@ -3713,6 +3903,21 @@ fn filter_plan_here(bwrap: &Path, identity: bool) -> crate::contain::launch::Fil
     crate::contain::launch::filter_plan(identity, host, |rules| {
         filter_probe(bwrap, rules, identity)
     })
+}
+
+/// [`filter_plan_here`] asking for the identified filter in every jail,
+/// a plain one included (probed under the plain jail's own options): a
+/// jail that holds the launcher's record channel keeps its user namespaces
+/// closed.
+#[cfg(target_os = "linux")]
+fn filter_plan_for_channel(bwrap: &Path, identity: bool) -> crate::contain::launch::FilterPlan {
+    let host = filter_host_here(Path::new(OSRELEASE));
+    crate::contain::launch::filter_plan(true, host, |rules| filter_probe(bwrap, rules, identity))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn filter_plan_for_channel(bwrap: &Path, identity: bool) -> crate::contain::launch::FilterPlan {
+    filter_plan_here(bwrap, identity)
 }
 
 #[cfg(not(target_os = "linux"))]
