@@ -29,10 +29,14 @@
 //! hash is trusted), and, in a listing that is the whole of the server's tools,
 //! a tool that looks like a pinned one the listing no longer has
 //! ([`looks_renamed`]: the same input schema, or nearly the same
-//! description), reported as a possible rename; and, once the session's
-//! first listing is over, a tool never pinned whose name the session never
-//! listed (new in the middle of a session), whatever the listing: whole, one
-//! page, after an empty answer, or past a cut. The names a session heard
+//! description), reported as a possible rename; and, once the server was
+//! listed before (the record has pins for it, from this session or an
+//! earlier one, or this session's first listing is over), a tool never
+//! pinned whose name the session never listed, whatever the listing: whole,
+//! one page, after an empty answer, past a cut, or the first listing after
+//! the proxy restarted. Only the first listing of a server the record never
+//! saw pins what it hears and passes: a server updated to one with more
+//! tools has them approved by the person (`innerwarden mcp approve`). The names a session heard
 //! only grow (kept as hashes, within [`MAX_GATHERED_NAMES_BYTES`]); no
 //! answer of the server takes one out. Such a tool that cannot be pinned
 //! (the server has [`MAX_PINNED_TOOLS`], its name is too long, the record is
@@ -617,13 +621,14 @@ impl PinRecord {
     }
 
     /// [`PinRecord::check_listing_with`], with what the session heard before
-    /// (`scope`): once the session's first listing is over (`seen` is set),
-    /// a tool never pinned whose name the session never listed is held like a
-    /// change (a tool new in the middle of a session), whatever the listing
+    /// (`scope`): once the server was listed before (`seen` is set: the
+    /// session's first listing is over, or the record had pins for the
+    /// server when this listing began), a tool never pinned whose name the
+    /// session never listed is held like a change, whatever the listing
     /// (whole, one page, after an empty answer). One that cannot be pinned
     /// (the server's pins are full, its name is too long, the record is
-    /// full) is held for the session. The first listing of a session pins
-    /// what it hears, as before.
+    /// full) is held for the session. Only the first listing of a server the
+    /// record never saw pins what it hears and passes.
     pub fn check_listing_in(
         &mut self,
         server: &str,
@@ -731,7 +736,7 @@ impl PinRecord {
                     };
                     pins.tools.insert(name.to_string(), pin);
                     check.dirty = true;
-                    if why.is_none() {
+                    if why.is_none() || why.as_deref() == Some(new_in_session().as_str()) {
                         check.first_heard.push(name.to_string());
                     }
                     if let Some(why) = why {
@@ -812,14 +817,23 @@ impl PinRecord {
             .filter_map(|(name, pin)| pin.definition.clone().map(|d| (name.clone(), d)))
             .collect();
         let now = now_utc();
+        let new = [new_in_session()];
         for name in first_heard {
             let Some(pin) = pins.tools.get_mut(name) else {
                 continue;
             };
-            if pin.sha256 == UNAPPROVED || pin.changed.is_some() {
-                continue;
-            }
-            let Some(definition) = pin.definition.as_ref() else {
+            // Pinned as heard, or held on its page as new: either may be a
+            // rename the whole listing shows.
+            let held_as_new =
+                pin.sha256 == UNAPPROVED && pin.changed.as_ref().is_some_and(|c| c.fields == new);
+            let definition = if held_as_new {
+                pin.changed.as_ref().and_then(|c| c.definition.as_ref())
+            } else if pin.sha256 != UNAPPROVED && pin.changed.is_none() {
+                pin.definition.as_ref()
+            } else {
+                None
+            };
+            let Some(definition) = definition else {
                 continue;
             };
             let why = vanished.iter().find_map(|(old, kept)| {
@@ -829,6 +843,19 @@ impl PinRecord {
             let Some(why) = why else {
                 continue;
             };
+            if held_as_new {
+                let changed = pin.changed.as_mut().expect("held as new");
+                changed.fields = vec![why.clone()];
+                check.dirty = true;
+                check.changes.push((
+                    ToolChange {
+                        tool: name.clone(),
+                        fields: vec![why],
+                    },
+                    changed.sha256.clone(),
+                ));
+                continue;
+            }
             let hash = std::mem::replace(&mut pin.sha256, UNAPPROVED.to_string());
             pin.pinned_at = now.clone();
             pin.changed = Some(ChangedDefinition {
@@ -901,7 +928,7 @@ impl SeenNames {
 
 /// Why a tool new in the middle of a session is held.
 fn new_in_session() -> String {
-    "new since this session's first listing".to_string()
+    "new: this server did not list it before".to_string()
 }
 
 /// Why a definition over the ceiling is held.
@@ -1070,6 +1097,9 @@ struct PagedListing {
     /// nothing more is gathered, and the rename check, which needs the whole
     /// list, is not run on it.
     cut: bool,
+    /// The record had pins for the server when the listing began: the server
+    /// was listed before, so a tool it never listed is held from page 1.
+    listed_before: bool,
 }
 
 impl PinSession {
@@ -1143,6 +1173,10 @@ impl PinSession {
             return Vec::new();
         };
         let more = result.get("nextCursor").is_some_and(|c| !c.is_null());
+        // A server the record has pins for was listed before (in this session
+        // or an earlier one): read from the record when a listing begins,
+        // so a restarted proxy holds a new tool as a running one does.
+        let listed_before = self.first_done || self.record_has_pins();
         let mut check;
         if self.paged.is_none() && !more {
             // The whole list in one answer.
@@ -1152,7 +1186,7 @@ impl PinSession {
                 result,
                 ListingScope {
                     complete: true,
-                    seen: self.first_done.then_some(&self.seen),
+                    seen: listed_before.then_some(&self.seen),
                 },
             );
             self.first_done = true;
@@ -1161,7 +1195,10 @@ impl PinSession {
             // in the session is held on its page), and gathered, so the
             // rename check, which needs the whole list, runs when its last
             // page is in. Past the ceilings nothing more is gathered.
-            let paged = self.paged.get_or_insert_with(PagedListing::default);
+            let paged = self.paged.get_or_insert_with(|| PagedListing {
+                listed_before,
+                ..PagedListing::default()
+            });
             paged.pages += 1;
             if !paged.cut {
                 paged.cut = paged.pages > MAX_LISTING_PAGES
@@ -1193,7 +1230,7 @@ impl PinSession {
                 result,
                 ListingScope {
                     complete: false,
-                    seen: self.first_done.then_some(&self.seen),
+                    seen: (self.first_done || paged.listed_before).then_some(&self.seen),
                 },
             );
             if !paged.cut {
@@ -1208,7 +1245,18 @@ impl PinSession {
                         &paged.first_heard,
                     );
                     check.dirty |= whole.dirty;
-                    check.changes.extend(whole.changes);
+                    // A tool held on its page as new and found a possible
+                    // rename at the end: one finding, with the rename.
+                    for (change, hash) in whole.changes {
+                        match check
+                            .changes
+                            .iter_mut()
+                            .find(|(c, _)| c.tool == change.tool)
+                        {
+                            Some(held) => *held = (change, hash),
+                            None => check.changes.push((change, hash)),
+                        }
+                    }
                 }
                 self.first_done = true;
             }
@@ -1267,6 +1315,14 @@ impl PinSession {
     /// ([`LISTING_CUT_RULE`]), taken.
     pub fn take_cut_notices(&mut self) -> Vec<String> {
         std::mem::take(&mut self.cut_notices)
+    }
+
+    /// Whether the record has pins for this server: it was listed before.
+    fn record_has_pins(&self) -> bool {
+        self.record
+            .servers
+            .get(&self.server)
+            .is_some_and(|s| !s.tools.is_empty())
     }
 
     /// Whether `tool` has a pin in the record.
@@ -1456,21 +1512,17 @@ mod tests {
         assert_eq!(changes[0].fields, vec!["annotations (added)".to_string()]);
     }
 
-    /// A tool new to the record, in the first listing of a session, is pinned
-    /// and passes. The same tool added in the middle of a session, beside the
-    /// tools listed before, is held until the person approves it (it passed
-    /// here before that check existed).
+    /// A tool in the first listing of a server the record never saw is pinned
+    /// and passes. The same tool new to a server the record has pins for is
+    /// held until the person approves it, in the first listing of a later
+    /// session and in the middle of a session. Rule 11: it passed in the
+    /// first case until the supervisor's decision of 2026-11-20 (a server that
+    /// has pins was listed before; a restart must not let a new tool in), and
+    /// in the middle of a session until the review of 2026-11-19.
     #[test]
     fn a_new_tool_is_pinned_and_passes() {
-        let mut record = PinRecord::default();
-        record.check_listing(
-            &server_id(&cmd()),
-            &cmd(),
-            &listing(json!([read_file("Read a file.")])),
-        );
         let other = json!({"name": "list_dir", "description": "List a folder."});
         let mut s = PinSession::new(None, &cmd());
-        s.record = record;
         let changes = s.check_listing(
             None,
             &listing(json!([read_file("Read a file."), other.clone()])),
@@ -1479,6 +1531,21 @@ mod tests {
         assert!(!s.is_held("list_dir"));
         let pins = &s.record.servers[s.server()].tools;
         assert!(pins.contains_key("list_dir") && pins.contains_key("read_file"));
+
+        let mut record = PinRecord::default();
+        record.check_listing(
+            &server_id(&cmd()),
+            &cmd(),
+            &listing(json!([read_file("Read a file.")])),
+        );
+        let mut s = PinSession::new(None, &cmd());
+        s.record = record;
+        let changes = s.check_listing(
+            None,
+            &listing(json!([read_file("Read a file."), other.clone()])),
+        );
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert!(s.is_held("list_dir"));
 
         let mut s = PinSession::new(None, &cmd());
         s.check_listing(None, &listing(json!([read_file("Read a file.")])));

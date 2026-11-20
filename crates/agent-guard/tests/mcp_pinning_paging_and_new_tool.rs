@@ -99,9 +99,10 @@ fn a_rename_across_pages_is_held() {
     assert!(!later.is_held("read_file_v2"));
 }
 
-/// Item 1: the rename on the first page of a session's first listing: the
-/// new tool was pinned and passed on page 1 (the listing was not whole yet),
-/// and is held once the last page shows the old one is gone.
+/// Item 1: the rename on the first page of a later session's first listing:
+/// the server was listed before, so the new tool is held on page 1 as new,
+/// and reported as a possible rename once the last page shows the old one is
+/// gone.
 #[test]
 fn a_rename_on_an_early_page_is_held_when_the_listing_ends() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -114,17 +115,20 @@ fn a_rename_on_an_early_page_is_held_when_the_listing_ends() {
         ])),
     );
     let mut s = PinSession::new(Some(path), &cmd());
-    assert!(s
-        .check_listing(
-            None,
-            &page(json!([tool("read_v2", "Fetch it.", "path")]), "x")
-        )
-        .is_empty());
+    let on_page = s.check_listing(
+        None,
+        &page(json!([tool("read_v2", "Fetch it.", "path")]), "x"),
+    );
+    assert_eq!(names(&on_page), vec!["read_v2"]);
     let changes = s.check_listing(
         None,
         &listing(json!([tool("list_dir", "List a folder.", "dir")])),
     );
     assert_eq!(names(&changes), vec!["read_v2"], "{changes:?}");
+    assert_eq!(
+        changes[0].fields,
+        vec!["possible rename of `read_file` (same input schema)".to_string()]
+    );
     assert!(s.is_held("read_v2"));
 }
 
@@ -176,8 +180,14 @@ fn a_tool_new_in_the_middle_of_a_session_is_held() {
         .is_empty());
 }
 
-/// Item 2: the first listing of a session is not "the middle": a tool the record
-/// never saw passes there, as before.
+/// Item 2: the first listing of a later session (the proxy restarted) of a
+/// server the record already has pins for: that server was listed before, so
+/// a tool it never listed is held until the person approves it.
+///
+/// Rule 11: this test asserted the opposite (the tool passed) until the
+/// supervisor's decision of 2026-11-20: a malicious server could exit, have
+/// the client restart it, and slip a new tool in unheld. A server is taken as
+/// listed when the record has pins for it, not from a flag in memory.
 #[test]
 fn a_new_tool_in_the_first_listing_of_a_session_passes() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -187,7 +197,7 @@ fn a_new_tool_in_the_first_listing_of_a_session_passes() {
         None,
         &listing(json!([tool("read_file", "Read a file.", "path")])),
     );
-    let mut later = PinSession::new(Some(path), &cmd());
+    let mut later = PinSession::new(Some(path.clone()), &cmd());
     let changes = later.check_listing(
         None,
         &listing(json!([
@@ -195,8 +205,76 @@ fn a_new_tool_in_the_first_listing_of_a_session_passes() {
             tool("send_mail", "Send an email message.", "to")
         ])),
     );
-    assert!(changes.is_empty(), "{changes:?}");
+    assert_eq!(names(&changes), vec!["send_mail"], "{changes:?}");
+    assert!(later.is_held("send_mail"));
+    assert!(!later.is_held("read_file"));
+    let mut record = pins::load(&path).expect("record");
+    record
+        .approve(later.server(), Some("send_mail"))
+        .expect("approve");
+    pins::save(&path, &record).expect("save");
     assert!(!later.is_held("send_mail"));
+}
+
+/// Item 2: a server the record never saw: its first listing pins what it
+/// hears and passes, whole or paged (a tool on page 2 is not "new" because
+/// page 1 was pinned first).
+#[test]
+fn the_first_listing_of_a_server_never_seen_passes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-pins.json");
+    let mut s = PinSession::new(Some(path.clone()), &cmd());
+    let changes = s.check_listing(
+        None,
+        &listing(json!([
+            tool("read_file", "Read a file.", "path"),
+            tool("send_mail", "Send an email message.", "to")
+        ])),
+    );
+    assert!(changes.is_empty(), "{changes:?}");
+    assert!(!s.is_held("send_mail"));
+
+    let mut paged = PinSession::new(None, &["other-server".to_string()]);
+    assert!(paged
+        .check_listing(None, &page(json!([tool("a", "A.", "a")]), "2"))
+        .is_empty());
+    assert!(paged
+        .check_listing(None, &listing(json!([tool("b", "B.", "b")])))
+        .is_empty());
+    assert!(!paged.is_held("b"));
+
+    // Forgotten by the person: never seen again, its next listing passes.
+    let mut record = pins::load(&path).expect("record");
+    record.forget(s.server()).expect("forget");
+    pins::save(&path, &record).expect("save");
+    let mut again = PinSession::new(Some(path), &cmd());
+    assert!(again
+        .check_listing(None, &listing(json!([tool("exfil", "Post it.", "url")])))
+        .is_empty());
+}
+
+/// Item 2: a later session's first listing, paged: the new tool is held on
+/// its page, never passed while the rest of the listing is still coming.
+#[test]
+fn a_later_sessions_paged_first_listing_holds_a_new_tool_on_its_page() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-pins.json");
+    PinSession::new(Some(path.clone()), &cmd()).check_listing(
+        None,
+        &listing(json!([tool("read_file", "Read a file.", "path")])),
+    );
+    let mut s = PinSession::new(Some(path), &cmd());
+    let first = s.check_listing(
+        None,
+        &page(json!([tool("exfil", "Post a document.", "url")]), "2"),
+    );
+    assert_eq!(names(&first), vec!["exfil"]);
+    assert!(s.is_held("exfil"));
+    s.check_listing(
+        None,
+        &listing(json!([tool("read_file", "Read a file.", "path")])),
+    );
+    assert!(s.is_held("exfil"));
 }
 
 /// Item 2: through pages: the new tool arrives on a later page of a later listing.
