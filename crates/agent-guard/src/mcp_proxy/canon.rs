@@ -605,18 +605,26 @@ mod tests {
         }
     }
 
-    /// A text of ampersands costs time in proportion to its length.
+    /// A text of ampersands costs time in proportion to its length: four
+    /// times the text takes far less than sixteen times the time (a
+    /// quadratic scan would), measured against the same machine so a slow
+    /// runner does not fail it.
     #[test]
     fn many_ampersands_take_linear_time() {
-        let text = "&".repeat(4 * 1024 * 1024);
-        let start = std::time::Instant::now();
-        let _ = canonical(&text);
-        let mixed = "&amp".repeat(1024 * 1024);
-        let _ = canonical(&mixed);
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
-            "{:?}",
+        let cost = |n: usize| {
+            let text = "&".repeat(n);
+            let mixed = "&amp".repeat(n / 4);
+            let start = std::time::Instant::now();
+            let _ = canonical(&text);
+            let _ = canonical(&mixed);
             start.elapsed()
+        };
+        let _ = cost(64 * 1024);
+        let small = cost(1024 * 1024);
+        let large = cost(4 * 1024 * 1024);
+        assert!(
+            large < small * 10 + std::time::Duration::from_millis(200),
+            "1 MiB {small:?}, 4 MiB {large:?}"
         );
     }
 
