@@ -2157,6 +2157,11 @@ pub struct JailInputs {
     /// ([`ClaudeState`]). Both `false` unless the launch asked for an
     /// identity record, and then nothing of it reaches the argv.
     pub claude_state: ClaudeState,
+    /// Where a jail with no launch record keeps Claude Code's settings file
+    /// for this project ([`ProjectClaude`], Linux). `None` for an
+    /// `--identity` jail (it keeps it as [`ClaudeState`] says), on macOS,
+    /// and where the launcher could not make the folder (said).
+    pub project_claude: Option<ProjectClaude>,
     /// The host folders a program in the jail can write, as named and as
     /// they lead ([`PlaceFacts::writable`]). Linux: a place the jail binds
     /// from a descriptor is opened with no link in one of them followed.
@@ -2239,6 +2244,130 @@ pub(crate) const CLAUDE_SETTINGS_KEPT: &str = ".claude/.claude.json";
 /// with an empty folder of its own.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const CLAUDE_RUN_FOLDERS: [&str; 2] = ["sessions", "backups"];
+
+/// Where root's copy of the CLI is installed, in the order the hook takes
+/// them ([`hook_cli_for`]).
+#[cfg_attr(not(unix), allow(dead_code))]
+pub const SYSTEM_CLI_PATHS: [&str; 2] = ["/usr/local/bin/innerwarden", "/usr/bin/innerwarden"];
+
+/// PURE. The CLI the guard's hook runs, for a jail: the launcher itself
+/// (`own`) where only root can replace it (`root_held`: it and every folder
+/// above it root's and writable by no one else, no link on the way), else
+/// root's copy at the first of [`SYSTEM_CLI_PATHS`] that is so, else the
+/// launcher, said. NEW-20261019-guard-hook-cli-refused-in-jail: a hook wired
+/// to a copy in the person's home (`~/.local/bin/innerwarden`) runs, in the
+/// jail, a program the jail's own account can replace, and InnerWarden Pro's
+/// Execution Gate in enforce refuses it there: the hook's wiring then holds
+/// every call. Root's copy is the one the gate can allow. Nothing is
+/// allowed by its name here: the hook only names a file of root's.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn hook_cli_for(own: &Path, root_held: &dyn Fn(&Path) -> bool) -> (PathBuf, Option<String>) {
+    if root_held(own) {
+        return (own.to_path_buf(), None);
+    }
+    for system in SYSTEM_CLI_PATHS.iter().map(Path::new) {
+        if system != own && root_held(system) {
+            return (
+                system.to_path_buf(),
+                Some(format!(
+                    "the guard hook runs {}, root's copy, not this launcher at {}, which this \
+                     account can replace",
+                    printable(system),
+                    printable(own)
+                )),
+            );
+        }
+    }
+    (
+        own.to_path_buf(),
+        Some(format!(
+            "the guard hook runs {}, a copy this account can replace; InnerWarden Pro's \
+             Execution Gate in enforce refuses such a copy in the jail, and every call is then \
+             held. Install innerwarden as root ({}) and the hook runs that copy.",
+            printable(own),
+            SYSTEM_CLI_PATHS[0]
+        )),
+    )
+}
+
+/// The folder, beside the launcher's records, that holds one folder per
+/// project for Claude Code's settings file in a jail with no launch record.
+pub(crate) const PROJECT_CLAUDE_DIR: &str = "jail-claude";
+
+/// Where a jail with no launch record keeps Claude Code's settings file
+/// (`~/.claude.json`) of one project, on Linux. The jail's home is an empty
+/// folder of its own, so the file Claude Code keeps there was gone at every
+/// launch. It is kept in a folder of the project's own under the
+/// launcher's state folder instead, beside the records
+/// (`<state>/innerwarden/jail-claude/<name>-<hash of the project's path>`),
+/// which the jail shows writable alone: every other project's folder is
+/// under an empty folder of the jail's, so no jail reads or writes
+/// another project's file, and the person's own `~/.claude.json` is never
+/// shown. The jail's `~/.claude.json` is a link to the file in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectClaude {
+    /// Every place the jail shows the folder of all projects
+    /// ([`PROJECT_CLAUDE_DIR`]), each covered by an empty folder.
+    pub covered: Vec<PathBuf>,
+    /// This project's folder, as the jail shows it (under the first place
+    /// of `covered`), bound there writable from `source`.
+    pub folder: PathBuf,
+    /// This project's folder on the host.
+    pub source: PathBuf,
+}
+
+/// PURE. The name of a project's folder in [`PROJECT_CLAUDE_DIR`]: the
+/// project's folder name (letters, digits, `.`, `_` and `-` alone, at most
+/// 40 of them) and 16 hex digits of the SHA-256 of its whole path, so two
+/// projects of the same name never share one.
+pub fn project_claude_key(project: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let name: String = project
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(40)
+        .collect();
+    let name = match name.trim_start_matches('.') {
+        "" => "project",
+        trimmed => trimmed,
+    };
+    let digest = Sha256::digest(project.to_string_lossy().as_bytes());
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    format!("{name}-{hex}")
+}
+
+/// PURE. [`ProjectClaude`] for `project`, from the places the jail shows
+/// the launcher's records folder (`records`, as named first and as it
+/// resolves after, [`launch::records_dir`]) and the folder it leads to on
+/// the host (`real`). `None` with no records folder.
+pub fn plan_project_claude(
+    records: &[PathBuf],
+    real: &Path,
+    project: &Path,
+) -> Option<ProjectClaude> {
+    let all = |records: &Path| records.parent().map(|state| state.join(PROJECT_CLAUDE_DIR));
+    let covered: Vec<PathBuf> =
+        records
+            .iter()
+            .filter_map(|dir| all(dir))
+            .fold(Vec::new(), |mut seen, dir| {
+                if !seen.contains(&dir) {
+                    seen.push(dir);
+                }
+                seen
+            });
+    let key = project_claude_key(project);
+    let folder = covered.first()?.join(&key);
+    let source = all(real)?.join(&key);
+    Some(ProjectClaude {
+        covered,
+        folder,
+        source,
+    })
+}
 
 /// What the launcher found on the host of the places an identified jail
 /// keeps Claude Code's own state in ([`build_linux_jail`]). Read only for an
@@ -2809,8 +2938,12 @@ pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
     };
     let mut places: Vec<&Path> = vec![input.iw_config_real.as_path()];
     places.extend(input.iw_config_shown.iter().map(PathBuf::as_path));
-    if input.args.identity {
-        places.extend(input.records_dirs.iter().map(PathBuf::as_path));
+    // The launcher's records folder: hidden in an identified jail,
+    // read-only in a plain one; and where a plain jail keeps Claude Code's
+    // settings file of each project, covered.
+    places.extend(input.records_dirs.iter().map(PathBuf::as_path));
+    if let Some(claude) = &input.project_claude {
+        places.extend(claude.covered.iter().map(PathBuf::as_path));
     }
     places.extend(input.hide_paths.iter().map(|hidden| hidden.abs.as_path()));
     places.extend(input.linked_masks.iter().map(|mask| mask.abs.as_path()));
@@ -2997,6 +3130,7 @@ pub fn macos_pins(input: &JailInputs) -> Vec<PathBuf> {
         places.push(input.iw_config_real.clone());
     }
     places.extend(input.deny_paths.iter().map(|denied| denied.abs.clone()));
+    places.extend(input.records_dirs.iter().cloned());
     places.extend(
         input
             .linked_denies
@@ -3205,6 +3339,28 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
             push(&["--symlink", &target, &link.to_string_lossy()]);
         }
     }
+    // --- the same file in a plain jail: a link to this project's own
+    // folder beside the launcher's records ([`ProjectClaude`], bound below),
+    // where Claude Code writes through it. Not where a hidden or denied
+    // path, or a profile's read-only path, covers it or `~/.claude.json`. ---
+    if let (false, Some(claude)) = (input.args.identity, &input.project_claude) {
+        let kept = claude.folder.join(CLAUDE_SETTINGS);
+        let link = input.home.join(CLAUDE_SETTINGS);
+        let covered = input
+            .hide_paths
+            .iter()
+            .chain(&input.deny_paths)
+            .map(|hidden| hidden.abs.as_path())
+            .chain(input.args.extra_ro.iter().map(PathBuf::as_path))
+            .any(|other| paths_overlap(other, &kept) || paths_overlap(other, &link));
+        if !covered {
+            push(&[
+                "--symlink",
+                &kept.to_string_lossy(),
+                &link.to_string_lossy(),
+            ]);
+        }
+    }
 
     // --- agent + guard binaries reachable after HOME tmpfs ---
     if let Some(bin) = &input.agent_binary {
@@ -3213,8 +3369,13 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
             push(&["--ro-bind", &s, &s]);
         }
     }
-    let iw = input.iw_binary.to_string_lossy().to_string();
-    push(&["--ro-bind", &iw, &iw]);
+    // A launcher under `/usr` is shown already, read-only and as it is now:
+    // bound on its own, the jail kept the file it started with, and after
+    // an upgrade replaced it the hook in a running jail ran the old one.
+    if !input.iw_binary.starts_with("/usr") {
+        let iw = input.iw_binary.to_string_lossy().to_string();
+        push(&["--ro-bind", &iw, &iw]);
+    }
 
     // --- extra read-only paths (a jail profile's `extra_ro`), before the
     // project and before the protected masks are re-applied, so neither can
@@ -3314,7 +3475,7 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // the person's own settings file. After every bind that can show them (the
     // dotdirs, the read-only paths, the project, the worktree) and before
     // every mask, so a hidden path still covers them. ---
-    if input.args.identity && input.exists(&input.home.join(".claude")) {
+    if input.exists(&input.home.join(".claude")) {
         for folder in &input.claude_state.own_folders {
             push(&["--tmpfs", &folder.to_string_lossy()]);
         }
@@ -3337,6 +3498,29 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         for dir in &input.records_dirs {
             let dest = dir.to_string_lossy().to_string();
             push(&["--tmpfs", &dest]);
+        }
+    } else {
+        // --- read-only in a plain jail: the host's dashboard and agents
+        // read the records there, so a program in the jail must not plant
+        // one. Only the launcher writes them, outside the jail. ---
+        // `-try`: the real run makes the folder first
+        // ([`crate::contain_io`]'s `with_plain_state_made`); one it could
+        // not make is said there.
+        for dir in &input.records_dirs {
+            let dest = dir.to_string_lossy().to_string();
+            push(&["--ro-bind-try", &dest, &dest]);
+        }
+        // --- every project's Claude Code settings folder under an empty
+        // folder, then this project's own, writable ([`ProjectClaude`]). ---
+        if let Some(claude) = &input.project_claude {
+            for dir in &claude.covered {
+                push(&["--tmpfs", &dir.to_string_lossy()]);
+            }
+            push(&[
+                "--bind",
+                &claude.source.to_string_lossy(),
+                &claude.folder.to_string_lossy(),
+            ]);
         }
     }
 
@@ -3719,6 +3903,16 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
         "(deny file-write* (subpath \"{}\"))\n",
         e(&iw_cfg)
     ));
+    // The launcher's records folder, as named and as it resolves: under the
+    // `~/.local` the jail writes, and the host's dashboard and agents read
+    // the records in it, so a program in the jail must not plant one. Read
+    // as before. Empty where the launcher found none to keep.
+    for dir in &input.records_dirs {
+        p.push_str(&format!(
+            "(deny file-write* (subpath \"{}\"))\n",
+            e(&dir.to_string_lossy())
+        ));
+    }
     if deny_iw_real {
         p.push_str(&format!(
             "(deny file-write* (subpath \"{}\"))\n",
@@ -5747,6 +5941,7 @@ mod tests {
             jail_writes: vec![],
             bind_fds: vec![],
             record_channel: None,
+            project_claude: None,
         }
     }
 
@@ -7869,7 +8064,8 @@ mod tests {
                 .join("\n"),
             GOLDEN_ARGV_IDENTIFIED
         );
-        // No flag: a descriptor changes nothing.
+        // No flag: a descriptor changes nothing (the records read-only and
+        // Claude Code's folders of its own are every plain jail's now).
         let mut off = identified_inputs();
         off.args.identity = false;
         off.info_fd = None;
@@ -7879,8 +8075,245 @@ mod tests {
         off.seccomp_fd = Some(launch::DRY_RUN_SECCOMP_FD);
         assert_eq!(
             build_linux_jail(&off).unwrap().bwrap_args.join("\n"),
-            GOLDEN_ARGV_PLAIN
+            plain_with_read_only_records()
         );
+    }
+
+    /// NEW-20261020-jail-claude-json-lost-plain-jail and
+    /// -sessions-pid2-collision-plain-jail: a plain jail lost
+    /// `~/.claude.json` at every launch (its home is an empty folder of its
+    /// own), and two plain jails wrote the same `~/.claude/sessions/2.json`
+    /// (Claude Code is process 2 in each). Now the file is a link to this
+    /// project's own folder beside the launcher's records, every other
+    /// project's folder is under an empty folder of the jail's, and each
+    /// jail covers the folders of its runs with folders of its own.
+    /// NEW-20261020-plain-jail-plants-launcher-records: the records folder,
+    /// under the `~/.local` the jail writes, is read-only, and the folders
+    /// above it and above the projects' folder are pinned.
+    ///
+    /// FAILS ON REVERT: drop the plain branch of the records (or the
+    /// project's bind, or the link) and its line is gone.
+    #[test]
+    fn a_plain_jail_keeps_claude_codes_file_per_project_and_reads_the_records_only() {
+        let mut plain = identified_inputs();
+        plain.args.identity = false;
+        plain.info_fd = None;
+        plain.record_fd = None;
+        plain.child_env.clear();
+        let all = PathBuf::from("/home/dev/.local/state/innerwarden/jail-claude");
+        let key = project_claude_key(&plain.args.project);
+        plain.project_claude = Some(ProjectClaude {
+            covered: vec![
+                all.clone(),
+                PathBuf::from("/data/dev/state/innerwarden/jail-claude"),
+            ],
+            folder: all.join(&key),
+            source: PathBuf::from("/data/dev/state/innerwarden/jail-claude").join(&key),
+        });
+        let got = build_linux_jail(&plain).unwrap().bwrap_args;
+        let at = |w: &[&str]| {
+            got.windows(w.len())
+                .position(|x| x == w)
+                .unwrap_or_else(|| panic!("{w:?} in {got:?}"))
+        };
+        let folder = all.join(&key).to_string_lossy().to_string();
+        let source = format!("/data/dev/state/innerwarden/jail-claude/{key}");
+        let kept = format!("{folder}/.claude.json");
+        let link = at(&["--symlink", &kept, "/home/dev/.claude.json"]);
+        let records = at(&[
+            "--ro-bind-try",
+            "/home/dev/.local/state/innerwarden/instances",
+            "/home/dev/.local/state/innerwarden/instances",
+        ]);
+        at(&[
+            "--ro-bind-try",
+            "/data/dev/state/innerwarden/instances",
+            "/data/dev/state/innerwarden/instances",
+        ]);
+        let cover = at(&["--tmpfs", "/home/dev/.local/state/innerwarden/jail-claude"]);
+        let other = at(&["--tmpfs", "/data/dev/state/innerwarden/jail-claude"]);
+        let bind = at(&["--bind", &source, &folder]);
+        let home = at(&["--tmpfs", "/home/dev"]);
+        let local = at(&["--bind", "/home/dev/.local", "/home/dev/.local"]);
+        let project = at(&["--bind", "/home/dev/proj", "/home/dev/proj"]);
+        let mask = at(&["--ro-bind", "/dev/null", "/home/dev/proj/.env"]);
+        let protected = at(&["--tmpfs", "/home/dev/.ssh"]);
+        assert!(
+            home < link && local < records && project < records,
+            "{got:?}"
+        );
+        assert!(protected < records && records < mask, "{got:?}");
+        assert!(cover < bind && other < bind && bind < mask, "{got:?}");
+        // The folders above both, in the `~/.local` the jail writes, pinned.
+        for pinned in [
+            "/home/dev/.local/state",
+            "/home/dev/.local/state/innerwarden",
+        ] {
+            assert!(
+                got.windows(3)
+                    .any(|w| w[0] == "--bind" && w[1] == pinned && w[2] == pinned),
+                "{pinned} in {got:?}"
+            );
+        }
+        // Each folder of its runs is the jail's own.
+        at(&["--tmpfs", "/home/dev/.claude/sessions"]);
+        at(&["--tmpfs", "/home/dev/.claude/backups"]);
+        // Nothing of the identified jail's kept file or its hiding.
+        assert!(
+            !got.iter().any(|a| a == "/home/dev/.claude/.claude.json"),
+            "{got:?}"
+        );
+        assert!(
+            !got.windows(2)
+                .any(|w| w[0] == "--tmpfs" && w[1].ends_with("/instances")),
+            "{got:?}"
+        );
+    }
+
+    /// NEW-20261020-plain-jail-plants-launcher-records, macOS: the sandbox
+    /// let every jail write the launcher's records folder (`~/.local` is
+    /// writable), and the host's dashboard read what it planted. Now writing
+    /// there is denied, as named and as it resolves, and the folders above
+    /// it that the jail may write are kept in place, so it is not renamed
+    /// away. Reading stays as it was.
+    ///
+    /// FAILS ON REVERT: drop the records' write deny (or their pins).
+    #[test]
+    fn a_macos_jail_never_writes_the_launchers_records() {
+        let mut input = inputs(&["claude", "--print"]);
+        let named = PathBuf::from("/home/dev/.local/state/innerwarden/instances");
+        let real = PathBuf::from("/Volumes/data/state/innerwarden/instances");
+        input.records_dirs = vec![named.clone(), real.clone()];
+        let profile = build_macos_profile(&input).unwrap().profile;
+        for dir in [&named, &real] {
+            let deny = format!("(deny file-write* (subpath \"{}\"))", dir.display());
+            assert!(profile.contains(&deny), "{deny} in {profile}");
+            assert!(!profile.contains(&format!(
+                "(deny file-read* (subpath \"{}\"))",
+                dir.display()
+            )));
+        }
+        let pins = macos_pins(&input);
+        for folder in [
+            "/home/dev/.local/state",
+            "/home/dev/.local/state/innerwarden",
+        ] {
+            assert!(
+                pins.iter().any(|p| p == Path::new(folder)),
+                "{folder} in {pins:?}"
+            );
+        }
+        let none = build_macos_profile(&inputs(&["claude", "--print"]))
+            .unwrap()
+            .profile;
+        assert!(!none.contains("instances"), "{none}");
+    }
+
+    /// NEW-20261019-guard-hook-cli-refused-in-jail: the hook runs the
+    /// launcher where only root can replace it, else root's copy at the
+    /// first system place that is so, else the launcher, said. A launcher
+    /// under `/usr` is not bound on its own (the jail shows `/usr` as it is
+    /// now), so an upgrade that replaced it reaches a running jail.
+    ///
+    /// FAILS ON REVERT: let `hook_cli_for` return the launcher always, or
+    /// bind the launcher under `/usr` again.
+    #[test]
+    fn the_hook_runs_a_cli_only_root_can_replace() {
+        let own = Path::new("/home/dev/.local/bin/innerwarden");
+        let local = Path::new(SYSTEM_CLI_PATHS[0]);
+        let usr = Path::new(SYSTEM_CLI_PATHS[1]);
+        let held =
+            |set: &'static [&'static str]| move |p: &Path| set.iter().any(|s| Path::new(s) == p);
+        // The launcher is root's: it is the hook's, nothing said.
+        assert_eq!(
+            hook_cli_for(local, &held(&["/usr/local/bin/innerwarden"])),
+            (local.to_path_buf(), None)
+        );
+        // A copy in the home: root's copy, the first one there is.
+        let (cli, said) = hook_cli_for(
+            own,
+            &held(&["/usr/local/bin/innerwarden", "/usr/bin/innerwarden"]),
+        );
+        assert_eq!(cli, local);
+        assert!(said.unwrap().contains("root's copy"));
+        let (cli, _) = hook_cli_for(own, &held(&["/usr/bin/innerwarden"]));
+        assert_eq!(cli, usr);
+        // None of root's: the launcher, and the start says why it may hold.
+        let (cli, said) = hook_cli_for(own, &held(&[]));
+        assert_eq!(cli, own);
+        assert!(said.unwrap().contains("Execution Gate"));
+
+        let mut input = inputs(&["claude", "--print"]);
+        input.iw_binary = local.to_path_buf();
+        let got = build_linux_jail(&input).unwrap().bwrap_args;
+        assert!(!got.iter().any(|a| a == SYSTEM_CLI_PATHS[0]), "{got:?}");
+        assert!(
+            got.windows(3).any(|w| w == ["--ro-bind", "/usr", "/usr"]),
+            "{got:?}"
+        );
+    }
+
+    /// Two projects of one name never share a folder; the name is kept to
+    /// what a folder name may hold; and the folder is under the first place
+    /// the jail shows the records' parent, once per place.
+    #[test]
+    fn each_project_has_a_folder_of_its_own_for_claude_codes_file() {
+        let a = project_claude_key(Path::new("/home/dev/work/app"));
+        let b = project_claude_key(Path::new("/home/dev/other/app"));
+        assert_ne!(a, b);
+        assert!(a.starts_with("app-") && a.len() == "app-".len() + 16, "{a}");
+        assert_eq!(a, project_claude_key(Path::new("/home/dev/work/app")));
+        let odd = project_claude_key(Path::new("/home/dev/../a b$(x)"));
+        assert!(odd.starts_with("abx-"), "{odd}");
+        let dots = project_claude_key(Path::new("/home/dev/.."));
+        assert!(dots.starts_with("project-"), "{dots}");
+        let records = [
+            PathBuf::from("/home/dev/.local/state/innerwarden/instances"),
+            PathBuf::from("/home/dev/.local/state/innerwarden/instances"),
+            PathBuf::from("/data/state/innerwarden/instances"),
+        ];
+        let got = plan_project_claude(
+            &records,
+            Path::new("/data/state/innerwarden/instances"),
+            Path::new("/home/dev/proj"),
+        )
+        .unwrap();
+        let key = project_claude_key(Path::new("/home/dev/proj"));
+        assert_eq!(
+            got.covered,
+            [
+                PathBuf::from("/home/dev/.local/state/innerwarden/jail-claude"),
+                PathBuf::from("/data/state/innerwarden/jail-claude"),
+            ]
+        );
+        assert_eq!(got.folder, got.covered[0].join(&key));
+        assert_eq!(got.source, got.covered[1].join(&key));
+        assert_eq!(
+            plan_project_claude(&[], Path::new("/x"), Path::new("/p")),
+            None
+        );
+    }
+
+    /// [`GOLDEN_ARGV_PLAIN`] of [`identified_inputs`] without the flag: the
+    /// same jail, plus Claude Code's folders of its runs covered by folders
+    /// of the jail's own and the launcher's records folder, at both places,
+    /// read-only after every writable bind and before the project's masks.
+    fn plain_with_read_only_records() -> String {
+        GOLDEN_ARGV_PLAIN
+            .replace(
+                "--chdir\n/home/dev/proj\n",
+                "--chdir\n/home/dev/proj\n\
+                 --tmpfs\n/home/dev/.claude/sessions\n\
+                 --tmpfs\n/home/dev/.claude/backups\n",
+            )
+            .replace(
+                "--ro-bind\n/dev/null\n/home/dev/proj/.env\n",
+                "--ro-bind-try\n/home/dev/.local/state/innerwarden/instances\n\
+                 /home/dev/.local/state/innerwarden/instances\n\
+                 --ro-bind-try\n/data/dev/state/innerwarden/instances\n\
+                 /data/dev/state/innerwarden/instances\n\
+                 --ro-bind\n/dev/null\n/home/dev/proj/.env\n",
+            )
     }
 
     fn found(uid: u32, mode: u32, dir: bool) -> launch::HostEntry {
@@ -8669,21 +9102,26 @@ mod tests {
         }
     }
 
-    /// Without `--identity` neither the records folder, the command's
-    /// variables nor Claude Code's own state reach the argv, whatever the
-    /// inputs carry.
+    /// Without `--identity` the command's variables and Claude Code's kept
+    /// settings file do not reach the argv, whatever the inputs carry. The
+    /// records folder does, read-only (no longer hidden, and no longer
+    /// writable as it was before this change: a plain jail wrote it, and
+    /// the host's dashboard read what it planted), and so do Claude Code's
+    /// folders of its runs, each the jail's own.
+    ///
+    /// FAILS ON REVERT: lay the records only for `--identity` again and
+    /// the read-only binds are gone.
     #[test]
-    fn without_identity_the_records_folder_and_variables_change_nothing() {
+    fn without_identity_the_records_are_read_only_and_variables_change_nothing() {
         let mut off = identified_inputs();
         off.args.identity = false;
         off.info_fd = None;
         off.record_fd = None;
         off.existing_paths.pop();
         off.seccomp_fd = Some(launch::DRY_RUN_SECCOMP_FD);
-        assert_eq!(
-            build_linux_jail(&off).unwrap().bwrap_args.join("\n"),
-            GOLDEN_ARGV_PLAIN
-        );
+        let got = build_linux_jail(&off).unwrap().bwrap_args.join("\n");
+        assert_eq!(got, plain_with_read_only_records());
+        assert!(!got.contains("/home/dev/.claude/.claude.json"), "{got}");
         assert!(!compute_jail_env(&off)
             .iter()
             .any(|(k, _)| k == "IW_HOOK_AGENT"));

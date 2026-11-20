@@ -15,6 +15,20 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Security
 
+- **A jail without `--identity` keeps the launcher's records and Claude
+  Code's state out of its reach.** On Linux the launcher's records of its
+  instances, which the dashboard and the host's agents read, are read-only
+  in such a jail (before, a program there could plant one); on macOS the
+  sandbox denies writing them. Each refusal `contain` writes for a Linux
+  jail is also told beside your own record, as a `guard.blocked` line
+  marked `reported_by: jail`: on a host with InnerWarden Community alone a
+  refusal in the jail reached no file the host reads. Claude Code's
+  `~/.claude.json` is kept per project instead of lost at every launch,
+  and each jail has `~/.claude/sessions` and `~/.claude/backups` of its
+  own (Linux; on macOS a jail still writes your own). The guard's hook runs
+  a copy of the CLI only root can replace where there is one, so InnerWarden
+  Pro's Execution Gate in enforce does not refuse it in the jail.
+  [AI Jail](docs/features.md).
 - **What a pipe hands a shell on its input is its script.** Text that a pipe
   or a here-string hands a shell or an interpreter on its input is read as
   that program's script when the line writes it out (`echo`, `printf`, a

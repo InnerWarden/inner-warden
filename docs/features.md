@@ -90,6 +90,48 @@ list, with every limit.
   it (`cd .. && rm -rf proj`, `rm -rf "$PWD"`), and a program run there
   (for example `python3 -c` code that opens the file). On macOS the record
   is not tamper-proof.
+  On Linux `contain` also tells each refusal it writes for a jail beside
+  your own record (the `guard-events.jsonl` next to the graph
+  `innerwarden graph` reads, usually in `~/.config/innerwarden`), as a
+  `guard.blocked` line marked `reported_by: jail`. The jail hides that
+  folder, so on a host with InnerWarden Community alone a refusal inside
+  the jail was in the project's record only, which nothing on the host
+  reads. Only refusals are told, and only where the record channel is open;
+  a program in the jail can add refusals of its own there too, within the
+  same rate.
+  The launcher's records of its instances
+  (`$XDG_STATE_HOME/innerwarden/instances`, else
+  `~/.local/state/innerwarden/instances`), which the dashboard and the
+  host's agents read, are out of every jail's writing: hidden in a jail
+  with `--identity`, read-only in one without (made first where they are
+  not there yet, and the folders above them in `~/.local` held in place).
+  On macOS the sandbox denies writing them and keeps the folders above
+  them in place; reading them stays allowed.
+  Claude Code's settings file, `~/.claude.json`, was gone at every launch
+  of a Linux jail without `--identity` (the jail's home is an empty folder
+  of its own), and two such jails wrote the same session file in
+  `~/.claude/sessions` (Claude Code is process 2 in each). Now each project
+  keeps its own file in `$XDG_STATE_HOME/innerwarden/jail-claude/<project
+  name>-<hash of its path>` (else under `~/.local/state`), made 0700 by
+  `contain`; the jail's `~/.claude.json` is a link to it, every other
+  project's folder is hidden, and your own `~/.claude.json` is not shown.
+  Each jail covers `~/.claude/sessions` and `~/.claude/backups` with empty
+  folders of its own, so two jails no longer share them, and neither sees
+  yours. Two jails on the same project share that project's file, as two
+  Claude Code runs on the host share yours. The file starts empty: the
+  first run in a project asks what Claude Code asks on a new account. On
+  macOS the sandbox cannot point a name elsewhere: a jail there writes
+  your own `~/.claude.json` and `~/.claude/sessions`, as before.
+  The guard's hook in a jail runs a copy of the CLI only root can replace:
+  the launcher itself where it is one, else root's copy at
+  `/usr/local/bin/innerwarden` or `/usr/bin/innerwarden` (said as the jail
+  starts). A copy in your home (`~/.local/bin/innerwarden`) is one a
+  program in the jail can replace, and InnerWarden Pro's Execution Gate in
+  enforce refuses it there; the hook's wiring then holds every call. With
+  no copy of root's, the hook runs the launcher and the start says so. The
+  hook's wiring is the same for your agent outside the jail. A launcher
+  under `/usr` is shown as `/usr` is, not bound on its own, so an upgrade
+  that replaces it reaches a jail that is running.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
   tell one agent's runs apart. See [Agent identity and trust](agent-identity.md).

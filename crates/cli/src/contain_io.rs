@@ -58,6 +58,19 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // The CLI the guard's hook runs: root's copy where this launcher is
+    // one the account can replace ([`crate::contain::hook_cli_for`]).
+    #[cfg(unix)]
+    let (hook_cli, hook_said) = crate::contain::hook_cli_for(&iw_binary, &|path: &Path| {
+        backend_facts(path).is_some_and(|facts| backend_trusted(&facts))
+    });
+    #[cfg(not(unix))]
+    let (hook_cli, hook_said): (PathBuf, Option<String>) = (iw_binary.clone(), None);
+    if !args.dry_run {
+        if let Some(said) = &hook_said {
+            eprintln!("innerwarden contain: {said}");
+        }
+    }
 
     // --setup intentionally only arms the hook and therefore needs no project.
     // Every normal run validates all future writable binds BEFORE this host
@@ -88,7 +101,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
     let (block_review, monitor) = args.mode.hook_flags();
     if args.setup_only {
-        match hook::install_hook(&home, &args.agent, None, &iw_binary, block_review, monitor) {
+        match hook::install_hook(&home, &args.agent, None, &hook_cli, block_review, monitor) {
             Ok(_) => {}
             Err(e) => eprintln!(
                 "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
@@ -196,7 +209,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             &input.home,
             &input.args.agent,
             None,
-            &input.iw_binary,
+            &hook_cli,
             block_review,
             monitor,
         ) {
@@ -215,11 +228,17 @@ pub fn cmd(rest: &[String]) -> ExitCode {
                 "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
             ),
         }
+        // A plain jail shows the launcher's records folder read-only, so it
+        // is made first where it is not there yet.
+        #[cfg(target_os = "linux")]
+        let records_made = make_plain_records(&input);
+        #[cfg(not(target_os = "linux"))]
+        let records_made = false;
         // On an account where Claude Code never ran, arming the hook made
         // `~/.claude` after the jail was planned without it: the jail would
         // show no `~/.claude`, so no settings file and no hook. The jail is
         // planned again, and checked again, on what is there now.
-        if existing_home_paths(&input.home) != input.existing_paths {
+        if records_made || existing_home_paths(&input.home) != input.existing_paths {
             input = match resolve_screened(
                 input.args.clone(),
                 input.home.clone(),
@@ -551,9 +570,10 @@ fn resolve_planned(
         None
     };
 
-    // Only an identified launch hides the launcher's records and keeps its
-    // helpers' environment apart; without the flag none of this is read.
-    let (records_dirs, child_env) = if args.identity {
+    // Every launch keeps the launcher's records out of the jail's writing:
+    // an identified one hides them, a plain one shows them read-only. Only
+    // an identified launch keeps its helpers' environment apart.
+    let (records_dirs, records_real) = {
         let nominal = crate::contain::launch::records_dir(
             std::env::var("XDG_STATE_HOME").ok().as_deref(),
             &home,
@@ -583,37 +603,55 @@ fn resolve_planned(
             let others = crate::contain::other_jail_views(&real, &named, &shown);
             dirs.extend(others);
         }
+        (dirs, real)
+    };
+    let child_env = if args.identity {
         // The command's own `PATH` (and a loader variable only when passed
         // by name): what the allow list lets in, as without the flag.
-        let child_env = crate::contain::launch_env(std::env::vars_os())
+        crate::contain::launch_env(std::env::vars_os())
             .child_env
             .into_iter()
             .filter(|(name, _)| {
                 crate::contain::env_goes_in(std::ffi::OsStr::new(name), &args.pass_env)
             })
-            .collect();
-        (dirs, child_env)
+            .collect()
     } else {
-        (Vec::new(), Vec::new())
+        Vec::new()
+    };
+    // A plain Linux jail keeps Claude Code's settings file of this project
+    // beside the records ([`crate::contain::ProjectClaude`]); made by the
+    // real run alone ([`with_plain_state_made`]).
+    let project_claude = (cfg!(target_os = "linux") && !args.identity)
+        .then(|| crate::contain::plan_project_claude(&records_dirs, &records_real, &args.project))
+        .flatten()
+        .filter(|claude| std::fs::symlink_metadata(&claude.source).is_ok_and(|m| m.is_dir()));
+    // A plain Linux jail shows a records folder read-only only where it is
+    // there: the real run makes it before the jail is planned
+    // ([`make_plain_records`]), and a folder that is not there is never
+    // pinned. An identified one hides it where it is.
+    let records_dirs = if args.identity || !cfg!(target_os = "linux") {
+        records_dirs
+    } else {
+        records_dirs
+            .into_iter()
+            .filter(|dir| std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()))
+            .collect()
     };
 
-    // Only an identified Linux launch keeps Claude Code's own state in the
-    // folder the jail shares with the host; without the flag none of it is
-    // read. Read only here: the folders the jail covers are made by the
-    // real run alone, after every check ([`with_claude_folders_made`]).
+    // Every Linux launch gives Claude Code folders of its runs of its own
+    // in the `~/.claude` the jail shares with the host (an identified one
+    // also keeps its settings file there). Read only here: the folders the
+    // jail covers are made by the real run alone, after every check
+    // ([`with_claude_folders_made`]).
     #[cfg(target_os = "linux")]
-    let claude_state = if args.identity {
-        claude_state_for(
-            &args,
-            &home,
-            worktree.as_ref(),
-            &existing_paths,
-            &iw_binary,
-            false,
-        )
-    } else {
-        crate::contain::ClaudeState::default()
-    };
+    let claude_state = claude_state_for(
+        &args,
+        &home,
+        worktree.as_ref(),
+        &existing_paths,
+        &iw_binary,
+        false,
+    );
     #[cfg(not(target_os = "linux"))]
     let claude_state = crate::contain::ClaudeState::default();
 
@@ -654,6 +692,7 @@ fn resolve_planned(
         jail_writes: facts.writable.clone(),
         bind_fds: Vec::new(),
         record_channel: None,
+        project_claude,
     })
 }
 
@@ -2203,9 +2242,7 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     };
     if input.args.dry_run {
         #[cfg(target_os = "linux")]
-        if input.args.identity {
-            say_claude_state(&input.claude_state);
-        }
+        say_claude_state(&input.claude_state);
         println!("# innerwarden contain - DRY RUN (Linux / bubblewrap)");
         print_plan_env(&plan.env);
         print_credentials_kept_out(input);
@@ -2252,8 +2289,60 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
     if input.args.identity {
         return run_linux_identified(&with_claude_folders_made(input), &bwrap, marks);
     }
+    #[cfg(target_os = "linux")]
+    let prepared = with_claude_folders_made(input);
+    #[cfg(target_os = "linux")]
+    let input = &prepared;
     announce(input);
     run_unrecorded(&bwrap, input, marks)
+}
+
+/// Linux, the real run of a plain jail, once the jail was planned with
+/// every check passed: the launcher's records folder made (0700, this
+/// account's) where it is not there, so the jail is planned again and shows
+/// it read-only, and never makes one of its own in the `~/.local` it
+/// writes. Whether it was made now. One that cannot be made is said, and
+/// the jail runs without it, as before.
+#[cfg(target_os = "linux")]
+fn make_plain_records(input: &JailInputs) -> bool {
+    if input.args.identity {
+        return false;
+    }
+    // SAFETY: getuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let nominal = crate::contain::launch::records_dir(
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        &input.home,
+    );
+    let mut made = false;
+    if std::fs::symlink_metadata(&nominal).is_err() {
+        match own_records_dir(&nominal, uid) {
+            Ok(()) => made = true,
+            Err(e) => {
+                eprintln!(
+                    "innerwarden contain: the launcher's records folder cannot be made ({e}); \
+                     the jail may write there this run"
+                );
+                return false;
+            }
+        }
+    }
+    // This project's folder for Claude Code's settings file, beside it.
+    let real = std::fs::canonicalize(&nominal).unwrap_or(nominal.clone());
+    if input.project_claude.is_none() {
+        if let Some(claude) =
+            crate::contain::plan_project_claude(&[nominal], &real, &input.args.project)
+        {
+            match own_records_dir(&claude.source, uid) {
+                Ok(()) => made = true,
+                Err(e) => eprintln!(
+                    "innerwarden contain: Claude Code's settings file for this project cannot be \
+                     kept ({e}); it is gone when the jail ends"
+                ),
+            }
+        }
+    }
+    made
 }
 
 /// Linux: the project's record folder ([`crate::contain::jail_graph_dir`])
@@ -2361,6 +2450,11 @@ fn with_record_channel(
     match crate::jail_record::Channel::open(&base, dir.join(crate::contain::JAIL_GRAPH_NAME), stamp)
     {
         Ok(channel) => {
+            // The host's own record hears each refusal too: on a host with
+            // InnerWarden Community alone it is the only one read.
+            if let Some(host) = crate::graph_io::graph_path() {
+                channel.mirror_blocks_to(host);
+            }
             out.record_channel = Some(channel.dir().to_path_buf());
             eprintln!(
                 "  the jail's record ({}) is read-only inside the jail; the launcher writes each decision the hook hands it.",
@@ -5752,6 +5846,68 @@ mod tests {
         let (_, at, _) = open_held(&home.join(".cache/x"), &wide, &[home.join(".cache")]).unwrap();
         assert_eq!(at, home.join("disk/cache/x"));
         assert!(open_held(&home.join("shared/ro"), &wide, &[home.join(".cache")]).is_err());
+    }
+
+    /// A plain jail's real run makes the launcher's records folder and this
+    /// project's folder for Claude Code's settings file (0700, this
+    /// account's) before the jail is planned again, and the plan then shows
+    /// both: the records read-only, the project's folder writable. Before
+    /// they are there the plan shows neither, so nothing missing is pinned.
+    ///
+    /// FAILS ON REVERT: let `make_plain_records` make nothing and the second
+    /// plan has no records folder and no project folder.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_plain_jails_real_run_makes_the_records_and_the_projects_claude_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("XDG_STATE_HOME").is_some() {
+            eprintln!("XDG_STATE_HOME is set: this test makes folders only in a home of its own");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(home.join(".local")).unwrap();
+        let project = r.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let rest: Vec<String> = ["--project", project.to_str().unwrap(), "--", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let args = parse_contain_args(&rest).unwrap();
+        let plan = |args: &ContainArgs| {
+            resolve_inputs(args.clone(), home.clone(), PathBuf::from("/usr/bin/true")).unwrap()
+        };
+        let before = plan(&args);
+        assert!(before.records_dirs.is_empty(), "{:?}", before.records_dirs);
+        assert_eq!(before.project_claude, None);
+        assert!(make_plain_records(&before));
+        let records = home.join(".local/state/innerwarden/instances");
+        let key = crate::contain::project_claude_key(&project);
+        let folder = home.join(".local/state/innerwarden/jail-claude").join(&key);
+        for dir in [&records, &folder] {
+            let mode = std::fs::metadata(dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", dir.display());
+        }
+        let after = plan(&args);
+        assert_eq!(after.records_dirs, std::slice::from_ref(&records));
+        let claude = after.project_claude.clone().expect("the project's folder");
+        assert_eq!(claude.folder, folder);
+        assert_eq!(claude.source, folder);
+        let argv = crate::contain::build_linux_jail(&after).unwrap().bwrap_args;
+        let shown = records.to_string_lossy().to_string();
+        assert!(
+            argv.windows(3)
+                .any(|w| w == ["--ro-bind-try", shown.as_str(), shown.as_str()]),
+            "{argv:?}"
+        );
+        // Made once; an identified launch makes nothing here.
+        assert!(!make_plain_records(&after));
+        let mut identified = args.clone();
+        identified.identity = true;
+        std::fs::remove_dir(&folder).unwrap();
+        assert!(!make_plain_records(&plan(&identified)));
+        assert!(!folder.exists());
     }
 
     /// CWNF-1 (Linux): the real run opens each pin and each read-only path

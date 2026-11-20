@@ -722,6 +722,10 @@ struct Shared {
     /// Reports turned away with [`BUSY`], by id, and when last: counted once
     /// they have not come back within [`Limits::abandon_after`].
     turned_away: std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+    /// The host's own record ([`Channel::mirror_blocks_to`]): each refusal
+    /// written for the jail is also told there, as a `guard.blocked` line
+    /// beside it. Unset, the jail's refusals stay in its project's record.
+    host_graph: std::sync::OnceLock<std::path::PathBuf>,
 }
 
 /// Why a report was not written, as the record's health says it.
@@ -945,6 +949,7 @@ impl Channel {
             health: Mutex::new(()),
             held: Default::default(),
             turned_away: Mutex::new(std::collections::HashMap::new()),
+            host_graph: std::sync::OnceLock::new(),
         });
         let stop = Arc::new(AtomicBool::new(false));
         listener
@@ -1005,6 +1010,21 @@ impl Channel {
     /// the jail at [`JAIL_RECORD_DIR`].
     pub fn dir(&self) -> &std::path::Path {
         &self.dir
+    }
+
+    /// Tell each refusal written for the jail also beside `host_graph`, the
+    /// host's own record, as a `guard.blocked` line marked as the jail's
+    /// (`reported_by: jail`), the line's contract as it is. On a
+    /// host with InnerWarden Community alone, nothing reads a project's
+    /// record: a refusal in the jail reached no file the host's
+    /// `innerwarden graph`, dashboard or agents read, since the jail hides
+    /// the host's `~/.config/innerwarden`. A record in the project's own
+    /// folder is not told twice. Set once; later calls change nothing.
+    pub fn mirror_blocks_to(&self, host_graph: std::path::PathBuf) {
+        if host_graph.parent() == self.shared.graph.parent() {
+            return;
+        }
+        let _ = self.shared.host_graph.set(host_graph);
     }
 
     /// What the launcher has not written so far, by why.
@@ -1290,7 +1310,12 @@ fn take_one(mut stream: std::os::unix::net::UnixStream, bytes: &[u8], shared: &S
         Some(message) => {
             let written = match message {
                 Message::Decision(decision) => {
-                    crate::graph_io::persist(&shared.graph, &stamped(*decision, &shared.stamp))
+                    let decision = stamped(*decision, &shared.stamp);
+                    let written = crate::graph_io::persist(&shared.graph, &decision);
+                    if let Some(host) = shared.host_graph.get() {
+                        crate::graph_io::mirror_jail_block(host, &decision);
+                    }
+                    written
                 }
                 Message::Event(line) => shared
                     .graph
@@ -1816,6 +1841,57 @@ mod tests {
             .find(|l: &Value| l["kind"] == "guard.blocked")
             .unwrap_or_else(|| panic!("{events}"));
         assert_eq!(blocked["reported_by"], "jail", "{events}");
+    }
+
+    /// On a host with InnerWarden Community alone the jail's refusal reached
+    /// no file the host reads: the jail hides `~/.config/innerwarden`, and
+    /// the launcher wrote it only to the project's record. The launcher now
+    /// tells each refusal beside the host's own record too, stamped and
+    /// marked as the jail's; an allowed call is not told, and a record in
+    /// the project's own folder is not told twice.
+    ///
+    /// FAILS ON REVERT: without `mirror_jail_block` in `take_one` the
+    /// host's `guard-events.jsonl` is never made.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refusal_in_the_jail_reaches_the_hosts_own_record() {
+        let (_base, record, channel, socket) = channel_with(Limits::default(), Stamp::default());
+        let host = tempfile::TempDir::new().unwrap();
+        channel.mirror_blocks_to(host.path().join("graph.json"));
+        let mut refused = decision();
+        refused.event_hash = None;
+        refused.origin.project = Some("forged-project".into());
+        let mut allowed = decision();
+        allowed.event_hash = None;
+        allowed.command = "ls -la".into();
+        allowed.outcome = innerwarden_graph::DecisionOutcome::Allowed;
+        assert_eq!(hand_over(&socket, &refused), Ok(()));
+        assert_eq!(hand_over(&socket, &allowed), Ok(()));
+        drop(channel);
+        let events = std::fs::read_to_string(host.path().join("guard-events.jsonl"))
+            .expect("the host's own sink is written");
+        let lines: Vec<Value> = events
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        assert_eq!(lines.len(), 1, "{events}");
+        assert_eq!(lines[0]["kind"], "guard.blocked", "{events}");
+        assert_eq!(lines[0]["reported_by"], "jail", "{events}");
+        assert!(!events.contains("forged-project"), "{events}");
+        assert!(!events.contains("ls -la"), "{events}");
+        // The project's record keeps its own line, once.
+        let own = std::fs::read_to_string(record.path().join("guard-events.jsonl")).unwrap();
+        assert_eq!(own.matches("guard.blocked").count(), 1, "{own}");
+
+        // A host record in the project's own folder is not told twice.
+        let (_base, record, channel, socket) = channel_with(Limits::default(), Stamp::default());
+        channel.mirror_blocks_to(record.path().join("graph.json"));
+        let mut again = decision();
+        again.event_hash = None;
+        assert_eq!(hand_over(&socket, &again), Ok(()));
+        drop(channel);
+        let own = std::fs::read_to_string(record.path().join("guard-events.jsonl")).unwrap();
+        assert_eq!(own.matches("guard.blocked").count(), 1, "{own}");
     }
 
     /// The lines kept beside the record reach it through the

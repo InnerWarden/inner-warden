@@ -1404,6 +1404,47 @@ pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Dec
     written
 }
 
+/// A refusal written for a jail, told beside the host's own record
+/// `host_graph` too ([`crate::jail_record::Channel::mirror_blocks_to`]): the
+/// same `guard.blocked` line [`persist`] writes beside the project's record,
+/// with the stamp the launcher put on the decision. Only a block or a
+/// would-block, never a demo call; whether a line was told.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn mirror_jail_block(
+    host_graph: &std::path::Path,
+    decision: &crate::jail_record::Decision,
+) -> bool {
+    let crate::jail_record::Decision {
+        session,
+        command,
+        verdict,
+        mode,
+        outcome,
+        origin,
+        ..
+    } = decision;
+    if origin.demo
+        || !matches!(
+            outcome,
+            DecisionOutcome::Blocked | DecisionOutcome::WouldBlock
+        )
+    {
+        return false;
+    }
+    emit_guard_event(
+        host_graph,
+        command,
+        verdict,
+        DecisionContextParts {
+            mode: *mode,
+            outcome: *outcome,
+        },
+        session,
+        origin,
+    );
+    true
+}
+
 /// Append one BLOCKED / WOULD-BLOCK guard decision to `guard-events.jsonl`, an
 /// append-only sink next to the graph, for a co-located InnerWarden host agent
 /// (Enterprise) to tail by byte offset and ingest into its incident pipeline.
