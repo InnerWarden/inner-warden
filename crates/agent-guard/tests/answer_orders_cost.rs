@@ -11,13 +11,14 @@ use innerwarden_agent_guard::benchmark::{Corpus, Label, Surface};
 use innerwarden_agent_guard::mcp::inspect_answer_orders;
 
 /// Every `tests/data/atr-benign-*.json` item and every benign `tool_result`
-/// case of every corpus: none is held back for orders, but the four that the
-/// `read-and-disclose` reading already held on main when this was written
-/// (2026-11-20, 747b946): an API quickstart that says "retrieve the API key
-/// ... and send a test message", and a security Q&A quoting "retrieve my
-/// password and send it". They are listed so the number cannot grow.
+/// case of every corpus: none is held back for orders. Until 2026-11-20 four
+/// were, by the `read-and-disclose` reading: an API quickstart that says
+/// "retrieve the API key ... and send a test message to you@example.com", and
+/// a security Q&A quoting "retrieve my password and send it" next to "forward
+/// the message to security@...". A send order now discloses a secret named by
+/// its kind only when what it sends can be that secret.
 ///
-/// FAILS when a reading of answers holds back more ordinary tool output.
+/// FAILS when a reading of answers holds back any ordinary tool output.
 #[test]
 fn ordinary_tool_output_is_not_held_for_orders() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data");
@@ -71,29 +72,15 @@ fn ordinary_tool_output_is_not_held_for_orders() {
             })
         })
         .collect();
-    const HELD_ON_MAIN: [&str; 4] = [
-        "atr-benign-results.json#71",
-        "atr-benign-results.json#72",
-        "atr-benign-results.json#284",
-        "atr-benign-results.json#285",
-    ];
-    let new: Vec<&String> = held
-        .iter()
-        .filter(|line| {
-            !HELD_ON_MAIN
-                .iter()
-                .any(|id| line.starts_with(&format!("{id}: ")))
-        })
-        .collect();
     assert!(
-        new.is_empty() && held.len() <= HELD_ON_MAIN.len(),
+        held.is_empty(),
         "{} of {} held back:\n{}",
         held.len(),
         texts.len(),
         held.join("\n")
     );
     eprintln!(
-        "answer orders: {} of {} ordinary tool outputs held back (all held on main)",
+        "answer orders: {} of {} ordinary tool outputs held back",
         held.len(),
         texts.len()
     );
