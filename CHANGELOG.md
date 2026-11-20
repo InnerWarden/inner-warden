@@ -15,6 +15,16 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Security
 
+- **A review asks you instead of passing unseen.** In enforce mode the hook
+  used to refuse a `deny` and let a `review` run without a word (`chmod 777`
+  on a folder, for one). It now hands a review to the person: Claude Code
+  gets `permissionDecision: "ask"` with the reason, and Hermes Agent
+  `action: "approve"`, which its approval gate refuses when nobody is there.
+  Codex CLI has no way for a hook to ask, so there a review runs with a
+  warning Codex shows you. Gemini CLI, whose ask is not sure to reach a
+  person, and any other agent refuse a review with the reason.
+  `--block-review` still refuses every review, and monitor mode still never
+  refuses. [What the hook does with each verdict](docs/features.md#what-an-agents-hook-does-with-each-verdict).
 - **The MCP proxy refuses a read of a named credential store.** In `guard`
   and `kill`, a resource read whose location names a credential
   (`internal://credentials`, `config://auth_tokens`) or a secret store by
