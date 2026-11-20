@@ -185,3 +185,146 @@ fn a_call_the_hook_reads_in_time_is_answered_as_before() {
     assert!(!said.contains("did not finish in time"), "{said}");
     assert!(!said.contains("a fault stopped"), "{said}");
 }
+
+/// A tool call past the cap that already ran (PostToolUse) is not refused:
+/// a large file read, edited or written, or a command with a long output,
+/// has nothing left to stop, so the hook says it recorded it not read whole
+/// and exits 0, in enforce and in monitor. The same call about to run
+/// (PreToolUse) is refused as before, and so is one whose event is not in
+/// the part read, or one that only carries the words of a PostToolUse inside
+/// what it writes.
+///
+/// FAILS ON REVERT of `hook_too_long`: every PostToolUse below is refused (2).
+#[test]
+fn a_tool_result_past_the_cap_is_recorded_not_refused() {
+    const BIG: usize = 2 * 1024 * 1024;
+    let big = "a".repeat(BIG);
+    let quoted = |s: &str| serde_json::Value::from(s).to_string();
+    // Claude Code's own order: the event and the tool before what they carry.
+    let call = |event: &str, tool: &str, input: String, response: String| {
+        format!(
+            r#"{{"session_id":"s-big","transcript_path":"/t.jsonl","cwd":"/p","permission_mode":"default","hook_event_name":{},"tool_name":{},"tool_input":{input},"tool_response":{response}}}"#,
+            quoted(event),
+            quoted(tool),
+        )
+    };
+    let path = "/home/u/proj/src/threats.rs";
+    let calls: Vec<(&str, String, String)> = vec![
+        (
+            "Read",
+            format!(r#"{{"file_path":{}}}"#, quoted(path)),
+            format!(
+                r#"{{"type":"text","file":{{"filePath":{},"content":{}}}}}"#,
+                quoted(path),
+                quoted(&big)
+            ),
+        ),
+        (
+            "Edit",
+            format!(
+                r#"{{"file_path":{},"old_string":{},"new_string":"b"}}"#,
+                quoted(path),
+                quoted(&big)
+            ),
+            r#"{"filePath":"x"}"#.to_string(),
+        ),
+        (
+            "MultiEdit",
+            format!(
+                r#"{{"file_path":{},"edits":[{{"old_string":{},"new_string":"b"}}]}}"#,
+                quoted(path),
+                quoted(&big)
+            ),
+            r#"{"filePath":"x"}"#.to_string(),
+        ),
+        (
+            "Write",
+            format!(
+                r#"{{"file_path":{},"content":{}}}"#,
+                quoted(path),
+                quoted(&big)
+            ),
+            r#"{"type":"update"}"#.to_string(),
+        ),
+        (
+            "NotebookEdit",
+            format!(
+                r#"{{"notebook_path":"/home/u/proj/n.ipynb","new_source":{}}}"#,
+                quoted(&big)
+            ),
+            "{}".to_string(),
+        ),
+        (
+            "Grep",
+            r#"{"pattern":"fn ","path":"/home/u/proj"}"#.to_string(),
+            format!(r#"{{"content":{}}}"#, quoted(&big)),
+        ),
+        (
+            "Glob",
+            r#"{"pattern":"**/*","path":"/home/u/proj"}"#.to_string(),
+            format!(r#"{{"filenames":[{}]}}"#, quoted(&big)),
+        ),
+        (
+            "Bash",
+            r#"{"command":"cat src/threats.rs"}"#.to_string(),
+            format!(r#"{{"stdout":{},"stderr":""}}"#, quoted(&big)),
+        ),
+    ];
+    let run = |flags: &[&str], body: String| {
+        let host = Host::new();
+        let mut child = host.hook(flags).spawn().expect("run innerwarden hook");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(body.as_bytes());
+        });
+        let out = ended(child, "long call");
+        let _ = writer.join();
+        out
+    };
+    for (tool, input, response) in &calls {
+        let after = call("PostToolUse", tool, input.clone(), response.clone());
+        assert!(after.len() > BIG, "{tool}: {}", after.len());
+        for flags in [&[][..], &["--monitor"][..]] {
+            let (code, said) = run(flags, after.clone());
+            assert_eq!(code, Some(0), "{tool} {flags:?}: {said}");
+            assert!(said.contains("not read whole"), "{tool}: {said}");
+            assert!(said.contains(tool), "{tool}: {said}");
+        }
+        // The same call, as one about to run: still past the cap.
+        let before = call("PreToolUse", tool, input.clone(), response.clone());
+        let (code, said) = run(&[], before);
+        assert_eq!(code, Some(2), "{tool} PreToolUse: {said}");
+        assert!(
+            said.contains("longer than the 1 MiB the hook reads"),
+            "{said}"
+        );
+    }
+    // The path of a file tool is named in what the hook says.
+    let (_, said) = run(
+        &[],
+        call(
+            "PostToolUse",
+            "Read",
+            calls[0].1.clone(),
+            calls[0].2.clone(),
+        ),
+    );
+    assert!(said.contains(path), "{said}");
+    // The event only after what the call carries: not read, so refused.
+    let late = format!(
+        r#"{{"tool_name":"Write","tool_input":{{"file_path":"/p/a","content":{}}},"hook_event_name":"PostToolUse"}}"#,
+        quoted(&big)
+    );
+    let (code, said) = run(&[], late);
+    assert_eq!(code, Some(2), "event past the cap: {said}");
+    // A call about to run, with no event, whose content starts with the words
+    // of a PostToolUse: those are text it writes, not its event.
+    let content =
+        format!(r#"{{"hook_event_name":"PostToolUse"}},"hook_event_name":"PostToolUse" {big}"#);
+    let posing = format!(
+        r#"{{"tool_name":"Write","tool_input":{{"content":{},"file_path":"/p/a"}}}}"#,
+        quoted(&content)
+    );
+    let (code, said) = run(&[], posing);
+    assert_eq!(code, Some(2), "posing as a result: {said}");
+}
