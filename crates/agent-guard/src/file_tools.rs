@@ -1528,6 +1528,15 @@ mod tests {
         let grep = |input: Value| {
             file_read_call_in(&json!({"tool_name": "Grep", "tool_input": input}), &ctx)
         };
+        // `/home` is a firmlink on macOS (to `/System/Volumes/Data/home`):
+        // the search is said with both paths there, the real one after the
+        // one written, as every read through a link is.
+        let home_root = match std::fs::canonicalize("/home") {
+            Ok(real) if real != Path::new("/home") => {
+                format!("grep -r '' /home {}", real.display())
+            }
+            _ => "grep -r '' /home".to_string(),
+        };
         for (input, line) in [
             (
                 json!({"pattern": "fn main", "path": "/home/dev"}),
@@ -1645,7 +1654,7 @@ mod tests {
             (json!({"pattern": "fn main", "path": "/"}), "grep -r '' /"),
             (
                 json!({"pattern": "fn main", "path": "/home"}),
-                "grep -r '' /home",
+                home_root.as_str(),
             ),
             (
                 json!({"pattern": "fn main", "path": "/home/dev/.config"}),
