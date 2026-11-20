@@ -88,13 +88,29 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         .take_while(|a| *a != "--")
         .any(|a| matches!(a.as_str(), "--monitor" | "--enforce" | "--block-review"));
     let mut args = args;
+    // The person's Claude Code folder: `~/.claude`, or the one
+    // `CLAUDE_CONFIG_DIR` names where it is handed in.
+    let claude_dir = match crate::contain::persons_claude_dir(
+        &home,
+        &args.pass_env,
+        std::env::var_os(crate::contain::CLAUDE_CONFIG_ENV).as_deref(),
+    ) {
+        Ok(dir) => dir,
+        Err(error) => {
+            eprintln!("innerwarden contain: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let claude_settings = claude_dir.join("settings.json");
+    let claude_settings_arg = claude_settings.to_string_lossy().to_string();
+    let settings_named = (claude_dir != home.join(crate::contain::CLAUDE_DIR))
+        .then_some(claude_settings_arg.as_str());
     if !mode_given {
-        if let Some((block_review, monitor)) =
-            std::fs::read_to_string(home.join(".claude/settings.json"))
-                .ok()
-                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                .as_ref()
-                .and_then(hook::kept_hook_flags)
+        if let Some((block_review, monitor)) = std::fs::read_to_string(&claude_settings)
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .as_ref()
+            .and_then(hook::kept_hook_flags)
         {
             args.mode = match (block_review, monitor) {
                 (true, _) => crate::contain::Mode::BlockReview,
@@ -105,7 +121,14 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
     let (block_review, monitor) = args.mode.hook_flags();
     if args.setup_only {
-        match hook::install_hook(&home, &args.agent, None, &hook_cli, block_review, monitor) {
+        match hook::install_hook(
+            &home,
+            &args.agent,
+            settings_named,
+            &hook_cli,
+            block_review,
+            monitor,
+        ) {
             Ok(_) => {}
             Err(e) => eprintln!(
                 "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
@@ -207,7 +230,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // turn the guard's hook off, that cannot be read, or that sets hooks in
     // a form InnerWarden does not read, keeps the jail from starting,
     // before anything on the host is changed.
-    if let Some(why) = claude_settings_refused(&input.home, &input.args.project) {
+    if let Some(why) = claude_settings_refused(&input.claude_host_dir, &input.args.project) {
         eprintln!("innerwarden contain: refusing to start: {why}");
         return ExitCode::from(2);
     }
@@ -229,7 +252,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         match hook::install_hook(
             &input.home,
             &input.args.agent,
-            None,
+            settings_named,
             &hook_cli,
             block_review,
             monitor,
@@ -425,10 +448,10 @@ fn existing_home_paths(home: &Path) -> Vec<PathBuf> {
 /// read by [`read_claude_settings`] and judged by
 /// [`crate::contain::claude_settings_refusal`]. One that is not there
 /// keeps nothing from starting; every other doubt does.
-fn claude_settings_refused(home: &Path, project: &Path) -> Option<String> {
+fn claude_settings_refused(claude: &Path, project: &Path) -> Option<String> {
     let person = crate::contain::CLAUDE_GUARD_SETTINGS
         .iter()
-        .map(|name| (home.join(name), false));
+        .map(|name| (claude_setting(claude, name), false));
     let projects = crate::contain::PROJECT_CLAUDE_SETTINGS
         .iter()
         .map(|name| (project.join(name), true));
@@ -563,6 +586,13 @@ fn keep_absent_names(
     write_private_file(dir, &marker, &temp, absent.join("\n").as_bytes(), uid)
         .map(|_| ())
         .map_err(|e| format!("the launcher cannot keep what the project lacks ({e})"))
+}
+
+/// The person's Claude Code settings file `name` (one of
+/// [`crate::contain::CLAUDE_GUARD_SETTINGS`]) in their Claude Code folder
+/// `claude` ([`crate::contain::persons_claude_dir`]).
+fn claude_setting(claude: &Path, name: &str) -> PathBuf {
+    claude.join(Path::new(name).file_name().unwrap_or_default())
 }
 
 /// The settings in the Claude Code settings file `path` (`None` where it is
@@ -876,8 +906,13 @@ fn resolve_planned(
             .filter(|claude| std::fs::symlink_metadata(&claude.source).is_ok_and(|m| m.is_dir()));
     // The host's `~/.claude`, never shown writable: as named, where it
     // leads, and (Linux) every other place a folder the jail shows it.
+    let claude_host_dir = crate::contain::persons_claude_dir(
+        &home,
+        &args.pass_env,
+        std::env::var_os(crate::contain::CLAUDE_CONFIG_ENV).as_deref(),
+    )?;
     let claude_views = {
-        let named = home.join(crate::contain::CLAUDE_DIR);
+        let named = claude_host_dir.clone();
         let real = std::fs::canonicalize(&named).unwrap_or_else(|_| named.clone());
         let mut views = vec![named.clone()];
         if real != named {
@@ -945,6 +980,7 @@ fn resolve_planned(
         claude_views,
         claude_hook_files: Vec::new(),
         project_guard_files,
+        claude_host_dir,
         hook_cli: None,
         jail_writes: facts.writable.clone(),
         bind_fds: Vec::new(),
@@ -2678,7 +2714,7 @@ fn prepare_project_claude(input: &JailInputs) -> Result<JailInputs, String> {
     trim_project_claude(&claude, uid);
     let mut settings = Vec::new();
     for name in CLAUDE_GUARD_SETTINGS {
-        let from = input.home.join(name);
+        let from = claude_setting(&input.claude_host_dir, name);
         let (bytes, value) = claude_settings_value(&from, false)?
             .unwrap_or_else(|| (b"{}".to_vec(), serde_json::json!({})));
         let to = crate::contain::claude_copy_of(&source, &from);
@@ -2693,16 +2729,17 @@ fn prepare_project_claude(input: &JailInputs) -> Result<JailInputs, String> {
     }
     #[cfg(target_os = "linux")]
     {
-        copy_claude_login(&input.home, &source, uid)?;
-        out.claude_hook_files = crate::contain::claude_hook_files(&settings, &input.home);
+        copy_claude_login(&input.claude_host_dir, &source, uid)?;
+        out.claude_hook_files =
+            crate::contain::claude_hook_files(&settings, &input.home, &input.claude_host_dir);
     }
     // What a jail wrote in its own folder at a name the person's folder
     // does not have (`CLAUDE.md`, `skills`, a hook's script) is no longer
     // laid over from the host, so it would reach the next jail: removed.
-    let host = input.home.join(crate::contain::CLAUDE_DIR);
-    let hook_names = crate::contain::claude_hook_files(&settings, &input.home)
+    let host = &input.claude_host_dir;
+    let hook_names = crate::contain::claude_hook_files(&settings, &input.home, host)
         .into_iter()
-        .filter_map(|file| file.strip_prefix(&host).ok().map(Path::to_path_buf));
+        .filter_map(|file| file.strip_prefix(host).ok().map(Path::to_path_buf));
     let shared = CLAUDE_READ_ONLY_SHARED.iter().map(PathBuf::from);
     for name in shared.chain(hook_names) {
         if std::fs::symlink_metadata(host.join(&name)).is_ok() {
@@ -2721,7 +2758,7 @@ fn prepare_project_claude(input: &JailInputs) -> Result<JailInputs, String> {
     {
         let _ = settings;
         for name in CLAUDE_READ_ONLY_SHARED {
-            let host = input.home.join(crate::contain::CLAUDE_DIR).join(name);
+            let host = input.claude_host_dir.join(name);
             let at = source.join(name);
             if std::fs::symlink_metadata(&host).is_ok() && std::fs::symlink_metadata(&at).is_err() {
                 let _ = std::os::unix::fs::symlink(&host, &at);
@@ -2753,12 +2790,10 @@ fn launch_temp_name(target: &Path) -> String {
 /// a file of its own of at most 1 MiB, copied into the jail's own
 /// `~/.claude` (`source`), `0600`. Nothing where the person has none.
 #[cfg(target_os = "linux")]
-fn copy_claude_login(home: &Path, source: &Path, uid: u32) -> Result<(), String> {
+fn copy_claude_login(claude: &Path, source: &Path, uid: u32) -> Result<(), String> {
     use std::io::Read;
     const MAX_LOGIN_BYTES: u64 = 1024 * 1024;
-    let from = home
-        .join(crate::contain::CLAUDE_DIR)
-        .join(".credentials.json");
+    let from = claude.join(".credentials.json");
     let Ok(meta) = std::fs::symlink_metadata(&from) else {
         return Ok(());
     };
@@ -6236,7 +6271,7 @@ mod tests {
         let p = root.path().join("proj");
         std::fs::create_dir_all(home.join(".claude")).unwrap();
         std::fs::create_dir_all(p.join(".claude")).unwrap();
-        assert_eq!(claude_settings_refused(&home, &p), None);
+        assert_eq!(claude_settings_refused(&home.join(".claude"), &p), None);
         let ours = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/usr/local/bin/innerwarden hook --agent claude-code"}]}]}}"#;
         std::fs::write(home.join(".claude/settings.json"), ours).unwrap();
         std::fs::write(
@@ -6244,11 +6279,11 @@ mod tests {
             r#"{"permissions":{"allow":["Bash(ls)"]},"disableAllHooks":false}"#,
         )
         .unwrap();
-        assert_eq!(claude_settings_refused(&home, &p), None);
+        assert_eq!(claude_settings_refused(&home.join(".claude"), &p), None);
         let refused = |path: &Path, text: &[u8]| {
             let before = std::fs::read(path).ok();
             std::fs::write(path, text).unwrap();
-            let why = claude_settings_refused(&home, &p);
+            let why = claude_settings_refused(&home.join(".claude"), &p);
             match before {
                 Some(before) => std::fs::write(path, before).unwrap(),
                 None => std::fs::remove_file(path).unwrap(),
@@ -6300,7 +6335,7 @@ mod tests {
             std::fs::write(&elsewhere, "{}").unwrap();
             for link in [local.clone(), p.join(".claude/settings.json")] {
                 std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
-                let why = claude_settings_refused(&home, &p).unwrap();
+                let why = claude_settings_refused(&home.join(".claude"), &p).unwrap();
                 assert!(why.contains("is a link"), "{why}");
                 std::fs::remove_file(&link).unwrap();
             }
@@ -6311,7 +6346,7 @@ mod tests {
         assert!(refused(&p.join(".claude/settings.json"), others.as_bytes())
             .contains("none of InnerWarden's"));
         std::fs::write(&local, others).unwrap();
-        assert_eq!(claude_settings_refused(&home, &p), None);
+        assert_eq!(claude_settings_refused(&home.join(".claude"), &p), None);
     }
 
     /// Second review of #352, item 1, as the real run readies the jail's

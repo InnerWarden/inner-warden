@@ -4229,6 +4229,69 @@ fn what_a_jail_writes_in_the_projects_claude_files_never_reaches_the_host() {
     );
 }
 
+/// NEW-20261020-jail-config-dir-not-covered: with `CLAUDE_CONFIG_DIR`
+/// handed in (`--pass-env`), the jail's Claude Code used the folder it
+/// names, while `contain` armed and checked `~/.claude`. Now that folder
+/// is the person's Claude Code folder: settings there that turn hooks off
+/// refuse the start (naming the file), the guard's hook is armed there and
+/// not in `~/.claude`, and a relative value refuses the start. No
+/// bubblewrap is needed: all of it happens before the jail is built.
+///
+/// FAILS ON REVERT: read and arm `~/.claude` whatever the variable says.
+#[cfg(unix)]
+#[test]
+fn the_folder_claude_config_dir_names_is_checked_and_armed() {
+    let run = |h: &std::path::Path, value: &str| {
+        let project = tempfile::TempDir::new().unwrap();
+        cli()
+            .args([
+                "contain",
+                "--pass-env",
+                "CLAUDE_CONFIG_DIR",
+                "--project",
+                project.path().to_str().unwrap(),
+                "--",
+                "/bin/true",
+            ])
+            .env("HOME", h)
+            .env("CLAUDE_CONFIG_DIR", value)
+            .output()
+            .expect("run the launcher")
+    };
+    let home = state_home();
+    let h = home.path();
+    let cfg = h.join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("settings.local.json"),
+        r#"{"disableAllHooks":true}"#,
+    )
+    .unwrap();
+    let off = run(h, cfg.to_str().unwrap());
+    let err = String::from_utf8_lossy(&off.stderr);
+    assert_eq!(off.status.code(), Some(2), "{err}");
+    assert!(err.contains("cfg/settings.local.json"), "{err}");
+    assert!(
+        !cfg.join("settings.json").exists(),
+        "armed before the check"
+    );
+    std::fs::remove_file(cfg.join("settings.local.json")).unwrap();
+    let _ = run(h, cfg.to_str().unwrap());
+    let armed = std::fs::read_to_string(cfg.join("settings.json")).unwrap_or_default();
+    assert!(
+        armed.contains("hook"),
+        "not armed where the variable points: {armed}"
+    );
+    assert!(
+        !h.join(".claude/settings.json").exists(),
+        "armed in ~/.claude"
+    );
+    let relative = run(h, "cfg");
+    let err = String::from_utf8_lossy(&relative.stderr);
+    assert_eq!(relative.status.code(), Some(2), "{err}");
+    assert!(err.contains("CLAUDE_CONFIG_DIR"), "{err}");
+}
+
 /// Second review of #352, item 3: a start that could not read the person's
 /// Claude Code settings went on as if nothing turned the hook off. Now each
 /// doubt refuses the start (exit 2), names the file, and arms nothing: the
@@ -6147,6 +6210,12 @@ fn the_jails_record_of_decisions_is_out_of_the_agents_reach() {
 ///
 /// FAILS ON REVERT: read the folder's presence again (`in_record_jail`)
 /// and the program's socket hears the decision and the record has none.
+///
+/// The script waits for the program's socket by the program's own word
+/// (a line it writes to a FIFO once it listens, or `dead` if it ended
+/// before), never by polling with a deadline: under a full suite the
+/// program took longer than the 5 s the poll allowed, and the test failed
+/// once and passed the next run (NEW-20261120-flaky-jail-record-folder-test).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers() {
@@ -6162,10 +6231,11 @@ fn a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers() {
     let fake = project.path().join("fake.py");
     std::fs::write(
         &fake,
-        "import socket\n\
+        "import os, socket\n\
          s = socket.socket(socket.AF_UNIX)\n\
          s.bind('/run/innerwarden-record/graph.sock')\n\
          s.listen(8)\n\
+         open('/tmp/up', 'w').write('up %d\\n' % os.getpid())\n\
          while True:\n    \
              c, _ = s.accept()\n    \
              d = c.recv(1 << 20)\n    \
@@ -6176,11 +6246,11 @@ fn a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers() {
     .unwrap();
     let script = format!(
         "command -v python3 >/dev/null || {{ echo NO_PYTHON; exit 0; }}; \
-         mkdir -p /run/innerwarden-record && python3 '{}' & FAKE=$!; \
-         i=0; while [ ! -S /run/innerwarden-record/graph.sock ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; \
-         [ -S /run/innerwarden-record/graph.sock ] && echo FAKE_UP; \
+         mkdir -p /run/innerwarden-record && mkfifo /tmp/up || exit 0; \
+         ( python3 '{}'; echo dead 0 > /tmp/up ) >/dev/null 2>&1 & WATCH=$!; \
+         read UP FAKE < /tmp/up; [ \"$UP\" = up ] && echo FAKE_UP; \
          {}; \
-         if [ -s /tmp/heard ]; then echo HEARD; fi; kill $FAKE 2>/dev/null; true",
+         if [ -s /tmp/heard ]; then echo HEARD; fi; kill $WATCH $FAKE 2>/dev/null; true",
         fake.display(),
         jail_hook_line("fake"),
     );

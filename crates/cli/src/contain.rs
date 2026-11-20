@@ -2137,6 +2137,12 @@ pub struct JailInputs {
     /// Each of the project's [`PROJECT_GUARD_NAMES`] that is there (and no
     /// link), shown read-only for the run (Linux) or denied writing (macOS).
     pub project_guard_files: Vec<PathBuf>,
+    /// The person's Claude Code folder on the host: `~/.claude`, or the
+    /// folder `CLAUDE_CONFIG_DIR` names where the launch hands that variable
+    /// in ([`persons_claude_dir`]). Its settings are what the guard's hook
+    /// is armed in and what the jail gets copies of, it is never shown
+    /// writable, and in the jail the variable names the jail's own folder.
+    pub claude_host_dir: PathBuf,
     /// The CLI the guard's hook runs ([`hook_cli_for`]). macOS: denied
     /// writing with its folder ([`macos_hook_cli_denies`]).
     pub hook_cli: Option<PathBuf>,
@@ -2290,6 +2296,48 @@ pub fn project_settings_made_refusal(
         return said("it names MCP servers");
     }
     None
+}
+
+/// The variable that moves Claude Code's folder.
+pub(crate) const CLAUDE_CONFIG_ENV: &str = "CLAUDE_CONFIG_DIR";
+
+/// PURE. The person's Claude Code folder for a launch from `home` that
+/// hands in the variables `pass_env` names, where `CLAUDE_CONFIG_DIR` is
+/// `value` in the launcher's environment: that folder where the variable
+/// goes into the jail and is set, else `~/.claude`. NEW-20261020-jail-
+/// config-dir-not-covered: the launcher armed and guarded `~/.claude`
+/// while the jail's Claude Code used the folder the variable named, so its
+/// settings were not guarded and jails at once shared that folder. A value
+/// that is not an absolute path with no `.` or `..` step is refused: the
+/// jail runs in another folder, so a relative one names another place.
+pub fn persons_claude_dir(
+    home: &Path,
+    pass_env: &[String],
+    value: Option<&std::ffi::OsStr>,
+) -> Result<PathBuf, ContainError> {
+    let default = home.join(CLAUDE_DIR);
+    if !pass_env.iter().any(|name| name == CLAUDE_CONFIG_ENV) {
+        return Ok(default);
+    }
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(default);
+    };
+    let path = PathBuf::from(value);
+    let plain = path.is_absolute()
+        && path.components().all(|c| {
+            !matches!(
+                c,
+                std::path::Component::ParentDir | std::path::Component::CurDir
+            )
+        });
+    if !plain {
+        return Err(ContainError::Unsupported(format!(
+            "refusing to start: CLAUDE_CONFIG_DIR is handed in as {}, which is not an absolute \
+             path with no . or .. in it; name Claude Code's folder by its full path",
+            printable(&path)
+        )));
+    }
+    Ok(path.components().collect())
 }
 
 /// The launcher's copy, in the jail's own `~/.claude` (`source`), of the
@@ -2588,10 +2636,15 @@ fn hooks_in_known_form(hooks: &serde_json::Value) -> bool {
 /// jail shows each read-only from the host in its own `~/.claude`, so the
 /// person's hooks still run there and no program in the jail can change
 /// what they run. A path with `..` in it is none.
+///
+/// `claude` is the person's Claude Code folder ([`JailInputs::claude_host_dir`]).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub fn claude_hook_files(settings: &[serde_json::Value], home: &Path) -> Vec<PathBuf> {
+pub fn claude_hook_files(
+    settings: &[serde_json::Value],
+    home: &Path,
+    claude: &Path,
+) -> Vec<PathBuf> {
     use serde_json::Value;
-    let claude = home.join(CLAUDE_DIR);
     let mut out: Vec<PathBuf> = Vec::new();
     let commands = settings
         .iter()
@@ -2621,7 +2674,7 @@ pub fn claude_hook_files(settings: &[serde_json::Value], home: &Path) -> Vec<Pat
                     std::path::Component::ParentDir | std::path::Component::CurDir
                 )
             });
-            if plain && path.starts_with(&claude) && path != claude && !out.contains(&path) {
+            if plain && path.starts_with(claude) && path != claude && !out.contains(&path) {
                 out.push(path);
             }
         }
@@ -3847,11 +3900,25 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         }
         let shared = CLAUDE_READ_ONLY_SHARED
             .iter()
-            .map(|name| own.join(name))
-            .chain(input.claude_hook_files.iter().cloned());
-        for path in shared {
-            let at = path.to_string_lossy().to_string();
-            push(&["--ro-bind-try", &at, &at]);
+            .map(|name| (input.claude_host_dir.join(name), own.join(name)))
+            .chain(
+                input
+                    .claude_hook_files
+                    .iter()
+                    .map(|file| (file.clone(), file.clone())),
+            );
+        for (from, at) in shared {
+            push(&[
+                "--ro-bind-try",
+                &from.to_string_lossy(),
+                &at.to_string_lossy(),
+            ]);
+        }
+        // `CLAUDE_CONFIG_DIR` handed in names the person's folder: in the
+        // jail it names the jail's own, as `~/.claude` does
+        // (NEW-20261020-jail-config-dir-not-covered).
+        if input.claude_host_dir != own {
+            push(&["--setenv", CLAUDE_CONFIG_ENV, &own_at]);
         }
     }
 
@@ -6342,6 +6409,7 @@ mod tests {
             claude_views: vec![PathBuf::from("/home/dev/.claude")],
             claude_hook_files: vec![],
             project_guard_files: vec![],
+            claude_host_dir: PathBuf::from("/home/dev/.claude"),
             hook_cli: None,
             jail_writes: vec![],
             bind_fds: vec![],
@@ -9042,6 +9110,73 @@ mod tests {
         assert_eq!(got.matches(CLAUDE_STATE_LINES).count(), 1, "{got}");
     }
 
+    /// NEW-20261020-jail-config-dir-not-covered: where `CLAUDE_CONFIG_DIR`
+    /// is handed in, the folder it names is the person's Claude Code folder:
+    /// the launcher takes its settings and its shared files from there, and
+    /// in the jail the variable names the jail's own folder, as `~/.claude`
+    /// does. Not handed in, or empty: `~/.claude`, and the jail is the one
+    /// it was. A relative value, or one with `.` or `..`, refuses the start.
+    ///
+    /// FAILS ON REVERT: read the variable only as `~/.claude`, or leave it
+    /// naming the person's folder in the jail.
+    #[test]
+    fn the_folder_claude_config_dir_names_is_taken_as_claude_codes_folder() {
+        use std::ffi::OsStr;
+        let home = Path::new("/home/dev");
+        let passed = vec!["CLAUDE_CONFIG_DIR".to_string()];
+        let default = PathBuf::from("/home/dev/.claude");
+        assert_eq!(
+            persons_claude_dir(home, &[], Some(OsStr::new("/srv/c"))).unwrap(),
+            default
+        );
+        assert_eq!(persons_claude_dir(home, &passed, None).unwrap(), default);
+        assert_eq!(
+            persons_claude_dir(home, &passed, Some(OsStr::new(""))).unwrap(),
+            default
+        );
+        assert_eq!(
+            persons_claude_dir(home, &passed, Some(OsStr::new("/home/dev/.config/claude/")))
+                .unwrap(),
+            PathBuf::from("/home/dev/.config/claude")
+        );
+        for bad in ["cfg", "./cfg", "/home/dev/../x/c"] {
+            let why = persons_claude_dir(home, &passed, Some(OsStr::new(bad)))
+                .unwrap_err()
+                .to_string();
+            assert!(why.contains("refusing to start"), "{bad}: {why}");
+        }
+        let mut input = identified_inputs();
+        let plain_argv = build_linux_jail(&input).unwrap().bwrap_args;
+        assert!(!plain_argv.iter().any(|a| a == "CLAUDE_CONFIG_DIR"));
+        input.claude_host_dir = PathBuf::from("/home/dev/.config/claude");
+        input.claude_views = vec![input.claude_host_dir.clone()];
+        let got = build_linux_jail(&input).unwrap().bwrap_args;
+        assert!(
+            got.windows(3)
+                .any(|w| w == ["--setenv", "CLAUDE_CONFIG_DIR", "/home/dev/.claude"]),
+            "{got:?}"
+        );
+        assert!(
+            got.windows(3).any(|w| w
+                == [
+                    "--ro-bind-try",
+                    "/home/dev/.config/claude/agents",
+                    "/home/dev/.claude/agents"
+                ]),
+            "{got:?}"
+        );
+        // Covered where the person's folder is, before the jail's own.
+        let cover = got
+            .windows(2)
+            .position(|w| w == ["--tmpfs", "/home/dev/.config/claude"])
+            .unwrap();
+        let own = got
+            .windows(3)
+            .position(|w| w[0] == "--bind" && w[2] == "/home/dev/.claude")
+            .unwrap();
+        assert!(cover < own, "{got:?}");
+    }
+
     /// Second review of #352: a hook of the person's that runs a file in
     /// `~/.claude` runs it in the jail too, read-only from the host: each
     /// such file is found as written, after `~/`, `$HOME/` or `${HOME}/`,
@@ -9059,7 +9194,7 @@ mod tests {
             ]}]
         }});
         let home = Path::new("/home/dev");
-        let found = claude_hook_files(&[settings], home);
+        let found = claude_hook_files(&[settings], home, &home.join(".claude"));
         assert_eq!(
             found,
             paths(&[

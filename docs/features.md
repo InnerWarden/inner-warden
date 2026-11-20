@@ -199,6 +199,13 @@ list, with every limit.
   back the next start, not the run it is made in (the guard's part of that
   is separate work), and a change you make to yours during a run reaches
   the jail at its next start.
+  Where you hand `CLAUDE_CONFIG_DIR` in (`--pass-env CLAUDE_CONFIG_DIR`),
+  the folder it names is taken as your `~/.claude`: `contain` checks the
+  settings there, arms the guard's hook there, gives the jail copies of
+  them and covers that folder, and in the jail the variable names the
+  jail's own folder. A value that is not a full path (relative, or with a
+  `..` in it) refuses the start. Not handed in, the variable stays out of
+  the jail and `~/.claude` is your folder, as before.
   Limit: a second Claude Code an agent starts in the jail with another
   `CLAUDE_CONFIG_DIR` reads the settings in that folder, not the jail's
   copies, so it may run without the guard's hook; the guard refuses such a
