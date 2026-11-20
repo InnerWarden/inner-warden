@@ -2179,8 +2179,9 @@ pub struct JailInputs {
     /// [`crate::jail_record::JAIL_RECORD_DIR`]; the project's record folder
     /// ([`JAIL_GRAPH_DIR`]) is then read-only in the jail, and the launcher
     /// writes each decision the hook hands it. `None` where the launcher
-    /// could not open it (said as the jail starts): the hook then writes the
-    /// record in the project itself, as it did before.
+    /// could not open it (said as the jail starts): an `--identity` jail is
+    /// then refused, and a plain one runs with the hook writing the record
+    /// in the project itself, as it did before.
     pub record_channel: Option<PathBuf>,
 }
 

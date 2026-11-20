@@ -1248,9 +1248,13 @@ fn record(
     // Inside a jail whose launcher keeps the record, the decision goes to
     // the launcher and nowhere else: the record folder is read-only here,
     // and a path from the environment (`IW_GRAPH_FILE`, which a program in
-    // the jail can set) never takes it elsewhere.
-    if let Some(socket) = crate::jail_record::socket_here() {
-        if let Err(code) = crate::jail_record::hand_over(&socket, &decision) {
+    // the jail can set) never takes it elsewhere. With the launcher's
+    // folder there and its socket gone, nothing is written either.
+    if crate::jail_record::in_record_jail() {
+        let handed = crate::jail_record::socket_here()
+            .ok_or("jail_record_unreachable")
+            .and_then(|socket| crate::jail_record::hand_over(&socket, &decision));
+        if let Err(code) = handed {
             eprintln!("innerwarden: graph record skipped ({code})");
         }
         return;
@@ -1324,8 +1328,8 @@ fn prepare(
 /// Write one prepared decision into the graph at `path` (and
 /// `guard-events.jsonl` beside it): the hook's own write, and the
 /// launcher's write of what the hook in a jail handed it
-/// ([`crate::jail_record`]).
-pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Decision) {
+/// ([`crate::jail_record`]). Whether the decision is in the graph.
+pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Decision) -> bool {
     let crate::jail_record::Decision {
         session,
         command,
@@ -1336,7 +1340,7 @@ pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Dec
         event_hash,
     } = decision;
     let (mode, outcome) = (*mode, *outcome);
-    if let Err(error) = record_at_with_origin(
+    let written = if let Err(error) = record_at_with_origin(
         path,
         session,
         command,
@@ -1357,12 +1361,16 @@ pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Dec
         if crate::record_health::is_first_of_episode_at(path) {
             crate::notify_io::fire_text(&outage.summary());
         }
-    } else if let Some(ended) = crate::record_health::note_success_at(path) {
-        eprintln!(
-            "innerwarden: recording recovered after {} lost action(s)",
-            ended.lost
-        );
-    }
+        false
+    } else {
+        if let Some(ended) = crate::record_health::note_success_at(path) {
+            eprintln!(
+                "innerwarden: recording recovered after {} lost action(s)",
+                ended.lost
+            );
+        }
+        true
+    };
     // Emit a compact, append-only guard event for a CO-LOCATED InnerWarden host
     // agent (Enterprise) to ingest, so the free guard's blocks (command AND MCP)
     // reach the paid incident pipeline / graph / model. Block-only + best-effort:
@@ -1393,6 +1401,7 @@ pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Dec
             origin,
         );
     }
+    written
 }
 
 /// Append one BLOCKED / WOULD-BLOCK guard decision to `guard-events.jsonl`, an
@@ -1474,8 +1483,27 @@ fn rule_change_line(
 /// agent tails `guard-events.jsonl` from beside the graph, and a sink that
 /// stayed in the operator home while the graph moved would be the same split in
 /// a second file.
+///
+/// Inside a jail whose launcher keeps the record, `IW_GRAPH_FILE` is not
+/// read here: a program in the jail can set it, and the lines this folder
+/// holds go to the launcher ([`append_guard_event_at`]); what is kept
+/// here (a pending conversation attempt, the profiles' snapshot) is the
+/// jail's own.
 pub(crate) fn sink_dir() -> Option<std::path::PathBuf> {
-    graph_path()?
+    let path = if crate::jail_record::in_record_jail() {
+        resolve_with(
+            std::path::Path::new(innerwarden_graph::GUARD_CONFIG_PATH),
+            |key| {
+                (key != "IW_GRAPH_FILE")
+                    .then(|| std::env::var(key).ok())
+                    .flatten()
+            },
+        )
+        .path
+    } else {
+        graph_path()
+    };
+    path?
         .parent()
         .map(std::path::Path::to_path_buf)
         .filter(|dir| !dir.as_os_str().is_empty())
@@ -1488,6 +1516,9 @@ pub(crate) fn sink_dir() -> Option<std::path::PathBuf> {
 /// same best-effort contract: an error here can never alter the decision it
 /// reports on.
 pub(crate) fn append_guard_event(line: &Value) {
+    if crate::jail_record::hand_event_here(line).is_some() {
+        return;
+    }
     let Some(dir) = sink_dir() else {
         return;
     };
@@ -1517,8 +1548,16 @@ pub(crate) fn append_guard_event(line: &Value) {
 /// the guarantee `O_APPEND` actually offers; it is not a promise about every
 /// filesystem, and this stays best-effort telemetry that can never alter a
 /// verdict.
-pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
+///
+/// Inside a jail whose launcher keeps the record the line goes to the
+/// launcher, whatever `dir` is: the record's folder is read-only there,
+/// and a folder from the environment is the jail's to choose. Whether the
+/// line was written (or taken by the launcher).
+pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) -> bool {
     use std::io::Write;
+    if let Some(handed) = crate::jail_record::hand_event_here(line) {
+        return handed;
+    }
     let path = dir.join("guard-events.jsonl");
     create_sink_with_directory_ownership(&path);
     let mut record = line.to_string();
@@ -1550,12 +1589,13 @@ pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) {
         },
         Err(error) => Some(format!("could not be opened ({})", error.kind())),
     };
-    if let Some(why) = refused {
+    if let Some(why) = &refused {
         eprintln!(
             "innerwarden: a guard event was not recorded: guard-events.jsonl {why}. \
              `innerwarden graph --stats` says what to do."
         );
     }
+    refused.is_none()
 }
 
 /// Create the sink, if it does not exist yet, with the mode AND group its

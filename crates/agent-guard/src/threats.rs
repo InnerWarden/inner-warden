@@ -8896,10 +8896,12 @@ fn home_spelled(target: &str) -> String {
     lower
 }
 
-/// Whether a path names the guard's configuration directory or a file in it.
+/// Whether a path names the record folder of the project a command runs
+/// in, as far as the text says ([`crate::file_tools::names_jail_record`]
+/// with no working directory: a `cd` on the line is joined to a relative
+/// target by [`writes_place`]).
 fn names_jail_record_place(target: &str, _taken: bool) -> bool {
-    named_path(&home_spelled(target))
-        .is_some_and(|named| Place::Components(crate::file_tools::JAIL_RECORD_FOLDER).holds(&named))
+    crate::file_tools::names_jail_record(target, None)
 }
 
 /// Whether a command line writes into, removes or moves a project's record
@@ -8915,6 +8917,7 @@ fn writes_jail_record(content: &str) -> bool {
         && writes_place(content, 0, names_jail_record_place, false)
 }
 
+/// Whether a path names the guard's configuration directory or a file in it.
 fn names_guard_config(target: &str) -> bool {
     named_path(&home_spelled(target))
         .is_some_and(|named| Place::Components(".config/innerwarden").holds(&named))
@@ -26893,6 +26896,27 @@ mod brq_evaluation_tests {
         ] {
             assert_eq!(check_guard_self_disable(cmd), None, "{cmd}");
         }
+    }
+
+    /// T-078 (9): a folder named `.innerwarden` that is not the project's
+    /// record (a dependency's, the system's) is the agent's to change; the
+    /// project's, named from a folder below it, is still refused.
+    ///
+    /// FAILS ON REVERT: refuse any component named `.innerwarden` and
+    /// the first three are refused.
+    #[test]
+    fn a_shell_write_into_another_innerwarden_folder_is_not_a_bypass() {
+        for cmd in [
+            "rm -rf node_modules/pkg/.innerwarden",
+            "rm -rf /opt/tool/.innerwarden",
+            "echo {} > fixtures/.innerwarden/graph.json",
+        ] {
+            assert_eq!(check_guard_self_disable(cmd), None, "{cmd}");
+        }
+        assert_eq!(
+            check_guard_self_disable("rm -rf ../.innerwarden").map(|(why, _)| why),
+            Some(crate::file_tools::JAIL_RECORD_WRITTEN)
+        );
     }
 
     /// A write into the guard's own configuration directory is the same

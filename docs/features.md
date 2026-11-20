@@ -25,16 +25,35 @@ list, with every limit.
   variable it kept out, never a value.
   The hook inside the jail keeps its record of decisions in the project, in
   `<project>/.innerwarden/graph.json`. On Linux that folder is read-only
-  inside the jail: the hook hands each decision over a socket to `contain`,
-  which runs outside the jail and writes it. A program in the jail cannot
-  change or remove a decision already written, and `IW_GRAPH_FILE` does not
-  send the hook's decisions anywhere else. It can still add records of its
-  own through that socket: the record says what the jail reported, not what
-  the host saw, and enough of them push the oldest out of the record's size
-  cap. On macOS the sandbox gives no such folder: the guard refuses a shell
-  command or a file tool that writes, moves or removes `.innerwarden`, but a
-  program run there (for example `python3 -c` code that opens the file) can
-  still change it. On macOS the record is not tamper-proof.
+  inside the jail: the hook hands each decision, and each line it keeps
+  beside the record (a suppression or rule changed, an agent's decision),
+  over a socket to `contain`, which runs outside the jail and writes it. A
+  program in the jail cannot change or remove a decision already written,
+  and `IW_GRAPH_FILE` does not send the hook's decisions or those lines
+  anywhere else. The socket's folder is in `$XDG_RUNTIME_DIR`, else in
+  `$TMPDIR`; one inside a folder the jail can write is refused. A program
+  in the jail can still add records of its own through that socket: the
+  record says what the jail reported, not what the host saw. `contain`
+  writes its own instance id and project name on each one, never a host
+  decision the jail names, and writes at most 512 at once and 64 a second
+  after that. What it does not write (too many connections waiting, a
+  connection that sends no report within 2 seconds, over that rate, a write
+  that failed) is counted in the record's health, which
+  `innerwarden graph --stats` and the dashboard show, and in one
+  `guard.jail_record_lost` line when the jail ends. The record's size cap
+  still pushes its oldest decisions out. An entry at `.innerwarden` that is
+  not a folder of the launching account is moved aside first. Where the
+  folder or the socket cannot be had, `contain --identity` refuses to start;
+  a jail without `--identity` runs with the record writable and says so.
+  On macOS the sandbox gives no such folder. The guard refuses a shell
+  command or a file tool that writes, moves or removes the project's
+  `.innerwarden` only when the name is written literally (`.innerwarden`,
+  `../.innerwarden`, an absolute path to it). These still pass: a glob
+  (`rm -rf .inner*`, `mv .[i]nnerwarden x`), a link made to the folder
+  (`ln -s .innerwarden r && rm r/graph.json`), removing the project around
+  it (`cd .. && rm -rf proj`, `rm -rf "$PWD"`), and a program run there
+  (for example `python3 -c` code that opens the file). On macOS the record
+  is not tamper-proof.
 - Agent identity (off by default, Linux): `innerwarden contain --identity --
   <command>` records the run as an instance, so its hook and the dashboard can
   tell one agent's runs apart. See [Agent identity and trust](agent-identity.md).

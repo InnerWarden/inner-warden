@@ -2259,60 +2259,146 @@ fn run_linux(input: &JailInputs, marks: bool) -> ExitCode {
 /// Linux: the project's record folder ([`crate::contain::jail_graph_dir`])
 /// made where it is not there, and the launcher's record channel opened
 /// ([`crate::jail_record::Channel`]): the jail then shows the folder
-/// read-only and the hook hands each decision to the launcher. Where the
-/// folder is not a real folder of this account, or the channel cannot be
-/// opened, the jail runs as before (the hook writes the record in the
-/// project, where the jail can change it), and the launcher says so.
+/// read-only and the hook hands each decision to the launcher, which puts
+/// `instance` and the project's name on it.
+///
+/// An entry at the folder's name that is not a real folder of this account
+/// (a link, a file, a folder of another account, left there by an earlier
+/// jail, say) is moved aside and the folder made again, and contain says
+/// so. Where the folder or the channel still cannot be had, an
+/// `--identity` jail is refused (`Err`, said): its record is what the
+/// host reads of the instance. A plain jail runs as before (the hook
+/// writes the record in the project, where the jail can change it), and
+/// the launcher says so.
 #[cfg(target_os = "linux")]
-fn with_record_channel(input: &JailInputs) -> (JailInputs, Option<crate::jail_record::Channel>) {
+fn with_record_channel(
+    input: &JailInputs,
+    instance: Option<&str>,
+) -> Result<(JailInputs, Option<crate::jail_record::Channel>), ExitCode> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     let dir = crate::contain::jail_graph_dir(&input.args.project);
     let mut out = input.clone();
     out.record_channel = None;
-    let said = |why: &str| {
-        eprintln!(
-            "innerwarden contain: the jail's record ({}) stays writable inside the jail this run: {why}",
-            crate::contain::printable(&dir)
-        );
+    let identity = input.args.identity;
+    let failed = |why: &str| {
+        if identity {
+            eprintln!(
+                "innerwarden contain: refusing to start: the jail's record ({}) would stay writable inside the jail: {why}",
+                crate::contain::printable(&dir)
+            );
+            Err(ExitCode::from(2))
+        } else {
+            eprintln!(
+                "innerwarden contain: the jail's record ({}) stays writable inside the jail this run: {why}",
+                crate::contain::printable(&dir)
+            );
+            Ok((out.clone(), None))
+        }
     };
+    let vet = |found: &std::fs::Metadata| {
+        crate::contain::launch::vet_jail_graph_dir(
+            &crate::contain::launch::GraphEntry {
+                symlink: found.file_type().is_symlink(),
+                dir: found.is_dir(),
+                regular: false,
+                uid: found.uid(),
+                len: 0,
+            },
+            own_uid(),
+        )
+    };
+    if let Ok(found) = std::fs::symlink_metadata(&dir) {
+        if let Err(why) = vet(&found) {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let aside = dir.with_file_name(format!(
+                "{}.set-aside-{secs}-{}",
+                crate::contain::JAIL_GRAPH_DIR,
+                std::process::id()
+            ));
+            match std::fs::rename(&dir, &aside) {
+                Ok(()) => eprintln!(
+                    "innerwarden contain: {} was not a folder of this account ({why}); moved aside to {} and made again.",
+                    crate::contain::printable(&dir),
+                    crate::contain::printable(&aside)
+                ),
+                Err(e) => return failed(&format!("{why}, and it could not be moved aside ({e})")),
+            }
+        }
+    }
     let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
     let found = match std::fs::symlink_metadata(&dir) {
         Ok(m) => m,
-        Err(e) => {
-            said(&format!("it cannot be made ({e})"));
-            return (out, None);
-        }
+        Err(e) => return failed(&format!("it cannot be made ({e})")),
     };
-    let entry = crate::contain::launch::GraphEntry {
-        symlink: found.file_type().is_symlink(),
-        dir: found.is_dir(),
-        regular: false,
-        uid: found.uid(),
-        len: 0,
-    };
-    if let Err(why) = crate::contain::launch::vet_jail_graph_dir(&entry, own_uid()) {
-        said(why);
-        return (out, None);
+    if let Err(why) = vet(&found) {
+        return failed(why);
     }
-    match crate::jail_record::Channel::open(
-        &launcher_tmpdir(),
-        dir.join(crate::contain::JAIL_GRAPH_NAME),
-    ) {
+    let base = match record_base(input) {
+        Ok(base) => base,
+        Err(why) => return failed(&why),
+    };
+    let stamp = crate::jail_record::Stamp {
+        instance_id: instance.map(str::to_string),
+        project: input
+            .args
+            .project
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+    };
+    match crate::jail_record::Channel::open(&base, dir.join(crate::contain::JAIL_GRAPH_NAME), stamp)
+    {
         Ok(channel) => {
             out.record_channel = Some(channel.dir().to_path_buf());
             eprintln!(
                 "  the jail's record ({}) is read-only inside the jail; the launcher writes each decision the hook hands it.",
                 crate::contain::printable(&dir)
             );
-            (out, Some(channel))
+            Ok((out, Some(channel)))
         }
-        Err(why) => {
-            said(&format!(
-                "the launcher's record channel did not open ({why})"
+        Err(why) => failed(&format!(
+            "the launcher's record channel did not open ({why})"
+        )),
+    }
+}
+
+/// Linux: the folder the launcher's record channel is made in. The
+/// account's `XDG_RUNTIME_DIR` where it is a folder of this account that
+/// no one else may enter (the jail hides `/run` under a folder of its
+/// own), else the launcher's temporary folder. Never a folder the jail
+/// shows writable (the project, a home folder it binds, `--rw`): from
+/// there a program in the jail could remove the socket or put one of its
+/// own in its place; such a folder is refused, with what to set instead.
+#[cfg(target_os = "linux")]
+fn record_base(input: &JailInputs) -> Result<PathBuf, String> {
+    use std::os::unix::fs::MetadataExt;
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .filter(|dir| {
+            std::fs::symlink_metadata(dir)
+                .is_ok_and(|m| m.is_dir() && m.uid() == own_uid() && m.mode() & 0o077 == 0)
+        });
+    let base = runtime.unwrap_or_else(launcher_tmpdir);
+    let base = std::fs::canonicalize(&base).unwrap_or(base);
+    let real = |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let writable = std::iter::once(&input.args.project)
+        .chain(&input.jail_writes)
+        .chain(&input.args.extra_rw)
+        .map(|path| real(path));
+    for place in writable {
+        if base.starts_with(&place) {
+            return Err(format!(
+                "the folder for its socket ({}) is inside {}, which the jail can write; \
+                 set XDG_RUNTIME_DIR or TMPDIR to a folder the jail does not show",
+                crate::contain::printable(&base),
+                crate::contain::printable(&place)
             ));
-            (out, None)
         }
     }
+    Ok(base)
 }
 
 /// A jail with no launch record, as it runs: under the jail's seccomp filter
@@ -2327,7 +2413,10 @@ fn run_unrecorded(bwrap: &Path, input: &JailInputs, marks: bool) -> ExitCode {
     #[cfg(target_os = "linux")]
     let filter = unrecorded_filter(bwrap, input.args.identity);
     #[cfg(target_os = "linux")]
-    let (with_channel, channel) = with_record_channel(input);
+    let (with_channel, channel) = match with_record_channel(input, None) {
+        Ok(with_channel) => with_channel,
+        Err(code) => return code,
+    };
     #[cfg(target_os = "linux")]
     let input = &JailInputs {
         profiles_marker_fd: marker.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
@@ -2873,7 +2962,10 @@ fn launch_identified(
     // the launcher writes only after the admission: a launcher that dies
     // before the host answered leaves the jail an empty record.
     identified.gate_instance = crate::contain::launch::gate_for(input.args.start, instance_id);
-    let (identified, channel) = with_record_channel(&identified);
+    let (identified, channel) = match with_record_channel(&identified, Some(instance_id)) {
+        Ok(with_channel) => with_channel,
+        Err(code) => return Attempt::Done(code),
+    };
     // Each pin and read-only path from a descriptor opened now, after every
     // check ([`with_held_binds`]); bwrap holds its own copies once started.
     let (identified, held) = match with_held_binds(&identified) {
