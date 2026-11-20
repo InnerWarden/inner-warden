@@ -321,4 +321,4 @@ jobs:
           cargo test -p innerwarden-agent-guard --test guard_lowering_parse -- --nocapture
           cargo test -p innerwarden-agent-guard --test inline_runtime_robustness -- --nocapture
           cargo test -p innerwarden --test cjc_j012_notifications -- --nocapture
-          cargo test -p innerwarden-agent-guard --lib shell::inline_calls::tests::the_largest_code_read_is_read_in_well_under_a_second -- --exact --nocapture
+          bash scripts/cargo-test-at-least.sh 1 -p innerwarden-agent-guard --lib shell::inline_calls::tests::the_largest_code_read_is_read_in_well_under_a_second -- --exact --nocapture
