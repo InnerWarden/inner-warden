@@ -28,11 +28,27 @@
 //! $J cases <branch-tree> > b.jsonl     # the base's generator, the branch's corpora
 //! $J superset --base b.jsonl --branch c.jsonl   # c: the branch's own generator
 //! $J union a.jsonl b.jsonl [c.jsonl] > cases.jsonl
-//! $J judge cases.jsonl --place D > base.jsonl   # built on the merge base
-//! $J judge cases.jsonl --place D > head.jsonl   # built on the branch
-//! $J compare --cases cases.jsonl --base base.jsonl --head head.jsonl \
+//! $J tripwire --base-bin B --base-rev R --head-bin H --head-rev R
+//! $J judge cases.jsonl --place D --home H > base-H.jsonl   # built on the merge base
+//! $J judge cases.jsonl --place D --home H > head-H.jsonl   # built on the branch
+//! $J compare --cases cases.jsonl --base base-H.jsonl --head head-H.jsonl \
 //!     --changes crates/agent-guard/corpus/REFERENCE-CHANGES.md [--base-bin P --head-bin P]
 //! ```
+//!
+//! Every line is judged in two places (`--home`, both sides in the same):
+//! `empty`, an empty home and a command judged by its text alone, as the
+//! release safety suite judges; and `keys`, a home that holds an SSH key and
+//! cloud credentials, as a developer's does, with a command judged where it
+//! runs, as the agent hook judges it. Some verdicts read what the home holds
+//! (a read of the whole home is stopped because a key is in it), and neither
+//! an empty home nor the text alone shows them. The rule holds in each place.
+//!
+//! Each judge reports the revision its guard was built from (`revision`,
+//! `benchmark::JUDGE_REVISION`, set by the job). `tripwire` refuses a judge
+//! that reports none, or another revision than the one the job built it from:
+//! the "main" judge built from the branch would compare the branch with
+//! itself. Two judges can be the same binary but for that revision (a change
+//! the judge does not link), so their bytes are never compared.
 //!
 //! `cases` reads every corpus (`benchmarks/agent_attack_corpus.yml` and each
 //! `corpus/*/cases.yml`) and adds metamorphic variants of every malicious shell
@@ -61,7 +77,8 @@ use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use innerwarden_agent_guard::benchmark::{run, Corpus};
+use innerwarden_agent_guard::benchmark::{run_in, Corpus, JUDGE_REVISION};
+use innerwarden_agent_guard::mcp::WorkingContext;
 use innerwarden_agent_guard::rules::RuleEngine;
 use serde::{Deserialize, Serialize};
 
@@ -139,8 +156,10 @@ fn main() {
         Some("union") => union(&args[1..]),
         Some("superset") => superset(&args[1..]),
         Some("kept") => kept(&args[1..]),
+        Some("revision") => revision(),
+        Some("tripwire") => tripwire(&args[1..]),
         _ => {
-            eprintln!("usage: differential_guard cases <repo> | union <a.jsonl> <b.jsonl>... | superset --base F --branch F | kept --base F --branch F | judge <cases.jsonl> --place <dir> | compare --cases F --base F --head F --changes F [--base-bin P --head-bin P]");
+            eprintln!("usage: differential_guard cases <repo> | union <a.jsonl> <b.jsonl>... | superset --base F --branch F | kept --base F --branch F | revision | tripwire --base-bin P --base-rev R --head-bin P --head-rev R | judge <cases.jsonl> --place <dir> [--home empty|keys] | compare --cases F --base F --head F --changes F [--base-bin P --head-bin P]");
             2
         }
     };
@@ -388,20 +407,204 @@ fn variants(input: &str) -> Vec<(String, String)> {
 // judge
 // ---------------------------------------------------------------------------
 
-/// Judge from an empty home and an empty working folder, as the release safety
-/// suite does: some verdicts read what the home holds. The place is given, not
-/// under `/tmp` by default, and both sides must be given the same one.
-fn enter_empty_place(place: &Path) -> std::io::Result<()> {
+/// The place a line is judged in. Some verdicts read what the home holds, so
+/// every line is judged in both and the rule holds in each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Home {
+    /// Nothing in the home, and a command judged by its text alone, as the
+    /// release safety suite judges.
+    Empty,
+    /// A developer's machine: an SSH key and cloud credentials in the home
+    /// ([`KEYS_HOME`]), and a command judged where it runs, in `~/project`
+    /// with the home known, as the agent hook judges it. A search of the home
+    /// is refused because the home holds a key, which neither the empty home
+    /// nor the text alone shows.
+    Keys,
+}
+
+impl Home {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "empty" => Some(Self::Empty),
+            "keys" => Some(Self::Keys),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::Keys => "keys",
+        }
+    }
+}
+
+/// The files of the `keys` home, relative to it. Their contents are
+/// stand-ins: the guard judges by where a secret is, never by its bytes.
+const KEYS_HOME: &[&str] = &[
+    ".ssh/id_ed25519",
+    ".aws/credentials",
+    ".config/gcloud/application_default_credentials.json",
+];
+
+const STAND_IN: &str = "a stand-in written by the differential check, not a credential\n";
+
+/// Make the place a line is judged in: `<place>/home`, holding what `home`
+/// says, and an empty working folder (`<place>/work`, or `~/project` in the
+/// `keys` place), all new. Returns the home and the working folder.
+fn make_place(place: &Path, home: Home) -> std::io::Result<(PathBuf, PathBuf)> {
     if place.exists() {
         std::fs::remove_dir_all(place)?;
     }
-    let home = place.join("home");
-    let work = place.join("work");
-    std::fs::create_dir_all(&home)?;
+    let home_dir = place.join("home");
+    let work = match home {
+        Home::Empty => place.join("work"),
+        Home::Keys => home_dir.join("project"),
+    };
+    std::fs::create_dir_all(&home_dir)?;
     std::fs::create_dir_all(&work)?;
+    if home == Home::Keys {
+        for file in KEYS_HOME {
+            let path = home_dir.join(file);
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir)?;
+                set_mode(dir, 0o700)?;
+            }
+            std::fs::write(&path, STAND_IN)?;
+            set_mode(&path, 0o600)?;
+        }
+    }
+    Ok((home_dir, work))
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_: &Path, _: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Judge from `home` and an empty working folder. The place is given, not
+/// under `/tmp` by default, and both sides must be given the same one.
+/// Returns the home and the working folder.
+fn enter_place(place: &Path, home: Home) -> std::io::Result<(PathBuf, PathBuf)> {
+    let (home, work) = make_place(place, home)?;
     std::env::set_var("HOME", &home);
     std::env::remove_var("XDG_CONFIG_HOME");
-    std::env::set_current_dir(&work)
+    std::env::set_current_dir(&work)?;
+    Ok((home, work))
+}
+
+/// The working context a command is judged in: none in the `empty` place
+/// (the text alone), the working folder and the home in the `keys` place.
+fn context_of(home: Home, home_dir: &Path, work: &Path) -> Option<WorkingContext> {
+    match home {
+        Home::Empty => None,
+        Home::Keys => {
+            WorkingContext::discover(&work.to_string_lossy(), Some(&home_dir.to_string_lossy()))
+        }
+    }
+}
+
+/// The revision this judge's guard was built from, on stdout. Exit 1 when it
+/// was built without one: the tripwire refuses such a judge.
+fn revision() -> i32 {
+    match JUDGE_REVISION {
+        Some(rev) => {
+            println!("{rev}");
+            0
+        }
+        None => {
+            eprintln!("revision: this guard was built without IW_JUDGE_REV");
+            1
+        }
+    }
+}
+
+/// One judge as the tripwire sees it: its side, the revision the job built it
+/// from, and the revision it reports (`None` when it reports none).
+struct Built<'a> {
+    side: &'a str,
+    built_from: &'a str,
+    reports: Option<&'a str>,
+}
+
+/// Every judge must report the revision the job built it from. Its bytes are
+/// not asked: a change the judge does not link leaves two judges that differ
+/// only in the revision they carry, and both pass.
+fn tripwire_check(judges: &[Built<'_>]) -> Result<Vec<String>, String> {
+    let mut seen = Vec::new();
+    for judge in judges {
+        match judge.reports {
+            Some(rev) if rev == judge.built_from => {
+                seen.push(format!("{}: guard built from {rev}", judge.side));
+            }
+            Some(rev) => {
+                return Err(format!(
+                    "The {} judge reports a guard built from {rev}, not {}: its build did not run, and the check would judge the wrong guard.",
+                    judge.side, judge.built_from
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "The {} judge reports no revision: it cannot show its guard was built from {}.",
+                    judge.side, judge.built_from
+                ));
+            }
+        }
+    }
+    Ok(seen)
+}
+
+/// Ask each judge binary for its revision and check it against the one the
+/// job built it from.
+fn tripwire(args: &[String]) -> i32 {
+    let (Some(base_bin), Some(base_rev), Some(head_bin), Some(head_rev)) = (
+        flag(args, "--base-bin"),
+        flag(args, "--base-rev"),
+        flag(args, "--head-bin"),
+        flag(args, "--head-rev"),
+    ) else {
+        eprintln!("tripwire: give --base-bin, --base-rev, --head-bin and --head-rev");
+        return 2;
+    };
+    let ask = |bin: &str| -> Option<String> {
+        let out = std::process::Command::new(bin)
+            .arg("revision")
+            .output()
+            .ok()?;
+        let rev = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (out.status.success() && !rev.is_empty()).then_some(rev)
+    };
+    let (base, head) = (ask(&base_bin), ask(&head_bin));
+    let judges = [
+        Built {
+            side: "main",
+            built_from: &base_rev,
+            reports: base.as_deref(),
+        },
+        Built {
+            side: "this branch",
+            built_from: &head_rev,
+            reports: head.as_deref(),
+        },
+    ];
+    match tripwire_check(&judges) {
+        Ok(seen) => {
+            for line in seen {
+                println!("Judge, {line}.");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
+    }
 }
 
 fn read_lines(path: &str) -> Result<Vec<Line>, String> {
@@ -433,10 +636,28 @@ fn judge(args: &[String]) -> i32 {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("target/differential-place"));
     let place = std::path::absolute(&place).unwrap_or(place);
-    if let Err(e) = enter_empty_place(&place) {
-        eprintln!("judge: {}: {e}", place.display());
+    let home_name = flag(args, "--home").unwrap_or_else(|| "empty".to_string());
+    let Some(home) = Home::parse(&home_name) else {
+        eprintln!("judge: --home {home_name}: give empty or keys");
+        return 2;
+    };
+    let context = match enter_place(&place, home) {
+        Ok((home_dir, work)) => context_of(home, &home_dir, &work),
+        Err(e) => {
+            eprintln!("judge: {}: {e}", place.display());
+            return 2;
+        }
+    };
+    if home == Home::Keys && context.is_none() {
+        eprintln!("judge: {}: no working context", place.display());
         return 2;
     }
+    eprintln!(
+        "judge: {} lines, home {}, guard built from {}",
+        lines.len(),
+        home.name(),
+        JUDGE_REVISION.unwrap_or("an unnamed revision")
+    );
     let engine = RuleEngine::load_embedded();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -485,8 +706,9 @@ fn judge(args: &[String]) -> i32 {
         // the run and every line after it has no verdict, which `compare`
         // refuses as a broken run.
         let started = Instant::now();
-        let judged =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(&corpus, &engine)));
+        let judged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_in(&corpus, &engine, context.as_ref())
+        }));
         let micros = started.elapsed().as_micros() as u64;
         let verdict = match judged {
             Ok(results) => {
@@ -1324,6 +1546,136 @@ mod tests {
         assert!(h
             .iter()
             .any(|(n, s)| n == "body-if" && s.ends_with("EOF\nfi")));
+    }
+
+    /// The false alarm of #330: a change to the MCP proxy, which the judge
+    /// does not link, built two judges the same in every byte, and the
+    /// tripwire compared bytes, so it said the base build had not run. Each
+    /// judge now reports the revision its guard was built from: two judges
+    /// that differ only in that revision, each reporting its own, pass.
+    #[test]
+    fn a_change_outside_the_judge_passes_on_the_revisions_each_judge_reports() {
+        let judges = [
+            Built {
+                side: "main",
+                built_from: "base-sha",
+                reports: Some("base-sha"),
+            },
+            Built {
+                side: "this branch",
+                built_from: "head-sha",
+                reports: Some("head-sha"),
+            },
+        ];
+        let seen = tripwire_check(&judges).expect("each judge reports its own revision");
+        assert_eq!(seen.len(), 2);
+    }
+
+    /// The failure the tripwire exists for: the "main" judge left over from
+    /// the branch's build compares the branch with itself. It reports the
+    /// branch's revision, and a judge that reports none is refused too.
+    #[test]
+    fn a_judge_built_from_the_other_tree_or_from_none_is_refused() {
+        let left_over = [
+            Built {
+                side: "main",
+                built_from: "base-sha",
+                reports: Some("head-sha"),
+            },
+            Built {
+                side: "this branch",
+                built_from: "head-sha",
+                reports: Some("head-sha"),
+            },
+        ];
+        let e = tripwire_check(&left_over).expect_err("the main judge is the branch's");
+        assert!(e.contains("main judge") && e.contains("head-sha"), "{e}");
+        let unnamed = [Built {
+            side: "this branch",
+            built_from: "head-sha",
+            reports: None,
+        }];
+        assert!(tripwire_check(&unnamed).is_err());
+    }
+
+    /// The `keys` home holds an SSH key and cloud credentials, readable by
+    /// their owner only; the `empty` home holds nothing. Both are made new:
+    /// a key left from a run in the `keys` home never reaches the `empty` one.
+    #[test]
+    fn the_keys_home_holds_a_key_and_cloud_credentials_and_the_empty_one_nothing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let place = root.path().join("place");
+        let (home, work) = make_place(&place, Home::Keys).expect("keys place");
+        for file in KEYS_HOME {
+            let path = home.join(file);
+            assert_eq!(std::fs::read_to_string(&path).expect(file), STAND_IN);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).expect(file).permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{file}");
+            }
+        }
+        assert!(KEYS_HOME.contains(&".ssh/id_ed25519"));
+        assert_eq!(std::fs::read_dir(&work).expect("work").count(), 0);
+        let (home, work) = make_place(&place, Home::Empty).expect("empty place");
+        assert_eq!(std::fs::read_dir(&home).expect("home").count(), 0);
+        assert_eq!(std::fs::read_dir(&work).expect("work").count(), 0);
+        assert_eq!(Home::parse("keys"), Some(Home::Keys));
+        assert_eq!(Home::parse("empty"), Some(Home::Empty));
+        assert_eq!(Home::parse("full"), None);
+        // The working folder of the `keys` place is in its home, as a
+        // developer's project is.
+        let (home, work) = make_place(&place, Home::Keys).expect("keys place");
+        assert!(work.starts_with(&home));
+        let context = context_of(Home::Keys, &home, &work).expect("a context");
+        assert_eq!(context.home.as_deref(), Some(&*home.to_string_lossy()));
+        assert!(context_of(Home::Empty, &home, &work).is_none());
+    }
+
+    /// The finding the second place exists for: a read of the whole home is
+    /// stopped because the home holds a key, and the guard only sees it where
+    /// the command runs with the home known. By its text alone, or in a home
+    /// with no key, the line passes, so both sides of the check agreed on it
+    /// whatever either guard did with a home that holds one. FAILS ON REVERT
+    /// (the `keys` place judged without its context, or with no key in it).
+    #[test]
+    fn a_read_of_a_home_that_holds_a_key_is_stopped_only_in_the_keys_place() {
+        let engine = RuleEngine::load_embedded();
+        let root = tempfile::tempdir().expect("tempdir");
+        let (home, work) = make_place(&root.path().join("keys"), Home::Keys).expect("keys place");
+        let keys = context_of(Home::Keys, &home, &work).expect("keys context");
+        let bare = root.path().join("bare/home");
+        std::fs::create_dir_all(bare.join("project")).expect("bare home");
+        let no_key = WorkingContext::discover(
+            &bare.join("project").to_string_lossy(),
+            Some(&bare.to_string_lossy()),
+        )
+        .expect("bare context");
+        for input in ["tar czf /tmp/backup.tgz ~", "grep -r password ~"] {
+            let corpus: Corpus = serde_json::from_value(serde_json::json!({
+                "cases": [{
+                    "id": "home-read",
+                    "category": "credential_access",
+                    "label": "malicious",
+                    "surface": "command",
+                    "input": input,
+                }]
+            }))
+            .expect("a case");
+            let stopped = |context: Option<&WorkingContext>| {
+                run_in(&corpus, &engine, context)[0].blocks_for_agent()
+            };
+            assert!(
+                stopped(Some(&keys)),
+                "{input}: not stopped in the keys place"
+            );
+            assert!(
+                !stopped(Some(&no_key)),
+                "{input}: stopped with no key in the home"
+            );
+            assert!(!stopped(None), "{input}: stopped by its text alone");
+        }
     }
 
     #[test]

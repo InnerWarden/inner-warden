@@ -81,7 +81,7 @@ say so in `REFERENCE-CHANGES.md`.
 CARGO_PROFILE_RELEASE_PANIC=unwind cargo build --release -p innerwarden-agent-guard --example differential_guard
 J=target/release/examples/differential_guard
 $J cases . > cases.jsonl
-$J judge cases.jsonl --place /some/empty/dir > head.jsonl
+$J judge cases.jsonl --place /some/empty/dir --home keys > head-keys.jsonl
 ```
 
 The release safety suite holds the guard to a reference total. The
@@ -115,6 +115,23 @@ verb (`stop>/dev/null`), a word split with quotes or an escape (`st''op`,
 `s\top`, `$'stop'`), the verb routed through a variable or a brace
 (`v=stop; systemctl $v ...`, `{stop,}`), and flags clustered differently
 (`-rf`, `-fr`, `-r -f`). They are generated in the job, not stored.
+
+Every line is judged in two places, both sides in the same. **empty**: an
+empty home, and a command judged by its text alone, as the release safety
+suite judges. **keys**: a developer's machine, a home holding an SSH key
+(`~/.ssh/id_ed25519`) and cloud credentials (`~/.aws/credentials`,
+`~/.config/gcloud/application_default_credentials.json`, stand-in contents),
+and a command judged where it runs (`~/project`, the home known), as the agent
+hook judges it. Some verdicts read what the home holds: a read of the whole
+home is stopped because a key is in it, which neither the empty home nor the
+text alone shows. The rule below holds in each place.
+
+Each judge's guard carries the revision the job built it from
+(`IW_JUDGE_REV`, compiled into `benchmark::JUDGE_REVISION`), and the job
+refuses a judge that reports none or another one: a "main" judge built from
+the branch would compare the branch with itself. The two judges' bytes are not
+compared. A change the judge does not link (the MCP proxy) leaves two judges
+that are the same binary but for that revision.
 
 A line is **stopped** when it is denied, or reviewed with a signal that holds
 an agent. The job fails when main stops a line and the branch does not. The
