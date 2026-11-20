@@ -393,6 +393,14 @@ pub fn current() -> Option<Outage> {
 /// Returns the resulting state so a caller can decide whether this is the first
 /// failure of an episode and therefore worth an out-of-band notification.
 pub fn note_failure_at(graph: &Path, code: &str) -> Outage {
+    note_failures_at(graph, code, 1)
+}
+
+/// [`note_failure_at`] for `lost` writes at once (at least one): a writer
+/// that counts losses as they happen and notes them in batches, so a flood
+/// of them costs one write of the health file, not one each.
+pub fn note_failures_at(graph: &Path, code: &str, lost: u64) -> Outage {
+    let lost = lost.max(1);
     let previous = read_at(graph);
     // A new fault opens a new episode, so it may notify again. Only a REPEAT of
     // the same fault must stay quiet, or a broken install sends one message per
@@ -400,7 +408,7 @@ pub fn note_failure_at(graph: &Path, code: &str) -> Outage {
     let first_of_episode = previous.as_ref().is_none_or(|p| p.code != code);
     let outage = match previous {
         Some(p) if p.code == code => Outage {
-            lost: p.lost.saturating_add(1),
+            lost: p.lost.saturating_add(lost),
             ..p
         },
         // A DIFFERENT failure code restarts the episode: it is a new fault, and
@@ -409,7 +417,7 @@ pub fn note_failure_at(graph: &Path, code: &str) -> Outage {
         _ => Outage {
             code: code.to_string(),
             since_unix: now_unix(),
-            lost: 1,
+            lost,
         },
     };
     let body = json!({
