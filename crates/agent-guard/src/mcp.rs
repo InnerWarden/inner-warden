@@ -1187,10 +1187,10 @@ fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCall
             .iter()
             .filter(|command| command.line.contains("$(") || command.line.contains('`'))
             // The variables such a field may set are named for what they
-            // are, a name and a value the line does not show: a move to
-            // another folder alone no longer puts a plain tool's query in
-            // doubt, and a variable can (`BASH_FUNC_go%%` is the function
-            // `go` the query would run).
+            // are, a name and a value the line does not show: a move into a
+            // folder of the project alone does not put a plain tool's query
+            // in doubt, and a variable can (`BASH_FUNC_go%%` is the
+            // function `go` the query would run).
             .map(|command| ToolCommand {
                 line: Cow::Owned(format!(
                     "export \"$CALL_VARIABLE\"=\"$CALL_VALUE\"; cd {} && {}",
@@ -2737,9 +2737,10 @@ const PROGRAM_UNDER_UNREAD_QUERY: &str = "the program this line runs is in a fol
 
 /// The reason for a program already written as one pair of double quotes
 /// under a folder query the guard reads, where something else on the line
-/// changes this shell, fetches, loops or hands the program an input stream:
-/// quoting frees nothing, a line of its own or the path written out does.
-const PROGRAM_UNDER_QUERY_IN_DOUBT: &str = "the program this line runs is in a folder a command prints when the line runs, and another part of this line can change what that folder holds or how this shell runs it (a builtin that sets or runs code, a function, a fetch, a loop, a setting the program loads, or code or input handed to the program), so the guard cannot tell whether it is an interpreter: write the path out, as in ./node_modules/.bin/eslint, or run the tool on a line of its own";
+/// could plant or move the program, changes this shell, fetches, loops or
+/// hands the program an input stream: quoting frees nothing, a line of its
+/// own or the path written out does.
+const PROGRAM_UNDER_QUERY_IN_DOUBT: &str = "the program this line runs is in a folder a command prints when the line runs, and another part of this line can change what that folder holds or how this shell runs it (a copy, link or write, a setting, a builtin that sets or runs code, a function, a fetch, a loop, or code or input handed to the program; only a package manager's install from its registry or a move into a folder of the project is not), so the guard cannot tell whether it is an interpreter: write the path out, as in ./node_modules/.bin/eslint, or run the tool on a line of its own";
 
 /// The reason a refusal for a program named at run time gives, by why the
 /// name could not be read.
@@ -4691,28 +4692,6 @@ mod tests {
     #[test]
     fn a_folder_query_beside_a_command_not_known_to_run_nothing_is_refused() {
         for command in [
-            format!("time cp ./lint ~/go/bin/golangci-lint; {GO_LINT}"),
-            format!("env -S \"sh -c 'ln -sf ./lint ~/go/bin/golangci-lint'\"; {GO_LINT}"),
-            format!("builtin cd ./vendor; {RUST_FMT}"),
-            format!("read -r GOPATH < ./gopath.txt; {GO_LINT}"),
-            format!("printf -v GOPATH %s ./vendor/go; {GO_LINT}"),
-            format!("printf -\"\"v GOPATH %s ./vendor/go; {GO_LINT}"),
-            format!("builtin printf -v PATH %s ./bin; {GO_LINT}"),
-            format!("print -v PATH ./bin; {GO_LINT}"),
-            format!("mapfile -t lines < ./t; {GO_LINT}"),
-            format!("command . ./p; {GO_LINT}"),
-            format!("builtin source ./p; {GO_LINT}"),
-            format!("test -v 'a[X]' && {GO_LINT}"),
-            format!("sleep 0 & wait -n -p 'a[X]'; {GO_LINT}"),
-        ] {
-            assert!(refused_for_its_program_name(&command), "{command}");
-        }
-        // Read by its name since 2026-11-19, on purpose: the program is a
-        // plain tool (no shell, interpreter or runner, no input stream), and
-        // what these commands install, write, set or move is there for the
-        // same tool written out, which was read by its name already. What
-        // changes this shell itself stays above.
-        for command in [
             format!("printf 'toolchain go1.99.0\\n' > go.mod && {GO_LINT}"),
             format!(r#"ln -sf ./lint "$(go env GOPATH)/bin/golangci-lint" && {GO_LINT}"#),
             format!("link ./lint ./bin/golangci-lint && {GO_LINT}"),
@@ -4728,28 +4707,49 @@ mod tests {
             format!("xxd -r ./t go.mod && {GO_LINT}"),
             format!("go env -w GOTOOLCHAIN=go1.99.0 && {GO_LINT}"),
             format!("rustup override set nightly && {RUST_FMT}"),
-            format!("npm install && {NPM_LINT}"),
-            format!("npm ci && {NPM_LINT}"),
             format!("cargo build && {RUST_FMT}"),
-            r#"gem install rubocop && "$(gem env gemdir)/bin/rubocop""#.to_string(),
             r#"git config core.worktree ./w && "$(git rev-parse --show-toplevel)/scripts/test.sh""#
                 .to_string(),
             r#"chmod +x ./x && "$(pwd)/x""#.to_string(),
             r#"mkdir -p build && "$(npm bin)/tsc" --outDir build"#.to_string(),
             format!("git status && {NPM_LINT}"),
             format!("npm --version 2>&1; {NPM_LINT}"),
+            format!("time cp ./lint ~/go/bin/golangci-lint; {GO_LINT}"),
             format!("taskset -c 0 cp ./lint ~/go/bin/golangci-lint; {GO_LINT}"),
             format!("flock ./lock cp ./lint ~/go/bin/golangci-lint; {GO_LINT}"),
             format!("strace -o /dev/null cp ./lint ~/go/bin/golangci-lint; {GO_LINT}"),
             format!("bash -c 'ln -sf ./lint ~/go/bin/golangci-lint'; {GO_LINT}"),
             format!("mksh -c 'ln -sf ./lint ~/go/bin/golangci-lint'; {GO_LINT}"),
             format!("busybox ash -c 'ln -sf ./lint ~/go/bin/golangci-lint'; {GO_LINT}"),
+            format!("env -S \"sh -c 'ln -sf ./lint ~/go/bin/golangci-lint'\"; {GO_LINT}"),
             format!("sh <<'EOF'\nln -sf ./lint ~/go/bin/golangci-lint\nEOF\n{GO_LINT}"),
             format!(r#"python3 -c 'open("go.mod", "w").write("toolchain go1.99.0")' && {GO_LINT}"#),
             format!(r#"node -e 'require("fs").writeFileSync("go.mod", "x")' && {GO_LINT}"#),
             format!("npx some-tool && {NPM_LINT}"),
             format!("uvx some-tool && {NPM_LINT}"),
             format!("go run example.com/gen@v1.0.0 && {GO_LINT}"),
+            format!("builtin cd ./vendor; {RUST_FMT}"),
+            format!("read -r GOPATH < ./gopath.txt; {GO_LINT}"),
+            format!("printf -v GOPATH %s ./vendor/go; {GO_LINT}"),
+            format!("printf -\"\"v GOPATH %s ./vendor/go; {GO_LINT}"),
+            format!("builtin printf -v PATH %s ./bin; {GO_LINT}"),
+            format!("print -v PATH ./bin; {GO_LINT}"),
+            format!("mapfile -t lines < ./t; {GO_LINT}"),
+            format!("command . ./p; {GO_LINT}"),
+            format!("builtin source ./p; {GO_LINT}"),
+            format!("test -v 'a[X]' && {GO_LINT}"),
+            format!("sleep 0 & wait -n -p 'a[X]'; {GO_LINT}"),
+        ] {
+            assert!(refused_for_its_program_name(&command), "{command}");
+        }
+        // Read by its name since 2026-11-19, on purpose: a package manager's
+        // install from its registry, or a move into a folder of the project,
+        // before a plain tool (no shell, interpreter or runner, no input
+        // stream). Everything else above stays refused.
+        for command in [
+            format!("npm install && {NPM_LINT}"),
+            format!("npm ci && {NPM_LINT}"),
+            r#"gem install rubocop && "$(gem env gemdir)/bin/rubocop""#.to_string(),
             format!("cd ./vendor && {RUST_FMT}"),
             format!("pushd ./vendor; {RUST_FMT}"),
         ] {
@@ -4789,6 +4789,8 @@ mod tests {
         for command in [
             format!("export GOPATH=./vendor/go; {GO_LINT}"),
             format!("PATH=./bin:$PATH; {GO_LINT}"),
+            format!("FOO=1; {GO_LINT}"),
+            format!("export FOO=1; {GO_LINT}"),
             r#"export GEMRC=./gemrc; "$(gem env gemdir)/bin/rubocop""#.to_string(),
             format!("export COREPACK_NPM_REGISTRY=http://e.example; {NPM_LINT}"),
             r#"BASH_ARGV0=./e/x; "$(dirname "$0")/build.sh""#.to_string(),
@@ -4835,9 +4837,7 @@ mod tests {
         };
         assert!(!in_env(serde_json::json!({"GOPATH": "./vendor/go"})));
         assert!(!in_env(serde_json::json!({"PATH": "./bin:/usr/bin:/bin"})));
-        // A setting no query and no loader reads reaches the plain tool as
-        // one set in front of it does: read by its name since 2026-11-19.
-        assert!(in_env(serde_json::json!({"FOO": "1"})));
+        assert!(!in_env(serde_json::json!({"FOO": "1"})));
         assert!(!in_env(
             serde_json::json!({"BASH_FUNC_go%%": "() { . ./p; }"})
         ));
@@ -4877,21 +4877,6 @@ mod tests {
         assert!(
             other_tool(serde_json::json!({"command": RUST_FMT, "description": "x"})).is_empty()
         );
-        // Read by its name since 2026-11-19, on purpose: the program is a
-        // plain tool (no shell, interpreter or runner, no input stream), and
-        // what these commands install, write, set or move is there for the
-        // same tool written out, which was read by its name already. What
-        // changes this shell itself stays above.
-        for command in [
-            format!("FOO=1; {GO_LINT}"),
-            format!("export FOO=1; {GO_LINT}"),
-        ] {
-            assert_eq!(
-                analyze_command(&command, None).recommendation,
-                "allow",
-                "{command}"
-            );
-        }
     }
 
     /// The entries of a tool call's `commands` list run one after another,
@@ -4901,18 +4886,19 @@ mod tests {
     #[test]
     fn a_folder_query_after_another_entry_of_a_commands_list_is_refused() {
         assert!(!call_runs(serde_json::json!({
-            "commands": ["export GOPATH=./vendor/go", GO_LINT]
-        })));
-        assert!(!call_runs(
-            serde_json::json!({"commands": [". ./env.sh", RUST_FMT]})
-        ));
-        // A copy or a move to another folder before a plain tool is read as
-        // it is before the tool written out: by its name, since 2026-11-19.
-        assert!(call_runs(serde_json::json!({
             "commands": ["cp ./lint ~/go/bin/golangci-lint", GO_LINT]
         })));
+        assert!(!call_runs(serde_json::json!({
+            "commands": ["export GOPATH=./vendor/go", GO_LINT]
+        })));
+        // A move into a folder of the project before a plain tool is read
+        // by the tool's name since 2026-11-19; the joined reading still
+        // refuses what only the two entries together say.
         assert!(call_runs(
             serde_json::json!({"commands": ["cd ./vendor", RUST_FMT]})
+        ));
+        assert!(!call_runs(
+            serde_json::json!({"commands": ["cd ./vendor", "cp ./lint ~/go/bin/golangci-lint", GO_LINT]})
         ));
         assert!(call_runs(
             serde_json::json!({"commands": ["echo start", GO_LINT]})
@@ -4930,29 +4916,16 @@ mod tests {
     #[test]
     fn a_folder_query_in_a_line_that_writes_a_file_is_refused() {
         for command in [
+            format!("echo 'toolchain go1.99.0' > go.mod && {GO_LINT}"),
+            format!(r#"echo GOTOOLCHAIN=go1.99.0 >> "$(go env GOROOT)/go.env" && {GO_LINT}"#),
+            format!("cat ./t.toml > rust-toolchain.toml; {RUST_FMT}"),
+            format!("{GO_LINT} && echo x > go.mod"),
             r#""$(go env GOPATH)/bin/bash" ./x.sh > go.mod"#.to_string(),
             r#""$(go env GOPATH)/bin/python3" ./x.py > go.mod"#.to_string(),
             r#"for f in a b; do "$(npm bin)/eslint" "$f" > "$f.txt"; done"#.to_string(),
             format!(r#"{GO_LINT} > lint.txt; "$(go env GOPATH)/bin/staticcheck" ./..."#),
         ] {
             assert!(refused_for_its_program_name(&command), "{command}");
-        }
-        // Read by its name since 2026-11-19, on purpose: the program is a
-        // plain tool (no shell, interpreter or runner, no input stream), and
-        // what these commands install, write, set or move is there for the
-        // same tool written out, which was read by its name already. What
-        // changes this shell itself stays above.
-        for command in [
-            format!("echo 'toolchain go1.99.0' > go.mod && {GO_LINT}"),
-            format!(r#"echo GOTOOLCHAIN=go1.99.0 >> "$(go env GOROOT)/go.env" && {GO_LINT}"#),
-            format!("cat ./t.toml > rust-toolchain.toml; {RUST_FMT}"),
-            format!("{GO_LINT} && echo x > go.mod"),
-        ] {
-            assert_eq!(
-                analyze_command(&command, None).recommendation,
-                "allow",
-                "{command}"
-            );
         }
     }
 
@@ -5062,18 +5035,12 @@ mod tests {
             "command": "bash",
             "args": ["-c", format!("{GO_LINT} > lint.txt")]
         })));
-        let command = format!("bash -c '{GO_LINT} > lint.txt' x");
-        assert!(refused_for_its_program_name(&command), "{command}");
-        // Read by its name since 2026-11-19, on purpose: the program is a
-        // plain tool (no shell, interpreter or runner, no input stream), and
-        // what the copy writes is there for the same tool written out, which
-        // was read by its name already.
-        let command = format!("bash -c 'cp ./lint ~/go/bin/golangci-lint; {GO_LINT}'");
-        assert_eq!(
-            analyze_command(&command, None).recommendation,
-            "allow",
-            "{command}"
-        );
+        for command in [
+            format!("bash -c '{GO_LINT} > lint.txt' x"),
+            format!("bash -c 'cp ./lint ~/go/bin/golangci-lint; {GO_LINT}'"),
+        ] {
+            assert!(refused_for_its_program_name(&command), "{command}");
+        }
     }
 
     /// The program a folder query builds is refused where it installs a

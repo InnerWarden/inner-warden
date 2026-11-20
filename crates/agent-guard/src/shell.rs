@@ -7578,11 +7578,18 @@ pub(crate) fn runtime_program_why(source: &str) -> RuntimeProgramWhy {
         if !word_ends_in_literal_program(program, false) {
             return RuntimeProgramWhy::Unquoted;
         }
-        if NAMES_IN_DOUBT.with(std::cell::Cell::get) {
-            return RuntimeProgramWhy::LineInDoubt;
-        }
-        if !word_ends_in_literal_program(program, true) {
+        // Whether the guard knows the query at all is asked first, with the
+        // line's doubt set aside for the asking: a query it does not know is
+        // refused on any line, and writing the path out is the way out.
+        let in_doubt = NAMES_IN_DOUBT.with(std::cell::Cell::get);
+        NAMES_IN_DOUBT.with(|doubt| doubt.set(false));
+        let known = word_ends_in_literal_program(program, true);
+        NAMES_IN_DOUBT.with(|doubt| doubt.set(in_doubt));
+        if !known {
             return RuntimeProgramWhy::QueryNotRead;
+        }
+        if in_doubt {
+            return RuntimeProgramWhy::LineInDoubt;
         }
     }
     RuntimeProgramWhy::Unquoted
@@ -7865,25 +7872,23 @@ fn line_gives_folder_queries_cause(root: tree_sitter::Node<'_>, text: &str, dept
     }) {
         return true;
     }
-    // A tool that is handed no code and no input stream does with the
-    // folder the query prints what the same tool written out does with its
-    // path: what another program on the line installs, writes or moves, or
-    // a folder the line moves to, is there for the written path just as
-    // much, and the guard reads that path by its name. Only what changes
-    // this shell itself keeps the query in doubt.
+    // A tool that is handed no code and no input stream is read by its name
+    // beside a registry install or a move into a folder of the project
+    // ([`command_installs_or_enters_the_project`]); nothing else on the line
+    // is let change that.
     let plain_tool = built.is_some_and(|built| built_program_is_a_plain_tool(built, source));
     let mut commands = Vec::new();
     collect_all_commands(root, &mut commands, 0);
     if commands.into_iter().any(|command| {
         built.is_none_or(|built| built.id() != command.id())
             && !command_writes_and_runs_nothing(command, source)
-            && (!plain_tool || command_changes_this_shell(command, source))
+            && !(plain_tool && command_installs_or_enters_the_project(command, source))
     }) {
         return true;
     }
-    if line_sets_what_a_query_may_read(root, source, built, plain_tool)
+    if line_sets_what_a_query_may_read(root, source, built)
         || line_reads_what_a_command_set(root, source)
-        || line_writes_a_file(root, source, built, plain_tool)
+        || line_writes_a_file(root, source, built)
         || line_reckons_arithmetic(root, text)
     {
         return true;
@@ -7946,124 +7951,143 @@ fn built_program_reads_a_stream(built: tree_sitter::Node<'_>, source: &[u8]) -> 
     false
 }
 
-/// The builtins and reserved words of bash and zsh, the commands that run
-/// inside the shell that reads the line rather than as a program of their
-/// own. A whole list: a shell has no others.
-const SHELL_BUILTINS: [&str; 75] = [
-    ".",
-    ":",
-    "[",
-    "alias",
-    "bg",
-    "bind",
-    "break",
-    "builtin",
-    "caller",
-    "cd",
-    "command",
-    "compgen",
-    "complete",
-    "compopt",
-    "continue",
-    "declare",
-    "dirs",
-    "disown",
-    "echo",
-    "enable",
-    "eval",
-    "exec",
-    "exit",
-    "export",
-    "false",
-    "fc",
-    "fg",
-    "getopts",
-    "hash",
-    "help",
-    "history",
-    "jobs",
-    "kill",
-    "let",
-    "local",
-    "logout",
-    "mapfile",
-    "popd",
-    "printf",
-    "pushd",
-    "pwd",
-    "read",
-    "readarray",
-    "readonly",
-    "return",
-    "set",
-    "shift",
-    "shopt",
-    "source",
-    "suspend",
-    "test",
-    "times",
-    "trap",
-    "true",
-    "type",
-    "typeset",
-    "ulimit",
-    "umask",
-    "unalias",
-    "unset",
-    "wait",
-    "print",
-    "autoload",
-    "emulate",
-    "setopt",
-    "unsetopt",
-    "zmodload",
-    "functions",
-    "whence",
-    "rehash",
-    "noglob",
-    "time",
-    "coproc",
-    "function",
-    "select",
-];
-
-/// Whether a command, beside a plain tool a folder query builds, may change
-/// the shell that reads the line rather than files and folders: a builtin
-/// ([`SHELL_BUILTINS`]) but a move to another folder (`cd`, `pushd`,
-/// `popd`, as plain as the tool's own folder change would be), a program
-/// whose name is not written out plain (it may be any of those), a fetch,
-/// and a setting of what a shell reads before its commands handed to a
-/// program. Every other program runs in a process of its own: what it
-/// writes is there for a path written out just as much.
-fn command_changes_this_shell(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+/// Whether a command, beside a plain tool a folder query builds, only
+/// installs packages with its package manager from their registry, or moves
+/// into a folder of the project. Those are what a line runs before such a
+/// tool (`npm ci && "$(npm bin)/jest"`, `cd web && "$(npm bin)/eslint" .`),
+/// and neither picks the program the query leads to: a registry install
+/// puts the package's own program where the query prints, and a folder of
+/// the project is one the tool would be run in anyway. Anything else keeps
+/// the query in doubt: a copy, a link or a write that could plant the
+/// program, a setting or a value read from a file that could move it, a
+/// builtin, a wrapper, an install from a path, a folder or a URL, or one
+/// told to put its programs somewhere else.
+fn command_installs_or_enters_the_project(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     let Some(name) = command.child_by_field_name("name") else {
-        return true;
+        return false;
     };
     let name = node_text(name, source);
-    if !name.chars().all(|character| {
-        character.is_ascii_alphanumeric()
-            || matches!(character, '.' | '_' | '+' | '/' | '-' | '[' | ':')
-    }) {
-        return true;
-    }
-    if matches!(name.as_str(), "cd" | "pushd" | "popd") {
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+    {
         return false;
     }
-    if SHELL_BUILTINS.contains(&name.as_str()) {
-        return true;
+    let mut cursor = command.walk();
+    if command
+        .named_children(&mut cursor)
+        .any(|part| part.kind() == "variable_assignment" || part.kind().ends_with("redirect"))
+    {
+        return false;
     }
-    let Some(words) = command_words(command, source) else {
-        return true;
+    let arguments = command_arguments(command);
+    let Some(words) = arguments
+        .iter()
+        .map(|argument| literal_value(*argument, source))
+        .collect::<Option<Vec<String>>>()
+    else {
+        return false;
     };
-    let plain: Vec<String> = words.iter().map(|word| shell_word(word)).collect();
-    plain.iter().skip(1).any(|word| {
-        word.split_once('=').is_some_and(|(variable, _)| {
-            SHELL_START_VARIABLES.contains(&variable) || variable.starts_with("BASH_FUNC_")
-        })
-    }) || effective_command_words(&plain, 0).is_none_or(|effective| {
-        produces_downloaded_bytes(effective)
-            || SHELL_BUILTINS.contains(&normalized_command_name(&effective[0]).as_str())
-    })
+    match name.as_str() {
+        "cd" | "pushd" => matches!(words.as_slice(), [folder] if is_project_folder(folder)),
+        _ => installs_from_the_registry(&name, &words),
+    }
+}
+
+/// Whether a folder named to `cd` is one of the project: a plain path
+/// below the folder the line starts in, with no `..`, no root, no home and
+/// nothing expanded.
+fn is_project_folder(folder: &str) -> bool {
+    !folder.is_empty()
+        && !folder.starts_with(['/', '~', '-'])
+        && folder.chars().all(is_plain_path_character)
+        && folder.split('/').all(|part| part != "..")
+}
+
+/// Options of the package managers that put what they install somewhere
+/// else than where their folder query looks, or install from a path.
+const INSTALL_ELSEWHERE: [&str; 22] = [
+    "-g",
+    "--global",
+    "--location",
+    "--prefix",
+    "--root",
+    "--path",
+    "--target",
+    "-t",
+    "--install-dir",
+    "-i",
+    "--bindir",
+    "-n",
+    "-C",
+    "--dir",
+    "--cwd",
+    "--modules-folder",
+    "--global-folder",
+    "-e",
+    "--editable",
+    "--src",
+    "--force-reinstall",
+    "--git",
+];
+
+/// Whether a package manager's command line installs from its registry:
+/// `npm`, `pnpm`, `yarn` and `bun` install or clean install, `go install
+/// module@version`, `pip install` (also as `python -m pip`), `cargo
+/// install`, `gem install`, `bundle install`, `composer install`. No
+/// option from [`INSTALL_ELSEWHERE`], and no operand that is a path, a
+/// URL or a file (`./lint`, `file:`, `git+`).
+fn installs_from_the_registry(name: &str, words: &[String]) -> bool {
+    let operands: Vec<&str> = words
+        .iter()
+        .map(String::as_str)
+        .filter(|word| !word.starts_with('-'))
+        .collect();
+    let elsewhere = words.iter().any(|word| {
+        let option = word
+            .split_once('=')
+            .map_or(word.as_str(), |(option, _)| option);
+        INSTALL_ELSEWHERE.contains(&option)
+    });
+    let from_a_path = operands.iter().any(|operand| {
+        operand.starts_with(['.', '/', '~'])
+            || operand.contains(':')
+            || operand.contains("git+")
+            || operand.ends_with(".tgz")
+            || operand.ends_with(".whl")
+            || operand.ends_with(".gem")
+    });
+    if elsewhere || from_a_path {
+        return false;
+    }
+    let first = operands.first().copied();
+    match name {
+        "npm" | "pnpm" | "bun" => matches!(
+            first,
+            Some("install" | "i" | "ci" | "clean-install" | "add")
+        ),
+        "yarn" => matches!(first, None | Some("install" | "add")),
+        "go" => {
+            first == Some("install")
+                && operands.len() > 1
+                && operands[1..].iter().all(|module| module.contains('@'))
+        }
+        "pip" | "pip3" => first == Some("install"),
+        "python" | "python3" => {
+            matches!(
+                words
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                ["-m", "pip", "install", ..]
+            ) && !words[3..]
+                .iter()
+                .any(|word| word.starts_with(['.', '/', '~']))
+        }
+        "cargo" | "gem" | "bundle" | "composer" => first == Some("install"),
+        _ => false,
+    }
 }
 
 /// The line a shell is handed where the whole line is that shell and that
@@ -8713,7 +8737,6 @@ fn line_sets_what_a_query_may_read(
     root: tree_sitter::Node<'_>,
     source: &[u8],
     built: Option<tree_sitter::Node<'_>>,
-    plain_tool: bool,
 ) -> bool {
     let program_runs_code = built.is_some_and(|built| built_program_runs_code(built, source));
     let mut assignments = Vec::new();
@@ -8741,11 +8764,6 @@ fn line_sets_what_a_query_may_read(
         });
         if in_front_of_the_program {
             program_runs_code || !setting_in_front_of_the_program(&name, value.as_deref())
-        } else if plain_tool {
-            // Set earlier on the line, the value reaches the tool as one set
-            // in front of it does, and the path its query prints is one a
-            // path written out could name as well.
-            !setting_in_front_of_the_program(&name, value.as_deref())
         } else {
             !setting_no_query_reads(&name, value.as_deref())
         }
@@ -8889,7 +8907,6 @@ fn line_writes_a_file(
     root: tree_sitter::Node<'_>,
     source: &[u8],
     built: Option<tree_sitter::Node<'_>>,
-    plain_tool: bool,
 ) -> bool {
     let named_descriptor = ["file_redirect", "heredoc_redirect", "herestring_redirect"]
         .iter()
@@ -8906,10 +8923,6 @@ fn line_writes_a_file(
         });
     if named_descriptor {
         return true;
-    }
-    // A plain tool reads the file a written path leads to as well.
-    if plain_tool {
-        return false;
     }
     let mut redirects = Vec::new();
     collect_nodes_of_kind(root, "file_redirect", &mut redirects, 0);

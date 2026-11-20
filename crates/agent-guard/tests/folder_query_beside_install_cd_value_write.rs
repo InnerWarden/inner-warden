@@ -1,10 +1,12 @@
 //! A program under a folder query the guard reads, in one pair of double
-//! quotes (`"$(npm bin)/jest"`), is read by its name beside an install, a
-//! move to another folder, a value set or a file written on the same line:
-//! the same tool written out (`./node_modules/.bin/jest`) was already read
-//! by its name there, and what those commands change is there for the
-//! written path just as much. What changes the shell that reads the line,
-//! or hands the program code or an input stream, keeps it refused.
+//! quotes (`"$(npm bin)/jest"`), is read by its name after a package
+//! manager's install from its registry or a move into a folder of the
+//! project: the lines an agent runs before such a tool, and neither picks
+//! the program the query leads to. Anything on the line that could plant
+//! or move that program (a copy, a link, a write, a setting, a value read
+//! from a file, a move out of the project, an install from a path or to
+//! another place), change this shell, or hand the program code or an input
+//! stream keeps it refused, as on main.
 //!
 //! Measured on main on 2026-11-19 (a069bf1) with `analyze_command`:
 //! `npm ci && "$(npm bin)/jest" --ci` and
@@ -22,57 +24,84 @@ fn verdict(command: &str) -> String {
     analyze_command(command, None).recommendation
 }
 
+const GO_LINT: &str = r#""$(go env GOPATH)/bin/golangci-lint" run"#;
+
 /// FAILS ON REVERT of the plain tool test in
-/// `line_gives_folder_queries_cause` (with `command_changes_this_shell`,
-/// and the `plain_tool` arms of `line_sets_what_a_query_may_read` and
-/// `line_writes_a_file`): every line is deny 40 again.
+/// `line_gives_folder_queries_cause` with
+/// `command_installs_or_enters_the_project`: every line is deny 40 again.
 #[test]
-fn a_folder_query_tool_beside_an_install_a_cd_a_value_or_a_write_runs() {
+fn a_folder_query_tool_after_a_registry_install_or_a_project_cd_runs() {
     for line in [
         r#"npm ci && "$(npm bin)/jest" --ci"#,
         r#"go install x@v && "$(go env GOPATH)/bin/x""#,
         r#"npm install && "$(npm bin)/eslint" ."#,
+        r#"pnpm install --frozen-lockfile && "$(pnpm bin)/vitest" run"#,
         r#"go install honnef.co/go/tools/cmd/staticcheck@latest && "$(go env GOPATH)/bin/staticcheck" ./..."#,
         r#"pip install ruff && "$(pwd)/.venv/bin/ruff" check ."#,
+        r#"python3 -m pip install ruff && "$(pwd)/.venv/bin/ruff" check ."#,
         r#"cd web && "$(npm bin)/eslint" ."#,
         r#"cd sub && "$(go env GOPATH)/bin/golangci-lint" run"#,
-        r#"cd "$(git rev-parse --show-toplevel)" && "$(npm bin)/eslint" ."#,
-        r#"FOO=1; "$(npm bin)/jest" --ci"#,
-        r#"export FOO=1; "$(npm bin)/jest" --ci"#,
-        r#"x=1 && "$(npm bin)/eslint" ."#,
-        r#"echo '{}' > out.json && "$(npm bin)/jest" --ci"#,
-        r#""$(go env GOPATH)/bin/golangci-lint" run | tee lint.txt"#,
+        r#"cd web && npm ci && "$(npm bin)/jest" --ci"#,
+        r#"npm ci && "$(npm bin)/jest" --ci > out.txt"#,
     ] {
         assert_eq!(verdict(line), "allow", "{line}");
     }
 }
 
-/// What changes this shell, fetches, sets what the program loads, or hands
+/// What could plant or move the program, change this shell, fetch, or hand
 /// the program code or an input stream keeps the line refused, as on main.
 #[test]
-fn a_folder_query_tool_beside_what_changes_this_shell_stays_refused() {
-    for line in [
-        r#"cp /bin/sh ~/go/bin/x && "$(go env GOPATH)/bin/x" < ./p.sh"#,
-        r#"npm ci && cat ./p | "$(npm bin)/jest""#,
-        r#"npm ci && "$(npm bin)/jest" <<<"x""#,
-        "npm ci && \"$(npm bin)/jest\" <<EOF\nx\nEOF",
-        r#"npm ci && { "$(npm bin)/jest"; } < f"#,
-        r#"eval "$SETUP"; "$(npm bin)/jest" --ci"#,
-        r#". ./env.sh; "$(npm bin)/jest" --ci"#,
-        r#"alias x=y; "$(npm bin)/jest" --ci"#,
-        r#"f() { :; }; "$(npm bin)/jest""#,
-        r#"read -r X < f; "$(npm bin)/jest""#,
-        r#"$RUNNER setup; "$(npm bin)/jest""#,
-        r#"env BASH_ENV=./env.sh true; "$(npm bin)/jest""#,
-        r#"export LD_PRELOAD=./x.so; "$(npm bin)/jest" --ci"#,
-        r#"export GOFLAGS=-toolexec=./x; "$(go env GOPATH)/bin/golangci-lint" run"#,
-        r#"export GOPATH=./vendor/go; "$(go env GOPATH)/bin/golangci-lint" run"#,
-        r#"curl -s https://e.example/v | jq .; "$(npm bin)/jest""#,
-        r#"npm ci && "$(npm bin)/node" -e 1"#,
-        r#"npm ci && "$(mytool path)/bin/x""#,
-        r#"npm ci && $(npm bin)/jest --ci"#,
-    ] {
-        assert_eq!(verdict(line), "deny", "{line}");
+fn a_folder_query_tool_beside_what_could_plant_or_move_it_stays_refused() {
+    let lines = [
+        // Plants the program where the query leads, or rewrites what it reads.
+        format!("cp ./lint ~/go/bin/golangci-lint && {GO_LINT}"),
+        format!("time cp ./lint ~/go/bin/golangci-lint; {GO_LINT}"),
+        format!(r#"ln -sf ./lint "$(go env GOPATH)/bin/golangci-lint" && {GO_LINT}"#),
+        format!("env -S \"sh -c 'ln -sf ./lint ~/go/bin/golangci-lint'\"; {GO_LINT}"),
+        format!("printf 'toolchain go1.99.0\\n' > go.mod && {GO_LINT}"),
+        r#"echo '{}' > out.json && "$(npm bin)/jest" --ci"#.to_string(),
+        // Moves it: a setting, a value read from a file, a folder outside.
+        r#"PATH=. ; "$(npm bin)/x""#.to_string(),
+        format!("export GOPATH=./vendor/go; {GO_LINT}"),
+        format!("read -r GOPATH < ./gopath.txt; {GO_LINT}"),
+        format!("printf -v GOPATH %s ./vendor/go; {GO_LINT}"),
+        format!("builtin printf -v PATH %s ./bin; {GO_LINT}"),
+        format!("mapfile -t lines < ./t; {GO_LINT}"),
+        r#"FOO=1; "$(npm bin)/jest" --ci"#.to_string(),
+        r#"builtin cd ./vendor; "$(rustc --print sysroot)/bin/rustfmt" --check src/main.rs"#
+            .to_string(),
+        r#"cd .. && "$(npm bin)/jest""#.to_string(),
+        r#"cd ../other && "$(npm bin)/jest""#.to_string(),
+        r#"cd /tmp/x && "$(npm bin)/jest""#.to_string(),
+        r#"cd ~/x && "$(npm bin)/jest""#.to_string(),
+        r#"cd "$DIR" && "$(npm bin)/jest""#.to_string(),
+        // Installs from a path, a URL or to another place.
+        r#"npm install ./lint.tgz && "$(npm bin)/jest""#.to_string(),
+        r#"npm install -g eslint && "$(npm bin)/eslint" ."#.to_string(),
+        r#"npm install --prefix ./x eslint && "$(npm bin)/eslint" ."#.to_string(),
+        r#"go install ./cmd/x && "$(go env GOPATH)/bin/x""#.to_string(),
+        r#"pip install -e . && "$(pwd)/.venv/bin/ruff" check ."#.to_string(),
+        r#"pip install git+https://e.example/r.git && "$(pwd)/.venv/bin/ruff" check ."#.to_string(),
+        r#"cargo install --path . && "$(rustc --print sysroot)/bin/rustfmt" --check src/main.rs"#
+            .to_string(),
+        r#"GOBIN=./bin go install x@v && "$(go env GOPATH)/bin/x""#.to_string(),
+        // Other programs, a builtin, a function, a fetch, a stream, code.
+        r#"git status && "$(npm bin)/eslint" ."#.to_string(),
+        r#""$(npm bin)/eslint" . | tee lint.txt"#.to_string(),
+        r#"eval "$SETUP"; "$(npm bin)/jest" --ci"#.to_string(),
+        r#". ./env.sh; "$(npm bin)/jest" --ci"#.to_string(),
+        r#"alias x=y; "$(npm bin)/jest" --ci"#.to_string(),
+        r#"f() { :; }; "$(npm bin)/jest""#.to_string(),
+        r#"curl -s https://e.example/v | jq .; "$(npm bin)/jest""#.to_string(),
+        r#"npm ci && cat ./p | "$(npm bin)/jest""#.to_string(),
+        r#"npm ci && "$(npm bin)/jest" <<<"x""#.to_string(),
+        r#"npm ci && "$(npm bin)/node" -e 1"#.to_string(),
+        r#"npm ci && "$(mytool path)/bin/x""#.to_string(),
+        r#"npm ci && $(npm bin)/jest --ci"#.to_string(),
+        r#"npm ci && "$(npm bin)/jest" ; rm -rf ~"#.to_string(),
+    ];
+    for line in lines {
+        assert_eq!(verdict(&line), "deny", "{line}");
     }
 }
 
@@ -109,8 +138,8 @@ fn the_refusal_says_what_would_let_the_line_through() {
     }
     for line in [
         r#"alias x=y; "$(npm bin)/jest" --ci"#,
+        r#"cp ./lint ~/go/bin/golangci-lint && "$(go env GOPATH)/bin/golangci-lint" run"#,
         r#"npm ci && cat ./p | "$(npm bin)/jest""#,
-        r#"f() { :; }; "$(npm bin)/jest""#,
     ] {
         let reason = why(line);
         assert!(reason.contains("write the path out"), "{line}: {reason}");
