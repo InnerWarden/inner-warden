@@ -78,7 +78,7 @@ Debian/Ubuntu and Fedora/RHEL packages are attached to each release; see
 Windows (PowerShell):
 
 ```powershell
-irm https://innerwarden.com/free.ps1 | iex
+irm https://www.innerwarden.com/free.ps1 | iex
 ```
 
 The installer verifies the binary's SHA-256 and Ed25519 signature against a key

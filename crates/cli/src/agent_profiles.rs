@@ -13,7 +13,7 @@
 
 use innerwarden_agent_guard::identity::{RuleLayer, Trust, Verdict};
 use innerwarden_agent_guard::profiles::{
-    self, AgentProfile, AgentProfiles, ProfileChange, ShellCall,
+    self, AgentProfile, AgentProfiles, ProfileChange, ProxyProfile, ShellCall,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -160,6 +160,40 @@ pub fn agent_type(hook_agent: Option<&str>, identity: Option<&Identity>) -> Opti
     hook_agent
         .map(str::to_string)
         .or_else(|| identity.and_then(|id| id.agent_type.clone()))
+}
+
+/// PURE. What the MCP proxy applies for `agent` (its `--agent`) and the
+/// instance it runs as, from the profiles state: `None` with no profiles
+/// file, every call refused with an unusable one, and otherwise the agent
+/// type's profile with its trust and any revocation. The proxy and
+/// `innerwarden demo` both build it here, so the demo judges a call as the
+/// proxy would.
+pub fn proxy_profile(
+    state: &ProfilesState,
+    agent: Option<&str>,
+    identity: Option<&Identity>,
+) -> Option<ProxyProfile> {
+    match state {
+        ProfilesState::Off => None,
+        ProfilesState::Invalid(why) => Some(ProxyProfile::Invalid { why: why.clone() }),
+        ProfilesState::On(profiles) => {
+            let agent_type = agent_type(agent, identity);
+            let profile = agent_type
+                .as_deref()
+                .and_then(|name| profiles.get(name))
+                .cloned();
+            let revoked = profiles.revocation(
+                agent_type.as_deref(),
+                identity.and_then(|id| id.instance_id.as_deref()),
+            );
+            Some(ProxyProfile::Active {
+                agent_type,
+                profile,
+                trust: trust(identity),
+                revoked,
+            })
+        }
+    }
 }
 
 /// The trust a decision is made at: the hook's own reading of its instance,

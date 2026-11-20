@@ -3482,33 +3482,17 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
     let identity = hook_identity::current(agent.as_deref(), None);
     // Per-agent profiles, read once: the proxy is a long-lived process. With
     // no profiles file this is `None` and the proxy is what it was.
-    let profile = match agent_profiles_io::load() {
-        agent_profiles::ProfilesState::Off => None,
-        agent_profiles::ProfilesState::Invalid(why) => {
-            eprintln!(
-                "innerwarden proxy: the agent profiles cannot be used ({why}); every tool call is \
-                 refused in guard and kill mode until the file is fixed or removed"
-            );
-            Some(innerwarden_agent_guard::profiles::ProxyProfile::Invalid { why })
-        }
-        agent_profiles::ProfilesState::On(profiles) => {
-            let agent_type = agent_profiles::agent_type(agent.as_deref(), identity.as_ref());
-            let profile = agent_type
-                .as_deref()
-                .and_then(|name| profiles.get(name))
-                .cloned();
-            let revoked = profiles.revocation(
-                agent_type.as_deref(),
-                identity.as_ref().and_then(|id| id.instance_id.as_deref()),
-            );
-            Some(innerwarden_agent_guard::profiles::ProxyProfile::Active {
-                agent_type,
-                profile,
-                trust: agent_profiles::trust(identity.as_ref()),
-                revoked,
-            })
-        }
-    };
+    let profile = agent_profiles::proxy_profile(
+        &agent_profiles_io::load(),
+        agent.as_deref(),
+        identity.as_ref(),
+    );
+    if let Some(innerwarden_agent_guard::profiles::ProxyProfile::Invalid { why }) = &profile {
+        eprintln!(
+            "innerwarden proxy: the agent profiles cannot be used ({why}); every tool call is \
+             refused in guard and kill mode until the file is fixed or removed"
+        );
+    }
     let report_to = reporter.sender();
     let on_event = move |d: &ProxyDecision| {
         // The graph is an action timeline: persist every client tools/call,

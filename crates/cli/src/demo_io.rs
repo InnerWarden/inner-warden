@@ -8,9 +8,10 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use innerwarden_agent_guard::agents::{AgentStatus, GuardMode};
-use innerwarden_agent_guard::mcp_proxy::enforce::{apply_mode, ProxyAction, ProxyMode};
+use innerwarden_agent_guard::mcp_proxy::enforce::{apply_layers, ProxyAction, ProxyMode};
 use innerwarden_agent_guard::mcp_proxy::jsonrpc::JsonRpcEnvelope;
 use innerwarden_agent_guard::mcp_proxy::router::{route_message, Direction};
+use innerwarden_agent_guard::profiles::ProxyProfile;
 use innerwarden_agent_guard::rules::RuleEngine;
 use innerwarden_agent_guard::{agents_ops, hook};
 
@@ -82,6 +83,8 @@ pub(crate) fn cmd(rest: &[String]) -> ExitCode {
 fn gather(home: &Path, rows: &[AgentStatus], calls: &[DemoCall], nonce: &str) -> Vec<AgentDemo> {
     let wiring = crate::status_wiring(Some(home), rows);
     let mut engine: Option<RuleEngine> = None;
+    // The agent profiles, read as the proxy reads them when it starts.
+    let mut profiles: Option<crate::agent_profiles::ProfilesState> = None;
     let mut out = Vec::new();
     for row in rows {
         let via = if row.hookable { Via::Hook } else { Via::Proxy };
@@ -135,7 +138,11 @@ fn gather(home: &Path, rows: &[AgentStatus], calls: &[DemoCall], nonce: &str) ->
             Via::Hook => through_hooks(home, calls, nonce),
             Via::Proxy => {
                 let engine = engine.get_or_insert_with(RuleEngine::load_embedded);
-                through_proxy(calls, row.mode, engine)
+                let state = profiles.get_or_insert_with(crate::agent_profiles_io::load);
+                // The wiring passes the agent's name as `--agent`; the demo
+                // runs outside the agent, so no instance identity is read.
+                let profile = crate::agent_profiles::proxy_profile(state, Some(&row.name), None);
+                through_proxy(calls, row.mode, engine, profile.as_ref())
             }
         };
         out.push(AgentDemo {
@@ -309,12 +316,14 @@ fn run_bounded(
 }
 
 /// Each call, as a `tools/call` the proxy wrapping this agent's servers would
-/// receive, judged by the proxy's own router and mode. The wrapper is not
-/// started, so neither is any server behind it.
+/// receive, judged by the proxy's own router, the agent profiles it applies
+/// (`profile`, built as the proxy builds it) and its mode. The wrapper is
+/// not started, so neither is any server behind it.
 fn through_proxy(
     calls: &[DemoCall],
     mode: Option<GuardMode>,
     engine: &RuleEngine,
+    profile: Option<&ProxyProfile>,
 ) -> Vec<CallResult> {
     // A mixed or unreadable wiring has servers that only record: the demo
     // shows the weaker of the two, which is what part of the calls get.
@@ -332,12 +341,20 @@ fn through_proxy(
                 result.why = Some("the call could not be read back as JSON-RPC".into());
                 return result;
             };
-            let decision = route_message(
+            let mut decision = route_message(
                 &envelope,
                 Direction::ClientToServer,
                 None,
                 Some(engine),
                 None,
+            );
+            let action = apply_layers(
+                &mut decision,
+                &envelope,
+                profile,
+                Some(engine),
+                proxy_mode,
+                false,
             );
             let why = decision
                 .verdict
@@ -346,7 +363,7 @@ fn through_proxy(
                 .find(|a| a.block)
                 .or(decision.verdict.alerts.first())
                 .map(|a| a.detail.clone());
-            let outcome = match apply_mode(&decision, proxy_mode, false) {
+            let outcome = match action {
                 ProxyAction::Block { .. } | ProxyAction::Kill { .. } => Outcome::Refused,
                 _ if !decision.verdict.allowed => Outcome::WouldRefuse,
                 _ => Outcome::Allowed,
@@ -380,8 +397,8 @@ mod tests {
     fn the_proxy_refuses_in_enforce_and_only_flags_in_monitor() {
         let engine = RuleEngine::load_embedded();
         let calls = demo::calls(Path::new("/home/someone"));
-        let enforce = through_proxy(&calls, Some(GuardMode::Enforce), &engine);
-        let monitor = through_proxy(&calls, Some(GuardMode::Monitor), &engine);
+        let enforce = through_proxy(&calls, Some(GuardMode::Enforce), &engine, None);
+        let monitor = through_proxy(&calls, Some(GuardMode::Monitor), &engine, None);
         for id in ["download-to-shell", "read-ssh-key"] {
             let e = enforce.iter().find(|r| r.id == id).unwrap();
             assert_eq!(e.outcome, Outcome::Refused, "{id}: {e:?}");
@@ -390,8 +407,78 @@ mod tests {
             assert_eq!(m.outcome, Outcome::WouldRefuse, "{id}: {m:?}");
         }
         // A mixed or unreadable wiring shows what its recording half does.
-        let mixed = through_proxy(&calls, Some(GuardMode::Mixed), &engine);
+        let mixed = through_proxy(&calls, Some(GuardMode::Mixed), &engine, None);
         assert!(mixed.iter().all(|r| r.outcome != Outcome::Refused));
+    }
+
+    /// The MCP half applies the agent profiles the proxy applies: a profile
+    /// that denies a tool refuses its call in enforce, and an unusable
+    /// profiles file refuses every call, as the proxy does. Each is built
+    /// by `agent_profiles::proxy_profile`, the proxy's own builder.
+    ///
+    /// FAILS ON REVERT of `apply_layers` (back to `apply_mode`): the
+    /// profile is not read and the reasons below are not given.
+    #[test]
+    fn the_proxy_half_applies_the_agent_profiles_the_proxy_applies() {
+        use crate::agent_profiles::{proxy_profile, ProfilesState};
+        let engine = RuleEngine::load_embedded();
+        // The four calls are refused by the rules alone, so a profile only
+        // shows on a call the rules let through: a weather lookup.
+        let weather = DemoCall {
+            id: "weather",
+            tool: "weather",
+            shown: "weather NYC".into(),
+            hook_input: serde_json::json!({}),
+            mcp_tool: "weather",
+            mcp_args: serde_json::json!({ "location": "NYC" }),
+        };
+        let mut calls = demo::calls(Path::new("/home/someone"));
+        calls.push(weather);
+        let plain = through_proxy(&calls, Some(GuardMode::Enforce), &engine, None);
+        assert_eq!(plain[4].outcome, Outcome::Allowed, "{:?}", plain[4]);
+
+        let invalid = proxy_profile(
+            &ProfilesState::Invalid("agents.toml: line 3 is not a profile".into()),
+            Some("cursor"),
+            None,
+        );
+        let refused = through_proxy(&calls, Some(GuardMode::Enforce), &engine, invalid.as_ref());
+        assert!(
+            refused.iter().all(|r| r.outcome == Outcome::Refused),
+            "{refused:?}"
+        );
+        let why = refused[4].why.clone().unwrap_or_default();
+        assert!(why.contains("agent profiles file"), "{why}");
+
+        let profiles = innerwarden_agent_guard::profiles::parse(
+            b"schema_version = 1\n[profile.cursor]\nmcp_tools_deny = [\"weather\"]\n",
+        )
+        .expect("profiles");
+        let state = ProfilesState::On(profiles);
+        let denying = proxy_profile(&state, Some("cursor"), None);
+        let results = through_proxy(&calls, Some(GuardMode::Enforce), &engine, denying.as_ref());
+        assert_eq!(results[4].outcome, Outcome::Refused, "{:?}", results[4]);
+        // In monitor the proxy only records what the profile refuses.
+        let monitor = through_proxy(&calls, Some(GuardMode::Monitor), &engine, denying.as_ref());
+        assert_eq!(monitor[4].outcome, Outcome::WouldRefuse, "{:?}", monitor[4]);
+        // Another agent's profile is not this one's.
+        let codex = proxy_profile(&state, Some("codex"), None);
+        let other = through_proxy(&calls, Some(GuardMode::Enforce), &engine, codex.as_ref());
+        assert_eq!(other[4].outcome, Outcome::Allowed, "{:?}", other[4]);
+        // Another agent's type does not apply to this one.
+        assert_eq!(
+            proxy_profile(&state, Some("codex"), None),
+            Some(ProxyProfile::Active {
+                agent_type: Some("codex".into()),
+                profile: None,
+                trust: innerwarden_agent_guard::identity::Trust::Declared,
+                revoked: None,
+            })
+        );
+        assert_eq!(
+            proxy_profile(&ProfilesState::Off, Some("cursor"), None),
+            None
+        );
     }
 
     /// A hook program whose `--version` hangs is stopped at the wait, and

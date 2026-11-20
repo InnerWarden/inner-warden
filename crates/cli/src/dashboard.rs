@@ -1222,6 +1222,60 @@ fn meta_json_with_freshness(
     .unwrap_or_else(|_| "{}".into())
 }
 
+/// What says whether the person can open the dashboard on this machine.
+#[derive(Debug, Default)]
+pub(crate) struct ScreenFacts {
+    /// `SSH_CONNECTION` (or `SSH_CLIENT`): the session came in over SSH.
+    pub ssh_connection: Option<String>,
+    /// A graphical display is named (`DISPLAY` or `WAYLAND_DISPLAY`).
+    pub display: bool,
+    /// The host has no other screen than one named that way (Linux and the
+    /// other Unix systems; macOS and Windows always have their own).
+    pub display_needs_name: bool,
+    /// The login name, for the tunnel command.
+    pub user: Option<String>,
+}
+
+impl ScreenFacts {
+    fn from_env() -> Self {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+        Self {
+            ssh_connection: var("SSH_CONNECTION").or_else(|| var("SSH_CLIENT")),
+            display: var("DISPLAY").is_some() || var("WAYLAND_DISPLAY").is_some(),
+            display_needs_name: cfg!(unix) && !cfg!(target_os = "macos"),
+            user: var("USER").or_else(|| var("LOGNAME")),
+        }
+    }
+}
+
+/// PURE. On a host the person reached over SSH, or one with no screen, the
+/// line that says how to open a loopback dashboard from their own machine:
+/// an SSH tunnel to the port. It names the login and the address the SSH
+/// session came in on (`SSH_CONNECTION`'s third field), never a secret;
+/// with no SSH session it names the host as a placeholder. `None` where
+/// a browser here can open it, and for a non-loopback bind (`--expose`),
+/// whose URL is reached directly.
+pub(crate) fn tunnel_line(bind: &str, facts: &ScreenFacts) -> Option<String> {
+    let headless = facts.ssh_connection.is_some() || (facts.display_needs_name && !facts.display);
+    if !headless || !is_loopback_bind(bind) {
+        return None;
+    }
+    let (bound, port) = bind.rsplit_once(':')?;
+    if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let host = facts
+        .ssh_connection
+        .as_deref()
+        .and_then(|c| c.split_whitespace().nth(2))
+        .unwrap_or("<this-host>");
+    let user = facts.user.as_deref().unwrap_or("<you>");
+    Some(format!(
+        "innerwarden dashboard: no screen here. From your own machine, run this and open \
+         http://127.0.0.1:{port} there:\n  ssh -N -L {port}:{bound}:{port} {user}@{host}"
+    ))
+}
+
 /// True when `bind` targets loopback (safe: not reachable off-host). Anything else
 /// publishes the read-only UI (command history + graph) to the network, and the
 /// dashboard has NO auth/TLS, so a non-loopback bind must be an explicit, informed
@@ -1412,6 +1466,9 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     };
     let url = format!("http://{bind}");
     eprintln!("innerwarden dashboard: serving on {url}  (read-only API; Ctrl-C to stop)");
+    if let Some(line) = tunnel_line(&bind, &ScreenFacts::from_env()) {
+        eprintln!("{line}");
+    }
     // The graph and the event log, parsed once per version of each file. The
     // loop is single-threaded, so the caches need no lock.
     let mut community = CommunityRecord::default();
@@ -3672,6 +3729,55 @@ mod tests {
         assert_eq!(discovery.freshness.state, FreshnessState::Stale);
         assert_eq!(bootstrap.community_contract.id, "CJC-090");
         assert!(bootstrap.community_contract.digest.starts_with("sha256:"));
+    }
+
+    /// A host reached over SSH, or one with no screen, says how to open the
+    /// dashboard from the person's own machine: an SSH tunnel to the port,
+    /// with the login and the address the session came in on, nothing else.
+    /// A desktop, and an exposed bind, get no such line.
+    ///
+    /// FAILS ON REVERT of `tunnel_line` (no line on a headless host).
+    #[test]
+    fn a_host_without_a_screen_gets_the_tunnel_line() {
+        let over_ssh = ScreenFacts {
+            ssh_connection: Some("203.0.113.7 51022 198.51.100.4 22".into()),
+            display: false,
+            display_needs_name: true,
+            user: Some("dev".into()),
+        };
+        let line = tunnel_line(DEFAULT_BIND, &over_ssh).expect("a line over SSH");
+        assert!(
+            line.contains("ssh -N -L 8788:127.0.0.1:8788 dev@198.51.100.4"),
+            "{line}"
+        );
+        assert!(line.contains("http://127.0.0.1:8788"), "{line}");
+        // Over SSH from a desktop that forwards X: still not this screen.
+        let forwarded = ScreenFacts {
+            display: true,
+            ..over_ssh
+        };
+        assert!(tunnel_line("127.0.0.1:9000", &forwarded)
+            .expect("over SSH")
+            .contains("ssh -N -L 9000:127.0.0.1:9000 dev@198.51.100.4"));
+        // A server console with no display and no SSH: a placeholder host.
+        let console = ScreenFacts {
+            display_needs_name: true,
+            ..ScreenFacts::default()
+        };
+        let line = tunnel_line(DEFAULT_BIND, &console).expect("a line with no screen");
+        assert!(line.contains("<you>@<this-host>"), "{line}");
+        // A desktop opens it here; an exposed bind is reached directly.
+        let desktop = ScreenFacts {
+            display: true,
+            display_needs_name: true,
+            ..ScreenFacts::default()
+        };
+        assert_eq!(tunnel_line(DEFAULT_BIND, &desktop), None);
+        let v6 = tunnel_line("[::1]:8788", &console).expect("loopback v6");
+        assert!(v6.contains("ssh -N -L 8788:[::1]:8788"), "{v6}");
+        let mac = ScreenFacts::default();
+        assert_eq!(tunnel_line(DEFAULT_BIND, &mac), None);
+        assert_eq!(tunnel_line("0.0.0.0:8788", &console), None);
     }
 
     #[test]
