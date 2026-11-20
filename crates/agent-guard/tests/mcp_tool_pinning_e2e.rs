@@ -184,13 +184,18 @@ fn guard_mode_holds_a_changed_tool_until_the_person_approves_it() {
                 .any(|m| m["method"] == "notifications/tools/list_changed"),
             "the notification is relayed: {before:?}"
         );
+        // list_dir is new in the middle of the session, beside the tools
+        // listed before: held too (it passed here before that check).
         assert_eq!(
             names(&listed),
-            vec!["list_dir"],
-            "the two changed tools are held, the new one passes"
+            Vec::<String>::new(),
+            "the two changed tools and the new one are held"
         );
         let changed = s.alerts(TOOL_CHANGED_RULE);
-        assert_eq!(changed.len(), 2, "{changed:?}");
+        assert_eq!(changed.len(), 3, "{changed:?}");
+        assert!(changed
+            .iter()
+            .any(|d| d.contains("`list_dir` is new and held")));
         assert!(changed.iter().any(|d| d.contains("`read_file`")
             && d.contains(": description;")
             && d.contains("held from the client")));
@@ -201,12 +206,15 @@ fn guard_mode_holds_a_changed_tool_until_the_person_approves_it() {
             .iter()
             .all(|d| d.contains("innerwarden mcp approve ")));
 
-        // A call to a held tool is refused; the new tool is answered.
+        // A call to a held tool is refused, the new one's too.
         let refused = s.call(3, "read_file").await;
         assert!(!answered_by_server(&refused, "read_file"), "{refused}");
         assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
         assert_eq!(s.alerts(TOOL_HELD_RULE).len(), 1);
-        assert!(answered_by_server(&s.call(4, "list_dir").await, "list_dir"));
+        assert!(!answered_by_server(
+            &s.call(4, "list_dir").await,
+            "list_dir"
+        ));
 
         // The record on disk says what waits, field by field.
         let mut record = pins::load(&path).expect("record");
@@ -230,7 +238,7 @@ fn guard_mode_holds_a_changed_tool_until_the_person_approves_it() {
             "write_file"
         ));
         let (listed, _) = s.ask(7, "tools/list", json!({})).await;
-        assert_eq!(names(&listed), vec!["read_file", "list_dir"]);
+        assert_eq!(names(&listed), vec!["read_file"]);
     });
 }
 
@@ -245,8 +253,9 @@ fn advisory_mode_reports_the_change_and_holds_nothing() {
         s.ask(1, "tools/list", json!({})).await;
         let (listed, _) = s.ask(2, "tools/list", json!({})).await;
         assert_eq!(names(&listed), vec!["read_file", "write_file", "list_dir"]);
+        // The two changed tools and list_dir, new in the middle of the session.
         let changed = s.alerts(TOOL_CHANGED_RULE);
-        assert_eq!(changed.len(), 2, "{changed:?}");
+        assert_eq!(changed.len(), 3, "{changed:?}");
         assert!(changed
             .iter()
             .all(|d| d.contains("forwarded to the client unchanged")));

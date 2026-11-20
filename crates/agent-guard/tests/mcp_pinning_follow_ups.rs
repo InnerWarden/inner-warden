@@ -205,30 +205,71 @@ fn a_renamed_tool_is_reported_and_held() {
         vec!["possible rename of `fetch` (nearly the same description)".to_string()]
     );
 
-    // Unlike anything that left: pinned as heard, as before.
+    // Unlike anything that left: not a rename. It is held as new (the
+    // server was listed before), never as a rename, in the same session and
+    // in the first listing of a later one. (It passed in both until the
+    // supervisor's decisions of 2026-11-19 and 2026-11-20: a tool a server
+    // that was listed before never listed is held, whatever the session.)
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-pins.json");
+    let mut s = PinSession::new(Some(path.clone()), &cmd());
+    s.check_listing(
+        None,
+        &listing(json!([tool("read_file", "Read a file.", "path")])),
+    );
+    let send_mail = listing(json!([tool("send_mail", "Send an email message.", "to")]));
+    let new = vec!["new: this server did not list it before".to_string()];
+    let mut fresh = PinSession::new(Some(path), &cmd());
+    let changes = fresh.check_listing(None, &send_mail);
+    assert_eq!(changes[0].fields, new, "{changes:?}");
     let mut s = PinSession::new(None, &cmd());
     s.check_listing(
         None,
         &listing(json!([tool("read_file", "Read a file.", "path")])),
     );
-    let changes = s.check_listing(
-        None,
-        &listing(json!([tool("send_mail", "Send an email message.", "to")])),
-    );
-    assert!(changes.is_empty(), "{changes:?}");
-    assert!(!s.is_held("send_mail"));
+    let changes = s.check_listing(None, &send_mail);
+    assert_eq!(changes[0].fields, new);
 
-    // One page of a paged list, and the page after it: nothing is gone.
-    let mut s = PinSession::new(None, &cmd());
-    s.check_listing(
+    // One page of a paged list says nothing is gone. Its pages are gathered,
+    // and the last one closes the listing: read_file is on no page, so the
+    // two tools that take what it took are reported as possible renames
+    // (both passed here before the pages were gathered). The server was
+    // listed before, so each is held on its own page already, as new.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-pins.json");
+    PinSession::new(Some(path.clone()), &cmd()).check_listing(
         None,
         &listing(json!([tool("read_file", "Read a file.", "path")])),
     );
+    let mut s = PinSession::new(Some(path), &cmd());
     let mut page = listing(json!([tool("read_copy", "Read a file.", "path")]));
     page["nextCursor"] = json!("2");
-    assert!(s.check_listing(None, &page).is_empty());
+    let on_page: Vec<String> = s
+        .check_listing(None, &page)
+        .into_iter()
+        .map(|c| c.tool)
+        .collect();
+    assert_eq!(on_page, vec!["read_copy"]);
     let last = listing(json!([tool("read_again", "Read a file.", "path")]));
-    assert!(s.check_listing(None, &last).is_empty());
+    let mut renamed: Vec<(String, Vec<String>)> = s
+        .check_listing(None, &last)
+        .into_iter()
+        .map(|c| (c.tool, c.fields))
+        .collect();
+    renamed.sort();
+    assert_eq!(
+        renamed,
+        vec![
+            (
+                "read_again".to_string(),
+                vec!["possible rename of `read_file` (same input schema)".to_string()]
+            ),
+            (
+                "read_copy".to_string(),
+                vec!["possible rename of `read_file` (same input schema)".to_string()]
+            ),
+        ]
+    );
 
     // Two tools that take nothing are not alike.
     assert_eq!(

@@ -391,8 +391,12 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              and kill mode, held: left out of the tool list and refused when called.\n  \
              A new tool that looks like a pinned one gone from the list (a possible\n  \
              rename), or a definition over 64 KiB, is held the same way.\n  \
+             Only the first listing of a server never pinned passes as heard: once a\n  \
+             server has pins, a tool it never listed before is held, in this session\n  \
+             and after a restart. When you update a server and it gains tools,\n  \
+             approve them: {p} mcp approve <server> --all\n  \
              list      the servers pinned, and the tools held with what changed\n  \
-             approve   accept the changed definition of one tool (or --all of them)\n  \
+             approve   accept a held tool, changed or new (or --all of them)\n  \
              forget    drop a server's pins after you reinstalled it on purpose\n  \
              A server is named by the id `list` prints, or its command line.\n  \
              approve and forget need a terminal, and the guard refuses an agent that\n  \
