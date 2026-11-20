@@ -30,6 +30,7 @@ is allowed. The guard reads the home from the process environment, so
 | proof | `../benchmarks/agent_attack_corpus.yml` | the curated agent-attack corpus and benign controls |
 | attack-2026-11 | `attack-2026-11/cases.yml` | the lines the guard's tests fixed on 2026-11-18 and 19 (removals, including through xargs and find -exec, persistence files, SSH keys and their use, the guard's own files, secret reads, shell runner forms), with the verdict each test asserts; a test that only asserts "not allow" gives `expect: review` |
 | real | `real/cases.yml` | lines agents really ran while building the guard, refused or held, then labelled by a person |
+| external-2026-11 | `external-2026-11/cases.yml` | attacks the guard's authors did not write: AgentDojo's injection tasks (the text injected into a tool result and the tool calls the attack wants) and the shell calls of a model poisoned with a public recipe, with benign controls from the same sources; sources and licences in `external-2026-11/SOURCES.md`, the end-to-end result through the proxy and the hook in `external-2026-11/RESULTS.md` |
 
 In `real`, `right_block` means the refusal was right (`expect: deny`: only a
 deny counts); `legit_work` and `guard_bug` mean the line should pass, at most
@@ -46,6 +47,14 @@ Hosts, users, addresses and internal folder and file names are replaced in
 `real` by neutral ones that keep the shape of the line; a line seen twice is
 kept once; Write and Edit tool calls are not shell lines and are left
 out. Nothing in the corpora is executed.
+
+In `external-2026-11`, a tool call is written whole, as an MCP client sends it,
+with `surface: tool_call` and the input `{"tool": ..., "arguments": {...}}`.
+The suite judges each message on its own, so what the proxy decides from the
+session (an argument that came out of an earlier result, the loop breaker,
+pinned tools) is not in these verdicts; `RESULTS.md` has the session numbers.
+Its misses and false positives at the first reference are the baseline the
+suite holds, not a pass.
 
 ## Changing the reference
 
