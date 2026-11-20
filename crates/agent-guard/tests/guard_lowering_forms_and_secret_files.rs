@@ -73,8 +73,10 @@ fn a_piece_of_the_name_reaches_the_guard_through_any_launcher_and_reader() {
         "pgrep warden | xargs kill -9",
         "kill $(pidof innerwarden)",
         "pidof innerwarden | xargs kill",
-        // The layout older wrappers ran with.
+        // The layout older wrappers ran with, killed or started by the agent.
         "pkill -f 'mcp-proxy -- npx'",
+        "innerwarden mcp-proxy -- node server.js",
+        "innerwarden mcp-proxy -- npx -y some-mcp-server",
     ] {
         assert_eq!(verdict(command), "deny", "{command}");
     }

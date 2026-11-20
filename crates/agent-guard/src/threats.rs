@@ -7000,6 +7000,7 @@ const GUARD_VERB_HEADS: &[&str] = &[
     "agent",
     "uninstall",
     "mcp",
+    "mcp-proxy",
 ];
 
 /// The arguments after `innerwarden`: whether they widen what is let through.
@@ -7051,6 +7052,12 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         // with the demo's marker a call that sends no alert. Only the agent's
         // wiring runs it.
         "hook" => !asks_for_help,
+        // `innerwarden mcp-proxy -- <server>`: the layout of older MCP
+        // wrappers. Today's CLI has no such verb, so where it still runs the
+        // proxy is an older guard's, started by an agent's wiring only: one
+        // the agent starts itself stands between it and a server on terms it
+        // chose (a monitor default of an older release).
+        "mcp-proxy" => !asks_for_help,
         // `innerwarden agents approve|profile|allow|revoke`: the decisions
         // about an agent are the person's, every one of them. Listing the
         // agents, connecting them and asking for help are not decisions.
