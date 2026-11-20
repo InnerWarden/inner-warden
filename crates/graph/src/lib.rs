@@ -2749,8 +2749,7 @@ mod tests {
                 other.path,
                 Some(std::path::PathBuf::from(
                     "/var/lib/innerwarden/guard/graph.json"
-                )),
-                "{account:?}"
+                ))
             );
             assert_eq!(other.source, GraphPathSource::ProductConfigFile);
             assert_eq!(other.account_problem, None);

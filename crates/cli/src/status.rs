@@ -574,10 +574,15 @@ pub fn record_place_finding(place: &RecordPlace) -> Finding {
 pub struct RecordKeptApart {
     pub shared_dir: String,
     pub own_dir: String,
-    /// This account's name, from the account database by uid. Empty when it
-    /// could not be read.
-    pub account: String,
+    /// This account's Linux user name, from the user database by uid, for
+    /// the command the person runs. Empty when it could not be read.
+    pub user_name: LinuxUserName,
 }
+
+/// A Linux user name, as `id -un` prints it: a public identifier the person
+/// types into a command, never a credential.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinuxUserName(pub String);
 
 /// The one line that says a record was kept apart. Every screened call is
 /// still judged and recorded; the hook says nothing about this on each call,
@@ -591,10 +596,10 @@ pub struct RecordKeptApart {
 /// `innerwarden` group, which reads every member's decisions and
 /// InnerWarden's own state.
 pub fn record_kept_apart_finding(apart: &RecordKeptApart) -> Finding {
-    let account = if apart.account.is_empty() {
+    let user = if apart.user_name.0.is_empty() {
         "\"$(id -un)\"".to_string()
     } else {
-        apart.account.clone()
+        apart.user_name.0.clone()
     };
     Finding::NotWorking {
         what: format!(
@@ -606,7 +611,7 @@ pub fn record_kept_apart_finding(apart: &RecordKeptApart) -> Finding {
             apart.shared_dir, apart.own_dir
         ),
         next: format!(
-            "sudo innerwarden-ctl agent-user add {account} (on the InnerWarden Pro \
+            "sudo innerwarden-ctl agent-user add {user} (on the InnerWarden Pro \
              install: a folder of its own for this account that Pro reads; never add \
              an AI agent's account to the innerwarden group), then run innerwarden \
              status again"
@@ -1350,7 +1355,7 @@ mod tests {
         facts.record_kept_apart = Some(RecordKeptApart {
             shared_dir: "/var/lib/innerwarden/guard".into(),
             own_dir: "/home/agent/.config/innerwarden".into(),
-            account: "agent".into(),
+            user_name: LinuxUserName("agent".into()),
         });
         let findings = assess(&facts);
         let apart: Vec<usize> = findings
@@ -1392,13 +1397,13 @@ mod tests {
         let finding = record_kept_apart_finding(&RecordKeptApart {
             shared_dir: "/var/lib/innerwarden/guard".into(),
             own_dir: "/home/agent/.config/innerwarden".into(),
-            account: "agent".into(),
+            user_name: LinuxUserName("agent".into()),
         });
         let mut facts = healthy();
         facts.record_kept_apart = Some(RecordKeptApart {
             shared_dir: "/var/lib/innerwarden/guard".into(),
             own_dir: "/home/agent/.config/innerwarden".into(),
-            account: "agent".into(),
+            user_name: LinuxUserName("agent".into()),
         });
         assert_eq!(
             headline(&assess(&facts)),
