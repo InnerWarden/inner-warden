@@ -36,6 +36,11 @@ the text of a command; what it does not see is written down, as measured:
   enforce mode, refuses the call with the reason until `innerwarden agents
   connect cursor` restores it (monitor mode only says so). An edit that takes
   every entry out at once is not seen: Cursor then starts no hook of ours.
+  `status`, `agents` and the dashboard say it instead: Cursor's hooks are not
+  in the file (while its MCP servers still run behind the guard), or its
+  hooks run another program than the guard, named with the guard's. The
+  dashboard labels what Cursor's hooks judge "Shell commands, MCP calls and
+  reads".
 - **Connect keeps your keys in their order.** `agents connect` and
   `disconnect` write `~/.cursor/hooks.json`, `~/.gemini/settings.json` and
   the MCP configs back in the order you wrote them; only the guard's entries
