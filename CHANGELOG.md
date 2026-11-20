@@ -6,9 +6,10 @@ follows semantic versioning.
 ## 1.6.15 - 2026-11-20
 
 Codex CLI, Gemini CLI and Hermes Agent are screened through their own hooks,
-not only on their MCP side: their shell commands and file changes are judged
-before they run. Under an enforcing hook, a line with a part the guard cannot
-read is held for review instead of allowed. The MCP proxy pins each tool's
+not only on their MCP side: their shell commands and changes to privileged
+files are judged before they run. Under an enforcing hook, a line with a part
+the guard cannot read is held for review instead of allowed. The MCP proxy
+pins each tool's
 definition and holds one a server changes, adds or may have renamed until you
 approve it. The AI Jail hands in only what a shell needs of your environment.
 The guard still reads the text of a command, and what it does not see is
@@ -21,8 +22,9 @@ written down: [Where this ends](docs/features.md#where-this-ends).
   the guard into the agent's own pre-tool hook: Codex `PreToolUse` in
   `~/.codex/hooks.json`, Gemini `BeforeTool` in `~/.gemini/settings.json`,
   Hermes `hooks.pre_tool_call` in `~/.hermes/config.yaml`. Their shell
-  commands and their file changes (Codex `apply_patch`; Gemini `write_file`
-  and `replace`; Hermes `write_file` and `patch`) are judged before they run,
+  commands and their changes to privileged files (Codex `apply_patch`; Gemini
+  `write_file` and `replace`; Hermes `write_file` and `patch`) are judged
+  before they run,
   beside the MCP proxy that already carried Codex's and Gemini's MCP servers.
   Gemini's reads (`read_file`, `read_many_files`, `glob`, `grep_search`) and
   Hermes' (`read_file`, `search_files`) are judged by the secret rules Claude
@@ -47,9 +49,14 @@ written down: [Where this ends](docs/features.md#where-this-ends).
 - **Hermes: code and typed text are judged as what they are.** The Python
   `execute_code` runs is judged as `python3 -c`, and text `process_manage`
   types into a running process as a shell line. In enforce, a `terminal`
-  command that only starts a shell or a language, waiting for input, is
-  refused. A `terminal` command is judged in the `workdir` it names. Not
-  screened: Hermes' other tools (the browser, its MCP servers).
+  command that only starts a shell, a language or a database client, waiting
+  for input, is refused. A `terminal` command is judged in the `workdir` it
+  names. Not screened: Hermes' other tools (the browser, its MCP servers).
+- **Codex: a shell left waiting for input is refused in enforce.** Codex
+  types into a running command through `write_stdin`, which runs no hook, so
+  in enforce a shell call that starts a shell, a language or a database
+  client with nothing to run (`bash`, `python3`, `psql`) is refused. Not
+  screened: Codex's `write_stdin` and `tool_search`.
 - **An agent cannot switch its own hook off.** Under an enforcing hook, an
   agent that disconnects or lowers its own hook from its shell is refused,
   and so is starting Codex with `--disable hooks` or a `-c` override of its
@@ -228,8 +235,8 @@ written down: [Where this ends](docs/features.md#where-this-ends).
   and on macOS the agent process scan lists processes instead of always
   answering that it does not know.
 - **A long line is parsed once.** A 64 KiB `python3 -c` line was parsed by
-  the shell grammar 19 times in one check; it is now parsed once and the
-  worst case measured went from 271 ms to 159 ms in a release build.
+  the shell grammar 19 times in one check, 5 to 8 ms each in a release
+  build; it is now parsed once.
 - **Dependencies:** regex-automata 0.4.18, fancy-regex 0.20.2, xattr 1.7.0,
   tokio 1.54.1, ureq 3.5.2.
 
@@ -238,15 +245,16 @@ written down: [Where this ends](docs/features.md#where-this-ends).
 Some ordinary lines are held under an enforcing hook, and the hold says why.
 A line whose program, write target or arguments come from a substitution or
 from a variable the line does not set is held for review unless the program
-only reads or prints, or takes the value only as data. A Hermes `terminal`
-command that only opens a shell or a language is refused in enforce. An agent
+only reads or prints, or takes the value only as data. A Codex shell call or
+a Hermes `terminal` command that only opens a shell, a language or a database
+client is refused in enforce. An agent
 in the AI Jail that reads any variable outside the short list above needs
 `--pass-env` with its name. Behind the MCP proxy in `guard` or `kill`, a
 server updated to one with more tools, or one that changes a tool's
 definition, has those tools held until you run `innerwarden mcp approve`. An
-enforcing Codex or Gemini hook refuses every call once the innerwarden
-program is gone: run `innerwarden uninstall` before removing the package, or
-take the hook out of the agent's settings by hand.
+enforcing Codex, Gemini or Hermes hook refuses every call once the
+innerwarden program is gone: run `innerwarden uninstall` before removing the
+package, or take the hook out of the agent's settings by hand.
 
 ### Upgrading
 
