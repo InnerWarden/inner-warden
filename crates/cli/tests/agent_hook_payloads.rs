@@ -1057,8 +1057,10 @@ fn a_missing_program_is_a_refusal_on_hermes_in_enforce() {
 /// writable permissions") under the enforcing line `agents connect` writes,
 /// started as each agent starts it, read as each agent reads the answer:
 ///
-/// - Claude Code, Gemini CLI and Hermes Agent ask the person, with the
-///   guard's reason, and the call runs only if they approve it;
+/// - Claude Code and Hermes Agent ask the person, with the guard's reason,
+///   and the call runs only if they approve it;
+/// - Gemini CLI refuses it with the reason: its `ask` is not proven to
+///   reach a person on every path;
 /// - Codex CLI has no ask (an `ask` is read as unsupported and the call
 ///   runs), so the call runs with a `systemMessage` Codex shows the person;
 /// - `--block-review` refuses it everywhere, and monitor lets it run with
@@ -1066,8 +1068,9 @@ fn a_missing_program_is_a_refusal_on_hermes_in_enforce() {
 ///
 /// A deny is still a refusal and an allow still runs with nothing on stdout.
 ///
-/// FAILS ON REVERT: take the `is_review` arm out of `cmd_hook` and the
-/// three agents run the call without asking and Codex shows nothing.
+/// FAILS ON REVERT: take the `is_review` arm out of `cmd_hook` and Claude
+/// Code and Hermes run the call without asking, Gemini runs it, and Codex
+/// shows nothing.
 #[cfg(unix)]
 #[test]
 fn a_review_asks_the_person_where_the_agent_can_and_is_shown_where_it_cannot() {
@@ -1130,13 +1133,16 @@ fn a_review_asks_the_person_where_the_agent_can_and_is_shown_where_it_cannot() {
         "monitor",
     );
 
-    // Gemini CLI.
+    // Gemini CLI: its `ask` is not proven to reach a person, so a review is
+    // refused with the reason, as a deny is. Monitor lets it run.
     let gemini = |command: &str| host.gemini("run_shell_command", json!({"command": command}));
     let line = GEMINI.command(bin(), false, false);
-    asks(
-        gemini_reads,
-        &host.run("bash", &line, &gemini(review)),
-        "gemini",
+    let answer = host.run("bash", &line, &gemini(review));
+    assert_refused_by(gemini_reads, &answer, "gemini review");
+    assert!(
+        answer.stderr.contains("world-writable permissions"),
+        "gemini: the refusal says why: {}",
+        answer.stderr
     );
     assert_refused_by(
         gemini_reads,
@@ -1153,6 +1159,12 @@ fn a_review_asks_the_person_where_the_agent_can_and_is_shown_where_it_cannot() {
         gemini_reads,
         &host.run("bash", &block, &gemini(review)),
         "gemini --block-review",
+    );
+    let monitor = GEMINI.command(bin(), false, true);
+    assert_runs_on(
+        gemini_reads,
+        &host.run("bash", &monitor, &gemini(review)),
+        "gemini monitor",
     );
 
     // Hermes Agent, started without a shell, its enforce entry fail-closed.
@@ -1187,6 +1199,39 @@ fn a_review_asks_the_person_where_the_agent_can_and_is_shown_where_it_cannot() {
     let ls = hermes("ls");
     assert_eq!(hermes_reads(true, &ls, true), Call::Runs);
     assert!(ls.stdout.is_empty(), "{}", ls.stdout);
+    // --block-review refuses the review; monitor lets it run and asks nothing.
+    let hermes_with = |flag: &str, command: &str| {
+        let argv: Vec<String> = vec![
+            bin().display().to_string(),
+            "hook".into(),
+            flag.into(),
+            "--agent".into(),
+            "hermes".into(),
+        ];
+        host.run_words(&argv, &host.hermes("terminal", json!({"command": command})))
+            .expect("the guard starts")
+    };
+    assert_eq!(
+        hermes_hook::command(bin(), true, false),
+        format!("\"{}\" hook --block-review --agent hermes", bin().display())
+    );
+    let blocked = hermes_with("--block-review", review);
+    assert_eq!(
+        blocked.code,
+        Some(2),
+        "hermes --block-review: {}",
+        blocked.stderr
+    );
+    assert_eq!(hermes_reads(true, &blocked, true), Call::Refused);
+    assert!(blocked.stdout.is_empty(), "{}", blocked.stdout);
+    assert_eq!(
+        hermes_hook::command(bin(), false, true),
+        format!("\"{}\" hook --monitor --agent hermes", bin().display())
+    );
+    let watched = hermes_with("--monitor", review);
+    assert_eq!(watched.code, Some(0), "hermes monitor: {}", watched.stderr);
+    assert_eq!(hermes_reads(true, &watched, false), Call::Runs);
+    assert!(watched.stdout.is_empty(), "{}", watched.stdout);
 
     // Codex CLI: no ask to give, so the review runs with a warning the
     // person sees, and `--block-review` refuses it.
@@ -1219,5 +1264,47 @@ fn a_review_asks_the_person_where_the_agent_can_and_is_shown_where_it_cannot() {
         codex_reads,
         &host.run("/bin/sh", &monitor, &codex(review)),
         "codex monitor",
+    );
+}
+
+/// An agent the hook has no review answer for (any `--agent` id but
+/// Claude Code's, Codex's and Hermes's) is refused a review in enforce mode,
+/// with the reason on stderr, exactly as a deny is. Before, the hook printed
+/// nothing and exited 0, so the review ran unseen. Monitor still lets it run.
+///
+/// FAILS ON REVERT: answer `None` again for an unknown agent and the review
+/// exits 0 with nothing said.
+#[cfg(unix)]
+#[test]
+fn a_review_for_an_agent_with_no_way_to_ask_is_refused_with_the_reason() {
+    let host = Host::new();
+    let review = "chmod 777 ./build.sh";
+    let payload = |command: &str| {
+        json!({
+            "session_id": "s-other",
+            "cwd": host.project(),
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+        })
+    };
+    let line = hook_command_for(bin(), false, false, Some("some-agent"));
+    let answer = host.run("/bin/sh", &line, &payload(review));
+    assert_refused_by(claude_reads, &answer, "unknown agent review");
+    assert!(
+        answer.stderr.contains("world-writable permissions"),
+        "the refusal says why: {}",
+        answer.stderr
+    );
+    assert_runs_on(
+        claude_reads,
+        &host.run("/bin/sh", &line, &payload("ls")),
+        "unknown agent ls",
+    );
+    let monitor = hook_command_for(bin(), false, true, Some("some-agent"));
+    assert_runs_on(
+        claude_reads,
+        &host.run("/bin/sh", &monitor, &payload(review)),
+        "unknown agent monitor",
     );
 }

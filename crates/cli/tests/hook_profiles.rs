@@ -176,10 +176,13 @@ fn a_profile_deny_refuses_the_declared_type_and_is_reported() {
     let attrs = host.last_command_attrs();
     assert_eq!(attrs["deciding_layer"], "agent_type");
 
-    assert_eq!(
-        host.hook(&["--agent", "cursor"], &host.bash(REVIEW)).0,
-        Some(0)
-    );
+    // Another type is untouched by the profile: the general verdict (a
+    // review) decides. An agent the hook cannot ask through is refused a
+    // review with the review's reason, never the profile's.
+    let (code, stderr) = host.hook(&["--agent", "cursor"], &host.bash(REVIEW));
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("flagged this call for review"), "{stderr}");
+    assert!(!stderr.contains("agent profile denies"), "{stderr}");
     assert_eq!(host.last_command_attrs()["deciding_layer"], "general");
 
     let changes: Vec<String> = host

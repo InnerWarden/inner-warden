@@ -1514,50 +1514,67 @@ fn apply_taint(
     verdict
 }
 
-/// What an enforcing hook says about a `review` that no policy refuses, for
-/// the agent the hook line names: written to stdout, with exit 0.
+/// What an enforcing hook does with a `review` that no policy refuses, for
+/// the agent the hook line names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewAnswer {
-    /// Claude Code: `hookSpecificOutput.permissionDecision: "ask"`.
+    /// Claude Code: `hookSpecificOutput.permissionDecision: "ask"` on stdout,
+    /// exit 0.
     AskClaudeCode,
-    /// Gemini CLI (0.68.0 `scheduler/hook-utils.ts`): `decision: "ask"` is a
-    /// confirmation the person must give, whatever the policy said.
-    AskGemini,
-    /// Hermes Agent (v0.23.1 `agent/shell_hooks.py`): `action: "approve"`
-    /// goes to its human approval gate, which refuses when nobody is there.
+    /// Hermes Agent (v0.23.1, `agent/shell_hooks.py` `_parse_pre_tool_call`,
+    /// `hermes_cli/plugins.py` `_resolve_block_from_details`,
+    /// `tools/approval.py` `request_tool_approval`): `action: "approve"` on
+    /// stdout goes to its human approval gate, which blocks when no person or
+    /// gateway can answer. It lets the call through when the person set
+    /// Hermes to approve on its own (yolo, `approvals.mode: off`, or
+    /// `approvals.cron_mode` / `single_query_mode` set to approve).
     AskHermes,
     /// Codex CLI (0.167.2, `hooks/src/events/pre_tool_use.rs`) has no ask: it
     /// reads `permissionDecision: "ask"` as unsupported and runs the tool. A
-    /// `systemMessage` is shown to the person as a warning, so the review
-    /// runs, but not unseen. Refusing every review there would refuse
+    /// `systemMessage` on stdout is shown to the person as a warning, so the
+    /// review runs, but not unseen. Refusing every review there would refuse
     /// ordinary work (a program named by a variable, a value read from a
     /// file); `--block-review` refuses them for whoever wants that.
     WarnCodex,
+    /// Every other agent: refused, exit 2 with the reason on stderr, as a
+    /// `deny` is. That is Gemini CLI, whose `decision: "ask"` is not proven
+    /// to reach a person: in 0.68.0 (`scheduler/scheduler.ts`,
+    /// `tools/tools.ts`) the forced confirmation runs the tool when the tool
+    /// has no confirmation to show (`getConfirmationDetails` answers false
+    /// without a message bus, and a tool may override it), and its
+    /// non-interactive path was not followed. And it is any agent this table
+    /// does not know: an answer in a shape it may not read would let the
+    /// review run unseen.
+    Refuse,
 }
 
 /// How a review is answered for `agent` (the hook line's `--agent`). A hook
-/// line with no agent is the Claude Code line the guard always wrote. An
-/// agent this table does not know keeps the old answer (the call runs, with
-/// nothing on stdout): no answer in a shape it does not read.
-fn review_answer(agent: Option<&str>) -> Option<ReviewAnswer> {
+/// line with no agent is the Claude Code line the guard always wrote.
+fn review_answer(agent: Option<&str>) -> ReviewAnswer {
     match agent {
-        None | Some("claude-code") => Some(ReviewAnswer::AskClaudeCode),
-        Some("gemini") => Some(ReviewAnswer::AskGemini),
-        Some(innerwarden_agent_guard::hermes_hook::AGENT) => Some(ReviewAnswer::AskHermes),
-        Some("codex") => Some(ReviewAnswer::WarnCodex),
-        Some(_) => None,
+        None | Some("claude-code") => ReviewAnswer::AskClaudeCode,
+        Some(innerwarden_agent_guard::hermes_hook::AGENT) => ReviewAnswer::AskHermes,
+        Some("codex") => ReviewAnswer::WarnCodex,
+        Some(_) => ReviewAnswer::Refuse,
     }
 }
 
-/// The line the agent reads for a review, with the guard's reason. Pure, so
-/// each agent's words are tested on their own.
-fn review_answer_line(answer: ReviewAnswer, explanation: &str) -> String {
+/// "InnerWarden flagged this call for review", with the guard's reason.
+fn review_flagged(explanation: &str) -> String {
     let explanation = explanation.trim();
-    let flagged = if explanation.is_empty() {
+    if explanation.is_empty() {
         "InnerWarden flagged this call for review.".to_string()
     } else {
         format!("InnerWarden flagged this call for review: {explanation}.")
-    };
+    }
+}
+
+/// The line the agent reads on stdout for a review, with the guard's reason.
+/// `None` for [`ReviewAnswer::Refuse`], which answers on stderr
+/// ([`review_refusal_line`]). Pure, so each agent's words are tested on
+/// their own.
+fn review_answer_line(answer: ReviewAnswer, explanation: &str) -> Option<String> {
+    let flagged = review_flagged(explanation);
     let ask = format!("{flagged} It runs only if you approve it.");
     let json = match answer {
         ReviewAnswer::AskClaudeCode => serde_json::json!({
@@ -1566,11 +1583,6 @@ fn review_answer_line(answer: ReviewAnswer, explanation: &str) -> String {
                 "permissionDecision": "ask",
                 "permissionDecisionReason": ask,
             }
-        }),
-        ReviewAnswer::AskGemini => serde_json::json!({
-            "decision": "ask",
-            "reason": ask,
-            "systemMessage": ask,
         }),
         ReviewAnswer::AskHermes => serde_json::json!({
             "action": "approve",
@@ -1582,8 +1594,18 @@ fn review_answer_line(answer: ReviewAnswer, explanation: &str) -> String {
                  instead, connect the hook with --block-review."
             ),
         }),
+        ReviewAnswer::Refuse => return None,
     };
-    json.to_string()
+    Some(json.to_string())
+}
+
+/// What the hook writes to stderr when it refuses a review for an agent it
+/// cannot ask the person through ([`ReviewAnswer::Refuse`]).
+fn review_refusal_line(explanation: &str) -> String {
+    format!(
+        "{} This agent cannot be relied on to ask you first, so InnerWarden refused it.",
+        review_flagged(explanation)
+    )
 }
 
 /// Whether a verdict is a `review`.
@@ -1718,16 +1740,23 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         std::process::ExitCode::from(2)
     } else if !monitor && is_review(&verdict) {
         // A review no policy refuses goes to the person where the agent can
-        // ask, and is shown to them where it cannot. It used to run here
-        // without a word to anyone.
-        if let Some(answer) = review_answer(agent_flag(rest).as_deref()) {
-            let expl = verdict
-                .get("explanation")
-                .and_then(|e| e.as_str())
-                .unwrap_or("");
-            println!("{}", review_answer_line(answer, expl));
+        // ask, is shown to them on Codex, which cannot ask, and is refused
+        // for every other agent. It used to run here without a word to anyone.
+        let expl = verdict
+            .get("explanation")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        match review_answer_line(review_answer(agent_flag(rest).as_deref()), expl) {
+            Some(line) => {
+                println!("{line}");
+                std::process::ExitCode::SUCCESS
+            }
+            None => {
+                eprintln!("{}", review_refusal_line(expl));
+                eprintln!("{}", hook_block_remedy(&verdict));
+                std::process::ExitCode::from(2)
+            }
         }
-        std::process::ExitCode::SUCCESS
     } else {
         std::process::ExitCode::SUCCESS
     }
@@ -3698,7 +3727,7 @@ fn help_text() -> String {
            {p} check \"$CMD\" || echo blocked\n\
          \n\
          proxy --mode: advisory | warn | guard (default) | kill\n\
-         install --block-review also blocks `review` verdicts (default: a review asks you)\n\
+         install --block-review refuses every `review` (default: a review asks you on Claude Code and Hermes, runs with a warning on Codex, is refused elsewhere)\n\
          install/hook --monitor records every command but never blocks (observe-only)\n\
          notify: set channels once (Telegram/Slack/...); a deny verdict pings them.\n  \
            {p} notify --telegram-token <T> --telegram-chat <C> [--test]\n\
@@ -4500,22 +4529,28 @@ mod tests {
     }
 
     #[test]
-    fn review_answer_asks_where_the_agent_can_and_warns_on_codex() {
-        assert_eq!(review_answer(None), Some(ReviewAnswer::AskClaudeCode));
+    fn review_answer_asks_where_the_agent_can_warns_on_codex_and_refuses_elsewhere() {
+        assert_eq!(review_answer(None), ReviewAnswer::AskClaudeCode);
         assert_eq!(
             review_answer(Some("claude-code")),
-            Some(ReviewAnswer::AskClaudeCode)
+            ReviewAnswer::AskClaudeCode
         );
-        assert_eq!(review_answer(Some("gemini")), Some(ReviewAnswer::AskGemini));
-        assert_eq!(review_answer(Some("hermes")), Some(ReviewAnswer::AskHermes));
-        assert_eq!(review_answer(Some("codex")), Some(ReviewAnswer::WarnCodex));
-        assert_eq!(review_answer(Some("cursor")), None);
+        assert_eq!(review_answer(Some("hermes")), ReviewAnswer::AskHermes);
+        assert_eq!(review_answer(Some("codex")), ReviewAnswer::WarnCodex);
+        // Gemini's ask is not proven to reach a person, and an agent this
+        // table does not know may not read an answer at all.
+        assert_eq!(review_answer(Some("gemini")), ReviewAnswer::Refuse);
+        assert_eq!(review_answer(Some("cursor")), ReviewAnswer::Refuse);
+        assert_eq!(review_answer(Some("openclaw")), ReviewAnswer::Refuse);
     }
 
     #[test]
     fn review_answer_line_speaks_each_agents_words_with_the_reason() {
         let read = |answer| -> serde_json::Value {
-            serde_json::from_str(&review_answer_line(answer, "world-writable permissions")).unwrap()
+            serde_json::from_str(
+                &review_answer_line(answer, "world-writable permissions").expect("a stdout line"),
+            )
+            .unwrap()
         };
         let claude = read(ReviewAnswer::AskClaudeCode);
         let out = &claude["hookSpecificOutput"];
@@ -4525,12 +4560,6 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("world-writable permissions"));
-        let gemini = read(ReviewAnswer::AskGemini);
-        assert_eq!(gemini["decision"], "ask");
-        assert!(gemini["reason"]
-            .as_str()
-            .unwrap()
-            .contains("world-writable"));
         let hermes = read(ReviewAnswer::AskHermes);
         assert_eq!(hermes["action"], "approve");
         assert!(hermes["message"]
@@ -4544,14 +4573,18 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("world-writable"));
+        // A refusal says nothing on stdout; its reason goes to stderr.
+        assert_eq!(review_answer_line(ReviewAnswer::Refuse, "x"), None);
+        let refusal = review_refusal_line("world-writable permissions");
+        assert!(refusal.contains("world-writable permissions"), "{refusal}");
+        assert!(refusal.contains("refused"), "{refusal}");
         // One line, so an agent that reads stdout as one JSON object can.
         for answer in [
             ReviewAnswer::AskClaudeCode,
-            ReviewAnswer::AskGemini,
             ReviewAnswer::AskHermes,
             ReviewAnswer::WarnCodex,
         ] {
-            assert!(!review_answer_line(answer, "").contains('\n'));
+            assert!(!review_answer_line(answer, "").unwrap().contains('\n'));
         }
     }
 

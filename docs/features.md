@@ -145,21 +145,34 @@ The hook answers each agent in the words that agent reads. In enforce mode
 | Agent | `allow` | `review` | `deny` |
 |---|---|---|---|
 | Claude Code | runs | asks you (`permissionDecision: "ask"`, with the guard's reason) | refused |
-| Gemini CLI | runs | asks you (`decision: "ask"`, with the reason) | refused |
+| Gemini CLI | runs | refused, with the reason | refused |
 | Hermes Agent | runs | asks you through its approval gate (`action: "approve"`); refused when nobody is there to approve | refused |
+| any other agent | runs | refused, with the reason | refused |
 | Codex CLI | runs | runs, and Codex shows you a warning with the reason (`systemMessage`) | refused |
 
 Codex CLI has no way for a hook to ask the person: it reads an `ask` as
 unsupported and runs the call. Refusing every review there would also refuse
 ordinary work (a program named by a variable, a value an earlier tool
-returned), so a review runs and is shown, never silent.
+returned), so on Codex a review runs: Codex shows you the warning, but it
+does not wait for you. Use `--block-review` to refuse reviews there.
+
+Gemini CLI reads `decision: "ask"`, but in 0.68.0 that ask is not sure to
+reach a person: a tool with no confirmation to show runs at once, and the
+non-interactive path was not followed. So on Gemini a review is refused with
+the reason, as a deny is. The same holds for any agent this table does not
+list: an answer it may not read would let the review run unseen.
+
+Hermes Agent's approval gate (v0.23.1, `request_tool_approval`) asks the
+person in a chat or through its gateway and refuses when nobody can answer.
+It lets the call run without asking when you set Hermes to approve on its
+own: yolo, `approvals.mode: off`, or `approvals.cron_mode` /
+`approvals.single_query_mode` set to approve.
 
 A review that carries a signal no agent should act on unasked (fetch and
 execute, an obfuscated command, a persistence entry, a near-miss package
 name) is refused like a deny, on every agent. `--block-review` refuses every
-review. Monitor mode (`--monitor`) refuses and asks nothing: every verdict
-runs and is recorded. An agent this table does not list keeps the older
-answer: a review runs, with nothing said to the agent.
+review. Monitor mode (`--monitor`) never refuses: every verdict runs, is
+recorded, and nothing is asked.
 
 What each agent does with the answer is read from its own source (Claude
 Code's hooks reference, Gemini CLI 0.68.0, Hermes Agent v0.23.1, Codex CLI

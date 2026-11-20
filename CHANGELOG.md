@@ -18,12 +18,13 @@ the text of a command; what it does not see is written down, as measured:
 - **A review asks you instead of passing unseen.** In enforce mode the hook
   used to refuse a `deny` and let a `review` run without a word (`chmod 777`
   on a folder, for one). It now hands a review to the person: Claude Code
-  gets `permissionDecision: "ask"` with the reason, Gemini CLI
-  `decision: "ask"`, and Hermes Agent `action: "approve"`, which its
-  approval gate refuses when nobody is there. Codex CLI has no way for a hook
-  to ask, so there a review runs with a warning Codex shows you.
-  `--block-review` still refuses every review, and monitor mode still asks
-  nothing. [What the hook does with each verdict](docs/features.md#what-an-agents-hook-does-with-each-verdict).
+  gets `permissionDecision: "ask"` with the reason, and Hermes Agent
+  `action: "approve"`, which its approval gate refuses when nobody is there.
+  Codex CLI has no way for a hook to ask, so there a review runs with a
+  warning Codex shows you. Gemini CLI, whose ask is not sure to reach a
+  person, and any other agent refuse a review with the reason.
+  `--block-review` still refuses every review, and monitor mode still never
+  refuses. [What the hook does with each verdict](docs/features.md#what-an-agents-hook-does-with-each-verdict).
 - **What a pipe hands a shell on its input is its script.** Text that a pipe
   or a here-string hands a shell or an interpreter on its input is read as
   that program's script when the line writes it out (`echo`, `printf`, a
