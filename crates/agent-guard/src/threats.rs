@@ -16251,21 +16251,56 @@ fn searches_for_narrow_text(segment: &str) -> bool {
         patterns.extend(positional);
     }
     !patterns.is_empty()
-        && patterns.iter().all(|pattern| {
-            let narrow_char = |c: char| {
-                c.is_ascii_alphanumeric()
-                    || matches!(
-                        c,
-                        ' ' | '_' | '-' | ':' | '#' | '@' | '/' | '<' | '>' | ',' | '='
-                    )
-                    || (fixed && c == '.')
-            };
-            pattern.chars().count() >= 3
-                && pattern.chars().filter(char::is_ascii_alphanumeric).count() >= 2
-                && pattern.chars().all(narrow_char)
-                && credential_hunt_token(pattern).is_none()
-                && !names_credential_marker(pattern)
-        })
+        && patterns
+            .iter()
+            .all(|pattern| pattern_is_narrow(pattern, fixed))
+}
+
+/// Whether one grep pattern is a narrow text: at least three characters,
+/// two of them letters or digits, the rest of a short set that a regular
+/// expression does not widen (`.` only when `fixed`, a fixed string), and
+/// none a word a hunt for secrets looks for ([`credential_hunt_token`]) nor
+/// a credential marker ([`names_credential_marker`]). What
+/// [`searches_for_narrow_text`] asks of each pattern of a shell `grep`, and
+/// what the search tools of an agent are asked of theirs
+/// ([`crate::file_tools::file_read_call_in`]).
+pub fn pattern_is_narrow(pattern: &str, fixed: bool) -> bool {
+    let narrow_char = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                ' ' | '_' | '-' | ':' | '#' | '@' | '/' | '<' | '>' | ',' | '='
+            )
+            || (fixed && c == '.')
+    };
+    pattern.chars().count() >= 3
+        && pattern.chars().filter(char::is_ascii_alphanumeric).count() >= 2
+        && pattern.chars().all(narrow_char)
+        && credential_hunt_token(pattern).is_none()
+        && !names_credential_marker(pattern)
+}
+
+/// Whether a file glob that limits a search (`*.pem`, `**/.ssh/*`,
+/// `.aws/**`, `*credentials*`) aims at secrets: a word a hunt for secrets
+/// looks for, a credential marker, the name of a place or a kind of file
+/// where logins are kept, or a hidden folder or file (`.config/**`, `.*`).
+/// Read wide on purpose: a glob that limits a search to source files
+/// (`*.rs`, `src/**/*.ts`, `*.md`) names none of them.
+pub fn glob_aims_at_secrets(glob: &str) -> bool {
+    static PLACE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let place = PLACE.get_or_init(|| {
+        regex::Regex::new(
+            r"(?i)(^|[^a-z0-9])(ssh|aws|gnupg|gpg|pem|p12|pfx|jks|keystore|env|netrc|npmrc|pypirc|token|secret|id_|kube|vault|docker|gcloud|azure|ppk|asc|kdbx|htpasswd|shadow)",
+        )
+        .expect("static secret place regex")
+    });
+    let hidden = glob
+        .split(['/', '{', ','])
+        .any(|part| part.starts_with('.') && part != "." && part != "..");
+    hidden
+        || credential_hunt_token(glob).is_some()
+        || names_credential_marker(glob)
+        || place.is_match(glob)
 }
 
 /// A known credential prefix or key marker in a grep pattern (`AKIA`,
@@ -16274,13 +16309,18 @@ fn searches_for_narrow_text(segment: &str) -> bool {
 /// character that is not a letter or digit. A recursive search of a home or
 /// a wide root for one of these is a hunt for keys, never a narrow text: it
 /// keeps the hard refusal (`grep -r AKIA ~` is `deny`, as before
-/// `searches_home_for_narrow_text`).
+/// `searches_home_for_narrow_text`). The base64 a key's body starts with
+/// is one too (`b3BlbnNzaC1rZXk`, `openssh-key`; `AAAAB3NzaC1`,
+/// `AAAAC3NzaC1`; `MII` and a letter, a DER key): a search for it prints a
+/// line of the key. The word boundaries are the regex's `\b`: until
+/// 2026-11-20 two of them were backspace characters in the source, and
+/// `BEGIN` and `pass` alone were taken for narrow text.
 fn names_credential_marker(pattern: &str) -> bool {
     static MARKER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     MARKER
         .get_or_init(|| {
             regex::Regex::new(
-                r"(?i)(^|[^a-z0-9])(akia|asia|aroa|aida|gh[pousr]_|github_pat_|glpat-|sk-|sk_(live|test)_|rk_live_|xox[abposr]-|aiza|ya29.|npm_[a-z0-9]|pypi-|hf_[a-z0-9]|-{3,}|begin|private|ssh-(rsa|ed25519|dss)|ecdsa-sha2|bearer|auth|cred|passw|pwd|pass|key|jwt|eyj)",
+                r"(?i)(^|[^a-z0-9])(akia|asia|aroa|aida|gh[pousr]_|github_pat_|glpat-|sk-|sk_(live|test)_|rk_live_|xox[abposr]-|aiza|ya29.|npm_[a-z0-9]|pypi-|hf_[a-z0-9]|-{3,}|begin\b|private|ssh-(rsa|ed25519|dss)|ecdsa-sha2|bearer|auth|cred|passw|pwd|pass\b|key|jwt|eyj|b3blbnnzac1rzxk|aaaa[bc]3nzac1|mii[a-z][a-z0-9+/])",
             )
             .expect("static credential marker regex")
         })

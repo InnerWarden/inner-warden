@@ -247,7 +247,9 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              API key with it) and the project's secrets are not shown to the jailed\n  \
              command. Of the variables you exported, only what a shell needs goes in:\n  \
              PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*, TERM, TZ, TMPDIR, COLORTERM\n  \
-             and the proxy settings (*_PROXY, NO_PROXY). Every other one stays out, an\n  \
+             and the proxy settings (HTTP_PROXY, HTTPS_PROXY, FTP_PROXY, ALL_PROXY,\n  \
+             NO_PROXY, in capitals or lowercase); an LC_* variable goes in with its value\n  \
+             as it is. Every other one stays out, an\n  \
              API key or a DATABASE_URL holding a password alike, and contain names the\n  \
              ones it kept out (never their values). An agent that reads its key or any\n  \
              other variable from the environment needs --pass-env NAME.\n\
@@ -714,7 +716,7 @@ mod tests {
         let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
         let help = flat(&usage("contain", &[]).expect("contain has usage"));
         for said in [
-            "Of the variables you exported, only what a shell needs goes in: PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*, TERM, TZ, TMPDIR, COLORTERM and the proxy settings (*_PROXY, NO_PROXY).",
+            "Of the variables you exported, only what a shell needs goes in: PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*, TERM, TZ, TMPDIR, COLORTERM and the proxy settings (HTTP_PROXY, HTTPS_PROXY, FTP_PROXY, ALL_PROXY, NO_PROXY, in capitals or lowercase); an LC_* variable goes in with its value as it is.",
             "Every other one stays out, an API key or a DATABASE_URL holding a password alike, and contain names the ones it kept out (never their values).",
             "needs --pass-env NAME",
             "--pass-env NAME hand one variable of your environment to the jailed command",
