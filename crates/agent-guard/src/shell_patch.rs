@@ -1418,7 +1418,6 @@ mod tests {
             "${A}_pat{c,x}h < /tmp/change.patch",
             "$(echo apply_patch) < /tmp/change.patch",
             "`printf apply_patch` < /tmp/change.patch",
-            "for a in apply; do ${a}_patch < /tmp/change.patch; done",
             "a=foo; a=apply; ${a}_patch < /tmp/change.patch",
             "$(echo apply)_patch '*** Begin Patch\n*** Delete File: /home/dev/.bashrc\n*** End Patch'",
         ]
@@ -1438,6 +1437,11 @@ mod tests {
         // the reason stays the one the plain name gets.
         assert_eq!(
             shell_patch("a=apply; ${a}_patch < /tmp/change.patch"),
+            ShellPatch::Unreadable(NOT_WRITTEN)
+        );
+        // So does a `for` list the shell reader follows.
+        assert_eq!(
+            shell_patch("for a in apply; do ${a}_patch < /tmp/change.patch; done"),
             ShellPatch::Unreadable(NOT_WRITTEN)
         );
     }

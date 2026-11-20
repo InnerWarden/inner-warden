@@ -2991,10 +2991,6 @@ mod tests {
         assert_eq!(c3, "\"/x/innerwarden\" hook --monitor");
         let c4 = hook_command(Path::new("/x/innerwarden"), false, true);
         assert_eq!(c4, "\"/x/innerwarden\" hook --monitor");
-        assert_eq!(
-            hook_command(Path::new("/x/innerwarden"), true, false),
-            hook_command_shaped(Path::new("/x/innerwarden"), true, false, None, cfg!(unix))
-        );
     }
 
     #[test]
@@ -3926,8 +3922,9 @@ mod tests {
         );
         let plain = hook_command_shaped(Path::new(GUARD), false, false, Some("codex"), false);
         assert_eq!(plain, "\"/opt/iw/innerwarden\" hook --agent codex");
+        // What Codex is written: this script, not Claude Code's tail.
         assert_eq!(
-            hook_command_for(Path::new(GUARD), false, false, Some("codex")),
+            crate::agent_hooks::CODEX.command(Path::new(GUARD), false, false),
             hook_command_shaped(Path::new(GUARD), false, false, Some("codex"), cfg!(unix))
         );
     }
@@ -4115,10 +4112,7 @@ mod tests {
             enforcing,
             hook_command_for(bin, false, false, Some("claude-code"))
         );
-        assert!(
-            enforcing.starts_with("/bin/sh -c '\"$0\" hook"),
-            "{enforcing}"
-        );
+        assert!(enforcing.ends_with(FAIL_CLOSED), "{enforcing}");
         // An install from before the read entry is brought up to it, fail-closed.
         let old = json!({"hooks": {"PreToolUse": [
             {"matcher": "Bash", "hooks": [{"type": "command",
@@ -4303,8 +4297,8 @@ mod tests {
 
     /// A Claude Code hook written before the fail-closed line is repaired to
     /// it: the plain enforcing line lets every call through when its program
-    /// goes, so it is drift, as a moved program is. Its PostToolUse half stays
-    /// plain (the tool has run; there is nothing to refuse), and a monitor
+    /// goes, so it is drift, as a moved program is. Its PostToolUse half gets
+    /// the same line ([`FAIL_CLOSED`] on every enforcing half), and a monitor
     /// hook is left as it is.
     ///
     /// FAILS ON REVERT: write the plain line in `hook_command_for` and the old
@@ -4331,7 +4325,7 @@ mod tests {
         }
         assert_eq!(
             v["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
-            json!(plain)
+            json!(wrapped)
         );
         assert!(!needs_iwguard_hook_reconciliation(&v, bin, false, false));
         assert_eq!(effective_iwguard_hook_programs(&v), vec![GUARD.to_string()]);

@@ -1549,7 +1549,7 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     if let Some(exit) = screen_shell_patch(&buf, rest, monitor, demo) {
         return exit;
     }
-    if let Some(exit) = refuse_a_waiting_interpreter(&buf, rest, monitor) {
+    if let Some(exit) = refuse_a_waiting_interpreter(&buf, rest, monitor, demo) {
         return exit;
     }
 
@@ -1637,6 +1637,7 @@ fn refuse_a_waiting_interpreter(
     buf: &str,
     rest: &[String],
     monitor: bool,
+    demo: bool,
 ) -> Option<std::process::ExitCode> {
     use innerwarden_agent_guard::interactive::{interactive_interpreter, INTERACTIVE_REFUSAL};
     if monitor {
@@ -1651,11 +1652,27 @@ fn refuse_a_waiting_interpreter(
         HookInput::Commands(lines) => lines,
         _ => return None,
     };
-    let program = lines
-        .iter()
-        .find_map(|command| interactive_interpreter(command))?;
+    let (command, program) = lines.iter().find_map(|command| {
+        interactive_interpreter(command).map(|program| (command.as_str(), program))
+    })?;
+    let explanation = format!("`{program}` {INTERACTIVE_REFUSAL}");
+    // Recorded as every refusal of the hook is, so the record, `status` and
+    // the dashboard show it: a refusal said only to the agent was not there.
+    let verdict = serde_json::json!({
+        "command": command,
+        "risk_score": 60,
+        "severity": "high",
+        "signals": [{
+            "signal": "interactive_interpreter",
+            "score": 60,
+            "detail": explanation,
+        }],
+        "recommendation": "deny",
+        "explanation": explanation,
+    });
+    record_shell(buf, rest, command, &verdict, false, true, None, demo);
     eprintln!(
-        "InnerWarden blocked this command (recommendation=deny): `{program}` {INTERACTIVE_REFUSAL}.\n  \
+        "InnerWarden blocked this command (recommendation=deny): {explanation}.\n  \
          Give it its script or its code on the same line (`{program} script`, `{program} -c '...'`) \
          so the guard reads what runs."
     );

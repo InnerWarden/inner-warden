@@ -178,7 +178,13 @@ impl HookSpec {
     /// path. Codex's trust covers the line and the timeout, so a line that
     /// moved with a version would switch the hook off at every upgrade.
     pub fn command(&self, guard_bin: &Path, block_review: bool, monitor: bool) -> String {
-        hook::hook_command_shaped(guard_bin, block_review, monitor, Some(self.agent), cfg!(unix))
+        hook::hook_command_shaped(
+            guard_bin,
+            block_review,
+            monitor,
+            Some(self.agent),
+            cfg!(unix),
+        )
     }
 
     /// How long the agent waits for the hook before it runs the tool.

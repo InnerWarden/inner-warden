@@ -383,7 +383,7 @@ fn lock(dir: &Path, locked: bool) {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
-/// Claude Code's enforcing hook is the fail-closed script: with its program
+/// Claude Code's enforcing hook is the fail-closed line: with its program
 /// gone, Claude Code refuses every tool call, the one that would mend the
 /// file included. When the hook cannot be taken out (here `~/.claude` is
 /// read-only), `uninstall` stops with the binary and the configuration in
@@ -403,7 +403,7 @@ fn a_claude_code_hook_that_cannot_be_removed_stops_the_uninstall() {
     let installed = text(&run_cli(&exe, home.path(), &["install", "claude-code"]));
     let settings = std::fs::read_to_string(claude.join("settings.json")).unwrap_or_default();
     assert!(
-        settings.contains("/bin/sh -c") && settings.contains("hook --agent claude-code"),
+        settings.contains("[ $s -ge 126 ] && exit 2") && settings.contains("hook --agent claude-code"),
         "the install wrote no enforcing hook, so the rest of this test proves \
          nothing:\n{installed}\n{settings}"
     );
