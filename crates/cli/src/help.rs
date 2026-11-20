@@ -162,7 +162,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              blocks the call, exit 0 allows it. Any other tool call always allows, so it\n  \
              is never wedged.\n\
              \n  \
-             --block-review   block `review` verdicts too (default: deny only)\n  \
+             --block-review   block `review` verdicts too (default: a review asks you)\n  \
              --monitor        record every command and never block"
         ),
         "setup" => format!(
@@ -184,7 +184,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              none is refused rather than assumed.\n\
              \n  \
              --settings PATH   write to this settings file instead of the default\n  \
-             --block-review    block `review` verdicts too (default: deny only)\n  \
+             --block-review    block `review` verdicts too (default: a review asks you)\n  \
              --monitor         record every command and never block"
         ),
         "uninstall" => format!(

@@ -137,6 +137,35 @@ list, with every limit.
 The verdict is JSON: a recommendation (`allow` / `review` / `deny`), a risk
 score, matched signals, and a short explanation.
 
+### What an agent's hook does with each verdict
+
+The hook answers each agent in the words that agent reads. In enforce mode
+(the default of `agents connect`):
+
+| Agent | `allow` | `review` | `deny` |
+|---|---|---|---|
+| Claude Code | runs | asks you (`permissionDecision: "ask"`, with the guard's reason) | refused |
+| Gemini CLI | runs | asks you (`decision: "ask"`, with the reason) | refused |
+| Hermes Agent | runs | asks you through its approval gate (`action: "approve"`); refused when nobody is there to approve | refused |
+| Codex CLI | runs | runs, and Codex shows you a warning with the reason (`systemMessage`) | refused |
+
+Codex CLI has no way for a hook to ask the person: it reads an `ask` as
+unsupported and runs the call. Refusing every review there would also refuse
+ordinary work (a program named by a variable, a value an earlier tool
+returned), so a review runs and is shown, never silent.
+
+A review that carries a signal no agent should act on unasked (fetch and
+execute, an obfuscated command, a persistence entry, a near-miss package
+name) is refused like a deny, on every agent. `--block-review` refuses every
+review. Monitor mode (`--monitor`) refuses and asks nothing: every verdict
+runs and is recorded. An agent this table does not list keeps the older
+answer: a review runs, with nothing said to the agent.
+
+What each agent does with the answer is read from its own source (Claude
+Code's hooks reference, Gemini CLI 0.68.0, Hermes Agent v0.23.1, Codex CLI
+0.167.2) and held by tests that feed each agent's payload through the line
+`agents connect` writes; it was not measured in a running chat of each agent.
+
 ### Where decisions are recorded
 
 On its own, InnerWarden keeps its record in the home of the account that runs

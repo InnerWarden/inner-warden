@@ -687,7 +687,8 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
 /// the tool call as JSON on stdin, extracts the Bash command, runs the guardrail
 /// in-process, and exits per Claude Code's hook contract: exit 2 BLOCKS the tool
 /// call (its stderr is shown to the agent), exit 0 allows it. A `deny` blocks;
-/// with --block-review a `review` blocks too. No command in the payload (or an
+/// a `review` asks the person where the agent can ([`review_answer`]), and
+/// with --block-review it blocks too. No command in the payload (or an
 /// unparsable payload) allows, so a non-Bash tool call is never wedged.
 /// Extract the shell command from a Claude Code PreToolUse payload (empty when
 /// absent/unparsable). Pure/tested; shared by `hook_verdict` and the notify path.
@@ -1513,6 +1514,83 @@ fn apply_taint(
     verdict
 }
 
+/// What an enforcing hook says about a `review` that no policy refuses, for
+/// the agent the hook line names: written to stdout, with exit 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewAnswer {
+    /// Claude Code: `hookSpecificOutput.permissionDecision: "ask"`.
+    AskClaudeCode,
+    /// Gemini CLI (0.68.0 `scheduler/hook-utils.ts`): `decision: "ask"` is a
+    /// confirmation the person must give, whatever the policy said.
+    AskGemini,
+    /// Hermes Agent (v0.23.1 `agent/shell_hooks.py`): `action: "approve"`
+    /// goes to its human approval gate, which refuses when nobody is there.
+    AskHermes,
+    /// Codex CLI (0.167.2, `hooks/src/events/pre_tool_use.rs`) has no ask: it
+    /// reads `permissionDecision: "ask"` as unsupported and runs the tool. A
+    /// `systemMessage` is shown to the person as a warning, so the review
+    /// runs, but not unseen. Refusing every review there would refuse
+    /// ordinary work (a program named by a variable, a value read from a
+    /// file); `--block-review` refuses them for whoever wants that.
+    WarnCodex,
+}
+
+/// How a review is answered for `agent` (the hook line's `--agent`). A hook
+/// line with no agent is the Claude Code line the guard always wrote. An
+/// agent this table does not know keeps the old answer (the call runs, with
+/// nothing on stdout): no answer in a shape it does not read.
+fn review_answer(agent: Option<&str>) -> Option<ReviewAnswer> {
+    match agent {
+        None | Some("claude-code") => Some(ReviewAnswer::AskClaudeCode),
+        Some("gemini") => Some(ReviewAnswer::AskGemini),
+        Some(innerwarden_agent_guard::hermes_hook::AGENT) => Some(ReviewAnswer::AskHermes),
+        Some("codex") => Some(ReviewAnswer::WarnCodex),
+        Some(_) => None,
+    }
+}
+
+/// The line the agent reads for a review, with the guard's reason. Pure, so
+/// each agent's words are tested on their own.
+fn review_answer_line(answer: ReviewAnswer, explanation: &str) -> String {
+    let explanation = explanation.trim();
+    let flagged = if explanation.is_empty() {
+        "InnerWarden flagged this call for review.".to_string()
+    } else {
+        format!("InnerWarden flagged this call for review: {explanation}.")
+    };
+    let ask = format!("{flagged} It runs only if you approve it.");
+    let json = match answer {
+        ReviewAnswer::AskClaudeCode => serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "ask",
+                "permissionDecisionReason": ask,
+            }
+        }),
+        ReviewAnswer::AskGemini => serde_json::json!({
+            "decision": "ask",
+            "reason": ask,
+            "systemMessage": ask,
+        }),
+        ReviewAnswer::AskHermes => serde_json::json!({
+            "action": "approve",
+            "message": ask,
+        }),
+        ReviewAnswer::WarnCodex => serde_json::json!({
+            "systemMessage": format!(
+                "{flagged} Codex cannot ask you first, so it runs. To refuse reviews \
+                 instead, connect the hook with --block-review."
+            ),
+        }),
+    };
+    json.to_string()
+}
+
+/// Whether a verdict is a `review`.
+fn is_review(verdict: &serde_json::Value) -> bool {
+    verdict.get("recommendation").and_then(|r| r.as_str()) == Some("review")
+}
+
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let block_review = rest.iter().any(|a| a == "--block-review");
     // Monitor (observe-only): still records every command into the graph, but never
@@ -1638,6 +1716,18 @@ fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
         // here was an instruction the agent could follow to lift its own block.
         eprintln!("{}", hook_block_remedy(&verdict));
         std::process::ExitCode::from(2)
+    } else if !monitor && is_review(&verdict) {
+        // A review no policy refuses goes to the person where the agent can
+        // ask, and is shown to them where it cannot. It used to run here
+        // without a word to anyone.
+        if let Some(answer) = review_answer(agent_flag(rest).as_deref()) {
+            let expl = verdict
+                .get("explanation")
+                .and_then(|e| e.as_str())
+                .unwrap_or("");
+            println!("{}", review_answer_line(answer, expl));
+        }
+        std::process::ExitCode::SUCCESS
     } else {
         std::process::ExitCode::SUCCESS
     }
@@ -3608,7 +3698,7 @@ fn help_text() -> String {
            {p} check \"$CMD\" || echo blocked\n\
          \n\
          proxy --mode: advisory | warn | guard (default) | kill\n\
-         install --block-review also blocks `review` verdicts (default: deny only)\n\
+         install --block-review also blocks `review` verdicts (default: a review asks you)\n\
          install/hook --monitor records every command but never blocks (observe-only)\n\
          notify: set channels once (Telegram/Slack/...); a deny verdict pings them.\n  \
            {p} notify --telegram-token <T> --telegram-chat <C> [--test]\n\
@@ -4407,6 +4497,62 @@ mod tests {
         // An ordinary file says nothing.
         let ordinary = verdict_in(&read(format!("{repo_s}/src/main.rs")), &home_s);
         assert_eq!(ordinary["recommendation"], "allow", "{ordinary}");
+    }
+
+    #[test]
+    fn review_answer_asks_where_the_agent_can_and_warns_on_codex() {
+        assert_eq!(review_answer(None), Some(ReviewAnswer::AskClaudeCode));
+        assert_eq!(
+            review_answer(Some("claude-code")),
+            Some(ReviewAnswer::AskClaudeCode)
+        );
+        assert_eq!(review_answer(Some("gemini")), Some(ReviewAnswer::AskGemini));
+        assert_eq!(review_answer(Some("hermes")), Some(ReviewAnswer::AskHermes));
+        assert_eq!(review_answer(Some("codex")), Some(ReviewAnswer::WarnCodex));
+        assert_eq!(review_answer(Some("cursor")), None);
+    }
+
+    #[test]
+    fn review_answer_line_speaks_each_agents_words_with_the_reason() {
+        let read = |answer| -> serde_json::Value {
+            serde_json::from_str(&review_answer_line(answer, "world-writable permissions")).unwrap()
+        };
+        let claude = read(ReviewAnswer::AskClaudeCode);
+        let out = &claude["hookSpecificOutput"];
+        assert_eq!(out["hookEventName"], "PreToolUse");
+        assert_eq!(out["permissionDecision"], "ask");
+        assert!(out["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("world-writable permissions"));
+        let gemini = read(ReviewAnswer::AskGemini);
+        assert_eq!(gemini["decision"], "ask");
+        assert!(gemini["reason"]
+            .as_str()
+            .unwrap()
+            .contains("world-writable"));
+        let hermes = read(ReviewAnswer::AskHermes);
+        assert_eq!(hermes["action"], "approve");
+        assert!(hermes["message"]
+            .as_str()
+            .unwrap()
+            .contains("world-writable"));
+        // Codex: a warning only, never a field it reads as a decision.
+        let codex = read(ReviewAnswer::WarnCodex);
+        assert_eq!(codex.as_object().unwrap().len(), 1, "{codex}");
+        assert!(codex["systemMessage"]
+            .as_str()
+            .unwrap()
+            .contains("world-writable"));
+        // One line, so an agent that reads stdout as one JSON object can.
+        for answer in [
+            ReviewAnswer::AskClaudeCode,
+            ReviewAnswer::AskGemini,
+            ReviewAnswer::AskHermes,
+            ReviewAnswer::WarnCodex,
+        ] {
+            assert!(!review_answer_line(answer, "").contains('\n'));
+        }
     }
 
     #[test]

@@ -218,6 +218,12 @@ Whatever agent you run, there is a mechanism and a command for it:
   there. Needs Hermes Agent v0.22.5 or newer; measured through Hermes
   Agent v0.23.1's own hook runner (`hermes hooks test`), not in a full chat.
   Reversible with `agents disconnect hermes`.
+- **What the hook does with a verdict.** In enforce mode a `deny` is
+  refused and an `allow` runs on every agent. A `review` asks you on
+  Claude Code, Gemini CLI and Hermes Agent, with the guard's reason. Codex
+  CLI has no way for a hook to ask, so there a review runs with a warning
+  Codex shows you. `--block-review` refuses every review; monitor mode
+  refuses and asks nothing. Details: [docs/features.md](docs/features.md).
 - **The hook line fails closed.** On Linux and macOS an enforcing hook line
   (Claude Code, Codex, Gemini) runs the guard inside a small `/bin/sh`
   script: if the innerwarden program is missing, cannot start, is killed or
