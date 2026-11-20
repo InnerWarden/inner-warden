@@ -2134,6 +2134,9 @@ pub struct JailInputs {
     /// Code settings runs, shown read-only from the host in the jail's own
     /// `~/.claude`. Found by the real run ([`crate::contain_io`]).
     pub claude_hook_files: Vec<PathBuf>,
+    /// Each of the project's [`PROJECT_GUARD_NAMES`] that is there (and no
+    /// link), shown read-only for the run (Linux) or denied writing (macOS).
+    pub project_guard_files: Vec<PathBuf>,
     /// The CLI the guard's hook runs ([`hook_cli_for`]). macOS: denied
     /// writing with its folder ([`macos_hook_cli_denies`]).
     pub hook_cli: Option<PathBuf>,
@@ -2219,6 +2222,76 @@ pub(crate) const CLAUDE_READ_ONLY_SHARED: &[&str] = &[
     "output-styles",
     "local",
 ];
+/// What of a project the host's Claude Code loads when it opens it, and a
+/// jail may not change for it: the project's Claude Code folder and its
+/// MCP servers. Read-only in the jail where there; where not, what a jail
+/// makes there is checked after the run and before the next
+/// ([`project_settings_made_refusal`]).
+pub(crate) const PROJECT_GUARD_NAMES: [&str; 2] = [".claude", ".mcp.json"];
+
+/// PURE. Why a project's Claude Code file `name` that appeared while a
+/// jail ran there (it was not there when the jail started) keeps the next
+/// jail from starting, or `None`: `settings` is what it holds, `None`
+/// where it cannot be read as JSON (a link, too large, not JSON). The host's
+/// Claude Code loads it when it opens the project, so a file a program in
+/// the jail made with hooks, hooks off, permissions in bypass, every
+/// project server turned on or MCP servers would reach it.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn project_settings_made_refusal(
+    name: &str,
+    settings: Option<&serde_json::Value>,
+) -> Option<String> {
+    use serde_json::Value;
+    let said = |what: &str| {
+        Some(format!(
+            "{name} appeared while a jail ran in this project, and {what}; Claude Code on this \
+             machine would load it when it opens the project. Remove it (or what it sets) and \
+             start again"
+        ))
+    };
+    let Some(settings) = settings else {
+        return said("it cannot be read as JSON");
+    };
+    let Some(object) = settings.as_object() else {
+        return said("it is not a JSON object");
+    };
+    let non_empty = |key: &str| {
+        object.get(key).is_some_and(|v| match v {
+            Value::Object(map) => !map.is_empty(),
+            Value::Array(list) => !list.is_empty(),
+            Value::Null => false,
+            _ => true,
+        })
+    };
+    if non_empty("hooks") {
+        return said("it sets hooks");
+    }
+    if !matches!(
+        object.get("disableAllHooks"),
+        None | Some(Value::Bool(false))
+    ) {
+        return said("it sets disableAllHooks");
+    }
+    if object
+        .get("permissions")
+        .and_then(|p| p.get("defaultMode"))
+        .and_then(Value::as_str)
+        == Some("bypassPermissions")
+    {
+        return said("it sets permissions in bypass mode");
+    }
+    if !matches!(
+        object.get("enableAllProjectMcpServers"),
+        None | Some(Value::Bool(false))
+    ) {
+        return said("it turns every project MCP server on");
+    }
+    if non_empty("mcpServers") || non_empty("enabledMcpjsonServers") {
+        return said("it names MCP servers");
+    }
+    None
+}
+
 /// The launcher's copy, in the jail's own `~/.claude` (`source`), of the
 /// person's Claude Code settings file `at` (one of
 /// [`CLAUDE_GUARD_SETTINGS`]).
@@ -2464,7 +2537,7 @@ pub fn claude_settings_refusal(
         .and_then(|hooks| hooks.get("PreToolUse"))
         .and_then(serde_json::Value::as_array)
         .is_some_and(|entries| !entries.is_empty());
-    if pre_tool_use && !innerwarden_agent_guard::hook::has_iwguard_wiring(settings) {
+    if pre_tool_use && !innerwarden_agent_guard::hook::has_iwguard_hook(settings) {
         return Some(format!(
             "{name} sets PreToolUse hooks with none of InnerWarden's in them; \
              remove them, or add the guard's hook there (innerwarden setup), and start the \
@@ -3679,6 +3752,16 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
             .map(String::as_str)
             .collect::<Vec<_>>(),
     );
+    // --- the project's own Claude Code settings (`.claude`) and MCP
+    // servers (`.mcp.json`), read-only where they are there: the host's
+    // Claude Code loads them when it opens the project, so what a program
+    // in the jail wrote there (hooks off, a server, every project server
+    // on) reached the host. Where they are not there, the launcher checks
+    // what appears ([`PROJECT_GUARD_NAMES`]). ---
+    for path in &input.project_guard_files {
+        let at = path.to_string_lossy().to_string();
+        push(&["--ro-bind", &at, &at]);
+    }
 
     // --- git worktree admin dirs, AFTER the project bind; in the real run
     // from the descriptor the launcher opened just before bwrap starts
@@ -4149,6 +4232,14 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
             e(&path.to_string_lossy())
         ));
     }
+    // The project's Claude Code folder and MCP servers, where they are
+    // there: the host's Claude Code loads them ([`PROJECT_GUARD_NAMES`]).
+    for path in &input.project_guard_files {
+        p.push_str(&format!(
+            "(deny file-write* (subpath \"{}\"))\n",
+            e(&path.to_string_lossy())
+        ));
+    }
     // The CLI the guard's hook runs and the folder it is in, where the
     // account can write them: a program in the jail could otherwise put a
     // program of its own where the hook runs.
@@ -4172,6 +4263,14 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
     // beside the records: Claude Code is pointed at it, and writes there
     // alone. The launcher's copies of the person's settings in it, never.
     if let Some(claude) = &input.project_claude {
+        // Every project's folder denied first, this one's allowed after:
+        // a jail in one project never rewrites another's.
+        for dir in &claude.covered {
+            p.push_str(&format!(
+                "(deny file-write* (subpath \"{}\"))\n",
+                e(&dir.to_string_lossy())
+            ));
+        }
         p.push_str(&format!(
             "(allow file-write* (subpath \"{}\"))\n",
             e(&claude.source.to_string_lossy())
@@ -6242,6 +6341,7 @@ mod tests {
             gate_instance: None,
             claude_views: vec![PathBuf::from("/home/dev/.claude")],
             claude_hook_files: vec![],
+            project_guard_files: vec![],
             hook_cli: None,
             jail_writes: vec![],
             bind_fds: vec![],
@@ -8802,6 +8902,123 @@ mod tests {
             plan_project_claude(&[], Path::new("/x"), Path::new("/p")),
             None
         );
+    }
+
+    /// Final review of #352, item 4: the project's `PreToolUse` hooks pass
+    /// only where the guard's hook is the one in effect for `Bash`, not
+    /// where it is only wired under a matcher that leaves `Bash` out.
+    ///
+    /// FAILS ON REVERT: take the guard's wiring as its hook.
+    #[test]
+    fn a_project_hook_of_the_guards_that_leaves_bash_out_is_no_hook() {
+        use serde_json::json;
+        let guard = "/usr/local/bin/innerwarden hook --agent claude-code";
+        let wired_only = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Read", "hooks": [{"type": "command", "command": guard}]}
+        ]}});
+        assert!(project_settings_refusal(".claude/settings.json", &wired_only).is_some());
+        let effective = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": guard}]}
+        ]}});
+        assert_eq!(
+            project_settings_refusal(".claude/settings.json", &effective),
+            None
+        );
+    }
+
+    /// Final review of #352, item 1: a project's Claude Code file that
+    /// appeared while a jail ran keeps the next jail from starting where it
+    /// sets hooks, turns them off, puts permissions in bypass, turns every
+    /// project server on, or names MCP servers, or where it does not read;
+    /// one that sets none of these does not.
+    ///
+    /// FAILS ON REVERT: let any of these through.
+    #[test]
+    fn a_project_file_made_in_a_jail_that_reaches_the_host_refuses_the_next_start() {
+        use serde_json::json;
+        for refused in [
+            json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x"}]}]}}),
+            json!({"disableAllHooks": true}),
+            json!({"disableAllHooks": "no"}),
+            json!({"permissions": {"defaultMode": "bypassPermissions"}}),
+            json!({"enableAllProjectMcpServers": true}),
+            json!({"enabledMcpjsonServers": ["evil"]}),
+            json!({"mcpServers": {"evil": {"command": "nc"}}}),
+            json!([]),
+        ] {
+            let why =
+                project_settings_made_refusal("p/.claude/settings.local.json", Some(&refused))
+                    .unwrap_or_else(|| panic!("{refused} starts"));
+            assert!(why.contains("p/.claude/settings.local.json"), "{why}");
+        }
+        assert!(project_settings_made_refusal("p/.mcp.json", None).is_some());
+        for fine in [
+            json!({}),
+            json!({"permissions": {"allow": ["Bash(ls)"]}}),
+            json!({"hooks": {}, "disableAllHooks": false, "mcpServers": {}}),
+        ] {
+            assert_eq!(
+                project_settings_made_refusal("x", Some(&fine)),
+                None,
+                "{fine}"
+            );
+        }
+    }
+
+    /// Final review of #352, items 1 and 3: the project's `.claude` and
+    /// `.mcp.json`, where there, are read-only in a Linux jail after the
+    /// project's bind, and denied writing on macOS; on macOS every
+    /// project's own folder is denied writing before this one's is allowed.
+    ///
+    /// FAILS ON REVERT: drop either, and the jail writes what the host's
+    /// Claude Code loads, or another project's folder.
+    #[test]
+    fn the_projects_claude_files_are_read_only_and_other_projects_folders_unwritten() {
+        let mut input = identified_inputs();
+        input.project_guard_files = paths(&["/home/dev/proj/.claude", "/home/dev/proj/.mcp.json"]);
+        let got = build_linux_jail(&input).unwrap().bwrap_args;
+        let project = got
+            .windows(3)
+            .position(|w| w == ["--bind", "/home/dev/proj", "/home/dev/proj"])
+            .unwrap();
+        for path in ["/home/dev/proj/.claude", "/home/dev/proj/.mcp.json"] {
+            let at = got
+                .windows(3)
+                .position(|w| w == ["--ro-bind", path, path])
+                .unwrap_or_else(|| panic!("{path}: {got:?}"));
+            assert!(project < at, "{got:?}");
+        }
+        let mut mac = inputs(&["claude", "--print"]);
+        mac.project_guard_files = input.project_guard_files.clone();
+        let all = PathBuf::from("/home/dev/.local/state/innerwarden/jail-claude");
+        mac.project_claude = Some(ProjectClaude {
+            covered: vec![all.clone()],
+            folder: all.join("proj-0123456789abcdef"),
+            source: all.join("proj-0123456789abcdef"),
+        });
+        let profile = build_macos_profile(&mac).unwrap().profile;
+        let proj = profile
+            .find("(allow file-write* (subpath \"/home/dev/proj\"))")
+            .unwrap();
+        for path in ["/home/dev/proj/.claude", "/home/dev/proj/.mcp.json"] {
+            let deny = profile
+                .find(&format!("(deny file-write* (subpath \"{path}\"))"))
+                .unwrap_or_else(|| panic!("{path}: {profile}"));
+            assert!(proj < deny, "{profile}");
+        }
+        let deny_all = profile
+            .find(&format!(
+                "(deny file-write* (subpath \"{}\"))",
+                all.display()
+            ))
+            .unwrap();
+        let allow_own = profile
+            .find(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                all.join("proj-0123456789abcdef").display()
+            ))
+            .unwrap();
+        assert!(deny_all < allow_own, "{profile}");
     }
 
     /// Measured on the lab host (#352, second review): a profile that hides

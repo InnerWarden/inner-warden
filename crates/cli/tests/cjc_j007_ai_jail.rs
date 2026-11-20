@@ -4107,6 +4107,114 @@ fn a_jail_cannot_change_the_settings_that_carry_the_guards_hook() {
     }
 }
 
+/// Final review of #352, item 2: a jail wrote `~/.claude/CLAUDE.md` and a
+/// hook's script (`~/.claude/hooks/x.sh`, named in the person's settings)
+/// where the person has neither, and the next jail on the project loaded
+/// them from the project's own folder. Each is removed before the next run.
+///
+/// FAILS ON REVERT: keep what the jail wrote at a name the host lacks.
+#[cfg(target_os = "linux")]
+#[test]
+fn what_a_jail_writes_where_the_person_has_nothing_never_reaches_the_next() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    std::fs::write(
+        h.join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"sh ~/.claude/hooks/x.sh"}]}]}}"#,
+    )
+    .unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let write =
+        "mkdir -p \"$HOME/.claude/hooks\" && echo JAIL-WROTE > \"$HOME/.claude/CLAUDE.md\" && \
+                 echo JAIL-WROTE > \"$HOME/.claude/hooks/x.sh\" && echo WROTE";
+    let first = jail_sh(false, h, project.path(), write);
+    let out = String::from_utf8_lossy(&first.stdout);
+    assert!(
+        out.contains("WROTE"),
+        "{out} {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = jail_sh(
+        false,
+        h,
+        project.path(),
+        "cat \"$HOME/.claude/CLAUDE.md\" \"$HOME/.claude/hooks/x.sh\" 2>/dev/null; echo DONE",
+    );
+    let out = String::from_utf8_lossy(&second.stdout);
+    assert!(out.contains("DONE"), "{out}");
+    assert!(
+        !out.contains("JAIL-WROTE"),
+        "the next jail loaded it: {out}"
+    );
+}
+
+/// Final review of #352, item 1: the project is writable in the jail, and
+/// the host's Claude Code loads the project's `.claude` and `.mcp.json`
+/// when it opens it. Where they are there, a jail cannot write them; where
+/// they are not, one a jail makes with hooks off is said as the jail ends,
+/// and the next start is refused, naming it.
+///
+/// FAILS ON REVERT: bind the project's Claude Code files writable, or keep
+/// no names that were absent.
+#[cfg(target_os = "linux")]
+#[test]
+fn what_a_jail_writes_in_the_projects_claude_files_never_reaches_the_host() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    let there = tempfile::TempDir::new().unwrap();
+    let p = there.path();
+    std::fs::create_dir_all(p.join(".claude")).unwrap();
+    std::fs::write(p.join(".claude/settings.json"), "{}").unwrap();
+    std::fs::write(p.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    let out = jail_sh(
+        false,
+        h,
+        p,
+        "(echo '{\"disableAllHooks\":true}' > .claude/settings.json) 2>/dev/null && echo WROTE; \
+         (echo '{\"disableAllHooks\":true}' > .claude/settings.local.json) 2>/dev/null && echo LOCAL; \
+         (echo '{\"mcpServers\":{\"e\":{}}}' > .mcp.json) 2>/dev/null && echo MCP; echo DONE",
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("DONE"), "{text}");
+    for done in ["WROTE", "LOCAL", "MCP"] {
+        assert!(!text.contains(done), "{done}: {text}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(p.join(".claude/settings.json")).unwrap(),
+        "{}"
+    );
+    // Not there: made in the jail, said as it ends, refused at the next start.
+    let absent = tempfile::TempDir::new().unwrap();
+    let a = absent.path();
+    let made = jail_sh(
+        false,
+        h,
+        a,
+        "mkdir -p .claude && echo '{\"disableAllHooks\":true}' > .claude/settings.local.json && echo MADE",
+    );
+    let err = String::from_utf8_lossy(&made.stderr);
+    assert!(
+        String::from_utf8_lossy(&made.stdout).contains("MADE"),
+        "{err}"
+    );
+    assert!(
+        err.contains("settings.local.json appeared while a jail ran"),
+        "{err}"
+    );
+    let next = jail_sh(false, h, a, "echo STARTED");
+    let err = String::from_utf8_lossy(&next.stderr);
+    assert_eq!(next.status.code(), Some(2), "{err}");
+    assert!(!String::from_utf8_lossy(&next.stdout).contains("STARTED"));
+    assert!(
+        err.contains("refusing to start") && err.contains("disableAllHooks"),
+        "{err}"
+    );
+}
+
 /// Second review of #352, item 3: a start that could not read the person's
 /// Claude Code settings went on as if nothing turned the hook off. Now each
 /// doubt refuses the start (exit 2), names the file, and arms nothing: the

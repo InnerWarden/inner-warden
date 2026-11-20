@@ -162,6 +162,24 @@ list, with every limit.
   folder. A file that is not JSON, or a link, is removed, and what a
   program in an earlier jail put there as a link at a name `contain`
   writes is removed without being followed.
+  What a jail writes in its own `~/.claude` at a name your folder does not
+  have (a `CLAUDE.md`, `skills`, the script a hook of yours names) is
+  removed before the next run on the project, so no jail loads what an
+  earlier one left there.
+  The project's own Claude Code folder (`.claude`) and MCP servers file
+  (`.mcp.json`) are read-only in the jail where they are there (on macOS
+  the sandbox denies writing them): Claude Code on this machine loads them
+  when it opens the project, so a jail could otherwise turn hooks off,
+  turn every project server on or add a server there for you. So what you
+  allow with "always allow" inside a jail is not saved in the project's
+  `.claude/settings.local.json` and is asked again next run. Where they
+  are not there, `contain` keeps that they were not, and one a jail makes
+  that sets hooks, `disableAllHooks`, permissions in bypass mode,
+  `enableAllProjectMcpServers` or MCP servers (or that does not read as
+  JSON) is said as the jail ends and refuses the next start on the
+  project, naming the file; remove it, or what it sets, to start again.
+  On macOS a jail writes only its own project's folder of the launcher's,
+  never another project's.
   A jail does not start where Claude Code's settings may turn the guard's
   hook off or cannot be read: your `~/.claude/settings.json` and
   `~/.claude/settings.local.json` and the project's
@@ -169,7 +187,9 @@ list, with every limit.
   anything but a file, over 4 MiB, not JSON (a comment in it included), not
   a JSON object, with `disableAllHooks` set to anything but `false`, or
   with hooks in a form other than Claude Code's; and the project's where it
-  sets `PreToolUse` hooks with none of InnerWarden's in them. `contain`
+  sets `PreToolUse` hooks with none of InnerWarden's in effect for `Bash`
+  in them, or where the project's `.claude` or `.mcp.json` is a link, or
+  its `.mcp.json` does not read as a JSON object. `contain`
   says which file and why, exits 2 and changes nothing. Hooks on other
   events, and `PreToolUse` hooks beside the guard's, start as before. The
   project's own settings files stay writable in the project, as the rest of
