@@ -225,6 +225,39 @@ const KERNEL_GUARD_LINES: &[&str] = &[
     "innerwarden-config-sign lsm --mode disabled --apply",
 ];
 
+/// The guard's services and processes stopped in shapes a reading by
+/// distance missed: a `pkill -f` or `pgrep -f | kill` pattern that matches
+/// a command line the guard runs (its hook, its MCP proxy), a redirection
+/// glued to the verb, and systemd's manager reached over D-Bus. Each is
+/// taken with and without `sudo`.
+const SERVICE_AND_PROCESS_LINES: &[&str] = &[
+    "pkill -f 'hook --agent claude-code'",
+    "pkill -f 'hook --agent codex'",
+    "pkill -f 'proxy -- '",
+    "pkill -f 'proxy --label claude-code --agent claude-code --mode guard'",
+    "pgrep -f 'proxy -- npx' | xargs kill",
+    "kill $(pgrep -f 'hook --agent claude-code')",
+    "systemctl stop>&2 innerwarden-agent",
+    "systemctl stop>/dev/null innerwarden-sensor",
+    "launchctl unload>/dev/null ~/Library/LaunchAgents/com.innerwarden.agent.plist",
+    "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StopUnit ss innerwarden-agent.service replace",
+    "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager KillUnit ssi innerwarden-agent.service all 9",
+    "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss innerwarden-sensor.service replace",
+    "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager MaskUnitFiles asbb 1 innerwarden-agent.service false true",
+    "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/innerwarden_2dagent_2eservice org.freedesktop.systemd1.Unit Stop s replace",
+    "dbus-send --system --print-reply --dest=org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager.StopUnit string:innerwarden-agent.service string:replace",
+    "gdbus call --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 --method org.freedesktop.systemd1.Manager.StopUnit innerwarden-agent.service replace",
+    "pkill -f warden",
+    "env pkill -f warden",
+    "pgrep -f warden | xargs kill",
+    "kill $(pidof innerwarden)",
+    "pkill -f 'mcp-proxy -- npx'",
+    r"pkill -f 'innerwar\den'",
+    "killall -r warden",
+    "systemctl stop 'innerwar*'",
+    "systemctl stop '*warden*'",
+];
+
 /// Every command the corpus denies, with a short label of how it was built.
 fn deny_cases() -> Vec<(String, String)> {
     let mut cases = Vec::new();
@@ -465,6 +498,12 @@ fn deny_cases() -> Vec<(String, String)> {
             }
         }
     }
+    for line in SERVICE_AND_PROCESS_LINES {
+        for sudo in ["", "sudo "] {
+            let command = format!("{sudo}{line}");
+            cases.push((command.clone(), format!("service-or-process|{command}")));
+        }
+    }
     cases
 }
 
@@ -530,6 +569,26 @@ fn allow_cases() -> Vec<(String, String)> {
         (
             "sudo innerwarden-config-sign secret-guard protect --path /etc/app/prod.key".into(),
             "set-up|secret-guard-protect".into(),
+        ),
+        // A pattern on another program's part of the guard's command lines
+        // (the agent's name, the MCP server), a service that is not the
+        // guard's behind a glued redirection, and a D-Bus read of a unit.
+        ("pkill -f claude".into(), "control|pkill-agent-name".into()),
+        ("pkill -f 'node server.js'".into(), "control|pkill-server".into()),
+        ("pkill -f innerwarden-docs-server".into(), "control|pkill-longer-name".into()),
+        ("pkill node".into(), "control|pkill-name".into()),
+        ("killall node".into(), "control|killall-other".into()),
+        ("systemctl stop 'nginx*'".into(), "control|stop-glob-other".into()),
+        ("pgrep -f 'hook --agent claude-code'".into(), "read|pgrep-hook".into()),
+        ("systemctl stop>&2 nginx".into(), "control|stop-glued-other".into()),
+        ("systemctl status innerwarden-agent".into(), "read|status".into()),
+        (
+            "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager GetUnit s innerwarden-agent.service".into(),
+            "read|dbus-get-unit".into(),
+        ),
+        (
+            "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss nginx.service replace".into(),
+            "control|dbus-restart-other".into(),
         ),
     ]
 }
