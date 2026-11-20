@@ -5898,8 +5898,9 @@ fn a_socket_folder_the_jail_can_write_is_refused() {
     }
 }
 
-/// T-078 (7): the lines the hook keeps beside the record (here a
-/// suppression added with `innerwarden allow`) went to the folder
+/// T-078 (7): the lines the hook keeps beside the record (here an
+/// OpenClaw call that ran other than as screened, `openclaw ran`, which
+/// needs no terminal as `allow` does) went to the folder
 /// `IW_GRAPH_FILE` names, which a program in the jail sets, or hit the
 /// read-only record folder and were lost. Now they go to the launcher,
 /// marked as the jail's, whatever the variable says.
@@ -5917,7 +5918,8 @@ fn the_lines_beside_the_record_reach_it_from_a_jail_whatever_iw_graph_file_says(
         let project = tempfile::TempDir::new().unwrap();
         let script = format!(
             "mkdir -p /tmp/elsewhere; \
-             IW_SUPPRESS_CONFIG=\"$HOME/suppress.toml\" IW_GRAPH_FILE=/tmp/elsewhere/graph.json '{}' allow 'echo side-event-marker*' >/dev/null 2>&1; \
+             echo '{{\"rewritten\":true,\"tool\":\"exec\",\"session\":\"side-event-marker\"}}' \
+             | IW_GRAPH_FILE=/tmp/elsewhere/graph.json '{}' openclaw ran >/dev/null 2>&1; \
              if [ -e /tmp/elsewhere/guard-events.jsonl ]; then echo ELSEWHERE; fi",
             bin()
         );
@@ -5936,7 +5938,7 @@ fn the_lines_beside_the_record_reach_it_from_a_jail_whatever_iw_graph_file_says(
             .find(|l| l.contains("side-event-marker"))
             .unwrap_or_else(|| panic!("identity={identity}: no line: {events} {err}"));
         assert!(line.contains("\"reported_by\":\"jail\""), "{line}");
-        assert!(line.contains("guard.suppression_changed"), "{line}");
+        assert!(line.contains("guard.call_rewritten"), "{line}");
     }
 }
 
