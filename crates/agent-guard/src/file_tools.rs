@@ -311,6 +311,45 @@ pub const READ_TOOLS_MATCHER: &str = "Read|Grep|Glob";
 /// Where a read tool names the folder it searches.
 const FOLDER_KEYS: &[&str] = &["path", "dir_path"];
 
+/// The keys of a search call that limit it to the files a glob matches
+/// (Claude Code's `Grep` `glob`, Gemini CLI's `grep_search` `include`).
+const GLOB_KEYS: [&str; 2] = ["glob", "include"];
+
+/// The pattern of a search of the whole home that looks for a narrow text
+/// ([`crate::threats::pattern_is_narrow`]), with no glob that aims at
+/// secrets ([`crate::threats::glob_aims_at_secrets`]): said in the line, so
+/// the search is judged as its shell twin `grep -r <text> ~` is, a person's
+/// call (`review`) when the home holds a key, since grep opens the key and
+/// prints from it only a line holding that text. Every other search keeps
+/// the empty pattern, and a search of the home with it reads the whole
+/// home: the hard refusal. Measured 2026-11-18: a `Grep` of the home for
+/// any text was denied in a home that held a login, where the same search
+/// in the shell was a `review`.
+///
+/// Only the home itself, as written (`~`, `$HOME`, its path): a search of a
+/// folder the home is in (`/`, `/home`) keeps the empty pattern. The
+/// search pattern of a tool is a regular expression, never a fixed string.
+fn narrow_search_of_the_home<'a>(
+    pattern: Option<&'a str>,
+    globs: &[Option<&str>],
+    folder: &str,
+    context: &WriteContext<'_>,
+) -> Option<&'a str> {
+    let pattern = pattern.filter(|pattern| crate::threats::pattern_is_narrow(pattern, false))?;
+    if globs
+        .iter()
+        .flatten()
+        .any(|glob| crate::threats::glob_aims_at_secrets(glob))
+    {
+        return None;
+    }
+    let home = context.home?.to_str()?.trim_end_matches('/');
+    let folder = folder.trim_end_matches('/');
+    let is_home =
+        matches!(folder, "~" | "$HOME" | "${HOME}") || (!home.is_empty() && folder == home);
+    is_home.then_some(pattern)
+}
+
 /// One tool call, read for what it reads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileReadCall {
@@ -481,6 +520,15 @@ pub fn file_read_call_in(payload: &Value, context: &WriteContext<'_>) -> FileRea
             let hunted = text("pattern")
                 .and_then(crate::threats::credential_hunt_token)
                 .map(|word| format!("-e {word} "))
+                .or_else(|| {
+                    narrow_search_of_the_home(
+                        text("pattern"),
+                        &GLOB_KEYS.map(text),
+                        folder(),
+                        context,
+                    )
+                    .map(|pattern| format!("-e '{pattern}' "))
+                })
                 .unwrap_or_else(|| "'' ".to_string());
             FileReadCall::Reads(format!("grep -r {hunted}{}", words_of(folder())))
         }
@@ -1412,6 +1460,108 @@ mod tests {
             ("fn main", "grep -r '' /"),
         ] {
             assert_eq!(grep(pattern), FileReadCall::Reads(line.into()), "{pattern}");
+        }
+    }
+
+    /// A search of the home itself for a narrow text keeps its text, so it
+    /// is judged as `grep -r <text> ~` is; one for a secret, one limited to
+    /// files where secrets are kept, and one of a folder the home is in keep
+    /// the empty pattern, the read of the whole home.
+    ///
+    /// FAILS ON REVERT of `narrow_search_of_the_home` in the search arm:
+    /// the first lines hold `''`.
+    #[test]
+    fn a_narrow_search_of_the_home_keeps_its_text() {
+        let home = Path::new("/home/dev");
+        let project = home.join("proj");
+        let ctx = context(home, &project);
+        let grep = |input: Value| {
+            file_read_call_in(&json!({"tool_name": "Grep", "tool_input": input}), &ctx)
+        };
+        for (input, line) in [
+            (
+                json!({"pattern": "fn main", "path": "/home/dev"}),
+                "grep -r -e 'fn main' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev/"}),
+                "grep -r -e 'TODO' /home/dev/",
+            ),
+            (
+                json!({"pattern": "innerwarden", "path": "~"}),
+                "grep -r -e 'innerwarden' ~",
+            ),
+            (
+                json!({"pattern": "use serde", "path": "/home/dev", "glob": "*.rs"}),
+                "grep -r -e 'use serde' /home/dev",
+            ),
+            // A secret, by the word a hunt looks for: as before.
+            (
+                json!({"pattern": "password", "path": "/home/dev"}),
+                "grep -r -e password /home/dev",
+            ),
+            (
+                json!({"pattern": "TOKEN", "path": "/home/dev"}),
+                "grep -r -e token /home/dev",
+            ),
+            // By a credential marker, a wide pattern, or a glob that aims at
+            // secrets: the whole home.
+            (
+                json!({"pattern": "AKIA", "path": "/home/dev"}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "ssh-ed25519", "path": "/home/dev"}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO|FIXME", "path": "/home/dev"}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": ".*", "path": "/home/dev"}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "glob": "**/.ssh/*"}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "glob": ".aws/**"}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "glob": "*.pem"}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "glob": "id_*"}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "glob": "*credentials*"}),
+                "grep -r '' /home/dev",
+            ),
+            (
+                json!({"pattern": "TODO", "path": "/home/dev", "include": "*.env"}),
+                "grep -r '' /home/dev",
+            ),
+            // Not the home itself: as before.
+            (json!({"pattern": "fn main", "path": "/"}), "grep -r '' /"),
+            (
+                json!({"pattern": "fn main", "path": "/home"}),
+                "grep -r '' /home",
+            ),
+            (
+                json!({"pattern": "fn main", "path": "/home/dev/.config"}),
+                "grep -r '' /home/dev/.config",
+            ),
+        ] {
+            assert_eq!(
+                grep(input.clone()),
+                FileReadCall::Reads(line.into()),
+                "{input}"
+            );
         }
     }
 

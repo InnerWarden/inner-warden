@@ -520,6 +520,54 @@ fn a_search_is_judged_as_its_shell_twin() {
     assert_eq!(host.hook(&["--block-review"], &plain).0, Some(0));
 }
 
+/// A `Grep` of the home is not a read of its secrets just for covering the
+/// folder: one for a narrow text is the person's call (`review`), as its
+/// shell twin `grep -r <text> ~` is. One whose pattern or glob aims at a
+/// secret (a key marker, a token, `.ssh`, `.aws`) keeps the hard refusal,
+/// as before.
+///
+/// FAILS ON REVERT of `narrow_search_of_the_home` in the search arm of
+/// `file_read_call_in`: the narrow searches are denied in an enforcing hook.
+#[test]
+fn a_grep_of_the_home_is_refused_only_when_it_aims_at_a_secret() {
+    let host = Host::new();
+    let home = host.home().to_string_lossy().into_owned();
+    let grep = |input: serde_json::Value| host.call("Grep", input);
+    for payload in [
+        grep(serde_json::json!({ "pattern": "fn main", "path": home })),
+        grep(
+            serde_json::json!({ "pattern": "TODO", "path": format!("{home}/"), "output_mode": "content" }),
+        ),
+        grep(serde_json::json!({ "pattern": "use serde", "path": home, "glob": "*.rs" })),
+        host.call(
+            "Bash",
+            serde_json::json!({ "command": format!("grep -r 'fn main' {home}") }),
+        ),
+    ] {
+        let (code, stderr) = host.hook(&[], &payload);
+        assert_eq!(code, Some(0), "{payload}: {stderr}");
+        let (code, stderr) = host.hook(&["--block-review"], &payload);
+        assert_eq!(code, Some(2), "{payload}: {stderr}");
+        assert!(stderr.contains("searches the whole home"), "{stderr}");
+    }
+    for payload in [
+        grep(serde_json::json!({ "pattern": "AKIA", "path": home })),
+        grep(serde_json::json!({ "pattern": "ssh-ed25519", "path": home })),
+        grep(serde_json::json!({ "pattern": "token", "path": home })),
+        grep(serde_json::json!({ "pattern": "TODO|FIXME", "path": home })),
+        grep(serde_json::json!({ "pattern": "TODO", "path": home, "glob": "**/.ssh/*" })),
+        grep(serde_json::json!({ "pattern": "TODO", "path": home, "glob": ".aws/**" })),
+        grep(serde_json::json!({ "pattern": "TODO", "path": home, "glob": "*.pem" })),
+        host.call(
+            "Bash",
+            serde_json::json!({ "command": format!("grep -r AKIA {home}") }),
+        ),
+    ] {
+        let (code, stderr) = host.hook(&[], &payload);
+        assert_eq!(code, Some(2), "{payload}: {stderr}");
+    }
+}
+
 /// Monitor never blocks: the refusal is recorded as one it would have made.
 #[test]
 fn monitor_records_the_read_and_lets_it_run() {

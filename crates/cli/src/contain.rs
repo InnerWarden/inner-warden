@@ -240,8 +240,8 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
 /// The variables of the launcher's environment the jail's command gets
 /// without being asked: what a shell and its programs need to run. Every
 /// other one stays out unless `--pass-env NAME` hands it in. Also in: every
-/// `LC_*` locale variable and the proxy settings (`*_PROXY`, `NO_PROXY`, in
-/// either case), where they are set ([`env_goes_in`]).
+/// `LC_*` locale variable, its value as it is, and the proxy settings
+/// ([`PROXY_NAMES`], in either case), where they are set ([`env_goes_in`]).
 pub const ENV_ALLOWED: &[&str] = &[
     "PATH",
     "HOME",
@@ -255,6 +255,17 @@ pub const ENV_ALLOWED: &[&str] = &[
     "COLORTERM",
 ];
 
+/// The proxy settings that go in, by their exact names, in capitals or in
+/// lowercase. Not every name ending in `_PROXY`: a secret under one
+/// (`CREDS_PROXY`) reached the jail when the ending was enough.
+pub const PROXY_NAMES: &[&str] = &[
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "FTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+];
+
 /// How [`env_said`] and the help name what goes in without `--pass-env`.
 pub const ENV_ALLOWED_WORDS: &str =
     "PATH, HOME, USER, LOGNAME, SHELL, LANG, LC_*, TERM, TZ, TMPDIR, COLORTERM and the proxy settings";
@@ -264,11 +275,11 @@ pub const ENV_ALLOWED_WORDS: &str =
 /// exact name with `--pass-env`.
 pub fn env_goes_in(name: &std::ffi::OsStr, pass: &[String]) -> bool {
     let bytes = name.as_encoded_bytes();
-    let upper = bytes.to_ascii_uppercase();
     ENV_ALLOWED.iter().any(|kept| bytes == kept.as_bytes())
         || (bytes.starts_with(b"LC_") && bytes.len() > 3)
-        || upper == b"NO_PROXY"
-        || (upper.len() > b"_PROXY".len() && upper.ends_with(b"_PROXY"))
+        || PROXY_NAMES.iter().any(|proxy| {
+            bytes == proxy.as_bytes() || bytes == proxy.to_ascii_lowercase().as_bytes()
+        })
         || pass.iter().any(|kept| name == kept.as_str())
 }
 
@@ -8616,6 +8627,39 @@ mod tests {
         // no PATH and no loader variable: nothing to hand back
         let bare = launch_env([(OsString::from("HOME"), OsString::from("/h"))]);
         assert_eq!(bare, LaunchEnv::default());
+    }
+
+    /// A proxy setting goes in only by one of its exact names, in capitals
+    /// or in lowercase: a secret under another name that ends in `_PROXY`
+    /// stays out.
+    ///
+    /// FAILS ON REVERT of [`PROXY_NAMES`] in [`env_goes_in`] (the ending
+    /// `_PROXY` was enough): `CREDS_PROXY` and the rest went in.
+    #[test]
+    fn a_proxy_setting_goes_in_only_by_its_exact_name() {
+        use std::ffi::OsStr;
+        for name in PROXY_NAMES {
+            assert!(env_goes_in(OsStr::new(name), &[]), "{name}");
+            let lower = name.to_ascii_lowercase();
+            assert!(env_goes_in(OsStr::new(&lower), &[]), "{lower}");
+        }
+        for name in [
+            "CREDS_PROXY",
+            "creds_proxy",
+            "DB_PASSWORD_PROXY",
+            "SOCKS_PROXY",
+            "MY_HTTP_PROXY",
+            "HTTP_PROXY_PASSWORD",
+            "Http_Proxy",
+            "_PROXY",
+        ] {
+            assert!(!env_goes_in(OsStr::new(name), &[]), "{name}");
+        }
+        // Passed by its exact name, one of them goes in as any other does.
+        assert!(env_goes_in(
+            OsStr::new("SOCKS_PROXY"),
+            &["SOCKS_PROXY".into()]
+        ));
     }
 
     /// The jail's command gets only what a shell needs, a variable passed by
