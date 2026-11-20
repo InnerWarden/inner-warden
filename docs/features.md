@@ -172,6 +172,23 @@ guard lets through is answered `allow` in JSON. Its `beforeReadFile` takes
 allow or deny only, so a read rated review cannot be asked about and is
 refused with the reason.
 
+Cursor has no hook before a file edit, so its agent can edit
+`~/.cursor/hooks.json` itself and turn the guard off: a shell command that
+rewrites or removes that file is refused, an edit is not screened. What is
+seen afterwards:
+
+- an edit that takes out some of the guard's entries, or turns `failClosed`
+  off: every Cursor call the guard still sees is refused, with the reason,
+  until `innerwarden agents connect cursor` puts them back;
+- an edit that keeps the entries and points them at another program: the
+  guard no longer runs, so nothing is refused; `innerwarden status`,
+  `agents` and the dashboard say that Cursor's hook runs another program;
+- an edit that takes every entry out: the guard no longer runs either;
+  `status`, `agents` and the dashboard say the hooks are not in the file.
+
+In the last two cases Cursor's calls run unscreened until the hooks are
+connected again. Community does not stop the edit itself.
+
 Hermes Agent's approval gate (v0.23.1, `request_tool_approval`) asks the
 person in a chat or through its gateway and refuses when nobody can answer.
 It lets the call run without asking when you set Hermes to approve on its

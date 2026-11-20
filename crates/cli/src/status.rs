@@ -375,7 +375,9 @@ pub fn tool_classes_finding(classes: &ToolClasses) -> Finding {
 /// PURE: what one agent's wiring judges, as a key and as the sentence
 /// `status` prints for it without the agent's name, so the dashboard and
 /// `status` say one thing. The keys: `shell_and_privileged_files` (with or
-/// without the reads, which the sentence says), `shell_only` and
+/// without the reads, which the sentence says), `shell_only`,
+/// `shell_mcp_and_reads` (Cursor's hooks: shell, MCP calls and reads, never
+/// its file edits) and
 /// `mcp_server_calls`. A hook beside the proxy has no key of its own: on, it
 /// is the first; not on, the proxy is all that judges, which is the last.
 pub fn judges(classes: &ToolClasses) -> (&'static str, String) {
@@ -414,7 +416,7 @@ pub fn judges(classes: &ToolClasses) -> (&'static str, String) {
         ToolClasses::HookAndProxy {
             agent, screened, ..
         } if agent == innerwarden_agent_guard::cursor_hook::AGENT => {
-            ("shell_only", sentence(screened))
+            ("shell_mcp_and_reads", sentence(screened))
         }
         ToolClasses::HookAndProxy { screened, .. } => {
             ("shell_and_privileged_files", sentence(screened))

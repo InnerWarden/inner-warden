@@ -1136,7 +1136,7 @@ export function readOverviewRecord(value: unknown): RecordSpan | undefined {
 // ---------------------------------------------------------------------------
 
 /** What an agent's connection judges before a call runs (`judges`). */
-export const JUDGES = ["shell_and_privileged_files", "shell_only", "mcp_server_calls"] as const;
+export const JUDGES = ["shell_and_privileged_files", "shell_only", "shell_mcp_and_reads", "mcp_server_calls"] as const;
 export type Judges = (typeof JUDGES)[number];
 
 /** An agent's own mode, as one word a page can branch on. */

@@ -685,9 +685,28 @@ pub fn merge(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, S
 /// entry gone Cursor starts no hook of ours, so there is no call to refuse.
 /// The program is not looked at here: it is the one asking.
 pub fn cursor_wiring_lost(home: &Path) -> Option<String> {
+    let binary = std::env::current_exe().ok();
+    cursor_wiring_lost_for(home, binary.as_deref(), std::env::var_os("PATH").as_deref())
+}
+
+/// [`cursor_wiring_lost`], with this program (`binary`, when it is known)
+/// and the `PATH` a bare program name is looked up on handed in.
+fn cursor_wiring_lost_for(
+    home: &Path,
+    binary: Option<&Path>,
+    path_env: Option<&OsStr>,
+) -> Option<String> {
     let file = CURSOR.path(home);
     let events = CURSOR.events().collect::<Vec<_>>().join(", ");
-    match state_with(home, &CURSOR, |_| hook::ProgramFact::Executable) {
+    let state = state_with(home, &CURSOR, |_| hook::ProgramFact::Executable);
+    let state = match binary {
+        Some(binary) => cursor_runs_this(home, state, binary, path_env),
+        None => state,
+    };
+    match state {
+        HookState::Off(reason @ Reason::OtherProgram { .. }) => {
+            Some(format!("{}: {}", file.display(), reason.why(&CURSOR)))
+        }
         HookState::Off(Reason::Altered) => Some(format!(
             "{} no longer lists the InnerWarden entry, as `innerwarden agents connect cursor` \
              wrote it, under each of {events}",
@@ -1060,6 +1079,11 @@ pub enum Reason {
     GeminiHooksOff,
     /// Gemini's settings disable this hook by name.
     GeminiHookDisabled,
+    /// Cursor's entries are the shape `agents connect` writes, and run
+    /// another program than this innerwarden: an edit of the file (Cursor
+    /// screens none) can point them anywhere. Holds that program and this
+    /// one.
+    OtherProgram { program: String, ours: String },
 }
 
 impl Reason {
@@ -1083,6 +1107,11 @@ impl Reason {
             Self::GeminiHookDisabled => {
                 "Gemini skips it: it is listed under `hooksConfig.disabled`".to_string()
             }
+            Self::OtherProgram { program, ours } => format!(
+                "it runs another program ({program}), not this innerwarden ({ours}), so no call \
+                 of {} reaches the guard",
+                spec.product
+            ),
         }
     }
 
@@ -1090,6 +1119,7 @@ impl Reason {
     fn step(&self, spec: &HookSpec) -> String {
         match self {
             Self::Altered
+            | Self::OtherProgram { .. }
             | Self::Broken { .. }
             | Self::Unchecked { .. }
             | Self::Codex(Skip::NotTrusted | Skip::Changed) => {
@@ -1161,6 +1191,16 @@ pub fn not_on(spec: &HookSpec, state: &HookState) -> Option<(String, String)> {
     let connect = format!("innerwarden agents connect {}", spec.agent);
     match state {
         HookState::On { .. } => None,
+        // Cursor's file edits are not screened: an edit can take every entry
+        // out at once, and the guard never runs again to see it.
+        HookState::Absent if spec.host == Host::Cursor => Some((
+            format!(
+                "hooks are not in ~/{} (removed, or never connected; an edit of that file \
+                 by the agent can take them out, since Cursor screens no edit)",
+                spec.file
+            ),
+            connect,
+        )),
         HookState::Absent => Some((format!("{} hook is not installed", spec.event), connect)),
         HookState::Unreadable => Some((
             format!(
@@ -1218,7 +1258,97 @@ pub fn state(home: &Path, spec: &HookSpec, path_env: Option<&OsStr>) -> HookStat
     let state = state_with(home, spec, |program| {
         agents_ops::program_fact(program, path_env)
     });
-    where_codex_reads(home, spec, state)
+    let state = where_codex_reads(home, spec, state);
+    match std::env::current_exe() {
+        Ok(binary) if spec.host == Host::Cursor => cursor_runs_this(home, state, &binary, path_env),
+        _ => state,
+    }
+}
+
+/// Cursor's `state`, once the program its entries run is compared with
+/// `binary` (this innerwarden), as written or resolved (a link to it runs
+/// it, a bare name is looked up on `path_env`). Cursor's file edits are not
+/// screened, so an edit can keep every entry in the shape `agents connect`
+/// writes and point it at another program, and that program then answers
+/// every call: the guard never runs to see it. `status` and `agents` are
+/// where it shows. A state that is not installed, or already altered, stays
+/// what it was.
+fn cursor_runs_this(
+    home: &Path,
+    state: HookState,
+    binary: &Path,
+    path_env: Option<&OsStr>,
+) -> HookState {
+    if !state.installed() || state == HookState::Off(Reason::Altered) {
+        return state;
+    }
+    let path = CURSOR.path(home);
+    let Ok(Some(bytes)) = file_update::read_config(&path) else {
+        return state;
+    };
+    let Ok(settings) = parse(&path, Some(bytes.as_slice())) else {
+        return state;
+    };
+    let Some(first) = found(&settings, &CURSOR).into_iter().next() else {
+        return state;
+    };
+    if guard_programs(home, binary)
+        .iter()
+        .any(|ours| runs_binary(&first.line.program, Path::new(ours), path_env))
+    {
+        return state;
+    }
+    HookState::Off(Reason::OtherProgram {
+        program: first.line.program,
+        ours: binary.display().to_string(),
+    })
+}
+
+/// The programs this machine runs as its guard: `binary` (the one asking)
+/// and every program Claude Code's, Codex's and Gemini's hooks of ours run.
+/// `status` may be started from another copy of the guard than the one
+/// `agents connect` wired (an npm install beside a package, say): a Cursor
+/// hook that runs any of them is ours. Cursor's own files are not counted:
+/// its agent can edit them unscreened.
+fn guard_programs(home: &Path, binary: &Path) -> Vec<String> {
+    let mut programs = vec![binary.display().to_string()];
+    let claude = home.join(".claude/settings.json");
+    if let Some(settings) = file_update::read_config(&claude)
+        .ok()
+        .flatten()
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+    {
+        programs.extend(hook::effective_iwguard_hook_programs(&settings));
+    }
+    for spec in [&CODEX, &GEMINI] {
+        let path = spec.path(home);
+        if let Ok(settings) = parse(
+            &path,
+            file_update::read_config(&path).ok().flatten().as_deref(),
+        ) {
+            programs.extend(
+                found(&settings, spec)
+                    .into_iter()
+                    .map(|hook| hook.line.program),
+            );
+        }
+    }
+    programs
+}
+
+/// Whether a hook line's `program` is `binary`: as written, through a link,
+/// or, for a bare name, the first file of that name on `path_env`.
+fn runs_binary(program: &str, binary: &Path, path_env: Option<&OsStr>) -> bool {
+    if Path::new(program).components().count() > 1 {
+        return is_program(program, binary);
+    }
+    path_env
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .is_some_and(|found| is_program(&found.to_string_lossy(), binary))
 }
 
 /// `state`, once the folder Codex reads is taken into account.
@@ -3750,6 +3880,101 @@ mod tests {
         ));
     }
 
+    /// Entries of the shape connect writes that run another program are
+    /// "another program", named with this one; a link to this program, and
+    /// the program itself, are this one; a state that is not installed or is
+    /// already altered stays as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_cursor_hook_that_runs_another_program_is_said() {
+        let home = tempfile::TempDir::new().unwrap();
+        let home = home.path();
+        let real = home.join("bin/innerwarden");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "").unwrap();
+        let link = home.join("bin/iw-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let on = HookState::On {
+            monitor: false,
+            block_review: false,
+        };
+        let wire = |program: &Path| {
+            let line = CURSOR.command(program, false, false);
+            write(
+                home,
+                CURSOR.file,
+                &merge(json!(null), &CURSOR, &line).unwrap().to_string(),
+            );
+        };
+
+        wire(Path::new(BIN));
+        let said = cursor_runs_this(home, on.clone(), &real, None);
+        let HookState::Off(reason @ Reason::OtherProgram { .. }) = &said else {
+            panic!("{said:?}");
+        };
+        let why = reason.why(&CURSOR);
+        assert!(
+            why.contains(BIN) && why.contains(&real.display().to_string()),
+            "{why}"
+        );
+        assert!(not_on(&CURSOR, &said).is_some());
+
+        wire(&real);
+        assert_eq!(cursor_runs_this(home, on.clone(), &real, None), on);
+        wire(&link);
+        assert_eq!(
+            cursor_runs_this(home, on.clone(), &real, None),
+            on,
+            "a link to it"
+        );
+        // A program Codex's hook of ours runs is the guard too: status may be
+        // started from another copy than the one connect wired.
+        write(
+            home,
+            CODEX.file,
+            &json!({"hooks": {"PreToolUse": [codex_entry(&CODEX_LINE)]}}).to_string(),
+        );
+        wire(Path::new(BIN));
+        assert_eq!(
+            cursor_runs_this(home, on.clone(), &real, None),
+            on,
+            "Codex's program"
+        );
+        std::fs::remove_file(home.join(CODEX.file)).unwrap();
+        let altered = HookState::Off(Reason::Altered);
+        assert_eq!(
+            cursor_runs_this(home, altered.clone(), &real, None),
+            altered
+        );
+        assert_eq!(
+            cursor_runs_this(home, HookState::Absent, &real, None),
+            HookState::Absent
+        );
+    }
+
+    /// A bare program name is the first file of that name on PATH.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_program_name_is_looked_up_on_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("innerwarden");
+        std::fs::write(&real, "").unwrap();
+        let path = std::ffi::OsString::from(dir.path());
+        assert!(runs_binary("innerwarden", &real, Some(&path)));
+        assert!(!runs_binary("innerwarden", &real, None));
+        assert!(!runs_binary("other", &real, Some(&path)));
+    }
+
+    /// Status says Cursor's hooks are gone from the file, and that an edit
+    /// of the agent's can take them out.
+    #[test]
+    fn cursor_hooks_not_in_the_file_are_said_as_such() {
+        let (what, next) = not_on(&CURSOR, &HookState::Absent).unwrap();
+        assert!(what.contains("not in ~/.cursor/hooks.json"), "{what}");
+        assert!(what.contains("edit"), "{what}");
+        assert_eq!(next, "innerwarden agents connect cursor");
+    }
+
     fn cursor_file() -> Value {
         let line = CURSOR.command(Path::new(BIN), false, false);
         merge(json!(null), &CURSOR, &line).unwrap()
@@ -3763,10 +3988,11 @@ mod tests {
     fn cursor_wiring_lost_is_said_until_it_is_put_back() {
         let home = tempfile::TempDir::new().unwrap();
         let home = home.path();
-        assert_eq!(cursor_wiring_lost(home), None, "no file");
+        let lost = |home: &Path| cursor_wiring_lost_for(home, Some(Path::new(BIN)), None);
+        assert_eq!(lost(home), None, "no file");
         let whole = cursor_file();
         write(home, CURSOR.file, &whole.to_string());
-        assert_eq!(cursor_wiring_lost(home), None, "whole");
+        assert_eq!(lost(home), None, "whole");
 
         let mut no_read = whole.clone();
         no_read["hooks"]
@@ -3774,27 +4000,32 @@ mod tests {
             .unwrap()
             .remove(crate::cursor_hook::READ_EVENT);
         write(home, CURSOR.file, &no_read.to_string());
-        let why = cursor_wiring_lost(home).expect("an event without the entry");
+        let why = lost(home).expect("an event without the entry");
         assert!(why.contains(".cursor/hooks.json"), "{why}");
         assert!(why.contains(crate::cursor_hook::READ_EVENT), "{why}");
 
         let mut open = whole.clone();
         open["hooks"][crate::cursor_hook::MCP_EVENT][0]["failClosed"] = json!(false);
         write(home, CURSOR.file, &open.to_string());
-        assert!(cursor_wiring_lost(home).is_some(), "failClosed off");
+        assert!(lost(home).is_some(), "failClosed off");
 
         write(home, CURSOR.file, "{ not json");
-        assert!(cursor_wiring_lost(home).is_some(), "unreadable");
+        assert!(lost(home).is_some(), "unreadable");
 
         write(
             home,
             CURSOR.file,
             &json!({"version": 1, "hooks": {}}).to_string(),
         );
-        assert_eq!(cursor_wiring_lost(home), None, "nothing of ours left");
+        assert_eq!(lost(home), None, "nothing of ours left");
 
         write(home, CURSOR.file, &whole.to_string());
-        assert_eq!(cursor_wiring_lost(home), None, "put back");
+        assert_eq!(lost(home), None, "put back");
+
+        // The whole file, for another program than this one.
+        let elsewhere = cursor_wiring_lost_for(home, Some(Path::new("/usr/local/bin/iw")), None)
+            .expect("another program");
+        assert!(elsewhere.contains("another program"), "{elsewhere}");
     }
 
     /// Connect and disconnect keep the person's keys in their order in

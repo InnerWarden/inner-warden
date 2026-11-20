@@ -3441,6 +3441,52 @@ mod tests {
         }
     }
 
+    /// With ~/.cursor a link to another folder, automatic setup writes
+    /// nothing there: not the hooks (it never writes Cursor's, Codex's or
+    /// Gemini's hook) and not the MCP config (it refuses a linked path). A
+    /// connect the person runs follows the link, as it does for every agent:
+    /// the person chose where their Cursor folder lives.
+    ///
+    /// FAILS ON REVERT: let automatic setup take the `connect_hook_and_proxy`
+    /// arm in `connect_one_result_with_link_policy`, and hooks.json appears
+    /// behind the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_cursor_folder_is_never_written_by_automatic_setup() {
+        let home = tempfile::TempDir::new().unwrap();
+        let elsewhere = tempfile::TempDir::new().unwrap();
+        let target = elsewhere.path().join("cursor");
+        std::fs::create_dir_all(&target).unwrap();
+        let mcp = r#"{"mcpServers":{"files":{"command":"npx","args":["files-server"]}}}"#;
+        std::fs::write(target.join("mcp.json"), mcp).unwrap();
+        // Discovery does not follow a linked folder: the row is read while
+        // ~/.cursor is a folder, and the folder becomes a link after, as a
+        // change between discovery and the write would.
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::write(home.path().join(".cursor/mcp.json"), mcp).unwrap();
+        let cursor = known_row(home.path(), "cursor");
+        std::fs::remove_dir_all(home.path().join(".cursor")).unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join(".cursor")).unwrap();
+
+        let automatic =
+            connect_one_result_automatic(home.path(), &cursor, "/abs/innerwarden", false, false);
+        assert_ne!(
+            automatic.effect,
+            ConnectEffect::Connected,
+            "{}",
+            automatic.line
+        );
+        assert!(!target.join("hooks.json").exists(), "{}", automatic.line);
+        assert_eq!(
+            std::fs::read_to_string(target.join("mcp.json")).unwrap(),
+            mcp
+        );
+
+        let person = connect_one_result(home.path(), &cursor, "/abs/innerwarden", false, false);
+        assert_ne!(person.effect, ConnectEffect::Failed, "{}", person.line);
+        assert!(target.join("hooks.json").exists(), "{}", person.line);
+    }
+
     fn known_row(home: &Path, name: &str) -> AgentStatus {
         let (rows, _) = rows_from_sources(home, &[], None);
         rows.into_iter().find(|row| row.name == name).unwrap()

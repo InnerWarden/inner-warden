@@ -159,6 +159,15 @@ describe("the Community routes, read strictly", () => {
 });
 
 describe("the fields and routes v2 reads (A1 to E2): present, absent, malformed", () => {
+  it("reads Cursor's judges key, shell commands, MCP calls and reads, and drops a key it does not know", () => {
+    const row = (judges: string) => ({
+      ...agentsFixture,
+      agents: [{ ...(agentsFixture as { agents: Record<string, unknown>[] }).agents[0], id: "cursor", judges }],
+    });
+    expect(readAgentsFacts(row("shell_mcp_and_reads")).agents[0]!.judges).toBe("shell_mcp_and_reads");
+    expect(readAgentsFacts(row("everything")).agents[0]!.judges).toBeUndefined();
+  });
+
   it("A1 to A5: reads each agent's facts, and leaves every one it was not sent absent", () => {
     const facts = readAgentsFacts(agentsFixture);
     const claude = facts.agents.find((agent) => agent.id === "claude-code")!;

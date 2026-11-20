@@ -265,6 +265,7 @@ export const MECHANISM_WORDS: Record<"hook" | "mcp", string> = { hook: "Shell ho
 export const JUDGES_SHORT: Record<NonNullable<AgentFacts["judges"]>, string> = {
   shell_and_privileged_files: "Shell commands and privileged files",
   shell_only: "Shell commands",
+  shell_mcp_and_reads: "Shell commands, MCP calls and reads",
   mcp_server_calls: "Calls to its MCP servers",
 };
 

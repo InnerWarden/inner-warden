@@ -1470,6 +1470,80 @@ fn cursor_payloads_are_answered_in_cursors_words() {
     assert_eq!(cursor_json(&broken)["permission"], "deny");
 }
 
+/// The `content` Cursor sends with a `beforeReadFile` (the file's text) is
+/// never kept: not in the record, the session store, any other file the
+/// hook writes, nor its answer. A read allowed, a read refused, a read the
+/// hook cannot read as a call, and one longer than the hook reads whole.
+///
+/// Every file under the test's folder is read for the content after the four
+/// calls, so a new place the hook writes is covered too.
+#[cfg(unix)]
+#[test]
+fn cursor_read_content_is_never_kept() {
+    const MARK: &str = "CONTENT-MARK-7f3a91";
+    let host = Host::new();
+    std::fs::create_dir_all(host.home().join(".ssh")).expect("ssh");
+    std::fs::write(host.home().join(".ssh/id_ed25519"), "dummy key\n").expect("key");
+    std::fs::write(host.project().join("src/main.rs"), "fn main() {}\n").expect("main.rs");
+    let line = CURSOR.command(bin(), false, false);
+    let read = |path: &Path, content: String| {
+        host.cursor(
+            "beforeReadFile",
+            json!({"file_path": path, "content": content, "attachments": []}),
+        )
+    };
+    let answers = [
+        host.run(
+            "/bin/sh",
+            &line,
+            &read(&host.project().join("src/main.rs"), MARK.to_string()),
+        ),
+        host.run(
+            "/bin/sh",
+            &line,
+            &read(&host.home().join(".ssh/id_ed25519"), MARK.to_string()),
+        ),
+        host.run(
+            "/bin/sh",
+            &line,
+            &host.cursor("beforeReadFile", json!({"content": MARK})),
+        ),
+        host.run(
+            "/bin/sh",
+            &line,
+            &read(&host.project().join("src/main.rs"), MARK.repeat(80_000)),
+        ),
+    ];
+    for answer in &answers {
+        assert!(!answer.stdout.contains(MARK), "{}", answer.stdout);
+        assert!(!answer.stderr.contains(MARK), "{}", answer.stderr);
+    }
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(host.dir.path(), &mut files);
+    assert!(
+        files.iter().any(|file| file.ends_with("graph.json")),
+        "the reads were recorded: {files:?}"
+    );
+    for file in files {
+        let text = String::from_utf8_lossy(&std::fs::read(&file).unwrap_or_default()).into_owned();
+        assert!(
+            !text.contains(MARK),
+            "{} keeps the read's content",
+            file.display()
+        );
+    }
+}
+
 /// A Cursor call that comes while ~/.cursor/hooks.json has lost one of the
 /// guard's entries (an agent's file edit, which Cursor does not screen, can
 /// take it out) is refused in enforce mode until the entry is back, and only

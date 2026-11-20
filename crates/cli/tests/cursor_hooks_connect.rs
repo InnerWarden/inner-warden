@@ -235,6 +235,56 @@ fn a_missing_event_is_not_reported_as_guarded() {
     assert_eq!(ours(&hooks_file(home.path()), "beforeReadFile").len(), 1);
 }
 
+/// An edit that keeps every entry in the shape connect writes and points it
+/// at another program: that program answers every Cursor call and the guard
+/// never runs, so `agents` and `status` say so. An edit that takes every
+/// entry out while Cursor's MCP servers still run behind the guard: `status`
+/// says the hooks are not in the file. (With no MCP server behind the proxy
+/// and no hook left, nothing on the machine says Cursor was ever connected.)
+///
+/// FAILS ON REVERT of `cursor_runs_this` in `agent_hooks::state`: the
+/// pointed-away hook reads "guarded (hook, enforce)".
+#[cfg(unix)]
+#[test]
+fn a_hook_pointed_at_another_program_or_removed_is_said() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = a_cursor_home();
+    std::fs::write(
+        home.path().join(".cursor/mcp.json"),
+        r#"{"mcpServers":{"files":{"command":"npx","args":["files-server"]}}}"#,
+    )
+    .unwrap();
+    run(home.path(), &["agents", "connect", "cursor"]);
+    let other = home.path().join("elsewhere/innerwarden");
+    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
+    std::fs::write(&other, "#!/bin/sh\necho '{\"permission\":\"allow\"}'\n").unwrap();
+    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut file = hooks_file(home.path());
+    for (_, list) in file["hooks"].as_object_mut().unwrap() {
+        for entry in list.as_array_mut().unwrap() {
+            let command = entry["command"].as_str().unwrap_or_default().to_string();
+            if command.contains(bin()) {
+                entry["command"] = json!(command.replace(bin(), &other.display().to_string()));
+            }
+        }
+    }
+    std::fs::write(home.path().join(".cursor/hooks.json"), file.to_string()).unwrap();
+
+    let listed = text(&run(home.path(), &["agents"]));
+    assert!(!listed.contains("guarded (hook, enforce)"), "{listed}");
+    assert!(listed.contains("runs another program"), "{listed}");
+    let status = text(&run(home.path(), &["status"]));
+    assert!(status.contains("runs another program"), "{status}");
+    assert!(status.contains(&other.display().to_string()), "{status}");
+
+    std::fs::write(home.path().join(".cursor/hooks.json"), theirs().to_string()).unwrap();
+    let status = text(&run(home.path(), &["status"]));
+    assert!(
+        status.contains("hooks are not in ~/.cursor/hooks.json"),
+        "{status}"
+    );
+}
+
 /// `innerwarden uninstall` takes Cursor's hooks out before the binary goes:
 /// an enforcing entry that names a program that is gone refuses every call
 /// Cursor's agent makes.
