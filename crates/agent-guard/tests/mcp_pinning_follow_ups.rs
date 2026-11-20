@@ -205,28 +205,46 @@ fn a_renamed_tool_is_reported_and_held() {
         vec!["possible rename of `fetch` (nearly the same description)".to_string()]
     );
 
-    // Unlike anything that left: pinned as heard, as before.
+    // Unlike anything that left: not a rename. In the first listing of a
+    // later session it is pinned as heard, as before. In the same session it
+    // is held as new in the session, not as a rename (it passed here before
+    // that check existed).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-pins.json");
+    let mut s = PinSession::new(Some(path.clone()), &cmd());
+    s.check_listing(
+        None,
+        &listing(json!([tool("read_file", "Read a file.", "path")])),
+    );
+    let send_mail = listing(json!([tool("send_mail", "Send an email message.", "to")]));
+    let mut fresh = PinSession::new(Some(path), &cmd());
+    let changes = fresh.check_listing(None, &send_mail);
+    assert!(changes.is_empty(), "{changes:?}");
+    assert!(!fresh.is_held("send_mail"));
     let mut s = PinSession::new(None, &cmd());
     s.check_listing(
         None,
         &listing(json!([tool("read_file", "Read a file.", "path")])),
     );
-    let changes = s.check_listing(
-        None,
-        &listing(json!([tool("send_mail", "Send an email message.", "to")])),
+    let changes = s.check_listing(None, &send_mail);
+    assert_eq!(
+        changes[0].fields,
+        vec!["new since this session's first listing".to_string()]
     );
-    assert!(changes.is_empty(), "{changes:?}");
-    assert!(!s.is_held("send_mail"));
 
     // One page of a paged list says nothing is gone. Its pages are gathered,
     // and the last one closes the listing: read_file is on no page, so the
     // two tools that take what it took are held as possible renames (both
-    // passed here before the pages were gathered).
-    let mut s = PinSession::new(None, &cmd());
-    s.check_listing(
+    // passed here before the pages were gathered). The listing is the first
+    // of a later session: in the same session they are held on their page,
+    // as new.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("mcp-pins.json");
+    PinSession::new(Some(path.clone()), &cmd()).check_listing(
         None,
         &listing(json!([tool("read_file", "Read a file.", "path")])),
     );
+    let mut s = PinSession::new(Some(path), &cmd());
     let mut page = listing(json!([tool("read_copy", "Read a file.", "path")]));
     page["nextCursor"] = json!("2");
     assert!(s.check_listing(None, &page).is_empty());
