@@ -517,6 +517,18 @@ impl TaintTracker {
         // call sends as `attacker@evil.com`. Arguments are searched in both
         // spellings (`arg_taint_alert`).
         let canon = super::canon::canonical(text);
+        // What the server said as written, to tell a value it repeated
+        // verbatim from one it only spelled like a value the call sent: the
+        // exemption below is for the agent's own value repeated as sent
+        // (`note_call` keeps it as sent). A value sent clean and answered
+        // defanged (`evil.com/inbox` sent, `evil[.]com/inbox` said) is
+        // recorded, as on main.
+        let verbatim: Option<HashSet<String>> = match (&canon, sent) {
+            (Cow::Owned(_), Some(_)) => {
+                Some(tokenize(text).into_iter().map(Cow::into_owned).collect())
+            }
+            _ => None,
+        };
         for raw in tokenize(&canon) {
             let tok = kept_part(&raw, provenance);
             match self.find(tok) {
@@ -534,7 +546,9 @@ impl TaintTracker {
                 None => {
                     // The call itself sent it: the agent's value, not one
                     // the server brought in.
-                    if sent.is_some_and(|sent| sent.contains(&*raw)) {
+                    if sent.is_some_and(|sent| sent.contains(&*raw))
+                        && verbatim.as_ref().is_none_or(|said| said.contains(&*raw))
+                    {
                         continue;
                     }
                     whole_cost += cost_of(tok);
@@ -1223,6 +1237,34 @@ mod tests {
     /// version of this change refused; main does not. Holds the main's
     /// behaviour until a destination inside a word is taken out with the
     /// user's request as its release.
+    /// The agent's own value is left out of the answer to its call only when
+    /// the server repeats it as sent. Repeated in another spelling, it is the
+    /// server's text and is recorded, as on main: a later call carrying that
+    /// spelling is refused.
+    ///
+    /// FAILS ON REVERT of `verbatim` in `record`: the defanged echo is
+    /// matched to the clean value sent and is not recorded.
+    #[test]
+    fn a_value_sent_and_echoed_in_another_spelling_is_still_recorded() {
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(1)), &json!({"url": "evil.com/inbox"}), false);
+        t.record_answer(
+            Some(&json!(1)),
+            "Saved evil[.]com/inbox",
+            Provenance::Content,
+        );
+        assert!(t
+            .arg_taint_alert("post_webpage", &json!({"url": "evil[.]com/inbox"}))
+            .is_some());
+        // Repeated as sent, it is still the agent's own.
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(1)), &json!({"url": "evil.com/inbox"}), false);
+        t.record_answer(Some(&json!(1)), "Saved evil.com/inbox", Provenance::Content);
+        assert!(t
+            .arg_taint_alert("post_webpage", &json!({"url": "evil.com/inbox"}))
+            .is_none());
+    }
+
     #[test]
     fn a_reply_to_the_sender_of_a_mail_read_is_not_tainted() {
         for header in [

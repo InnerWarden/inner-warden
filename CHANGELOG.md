@@ -43,7 +43,7 @@ the text of a command; what it does not see is written down, as measured:
   embedded resources, resource links, listings, errors, prompts,
   notifications), gets `AG-EFFECT`: a payment to an account, address or link
   a server named is refused, though no rule refuses the tool by name; any
-  other such call is held for review. Every value counts, at any depth, as a
+  other such call is forwarded with an alert. Every value counts, at any depth, as a
   map key and joined from pieces. Nothing is lowered: a refusal by name
   (ATR-2026-098, ATR-2026-040) stays, because a value found in no server's
   text is not proof the person asked for it. Lowering waits for the person's

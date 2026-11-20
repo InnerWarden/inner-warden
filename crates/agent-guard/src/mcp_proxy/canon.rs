@@ -196,7 +196,12 @@ fn entities_decoded(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         let tail = &rest[at..];
-        let end = tail[1..].find(';').map(|e| e + 1).filter(|&e| e <= 12);
+        // Only the next bytes: an entity is short, and a search of the whole
+        // rest at every `&` is quadratic in a text of ampersands.
+        let end = tail.as_bytes()[1..tail.len().min(14)]
+            .iter()
+            .position(|&b| b == b';')
+            .map(|e| e + 1);
         let decoded = end.and_then(|end| {
             let body = &tail[1..end];
             let c = if let Some(num) = body.strip_prefix('#') {
@@ -598,6 +603,21 @@ mod tests {
             let _ = without_scheme(text);
             let _ = squeezed(text);
         }
+    }
+
+    /// A text of ampersands costs time in proportion to its length.
+    #[test]
+    fn many_ampersands_take_linear_time() {
+        let text = "&".repeat(4 * 1024 * 1024);
+        let start = std::time::Instant::now();
+        let _ = canonical(&text);
+        let mixed = "&amp".repeat(1024 * 1024);
+        let _ = canonical(&mixed);
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]

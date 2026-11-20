@@ -22,9 +22,12 @@
 //!   or a link a server said is **refused** (`AG-EFFECT`, blocking): the shape
 //!   of an injected payment. A payment the person asked for from a bill a
 //!   tool read is refused too, as `send_money` already was by name;
-//! * any other acting call carrying a value a server said is **held for
-//!   review** (`AG-EFFECT`, an alert that does not block), naming the
+//! * any other acting call carrying a value a server said is **forwarded
+//!   with an alert** (`AG-EFFECT`, which does not block), naming the
 //!   argument and the value.
+//!
+//! The search has a budget ([`MAX_EFFECT_SCAN_BYTES`]): a call whose values
+//! cannot all be looked for in time gets the same alert, saying so.
 //!
 //! 1. **Effect class, once per tool, at `tools/list`** ([`EffectClass::of_tool`]):
 //!    from the input schema's slot names, the MCP annotations
@@ -72,6 +75,12 @@ use crate::mcp::{Verdict, VerdictAlert};
 
 /// The rule a raised verdict is reported under.
 pub const EFFECT_RULE: &str = "AG-EFFECT";
+
+/// The most bytes of what servers said that one call's values may be looked
+/// for in, all forms counted (about the work of the taint tracker's
+/// `MAX_SEARCH_STEPS`). Past it the rest is not looked for and the call is
+/// forwarded with an alert that says so.
+pub(crate) const MAX_EFFECT_SCAN_BYTES: usize = 64 * 1024 * 1024;
 
 /// A value shorter than this (in characters) raises nothing unless it holds
 /// a digit, `@`, `.` or `/`: a short plain word is in almost any text.
@@ -134,6 +143,14 @@ const DELETE_WORDS: &[&str] = &[
     "delete", "remove", "rm", "drop", "purge", "erase", "destroy", "unlink", "wipe", "trash",
 ];
 const SHARE_WORDS: &[&str] = &["share", "invite"];
+/// Verbs of action that make a name that starts as a reader an actor.
+/// Nouns (`transaction`, `email`, `message`, `post`) are not among them:
+/// `get_scheduled_transactions` and `read_email` read.
+const ACTION_VERBS: &[&str] = &[
+    "pay", "transfer", "wire", "remit", "withdraw", "refund", "purchase", "checkout", "charge",
+    "payout", "delete", "remove", "rm", "drop", "purge", "erase", "destroy", "unlink", "wipe",
+    "trash", "share", "invite", "send", "reply", "forward", "notify", "publish", "tweet", "submit",
+];
 const SEND_WORDS: &[&str] = &[
     "send", "email", "mail", "message", "post", "reply", "forward", "notify", "sms", "publish",
     "tweet", "dm", "comment", "submit",
@@ -282,8 +299,12 @@ impl EffectClass {
         let w = words(name);
         let slot_words: Vec<Vec<String>> = slots.iter().map(|s| words(s)).collect();
         let has_slot = |set: &[&str]| slot_words.iter().any(|sw| any_in(sw, set));
+        // A reader by its first word, unless an action verb follows
+        // (`check_and_pay`, `search_and_send_email`, `get_and_transfer`):
+        // a word of action anywhere in the name wins over one of reading.
         if w.first()
             .is_some_and(|first| READ_VERBS.contains(&first.as_str()))
+            && !any_in(&w[1..], ACTION_VERBS)
         {
             if any_in(&w, SECRET_WORDS) {
                 return EffectClass::ReadSecret;
@@ -399,6 +420,12 @@ impl SeenText {
     #[cfg(test)]
     pub(crate) fn is_whole(&self) -> bool {
         self.whole
+    }
+
+    /// What looking for `value` costs: the bytes kept, once per form.
+    pub(crate) fn scan_cost(&self, value: &str) -> usize {
+        let forms = super::canon::value_forms(value).len().max(1);
+        (self.text.len() + self.squeezed.len() + value.len()).saturating_mul(forms)
     }
 
     /// Whether `value` appeared in what servers said, in any of its forms
@@ -555,10 +582,31 @@ pub(crate) fn apply_table(
     {
         return;
     }
-    let said: Vec<(String, String)> = carried(args)
-        .into_iter()
-        .filter(|(_, value)| raises(value) && seen.contains_value(value))
-        .collect();
+    let mut said: Vec<(String, String)> = Vec::new();
+    let mut looked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut budget = MAX_EFFECT_SCAN_BYTES;
+    for (slot, value) in carried(args) {
+        if !raises(&value) || !looked.insert(value.clone()) {
+            continue;
+        }
+        let cost = seen.scan_cost(&value);
+        if cost > budget {
+            verdict.alerts.push(VerdictAlert::builtin(
+                EFFECT_RULE,
+                format!(
+                    "{} call carries more values than can be looked for in time in what \
+                     servers said this session: forwarded with an alert, not checked whole",
+                    class.label(),
+                ),
+                false,
+            ));
+            break;
+        }
+        budget -= cost;
+        if seen.contains_value(&value) {
+            said.push((slot, value));
+        }
+    }
     let Some(first) = said.first() else {
         return;
     };
@@ -576,7 +624,7 @@ pub(crate) fn apply_table(
     let what = if refuses {
         "refused: a payment to a destination a server named is the shape of an injected one"
     } else {
-        "held for review"
+        "forwarded with an alert"
     };
     verdict.alerts.push(VerdictAlert::builtin(
         EFFECT_RULE,
@@ -620,6 +668,15 @@ mod tests {
                 EffectClass::MoneyMovement,
             ),
             ("get_scheduled_transactions", &[][..], EffectClass::ReadOnly),
+            ("read_email", &["id"][..], EffectClass::ReadOnly),
+            ("check_and_pay", &["bill"][..], EffectClass::MoneyMovement),
+            ("get_and_transfer", &["to"][..], EffectClass::MoneyMovement),
+            (
+                "search_and_send_email",
+                &["to"][..],
+                EffectClass::SendExternal,
+            ),
+            ("list_and_delete_files", &["path"][..], EffectClass::Delete),
             ("search_emails", &["query"][..], EffectClass::ReadOnly),
             (
                 "send_email",
@@ -694,6 +751,42 @@ mod tests {
         assert!(seen.is_whole());
         seen.note_unread();
         assert!(!seen.is_whole());
+    }
+
+    /// A call with more values than can be looked for in time is not
+    /// searched past the budget: it gets an alert saying so, in bounded time.
+    #[test]
+    fn a_call_with_too_many_values_is_looked_for_within_a_budget() {
+        let mut seen = SeenText::default();
+        seen.record(&"lorem ipsum dolor sit amet ".repeat(70_000));
+        let values: Vec<Value> = (0..100_000)
+            .map(|i| json!(format!("acct-{i:08}")))
+            .collect();
+        let mut verdict = Verdict {
+            allowed: true,
+            alerts: Vec::new(),
+        };
+        let start = std::time::Instant::now();
+        apply_table(
+            "send_message",
+            &json!({"to": values}),
+            EffectClass::SendExternal,
+            &seen,
+            &mut verdict,
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(20),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(verdict.allowed);
+        assert!(
+            verdict.alerts.iter().any(|a| a.rule == EFFECT_RULE
+                && !a.block
+                && a.detail.contains("not checked whole")),
+            "{:?}",
+            verdict.alerts
+        );
     }
 
     #[test]

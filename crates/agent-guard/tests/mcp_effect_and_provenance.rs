@@ -1,7 +1,7 @@
 //! The provenance table only RAISES a verdict: a call that moves money,
 //! sends, shares or deletes, carrying a value a server said this session,
 //! gets `AG-EFFECT` (refused for a payment to a destination a server named,
-//! held for review otherwise). It never lowers one: without the person's
+//! forwarded with an alert otherwise). It never lowers one: without the person's
 //! request as a source, a value found nowhere is not proof it is theirs, so
 //! a refusal by name (ATR-2026-098, ATR-2026-040) stays.
 //!
@@ -221,7 +221,7 @@ fn a_payment_to_a_destination_a_server_said_is_refused() {
     assert_eq!(effect(&d), None);
 }
 
-/// Any other acting call carrying a value a server said is held for review:
+/// Any other acting call carrying a value a server said is forwarded with
 /// an alert, not a refusal.
 #[test]
 fn a_send_carrying_a_value_a_server_said_is_held_for_review() {
@@ -270,7 +270,7 @@ fn a_destination_anywhere_in_the_call_is_read() {
         let d = s.call("schedule_transaction", args.clone());
         assert!(!d.verdict.allowed, "{args}: {:?}", rules(&d));
     }
-    // A plain word a server said, as the key of a map: held for review.
+    // A plain word a server said, as the key of a map: an alert.
     let mut s = Session::new();
     s.read(
         "read_document",
