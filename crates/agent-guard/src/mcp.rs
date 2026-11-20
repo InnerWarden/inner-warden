@@ -2977,6 +2977,10 @@ pub fn analyze_command_in(
 /// payload that itself writes a startup file is analysed once more, no further.
 const STARTUP_PAYLOAD_DEPTH: u8 = 2;
 
+/// How a finding of a line a substitution runs is named
+/// ([`crate::shell::lines_substitutions_run`]).
+const SUBSTITUTION_HANDS_ON: &str = "in a line a substitution runs";
+
 /// The command as bash reads it and, where sh and dash read it differently,
 /// as they do: the reading that scores higher is the verdict.
 ///
@@ -3968,6 +3972,12 @@ fn analyze_command_as_read(
     // The fetch-and-execute findings of the lines handed on, charged at the
     // end only when the line itself charged none.
     let mut handed_fetch_exec: Vec<AnalysisSignal> = Vec::new();
+    // The other findings of the lines the line's substitutions run, charged
+    // at the end under each name the line around them did not charge as
+    // high: the line as written shows the substitution's text to the outer
+    // rules too, so `git commit -m "$(cat ~/.ssh/id_ed25519)"` would
+    // otherwise count the read twice.
+    let mut substituted: Vec<AnalysisSignal> = Vec::new();
     if depth < STARTUP_PAYLOAD_DEPTH {
         // A line handed over again says nothing new: each is judged once,
         // where it is first handed over.
@@ -3987,6 +3997,10 @@ fn analyze_command_as_read(
             (
                 crate::shell::lines_xargs_builds(cmd),
                 "in a line xargs builds from the words handed to it",
+            ),
+            (
+                crate::shell::lines_substitutions_run(cmd),
+                SUBSTITUTION_HANDS_ON,
             ),
         ] {
             lines.retain(|line| seen.insert(line.clone()));
@@ -4019,6 +4033,15 @@ fn analyze_command_as_read(
                         .any(|s: &AnalysisSignal| s.signal == handed.signal)
                     {
                         handed_fetch_exec.push(AnalysisSignal { detail, ..handed });
+                    }
+                    continue;
+                }
+                if handed_by == SUBSTITUTION_HANDS_ON {
+                    if !substituted
+                        .iter()
+                        .any(|s| s.signal == handed.signal && s.detail == detail)
+                    {
+                        substituted.push(AnalysisSignal { detail, ..handed });
                     }
                     continue;
                 }
@@ -4535,6 +4558,20 @@ fn analyze_command_as_read(
         for handed in handed_fetch_exec {
             score += handed.score;
             signals.push(handed);
+        }
+    }
+    // A substitution is a program of its own, in whatever slot it stands
+    // (`--body`, `-m`, `pytest -k`, any argument): what it runs is charged
+    // here when the line around it did not charge the same finding at least
+    // as high, so the line is never judged below the line the substitution
+    // holds, run on its own.
+    for found in substituted {
+        if !signals
+            .iter()
+            .any(|s| s.signal == found.signal && s.score >= found.score)
+        {
+            score += found.score;
+            signals.push(found);
         }
     }
 

