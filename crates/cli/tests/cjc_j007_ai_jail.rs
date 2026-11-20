@@ -5917,7 +5917,7 @@ fn the_lines_beside_the_record_reach_it_from_a_jail_whatever_iw_graph_file_says(
         let project = tempfile::TempDir::new().unwrap();
         let script = format!(
             "mkdir -p /tmp/elsewhere; \
-             IW_GRAPH_FILE=/tmp/elsewhere/graph.json '{}' allow 'echo side-event-marker*' >/dev/null 2>&1; \
+             IW_SUPPRESS_CONFIG=\"$HOME/suppress.toml\" IW_GRAPH_FILE=/tmp/elsewhere/graph.json '{}' allow 'echo side-event-marker*' >/dev/null 2>&1; \
              if [ -e /tmp/elsewhere/guard-events.jsonl ]; then echo ELSEWHERE; fi",
             bin()
         );
