@@ -125,7 +125,7 @@ Connect the agent you use:
 
 ```sh
 innerwarden install claude-code       # Claude Code's PreToolUse hook
-innerwarden agents connect cursor    # or: codex, gemini, openclaw
+innerwarden agents connect cursor    # or: codex, gemini, hermes, openclaw
 ```
 
 See what the guard refuses for each connected agent, without running anything:
@@ -197,8 +197,9 @@ Whatever agent you run, there is a mechanism and a command for it:
   `innerwarden agents connect codex` or `gemini`. Codex runs the hook only
   once it trusts it, and connect asks Codex to. Needs Codex CLI 0.166.0 or
   newer (older ones send the session's folder, not the command's) and Gemini
-  CLI 0.26.0 or newer (older ones run no hook unless switched on); measured
-  on macOS with Codex 0.167.2 and Gemini 0.68.0.
+  CLI 0.26.0 or newer (older ones run no hook unless switched on). Codex
+  was measured on Linux with Codex CLI 0.170.0 and on macOS with 0.167.2;
+  Gemini is judged only by its payload, not on a running Gemini.
 - **Hermes Agent** - its own shell hook, under `hooks.pre_tool_call` in
   `~/.hermes/config.yaml`, judges its `terminal` commands (in the `workdir`
   they name), its file changes through `write_file` and `patch`, and its
@@ -214,9 +215,9 @@ Whatever agent you run, there is a mechanism and a command for it:
   servers).
   Hermes keeps the folder a command `cd`s into for its next command but
   sends the folder it was started in, so a later relative path is judged
-  there. Needs Hermes Agent v0.22.5 or newer; read in its v0.23.1 source,
-  not yet measured on a running Hermes. Reversible with `agents disconnect
-  hermes`.
+  there. Needs Hermes Agent v0.22.5 or newer; measured through Hermes
+  Agent v0.23.1's own hook runner (`hermes hooks test`), not in a full chat.
+  Reversible with `agents disconnect hermes`.
 - **The hook line fails closed.** On Linux and macOS an enforcing hook line
   (Claude Code, Codex, Gemini) runs the guard inside a small `/bin/sh`
   script: if the innerwarden program is missing, cannot start, is killed or
