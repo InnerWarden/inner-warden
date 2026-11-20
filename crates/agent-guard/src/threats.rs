@@ -20753,7 +20753,7 @@ fn interpreter_executes_target(
     depth: u8,
 ) -> TargetExecution {
     let arguments = &words[1..];
-    if matches!(interpreter, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish") {
+    if crate::shell::names_a_shell(interpreter) {
         return if shell_interpreter_executes_target(arguments, target, cwd, variables, depth) {
             TargetExecution::Interpreted
         } else {
@@ -20914,7 +20914,7 @@ fn shell_noexec_mode(words: &[String]) -> bool {
         return false;
     };
     let name = token_basename(command).to_ascii_lowercase();
-    if !matches!(name.as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh") {
+    if !crate::shell::names_a_shell(&name) || name == "fish" {
         return false;
     }
     words[1..]

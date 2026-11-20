@@ -9,6 +9,7 @@
 use std::ops::Range;
 
 mod inline_calls;
+mod runners;
 mod unread_parts;
 
 pub(crate) use inline_calls::InlineReading;
@@ -585,10 +586,8 @@ fn with_evaluated_subscripts_run(text: &str) -> Option<String> {
         let read_by_a_shell = heredoc_owner(body)
             .and_then(|command| command_name(command, bytes))
             .is_some_and(|name| {
-                matches!(
-                    versionless_interpreter_name(&normalized_command_name(&name)),
-                    "sh" | "bash" | "zsh" | "dash" | "ksh"
-                )
+                let name = normalized_command_name(&name);
+                is_shell_name(&name) && versionless_interpreter_name(&name) != "fish"
             });
         if !read_by_a_shell {
             continue;
@@ -2058,7 +2057,7 @@ fn names_a_script_file(
     source: &[u8],
 ) -> bool {
     let code_letters: &[char] = match interpreter_language(interpreter) {
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => &['c'],
+        shell if is_shell_name(shell) => &['c'],
         "python" => &['c'],
         "php" => &['r'],
         "perl" | "ruby" | "lua" | "node" => &['e', 'E', 'p'],
@@ -2978,6 +2977,9 @@ pub(crate) struct HandedLines {
     /// A shell's `-c` line is not written out (`sh -c "$C"` with `C` not
     /// set on the line, `sh -c "$X$Y"`): the guard cannot read it.
     pub(crate) not_literal: bool,
+    /// A file the line writes and then runs holds text the line prints
+    /// without showing it (`echo "$X" > x.sh; sh x.sh`, `exec > x.sh`).
+    pub(crate) file_not_shown: bool,
 }
 
 /// The most levels of `xargs` and `find -exec` a handed line is read
@@ -3153,17 +3155,26 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             let Some(words) = command_words(owner, bytes) else {
                 continue;
             };
+            let words = through_line_function(owner, words, bytes);
             let Some(effective) = effective_command_words(&words, 0) else {
                 continue;
             };
             let name = normalized_command_name(&effective[0]);
-            if !(is_shell_name(&name) || names_a_shell_at_run_time(&effective[0])) {
-                continue;
-            }
             let args: Vec<String> = effective[1..]
                 .iter()
                 .map(|argument| shell_literal_word(argument))
                 .collect();
+            if !(is_shell_name(&name) || names_a_shell_at_run_time(&effective[0])) {
+                // A runner that reads a script on stdin (`at now <<'EOF'`).
+                if let Some(language) = runners::stdin_script(runners::versionless(&name), &args) {
+                    handed.lines.extend(runners::shell_lines(
+                        language,
+                        &stdin_code_text(body, bytes),
+                        "",
+                    ));
+                }
+                continue;
+            }
             if shell_code_input(&args) == CodeInput::Stdin {
                 handed.lines.push(stdin_code_text(body, bytes));
             }
@@ -3180,17 +3191,38 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         let Some(words) = command_words(*command, bytes) else {
             continue;
         };
+        let words = through_line_function(*command, words, bytes);
         let Some(effective) = effective_command_words(&words, 0) else {
             continue;
         };
         let name = normalized_command_name(&effective[0]);
-        if !(is_shell_name(&name) || names_a_shell_at_run_time(&effective[0])) {
-            continue;
-        }
         let args: Vec<String> = effective[1..]
             .iter()
             .map(|argument| shell_literal_word(argument))
             .collect();
+        if !(is_shell_name(&name) || names_a_shell_at_run_time(&effective[0])) {
+            // A runner that reads a script on stdin: `at` and `batch`, `make
+            // -f -`, an `awk` program that runs its input, `parallel` with no
+            // command. Text the line does not show is held for review.
+            if let Some(language) = runners::stdin_script(runners::versionless(&name), &args) {
+                match piped_input(*command, bytes) {
+                    Some(PipedInput::Text(text)) => {
+                        handed
+                            .lines
+                            .extend(runners::shell_lines(language, &text, ""));
+                    }
+                    Some(PipedInput::Unread) => handed.not_literal = true,
+                    None => {
+                        if let Some(text) = stdin_text_of(*command, bytes) {
+                            handed
+                                .lines
+                                .extend(runners::shell_lines(language, &text, ""));
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         if shell_code_input(&args) != CodeInput::Stdin {
             continue;
         }
@@ -3205,8 +3237,423 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             handed.lines.push(text);
         }
     }
+    // A file the line writes and then runs: what it wrote is the code that
+    // runs, read as the runner reads it (a shell script, a makefile's
+    // recipes, code in another language). A file the line prints into with
+    // text it does not show is held for review; one a program writes (`python3
+    // gen.py > r.sh`), a copy, or a download (the download rules' own) is
+    // read only when the line shows its text.
+    for command in &commands {
+        if never_runs(*command, bytes) {
+            continue;
+        }
+        let Some(words) = command_words(*command, bytes) else {
+            continue;
+        };
+        let Some(effective) = effective_command_words(&words, 0) else {
+            continue;
+        };
+        if command_is_noexec_shell(effective) {
+            continue;
+        }
+        for (path, language) in files_a_command_runs(effective) {
+            let Some(writer) = file_writer(*command, &path, bytes) else {
+                continue;
+            };
+            let text = file_text_before(*command, &path, bytes)
+                .or_else(|| substituted_writer_text(*command, &path, bytes, &assignments));
+            match (text, writer) {
+                (Some(text), _) => {
+                    let (language, program) = match (language, runners::shebang(&text)) {
+                        (None, Some(found)) => (found.0, found.1),
+                        (None, None) => (runners::Language::Shell, String::new()),
+                        (Some(language), _) => (language, String::new()),
+                    };
+                    handed
+                        .lines
+                        .extend(runners::shell_lines(language, &text, &program));
+                }
+                (None, Writer::Printer) => handed.file_not_shown = true,
+                (None, Writer::Program | Writer::Download) => {}
+            }
+        }
+    }
     handed.lines.retain(|line| !line.trim().is_empty());
     handed
+}
+
+/// The files the command `effective` runs, each with how it reads it
+/// ([`runners::file_scripts`]); a program run by its path (`./x.sh`)
+/// is read by its first line, `None` here.
+fn files_a_command_runs(effective: &[String]) -> Vec<(String, Option<runners::Language>)> {
+    let program = shell_literal_word(&effective[0]);
+    if program.contains(['$', '`']) {
+        return Vec::new();
+    }
+    if program.contains('/') && !program.ends_with('/') {
+        return vec![(program, None)];
+    }
+    let name = normalized_command_name(&effective[0]);
+    let args: Vec<String> = effective[1..]
+        .iter()
+        .map(|argument| shell_literal_word(argument))
+        .collect();
+    runners::file_scripts(runners::versionless(&name), &args)
+        .into_iter()
+        .map(|(path, language)| (path, Some(language)))
+        .collect()
+}
+
+/// `path` as the line may write it: as given, and with or without a
+/// leading `./`.
+fn spellings_of(path: &str) -> Vec<String> {
+    let bare = path.trim_start_matches("./");
+    vec![bare.to_owned(), format!("./{bare}")]
+}
+
+/// Who writes a file the line runs, the strongest first: a download
+/// (the download rules read it), a printer of text (`echo`, `printf`, `cat`,
+/// `exec >`, `tee` of a printer, inline code naming the file), or another
+/// program (its output, a copy, a link).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Writer {
+    Program,
+    Printer,
+    Download,
+}
+
+/// Who writes `path` before `reader` runs it on the line, if anyone does:
+/// the strongest [`Writer`] of them.
+fn file_writer(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Option<Writer> {
+    let spellings = spellings_of(path);
+    let root = root_node(reader);
+    let printer_name = |name: &str| matches!(name, "echo" | "printf" | "cat" | "exec" | "print");
+    let mut found: Option<Writer> = None;
+    let mut note = |writer: Writer| found = Some(found.map_or(writer, |before| before.max(writer)));
+    let mut redirects = Vec::new();
+    collect_nodes_of_kind(root, "file_redirect", &mut redirects, 0);
+    for redirect in redirects {
+        let statement = ancestor_of_kind(redirect, "redirected_statement").unwrap_or(redirect);
+        // The grammar hangs `>f` on a whole list (`false && cat >f`): the
+        // command that writes is the list's last, and it may never run.
+        let writes = statement_owner(statement).unwrap_or(statement);
+        if redirect.start_byte() >= reader.start_byte()
+            || never_runs(statement, source)
+            || never_runs(writes, source)
+        {
+            continue;
+        }
+        let Some(destination) = redirect.child_by_field_name("destination") else {
+            continue;
+        };
+        let operator = node_text(redirect, source);
+        let operator = operator
+            .get(
+                ..destination
+                    .start_byte()
+                    .saturating_sub(redirect.start_byte()),
+            )
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if !operator.contains('>')
+            || operator.contains(">&")
+            || !spellings.contains(&shell_literal_word(&node_text(destination, source)))
+        {
+            continue;
+        }
+        let owner = ancestor_of_kind(redirect, "redirected_statement").and_then(statement_owner);
+        let name = owner
+            .and_then(|owner| command_name(owner, source))
+            .map(|name| normalized_command_name(&name))
+            .unwrap_or_default();
+        let defined = owner.is_some_and(|owner| {
+            line_function_body(root, &name, source).is_some() && owner.kind() == "command"
+        });
+        note(match name.as_str() {
+            "curl" | "wget" => Writer::Download,
+            _ if printer_name(&name) || defined => Writer::Printer,
+            // A group or a subshell that prints (`{ echo "$f"; } > r.sh`).
+            _ if owner.is_none() => Writer::Printer,
+            _ => Writer::Program,
+        });
+    }
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    for command in commands {
+        if command.end_byte() > reader.start_byte() || never_runs(command, source) {
+            continue;
+        }
+        let Some(words) = command_words(command, source) else {
+            continue;
+        };
+        let Some(effective) = effective_command_words(&words, 0) else {
+            continue;
+        };
+        let args: Vec<String> = effective[1..]
+            .iter()
+            .map(|argument| shell_literal_word(argument))
+            .collect();
+        let names = |word: &String| spellings.contains(word);
+        let name = normalized_command_name(&effective[0]);
+        match name.as_str() {
+            "tee" if args.iter().any(names) => {
+                let fed_by_printer =
+                    pipe_writer_name(command, source).is_some_and(|writer| printer_name(&writer));
+                note(if fed_by_printer {
+                    Writer::Printer
+                } else {
+                    Writer::Program
+                });
+            }
+            "cp" | "mv" | "install" | "ln" | "rsync" | "scp" | "dd"
+                if args.iter().any(names)
+                    || args.iter().any(|arg| {
+                        arg.strip_prefix("of=")
+                            .is_some_and(|of| spellings.iter().any(|s| s == of))
+                    }) =>
+            {
+                note(Writer::Program);
+            }
+            "curl" | "wget" if args.iter().any(names) => note(Writer::Download),
+            _ if is_code_language(&name)
+                && args.iter().any(|arg| {
+                    spellings.iter().any(|spelling| {
+                        arg.contains(&format!("'{spelling}'"))
+                            || arg.contains(&format!("\"{spelling}\""))
+                    })
+                }) =>
+            {
+                note(Writer::Printer);
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Whether `node` never runs: it is in a literally unreachable branch
+/// ([`node_is_in_literal_unreachable_branch`]), or it follows, through
+/// `&&` only, a member of its list that surely fails (`false && a && b`,
+/// whose grammar holds three members in one list).
+fn never_runs(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if node_is_in_literal_unreachable_branch(node, source) {
+        return true;
+    }
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "list" {
+            let mut cursor = parent.walk();
+            let children: Vec<_> = parent.children(&mut cursor).collect();
+            if let Some(at) = children.iter().position(|child| {
+                child.start_byte() <= node.start_byte() && node.end_byte() <= child.end_byte()
+            }) {
+                let mut index = at;
+                while index >= 2 && node_text(children[index - 1], source).trim() == "&&" {
+                    if surely_fails(children[index - 2], source) {
+                        return true;
+                    }
+                    index -= 2;
+                }
+            }
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Whether a statement surely fails: `false` as the shell reads it, or a
+/// list joined by `&&` that starts with one.
+fn surely_fails(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if literal_shell_status(node, source) == Some(false) {
+        return true;
+    }
+    if node.kind() != "list" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    children
+        .first()
+        .is_some_and(|first| surely_fails(*first, source))
+        && children
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .all(|operator| node_text(*operator, source).trim() == "&&")
+}
+
+/// The name of the command before `command` in its pipeline.
+fn pipe_writer_name(command: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let unit = command
+        .parent()
+        .filter(|parent| parent.kind() == "redirected_statement")
+        .unwrap_or(command);
+    let pipeline = unit.parent().filter(|parent| parent.kind() == "pipeline")?;
+    let mut cursor = pipeline.walk();
+    let stages: Vec<_> = pipeline.named_children(&mut cursor).collect();
+    let at = stages.iter().position(|stage| *stage == unit)?;
+    let writer = stages.get(at.checked_sub(1)?)?;
+    let writer = if writer.kind() == "redirected_statement" {
+        writer.child_by_field_name("body")?
+    } else {
+        *writer
+    };
+    command_name(writer, source).map(|name| normalized_command_name(&name))
+}
+
+/// What the printer that writes `path` prints once the variables it names
+/// are read as the values the line set them to, written out, before it
+/// (`f=$(curl ...); f=reset; echo "$f" > r.sh` writes `reset`). `None` when a
+/// variable has no such value, or when more than one statement writes it.
+fn substituted_writer_text(
+    reader: tree_sitter::Node<'_>,
+    path: &str,
+    source: &[u8],
+    assignments: &[Assignment],
+) -> Option<String> {
+    let spellings = spellings_of(path);
+    let mut redirects = Vec::new();
+    collect_nodes_of_kind(root_node(reader), "file_redirect", &mut redirects, 0);
+    let mut writers = redirects.into_iter().filter(|redirect| {
+        redirect.start_byte() < reader.start_byte()
+            && redirect
+                .child_by_field_name("destination")
+                .is_some_and(|destination| {
+                    spellings.contains(&shell_literal_word(&node_text(destination, source)))
+                })
+    });
+    let redirect = writers.next()?;
+    if writers.next().is_some() {
+        return None;
+    }
+    let writer = ancestor_of_kind(redirect, "redirected_statement").and_then(statement_owner)?;
+    let at = writer.start_byte();
+    let mut text = node_text(writer, source);
+    let reference = regex::Regex::new(r#""?\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"?"#).ok()?;
+    let mut values = Vec::new();
+    for found in reference.captures_iter(&text.clone()) {
+        let name = found.get(1)?.as_str();
+        let before: Vec<&Assignment> = assignments
+            .iter()
+            .filter(|(assigned, _, end, _, _)| assigned == name && *end <= at)
+            .collect();
+        let last = before.last()?;
+        // Only one set at the top of the line, where it surely ran.
+        if last.3.is_some() || !last.4.is_empty() {
+            return None;
+        }
+        let value = last.1.clone()?;
+        values.push((found.get(0)?.as_str().to_owned(), value));
+    }
+    if values.is_empty() {
+        return None;
+    }
+    for (written, value) in values {
+        text = text.replace(&written, &format!("'{}'", value.replace('\'', "'\\''")));
+    }
+    let (tree, _doubt) = parse_line(&text)?;
+    let command = first_command(tree.root_node())?;
+    printed_text(command, text.as_bytes(), 0)
+}
+
+/// What the line wrote to `path` before `reader` runs it, when it shows the
+/// text: a redirect of text written out ([`written_file_text`]), a `tee` of
+/// such text, or inline code that writes a string it spells out
+/// ([`runners::code_written_text`]).
+fn file_text_before(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Option<String> {
+    for spelling in spellings_of(path) {
+        if let Some(text) = written_file_text(reader, &spelling, source, 0) {
+            return Some(text);
+        }
+    }
+    let spellings = spellings_of(path);
+    let mut commands = Vec::new();
+    collect_all_commands(root_node(reader), &mut commands, 0);
+    let mut text = None;
+    for command in commands
+        .into_iter()
+        .filter(|command| command.end_byte() <= reader.start_byte())
+    {
+        let Some(words) = command_words(command, source) else {
+            continue;
+        };
+        let Some(effective) = effective_command_words(&words, 0) else {
+            continue;
+        };
+        let name = normalized_command_name(&effective[0]);
+        let args: Vec<String> = effective[1..]
+            .iter()
+            .map(|argument| shell_literal_word(argument))
+            .collect();
+        if name == "tee" && args.iter().any(|arg| spellings.contains(arg)) {
+            text = match piped_input(command, source) {
+                Some(PipedInput::Text(text)) => Some(text),
+                Some(PipedInput::Unread) => return None,
+                None => Some(stdin_text_of(command, source)?),
+            };
+            continue;
+        }
+        let Some(row) = runners::program(runners::versionless(&name)) else {
+            continue;
+        };
+        let Some(flag) = row.inline.as_deref() else {
+            continue;
+        };
+        let Some(code) = args
+            .iter()
+            .position(|arg| arg == flag)
+            .and_then(|at| args.get(at + 1))
+        else {
+            continue;
+        };
+        match runners::code_written_text(row.language, code, path) {
+            Some(Some(written)) => text = Some(written),
+            Some(None) => return None,
+            None => {}
+        }
+    }
+    text
+}
+
+/// The words `command` runs as when it calls a function the line defines
+/// whose body is one command: that command's words (`x() { tcsh; }; x
+/// <<'EOF'` reads as `tcsh`). Any other command keeps its own.
+fn through_line_function(
+    command: tree_sitter::Node<'_>,
+    words: Vec<String>,
+    source: &[u8],
+) -> Vec<String> {
+    let Some(name) = words.first() else {
+        return words;
+    };
+    match line_function_body(root_node(command), name, source) {
+        Some(body) => match body.as_slice() {
+            [only] => command_words(*only, source).unwrap_or(words),
+            _ => words,
+        },
+        None => words,
+    }
+}
+
+/// The commands of the body of the last function named `name` the line
+/// defines.
+fn line_function_body<'tree>(
+    root: tree_sitter::Node<'tree>,
+    name: &str,
+    source: &[u8],
+) -> Option<Vec<tree_sitter::Node<'tree>>> {
+    let mut definitions = Vec::new();
+    collect_nodes_of_kind(root, "function_definition", &mut definitions, 0);
+    let definition = definitions.into_iter().rev().find(|definition| {
+        definition
+            .child_by_field_name("name")
+            .is_some_and(|found| node_text(found, source) == name)
+    })?;
+    let body = definition.child_by_field_name("body")?;
+    let mut commands = Vec::new();
+    collect_all_commands(body, &mut commands, 0);
+    Some(commands)
 }
 
 /// A variable set on the line: name, value when written out, where the
@@ -3704,6 +4151,21 @@ fn handed_lines_of(words: &[String], depth: u8, assignments: &LineVars, handed: 
     let Some(effective) = effective_command_words(&words, 0) else {
         return;
     };
+    // The command a launcher of the table starts that the readings of a
+    // line's text do not look past (`busybox rm -rf /`, `systemd-run rm
+    // ...`) is a line of its own. Measured 2026-11-20 on main: both were
+    // allowed while `rm -rf ~/.ssh` alone is refused.
+    let launcher = normalized_command_name(&words[0]);
+    if matches!(launcher.as_str(), "busybox" | "toybox") && effective.len() < words.len() {
+        handed.lines.push(effective.join(" "));
+    }
+    if launcher == "systemd-run" {
+        if let Some(at) = systemd_run_command_start(&words) {
+            handed.lines.push(words[at..].join(" "));
+            handed_lines_of(&words[at..], depth + 1, assignments, handed);
+        }
+        return;
+    }
     // A program named at run time (`X=bash; $X -c ...`, `$(echo bash) -c
     // ...`) is the program the line names for it when the line does.
     let run_time =
@@ -3724,6 +4186,11 @@ fn handed_lines_of(words: &[String], depth: u8, assignments: &LineVars, handed: 
         }
         "find" => {
             for invoked in find_exec_commands(effective) {
+                // The command `-exec` runs is a line of its own; a shell it
+                // starts hands its own line on below.
+                if !invoked.is_empty() {
+                    handed.lines.push(invoked.join(" "));
+                }
                 handed_lines_of(invoked, depth + 1, assignments, handed);
             }
         }
@@ -3852,11 +4319,15 @@ fn program_named_on_the_line(word: &str, assignments: &LineVars) -> Option<Strin
     Some(normalized_command_name(program))
 }
 
+/// [`is_shell_name`], for the readings outside this module.
+pub(crate) fn names_a_shell(name: &str) -> bool {
+    is_shell_name(name)
+}
+
+/// Whether `name` is a shell, as the table of programs that run what they
+/// are handed says ([`runners`], `data/programs.toml`).
 fn is_shell_name(name: &str) -> bool {
-    matches!(
-        versionless_interpreter_name(name),
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
-    )
+    runners::program(versionless_interpreter_name(name)).is_some_and(|program| program.shell)
 }
 
 /// The text of a double-quoted word as the shell hands it on: a backslash
@@ -4006,6 +4477,57 @@ fn xargs_command_start(words: &[String]) -> Option<usize> {
 }
 
 /// The commands `find` runs with `-exec`, `-execdir`, `-ok` or `-okdir`.
+/// Where the command `systemd-run` starts begins in `words` (its name
+/// first): past its options, those that take a value with it.
+fn systemd_run_command_start(words: &[String]) -> Option<usize> {
+    const VALUED: &[&str] = &[
+        "-u",
+        "--unit",
+        "-p",
+        "--property",
+        "-E",
+        "--setenv",
+        "-M",
+        "--machine",
+        "-H",
+        "--host",
+        "-D",
+        "--working-directory",
+        "--description",
+        "--slice",
+        "--uid",
+        "--gid",
+        "--nice",
+        "--on-active",
+        "--on-boot",
+        "--on-startup",
+        "--on-unit-active",
+        "--on-unit-inactive",
+        "--on-calendar",
+        "--timer-property",
+        "--path-property",
+        "--socket-property",
+        "--service-type",
+    ];
+    let mut at = 1;
+    while let Some(word) = words.get(at) {
+        let word = shell_word(word);
+        if word == "--" {
+            return (at + 1 < words.len()).then_some(at + 1);
+        }
+        if VALUED.contains(&word.as_str()) {
+            at += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            at += 1;
+            continue;
+        }
+        return Some(at);
+    }
+    None
+}
+
 fn find_exec_commands(words: &[String]) -> Vec<&[String]> {
     let mut commands = Vec::new();
     let mut index = 1;
@@ -4147,6 +4669,13 @@ pub(crate) fn piped_input(consumer: tree_sitter::Node<'_>, source: &[u8]) -> Opt
                 Some(body) if body.kind() == "command" => body,
                 _ => return Some(PipedInput::Unread),
             },
+            // A group or a subshell prints what each of its commands prints
+            // (a called function's body written out at the call).
+            "compound_statement" | "subshell" => {
+                return Some(
+                    group_printed_text(writer, source).map_or(PipedInput::Unread, PipedInput::Text),
+                );
+            }
             _ => return Some(PipedInput::Unread),
         };
         return Some(printed_text(writer, source, 0).map_or(PipedInput::Unread, PipedInput::Text));
@@ -4156,6 +4685,27 @@ pub(crate) fn piped_input(consumer: tree_sitter::Node<'_>, source: &[u8]) -> Opt
         .filter(|parent| parent.kind() == "heredoc_redirect")?;
     let writer = heredoc_owner(redirect)?;
     Some(printed_text(writer, source, 0).map_or(PipedInput::Unread, PipedInput::Text))
+}
+
+/// What a group (`{ ...; }`) or a subshell prints, when each statement in
+/// it is a command whose text the line writes out.
+fn group_printed_text(group: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
+    let mut cursor = group.walk();
+    let mut text = String::new();
+    let mut any = false;
+    for statement in group.named_children(&mut cursor) {
+        let command = match statement.kind() {
+            "comment" => continue,
+            "command" => statement,
+            "redirected_statement" => statement
+                .child_by_field_name("body")
+                .filter(|body| body.kind() == "command")?,
+            _ => return None,
+        };
+        text.push_str(&printed_text(command, source, 0)?);
+        any = true;
+    }
+    any.then_some(text)
 }
 
 /// The text `command` prints, when the line writes it out: see
@@ -4219,6 +4769,27 @@ fn printed_text(command: tree_sitter::Node<'_>, source: &[u8], level: u8) -> Opt
             let mut text = String::new();
             for path in paths {
                 text.push_str(&written_file_text(command, path, source, level + 1)?);
+            }
+            Some(text)
+        }
+        // A function the line defines prints what its body prints; a body
+        // that is a bare `cat` prints what the call is handed.
+        _ if level < PIPED_FILE_LEVELS => {
+            let body = line_function_body(root_node(command), &name, source)?;
+            if body.is_empty() {
+                return None;
+            }
+            let mut text = String::new();
+            for inner in body {
+                let bare_cat = command_name(inner, source)
+                    .is_some_and(|inner_name| normalized_command_name(&inner_name) == "cat")
+                    && command_arguments(inner).is_empty()
+                    && stdin_text_of(inner, source).is_none();
+                if bare_cat {
+                    text.push_str(&stdin_text_of(command, source)?);
+                } else {
+                    text.push_str(&printed_text(inner, source, level + 1)?);
+                }
             }
             Some(text)
         }
@@ -7184,26 +7755,10 @@ impl LineLink {
     }
 }
 
+/// Whether `name` runs what it reads on stdin as code, as the table of
+/// programs says ([`runners`]).
 fn is_stdin_code_executor(name: &str) -> bool {
-    matches!(
-        versionless_interpreter_name(name),
-        "sh" | "bash"
-            | "zsh"
-            | "dash"
-            | "ksh"
-            | "fish"
-            | "python"
-            | "perl"
-            | "ruby"
-            | "node"
-            | "nodejs"
-            | "bun"
-            | "deno"
-            | "php"
-            | "lua"
-            | "source"
-            | "."
-    )
+    runners::program(versionless_interpreter_name(name)).is_some_and(|program| program.stdin_code)
 }
 
 fn versionless_interpreter_name(name: &str) -> &str {
@@ -7253,10 +7808,7 @@ fn shell_inline_code_payload(words: &[String]) -> Option<String> {
 pub(crate) fn shell_inline_code_place(words: &[String]) -> Option<usize> {
     let command = words.first()?;
     let name = normalized_command_name(command);
-    if !matches!(
-        name.as_str(),
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
-    ) {
+    if !is_shell_name(&name) {
         return None;
     }
     let args: Vec<String> = words[1..]
@@ -8005,10 +8557,7 @@ fn shell_command_waits_for_xargs_payload(words: &[String]) -> bool {
         return false;
     };
     let name = normalized_command_name(command);
-    if !matches!(
-        name.as_str(),
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish"
-    ) {
+    if !is_shell_name(&name) {
         return false;
     }
     words.iter().enumerate().skip(1).any(|(index, argument)| {
@@ -9687,7 +10236,7 @@ fn command_code_input(words: &[String]) -> CodeInput {
     }
 
     match name.as_str() {
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => shell_code_input(&args),
+        shell if is_shell_name(shell) => shell_code_input(&args),
         "python" => python_code_input(&args),
         "perl" => perl_code_input(&args),
         "ruby" => ruby_code_input(&args),
@@ -11218,7 +11767,7 @@ fn command_is_noexec_shell(words: &[String]) -> bool {
         return false;
     };
     let name = normalized_command_name(command);
-    if !matches!(name.as_str(), "sh" | "bash" | "zsh" | "dash" | "ksh") {
+    if !is_shell_name(&name) || versionless_interpreter_name(&name) == "fish" {
         return false;
     }
     for argument in &words[1..] {
@@ -12428,27 +12977,10 @@ fn collect_all_commands<'tree>(
     }
 }
 
+/// Whether `name` turns its input or its arguments into code, as the table
+/// of programs says ([`runners`]).
 fn is_execution_sink(name: &str) -> bool {
-    matches!(
-        versionless_interpreter_name(name),
-        "sh" | "bash"
-            | "zsh"
-            | "dash"
-            | "ksh"
-            | "fish"
-            | "python"
-            | "perl"
-            | "ruby"
-            | "node"
-            | "php"
-            | "lua"
-            | "eval"
-            | "source"
-            | "."
-            | "exec"
-            | "xargs"
-            | "ssh"
-    )
+    runners::program(versionless_interpreter_name(name)).is_some_and(|program| program.sink)
 }
 
 fn command_name(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<String> {
