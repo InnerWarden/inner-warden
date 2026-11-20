@@ -46,12 +46,7 @@ fn unseen_writes(file: &str) -> Vec<String> {
 /// held for review, not allowed and not refused.
 #[test]
 fn a_startup_file_replaced_from_unseen_content_is_held_for_review() {
-    for file in [
-        "~/.bashrc",
-        "~/.profile",
-        "~/.zshrc",
-        "~/.bash_profile",
-    ] {
+    for file in ["~/.bashrc", "~/.profile", "~/.zshrc", "~/.bash_profile"] {
         for line in unseen_writes(file) {
             assert_eq!(verdict(&line), "review", "{line}");
         }

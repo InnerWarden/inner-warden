@@ -246,7 +246,7 @@ fn status_wiring(
         .collect();
     // OpenClaw's own tools screened by its plugin are wiring too, with or
     // without MCP servers behind the proxy, in the plugin's own mode.
-    let openclaw_plugin = home.as_deref().and_then(status::openclaw_plugin_mode);
+    let openclaw_plugin = home.and_then(status::openclaw_plugin_mode);
     let openclaw = openclaw_guard::AGENT;
     if openclaw_plugin.is_some()
         && rows.iter().any(|r| r.name == openclaw)

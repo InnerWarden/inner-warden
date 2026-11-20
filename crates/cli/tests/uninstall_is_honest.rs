@@ -403,7 +403,8 @@ fn a_claude_code_hook_that_cannot_be_removed_stops_the_uninstall() {
     let installed = text(&run_cli(&exe, home.path(), &["install", "claude-code"]));
     let settings = std::fs::read_to_string(claude.join("settings.json")).unwrap_or_default();
     assert!(
-        settings.contains("[ $s -ge 126 ] && exit 2") && settings.contains("hook --agent claude-code"),
+        settings.contains("[ $s -ge 126 ] && exit 2")
+            && settings.contains("hook --agent claude-code"),
         "the install wrote no enforcing hook, so the rest of this test proves \
          nothing:\n{installed}\n{settings}"
     );
