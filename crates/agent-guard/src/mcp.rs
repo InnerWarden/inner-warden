@@ -2574,6 +2574,7 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "download_and_execute",
     "download_chmod_execute",
     "download_fed_to_script",
+    "download_run_in_text_argument",
     "dynamic_code_execution",
     "fetch_exec_unanalyzable",
     "fetch_exec_unparsed",
@@ -4559,6 +4560,30 @@ fn analyze_command_as_read(
             score += handed.score;
             signals.push(handed);
         }
+    }
+    // A download handed to a shell inside a substitution that stands in an
+    // argument of a program (`--body`, `-m`, `--title`, `--changelog`,
+    // `pytest -k`, any text a program is handed): that slot exists to
+    // produce text, and nobody installs software through it. Refused,
+    // whatever the source; the same download run on its own, or as a
+    // variable's value, is reviewed as before (an installer looks like it).
+    if crate::shell::lines_substitutions_in_arguments(cmd)
+        .iter()
+        .any(|line| {
+            threats::check_download_execute_pipe(&threats::strip_shell_noops(line)).is_some()
+        })
+        && !signals
+            .iter()
+            .any(|s| s.signal == "download_run_in_text_argument")
+    {
+        signals.push(AnalysisSignal {
+            signal: "download_run_in_text_argument".into(),
+            score: 40,
+            detail: "a download piped to a shell inside a substitution that stands in a program's \
+                     argument, a slot that produces text: nobody installs through it"
+                .into(),
+        });
+        score += 40;
     }
     // A substitution is a program of its own, in whatever slot it stands
     // (`--body`, `-m`, `pytest -k`, any argument): what it runs is charged

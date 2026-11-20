@@ -7468,6 +7468,19 @@ pub(crate) fn line_with_known_paths(source: &str) -> Option<String> {
 /// A line that does not parse holds none here: it is read the conservative
 /// way as a whole.
 pub(crate) fn lines_substitutions_run(source: &str) -> Vec<String> {
+    substitution_lines(source, false)
+}
+
+/// The lines of the substitutions of `source` that stand in an argument of
+/// a program (`git commit -m "$(...)"`, `--body "\`...\`"`, `pytest -k
+/// "$(...)"`, `--body-file <(...)`): a slot the program reads as text,
+/// never the program's own name, a variable's value or a redirection.
+/// Found where the parser finds the substitution, never by a flag's name.
+pub(crate) fn lines_substitutions_in_arguments(source: &str) -> Vec<String> {
+    substitution_lines(source, true)
+}
+
+fn substitution_lines(source: &str, only_arguments: bool) -> Vec<String> {
     if !source.contains("$(")
         && !source.contains('`')
         && !source.contains("<(")
@@ -7478,10 +7491,17 @@ pub(crate) fn lines_substitutions_run(source: &str) -> Vec<String> {
     let Some(tree) = parse_bash(source) else {
         return Vec::new();
     };
+    let root = tree.root_node();
     let mut ranges = Vec::new();
-    collect_executable_substitutions(tree.root_node(), source.as_bytes(), &mut ranges, 0);
+    collect_executable_substitutions(root, source.as_bytes(), &mut ranges, 0);
     ranges
         .into_iter()
+        .filter(|range| {
+            !only_arguments
+                || root
+                    .descendant_for_byte_range(range.start, range.end)
+                    .is_some_and(stands_in_an_argument)
+        })
         .filter_map(|range| source.get(range))
         .filter_map(|written| {
             written
@@ -7499,6 +7519,30 @@ pub(crate) fn lines_substitutions_run(source: &str) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Whether `node` stands, through the words around it, in an argument of
+/// the nearest command: not in its name, not in an assignment in front of
+/// it and not in a redirection.
+fn stands_in_an_argument(node: tree_sitter::Node<'_>) -> bool {
+    let mut child = node;
+    while let Some(parent) = child.parent() {
+        match parent.kind() {
+            "command" => {
+                return parent.child_by_field_name("name") != Some(child)
+                    && !matches!(
+                        child.kind(),
+                        "variable_assignment"
+                            | "file_redirect"
+                            | "heredoc_redirect"
+                            | "herestring_redirect"
+                    );
+            }
+            "string" | "concatenation" | "word" | "arithmetic_expansion" => child = parent,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// The command lines `xargs` builds from the words a literal `echo` or

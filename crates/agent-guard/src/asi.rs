@@ -130,6 +130,7 @@ pub fn signal_to_asi(signal: &str) -> Option<&'static str> {
         "obfuscated_command"
         | "download_and_execute"
         | "download_chmod_execute"
+        | "download_run_in_text_argument"
         | "dynamic_code_execution"
         | "tmp_execution"
         // The aggravating factors that turn a fetch-and-execute from a shape into a

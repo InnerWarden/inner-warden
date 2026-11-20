@@ -101,3 +101,17 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   verdict of `innerwarden check` (1.6.15, empty home) for each: 7 deny and
   1 review of 23, the false-positive baseline of these families, not a
   pass. No case of another corpus moved.
+- 2026-11-20: the reference is rewritten with the verdicts of main plus
+  the data-slot substitution change; no case moves because of that change
+  (the data-slot corpus is read by the differential check, not by this
+  suite). The lines that move were already moved on main:
+  attack-2026-11/a11-501..a11-507 go from review to deny, the tightening
+  of #343 (a removal or a disk overwrite run by xargs on words the line
+  does not show is refused, as the bare removal is). proof/dx-082,
+  proof/dx-083 and proof/dx-091..dx-094 go from review to deny with
+  dc6c998 (a download piped to `bash -c` that writes it to a file and runs
+  that file is judged as the code it runs). own-work/own-008 goes from
+  deny to allow, a false positive resolved by ec7f764 (#325, a here-document
+  belongs to the command it is written after): the text `cat >> log.md`
+  appends is a note, not a stop of the guard; measured deny at guard-v1.6.15
+  and allow from ec7f764 on.

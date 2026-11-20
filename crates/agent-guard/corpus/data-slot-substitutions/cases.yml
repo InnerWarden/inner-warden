@@ -15,10 +15,11 @@
 #
 # The comment above each case is the verdict of the released guard
 # (`innerwarden check`, 1.6.15, 2026-11-20). A download piped to a shell
-# inside a slot is held for review there, not denied: that is the gap these
-# lines hold open until the guard refuses it. Those lines carry
-# `expect: deny`: scored by the benchmark, only a refusal counts as caught
-# and a review is a miss, so the gap shows as one.
+# inside a slot is held for review there, not denied. Since 2026-11-20 it
+# is denied (decision: a program's argument is a slot that produces text,
+# nobody installs through it; the same download on its own stays
+# reviewed). Those lines carry `expect: deny`: scored by the benchmark,
+# only a refusal counts as caught and a review is a miss.
 #
 # Downloads come from e.example; the format target is /dev/sda1. Nothing in
 # this file is executed.
