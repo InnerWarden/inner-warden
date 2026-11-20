@@ -288,3 +288,44 @@ fn a_line_the_grammar_cannot_read_keeps_its_reading() {
         "allow",
     );
 }
+
+/// A part not read that a known program only takes as data (a test filter,
+/// a commit's or a pull request's text, a name it gives a thing) names no
+/// program to run and no path to write or delete: allowed. Where the same
+/// value names a program, a path or code, it is still held.
+#[test]
+fn an_unread_part_a_known_program_takes_as_data_is_allowed() {
+    assert_verdict(
+        &[
+            "cargo test $TEST_NAME",
+            "cargo test -p innerwarden-agent-guard \"$T\" -- --nocapture",
+            "cargo test --release \"$FILTER\" -- --exact \"$NAME\"",
+            "cargo nextest run \"$T\"",
+            "pytest -k \"$T\"",
+            "pytest -m \"$MARK\" tests/",
+            "python3 -m pytest -k \"$T\" -q",
+            "go test ./... -run \"$T\"",
+            "npx jest -t \"$T\"",
+            "git commit -m \"$MSG\"",
+            "gh pr create --title \"$T\" --body \"$B\"",
+            "docker run --rm --name \"$N\" alpine true",
+        ],
+        "allow",
+    );
+    // Held, or refused by another rule (`eval "$CMD"`, `xargs "$C"`).
+    for line in [
+        "cargo test --manifest-path \"$M\"",
+        "cargo test --target-dir \"$D\"",
+        "cargo run --bin \"$B\"",
+        "pytest \"$TESTS\"",
+        "rm -rf \"$DIR\"",
+        "cp x \"$DEST\"",
+        "curl \"$URL\"",
+        "bash -c \"$CMD\"",
+        "eval \"$CMD\"",
+        "ls | xargs \"$C\"",
+        "$CMD test",
+    ] {
+        assert_ne!(verdict(line), "allow", "{line}");
+    }
+}

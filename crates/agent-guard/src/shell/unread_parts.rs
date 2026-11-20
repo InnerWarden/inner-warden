@@ -229,8 +229,8 @@ fn unread_part_at(source: &str, depth: u8, positional: Vec<bool>) -> Option<&'st
     // text scan and the fetch-and-run net of `unparsed.rs`. Holding it too
     // was measured on 2026-11-20 at 8 of the 160 benign lines of the proof
     // corpus, 4 of them everyday ones (`grep -rn TODO src | wc -l )`), most
-    // of them lines bash refuses as well; that cost is the supervisor's to
-    // take.
+    // of them lines bash refuses as well. Kept out by decision of 2026-11-20,
+    // until the grammar reads more of what bash reads.
     let tree = parse_complete_tree(source)?;
     let bytes = source.as_bytes();
     let root = tree.root_node();
@@ -933,6 +933,17 @@ fn command_unread(
     if !argument_flags.iter().any(|flag| *flag) {
         return None;
     }
+    // Words a known program only takes as data (a test filter, a commit's
+    // message, a name it gives a thing): unread there, they name no program
+    // to run and no path to write or delete.
+    let data = data_arguments(&name, arguments);
+    if argument_flags
+        .iter()
+        .zip(&data)
+        .all(|(unread, data)| !unread || *data)
+    {
+        return None;
+    }
     match name.as_str() {
         "source" | "." => Some(UNREAD_CODE),
         "xargs" | "gxargs" | "parallel" => xargs_unread(arguments, argument_flags),
@@ -1004,6 +1015,100 @@ fn handed_lines(word: tree_sitter::Node<'_>, source: &[u8], names: &Names) -> Ve
         at += 1;
     }
     vec![out]
+}
+
+/// Which of `arguments` a known program takes only as data: a test filter
+/// (`cargo test FILTER` and what follows its `--`, `pytest -k`/`-m`, `go test
+/// -run`, `jest -t`), a commit's or a pull request's text, a name or a label
+/// it gives a thing (`--name`). None of these names a program to run or a
+/// path to write or delete. Anything else is not data, a path the program
+/// reads or builds in included.
+fn data_arguments(name: &str, arguments: &[String]) -> Vec<bool> {
+    let words: Vec<String> = arguments.iter().map(|word| shell_word(word)).collect();
+    let mut data = vec![false; words.len()];
+    // `python3 -m pytest ...` is pytest.
+    if name.starts_with("python")
+        && words.len() >= 2
+        && words[0] == "-m"
+        && matches!(words[1].as_str(), "pytest" | "unittest")
+    {
+        let inner = data_arguments(&words[1], &arguments[2..]);
+        data[2..].copy_from_slice(&inner);
+        return data;
+    }
+    // `npx jest ...` is jest.
+    if matches!(name, "npx" | "pnpx" | "bunx") {
+        if let Some(at) = words.iter().position(|word| !word.starts_with('-')) {
+            let inner = data_arguments(&normalized_command_name(&words[at]), &arguments[at + 1..]);
+            data[at + 1..].copy_from_slice(&inner);
+        }
+        return data;
+    }
+    let value_flags: &[&str] = match name {
+        "cargo" => &["-p", "--package", "--test", "--features", "-F", "--bench"],
+        "pytest" | "py.test" | "unittest" => &["-k", "-m"],
+        "go" => &["-run", "-bench", "-skip"],
+        "jest" | "vitest" => &["-t", "--testNamePattern"],
+        "git" => &["-m", "--message"],
+        "gh" => &["--title", "-t", "--body", "-b", "--name", "--label", "-l"],
+        "docker" | "podman" | "kubectl" | "helm" | "npm" | "pnpm" | "yarn" => &["--name"],
+        _ => return data,
+    };
+    for (at, word) in words.iter().enumerate() {
+        if value_flags.contains(&word.as_str()) && at + 1 < data.len() {
+            data[at + 1] = true;
+        }
+        if let Some((flag, _)) = word.split_once('=') {
+            if flag.starts_with("--") && value_flags.contains(&flag) {
+                data[at] = true;
+            }
+        }
+    }
+    // `cargo test FILTER -- ARGS`: the filter and the test binary's own
+    // arguments are data; a flag's value is not, unless listed above.
+    if name == "cargo" {
+        const TAKES_VALUE: &[&str] = &[
+            "--manifest-path",
+            "--target-dir",
+            "--config",
+            "--bin",
+            "--example",
+            "--target",
+            "-j",
+            "--jobs",
+            "--profile",
+            "-Z",
+            "--color",
+            "--message-format",
+            "-p",
+            "--package",
+            "--test",
+            "--features",
+            "-F",
+            "--bench",
+            "--exclude",
+        ];
+        if let Some(sub) = words.iter().position(|word| !word.starts_with('-')) {
+            let nextest = words[sub] == "nextest";
+            if matches!(words[sub].as_str(), "test" | "t" | "bench") || nextest {
+                let mut after_dashes = false;
+                for at in sub + 1..words.len() {
+                    let word = &words[at];
+                    if after_dashes {
+                        data[at] = true;
+                    } else if word == "--" {
+                        after_dashes = true;
+                    } else if !word.starts_with('-')
+                        && !TAKES_VALUE.contains(&words[at - 1].as_str())
+                        && !(nextest && at == sub + 1)
+                    {
+                        data[at] = true;
+                    }
+                }
+            }
+        }
+    }
+    data
 }
 
 /// The value of a word that is one variable the line sets to text written
