@@ -424,11 +424,7 @@ impl TaintTracker {
         if let Some(class) = self.effects.get(tool) {
             return *class;
         }
-        let slots: Vec<&str> = args
-            .as_object()
-            .map(|m| m.keys().map(String::as_str).collect())
-            .unwrap_or_default();
-        super::effect::EffectClass::of(tool, None, &slots)
+        super::effect::EffectClass::of_call(tool, args)
     }
 
     /// What the server declared about `tool`, as last heard.

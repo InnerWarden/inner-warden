@@ -437,6 +437,16 @@ Also not seen today, and not promised for any date:
 - Some ways of stopping the guard: a `pkill` pattern that matches only part
   of the guard's command line, and a stop or kill of its service sent over
   D-Bus (`busctl`, `gdbus`, `dbus-send`) instead of through `systemctl`.
+- A path that steps back with `..` after a symbolic link. The MCP proxy
+  reads a path where a call writes by its text, with `.` and `..` taken
+  out, without looking at the disk: the proxy may not run on the server's
+  host, and the disk can change before the server opens the path. So
+  `/srv/app/link/../sudoers` is read as `/srv/app/sudoers`, while a server
+  whose `link` points into `/etc` writes `/etc/sudoers`.
+- A tool its MCP server declares read-only (`readOnlyHint: true`). The
+  proxy believes the declaration for the provenance table, a booking tool
+  too, so a value a server said in such a call raises no alert. A tool whose
+  name says it writes (`write_file`) is still held to the privileged files.
 - A flaw in an MCP server's own logic. The proxy sees the calls, not what the
   server does with them: a forged token the server accepts, or a parameter
   that returns another user's record, looks like any other call. What is

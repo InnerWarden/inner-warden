@@ -109,6 +109,18 @@ the text of a command; what it does not see is written down, as measured:
   `book_flight` and the like are class `commitment`, and a calendar entry
   with guests is `send-external` with its guests as destinations; the
   provenance table reads every value they carry.
+- **A long path is read under any argument, and a booking behind a reading
+  verb books.** An over-long path under an argument name outside the target
+  list (`save_to`, `dest_dir`) passed unread; it is now read the same way,
+  in a `file:` URL after its `%2e` is decoded, and refused when it is still
+  too long and holds a `.` or a `%`. A path with a line break inside it,
+  where a call writes, is refused. `search_and_book_hotel`,
+  `check_and_book_flight` and `get_and_order_food` were read-only; one list
+  of action words, bookings included (`book`, `order`, `rent`, `register`,
+  `hold`, `schedule`, `lease`, `hire`, `sign_up`, `appointment`, `ticket`,
+  `reserve`), now makes them `commitment`. A guest count (`"guests": 2`)
+  no longer makes a booking `send-external`; guests named at any depth, or
+  as a map's keys, still do.
 - **The differential check replays whole MCP sessions.** A corpus line can be
   a session (`surface: session`): client and server messages replayed
   through the proxy's router with one taint tracker, judged by its last

@@ -2063,12 +2063,7 @@ fn judged(text: &str, named: Named) -> Option<threats::PrivilegedTarget> {
         Named::Target => threats::privileged_write_target(text),
         Named::InPassing => {
             let token = text.trim().trim_matches(['"', '\'']);
-            let spelled_as_path = token.starts_with('/')
-                || token.starts_with('~')
-                || token
-                    .get(..5)
-                    .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"));
-            if !spelled_as_path || token.contains(char::is_whitespace) {
+            if !spelled_as_path(token) || token.contains(char::is_whitespace) {
                 return None;
             }
             threats::privileged_write_target(token).filter(|found| !found.group.named_in_passing)
@@ -2110,32 +2105,104 @@ fn sensitive_path_in_arguments(args: &serde_json::Value) -> Option<&'static str>
 /// No path a system opens is longer than this (Linux's `PATH_MAX`).
 const MAX_TARGET_PATH_BYTES: usize = 4096;
 
-/// What a string longer than [`MAX_TARGET_PATH_BYTES`] where a call writes
-/// is: the file its lexical form names, read like any target, when `.` and
-/// `..` bring it under the cap (`/etc/././.../sudoers`, which a server
-/// normalises before it opens it); still too long, on one line, a path the
-/// guard cannot read, refused rather than passed unread. Text over several
-/// lines is content, not a path.
+/// Whether a token is spelled as a path a server opens where it starts:
+/// `/`, `~` or a `file:` URL first.
+fn spelled_as_path(token: &str) -> bool {
+    token.starts_with('/')
+        || token.starts_with('~')
+        || token
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+}
+
+/// What a string longer than [`MAX_TARGET_PATH_BYTES`] in a call that may
+/// write is: the file its lexical form names, read like any string at its
+/// place, when `.`, `..` and `//` bring it under the cap
+/// (`/etc/././.../sudoers`, which a server normalises before it opens it);
+/// still too long, a path the guard cannot read, refused rather than passed
+/// unread.
+///
+/// Where it sits decides what counts as a path:
+/// * under an argument that says where the call writes ([`Named::Target`]),
+///   any one-line string, and a string over several lines that has no other
+///   space and reads as a path (`/`, `~`, `file:` first, or a `/./` or
+///   `/../` in it): a path does not hold a line break, so one that does is
+///   refused. Text with spaces over several lines (`source` code) is content;
+/// * anywhere else ([`Named::InPassing`]: `save_to`, `dest_dir`), a single
+///   token spelled as a path. Refused unread only when it holds a `.` or a
+///   `%`, the padding that shrinks: base64 data (`/9j/...`, an image) has
+///   neither, and a literal path over the cap is one no system opens.
+///
+/// The form is lexical: a `..` after a segment that is a symbolic link on
+/// the server's host steps back from the link's target, not from where the
+/// text says. That is a limit of every path read here, not only long ones.
 enum LongTarget {
     Judged(Option<threats::PrivilegedTarget>),
     Unread(usize),
 }
 
 fn long_target(text: &str, named: Named) -> Option<LongTarget> {
-    let trimmed = text.trim();
-    if named != Named::Target || trimmed.len() <= MAX_TARGET_PATH_BYTES {
+    let token = text.trim().trim_matches(['"', '\'']);
+    if token.len() <= MAX_TARGET_PATH_BYTES {
         return None;
     }
-    let collapsed = threats::collapse_path(trimmed.trim_matches(['"', '\'']));
+    let one_word = !token.contains(|c: char| c.is_whitespace() && c != '\n' && c != '\r');
+    let shrinks = token.contains(['.', '%']);
+    if token.contains(['\n', '\r']) {
+        let reads_as_path = spelled_as_path(token)
+            || token.contains("/./")
+            || token.contains("/../")
+            || token.starts_with("./")
+            || token.starts_with("../");
+        let refused = one_word
+            && reads_as_path
+            && match named {
+                Named::Target => true,
+                Named::InPassing => spelled_as_path(token) && shrinks,
+            };
+        return refused.then_some(LongTarget::Unread(token.len()));
+    }
+    if named == Named::InPassing && !(one_word && spelled_as_path(token)) {
+        return None;
+    }
+    let collapsed = collapsed_long_path(token);
     if collapsed.len() <= MAX_TARGET_PATH_BYTES {
-        return Some(LongTarget::Judged(threats::privileged_write_target(
-            &collapsed,
-        )));
+        return Some(LongTarget::Judged(judged(&collapsed, named)));
     }
-    if trimmed.contains(['\n', '\r']) {
+    if named == Named::InPassing && !shrinks {
         return None;
     }
-    Some(LongTarget::Unread(trimmed.len()))
+    Some(LongTarget::Unread(token.len()))
+}
+
+/// A long path with `.`, `..` and `//` taken out, read the way
+/// [`threats::privileged_write_target`] reads a short one: a `file:` URL is
+/// decoded first (its `%2e` is a dot to the server that opens it), and a
+/// `~user/` start is kept. A plain path is not decoded: there `%2e` is a
+/// name, as it is to the system.
+fn collapsed_long_path(token: &str) -> String {
+    if token
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
+        let rest = &token[5..];
+        let rest = rest.strip_prefix("//").unwrap_or(rest);
+        let rest = match rest.get(..9) {
+            Some(host) if host.eq_ignore_ascii_case("localhost") => &rest[9..],
+            _ => rest,
+        };
+        let decoded = threats::percent_decode(rest);
+        return if decoded.starts_with('/') {
+            threats::collapse_path(&decoded)
+        } else {
+            token.to_string()
+        };
+    }
+    if let Some(rest) = token.strip_prefix('~') {
+        let (user, rest) = rest.split_once('/').unwrap_or((rest, ""));
+        return format!("~{user}/{}", threats::collapse_path(rest));
+    }
+    threats::collapse_path(token)
 }
 
 /// Refuse a tool call that would change a file granting privilege or a login,
@@ -7102,6 +7169,107 @@ mod tests {
             None,
         );
         assert!(priv_write(&v).is_none(), "{:?}", v.alerts);
+    }
+
+    /// A path over the cap is read, or refused, under any argument of a call
+    /// that may write, not only under the target names: `save_to`,
+    /// `dest_dir`. Before, `/etc/` + `./` x 2100 + `sudoers` under such a
+    /// key passed unread. A plain path's `%2e` is a name (too long, refused
+    /// unread), a `file:` URL's is a dot; a trailing `/` is taken out; a line
+    /// break inside a path in a target argument is refused. Base64 data that
+    /// starts with `/` is not a path.
+    ///
+    /// FAILS ON REVERT of `long_target` reading `Named::InPassing` strings:
+    /// the `save_to` and `dest_dir` cases raise nothing.
+    #[test]
+    fn a_long_path_is_read_under_any_key_and_in_any_spelling() {
+        let call = |tool: &str, key: &str, value: String| {
+            let mut args = serde_json::Map::new();
+            args.insert(key.to_string(), serde_json::Value::String(value));
+            args.insert("format".to_string(), serde_json::json!("pdf"));
+            inspect_tool_call(tool, &serde_json::Value::Object(args), None)
+        };
+        let pad = "./".repeat(2100);
+        for key in ["save_to", "dest_dir", "outputLocation"] {
+            let v = call("export_report", key, format!("/etc/{pad}sudoers"));
+            let alert = priv_write(&v).unwrap_or_else(|| panic!("{key}: {:?}", v.alerts));
+            assert!(
+                alert.detail.contains("/etc/sudoers"),
+                "{key}: {}",
+                alert.detail
+            );
+            assert!(!v.allowed, "{key}");
+            // Nested under a key outside the list, as a map's key too.
+            let v = inspect_tool_call(
+                "export_report",
+                &serde_json::json!({"options": {"save": [format!("~root/{pad}.ssh/authorized_keys")]}}),
+                None,
+            );
+            assert!(priv_write(&v).is_some(), "{:?}", v.alerts);
+        }
+
+        // Still too long once `.` is taken out: refused unread, any key.
+        let long = format!("/home/dev/{}notes.md", "aa/./".repeat(1500));
+        for key in ["path", "save_to"] {
+            let v = call("export_report", key, long.clone());
+            let alert = priv_write(&v).unwrap_or_else(|| panic!("{key}: {:?}", v.alerts));
+            assert!(alert.detail.contains("not read"), "{key}: {}", alert.detail);
+        }
+
+        // `%2e` in a plain path is a name to the system: nothing shrinks, so
+        // over the cap it is refused unread, under a target or any key.
+        let encoded = format!("/etc/{}sudoers", "%2e/".repeat(1100));
+        assert!(encoded.len() > MAX_TARGET_PATH_BYTES);
+        for key in ["path", "save_to"] {
+            let v = call("write_file", key, encoded.clone());
+            let alert = priv_write(&v).unwrap_or_else(|| panic!("{key}: {:?}", v.alerts));
+            assert!(alert.detail.contains("not read"), "{key}: {}", alert.detail);
+        }
+
+        // A long `file:` URL is decoded first: its `%2e` is a dot.
+        for url in [
+            format!("file:///etc/{}sudoers", "%2e/".repeat(1100)),
+            format!("file://localhost/etc/{pad}sudoers"),
+            format!("FILE:///tmp/{}../etc/sudoers.d/agent", "x/../".repeat(900)),
+        ] {
+            for key in ["uri", "save_to"] {
+                let v = call("write_file", key, url.clone());
+                let alert = priv_write(&v).unwrap_or_else(|| panic!("{key}: {:?}", v.alerts));
+                assert!(
+                    alert.detail.contains("/etc/sudoers"),
+                    "{key}: {}",
+                    alert.detail
+                );
+            }
+        }
+
+        // A trailing `/` is taken out like any empty segment.
+        for key in ["dir", "dest_dir"] {
+            let v = call("create_directory", key, format!("/etc/{pad}sudoers.d/"));
+            assert!(priv_write(&v).is_some(), "{key}: {:?}", v.alerts);
+        }
+
+        // A line break inside a path in a target argument: refused.
+        let broken = format!("/etc/{}\n{}sudoers", "./".repeat(1100), "./".repeat(1100));
+        for key in ["path", "save_to"] {
+            let v = call("write_file", key, broken.clone());
+            let alert = priv_write(&v).unwrap_or_else(|| panic!("{key}: {:?}", v.alerts));
+            assert!(alert.detail.contains("not read"), "{key}: {}", alert.detail);
+        }
+
+        // Base64 data that starts with `/` (a JPEG) is no path, on one line
+        // or wrapped, under a key outside the list.
+        let image = format!("/9j/{}", "4AAQSkZJRgABAQ+/".repeat(400));
+        let wrapped: String = image
+            .as_bytes()
+            .chunks(76)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for data in [image, wrapped] {
+            let v = call("upload_image", "image", data);
+            assert!(priv_write(&v).is_none(), "{:?}", v.alerts);
+        }
     }
 
     #[test]

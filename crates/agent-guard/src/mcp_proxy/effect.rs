@@ -61,15 +61,21 @@
 //!   conversation before the proxy started. A session past
 //!   [`SEEN_TEXT_BUDGET`] keeps nothing more, so later values raise nothing.
 //! * **A booking only raises an alert.** `reserve_hotel`, `book_flight`
-//!   and the like are class `commitment`, and a calendar entry with guests
-//!   (`participants`, `attendees`) is `send-external` with its guests as
-//!   destinations. A booking or an invitation carrying a value a server said
+//!   and the like are class `commitment`, also behind a reading verb
+//!   (`search_and_book_hotel`), and a calendar entry with guests
+//!   (`participants`, `attendees`, at any depth, as a list or as a map's
+//!   keys) is `send-external` with its guests as destinations. A guest count
+//!   (`"guests": 2`, or a property typed a number) is not a guest. A reader
+//!   whose name holds a booking word (`list_appointments`,
+//!   `get_order_status`) is classed `commitment` too: an alert, never a
+//!   refusal, is its cost. A booking or an invitation carrying a value a server said
 //!   is forwarded with an alert, not refused: the person's own booking of a hotel a
 //!   search found looks the same until the person's request is a source. A
 //!   guest address long enough for the taint tracker is refused there
 //!   (`AG-TAINT`).
 //! * **A server's annotations are believed** for the class: a tool declared
-//!   `readOnlyHint: true` raises nothing here. It lowers nothing either, so
+//!   `readOnlyHint: true` raises nothing here, a booking tool too
+//!   (`reserve_hotel` declared read-only is `read-only`). It lowers nothing either, so
 //!   the verdict its name earns stays.
 //! * **A short value** (fewer than [`RAISING_MIN_CHARS`] characters and no
 //!   digit, `@`, `.` or `/`) raises nothing: `"7"` or `"Hi"` is in
@@ -152,57 +158,43 @@ const DELETE_WORDS: &[&str] = &[
     "delete", "remove", "rm", "drop", "purge", "erase", "destroy", "unlink", "wipe", "trash",
 ];
 const SHARE_WORDS: &[&str] = &["share", "invite"];
-/// Verbs of action that make a name that starts as a reader an actor.
-/// Nouns (`transaction`, `email`, `message`, `post`) are not among them:
-/// `get_scheduled_transactions` and `read_email` read.
+/// Verbs of action that make a name that starts as a reader an actor, with
+/// [`COMMITMENT_WORDS`]: the two are one list of action words, so a booking
+/// behind a reading verb (`search_and_book_hotel`, `get_and_order_food`)
+/// is the booking it is. Nouns (`transaction`, `email`, `message`,
+/// `post`) are not among them: `get_scheduled_transactions` and
+/// `read_email` read.
 const ACTION_VERBS: &[&str] = &[
-    "pay",
-    "transfer",
-    "wire",
-    "remit",
-    "withdraw",
-    "refund",
-    "purchase",
-    "checkout",
-    "charge",
-    "payout",
-    "delete",
-    "remove",
-    "rm",
-    "drop",
-    "purge",
-    "erase",
-    "destroy",
-    "unlink",
-    "wipe",
-    "trash",
-    "share",
-    "invite",
-    "send",
-    "reply",
-    "forward",
-    "notify",
-    "publish",
-    "tweet",
-    "submit",
-    "reserve",
-    "buy",
-    "subscribe",
-    "enroll",
+    "pay", "transfer", "wire", "remit", "withdraw", "refund", "purchase", "checkout", "charge",
+    "payout", "delete", "remove", "rm", "drop", "purge", "erase", "destroy", "unlink", "wipe",
+    "trash", "share", "invite", "send", "reply", "forward", "notify", "publish", "tweet", "submit",
 ];
+/// Words that commit the person to something, and act behind a reading
+/// verb as [`ACTION_VERBS`] do. `appointment` and `ticket` are nouns kept
+/// here on purpose: `check_and_get_appointment` is read as a booking, and a
+/// reader so named (`list_appointments`) gets an alert, never a refusal.
+/// `sign_up` is matched as the two words in a row (see [`commits`]).
 const COMMITMENT_WORDS: &[&str] = &[
     "reserve",
-    "reservation",
     "book",
-    "booking",
     "order",
     "rent",
-    "rental",
+    "register",
+    "hold",
+    "schedule",
+    "lease",
+    "hire",
+    "signup",
+    "appointment",
+    "ticket",
+    "buy",
     "subscribe",
     "enroll",
-    "register",
-    "buy",
 ];
+/// Nouns of a booking that class a tool that does not start by reading
+/// (`car_rental_reservation`), but do not make a reader an actor:
+/// `get_all_car_rental_companies_in_city` reads.
+const COMMITMENT_NOUNS: &[&str] = &["reservation", "booking", "rental"];
 /// Slot words that name who an event or a meeting invites: an invitation is
 /// sent to each of them.
 const GUEST_SLOTS: &[&str] = &["participant", "attendee", "invitee", "guest"];
@@ -299,6 +291,88 @@ fn any_in(words: &[String], set: &[&str]) -> bool {
     words.iter().any(|w| set.contains(&w.as_str()))
 }
 
+/// Whether the words hold one of [`COMMITMENT_WORDS`], `sign_up` and
+/// `signUp` as one word.
+fn commits(words: &[String]) -> bool {
+    any_in(words, COMMITMENT_WORDS)
+        || words
+            .windows(2)
+            .any(|pair| pair[0] == "sign" && pair[1] == "up")
+}
+
+/// Whether a word of action (one list: [`ACTION_VERBS`] and
+/// [`COMMITMENT_WORDS`]) is among the words.
+fn acts_by_word(words: &[String]) -> bool {
+    any_in(words, ACTION_VERBS) || commits(words)
+}
+
+/// Whether a slot name names who an event invites ([`GUEST_SLOTS`]).
+fn is_guest_slot(slot: &str) -> bool {
+    any_in(&words(slot), GUEST_SLOTS)
+}
+
+/// Whether a value under a guest slot names people: anything but a number,
+/// a numeric string or a list of them. `"guests": 2` in a hotel booking is
+/// a count, not a destination.
+fn names_people(value: &Value) -> bool {
+    match value {
+        Value::Number(_) | Value::Null | Value::Bool(_) => false,
+        Value::String(s) => s.trim().parse::<f64>().is_err(),
+        Value::Array(items) => items.iter().any(names_people),
+        Value::Object(_) => true,
+    }
+}
+
+/// Whether a call's arguments, at any depth, hold a guest slot that names
+/// people (`{"event": {"attendees": [...]}}`, `{"guests": {"a@x": ...}}`).
+fn call_has_guests(args: &Value) -> bool {
+    let mut pending = vec![args];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map {
+                    if is_guest_slot(key) && names_people(value) {
+                        return true;
+                    }
+                    pending.push(value);
+                }
+            }
+            Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether an input schema, at any depth, has a guest property that is not
+/// declared a number (`{"guests": {"type": "integer"}}` is a count).
+fn schema_has_guests(schema: &Value) -> bool {
+    let mut pending = vec![schema];
+    let mut budget = 4096usize;
+    while let Some(schema) = pending.pop() {
+        budget = match budget.checked_sub(1) {
+            Some(left) => left,
+            None => return false,
+        };
+        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+            for (key, property) in properties {
+                let numeric = property
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t == "integer" || t == "number");
+                if is_guest_slot(key) && !numeric {
+                    return true;
+                }
+                pending.push(property);
+            }
+        }
+        if let Some(items) = schema.get("items") {
+            pending.push(items);
+        }
+    }
+    false
+}
+
 impl EffectClass {
     /// The name said in an alert.
     pub fn label(self) -> &'static str {
@@ -332,19 +406,38 @@ impl EffectClass {
     /// names of its input schema's properties.
     pub fn of_tool(tool: &Value) -> Self {
         let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
-        let slots: Vec<&str> = tool
-            .get("inputSchema")
+        let schema = tool.get("inputSchema");
+        let slots: Vec<&str> = schema
             .and_then(|s| s.get("properties"))
             .and_then(Value::as_object)
             .map(|p| p.keys().map(String::as_str).collect())
             .unwrap_or_default();
-        Self::of(name, tool.get("annotations"), &slots)
+        let guests = schema.is_some_and(schema_has_guests);
+        Self::classify(name, tool.get("annotations"), &slots, guests)
+    }
+
+    /// The class of a call to a tool no listing classed: its name, its
+    /// argument names, and guests read from the values they hold.
+    pub fn of_call(name: &str, args: &Value) -> Self {
+        let slots: Vec<&str> = args
+            .as_object()
+            .map(|m| m.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        Self::classify(name, None, &slots, call_has_guests(args))
     }
 
     /// The class of a tool from its name, its MCP annotations and its slot
     /// names. A server that declares a tool read-only is believed: the class
-    /// that lowers nothing.
+    /// that lowers nothing. A guest slot here names people, since no value
+    /// or type says otherwise.
     pub fn of(name: &str, annotations: Option<&Value>, slots: &[&str]) -> Self {
+        let guests = slots.iter().any(|slot| is_guest_slot(slot));
+        Self::classify(name, annotations, slots, guests)
+    }
+
+    /// [`EffectClass::of`], with whether some slot names guests (people an
+    /// event invites, not a count of them) said apart.
+    fn classify(name: &str, annotations: Option<&Value>, slots: &[&str], guests: bool) -> Self {
         let hint = |key: &str| {
             annotations
                 .and_then(|a| a.get(key))
@@ -361,7 +454,7 @@ impl EffectClass {
         // a word of action anywhere in the name wins over one of reading.
         if w.first()
             .is_some_and(|first| READ_VERBS.contains(&first.as_str()))
-            && !any_in(&w[1..], ACTION_VERBS)
+            && !acts_by_word(&w[1..])
         {
             if any_in(&w, SECRET_WORDS) {
                 return EffectClass::ReadSecret;
@@ -390,12 +483,16 @@ impl EffectClass {
         if any_in(&w, SHARE_WORDS) {
             return EffectClass::Share;
         }
-        // A calendar entry with guests sends each of them an invitation.
-        if any_in(&w, SEND_WORDS) || has_slot(GUEST_SLOTS) {
+        if any_in(&w, SEND_WORDS) {
             return EffectClass::SendExternal;
         }
-        if any_in(&w, COMMITMENT_WORDS) {
+        // A booking before its guests: `reserve_hotel` with `guests` books.
+        if commits(&w) || any_in(&w, COMMITMENT_NOUNS) {
             return EffectClass::Commitment;
+        }
+        // A calendar entry with guests sends each of them an invitation.
+        if guests {
+            return EffectClass::SendExternal;
         }
         EffectClass::Other
     }
@@ -796,6 +893,131 @@ mod tests {
         }
     }
 
+    /// A booking behind a reading verb books (one list of action words), a
+    /// guest count is no guest, and guests are read at any depth and as a
+    /// map's keys. A server's `readOnlyHint` is believed even for a booking.
+    ///
+    /// FAILS ON REVERT of `acts_by_word` in the reader test: the first three
+    /// are `read-only`; of the commitment test before guests: `reserve_hotel`
+    /// with `guests` is `send-external`.
+    #[test]
+    fn a_booking_behind_a_reading_verb_books_and_a_guest_count_is_no_guest() {
+        for (name, slots, class) in [
+            (
+                "search_and_book_hotel",
+                &["hotel"][..],
+                EffectClass::Commitment,
+            ),
+            (
+                "check_and_book_flight",
+                &["flight"][..],
+                EffectClass::Commitment,
+            ),
+            ("get_and_order_food", &["item"][..], EffectClass::Commitment),
+            ("find_and_rent_car", &["car"][..], EffectClass::Commitment),
+            (
+                "search_and_sign_up",
+                &["event"][..],
+                EffectClass::Commitment,
+            ),
+            ("lookupAndSignUp", &["event"][..], EffectClass::Commitment),
+            (
+                "check_and_schedule_appointment",
+                &["when"][..],
+                EffectClass::Commitment,
+            ),
+            ("get_and_hold_seat", &["seat"][..], EffectClass::Commitment),
+            (
+                "search_and_hire_contractor",
+                &["name"][..],
+                EffectClass::Commitment,
+            ),
+            (
+                "find_and_lease_office",
+                &["office"][..],
+                EffectClass::Commitment,
+            ),
+            (
+                "get_and_register_domain",
+                &["domain"][..],
+                EffectClass::Commitment,
+            ),
+            (
+                "reserve_hotel",
+                &["hotel", "guests"][..],
+                EffectClass::Commitment,
+            ),
+            (
+                "car_rental_reservation",
+                &["company"][..],
+                EffectClass::Commitment,
+            ),
+            (
+                "get_all_car_rental_companies_in_city",
+                &["city"][..],
+                EffectClass::ReadOnly,
+            ),
+            (
+                "get_rating_reviews_for_car_rental",
+                &["company_name"][..],
+                EffectClass::ReadOnly,
+            ),
+        ] {
+            assert_eq!(EffectClass::of(name, None, slots), class, "{name}");
+        }
+
+        // A count of guests is not a guest list.
+        for args in [
+            json!({"hotel": "Le Marais", "guests": 2}),
+            json!({"hotel": "Le Marais", "guests": "2"}),
+        ] {
+            assert_eq!(
+                EffectClass::of_call("reserve_hotel", &args),
+                EffectClass::Commitment
+            );
+            assert_eq!(
+                EffectClass::of_call("create_calendar_event", &args),
+                EffectClass::Other
+            );
+        }
+        // People are, at any depth and as a map's keys.
+        for args in [
+            json!({"title": "sync", "guests": ["bob@example.net"]}),
+            json!({"event": {"title": "sync", "attendees": ["bob@example.net"]}}),
+            json!({"title": "sync", "guests": {"bob@example.net": "required"}}),
+            json!({"event": {"invitees": {"bob@example.net": {"optional": false}}}}),
+            json!({"events": [{"participants": [{"email": "bob@example.net"}]}]}),
+        ] {
+            assert_eq!(
+                EffectClass::of_call("create_calendar_event", &args),
+                EffectClass::SendExternal,
+                "{args}"
+            );
+        }
+        // The same read from a listing: a guest property typed a number is a
+        // count; one nested under an object is a guest list.
+        let count = json!({"name": "create_event", "inputSchema": {"properties": {
+            "title": {"type": "string"}, "guests": {"type": "integer"}}}});
+        assert_eq!(EffectClass::of_tool(&count), EffectClass::Other);
+        let nested = json!({"name": "create_event", "inputSchema": {"properties": {
+            "event": {"type": "object", "properties": {
+                "attendees": {"type": "array", "items": {"type": "string"}}}}}}});
+        assert_eq!(EffectClass::of_tool(&nested), EffectClass::SendExternal);
+        let booked = json!({"name": "reserve_hotel", "inputSchema": {"properties": {
+            "hotel": {"type": "string"}, "guests": {"type": "array"}}}});
+        assert_eq!(EffectClass::of_tool(&booked), EffectClass::Commitment);
+
+        // A server that says a booking tool only reads is believed: the
+        // class is `read-only` and the table raises nothing for it.
+        let hint = json!({"readOnlyHint": true});
+        assert_eq!(
+            EffectClass::of("reserve_hotel", Some(&hint), &["hotel"]),
+            EffectClass::ReadOnly
+        );
+        let declared = json!({"name": "search_and_book_hotel", "annotations": hint,
+            "inputSchema": {"properties": {"hotel": {"type": "string"}}}});
+        assert_eq!(EffectClass::of_tool(&declared), EffectClass::ReadOnly);
+    }
     #[test]
     fn annotations_are_read_and_read_only_wins() {
         let ro = json!({"readOnlyHint": true});
