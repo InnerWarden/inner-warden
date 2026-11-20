@@ -3941,6 +3941,9 @@ fn analyze_command_as_read(
     // one it cannot read is held above.
     let inline_names_read =
         threats::inline_call_names_read(scan_cmd, &inline_code.code, &inline_code.residue);
+    // The fetch-and-execute findings of the lines handed on, charged at the
+    // end only when the line itself charged none.
+    let mut handed_fetch_exec: Vec<AnalysisSignal> = Vec::new();
     if depth < STARTUP_PAYLOAD_DEPTH {
         // A line handed over again says nothing new: each is judged once,
         // where it is first handed over.
@@ -3983,12 +3986,21 @@ fn analyze_command_as_read(
                 // the same name is its own (`chmod -R 777 build; sh -c 'rm
                 // -rf /'` holds two).
                 let detail = format!("{handed_by}: {}", handed.detail);
-                if fetch_exec
-                    || signals.iter().any(|s| {
-                        s.signal == handed.signal
-                            && (s.detail == handed.detail || s.detail == detail)
-                    })
-                {
+                // A fetch-and-execute is charged once: kept aside here and
+                // charged at the end only when no rule on the line around it
+                // charged one (see [`handed_fetch_exec`] below).
+                if fetch_exec {
+                    if !handed_fetch_exec
+                        .iter()
+                        .any(|s: &AnalysisSignal| s.signal == handed.signal)
+                    {
+                        handed_fetch_exec.push(AnalysisSignal { detail, ..handed });
+                    }
+                    continue;
+                }
+                if signals.iter().any(|s| {
+                    s.signal == handed.signal && (s.detail == handed.detail || s.detail == detail)
+                }) {
                     continue;
                 }
                 score += handed.score;
@@ -4475,6 +4487,26 @@ fn analyze_command_as_read(
             detail: threats::BRACE_EXPANSION_UNREAD.into(),
         });
         score += 60;
+    }
+
+    // A fetch-and-execute in a line the line hands on (inline code's
+    // process line, a shell's here-document) is the line's own when no rule
+    // on the line charged one: code a here-document hands Python
+    // (`cd x && python3 - <<'EOF'` with `os.system('curl .. | sh')`) is not
+    // text the outer rules read, so it is charged here or not at all. Asked
+    // after every outer rule has run, so one the outer rules charge later
+    // (`pipe to shell`) is not charged twice.
+    if !signals.iter().any(|s| {
+        s.score > 0
+            && (FETCH_EXEC_OBSERVATION.contains(&s.signal.as_str())
+                || AGGRAVATING_SIGNAL_NAMES.contains(&s.signal.as_str())
+                || s.signal.starts_with("fetch_exec_")
+                || (s.signal == "dangerous_command" && s.detail.contains("pipe to shell")))
+    }) {
+        for handed in handed_fetch_exec {
+            score += handed.score;
+            signals.push(handed);
+        }
     }
 
     // Correlated evidence is not independent evidence. Do this after every rule has
