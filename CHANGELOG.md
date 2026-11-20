@@ -17,6 +17,32 @@ follows semantic versioning.
   every variable it kept out (never a value). The cost: an agent that read
   any other variable from the environment (its API key, `CLAUDE_CONFIG_DIR`,
   `EDITOR`, a loader variable) now needs `--pass-env NAME` for each.
+- **Removing any place the installers write is refused.** `rm -rf
+  /usr/local/lib/innerwarden/` was allowed, and so were `rm` and `mv` of
+  the guard's run-time folder, its systemd units and the links that enable
+  them, its sudo rules, its audit rule, the boot setting of the kernel layer,
+  its launchd jobs on macOS and the licence text of the packages. Each is now
+  refused as the guard's binaries and configuration already were.
+- **A `pkill -f` is judged by what its pattern matches.** The pattern is
+  matched against the command lines the guard's own processes run with: one
+  that spells the guard's name another way (`[i]nnerwarden-agent`) is now
+  refused, and one that matches none of them (`pkill -f
+  innerwarden-agent-guard`, a test run of the crate) is no longer refused for
+  the words it holds.
+
+### Fixed
+
+- **Text that interpreter code only edits, writes or prints is not a
+  command.** `python3 - <<'EOF'` that edits a file with `s.replace(old,
+  new)`, where the strings hold `rm -rf -- "$dir"/x`, was refused as a
+  removal. In Python, Node and Ruby code, only the line a process call runs
+  now counts; a string that reaches a process, runs code where it stands (an
+  f-string, a Ruby backquote, a tagged template) or passes through anything
+  the reader cannot follow keeps its refusal, and the guard's own words and
+  startup files are still read in the whole line.
+- **A long line is parsed once.** A 64 KiB `python3 -c` line was parsed by
+  the shell grammar 19 times in one check; it is now parsed once and the
+  worst case measured went from 271 ms to 159 ms in a release build.
 
 ## 1.6.14 - 2026-11-19
 
