@@ -146,6 +146,11 @@ impl Host {
     /// Run `line` with `shell -c`, as an agent starts its hook, with
     /// `payload` on stdin, from the project folder.
     fn run(&self, shell: &str, line: &str, payload: &Value) -> Answer {
+        self.run_raw(shell, line, payload.to_string().as_bytes())
+    }
+
+    /// [`Host::run`] with the payload's bytes as they are, JSON or not.
+    fn run_raw(&self, shell: &str, line: &str, payload: &[u8]) -> Answer {
         let mut child = Command::new(shell)
             .arg("-c")
             .arg(line)
@@ -205,8 +210,8 @@ impl Host {
 /// Write the call to the hook's stdin, as an agent does. A hook that ends
 /// before it reads (a shell that cannot find the program) closes the pipe
 /// first; the agents go on to read its answer, and so does this.
-fn write_payload(mut stdin: std::process::ChildStdin, payload: &Value) {
-    match stdin.write_all(payload.to_string().as_bytes()) {
+fn write_payload(mut stdin: std::process::ChildStdin, payload: &[u8]) {
+    match stdin.write_all(payload) {
         Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => {
             panic!("write the payload: {error}")
         }
@@ -829,7 +834,10 @@ impl Host {
             .stderr(Stdio::piped())
             .spawn()
             .ok()?;
-        write_payload(child.stdin.take().expect("stdin"), payload);
+        write_payload(
+            child.stdin.take().expect("stdin"),
+            payload.to_string().as_bytes(),
+        );
         let out = child.wait_with_output().expect("wait for the hook");
         Some(Answer {
             code: out.status.code(),
@@ -1475,6 +1483,70 @@ fn cursor_payloads_are_answered_in_cursors_words() {
 /// hook writes, nor its answer. A read allowed, a read refused, a read the
 /// hook cannot read as a call, and one longer than the hook reads whole.
 ///
+/// Cursor sends the whole file with a `beforeReadFile`. A read of a 5 MiB
+/// project file is judged by its path and runs; the same read of a private
+/// key is refused; a payload cut short inside the content, and one that is
+/// not JSON at all, are refused as unreadable.
+///
+/// FAILS ON REVERT of `read_cursor_call_or_head` in `cmd_hook_screen`: the
+/// 5 MiB read is past the 1 MiB the hook reads, and is refused.
+#[cfg(unix)]
+#[test]
+fn a_large_cursor_read_is_judged_by_its_path() {
+    let host = Host::new();
+    std::fs::create_dir_all(host.home().join(".ssh")).expect("ssh");
+    std::fs::write(host.home().join(".ssh/id_ed25519"), "dummy key\n").expect("key");
+    let big = host.project().join("src/big.txt");
+    let content = "0123456789abcdef\n".repeat(5 * 1024 * 1024 / 17 + 1);
+    assert!(content.len() >= 5 * 1024 * 1024);
+    std::fs::write(&big, &content).expect("big file");
+    let line = CURSOR.command(bin(), false, false);
+    let read = |path: &Path| {
+        host.cursor(
+            "beforeReadFile",
+            json!({"file_path": path, "content": content, "attachments": []}),
+        )
+    };
+
+    let allowed = host.run("/bin/sh", &line, &read(&big));
+    assert_eq!(allowed.code, Some(0), "{}", allowed.stderr);
+    assert_eq!(
+        cursor_json(&allowed)["permission"],
+        "allow",
+        "{}",
+        allowed.stderr
+    );
+
+    let key = host.run(
+        "/bin/sh",
+        &line,
+        &read(&host.home().join(".ssh/id_ed25519")),
+    );
+    assert_eq!(cursor_reads(&key, true), Call::Refused, "{}", key.stderr);
+
+    let whole = read(&big).to_string();
+    let cut = &whole.as_bytes()[..whole.len() / 2];
+    let broken = host.run_raw("/bin/sh", &line, cut);
+    assert_eq!(
+        cursor_reads(&broken, true),
+        Call::Refused,
+        "{}",
+        broken.stderr
+    );
+    assert_eq!(cursor_json(&broken)["permission"], "deny");
+    let not_json = host.run_raw(
+        "/bin/sh",
+        &line,
+        b"{\"hook_event_name\": \"beforeReadFile\", \"file_path\": ",
+    );
+    assert_eq!(
+        cursor_reads(&not_json, true),
+        Call::Refused,
+        "{}",
+        not_json.stderr
+    );
+}
+
 /// Every file under the test's folder is read for the content after the four
 /// calls, so a new place the hook writes is covered too.
 #[cfg(unix)]

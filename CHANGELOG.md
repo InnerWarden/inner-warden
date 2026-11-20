@@ -41,6 +41,12 @@ the text of a command; what it does not see is written down, as measured:
   hooks run another program than the guard, named with the guard's. The
   dashboard labels what Cursor's hooks judge "Shell commands, MCP calls and
   reads".
+- **A large file read by Cursor is judged by its path.** Cursor sends the
+  whole file with a `beforeReadFile`; the hook reads that `content` through
+  and drops it as it streams, without keeping it or counting it toward the
+  1 MiB a call may take, so a read of a 5 MiB file is judged like any other
+  (before, every read past 1 MiB was refused as unreadable). A payload that
+  is not JSON, one cut short inside the content included, is still refused.
 - **Connect keeps your keys in their order.** `agents connect` and
   `disconnect` write `~/.cursor/hooks.json`, `~/.gemini/settings.json` and
   the MCP configs back in the order you wrote them; only the guard's entries

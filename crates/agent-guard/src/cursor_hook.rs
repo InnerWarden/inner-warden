@@ -175,6 +175,132 @@ pub fn read(payload: &str) -> CursorCall {
     }
 }
 
+/// How much of a Cursor payload the hook reads in all, the `content` it
+/// throws away included. Past it the call is not read, and is refused in
+/// enforce, as any call the hook cannot read is.
+pub const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// A Cursor payload as the hook read it: the call with the file's `content`
+/// left out (`Whole`), or the head of one whose other fields are longer
+/// than the hook keeps (`TooLong`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Payload {
+    Whole(Vec<u8>),
+    TooLong(Vec<u8>),
+}
+
+/// Read a Cursor payload from `reader`, keeping at most `keep` bytes, with
+/// the string value of the top-level `content` key (the text of the file a
+/// `beforeReadFile` is about, which the guard never judges) read through and
+/// thrown away as it streams, so a large file costs no memory and does not
+/// count toward `keep`. What is kept is the payload with `"content": ""`.
+///
+/// Nothing is parsed here beyond what finds that one value: the kept bytes
+/// are read as JSON afterwards, and a payload that is not JSON (one cut short
+/// inside the content too) stays unreadable. A `content` inside another
+/// object, or one whose value is not a string, is kept as it is. Past
+/// `total` bytes in all, the call is `TooLong`.
+pub fn read_without_content(
+    reader: impl std::io::Read,
+    keep: usize,
+    total: u64,
+) -> std::io::Result<Payload> {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader);
+    let mut out: Vec<u8> = Vec::new();
+    let mut seen: u64 = 0;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut expect_key = false;
+    let mut key: Option<Vec<u8>> = None;
+    let mut key_is_content = false;
+    let mut want_value = false;
+    let mut skipping = false;
+    let mut skip_escaped = false;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(Payload::Whole(out));
+        }
+        let len = chunk.len();
+        seen += len as u64;
+        if seen > total {
+            out.truncate(keep);
+            return Ok(Payload::TooLong(out));
+        }
+        for &byte in chunk {
+            if skipping {
+                if skip_escaped {
+                    skip_escaped = false;
+                } else if byte == b'\\' {
+                    skip_escaped = true;
+                } else if byte == b'"' {
+                    skipping = false;
+                    out.push(b'"');
+                }
+                continue;
+            }
+            if want_value {
+                if byte.is_ascii_whitespace() {
+                    out.push(byte);
+                    continue;
+                }
+                want_value = false;
+                if byte == b'"' {
+                    out.push(b'"');
+                    skipping = true;
+                    continue;
+                }
+            }
+            out.push(byte);
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                    if let Some(name) = key.take() {
+                        key_is_content = name == b"content";
+                    }
+                    continue;
+                }
+                if let Some(name) = key.as_mut() {
+                    name.push(byte);
+                }
+            } else {
+                match byte {
+                    b'"' => {
+                        in_string = true;
+                        if depth == 1 && expect_key {
+                            key = Some(Vec::new());
+                            expect_key = false;
+                        }
+                    }
+                    b'{' | b'[' => {
+                        depth += 1;
+                        if byte == b'{' && depth == 1 {
+                            expect_key = true;
+                        }
+                    }
+                    b'}' | b']' => depth = depth.saturating_sub(1),
+                    b',' if depth == 1 => expect_key = true,
+                    b':' if depth == 1 => {
+                        want_value = std::mem::take(&mut key_is_content);
+                    }
+                    _ => {}
+                }
+            }
+            if out.len() > keep {
+                out.truncate(keep);
+                return Ok(Payload::TooLong(out));
+            }
+        }
+        reader.consume(len);
+    }
+}
+
 /// The answer that lets a call run.
 pub fn allow() -> String {
     json!({ "permission": "allow" }).to_string()
@@ -376,6 +502,61 @@ mod tests {
         let denied: Value = serde_json::from_str(&deny("why")).unwrap();
         assert_eq!(denied["user_message"], "why");
         assert_eq!(denied["agent_message"], "why");
+    }
+
+    fn kept(payload: &str, keep: usize) -> Payload {
+        read_without_content(payload.as_bytes(), keep, MAX_PAYLOAD_BYTES).unwrap()
+    }
+
+    /// The content of a read is thrown away as it streams, escapes and all,
+    /// and the rest of the call is kept as it came; a call that is not JSON
+    /// stays one that is not JSON.
+    #[test]
+    fn a_reads_content_is_dropped_and_nothing_else() {
+        let content = "x\\\" \\\\ \\u0041 }{,:\"content\":".repeat(1000);
+        let payload = with(
+            READ_EVENT,
+            json!({"file_path": "/home/dev/app/big.txt", "content": content, "attachments": []}),
+        );
+        let Payload::Whole(bytes) = kept(&payload, 4096) else {
+            panic!("the content counted toward the cap");
+        };
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["content"], "");
+        assert_eq!(value["file_path"], "/home/dev/app/big.txt");
+        let mut expected: Value = serde_json::from_str(&payload).unwrap();
+        expected["content"] = json!("");
+        assert_eq!(value, expected);
+        let CursorCall::Call(Event::Read, call) = read(std::str::from_utf8(&bytes).unwrap()) else {
+            panic!();
+        };
+        assert_eq!(call["tool_input"]["file_path"], "/home/dev/app/big.txt");
+
+        // A `content` that is not the top level's, or not a string, stays.
+        let nested =
+            r#"{"hook_event_name":"preToolUse","tool_input":{"content":"keep me"},"content":7}"#;
+        assert_eq!(
+            kept(nested, 4096),
+            Payload::Whole(nested.as_bytes().to_vec())
+        );
+
+        // Cut short inside the content: what is kept is not JSON.
+        let cut = &payload[..payload.len() / 2];
+        let Payload::Whole(bytes) = kept(cut, 4096) else {
+            panic!();
+        };
+        assert!(serde_json::from_slice::<Value>(&bytes).is_err());
+
+        // The other fields still count toward the cap, and so does the whole.
+        let long = with(
+            READ_EVENT,
+            json!({"file_path": "a".repeat(5000), "content": "x"}),
+        );
+        assert!(matches!(kept(&long, 4096), Payload::TooLong(_)));
+        assert!(matches!(
+            read_without_content(payload.as_bytes(), 4096, 100).unwrap(),
+            Payload::TooLong(_)
+        ));
     }
 
     #[test]

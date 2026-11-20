@@ -882,6 +882,26 @@ pub(crate) fn read_tool_call_or_head(reader: impl std::io::Read) -> std::io::Res
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// [`read_tool_call_or_head`] for Cursor: the `content` a `beforeReadFile`
+/// carries (the whole file) is read through and dropped, not counted toward
+/// [`MAX_TOOL_CALL_BYTES`], so a large file is judged by its path like a
+/// small one (`cursor_hook::read_without_content`).
+pub(crate) fn read_cursor_call_or_head(
+    reader: impl std::io::Read,
+) -> std::io::Result<ToolCallRead> {
+    use innerwarden_agent_guard::cursor_hook::{self, Payload};
+    match cursor_hook::read_without_content(
+        reader,
+        MAX_TOOL_CALL_BYTES as usize,
+        cursor_hook::MAX_PAYLOAD_BYTES,
+    )? {
+        Payload::TooLong(head) => Ok(ToolCallRead::TooLong(head)),
+        Payload::Whole(buf) => String::from_utf8(buf)
+            .map(ToolCallRead::Whole)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
+    }
+}
+
 /// What the head of a tool call past the cap says about it, read from its
 /// top-level fields only. A field counts only when its whole value is in the
 /// head; text inside a string (a file's content, a command) is never read as
@@ -1743,7 +1763,12 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     // the first hook of this version brings it up to this one's.
     agents_io::rewire_once_per_version();
 
-    let buf = match read_tool_call_or_head(std::io::stdin()) {
+    let read = if agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::cursor_hook::AGENT) {
+        read_cursor_call_or_head(std::io::stdin())
+    } else {
+        read_tool_call_or_head(std::io::stdin())
+    };
+    let buf = match read {
         Ok(ToolCallRead::Whole(buf)) => buf,
         Ok(ToolCallRead::TooLong(head)) => return hook_too_long(&head, rest, monitor),
         Err(_) => return hook_unreadable("", rest, "stdin could not be read", monitor),
