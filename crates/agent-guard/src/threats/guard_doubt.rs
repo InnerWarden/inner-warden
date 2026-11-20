@@ -475,6 +475,7 @@ mod tests {
             ("uninstall", &[]),
             ("hook", &[]),
             ("mcp", &["approve", "0123abcd4567", "read_file"]),
+            ("mcp-proxy", &["--", "npx", "server"]),
         ];
         assert_eq!(tails.len(), GUARD_VERB_HEADS.len());
         for head in GUARD_VERB_HEADS {
