@@ -50,7 +50,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncWriteExt, BufReader, DuplexStream};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{
+    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+};
 
 /// The environment variables a wrapper carries its server's headers in:
 /// `INNERWARDEN_MCP_HEADER_1`, `_2`, ... each `Name: value`.
@@ -67,6 +69,12 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Bytes buffered in each pipe between the loop and the bridge.
 const PIPE_BYTES: usize = 256 * 1024;
+
+/// Server messages waiting for the bridge. A full queue holds the threads
+/// that read the server: a server that streams without end, in front of a
+/// client that reads slowly, waits instead of filling memory. The client's
+/// side is not bounded, so neither side can hold the other up in a cycle.
+const SERVER_QUEUE: usize = 256;
 
 /// Whether a server command's first word is an address the proxy reaches
 /// over HTTP rather than a program it spawns.
@@ -124,6 +132,8 @@ impl RemoteSpec {
         let mut words = rest.iter();
         while let Some(word) = words.next() {
             match word.as_str() {
+                // What the entry had, for disconnect; nothing to the proxy.
+                "--headers" | "--env" => {}
                 "--key" | "--type" => {
                     let Some(value) = words.next() else {
                         return Err(format!(
@@ -186,12 +196,12 @@ impl Remote {
     pub(super) fn start(spec: RemoteSpec) -> Self {
         let (input, bridge_in) = tokio::io::duplex(PIPE_BYTES);
         let (bridge_out, output) = tokio::io::duplex(PIPE_BYTES);
-        let (tx, rx) = unbounded_channel();
+        let (in_tx, in_rx) = unbounded_channel();
+        let (tx, rx) = channel(SERVER_QUEUE);
         // The loop's lines are read by a task of their own and handed over
-        // as messages, so the bridge waits on one channel and no read is
-        // ever cut in the middle of a line.
-        let reader = tokio::spawn(read_input(bridge_in, tx.clone()));
-        let bridge = tokio::spawn(bridge(spec, bridge_out, tx, rx));
+        // as messages, so no read is ever cut in the middle of a line.
+        let reader = tokio::spawn(read_input(bridge_in, in_tx));
+        let bridge = tokio::spawn(bridge(spec, bridge_out, tx, rx, in_rx));
         Self {
             input: Some(input),
             output: Some(output),
@@ -214,12 +224,16 @@ impl Drop for Remote {
     }
 }
 
-/// What reaches the bridge.
-enum Up {
+/// What the loop hands the bridge.
+enum Input {
     /// A line the loop forwarded to the server.
-    Input(String),
+    Line(String),
     /// The loop closed its end: the client left.
-    InputClosed,
+    Closed,
+}
+
+/// What reaches the bridge from the threads that talk to the server.
+enum Up {
     /// A message from the server, as one line.
     Line(String),
     /// A request finished (answered, failed, or none was due).
@@ -233,14 +247,48 @@ enum Up {
     Fallback(String),
 }
 
-async fn read_input(input: DuplexStream, tx: UnboundedSender<Up>) {
+async fn read_input(input: DuplexStream, tx: UnboundedSender<Input>) {
     let mut lines = super::transport::CappedLines::new(BufReader::new(input), MAX_MESSAGE_BYTES);
     while let Ok(Some(line)) = lines.next_line().await {
-        if !line.trim().is_empty() && tx.send(Up::Input(line)).is_err() {
+        if !line.trim().is_empty() && tx.send(Input::Line(line)).is_err() {
             return;
         }
     }
-    let _ = tx.send(Up::InputClosed);
+    let _ = tx.send(Input::Closed);
+}
+
+/// The server's address as `scheme://host`, the only part of it a message
+/// names: a path or query may carry a token.
+fn host_of(url: &str) -> &str {
+    split_origin(url).map_or("the remote MCP server", |(origin, _)| origin)
+}
+
+/// An error's text with every address in it cut to its host, for the same
+/// reason as [`host_of`].
+fn scrub(text: &str) -> String {
+    text.split(' ')
+        .map(|word| {
+            let Some(at) = word.find("://") else {
+                return word.to_string();
+            };
+            let after = &word[at + 3..];
+            let end = after
+                .find(['/', '?', '#', '"', '\'', ')', ']', ','])
+                .unwrap_or(after.len());
+            let authority = &after[..end];
+            let host = authority.rsplit('@').next().unwrap_or(authority);
+            format!("{}{host}", &word[..at + 3])
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn unreachable(shared: &Shared, error: &ureq::Error) -> String {
+    format!(
+        "{} could not be reached: {}",
+        host_of(&shared.url),
+        scrub(&error.to_string())
+    )
 }
 
 /// What every request to the server shares.
@@ -260,6 +308,9 @@ impl Shared {
             .max_redirects(0)
             .max_redirects_will_error(false)
             .timeout_connect(Some(CONNECT_TIMEOUT))
+            // Never through a proxy from the environment: with an http://
+            // address the entry's token would cross it in clear.
+            .proxy(None)
             .build()
             .new_agent();
         Self {
@@ -303,43 +354,57 @@ impl Shared {
     }
 }
 
-/// The id and method of a line the client sent.
+/// The method of a line the client sent, and the id of every request in it
+/// (one, or each of a batch).
 struct Sent {
-    id: Option<Value>,
     method: Option<String>,
+    ids: Vec<Value>,
 }
 
 impl Sent {
     fn of(line: &str) -> Self {
         let value: Value = serde_json::from_str(line).unwrap_or(Value::Null);
+        let request_id = |message: &Value| {
+            message
+                .get("method")
+                .and_then(Value::as_str)
+                .and(message.get("id"))
+                .filter(|id| !id.is_null())
+                .cloned()
+        };
+        let ids = match &value {
+            Value::Array(items) => items.iter().filter_map(request_id).collect(),
+            other => request_id(other).into_iter().collect(),
+        };
         Self {
-            id: value.get("id").filter(|id| !id.is_null()).cloned(),
             method: value
                 .get("method")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            ids,
         }
     }
 
-    /// Answer a request the server could not answer, so the client is not
-    /// left waiting. A notification gets nothing.
-    fn fail(&self, tx: &UnboundedSender<Up>, why: &str) {
-        if let Some(line) = self.error_line(why) {
-            let _ = tx.send(Up::Line(line));
+    /// Answer every request the server could not answer, so the client is
+    /// not left waiting. A notification gets nothing.
+    fn fail(&self, tx: &Sender<Up>, why: &str) {
+        for line in self.error_lines(why) {
+            let _ = tx.blocking_send(Up::Line(line));
         }
     }
 
-    fn error_line(&self, why: &str) -> Option<String> {
-        let id = self.id.as_ref()?;
-        self.method.as_ref()?;
-        Some(
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {"code": -32603, "message": format!("innerwarden proxy: {why}")}
+    fn error_lines(&self, why: &str) -> Vec<String> {
+        self.ids
+            .iter()
+            .map(|id| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {"code": -32603, "message": format!("innerwarden proxy: {why}")}
+                })
+                .to_string()
             })
-            .to_string(),
-        )
+            .collect()
     }
 }
 
@@ -380,30 +445,75 @@ fn is_event_stream(response: &ureq::http::Response<ureq::Body>) -> bool {
     })
 }
 
+/// Lines of an event stream, ended by `\r\n`, `\n` or `\r` alone (all
+/// three are valid there), each at most [`MAX_MESSAGE_BYTES`].
+struct EventLines<R> {
+    reader: std::io::BufReader<R>,
+    /// The last line ended with `\r`: a `\n` right after it is part of
+    /// that end, even when it comes in the next read.
+    after_cr: bool,
+}
+
+impl<R: Read> EventLines<R> {
+    /// The next line into `line`: `Ok(false)` at the end of the stream.
+    fn next(&mut self, line: &mut Vec<u8>) -> std::io::Result<bool> {
+        line.clear();
+        loop {
+            let available = self.reader.fill_buf()?;
+            if available.is_empty() {
+                return Ok(!line.is_empty());
+            }
+            let start = usize::from(std::mem::take(&mut self.after_cr) && available[0] == b'\n');
+            match available[start..]
+                .iter()
+                .position(|&b| b == b'\n' || b == b'\r')
+            {
+                Some(at) => {
+                    line.extend_from_slice(&available[start..start + at]);
+                    self.after_cr = available[start + at] == b'\r';
+                    self.reader.consume(start + at + 1);
+                    return Ok(true);
+                }
+                None => {
+                    let used = available.len();
+                    line.extend_from_slice(&available[start..]);
+                    self.reader.consume(used);
+                    if line.len() > MAX_MESSAGE_BYTES {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "event line over the size limit",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Read a server-sent event stream, handing each event's type and data to
 /// `on_event` until it returns false, the stream ends, or an event is
 /// longer than [`MAX_MESSAGE_BYTES`].
 fn read_events(reader: impl Read, mut on_event: impl FnMut(&str, &str) -> bool) {
-    let mut reader = std::io::BufReader::new(reader);
+    let mut lines = EventLines {
+        reader: std::io::BufReader::new(reader),
+        after_cr: false,
+    };
     let mut event = String::new();
     let mut data = String::new();
     let mut has_data = false;
     let mut line = Vec::new();
     loop {
-        line.clear();
-        let read = (&mut reader)
-            .take(MAX_MESSAGE_BYTES as u64 + 1)
-            .read_until(b'\n', &mut line);
-        match read {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
-        if line.len() > MAX_MESSAGE_BYTES {
-            eprintln!("innerwarden proxy: the remote MCP server sent an event over the size limit");
-            return;
+        match lines.next(&mut line) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(_) => {
+                eprintln!(
+                    "innerwarden proxy: the remote MCP server sent an event over the size limit"
+                );
+                return;
+            }
         }
         let text = String::from_utf8_lossy(&line);
-        let text = text.trim_end_matches(['\n', '\r']);
         if text.is_empty() {
             if has_data && !on_event(&event, &data) {
                 return;
@@ -418,7 +528,7 @@ fn read_events(reader: impl Read, mut on_event: impl FnMut(&str, &str) -> bool) 
         }
         let (field, value) = match text.split_once(':') {
             Some((field, value)) => (field, value.strip_prefix(' ').unwrap_or(value)),
-            None => (text, ""),
+            None => (&*text, ""),
         };
         match field {
             "event" => event = value.to_string(),
@@ -481,8 +591,9 @@ async fn write_line(output: &mut DuplexStream, line: &str) -> std::io::Result<()
 async fn bridge(
     spec: RemoteSpec,
     mut output: DuplexStream,
-    tx: UnboundedSender<Up>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Up>,
+    tx: Sender<Up>,
+    mut rx: Receiver<Up>,
+    mut input: UnboundedReceiver<Input>,
 ) {
     let shared = Arc::new(Shared::new(&spec));
     let mut legacy = spec.legacy_sse;
@@ -493,51 +604,56 @@ async fn bridge(
     if legacy {
         open_legacy_stream(Arc::clone(&shared), tx.clone());
     }
-    while let Some(up) = rx.recv().await {
-        match up {
-            Up::Input(line) => match (legacy, &endpoint) {
-                (false, _) => {
-                    in_flight += 1;
-                    post_streamable(Arc::clone(&shared), line, tx.clone());
-                }
-                (true, Some(at)) => {
-                    in_flight += 1;
-                    post_legacy(Arc::clone(&shared), at.clone(), line, tx.clone());
-                }
-                (true, None) => queued.push_back(line),
+    loop {
+        tokio::select! {
+            got = input.recv(), if input_open => match got {
+                Some(Input::Line(line)) => match (legacy, &endpoint) {
+                    (false, _) => {
+                        in_flight += 1;
+                        post_streamable(Arc::clone(&shared), line, tx.clone());
+                    }
+                    (true, Some(at)) => {
+                        in_flight += 1;
+                        post_legacy(Arc::clone(&shared), at.clone(), line, tx.clone());
+                    }
+                    (true, None) => queued.push_back(line),
+                },
+                Some(Input::Closed) | None => input_open = false,
             },
-            Up::InputClosed => input_open = false,
-            Up::Line(line) => {
-                if write_line(&mut output, &line).await.is_err() {
-                    break;
-                }
-            }
-            Up::Done => in_flight = in_flight.saturating_sub(1),
-            Up::Fallback(line) => {
-                if !legacy {
-                    legacy = true;
-                    open_legacy_stream(Arc::clone(&shared), tx.clone());
-                }
-                queued.push_back(line);
-            }
-            Up::Endpoint(at) => {
-                while let Some(line) = queued.pop_front() {
-                    in_flight += 1;
-                    post_legacy(Arc::clone(&shared), at.clone(), line, tx.clone());
-                }
-                endpoint = Some(at);
-            }
-            Up::StreamEnded => {
-                if legacy {
-                    for line in queued.drain(..) {
-                        let sent = Sent::of(&line);
-                        if let Some(reply) =
-                            sent.error_line("the remote MCP server's stream closed")
-                        {
-                            let _ = write_line(&mut output, &reply).await;
+            got = rx.recv() => {
+                let Some(up) = got else { break };
+                match up {
+                    Up::Line(line) => {
+                        if write_line(&mut output, &line).await.is_err() {
+                            break;
                         }
                     }
-                    break;
+                    Up::Done => in_flight = in_flight.saturating_sub(1),
+                    Up::Fallback(line) => {
+                        if !legacy {
+                            legacy = true;
+                            open_legacy_stream(Arc::clone(&shared), tx.clone());
+                        }
+                        queued.push_back(line);
+                    }
+                    Up::Endpoint(at) => {
+                        while let Some(line) = queued.pop_front() {
+                            in_flight += 1;
+                            post_legacy(Arc::clone(&shared), at.clone(), line, tx.clone());
+                        }
+                        endpoint = Some(at);
+                    }
+                    Up::StreamEnded => {
+                        if legacy {
+                            for line in queued.drain(..) {
+                                let why = "the remote MCP server's stream closed";
+                                for reply in Sent::of(&line).error_lines(why) {
+                                    let _ = write_line(&mut output, &reply).await;
+                                }
+                            }
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -552,14 +668,11 @@ async fn bridge(
 
 /// Send one line as a Streamable HTTP POST, on a thread of its own: an
 /// answer that streams for a long time holds no other request back.
-fn post_streamable(shared: Arc<Shared>, line: String, tx: UnboundedSender<Up>) {
+fn post_streamable(shared: Arc<Shared>, line: String, tx: Sender<Up>) {
     std::thread::spawn(move || {
         let sent = Sent::of(&line);
         match shared.post(&shared.url, &line) {
-            Err(error) => sent.fail(
-                &tx,
-                &format!("the remote MCP server could not be reached: {error}"),
-            ),
+            Err(error) => sent.fail(&tx, &unreachable(&shared, &error)),
             Ok(response) => {
                 let status = response.status().as_u16();
                 if let Some(session) = header(&response, "mcp-session-id") {
@@ -571,8 +684,8 @@ fn post_streamable(shared: Arc<Shared>, line: String, tx: UnboundedSender<Up>) {
                     && sent.method.as_deref() == Some("initialize")
                     && shared.session().is_none()
                 {
-                    let _ = tx.send(Up::Fallback(line));
-                    let _ = tx.send(Up::Done);
+                    let _ = tx.blocking_send(Up::Fallback(line));
+                    let _ = tx.blocking_send(Up::Done);
                     return;
                 }
                 if (200..300).contains(&status) {
@@ -585,7 +698,7 @@ fn post_streamable(shared: Arc<Shared>, line: String, tx: UnboundedSender<Up>) {
                         if initialize {
                             record_protocol(&shared, &line);
                         }
-                        tx.send(Up::Line(line)).is_ok()
+                        tx.blocking_send(Up::Line(line)).is_ok()
                     };
                     let streams = is_event_stream(&response);
                     let body = response.into_body();
@@ -616,7 +729,7 @@ fn post_streamable(shared: Arc<Shared>, line: String, tx: UnboundedSender<Up>) {
                 }
             }
         }
-        let _ = tx.send(Up::Done);
+        let _ = tx.blocking_send(Up::Done);
     });
 }
 
@@ -636,7 +749,7 @@ fn record_protocol(shared: &Shared, line: &str) {
 /// Open the server's own stream (Streamable HTTP), once: what the server
 /// sends there (a notification, a request of its own) comes back through
 /// the loop like any answer. A server with none (405) is fine.
-fn listen(shared: Arc<Shared>, tx: UnboundedSender<Up>) {
+fn listen(shared: Arc<Shared>, tx: Sender<Up>) {
     if shared.listening.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -652,18 +765,18 @@ fn listen(shared: Arc<Shared>, tx: UnboundedSender<Up>) {
                 return true;
             }
             let line = one_line(data);
-            line.is_empty() || tx.send(Up::Line(line)).is_ok()
+            line.is_empty() || tx.blocking_send(Up::Line(line)).is_ok()
         });
     });
 }
 
 /// Open the older transport's stream: its `endpoint` event, then every
 /// message the server sends.
-fn open_legacy_stream(shared: Arc<Shared>, tx: UnboundedSender<Up>) {
+fn open_legacy_stream(shared: Arc<Shared>, tx: Sender<Up>) {
     std::thread::spawn(move || {
         match shared.open_stream() {
             Err(error) => {
-                eprintln!("innerwarden proxy: the remote MCP server could not be reached: {error}")
+                eprintln!("innerwarden proxy: {}", unreachable(&shared, &error))
             }
             Ok(response) => {
                 let status = response.status().as_u16();
@@ -677,7 +790,7 @@ fn open_legacy_stream(shared: Arc<Shared>, tx: UnboundedSender<Up>) {
                         response.into_body().into_reader(),
                         |event, data| match event {
                             "endpoint" => match resolve_endpoint(&shared.url, data) {
-                                Some(at) => tx.send(Up::Endpoint(at)).is_ok(),
+                                Some(at) => tx.blocking_send(Up::Endpoint(at)).is_ok(),
                                 None => {
                                     eprintln!(
                                     "innerwarden proxy: the remote MCP server named an endpoint \
@@ -688,7 +801,7 @@ fn open_legacy_stream(shared: Arc<Shared>, tx: UnboundedSender<Up>) {
                             },
                             "" | "message" => {
                                 let line = one_line(data);
-                                line.is_empty() || tx.send(Up::Line(line)).is_ok()
+                                line.is_empty() || tx.blocking_send(Up::Line(line)).is_ok()
                             }
                             _ => true,
                         },
@@ -696,20 +809,17 @@ fn open_legacy_stream(shared: Arc<Shared>, tx: UnboundedSender<Up>) {
                 }
             }
         }
-        let _ = tx.send(Up::StreamEnded);
+        let _ = tx.blocking_send(Up::StreamEnded);
     });
 }
 
 /// POST one line to the older transport's endpoint; its answer comes on the
 /// stream.
-fn post_legacy(shared: Arc<Shared>, at: String, line: String, tx: UnboundedSender<Up>) {
+fn post_legacy(shared: Arc<Shared>, at: String, line: String, tx: Sender<Up>) {
     std::thread::spawn(move || {
         let sent = Sent::of(&line);
         match shared.post(&at, &line) {
-            Err(error) => sent.fail(
-                &tx,
-                &format!("the remote MCP server could not be reached: {error}"),
-            ),
+            Err(error) => sent.fail(&tx, &unreachable(&shared, &error)),
             Ok(response) => {
                 let status = response.status().as_u16();
                 if !(200..300).contains(&status) {
@@ -717,7 +827,7 @@ fn post_legacy(shared: Arc<Shared>, at: String, line: String, tx: UnboundedSende
                 }
             }
         }
-        let _ = tx.send(Up::Done);
+        let _ = tx.blocking_send(Up::Done);
     });
 }
 
@@ -881,6 +991,116 @@ mod tests {
         }
     }
 
+    /// A server that streams without end, in front of a client that does not
+    /// read, is held back: what the bridge keeps is bounded (the queue of
+    /// [`SERVER_QUEUE`] messages and the pipe), so the server's writes stall
+    /// long before it has sent everything. With an unbounded queue all 40 MB
+    /// were taken in at once.
+    #[test]
+    fn a_server_that_streams_without_end_is_held_back() {
+        use std::io::{BufRead, Read, Write};
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::AsyncWriteExt;
+        const EVENTS: usize = 10_000;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let sent = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&sent);
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut length = 0usize;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap_or(0);
+                }
+            }
+            let mut body = vec![0u8; length];
+            let _ = reader.read_exact(&mut body);
+            let _ = writer.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            let text = "x".repeat(4000);
+            let event = format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{{\"t\":\"{text}\"}}}}\n\n"
+            );
+            for _ in 0..EVENTS {
+                if writer.write_all(event.as_bytes()).is_err() {
+                    return;
+                }
+                counter.fetch_add(event.len(), Ordering::SeqCst);
+            }
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let mut remote = Remote::start(RemoteSpec {
+                url,
+                legacy_sse: false,
+                headers: Vec::new(),
+            });
+            let mut input = remote.input.take().unwrap();
+            let _output = remote.output.take().unwrap();
+            input
+                .write_all(
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{}}\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        });
+        // Each event is a little over 4000 bytes.
+        let total = EVENTS * 4000;
+        let taken = sent.load(Ordering::SeqCst);
+        assert!(
+            taken < total / 2,
+            "the server sent {taken} of {total} bytes to a client that reads nothing"
+        );
+    }
+
+    /// An address in an error is cut to its host: its path and query may
+    /// carry a token, and so may a user part.
+    #[test]
+    fn an_error_names_only_the_host() {
+        assert_eq!(
+            scrub("bad uri: https://u:p@mcp.example.com/v1/sse?token=abc failed"),
+            "bad uri: https://mcp.example.com failed"
+        );
+        assert_eq!(scrub("Uri(\"http://h:9/x?k=1\")"), "Uri(\"http://h:9");
+        assert_eq!(
+            host_of("https://mcp.example.com/mcp?key=s"),
+            "https://mcp.example.com"
+        );
+    }
+
+    /// Every request of a batch the server could not answer gets its error;
+    /// notifications get none.
+    #[test]
+    fn each_request_of_a_failed_batch_is_answered() {
+        let batch = r#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/x"},{"jsonrpc":"2.0","id":"b","method":"ping"}]"#;
+        let lines = Sent::of(batch).error_lines("down");
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("\"id\":1") && lines[1].contains("\"id\":\"b\""));
+        assert!(
+            Sent::of(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .error_lines("down")
+                .is_empty()
+        );
+        // A response the client sends (no method) is not a request.
+        assert!(Sent::of(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#)
+            .error_lines("down")
+            .is_empty());
+    }
+
     #[test]
     fn an_endpoint_stays_on_the_server_it_came_from() {
         let base = "https://mcp.example.com/v1/sse?x=1";
@@ -923,5 +1143,29 @@ mod tests {
             ]
         );
         assert_eq!(one_line("{\"a\":\r\n 1}\n"), "{\"a\":   1}");
+        // A stream whose lines end with \r alone, or \r\n cut between reads.
+        let mut seen = Vec::new();
+        read_events(
+            &b"event: endpoint\rdata: /m\r\rdata: x\r\r"[..],
+            |event, data| {
+                seen.push((event.to_string(), data.to_string()));
+                true
+            },
+        );
+        read_events(
+            std::io::Read::chain(&b"data: a\r"[..], &b"\n\r\n"[..]),
+            |event, data| {
+                seen.push((event.to_string(), data.to_string()));
+                true
+            },
+        );
+        assert_eq!(
+            seen,
+            vec![
+                ("endpoint".to_string(), "/m".to_string()),
+                (String::new(), "x".to_string()),
+                (String::new(), "a".to_string()),
+            ]
+        );
     }
 }

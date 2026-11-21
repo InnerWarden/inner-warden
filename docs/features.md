@@ -43,7 +43,9 @@ list, with every limit.
   posture). The proxy opens no port and serves no TLS of its own: the client
   reaches it through a pipe, and it reaches the server with the system's
   certificates. The entry's headers travel in the wrapper's `env`
-  (`INNERWARDEN_MCP_HEADER_1`, ...), redirects are not followed, and an SSE
+  (`INNERWARDEN_MCP_HEADER_1`, ...), redirects are not followed, no proxy from
+  the environment (`HTTP_PROXY`) is used, an error names only the server's
+  host, and an SSE
   endpoint on another origin is refused. `agents disconnect` writes the entry
   back with its address, key, type and headers. Limits: the proxy cannot sign
   in for the client, so an entry with `oauth`, `auth` or

@@ -405,10 +405,14 @@ fn remote_entry(server: &Value) -> Option<RemoteEntry> {
 
 /// A remote entry written as a local one whose command is its address, the
 /// shape [`wrap_server`] then wraps like any other.
+///
+/// `--headers` and `--env` say the entry had those keys (an empty
+/// `headers` or `env` too), so disconnect gives back exactly what was
+/// there and nothing it did not have.
 fn remote_as_local(server: &Value, remote: &RemoteEntry) -> Option<Value> {
     let mut obj = server.as_object()?.clone();
     obj.remove(&remote.key);
-    obj.remove("headers");
+    let had_headers = obj.remove("headers").is_some();
     let mut args: Vec<Value> = Vec::new();
     if remote.key != "url" {
         args.extend([json!("--key"), json!(remote.key)]);
@@ -416,6 +420,12 @@ fn remote_as_local(server: &Value, remote: &RemoteEntry) -> Option<Value> {
     if let Some(kind) = &remote.kind {
         args.extend([json!("--type"), json!(kind)]);
         obj.insert("type".into(), json!("stdio"));
+    }
+    if had_headers {
+        args.push(json!("--headers"));
+    }
+    if obj.contains_key("env") {
+        args.push(json!("--env"));
     }
     if !remote.headers.is_empty() {
         let env = obj
@@ -441,12 +451,18 @@ fn remote_as_local(server: &Value, remote: &RemoteEntry) -> Option<Value> {
 fn restore_remote(obj: &mut serde_json::Map<String, Value>, url: &str, words: &[Value]) -> bool {
     let mut key = "url".to_string();
     let mut kind: Option<String> = None;
+    let mut had_headers = false;
+    let mut had_env = false;
     let mut it = words.iter();
     while let Some(word) = it.next() {
-        let value = it.next().and_then(Value::as_str);
-        match (word.as_str(), value) {
-            (Some("--key"), Some(value)) if REMOTE_URL_KEYS.contains(&value) => key = value.into(),
-            (Some("--type"), Some(value)) => kind = Some(value.to_string()),
+        match word.as_str() {
+            Some("--headers") => had_headers = true,
+            Some("--env") => had_env = true,
+            Some(flag @ ("--key" | "--type")) => match (flag, it.next().and_then(Value::as_str)) {
+                ("--key", Some(value)) if REMOTE_URL_KEYS.contains(&value) => key = value.into(),
+                ("--type", Some(value)) => kind = Some(value.to_string()),
+                _ => return false,
+            },
             _ => return false,
         }
     }
@@ -467,15 +483,20 @@ fn restore_remote(obj: &mut serde_json::Map<String, Value>, url: &str, words: &[
         let mut n = 1;
         while let Some(line) = env.remove(&format!("{HEADER_ENV_PREFIX}{n}")) {
             if let Some((name, value)) = line.as_str().and_then(|line| line.split_once(':')) {
-                headers.insert(name.to_string(), json!(value.trim_start()));
+                // Connect wrote `Name: value`: one space after the colon is
+                // its own, any other is the value's.
+                headers.insert(
+                    name.to_string(),
+                    json!(value.strip_prefix(' ').unwrap_or(value)),
+                );
             }
             n += 1;
         }
-        if env.is_empty() {
+        if env.is_empty() && !had_env {
             obj.remove("env");
         }
     }
-    if !headers.is_empty() {
+    if had_headers || !headers.is_empty() {
         obj.insert("headers".into(), Value::Object(headers));
     }
     obj.insert(key, json!(url));
@@ -2058,7 +2079,8 @@ mod remote_wiring_tests {
                 "--",
                 "https://api.example.com/mcp",
                 "--key",
-                "httpUrl"
+                "httpUrl",
+                "--headers"
             ])
         );
         assert_eq!(
@@ -2102,6 +2124,41 @@ mod remote_wiring_tests {
         let (restored, n) = unwrap(monitor);
         assert_eq!(n, 3);
         assert_eq!(restored, original);
+    }
+
+    /// What the entry had comes back as it was: an empty `headers`, an empty
+    /// `env` with no headers, and a header value that starts with a space.
+    /// FAILS ON REVERT of the `--headers` / `--env` words or of
+    /// `strip_prefix` (it was `trim_start`).
+    #[test]
+    fn disconnect_gives_back_empty_keys_and_spaces_as_they_were() {
+        let original = json!({"mcpServers": {
+            "empty_headers": {"url": "https://a.example/mcp", "headers": {}},
+            "empty_env": {"url": "https://b.example/mcp", "env": {}},
+            "spaced": {"url": "https://c.example/mcp", "headers": {"Authorization": " Bearer x"}},
+            "both": {"url": "https://d.example/mcp", "headers": {"A": "1"}, "env": {"KEEP": "1"}}
+        }});
+        let (wrapped, n) = wrap(original.clone(), "/abs/innerwarden", false, "cursor");
+        assert_eq!(n, 4);
+        let (restored, n) = unwrap(wrapped.clone());
+        assert_eq!(n, 4);
+        assert_eq!(restored, original);
+        // The proxy still reads the header the entry gave.
+        let spaced = &wrapped["mcpServers"]["spaced"];
+        let words: Vec<String> = spaced["args"].as_array().unwrap()[8..]
+            .iter()
+            .map(|w| w.as_str().unwrap().to_string())
+            .collect();
+        let env = spaced["env"].clone();
+        let spec = crate::mcp_proxy::remote::RemoteSpec::from_cmd(&words, |name| {
+            env.get(name).and_then(Value::as_str).map(str::to_string)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            spec.headers,
+            vec![("Authorization".to_string(), "Bearer x".to_string())]
+        );
     }
 
     /// Entries the proxy cannot carry are left as they are and counted
