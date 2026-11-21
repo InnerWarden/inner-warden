@@ -2,6 +2,9 @@
 //! `agents disconnect cursor` takes out only what it wrote, and `agents`
 //! and `status` say what is screened. Drives the real binary over a
 //! disposable HOME.
+//!
+//! Unix only: every test here runs the hook line through `/bin/sh`.
+#![cfg(unix)]
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};

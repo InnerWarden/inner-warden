@@ -29,7 +29,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use innerwarden_agent_guard::agent_hooks::{CODEX, CURSOR, GEMINI};
+#[cfg(unix)]
+use innerwarden_agent_guard::agent_hooks::CURSOR;
+use innerwarden_agent_guard::agent_hooks::{CODEX, GEMINI};
 use innerwarden_agent_guard::hook::hook_command_for;
 use serde_json::{json, Value};
 
@@ -1323,6 +1325,7 @@ fn a_review_for_an_agent_with_no_way_to_ask_is_refused_with_the_reason() {
 /// stdout that is not JSON of that shape blocks too. Any other end (another
 /// exit, a signal, a timeout) runs the call unless the entry carries
 /// `failClosed: true`.
+#[cfg(unix)]
 fn cursor_reads(answer: &Answer, fail_closed: bool) -> Call {
     match answer.code {
         Some(2) => Call::Refused,
@@ -1339,6 +1342,8 @@ fn cursor_reads(answer: &Answer, fail_closed: bool) -> Call {
     }
 }
 
+/// Cursor's payloads, for the tests of its hook, which run on unix only.
+#[cfg(unix)]
 impl Host {
     /// A Cursor hook payload: the fields every event carries, then the
     /// event's own, as its hooks documentation lists them.
@@ -1387,6 +1392,7 @@ impl Host {
 }
 
 /// The answer Cursor reads on stdout, as JSON.
+#[cfg(unix)]
 fn cursor_json(answer: &Answer) -> Value {
     serde_json::from_str(answer.stdout.trim())
         .unwrap_or_else(|_| panic!("one JSON line on stdout: {:?}", answer.stdout))
