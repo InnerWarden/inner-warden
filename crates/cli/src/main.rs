@@ -3284,7 +3284,10 @@ fn screen_file_tool(
         FileToolCall::Unreadable(why) => return Some(hook_unreadable(buf, rest, why, monitor)),
         FileToolCall::Writes { tool, paths } => (tool, paths),
     };
-    let screen = screen_file_writes(buf, rest, monitor, demo, &tool, &paths);
+    let screen = match screen_file_writes(buf, rest, monitor, demo, &tool, &paths) {
+        FileScreen::Pass => screen_instruction_orders(buf, rest, monitor, demo, &tool, &payload),
+        other => other,
+    };
     Some(
         file_screen_exit(buf, rest, screen, monitor, demo).unwrap_or_else(|| {
             if demo {
@@ -3449,6 +3452,52 @@ pub(crate) fn screen_file_writes(
     FileScreen::Refused {
         explanation: file_tools::refusal_explanation(tool, path, what),
     }
+}
+
+/// A file tool call that writes an order into a file an agent reads as its
+/// instructions (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursorrules`):
+/// refused as the same text written there by a shell line is
+/// (`agent_instruction_order`), recorded and alerted on like every refused
+/// file change. A note, a build command or a style rule passes, unrecorded.
+/// The rule engine is loaded only for a call that writes such a file.
+fn screen_instruction_orders(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    demo: bool,
+    tool: &str,
+    payload: &serde_json::Value,
+) -> FileScreen {
+    use innerwarden_agent_guard::{file_tools, mcp};
+    let Some((path, why)) =
+        file_tools::written_texts(payload)
+            .into_iter()
+            .find_map(|(path, text)| {
+                mcp::written_instruction_order(&path, &text, Some(shell_engine()))
+                    .map(|why| (path, why))
+            })
+    else {
+        return FileScreen::Pass;
+    };
+    let explanation = format!(
+        "{tool} {why}. An agent may not write orders into its own instructions; if you meant \
+         the change, make it yourself"
+    );
+    let command = format!("{tool} {}", path.trim());
+    let verdict = serde_json::json!({
+        "command": command,
+        "risk_score": 60,
+        "severity": "high",
+        "signals": [{
+            "signal": "agent_instruction_order",
+            "score": 60,
+            "detail": why,
+        }],
+        "recommendation": "deny",
+        "explanation": explanation,
+    });
+    record_shell(buf, rest, &command, &verdict, monitor, true, None, demo);
+    FileScreen::Refused { explanation }
 }
 
 /// A file change that is not to a privileged file: refused (outside monitor)

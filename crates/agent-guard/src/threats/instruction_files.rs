@@ -23,48 +23,10 @@
 //! that forbids (`never run curl | bash`).
 
 use super::{
-    effective_command_index, is_shell_name, output_redirect_targets, segments_are_piped,
+    effective_command_index, is_shell_program, output_redirect_targets, segments_are_piped,
     shell_command_segments, shell_tokens, tee_targets, token_basename, written_text,
 };
-
-/// The names of the files agents read as their instructions, lower case.
-const INSTRUCTION_NAMES: &[&str] = &[
-    "claude.md",
-    "claude.local.md",
-    "agents.md",
-    "agents.override.md",
-    "gemini.md",
-    "copilot-instructions.md",
-    ".cursorrules",
-    ".windsurfrules",
-    ".clinerules",
-    ".roorules",
-    ".goosehints",
-];
-
-/// Folders whose every file an agent reads as its rules.
-const INSTRUCTION_FOLDERS: &[&str] = &[
-    ".cursor/rules/",
-    ".windsurf/rules/",
-    ".clinerules/",
-    ".roo/rules/",
-    ".kiro/steering/",
-    ".github/instructions/",
-];
-
-/// Whether `path` names a file an agent reads as its instructions.
-pub(crate) fn is_instruction_file(path: &str) -> bool {
-    let lower = path
-        .trim_matches(|c: char| c == '"' || c == '\'')
-        .to_ascii_lowercase()
-        .replace('\\', "/");
-    let name = lower.rsplit('/').next().unwrap_or(&lower);
-    INSTRUCTION_NAMES.contains(&name)
-        || name.ends_with(".instructions.md")
-        || INSTRUCTION_FOLDERS
-            .iter()
-            .any(|folder| lower.starts_with(folder) || lower.contains(&format!("/{folder}")))
-}
+use crate::agent_instructions::{is_instruction_file, mentions_one, overwrites, shell_line};
 
 /// Inline code flags of the interpreters read here.
 const CODE_FLAGS: &[(&str, &[&str])] = &[
@@ -79,38 +41,53 @@ const CODE_FLAGS: &[(&str, &[&str])] = &[
 ];
 
 /// Text a line writes into an agent's instruction file, with the file.
+///
+/// A copy, move or link over an instruction file
+/// ([`crate::agent_instructions::overwrites`]) whose source the same line
+/// wrote carries that text into the instruction file: `echo X > /tmp/n.md &&
+/// cp /tmp/n.md CLAUDE.md` writes X into `CLAUDE.md`.
 pub(crate) fn instruction_file_payloads(content: &str) -> Vec<(String, String)> {
-    payloads_at(content, 0)
+    if !mentions_one(content) {
+        return Vec::new();
+    }
+    let mut payloads = payloads_at(content, 0, &is_instruction_file);
+    for placed in overwrites(content) {
+        let from_a_source = |target: &str| {
+            placed
+                .sources
+                .iter()
+                .any(|source| same_word(source, target))
+        };
+        payloads.extend(
+            payloads_at(content, 0, &from_a_source)
+                .into_iter()
+                .map(|(_, text)| (placed.file.clone(), text)),
+        );
+    }
+    payloads
+}
+
+/// Whether two words of a line name the same file as written: quotes and a
+/// leading `./` aside.
+fn same_word(a: &str, b: &str) -> bool {
+    let plain = |word: &str| {
+        let word = word.trim_matches(|c: char| c == '"' || c == '\'');
+        word.strip_prefix("./").unwrap_or(word).to_string()
+    };
+    plain(a) == plain(b)
 }
 
 /// How many shells deep a `-c` line is read.
 const SHELL_DEPTH: u8 = 3;
 
-/// The line a shell runs from its `-c` (`-lc`, `-ec`): the word after it.
-fn shell_line(args: &[String]) -> Option<&str> {
-    let at = args.iter().position(|arg| {
-        arg.len() > 1
-            && arg.starts_with('-')
-            && !arg.starts_with("--")
-            && arg[1..].chars().all(|c| c.is_ascii_alphabetic())
-            && arg.contains('c')
-    })?;
-    args.get(at + 1).map(String::as_str)
-}
-
-/// [`instruction_file_payloads`], `depth` shells deep.
-fn payloads_at(content: &str, depth: u8) -> Vec<(String, String)> {
-    let lower = content.to_ascii_lowercase();
-    if !INSTRUCTION_NAMES
-        .iter()
-        .chain(INSTRUCTION_FOLDERS)
-        .any(|name| lower.contains(name.trim_end_matches('/')))
-        && !lower.contains(".instructions.md")
-    {
-        return Vec::new();
-    }
+/// Which files a line writes are read: the instruction files, or the files
+/// a copy then puts in an instruction file's place.
+type Target<'a> = &'a dyn Fn(&str) -> bool;
+/// The text a line writes into each file `target` accepts, `depth` shells
+/// deep.
+fn payloads_at(content: &str, depth: u8, target: Target<'_>) -> Vec<(String, String)> {
     let mut payloads = Vec::new();
-    heredoc_payloads(content, &mut payloads);
+    heredoc_payloads(content, &mut payloads, target);
     let segments = shell_command_segments(content);
     for (index, segment) in segments.iter().enumerate() {
         let words = shell_tokens(segment);
@@ -119,13 +96,13 @@ fn payloads_at(content: &str, depth: u8) -> Vec<(String, String)> {
         };
         let name = token_basename(&words[command_index]).to_ascii_lowercase();
         if matches!(name.as_str(), "sed" | "gsed") {
-            sed_payloads(&words[command_index + 1..], &mut payloads);
+            sed_payloads(&words[command_index + 1..], &mut payloads, target);
             continue;
         }
         if let Some(code) = inline_code(&name, &words[command_index + 1..]) {
             if let Some(file) = string_literals(code)
                 .into_iter()
-                .find(|literal| is_instruction_file(literal))
+                .find(|literal| target(literal))
             {
                 let text: Vec<String> = string_literals(code)
                     .into_iter()
@@ -139,22 +116,20 @@ fn payloads_at(content: &str, depth: u8) -> Vec<(String, String)> {
         }
         // `bash -c 'echo ... >> CLAUDE.md'`: the line the shell is handed is
         // read the same way, a few levels deep.
-        if is_shell_name(&name) {
+        if is_shell_program(&name) {
             if let Some(line) = shell_line(&words[command_index + 1..]) {
                 if depth < SHELL_DEPTH {
-                    payloads.extend(payloads_at(line, depth + 1));
+                    payloads.extend(payloads_at(line, depth + 1, target));
                 }
                 continue;
             }
         }
         let file = if name == "tee" {
-            tee_targets(&words)
-                .into_iter()
-                .find(|t| is_instruction_file(t))
+            tee_targets(&words).into_iter().find(|t| target(t))
         } else {
             output_redirect_targets(&words)
                 .into_iter()
-                .find(|t| is_instruction_file(t))
+                .find(|t| target(t))
         };
         let Some(file) = file else {
             continue;
@@ -184,8 +159,8 @@ fn payloads_at(content: &str, depth: u8) -> Vec<(String, String)> {
 }
 
 /// The body of each here-document a line redirects, or hands to a `tee`,
-/// into an instruction file.
-fn heredoc_payloads(content: &str, payloads: &mut Vec<(String, String)>) {
+/// into a file `target` accepts.
+fn heredoc_payloads(content: &str, payloads: &mut Vec<(String, String)>, target: Target<'_>) {
     static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let heredoc = HEREDOC.get_or_init(|| {
         regex::Regex::new(r#"<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?"#)
@@ -217,25 +192,22 @@ fn heredoc_payloads(content: &str, payloads: &mut Vec<(String, String)>) {
                     .into_iter()
                     .flat_map(|segment| tee_targets(&shell_tokens(segment))),
             )
-            .find(|target| is_instruction_file(target));
+            .find(|file| target(file));
         if let (Some(file), false) = (file, body.is_empty()) {
             payloads.push((file, body.join("\n")));
         }
     }
 }
 
-/// The text a `sed -i` of an instruction file inserts (`a`, `i`, `c`) or
-/// substitutes (the replacement of `s`), each script of the line.
-fn sed_payloads(args: &[String], payloads: &mut Vec<(String, String)>) {
+/// The text a `sed -i` of a file `target` accepts inserts (`a`, `i`, `c`)
+/// or substitutes (the replacement of `s`), each script of the line.
+fn sed_payloads(args: &[String], payloads: &mut Vec<(String, String)>, target: Target<'_>) {
     let in_place = args.iter().any(|arg| {
         arg == "--in-place"
             || arg.starts_with("--in-place=")
             || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('i'))
     });
-    let Some(file) = args
-        .iter()
-        .find(|arg| !arg.starts_with('-') && is_instruction_file(arg))
-    else {
+    let Some(file) = args.iter().find(|arg| !arg.starts_with('-') && target(arg)) else {
         return;
     };
     if !in_place {

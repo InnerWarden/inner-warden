@@ -3455,6 +3455,7 @@ pub fn blocks_for_agent(analysis: &CommandAnalysis) -> bool {
 /// name the list does not have, or the list keeps one nothing raises.
 pub const SIGNAL_NAMES: &[&str] = &[
     "agent_instruction_order",
+    "agent_instruction_overwrite",
     "anti_forensics",
     "bare_ip_fetch",
     "clone_and_run",
@@ -4028,6 +4029,28 @@ fn instruction_order(text: &str, rule_engine: Option<&RuleEngine>, depth: u8) ->
     reading
         .over_budget
         .then(|| "more of it than the guard reads".to_string())
+}
+
+/// Why `text`, written into `path` by an agent's own file tool (`Write`,
+/// `Edit`, `write_file`, `apply_patch`, ...), is an order to every later
+/// session, if `path` is a file an agent reads as its instructions and the
+/// text is one: the reading the shell side gives the text a line writes
+/// there (`agent_instruction_order`). `None` for any other file, and for a
+/// note, a build command, a style rule or a clause that forbids.
+pub fn written_instruction_order(
+    path: &str,
+    text: &str,
+    rule_engine: Option<&RuleEngine>,
+) -> Option<String> {
+    if text.trim().is_empty() || !crate::agent_instructions::is_instruction_file(path) {
+        return None;
+    }
+    let why = instruction_order(text, rule_engine, 0)?;
+    let shown: String = path.trim().chars().take(200).collect();
+    Some(format!(
+        "writes an order into `{shown}`, which an agent reads as its instructions at every \
+         session: {why}"
+    ))
 }
 
 /// [`analyze_command_at`] before a refusal is asked whether it came from a
@@ -4999,6 +5022,31 @@ fn analyze_command_as_read(
                 ),
             });
             score += 60;
+        } else if let Some(placed) = crate::agent_instructions::overwrites(cmd)
+            .into_iter()
+            .next()
+        {
+            // A copy, move or link over the same file writes text that is
+            // not on the line: what `/tmp/x.md` says is not known here. A
+            // review, not a refusal: restoring a CLAUDE.md from a backup is
+            // ordinary work. When this line wrote the copied file, its text
+            // was read above as written into the instruction file.
+            let sources: Vec<String> = placed
+                .sources
+                .iter()
+                .map(|source| format!("`{}`", source.chars().take(200).collect::<String>()))
+                .collect();
+            signals.push(AnalysisSignal {
+                signal: "agent_instruction_overwrite".into(),
+                score: 25,
+                detail: format!(
+                    "puts {} in the place of `{}`, which an agent reads as its instructions at \
+                     every session; what it says is not on this line",
+                    sources.join(", "),
+                    placed.file.chars().take(200).collect::<String>()
+                ),
+            });
+            score += 25;
         }
     }
 

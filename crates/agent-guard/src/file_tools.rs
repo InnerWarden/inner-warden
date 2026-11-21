@@ -283,6 +283,122 @@ pub(crate) fn patch_paths(patch: &str) -> Option<Vec<String>> {
     Some(paths)
 }
 
+/// Where a file tool carries the text it writes: `content` (`Write`,
+/// `write_file`), `new_string` (`Edit`, `replace`, Hermes's `patch` in
+/// replace mode), `new_source` (`NotebookEdit`). `MultiEdit` carries a
+/// `new_string` in each of its `edits`.
+const TEXT_KEYS: &[&str] = &["content", "new_string", "new_source"];
+
+/// PURE: the text one file tool call writes, with the file it writes it
+/// to: what a `Write`, `Edit`, `MultiEdit` or `NotebookEdit` (Claude
+/// Code), a `write_file` or `replace` (Gemini CLI, Hermes Agent), an
+/// `apply_patch` (Codex CLI) or a `patch` (Hermes Agent) puts in the file,
+/// never what it takes out. A patch gives the lines it adds (`+`) to each
+/// file it names. Empty for any other tool.
+///
+/// Read so the text an agent writes into its own instruction file
+/// (`CLAUDE.md`, `AGENTS.md`) is judged as the same text written there by
+/// a shell line is ([`crate::mcp::written_instruction_order`]).
+pub fn written_texts(payload: &Value) -> Vec<(String, String)> {
+    let tool = payload
+        .get("tool_name")
+        .or_else(|| payload.get("tool"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let input = payload.get("tool_input");
+    let mut out: Vec<(String, String)> = Vec::new();
+    if tool == PATCH_TOOL || tool == HERMES_PATCH_TOOL {
+        let patch = if tool == PATCH_TOOL {
+            patch_text(input)
+        } else {
+            input
+                .and_then(|input| input.get("patch"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        };
+        if let Some(patch) = patch {
+            out.extend(patch_additions(&patch));
+        }
+        if tool == PATCH_TOOL {
+            return out;
+        }
+    } else if !FILE_TOOLS.contains(&tool) && !GEMINI_FILE_TOOLS.contains(&tool) {
+        return out;
+    }
+    let Some(input) = input else {
+        return out;
+    };
+    let mut texts: Vec<&str> = TEXT_KEYS
+        .iter()
+        .filter_map(|key| input.get(*key).and_then(Value::as_str))
+        .collect();
+    if let Some(edits) = input.get("edits").and_then(Value::as_array) {
+        texts.extend(
+            edits
+                .iter()
+                .filter_map(|edit| edit.get("new_string").and_then(Value::as_str)),
+        );
+    }
+    let text = texts.join("\n");
+    if text.trim().is_empty() {
+        return out;
+    }
+    for path in PATH_KEYS
+        .iter()
+        .filter_map(|key| input.get(*key).and_then(Value::as_str))
+        .filter(|path| !path.trim().is_empty())
+    {
+        out.push((path.to_string(), text.clone()));
+    }
+    out
+}
+
+/// The lines a patch (Codex's or Hermes's V4A) adds to each file it names,
+/// the file being the last one a marker named: `Add File`, `Update File`,
+/// the end of a move (`Move to:`, `Move File: a -> b`).
+fn patch_additions(patch: &str) -> Vec<(String, String)> {
+    static MARKERS: std::sync::OnceLock<(regex::Regex, regex::Regex, regex::Regex)> =
+        std::sync::OnceLock::new();
+    let (moved, moved_to, named) = MARKERS.get_or_init(|| {
+        (
+            regex::Regex::new(r"^\*\*\*\s*Move\s+File:\s*.*?\s*->\s*(.*)$").expect("move marker"),
+            regex::Regex::new(r"^\*\*\*\s*Move\s+to:\s*(.*)$").expect("move-to marker"),
+            regex::Regex::new(r"^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.*)$")
+                .expect("file marker"),
+        )
+    });
+    let mut out: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut current: Option<usize> = None;
+    for line in patch.split('\n') {
+        let trimmed = line.trim();
+        let marker = moved
+            .captures(trimmed)
+            .or_else(|| moved_to.captures(trimmed))
+            .or_else(|| named.captures(trimmed))
+            .and_then(|caps| caps.get(1))
+            .map(|path| path.as_str().trim().to_string());
+        if let Some(path) = marker {
+            current = Some(match out.iter().position(|(seen, _)| *seen == path) {
+                Some(at) => at,
+                None => {
+                    out.push((path, Vec::new()));
+                    out.len() - 1
+                }
+            });
+            continue;
+        }
+        if let (Some(at), Some(added)) = (current, line.strip_prefix('+')) {
+            if !line.starts_with("+++") {
+                out[at].1.push(added);
+            }
+        }
+    }
+    out.into_iter()
+        .filter(|(_, lines)| !lines.is_empty())
+        .map(|(path, lines)| (path, lines.join("\n")))
+        .collect()
+}
+
 /// Claude Code's tools that read a file or search files, by name. They
 /// never pass through the shell either, so a hook wired to `Bash` and the
 /// file-changing tools let `Read` of a private key, or `Grep` over a folder
@@ -2733,5 +2849,93 @@ mod tests {
             Some(AGENT_HOOK_SETTINGS)
         );
         assert_eq!(privileged_file_write("plain.json", &ctx), None);
+    }
+}
+
+/// What each agent's file tool writes, read for the text it puts in a file.
+#[cfg(test)]
+mod written_text_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn texts(tool: &str, input: Value) -> Vec<(String, String)> {
+        written_texts(&json!({"tool_name": tool, "tool_input": input}))
+    }
+
+    /// Each tool gives the text it adds, never the text it takes out.
+    ///
+    /// FAILS ON REVERT: read `old_string` with `new_string`, and an `Edit`
+    /// that takes an order out of CLAUDE.md reads as one that writes it.
+    #[test]
+    fn each_tool_gives_what_it_writes() {
+        assert_eq!(
+            texts("Write", json!({"file_path": "CLAUDE.md", "content": "a"})),
+            [("CLAUDE.md".to_string(), "a".to_string())]
+        );
+        assert_eq!(
+            texts(
+                "Edit",
+                json!({"file_path": "AGENTS.md", "old_string": "gone", "new_string": "b"})
+            ),
+            [("AGENTS.md".to_string(), "b".to_string())]
+        );
+        assert_eq!(
+            texts(
+                "MultiEdit",
+                json!({"file_path": "CLAUDE.md", "edits": [
+                    {"old_string": "x", "new_string": "c1"},
+                    {"old_string": "y", "new_string": "c2"},
+                ]})
+            ),
+            [("CLAUDE.md".to_string(), "c1\nc2".to_string())]
+        );
+        assert_eq!(
+            texts(
+                "write_file",
+                json!({"file_path": "GEMINI.md", "content": "d"})
+            ),
+            [("GEMINI.md".to_string(), "d".to_string())]
+        );
+        assert_eq!(
+            texts(
+                "replace",
+                json!({"file_path": "GEMINI.md", "old_string": "o", "new_string": "e"})
+            ),
+            [("GEMINI.md".to_string(), "e".to_string())]
+        );
+        assert_eq!(
+            texts(
+                HERMES_PATCH_TOOL,
+                json!({"mode": "replace", "path": "AGENTS.md", "old_string": "o", "new_string": "f"})
+            ),
+            [("AGENTS.md".to_string(), "f".to_string())]
+        );
+        assert!(texts(
+            "Edit",
+            json!({"file_path": "CLAUDE.md", "old_string": "gone", "new_string": ""})
+        )
+        .is_empty());
+        assert!(texts("Read", json!({"file_path": "CLAUDE.md", "content": "a"})).is_empty());
+    }
+
+    /// A patch gives the lines it adds to each file it names, the end of a
+    /// move included, and none of the lines it takes out.
+    #[test]
+    fn a_patch_gives_its_added_lines_per_file() {
+        let patch = "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** Update File: docs/x.md\n*** Move to: AGENTS.md\n@@\n keep\n+order here\n*** Add File: CLAUDE.md\n+line one\n+line two\n*** End Patch\n";
+        let found = texts(PATCH_TOOL, json!({"command": patch}));
+        assert_eq!(
+            found,
+            [
+                ("src/a.rs".to_string(), "new".to_string()),
+                ("AGENTS.md".to_string(), "order here".to_string()),
+                ("CLAUDE.md".to_string(), "line one\nline two".to_string()),
+            ]
+        );
+        let v4a = "*** Begin Patch\n*** Update File: GEMINI.md\n@@\n+v4a line\n*** End Patch";
+        assert_eq!(
+            texts(HERMES_PATCH_TOOL, json!({"mode": "patch", "patch": v4a})),
+            [("GEMINI.md".to_string(), "v4a line".to_string())]
+        );
     }
 }

