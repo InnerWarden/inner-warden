@@ -5259,18 +5259,34 @@ mod install_target_tests {
         );
     }
 
-    /// An agent nothing can wire yet must be routed to isolation, never offered
-    /// a connect command that would silently do nothing. Goose keeps its servers
-    /// in YAML, which no writer here can round-trip.
+    /// An agent nothing can wire must be routed to isolation, never offered a
+    /// connect command that would silently do nothing. Aider has no hook and
+    /// no MCP surface.
     #[test]
     fn an_unwirable_agent_is_routed_to_isolation() {
-        let home = home_with(&[".config/goose"]);
+        let home = home_with(&[".aider"]);
         let err = resolve_install_target(home.path()).unwrap_err();
-        assert!(err.contains("Goose"));
+        assert!(err.contains("Aider"));
         assert!(err.contains("innerwarden contain"), "got: {err}");
         assert!(
             !err.contains("agents connect"),
             "offering a connect that cannot work would be a false promise: {err}"
+        );
+    }
+
+    /// Goose was routed to isolation while no writer here could edit its
+    /// YAML. Its stdio servers are now wired by `agents connect goose`, so
+    /// `install` names that command, as it does for Codex.
+    ///
+    /// FAILS ON REVERT: Goose back to `NotYetWirable`.
+    #[test]
+    fn goose_is_routed_to_the_automatic_path() {
+        let home = home_with(&[".config/goose"]);
+        let err = resolve_install_target(home.path()).unwrap_err();
+        assert!(err.contains("Goose"));
+        assert!(
+            err.contains("innerwarden agents connect goose"),
+            "must name the automatic path: {err}"
         );
     }
 

@@ -15,6 +15,20 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Added
 
+- **Goose's MCP servers are wired through the proxy.** `innerwarden agents
+  connect goose` now routes every `type: stdio` extension in
+  `~/.config/goose/config.yaml` through `innerwarden proxy`, naming Goose,
+  in monitor or enforce, and `innerwarden install` names that command instead
+  of sending Goose to `contain`. The YAML is read as the same server table the
+  JSON clients use, and written back line by line: only the `cmd` and `args`
+  lines of the servers that change are replaced, and every other line of the
+  file (comments, key order, other settings) is kept. The edited file is
+  parsed again and must equal the original with only those fields changed, or
+  nothing is written; a server written on one line is refused, not rewritten.
+  Disconnect restores each server's own command. Goose's built-in extensions
+  (`developer` among them) run inside Goose, where no proxy sees them; the
+  connect line says so.
+
 - **Cursor is screened through its own hooks.** `innerwarden agents connect
   cursor` now writes an entry under `beforeShellExecution`,
   `beforeMCPExecution` and `beforeReadFile` in `~/.cursor/hooks.json`,
@@ -108,6 +122,21 @@ the text of a command; what it does not see is written down, as measured:
   judged by what was opened, so a FIFO or a link to `/dev/zero` no longer
   makes `status` wait and nothing can be swapped in between a check and the
   open.
+- **A jail's change to the project's Claude Code files is told apart from
+  yours.** A `.claude` settings file or a `.mcp.json` that a jail made
+  during its run with hooks, hooks off, a bypass mode or MCP servers now
+  ends the launch with exit status 3 (the command's own failure is kept),
+  besides the line it already printed, so a script running `contain` sees
+  it; the next starts are refused until you remove it or accept it with
+  `innerwarden contain --accept-project-files --project <dir>` from your own
+  terminal. One you make between runs is yours and no longer refuses the
+  start as if a jail had made it. A launch that stopped before its jail
+  ended leaves what it found absent judged at the next start. The
+  launcher's notes in `~/.local/state/innerwarden/jail-claude` are held by
+  the guard like its own configuration (shell writes, removal, moves, links,
+  mode and owner changes, interpreter code, the file tools), a note that
+  cannot be read refuses the start, and the guard refuses an agent's
+  `contain --accept-project-files` under any name or wrapper of the program.
 - **A review asks you instead of passing unseen.** In enforce mode the hook
   used to refuse a `deny` and let a `review` run without a word (`chmod 777`
   on a folder, for one). It now hands a review to the person: Claude Code
@@ -181,6 +210,17 @@ the text of a command; what it does not see is written down, as measured:
   a download that code runs is refused for an agent.
 
 ### Fixed
+
+- **A shell tool's call that names its program in `argv` is judged by its
+  line.** `run_shell {"argv": ["ls", "-la"]}` and `{"program": "ls", "args":
+  []}` were refused by ATR-2026-040 for the tool's name: `argv` with no
+  program beside it was read as arguments added to a program the call never
+  named, and an empty argument list was left unread, so no line was read and
+  the name conditions judged the call. An `argv` with no program is now the
+  program's whole vector (its first word the program) and an empty list adds
+  nothing. A harmful line in that shape is refused by the line, on a process
+  tool too: `start_process {"argv": ["rm", "-rf", "/"]}` ran before. The
+  differential check over 33,112 corpus lines and variants moves no verdict.
 
 - **The MCP proxy raises the verdict of a payment, a message, a share or a
   delete that carries a value a server said.** Each listed tool is classed

@@ -766,7 +766,9 @@ pub const CHILD_AGENT_OTHER_FOLDER: &str = "starts Claude Code with CLAUDE_CONFI
 /// agent's own folder, Codex's `CODEX_HOME`, Hermes's `HERMES_HOME`,
 /// `HERMES_SAFE_MODE` and `HERMES_IGNORE_USER_CONFIG`, Gemini's
 /// `GEMINI_CLI_HOME`, `GEMINI_CLI_SYSTEM_SETTINGS_PATH` and
-/// `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, and Claude Code's `CLAUDE_CONFIG_DIR`,
+/// `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, Cursor's `CURSOR_CONFIG_DIR` (the
+/// folder the Cursor CLI reads its configuration from, cursor.com/docs/cli,
+/// 2026-11-21), and Claude Code's `CLAUDE_CONFIG_DIR`,
 /// `CLAUDE_CODE_SIMPLE`, `CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_RESTRICTED`,
 /// `CLAUDE_CODE_MANAGED_SETTINGS_PATH`, `CLAUDE_CODE_PERSONAL_HOOKS_OFF`,
 /// `CLAUDE_CODE_RESTRICT_PERSONAL_CONFIG` and
@@ -782,6 +784,7 @@ const AGENT_HOOK_VARIABLES: &[&str] = &[
     "gemini_cli_home",
     "gemini_cli_system_settings_path",
     "gemini_cli_trusted_folders_path",
+    "cursor_config_dir",
     "claude_config_dir",
     "claude_code_simple",
     "claude_code_safe_mode",
@@ -792,8 +795,9 @@ const AGENT_HOOK_VARIABLES: &[&str] = &[
     "claude_code_remote_session_origin",
 ];
 
-/// The agent CLIs whose hook the guard writes, by program name.
-const HOOKED_AGENT_PROGRAMS: &[&str] = &["codex", "gemini", "hermes", "claude"];
+/// The agent CLIs whose hook (or, for the Cursor CLI, whose MCP wiring) the
+/// guard writes, by program name.
+const HOOKED_AGENT_PROGRAMS: &[&str] = &["codex", "gemini", "hermes", "claude", "cursor-agent"];
 
 /// The npm packages of [`HOOKED_AGENT_PROGRAMS`], with the program each one
 /// is: what `npx`, `bunx`, `pnpm dlx` or `npm exec` are told to run, and
@@ -1532,6 +1536,9 @@ fn setter_effect(program: &str, command: &Spoken, at: usize, set: &mut SetBefore
             // starts the value is the home folder.
             found |= match argument.split_once('=') {
                 Some((_, target)) if reference && is_shell_name(target) => unshown(set, target),
+                // A name built at run time (`export CLAUDE_${X:-CONFIG}_DIR=...`):
+                // it may be any of the watched ones.
+                Some((name, _)) if name.contains(['$', '`']) => UNHOOKED,
                 _ => assignment_effect(argument, written(index).map(|word| (word, 0)), true),
             };
         }
@@ -3741,6 +3748,9 @@ fn guard_self_disable_after_patterns(content: &str) -> Option<(&'static str, u32
         ));
     }
     if writes_guard_config(content, 0) {
+        return Some((GUARD_CONFIG_WRITTEN, 60));
+    }
+    if changes_jail_notes_mode(content) {
         return Some((GUARD_CONFIG_WRITTEN, 60));
     }
     if writes_jail_record(content) {
@@ -8988,6 +8998,8 @@ fn home_spelled(target: &str) -> String {
         ("$home", "~"),
         ("${xdg_config_home}", "~/.config"),
         ("$xdg_config_home", "~/.config"),
+        ("${xdg_state_home}", "~/.local/state"),
+        ("$xdg_state_home", "~/.local/state"),
     ] {
         if let Some(rest) = lower.strip_prefix(variable) {
             if rest.is_empty() || rest.starts_with('/') {
@@ -9350,8 +9362,10 @@ fn code_names_and_writes_guard_config(code: &str) -> bool {
     static NAMES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
-        regex::Regex::new(r#"\.config\W{1,8}innerwarden|xdg_config_home\W{1,24}innerwarden"#)
-            .expect("static config path regex")
+        regex::Regex::new(
+            r#"\.config\W{1,8}innerwarden|xdg_config_home\W{1,24}innerwarden|innerwarden\W{1,8}jail-claude"#,
+        )
+        .expect("static config path regex")
     });
     let writes = WRITES.get_or_init(|| {
         regex::Regex::new(
@@ -9360,6 +9374,25 @@ fn code_names_and_writes_guard_config(code: &str) -> bool {
         .expect("static interpreter write regex")
     });
     names.is_match(code) && writes.is_match(code)
+}
+
+/// Whether a line changes the mode, owner or attributes of the jail
+/// launcher's folder of projects (`~/.local/state/innerwarden/jail-claude`)
+/// or anything in it. A mode that keeps the owner's rights is no write
+/// elsewhere ([`mode_keeps_owner`]), but here a note made unreadable is a
+/// note taken away, and one opened to others is one another account can
+/// take away: any `chmod`, `chown`, `chgrp`, `setfacl` or `chattr` that
+/// names the folder is refused.
+fn changes_jail_notes_mode(content: &str) -> bool {
+    if !mentions_any(content, &["jail-claude"]) {
+        return false;
+    }
+    static MODE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(?:chmod|chown|chgrp|setfacl|chattr)\b[^;&|\n]*jail-claude")
+            .expect("static jail notes mode regex")
+    })
+    .is_match(content)
 }
 
 /// Cheap literal gate in front of a regex family.
@@ -19886,6 +19919,12 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
             Place::Components(".openclaw/hooks"),
             // The Community configuration, its allow rules and its record.
             Place::Components(".config/innerwarden"),
+            // The jail launcher's folder of each project's own Claude Code
+            // folder, and beside each its notes of what a jail made in the
+            // project (`<key>.made`, `<key>.run.<pid>`, `<key>.absent`):
+            // an agent outside the jail that took a note away would let the
+            // next jail start on a file the person never accepted.
+            Place::Components(".local/state/innerwarden/jail-claude"),
             // INNERWARDEN_SELF_PATHS, but for the binary, which is a program.
             Place::Tree("/etc/innerwarden"),
             Place::Tree("/var/lib/innerwarden"),
@@ -26531,6 +26570,20 @@ mod brq_evaluation_tests {
     ///
     /// FAILS ON REVERT: drop the `disconnect`, `connect --monitor` or
     /// `contain` arm and its forms are `None` again.
+    /// T-109: accepting the project files a jail made is the person's; an
+    /// agent's `innerwarden contain --accept-project-files` is stopped like
+    /// every other `contain` that is not help or a dry run.
+    #[test]
+    fn an_agent_cannot_accept_what_a_jail_made() {
+        for cmd in [
+            "innerwarden contain --accept-project-files",
+            "innerwarden contain --accept-project-files --project /w/app",
+            "innerwarden contain --project . --accept-project-files",
+        ] {
+            assert!(check_guard_self_disable(cmd).is_some(), "{cmd}");
+        }
+    }
+
     #[test]
     fn an_agent_cannot_lower_its_own_guard_by_wiring_or_a_jail() {
         for cmd in [
@@ -28792,6 +28845,7 @@ mod privileged_write_target_tests {
             }
             wired.extend(known.mcp_json.map(str::to_string));
             wired.extend(known.mcp_toml.map(str::to_string));
+            wired.extend(known.mcp_yaml.map(str::to_string));
             if let Some(profile) = known.profile_config {
                 wired.push(format!(
                     "{}work/{}",

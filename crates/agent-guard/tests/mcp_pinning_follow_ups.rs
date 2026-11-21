@@ -57,9 +57,14 @@ fn mcp_client_configs() -> Vec<String> {
     for agent in KNOWN {
         files.extend(agent.mcp_json.map(str::to_string));
         files.extend(agent.mcp_toml.map(str::to_string));
+        files.extend(agent.mcp_yaml.map(str::to_string));
         // The agents whose servers or hook the guard wires: their own
         // settings carry `mcpServers` too.
-        if agent.hookable || agent.mcp_json.is_some() || agent.mcp_toml.is_some() {
+        if agent.hookable
+            || agent.mcp_json.is_some()
+            || agent.mcp_toml.is_some()
+            || agent.mcp_yaml.is_some()
+        {
             files.extend(agent.config_files.iter().map(|(f, _)| f.to_string()));
         }
     }

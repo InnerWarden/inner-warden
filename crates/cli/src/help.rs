@@ -260,6 +260,10 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              \x20                 (repeat for more), for an agent that needs its own key\n  \
              --dry-run         print the jail that would be built and run nothing\n  \
              --setup           arm the in-jail hook only\n  \
+             --accept-project-files  take the project's Claude Code files a jail\n  \
+             \x20                 made as yours (with --project <dir>), from your\n  \
+             \x20                 own terminal; starts nothing (a launch whose jail\n  \
+             \x20                 made such a file exits 3)\n  \
              --identity        (Linux) record the run as an identified instance\n\
              \n  \
              With --identity the hook inside the jail tells this instance apart from\n  \

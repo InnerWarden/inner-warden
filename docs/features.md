@@ -173,11 +173,27 @@ list, with every limit.
   turn every project server on or add a server there for you. So what you
   allow with "always allow" inside a jail is not saved in the project's
   `.claude/settings.local.json` and is asked again next run. Where they
-  are not there, `contain` keeps that they were not, and one a jail makes
-  that sets hooks, `disableAllHooks`, permissions in bypass mode,
-  `enableAllProjectMcpServers` or MCP servers (or that does not read as
-  JSON) is said as the jail ends and refuses the next start on the
-  project, naming the file; remove it, or what it sets, to start again.
+  are not there, `contain` keeps that they were not for the run, and one a
+  jail makes during it that sets hooks, `disableAllHooks`, permissions in
+  bypass mode, `enableAllProjectMcpServers` or MCP servers (or that does
+  not read as JSON) is said as the jail ends, `contain` exits 3 (the
+  command's own failure status is kept), and it refuses each next start on
+  the project, naming the file. Remove it, or what it sets, to start again,
+  or, if you read it and want it, accept it from your own terminal with
+  `innerwarden contain --accept-project-files --project <dir>` (refused in
+  an agent's shell, and the guard refuses it to an agent). A file you make
+  in the project between two runs is yours and refuses nothing for being
+  new; the start reads it as it reads your settings. A launch that stopped
+  before its jail ended (killed, the machine off) cannot say what its jail
+  made, so what it found absent and is there now refuses the next start
+  the same way; one that runs in the same project at the same time does
+  too, until it ends (a pid used again by another program is told apart by
+  when that program started). These notes sit beside the jail's own Claude
+  Code folders in `~/.local/state/innerwarden/jail-claude`, out of every
+  jail's reach; outside the jail, the guard holds that folder as it holds
+  its own configuration (a write, `rm`, `mv`, `ln`, a mode or owner change,
+  interpreter code, the file tools), and a note that cannot be read refuses
+  the start instead of counting as none.
   On macOS a jail writes only its own project's folder of the launcher's,
   never another project's.
   A jail does not start where Claude Code's settings may turn the guard's
@@ -414,10 +430,13 @@ following, and says they are the person's to run, from their own terminal.
   sources that leave out the user's, or with settings that switch hooks off
   or empty the events the guard's hook sits under; Codex CLI with `--disable
   hooks` or a `-c` override of its hooks; Hermes Agent with `--safe-mode` or
-  `--ignore-user-config`; or any of them, Gemini CLI included, with a
-  variable it reads that moves the folder its hook is in or switches its
-  hooks off (`HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`,
-  `GEMINI_CLI_HOME`, `CLAUDE_CODE_SIMPLE` and the others they read). `HOME`
+  `--ignore-user-config`; or any of them, Gemini CLI and the Cursor CLI
+  (`cursor-agent`, whose MCP wiring the guard writes) included, with a
+  variable it reads that moves the folder its hook or wiring is in or
+  switches its hooks off (`HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+  `HERMES_HOME`, `GEMINI_CLI_HOME`, `CURSOR_CONFIG_DIR`,
+  `CLAUDE_CODE_SIMPLE` and the others they read), also when the line builds
+  the variable's name at run time (`export CLAUDE_${X:-CONFIG}_DIR=...`). `HOME`
   set to the home folder the shell itself puts in, and `CLAUDE_CONFIG_DIR` set
   to the folder Claude Code already uses, move nothing and run; another
   folder for Claude Code is refused in words that say how to install the
@@ -630,9 +649,15 @@ Also not seen today, and not promised for any date:
   the guard does not count those writes.
 - A script that Python, Node or Ruby code writes and the same line then runs.
   The guard does not read what the code put in the file.
-- Some ways of stopping the guard: a `pkill` pattern that matches only part
-  of the guard's command line, and a stop or kill of its service sent over
-  D-Bus (`busctl`, `gdbus`, `dbus-send`) instead of through `systemctl`.
+- Some ways of stopping the guard: a `pkill` pattern that matches the
+  guard's command line only on another program's part (the agent's id, the
+  MCP server) or only on the shell a fail-closed hook script runs after the
+  guard ends (`exit 2`, `case $s in`), which any script holds, is left to
+  the other checks; process ids of the guard handed to a `kill` on a later
+  line, or by a program the line does not show, are not followed. A
+  restart of a service of the guard (`systemctl restart`) runs, as ordinary
+  maintenance, while a restart asked of systemd over D-Bus is refused. The
+  Cursor CLI's own flags are not read.
 - A path that steps back with `..` after a symbolic link. The MCP proxy
   reads a path where a call writes by its text, with `.` and `..` taken
   out, without looking at the disk: the proxy may not run on the server's
