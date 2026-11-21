@@ -876,6 +876,41 @@ fn read_yaml(path: &Path) -> Option<Value> {
         .and_then(|bytes| mcp_wire_yaml::view_of_bytes(&bytes))
 }
 
+/// Why a YAML MCP config that is there cannot be read ([`read_yaml`] is
+/// `None` for it): not text, not one YAML mapping (several documents), a
+/// merge key in its extensions. `None` for a config that is missing or
+/// reads. Its servers are then not known to be guarded, which the status says
+/// rather than "nothing left to guard".
+fn yaml_unreadable(path: &Path) -> Option<String> {
+    let bytes = match crate::file_update::read_config(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return None,
+        Err(error) => return Some(error),
+    };
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text,
+        Err(error) => return Some(format!("not valid UTF-8: {error}")),
+    };
+    mcp_wire_yaml::YamlDoc::parse(text).err()
+}
+
+/// The extensions of a YAML MCP config the proxy does not screen, as the
+/// words a line says them in (`remote-tools (streamable_http)`); empty when
+/// there are none or the config cannot be read.
+fn yaml_unscreened(path: &Path) -> Vec<String> {
+    crate::file_update::read_config(path)
+        .ok()
+        .flatten()
+        .and_then(|bytes| mcp_wire_yaml::YamlDoc::parse(std::str::from_utf8(&bytes).ok()?).ok())
+        .map(|doc| {
+            doc.unscreened()
+                .into_iter()
+                .map(|(name, kind)| format!("{name} ({kind})"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn read_yaml_for_update(
     trusted_root: &Path,
     path: &Path,
@@ -1140,9 +1175,13 @@ pub fn status_has_unguarded_server(home: &Path, agent: &AgentStatus) -> bool {
             .unwrap_or(false);
     }
     if let Some(relative) = &agent.mcp_yaml {
-        return read_yaml(&home.join(relative))
-            .map(|value| mcp_wire::has_unguarded_stdio_server(&value))
-            .unwrap_or(false);
+        // A config that is there and cannot be read is not "nothing left to
+        // guard": what its servers run is not known.
+        let path = home.join(relative);
+        return match read_yaml(&path) {
+            Some(value) => mcp_wire::has_unguarded_stdio_server(&value),
+            None => yaml_unreadable(&path).is_some(),
+        };
     }
     false
 }
@@ -1880,6 +1919,19 @@ fn connect_by_one_mechanism(
             }
         };
         let cfg = doc.view();
+        // Each extension the proxy never sees, named on the line, so a
+        // remote server is not taken for one behind the guard.
+        let unscreened: String = doc
+            .unscreened()
+            .iter()
+            .map(|(name, kind)| format!("{name} ({kind})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let unscreened = if unscreened.is_empty() {
+            String::new()
+        } else {
+            format!("; not screened by the proxy: {unscreened}")
+        };
         if reject_symlinks && mcp_wire::has_guard_wiring(&cfg) {
             return ConnectResult::new(
                 ConnectEffect::Skipped,
@@ -1899,7 +1951,7 @@ fn connect_by_one_mechanism(
             return ConnectResult::new(
                 ConnectEffect::Skipped,
                 format!(
-                    "  {} - {} has no local MCP servers to guard (built-in or remote only, or none)",
+                    "  {} - {} has no local MCP servers to guard (built-in or remote only, or none){unscreened}",
                     r.name,
                     path.display()
                 ),
@@ -1926,7 +1978,7 @@ fn connect_by_one_mechanism(
             Ok(()) if n == 0 => ConnectResult::new(
                 ConnectEffect::Unchanged,
                 format!(
-                    "  {} - already guarded (MCP proxy, {})",
+                    "  {} - already guarded (MCP proxy, {}){unscreened}",
                     r.name,
                     if monitor { "monitor" } else { "enforce" }
                 ),
@@ -1934,7 +1986,7 @@ fn connect_by_one_mechanism(
             Ok(()) => ConnectResult::new(
                 ConnectEffect::Connected,
                 format!(
-                    "  {} - connected ({n} MCP server{} routed through the guard proxy, {}; built-in extensions are not screened by it)",
+                    "  {} - connected ({n} MCP server{} routed through the guard proxy, {}; built-in extensions are not screened by it{unscreened})",
                     r.name,
                     if n == 1 { "" } else { "s" },
                     if monitor { "monitor" } else { "enforce" }
@@ -2154,6 +2206,14 @@ fn list_lines_of(home: &Path, rows: &[AgentStatus]) -> Vec<String> {
             } else {
                 None
             };
+            // Goose's YAML config: one that is there and cannot be read says
+            // so, and the extensions the proxy never sees are named.
+            let yaml_path = r.mcp_yaml.as_deref().map(|rel| home.join(rel));
+            let yaml_problem = yaml_path.as_deref().and_then(yaml_unreadable);
+            let unscreened = yaml_path
+                .as_deref()
+                .map(yaml_unscreened)
+                .unwrap_or_default();
             let guard = if !r.guardable() {
                 "detected (guard manually)".to_string()
             } else if broken.is_some() {
@@ -2162,6 +2222,8 @@ fn list_lines_of(home: &Path, rows: &[AgentStatus]) -> Vec<String> {
                 "✗ wired, part of its hook cannot run".to_string()
             } else if proxy_broken.is_some() {
                 "✗ wired, but its MCP proxy cannot run".to_string()
+            } else if yaml_problem.is_some() {
+                "? its MCP config cannot be read".to_string()
             } else if let Some((_, state)) = hooked {
                 two_way_label(home, r, state)
             } else if r.guarded {
@@ -2190,6 +2252,20 @@ fn list_lines_of(home: &Path, rows: &[AgentStatus]) -> Vec<String> {
                 "detected".to_string()
             };
             out.push(format!("  {:<13} {:<34} {where_}", r.name, guard));
+            if let (Some(problem), Some(path)) = (&yaml_problem, &yaml_path) {
+                out.push(format!(
+                    "  {:<13} {} cannot be read ({problem}), so whether its MCP servers are behind the proxy is not known",
+                    "",
+                    path.display()
+                ));
+            }
+            if !unscreened.is_empty() {
+                out.push(format!(
+                    "  {:<13} not screened by the proxy (the agent reaches them itself): {}",
+                    "",
+                    unscreened.join(", ")
+                ));
+            }
             if let Some(problem) = broken {
                 out.push(format!(
                     "  {:<13} {problem}, so nothing is screened. Fix: {}",
@@ -3845,6 +3921,61 @@ mod tests {
         assert_eq!(
             disconnect_one(home.path(), &row),
             "  goose, was not connected"
+        );
+    }
+
+    /// A Goose config that is there and cannot be read (two documents, a
+    /// merge key in its extensions) is not "nothing left to guard": the
+    /// status counts work left and the listing says the file cannot be read.
+    ///
+    /// FAILS ON REVERT of `yaml_unreadable` in `status_has_unguarded_server`
+    /// (false: nothing unguarded) or of the listing's unreadable line.
+    #[test]
+    fn an_unreadable_goose_config_is_unknown_not_guarded() {
+        for text in [
+            "extensions:\n  github:\n    type: stdio\n    cmd: npx\n---\nGOOSE_MODE: auto\n",
+            "base: &b\n  type: stdio\n  cmd: npx\nextensions:\n  github:\n    <<: *b\n    enabled: true\n",
+        ] {
+            let home = tempfile::TempDir::new().unwrap();
+            std::fs::create_dir_all(home.path().join(".config/goose")).unwrap();
+            let path = home.path().join(".config/goose/config.yaml");
+            std::fs::write(&path, text).unwrap();
+            let row = known_row(home.path(), "goose");
+            assert!(status_has_unguarded_server(home.path(), &row), "{text}");
+            let lines = list_lines_of(home.path(), std::slice::from_ref(&row)).join("\n");
+            assert!(lines.contains("its MCP config cannot be read"), "{lines}");
+            assert!(lines.contains("is not known"), "{lines}");
+            let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+            assert_eq!(result.effect, ConnectEffect::Failed, "{}", result.line);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    /// Goose's remote extensions are named, with their type, on the connect
+    /// line and in the listing: the proxy never sees them.
+    ///
+    /// FAILS ON REVERT of `unscreened` on the connect line or the listing.
+    #[test]
+    fn goose_remote_extensions_are_named_on_connect_and_in_the_listing() {
+        let text = "extensions:\n  filesystem:\n    type: stdio\n    name: filesystem\n    enabled: true\n    cmd: npx\n    args: [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]\n    timeout: 300\n  remote-tools:\n    type: streamable_http\n    name: remote-tools\n    enabled: true\n    uri: \"https://example.com/mcp\"\n  old:\n    type: sse\n    name: old\n    enabled: true\n    uri: \"https://example.com/sse\"\n";
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/goose")).unwrap();
+        std::fs::write(home.path().join(".config/goose/config.yaml"), text).unwrap();
+        let row = known_row(home.path(), "goose");
+        let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+        assert!(
+            result
+                .line
+                .contains("not screened by the proxy: remote-tools (streamable_http), old (sse)"),
+            "{}",
+            result.line
+        );
+        let row = known_row(home.path(), "goose");
+        let lines = list_lines_of(home.path(), std::slice::from_ref(&row)).join("\n");
+        assert!(
+            lines.contains("not screened by the proxy (the agent reaches them itself): remote-tools (streamable_http), old (sse)"),
+            "{lines}"
         );
     }
 

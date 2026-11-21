@@ -25,6 +25,16 @@ use serde_yaml::Value as Yaml;
 /// The table of the view, as [`crate::mcp_wire`] reads a JSON client's.
 const SERVERS: &str = "mcpServers";
 
+/// The comment on an `args` line connect wrote where the server had none:
+/// disconnect takes the line out again, so the file is as it was.
+const ARGS_ADDED: &str = "# added by innerwarden connect; disconnect removes it";
+
+/// The extension types whose servers Goose runs itself (`builtin`,
+/// `platform`) or that are local commands the proxy wraps (`stdio`). Any
+/// other type (`streamable_http`, `sse`, ...) is a server the proxy never
+/// sees: [`YamlDoc::unscreened`] names each.
+const OWN_OR_WRAPPED_TYPES: &[&str] = &["stdio", "builtin", "platform"];
+
 /// A Goose configuration: the text as the person wrote it and what it parses
 /// to.
 #[derive(Debug, Clone, PartialEq)]
@@ -44,6 +54,21 @@ impl YamlDoc {
             Yaml::Mapping(_) => value,
             _ => return Err("not a YAML mapping".to_string()),
         };
+        // A merge key (`<<: *base`) in the extensions: Goose (1.60, serde_yaml
+        // 0.9) does not apply it, so what such an extension runs, or whether
+        // Goose loads it at all, is not what the merged text says. Read
+        // without it, a stdio server whose `type` came from the merge was
+        // counted remote and left unwrapped without a word. The file is
+        // refused instead: nothing is written and the status says it could
+        // not be read.
+        if let Some(extensions) = value.get("extensions") {
+            if let Some(name) = extension_with_merge_key(extensions) {
+                return Err(format!(
+                    "a YAML merge key (`<<`) in extension `{name}`, which Goose does not apply; \
+                     write that extension's fields out in full"
+                ));
+            }
+        }
         Ok(Self {
             text: text.to_string(),
             value,
@@ -92,6 +117,27 @@ impl YamlDoc {
         let mut root = Map::new();
         root.insert(SERVERS.to_string(), Value::Object(servers));
         Value::Object(root)
+    }
+
+    /// The extensions the proxy does not screen and Goose does not run
+    /// itself: each by its name and its type (`streamable_http`, `sse`, a
+    /// missing type as `unknown`), in file order. Pure.
+    pub fn unscreened(&self) -> Vec<(String, String)> {
+        let Some(extensions) = extensions(&self.value) else {
+            return Vec::new();
+        };
+        extensions
+            .iter()
+            .filter_map(|(name, extension)| {
+                let name = name.as_str()?;
+                let kind = extension
+                    .get("type")
+                    .and_then(Yaml::as_str)
+                    .unwrap_or("unknown");
+                (!OWN_OR_WRAPPED_TYPES.contains(&kind))
+                    .then(|| (name.to_string(), kind.to_string()))
+            })
+            .collect()
     }
 
     /// Make the file say what `wanted` (a [`Self::view`] changed by
@@ -151,17 +197,22 @@ impl YamlDoc {
                     ))
                 }
             };
-            text = patch_extension(&text, name, command, &args)?;
+            let (patched, has_args) = patch_extension(&text, name, command, &args)?;
+            text = patched;
             let extension = expected
                 .get_mut("extensions")
                 .and_then(|extensions| extensions.get_mut(name.as_str()))
                 .and_then(Yaml::as_mapping_mut)
                 .ok_or_else(|| format!("extension `{name}` could not be found"))?;
             extension.insert(Yaml::from("cmd"), Yaml::from(command));
-            extension.insert(
-                Yaml::from("args"),
-                Yaml::Sequence(args.iter().map(|arg| Yaml::from(arg.as_str())).collect()),
-            );
+            if has_args {
+                extension.insert(
+                    Yaml::from("args"),
+                    Yaml::Sequence(args.iter().map(|arg| Yaml::from(arg.as_str())).collect()),
+                );
+            } else {
+                extension.remove("args");
+            }
             changed += 1;
         }
         if changed == 0 {
@@ -186,6 +237,28 @@ impl YamlDoc {
 pub fn view_of_bytes(bytes: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(bytes).ok()?;
     YamlDoc::parse(text).ok().map(|doc| doc.view())
+}
+
+/// The name of an extension that holds a merge key (`<<`) at any depth, or
+/// `""` for one on the `extensions` mapping itself.
+fn extension_with_merge_key(extensions: &Yaml) -> Option<String> {
+    fn holds_merge_key(value: &Yaml) -> bool {
+        match value {
+            Yaml::Mapping(map) => map
+                .iter()
+                .any(|(key, value)| key.as_str() == Some("<<") || holds_merge_key(value)),
+            Yaml::Sequence(items) => items.iter().any(holds_merge_key),
+            Yaml::Tagged(tagged) => holds_merge_key(&tagged.value),
+            _ => false,
+        }
+    }
+    let map = extensions.as_mapping()?;
+    if map.keys().any(|key| key.as_str() == Some("<<")) {
+        return Some(String::new());
+    }
+    map.iter()
+        .find(|(_, extension)| holds_merge_key(extension))
+        .map(|(name, _)| name.as_str().unwrap_or("?").to_string())
 }
 
 fn extensions(value: &Yaml) -> Option<&serde_yaml::Mapping> {
@@ -295,15 +368,18 @@ fn scalar(text: &str) -> String {
 }
 
 /// Rewrite the `cmd` and `args` lines of extension `name` in `text`, every
-/// other line kept as it was. An error for a shape the lines cannot be
-/// placed in: no block `extensions:` at the top level, the extension
-/// written inline, no `cmd` line.
+/// other line kept as it was, and say whether the extension still has an
+/// `args` field. An `args` line written where the server had none carries
+/// [`ARGS_ADDED`]; when the arguments go back to none, that line is taken
+/// out, so a server connect and disconnect pass over is as it was. An error
+/// for a shape the lines cannot be placed in: no block `extensions:` at the
+/// top level, the extension written inline, no `cmd` line.
 fn patch_extension(
     text: &str,
     name: &str,
     command: &str,
     args: &[String],
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let cannot = |why: &str| format!("extension `{name}` cannot be edited in place: {why}");
@@ -361,10 +437,20 @@ fn patch_extension(
         })
         .unwrap_or(field);
     let cmd_text = format!("{pad}cmd: {}{newline}", scalar(command));
-    let args_text = if args.is_empty() {
+    // Connect's own `args` line: written where there was none, or one it
+    // wrote before.
+    let added = args_span.is_none_or(|(start, _)| lines[start].contains(ARGS_ADDED));
+    let has_args = !(args.is_empty() && added);
+    let args_text = if !has_args {
+        String::new()
+    } else if args.is_empty() {
         format!("{pad}args: []{newline}")
     } else {
-        let mut out = format!("{pad}args:{newline}");
+        let mut out = if added {
+            format!("{pad}args: {ARGS_ADDED}{newline}")
+        } else {
+            format!("{pad}args:{newline}")
+        };
         for arg in args {
             out.push_str(&format!(
                 "{}- {}{newline}",
@@ -400,7 +486,7 @@ fn patch_extension(
         }
         at += 1;
     }
-    Ok(out)
+    Ok((out, has_args))
 }
 
 #[cfg(test)]
@@ -619,6 +705,149 @@ GOOSE_MODE: smart_approve
             restored["extensions"]["local"]["cmd"],
             "/opt/my tools/server"
         );
+    }
+
+    /// The extensions block Goose 1.60.2 documents as its "common extension
+    /// shapes" (documentation/docs/guides/config-files.md at tag v1.60.2,
+    /// commit fb55b5a6d7f5b5df96c8f817f1cde6a81880d9f1), verbatim, with the
+    /// settings it documents above it. Goose writes the same fields; the
+    /// file is copied from Goose's own page, not from a running Goose.
+    const GOOSE_1_60_2: &str = "# Security Configuration
+SECURITY_PROMPT_ENABLED: true
+
+extensions:
+  developer:
+    type: builtin
+    name: developer
+    enabled: true
+    bundled: true
+    timeout: 300
+
+  computercontroller:
+    type: platform
+    name: computercontroller
+    display_name: Computer Controller
+    enabled: true
+    bundled: true
+
+  filesystem:
+    type: stdio
+    name: filesystem
+    enabled: true
+    cmd: npx
+    args: [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]
+    env_keys: []
+    envs: {}
+    timeout: 300
+
+  remote-tools:
+    type: streamable_http
+    name: remote-tools
+    enabled: true
+    uri: \"https://example.com/mcp\"
+    headers: {}
+    env_keys: []
+    envs: {}
+    timeout: 300
+";
+
+    /// Goose 1.60.2's own sample: its stdio server is wrapped, the built-in
+    /// and platform ones are Goose's, the remote one is named as a server
+    /// the proxy does not see, and a disconnect gives back the same bytes.
+    #[test]
+    fn goose_1_60_2_sample_is_wrapped_and_its_remote_server_named() {
+        let mut doc = YamlDoc::parse(GOOSE_1_60_2).unwrap();
+        assert_eq!(
+            doc.unscreened(),
+            vec![("remote-tools".to_string(), "streamable_http".to_string())]
+        );
+        assert_eq!(wrap(&mut doc, false), 1);
+        assert!(mcp_wire::is_guarded(&doc.view()), "{}", doc.text());
+        assert_eq!(unwrap(&mut doc), 1);
+        let restored: Yaml = serde_yaml::from_str(doc.text()).unwrap();
+        let original: Yaml = serde_yaml::from_str(GOOSE_1_60_2).unwrap();
+        assert_eq!(restored, original);
+    }
+
+    /// FAILS ON REVERT of the merge key refusal in `YamlDoc::parse`: the
+    /// stdio server whose `type` comes from `<<: *base` is read as remote
+    /// and left unwrapped, and connect says nothing of it.
+    #[test]
+    fn an_extension_with_a_merge_key_refuses_the_file() {
+        let with_merge = GOOSE_1_60_2.replace(
+            "extensions:\n",
+            "stdio_base: &stdio_base\n  type: stdio\n  enabled: true\n  timeout: 300\n\nextensions:\n  github:\n    <<: *stdio_base\n    name: github\n    cmd: npx\n    args:\n    - -y\n    - '@modelcontextprotocol/server-github'\n",
+        );
+        let error = YamlDoc::parse(&with_merge).unwrap_err();
+        assert!(
+            error.contains("merge key") && error.contains("github"),
+            "{error}"
+        );
+        assert!(view_of_bytes(with_merge.as_bytes()).is_none());
+        // An anchor and an alias with no merge key are plain YAML Goose reads
+        // as written: such a file is read.
+        let anchors = GOOSE_1_60_2
+            .replace(
+                "    env_keys: []\n    envs: {}\n    timeout: 300\n\n  remote-tools:",
+                "    env_keys: &none []\n    envs: {}\n    timeout: 300\n\n  remote-tools:",
+            )
+            .replace(
+                "    headers: {}\n    env_keys: []",
+                "    headers: {}\n    env_keys: *none",
+            );
+        let doc = YamlDoc::parse(&anchors).unwrap();
+        assert_eq!(mcp_wire::server_counts(&doc.view()).stdio, 1);
+    }
+
+    /// A file of more than one document is not read: the parser Goose uses
+    /// refuses it too, and nothing here says what it runs.
+    #[test]
+    fn a_file_of_several_documents_is_not_read() {
+        let multi = format!("{GOOSE_1_60_2}---\nGOOSE_MODE: auto\n");
+        assert!(YamlDoc::parse(&multi).is_err());
+        assert!(view_of_bytes(multi.as_bytes()).is_none());
+    }
+
+    /// FAILS ON REVERT of `ARGS_ADDED` in `patch_extension`: a server with
+    /// no `args` line kept an `args: []` after connect and disconnect.
+    #[test]
+    fn disconnect_gives_back_a_server_without_args_as_it_was() {
+        let text = "extensions:\n  local:\n    type: stdio\n    name: local\n    enabled: true\n    cmd: /opt/tools/server\n    timeout: 300\n";
+        let mut doc = YamlDoc::parse(text).unwrap();
+        assert_eq!(wrap(&mut doc, false), 1);
+        assert!(doc.text().contains(ARGS_ADDED), "{}", doc.text());
+        // A mode switch keeps the line connect's own.
+        assert_eq!(wrap(&mut doc, true), 1);
+        assert!(doc.text().contains(ARGS_ADDED), "{}", doc.text());
+        assert_eq!(unwrap(&mut doc), 1);
+        assert_eq!(doc.text(), text);
+        // A server that had `args: []` keeps it.
+        let empty = text.replace("    timeout: 300\n", "    args: []\n    timeout: 300\n");
+        let mut doc = YamlDoc::parse(&empty).unwrap();
+        wrap(&mut doc, false);
+        unwrap(&mut doc);
+        let restored: Yaml = serde_yaml::from_str(doc.text()).unwrap();
+        assert_eq!(restored, serde_yaml::from_str::<Yaml>(&empty).unwrap());
+    }
+
+    /// Every extension the proxy does not see is named with its type: a
+    /// remote one of either kind, one of a type this reader does not know,
+    /// one with no type.
+    #[test]
+    fn extensions_the_proxy_does_not_see_are_named() {
+        let text = "extensions:\n  a:\n    type: sse\n    uri: http://x\n  b:\n    type: streamable_http\n    uri: http://y\n  c:\n    type: inline_python\n  d:\n    name: d\n  e:\n    type: builtin\n  f:\n    type: stdio\n    cmd: x\n";
+        let doc = YamlDoc::parse(text).unwrap();
+        let names: Vec<(String, String)> = doc.unscreened();
+        let want: Vec<(String, String)> = [
+            ("a", "sse"),
+            ("b", "streamable_http"),
+            ("c", "inline_python"),
+            ("d", "unknown"),
+        ]
+        .iter()
+        .map(|(n, t)| (n.to_string(), t.to_string()))
+        .collect();
+        assert_eq!(names, want);
     }
 
     /// A config with no stdio extension has nothing to wrap, and an empty

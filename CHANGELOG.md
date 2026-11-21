@@ -173,6 +173,42 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Fixed
 
+- **Every shape of an MCP shell call is judged by the line it builds.** The
+  proxy now finds the program and its arguments in every shape a shell or
+  process tool takes them: Node's `{"file": "ls", "args": ["-la"]}`,
+  `{"name"|"binary", "args"}`, arguments as one string (both readings, the
+  words a shell splits it into and one word, are judged), and arguments with
+  no program at all, the first word the program. Tools named for a shell or
+  the process call they make (`powershell`, `pwsh`, `cmd`, `subprocess`,
+  `os_command`, `system_call`) are shell tools: before, every call to them
+  was refused by ATR-2026-040 for the name, `ls -la` included, and the shapes
+  above were refused the same way in every shell tool. A harmful line in any
+  of them is refused by the line. A script handed to a shell on standard input
+  is that shell's lines: `{"argv": ["sh"], "stdin": "ls -la"}` runs and
+  `rm -rf /` there is refused. The hook still refuses the shapes it could
+  not read before.
+- **A working folder named plainly is where a command runs.**
+  `run_command {"argv": ["git", "status"], "cwd": "/home/u/app"}` was refused
+  (AG-EXEC, "not plain data") while `run_shell` ran it. A folder named with
+  letters, digits, spaces and the characters of a path is now judged as a path
+  by the checks on the call's arguments (a command run in the SSH keys' folder
+  is still refused); one holding shell syntax (`$(...)`, `;`, a backtick) is
+  also judged as the line a server would join it into, `cd <folder> && <line>`.
+- **Goose's config: a merge key, an unreadable file, remote extensions and
+  `args`.** An extension holding a YAML merge key (`<<: *base`), which
+  Goose does not apply, was read without it, so a stdio server whose `type`
+  came from the merge was counted remote and left unwrapped without a word:
+  such a file is now refused, and nothing is written. A config that is there
+  and cannot be read (several YAML documents, a merge key) made the status say
+  nothing was left unguarded: it now says the file cannot be read and that
+  whether its servers are behind the proxy is not known. Remote extensions
+  (`streamable_http`, `sse`, any other type the proxy never sees) are named
+  with their type on the connect line and in `innerwarden agents`. A stdio
+  server with no `args` got one on connect and kept `args: []` after
+  disconnect; the line connect adds is marked, and disconnect takes it out, so
+  the file is as it was. The tests read Goose 1.60.2's documented extension
+  shapes.
+
 - **A shell tool's call that names its program in `argv` is judged by its
   line.** `run_shell {"argv": ["ls", "-la"]}` and `{"program": "ls", "args":
   []}` were refused by ATR-2026-040 for the tool's name: `argv` with no

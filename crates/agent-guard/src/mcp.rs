@@ -399,7 +399,10 @@ pub(crate) struct ToolCommand<'a> {
 }
 
 /// Whether a tool takes a shell command line by its name: a shell tool
-/// (`bash`, `run_command`, `<server>__exec`, ...).
+/// (`bash`, `run_command`, `<server>__exec`, ...). A tool named for the
+/// shell or the process call it makes (`powershell`, `cmd`, `subprocess`,
+/// `os_command`, `system_call`) is one: its call is judged by the line it
+/// runs ([`read_tool_call`]), not refused for its name.
 pub(crate) fn names_a_shell_tool(tool_name: &str) -> bool {
     let canonical: String = tool_name
         .to_ascii_lowercase()
@@ -418,6 +421,12 @@ pub(crate) fn names_a_shell_tool(tool_name: &str) -> bool {
         "run_shell",
         "shell_exec",
         "computer_terminal",
+        "powershell",
+        "pwsh",
+        "cmd",
+        "subprocess",
+        "os_command",
+        "system_call",
     ];
     let namespace_safe_suffixes = [
         "bash",
@@ -429,12 +438,19 @@ pub(crate) fn names_a_shell_tool(tool_name: &str) -> bool {
         "run_shell",
         "shell_exec",
         "computer_terminal",
+        "powershell",
+        "pwsh",
+        "subprocess",
+        "os_command",
+        "system_call",
     ];
     exact.contains(&canonical.as_str())
         || tool_name
             .to_ascii_lowercase()
             .rsplit_once("__")
-            .is_some_and(|(namespace, last)| !namespace.is_empty() && last == "exec")
+            .is_some_and(|(namespace, last)| {
+                !namespace.is_empty() && matches!(last, "exec" | "cmd")
+            })
         || namespace_safe_suffixes
             .iter()
             .any(|candidate| canonical.ends_with(&format!("_{candidate}")))
@@ -578,6 +594,75 @@ fn program_argv(object: &serde_json::Map<String, serde_json::Value>) -> Option<&
     (!names_a_program && !other_arguments).then_some(argv)
 }
 
+/// The keys a call may name its program under when it names none under
+/// [`PROGRAM_KEYS`]: `{"file": "ls", "args": ["-la"]}` (Node's
+/// `execFile`), `{"name": ...}`, `{"binary": ...}`. Read as a program
+/// only beside arguments: alone, or beside text a terminal is handed, such a
+/// key names a file, a session or a window ([`canonical_call`]).
+const PROGRAM_NAME_KEYS: &[&str] = &["file", "name", "binary"];
+
+/// A call rewritten by [`canonical_call`], with each key it renamed (the new
+/// name, the call's own).
+type CanonicalCall = (
+    serde_json::Map<String, serde_json::Value>,
+    Vec<(&'static str, String)>,
+);
+
+/// A call that names its program or its command in a shape other than the
+/// ones [`read_tool_call`] reads, rewritten into one of them, with each key
+/// it renamed (the new name, the call's own). `None` when the call is
+/// already in such a shape. One reader for every shape, so a shape is never
+/// judged by the tool's name alone because the program was not found:
+///
+/// * a program under [`PROGRAM_NAME_KEYS`] beside arguments is the
+///   `program` those arguments are added to;
+/// * arguments with no program at all are the command: a list is the whole
+///   argument vector (`argv`, its first word the program), a string the
+///   command line (`command`).
+///
+/// Only a call that names no program under [`PROGRAM_KEYS`], no
+/// `commands` and no `argv` is rewritten, and only when it holds one
+/// field of arguments.
+fn canonical_call(object: &serde_json::Map<String, serde_json::Value>) -> Option<CanonicalCall> {
+    use serde_json::Value;
+    let present = |key: &str| object.get(key).is_some_and(|value| !value.is_null());
+    if PROGRAM_KEYS.iter().any(|key| present(key)) || present("commands") || present("argv") {
+        return None;
+    }
+    let mut arguments = ARGUMENT_KEYS.iter().filter(|key| present(key));
+    let argument_key = *arguments.next()?;
+    if arguments.next().is_some() {
+        return None;
+    }
+    let mut names = PROGRAM_NAME_KEYS.iter().filter(|key| present(key));
+    let renamed: Vec<(&'static str, String)> = match (names.next(), names.next()) {
+        (Some(name), None) if object.get(*name).is_some_and(Value::is_string) => {
+            vec![("program", (*name).to_string())]
+        }
+        (Some(_), _) => return None,
+        (None, _) => match object.get(argument_key) {
+            Some(Value::Array(_)) => vec![("argv", argument_key.to_string())],
+            Some(Value::String(_)) => vec![("command", argument_key.to_string())],
+            _ => return None,
+        },
+    };
+    let mut canonical = object.clone();
+    for (new, old) in &renamed {
+        let value = canonical.remove(old.as_str())?;
+        canonical.insert((*new).to_string(), value);
+    }
+    Some((canonical, renamed))
+}
+
+/// [`program_is_a_shell`] of a call in any shape it names its program in
+/// ([`canonical_call`]).
+fn call_program_is_a_shell(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    match canonical_call(object) {
+        Some((canonical, _)) => program_is_a_shell(&canonical),
+        None => program_is_a_shell(object),
+    }
+}
+
 /// The keys whose value is the environment a command runs with, as
 /// [`canonical_key`] gives them: `env`, `environment`, `env_vars`,
 /// `envVars`, `environment_variables`, ...
@@ -638,7 +723,7 @@ pub(crate) const MAX_STDIN_READ_BYTES: usize = 64 * 1024;
 /// a shell, when it is past [`MAX_STDIN_READ_BYTES`] and so not read.
 fn long_stdin_to_a_shell(args: &serde_json::Value) -> Option<usize> {
     let object = args.as_object()?;
-    if !program_is_a_shell(object) {
+    if !call_program_is_a_shell(object) {
         return None;
     }
     stdin_past_cap(args)
@@ -731,15 +816,15 @@ fn program_is_a_shell(object: &serde_json::Map<String, serde_json::Value>) -> bo
             _ => Vec::new(),
         };
         if key != "commands" && key != "argv" {
-            if let Some(Value::Array(arguments)) =
-                ARGUMENT_KEYS.iter().find_map(|key| object.get(*key))
-            {
-                words.extend(
+            match ARGUMENT_KEYS.iter().find_map(|key| object.get(*key)) {
+                Some(Value::Array(arguments)) => words.extend(
                     scalar_words(arguments)
                         .unwrap_or_default()
                         .into_iter()
                         .map(|word| word.into_owned()),
-                );
+                ),
+                Some(Value::String(arguments)) => words.extend(threats::shell_tokens(arguments)),
+                _ => {}
             }
         }
         words
@@ -866,7 +951,57 @@ pub(crate) struct ToolCallRead<'a> {
 ///   as they stand (a process gets them unexpanded).
 ///
 /// What could not be read is said beside the lines ([`ToolCallRead`]).
+///
+/// A call that names its program in another shape (under `file`, `name`
+/// or `binary`, or only as its arguments) is read as the shape it stands
+/// for ([`canonical_call`]). Its lines are then never judged alone
+/// ([`ToolCommand::exclusive`]): the checks on its arguments still run.
 fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCallRead<'a> {
+    use std::borrow::Cow;
+    let Some((canonical, renamed)) = args.as_object().and_then(canonical_call) else {
+        return read_call_shape(shell_tool, args);
+    };
+    let Some(object) = args.as_object() else {
+        return read_call_shape(shell_tool, args);
+    };
+    let canonical = serde_json::Value::Object(canonical);
+    let read = read_call_shape(shell_tool, &canonical);
+    let original = |key: &str| -> Option<&'a str> {
+        let name = renamed
+            .iter()
+            .find(|(new, _)| *new == key)
+            .map_or(key, |(_, old)| old.as_str());
+        object
+            .keys()
+            .find(|known| known.as_str() == name)
+            .map(String::as_str)
+    };
+    ToolCallRead {
+        commands: read
+            .commands
+            .into_iter()
+            .map(|command| ToolCommand {
+                line: Cow::Owned(command.line.into_owned()),
+                exclusive: false,
+            })
+            .collect(),
+        unreadable: read.unreadable,
+        // The hook still says such a call holds a field it reads for nothing
+        // (a program under a name no shell tool's call used, arguments with
+        // no program), as it did before this reading: it refuses a shell
+        // tool call with no command string and such a field. The proxy
+        // judges the lines read here.
+        unread_field: true,
+        read_keys: read
+            .read_keys
+            .iter()
+            .filter_map(|key| original(key))
+            .collect(),
+    }
+}
+
+/// [`read_tool_call`] of a call in a shape it reads as it stands.
+fn read_call_shape<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCallRead<'a> {
     use serde_json::Value;
     use std::borrow::Cow;
     let mut commands: Vec<ToolCommand<'a>> = Vec::new();
@@ -913,7 +1048,21 @@ fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCall
         unreadable.get_or_insert(UNREADABLE_ARGUMENTS);
     }
     let mut argument_readings: Vec<String> = Vec::new();
+    // Arguments given as one string: which reading the tool takes, the
+    // words a shell splits it into or one word, is not known, so both are
+    // judged. The call says the shape is unreadable (the hook refuses it),
+    // and the proxy, which judges every line, counts the field as read.
+    let mut arguments_as_text = false;
     for value in argument_values {
+        if let Value::String(text) = value {
+            arguments_as_text = true;
+            for words in [text.trim().to_string(), shell_quoted(text.trim())] {
+                if !words.trim().is_empty() && !argument_readings.contains(&words) {
+                    argument_readings.push(words);
+                }
+            }
+            continue;
+        }
         let words: Vec<String> = match value {
             Value::Array(items) => {
                 let mut words = Vec::new();
@@ -929,10 +1078,6 @@ fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCall
                 }
                 words
             }
-            Value::String(text) => {
-                unreadable.get_or_insert(UNREADABLE_ARGUMENTS);
-                vec![text.trim().to_string()]
-            }
             _ => {
                 unreadable.get_or_insert(UNREADABLE_ARGUMENTS);
                 Vec::new()
@@ -943,8 +1088,12 @@ fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCall
             argument_readings.push(words);
         }
     }
-    // Only the arguments were read so far: one flat list under one name.
+    // Only the arguments were read so far: one flat list, or one string,
+    // under one name.
     let arguments_whole = unreadable.is_none();
+    if arguments_as_text {
+        unreadable.get_or_insert(UNREADABLE_ARGUMENTS);
+    }
     let mut assignments: Vec<String> = Vec::new();
     // A variable whose name no shell can set (`BASH_FUNC_go%%`, which bash
     // reads as the function `go`) still reaches the process.
@@ -1189,8 +1338,18 @@ fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCall
                 }
             }
         }
-        // The field is not counted as read: the lines above add to what the
-        // call is judged by and take nothing from it. A call that holds
+        // Handed whole to a program that is a shell, the text is that shell's
+        // command lines, judged above on their own as any line is: the field
+        // is read in full, and the call is judged by its lines, not refused
+        // for its tool's name (`{"argv": ["sh"], "stdin": "ls -la"}`).
+        if typed_into_a_shell && value.is_string() && !text.trim().is_empty() {
+            let whole = scalar_text(value).is_some_and(|all| all.len() <= MAX_STDIN_READ_BYTES);
+            if whole {
+                read_keys.push(key.as_str());
+            }
+        }
+        // Otherwise the field is not counted as read: the lines above add to
+        // what the call is judged by and take nothing from it. A call that holds
         // standard input keeps what it was judged by before (a field nothing
         // else reads: the name conditions, the checks on the arguments, and
         // the hook's refusal of a shell call with a field it does not read).
@@ -1242,6 +1401,33 @@ fn read_tool_call<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCall
                     command.line
                 )),
                 exclusive: command.exclusive,
+            })
+            .collect();
+        for command in moved {
+            if !commands.iter().any(|known| known.line == command.line) {
+                commands.push(command);
+            }
+        }
+    }
+    // A working folder that is not named plainly ([`plain_folder`]) may be
+    // joined into a shell line by the server (`cd <cwd> && <line>`), where a
+    // substitution or an operator in it runs: each line is also judged as
+    // moved there, the folder as written. A plain one is a path, judged by
+    // the checks on the call's arguments.
+    let odd_folders: Vec<Cow<'a, str>> = object
+        .iter()
+        .filter(|(key, _)| WORKING_FOLDER_KEYS.contains(&canonical_key(key).as_str()))
+        .filter_map(|(_, value)| scalar_text(value))
+        .filter(|folder| !folder.trim().is_empty() && !plain_folder(folder))
+        .collect();
+    if !odd_folders.is_empty() {
+        let moved: Vec<ToolCommand<'a>> = commands
+            .iter()
+            .flat_map(|command| {
+                odd_folders.iter().map(move |folder| ToolCommand {
+                    line: Cow::Owned(format!("cd {folder} && {}", command.line)),
+                    exclusive: command.exclusive,
+                })
             })
             .collect();
         for command in moved {
@@ -1368,7 +1554,7 @@ fn words_a_server_may_join<'a>(
     let Some(object) = args.as_object() else {
         return Cow::Borrowed(args);
     };
-    if read_keys.is_empty() || program_is_a_shell(object) {
+    if read_keys.is_empty() || call_program_is_a_shell(object) {
         return unread_fields(args, read_keys);
     }
     Cow::Owned(Value::Object(
@@ -1408,7 +1594,7 @@ fn arguments_a_server_may_join<'a>(
     read_keys: &[&str],
 ) -> Option<std::borrow::Cow<'a, serde_json::Value>> {
     let object = args.as_object()?;
-    if program_is_a_shell(object) {
+    if call_program_is_a_shell(object) {
         return None;
     }
     let arguments: serde_json::Map<String, serde_json::Value> = object
@@ -1665,6 +1851,27 @@ fn is_runnable_arg(key: &str) -> bool {
         .any(|word| RUNNABLE_ARG_WORDS.contains(&word.as_str()))
 }
 
+/// Whether `text` is a folder named as plainly as a path can be: letters,
+/// digits, spaces and `/ . _ - ~ + , @ : =`, no word that starts with `-`,
+/// or a Windows path (`C:\\Users\\dev`) of the same characters and `\\`.
+/// Nothing in it is shell syntax (a quote, a substitution, a variable, an
+/// operator), so a call's working folder spelled so is data: where the
+/// command runs, judged as a path by the checks on the call's arguments.
+fn plain_folder(text: &str) -> bool {
+    let windows =
+        text.len() >= 3 && text.as_bytes()[0].is_ascii_alphabetic() && &text[1..3] == ":\\";
+    !text.trim().is_empty()
+        && text.chars().all(|c| {
+            c.is_alphanumeric()
+                || matches!(
+                    c,
+                    ' ' | '/' | '.' | '_' | '-' | '~' | '+' | ',' | '@' | ':' | '='
+                )
+                || (windows && c == '\\')
+        })
+        && text.split(' ').all(|word| !word.starts_with('-'))
+}
+
 /// Whether `text` is plain data: letters, digits, spaces and `, . : @ + - _`,
 /// no word that starts with `-`. Nothing in it is shell or code syntax (a
 /// path, a redirection, a quote, a substitution, an option), so a runner it
@@ -1849,7 +2056,15 @@ fn runner_alert(
                 ));
             }
         } else if let Some(text) = value.as_str() {
-            if !plain_data(text) {
+            // The folder a command the guard read runs in, named plainly, is
+            // where it runs: judged as a path by the checks on the call's
+            // arguments (a key's folder, a privileged one), not refused for
+            // its slashes. `run_command` refused `{"cwd": "/home/u/app"}`
+            // beside a command `run_shell` ran in it.
+            let folder = command_read
+                && WORKING_FOLDER_KEYS.contains(&canonical_key(key).as_str())
+                && plain_folder(text);
+            if !folder && !plain_data(text) {
                 refused = Some(format!(
                     "`{}` runs what its call hands it, and its `{key}` argument is not plain data",
                     safe_name_for_detail(tool_name)
