@@ -86,6 +86,97 @@ pub(crate) struct Overwrite {
     pub(crate) sources: Vec<String>,
 }
 
+/// The line with the body of each here-document a message reader takes
+/// (`git commit -F -`, `gh pr create --body-file -`) left out: that body is
+/// the message, data to git, never lines a shell runs. A commit message that
+/// quotes the line it fixes (an order written into `CLAUDE.md`) writes
+/// nothing into `CLAUDE.md`. A body under an unquoted delimiter that holds
+/// a `$(...)` or a backquote runs it, and is kept; so is any other
+/// here-document.
+pub(crate) fn without_message_bodies(content: &str) -> std::borrow::Cow<'_, str> {
+    static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let heredoc = HEREDOC.get_or_init(|| {
+        regex::Regex::new(r#"<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?"#)
+            .expect("static heredoc regex")
+    });
+    if !content.contains("<<") {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut dropped = false;
+    let mut lines = content.lines();
+    while let Some(line) = lines.next() {
+        kept.push(line);
+        let Some(captures) = heredoc.captures(line).filter(|_| !line.contains("<<<")) else {
+            continue;
+        };
+        let head = line.split("<<").next().unwrap_or_default();
+        if !reads_message_from_stdin(head) {
+            continue;
+        }
+        let tag = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+        // An unquoted delimiter expands the body: a `$(...)` or a backquote
+        // in it runs. Such a body is kept to be read.
+        let quoted = captures
+            .get(0)
+            .is_some_and(|m| m.as_str().contains(['\'', '"']));
+        let mut body = Vec::new();
+        let mut closed = None;
+        for candidate in lines.by_ref() {
+            if candidate.trim() == tag {
+                closed = Some(candidate);
+                break;
+            }
+            body.push(candidate);
+        }
+        let runs_something = body
+            .iter()
+            .any(|line| line.contains("$(") || line.contains('\x60'));
+        if quoted || !runs_something {
+            dropped |= !body.is_empty();
+        } else {
+            kept.extend(body);
+        }
+        kept.extend(closed);
+    }
+    if dropped {
+        std::borrow::Cow::Owned(kept.join("\n"))
+    } else {
+        std::borrow::Cow::Borrowed(content)
+    }
+}
+
+/// Whether the last command of `head` is `git`, `gh` or `glab` reading its
+/// message from stdin: `-F -`, `--file=-`, `--body-file -`,
+/// `--notes-file -`.
+fn reads_message_from_stdin(head: &str) -> bool {
+    let Some(segment) = shell_command_segments(head).into_iter().last() else {
+        return false;
+    };
+    let words = shell_tokens(segment);
+    let Some(at) = effective_command_index(&words) else {
+        return false;
+    };
+    if !matches!(
+        token_basename(&words[at]).to_ascii_lowercase().as_str(),
+        "git" | "gh" | "glab"
+    ) {
+        return false;
+    }
+    let flags = ["-F", "--file", "--body-file", "--notes-file"];
+    words
+        .windows(2)
+        .any(|pair| flags.contains(&pair[0].as_str()) && pair[1] == "-")
+        || words.last().is_some_and(|word| word == "-")
+            && words
+                .len()
+                .checked_sub(2)
+                .is_some_and(|before| flags.contains(&words[before].as_str()))
+        || words
+            .iter()
+            .any(|word| flags.iter().any(|flag| *word == format!("{flag}=-")))
+}
+
 /// Whether a line mentions an instruction file at all: the cheap test
 /// before it is parsed.
 pub(crate) fn mentions_one(content: &str) -> bool {
@@ -110,8 +201,11 @@ fn overwrites_at(content: &str, depth: u8) -> Vec<Overwrite> {
     if !mentions_one(content) {
         return Vec::new();
     }
+    let stripped = without_message_bodies(content);
+    let content: &str = &stripped;
     let mut out = Vec::new();
-    for segment in shell_command_segments(content) {
+    let segments = shell_command_segments(content);
+    for (index, segment) in segments.iter().enumerate() {
         let words = shell_tokens(segment);
         let Some(at) = effective_command_index(&words) else {
             continue;
@@ -125,14 +219,23 @@ fn overwrites_at(content: &str, depth: u8) -> Vec<Overwrite> {
                 continue;
             }
         }
+        let args = &words[at + 1..];
         // GNU's names on macOS (`gcp`, `gmv`, `gln`) are the same programs.
-        let program = match name.as_str() {
-            "cp" | "gcp" => "cp",
-            "mv" | "gmv" => "mv",
-            "ln" | "gln" => "ln",
-            _ => continue,
+        let found = match name.as_str() {
+            "cp" | "gcp" => placed("cp", args),
+            "mv" | "gmv" => placed("mv", args),
+            "ln" | "gln" => placed("ln", args),
+            "rsync" => synced(args),
+            "install" | "ginstall" => installed(args),
+            "curl" => curl_output(args),
+            "wget" => wget_output(args),
+            "invoke-webrequest" | "iwr" | "invoke-restmethod" | "irm" => web_request_output(args),
+            "git" => git_restored(args),
+            _ => None,
         };
-        out.extend(placed(program, &words[at + 1..]));
+        let previous = index.checked_sub(1).map(|before| segments[before]);
+        let found = found.or_else(|| redirected_blind(&name, segment, args, previous));
+        out.extend(found);
     }
     out
 }
@@ -143,66 +246,150 @@ fn is_redirection(word: &str) -> bool {
     rest.starts_with('>') || rest.starts_with('<')
 }
 
-/// The instruction file one `cp`/`mv`/`ln` replaces, from its arguments.
-fn placed(program: &str, args: &[String]) -> Option<Overwrite> {
-    let mut operands: Vec<String> = Vec::new();
-    let mut folder: Option<String> = None;
+/// The words of a command's arguments, read as its options parse them.
+#[derive(Debug, Default)]
+struct Walked {
+    /// The words that are not options nor their values, in order.
+    operands: Vec<String>,
+    /// Each option that took a value, as written (`-t`, `--output`), and
+    /// the value.
+    valued: Vec<(String, String)>,
+    /// Each option without a value, a short cluster split into its letters
+    /// (`-sSL` gives `-s`, `-S`, `-L`).
+    flags: Vec<String>,
+    /// The files read on standard input (`< file`).
+    inputs: Vec<String>,
+}
+
+impl Walked {
+    fn value(&self, names: &[&str]) -> Option<&str> {
+        self.valued
+            .iter()
+            .rev()
+            .find(|(flag, _)| names.contains(&flag.as_str()))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn has(&self, names: &[&str]) -> bool {
+        self.flags.iter().any(|flag| names.contains(&flag.as_str()))
+    }
+}
+
+/// Walks arguments as getopt does: `short` the letters that take a value
+/// (in the rest of their cluster or the next word), `long` the long options
+/// that take the next word when no `=` gives one. Redirections are not
+/// arguments; `--` ends the options. Matching is exact for short letters and
+/// without regard to case for long names starting with one `-` (PowerShell's
+/// `-OutFile`), when `long` lists them so.
+fn walk(args: &[String], short: &str, long: &[&str]) -> Walked {
+    let mut walked = Walked::default();
     let mut options_over = false;
     let mut at = 0;
     while let Some(arg) = args.get(at) {
         at += 1;
-        if is_redirection(arg) {
-            // A bare operator names its file in the next word.
-            if arg
-                .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '&' | '>' | '<'))
-                .is_empty()
-            {
+        if !options_over && is_redirection(arg) {
+            let rest = arg.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+            let input = rest.starts_with('<') && !rest.starts_with("<<");
+            let named = rest.trim_start_matches(['>', '<', '|']).to_string();
+            let file = if named.is_empty() {
                 at += 1;
+                args.get(at - 1).cloned()
+            } else {
+                Some(named)
+            };
+            if input {
+                walked.inputs.extend(file);
             }
             continue;
         }
         if options_over || !arg.starts_with('-') || arg == "-" {
-            operands.push(arg.clone());
-        } else if arg == "--" {
+            walked.operands.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
             options_over = true;
-        } else if arg == "-t" || arg == "--target-directory" {
-            folder = args.get(at).cloned();
-            at += 1;
-        } else if let Some(named) = arg.strip_prefix("--target-directory=") {
-            folder = Some(named.to_string());
-        } else if arg == "-S" || arg == "--suffix" {
-            at += 1;
+            continue;
+        }
+        if let Some(name) = long
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(arg) && name.len() > 2)
+        {
+            if let Some(value) = args.get(at) {
+                walked.valued.push((name.to_string(), value.clone()));
+                at += 1;
+            }
+            continue;
+        }
+        if arg.starts_with("--") {
+            match arg.split_once('=') {
+                Some((name, value)) => walked.valued.push((name.to_string(), value.to_string())),
+                None => walked.flags.push(arg.clone()),
+            }
+            continue;
+        }
+        // A short cluster: `-sSLo out`, `-Dm644`, `-qO-`.
+        let letters: Vec<char> = arg[1..].chars().collect();
+        for (index, letter) in letters.iter().enumerate() {
+            if short.contains(*letter) {
+                let rest: String = letters[index + 1..].iter().collect();
+                let value = if rest.is_empty() {
+                    at += 1;
+                    args.get(at - 1).cloned()
+                } else {
+                    Some(rest)
+                };
+                walked
+                    .valued
+                    .push((format!("-{letter}"), value.unwrap_or_default()));
+                break;
+            }
+            walked.flags.push(format!("-{letter}"));
         }
     }
-    let (target, sources, is_folder) = match folder {
-        Some(folder) => (folder, operands, true),
-        None if operands.len() >= 2 => {
-            let target = operands.pop()?;
-            (target, operands, false)
-        }
-        // `ln -s ../x/CLAUDE.md` makes the link in the working folder.
-        None if program == "ln" && operands.len() == 1 => (".".to_string(), operands, true),
-        None => return None,
-    };
-    let folder_like = is_folder
-        || matches!(target.as_str(), "." | ".." | "~")
+    walked
+}
+
+/// The last name of a path or an address: `https://x/a/CLAUDE.md?raw=1`
+/// gives `CLAUDE.md`, `host:proj/AGENTS.md` gives `AGENTS.md`.
+fn last_name(word: &str) -> &str {
+    let word = word.trim_matches(|c: char| c == '"' || c == '\'');
+    let word = word.split(['?', '#']).next().unwrap_or(word);
+    word.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\', ':'])
+        .next()
+        .unwrap_or(word)
+}
+
+/// The instruction file a copy of `sources` into `target` replaces.
+/// `target` is a folder when `is_folder` says so, when it is written as one
+/// (`.`, `..`, `~`, a trailing `/`), when more than one source goes into
+/// it, or when its last name has no `.` (`cp x/CLAUDE.md proj` writes
+/// `proj/CLAUDE.md` when `proj` is a folder, which the line does not say):
+/// a folder is the reading that puts the file in an instruction file's place.
+fn place(target: String, sources: Vec<String>, is_folder: Option<bool>) -> Option<Overwrite> {
+    let written_as_folder = matches!(target.as_str(), "." | ".." | "~")
         || target.ends_with('/')
         || target.ends_with('\\');
-    if !folder_like {
-        return is_instruction_file(&target).then_some(Overwrite {
+    if is_instruction_file(&target) && is_folder != Some(true) && !written_as_folder {
+        return Some(Overwrite {
             file: target,
             sources,
         });
     }
+    let folder_like = is_folder.unwrap_or_else(|| {
+        written_as_folder || sources.len() > 1 || !last_name(&target).contains('.')
+    });
+    if !folder_like {
+        return None;
+    }
     let mut file = None;
     let mut named = Vec::new();
     for source in &sources {
-        let base = source
-            .trim_end_matches(['/', '\\'])
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or(source);
-        let joined = format!("{}/{base}", target.trim_end_matches(['/', '\\']));
+        let joined = format!(
+            "{}/{}",
+            target.trim_end_matches(['/', '\\']),
+            last_name(source)
+        );
         if is_instruction_file(&joined) {
             file.get_or_insert(joined);
             named.push(source.clone());
@@ -211,6 +398,356 @@ fn placed(program: &str, args: &[String]) -> Option<Overwrite> {
     file.map(|file| Overwrite {
         file,
         sources: named,
+    })
+}
+
+/// The instruction file one `cp`/`mv`/`ln` replaces, from its arguments.
+fn placed(program: &str, args: &[String]) -> Option<Overwrite> {
+    let walked = walk(args, "tS", &["--target-directory", "--suffix"]);
+    let mut operands = walked.operands.clone();
+    let no_folder = walked.has(&["-T", "--no-target-directory"]);
+    match walked.value(&["-t", "--target-directory"]) {
+        Some(folder) => place(folder.to_string(), operands, Some(true)),
+        None if operands.len() >= 2 => {
+            let target = operands.pop()?;
+            place(target, operands, no_folder.then_some(false))
+        }
+        // `ln -s ../x/CLAUDE.md` makes the link in the working folder.
+        None if program == "ln" && operands.len() == 1 => {
+            place(".".to_string(), operands, Some(true))
+        }
+        None => None,
+    }
+}
+
+/// The instruction file an `rsync` replaces: its last operand is the
+/// target, as `cp`'s.
+fn synced(args: &[String]) -> Option<Overwrite> {
+    let walked = walk(
+        args,
+        "efBTM",
+        &[
+            "--rsh",
+            "--filter",
+            "--exclude",
+            "--include",
+            "--exclude-from",
+            "--include-from",
+            "--files-from",
+            "--chmod",
+            "--chown",
+            "--rsync-path",
+            "--port",
+            "--block-size",
+            "--temp-dir",
+            "--backup-dir",
+            "--suffix",
+            "--compare-dest",
+            "--copy-dest",
+            "--link-dest",
+            "--partial-dir",
+            "--log-file",
+            "--password-file",
+            "--timeout",
+            "--bwlimit",
+            "--remote-option",
+            "--max-size",
+            "--min-size",
+            "--usermap",
+            "--groupmap",
+        ],
+    );
+    let mut operands = walked.operands;
+    if operands.len() < 2 {
+        return None;
+    }
+    let target = operands.pop()?;
+    place(target, operands, None)
+}
+
+/// The instruction file an `install` replaces; `install -d` makes folders
+/// and copies nothing.
+fn installed(args: &[String]) -> Option<Overwrite> {
+    let walked = walk(
+        args,
+        "mogSt",
+        &[
+            "--mode",
+            "--owner",
+            "--group",
+            "--suffix",
+            "--target-directory",
+            "--strip-program",
+        ],
+    );
+    if walked.has(&["-d", "--directory"]) {
+        return None;
+    }
+    let mut operands = walked.operands.clone();
+    let no_folder = walked.has(&["-T", "--no-target-directory"]);
+    match walked.value(&["-t", "--target-directory"]) {
+        Some(folder) => place(folder.to_string(), operands, Some(true)),
+        None if operands.len() >= 2 => {
+            let target = operands.pop()?;
+            place(target, operands, no_folder.then_some(false))
+        }
+        None => None,
+    }
+}
+
+/// Whether a word is an address a download names.
+fn is_address(word: &str) -> bool {
+    let word = word.trim_matches(|c: char| c == '"' || c == '\'');
+    word.contains("://") || word.starts_with("www.")
+}
+
+/// The instruction file a `curl` writes: the file of `-o`, or the
+/// address's own name under `-O` (in `--output-dir`).
+fn curl_output(args: &[String]) -> Option<Overwrite> {
+    let walked = walk(
+        args,
+        "odHXuAebcFTwxKEmrYyzCPQtUh",
+        &[
+            "--output",
+            "--output-dir",
+            "--header",
+            "--data",
+            "--data-raw",
+            "--data-binary",
+            "--data-urlencode",
+            "--request",
+            "--user",
+            "--user-agent",
+            "--referer",
+            "--cookie",
+            "--cookie-jar",
+            "--form",
+            "--upload-file",
+            "--write-out",
+            "--proxy",
+            "--config",
+            "--cert",
+            "--max-time",
+            "--connect-timeout",
+            "--retry",
+            "--range",
+            "--url",
+        ],
+    );
+    let mut addresses: Vec<String> = walked
+        .operands
+        .iter()
+        .filter(|word| is_address(word) || !word.starts_with('-'))
+        .cloned()
+        .collect();
+    addresses.extend(
+        walked
+            .valued
+            .iter()
+            .filter(|(flag, _)| flag == "--url")
+            .map(|(_, value)| value.clone()),
+    );
+    for (flag, file) in &walked.valued {
+        if (flag == "-o" || flag == "--output") && is_instruction_file(file) {
+            return Some(Overwrite {
+                file: file.clone(),
+                sources: addresses.clone(),
+            });
+        }
+    }
+    if walked.has(&["-O", "--remote-name", "--remote-name-all"]) {
+        let folder = walked.value(&["--output-dir"]).unwrap_or(".").to_string();
+        return place(folder, addresses, Some(true));
+    }
+    None
+}
+
+/// The instruction file a `wget` writes: the file of `-O` (`-` is
+/// standard output), or else each address's own name (in `-P`).
+fn wget_output(args: &[String]) -> Option<Overwrite> {
+    let walked = walk(
+        args,
+        "OPoaiBtTwQeUlARDIX",
+        &[
+            "--output-document",
+            "--directory-prefix",
+            "--output-file",
+            "--append-output",
+            "--input-file",
+            "--tries",
+            "--timeout",
+            "--wait",
+            "--user-agent",
+            "--header",
+            "--user",
+            "--password",
+        ],
+    );
+    let addresses: Vec<String> = walked.operands.clone();
+    if let Some(file) = walked.value(&["-O", "--output-document"]) {
+        return (file != "-" && is_instruction_file(file)).then(|| Overwrite {
+            file: file.to_string(),
+            sources: addresses,
+        });
+    }
+    let folder = walked
+        .value(&["-P", "--directory-prefix"])
+        .unwrap_or(".")
+        .to_string();
+    place(folder, addresses, Some(true))
+}
+
+/// The instruction file PowerShell's `Invoke-WebRequest` writes with
+/// `-OutFile`.
+fn web_request_output(args: &[String]) -> Option<Overwrite> {
+    let walked = walk(
+        args,
+        "",
+        &["-OutFile", "-Uri", "-Method", "-Headers", "-Body"],
+    );
+    let file = walked.value(&["-OutFile"])?;
+    let mut sources = walked.operands.clone();
+    sources.extend(walked.value(&["-Uri"]).map(str::to_string));
+    is_instruction_file(file).then(|| Overwrite {
+        file: file.to_string(),
+        sources,
+    })
+}
+
+/// The instruction file a `git checkout <ref> -- <file>` or `git restore
+/// --source <ref> <file>` puts back from another commit: its text is that
+/// commit's, not on the line. A restore from the index (no ref) puts back
+/// what the work tree last staged, and is not read here.
+fn git_restored(args: &[String]) -> Option<Overwrite> {
+    // Past git's own options to its subcommand.
+    let mut at = 0;
+    while let Some(arg) = args.get(at) {
+        if matches!(
+            arg.as_str(),
+            "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace"
+        ) {
+            at += 2;
+        } else if arg.starts_with('-') {
+            at += 1;
+        } else {
+            break;
+        }
+    }
+    let subcommand = args.get(at)?.as_str();
+    let rest = &args[at + 1..];
+    let (reference, paths) = match subcommand {
+        "checkout" => {
+            let walked = walk(rest, "bB", &["--orphan", "--conflict"]);
+            if walked.value(&["-b", "-B", "--orphan"]).is_some() {
+                return None;
+            }
+            let split = rest.iter().position(|arg| arg == "--");
+            match split {
+                Some(split) => {
+                    let before = walk(&rest[..split], "", &["--conflict"]).operands;
+                    let paths: Vec<String> = rest[split + 1..].to_vec();
+                    (before.first().cloned()?, paths)
+                }
+                None => {
+                    let mut operands = walked.operands;
+                    if operands.len() < 2 {
+                        return None;
+                    }
+                    let reference = operands.remove(0);
+                    (reference, operands)
+                }
+            }
+        }
+        "restore" => {
+            let walked = walk(rest, "s", &["--source"]);
+            let reference = walked.value(&["-s", "--source"])?.to_string();
+            (reference, walked.operands)
+        }
+        _ => return None,
+    };
+    let file = paths.into_iter().find(|path| is_instruction_file(path))?;
+    Some(Overwrite {
+        sources: vec![format!("{reference}:{file}")],
+        file,
+    })
+}
+
+/// Programs whose output into a file is text written on the line itself
+/// (`echo`, `printf`), or nothing at all (`:`, `true`): the text is read,
+/// or there is none.
+const TEXT_ON_THE_LINE: &[&str] = &["echo", "printf", "print", ":", "true", "false"];
+
+/// The instruction file any other program's output is redirected into, or a
+/// `tee` writes from a pipe or a file: `cat /tmp/x > CLAUDE.md`,
+/// `curl -s URL | tee AGENTS.md`. What it writes is not on the line. Text
+/// on the line (`echo`, a here-document, a here-string) is read instead.
+fn redirected_blind(
+    name: &str,
+    segment: &str,
+    args: &[String],
+    previous: Option<&str>,
+) -> Option<Overwrite> {
+    if TEXT_ON_THE_LINE.contains(&name) || segment.contains("<<") {
+        return None;
+    }
+    let walked = walk(args, "", &[]);
+    if name == "tee" {
+        // `echo X | tee -a GEMINI.md`: the text is on the line, and is read
+        // as written. A tee with neither a command before it nor a file on
+        // its stdin writes nothing a line gave it.
+        let fed_text = previous.is_some_and(|previous| {
+            let words = shell_tokens(previous);
+            effective_command_index(&words).is_some_and(|at| {
+                TEXT_ON_THE_LINE.contains(&token_basename(&words[at]).to_ascii_lowercase().as_str())
+            })
+        });
+        if fed_text || (previous.is_none() && walked.inputs.is_empty()) {
+            return None;
+        }
+    }
+    let mut sources = walked.operands.clone();
+    sources.extend(walked.inputs.iter().cloned());
+    let file = if name == "tee" {
+        walked
+            .operands
+            .iter()
+            .find(|word| is_instruction_file(word))
+            .cloned()
+    } else {
+        let mut found = None;
+        let mut at = 0;
+        while let Some(arg) = args.get(at) {
+            at += 1;
+            let rest = arg.trim_start_matches(|c: char| c.is_ascii_digit() || c == '&');
+            if !rest.starts_with('>') || rest.starts_with(">&") || rest.starts_with(">(") {
+                continue;
+            }
+            let target = rest.trim_start_matches('>').trim_start_matches('|');
+            let target = if target.is_empty() {
+                at += 1;
+                args.get(at - 1).map(String::as_str).unwrap_or("")
+            } else {
+                target
+            };
+            if is_instruction_file(target) {
+                found = Some(target.to_string());
+                break;
+            }
+        }
+        found
+    }?;
+    if name == "tee" {
+        // A tee writes what it is handed: a pipe (judged by what feeds it,
+        // which is not on this segment) or a file.
+        sources.retain(|source| *source != file);
+    }
+    Some(Overwrite {
+        sources: if sources.is_empty() {
+            vec![name.to_string()]
+        } else {
+            sources
+        },
+        file,
     })
 }
 

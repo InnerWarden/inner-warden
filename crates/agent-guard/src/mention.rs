@@ -1265,7 +1265,17 @@ fn command_edits(
     match program.as_str() {
         "git" | "gh" | "glab" => {
             for (at, word) in words.iter().enumerate() {
-                if MESSAGE_OPTIONS.contains(&word.as_str()) && literal_at(at + 1) {
+                // `git commit -am`: a cluster of git's short flags that
+                // ends in `m` takes the message as `-m` does.
+                let message_cluster = program == "git"
+                    && word.len() > 2
+                    && word.starts_with('-')
+                    && !word.starts_with("--")
+                    && word.ends_with('m')
+                    && word[1..].chars().all(|c| c.is_ascii_alphabetic());
+                if (MESSAGE_OPTIONS.contains(&word.as_str()) || message_cluster)
+                    && literal_at(at + 1)
+                {
                     mask(at + 1, "'text'");
                 } else if let Some((option, _)) = word.split_once('=') {
                     if MESSAGE_OPTIONS.contains(&option) && literal_at(at) {

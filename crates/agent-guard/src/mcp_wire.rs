@@ -123,8 +123,8 @@ fn server_mode(server: &Value) -> Option<WiringMode> {
 
 /// Whether `innerwarden proxy`, started with these options (the words between
 /// `proxy` and the wrapper's `--`), refuses what the guard denies:
-/// `Some(true)` for `guard` and `kill`, `Some(false)` for `advisory` and
-/// `warn`, which only record.
+/// `Some(true)` for `guard`, `kill` and `strict`, `Some(false)` for
+/// `advisory` and `warn`, which only record.
 ///
 /// No `--mode` at all is `Some(true)`: legacy Community wrappers were written
 /// as `proxy -- <child>`, and the proxy's default is `guard`.
@@ -151,7 +151,7 @@ pub(crate) fn wrapper_blocks(options: &[Option<&str>]) -> Option<bool> {
         return None;
     }
     match walk.mode {
-        None | Some(Some("guard" | "kill")) => Some(true),
+        None | Some(Some("guard" | "kill" | "strict")) => Some(true),
         Some(Some("advisory" | "warn")) => Some(false),
         Some(_) => None,
     }
@@ -1262,6 +1262,27 @@ mod tests {
             .map(|w| Some(*w))
             .collect();
         assert_eq!(wrapper_blocks(&words), Some(false));
+    }
+
+    /// The proxy takes `--mode strict` (it refuses every review as well):
+    /// a wrapper written with it blocks, and status reads it as enforcing.
+    ///
+    /// FAILS ON REVERT: `strict` was not among the modes read, so a server
+    /// behind a strict proxy was reported with no mode.
+    #[test]
+    fn a_strict_proxy_blocks() {
+        for options in [
+            &["--mode", "strict"][..],
+            &["--mode=strict", "--agent", "x"][..],
+        ] {
+            let words: Vec<Option<&str>> = options.iter().map(|w| Some(*w)).collect();
+            assert_eq!(wrapper_blocks(&words), Some(true), "{options:?}");
+        }
+        let config = json!({"mcpServers": {"s": {
+            "command": "/abs/innerwarden",
+            "args": ["proxy", "--mode", "strict", "--", "npx", "server"]
+        }}});
+        assert_eq!(guarded_mode(&config), Some(WiringMode::Enforce));
     }
 
     #[test]

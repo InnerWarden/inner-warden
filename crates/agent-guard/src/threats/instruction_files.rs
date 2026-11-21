@@ -26,7 +26,9 @@ use super::{
     effective_command_index, is_shell_program, output_redirect_targets, segments_are_piped,
     shell_command_segments, shell_tokens, tee_targets, token_basename, written_text,
 };
-use crate::agent_instructions::{is_instruction_file, mentions_one, overwrites, shell_line};
+use crate::agent_instructions::{
+    is_instruction_file, mentions_one, overwrites, shell_line, without_message_bodies,
+};
 
 /// Inline code flags of the interpreters read here.
 const CODE_FLAGS: &[(&str, &[&str])] = &[
@@ -86,6 +88,8 @@ type Target<'a> = &'a dyn Fn(&str) -> bool;
 /// The text a line writes into each file `target` accepts, `depth` shells
 /// deep.
 fn payloads_at(content: &str, depth: u8, target: Target<'_>) -> Vec<(String, String)> {
+    let stripped = without_message_bodies(content);
+    let content: &str = &stripped;
     let mut payloads = Vec::new();
     heredoc_payloads(content, &mut payloads, target);
     let segments = shell_command_segments(content);
@@ -498,7 +502,10 @@ const READ_ACTS: &[&str] = &[
 
 /// Secrets as prose names them: keys, credentials and the files that keep
 /// tokens. In `.ssh/`, `config` and `known_hosts` are not secrets
-/// ([`SSH_NOT_SECRET`]): a setup step reads them.
+/// ([`SSH_NOT_SECRET`]): a setup step reads them; nor is a public key
+/// (`id_ed25519.pub`), which a setup step hands out. Credentials count as the
+/// files that keep them (`credentials.json`, `~/.aws/credentials`), not as
+/// the word: "set up credentials for the CI" reads nothing.
 const SECRET_PATHS: &[&str] = &[
     ".ssh/",
     "id_rsa",
@@ -506,7 +513,9 @@ const SECRET_PATHS: &[&str] = &[
     "id_ecdsa",
     "id_dsa",
     ".pem",
-    "credentials",
+    "credentials.json",
+    "credentials.db",
+    ".aws/credentials",
     ".git-credentials",
     ".aws/config",
     ".netrc",
@@ -529,7 +538,8 @@ const TEMPLATE_ENDS: &[&str] = &[".example", ".sample", ".template", ".dist", ".
 /// Whether `lower` names a secret of [`SECRET_PATHS`]: `.env` only as
 /// the file itself (not `.envrc`) and not in a clause that names a
 /// template of it (`Copy .env.example to .env`); `.ssh/` not for its
-/// `config` or `known_hosts`.
+/// `config`, `known_hosts` or a public key; a key file (`id_rsa`) not as
+/// its `.pub`.
 pub(crate) fn names_a_secret(lower: &str) -> bool {
     let env_template = TEMPLATE_ENDS
         .iter()
@@ -551,9 +561,19 @@ pub(crate) fn names_a_secret(lower: &str) -> bool {
         lower.match_indices(path).any(|(at, _)| {
             let after = &lower[at + path.len()..];
             if *path == ".ssh/" {
+                let file: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+                    .collect();
+                let file = file.trim_end_matches('.');
                 return !SSH_NOT_SECRET
                     .iter()
-                    .any(|name| after.strip_prefix(name).is_some_and(ends_here));
+                    .any(|name| after.strip_prefix(name).is_some_and(ends_here))
+                    && !file.ends_with(".pub");
+            }
+            // `id_ed25519.pub` is the public half: no secret.
+            if path.starts_with("id_") && after.strip_prefix(".pub").is_some_and(ends_here) {
+                return false;
             }
             !path.ends_with(|c: char| c.is_ascii_alphanumeric())
                 || after
