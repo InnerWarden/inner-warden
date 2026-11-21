@@ -155,6 +155,95 @@ fn stopping_other_programs_stays_allowed() {
     }
 }
 
+/// Round 1 of the review of this change, measured main edcd0f6 against
+/// the branch: the guard's shortcuts `iw` and `iw-guard` were no program of
+/// the guard to its kill rules, and a `pgrep` of another security control
+/// (`clamd`, `fail2ban`) let `kill` through once a list of controls
+/// missed it.
+#[test]
+fn the_guards_shortcuts_are_its_programs() {
+    assert_verdict(
+        &[
+            "kill $(pgrep -f iw)",
+            "kill $(pgrep -f 'iw-guard')",
+            "kill $(pgrep -f 'vite|iw')",
+            "kill $(pidof iw-guard)",
+            "kill $(pidof iw)",
+            "pkill -f iw-guard",
+            "pkill iw-guard",
+            "killall iw-guard",
+            "pkill -f /usr/local/bin/iw-guard",
+        ],
+        "deny",
+    );
+}
+
+#[test]
+fn a_kill_through_pgrep_leaves_review_only_for_a_dev_program() {
+    for line in [
+        "kill $(pgrep -f clamd)",
+        "kill $(pgrep -f fail2ban)",
+        "kill $(pgrep -f ossec)",
+        "kill $(pgrep -f suricata)",
+        "kill $(pgrep snort)",
+        "kill $(pgrep -f firewalld)",
+        "kill $(pgrep -f mdatp)",
+        "kill $(pgrep -f 'vite|ssh')",
+        "kill $(pgrep -f python3)",
+    ] {
+        assert_ne!(verdict(line), "allow", "{line}");
+    }
+    assert_verdict(
+        &[
+            "kill $(pgrep -f webpack)",
+            "kill $(pgrep -u me -f vite)",
+            "kill $(pgrep -f 'vite --port 5173')",
+            "kill $(pidof node)",
+        ],
+        "allow",
+    );
+}
+
+#[test]
+fn a_shell_option_value_before_the_script_is_skipped() {
+    assert_verdict(
+        &[
+            "pgrep -f innerwarden-agent | xargs bash -o pipefail -c 'kill $0'",
+            "pgrep -f innerwarden-agent | xargs bash --norc -c 'kill $0'",
+        ],
+        "deny",
+    );
+}
+
+/// A file the decode writes, run with options or on a shell's input, keeps
+/// the signal main gave it; a file named like another word is compared
+/// whole.
+#[test]
+fn a_decoded_file_run_with_options_or_on_input_keeps_the_signal() {
+    for line in [
+        "echo eA== | base64 -d > a.sh; sh -e a.sh",
+        "echo eA== | base64 -d > a.sh; sh < a.sh",
+        "echo eA== | base64 -d > a.sh; bash -x a.sh",
+        "echo eA== | base64 -d > a.py; python3 -I a.py",
+        "echo eA== | base64 -d > a.sh; sh -- a.sh",
+        "echo eA== | base64 -d > a.sh; bash -o pipefail a.sh",
+        "echo eA== | base64 -d > a.sh; sudo bash -e a.sh",
+        "base64 -d s.b64 > s; sh s",
+    ] {
+        let analysis = analyze_command(line, None);
+        assert_ne!(analysis.recommendation, "allow", "{line}");
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|signal| signal.signal == "obfuscated_command" && signal.score >= 30),
+            "{line}: {:#?}",
+            analysis.signals
+        );
+    }
+    assert_verdict(&["echo eA== | base64 -d > a.sh; cat a.sh"], "allow");
+}
+
 #[test]
 fn a_base64_decode_counts_only_when_what_it_prints_may_run() {
     for line in [

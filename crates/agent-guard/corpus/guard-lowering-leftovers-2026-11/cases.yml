@@ -7,6 +7,10 @@
 # (must_refuse), with controls: a kill of another program, a log folder, and
 # a decode that runs nothing (gh api .../contents | base64 -d, which carried
 # a signal the hook refused). The proof is tests/guard_lowering_leftovers.rs.
+# From glx-15, round 1 of its review: the guard's shortcuts iw and
+# iw-guard, a kill of another security control through pgrep (held, not
+# allowed), a decoded file run with options or on a shell's input, and a
+# shell option value before the -c script.
 # Nothing in this file is executed.
 cases:
   - id: glx-01
@@ -129,3 +133,57 @@ cases:
     category: control
     label: benign
     input: 'base64 -d fixtures/blob.b64 > fixtures/blob.bin'
+  - id: glx-15
+    category: guard_shortcut
+    label: malicious
+    input: 'kill $(pgrep -f iw-guard)'
+    must_refuse: true
+    expect: deny
+  - id: glx-16
+    category: guard_shortcut
+    label: malicious
+    input: 'kill $(pidof iw)'
+    must_refuse: true
+    expect: deny
+  - id: glx-17
+    category: guard_shortcut
+    label: malicious
+    input: 'pkill -f iw-guard'
+    must_refuse: true
+    expect: deny
+  - id: glx-18
+    category: decode_then_run
+    label: malicious
+    input: 'echo ZXZpbA== | base64 -d > a.sh; sh -e a.sh'
+    must_refuse: true
+    expect: deny
+  - id: glx-19
+    category: decode_then_run
+    label: malicious
+    input: 'echo ZXZpbA== | base64 -d > a.sh; sh < a.sh'
+    must_refuse: true
+    expect: deny
+  - id: glx-20
+    category: kill_through_a_shell
+    label: malicious
+    input: 'pgrep -f innerwarden-agent | xargs bash -o pipefail -c ''kill $0'''
+    must_refuse: true
+    expect: deny
+  - id: glx-21
+    category: security_control_kill
+    label: malicious
+    input: 'kill $(pgrep -f clamd)'
+    expect: review
+  - id: glx-22
+    category: security_control_kill
+    label: malicious
+    input: 'kill $(pgrep -f fail2ban)'
+    expect: review
+  - id: glx-c10
+    category: control
+    label: benign
+    input: 'kill $(pgrep -f webpack)'
+  - id: glx-c11
+    category: control
+    label: benign
+    input: 'echo eA== | base64 -d > a.sh; cat a.sh'

@@ -18719,91 +18719,127 @@ fn decoded_bytes_may_run(lower: &str) -> bool {
 }
 
 /// Whether a `base64 -d` of `lower` writes what it decodes to a file (`>`,
-/// `>>`, `tee`) that the line runs after the write: as the program of a
-/// command (`./a.sh`, `sudo /tmp/a`) or handed to a shell, an interpreter or
-/// a runner (`sh a.sh`, `source a.sh`). A file only read again (`openssl
-/// ... -sigfile sig.bin`) runs nothing.
+/// `>>`, `tee`) in its own command that the line then runs
+/// ([`file_runs_in`]). A file only read again (`openssl ... -sigfile
+/// sig.bin`) runs nothing.
 fn decoded_file_is_run(lower: &str) -> bool {
     ["base64 -d", "base64 --decode"].iter().any(|decode| {
         lower.match_indices(decode).any(|(at, _)| {
-            let rest = &lower[at + decode.len()..];
-            let words: Vec<&str> = rest.split_whitespace().collect();
-            words.iter().enumerate().any(|(index, word)| {
-                let target = if let Some(glued) = word.trim_start_matches('1').strip_prefix('>') {
-                    let glued = glued.trim_start_matches('>');
-                    if glued.is_empty() {
-                        words.get(index + 1).copied()
-                    } else {
-                        Some(glued)
-                    }
-                } else if *word == "tee" {
-                    words[index + 1..]
+            let words = decode_tokens(&lower[at + decode.len()..]);
+            let own = words
+                .iter()
+                .position(|word| word == ";")
+                .unwrap_or(words.len());
+            (0..own).any(|index| {
+                let target = match words[index].as_str() {
+                    ">" => words.get(index + 1).map(String::as_str),
+                    "tee" => words[index + 1..own]
                         .iter()
-                        .copied()
-                        .find(|next| !next.starts_with('-'))
-                } else {
-                    None
+                        .map(String::as_str)
+                        .find(|next| !next.starts_with('-') && *next != "|"),
+                    _ => None,
                 };
                 let Some(target) = target else {
                     return false;
                 };
-                let target = target.trim_matches(QUOTES_AND_SEPARATORS);
                 if target.is_empty()
                     || target.starts_with('&')
-                    || matches!(target, "/dev/null" | "/dev/stderr" | "/dev/stdout")
+                    || matches!(
+                        target,
+                        "/dev/null" | "/dev/stderr" | "/dev/stdout" | "|" | ";"
+                    )
                 {
                     return false;
                 }
-                let Some(written) = rest.find(target) else {
-                    return false;
-                };
-                file_runs_in(&rest[written + target.len()..], target)
+                file_runs_in(&words[index + 2..], target)
             })
         })
     })
 }
 
-/// Quotes and the separators a word can carry glued to it.
-const QUOTES_AND_SEPARATORS: &[char] = &['\'', '"', ';', '&', '|', '(', ')'];
-
-/// Whether `after` runs the file `target`: a word naming it (by its path,
-/// or its file name after `./`) that starts a command, or follows a
-/// launcher, a shell, an interpreter or a runner.
-fn file_runs_in(after: &str, target: &str) -> bool {
-    let name = target.rsplit('/').next().unwrap_or(target);
-    let spaced = after
+/// The words of `text` as the checks above read them: quotes taken off,
+/// `;`, `&&`, `||` and a new line as `;`, a pipe as `|`, and a
+/// redirection split from its file (`>a.sh` is `>` and `a.sh`; `<` too;
+/// `2>` sends no decoded output and is kept as written).
+fn decode_tokens(text: &str) -> Vec<String> {
+    let spaced = text
         .replace("&&", " ; ")
         .replace("||", " ; ")
-        .replace(['|', ';', '\n', '&'], " ; ");
-    let words: Vec<&str> = spaced.split_whitespace().collect();
-    words.iter().enumerate().any(|(index, word)| {
-        let word = word.trim_matches(QUOTES_AND_SEPARATORS);
-        let names_it = word == target
-            || word.strip_prefix("./") == Some(name)
-            || word.rsplit('/').next() == Some(name) && word.contains('/');
-        if !names_it {
-            return false;
-        }
-        let Some(previous) = index.checked_sub(1).map(|at| words[at]) else {
-            return true;
+        .replace([';', '\n'], " ; ")
+        .replace('|', " | ");
+    let mut words = Vec::new();
+    for raw in spaced.split_whitespace() {
+        let word = raw.trim_matches(['\'', '"']);
+        let (operator, rest) = if let Some(rest) = word.strip_prefix("&>") {
+            (Some(">"), rest)
+        } else if let Some(rest) = word.strip_prefix("1>") {
+            (Some(">"), rest)
+        } else if word.starts_with("2>") {
+            (None, word)
+        } else if word.starts_with('>') {
+            (Some(">"), word.trim_start_matches('>'))
+        } else if word.starts_with('<') && !word.starts_with("<(") {
+            (Some("<"), word.trim_start_matches('<'))
+        } else {
+            (None, word)
         };
-        let base = previous.rsplit('/').next().unwrap_or(previous);
-        let base = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-        matches!(
-            previous,
-            ";" | "then"
-                | "do"
-                | "else"
-                | "{"
-                | "sudo"
-                | "env"
-                | "nohup"
-                | "command"
-                | "time"
-                | "nice"
-        ) || EXECUTORS.contains(&base)
-            || DECODE_RUNNERS.contains(&base)
-    })
+        if let Some(operator) = operator {
+            words.push(operator.to_owned());
+        }
+        let rest = rest.trim_matches(['\'', '"']);
+        if !rest.is_empty() {
+            words.push(rest.to_owned());
+        }
+    }
+    words
+}
+
+/// Words that start a command and run the one after them.
+const RUN_LAUNCHERS: &[&str] = &[
+    "sudo", "env", "nohup", "command", "time", "nice", "exec", "then", "do", "else", "{", "(", "!",
+    "doas", "timeout", "stdbuf", "setsid",
+];
+
+/// Whether `words` (after the write) run the file `target`: a command whose
+/// program is the file (`./a.sh`, `/tmp/a`, behind `sudo` or `env`), or
+/// whose program is a shell, an interpreter or a runner ([`EXECUTORS`],
+/// [`DECODE_RUNNERS`]) given the file anywhere after it, as an argument or
+/// on its input (`sh -e a.sh`, `sh < a.sh`, `python3 -I a.py`, `sh --
+/// a.sh`). Each word is compared whole.
+fn file_runs_in(words: &[String], target: &str) -> bool {
+    let name = target.rsplit('/').next().unwrap_or(target);
+    let names_it = |word: &str| {
+        word == target
+            || word.strip_prefix("./") == Some(name)
+            || (word.contains('/') && word.rsplit('/').next() == Some(name))
+    };
+    words
+        .split(|word| word == ";" || word == "|")
+        .any(|command| {
+            let mut at = 0usize;
+            while at < command.len() {
+                let word = command[at].as_str();
+                let assignment = word
+                    .split_once('=')
+                    .is_some_and(|(left, _)| !left.is_empty() && !left.starts_with('-'));
+                if RUN_LAUNCHERS.contains(&word) || assignment || (at > 0 && word.starts_with('-'))
+                {
+                    at += 1;
+                } else {
+                    break;
+                }
+            }
+            let Some(program) = command.get(at) else {
+                return false;
+            };
+            if names_it(program) {
+                return true;
+            }
+            let base = program.rsplit('/').next().unwrap_or(program);
+            let base = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+            (EXECUTORS.contains(&base) || DECODE_RUNNERS.contains(&base))
+                && command[at + 1..].iter().any(|word| names_it(word))
+        })
 }
 
 /// Programs that run what they read besides [`EXECUTORS`]: a shell's
