@@ -167,6 +167,13 @@ fn arm_with_cap(monitor: bool, deadline: Duration, cap: Duration) -> Result<(), 
 /// The hook is about to make a wait it bounds itself by `bound`: move the
 /// deadline and the limit on the clock by as much. Nothing to move when no
 /// deadline is armed (the same code runs under `innerwarden check`).
+/// From here on the net ends the run as monitor does, never with a
+/// refusal: for a run that turned out to carry no tool call (the person's
+/// prompt), where a refusal would drop what the person typed.
+pub fn never_refuse() {
+    MONITOR.store(true, Ordering::SeqCst);
+}
+
 pub fn allow_wait(bound: Duration) {
     for limit in [&DEADLINE_MS, &WALL_MS] {
         let _ = limit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {

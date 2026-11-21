@@ -82,6 +82,10 @@ pub mod session;
 // line, so the hook judges them as it judges the patch tool's.
 pub mod shell_patch;
 pub mod threats;
+// What the person asked for, kept per agent session by the prompt hook, and
+// read by the MCP proxy to tell a value the person typed from one the model
+// wrote.
+pub mod user_prompt;
 
 // ── 3. INTERNAL ──────────────────────────────────────────────────────────────
 // No consumer outside this crate. Kept private so a future caller has to make a

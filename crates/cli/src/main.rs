@@ -1112,8 +1112,33 @@ mod json_head {
 /// that already ran (PostToolUse: a large file read, edited or written, a
 /// command with a long output) has nothing left to refuse: its head is
 /// recorded as a result not read whole, and the agent carries on.
+/// A prompt the person submitted (`UserPromptSubmit`): kept, masked and
+/// bounded, for the session it came in ([`user_prompt`]), and the hook ends
+/// with 0 and says nothing, whatever happened to the record. `None` for any
+/// other payload.
+///
+/// [`user_prompt`]: innerwarden_agent_guard::user_prompt
+fn keep_the_prompt(buf: &str, rest: &[String]) -> Option<std::process::ExitCode> {
+    use innerwarden_agent_guard::user_prompt;
+    let value: serde_json::Value = serde_json::from_str(buf).ok()?;
+    let prompt = user_prompt::prompt_of(&value)?;
+    // Claude Code drops the prompt on exit 2: nothing from here refuses.
+    hook_net::never_refuse();
+    let _ = user_prompt::record(
+        hook_session(buf).as_deref(),
+        agent_flag(rest).as_deref(),
+        &prompt,
+    );
+    Some(std::process::ExitCode::SUCCESS)
+}
+
 fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::ExitCode {
     let call = TooLongCall::read(head);
+    // A prompt past the cap is not kept, and never refused: the person's
+    // words go on to the agent as they would without the guard.
+    if call.event.as_deref() == Some(innerwarden_agent_guard::user_prompt::PROMPT_EVENT) {
+        return std::process::ExitCode::SUCCESS;
+    }
     if !call.already_ran() {
         return hook_unreadable("", rest, TOOL_CALL_TOO_LONG, monitor);
     }
@@ -1809,6 +1834,11 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         Ok(ToolCallRead::TooLong(head)) => return hook_too_long(&head, rest, monitor),
         Err(_) => return hook_unreadable("", rest, "stdin could not be read", monitor),
     };
+    // The person's prompt: kept for the MCP proxy, never refused, nothing
+    // printed (Claude Code adds a prompt hook's output to the conversation).
+    if let Some(exit) = keep_the_prompt(&buf, rest) {
+        return exit;
+    }
     // Cursor sends each event in its own shape: read as the call every other
     // agent's hook carries, and the event kept for the answer.
     let buf = if agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::cursor_hook::AGENT) {

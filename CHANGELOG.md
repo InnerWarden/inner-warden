@@ -13,6 +13,14 @@ guard, and refused if it lets through a line main stops. The guard still reads
 the text of a command; what it does not see is written down, as measured:
 [Where this ends](docs/features.md#where-this-ends).
 
+`innerwarden install` wires a hook on Claude Code's prompts
+(`UserPromptSubmit`) that keeps what the person asked, masked, per session,
+in `~/.config/innerwarden/prompts/` (0600, 24 hours, bounded), so the MCP
+proxy can ask whether a value appears in the person's request. The hook never
+stops a prompt and prints nothing. Other agents are not wired: their MCP
+servers get no session id to match. What is kept, where, for how long and how
+to delete it: [The prompt record](docs/prompt-record.md).
+
 ### Added
 
 - **Cursor is screened through its own hooks.** `innerwarden agents connect

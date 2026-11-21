@@ -154,6 +154,81 @@ pub fn merge_posttooluse_hook(mut settings: Value, hook_command: &str) -> Value 
     settings
 }
 
+/// Idempotently install the hook on the person's prompts
+/// (`UserPromptSubmit`): it keeps what the person asked for, per session,
+/// for the MCP proxy to read ([`crate::user_prompt`]).
+///
+/// The line is written without the fail-closed tail ([`prompt_hook_command`]):
+/// Claude Code drops the person's prompt when this hook exits 2, and a guard
+/// that is gone must never stop the person from talking to the agent. The
+/// mode of this line says nothing of the posture; only the tool halves do.
+/// A previous InnerWarden line under the event is replaced wherever it sits.
+pub fn merge_userpromptsubmit_hook(mut settings: Value, hook_command: &str) -> Value {
+    if !settings.is_object() {
+        settings = json!({});
+    }
+    let obj = settings.as_object_mut().expect("object");
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let list = hooks
+        .as_object_mut()
+        .expect("object")
+        .entry(crate::user_prompt::PROMPT_EVENT)
+        .or_insert_with(|| json!([]));
+    if !list.is_array() {
+        *list = json!([]);
+    }
+    let arr = list.as_array_mut().expect("array");
+    let mut kept: Option<serde_json::Map<String, Value>> = None;
+    arr.retain_mut(|entry| {
+        let Some(list) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        let was_empty = list.is_empty();
+        list.retain(|hook| {
+            if !is_iwguard_hook(hook) {
+                return true;
+            }
+            if kept.is_none() {
+                kept = hook.as_object().cloned();
+            }
+            false
+        });
+        was_empty || !list.is_empty()
+    });
+    let mut hook = kept.unwrap_or_default();
+    hook.insert("type".into(), json!("command"));
+    hook.insert("command".into(), json!(hook_command));
+    arr.push(json!({ "hooks": [ Value::Object(hook) ] }));
+    settings
+}
+
+/// The prompt hook's line ([`merge_userpromptsubmit_hook`]): the guard with
+/// the mode flags of the tool halves, naming its agent, and never the
+/// fail-closed script, so a guard that is gone ends it with 127 and the
+/// prompt goes on. The hook itself never refuses a prompt, whatever its mode.
+pub fn prompt_hook_command(
+    iw_guard: &Path,
+    block_review: bool,
+    monitor: bool,
+    agent: Option<&str>,
+) -> String {
+    hook_command_shaped(iw_guard, block_review, monitor, agent, false)
+}
+
+/// Whether the settings hold a prompt hook of ours.
+fn has_iwguard_prompt_hook(settings: &Value) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(crate::user_prompt::PROMPT_EVENT))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(is_iwguard_hook_entry)
+}
+
 pub fn merge_pretooluse_bash_hook(mut settings: Value, hook_command: &str) -> Value {
     if !settings.is_object() {
         settings = json!({});
@@ -251,7 +326,11 @@ const _: () = assert!(HOOK_LONGEST_SECS < HOOK_TIMEOUT_SECS && HOOK_TIMEOUT_SECS
 /// `timeout` of [`HOOK_TIMEOUT_SECS`] where it has none. A `timeout` already
 /// on a line (the operator's) is kept as it is; nothing else changes.
 pub fn with_hook_timeouts(mut settings: Value) -> Value {
-    for event in ["PreToolUse", "PostToolUse"] {
+    for event in [
+        "PreToolUse",
+        "PostToolUse",
+        crate::user_prompt::PROMPT_EVENT,
+    ] {
         let Some(entries) = settings
             .get_mut("hooks")
             .and_then(|hooks| hooks.get_mut(event))
@@ -925,6 +1004,19 @@ fn install_hook_with_link_policy(
         None => cmd.clone(),
     };
     let merged = merge_posttooluse_hook(merged, &post_command);
+    // The prompt half: what the person asked, kept for the MCP proxy to tell
+    // a value they typed from one the model wrote. Never refuses anything.
+    // Only an install or connect the person runs adds it: background setup
+    // after an upgrade does not start keeping prompts on its own, and keeps
+    // (re-points) one that is already there.
+    let merged = if !reject_symlinks || has_iwguard_prompt_hook(&existing) {
+        merge_userpromptsubmit_hook(
+            merged,
+            &prompt_hook_command(iw_guard, block_review, monitor, agent_flag.as_deref()),
+        )
+    } else {
+        merged
+    };
     // Claude Code waits 600 s for a hook that names no `timeout`; every line
     // of ours gets [`HOOK_TIMEOUT_SECS`] unless the operator set one. Only an
     // explicit install or connect writes it: background setup keeps every
@@ -1759,7 +1851,11 @@ pub fn unscreened_iwguard_hooks(
         let mut groups: Vec<(String, Vec<HookProgram>)> = Vec::new();
         let mut every_tool_runs = false;
         for entry in entries {
-            let label = matcher_label(entry);
+            let label = if event == crate::user_prompt::PROMPT_EVENT {
+                "every prompt".to_string()
+            } else {
+                matcher_label(entry)
+            };
             let verdicts: Vec<HookProgram> = entry
                 .get("hooks")
                 .and_then(Value::as_array)
@@ -2019,7 +2115,11 @@ pub fn uninstall_hook(
     // running the guard's binary after every tool call of an agent the person
     // had disconnected, and failed on each one once the binary was removed.
     let (cleaned, observed) = remove_iwguard_hooks_for_event(cleaned, "PostToolUse");
-    let removed = removed + observed;
+    // The prompt half goes too: left behind, it kept the person's words for a
+    // guard that no longer reads them.
+    let (cleaned, prompts) =
+        remove_iwguard_hooks_for_event(cleaned, crate::user_prompt::PROMPT_EVENT);
+    let removed = removed + observed + prompts;
     if removed > 0 {
         let body = serde_json::to_string_pretty(&cleaned).map_err(|e| e.to_string())? + "\n";
         crate::file_update::replace_if_unchanged(&settings_path, Some(&source), body.as_bytes())?;
@@ -3837,8 +3937,9 @@ mod tests {
         let (path, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
         assert_eq!(path, settings);
         assert_eq!(
-            removed, 4,
-            "the Bash hook, the file-tools hook, the read-tools hook and the PostToolUse hook"
+            removed, 5,
+            "the Bash hook, the file-tools hook, the read-tools hook, the PostToolUse hook and \
+             the prompt hook"
         );
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 0);
@@ -3871,10 +3972,109 @@ mod tests {
             3,
             "reinstall must not stack a second hook (Bash, file-tools and read-tools entries)"
         );
-        // uninstall finds and removes all four: Bash, file tools, read tools,
-        // PostToolUse.
+        // uninstall finds and removes all five: Bash, file tools, read tools,
+        // PostToolUse and the prompt hook.
         let (_, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
-        assert_eq!(removed, 4);
+        assert_eq!(removed, 5);
+    }
+
+    /// Uninstall takes out the prompt hook it installed and nothing else
+    /// under that event: the person's own prompt hook stays as it was.
+    #[test]
+    fn uninstall_removes_its_prompt_hook_and_keeps_the_persons() {
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let theirs = json!({
+            "hooks": [{"type": "command", "command": "/opt/notes/log-prompt"}]
+        });
+        std::fs::write(
+            &settings,
+            serde_json::to_string(&json!({"hooks": {"UserPromptSubmit": [theirs.clone()]}}))
+                .unwrap(),
+        )
+        .unwrap();
+        install_hook(
+            home.path(),
+            "claude-code",
+            None,
+            Path::new("/opt/innerwarden"),
+            false,
+            false,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let prompts = v["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(prompts.len(), 2, "{v}");
+        assert_eq!(prompts[0], theirs);
+        assert_eq!(
+            prompts[1]["hooks"][0]["command"],
+            json!(prompt_hook_command(
+                Path::new("/opt/innerwarden"),
+                false,
+                false,
+                Some("claude-code")
+            ))
+        );
+
+        uninstall_hook(home.path(), "claude-code", None).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["hooks"]["UserPromptSubmit"], json!([theirs]));
+    }
+
+    /// Background setup after an upgrade never starts keeping prompts on its
+    /// own: it adds no prompt hook to wiring that has none, and re-points one
+    /// that is there to the binary it wires.
+    #[test]
+    fn background_setup_keeps_a_prompt_hook_and_adds_none() {
+        let home = tempfile::TempDir::new().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = Path::new("/opt/old/innerwarden");
+        let new = Path::new("/opt/new/innerwarden");
+        let bash = hook_command_for(old, false, false, Some("claude-code"));
+        let without = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": bash}]}
+        ]}});
+        fs::write(&path, serde_json::to_string_pretty(&without).unwrap()).unwrap();
+        install_hook_no_symlinks(home.path(), "claude-code", None, new, false, false).unwrap();
+        let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            v["hooks"].get(crate::user_prompt::PROMPT_EVENT).is_none(),
+            "{v}"
+        );
+
+        let mut with = without.clone();
+        with["hooks"][crate::user_prompt::PROMPT_EVENT] = json!([{"hooks": [
+            {"type": "command", "command": prompt_hook_command(old, false, false, Some("claude-code"))}
+        ]}]);
+        fs::write(&path, serde_json::to_string_pretty(&with).unwrap()).unwrap();
+        install_hook_no_symlinks(home.path(), "claude-code", None, new, false, false).unwrap();
+        let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"][crate::user_prompt::PROMPT_EVENT][0]["hooks"][0]["command"],
+            json!(prompt_hook_command(new, false, false, Some("claude-code"))),
+            "{v}"
+        );
+    }
+
+    /// A reinstall replaces the prompt line in place and keeps the timeout
+    /// the person set on it.
+    #[test]
+    fn the_prompt_hook_merge_replaces_ours_and_keeps_its_timeout() {
+        let old = json!({"hooks": {"UserPromptSubmit": [
+            {"hooks": [{"type": "command", "command": "\"/old/innerwarden\" hook --monitor", "timeout": 7}]}
+        ]}});
+        let new = merge_userpromptsubmit_hook(old, "\"/new/innerwarden\" hook --monitor");
+        let entries = new["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{new}");
+        assert_eq!(
+            entries[0]["hooks"][0]["command"],
+            "\"/new/innerwarden\" hook --monitor"
+        );
+        assert_eq!(entries[0]["hooks"][0]["timeout"], 7);
+        let again = merge_userpromptsubmit_hook(new.clone(), "\"/new/innerwarden\" hook --monitor");
+        assert_eq!(again, new);
     }
 
     /// Uninstall takes out the PostToolUse hook it installed and nothing else
@@ -3903,8 +4103,9 @@ mod tests {
         )
         .unwrap();
 
+        // Our four tool lines and our prompt line.
         let (_, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
-        assert_eq!(removed, 4);
+        assert_eq!(removed, 5);
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v["hooks"]["PostToolUse"], json!([theirs]));
         assert_eq!(v["hooks"]["PreToolUse"], json!([]));
@@ -4388,7 +4589,8 @@ mod tests {
         assert!(!needs_iwguard_hook_reconciliation(&v, bin, false, false));
         assert_eq!(effective_iwguard_hook_programs(&v), vec![GUARD.to_string()]);
         let (_, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
-        assert_eq!(removed, 4, "uninstall finds the fail-closed lines");
+        // Four tool lines and the prompt line, which is never fail-closed.
+        assert_eq!(removed, 5, "uninstall finds the fail-closed lines");
 
         let monitor = hook_command_for(bin, false, true, Some("claude-code"));
         let watched = merge_pretooluse_read_hook(
