@@ -328,9 +328,8 @@ fn build_guard_lines() -> Vec<GuardLine> {
             }
             // The layouts older CLIs wrote ([`WRAPPER_LAYOUTS`]), in each mode,
             // their options in any order and as `--mode=guard` too (the
-            // proxy reads both): around the first server and after the
-            // first program, which stand for the rest, the options being
-            // the guard's part.
+            // proxy reads both), after every program and around every
+            // server, the options being the guard's part.
             for (layout, agent, mode) in WRAPPER_LAYOUTS.iter().flat_map(|layout| {
                 agents.iter().flat_map(move |agent| {
                     ["guard", "advisory"]
@@ -342,11 +341,7 @@ fn build_guard_lines() -> Vec<GuardLine> {
                     .iter()
                     .map(|word| word.replace("{mode}", mode).replace("{agent}", agent))
                     .collect();
-                let spellings = if index == 0 && program == programs[0] {
-                    option_spellings(&options)
-                } else {
-                    vec![options]
-                };
+                let spellings = option_spellings(&options);
                 for options in spellings {
                     let mut words: Vec<String> = vec![program.to_owned(), "proxy".into()];
                     words.extend(options);
@@ -853,19 +848,93 @@ fn listed_reach(command: &Command) -> PkillReach {
 }
 
 /// Whether `command` runs `kill` on what it is handed: `kill` itself, or
-/// `xargs` starting it, behind any launcher the shell reads.
+/// `xargs` starting it, behind any launcher the shell reads, or a shell
+/// `xargs` starts whose `-c` script runs one (`xargs -I{} sh -c 'kill
+/// {}'`, `xargs sh -c 'kill "$@"' _`): the script is read as a line.
 fn runs_kill(command: &Command) -> bool {
+    runs_kill_at(command, 0)
+}
+
+fn runs_kill_at(command: &Command, depth: u8) -> bool {
     let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
     let Some(at) = effective_command_index(&words) else {
         return false;
     };
     match program_name(&words[at]).as_str() {
         "kill" => true,
-        "xargs" => words[at + 1..]
-            .iter()
-            .any(|word| program_name(word) == "kill"),
+        "xargs" => {
+            let launched = &words[at + 1..];
+            launched.iter().any(|word| program_name(word) == "kill")
+                || (depth < NESTED_DEPTH
+                    && shell_script(launched).is_some_and(|script| {
+                        let line = read_line(script);
+                        line.commands
+                            .iter()
+                            .any(|inner| runs_kill_at(inner, depth + 1))
+                            || line.nested.iter().any(|nested| {
+                                read_line(nested)
+                                    .commands
+                                    .iter()
+                                    .any(|inner| runs_kill_at(inner, depth + 1))
+                            })
+                    }))
+        }
         _ => false,
     }
+}
+
+/// The shells a line hands a `-c` script to.
+const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "busybox"];
+
+/// The `-c` script of the first shell among `words` (the words `xargs`
+/// is given): the word after an option that holds `c` (`-c`, `-ec`,
+/// `-xc`).
+fn shell_script(words: &[String]) -> Option<&str> {
+    let start = words
+        .iter()
+        .position(|word| SCRIPT_SHELLS.contains(&program_name(word).as_str()))?;
+    let mut rest = words[start + 1..].iter();
+    while let Some(word) = rest.next() {
+        if word == "sh" && program_name(&words[start]) == "busybox" {
+            continue;
+        }
+        if !word.starts_with('-') || word.starts_with("--") {
+            return None;
+        }
+        if word[1..].contains('c') {
+            return rest.next().map(String::as_str);
+        }
+    }
+    None
+}
+
+/// Whether `text` (what a substitution in a `kill`'s words runs) is one
+/// `pgrep` or `pidof`, its words written out, that finds no process of
+/// the guard ([`PkillReach::Misses`]) and names no other security control:
+/// the ids it prints are another program's (`kill $(pgrep -f vite)`).
+pub(crate) fn lists_only_other_processes(text: &str) -> bool {
+    let line = read_line(text);
+    let [command] = line.commands.as_slice() else {
+        return false;
+    };
+    if !line.nested.is_empty() {
+        return false;
+    }
+    let Some(words) = plain_words(command) else {
+        return false;
+    };
+    let Some(at) = launched_command_index(&words) else {
+        return false;
+    };
+    if !matches!(program_name(&words[at]).as_str(), "pgrep" | "pidof") {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    listed_reach(command) == PkillReach::Misses
+        && !lower.contains(GUARD_NAME)
+        && !PROTECTED_TARGETS
+            .iter()
+            .any(|target| lower.contains(target))
 }
 
 /// What a `pgrep` or `pidof` that finds the guard's processes
@@ -1537,6 +1606,31 @@ mod tests {
                     .collect();
                 assert_eq!(args[0], "proxy", "{args:?}");
                 assert_eq!(args[1..separator], expected[..], "{agent}: {args:?}");
+            }
+        }
+    }
+
+    /// The glued and reordered spellings of every layout are lines of the
+    /// guard after every program and around every server, not only the
+    /// first of each.
+    #[test]
+    fn every_spelling_is_built_for_every_program_and_server() {
+        let texts: Vec<&str> = guard_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        for program in guard_programs() {
+            for server in SERVER_LINES {
+                let server = server.join(" ");
+                for options in [
+                    "--mode=guard",
+                    "--mode=advisory",
+                    "--mode guard --label claude-code",
+                    "--mode=guard --agent=claude-code --label=claude-code",
+                ] {
+                    let line = format!("{program} proxy {options} -- {server}");
+                    assert!(texts.contains(&line.as_str()), "{line}");
+                }
             }
         }
     }
