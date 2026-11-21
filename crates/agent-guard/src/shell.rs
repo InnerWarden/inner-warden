@@ -14513,6 +14513,41 @@ fn shell_word(word: &str) -> String {
 /// Remove one syntactic shell quote pair without trimming quote characters that
 /// belong to the embedded language (for example Ruby's `puts "..."`).
 fn shell_literal_word(word: &str) -> String {
+    shell_literal_word_read(word)
+}
+
+thread_local! {
+    /// Set while a line is judged with a single-quoted word that closes and
+    /// reopens its quote (`'\''`) read as it was before that reading
+    /// ([`with_quotes_as_before`]): its outer quotes taken off only.
+    static QUOTES_AS_BEFORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clears [`QUOTES_AS_BEFORE`] when the reading ends, unwinding too.
+struct QuotesAsBefore(bool);
+
+impl Drop for QuotesAsBefore {
+    fn drop(&mut self) {
+        let before = self.0;
+        QUOTES_AS_BEFORE.with(|flag| flag.set(before));
+    }
+}
+
+/// Runs `judge` with a single-quoted word that closes and reopens its quote
+/// read as before (outer quotes taken off only), and whether this is that
+/// reading already.
+pub(crate) fn with_quotes_as_before<T>(judge: impl FnOnce() -> T) -> T {
+    let before = QUOTES_AS_BEFORE.with(|flag| flag.replace(true));
+    let _restore = QuotesAsBefore(before);
+    judge()
+}
+
+/// Whether a line is being judged with the quotes read as before.
+pub(crate) fn reading_quotes_as_before() -> bool {
+    QUOTES_AS_BEFORE.with(std::cell::Cell::get)
+}
+
+fn shell_literal_word_read(word: &str) -> String {
     let trimmed = word.trim();
     // The word as the shell hands it on, when it is one word: quotes and
     // escapes taken out wherever they stand, so `'a '\''b'` is `a 'b`, as
@@ -14522,7 +14557,10 @@ fn shell_literal_word(word: &str) -> String {
     // Only a single-quoted word that closes and reopens its quote to put
     // one in (`'\''`, `'"'"'`): a double-quoted word keeps its escapes,
     // which may belong to the embedded language.
-    if trimmed.starts_with('\'') && (trimmed.contains("'\\''") || trimmed.contains("'\"'\"'")) {
+    if !QUOTES_AS_BEFORE.with(std::cell::Cell::get)
+        && trimmed.starts_with('\'')
+        && (trimmed.contains("'\\''") || trimmed.contains("'\"'\"'"))
+    {
         let line = crate::shell_words::read_line(trimmed);
         if let [command] = line.commands.as_slice() {
             if let [only] = command.words.as_slice() {

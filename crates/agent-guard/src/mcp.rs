@@ -4070,7 +4070,50 @@ fn analyze_command_as_sent(
 
 /// [`analyze_command_at`] past the `innerwarden check` and `$'...'`
 /// readings: a sole literal handed to `eval` or a shell, else the line.
+///
+/// A line with a single-quoted word that closes and reopens its quote
+/// (`'\''`, `'"'"'`) is judged twice: with that word read as the shell
+/// hands it on, and as it was read before (outer quotes taken off only).
+/// The stronger verdict stands: reading the quote right only adds what the
+/// line hid, it never takes away a stop the earlier reading gave (measured
+/// 2026-11-21: `bash -c 'echo '\''id'\'' > x.sh && sed -i ... && sh x.sh'`
+/// went from a stopped review to a review that does not stop).
 fn analyze_command_unwrapped(
+    command: &str,
+    rule_engine: Option<&RuleEngine>,
+    protected_reads: &[String],
+    context: Option<&WorkingContext>,
+    depth: u8,
+) -> CommandAnalysis {
+    let read =
+        analyze_command_unwrapped_once(command, rule_engine, protected_reads, context, depth);
+    if crate::shell::reading_quotes_as_before()
+        || !(command.contains("'\\''") || command.contains("'\"'\"'"))
+    {
+        return read;
+    }
+    let before = crate::shell::with_quotes_as_before(|| {
+        analyze_command_unwrapped_once(command, rule_engine, protected_reads, context, depth)
+    });
+    if verdict_strength(&before) > verdict_strength(&read) {
+        before
+    } else {
+        read
+    }
+}
+
+/// How strongly an analysis holds a line: its verdict, then whether it
+/// stops an agent ([`blocks_for_agent`]), then its score.
+fn verdict_strength(analysis: &CommandAnalysis) -> (u8, bool, u32) {
+    let rank = match analysis.recommendation.as_str() {
+        "deny" => 2,
+        "review" => 1,
+        _ => 0,
+    };
+    (rank, blocks_for_agent(analysis), analysis.risk_score)
+}
+
+fn analyze_command_unwrapped_once(
     command: &str,
     rule_engine: Option<&RuleEngine>,
     protected_reads: &[String],
