@@ -80,6 +80,13 @@
 //!   and email x@y`): a person writes these to a person in the same words.
 //!   A text from a person to a person (a greeting or a sign-off that names
 //!   one) never makes a soft order speak to the assistant.
+//! * An order quoted and named an example or an attack outside the quotes
+//!   (`For example, an invite could contain: "..."`, `the payload was
+//!   '...'`, "a comment such as ..."): an article that quotes an
+//!   injection mentions it. A text that dresses its order so is not read.
+//! * An order in a procedure written for a person (an install guide with
+//!   an install heading or command, an onboarding checklist), unless it
+//!   calls the assistant: its steps are the person's.
 //! * An obligation of the reader with no other class (`Notes: you must also
 //!   email X to Y`), as a FAQ writes it.
 //! * An order written as code, data or a URL, or split across more
@@ -1812,14 +1819,11 @@ const NOT_ROLE_BEFORE: &[&str] = &[
 /// told by the text (`your task has changed`, `el usuario quiere que`).
 const TASK_CUES: &[&str] = &[
     "your task has changed",
-    "your task is now",
-    "your new task is",
     "your only task",
     "your only job",
     "your real task",
     "your actual task",
     "your real job",
-    "your new job is",
     "change of task",
     "the real goal of this session",
     "the real goal of this conversation",
@@ -1831,10 +1835,6 @@ const TASK_CUES: &[&str] = &[
     "the user wants you to",
     "the person you work for wants",
     "your first move is",
-    "your first step is",
-    "your next step is",
-    "your first task is",
-    "your next task is",
     "correction from the user",
     "update from the user",
     "message from the user",
@@ -1850,16 +1850,12 @@ const TASK_CUES: &[&str] = &[
     "correccion del usuario",
     "actualizacion del usuario",
     "pida lo que pida el usuario",
-    "sua nova tarefa e",
-    "sua tarefa agora e",
     "sua unica tarefa",
     "o objetivo agora e",
     "seu objetivo agora e",
     "o usuario pediu que voce",
     "o usuario quer que voce",
     "o usuario agora quer",
-    "tu nueva tarea es",
-    "tu tarea ahora es",
     "tu unica tarea",
     "el objetivo ahora es",
     "el usuario quiere que",
@@ -2017,6 +2013,17 @@ const MORE_TASK_WORDS: &[&str] = &[
     "summary",
     "resumo",
     "resumen",
+];
+
+/// Going on, a task word only with the user's task named.
+const GO_ON: &[&str] = &[
+    "continue",
+    "continuing",
+    "proceed",
+    "proceeding",
+    "continuar",
+    "prosseguir",
+    "seguir",
 ];
 
 /// Words that may stand between `before` and the task (`before any
@@ -2366,6 +2373,17 @@ fn strong_precedence(words: &[&str], spaced: &str, parts: &[(&str, Option<char>)
             if !task_word(verb) && !on {
                 return false;
             }
+            // "before you continue, back up your files" is a step for a
+            // person; going on is the assistant's only with the user's task.
+            if on || GO_ON.contains(verb) {
+                return words[j + 1..].iter().take(5).any(|w| {
+                    USER_WORDS.contains(w)
+                        || matches!(
+                            *w,
+                            "task" | "tarefa" | "tarea" | "request" | "pedido" | "solicitud"
+                        )
+                });
+            }
             // `before answering the survey`, `before you reply to this survey`:
             // the reply is to something else than the user. Summarizing,
             // translating or going on is the assistant's task whatever its object.
@@ -2586,6 +2604,135 @@ fn to_a_person(text: &str) -> bool {
         .captures_iter(text)
         .chain(sign_off.captures_iter(text))
         .any(|c| c.get(1).is_some_and(|m| named(m.as_str())))
+}
+
+static INSTALL_HEADING: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static INSTALL_COMMAND: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static CHECKLIST_ITEM: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+static QUOTED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
+/// Whether the text is a procedure written for a person to follow: an
+/// install guide (an install heading, or an install command such as
+/// "curl ... | sh", "pip install") or a checklist of a new person's tasks
+/// (two items or more and a word of onboarding).
+fn a_procedure_for_a_person(text: &str) -> bool {
+    let heading = regex(
+        &INSTALL_HEADING,
+        r"(?im)^\s*#{1,6}\s*(?:install|installation|installing|setup|set up|getting started|quick ?start|requirements|prerequisites|upgrading|configure|configuration|instala[cç][aã]o|instalaci[oó]n|requisitos|configura[cç][aã]o|configuraci[oó]n|primeiros passos|primeros pasos|passo a passo)\b",
+    );
+    let command = regex(
+        &INSTALL_COMMAND,
+        r"(?i)(?:curl|wget)\s[^\n|]*\|\s*(?:sudo\s+)?(?:ba|z)?sh\b|\b(?:pip3?|npm|pnpm|yarn|brew|apt(?:-get)?|dnf|yum|cargo|go|gem|choco|winget)\s+(?:install|add)\b|\bdpkg\s+-i\b|\bdocker\s+(?:pull|run)\b",
+    );
+    if heading.is_match(text) || command.is_match(text) {
+        return true;
+    }
+    let items = regex(&CHECKLIST_ITEM, r"(?m)^\s*(?:[-*•]\s|\[[ xX]?\]|\d+[.)]\s)")
+        .find_iter(text)
+        .count();
+    let folded: String = text.chars().map(fold_char).collect();
+    let words = words_of(&folded);
+    let spaced = format!(" {} ", words.join(" "));
+    items >= 2
+        && [
+            "checklist",
+            "onboarding",
+            "new hire",
+            "week 1",
+            "day 1",
+            "first day",
+            "first week",
+            "welcome",
+            "integracao",
+            "primeira semana",
+            "primeiro dia",
+            "bem vindo",
+            "incorporacion",
+            "primera semana",
+            "primer dia",
+            "bienvenido",
+            "tasks",
+            "tarefas",
+            "tareas",
+        ]
+        .iter()
+        .any(|w| spaced.contains(&format!(" {w} ")))
+}
+
+/// Words that name a quoted text as an example or as an attack, said
+/// outside the quotes ("For example, an invite could contain: ...", "the
+/// payload was: ...").
+const MENTION_WORDS: &[&str] = &[
+    "example",
+    "examples",
+    "eg",
+    "instance",
+    "quoted",
+    "quote",
+    "payload",
+    "payloads",
+    "injection",
+    "injections",
+    "injected",
+    "inject",
+    "attacker",
+    "attackers",
+    "malicious",
+    "attack",
+    "trick",
+    "exemplo",
+    "exemplos",
+    "citacao",
+    "injecao",
+    "injecoes",
+    "atacante",
+    "malicioso",
+    "maliciosa",
+    "ataque",
+    "ejemplo",
+    "ejemplos",
+    "cita",
+    "inyeccion",
+    "inyecciones",
+    "inyectado",
+];
+
+/// Words right before a quote that introduce it as a mention.
+const QUOTE_INTRODUCERS: &[&str] = &[
+    "like", "read", "reads", "says", "said", "called", "como", "diz", "dizia", "dice", "decia",
+    "chamado", "llamado",
+];
+
+/// The text with its quoted parts blanked where the text outside the
+/// quotes names them an example or an attack: an article that quotes an
+/// injection mentions it and does not give it. Quotes are double quotes,
+/// curly quotes, single quotes between spaces or marks, backticks and lines
+/// that start with '>'. None when nothing is quoted or nothing names it.
+fn without_quoted_examples(text: &str) -> Option<String> {
+    let quoted = regex(
+        &QUOTED,
+        r#"(?m)"[^"\n]{6,}"|“[^”\n]{6,}”|(?:^|[\s(:])'[^'\n]{6,}'(?:[\s.,;:)!?]|$)|\x60[^\x60\n]{6,}\x60|^\s*>[^\n]*$"#,
+    );
+    if !quoted.is_match(text) {
+        return None;
+    }
+    let outside = quoted.replace_all(text, " ");
+    let folded: String = outside.chars().map(fold_char).collect();
+    let words = words_of(&folded);
+    // Or a quote introduced as one: "a comment such as ...", "un comentario
+    // como ...", "the text read ...".
+    let introduced = quoted.find_iter(text).any(|m| {
+        let before: String = text[..m.start()].chars().map(fold_char).collect();
+        let last: Vec<&str> = words_of(&before).into_iter().rev().take(2).collect();
+        last.first().is_some_and(|w| QUOTE_INTRODUCERS.contains(w))
+            || (last.len() == 2 && last[1] == "such" && last[0] == "as")
+    });
+    if !introduced && !words.iter().any(|w| MENTION_WORDS.contains(w)) {
+        return None;
+    }
+    // Each quote becomes one mark, so the sentences around it keep their
+    // shape.
+    Some(quoted.replace_all(text, " \u{2026} ").into_owned())
 }
 
 /// `sentence` without a leading data key (`"note": "`, `description:`), so
@@ -2872,6 +3019,7 @@ pub(crate) fn explain(text: &str) -> Vec<(String, u32)> {
 fn structure_of(text: &str, hidden: bool) -> Option<Found> {
     let frames = frame_tags(text);
     let person = to_a_person(text);
+    let procedure = a_procedure_for_a_person(text);
     let all = sentences(text);
     let masks: Vec<u32> = all.iter().map(|s| marks_of(s, &frames)).collect();
     let mut marked = vec![false; all.len()];
@@ -2917,6 +3065,12 @@ fn structure_of(text: &str, hidden: bool) -> Option<Found> {
             && !person;
         let hidden_order =
             hidden && acts && mask & bit(ADDRESSED | PRECEDENCE | AUTHORITY | FRAMING) != 0;
+        // A procedure for a person (an install guide, an onboarding
+        // checklist) orders that person: only the assistant called is an
+        // order to it.
+        if procedure && !called_to_act {
+            continue;
+        }
         if called_to_act
             || enough
             || set_aside_to_act
@@ -2954,6 +3108,8 @@ pub(crate) fn injection_structure(text: &str) -> Option<Found> {
         end -= 1;
     }
     let text = &text[..end];
+    let quoted = without_quoted_examples(text);
+    let text = quoted.as_deref().unwrap_or(text);
     let plain = structure_of(text, false);
     let canon = super::canon::canonical(text);
     let spelled = if canon.as_ref() == text {
