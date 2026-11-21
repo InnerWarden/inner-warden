@@ -727,6 +727,126 @@ pub struct Facts {
     /// Where this account's decisions are recorded and whether InnerWarden
     /// Pro reads them there. `None` when nothing names a record.
     pub record_place: Option<RecordPlace>,
+    /// Settings files of the project in the folder `status` runs in that
+    /// switch an agent's hooks off there, or run hooks of their own.
+    pub project_settings: Vec<ProjectSettings>,
+}
+
+/// A project's own agent settings file, and what it does to the hooks of
+/// the agent that reads it ([`project_settings_effect`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSettings {
+    /// The agent that reads the file.
+    pub agent: &'static str,
+    /// The file, as `status` shows it (relative to the project).
+    pub file: String,
+    pub effect: ProjectEffect,
+}
+
+/// What a project's settings file does to its agent's hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectEffect {
+    /// Every hook that is not managed is off, the guard's included; the
+    /// words say which key does it.
+    HooksOff(&'static str),
+    /// Hooks of the project's own, which the agent runs beside the guard's.
+    OwnHooks,
+}
+
+/// The project files an agent reads its hooks from, relative to the
+/// project, with the agent that reads each.
+pub const PROJECT_SETTINGS_FILES: &[(&str, &str)] = &[
+    ("claude-code", ".claude/settings.json"),
+    ("claude-code", ".claude/settings.local.json"),
+    ("gemini", ".gemini/settings.json"),
+    ("cursor", ".cursor/hooks.json"),
+];
+
+/// What a project's settings file does to its agent's hooks, read from its
+/// parsed text; `None` when it leaves them as they are.
+///
+/// * Claude Code (2.1.330): `disableAllHooks` set in the project's
+///   `settings.json` or `settings.local.json` switches off, in that folder,
+///   every hook that does not come from managed settings, the one in
+///   `~/.claude/settings.json` included. `hooks` there are added to the
+///   person's and run beside them.
+/// * Gemini CLI: `hooksConfig.enabled: false` switches hooks off; a name in
+///   `hooksConfig.disabled` that is the guard's switches its hook off.
+/// * Cursor: a project `hooks.json` adds hooks beside the person's.
+pub fn project_settings_effect(file: &str, settings: &serde_json::Value) -> Option<ProjectEffect> {
+    use serde_json::Value;
+    let on = |value: &Value| {
+        !matches!(value, Value::Null | Value::Bool(false)) && value.as_str() != Some("false")
+    };
+    let has_hooks = |hooks: Option<&Value>| {
+        hooks.and_then(Value::as_object).is_some_and(|events| {
+            events
+                .values()
+                .any(|entries| entries.as_array().is_some_and(|list| !list.is_empty()))
+        })
+    };
+    if file.starts_with(".claude/") {
+        if settings.get("disableAllHooks").is_some_and(on) {
+            return Some(ProjectEffect::HooksOff("sets \"disableAllHooks\""));
+        }
+        return has_hooks(settings.get("hooks")).then_some(ProjectEffect::OwnHooks);
+    }
+    if file.starts_with(".gemini/") {
+        let config = settings.get("hooksConfig");
+        if config
+            .and_then(|config| config.get("enabled"))
+            .and_then(Value::as_bool)
+            == Some(false)
+        {
+            return Some(ProjectEffect::HooksOff(
+                "sets \"hooksConfig.enabled\" to false",
+            ));
+        }
+        let names_guard = config
+            .and_then(|config| config.get("disabled"))
+            .and_then(Value::as_array)
+            .is_some_and(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|name| name.to_ascii_lowercase().contains("innerwarden"))
+            });
+        if names_guard {
+            return Some(ProjectEffect::HooksOff(
+                "lists the guard's hook under \"hooksConfig.disabled\"",
+            ));
+        }
+        return has_hooks(settings.get("hooks")).then_some(ProjectEffect::OwnHooks);
+    }
+    has_hooks(settings.get("hooks")).then_some(ProjectEffect::OwnHooks)
+}
+
+/// The line `status` prints for a project settings file.
+pub fn project_settings_finding(project: &ProjectSettings) -> Finding {
+    match project.effect {
+        ProjectEffect::HooksOff(how) => Finding::NotWorking {
+            what: format!(
+                "This project's {} {how}: {} started in this folder runs without the \
+                 guard's hook, so nothing it does here is screened.",
+                project.file, project.agent
+            ),
+            next: format!(
+                "remove it from {} yourself (an agent's change to that file is refused), \
+                 then start {} again",
+                project.file, project.agent
+            ),
+        },
+        ProjectEffect::OwnHooks => Finding::Unknown {
+            what: format!(
+                "This project's {} adds hooks of its own, which {} runs beside the \
+                 guard's on every call in this folder.",
+                project.file, project.agent
+            ),
+            why: "They are not the guard's and it does not judge them: read what they run \
+                  before you start an agent here."
+                .into(),
+        },
+    }
 }
 
 /// Where this account records, as `status` says it.
@@ -988,6 +1108,9 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     // Printed with no wired agent too: a hook that is in the file of an agent
     // with no MCP servers, and is not on, is the only line that agent gets.
     out.extend(facts.tool_classes.iter().map(tool_classes_finding));
+    // A project's own settings can switch the hook above off in its folder:
+    // the person's wiring reads as on while the agent there runs unscreened.
+    out.extend(facts.project_settings.iter().map(project_settings_finding));
     if facts.wired_agents.is_empty()
         && facts.hook_trouble.is_empty()
         && facts.tool_classes.is_empty()
@@ -1267,6 +1390,103 @@ mod tests {
         assert_eq!(
             headline(&findings),
             "InnerWarden is installed and waiting to be set up."
+        );
+    }
+
+    /// A project's settings that switch the hook off are a fault, with the
+    /// file and the key named; its own hooks are named as unjudged; a file
+    /// that only allows is silent.
+    ///
+    /// FAILS ON REVERT: drop the `project_settings` line from `assess` and
+    /// neither line is printed.
+    #[test]
+    fn a_project_that_switches_the_hook_off_is_named() {
+        use serde_json::json;
+        let effect =
+            |file: &str, settings: serde_json::Value| project_settings_effect(file, &settings);
+        for file in [".claude/settings.json", ".claude/settings.local.json"] {
+            assert!(matches!(
+                effect(file, json!({"disableAllHooks": true})),
+                Some(ProjectEffect::HooksOff(_))
+            ));
+            assert!(matches!(
+                effect(file, json!({"disableAllHooks": "yes"})),
+                Some(ProjectEffect::HooksOff(_))
+            ));
+            assert_eq!(effect(file, json!({"disableAllHooks": false})), None);
+            assert_eq!(
+                effect(
+                    file,
+                    json!({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": []}]}})
+                ),
+                Some(ProjectEffect::OwnHooks)
+            );
+            assert_eq!(effect(file, json!({"hooks": {}})), None);
+            assert_eq!(
+                effect(file, json!({"permissions": {"allow": ["Bash(npm test)"]}})),
+                None
+            );
+        }
+        assert!(matches!(
+            effect(
+                ".gemini/settings.json",
+                json!({"hooksConfig": {"enabled": false}})
+            ),
+            Some(ProjectEffect::HooksOff(_))
+        ));
+        assert!(matches!(
+            effect(
+                ".gemini/settings.json",
+                json!({"hooksConfig": {"disabled": ["innerwarden-guard"]}})
+            ),
+            Some(ProjectEffect::HooksOff(_))
+        ));
+        assert_eq!(
+            effect(
+                ".gemini/settings.json",
+                json!({"hooksConfig": {"disabled": ["lint"]}})
+            ),
+            None
+        );
+        assert_eq!(
+            effect(
+                ".cursor/hooks.json",
+                json!({"version": 1, "hooks": {"beforeShellExecution": [{"command": "./x.sh"}]}})
+            ),
+            Some(ProjectEffect::OwnHooks)
+        );
+
+        let mut facts = healthy();
+        facts.project_settings = vec![
+            ProjectSettings {
+                agent: "claude-code",
+                file: ".claude/settings.local.json".into(),
+                effect: ProjectEffect::HooksOff("sets \"disableAllHooks\""),
+            },
+            ProjectSettings {
+                agent: "cursor",
+                file: ".cursor/hooks.json".into(),
+                effect: ProjectEffect::OwnHooks,
+            },
+        ];
+        let report = render(&facts);
+        assert!(
+            report.contains(
+                "[off]     This project's .claude/settings.local.json sets \"disableAllHooks\""
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("remove it from .claude/settings.local.json yourself"),
+            "{report}"
+        );
+        assert!(
+            report.contains("This project's .cursor/hooks.json adds hooks of its own"),
+            "{report}"
+        );
+        assert!(
+            report.contains("NOT fully protecting this machine"),
+            "{report}"
         );
     }
 
@@ -2012,6 +2232,7 @@ mod tests {
             record_kept_apart: None,
             kept_apart_before: None,
             record_place: None,
+            project_settings: vec![],
         }
     }
 
@@ -2420,6 +2641,7 @@ mod tests {
             record_kept_apart: None,
             kept_apart_before: None,
             record_place: None,
+            project_settings: vec![],
         };
         for finding in assess(&facts) {
             assert!(

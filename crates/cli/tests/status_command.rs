@@ -466,3 +466,64 @@ fn status_names_the_read_tools_a_hook_wired_before_them_leaves_out() {
     );
     assert!(!after.contains("but its read tools"), "{after}");
 }
+
+/// A project whose own settings switch Claude Code's hooks off is named by
+/// `status` run in that folder: the person's wiring in the home reads as on
+/// while Claude Code there runs without it (2.1.330 takes `disableAllHooks`
+/// from `.claude/settings.local.json` and `.claude/settings.json`).
+///
+/// FAILS ON REVERT: drop `project_settings_in` from the status facts and the
+/// report says the install is on and screening.
+#[test]
+fn status_names_a_project_that_switches_the_hook_off() {
+    let home = tempfile::TempDir::new().expect("temp home");
+    let installed = run(home.path(), &["install", "claude-code"]);
+    assert!(
+        home.path().join(".claude/settings.json").exists(),
+        "the hook must be wired for this test to mean anything: {installed}"
+    );
+    let project = home.path().join("proj");
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    let status_in = |dir: &Path| {
+        let out = cli(home.path())
+            .arg("status")
+            .current_dir(dir)
+            .output()
+            .expect("run innerwarden status");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    std::fs::write(
+        project.join(".claude/settings.local.json"),
+        r#"{"permissions":{"allow":["Bash(npm test)"]}}"#,
+    )
+    .unwrap();
+    let allowing = status_in(&project);
+    assert!(!allowing.contains("This project's"), "{allowing}");
+
+    std::fs::write(
+        project.join(".claude/settings.local.json"),
+        r#"{"disableAllHooks": true, "permissions":{"allow":["Bash(npm test)"]}}"#,
+    )
+    .unwrap();
+    let off = status_in(&project);
+    assert!(
+        off.contains("This project's .claude/settings.local.json sets \"disableAllHooks\""),
+        "{off}"
+    );
+    assert!(off.contains("NOT fully protecting this machine"), "{off}");
+    // The same home, read from another folder, is not told about this one.
+    let elsewhere = status_in(home.path());
+    assert!(!elsewhere.contains("This project's"), "{elsewhere}");
+
+    std::fs::write(
+        project.join(".claude/settings.json"),
+        r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"./check.sh"}]}]}}"#,
+    )
+    .unwrap();
+    let own = status_in(&project);
+    assert!(
+        own.contains("This project's .claude/settings.json adds hooks of its own"),
+        "{own}"
+    );
+}

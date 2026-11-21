@@ -15,6 +15,18 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Security
 
+- **A project's Cursor hooks are held as its other agent settings are.** An
+  agent's write to a project's `.cursor/hooks.json`, by the shell or by a
+  file tool, is refused, as a write to a project's `.claude/settings.json`,
+  `.claude/settings.local.json`, `.gemini/settings.json` and
+  `.codex/config.toml` already was: a project's own settings can switch the
+  guard's hook off in that folder.
+- **`status` names a project that switches the hook off.** Run in a project
+  whose `.claude/settings.json` or `.claude/settings.local.json` sets
+  `disableAllHooks`, or whose `.gemini/settings.json` switches hooks off,
+  `status` says that the agent started there runs without the guard's hook,
+  and that you remove the key. A project file that adds hooks of its own is
+  named as hooks the guard does not judge.
 - **A review asks you instead of passing unseen.** In enforce mode the hook
   used to refuse a `deny` and let a `review` run without a word (`chmod 777`
   on a folder, for one). It now hands a review to the person: Claude Code
