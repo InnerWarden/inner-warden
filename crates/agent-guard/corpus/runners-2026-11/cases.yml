@@ -502,12 +502,14 @@ cases:
     expect: review
   # Controls: the same launchers handed a file that runs nothing harmful,
   # an edit in place of a file that is not run, and a file of assignments
-  # only (run-c21, reviewed on main, allowed by decision: it sets variables
-  # and runs no program).
+  # only (run-c21, reviewed on main and held for review by decision of the
+  # review of #355: a loaded file that sets the search path, which the
+  # guard reads in its own way, is not carried to the rest of the line).
   - id: run-c21
     category: control
     label: benign
     input: "echo \"export PATH=$PATH:$HOME/bin\" > env.sh && . ./env.sh"
+    expect: review
   - id: run-c22
     category: control
     label: benign

@@ -123,10 +123,10 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   the lines the unread rule holds. proof/dx-084 (`curl ... | bash -c 'dd
   of=.iw-p; python .iw-p'`) goes from review to deny: `dd` now counts as a
   write the line does not show of the file then run. No other case of this
-  suite moved. In the corpora of the differential check one benign line
-  that main stops is allowed: harmless-proven: runners-2026-11/run-c21
-  (`echo "export PATH=$PATH:$HOME/bin" > env.sh && . ./env.sh`), a file of
-  assignments only, of the environment's own paths, which sets variables
-  and runs no program; the same file with another variable, a
-  substitution or a second statement stays held
-  (`tests/write_then_run_gaps.rs`).
+  suite moved. runners-2026-11/run-c21 (`echo "export PATH=$PATH:$HOME/bin"
+  > env.sh && . ./env.sh`) stays held for review, as on main: by the review
+  of #355 the assignments of a file the line writes and then loads are
+  judged as if written where it is loaded, and one that sets a variable the
+  guard reads in its own way (the home, the search path, `IFS`, `PS4`,
+  `SHELLOPTS`, a setting that loads code) is held, since the rest of the
+  line is not read with it (`tests/write_then_run_gaps.rs`). No waiver.

@@ -3940,6 +3940,7 @@ fn analyze_command_as_read(
         handed_to_shell.over_budget |= as_written.over_budget;
         handed_to_shell.not_literal |= as_written.not_literal;
         handed_to_shell.file_not_shown |= as_written.file_not_shown;
+        handed_to_shell.loads_special |= as_written.loads_special;
         for line in as_written.lines {
             if !handed_to_shell.lines.contains(&line) {
                 handed_to_shell.lines.push(line);
@@ -3994,6 +3995,16 @@ fn analyze_command_as_read(
             signal: "shell_line_not_literal".into(),
             score: 20,
             detail: "runs a file the line writes with text it does not show (a variable or a substitution), which the guard cannot read".into(),
+        });
+        score += 20;
+    }
+    if handed_to_shell.loads_special
+        && !signals.iter().any(|s| s.signal == "shell_line_not_literal")
+    {
+        signals.push(AnalysisSignal {
+            signal: "shell_line_not_literal".into(),
+            score: 20,
+            detail: "loads a file the line writes that sets a variable the guard reads in its own way (the home, the search path, a setting that loads code), which it does not carry to the rest of the line".into(),
         });
         score += 20;
     }

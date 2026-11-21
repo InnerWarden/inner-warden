@@ -62,6 +62,17 @@ const KNOWN_VARIABLES: &[&str] = &[
 /// name (`rm -rf "$PWD"` empties a folder no rule saw).
 const FOLDERS_BY_MEANING: &[&str] = &["PWD", "OLDPWD"];
 
+/// Whether the guard reads the variable `name` in its own way: one it
+/// knows without the line setting it (the home, the search path, the
+/// working folder), or a setting whose value decides what later programs
+/// load or run. A value given to such a name in a file the line loads is
+/// not carried to what the rest of the line does with it.
+pub(crate) fn read_specially(name: &str) -> bool {
+    KNOWN_VARIABLES.contains(&name)
+        || FOLDERS_BY_MEANING.contains(&name)
+        || is_loading_setting(name)
+}
+
 /// Settings whose value decides what later programs load or run.
 fn is_loading_setting(name: &str) -> bool {
     matches!(

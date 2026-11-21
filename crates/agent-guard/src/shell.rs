@@ -2980,6 +2980,11 @@ pub(crate) struct HandedLines {
     /// A file the line writes and then runs holds text the line prints
     /// without showing it (`echo "$X" > x.sh; sh x.sh`, `exec > x.sh`).
     pub(crate) file_not_shown: bool,
+    /// A file the line writes and then loads in this shell (`. ./env.sh`)
+    /// sets a variable the guard reads in its own way (the home, the search
+    /// path, a setting that loads code), which it does not carry to the rest
+    /// of the line.
+    pub(crate) loads_special: bool,
 }
 
 /// The most levels of `xargs` and `find -exec` a handed line is read
@@ -3258,7 +3263,12 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         if command_is_noexec_shell(effective) {
             continue;
         }
-        for (path, language) in files_a_command_runs(*command, effective, bytes) {
+        let runs = files_a_command_runs(*command, effective, bytes, &mut handed.over_budget);
+        let loads_here = matches!(
+            normalized_command_name(&effective[0]).as_str(),
+            "source" | "."
+        );
+        for (path, language) in runs {
             let writers = file_writer(*command, &path, bytes);
             if writers.is_empty() {
                 continue;
@@ -3275,6 +3285,21 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                     handed
                         .lines
                         .extend(runners::shell_lines(language, &text, &program));
+                    // A shell file loaded in this shell (`. ./env.sh`): what it
+                    // sets is judged as if written where it is loaded.
+                    if loads_here && matches!(language, runners::Language::Shell) {
+                        if names_set_by(&text)
+                            .iter()
+                            .any(|name| unread_parts::read_specially(name))
+                        {
+                            handed.loads_special = true;
+                        }
+                        handed.lines.push(loaded_in_place(
+                            bytes,
+                            *command,
+                            &format!("{{ {text}\n}}"),
+                        ));
+                    }
                     // Another write the line does not show (`cp`, `mv`, `dd`,
                     // `sed -i`, `truncate`, a program's output, a download)
                     // may leave the file holding other text than the shown one.
@@ -3290,6 +3315,28 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                 None if writers.contains(&Writer::Program) => handed.file_not_shown = true,
                 None if writers.contains(&Writer::Printer) => {
                     match assignments_written(*command, &path, bytes, &assignments) {
+                        // A variable the guard reads in its own way (the
+                        // home, the search path, a setting that loads code):
+                        // what a later program does with it is not carried.
+                        Some(lines)
+                            if loads_here
+                                && lines.iter().any(|line| {
+                                    unread_parts::read_specially(assigned_name(line))
+                                }) =>
+                        {
+                            handed.loads_special = true;
+                        }
+                        // A file loaded in this shell (`. ./env.sh`): its
+                        // assignments are judged as if written where it is
+                        // loaded, so what the rest of the line does with
+                        // them is read as the same line typed out is.
+                        Some(lines) if loads_here => {
+                            handed.lines.push(loaded_in_place(
+                                bytes,
+                                *command,
+                                &lines.join(" && "),
+                            ));
+                        }
                         Some(lines) => handed.lines.extend(lines),
                         None => handed.file_not_shown = true,
                     }
@@ -3310,13 +3357,19 @@ fn files_a_command_runs(
     command: tree_sitter::Node<'_>,
     effective: &[String],
     source: &[u8],
+    over_budget: &mut bool,
 ) -> Vec<(String, Option<runners::Language>)> {
     let mut found = files_named_by(effective, 0);
     found.extend(file_on_stdin(command, effective, source));
-    found.extend(files_xargs_runs(command, effective, source));
-    found.extend(files_find_runs(command, effective, source));
+    found.extend(files_xargs_runs(command, effective, source, over_budget));
+    found.extend(files_find_runs(command, effective, source, over_budget));
     found
 }
+
+/// The most words `xargs` hands on, or files `find -exec` is matched
+/// against, that the guard reads one by one; past it the line is read past
+/// its budget ([`HandedLines::over_budget`]).
+const HANDED_ITEMS_READ: usize = 64;
 
 /// The files the words `effective` run by name: a script operand, a
 /// program run by its path (`./x.sh`), a program of the table run by its
@@ -3477,6 +3530,7 @@ fn files_xargs_runs(
     command: tree_sitter::Node<'_>,
     effective: &[String],
     source: &[u8],
+    over_budget: &mut bool,
 ) -> Vec<(String, Option<runners::Language>)> {
     const VALUED: &[&str] = &[
         "-I",
@@ -3547,8 +3601,12 @@ fn files_xargs_runs(
             None => return Vec::new(),
         },
     };
+    let items: Vec<&str> = text.split_whitespace().collect();
+    if items.len() > HANDED_ITEMS_READ {
+        *over_budget = true;
+    }
     let mut found = Vec::new();
-    for item in text.split_whitespace().take(64) {
+    for item in items.into_iter().take(HANDED_ITEMS_READ) {
         let built: Vec<String> = match &replace {
             Some(token) => run
                 .iter()
@@ -3575,6 +3633,7 @@ fn files_find_runs(
     command: tree_sitter::Node<'_>,
     effective: &[String],
     source: &[u8],
+    over_budget: &mut bool,
 ) -> Vec<(String, Option<runners::Language>)> {
     if effective
         .first()
@@ -3588,14 +3647,15 @@ fn files_find_runs(
         .take_while(|word| !word.starts_with('-') && !matches!(word.as_str(), "(" | "!" | "\\("))
         .cloned()
         .collect();
-    let mut names = Vec::new();
+    // Each name with whether it is matched without case (`-iname`).
+    let mut names: Vec<(String, bool)> = Vec::new();
     let mut runs: Vec<Vec<String>> = Vec::new();
     let mut at = operands.len();
     while let Some(word) = words.get(at) {
         match word.as_str() {
             "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" => {
                 if let Some(value) = words.get(at + 1) {
-                    names.push(value.clone());
+                    names.push((value.clone(), word.starts_with("-i")));
                 }
                 at += 2;
             }
@@ -3618,22 +3678,40 @@ fn files_find_runs(
     }
     let is_pattern = |name: &str| name.contains(['*', '?', '[']);
     let mut candidates: Vec<String> = operands.clone();
-    candidates.extend(names.iter().filter(|name| !is_pattern(name)).cloned());
-    if names.is_empty() || names.iter().any(|name| is_pattern(name)) {
+    candidates.extend(
+        names
+            .iter()
+            .filter(|(name, _)| !is_pattern(name))
+            .map(|(name, _)| name.clone()),
+    );
+    // A pattern, or a name matched without case, is matched against the
+    // files the line writes.
+    if names.is_empty()
+        || names
+            .iter()
+            .any(|(name, no_case)| *no_case || is_pattern(name))
+    {
         for written in paths_written_before(command, source) {
             let base = written.rsplit('/').next().unwrap_or(&written).to_owned();
-            if names.is_empty()
-                || names
-                    .iter()
-                    .any(|name| glob_matches(name.rsplit('/').next().unwrap_or(name), &base))
-            {
+            let matches = |(name, no_case): &(String, bool)| {
+                let pattern = name.rsplit('/').next().unwrap_or(name);
+                if *no_case {
+                    glob_matches(&pattern.to_lowercase(), &base.to_lowercase())
+                } else {
+                    glob_matches(pattern, &base)
+                }
+            };
+            if names.is_empty() || names.iter().any(matches) {
                 candidates.push(written);
             }
         }
     }
+    if candidates.len() > HANDED_ITEMS_READ {
+        *over_budget = true;
+    }
     let mut found = Vec::new();
     for run in &runs {
-        for candidate in candidates.iter().take(64) {
+        for candidate in candidates.iter().take(HANDED_ITEMS_READ) {
             let built: Vec<String> = run
                 .iter()
                 .map(|word| word.replace("{}", candidate))
@@ -3819,6 +3897,8 @@ fn file_writer(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Vec<
     }
     let mut commands = Vec::new();
     collect_all_commands(root, &mut commands, 0);
+    let mut unpacked = false;
+    let mut unpacked_named = false;
     for command in commands {
         if command.end_byte() > reader.start_byte() || never_runs(command, source) {
             continue;
@@ -3865,6 +3945,12 @@ fn file_writer(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Vec<
                 note(Writer::Program);
             }
             "truncate" | "sponge" if args.iter().any(names) => note(Writer::Program),
+            // An archive unpacked, a patch applied, a checkout: it writes
+            // files the line does not name or show.
+            _ if unpacks_files(&name, &args) => {
+                unpacked = true;
+                unpacked_named |= args.iter().any(names);
+            }
             _ if is_code_language(&name)
                 && args.iter().any(|arg| {
                     spellings.iter().any(|spelling| {
@@ -3878,7 +3964,74 @@ fn file_writer(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Vec<
             _ => {}
         }
     }
+    // An unpacking that names the file, or one on a line that also writes
+    // it: what the file holds when it runs is not the text the line shows.
+    // One that does not (`tar xzf pkg.tgz && sh ./configure`) leaves a file
+    // the line does not write, as any file already on disk is.
+    if unpacked && (unpacked_named || !found.is_empty()) && !found.contains(&Writer::Program) {
+        found.push(Writer::Program);
+    }
     found
+}
+
+/// Whether the command `name` with `args` writes files out of an archive, a
+/// patch or a repository: `tar` or `bsdtar` extracting (`x`, `-x`,
+/// `--extract`, `--get`), `unzip`, `7z x`, `cpio -i`, `patch`, and the
+/// `git` commands that write the working tree (`apply`, `checkout`,
+/// `restore`, ...).
+fn unpacks_files(name: &str, args: &[String]) -> bool {
+    let short_group_has = |flag: char| {
+        args.iter().any(|arg| {
+            arg.strip_prefix('-')
+                .is_some_and(|group| !group.starts_with('-') && group.contains(flag))
+        })
+    };
+    match name {
+        "tar" | "gtar" | "bsdtar" => {
+            args.first()
+                .is_some_and(|first| !first.starts_with('-') && first.contains('x'))
+                || short_group_has('x')
+                || args.iter().any(|arg| arg == "--extract" || arg == "--get")
+        }
+        "unzip" => !args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-l" | "-v" | "-t" | "-Z" | "-z")),
+        "7z" | "7za" | "7zr" => args
+            .first()
+            .is_some_and(|first| first == "x" || first == "e"),
+        "cpio" => short_group_has('i') || args.iter().any(|arg| arg == "--extract"),
+        "patch" => !args.iter().any(|arg| arg == "--dry-run"),
+        "git" => {
+            let mut at = 0;
+            while let Some(arg) = args.get(at) {
+                if matches!(arg.as_str(), "-C" | "-c" | "--git-dir" | "--work-tree") {
+                    at += 2;
+                } else if arg.starts_with('-') {
+                    at += 1;
+                } else {
+                    break;
+                }
+            }
+            args.get(at).is_some_and(|sub| {
+                matches!(
+                    sub.as_str(),
+                    "apply"
+                        | "am"
+                        | "checkout"
+                        | "restore"
+                        | "switch"
+                        | "reset"
+                        | "stash"
+                        | "pull"
+                        | "merge"
+                        | "rebase"
+                        | "cherry-pick"
+                        | "revert"
+                )
+            })
+        }
+        _ => false,
+    }
 }
 
 /// Whether `sed` edits its files in place: `-i`, `-i.bak`, `--in-place`, or
@@ -3907,26 +4060,39 @@ fn sed_in_place(args: &[String]) -> bool {
 }
 
 /// Whether `perl` edits its files in place: `-i` alone or in a group of
-/// short flags (`-pi`, `-pi.bak`, `-0777pi`) before one that takes a value.
+/// short flags (`-pi`, `-pi.bak`, `-0777pi`) before one that takes a value,
+/// anywhere among its switches as perl reads them: the code of `-e` and the
+/// value of `-I`, `-M` or `-m` written as the next word are skipped, so
+/// `perl -pe 's/a/b/' -i x.sh` edits `x.sh` in place. The switches end at
+/// `--` or at the first other word (the script, or a file after `-e`).
 fn perl_in_place(args: &[String]) -> bool {
-    args.iter()
-        .take_while(|arg| arg.starts_with('-') && arg.as_str() != "--")
-        .any(|arg| {
-            let Some(flags) = arg
-                .strip_prefix('-')
-                .filter(|flags| !flags.starts_with('-'))
-            else {
-                return false;
-            };
-            for flag in flags.chars() {
-                match flag {
-                    'i' => return true,
-                    'e' | 'E' | 'I' | 'M' | 'm' | 'x' | 'C' | 'd' | 'D' => return false,
-                    _ => {}
+    let mut at = 0;
+    while let Some(arg) = args.get(at) {
+        at += 1;
+        let Some(flags) = arg.strip_prefix('-') else {
+            return false;
+        };
+        if flags.is_empty() || flags == "-" {
+            return false;
+        }
+        if flags.starts_with('-') {
+            continue;
+        }
+        for (place, flag) in flags.char_indices() {
+            match flag {
+                'i' => return true,
+                'e' | 'E' | 'I' | 'M' | 'm' => {
+                    if flags[place + flag.len_utf8()..].is_empty() {
+                        at += 1;
+                    }
+                    break;
                 }
+                'x' | 'C' | 'd' | 'D' => break,
+                _ => {}
             }
-            false
-        })
+        }
+    }
+    false
 }
 
 /// Whether `gawk` edits its files in place: `-i inplace`, `-iinplace`,
@@ -4041,6 +4207,45 @@ fn assignments_written(
         .map(str::to_owned)
         .collect();
     (!lines.is_empty() && lines.iter().all(|line| statement.is_match(line))).then_some(lines)
+}
+
+/// The line `source` with the command `loader` (`. ./env.sh`) replaced by
+/// `code`, what the file it loads holds.
+fn loaded_in_place(source: &[u8], loader: tree_sitter::Node<'_>, code: &str) -> String {
+    let mut text = String::from_utf8_lossy(&source[..loader.start_byte()]).into_owned();
+    text.push_str(code);
+    text.push_str(&String::from_utf8_lossy(&source[loader.end_byte()..]));
+    text
+}
+
+/// The variables shell code `text` assigns or exports (`A=1`, `export
+/// B=2`, `declare -x C=3`, `export D`).
+fn names_set_by(text: &str) -> Vec<String> {
+    let Ok(assignment) = regex::Regex::new(r"(?:^|[\s;&|({])([A-Za-z_][A-Za-z0-9_]*)\+?=") else {
+        return Vec::new();
+    };
+    let Ok(exported) = regex::Regex::new(
+        r"(?:^|[\s;&|({])(?:export|declare|typeset|readonly|local)(?:\s+-[A-Za-z]+)*((?:\s+[A-Za-z_][A-Za-z0-9_]*)+)",
+    ) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = assignment
+        .captures_iter(text)
+        .filter_map(|found| found.get(1).map(|name| name.as_str().to_owned()))
+        .collect();
+    for found in exported.captures_iter(text) {
+        if let Some(list) = found.get(1) {
+            names.extend(list.as_str().split_whitespace().map(str::to_owned));
+        }
+    }
+    names
+}
+
+/// The variable a line of [`assignments_written`] sets.
+fn assigned_name(line: &str) -> &str {
+    let line = line.trim();
+    let line = line.strip_prefix("export").map_or(line, str::trim_start);
+    line.split('=').next().unwrap_or(line).trim()
 }
 
 /// Whether `node` never runs: it is in a literally unreachable branch
@@ -12641,8 +12846,14 @@ fn mask_data_heredoc(
     // enclosing pipeline is a known data consumer. Unknown consumers and
     // interpreter wrappers stay visible so a new launcher cannot become a
     // projection bypass.
+    // A `cat` or `tee` the line defines as a function or an alias runs
+    // that, with the body as its input.
+    let redefined = owner
+        .as_deref()
+        .is_some_and(|name| line_redefines(root_node(body), name, source));
     if (matches!(owner.as_deref(), Some("cat" | "tee"))
         || owner_command.is_some_and(|command| reads_stdin_as_message(command, redirected, source)))
+        && !redefined
         && data_only_pipeline
         && !owner_command.is_some_and(|command| has_execution_sink_ancestor(command, source))
         && !redirected_payload_executed_later(redirected, source)
@@ -12846,8 +13057,36 @@ fn substitution_is_inert_heredoc_text(node: tree_sitter::Node<'_>, source: &[u8]
     if normalized_command_name(&name) != "cat" {
         return false;
     }
+    // A line that gives `cat` another meaning (a function or an alias of
+    // that name) runs that, not `cat`.
+    if line_redefines(root_node(node), "cat", source) {
+        return false;
+    }
     // Exactly `cat`: the command node holds its name and nothing else.
     command.child_count() == 1
+}
+
+/// Whether the line gives the command `name` another meaning: a function
+/// or an alias of that name.
+fn line_redefines(root: tree_sitter::Node<'_>, name: &str, source: &[u8]) -> bool {
+    line_function_body(root, name, source).is_some() || line_defines_alias(root, name, source)
+}
+
+/// Whether the line defines an alias named `name` (`alias cat=sh`, also
+/// through `command` or `builtin`).
+fn line_defines_alias(root: tree_sitter::Node<'_>, name: &str, source: &[u8]) -> bool {
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    commands.into_iter().any(|command| {
+        command_run_name(command, source).is_some_and(|(run, _, arguments)| {
+            run == "alias"
+                && arguments.into_iter().any(|argument| {
+                    shell_literal_word(&node_text(argument, source))
+                        .split_once('=')
+                        .is_some_and(|(alias, _)| alias == name)
+                })
+        })
+    })
 }
 
 /// Is this a plain heredoc whose delimiter is quoted (`<<'EOF'` / `<<"EOF"`),
@@ -14069,6 +14308,36 @@ mod tests {
         assert!(
             projected.scan.contains("gh"),
             "the command itself stays visible"
+        );
+    }
+
+    /// A line that gives `cat` another meaning (a function or an alias of
+    /// that name) runs that with the body as its input: the body stays
+    /// visible. Review of #355: the shortcut held whatever `cat` meant.
+    #[test]
+    fn a_heredoc_to_a_cat_the_line_redefines_stays_visible() {
+        for command in [
+            "cat() { sh; }; X=\"$(cat <<'EOF'\nthe attacker ran systemctl stop foo\nEOF\n)\"",
+            "function cat { sh; }; X=\"$(cat <<'EOF'\nthe attacker ran systemctl stop foo\nEOF\n)\"",
+            "alias cat=sh; X=\"$(cat <<'EOF'\nthe attacker ran systemctl stop foo\nEOF\n)\"",
+            "command alias cat='bash -s'; X=\"$(cat <<'EOF'\nthe attacker ran systemctl stop foo\nEOF\n)\"",
+            "tee() { sh; }; tee <<'EOF'\nthe attacker ran systemctl stop foo\nEOF",
+        ] {
+            let projected = project(command);
+            assert!(
+                projected.scan.contains("systemctl stop foo"),
+                "{command}: {}",
+                projected.scan
+            );
+        }
+        // Another alias or function leaves the shortcut as it was.
+        let projected = project(
+            "alias ll='ls -l'; X=\"$(cat <<'EOF'\nthe attacker ran systemctl stop foo\nEOF\n)\"",
+        );
+        assert!(
+            !projected.scan.contains("systemctl stop foo"),
+            "{}",
+            projected.scan
         );
     }
 
