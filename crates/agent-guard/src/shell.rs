@@ -14514,6 +14514,24 @@ fn shell_word(word: &str) -> String {
 /// belong to the embedded language (for example Ruby's `puts "..."`).
 fn shell_literal_word(word: &str) -> String {
     let trimmed = word.trim();
+    // The word as the shell hands it on, when it is one word: quotes and
+    // escapes taken out wherever they stand, so `'a '\''b'` is `a 'b`, as
+    // the program receives it (the
+    // `-c` line of `sh -c 'php -r '\''...'\'''` is the `php` line bash
+    // runs). An expansion's text is kept as written.
+    // Only a single-quoted word that closes and reopens its quote to put
+    // one in (`'\''`, `'"'"'`): a double-quoted word keeps its escapes,
+    // which may belong to the embedded language.
+    if trimmed.starts_with('\'') && (trimmed.contains("'\\''") || trimmed.contains("'\"'\"'")) {
+        let line = crate::shell_words::read_line(trimmed);
+        if let [command] = line.commands.as_slice() {
+            if let [only] = command.words.as_slice() {
+                if line.nested.is_empty() || !only.has(crate::shell_words::Mark::Expansion) {
+                    return only.text.clone();
+                }
+            }
+        }
+    }
     if let Some(inner) = trimmed
         .strip_prefix("$'")
         .and_then(|value| value.strip_suffix('\''))

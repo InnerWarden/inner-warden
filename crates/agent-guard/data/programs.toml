@@ -88,14 +88,38 @@ stdin_code = true
 
 # Their arguments are a command: the shell's own, and the remote shell.
 [[program]]
-names = ["eval", "exec", "xargs", "ssh"]
+names = ["eval", "xargs", "ssh"]
 language = "shell"
 sink = true
 
-# Their arguments are a command the guard reads after them (a test holds
-# that each one is read through).
+# `exec` runs the command after it in the shell's place (`prefix`: the
+# command written right after its own options is the one that runs, so a
+# rule that reads a command by its name reads it past this word).
 [[program]]
-names = ["env", "sudo", "doas", "nice", "nohup", "timeout", "setsid", "stdbuf", "busybox", "find", "watch", "su", "systemd-run"]
+names = ["exec"]
+language = "shell"
+sink = true
+prefix = true
+
+# The shell's own: `command` and `builtin` run the command after them.
+[[program]]
+names = ["command", "builtin"]
+language = "shell"
+prefix = true
+
+# Their arguments are a command the guard reads after them (a test holds
+# that each one is read through). These run it right after their own
+# options (`prefix`): `env crontab -` is `crontab -` to every rule.
+[[program]]
+names = ["env", "sudo", "doas", "nice", "nohup", "timeout", "setsid", "stdbuf"]
+language = "shell"
+launcher = true
+prefix = true
+
+# These run a command too, in a shape of their own (`find . -exec`,
+# `su -c`, `busybox sh`).
+[[program]]
+names = ["busybox", "find", "watch", "su", "systemd-run"]
 language = "shell"
 launcher = true
 
