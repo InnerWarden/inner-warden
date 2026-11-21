@@ -1064,6 +1064,10 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
                 .into(),
             next: "innerwarden setup".into(),
         });
+        // A project that switches an agent's hooks off still says so: it is
+        // what the person meets once they set the guard up and start that
+        // agent here.
+        out.extend(facts.project_settings.iter().map(project_settings_finding));
         return out;
     }
 
@@ -1553,6 +1557,38 @@ mod tests {
             report.contains("NOT fully protecting this machine"),
             "{report}"
         );
+    }
+
+    /// On a machine not set up yet, a project that switches the hook off is
+    /// still named beside the one line about setup.
+    ///
+    /// FAILS ON REVERT: return after the setup line alone.
+    #[test]
+    fn a_project_that_switches_the_hook_off_is_named_before_setup() {
+        let findings = assess(&Facts {
+            never_configured: true,
+            project_settings: vec![ProjectSettings {
+                agent: "claude-code",
+                file: ".claude/settings.json".into(),
+                effect: ProjectEffect::HooksOff("sets \"disableAllHooks\""),
+            }],
+            ..healthy()
+        });
+        assert_eq!(findings.len(), 2, "{findings:?}");
+        assert!(
+            matches!(findings[0], Finding::NotConfigured { .. }),
+            "{findings:?}"
+        );
+        let said = render(&Facts {
+            never_configured: true,
+            project_settings: vec![ProjectSettings {
+                agent: "claude-code",
+                file: ".claude/settings.json".into(),
+                effect: ProjectEffect::HooksOff("sets \"disableAllHooks\""),
+            }],
+            ..healthy()
+        });
+        assert!(said.contains(".claude/settings.json"), "{said}");
     }
 
     /// Codex's project files are read, and a file this cannot parse is named
