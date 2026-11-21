@@ -354,6 +354,14 @@ their MCP servers get no session id to match. Details and limits:
 
 ### Fixed
 
+- **A rule file that does not load no longer leaves the guard with fewer
+  rules in silence.** A rule read from a folder (`RuleEngine::load`, or the
+  operator's overlay on the shipped rules) whose YAML did not parse or whose
+  pattern did not compile was skipped with a log warning, and the call that
+  rule refuses went through. Now every check refuses under
+  `AG-RULES-BROKEN`, naming the file and the line of the error, until it is
+  fixed or removed; a monitor mode forwards the call with that warning. The
+  rules embedded in the binary are unchanged.
 - **A refusal of the MCP proxy always reaches the guard's own record.**
   Whoever starts the proxy could move its record (`IW_GRAPH_FILE`) and turn
   off its report to the local agent (`INNERWARDEN_AGENT_URL=off`), and the

@@ -600,16 +600,67 @@ impl AtrMatch {
     }
 }
 
+/// The rule id a refusal for rule files that did not load is reported
+/// under ([`RuleEngine::load_failures`]). Not an `ATR-` id, so no reading
+/// of a call by its name alone makes that refusal a warning.
+pub const BROKEN_RULES_ID: &str = "AG-RULES-BROKEN";
+
+/// A rule file read from disk that did not load: it could not be read, its
+/// YAML does not parse, or a pattern of it does not compile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleLoadFailure {
+    pub path: std::path::PathBuf,
+    /// The 1-based line of the error in the file, when it is known.
+    pub line: Option<usize>,
+    pub error: String,
+}
+
+impl std::fmt::Display for RuleLoadFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.line {
+            Some(line) => write!(f, "{} line {line}: {}", self.path.display(), self.error),
+            None => write!(f, "{}: {}", self.path.display(), self.error),
+        }
+    }
+}
+
+/// A pattern of a rule read from disk that neither regex engine accepts.
+#[derive(Debug)]
+struct PatternError {
+    pattern: String,
+    error: String,
+}
+
+impl std::fmt::Display for PatternError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "pattern {:?} does not compile: {}",
+            self.pattern, self.error
+        )
+    }
+}
+
+impl std::error::Error for PatternError {}
+
 /// The ATR rule engine, holds compiled rules grouped by field type.
 pub struct RuleEngine {
     rules: Vec<CompiledRule>,
+    /// Rule files read from disk that did not load. Not empty, every check
+    /// returns a refusal under [`BROKEN_RULES_ID`] naming them: an engine
+    /// without a rule its operator wrote lets through what that rule
+    /// refuses, and a warning in a log said nothing to whoever ran the call.
+    broken: Vec<RuleLoadFailure>,
 }
 
 impl RuleEngine {
     /// Load ATR YAML rules from a directory (recursively reads `*.yaml`).
-    /// Rules that fail to parse or compile are skipped with a warning.
+    /// A file that fails to read, parse or compile is not loaded and is kept
+    /// in [`Self::load_failures`]; while there is one, every check refuses
+    /// (see [`BROKEN_RULES_ID`]).
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
         let mut rules = Vec::new();
+        let mut broken = Vec::new();
 
         if !dir.exists() {
             warn!(path = %dir.display(), "ATR rules directory not found, starting with 0 rules");
@@ -621,12 +672,15 @@ impl RuleEngine {
             match load_rule_file(path) {
                 Ok(Some(rule)) => rules.push(rule),
                 Ok(None) => {} // skipped (not pattern tier)
-                Err(e) => warn!(file = %path.display(), error = %e, "failed to load ATR rule"),
+                Err(failure) => {
+                    warn!(failure = %failure, "failed to load ATR rule; every check refuses until it is fixed or removed");
+                    broken.push(failure);
+                }
             }
         }
 
         tracing::info!(rules = rules.len(), dir = %dir.display(), "ATR rule engine loaded");
-        Ok(Self::from_rules(rules))
+        Ok(Self { rules, broken })
     }
 
     /// Load only the embedded rules that could ever fire for `source`.
@@ -722,6 +776,7 @@ impl RuleEngine {
         // that fired on one benign signal, and a path prefix that matched
         // `~/.local`. Nothing said a word, because the log only counted files.
         let mut shadowed: Vec<String> = Vec::new();
+        let mut broken: Vec<RuleLoadFailure> = Vec::new();
         if override_dir.exists() {
             match collect_yaml_files(override_dir) {
                 Ok(files) => {
@@ -735,14 +790,20 @@ impl RuleEngine {
                                 overlaid += 1;
                             }
                             Ok(None) => {}
-                            Err(e) => {
-                                warn!(file = %path.display(), error = %e, "failed to load overlay ATR rule")
+                            Err(failure) => {
+                                warn!(failure = %failure, "failed to load overlay ATR rule; every check refuses until it is fixed or removed");
+                                broken.push(failure);
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    warn!(dir = %override_dir.display(), error = %e, "failed to scan ATR overlay directory")
+                    warn!(dir = %override_dir.display(), error = %e, "failed to scan ATR overlay directory; every check refuses until it is readable");
+                    broken.push(RuleLoadFailure {
+                        path: override_dir.to_path_buf(),
+                        line: None,
+                        error: format!("the rules directory cannot be read: {e}"),
+                    });
                 }
             }
         }
@@ -769,7 +830,13 @@ impl RuleEngine {
                  shipped detection is not the one running"
             );
         }
-        (Self::from_rules(rules), shadowed)
+        (Self { rules, broken }, shadowed)
+    }
+
+    /// The rule files read from disk that did not load. Empty for an engine
+    /// of the embedded corpus alone.
+    pub fn load_failures(&self) -> &[RuleLoadFailure] {
+        &self.broken
     }
 
     /// Create an empty rule engine (no rules loaded).
@@ -778,7 +845,28 @@ impl RuleEngine {
     }
 
     fn from_rules(rules: Vec<CompiledRule>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            broken: Vec::new(),
+        }
+    }
+
+    /// The refusal every check returns while a rule file did not load.
+    fn broken_rules_match(&self) -> Option<AtrMatch> {
+        if self.broken.is_empty() {
+            return None;
+        }
+        let files: Vec<String> = self.broken.iter().map(ToString::to_string).collect();
+        Some(AtrMatch {
+            rule_id: BROKEN_RULES_ID.to_string(),
+            title: "A rule file of the guard did not load; every call is refused until it is fixed or removed".to_string(),
+            severity: "critical".to_string(),
+            category: "guard-integrity".to_string(),
+            matched_condition: files.join("; "),
+            matched: String::new(),
+            references: AtrReferences::default(),
+            undecided_refusal: false,
+        })
     }
 
     /// Check content against rules targeting user_input + content fields.
@@ -836,10 +924,14 @@ impl RuleEngine {
     /// is the production path; the field-only helpers above remain for public
     /// compatibility and focused rule tests.
     pub fn check_context(&self, context: AtrContext<'_>) -> Vec<AtrMatch> {
-        self.rules
-            .iter()
-            .filter(|rule| source_matches(&rule.source_type, context.source))
-            .filter_map(|rule| eval_rule_context(rule, context))
+        self.broken_rules_match()
+            .into_iter()
+            .chain(
+                self.rules
+                    .iter()
+                    .filter(|rule| source_matches(&rule.source_type, context.source))
+                    .filter_map(|rule| eval_rule_context(rule, context)),
+            )
             .collect()
     }
 
@@ -1181,16 +1273,55 @@ fn parse_field(raw: &str) -> AtrField {
     }
 }
 
-fn load_rule_file(path: &Path) -> anyhow::Result<Option<CompiledRule>> {
-    let content = std::fs::read_to_string(path)?;
-    load_rule_str_for(&content, None, Compile::AtLoad)
+/// Load one rule file from disk. A failure names the file and, for a YAML
+/// error or a pattern that does not compile, the line.
+fn load_rule_file(path: &Path) -> Result<Option<CompiledRule>, RuleLoadFailure> {
+    let failure = |line: Option<usize>, error: String| RuleLoadFailure {
+        path: path.to_path_buf(),
+        line,
+        error,
+    };
+    let content = std::fs::read_to_string(path).map_err(|e| failure(None, e.to_string()))?;
+    let mut failed = Vec::new();
+    let rule =
+        load_rule_str_reporting(&content, None, Compile::AtLoad, &mut failed).map_err(|e| {
+            match e.downcast_ref::<serde_yaml::Error>() {
+                Some(yaml) => failure(yaml.location().map(|l| l.line()), yaml.to_string()),
+                None => failure(None, e.to_string()),
+            }
+        })?;
+    match failed.into_iter().next() {
+        Some(pattern) => Err(failure(
+            pattern_line(&content, &pattern.pattern),
+            pattern.to_string(),
+        )),
+        None => Ok(rule),
+    }
+}
+
+/// The 1-based line of `content` that holds `pattern`, as written plain,
+/// in double quotes (each backslash and quote escaped) or in single quotes
+/// (each quote doubled).
+fn pattern_line(content: &str, pattern: &str) -> Option<usize> {
+    let double = pattern.replace('\\', "\\\\").replace('"', "\\\"");
+    let single = pattern.replace('\'', "''");
+    [pattern.to_string(), double, single]
+        .iter()
+        .find_map(|written| {
+            content
+                .lines()
+                .position(|line| line.contains(written.as_str()))
+                .map(|i| i + 1)
+        })
 }
 
 /// Parse one rule, optionally skipping it before anything is kept for it.
 ///
 /// Returns `Ok(None)` for non-pattern-tier rules, rules with no regex
 /// condition, a rule `only_for` excludes, and (with [`Compile::AtLoad`]) a
-/// rule whose every condition fails to compile.
+/// rule with a condition that fails to compile: keeping the rest of it would
+/// run a rule other than the one its author wrote. A caller that must know
+/// why a rule was dropped uses [`load_rule_str_reporting`].
 ///
 /// The surface filter happens here rather than on the finished `Vec` because
 /// it once had to: compiling was the expensive part of a load (~130ms for the
@@ -1202,6 +1333,17 @@ fn load_rule_str_for(
     content: &str,
     only_for: Option<AtrSource>,
     when: Compile,
+) -> anyhow::Result<Option<CompiledRule>> {
+    load_rule_str_reporting(content, only_for, when, &mut Vec::new())
+}
+
+/// [`load_rule_str_for`], also pushing to `failed` each pattern that did
+/// not compile (with [`Compile::AtLoad`]), the rule then being dropped.
+fn load_rule_str_reporting(
+    content: &str,
+    only_for: Option<AtrSource>,
+    when: Compile,
+    failed: &mut Vec<PatternError>,
 ) -> anyhow::Result<Option<CompiledRule>> {
     let raw: RawRule = serde_yaml::from_str(content)?;
 
@@ -1249,8 +1391,13 @@ fn load_rule_str_for(
         compiled: OnceLock::new(),
         regex_first: when == Compile::AtLoad,
     };
-    if when == Compile::AtLoad && conditions.get(&id).is_empty() {
-        return Ok(None);
+    if when == Compile::AtLoad {
+        let before = failed.len();
+        let compiled = compile_conditions_reporting(&id, &conditions.pending, true, failed);
+        if failed.len() > before || compiled.is_empty() {
+            return Ok(None);
+        }
+        let _ = conditions.compiled.set(compiled);
     }
 
     Ok(Some(CompiledRule {
@@ -1287,6 +1434,17 @@ fn compile_conditions(
     pending: &[PendingCondition],
     regex_first: bool,
 ) -> Vec<CompiledCondition> {
+    compile_conditions_reporting(rule_id, pending, regex_first, &mut Vec::new())
+}
+
+/// [`compile_conditions`], also pushing to `failed` each pattern neither
+/// engine accepts.
+fn compile_conditions_reporting(
+    rule_id: &str,
+    pending: &[PendingCondition],
+    regex_first: bool,
+    failed: &mut Vec<PatternError>,
+) -> Vec<CompiledCondition> {
     let mut conditions = Vec::with_capacity(pending.len());
     for cond in pending {
         let accepted = if regex_first {
@@ -1319,6 +1477,10 @@ fn compile_conditions(
                         fancy_error = %e_fancy,
                         "failed to compile ATR regex, skipping condition"
                     );
+                    failed.push(PatternError {
+                        pattern: cond.pattern.clone(),
+                        error: e_fast.to_string(),
+                    });
                     continue;
                 }
             },
