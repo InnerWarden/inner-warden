@@ -213,7 +213,27 @@ pub(super) fn inline_code_changes_agent_settings(content: &str) -> bool {
         return false;
     }
     let written = without_reads(&lower);
-    SETTINGS.is_match(&written) && CHANGES_FILE.is_match(&written)
+    SETTINGS
+        .find_iter(&written)
+        .any(|m| m.as_str() != ".claude.json" || in_home_folder(&written[..m.start()]))
+        && CHANGES_FILE.is_match(&written)
+}
+
+/// Whether the path code writes before a `.claude.json` (back to a quote,
+/// a space, a bracket, a comma or an `=`) is the home folder Claude Code
+/// reads it from, or no folder at all (`os.path.join(home, '.claude.json')`,
+/// a bare name). `/home/u/backup/.claude.json` is a copy in another folder.
+fn in_home_folder(before: &str) -> bool {
+    static HOME: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"^(?:\.|~|/root|\$\{?home\}?|/(?:home|users)/[^/]+|[a-z]:\\users\\[^\\]+)?$",
+        )
+        .expect("static home folder regex")
+    });
+    let start = before
+        .rfind(|c: char| "'\"`()[]{},=".contains(c) || c.is_whitespace())
+        .map_or(0, |at| at + 1);
+    HOME.is_match(before[start..].trim_end_matches(['/', '\\']))
 }
 
 /// What [`copies_onto_guard_place`] says.
