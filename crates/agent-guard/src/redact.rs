@@ -56,8 +56,9 @@ fn patterns() -> &'static [Pattern] {
             mk(r"AKIA[0-9A-Z]{16}", &[]),
             // A password in a URL: scheme://user:PASSWORD@host. The user name
             // stays, the password goes, whatever its length.
+            // A `/` in the password is the password's: `https://u:pa/ss@host`.
             mk(
-                r#"(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@'"]*:([^\s/@'"]+)@"#,
+                r#"(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@'"]*:([^\s@'"]+)@"#,
                 &[1],
             ),
             // Authorization (and Proxy-Authorization) headers, any scheme:
@@ -66,6 +67,8 @@ fn patterns() -> &'static [Pattern] {
                 r#"(?i)authorization['"]?\s*[:=]\s*(?:(?:basic|bearer|token|digest|negotiate)\s+)?([^\s'",]+)"#,
                 &[1],
             ),
+            // Cookie and Set-Cookie headers: the whole value, every pair.
+            mk(r#"(?i)\b(?:set-)?cookie['"]?\s*:\s*([^'"\r\n]+)"#, &[1]),
             // Bearer tokens outside a header.
             mk(r"(?i)bearer\s+[A-Za-z0-9._\-]{16,}", &[]),
             // A long flag that takes a secret, with a blank or `=`:
@@ -82,6 +85,23 @@ fn patterns() -> &'static [Pattern] {
                 &format!(
                     r"(?i:\b{PASSWORD_FLAG_PROGRAMS})\b[^|;&\n]*?\s-p\s*(?:'([^']*)'|\x22([^\x22]*)\x22|([^\s'\x22;|&\-][^\s'\x22;|&]*))"
                 ),
+                &[1, 2, 3],
+            ),
+            // docker login -p VALUE (its --password is the long flag's rule).
+            mk(
+                r"(?i:\bdocker\b[^|;&\n]*?\blogin)\b[^|;&\n]*?\s-p\s*(?:'([^']*)'|\x22([^\x22]*)\x22|([^\s'\x22;|&\-][^\s'\x22;|&]*))",
+                &[1, 2, 3],
+            ),
+            // ssh-keygen -P OLD and -N NEW: the passphrases, as typed. Upper
+            // case only: its -p asks to change a passphrase and takes none.
+            mk(
+                r"(?i:\bssh-keygen)\b[^|;&\n]*?\s-[PN]\s*(?:'([^']*)'|\x22([^\x22]*)\x22|([^\s'\x22;|&\-][^\s'\x22;|&]*))",
+                &[1, 2, 3],
+            ),
+            // The same, from the last flag back: a line with both -P and -N
+            // has the first masked above and the second here.
+            mk(
+                r"(?i:\bssh-keygen)\b[^|;&\n]*\s-[PN]\s*(?:'([^']*)'|\x22([^\x22]*)\x22|([^\s'\x22;|&\-][^\s'\x22;|&]*))",
                 &[1, 2, 3],
             ),
             // curl/wget user:password (a URL after -u is the URL rule's). Kept
@@ -102,6 +122,7 @@ fn patterns() -> &'static [Pattern] {
             // bare (not in a key=value), which is how an AI agent most often leaks
             // one into a shell command (`curl -H "Authorization: sk-…"`, a raw arg).
             mk(r"sk-[A-Za-z0-9_\-]{20,}", &[]), // OpenAI (incl. sk-proj-…)
+            mk(r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{16,}", &[]), // Stripe
             mk(r"gh[opsur]_[A-Za-z0-9]{20,}", &[]), // GitHub PAT / OAuth / server tokens
             mk(r"github_pat_[A-Za-z0-9_]{20,}", &[]), // GitHub fine-grained PAT
             mk(r"xox[baprs]-[A-Za-z0-9\-]{10,}", &[]), // Slack
@@ -291,6 +312,14 @@ mod tests {
         }
         let r = redact_secrets(&format!("psql postgres://app:{pw}@db/main"));
         assert!(r.text.contains("postgres://app:"), "user stays: {}", r.text);
+        // A `/` in the password does not end it.
+        let r = redact_secrets("git clone https://maicon:pa/ss@github.com/x/y");
+        assert!(!r.text.contains("pa/ss"), "{}", r.text);
+        assert!(
+            r.text.contains("https://maicon:[REDACTED]@github.com/x/y"),
+            "{}",
+            r.text
+        );
         // A URL with no password is left alone.
         let clean = "curl https://api.example:8443/v1 && ssh git@host";
         assert_eq!(redact_secrets(clean).text, clean);

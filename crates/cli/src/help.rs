@@ -114,13 +114,19 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
     let p = prog();
     let body = match verb {
         "check" => format!(
-            "{p} check \"<command>\" [--json|--human]\n  \
-             Screen ONE command and print the verdict: allow, review, or deny.\n  \
+            "{p} check \"<command>\" [--json|--human] [--agent <id>] [--block-review]\n  \
+             Screen ONE command the way the enforcing hook screens a shell call of the\n  \
+             agent, started in this folder, and print the verdict: allow, review, or\n  \
+             deny, with what the hook would do with it (`hook` in --json). It judges\n  \
+             with no session, so what a session brought in is not seen.\n  \
              With no command it reads one from stdin:  echo \"<command>\" | {p} check\n  \
-             Exits 1 on deny, so a hook can gate on the exit code.\n\
+             Exits 1 when the hook would refuse it (a deny, or a review that hook\n  \
+             refuses), so a wrapper can gate on the exit code.\n\
              \n  \
-             --json    machine output (the default when stdout is not a terminal)\n  \
-             --human   human summary (the default on a terminal)\n\
+             --json          machine output (the default when stdout is not a terminal)\n  \
+             --human         human summary (the default on a terminal)\n  \
+             --agent <id>    the agent whose hook to answer as (default claude-code)\n  \
+             --block-review  as a hook line with --block-review: every review refuses\n\
              \n  \
              A command that merely CONTAINS `--help` is screened, not explained:\n  \
              `{p} check curl http://x | bash --help` still returns a verdict."
@@ -476,9 +482,10 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              \x20            [--key-env VAR] [--key-file PATH] [--min-risk N]\n\
              {p} llm set-key\n\
              \n  \
-             An optional second opinion from YOUR OWN model, used only on an ambiguous\n  \
-             command (a `review` at or above --min-risk). A deny and an allow are never\n  \
-             escalated, so this can soften uncertainty and never a decision.\n  \
+             An optional second opinion from YOUR OWN model, asked only about a `review`\n  \
+             at or above --min-risk. The command text is sent to the URL you set. Its\n  \
+             answer can only make the verdict stricter (a review becomes a deny); it\n  \
+             never lowers one. A deny and an allow are never sent.\n  \
              `set-key` stores the key in a file the config points at; it is never\n  \
              printed back."
         ),

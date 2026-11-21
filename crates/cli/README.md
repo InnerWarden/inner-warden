@@ -35,9 +35,12 @@ innerwarden proxy --mode guard -- npx -y some-mcp-server --flag
 # --mode: advisory | warn | guard (default) | kill
 ```
 
-`check` exits `0` on `allow` or `review`, `1` on `deny`, and `2` when the
-command is empty or stdin cannot be read as UTF-8.
-It only screens the command; it does not execute it.
+`check` screens the command the way the enforcing hook screens a shell call
+(the same function, in this folder, with no session; `--agent <id>` answers as
+that agent's hook). It exits `1` when that hook would refuse it (a `deny`, or a
+`review` the hook refuses), `0` otherwise, and `2` when the command is empty
+or stdin cannot be read as UTF-8. The `hook` field of `--json` says what the
+hook would do and why. It only screens the command; it does not execute it.
 
 `check` and `serve` are advisory (they flag a dangerous command; the agent still
 decides). `proxy` is the enforcing form: a man-in-the-middle in front of an MCP
@@ -89,7 +92,8 @@ it.
 
 ### Any other agent (gate on the exit code)
 
-`check` exits `1` on a `deny`, so any pre-execution wrapper can block:
+`check` exits `1` when the hook would refuse the command, so any
+pre-execution wrapper can block:
 
 ```sh
 innerwarden check "$COMMAND" || { echo "blocked by InnerWarden"; exit 1; }

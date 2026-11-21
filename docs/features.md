@@ -307,11 +307,12 @@ list, with every limit.
   tell one agent's runs apart. See [Agent identity and trust](agent-identity.md).
 - Agent discovery: finds AI agents and agent tooling on the machine so you can
   see what is running and wire the guardrail into it.
-- `innerwarden demo`: sends a few known risky calls (a download piped to a
+- `innerwarden demo`: sends four known risky calls (a download piped to a
   shell, a read of an SSH key, a write of agent settings, a home wipe inside
-  `bash -c`, an MCP call) through the guard path each connected agent really
-  uses, and shows what was refused. Nothing is run; each call is recorded and
-  marked as a demo.
+  `bash -c`) through the guard path each connected agent really uses: its hook,
+  or, for an agent behind the MCP proxy, the same four as MCP calls through the
+  proxy's rules. It shows what was refused. Nothing is run; each call a hook
+  judged is recorded and marked as a demo.
 - Local dashboard: a read-only view on loopback at `http://127.0.0.1:8788`
   (`innerwarden dashboard`). It never leaves the machine. Port 8787 is a
   different surface: the local check-command contract served by `innerwarden

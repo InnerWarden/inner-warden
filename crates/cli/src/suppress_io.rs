@@ -151,10 +151,11 @@ pub fn consider(command: &str, verdict: &Value) -> Option<Value> {
     apply(command, verdict, &load_reporting(false))
 }
 
-/// [`consider`], saying on stderr what the load refused or holds with a
-/// caveat. For `innerwarden check`, which a person runs.
-pub fn consider_reporting(command: &str, verdict: &Value) -> Option<Value> {
-    apply(command, verdict, &load_reporting(true))
+/// Say on stderr what the load of the person's suppressions refused or
+/// holds with a caveat, and nothing else. `innerwarden check` calls it before
+/// it screens a command the way the hook does, which loads them silently.
+pub fn report_load() {
+    let _ = load_reporting(true);
 }
 
 /// Environment variables an AI coding agent sets in the shell it runs
