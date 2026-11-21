@@ -5,6 +5,18 @@ follows semantic versioning.
 
 ## Unreleased
 
+The MCP proxy's default posture (`guard`) refuses a tool call that acts
+(pays, sends, shares, deletes, books) when it carries a value a server said
+this session, and no longer refuses one only because a rule matched the
+tool's name or its argument names: that call is forwarded with a warning and
+a record. On AgentDojo, through `innerwarden proxy --mode guard` in front of
+a server that runs nothing: the calls its users asked for refused went from
+25 of 339 to 0, and the injection tasks stopped stayed 24 of 26 (main before
+this change: 24). A secret read, a privileged write, a tool whose definition
+changed, a shell line judged `deny`, and a call that names the root, a home
+or a key store are refused as before. `--mode kill` keeps every refusal of
+before. Details: [What InnerWarden does](docs/features.md).
+
 A here-document is read as the input of the command it is written after, and
 what a pipe hands a shell on its input is read as that shell's script. A
 narrow `Grep` of the home is held for review instead of refused. Every pull
