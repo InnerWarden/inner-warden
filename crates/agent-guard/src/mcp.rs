@@ -4508,16 +4508,21 @@ fn analyze_command_as_read(
                 detail: "removal of the account's keys or credential store".into(),
             });
             score += 50;
-        } else if context.is_some_and(|place| {
-            crate::threats::destructive_rm_in_place(command_scan, &place.cwd, place.home.as_deref())
-        }) {
+        } else if crate::threats::destructive_rm_in_place(
+            command_scan,
+            context.map_or("", |place| place.cwd.as_str()),
+            context.and_then(|place| place.home.as_deref()),
+        ) {
             // `rm -rf *`, `.`, `./*`, `..` are a wipe only where they run: from
             // the home or from `/`. Anywhere else they keep the verdict above.
+            // With no working directory known, a `cd` to a path the line
+            // spells out (`cd / && rm -rf *`, `X=/; cd $X && rm -rf *`)
+            // still says where they run.
             signals.push(AnalysisSignal {
                 signal: "destructive_command".into(),
                 score: 50,
                 detail: "recursive removal of a home directory or the filesystem root, \
-                         resolved from the working directory"
+                         resolved from the working directory or a directory the line changes to"
                     .into(),
             });
             score += 50;
@@ -4554,6 +4559,22 @@ fn analyze_command_as_read(
                 detail: "world-writable permissions".into(),
             });
             score += 20;
+        }
+        if crate::threats::recursive_owner_change_of_system(
+            command_scan,
+            context.map_or("", |place| place.cwd.as_str()),
+            context.and_then(|place| place.home.as_deref()),
+        ) {
+            // `chown -R nobody /` or `chmod -R 000 /usr` leaves the system
+            // unable to boot, log in or run sudo: as lasting as a removal.
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: "recursive owner or mode change of the filesystem root, a system \
+                         directory or a home"
+                    .into(),
+            });
+            score += 50;
         }
         // Disk-wipe: dd writing to a raw block device (sd*, nvme*, vd*, hd*,
         // mmcblk*). Spec 079 P3: was a destructive miss.
