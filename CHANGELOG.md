@@ -5,6 +5,18 @@ follows semantic versioning.
 
 ## Unreleased
 
+Ordinary agent work is refused less. In a set of commands from public
+coding-agent runs with no attack among them, main refused 69 lines; this
+change allows 26 of them, holds 42 for review and still refuses 1 (a line
+whose shell code does not parse). The refusals were for `exec(` or `eval(`
+in a Python check or test file, the word "at" in Python text read as the
+`at` scheduler, `PYTHONPATH="$(pwd)/lib"` before a quoted here-document,
+and `find <project> -name __pycache__ | xargs rm -rf`; edits are no longer
+held for `self.env.` (read as a `.env` file), `\x00` (read as a command
+in hex) or `pip install -e . > /dev/null`. `exec` of code that is decoded,
+decompressed, downloaded or read from input stays refused, and so does
+`at` behind `sudo`, `env`, `timeout`, `nice` or `xargs`.
+
 The MCP proxy's default posture (`guard`) refuses a tool call that acts
 (pays, sends, shares, deletes, books) when it carries a value a server said
 this session, and no longer refuses one only because a rule matched the

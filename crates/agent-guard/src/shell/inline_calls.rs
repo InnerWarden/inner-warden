@@ -58,6 +58,17 @@ pub(crate) struct InlineReading {
     /// (`exec(open('setup.py').read())`), or a value built at run time
     /// (`exec(input())`, `eval(x)`).
     pub(crate) code_unread: bool,
+    /// Some of the code was read as Python, whose own `exec` and `eval`
+    /// run code.
+    pub(crate) read_python: bool,
+    /// Some of the code was read in a language whose own `eval` runs code:
+    /// Python, Node, Ruby, Perl, PHP (not Lua).
+    pub(crate) read_eval_language: bool,
+    /// The strings it runs as code that the reader folded from what the
+    /// code writes out (`s = '...'; exec(s)`): read as code above, and also
+    /// judged as a shell line by the caller, so a command line run as code
+    /// keeps the refusal of the call's name.
+    pub(crate) code_run: Vec<String>,
     /// The code read, as it was handed to the reader.
     pub(crate) code: String,
     /// The same code as the reader saw it, with the name of every call it
@@ -80,6 +91,13 @@ impl InlineReading {
         self.unread |= other.unread;
         self.runs_download |= other.runs_download;
         self.code_unread |= other.code_unread;
+        self.read_python |= other.read_python;
+        self.read_eval_language |= other.read_eval_language;
+        for run in other.code_run {
+            if self.code_run.len() < 16 && !self.code_run.contains(&run) {
+                self.code_run.push(run);
+            }
+        }
         self.data_blanked.extend(other.data_blanked);
         for (mine, theirs) in [
             (&mut self.code, other.code),
@@ -589,6 +607,8 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
     let mut out = reader.out;
     out.code = code.to_owned();
     out.residue = residue;
+    out.read_python |= lang == Lang::Python;
+    out.read_eval_language |= lang != Lang::Lua;
     out
 }
 
@@ -1693,6 +1713,9 @@ impl Reader<'_> {
                 }
                 match self.fold(first, FOLD_DEPTH) {
                     Value::Str(code) if !code.contains(UNREAD) => {
+                        if self.out.code_run.len() < 16 && !self.out.code_run.contains(&code) {
+                            self.out.code_run.push(code.clone());
+                        }
                         let inner = read_code(self.lang, &code, self.depth - 1);
                         // Code written out is read in its place: what it
                         // calls is left in the residue of its own reading.
