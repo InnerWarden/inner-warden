@@ -444,37 +444,137 @@ fn status_io_cmd_rest(
     std::process::ExitCode::SUCCESS
 }
 
-/// The project settings files in `dir` that switch an agent's hooks off or
-/// add hooks of their own ([`status::project_settings_effect`]). A file that
-/// is missing, too large or not JSON says nothing here: the guard's own
-/// wiring lines are read from the home. Run in the home itself, these files
-/// are the person's own settings, read by the lines above, not a project's.
+/// The project settings files that switch an agent's hooks off or add hooks
+/// of their own ([`status::project_settings_read`]), in `dir` and in each
+/// folder above it up to the project's root ([`project_folders`]). Run in
+/// the home itself, these files are the person's own settings, read by the
+/// lines above, not a project's. A file in a folder above `dir` is named by
+/// its full path.
 fn project_settings_in(
     dir: &std::path::Path,
     home: Option<&std::path::Path>,
 ) -> Vec<status::ProjectSettings> {
-    const MOST: u64 = 1 << 20;
+    let mut found = Vec::new();
+    for folder in project_folders(dir, home) {
+        for (agent, file) in status::PROJECT_SETTINGS_FILES {
+            let Some(effect) = project_settings_effect_at(&folder.join(file), file) else {
+                continue;
+            };
+            found.push(status::ProjectSettings {
+                agent,
+                file: if folder == dir {
+                    (*file).to_string()
+                } else {
+                    folder.join(file).display().to_string()
+                },
+                effect,
+            });
+        }
+    }
+    found
+}
+
+/// The folders a project's settings are read in, from `dir` up: up to and
+/// with the first one that holds `.git` or `.claude` (the project's
+/// root), and never the home or a folder above it. When neither the home nor
+/// such a folder is above `dir` (a folder outside the home with no `.git`
+/// over it), `dir` alone: what lies above it, up to `/`, is no project's.
+/// Empty when `dir` is the home.
+fn project_folders<'a>(
+    dir: &'a std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<&'a std::path::Path> {
     let same = |a: &std::path::Path, b: &std::path::Path| {
         a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
     };
-    if home.is_some_and(|home| same(dir, home)) {
-        return Vec::new();
+    folders_up_to_root(
+        dir,
+        |folder| home.is_some_and(|home| same(folder, home)),
+        |folder| folder.join(".git").exists() || folder.join(".claude").is_dir(),
+    )
+}
+
+/// PURE: [`project_folders`] with what is the home and what is a project's
+/// root handed in.
+fn folders_up_to_root(
+    dir: &std::path::Path,
+    is_home: impl Fn(&std::path::Path) -> bool,
+    is_root: impl Fn(&std::path::Path) -> bool,
+) -> Vec<&std::path::Path> {
+    let mut folders = Vec::new();
+    for folder in dir.ancestors() {
+        if is_home(folder) {
+            return folders;
+        }
+        folders.push(folder);
+        if is_root(folder) {
+            return folders;
+        }
     }
-    status::PROJECT_SETTINGS_FILES
-        .iter()
-        .filter_map(|(agent, file)| {
-            let path = dir.join(file);
-            if std::fs::metadata(&path).ok()?.len() > MOST {
-                return None;
-            }
-            let settings = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-            Some(status::ProjectSettings {
-                agent,
-                file: (*file).to_string(),
-                effect: status::project_settings_effect(file, &settings)?,
-            })
-        })
-        .collect()
+    // No root and no home above it: only the folder itself.
+    folders.truncate(1);
+    folders
+}
+
+/// What the project settings file at `path` does to its agent's hooks. A
+/// missing file says nothing. The file is opened once, without following a
+/// link and without waiting (`O_NOFOLLOW | O_NONBLOCK` on unix), and what is
+/// judged is the file that was opened (`fstat` of it), so nothing can be put
+/// in its place between a check and the open. Only a regular file is read,
+/// and no more of it than the most that is read: a link, a pipe or a device
+/// (a link to `/dev/zero`, a FIFO) is named as not read, never waited on. A
+/// file that is there and cannot be opened (permission denied) is named too,
+/// never passed over.
+fn project_settings_effect_at(path: &std::path::Path, file: &str) -> Option<status::ProjectEffect> {
+    use std::io::Read;
+    const MOST: u64 = 1 << 20;
+    const NOT_REGULAR: &str =
+        "is not a regular file (a link, a pipe or a device), so it was not opened";
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_file()) {
+        return Some(status::ProjectEffect::Unread(NOT_REGULAR));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let opened = match options.open(path) {
+        Ok(opened) => opened,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return None;
+        }
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Some(status::ProjectEffect::Unread(NOT_REGULAR));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Some(status::ProjectEffect::Unread(
+                "could not be opened: permission denied",
+            ));
+        }
+        Err(_) => return Some(status::ProjectEffect::Unread("could not be opened")),
+    };
+    match opened.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Some(status::ProjectEffect::Unread(NOT_REGULAR)),
+        Err(_) => return Some(status::ProjectEffect::Unread("could not be checked")),
+    }
+    let mut body = Vec::new();
+    if opened.take(MOST + 1).read_to_end(&mut body).is_err() {
+        return Some(status::ProjectEffect::Unread("could not be read"));
+    }
+    if body.len() as u64 > MOST {
+        return Some(status::ProjectEffect::Unread("is larger than 1 MiB"));
+    }
+    status::project_settings_read(file, &body)
 }
 
 /// Does a local InnerWarden dashboard answer on `bind`?
@@ -1112,8 +1212,72 @@ mod json_head {
 /// that already ran (PostToolUse: a large file read, edited or written, a
 /// command with a long output) has nothing left to refuse: its head is
 /// recorded as a result not read whole, and the agent carries on.
+/// A prompt the person submitted (`UserPromptSubmit`): kept, masked and
+/// bounded, for the session it came in ([`user_prompt`]), and the hook ends
+/// with 0 and says nothing, whatever happened to the record. `None` for any
+/// other payload.
+///
+/// [`user_prompt`]: innerwarden_agent_guard::user_prompt
+fn keep_the_prompt(buf: &str, rest: &[String]) -> Option<std::process::ExitCode> {
+    use innerwarden_agent_guard::user_prompt;
+    let value: serde_json::Value = serde_json::from_str(buf).ok()?;
+    // A payload that names a tool is a tool call, whatever event it names:
+    // it is screened, never kept as a prompt.
+    if ["tool_name", "toolName", "tool"]
+        .iter()
+        .any(|key| value.get(key).is_some())
+    {
+        return None;
+    }
+    let prompt = user_prompt::prompt_of(&value)?;
+    // Claude Code drops the prompt on exit 2 and shows any other end: every
+    // end from here is 0 and silent.
+    hook_net::set_quiet(true);
+    // A debug build can be made to panic here, for the test that the panic
+    // guard ends a prompt run with 0.
+    #[cfg(debug_assertions)]
+    if std::env::var_os(TEST_PROMPT_PANIC_ENV).is_some() {
+        panic!("a panic asked for by {TEST_PROMPT_PANIC_ENV}");
+    }
+    let _ = user_prompt::record(
+        hook_session(buf).as_deref(),
+        agent_flag(rest).as_deref(),
+        &prompt,
+    );
+    Some(std::process::ExitCode::SUCCESS)
+}
+
+/// Whether a payload is the person's prompt: its event is
+/// `UserPromptSubmit` and it names no tool.
+fn is_prompt_naming_no_tool(buf: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(buf) else {
+        return false;
+    };
+    !["tool_name", "toolName", "tool"]
+        .iter()
+        .any(|key| value.get(key).is_some())
+        && innerwarden_agent_guard::user_prompt::prompt_of(&value).is_some()
+}
+
+/// Debug builds only: the prompt hook panics while it keeps the prompt.
+#[cfg(debug_assertions)]
+const TEST_PROMPT_PANIC_ENV: &str = "IW_TEST_PROMPT_HOOK_PANIC";
+
+/// A run on a tool call that came on the prompt line: the ends of the net
+/// and of the panic guard are a tool call's again.
+fn screen_as_a_tool_call() {
+    hook_net::set_quiet(false);
+}
+
 fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::ExitCode {
     let call = TooLongCall::read(head);
+    // A prompt the person submitted never ends with 2, on any line: past
+    // the cap it is not kept, and it goes on.
+    if call.event.as_deref() == Some(innerwarden_agent_guard::user_prompt::PROMPT_EVENT)
+        && call.tool.is_none()
+    {
+        return std::process::ExitCode::SUCCESS;
+    }
     if !call.already_ran() {
         return hook_unreadable("", rest, TOOL_CALL_TOO_LONG, monitor);
     }
@@ -1190,15 +1354,30 @@ fn hook_unreadable(buf: &str, rest: &[String], why: &str, monitor: bool) -> std:
 /// either strategy, so it decides the exit code: 2 in enforce (the call is
 /// refused, as for a call the hook could not read), 1 in monitor (it never
 /// blocks, and says the call went unscreened).
+///
+/// A run on the person's prompt ([`hook_net::set_quiet`]) ends with 0 and
+/// says nothing: Claude Code drops the prompt on 2 and shows any other end.
 fn install_hook_panic_guard(monitor: bool) {
-    let message = if monitor {
+    let message: &'static str = if monitor {
         "InnerWarden hook: an internal error stopped the screening of this tool call; it \
          was NOT screened (monitor mode never blocks).\n"
     } else {
         "InnerWarden hook: an internal error stopped the screening of this tool call; \
          refusing it rather than letting it run unscreened.\n"
     };
-    exit_on_panic(message, unreadable_exit_code(monitor));
+    let code = unreadable_exit_code(monitor);
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if hook_net::is_quiet() {
+            std::process::exit(0);
+        }
+        // The default report first: where it failed is what a bug report needs.
+        report(info);
+        // Never `eprintln!` here: it panics when stderr is gone, and a panic
+        // inside the panic hook aborts, which is the outcome this prevents.
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), message.as_bytes());
+        std::process::exit(i32::from(code));
+    }));
 }
 
 /// The MCP proxy's panic guard. A panic while a call is screened must never
@@ -1789,10 +1968,23 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     // blocks. A dev gets the live dashboard/narrative without the guardrail denying
     // day-to-day commands. Overrides --block-review.
     let monitor = rest.iter().any(|a| a == "--monitor");
+    // The line on the person's prompt: before anything is read, every end
+    // of this run is 0 and silent (a panic, stdin it cannot read, the
+    // deadline, a fault). A tool call that comes on it is screened as usual.
+    // The flag counts as the line's last word only, as the grammar of a line
+    // of ours reads it (`hook::is_iwguard_prompt_hook`), and never for
+    // Cursor, whose wiring has no prompt line.
+    let prompt_line = rest.last().map(String::as_str)
+        == Some(innerwarden_agent_guard::user_prompt::PROMPT_LINE_FLAG)
+        && agent_flag(rest).as_deref() != Some(innerwarden_agent_guard::cursor_hook::AGENT);
+    hook_net::set_quiet(prompt_line);
     install_hook_panic_guard(monitor);
     // Before stdin is read: a caller that never closes it is one of the
     // ends the net is for.
     if let Err(why) = hook_net::arm(monitor) {
+        if prompt_line {
+            return std::process::ExitCode::SUCCESS;
+        }
         return hook_unreadable("", rest, why, monitor);
     }
     // A host upgraded by an older binary still runs that binary's wiring:
@@ -1806,9 +1998,53 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     };
     let buf = match read {
         Ok(ToolCallRead::Whole(buf)) => buf,
-        Ok(ToolCallRead::TooLong(head)) => return hook_too_long(&head, rest, monitor),
+        Ok(ToolCallRead::TooLong(head)) => {
+            if prompt_line {
+                // A prompt past the cap is not kept, and the record of its
+                // session says a prompt went unkept. Anything else in a
+                // head this long is screened as a tool call would be.
+                let call = TooLongCall::read(&head);
+                // On the prompt line a head that names no tool, and whose
+                // event is a prompt or is past the head, is the person's
+                // prompt. A head whose event is read and is not a prompt is
+                // a call, screened as one.
+                let event = call.event.as_deref();
+                if call.tool.is_none()
+                    && (event.is_none()
+                        || event == Some(innerwarden_agent_guard::user_prompt::PROMPT_EVENT))
+                {
+                    let _ =
+                        innerwarden_agent_guard::user_prompt::record_lost(call.session.as_deref());
+                    return std::process::ExitCode::SUCCESS;
+                }
+                screen_as_a_tool_call();
+            }
+            return hook_too_long(&head, rest, monitor);
+        }
+        Err(_) if prompt_line => return std::process::ExitCode::SUCCESS,
         Err(_) => return hook_unreadable("", rest, "stdin could not be read", monitor),
     };
+    // A prompt the person submitted, on a line without the prompt flag: not
+    // kept, and never refused (2 drops what the person typed).
+    if !prompt_line && is_prompt_naming_no_tool(&buf) {
+        return std::process::ExitCode::SUCCESS;
+    }
+    if prompt_line {
+        // The person's prompt: kept for the MCP proxy, never refused, nothing
+        // printed (Claude Code adds a prompt hook's output to the
+        // conversation).
+        if let Some(exit) = keep_the_prompt(&buf, rest) {
+            return exit;
+        }
+        // Text that is not JSON is no call to screen: the prompt run ends as
+        // it began, with 0. Any JSON that is not a prompt goes to the
+        // screening every line gives a call, which reads it as it reads any
+        // other (a tool call of any shape, or a payload it refuses).
+        if serde_json::from_str::<serde_json::Value>(&buf).is_err() {
+            return std::process::ExitCode::SUCCESS;
+        }
+        screen_as_a_tool_call();
+    }
     // Cursor sends each event in its own shape: read as the call every other
     // agent's hook carries, and the event kept for the answer.
     let buf = if agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::cursor_hook::AGENT) {
@@ -4267,6 +4503,47 @@ mod status_wiring_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The folders a project's settings are read in stop at the project's
+    /// root (a folder with `.git` or `.claude`, read), at the home (not
+    /// read), and, with neither above, read the folder alone: a folder
+    /// outside the home with no `.git` never climbs to `/`.
+    #[test]
+    fn project_folders_stop_at_git_claude_or_home_and_never_climb_to_the_root() {
+        use std::path::Path;
+        let dir = Path::new("/srv/work/proj/src/module");
+        let never = |_: &Path| false;
+        let at = |stop: &'static str| move |folder: &Path| folder == Path::new(stop);
+        let names = |folders: Vec<&Path>| -> Vec<String> {
+            folders.iter().map(|f| f.display().to_string()).collect()
+        };
+        // A root (`.git` or `.claude`) two folders up: read up to it, it
+        // included.
+        assert_eq!(
+            names(super::folders_up_to_root(dir, never, at("/srv/work/proj"))),
+            [
+                "/srv/work/proj/src/module",
+                "/srv/work/proj/src",
+                "/srv/work/proj"
+            ]
+        );
+        // The home above, no root: up to the home, the home not read.
+        assert_eq!(
+            names(super::folders_up_to_root(dir, at("/srv/work"), never)),
+            [
+                "/srv/work/proj/src/module",
+                "/srv/work/proj/src",
+                "/srv/work/proj"
+            ]
+        );
+        // Outside the home, no root above: the folder alone, never `/`.
+        assert_eq!(
+            names(super::folders_up_to_root(dir, never, never)),
+            ["/srv/work/proj/src/module"]
+        );
+        // The home itself: nothing.
+        assert!(super::folders_up_to_root(dir, at("/srv/work/proj/src/module"), never).is_empty());
+    }
+
     #[test]
     fn check_stdin_hint_explains_terminal_input() {
         let hint = super::check_stdin_hint(true).expect("terminal input needs an explanation");

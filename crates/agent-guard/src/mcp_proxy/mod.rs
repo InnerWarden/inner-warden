@@ -25,5 +25,7 @@ pub mod jsonrpc;
 pub mod pins;
 pub mod router;
 pub(crate) mod structure;
+#[cfg(test)]
+mod structure_corpus;
 pub mod taint;
 pub mod transport;

@@ -527,3 +527,233 @@ fn status_names_a_project_that_switches_the_hook_off() {
         "{own}"
     );
 }
+
+/// `status` run with a timeout: a project file that makes it wait (a FIFO,
+/// a link to `/dev/zero`) fails the test instead of hanging the suite.
+fn status_within(home: &Path, dir: &Path) -> String {
+    let mut child = cli(home)
+        .arg("status")
+        .current_dir(dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run innerwarden status");
+    let started = std::time::Instant::now();
+    loop {
+        if child.try_wait().expect("poll status").is_some() {
+            break;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            let _ = child.kill();
+            panic!("status in {} did not finish in 30 s", dir.display());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().expect("collect status");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// `status` finds a project's settings from a folder inside the project,
+/// up to the folder that holds `.git`, and not above it; names Codex's
+/// project files; and says when a file is there and could not be read:
+/// JSON with a comment or a trailing comma, a file over 1 MiB, and a link,
+/// a FIFO or a link to `/dev/zero`, none of which it waits on.
+///
+/// FAILS ON REVERT: read the files in the working directory only, with
+/// `metadata` and an unbounded `fs::read`, and the run from the subfolder
+/// says nothing. A `status` that waits on the FIFO fails at the timeout
+/// instead of hanging the suite.
+#[test]
+fn status_reads_a_projects_settings_from_a_subfolder_and_says_what_it_could_not_read() {
+    let home = tempfile::TempDir::new().expect("temp home");
+    let project = home.path().join("work/proj");
+    let deep = project.join("src/module");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    std::fs::create_dir_all(project.join(".claude")).unwrap();
+    std::fs::create_dir_all(project.join(".codex")).unwrap();
+    // Above the project's root: never read.
+    std::fs::create_dir_all(home.path().join("work/.claude")).unwrap();
+    std::fs::write(
+        home.path().join("work/.claude/settings.json"),
+        r#"{"disableAllHooks": true}"#,
+    )
+    .unwrap();
+
+    std::fs::write(
+        project.join(".claude/settings.local.json"),
+        r#"{"disableAllHooks": true}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".codex/config.toml"),
+        "[features]\ncodex_hooks = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".codex/hooks.json"),
+        r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"./lint.sh"}]}]}}"#,
+    )
+    .unwrap();
+    let from_deep = status_within(home.path(), &deep);
+    let local = project.join(".claude/settings.local.json");
+    assert!(
+        from_deep.contains(&format!(
+            "This project's {} sets \"disableAllHooks\"",
+            std::fs::canonicalize(&local).unwrap().display()
+        )),
+        "{from_deep}"
+    );
+    assert!(
+        from_deep.contains("config.toml sets \"codex_hooks\" to false under [features]"),
+        "{from_deep}"
+    );
+    assert!(
+        from_deep.contains(".codex/hooks.json adds hooks of its own"),
+        "{from_deep}"
+    );
+    assert!(
+        !from_deep.contains("work/.claude/settings.json"),
+        "{from_deep}"
+    );
+
+    // In the project's own folder the names are short.
+    let at_root = status_within(home.path(), &project);
+    assert!(
+        at_root.contains("This project's .claude/settings.local.json sets \"disableAllHooks\""),
+        "{at_root}"
+    );
+
+    // Not JSON this reads: a comment, a trailing comma, more than 1 MiB.
+    std::fs::write(
+        project.join(".claude/settings.local.json"),
+        "{\n  // off here\n  \"disableAllHooks\": true,\n}\n",
+    )
+    .unwrap();
+    let mut big = String::from(r#"{"permissions":{"allow":["#);
+    while big.len() <= 1 << 20 {
+        big.push_str(r#""Bash(npm test)","#);
+    }
+    big.push_str(r#""Bash(ls)"]}}"#);
+    std::fs::write(project.join(".claude/settings.json"), big).unwrap();
+    let unread = status_within(home.path(), &project);
+    assert!(
+        unread.contains(
+            "Could not read this project's .claude/settings.local.json: it is not plain JSON"
+        ),
+        "{unread}"
+    );
+    assert!(
+        unread.contains(
+            "Could not read this project's .claude/settings.json: it is larger than 1 MiB"
+        ),
+        "{unread}"
+    );
+
+    #[cfg(unix)]
+    {
+        // A link to `/dev/zero` and a FIFO: named, never waited on.
+        std::fs::remove_file(project.join(".claude/settings.json")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", project.join(".claude/settings.json")).unwrap();
+        std::fs::remove_file(project.join(".claude/settings.local.json")).unwrap();
+        let made = Command::new("mkfifo")
+            .arg(project.join(".claude/settings.local.json"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo");
+        let special = status_within(home.path(), &project);
+        for file in [".claude/settings.json", ".claude/settings.local.json"] {
+            assert!(
+                special.contains(&format!(
+                    "Could not read this project's {file}: it is not a regular file"
+                )),
+                "{file}: {special}"
+            );
+        }
+    }
+}
+
+/// `status` stops climbing at a folder that holds `.claude` (the
+/// project's root, read) and at the home (never read as a project), and
+/// names a project settings file it was denied instead of passing over it.
+///
+/// FAILS ON REVERT: stop only at `.git`, and the `.gemini` file above the
+/// `.claude` folder is read as this project's; read with `symlink_metadata`
+/// and `.ok()?`, and the denied file says nothing.
+#[test]
+fn status_stops_at_claude_and_at_the_home_and_names_a_denied_file() {
+    let home = tempfile::TempDir::new().expect("temp home");
+    let off = r#"{"hooksConfig": {"enabled": false}}"#;
+    // A folder with `.claude` and no `.git` is the project's root.
+    let app = home.path().join("work/app");
+    let deep = app.join("src");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::create_dir_all(app.join(".claude")).unwrap();
+    std::fs::write(
+        app.join(".claude/settings.json"),
+        r#"{"disableAllHooks": true}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.path().join("work/.gemini")).unwrap();
+    std::fs::write(home.path().join("work/.gemini/settings.json"), off).unwrap();
+    let from_deep = status_within(home.path(), &deep);
+    assert!(
+        from_deep.contains(&format!(
+            "This project's {} sets \"disableAllHooks\"",
+            std::fs::canonicalize(app.join(".claude/settings.json"))
+                .unwrap()
+                .display()
+        )),
+        "{from_deep}"
+    );
+    assert!(!from_deep.contains("work/.gemini"), "{from_deep}");
+
+    // No root up to the home: every folder below the home is read, the
+    // home's own files are not a project's.
+    let loose = home.path().join("loose/sub");
+    std::fs::create_dir_all(&loose).unwrap();
+    std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
+    std::fs::write(home.path().join(".gemini/settings.json"), off).unwrap();
+    std::fs::create_dir_all(home.path().join("loose/.gemini")).unwrap();
+    std::fs::write(home.path().join("loose/.gemini/settings.json"), off).unwrap();
+    let from_loose = status_within(home.path(), &loose);
+    assert!(
+        from_loose.contains(&format!(
+            "{}",
+            std::fs::canonicalize(home.path().join("loose/.gemini/settings.json"))
+                .unwrap()
+                .display()
+        )),
+        "{from_loose}"
+    );
+    assert!(
+        !from_loose.contains(&format!(
+            "This project's {}",
+            std::fs::canonicalize(home.path().join(".gemini/settings.json"))
+                .unwrap()
+                .display()
+        )),
+        "{from_loose}"
+    );
+
+    // A file it is denied: named, never passed over. Root reads anything,
+    // so this part runs only as another user.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = Command::new("id").arg("-u").output().expect("id -u");
+        if String::from_utf8_lossy(&uid.stdout).trim() != "0" {
+            let folder = app.join(".claude");
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let denied = status_within(home.path(), &app);
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                denied.contains(
+                    "Could not read this project's .claude/settings.json: it could not be \
+                     opened: permission denied"
+                ),
+                "{denied}"
+            );
+        }
+    }
+}

@@ -13,6 +13,31 @@ guard, and refused if it lets through a line main stops. The guard still reads
 the text of a command; what it does not see is written down, as measured:
 [Where this ends](docs/features.md#where-this-ends).
 
+`innerwarden install` wires a hook on Claude Code's prompts
+(`UserPromptSubmit`) that keeps what the person submitted (pasted text
+included), up to its first 16,384 characters and 65,536 per session, masked,
+per session, in `~/.config/innerwarden/prompts/` (0600, 24 hours), so the MCP
+proxy can ask whether a value appears, whole, in the person's request. A
+session that lost words to those limits answers "unknown", never "no", for a
+value it does not hold. The answer is information only and never lets a
+refused call through: an agent with a shell on the same account can forge a
+record by running the hook itself, and the session id comes from a variable
+a process in between can change. The guard refuses an agent's reads of the
+folder as it refuses its writes (a `cd` into the folder and a glob in its
+name are not recognised). The prompt line ends with `--prompt` and is in
+order only under `UserPromptSubmit`; every end of its run is 0 and silent (a
+panic, unreadable stdin, the deadline), and any JSON on it that is not a prompt
+naming no tool is screened as a tool call. A guard whose program is gone ends
+the line with 127, shown as an error while the prompt goes on. Two prompts of
+one session written at once do not write over each other (the guard's update
+lock); one that still cannot be written marks the session as having lost a
+prompt. A tool line that ends with `--prompt` is said by `status` as not
+screened: its run still ends with 0 on stdin it cannot read, and writing it
+takes an edit of the agent settings the guard refuses to an agent (measured with `innerwarden check`: `jq` into a temp file and `mv`, `sed -i`, `python3` and `jq | sponge` on the `PreToolUse` of `~/.claude/settings.json` are each `deny`). An expired prompt
+is deleted when its session is written or read. Other agents are not wired:
+their MCP servers get no session id to match. Details and limits:
+[The prompt record](docs/prompt-record.md).
+
 ### Added
 
 - **`innerwarden contain --agent openclaw` (Linux).** OpenClaw runs in the
@@ -34,6 +59,22 @@ the text of a command; what it does not see is written down, as measured:
   holds (sessions, scheduled jobs) stays writable, as the gateway needs it. What OpenClaw uses was read from OpenClaw
   2026.9.7's own documentation and is held by unit tests; the jail was not
   run with a live gateway here.
+- **The MCP proxy reads more shapes of an order to the assistant.** The
+  reading of a server's text as an order (what raises a call that acts with a
+  value said in it) now finds the assistant called after a data key, a label
+  or a code comment, named with what it does ("the assistant reading this
+  must send"), a block dressed as the system or a tool, the task set aside or
+  replaced ("the user now wants you to", instructions ignored), an act kept
+  from the user, a role taken into the real world, a softened imperative, and
+  letters spaced out. A quote, a procedure's heading, a data key and a
+  greeting with a name take no mark away. On a private held-out set written
+  independently and run once: 31 of 80 attacks (main 10); benign flagged 3 of
+  80 (main 0). Those numbers were measured before the review that made the
+  reading only add marks; they change with it and were not measured again.
+  AgentDojo's 35 texts are all still found. A polite request, a claim of
+  authority or a role with only a sending is still not read as an order:
+  people write those to people in the same words. A text longer than the
+  1 MiB read for this structure is said to be read in its start only.
 - **Goose's MCP servers are wired through the proxy.** `innerwarden agents
   connect goose` now routes every `type: stdio` extension in
   `~/.config/goose/config.yaml` through `innerwarden proxy`, naming Goose,
@@ -103,6 +144,44 @@ the text of a command; what it does not see is written down, as measured:
   `status` says that the agent started there runs without the guard's hook,
   and that you remove the key. A project file that adds hooks of its own is
   named as hooks the guard does not judge.
+- **A project's agent settings are held by path.** Every write an agent makes
+  to them is refused, whatever it changes: a rule added to
+  `permissions.allow` and a project hook of its own (a formatter run after
+  each edit, for one) are refused too, a false positive accepted because a
+  hook the agent writes runs outside the guard. Claude Code's own "always
+  allow" answer is written by Claude Code, not through a tool call, and still
+  works. The shell forms held now include `cp`, `mv`, `tee`, an append,
+  a heredoc, a write from inside `.claude`, `git checkout <tree> -- <file>`
+  and `git restore`, a file written elsewhere and moved in, a link made at
+  the file or put where the folder was (`ln -sfn`), a link made first to the
+  folder or to a settings file and written through later (the line that
+  makes the link is refused: `ln -s .claude c`), the absolute path, node
+  and ruby code, and the folder spelled in capitals, which is the same folder
+  on a macOS disk. A move, link or copy onto the folder by its bare name
+  (`mv notes.md .claude`) is refused too, since with no folder there it
+  becomes the folder, and the refusal says to end the folder with a slash
+  (`mv notes.md .claude/`) to move a file into it. Not read, and so not
+  held: a target the shell builds (a glob, a brace, a substitution), a copy
+  of a whole folder that holds one of these files into a place other than
+  the agent's folder, an archive unpacked over one, a download that takes its
+  name from the URL, a branch switched, pulled or merged that changes one
+  (`git checkout <tree> -- <file>` and `git restore` of one are read), a
+  change of owner (`chown`), and a write made by interpreter code other than
+  the rewrites listed above.
+- **`status` reads a project's settings from anywhere inside it.** Run in a
+  subfolder, it reads each folder up to the project's root, the first one
+  that holds `.git` or `.claude`, and never the home or above it. Outside
+  the home, in a folder with no such root above it, it reads that folder
+  alone and never climbs to `/`. It also reads Codex's project
+  `.codex/config.toml` (`hooks = false` under `[features]`, or
+  `codex_hooks = false`, its older name, as read in Codex's source at
+  `rust-v0.171.0`) and `.codex/hooks.json`, and says when a file is there
+  and could not be read: JSON with a comment or a trailing comma, a file over
+  1 MiB, a file it was denied, or something that is not a regular file. Each
+  file is opened once, without following a link and without waiting, and
+  judged by what was opened, so a FIFO or a link to `/dev/zero` no longer
+  makes `status` wait and nothing can be swapped in between a check and the
+  open.
 - **A jail's change to the project's Claude Code files is told apart from
   yours.** A `.claude` settings file or a `.mcp.json` that a jail made
   during its run with hooks, hooks off, a bypass mode or MCP servers now
@@ -213,6 +292,69 @@ the text of a command; what it does not see is written down, as measured:
   starting a jail, `contain` now names lifting the sysctl too, after the
   AppArmor profile, and the jail tests are skipped there with that reason
   instead of failing (in CI they still fail).
+- **Every shape of an MCP shell call is judged by the line it builds.** The
+  proxy now finds the program and its arguments in every shape a shell or
+  process tool takes them: Node's `{"file": "ls", "args": ["-la"]}`,
+  `{"name"|"binary", "args"}`, arguments as one string (both readings, the
+  words a shell splits it into and one word, are judged), and arguments with
+  no program at all, the first word the program. Tools named for a shell or
+  the process call they make (`powershell`, `pwsh`, `cmd`, `subprocess`,
+  `os_command`, `system_call`) are shell tools: before, every call to them
+  was refused by ATR-2026-040 for the name, `ls -la` included, and the shapes
+  above were refused the same way in every shell tool. A harmful line in any
+  of them is refused by the line. A script handed to a shell on standard input
+  is that shell's lines: `{"argv": ["sh"], "stdin": "ls -la"}` runs and
+  `rm -rf /` there is refused. The hook still refuses the shapes it could
+  not read before.
+- **A working folder is where a command runs, and its operands are read
+  there.** `run_command {"argv": ["git", "status"], "cwd": "/home/u/app"}` was
+  refused (AG-EXEC, "not plain data") while `run_shell` ran it; it runs now.
+  Each operand a line writes relative to the folder is also read joined to it,
+  the folder as written with `..` taken lexically (one that climbs above
+  where it starts is read from `/`), `~` as the home, and through a link
+  to where it points: `cat shadow` in `/etc` is `cat /etc/shadow`, `rm -rf
+  .` in `/` is `rm -rf /`, `rm -rf *` in the home is a wipe of it, in
+  `run_shell` as in `run_command` and for a command string too (main judged
+  these as `cat shadow`). The line is read in the shell's words, so a quote
+  or an escape does not hide an operand (`cat 'shadow'`, `cat sh\adow`), and
+  each joined operand is collapsed (`../../etc//shadow` from `/home/u/app` is
+  `/etc/shadow`). The value of an operand written `name=value` is read there
+  too (`dd if=shadow` in `/etc`), a part the line builds when it runs (`cat
+  $f`, `$(echo shadow)`) is any name there (`cat /etc/*`), and a key or
+  secret file a joined operand names is refused (AG-FILE) even where the
+  analyzer lets the program's own reading of it through. A link is followed on the proxy's own disk, which is the
+  server's only when both run on the same machine; elsewhere the folder is
+  read as written. A folder holding shell syntax (`$(...)`, `;`, a
+  backtick) is also judged as the line a server would join it into, `cd
+  <folder> && <line>`.
+- **Words a server may join into a shell line are judged joined.** A call
+  that asks for a shell (`shell`, `use_shell`: true), or whose words hold a
+  glob, a redirection or a variable (a space in it too: `-rf /home/u/*`), is
+  also judged as its words joined as written (`cat *` in `~/.ssh`, `echo x
+  >~/.bashrc`); the flag keeps the call's other checks, its tool's name among
+  them. A word that is not text beside a command string no longer lets that
+  string be judged alone. The lists a call holds (its arguments, and any
+  other list beside the command, and the objects inside those lists) past
+  256 KiB or 4096 words in all are refused unread (AG-ARGV-LONG).
+- **Goose's config: a merge key, an unreadable file, remote extensions and
+  `args`.** An extension holding a YAML merge key (`<<: *base`), which
+  Goose does not apply, was read without it, so a stdio server whose `type`
+  came from the merge was counted remote and left unwrapped without a word:
+  such a file is now refused, and nothing is written. A config that is there
+  and cannot be read (several YAML documents, a merge key) made the status say
+  nothing was left unguarded: it now says the file cannot be read and that
+  whether its servers are behind the proxy is not known. Remote extensions
+  (`streamable_http`, `sse`, any other type the proxy never sees) are named
+  with their type on the connect line and in `innerwarden agents`. A stdio
+  server with no `args` got one on connect and kept `args: []` after
+  disconnect; the line connect adds is marked, and disconnect takes it out, so
+  the file is as it was. Code that runs inside Goose (`inline_python`,
+  `frontend`, an extension of an unknown type) is seen by no proxy: connect
+  says "wired" and "Partly guarded" and names it, and the agent is never
+  counted guarded. A key written twice in an extension is refused by the
+  parser, as Goose's is. The tests read Goose 1.60.2's documented extension
+  shapes.
+
 - **A shell tool's call that names its program in `argv` is judged by its
   line.** `run_shell {"argv": ["ls", "-la"]}` and `{"program": "ls", "args":
   []}` were refused by ATR-2026-040 for the tool's name: `argv` with no

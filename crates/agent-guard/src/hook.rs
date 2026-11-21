@@ -154,6 +154,90 @@ pub fn merge_posttooluse_hook(mut settings: Value, hook_command: &str) -> Value 
     settings
 }
 
+/// Idempotently install the hook on the person's prompts
+/// (`UserPromptSubmit`): it keeps what the person asked for, per session,
+/// for the MCP proxy to read ([`crate::user_prompt`]).
+///
+/// The line is written without the fail-closed tail ([`prompt_hook_command`]):
+/// Claude Code drops the person's prompt when this hook exits 2, and a guard
+/// that is gone must never stop the person from talking to the agent. The
+/// mode of this line says nothing of the posture; only the tool halves do.
+/// A previous InnerWarden line under the event is replaced wherever it sits.
+pub fn merge_userpromptsubmit_hook(mut settings: Value, hook_command: &str) -> Value {
+    if !settings.is_object() {
+        settings = json!({});
+    }
+    let obj = settings.as_object_mut().expect("object");
+    let hooks = obj.entry("hooks").or_insert_with(|| json!({}));
+    if !hooks.is_object() {
+        *hooks = json!({});
+    }
+    let list = hooks
+        .as_object_mut()
+        .expect("object")
+        .entry(crate::user_prompt::PROMPT_EVENT)
+        .or_insert_with(|| json!([]));
+    if !list.is_array() {
+        *list = json!([]);
+    }
+    let arr = list.as_array_mut().expect("array");
+    let mut kept: Option<serde_json::Map<String, Value>> = None;
+    arr.retain_mut(|entry| {
+        let Some(list) = entry.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        let was_empty = list.is_empty();
+        list.retain(|hook| {
+            if !is_iwguard_hook(hook) {
+                return true;
+            }
+            if kept.is_none() {
+                kept = hook.as_object().cloned();
+            }
+            false
+        });
+        was_empty || !list.is_empty()
+    });
+    let mut hook = kept.unwrap_or_default();
+    hook.insert("type".into(), json!("command"));
+    hook.insert("command".into(), json!(hook_command));
+    arr.push(json!({ "hooks": [ Value::Object(hook) ] }));
+    settings
+}
+
+/// The prompt hook's line ([`merge_userpromptsubmit_hook`]): the guard with
+/// the mode flags of the tool halves, naming its agent, then
+/// [`crate::user_prompt::PROMPT_LINE_FLAG`], and never the fail-closed
+/// script. The flag tells the hook, before it reads anything, that every end
+/// of this run is 0 and silent. A guard that is gone ends the line with 127
+/// (the one end the guard cannot answer for): Claude Code shows it as an
+/// error and the prompt goes on.
+pub fn prompt_hook_command(
+    iw_guard: &Path,
+    block_review: bool,
+    monitor: bool,
+    agent: Option<&str>,
+) -> String {
+    format!(
+        "{} {}",
+        hook_command_shaped(iw_guard, block_review, monitor, agent, false),
+        crate::user_prompt::PROMPT_LINE_FLAG
+    )
+}
+
+/// Whether the settings hold a prompt hook of ours.
+fn has_iwguard_prompt_hook(settings: &Value) -> bool {
+    settings
+        .get("hooks")
+        .and_then(|hooks| hooks.get(crate::user_prompt::PROMPT_EVENT))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .any(is_iwguard_prompt_hook)
+}
+
 pub fn merge_pretooluse_bash_hook(mut settings: Value, hook_command: &str) -> Value {
     if !settings.is_object() {
         settings = json!({});
@@ -251,7 +335,11 @@ const _: () = assert!(HOOK_LONGEST_SECS < HOOK_TIMEOUT_SECS && HOOK_TIMEOUT_SECS
 /// `timeout` of [`HOOK_TIMEOUT_SECS`] where it has none. A `timeout` already
 /// on a line (the operator's) is kept as it is; nothing else changes.
 pub fn with_hook_timeouts(mut settings: Value) -> Value {
-    for event in ["PreToolUse", "PostToolUse"] {
+    for event in [
+        "PreToolUse",
+        "PostToolUse",
+        crate::user_prompt::PROMPT_EVENT,
+    ] {
         let Some(entries) = settings
             .get_mut("hooks")
             .and_then(|hooks| hooks.get_mut(event))
@@ -291,7 +379,7 @@ pub fn iwguard_bash_hook_timeout(settings: &Value) -> Option<Option<u64>> {
         .filter(|entry| bash_matcher_coverage(entry) == BashMatcherCoverage::Includes)
         .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
         .flatten()
-        .filter(|hook| is_iwguard_hook(hook))
+        .filter(|hook| is_screening_iwguard_hook(hook))
         .map(|hook| {
             hook.get("timeout").and_then(|t| {
                 t.as_u64()
@@ -925,6 +1013,19 @@ fn install_hook_with_link_policy(
         None => cmd.clone(),
     };
     let merged = merge_posttooluse_hook(merged, &post_command);
+    // The prompt half: what the person asked, kept for the MCP proxy to tell
+    // a value they typed from one the model wrote. Never refuses anything.
+    // Only an install or connect the person runs adds it: background setup
+    // after an upgrade does not start keeping prompts on its own, and keeps
+    // (re-points) one that is already there.
+    let merged = if !reject_symlinks || has_iwguard_prompt_hook(&existing) {
+        merge_userpromptsubmit_hook(
+            merged,
+            &prompt_hook_command(iw_guard, block_review, monitor, agent_flag.as_deref()),
+        )
+    } else {
+        merged
+    };
     // Claude Code waits 600 s for a hook that names no `timeout`; every line
     // of ours gets [`HOOK_TIMEOUT_SECS`] unless the operator set one. Only an
     // explicit install or connect writes it: background setup keeps every
@@ -1144,9 +1245,23 @@ fn iwguard_hook_mode(hook: &Value) -> Option<HookProtection> {
 /// `--agent <id>`, alone or inside the fail-closed script ([`guard_words`]). A repeated flag, an unknown word or an agent id that is not
 /// a plain id means the line is not ours, exactly as before `--agent` existed:
 /// uninstall and repair must never claim an operator's own command.
+///
+/// The prompt line ([`prompt_hook_command`]) is not one of these: it screens
+/// no tool call, so wherever it stands it gives no mode and no screening
+/// ([`is_iwguard_prompt_hook`] reads it).
 fn iwguard_hook_parts(hook: &Value) -> Option<(HookProtection, Option<String>)> {
     let line = parse_guard_line(hook.get("command").and_then(Value::as_str)?)?;
-    Some((line.mode, line.agent))
+    (!line.prompt).then_some((line.mode, line.agent))
+}
+
+/// Whether a hook is the prompt line ([`prompt_hook_command`]): only under
+/// `UserPromptSubmit` is it a line in order. Anywhere else it is a line of
+/// ours that screens nothing, and it is replaced or removed with the others.
+pub fn is_iwguard_prompt_hook(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(Value::as_str)
+        .and_then(parse_guard_line)
+        .is_some_and(|line| line.prompt)
 }
 
 /// One line of ours, read apart by [`parse_guard_line`].
@@ -1155,6 +1270,8 @@ struct GuardLine {
     mode: HookProtection,
     agent: Option<String>,
     shape: LineShape,
+    /// The line ends with [`crate::user_prompt::PROMPT_LINE_FLAG`].
+    prompt: bool,
 }
 
 /// PURE: read a hook command as a line of ours, plain or fail-closed
@@ -1175,6 +1292,17 @@ fn parse_guard_words(words: &[String], shape: LineShape) -> Option<GuardLine> {
     let (executable, rest) = words.split_first()?;
     let (subcommand, flags) = rest.split_first()?;
     if !is_innerwarden_executable(executable) || subcommand != "hook" {
+        return None;
+    }
+    // The prompt line's last word ([`prompt_hook_command`]). A tool call
+    // that arrives on a line carrying it is screened as on any other.
+    let (flags, prompt) = match flags.split_last() {
+        Some((last, before)) if last == crate::user_prompt::PROMPT_LINE_FLAG => (before, true),
+        _ => (flags, false),
+    };
+    // The prompt line is the guard alone ([`prompt_hook_command`]), never
+    // inside a script.
+    if prompt && shape != LineShape::Plain {
         return None;
     }
     let (mode_flag, agent_flags) = match flags.first().map(String::as_str) {
@@ -1204,10 +1332,19 @@ fn parse_guard_words(words: &[String], shape: LineShape) -> Option<GuardLine> {
         mode,
         agent,
         shape,
+        prompt,
     })
 }
 
+/// A line of ours in any form, the prompt line included: what a reinstall
+/// replaces and an uninstall removes. Whether it screens is
+/// [`iwguard_hook_mode`].
 fn is_iwguard_hook(hook: &Value) -> bool {
+    iwguard_hook_mode(hook).is_some() || is_iwguard_prompt_hook(hook)
+}
+
+/// A line of ours that screens tool calls: not the prompt line.
+fn is_screening_iwguard_hook(hook: &Value) -> bool {
     iwguard_hook_mode(hook).is_some()
 }
 
@@ -1236,8 +1373,14 @@ pub struct HookLine {
 
 /// Read one hook object as an InnerWarden hook line, `None` when its command
 /// is not one [`hook_command_for`] writes.
+///
+/// The prompt line is `None` here: it screens no tool call, and a tool
+/// event that carries it has no line of ours in order.
 pub fn read_hook_line(hook: &Value) -> Option<HookLine> {
     let line = parse_guard_line(hook.get("command").and_then(Value::as_str)?)?;
+    if line.prompt {
+        return None;
+    }
     let (block_review, monitor) = line.mode.flags();
     Some(HookLine {
         program: line.program,
@@ -1671,7 +1814,7 @@ pub fn iwguard_hook_commands_for_tool(settings: &Value, tool: &str) -> Vec<Vec<S
         .filter(|entry| tool_matcher_coverage(entry, tool) == BashMatcherCoverage::Includes)
         .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
         .flatten()
-        .filter(|hook| is_iwguard_hook(hook))
+        .filter(|hook| is_screening_iwguard_hook(hook))
         .filter_map(|hook| hook.get("command").and_then(Value::as_str))
         .filter_map(hook_command_words)
         .filter(|words| !words.is_empty())
@@ -1755,26 +1898,61 @@ pub fn unscreened_iwguard_hooks(
         let Some(entries) = entries.as_array() else {
             continue;
         };
-        // (label, verdicts) per matcher, in file order.
-        let mut groups: Vec<(String, Vec<HookProgram>)> = Vec::new();
+        // (label, verdicts) per matcher, in file order, each verdict with whether it came
+        // from the prompt line, which screens no tool call.
+        let mut groups: Vec<(String, Vec<(HookProgram, bool)>)> = Vec::new();
         let mut every_tool_runs = false;
         for entry in entries {
-            let label = matcher_label(entry);
-            let verdicts: Vec<HookProgram> = entry
+            let label = if event == crate::user_prompt::PROMPT_EVENT {
+                "every prompt".to_string()
+            } else {
+                matcher_label(entry)
+            };
+            let prompt_event = event == crate::user_prompt::PROMPT_EVENT;
+            let verdicts: Vec<(HookProgram, bool)> = entry
                 .get("hooks")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter(|hook| is_iwguard_hook(hook))
-                .filter_map(|hook| hook.get("command").and_then(Value::as_str))
-                .filter_map(hook_command_words)
-                .filter_map(|words| words.into_iter().next())
-                .map(|program| judge_hook_program(&program, fact(&program)))
+                .filter_map(|hook| {
+                    let screening = if prompt_event {
+                        is_iwguard_prompt_hook(hook)
+                    } else {
+                        is_screening_iwguard_hook(hook)
+                    };
+                    // The prompt line under a tool event: a line of ours that
+                    // screens no tool call (its run even ends with 0 on stdin
+                    // it cannot read).
+                    let prompt_here = !prompt_event && is_iwguard_prompt_hook(hook);
+                    if !screening && !prompt_here {
+                        return None;
+                    }
+                    let program = hook
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .and_then(hook_command_words)
+                        .and_then(|words| words.into_iter().next())?;
+                    Some(if prompt_here {
+                        (
+                            HookProgram::Broken {
+                                problem: format!(
+                                    "its innerwarden line ends with {}, which screens no tool \
+                                     call",
+                                    crate::user_prompt::PROMPT_LINE_FLAG
+                                ),
+                                program,
+                            },
+                            true,
+                        )
+                    } else {
+                        (judge_hook_program(&program, fact(&program)), false)
+                    })
+                })
                 .collect();
             if verdicts.is_empty() {
                 continue;
             }
-            if label == "every tool" && verdicts.contains(&HookProgram::Runs) {
+            if label == "every tool" && verdicts.iter().any(|(v, _)| *v == HookProgram::Runs) {
                 every_tool_runs = true;
             }
             match groups.iter_mut().find(|(l, _)| *l == label) {
@@ -1788,16 +1966,19 @@ pub fn unscreened_iwguard_hooks(
         for (label, verdicts) in groups {
             if verdicts
                 .iter()
-                .any(|v| !matches!(v, HookProgram::Broken { .. }))
+                .any(|(v, _)| !matches!(v, HookProgram::Broken { .. }))
             {
                 continue;
             }
             // The Bash group is judged by `judge_iwguard_hooks`; a broken one
-            // already makes the whole agent off, said elsewhere.
-            if event == "PreToolUse" && label == "Bash" {
+            // already makes the whole agent off, said elsewhere. A Bash group
+            // whose every line of ours is the prompt line has no line there
+            // to judge, so it is said here.
+            let prompt_lines_only = verdicts.iter().all(|(_, prompt_line)| *prompt_line);
+            if event == "PreToolUse" && label == "Bash" && !prompt_lines_only {
                 continue;
             }
-            let Some(HookProgram::Broken { problem, .. }) = verdicts.into_iter().next() else {
+            let Some((HookProgram::Broken { problem, .. }, _)) = verdicts.into_iter().next() else {
                 continue;
             };
             let tools = if event == "PreToolUse" {
@@ -2019,7 +2200,11 @@ pub fn uninstall_hook(
     // running the guard's binary after every tool call of an agent the person
     // had disconnected, and failed on each one once the binary was removed.
     let (cleaned, observed) = remove_iwguard_hooks_for_event(cleaned, "PostToolUse");
-    let removed = removed + observed;
+    // The prompt half goes too: left behind, it kept the person's words for a
+    // guard that no longer reads them.
+    let (cleaned, prompts) =
+        remove_iwguard_hooks_for_event(cleaned, crate::user_prompt::PROMPT_EVENT);
+    let removed = removed + observed + prompts;
     if removed > 0 {
         let body = serde_json::to_string_pretty(&cleaned).map_err(|e| e.to_string())? + "\n";
         crate::file_update::replace_if_unchanged(&settings_path, Some(&source), body.as_bytes())?;
@@ -3837,8 +4022,9 @@ mod tests {
         let (path, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
         assert_eq!(path, settings);
         assert_eq!(
-            removed, 4,
-            "the Bash hook, the file-tools hook, the read-tools hook and the PostToolUse hook"
+            removed, 5,
+            "the Bash hook, the file-tools hook, the read-tools hook, the PostToolUse hook and \
+             the prompt hook"
         );
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v["hooks"]["PreToolUse"].as_array().unwrap().len(), 0);
@@ -3871,10 +4057,203 @@ mod tests {
             3,
             "reinstall must not stack a second hook (Bash, file-tools and read-tools entries)"
         );
-        // uninstall finds and removes all four: Bash, file tools, read tools,
-        // PostToolUse.
+        // uninstall finds and removes all five: Bash, file tools, read tools,
+        // PostToolUse and the prompt hook.
         let (_, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
-        assert_eq!(removed, 4);
+        assert_eq!(removed, 5);
+    }
+
+    /// Uninstall takes out the prompt hook it installed and nothing else
+    /// under that event: the person's own prompt hook stays as it was.
+    #[test]
+    fn uninstall_removes_its_prompt_hook_and_keeps_the_persons() {
+        let home = tempfile::TempDir::new().unwrap();
+        let settings = home.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let theirs = json!({
+            "hooks": [{"type": "command", "command": "/opt/notes/log-prompt"}]
+        });
+        std::fs::write(
+            &settings,
+            serde_json::to_string(&json!({"hooks": {"UserPromptSubmit": [theirs.clone()]}}))
+                .unwrap(),
+        )
+        .unwrap();
+        install_hook(
+            home.path(),
+            "claude-code",
+            None,
+            Path::new("/opt/innerwarden"),
+            false,
+            false,
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        let prompts = v["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(prompts.len(), 2, "{v}");
+        assert_eq!(prompts[0], theirs);
+        assert_eq!(
+            prompts[1]["hooks"][0]["command"],
+            json!(prompt_hook_command(
+                Path::new("/opt/innerwarden"),
+                false,
+                false,
+                Some("claude-code")
+            ))
+        );
+
+        uninstall_hook(home.path(), "claude-code", None).unwrap();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["hooks"]["UserPromptSubmit"], json!([theirs]));
+    }
+
+    /// Background setup after an upgrade never starts keeping prompts on its
+    /// own: it adds no prompt hook to wiring that has none, and re-points one
+    /// that is there to the binary it wires.
+    #[test]
+    fn background_setup_keeps_a_prompt_hook_and_adds_none() {
+        let home = tempfile::TempDir::new().unwrap();
+        let path = home.path().join(".claude/settings.json");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let old = Path::new("/opt/old/innerwarden");
+        let new = Path::new("/opt/new/innerwarden");
+        let bash = hook_command_for(old, false, false, Some("claude-code"));
+        let without = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "command": bash}]}
+        ]}});
+        fs::write(&path, serde_json::to_string_pretty(&without).unwrap()).unwrap();
+        install_hook_no_symlinks(home.path(), "claude-code", None, new, false, false).unwrap();
+        let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(
+            v["hooks"].get(crate::user_prompt::PROMPT_EVENT).is_none(),
+            "{v}"
+        );
+
+        let mut with = without.clone();
+        with["hooks"][crate::user_prompt::PROMPT_EVENT] = json!([{"hooks": [
+            {"type": "command", "command": prompt_hook_command(old, false, false, Some("claude-code"))}
+        ]}]);
+        fs::write(&path, serde_json::to_string_pretty(&with).unwrap()).unwrap();
+        install_hook_no_symlinks(home.path(), "claude-code", None, new, false, false).unwrap();
+        let v: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            v["hooks"][crate::user_prompt::PROMPT_EVENT][0]["hooks"][0]["command"],
+            json!(prompt_hook_command(new, false, false, Some("claude-code"))),
+            "{v}"
+        );
+    }
+
+    /// The prompt line is in order only under `UserPromptSubmit`. Under a
+    /// tool event it screens nothing: it gives no mode and no line, so the
+    /// event reads as having no hook of ours that screens, and a reinstall
+    /// replaces it as a line of ours. `--prompt` anywhere but last is no
+    /// line of ours at all.
+    #[test]
+    fn a_prompt_line_under_a_tool_event_is_not_a_screening_line() {
+        let prompt = prompt_hook_command(
+            Path::new("/opt/innerwarden"),
+            false,
+            false,
+            Some("claude-code"),
+        );
+        let hook = json!({"type": "command", "command": prompt});
+        assert!(is_iwguard_prompt_hook(&hook));
+        assert_eq!(read_hook_line(&hook), None);
+        assert_eq!(iwguard_hook_mode(&hook), None);
+        assert!(is_iwguard_hook(&hook), "still ours, to replace or remove");
+        let settings = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [hook.clone()]}
+        ]}});
+        assert_eq!(effective_iwguard_hook_mode(&settings), None, "{settings}");
+        assert!(!has_iwguard_hook(&settings), "{settings}");
+        // A reinstall puts the screening line in its place.
+        let repaired = merge_pretooluse_bash_hook(
+            settings,
+            &hook_command_for(
+                Path::new("/opt/innerwarden"),
+                false,
+                false,
+                Some("claude-code"),
+            ),
+        );
+        let lines = repaired["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(lines.len(), 1, "{repaired}");
+        assert!(!is_iwguard_prompt_hook(&lines[0]), "{repaired}");
+        // Not last: no line of ours.
+        let misplaced = json!({"type": "command",
+            "command": "\"/opt/innerwarden\" hook --prompt --agent claude-code"});
+        assert!(!is_iwguard_hook(&misplaced));
+        // Inside the fail-closed script: no line of ours either.
+        let scripted = hook_command_shaped(
+            Path::new("/opt/innerwarden"),
+            false,
+            false,
+            Some("claude-code"),
+            true,
+        )
+        .replace(" --agent claude-code;", " --agent claude-code --prompt;");
+        assert!(scripted.contains("--prompt;"), "{scripted}");
+        assert!(
+            !is_iwguard_hook(&json!({"type": "command", "command": scripted})),
+            "{scripted}"
+        );
+    }
+
+    /// Status says "not screened" for every tool event whose lines of ours
+    /// are all the prompt line, the Bash group too, and not for one that also
+    /// holds a line that screens.
+    #[test]
+    fn a_tool_event_whose_lines_are_all_prompt_lines_is_not_screened() {
+        let bin = Path::new("/opt/innerwarden");
+        let prompt = prompt_hook_command(bin, false, false, Some("claude-code"));
+        let screening = hook_command_for(bin, false, false, Some("claude-code"));
+        let settings = json!({"hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": prompt}]},
+                {"matcher": "Write|Edit", "hooks": [
+                    {"type": "command", "command": prompt},
+                    {"type": "command", "command": prompt}
+                ]},
+                {"matcher": "Read", "hooks": [
+                    {"type": "command", "command": prompt},
+                    {"type": "command", "command": screening}
+                ]}
+            ],
+            "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": prompt}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": prompt}]}]
+        }});
+        let found = unscreened_iwguard_hooks(&settings, |_| ProgramFact::Executable);
+        let tools: Vec<&str> = found.iter().map(|g| g.tools.as_str()).collect();
+        assert_eq!(
+            tools,
+            ["Bash", "Write/Edit", "PostToolUse (every tool)"],
+            "{found:?}"
+        );
+        assert!(
+            found.iter().all(|g| g.problem.contains("--prompt")),
+            "{found:?}"
+        );
+    }
+
+    /// A reinstall replaces the prompt line in place and keeps the timeout
+    /// the person set on it.
+    #[test]
+    fn the_prompt_hook_merge_replaces_ours_and_keeps_its_timeout() {
+        let old = json!({"hooks": {"UserPromptSubmit": [
+            {"hooks": [{"type": "command", "command": "\"/old/innerwarden\" hook --monitor", "timeout": 7}]}
+        ]}});
+        let new = merge_userpromptsubmit_hook(old, "\"/new/innerwarden\" hook --monitor");
+        let entries = new["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{new}");
+        assert_eq!(
+            entries[0]["hooks"][0]["command"],
+            "\"/new/innerwarden\" hook --monitor"
+        );
+        assert_eq!(entries[0]["hooks"][0]["timeout"], 7);
+        let again = merge_userpromptsubmit_hook(new.clone(), "\"/new/innerwarden\" hook --monitor");
+        assert_eq!(again, new);
     }
 
     /// Uninstall takes out the PostToolUse hook it installed and nothing else
@@ -3903,8 +4282,9 @@ mod tests {
         )
         .unwrap();
 
+        // Our four tool lines and our prompt line.
         let (_, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
-        assert_eq!(removed, 4);
+        assert_eq!(removed, 5);
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(v["hooks"]["PostToolUse"], json!([theirs]));
         assert_eq!(v["hooks"]["PreToolUse"], json!([]));
@@ -4388,7 +4768,8 @@ mod tests {
         assert!(!needs_iwguard_hook_reconciliation(&v, bin, false, false));
         assert_eq!(effective_iwguard_hook_programs(&v), vec![GUARD.to_string()]);
         let (_, removed) = uninstall_hook(home.path(), "claude-code", None).unwrap();
-        assert_eq!(removed, 4, "uninstall finds the fail-closed lines");
+        // Four tool lines and the prompt line, which is never fail-closed.
+        assert_eq!(removed, 5, "uninstall finds the fail-closed lines");
 
         let monitor = hook_command_for(bin, false, true, Some("claude-code"));
         let watched = merge_pretooluse_read_hook(

@@ -67,6 +67,9 @@ pub const TEST_DEADLINE_ENV: &str = "IW_TEST_HOOK_DEADLINE_MS";
 
 static MONITOR: AtomicBool = AtomicBool::new(false);
 
+/// Set for a run on the person's prompt: every end is 0 and silent.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
 /// Milliseconds of screening after [`arm`] at which the watchdog ends the
 /// hook. Zero while no deadline is armed.
 static DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
@@ -164,6 +167,19 @@ fn arm_with_cap(monitor: bool, deadline: Duration, cap: Duration) -> Result<(), 
         .map_err(|_| "no screening deadline could be set")
 }
 
+/// From here on every end of the net (the deadline, a fault) is 0 and
+/// silent, and so is the panic guard's: for a run on the person's prompt,
+/// where any other end shows an error, and 2 drops what the person typed.
+/// `false` puts the ends back, for a tool call that came on a prompt line.
+pub fn set_quiet(quiet: bool) {
+    QUIET.store(quiet, Ordering::SeqCst);
+}
+
+/// Whether the run ends quietly ([`set_quiet`]).
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::SeqCst)
+}
+
 /// The hook is about to make a wait it bounds itself by `bound`: move the
 /// deadline and the limit on the clock by as much. Nothing to move when no
 /// deadline is armed (the same code runs under `innerwarden check`).
@@ -253,7 +269,9 @@ fn watch(armed: Instant, queue: &RunQueue) -> ! {
         match time_left(armed.elapsed(), queue.since_armed(), deadline, cap) {
             Some(left) => std::thread::sleep(left.max(Duration::from_millis(1))),
             None => {
-                if MONITOR.load(Ordering::SeqCst) {
+                if QUIET.load(Ordering::SeqCst) {
+                    end("", 0)
+                } else if MONITOR.load(Ordering::SeqCst) {
                     end(OUT_OF_TIME_MONITOR, crate::unreadable_exit_code(true))
                 } else {
                     end(OUT_OF_TIME_ENFORCE, crate::unreadable_exit_code(false))
@@ -310,7 +328,9 @@ mod fault {
 
     extern "C" fn on_fault(_signal: libc::c_int) {
         // Only what a signal handler may do: read an atomic, `write`, `_exit`.
-        if super::MONITOR.load(Ordering::SeqCst) {
+        if super::QUIET.load(Ordering::SeqCst) {
+            super::end("", 0)
+        } else if super::MONITOR.load(Ordering::SeqCst) {
             super::end(super::FAULT_MONITOR, crate::unreadable_exit_code(true))
         } else {
             super::end(super::FAULT_ENFORCE, crate::unreadable_exit_code(false))
