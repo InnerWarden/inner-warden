@@ -183,6 +183,44 @@ pub(crate) fn effective_account() -> Option<String> {
     None
 }
 
+/// The home of the EFFECTIVE account, from the account database by uid
+/// (`pw_dir`). Never `HOME`: the MCP proxy runs with the environment of
+/// whoever started it, and a home it names would choose where the copy of a
+/// refusal goes ([`refusal_copy_path`]). `None` with no entry, an empty or
+/// a relative one, and off Unix, where no account database is read.
+#[cfg(unix)]
+pub(crate) fn account_home() -> Option<std::path::PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: a zeroed passwd is a valid out-parameter for getpwuid_r.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    // SAFETY: geteuid cannot fail; every pointer is to memory owned here and
+    // sized as passed, and the result is read only when the call filled it.
+    let status = unsafe {
+        libc::getpwuid_r(
+            libc::geteuid(),
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut found,
+        )
+    };
+    if status != 0 || found.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    // SAFETY: `pw_dir` points into `buffer`, NUL-terminated by the call.
+    let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
+    let dir = std::path::Path::new(std::ffi::OsStr::from_bytes(dir.to_bytes()));
+    dir.is_absolute().then(|| dir.to_path_buf())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn account_home() -> Option<std::path::PathBuf> {
+    None
+}
+
 /// Whether `dir` is this process's own record directory: a directory and not
 /// a link, owned by the effective uid, with no write bit for anyone else.
 /// The paid installer makes it `<name>:innerwarden 2750`.
@@ -1153,20 +1191,34 @@ pub fn record_mcp(
     // `innerwarden status` reads, whatever those variables say.
     if outcome == DecisionOutcome::Blocked {
         let config = refusal_copy_config();
-        if let Some(local) = refusal_copy_path(&config, |key| std::env::var(key).ok()) {
+        let home = refusal_copy_home();
+        if let Some(local) =
+            refusal_copy_path(&config, |key| std::env::var(key).ok(), home.as_deref())
+        {
             persist(&local, &decision);
         }
     }
 }
 
-/// The product config that says where the guard's own record is, read for
-/// the copy of a refusal ([`refusal_copy_path`]): [`GUARD_CONFIG_PATH`].
-/// A debug build (this repository's tests) takes another from
-/// `IW_TEST_GUARD_CONFIG`, so the suite, run on a host where InnerWarden Pro
-/// is installed, never writes its made-up refusals into that host's shared
-/// record. A release build has no such variable.
+/// The account home and the product config that say where the guard's own
+/// record is, read for the copy of a refusal ([`refusal_copy_path`]): the
+/// account database's home ([`account_home`]) and [`GUARD_CONFIG_PATH`]. A
+/// debug build (this repository's tests) takes others from
+/// `IW_TEST_ACCOUNT_HOME` and `IW_TEST_GUARD_CONFIG`, so the suite never
+/// writes its made-up refusals into the real home of whoever runs it, nor
+/// into the shared record of a host where InnerWarden Pro is installed. A
+/// release build has neither variable.
 ///
 /// [`GUARD_CONFIG_PATH`]: innerwarden_graph::GUARD_CONFIG_PATH
+fn refusal_copy_home() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("IW_TEST_ACCOUNT_HOME") {
+        return Some(path.into());
+    }
+    account_home()
+}
+
+/// The config path for [`refusal_copy_path`]; see [`refusal_copy_home`].
 fn refusal_copy_config() -> std::path::PathBuf {
     #[cfg(debug_assertions)]
     if let Some(path) = std::env::var_os("IW_TEST_GUARD_CONFIG") {
@@ -1175,21 +1227,27 @@ fn refusal_copy_config() -> std::path::PathBuf {
     std::path::PathBuf::from(innerwarden_graph::GUARD_CONFIG_PATH)
 }
 
-/// Where a refusal is written too, besides the record the environment
-/// moved it to, or `None`: the guard's own record (the place without
-/// `IW_GRAPH_FILE`, which `innerwarden status` reads), when `IW_GRAPH_FILE`
-/// moved this process's record away from it. `None` when the record was not
-/// moved, or the override names that same file.
+/// Where a refusal is written too, besides the record this process keeps,
+/// or `None`: the guard's own record, the one `innerwarden status` reads in
+/// the account's own terminal. It is resolved with nothing the proxy's
+/// environment says: no `IW_GRAPH_FILE`, and the account's home from the
+/// account database (`home`, [`account_home`]) in place of `HOME`, so a
+/// proxy started with `IW_GRAPH_FILE`, an empty `HOME` or a `HOME` of the
+/// agent's choosing still leaves the refusal where the operator looks. The
+/// product config's shared record, where it names one, is that record.
+/// `None` when this process's record is that same file, or there is no such
+/// record (no shared record and no account home).
 fn refusal_copy_path(
     config_path: &std::path::Path,
     get: impl Fn(&str) -> Option<String>,
+    home: Option<&std::path::Path>,
 ) -> Option<std::path::PathBuf> {
     let moved = resolve_with(config_path, &get);
-    if moved.source != innerwarden_graph::GraphPathSource::EnvironmentOverride {
-        return None;
-    }
-    let local = resolve_with(config_path, |key: &str| {
-        (key != "IW_GRAPH_FILE").then(|| get(key)).flatten()
+    let home = home.map(|home| home.to_string_lossy().to_string());
+    let local = resolve_with(config_path, |key: &str| match key {
+        "IW_GRAPH_FILE" => None,
+        "HOME" => home.clone(),
+        _ => get(key),
     })
     .path?;
     (moved.path.as_deref() != Some(local.as_path())).then_some(local)
@@ -4199,34 +4257,62 @@ mod tests {
         assert_eq!(std::fs::read(preserved).unwrap(), corrupt);
     }
 
-    /// NEW-20261102-free-mcp-proxy-env-hides-refusals: where `IW_GRAPH_FILE`
-    /// moved the record, a refusal is written to the guard's own record too
-    /// (the place without the override, which `innerwarden status` reads);
-    /// not moved, or moved onto that same file, nothing more is written.
+    /// NEW-20261102-free-mcp-proxy-env-hides-refusals: a refusal is written to
+    /// the guard's own record too, resolved with the account's home from the
+    /// account database, never the proxy's `HOME`: with `IW_GRAPH_FILE` and
+    /// `HOME` absent, empty or pointing elsewhere, the copy goes to the
+    /// account's home (the product config's shared record, where it names a
+    /// usable one, is resolved as the record always was).
+    /// Nothing more is written where the record already is that file, and
+    /// nowhere without an account home or a shared record.
     ///
-    /// FAILS ON REVERT: answer `None` always and the refusal stays only
-    /// where the environment sent it.
+    /// FAILS ON REVERT: read `HOME` from the environment again, and the
+    /// empty, absent and redirected rows go to no copy or to the agent's
+    /// folder.
     #[test]
-    fn a_refusal_moved_by_the_environment_is_kept_in_the_guards_record_too() {
-        let home = tempfile::TempDir::new().unwrap();
-        let config = home.path().join("no-guard.toml");
-        let own = home.path().join(".config/innerwarden/graph.json");
-        let home_text = home.path().to_string_lossy().to_string();
-        let env = |graph: Option<String>| {
-            let home_text = home_text.clone();
+    fn a_refusal_is_kept_in_the_accounts_own_record_whatever_home_says() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let account = dir.path().join("account");
+        let agent = dir.path().join("agent");
+        let config = dir.path().join("no-guard.toml");
+        let own = account.join(".config/innerwarden/graph.json");
+        let env = |graph: Option<&str>, home: Option<&str>| {
+            let graph = graph.map(str::to_string);
+            let home = home.map(str::to_string);
             move |key: &str| match key {
-                "HOME" => Some(home_text.clone()),
                 "IW_GRAPH_FILE" => graph.clone(),
+                "HOME" => home.clone(),
                 _ => None,
             }
         };
+        let agent_text = agent.to_string_lossy().to_string();
+        let account_text = account.to_string_lossy().to_string();
+        let own_text = own.to_string_lossy().to_string();
+        for (graph, home) in [
+            (Some("/elsewhere/graph.json"), None),
+            (Some("/elsewhere/graph.json"), Some("")),
+            (Some("/elsewhere/graph.json"), Some(agent_text.as_str())),
+            (Some("/elsewhere/graph.json"), Some(account_text.as_str())),
+            (None, Some(agent_text.as_str())),
+        ] {
+            assert_eq!(
+                refusal_copy_path(&config, env(graph, home), Some(&account)),
+                Some(own.clone()),
+                "{graph:?} {home:?}"
+            );
+        }
+        // The record is already the account's own: nothing more.
         assert_eq!(
-            refusal_copy_path(&config, env(Some("/elsewhere/graph.json".into()))),
-            Some(own.clone())
+            refusal_copy_path(&config, env(None, Some(&account_text)), Some(&account)),
+            None
         );
-        assert_eq!(refusal_copy_path(&config, env(None)), None);
         assert_eq!(
-            refusal_copy_path(&config, env(Some(own.to_string_lossy().to_string()))),
+            refusal_copy_path(&config, env(Some(&own_text), Some("")), Some(&account)),
+            None
+        );
+        // No account home and no shared record: nowhere to copy to.
+        assert_eq!(
+            refusal_copy_path(&config, env(Some("/x/graph.json"), Some(&agent_text)), None),
             None
         );
     }

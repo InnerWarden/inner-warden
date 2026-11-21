@@ -3392,7 +3392,9 @@ mod tests {
         // trap has written and exited, whatever the load: the trap's file
         // then says the server got the request, by order alone. A proxy that
         // kills without asking leaves no SIGTERM in the list and the file
-        // empty. The outer timeout only catches a hang.
+        // empty. The outer timeout of 60 s only catches a hang: well past a
+        // run on a loaded runner (seconds), and short enough that a proxy
+        // that never asks fails in a minute (its server sleeps 60 s).
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("server.pid");
         let asked = dir.path().join("asked-to-stop");
@@ -3402,7 +3404,7 @@ mod tests {
         drop(from_proxy);
         let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(60),
             TEST_SIGNALS.scope(
                 sent.clone(),
                 TEST_STOP_GRACE.scope(

@@ -97,7 +97,7 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // it starts only with the plugin wired, and holds that wiring read-only.
     let openclaw = args.agent == crate::contain::OPENCLAW_AGENT;
     if openclaw {
-        if let Some(why) = openclaw_refused(&home, mode_given, args.setup_only, args.dry_run) {
+        if let Some(why) = openclaw_refused(&home, mode_given, args.setup_only) {
             eprintln!("innerwarden contain: {why}");
             return ExitCode::from(2);
         }
@@ -222,6 +222,15 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         return ExitCode::from(2);
     }
     args.project = project;
+    if openclaw {
+        match openclaw_hold(&home, &args.project, args.dry_run) {
+            Ok(held) => args.openclaw_held = held,
+            Err(why) => {
+                eprintln!("innerwarden contain: {why}");
+                return ExitCode::from(2);
+            }
+        }
+    }
 
     // Each extra path found where it leads, with every link on its way
     // ([`crate::contain::screen_extra_paths`]): a read-only path is laid
@@ -609,11 +618,9 @@ fn openclaw_paths(home: &Path) -> Vec<PathBuf> {
 /// A mode flag is refused (the plugin's mode is `innerwarden enforce`'s and
 /// `monitor`'s), as is `--setup` (`agents connect openclaw` wires the
 /// guard); then OpenClaw's folder is checked
-/// ([`crate::contain::openclaw_dir_refusal`]). In a real run, what of the
-/// guard's wiring is not there and may be made empty (`.env`, `extensions`,
-/// `hooks`) is made, owner only, so the jail can hold it read-only and a
-/// program in it cannot make it for the next start.
-fn openclaw_refused(home: &Path, mode_given: bool, setup: bool, dry_run: bool) -> Option<String> {
+/// ([`crate::contain::openclaw_dir_refusal`]). What the jail holds
+/// read-only is found, checked and made by [`openclaw_hold`].
+fn openclaw_refused(home: &Path, mode_given: bool, setup: bool) -> Option<String> {
     if mode_given {
         return Some(
             "--monitor, --enforce and --block-review set Claude Code's hook; OpenClaw's guard \
@@ -636,27 +643,137 @@ fn openclaw_refused(home: &Path, mode_given: bool, setup: bool, dry_run: bool) -
     if let Some(why) = crate::contain::openclaw_dir_refusal(&dir, link, config, guard) {
         return Some(why);
     }
-    if dry_run {
-        return None;
+    None
+}
+
+/// The places beyond OpenClaw's config a jail of `project` holds read-only
+/// for `--agent openclaw` from `home` ([`crate::contain::openclaw_discovered`],
+/// kept by [`crate::contain::openclaw_in_reach`]), after checking every
+/// place it holds, [`crate::contain::OPENCLAW_GUARD_PATHS`] included: none
+/// may be a link, nor be reached through one from the folder the jail binds
+/// it in (`~/.openclaw`, the project, a home folder it writes), or the
+/// read-only mount would land where the link leads. In a real run each one
+/// not there is made, owner only (the `.env` as an empty file, the others as
+/// empty folders), so a program in the jail cannot make it for the next
+/// start; a load path of the config that is not there refuses the launch
+/// (it may name a file).
+fn openclaw_hold(home: &Path, project: &Path, dry_run: bool) -> Result<Vec<PathBuf>, String> {
+    use crate::contain::{
+        openclaw_discovered, openclaw_in_reach, OPENCLAW_DIR, OPENCLAW_GUARD_FILE,
+        OPENCLAW_GUARD_PATHS, OPENCLAW_WORKSPACE_PATHS,
+    };
+    let state = home.join(OPENCLAW_DIR);
+    let config_path = state.join("openclaw.json");
+    let config = read_bounded_text(&config_path, 16 << 20).ok_or_else(|| {
+        format!(
+            "refusing to start: {} cannot be read as text",
+            config_path.display()
+        )
+    })?;
+    let names_in = |dir: &Path, keep: &dyn Fn(&str) -> bool| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .filter(|name| keep(name))
+            .collect()
+    };
+    let agents = names_in(&state.join("agents"), &|_| true);
+    let workspaces = names_in(&state, &|name| name.starts_with("workspace-"));
+    let found = openclaw_discovered(home, &config, &agents, &workspaces)?;
+    let held = openclaw_in_reach(&found, home, project);
+    let core: Vec<PathBuf> = OPENCLAW_GUARD_PATHS
+        .iter()
+        .map(|name| state.join(name))
+        .collect();
+    let roots: Vec<PathBuf> = std::iter::once(state.clone())
+        .chain(std::iter::once(project.to_path_buf()))
+        .chain(
+            crate::contain::writable_home_dirs()
+                .iter()
+                .map(|name| home.join(name)),
+        )
+        .collect();
+    let linked = |path: &Path| -> Option<String> {
+        let root = roots.iter().find(|root| path.starts_with(root))?;
+        path.ancestors()
+            .take_while(|at| at.starts_with(root))
+            .find(|at| std::fs::symlink_metadata(at).is_ok_and(|m| m.file_type().is_symlink()))
+            .map(|at| {
+                format!(
+                    "refusing to start: {} is a link; the jail of OpenClaw holds {} read-only \
+                     only where it is",
+                    at.display(),
+                    path.display()
+                )
+            })
+    };
+    let all: Vec<&PathBuf> = core.iter().chain(held.iter()).collect();
+    if let Some(why) = all.iter().find_map(|path| linked(path)) {
+        return Err(why);
     }
-    for name in crate::contain::OPENCLAW_GUARD_PATHS {
-        let path = dir.join(name);
-        if std::fs::symlink_metadata(&path).is_ok() {
+    for path in &all {
+        if std::fs::symlink_metadata(path).is_ok() {
             continue;
         }
-        let made = if name.starts_with('.') {
-            make_owner_file(&path)
-        } else {
-            make_owner_dir(&path)
-        };
-        if let Err(error) = made {
-            return Some(format!(
-                "refusing to start: could not make {} for the jail to hold read-only: {error}",
-                path.display()
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let file = path.parent() == Some(state.as_path()) && name == OPENCLAW_GUARD_FILE;
+        let folder = (path.parent() == Some(state.as_path()) && core.contains(path))
+            || OPENCLAW_WORKSPACE_PATHS.contains(&name)
+            || name == "workshop-skills";
+        if !file && !folder {
+            return Err(format!(
+                "refusing to start: {} is named in {} and is not there; a program in the jail \
+                 could make it for the next start",
+                path.display(),
+                config_path.display()
             ));
         }
+        if dry_run {
+            continue;
+        }
+        let made = if file {
+            make_owner_file(path)
+        } else {
+            make_owner_dirs(path)
+        };
+        made.map_err(|error| {
+            format!(
+                "refusing to start: could not make {} for the jail to hold read-only: {error}",
+                path.display()
+            )
+        })?;
     }
-    None
+    // Made since: checked again, as the jail will bind them.
+    if let Some(why) = all.iter().find_map(|path| linked(path)) {
+        return Err(why);
+    }
+    Ok(held)
+}
+
+/// A file's text, when it is a plain file of at most `cap` bytes.
+fn read_bounded_text(path: &Path, cap: u64) -> Option<String> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > cap {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// A folder and every one missing above it, each only its owner reaches.
+fn make_owner_dirs(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+    }
+    #[cfg(not(unix))]
+    std::fs::DirBuilder::new().recursive(true).create(path)
 }
 
 /// An empty file only its owner reads and writes, made new (never over one).
@@ -669,17 +786,6 @@ fn make_owner_file(path: &Path) -> std::io::Result<()> {
         options.mode(0o600);
     }
     options.open(path).map(drop)
-}
-
-/// A folder only its owner reaches, made new (never over one).
-fn make_owner_dir(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(path)
-    }
-    #[cfg(not(unix))]
-    std::fs::DirBuilder::new().create(path)
 }
 
 /// The first of Claude Code's settings files that keeps a jail from
@@ -8614,10 +8720,15 @@ mod tests {
                 "this test runs a jail with the host's bubblewrap, which cannot start one here \
                  (lift the restriction, as CI does, instead of skipping it): {lines:?}"
             );
-            eprintln!(
-                "SKIPPED a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable: \
-                 no jail opens on this host: {}",
-                lines.join(" ")
+            // Past the harness's capture, so a passing run still shows it.
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(
+                format!(
+                    "SKIPPED a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable: \
+                     no jail opens on this host: {}\n",
+                    lines.join(" ")
+                )
+                .as_bytes(),
             );
             return;
         }
@@ -8896,51 +9007,31 @@ mod tests {
 
     /// `contain --agent openclaw` from a home: a mode flag or `--setup` is
     /// refused (the plugin keeps its own mode); OpenClaw's folder as a link,
-    /// with no config, or with the guard not wired or turned off is refused
-    /// and nothing is made; wired, the real run makes what of the guard's
-    /// wiring may be made empty and is not there (owner only), and a dry run
-    /// makes nothing.
+    /// with no config, or with the guard not wired or turned off is refused.
     ///
     /// FAILS ON REVERT: skip the guard check and a jail of OpenClaw starts
-    /// with no guard; skip the making and the jail refuses every home
-    /// without a `hooks` folder.
+    /// with no guard.
     #[cfg(unix)]
     #[test]
-    fn openclaw_starts_only_with_the_guard_wired_and_makes_the_rest_empty() {
-        use std::os::unix::fs::PermissionsExt;
-        let wired = r#"{"plugins":{"entries":{"innerwarden-guard":{"enabled":true,"config":{"mode":"enforce"}}}}}"#;
-        let setup = |config: Option<&str>, plugin: bool| {
-            let home = tempfile::TempDir::new().unwrap();
-            let dir = home.path().join(".openclaw");
-            std::fs::create_dir_all(&dir).unwrap();
-            if let Some(config) = config {
-                std::fs::write(dir.join("openclaw.json"), config).unwrap();
-            }
-            if plugin {
-                let files = dir.join("extensions/innerwarden-guard");
-                std::fs::create_dir_all(&files).unwrap();
-                std::fs::write(files.join("index.js"), "").unwrap();
-            }
-            home
-        };
-        let home = setup(Some(wired), true);
-        assert!(openclaw_refused(home.path(), true, false, false)
+    fn openclaw_starts_only_with_the_guard_wired() {
+        let home = openclaw_home(Some(WIRED), true);
+        assert_eq!(openclaw_refused(home.path(), false, false), None);
+        assert!(openclaw_refused(home.path(), true, false)
             .unwrap()
             .contains("innerwarden enforce"));
-        assert!(openclaw_refused(home.path(), false, true, false)
+        assert!(openclaw_refused(home.path(), false, true)
             .unwrap()
             .contains("agents connect openclaw"));
         let off = r#"{"plugins":{"entries":{"innerwarden-guard":{"enabled":false}}}}"#;
         for (config, plugin, said) in [
             (None, true, "openclaw.json"),
             (Some("{}"), true, "agents connect openclaw"),
-            (Some(wired), false, "agents connect openclaw"),
+            (Some(WIRED), false, "agents connect openclaw"),
             (Some(off), true, "agents connect openclaw"),
         ] {
-            let home = setup(config, plugin);
-            let why = openclaw_refused(home.path(), false, false, false).unwrap();
+            let home = openclaw_home(config, plugin);
+            let why = openclaw_refused(home.path(), false, false).unwrap();
             assert!(why.contains(said), "{config:?} {plugin}: {why}");
-            assert!(!home.path().join(".openclaw/hooks").exists());
         }
         let linked = tempfile::TempDir::new().unwrap();
         std::os::unix::fs::symlink(
@@ -8948,31 +9039,124 @@ mod tests {
             linked.path().join(".openclaw"),
         )
         .unwrap();
-        assert!(openclaw_refused(linked.path(), false, false, false)
+        assert!(openclaw_refused(linked.path(), false, false)
             .unwrap()
             .contains("is a link"));
+    }
 
-        let dry = setup(Some(wired), true);
-        assert_eq!(openclaw_refused(dry.path(), false, false, true), None);
-        assert!(!dry.path().join(".openclaw/.env").exists());
+    #[cfg(unix)]
+    const WIRED: &str = r#"{"plugins":{"entries":{"innerwarden-guard":{"enabled":true,"config":{"mode":"enforce"}}}}}"#;
 
-        assert_eq!(openclaw_refused(home.path(), false, false, false), None);
+    /// A home with OpenClaw's folder, its config (`config`) and the guard's
+    /// plugin files (`plugin`).
+    #[cfg(unix)]
+    fn openclaw_home(config: Option<&str>, plugin: bool) -> tempfile::TempDir {
+        let home = tempfile::TempDir::new().unwrap();
         let dir = home.path().join(".openclaw");
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(config) = config {
+            std::fs::write(dir.join("openclaw.json"), config).unwrap();
+        }
+        if plugin {
+            let files = dir.join("extensions/innerwarden-guard");
+            std::fs::create_dir_all(&files).unwrap();
+            std::fs::write(files.join("index.js"), "").unwrap();
+        }
+        home
+    }
+
+    /// Review of the jail of OpenClaw, items 3 and 4: the real run makes each
+    /// place it holds that is not there, owner only (the `.env` a file, the
+    /// rest folders, the workspaces' and the agents' included), a dry run
+    /// makes nothing, a second run changes nothing; any place it holds that
+    /// is a link, or is reached through one, refuses the launch, the
+    /// `.env`, the plugins, the hooks and a workspace's plugins alike; a load
+    /// path of the config that is not there refuses it too.
+    ///
+    /// FAILS ON REVERT: check only OpenClaw's folder for a link and a
+    /// `hooks` link into the project starts the jail.
+    #[cfg(unix)]
+    #[test]
+    fn openclaw_holds_each_place_it_loads_from_made_and_never_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = openclaw_home(Some(WIRED), true);
+        let project = tempfile::TempDir::new().unwrap();
+        let dir = home.path().join(".openclaw");
+
+        let dry = openclaw_home(Some(WIRED), true);
+        let held = openclaw_hold(dry.path(), project.path(), true).unwrap();
+        assert!(held.contains(&dry.path().join(".openclaw/workspace/.openclaw")));
+        assert!(!dry.path().join(".openclaw/.env").exists());
+        assert!(!dry.path().join(".openclaw/workspace").exists());
+
+        let held = openclaw_hold(home.path(), project.path(), false).unwrap();
         let env = std::fs::metadata(dir.join(".env")).unwrap();
         assert!(env.is_file() && env.len() == 0);
         assert_eq!(env.permissions().mode() & 0o777, 0o600);
-        let hooks = std::fs::metadata(dir.join("hooks")).unwrap();
-        assert!(hooks.is_dir());
-        assert_eq!(hooks.permissions().mode() & 0o777, 0o700);
+        for folder in [
+            "hooks",
+            "skills",
+            "cron",
+            "workspace/.openclaw",
+            "workspace/hooks",
+            "workspace/skills",
+            "workspace/.agents",
+            "agents/main/agent/workshop-skills",
+        ] {
+            let meta = std::fs::metadata(dir.join(folder)).unwrap_or_else(|_| panic!("{folder}"));
+            assert!(meta.is_dir(), "{folder}");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{folder}");
+        }
+        for path in &held {
+            assert!(path.exists(), "{path:?}");
+        }
         assert_eq!(
             std::fs::read_to_string(dir.join("openclaw.json")).unwrap(),
-            wired
+            WIRED
         );
         let found = existing_home_paths(home.path());
         for path in openclaw_paths(home.path()) {
             assert!(found.contains(&path), "{path:?}: {found:?}");
         }
-        // A second start finds them there and changes nothing.
-        assert_eq!(openclaw_refused(home.path(), false, false, false), None);
+        assert_eq!(
+            openclaw_hold(home.path(), project.path(), false).unwrap(),
+            held
+        );
+
+        for (place, into_project) in [
+            (".env", false),
+            ("extensions", true),
+            ("hooks", true),
+            ("workspace", true),
+        ] {
+            let home = openclaw_home(Some(WIRED), true);
+            let at = home.path().join(".openclaw").join(place);
+            let _ = std::fs::remove_dir_all(&at);
+            let target = project.path().join(format!("t-{place}"));
+            if into_project {
+                std::fs::create_dir_all(&target).unwrap();
+            } else {
+                std::fs::write(&target, "").unwrap();
+            }
+            std::os::unix::fs::symlink(&target, &at).unwrap();
+            let why = openclaw_hold(home.path(), project.path(), false).unwrap_err();
+            assert!(why.contains("is a link"), "{place}: {why}");
+            assert!(
+                std::fs::read_dir(&target).map_or(true, |mut d| d.next().is_none()),
+                "{place}: made through the link"
+            );
+        }
+
+        let named = openclaw_home(
+            Some(
+                r#"{"plugins":{"load":{"paths":["~/.openclaw/mine.js"]},"entries":{"innerwarden-guard":{"enabled":true}}}}"#,
+            ),
+            true,
+        );
+        let why = openclaw_hold(named.path(), project.path(), false).unwrap_err();
+        assert!(
+            why.contains("mine.js") && why.contains("not there"),
+            "{why}"
+        );
     }
 }

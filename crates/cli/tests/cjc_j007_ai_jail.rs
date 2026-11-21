@@ -281,7 +281,10 @@ fn require_bwrap() {
 /// sysctl says 1. Outside CI the test then says why and the fix, on stderr,
 /// and is skipped; in CI (`CI` set, where the workflow turns the sysctl off
 /// before the suite) it fails, so a runner never passes without measuring.
-/// Any other failure of the probe is left to the test to show.
+/// Any other failure of the probe (one without bwrap's `setting up uid
+/// map`) is left to the test to show. The skip is said past the test
+/// harness's capture ([`said_past_the_capture`]), so it shows in the output
+/// of a test that passed.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn jail_opens_here(test: &str) -> bool {
     #[cfg(target_os = "linux")]
@@ -294,7 +297,10 @@ fn jail_opens_here(test: &str) -> bool {
                 .stdin(std::process::Stdio::null())
                 .output()
                 .ok()?;
-            if probe.status.success() {
+            let said = String::from_utf8_lossy(&probe.stderr).to_string();
+            // Only the refusal this skip is for: bwrap could not set up its
+            // uid map. Any other failure is left to the test to show.
+            if probe.status.success() || !said.contains("setting up uid map") {
                 return None;
             }
             let restricted =
@@ -307,18 +313,27 @@ fn jail_opens_here(test: &str) -> bool {
                      the host as innerwarden contain says: an AppArmor profile for bwrap with \
                      userns, or sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
                     bwrap.display(),
-                    String::from_utf8_lossy(&probe.stderr).trim()
+                    said.trim()
                 )
             })
         });
         if let Some(why) = why {
             assert!(std::env::var_os("CI").is_none(), "{test}: {why}");
-            eprintln!("SKIPPED {test}: {why}");
+            said_past_the_capture(&format!("SKIPPED {test}: {why}\n"));
             return false;
         }
     }
     let _ = test;
     true
+}
+
+/// Write `line` to the process's stderr itself, not through `eprintln!`,
+/// which the test harness captures and shows only for a test that failed:
+/// a skipped test passes, and its reason must still be read.
+#[cfg(target_os = "linux")]
+fn said_past_the_capture(line: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(line.as_bytes());
 }
 
 /// A macOS jail test starts a real sandbox. Where `sandbox-exec` cannot start
@@ -7638,4 +7653,174 @@ fn on_a_bcachefs_disk_no_jail_makes_a_subvolume_or_snapshot() {
         ],
         newer: &["subvolume_create_v2", "snapshot_create_v2"],
     });
+}
+
+/// A home with OpenClaw set up and the guard's plugin wired, and keys,
+/// cloud credentials and docker's folder beside it.
+#[cfg(target_os = "linux")]
+fn openclaw_home() -> tempfile::TempDir {
+    let home = state_home();
+    let dir = home.path().join(".openclaw");
+    std::fs::create_dir_all(dir.join("extensions/innerwarden-guard")).unwrap();
+    std::fs::write(
+        dir.join("extensions/innerwarden-guard/index.js"),
+        "// guard\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("openclaw.json"),
+        r#"{"plugins":{"entries":{"innerwarden-guard":{"enabled":true,"config":{"mode":"enforce"}}}}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(".env"), "PROVIDER_KEY=from-host\n").unwrap();
+    for (file, text) in [
+        (".ssh/id_ed25519", "CJC-OC-SSH"),
+        (".aws/credentials", "CJC-OC-AWS"),
+        (".docker/config.json", "CJC-OC-DOCKER"),
+    ] {
+        let path = home.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    home
+}
+
+/// Review of the jail of OpenClaw, item 6, in a real bwrap: what wires the
+/// guard is read-only over the writable folder (a write, a removal and a
+/// rename of the config, the `.env`, the plugins and the hooks all fail,
+/// while the gateway's own sessions are written); a plugin cannot be
+/// planted in the workspace; keys, cloud credentials, docker's folder and
+/// socket are not there; automatic updates are off; and a nested user
+/// namespace is refused as in Claude Code's jail. On the host, nothing the
+/// jail was refused changed.
+///
+/// FAILS ON REVERT: drop the read-only binds and `MOVED-hooks` or
+/// `WROTE-config` is printed and the host's config changes.
+#[cfg(target_os = "linux")]
+#[test]
+fn openclaws_jail_holds_its_wiring_read_only_in_a_real_bwrap() {
+    if !jail_opens_here("openclaws_jail_holds_its_wiring_read_only_in_a_real_bwrap") {
+        return;
+    }
+    require_bwrap();
+    let home = openclaw_home();
+    let project = tempfile::TempDir::new().unwrap();
+    let script = r#"
+        o="$HOME/.openclaw"
+        if ( echo x >> "$o/openclaw.json" ) 2>/dev/null; then echo WROTE-config; fi
+        if ( echo X=1 >> "$o/.env" ) 2>/dev/null; then echo WROTE-env; fi
+        if mkdir "$o/extensions/evil" 2>/dev/null; then echo PLANTED-extensions; fi
+        if mkdir "$o/hooks/evil" 2>/dev/null; then echo PLANTED-hooks; fi
+        if mkdir "$o/skills/evil" 2>/dev/null; then echo PLANTED-skills; fi
+        for p in openclaw.json .env extensions hooks; do
+            if mv "$o/$p" "$o/$p.moved" 2>/dev/null; then echo "MOVED-$p"; fi
+            if rm -rf "$o/$p" 2>/dev/null && [ ! -e "$o/$p" ]; then echo "REMOVED-$p"; fi
+        done
+        if mkdir -p "$o/workspace/.openclaw/extensions/evil" 2>/dev/null; then echo PLANTED-workspace; fi
+        if mkdir -p "$o/agents/main/sessions" && echo '{}' > "$o/agents/main/sessions/s.json"; then echo WROTE-session; fi
+        for f in .ssh/id_ed25519 .aws/credentials .docker/config.json; do
+            if [ -e "$HOME/$f" ]; then echo "SHOWN-$f"; fi
+        done
+        if [ -e /var/run/docker.sock ] || [ -e /run/docker.sock ]; then echo SHOWN-docker-sock; fi
+        echo "UPDATE=$OPENCLAW_NO_AUTO_UPDATE"
+        if ! command -v unshare >/dev/null; then echo NO-UNSHARE;
+        elif unshare -U true 2>/dev/null; then echo NESTED-USERNS; else echo NESTED-REFUSED; fi
+        echo DONE
+    "#;
+    let output = cli()
+        .args([
+            "contain",
+            "--agent",
+            "openclaw",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .expect("run the jail of OpenClaw");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("DONE"), "{stdout} {stderr}");
+    for refused in [
+        "WROTE-config",
+        "WROTE-env",
+        "PLANTED-extensions",
+        "PLANTED-hooks",
+        "PLANTED-skills",
+        "PLANTED-workspace",
+        "MOVED-",
+        "REMOVED-",
+        "SHOWN-",
+    ] {
+        assert!(!stdout.contains(refused), "{refused}: {stdout}");
+    }
+    assert!(stdout.contains("WROTE-session"), "{stdout}");
+    assert!(stdout.contains("UPDATE=1"), "{stdout}");
+    let dir = home.path().join(".openclaw");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".env")).unwrap(),
+        "PROVIDER_KEY=from-host\n"
+    );
+    assert!(std::fs::read_to_string(dir.join("openclaw.json"))
+        .unwrap()
+        .ends_with("}}}}}"));
+    assert!(!dir.join("workspace/.openclaw/extensions/evil").exists());
+    assert!(dir.join("extensions/innerwarden-guard/index.js").is_file());
+    assert!(dir.join("agents/main/sessions/s.json").is_file());
+    match filter_here() {
+        FilterHere::Taken => {
+            assert!(!stdout.contains("NESTED-USERNS"), "{stdout}");
+            if !stdout.contains("NO-UNSHARE") {
+                assert!(stdout.contains("NESTED-REFUSED"), "{stdout}");
+            }
+        }
+        FilterHere::NotTaken => {
+            assert!(stderr.contains("no sandbox filter"), "{stderr}");
+        }
+        other => panic!("the jail ran on a host where {other:?}: {stdout}"),
+    }
+}
+
+/// Review of the jail of OpenClaw, items 4 and 6, in a real launch: a part of
+/// the guard's wiring that is a link (here `hooks` into the project) stops
+/// the jail before its command runs, and nothing is made through the link.
+///
+/// FAILS ON REVERT: check only `~/.openclaw` for a link and the command
+/// runs with the project's folder as OpenClaw's hooks.
+#[cfg(target_os = "linux")]
+#[test]
+fn openclaws_jail_does_not_start_through_a_link() {
+    require_bwrap();
+    let home = openclaw_home();
+    let project = tempfile::TempDir::new().unwrap();
+    let target = project.path().join("hooks");
+    std::fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&target, home.path().join(".openclaw/hooks")).unwrap();
+    let output = cli()
+        .args([
+            "contain",
+            "--agent",
+            "openclaw",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo RAN",
+        ])
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .expect("run the jail of OpenClaw");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("is a link"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("RAN"));
+    assert!(std::fs::read_dir(&target).unwrap().next().is_none());
 }

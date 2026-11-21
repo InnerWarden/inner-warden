@@ -103,6 +103,12 @@ pub struct ContainArgs {
     /// Paths under the home a jail profile hides (`hide_home`), joined to the
     /// home. Empty without one.
     pub hide_home: Vec<PathBuf>,
+    /// `--agent openclaw`: every place beyond [`OPENCLAW_GUARD_PATHS`] from
+    /// which OpenClaw loads code or instructions at its next start, in a place
+    /// the jail shows writable ([`openclaw_discovered`], kept by
+    /// [`openclaw_in_reach`]): each laid read-only over it. Empty for every
+    /// other agent.
+    pub openclaw_held: Vec<PathBuf>,
     /// `--pass-env NAME`: variables the person hands to the jail's command by
     /// name. Every other one [`env_goes_in`] does not let in is taken out of
     /// the jail's environment ([`env_kept_out`]).
@@ -151,34 +157,60 @@ pub const OPENCLAW_AGENT: &str = "openclaw";
 /// its databases and its workspace there.
 pub(crate) const OPENCLAW_DIR: &str = ".openclaw";
 
-/// What of [`OPENCLAW_DIR`] decides which code OpenClaw on the host runs,
-/// and so whether the guard runs: its config (`openclaw.json`, which wires
-/// the plugin and its mode), its global `.env` (read at every start: a
-/// variable written there, `OPENCLAW_CONFIG_PATH` say, moves the config),
-/// its plugins (`extensions`, the guard's among them) and its managed hooks
-/// (`hooks`). A jail shows each read-only over the writable folder, so a
-/// program in it can neither turn the guard off for the next start nor plant
-/// a plugin or a hook there. The gateway keeps working: its start validates
-/// the config without writing it, and a token it makes on loopback is
-/// runtime-only (`docs/gateway/doctor/config-migrations.md`,
-/// `docs/gateway/tailscale.md` of 2026.9.7); a settings change from inside
-/// the jail is refused. The launcher makes the ones that are not there
-/// (an empty `.env`, empty folders) before the jail starts, never
-/// `openclaw.json`: without it the guard is not wired, and the jail does
-/// not start.
-pub(crate) const OPENCLAW_GUARD_PATHS: [&str; 4] = ["openclaw.json", ".env", "extensions", "hooks"];
-
-/// The variables that move OpenClaw's folder or config away from
-/// [`OPENCLAW_DIR`] (`docs/help/environment.md` of 2026.9.7). The launcher
-/// keeps every one out of the jail already ([`env_goes_in`]); handed in with
-/// `--pass-env`, the jail's OpenClaw would read a config the jail does not
-/// hold read-only, so a launch of `--agent openclaw` that hands one in is
-/// refused ([`openclaw_pass_env_refusal`]).
-pub const OPENCLAW_PLACE_ENV: [&str; 3] = [
-    "OPENCLAW_HOME",
-    "OPENCLAW_STATE_DIR",
-    "OPENCLAW_CONFIG_PATH",
+/// What of [`OPENCLAW_DIR`] decides which code or instructions OpenClaw on
+/// the host loads at its next start, and so whether the guard runs
+/// (OpenClaw 2026.9.7's own documentation): its config (`openclaw.json`,
+/// which wires the plugin and its mode); its global `.env`, read at every
+/// start (a variable written there, `OPENCLAW_CONFIG_PATH` say, moves the
+/// config; `docs/help/environment.md`); its plugins (`extensions`, the
+/// guard's among them; `docs/gateway/config-extensions.md`); its managed
+/// hooks (`hooks`; `docs/automation/hooks/configuration.md`); its managed
+/// skills (`skills`; `docs/tools/skills.md`); and its old cron store
+/// (`cron`, which `doctor --fix` imports;
+/// `docs/automation/cron-jobs/managing-jobs.md`). A jail shows each
+/// read-only over the writable folder, as a mount point of its own, so a
+/// program in it can neither change, remove nor rename one, nor plant a
+/// plugin, a hook or a skill for the next start. The workspaces' and the
+/// agents' places are found per launch ([`openclaw_discovered`]). The
+/// launcher makes each one that is not there (an empty `.env`, empty
+/// folders) before the jail starts, never `openclaw.json`: without it the
+/// guard is not wired, and the jail does not start. A settings change from
+/// inside the jail is refused, and so is a config migration the gateway
+/// would write at its start (`docs/gateway/configuration.md`).
+pub(crate) const OPENCLAW_GUARD_PATHS: [&str; 6] = [
+    "openclaw.json",
+    ".env",
+    "extensions",
+    "hooks",
+    "skills",
+    "cron",
 ];
+
+/// Of [`OPENCLAW_GUARD_PATHS`], the one the launcher makes as an empty file
+/// where it is not there; it makes the others but the config as folders.
+pub(crate) const OPENCLAW_GUARD_FILE: &str = ".env";
+
+/// What OpenClaw loads from each of its workspaces (`<workspace>/...`):
+/// plugins (`.openclaw/extensions`), hooks (`hooks`, with the config's
+/// opt-in), and skills (`skills`, `.agents/skills`).
+pub(crate) const OPENCLAW_WORKSPACE_PATHS: [&str; 4] = [".openclaw", "hooks", "skills", ".agents"];
+
+/// The names an `--agent openclaw` launch never hands in with `--pass-env`,
+/// by prefix: every `OPENCLAW_` variable and the older names (`CLAWDBOT_`,
+/// `CLAWD_`, `MOLTBOT_`). OpenClaw 2026.9.7 documents `OPENCLAW_HOME`,
+/// `OPENCLAW_STATE_DIR`, `OPENCLAW_CONFIG_PATH`, `OPENCLAW_WORKSPACE_DIR`,
+/// `OPENCLAW_PROFILE`, `OPENCLAW_INCLUDE_ROOTS`, `OPENCLAW_GIT_DIR` and more
+/// that move its state, config, profile or what it loads, and says an
+/// undocumented one may come or go: a list of names would go stale, so the
+/// whole namespace stays out. The launcher keeps each out of the jail
+/// already ([`env_goes_in`]).
+pub const OPENCLAW_ENV_PREFIXES: [&str; 4] = ["OPENCLAW_", "CLAWDBOT_", "CLAWD_", "MOLTBOT_"];
+
+/// OpenClaw's own options that move its state away from [`OPENCLAW_DIR`]
+/// (`--profile <name>`, `--dev`; `docs/cli/index.md` of 2026.9.7): a gateway
+/// started with one reads a config the jail does not hold, with no guard
+/// wired. A launch of `--agent openclaw` whose command holds one is refused.
+pub const OPENCLAW_PLACE_OPTIONS: [&str; 2] = ["--profile", "--dev"];
 
 /// The variable that turns off OpenClaw's automatic updates, set in every
 /// jail of `--agent openclaw`: "Disable automatic update applies"
@@ -187,18 +219,37 @@ pub const OPENCLAW_PLACE_ENV: [&str; 3] = [
 /// replaces the program the host runs.
 pub const OPENCLAW_NO_AUTO_UPDATE: (&str, &str) = ("OPENCLAW_NO_AUTO_UPDATE", "1");
 
-/// PURE. Why a launch of `agent` that hands `pass_env` in is refused, or
-/// `None`: `--agent openclaw` with a variable of [`OPENCLAW_PLACE_ENV`].
-pub fn openclaw_pass_env_refusal(agent: &str, pass_env: &[String]) -> Option<String> {
+/// PURE. Why a launch of `agent` that hands `pass_env` in and runs `child`
+/// is refused, or `None`: `--agent openclaw` with a variable of
+/// [`OPENCLAW_ENV_PREFIXES`], or a command holding one of
+/// [`OPENCLAW_PLACE_OPTIONS`].
+pub fn openclaw_pass_env_refusal(
+    agent: &str,
+    pass_env: &[String],
+    child: &[String],
+) -> Option<String> {
     if agent != OPENCLAW_AGENT {
         return None;
     }
-    let name = pass_env
-        .iter()
-        .find(|name| OPENCLAW_PLACE_ENV.contains(&name.as_str()))?;
+    if let Some(name) = pass_env.iter().find(|name| {
+        OPENCLAW_ENV_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    }) {
+        return Some(format!(
+            "refusing to start: --pass-env {name}: no OpenClaw variable is handed to its jail \
+             (one moves its folder, config, profile or what it loads away from what the jail \
+             holds read-only); start without it"
+        ));
+    }
+    let option = child.iter().find(|arg| {
+        OPENCLAW_PLACE_OPTIONS
+            .iter()
+            .any(|option| *arg == option || arg.starts_with(&format!("{option}=")))
+    })?;
     Some(format!(
-        "refusing to start: --pass-env {name} moves OpenClaw's folder or config out of \
-            ~/{OPENCLAW_DIR}, which the jail holds read-only where it wires the guard;          start without it"
+        "refusing to start: {option} moves OpenClaw's state away from ~/{OPENCLAW_DIR}, where \
+         the jail holds the guard's wiring read-only; start OpenClaw without it"
     ))
 }
 
@@ -218,7 +269,8 @@ pub fn openclaw_os_refusal(agent: &str, macos: bool) -> Option<String> {
 /// found there. Each is bound by name, never with `-try`: one left out would
 /// be one a program in the jail could make for the next start.
 fn openclaw_paths_refusal(input: &JailInputs) -> Option<String> {
-    if input.args.agent != OPENCLAW_AGENT {
+    // A dry run makes nothing: the plan names what the real run makes.
+    if input.args.agent != OPENCLAW_AGENT || input.args.dry_run {
         return None;
     }
     let dir = input.home.join(OPENCLAW_DIR);
@@ -263,6 +315,139 @@ pub fn openclaw_dir_refusal(dir: &Path, link: bool, config: bool, guard: bool) -
         );
     }
     None
+}
+
+/// PURE. Every place beyond [`OPENCLAW_GUARD_PATHS`] from which OpenClaw
+/// 2026.9.7 loads code or instructions at its next start, under `home`, as
+/// the config (`openclaw.json`, read as JSON) and the folders found under
+/// `~/.openclaw` say it:
+///
+/// * each workspace (`~/.openclaw/workspace`, each `~/.openclaw/workspace-<id>`
+///   there, `agents.defaults.workspace`, its `<root>/<id>` for each agent
+///   entry without a workspace of its own, and each
+///   `agents.entries.<id>.workspace`; `docs/concepts/agent-workspace.md`),
+///   with [`OPENCLAW_WORKSPACE_PATHS`] under it;
+/// * each agent's workshop skills (`~/.openclaw/agents/<id>/agent/workshop-skills`,
+///   for `main`, each agent folder there and each agent entry);
+/// * the config's own load paths (`plugins.load.paths`,
+///   `hooks.internal.load.extraDirs`, `skills.load.extraDirs`).
+///
+/// `agent_dirs` and `workspace_dirs` are the names of the folders found
+/// in `~/.openclaw/agents` and of those named `workspace-*` in
+/// `~/.openclaw`. A config with `$include` is refused: its included files
+/// are confined to the config's folder, which the jail shows writable, and
+/// a program in it would change the config for the next start
+/// (`docs/help/environment.md`). So is a path that is not absolute after
+/// `~/`. Sorted, each once.
+pub fn openclaw_discovered(
+    home: &Path,
+    config_text: &str,
+    agent_dirs: &[String],
+    workspace_dirs: &[String],
+) -> Result<Vec<PathBuf>, String> {
+    use serde_json::Value;
+    if config_text.contains("$include") {
+        return Err(format!(
+            "refusing to start: ~/{OPENCLAW_DIR}/openclaw.json uses $include, whose files sit \
+             in the folder the jail shows writable; write the config in one file to jail OpenClaw"
+        ));
+    }
+    let config: Value = serde_json::from_str(config_text).map_err(|_| {
+        format!(
+            "refusing to start: ~/{OPENCLAW_DIR}/openclaw.json is not plain JSON, so the jail \
+             cannot find the workspaces and load paths it must hold read-only"
+        )
+    })?;
+    let state = home.join(OPENCLAW_DIR);
+    let path_of = |raw: &str| -> Result<PathBuf, String> {
+        let path = match raw.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None if raw == "~" => home.to_path_buf(),
+            None => PathBuf::from(raw),
+        };
+        if path.is_absolute() && plain_absolute(&path) {
+            Ok(path)
+        } else {
+            Err(format!(
+                "refusing to start: {raw:?} in ~/{OPENCLAW_DIR}/openclaw.json is not an absolute \
+                 path with no . or .. step"
+            ))
+        }
+    };
+    let text_at = |pointer: &str| config.pointer(pointer).and_then(Value::as_str);
+    let mut workspaces = vec![state.join("workspace")];
+    workspaces.extend(
+        workspace_dirs
+            .iter()
+            .filter(|name| name.starts_with("workspace-") && !name.contains('/'))
+            .map(|name| state.join(name)),
+    );
+    let root = text_at("/agents/defaults/workspace")
+        .map(path_of)
+        .transpose()?;
+    workspaces.extend(root.clone());
+    let mut agents: Vec<String> = vec!["main".to_string()];
+    agents.extend(agent_dirs.iter().cloned());
+    if let Some(entries) = config.pointer("/agents/entries").and_then(Value::as_object) {
+        for (id, entry) in entries {
+            agents.push(id.clone());
+            match entry.get("workspace").and_then(Value::as_str) {
+                Some(own) => workspaces.push(path_of(own)?),
+                None => workspaces.extend(root.as_ref().map(|root| root.join(id))),
+            }
+        }
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for workspace in &workspaces {
+        out.extend(
+            OPENCLAW_WORKSPACE_PATHS
+                .iter()
+                .map(|name| workspace.join(name)),
+        );
+    }
+    for id in agents {
+        if id.is_empty() || id.contains('/') || id == "." || id == ".." {
+            continue;
+        }
+        out.push(state.join("agents").join(id).join("agent/workshop-skills"));
+    }
+    for pointer in [
+        "/plugins/load/paths",
+        "/hooks/internal/load/extraDirs",
+        "/skills/load/extraDirs",
+    ] {
+        for raw in config
+            .pointer(pointer)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            out.push(path_of(raw)?);
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// PURE. Of `held` ([`openclaw_discovered`]), the places a jail of
+/// `project` under `home` shows writable, where a program in it could
+/// plant something: under `~/.openclaw`, the project, or a home folder
+/// every jail binds writable ([`writable_home_dirs`]). Any other place the
+/// jail does not show, so nothing is planted there and nothing is bound.
+pub fn openclaw_in_reach(held: &[PathBuf], home: &Path, project: &Path) -> Vec<PathBuf> {
+    let state = home.join(OPENCLAW_DIR);
+    held.iter()
+        .filter(|path| {
+            path.starts_with(&state)
+                || path.starts_with(project)
+                || writable_home_dirs()
+                    .iter()
+                    .any(|name| path.starts_with(home.join(name)))
+        })
+        .cloned()
+        .collect()
 }
 
 /// The project-relative secret globs denied by default inside the jail.
@@ -343,7 +528,7 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
     if !CONTAIN_AGENTS.contains(&agent.as_str()) {
         return Err(ContainError::UnknownAgent(agent));
     }
-    if let Some(why) = openclaw_pass_env_refusal(&agent, &pass_env) {
+    if let Some(why) = openclaw_pass_env_refusal(&agent, &pass_env, &child) {
         return Err(ContainError::Unsupported(why));
     }
     if child.is_empty() && !setup_only {
@@ -367,6 +552,7 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
         identity,
         start: innerwarden_agent_guard::profiles::JailStart::Always,
         hide_home: Vec::new(),
+        openclaw_held: Vec::new(),
         pass_env,
     })
 }
@@ -4163,6 +4349,13 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
             let path = dir.join(name).to_string_lossy().to_string();
             push(&["--ro-bind", &path, &path]);
         }
+        // Each place it loads from found for this launch, read-only too,
+        // by name, never with `-try`: the launcher made each one that was
+        // not there, and bwrap stops on one gone since.
+        for held in &input.args.openclaw_held {
+            let path = held.to_string_lossy().to_string();
+            push(&["--ro-bind", &path, &path]);
+        }
     }
 
     // --- the home paths a jail profile hides that exist (`hide_home`),
@@ -6627,6 +6820,7 @@ mod tests {
             identity: false,
             start: innerwarden_agent_guard::profiles::JailStart::Always,
             hide_home: vec![],
+            openclaw_held: Vec::new(),
             pass_env: vec![],
         }
     }
@@ -16178,7 +16372,17 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(why.contains("claude-code, openclaw"), "{why}");
-        for name in OPENCLAW_PLACE_ENV {
+        for name in [
+            "OPENCLAW_HOME",
+            "OPENCLAW_STATE_DIR",
+            "OPENCLAW_CONFIG_PATH",
+            "OPENCLAW_WORKSPACE_DIR",
+            "OPENCLAW_PROFILE",
+            "OPENCLAW_INCLUDE_ROOTS",
+            "OPENCLAW_SOMETHING_NEW",
+            "CLAWDBOT_GATEWAY_TOKEN",
+            "CLAWD_TOKEN",
+        ] {
             let why = parse_contain_args(&[
                 "--agent".into(),
                 "openclaw".into(),
@@ -16352,5 +16556,143 @@ mod tests {
             .unwrap()
             .contains("agents connect openclaw"));
         assert_eq!(openclaw_dir_refusal(dir, false, true, true), None);
+    }
+
+    /// Review of the jail of OpenClaw, item 2: OpenClaw's own options that move
+    /// its state (`--profile <name>`, `--profile=<name>`, `--dev`) refuse
+    /// the launch; a gateway without them starts.
+    ///
+    /// FAILS ON REVERT: look only at `--pass-env` and `--profile x` starts a
+    /// gateway with no guard wired.
+    #[test]
+    fn the_openclaw_jail_refuses_options_that_move_its_state() {
+        let launch = |child: &[&str]| {
+            let mut argv: Vec<String> = vec!["--agent".into(), "openclaw".into(), "--".into()];
+            argv.extend(child.iter().map(|s| s.to_string()));
+            parse_contain_args(&argv)
+        };
+        for child in [
+            &["openclaw", "--profile", "x", "gateway"][..],
+            &["openclaw", "--profile=x", "gateway"],
+            &["openclaw", "--dev", "gateway"],
+        ] {
+            let why = launch(child).unwrap_err().to_string();
+            assert!(why.contains("refusing to start"), "{child:?}: {why}");
+        }
+        assert!(launch(&["openclaw", "gateway", "--port", "18789"]).is_ok());
+        // Claude Code's jail does not read them.
+        assert!(parse_contain_args(&["--".into(), "x".into(), "--dev".into()]).is_ok());
+    }
+
+    /// Review of the jail of OpenClaw, item 3: every place OpenClaw loads code or
+    /// instructions from is found: each workspace (the default, each
+    /// `workspace-<id>` folder, the configured root and its per-agent folders,
+    /// an agent's own) with its plugins, hooks and skills; each agent's
+    /// workshop skills; the config's load paths. `$include`, a config that is
+    /// not JSON and a relative path refuse the launch. Only what the jail
+    /// shows writable is kept.
+    ///
+    /// FAILS ON REVERT: drop the workspaces and `<workspace>/.openclaw/extensions`
+    /// is writable in the jail.
+    #[test]
+    fn every_place_openclaw_loads_from_is_found_and_held() {
+        let home = Path::new("/home/dev");
+        let config = r#"{
+            "agents": {
+                "defaults": {"workspace": "~/proj/ws"},
+                "entries": {"work": {}, "ops": {"workspace": "/srv/ops"}}
+            },
+            "plugins": {"load": {"paths": ["~/.openclaw/mine.js"]}},
+            "hooks": {"internal": {"load": {"extraDirs": ["/opt/hooks"]}}},
+            "skills": {"load": {"extraDirs": ["~/.local/share/skills"]}}
+        }"#;
+        let found = openclaw_discovered(
+            home,
+            config,
+            &["helper".to_string()],
+            &["workspace-old".to_string(), "notes".to_string()],
+        )
+        .unwrap();
+        let has = |path: &str| found.contains(&PathBuf::from(path));
+        for path in [
+            "/home/dev/.openclaw/workspace/.openclaw",
+            "/home/dev/.openclaw/workspace/hooks",
+            "/home/dev/.openclaw/workspace/skills",
+            "/home/dev/.openclaw/workspace/.agents",
+            "/home/dev/.openclaw/workspace-old/.openclaw",
+            "/home/dev/proj/ws/skills",
+            "/home/dev/proj/ws/work/.openclaw",
+            "/srv/ops/hooks",
+            "/home/dev/.openclaw/agents/main/agent/workshop-skills",
+            "/home/dev/.openclaw/agents/helper/agent/workshop-skills",
+            "/home/dev/.openclaw/agents/work/agent/workshop-skills",
+            "/home/dev/.openclaw/mine.js",
+            "/opt/hooks",
+            "/home/dev/.local/share/skills",
+        ] {
+            assert!(has(path), "{path}: {found:?}");
+        }
+        assert!(!found.iter().any(|p| p.to_string_lossy().contains("notes")));
+        let kept = openclaw_in_reach(&found, home, Path::new("/home/dev/proj"));
+        assert!(kept.contains(&PathBuf::from("/home/dev/proj/ws/skills")));
+        assert!(kept.contains(&PathBuf::from("/home/dev/.local/share/skills")));
+        assert!(
+            !kept.contains(&PathBuf::from("/srv/ops/hooks")),
+            "not shown"
+        );
+        assert!(!kept.contains(&PathBuf::from("/opt/hooks")), "not shown");
+        for (bad, said) in [
+            (r#"{"a": {"$include": "./x.json5"}}"#, "$include"),
+            ("{ a: 1, }", "not plain JSON"),
+            (
+                r#"{"agents": {"defaults": {"workspace": "ws"}}}"#,
+                "absolute",
+            ),
+            (
+                r#"{"plugins": {"load": {"paths": ["/x/../y"]}}}"#,
+                "absolute",
+            ),
+        ] {
+            let why = openclaw_discovered(home, bad, &[], &[]).unwrap_err();
+            assert!(why.contains(said), "{bad}: {why}");
+        }
+    }
+
+    /// Each place found is bound read-only after OpenClaw's folder, after
+    /// every writable bind; and an identified jail of OpenClaw keeps the
+    /// same walls against nested user namespaces as Claude Code's: its
+    /// filter first and no capability.
+    ///
+    /// FAILS ON REVERT: skip the found places in the builder and a plugin
+    /// in the workspace is writable.
+    #[test]
+    fn the_found_places_are_read_only_and_the_identified_walls_hold() {
+        let mut input = openclaw_inputs();
+        let held = PathBuf::from("/home/dev/.openclaw/workspace/.openclaw");
+        input.args.openclaw_held = vec![held.clone()];
+        let got = build_linux_jail(&input).unwrap().bwrap_args;
+        let dir = "/home/dev/.openclaw";
+        let bind = got
+            .windows(3)
+            .position(|w| w == ["--bind", dir, dir])
+            .unwrap();
+        let at = got
+            .windows(3)
+            .position(|w| w[0] == "--ro-bind" && Path::new(&w[2]) == held)
+            .unwrap_or_else(|| panic!("{got:?}"));
+        assert!(bind < at, "{got:?}");
+        let mut identified = openclaw_inputs();
+        identified.args.identity = true;
+        identified.seccomp_fd = Some(13);
+        let claude = {
+            let mut c = inputs(&["claude"]);
+            c.args.identity = true;
+            c.seccomp_fd = Some(13);
+            build_linux_jail(&c).unwrap().bwrap_args
+        };
+        let got = build_linux_jail(&identified).unwrap().bwrap_args;
+        assert_eq!(got[..2], [SECCOMP_OPTION, "13"], "{got:?}");
+        assert_eq!(claude[..2], got[..2]);
+        assert!(got.windows(2).any(|w| w == CAP_DROP_ALL), "{got:?}");
     }
 }

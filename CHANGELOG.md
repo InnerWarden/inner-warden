@@ -17,14 +17,21 @@ the text of a command; what it does not see is written down, as measured:
 
 - **`innerwarden contain --agent openclaw` (Linux).** OpenClaw runs in the
   AI Jail with a profile of its own: `~/.openclaw` writable (sessions,
-  databases, workspace), and its config, its `.env`, its plugins and its
-  managed hooks read-only, so a program in the jail cannot turn the guard
-  plugin off or plant a plugin for the next start. Automatic updates are off
-  in the jail (`OPENCLAW_NO_AUTO_UPDATE=1`). `~/.ssh`, `~/.aws`, docker's
-  folder and socket and an ssh agent's socket stay out, as in every jail. It
-  starts only with the guard plugin wired (`agents connect openclaw`), keeps
-  the plugin's own mode, and refuses `--pass-env` of a variable that moves
-  OpenClaw's folder or config. What OpenClaw uses was read from OpenClaw
+  databases, workspace), and read-only over it every place OpenClaw loads
+  code or instructions from at its next start: its config, its `.env`, its
+  plugins, hooks, skills and old cron store, each workspace's plugins, hooks
+  and skills, each agent's workshop skills and the config's load paths, where
+  the jail shows them writable. Each is a mount point of its own, so it can
+  be neither changed, removed nor renamed; the launcher makes the ones that
+  are not there and refuses any that is a link or reached through one, a
+  config with `$include`, and a config that is not plain JSON. Automatic
+  updates are off in the jail (`OPENCLAW_NO_AUTO_UPDATE=1`). `~/.ssh`,
+  `~/.aws`, docker's folder and socket and an ssh agent's socket stay out, as
+  in every jail. It starts only with the guard plugin wired (`agents connect
+  openclaw`), keeps the plugin's own mode, and refuses `--pass-env` of any
+  `OPENCLAW_*` variable (and the older `CLAWDBOT_*`, `CLAWD_*`, `MOLTBOT_*`)
+  and a command with `--profile` or `--dev`. What OpenClaw's state database
+  holds (sessions, scheduled jobs) stays writable, as the gateway needs it. What OpenClaw uses was read from OpenClaw
   2026.9.7's own documentation and is held by unit tests; the jail was not
   run with a live gateway here.
 - **Goose's MCP servers are wired through the proxy.** `innerwarden agents
@@ -189,11 +196,18 @@ the text of a command; what it does not see is written down, as measured:
   Whoever starts the proxy could move its record (`IW_GRAPH_FILE`) and turn
   off its report to the local agent (`INNERWARDEN_AGENT_URL=off`), and the
   refusals, which still held, were out of the operator's sight. A refused
-  call is now also written to the record `innerwarden status` reads, graph
-  and `guard.blocked` line. `INNERWARDEN_AGENT_URL=off` turns off only the
-  report.
+  call is now also written to the guard's own record, graph and
+  `guard.blocked` line: the shared record where InnerWarden Pro names one,
+  else the record in the account's own home, found from the account database
+  by uid, never from `HOME`. An empty, missing or redirected `HOME` does not
+  move or drop the copy. `INNERWARDEN_AGENT_URL=off` turns off only the
+  report. On Windows, where no account database is read, the copy goes only
+  to a shared record.
 - **Disconnect gives a JSON MCP server back as it was.** A server that had
-  no `args` no longer comes back with `"args": []`.
+  no `args` no longer comes back with `"args": []`. JSON has no comment to
+  mark the entry connect added, so a server with no arguments comes back with
+  no `args` entry: an `"args": []` you wrote yourself is dropped on
+  disconnect (an empty list and no list run the same server).
 - **The jail names both fixes for Ubuntu's user namespace restriction.**
   Where `kernel.apparmor_restrict_unprivileged_userns = 1` keeps bwrap from
   starting a jail, `contain` now names lifting the sysctl too, after the

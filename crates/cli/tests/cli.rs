@@ -62,6 +62,9 @@ fn cli() -> Command {
     // this file instead of /etc/innerwarden/guard.toml, so the suite never
     // writes into the shared record of a host with InnerWarden Pro.
     command.env("IW_TEST_GUARD_CONFIG", scratch_home().join("no-guard.toml"));
+    // And the account's home is the scratch home too (debug builds read it
+    // in place of the account database), never the developer's own.
+    command.env("IW_TEST_ACCOUNT_HOME", scratch_home());
     // The person's shell, even when the suite runs under an AI agent's: a
     // jail and the wiring that lowers a guard are refused inside one. A test
     // about an agent's shell sets its marker again; the later value wins.

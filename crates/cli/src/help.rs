@@ -255,8 +255,9 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              other variable from the environment needs --pass-env NAME.\n\
              \n  \
              --agent NAME      claude-code (the default) or openclaw (Linux): OpenClaw's\n  \
-             \x20                 jail keeps ~/.openclaw writable and its config, .env,\n  \
-             \x20                 plugins and hooks read-only, sets OPENCLAW_NO_AUTO_UPDATE=1,\n  \
+             \x20                 jail keeps ~/.openclaw writable and every place OpenClaw\n  \
+             \x20                 loads code from (config, .env, plugins, hooks, skills, its\n  \
+             \x20                 workspaces') read-only, sets OPENCLAW_NO_AUTO_UPDATE=1,\n  \
              \x20                 and starts only with the guard plugin wired (agents connect\n  \
              \x20                 openclaw); the plugin keeps its own mode\n  \
              --project DIR     the directory the jailed command may write (default: cwd)\n  \
