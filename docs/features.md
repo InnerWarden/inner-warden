@@ -553,10 +553,17 @@ In the MCP proxy and in a line handed to a shell, the guard also does not see:
   of the same line typed out. A loaded file that sets a variable the guard
   reads in its own way (the home, the search path, `IFS`, `PS4`,
   `SHELLOPTS`, a setting that loads code) is held for review (`echo
-  "export PATH=$PATH:$HOME/bin" > env.sh && . ./env.sh`). A use later on
+  "export PATH=$PATH:$HOME/bin" > env.sh && . ./env.sh`), whether it
+  assigns it, exports it, reads it (`read`, `mapfile`, `printf -v`), loops
+  over it or unsets it. A use later on
   the line of a variable the loaded file sets can be held for review where
   the same line typed out is allowed (`. ./env.sh && rm -rf $X`): stricter,
-  never looser. `xargs` and `find -exec` are read one file at a time up
+  never looser. A value the line itself gives a name (`X=/`, `export`,
+  `declare`, `local`, `readonly`, `typeset`, a value set in front of the
+  command, a loop over one word, a loaded file's assignments) is read into
+  every look the line gets, the target of a removal and the program word
+  among them: `X=/; rm -rf $X` and `P=rm; $P -rf /` get the verdict of
+  `rm -rf /`. `xargs` and `find -exec` are read one file at a time up
   to 64 files; past that the line is refused as read past its budget.
   `find -exec` with a pattern is matched only against the files the line
   writes by a redirect or `tee`.

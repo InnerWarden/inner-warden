@@ -817,12 +817,12 @@ const HOOK_SWITCH_KEYS: &[&str] = &[
 ];
 
 /// The words that set a variable for the rest of the line.
-const VARIABLE_SETTERS: &[&str] = &["export", "declare", "typeset", "readonly", "local"];
+pub(crate) const VARIABLE_SETTERS: &[&str] = &["export", "declare", "typeset", "readonly", "local"];
 
 /// The builtins that give a variable a value the line does not show:
 /// `read`, `mapfile` and `readarray` from their input, `getopts` from the
 /// arguments.
-const VALUE_READERS: &[&str] = &["read", "mapfile", "readarray", "getopts"];
+pub(crate) const VALUE_READERS: &[&str] = &["read", "mapfile", "readarray", "getopts"];
 
 /// How many command lines deep [`child_agent_without_its_hook`] reads one
 /// handed to another (a substitution, a shell's command string, `eval`,

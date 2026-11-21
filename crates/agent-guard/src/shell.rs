@@ -4218,24 +4218,64 @@ fn loaded_in_place(source: &[u8], loader: tree_sitter::Node<'_>, code: &str) -> 
     text
 }
 
-/// The variables shell code `text` assigns or exports (`A=1`, `export
-/// B=2`, `declare -x C=3`, `export D`).
+/// The variables shell code `text` sets, exports or takes away, by the
+/// same table the reading of a line uses
+/// ([`crate::threats::VARIABLE_SETTERS`], [`crate::threats::VALUE_READERS`]):
+/// `A=1`, `export B=2`, `declare -x C=3`, `export D`, `read E`, `mapfile
+/// F`, `getopts ab G`, `unset H`, `printf -v I x`, `for J in ...`. Every
+/// plain word after a reader or `unset` counts: a prompt or an option's value
+/// taken for a name only adds one.
 fn names_set_by(text: &str) -> Vec<String> {
-    let Ok(assignment) = regex::Regex::new(r"(?:^|[\s;&|({])([A-Za-z_][A-Za-z0-9_]*)\+?=") else {
+    static PATTERNS: std::sync::OnceLock<Option<[regex::Regex; 4]>> = std::sync::OnceLock::new();
+    let Some([assignment, exported, listed, single]) = PATTERNS.get_or_init(|| {
+        let setters = crate::threats::VARIABLE_SETTERS.join("|");
+        let listers = crate::threats::VALUE_READERS
+            .iter()
+            .chain(&["unset"])
+            .copied()
+            .collect::<Vec<_>>()
+            .join("|");
+        Some([
+            regex::Regex::new(r"(?:^|[\s;&|({])([A-Za-z_][A-Za-z0-9_]*)\+?=").ok()?,
+            regex::Regex::new(&format!(
+                r"(?:^|[\s;&|({{])(?:{setters})(?:\s+-[A-Za-z]+)*((?:\s+[A-Za-z_][A-Za-z0-9_]*)+)"
+            ))
+            .ok()?,
+            regex::Regex::new(&format!(r"(?:^|[\s;&|({{])(?:{listers})((?:[ \t]+[^\s;&|()<>]+)+)"))
+                .ok()?,
+            regex::Regex::new(
+                r"(?:^|[\s;&|({])(?:printf[ \t]+(?:-[A-Za-z]*[ \t]+)*-v[ \t]*|for[ \t]+)([A-Za-z_][A-Za-z0-9_]*)",
+            )
+            .ok()?,
+        ])
+    }) else {
         return Vec::new();
     };
-    let Ok(exported) = regex::Regex::new(
-        r"(?:^|[\s;&|({])(?:export|declare|typeset|readonly|local)(?:\s+-[A-Za-z]+)*((?:\s+[A-Za-z_][A-Za-z0-9_]*)+)",
-    ) else {
-        return Vec::new();
+    let identifier = |word: &str| {
+        let mut chars = word.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     };
     let mut names: Vec<String> = assignment
         .captures_iter(text)
+        .chain(single.captures_iter(text))
         .filter_map(|found| found.get(1).map(|name| name.as_str().to_owned()))
         .collect();
     for found in exported.captures_iter(text) {
         if let Some(list) = found.get(1) {
             names.extend(list.as_str().split_whitespace().map(str::to_owned));
+        }
+    }
+    for found in listed.captures_iter(text) {
+        if let Some(list) = found.get(1) {
+            names.extend(
+                list.as_str()
+                    .split_whitespace()
+                    .filter(|word| identifier(word))
+                    .map(str::to_owned),
+            );
         }
     }
     names
