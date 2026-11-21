@@ -1,3 +1,10 @@
+* text=auto eol=lf
+
+# Every text file is stored and checked out with LF. Files pinned by SHA-256
+# (include_str! contracts, the openclaw hook handler) must hash the same bytes
+# on Windows as on Linux, so Git must not write CRLF into them. This line has
+# to stay first: the rules below override it for the paths they match.
+
 # The dashboard bundle is verified byte-for-byte.
 #
 # `crates/dashboard-kit/src/assets.rs` embeds `web/dist` and checks every file
