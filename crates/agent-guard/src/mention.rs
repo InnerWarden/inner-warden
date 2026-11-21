@@ -145,6 +145,83 @@ const OTHER_RUNS: &[&str] = &[
     "`",
 ];
 
+/// The settings an agent loads the guard by and the guard's own places: a
+/// path holding one of these is what the guard protects.
+const SETTINGS_PLACES: &[&str] = &[
+    ".claude",
+    ".codex",
+    ".cursor",
+    ".gemini",
+    ".openclaw",
+    ".hermes",
+    ".goose",
+    ".aider",
+    ".continue",
+    ".windsurf",
+    ".kiro",
+    ".vscode",
+    ".zed",
+    ".amp",
+    "settings.json",
+    "settings.local.json",
+    "hooks.json",
+    "mcp.json",
+    ".mcp",
+    "claude_desktop_config",
+    "config.toml",
+    "config.yaml",
+    "config.yml",
+    ".config/",
+    "/etc/",
+    ".innerwarden",
+    "innerwarden/",
+    "innerwarden.service",
+    "/.local/bin",
+    "/usr/local/bin",
+    "/opt/",
+];
+
+/// Calls of every language read here that write, copy, move, link or open
+/// a file for writing, lowercase.
+const WRITES_A_FILE: &[&str] = &[
+    "open(",
+    "write",
+    "copy",
+    "cp(",
+    "cp ",
+    ".cp",
+    "mv(",
+    "mv ",
+    ".mv",
+    "move",
+    "rename",
+    "install",
+    "replace(",
+    "symlink",
+    "link(",
+    "unlink",
+    "remove",
+    "rmtree",
+    "truncate",
+    "chmod",
+    "chown",
+    "fileutils",
+    "shutil",
+    "pathlib",
+    "path(",
+    "fs.",
+    "fs/",
+    "io.",
+    "file.",
+    "sysopen",
+    "touch",
+    "mkdir",
+    "dump(",
+    "put_contents",
+    "save",
+    "store",
+];
+
 /// What makes inline code change a file.
 const CHANGES_A_FILE: &[&str] = &[
     "open(",
@@ -602,6 +679,16 @@ pub(crate) fn code_may_act(
         return true;
     }
     let lower = code.to_ascii_lowercase();
+    // A path of an agent's settings or of the guard's own, anywhere in code
+    // that writes, copies, moves or opens a file, is never a mention, through
+    // a variable or not (`p=".claude/settings.json"; FileUtils.cp("x", p)`).
+    let argv_lower = argv.join(" ").to_ascii_lowercase();
+    let names_settings = SETTINGS_PLACES
+        .iter()
+        .any(|place| lower.contains(place) || argv_lower.contains(place));
+    if names_settings && WRITES_A_FILE.iter().any(|call| lower.contains(call)) {
+        return true;
+    }
     if language != "python" {
         // A name built from escapes, character codes, a variable's sigil or
         // an index (`'\x65xecSync'`, `String.fromCharCode`, `&$f(...)`) is
