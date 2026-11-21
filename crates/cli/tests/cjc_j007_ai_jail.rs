@@ -4229,6 +4229,193 @@ fn what_a_jail_writes_in_the_projects_claude_files_never_reaches_the_host() {
     );
 }
 
+/// NEW-20261020-jail-config-dir-not-covered: with `CLAUDE_CONFIG_DIR`
+/// handed in (`--pass-env`), the jail's Claude Code used the folder it
+/// names, while `contain` armed and checked `~/.claude`. Now that folder
+/// is the person's Claude Code folder: settings there that turn hooks off
+/// refuse the start (naming the file), the guard's hook is armed there and
+/// not in `~/.claude`, and a relative value refuses the start. No
+/// bubblewrap is needed: all of it happens before the jail is built.
+///
+/// FAILS ON REVERT: read and arm `~/.claude` whatever the variable says.
+#[cfg(unix)]
+#[test]
+fn the_folder_claude_config_dir_names_is_checked_and_armed() {
+    let run = |h: &std::path::Path, value: &str| {
+        let project = tempfile::TempDir::new().unwrap();
+        cli()
+            .args([
+                "contain",
+                "--pass-env",
+                "CLAUDE_CONFIG_DIR",
+                "--project",
+                project.path().to_str().unwrap(),
+                "--",
+                "/bin/true",
+            ])
+            .env("HOME", h)
+            .env("CLAUDE_CONFIG_DIR", value)
+            .output()
+            .expect("run the launcher")
+    };
+    let home = state_home();
+    let h = home.path();
+    let cfg = h.join("cfg");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("settings.local.json"),
+        r#"{"disableAllHooks":true}"#,
+    )
+    .unwrap();
+    let off = run(h, cfg.to_str().unwrap());
+    let err = String::from_utf8_lossy(&off.stderr);
+    assert_eq!(off.status.code(), Some(2), "{err}");
+    assert!(err.contains("cfg/settings.local.json"), "{err}");
+    assert!(
+        !cfg.join("settings.json").exists(),
+        "armed before the check"
+    );
+    std::fs::remove_file(cfg.join("settings.local.json")).unwrap();
+    let _ = run(h, cfg.to_str().unwrap());
+    let armed = std::fs::read_to_string(cfg.join("settings.json")).unwrap_or_default();
+    assert!(
+        armed.contains("hook"),
+        "not armed where the variable points: {armed}"
+    );
+    assert!(
+        !h.join(".claude/settings.json").exists(),
+        "armed in ~/.claude"
+    );
+    let relative = run(h, "cfg");
+    let err = String::from_utf8_lossy(&relative.stderr);
+    assert_eq!(relative.status.code(), Some(2), "{err}");
+    assert!(err.contains("CLAUDE_CONFIG_DIR"), "{err}");
+}
+
+/// Review of #357, items 3, 4 and 7: `CLAUDE_CONFIG_DIR` naming a folder
+/// that is not there, a link, the home, `/`, a folder in the project or
+/// one the jail writes refuses the start and `--setup` alike, naming why,
+/// and nothing is made or armed: `install_hook` makes the folder it is
+/// given and follows a link. No bubblewrap needed.
+///
+/// FAILS ON REVERT: arm the hook before the folder is checked.
+#[cfg(unix)]
+#[test]
+fn a_claude_config_dir_that_cannot_be_guarded_refuses_before_anything_is_written() {
+    let home = state_home();
+    let h = home.path();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = project.path();
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), h.join("link")).unwrap();
+    std::fs::create_dir_all(h.join(".local/claude")).unwrap();
+    std::fs::create_dir_all(p.join("cfg")).unwrap();
+    let run = |setup: bool, value: &std::path::Path| {
+        let mut args = vec!["contain", "--pass-env", "CLAUDE_CONFIG_DIR"];
+        if setup {
+            args.push("--setup");
+        } else {
+            args.extend(["--project", p.to_str().unwrap(), "--", "/bin/true"]);
+        }
+        cli()
+            .args(&args)
+            .current_dir(p)
+            .env("HOME", h)
+            .env("CLAUDE_CONFIG_DIR", value)
+            .output()
+            .expect("run the launcher")
+    };
+    let cases: Vec<(std::path::PathBuf, &str, bool)> = vec![
+        (h.join("missing"), "is not there", true),
+        (h.join("link"), "is a link", true),
+        (h.to_path_buf(), "home folder", true),
+        (std::path::PathBuf::from("/"), "home folder", true),
+        (h.join(".local/claude"), "which the jail writes", true),
+        (p.join("cfg"), "the jail writes the project", false),
+    ];
+    for (value, said, setup_too) in cases {
+        for setup in [false, true] {
+            if setup && !setup_too {
+                continue;
+            }
+            let out = run(setup, &value);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{value:?} setup={setup}: {err}");
+            assert!(
+                err.contains("refusing to start") && err.contains(said),
+                "{value:?} setup={setup}: {err}"
+            );
+        }
+    }
+    assert!(!h.join("missing").exists(), "the folder was made");
+    assert!(
+        std::fs::read_dir(elsewhere.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "written where the link leads"
+    );
+    assert!(!h.join(".local/claude/settings.json").exists());
+    assert!(!h.join("settings.json").exists());
+    assert!(
+        !h.join(".claude/settings.json").exists(),
+        "armed in ~/.claude"
+    );
+}
+
+/// Review of #357, item 7: the folder `CLAUDE_CONFIG_DIR` names is not
+/// writable in the jail, as named or through the variable, which there
+/// names the jail's own folder. Measured on the lab host (b377dd3): the
+/// place was covered by an empty folder the jail could write, so a write
+/// there "worked" (into the cover, not the host); the cover is read-only.
+///
+/// FAILS ON REVERT: leave the person's folder shown in the jail's
+/// writable `~/.config`.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_folder_claude_config_dir_names_is_never_written_in_the_jail() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    let cfg = h.join(".config/claude");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("settings.json"), "{}").unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let out = cli()
+        .args([
+            "contain",
+            "--pass-env",
+            "CLAUDE_CONFIG_DIR",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            &format!(
+                "(echo JAIL > '{c}/settings.json') 2>/dev/null && echo WROTE; \
+                 (echo JAIL > '{c}/new') 2>/dev/null && echo MADE; \
+                 echo JAIL > \"$CLAUDE_CONFIG_DIR/mine\" && echo OWN; \
+                 [ \"$CLAUDE_CONFIG_DIR\" = '{c}' ] || echo MOVED; echo DONE",
+                c = cfg.display()
+            ),
+        ])
+        .env("HOME", h)
+        .env("CLAUDE_CONFIG_DIR", &cfg)
+        .output()
+        .expect("run the jail");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("DONE"), "{text} {err}");
+    // The host's folder: untouched.
+    assert!(!cfg.join("new").exists() && !cfg.join("mine").exists());
+    let kept = std::fs::read_to_string(cfg.join("settings.json")).unwrap();
+    assert!(!kept.contains("JAIL"), "{kept}");
+    // In the jail: the variable names the jail's own folder, which it
+    // writes; the place of the host's folder takes no write at all.
+    assert!(text.contains("MOVED") && text.contains("OWN"), "{text}");
+    assert!(!text.contains("WROTE") && !text.contains("MADE"), "{text}");
+}
+
 /// Second review of #352, item 3: a start that could not read the person's
 /// Claude Code settings went on as if nothing turned the hook off. Now each
 /// doubt refuses the start (exit 2), names the file, and arms nothing: the
@@ -6147,6 +6334,13 @@ fn the_jails_record_of_decisions_is_out_of_the_agents_reach() {
 ///
 /// FAILS ON REVERT: read the folder's presence again (`in_record_jail`)
 /// and the program's socket hears the decision and the record has none.
+///
+/// The script waits for the program's socket by the program's own word
+/// (a line it writes to a FIFO once it listens, or `dead` if it ended
+/// before; the program has 20 s, the jail 60 s, review of #357), never by
+/// polling with a deadline: under a full suite the
+/// program took longer than the 5 s the poll allowed, and the test failed
+/// once and passed the next run (NEW-20261120-flaky-jail-record-folder-test).
 #[cfg(target_os = "linux")]
 #[test]
 fn a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers() {
@@ -6162,10 +6356,11 @@ fn a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers() {
     let fake = project.path().join("fake.py");
     std::fs::write(
         &fake,
-        "import socket\n\
+        "import os, socket\n\
          s = socket.socket(socket.AF_UNIX)\n\
          s.bind('/run/innerwarden-record/graph.sock')\n\
          s.listen(8)\n\
+         open('/tmp/up', 'w').write('up %d\\n' % os.getpid())\n\
          while True:\n    \
              c, _ = s.accept()\n    \
              d = c.recv(1 << 20)\n    \
@@ -6176,19 +6371,32 @@ fn a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers() {
     .unwrap();
     let script = format!(
         "command -v python3 >/dev/null || {{ echo NO_PYTHON; exit 0; }}; \
-         mkdir -p /run/innerwarden-record && python3 '{}' & FAKE=$!; \
-         i=0; while [ ! -S /run/innerwarden-record/graph.sock ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; \
-         [ -S /run/innerwarden-record/graph.sock ] && echo FAKE_UP; \
+         mkdir -p /run/innerwarden-record && mkfifo /tmp/up || exit 0; \
+         ( timeout 20 python3 '{}'; echo dead > /tmp/up ) >/dev/null 2>&1 & WATCH=$!; \
+         read UP FAKE < /tmp/up; [ \"$UP\" = up ] && echo FAKE_UP; \
+         case \"$FAKE\" in ''|*[!0-9]*|0) FAKE= ;; esac; \
          {}; \
-         if [ -s /tmp/heard ]; then echo HEARD; fi; kill $FAKE 2>/dev/null; true",
+         if [ -s /tmp/heard ]; then echo HEARD; fi; kill $WATCH $FAKE 2>/dev/null; true",
         fake.display(),
         jail_hook_line("fake"),
     );
-    let output = record_jail_sh(false, h, project.path(), &script)
+    let mut child = record_jail_sh(false, h, project.path(), &script)
         .env("TMPDIR", &tmp)
         .env_remove("XDG_RUNTIME_DIR")
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("run the jail");
+    // The program waits 20 s at most in the jail; the jail, 60 s here.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while child.try_wait().expect("wait for the jail").is_none() {
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the jail did not end in 60 s");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().expect("read the jail");
     let out = String::from_utf8_lossy(&output.stdout);
     let err = String::from_utf8_lossy(&output.stderr);
     assert!(!out.contains("NO_PYTHON"), "the jail needs python3: {out}");
