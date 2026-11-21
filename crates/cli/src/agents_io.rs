@@ -352,7 +352,7 @@ pub(crate) fn help_text() -> String {
          refusing every deny.\n  \
          --strict        refuse every deny and every review (the --block-review\n  \
          \x20               wiring of earlier versions' --strict)\n  \
-         --guard         move a strict install to the default posture (your terminal only)\n  \
+         --guard         move a strict install to the default hook posture (your terminal only)\n  \
          --block-review  refuse every review too\n  \
          --monitor       record every call and refuse nothing\n  \
          Automatic setup is opt-in and monitor-only; unknown flags fail without\n  \

@@ -134,7 +134,7 @@ in hex) or `pip install -e . > /dev/null`. `exec` of code that is decoded,
 decompressed, downloaded or read from input stays refused, and so does
 `at` behind `sudo`, `env`, `timeout`, `nice` or `xargs`.
 
-The MCP proxy's default posture (`guard`) refuses a tool call that acts
+The MCP proxy's default mode (`guard`) refuses a tool call that acts
 (pays, sends, shares, deletes, books) when it carries a value a server said
 this session, and no longer refuses one only because a rule matched the
 tool's name or its argument names: that call is forwarded with a warning and
@@ -163,7 +163,11 @@ terminal, moves it to the default posture. `innerwarden status` says the
 posture in force and what it refuses. In the Community CLI `--strict` now
 names that posture: it used to be another name for `--block-review`, which
 stays the way to refuse every review. Wiring already on a host is not
-rewritten. [The posture](docs/features.md#the-posture-what-an-enforcing-hook-refuses).
+rewritten. The two hook postures are `default` and `strict`, the words kept
+in `~/.config/innerwarden/posture` and printed by `status` as `Hook posture:
+default`; a file that says `guard`, as builds of main wrote it, is read as
+`default`. The MCP proxy's modes (`advisory`, `warn`, `guard`, `strict`,
+`kill`) are not postures and did not change. [The posture](docs/features.md#the-posture-what-an-enforcing-hook-refuses).
 
 A `chmod` (numeric or symbolic, `-R` too) or an `install -m` that lets the
 group or everyone else write the guard's files or an agent's settings is

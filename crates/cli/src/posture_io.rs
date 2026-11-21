@@ -2,9 +2,12 @@
 //! ([`innerwarden_agent_guard::posture`]).
 //!
 //! - `--strict`: the enforce of every install before the posture existed.
-//! - `--guard`: the default posture, asked for by name (an install that was
-//!   strict moves to it). It lowers what the hook refuses, so it is the
-//!   person's, never a command an agent's shell runs.
+//! - `--guard`: the default posture (file word `default`), asked for by
+//!   name (an install that was strict moves to it). It lowers what the hook
+//!   refuses, so it is the person's, never a command an agent's shell runs.
+//!   The flag keeps its name because the guard's rule that refuses an agent
+//!   running it reads `--guard` (`threats::guard_verb_loosens`); a second
+//!   spelling would be one that rule does not know.
 //! - neither: a posture already chosen stays; a home with no file and no
 //!   wiring yet (a new install) gets the default posture; a home already
 //!   wired before the posture existed is kept strict, so an upgrade or a
@@ -22,7 +25,7 @@ pub(crate) fn requested(rest: &[String]) -> Result<Option<Posture>, String> {
     match (strict, guard) {
         (true, true) => Err("`--strict` and `--guard` name two postures; choose one".into()),
         (true, false) => Ok(Some(Posture::Strict)),
-        (false, true) => Ok(Some(Posture::Guard)),
+        (false, true) => Ok(Some(Posture::Default)),
         (false, false) => Ok(None),
     }
 }
@@ -70,7 +73,7 @@ pub(crate) fn to_write(
         (Some(asked), _) => Some(asked),
         (None, Some(_)) => None,
         (None, None) if was_wired => Some(Posture::Strict),
-        (None, None) => Some(Posture::Guard),
+        (None, None) => Some(Posture::Default),
     }
 }
 
@@ -90,13 +93,13 @@ pub(crate) fn settle(
 /// The one line that says the posture in force and what it refuses.
 pub(crate) fn line(posture: Posture) -> String {
     let harden = match posture {
-        Posture::Guard => {
+        Posture::Default => {
             " Refuse every deny and every review instead: `innerwarden agents connect --strict`."
         }
         Posture::Strict => "",
     };
     format!(
-        "  Posture: {} ({}).{harden}",
+        "  Hook posture: {} ({}).{harden}",
         posture.word(),
         posture::refuses_summary(posture)
     )
@@ -112,17 +115,17 @@ mod tests {
 
     #[test]
     fn a_new_install_gets_the_default_and_an_old_one_stays_strict() {
-        assert_eq!(to_write(None, None, false), Some(Posture::Guard));
+        assert_eq!(to_write(None, None, false), Some(Posture::Default));
         assert_eq!(to_write(None, None, true), Some(Posture::Strict));
-        assert_eq!(to_write(None, Some(Posture::Guard), true), None);
+        assert_eq!(to_write(None, Some(Posture::Default), true), None);
         assert_eq!(to_write(None, Some(Posture::Strict), false), None);
         assert_eq!(
-            to_write(Some(Posture::Strict), Some(Posture::Guard), true),
+            to_write(Some(Posture::Strict), Some(Posture::Default), true),
             Some(Posture::Strict)
         );
         assert_eq!(
-            to_write(Some(Posture::Guard), Some(Posture::Strict), true),
-            Some(Posture::Guard)
+            to_write(Some(Posture::Default), Some(Posture::Strict), true),
+            Some(Posture::Default)
         );
     }
 
@@ -134,7 +137,7 @@ mod tests {
         );
         assert_eq!(
             requested(&args(&["connect", "--guard"])),
-            Ok(Some(Posture::Guard))
+            Ok(Some(Posture::Default))
         );
         assert_eq!(requested(&args(&["connect"])), Ok(None));
         assert!(requested(&args(&["connect", "--guard", "--strict"])).is_err());
@@ -153,11 +156,15 @@ mod tests {
     fn settle_writes_once_and_keeps_a_choice() {
         let home = tempfile::tempdir().unwrap();
         let said = settle(home.path(), None, false).unwrap();
-        assert!(said.contains("Posture: guard"), "{said}");
+        assert!(said.contains("Hook posture: default"), "{said}");
+        assert_eq!(
+            std::fs::read_to_string(posture::posture_path(home.path())).unwrap(),
+            "default\n"
+        );
         // A later connect with no flag keeps it.
         settle(home.path(), None, true).unwrap();
-        assert_eq!(posture::posture_in_force(home.path()), Posture::Guard);
+        assert_eq!(posture::posture_in_force(home.path()), Posture::Default);
         let said = settle(home.path(), Some(Posture::Strict), true).unwrap();
-        assert!(said.contains("Posture: strict"), "{said}");
+        assert!(said.contains("Hook posture: strict"), "{said}");
     }
 }

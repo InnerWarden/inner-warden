@@ -165,7 +165,9 @@ then asks you or is refused, by agent. `--block-review` refuses every review
 too, and `--monitor` refuses nothing. An install from before the posture
 existed keeps refusing every `deny` after an upgrade; `agents connect
 --guard`, from your own terminal, moves it to the default posture.
-`innerwarden status` says which posture is in force and what it refuses.
+`innerwarden status` says which posture is in force (`Hook posture: default`
+or `strict`) and what it refuses. The MCP proxy's modes (`proxy --mode
+guard` and the rest) are its own and are not the hook posture.
 
 ## What it does
 

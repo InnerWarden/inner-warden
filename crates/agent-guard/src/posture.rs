@@ -5,9 +5,9 @@
 //! certain of, and every other refusal or review of the rules lets the call
 //! run, records it and shows a one-line warning where the agent shows one:
 //!
-//! - [`Posture::Guard`], the default of a new install: refuses the
+//! - [`Posture::Default`] (`default`), the posture of a new install: refuses the
 //!   [high-certainty class](high_certainty_signal) only.
-//! - [`Posture::Strict`], the enforce of every install before it: every
+//! - [`Posture::Strict`] (`strict`), the enforce of every install before it: every
 //!   `deny` refuses, and a `review` asks the person or is refused, by agent.
 //!
 //! The posture is kept in the guard's own folder
@@ -15,6 +15,11 @@
 //! rules and the shell rules refuse a write there). A missing or unreadable
 //! file is [`Posture::Strict`]: an install from before the posture existed
 //! keeps the mode it had, and taking the file away only hardens the guard.
+//!
+//! The file word `guard`, which builds of main wrote before the posture was
+//! named `default`, is still read as [`Posture::Default`]. The posture is the
+//! hook's alone: the MCP proxy keeps its own modes (`advisory`, `warn`,
+//! `guard`, `strict`, `kill`), and its `guard` is not this posture.
 //!
 //! It only ever applies to an enforcing hook line with no mode flag. A
 //! `--monitor` line refuses nothing and a `--block-review` line refuses
@@ -29,7 +34,7 @@ pub const POSTURE_FILE: &str = ".config/innerwarden/posture";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Posture {
     /// Refuses the high-certainty class only; the rest runs with a warning.
-    Guard,
+    Default,
     /// Every `deny` refuses and a `review` asks or refuses, as before.
     Strict,
 }
@@ -38,15 +43,16 @@ impl Posture {
     /// The word kept in the file and shown by `status`.
     pub fn word(self) -> &'static str {
         match self {
-            Self::Guard => "guard",
+            Self::Default => "default",
             Self::Strict => "strict",
         }
     }
 
-    /// The posture a word names: `None` for anything else.
+    /// The posture a word names: `None` for anything else. `guard` is the
+    /// word builds of main wrote before the posture was named `default`.
     pub fn from_word(word: &str) -> Option<Self> {
         match word.trim() {
-            "guard" => Some(Self::Guard),
+            "default" | "guard" => Some(Self::Default),
             "strict" => Some(Self::Strict),
             _ => None,
         }
@@ -66,7 +72,7 @@ pub fn read_posture_file(home: &Path) -> Option<Posture> {
 }
 
 /// The posture in force under `home`: [`Posture::Strict`] unless the file
-/// says `guard`.
+/// says `default` (or `guard`, its earlier word).
 pub fn posture_in_force(home: &Path) -> Posture {
     read_posture_file(home).unwrap_or(Posture::Strict)
 }
@@ -200,7 +206,7 @@ pub fn verdict_is_high_certainty(verdict: &serde_json::Value) -> bool {
 }
 
 /// Whether `posture` refuses a call the strict policy refuses
-/// (`strict_refuses`): [`Posture::Strict`] always, [`Posture::Guard`]
+/// (`strict_refuses`): [`Posture::Strict`] always, [`Posture::Default`]
 /// only for the high-certainty class.
 pub fn refuses(posture: Posture, strict_refuses: bool, verdict: &serde_json::Value) -> bool {
     strict_refuses && (posture == Posture::Strict || verdict_is_high_certainty(verdict))
@@ -224,7 +230,7 @@ pub fn warning_line(recommendation: &str, explanation: &str) -> String {
 /// What `status` says each posture refuses, in one line.
 pub fn refuses_summary(posture: Posture) -> &'static str {
     match posture {
-        Posture::Guard => {
+        Posture::Default => {
             "refuses secret reads (hard class), destruction of the system or a home, \
              acts that take the guard down, reverse shells and download-and-run; \
              every other deny or review runs with a one-line warning and is recorded"
@@ -249,10 +255,42 @@ mod tests {
         std::fs::create_dir_all(home.path().join(".config/innerwarden")).unwrap();
         std::fs::write(posture_path(home.path()), "loose\n").unwrap();
         assert_eq!(posture_in_force(home.path()), Posture::Strict);
-        write_posture(home.path(), Posture::Guard).unwrap();
-        assert_eq!(posture_in_force(home.path()), Posture::Guard);
+        write_posture(home.path(), Posture::Default).unwrap();
+        assert_eq!(posture_in_force(home.path()), Posture::Default);
         write_posture(home.path(), Posture::Strict).unwrap();
         assert_eq!(read_posture_file(home.path()), Some(Posture::Strict));
+    }
+
+    /// The words the file is read by: `default`, and `guard`, the word builds
+    /// of main wrote before the posture was named `default`, are the default
+    /// posture; `strict` is strict; anything else, or nothing, is strict.
+    #[test]
+    fn the_file_words_default_guard_strict_and_anything_else() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/innerwarden")).unwrap();
+        for (text, read, in_force) in [
+            ("guard\n", Some(Posture::Default), Posture::Default),
+            ("default\n", Some(Posture::Default), Posture::Default),
+            ("  default  ", Some(Posture::Default), Posture::Default),
+            ("strict\n", Some(Posture::Strict), Posture::Strict),
+            ("Default\n", None, Posture::Strict),
+            ("defaults\n", None, Posture::Strict),
+            ("guard strict\n", None, Posture::Strict),
+            ("", None, Posture::Strict),
+            ("\u{0}garbage", None, Posture::Strict),
+        ] {
+            std::fs::write(posture_path(home.path()), text).unwrap();
+            assert_eq!(read_posture_file(home.path()), read, "{text:?}");
+            assert_eq!(posture_in_force(home.path()), in_force, "{text:?}");
+        }
+        // What is written is the new word, and it reads back.
+        write_posture(home.path(), Posture::Default).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(posture_path(home.path())).unwrap(),
+            "default\n"
+        );
+        assert_eq!(Posture::Default.word(), "default");
+        assert_eq!(Posture::Strict.word(), "strict");
     }
 
     /// The write goes through a temporary file renamed over the posture, and
@@ -261,14 +299,14 @@ mod tests {
     fn a_write_leaves_only_the_posture_file() {
         let home = tempfile::tempdir().unwrap();
         write_posture(home.path(), Posture::Strict).unwrap();
-        write_posture(home.path(), Posture::Guard).unwrap();
+        write_posture(home.path(), Posture::Default).unwrap();
         let folder = posture_path(home.path()).parent().unwrap().to_path_buf();
         let names: Vec<_> = std::fs::read_dir(&folder)
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .collect();
         assert_eq!(names, vec!["posture".to_string()]);
-        assert_eq!(read_posture_file(home.path()), Some(Posture::Guard));
+        assert_eq!(read_posture_file(home.path()), Some(Posture::Default));
     }
 
     #[test]
@@ -276,10 +314,10 @@ mod tests {
         let soft = signal("container_escape", 80, "x");
         let hard = signal("reverse_shell", 80, "x");
         assert!(refuses(Posture::Strict, true, &soft));
-        assert!(!refuses(Posture::Guard, true, &soft));
-        assert!(refuses(Posture::Guard, true, &hard));
+        assert!(!refuses(Posture::Default, true, &soft));
+        assert!(refuses(Posture::Default, true, &hard));
         // Never stricter than strict.
-        assert!(!refuses(Posture::Guard, false, &hard));
+        assert!(!refuses(Posture::Default, false, &hard));
         assert!(!refuses(Posture::Strict, false, &hard));
     }
 
