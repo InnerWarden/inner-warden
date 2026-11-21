@@ -44,7 +44,10 @@
 //!   to exit, then stops it.
 //! * the process is asked to stop (SIGTERM, SIGHUP or SIGINT; Ctrl-C on
 //!   Windows): the proxy stops the server, then exits. A signal that whoever
-//!   started the proxy set to be ignored (`nohup`) stays ignored.
+//!   started the proxy set to be ignored (`nohup`) stays ignored, for the
+//!   proxy. The server is started with SIGTERM at its default action, since
+//!   that is how the proxy asks it to stop; SIGHUP and SIGINT reach it as
+//!   they came.
 //! * an I/O error: the proxy stops the server, then reports the error.
 //!
 //! "Stops the server" is the MCP stdio shutdown: SIGTERM, then SIGKILL 1 s
@@ -1617,6 +1620,23 @@ impl Server {
         // Its own group, so a launcher's children are stopped with it.
         #[cfg(unix)]
         command.process_group(0);
+        // SIGTERM is how the proxy asks the server to stop, so the server
+        // gets it at its default action, whatever the proxy's own is. A
+        // disposition of "ignored" is kept across exec and a shell cannot
+        // trap a signal ignored when it started: a proxy started with SIGTERM
+        // ignored handed that on, its request did nothing, and the server
+        // was killed after the grace without running its own shutdown (seen
+        // on the macOS runner). SIGHUP and SIGINT are left as they came:
+        // ignoring them (`nohup`) is a choice that the tools survive.
+        #[cfg(unix)]
+        // SAFETY: signal(2) is async-signal-safe and touches only the child
+        // between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                Ok(())
+            });
+        }
         let child = command.spawn()?;
         Ok(Self {
             #[cfg(unix)]
@@ -1670,6 +1690,8 @@ impl Server {
             unsafe {
                 libc::killpg(group, signo);
             }
+            #[cfg(test)]
+            let _ = TEST_SIGNALS.try_with(|sent| sent.lock().unwrap().push(signo));
         }
     }
 
@@ -1762,6 +1784,15 @@ fn stop_grace() -> Duration {
 #[cfg(test)]
 tokio::task_local! {
     static TEST_STOP_GRACE: Duration;
+}
+
+#[cfg(all(test, unix))]
+tokio::task_local! {
+    /// Each signal a test's proxy sent its server's group, in the order it
+    /// sent them: a test proves the order (asked to stop, then killed, then
+    /// the session's end reported) by this list, not by how soon a server
+    /// on a loaded runner got the CPU to say it was asked.
+    static TEST_SIGNALS: std::sync::Arc<std::sync::Mutex<Vec<i32>>>;
 }
 
 /// Resolves when the process is asked to stop: SIGTERM, SIGHUP or SIGINT.
@@ -3362,6 +3393,31 @@ mod tests {
         );
     }
 
+    /// The processes left in the group of the server whose pid `pid_file`
+    /// holds, as `ps` lists them (pid, group, state, command), for a test
+    /// that hung waiting for that group.
+    #[cfg(unix)]
+    fn group_members(pid_file: &std::path::Path) -> String {
+        let Some(group) = std::fs::read_to_string(pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        else {
+            return "no server pid".to_string();
+        };
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,pgid=,stat=,comm="])
+            .output()
+        else {
+            return "ps did not run".to_string();
+        };
+        let members: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| line.split_whitespace().nth(1) == Some(group.to_string().as_str()))
+            .map(|line| line.trim().to_string())
+            .collect();
+        format!("{members:?}")
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_error_asks_the_server_to_stop_before_it_is_reported() {
@@ -3370,46 +3426,88 @@ mod tests {
         // asked to stop with SIGTERM, so it can finish cleanly, and is not left
         // to the SIGKILL of a dropped child.
         //
-        // The proxy waits for a signal here, not for its 1 s grace: for this
-        // proxy only, the grace is a bound of 5 s on the wait for the
-        // server's group to be gone, which ends as soon as the trap exits.
-        // With the 1 s grace, a loaded runner killed a server whose trap had
-        // not yet run, and this failed with nothing wrong in the proxy. A
-        // proxy that kills without asking still leaves the file empty.
+        // Proved by order and count, never by how long a server takes to get
+        // the CPU (NEW-20261118-mcp-transport-test-flaky-macos: with a grace
+        // of 1 s, then 5 s, a loaded macOS runner killed a server whose trap
+        // had not yet run, and this failed with nothing wrong in the proxy).
+        // The proxy records each signal it sends the server's group: when
+        // its error comes back, exactly one SIGTERM was sent, and first; a
+        // SIGKILL, if any, after it. For this proxy only the grace has no
+        // bound a runner can reach, so the wait for the group ends when the
+        // trap has written and exited, whatever the load: the trap's file
+        // then says the server got the request, by order alone. A proxy that
+        // kills without asking leaves no SIGTERM in the list and the file
+        // empty. The outer timeout of 60 s only catches a hang: well past a
+        // run on a loaded runner (seconds), and short enough that a proxy
+        // that never asks fails in a minute (its server sleeps 60 s).
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("server.pid");
         let asked = dir.path().join("asked-to-stop");
-        let script = r#"echo $$ > "$1"; trap 'echo yes > "$2"; kill $! 2>/dev/null; exit 0' TERM; printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'; sleep 60 & wait"#;
+        // The server waits in the foreground, a second at a time: the group's
+        // SIGTERM ends the \`sleep\` it waits on and the trap runs at once. A
+        // \`sleep 60 &\` killed by \`$!\` from the trap could outlive it: bash
+        // 3.2, macOS's \`sh\`, can run the trap before \`$!\` names the job just
+        // started, and the sleep then held the group for its whole minute
+        // (CI macOS, 2026-11-21: trap written, one SIGTERM sent, proxy still
+        // waiting for the group).
+        let script = r#"echo $$ > "$1"; trap 'echo yes > "$2"; exit 0' TERM; printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'; while :; do sleep 1; done"#;
         let (_to_proxy, proxy_in) = duplex(16384);
         let (proxy_out, from_proxy) = duplex(16384);
         drop(from_proxy);
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            TEST_STOP_GRACE.scope(
-                std::time::Duration::from_secs(5),
-                run_proxy_with_io(
-                    proxy_in,
-                    proxy_out,
-                    advisory(vec![
-                        "sh".into(),
-                        "-c".into(),
-                        script.into(),
-                        "sh".into(),
-                        pid_file.display().to_string(),
-                        asked.display().to_string(),
-                    ]),
-                    None,
-                    |_d: &ProxyDecision| {},
+            std::time::Duration::from_secs(60),
+            TEST_SIGNALS.scope(
+                sent.clone(),
+                TEST_STOP_GRACE.scope(
+                    std::time::Duration::from_secs(3600),
+                    run_proxy_with_io(
+                        proxy_in,
+                        proxy_out,
+                        advisory(vec![
+                            "sh".into(),
+                            "-c".into(),
+                            script.into(),
+                            "sh".into(),
+                            pid_file.display().to_string(),
+                            asked.display().to_string(),
+                        ]),
+                        None,
+                        |_d: &ProxyDecision| {},
+                    ),
                 ),
             ),
         )
         .await
-        .expect("the proxy hung on an error");
+        .unwrap_or_else(|_| {
+            panic!(
+                "the proxy hung on an error (SIGTERM ignored in this process: {}; \
+                 signals sent: {:?}; trap wrote: {:?}; left in the server's group: {})",
+                ignored_from_the_start(libc::SIGTERM),
+                sent.lock().unwrap(),
+                std::fs::read_to_string(&asked).ok(),
+                group_members(&pid_file)
+            )
+        });
+        // Read the moment the error is reported, before anything else runs.
+        let at_report = sent.lock().unwrap().clone();
         assert_eq!(
             result
                 .expect_err("a client that cannot be written is an error")
                 .kind(),
             std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            at_report.iter().filter(|s| **s == libc::SIGTERM).count(),
+            1,
+            "asked to stop once, before the error was reported: {at_report:?}"
+        );
+        assert_eq!(at_report.first(), Some(&libc::SIGTERM), "{at_report:?}");
+        assert!(
+            at_report
+                .iter()
+                .all(|s| [libc::SIGTERM, libc::SIGKILL].contains(s)),
+            "{at_report:?}"
         );
         assert_eq!(
             std::fs::read_to_string(&asked).ok().as_deref(),
