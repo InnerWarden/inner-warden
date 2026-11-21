@@ -4365,7 +4365,9 @@ fn a_claude_config_dir_that_cannot_be_guarded_refuses_before_anything_is_written
 
 /// Review of #357, item 7: the folder `CLAUDE_CONFIG_DIR` names is not
 /// writable in the jail, as named or through the variable, which there
-/// names the jail's own folder.
+/// names the jail's own folder. Measured on the lab host (b377dd3): the
+/// place was covered by an empty folder the jail could write, so a write
+/// there "worked" (into the cover, not the host); the cover is read-only.
 ///
 /// FAILS ON REVERT: leave the person's folder shown in the jail's
 /// writable `~/.config`.
@@ -4404,11 +4406,14 @@ fn the_folder_claude_config_dir_names_is_never_written_in_the_jail() {
     let text = String::from_utf8_lossy(&out.stdout);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(text.contains("DONE"), "{text} {err}");
-    assert!(text.contains("MOVED"), "{text}");
-    assert!(!text.contains("WROTE") && !text.contains("MADE"), "{text}");
+    // The host's folder: untouched.
     assert!(!cfg.join("new").exists() && !cfg.join("mine").exists());
     let kept = std::fs::read_to_string(cfg.join("settings.json")).unwrap();
     assert!(!kept.contains("JAIL"), "{kept}");
+    // In the jail: the variable names the jail's own folder, which it
+    // writes; the place of the host's folder takes no write at all.
+    assert!(text.contains("MOVED") && text.contains("OWN"), "{text}");
+    assert!(!text.contains("WROTE") && !text.contains("MADE"), "{text}");
 }
 
 /// Second review of #352, item 3: a start that could not read the person's

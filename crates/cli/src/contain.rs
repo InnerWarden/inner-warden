@@ -2351,6 +2351,27 @@ fn claude_dir_in_jail_dotdir(home: &Path, dir: &Path) -> Option<PathBuf> {
         .find(|rw| dir == rw.as_path() || (dir.starts_with(rw) && !rw.ends_with(".config")))
 }
 
+/// The places of the person's Claude Code folder ([`JailInputs::claude_views`])
+/// that lie in a home folder the jail binds writable ([`DOTDIR_RW`]), as
+/// the jail shows them.
+fn claude_views_in_jail_writes(input: &JailInputs) -> Vec<PathBuf> {
+    let shown: Vec<PathBuf> = DOTDIR_RW
+        .iter()
+        .filter(|name| !DOTDIR_DENY.contains(name))
+        .map(|name| input.home.join(name))
+        .filter(|rw| input.exists(rw))
+        .collect();
+    let mut views: Vec<PathBuf> = input
+        .claude_views
+        .iter()
+        .filter(|view| shown.iter().any(|rw| view.starts_with(rw) && *view != rw))
+        .cloned()
+        .collect();
+    views.sort();
+    views.dedup();
+    views
+}
+
 /// PURE. Why the folder `dir` named by `CLAUDE_CONFIG_DIR` cannot be the
 /// person's Claude Code folder for a jail of `project` from `home`, by its
 /// name alone: `/`, the home or a folder above it (the jail would cover the
@@ -4081,6 +4102,19 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
             &fd.to_string(),
             innerwarden_agent_guard::identity::JAIL_RECORD_PATH,
         ]);
+    }
+
+    // --- the person's Claude Code folder that `CLAUDE_CONFIG_DIR` names, in
+    // a home folder the jail writes (`~/.config/claude`): after every
+    // mount, an empty folder mounted read-only at each place the jail
+    // shows it, so nothing is written there, not even into the cover
+    // (review of #357: an empty writable cover took writes and new files). ---
+    if input.claude_host_dir != input.home.join(CLAUDE_DIR) {
+        for view in claude_views_in_jail_writes(input) {
+            let at = view.to_string_lossy().to_string();
+            push(&["--tmpfs", &at]);
+            push(&["--remount-ro", &at]);
+        }
     }
 
     // --- namespaces / lifecycle ---
@@ -9247,6 +9281,17 @@ mod tests {
             .position(|w| w[0] == "--bind" && w[2] == "/home/dev/.claude")
             .unwrap();
         assert!(cover < own, "{got:?}");
+        // After every mount, read-only (review of #357).
+        let ro = got
+            .windows(2)
+            .rposition(|w| w == ["--remount-ro", "/home/dev/.config/claude"])
+            .unwrap_or_else(|| panic!("{got:?}"));
+        assert_eq!(got[ro - 2..ro], ["--tmpfs", "/home/dev/.config/claude"]);
+        let last_mount = got
+            .iter()
+            .rposition(|a| a.starts_with("--") && (a.contains("bind") || a == "--tmpfs"))
+            .unwrap();
+        assert!(ro > last_mount, "{got:?}");
         // macOS: the jail's Claude Code gets the jail's own folder, one value.
         let mut mac = inputs(&["claude"]);
         mac.claude_host_dir = PathBuf::from("/Users/dev/.config/claude");
