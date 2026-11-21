@@ -302,6 +302,28 @@ fn ordinary_links_copies_and_moves_in_a_project_still_run() {
     assert!(stopped.is_empty(), "stopped:\n{}", stopped.join("\n"));
 }
 
+/// The negative side of the copy and unpack shapes: the same verbs that are
+/// refused into an agent's folder (contents copied, a glob, an archive
+/// unpacked) run when the destination is any other folder of the project.
+#[test]
+fn copies_and_unpacks_into_ordinary_folders_still_run() {
+    let host = Host::new();
+    let mut stopped = Vec::new();
+    for command in [
+        "rsync -a src/ build/",
+        "cp -r ../tpl .",
+        "tar -xf x.tar -C vendor",
+        "cp *.md docs/",
+        "cp -r fixtures/. tests/tmp/",
+    ] {
+        let (code, stderr) = host.hook(&host.bash(command));
+        if code != Some(0) {
+            stopped.push(format!("{code:?} {command} :: {stderr}"));
+        }
+    }
+    assert!(stopped.is_empty(), "stopped:\n{}", stopped.join("\n"));
+}
+
 /// A move onto an agent's folder by its bare name stays refused, because
 /// with no folder there it becomes the folder, settings included; the
 /// refusal says so and names the spelling that moves a file into it.
