@@ -11,9 +11,17 @@
 //! four times the first. A reading that costs the line's length takes four
 //! times as long; one that reads the rest again at each step takes sixteen
 //! times. The bound between them is eight.
+//!
+//! Only that ratio is asserted, both lengths read in the same run, one after
+//! the other, and timed by the CPU time of the thread that reads where the
+//! system keeps one (Linux, macOS). A ceiling in seconds failed on a slower
+//! runner (macOS, 2026-11-21) with no change to the reading, and the wall
+//! clock counts whatever else the runner was doing. That the ratio tells a
+//! reading that grows with the square of the length from one that grows with
+//! it is itself tested: `the_measure_tells_a_square_from_a_line`.
 
 use std::hint::black_box;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use innerwarden_agent_guard::threats::check_guard_self_disable;
 
@@ -30,20 +38,17 @@ const TIMES: u32 = 8;
 /// it the clock, not the reading, decides the ratio.
 const SHORT_FLOOR: Duration = Duration::from_millis(2);
 
-/// The most the long line may take, whatever the short one took: some three
-/// times the slowest measured in a debug build on the lab box (4.4 s,
-/// 2026-11-10). The release build the hook runs is some ten times faster.
-const LONG_CEILING: Duration = Duration::from_secs(12);
-
-/// A line is read up to three times and the fastest kept; once the readings
-/// of one line have taken this long together, no more are made.
-const ENOUGH_READING: Duration = Duration::from_millis(300);
+/// The two lines of a shape are read in turn, short then long, up to this
+/// many times while the long one looks too slow; the fastest reading of each
+/// is kept. A reading the runner held up is slower, never faster, so the
+/// fastest is the one the check's own work decides.
+const ROUNDS: usize = 5;
 
 /// Set by a mutation sweep, which runs the suite once per mutant on a shared
-/// runner: a ceiling that fails there on a busy runner hides a mutant no test
-/// checks, and half a minute of measuring for each mutant is hours. Nothing
-/// is measured there. Outside a sweep the ceilings hold, which is where a
-/// slow change is caught.
+/// runner: half a minute of measuring for each mutant is hours, and a bound
+/// that fails there on a busy runner hides a mutant no test checks. Nothing
+/// is measured there. Outside a sweep the bound holds, which is where a slow
+/// change is caught.
 const NO_CEILINGS_ENV: &str = "IW_NO_WALL_CLOCK_CEILINGS";
 
 fn ceilings_are_asserted() -> bool {
@@ -276,26 +281,52 @@ fn shapes(bytes: usize) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The fastest of up to three readings of `line`.
-fn fastest(line: &str) -> Duration {
-    let mut fastest = Duration::MAX;
-    let mut spent = Duration::ZERO;
-    for _ in 0..3 {
-        let start = Instant::now();
-        black_box(check_guard_self_disable(black_box(line)));
-        let took = start.elapsed();
-        fastest = fastest.min(took);
-        spent += took;
-        if spent >= ENOUGH_READING {
-            break;
-        }
-    }
-    fastest
+/// What the thread that asks has spent so far: its CPU time where the
+/// system keeps one, so a runner busy with other work does not count; the
+/// wall clock elsewhere (Windows).
+#[cfg(unix)]
+fn spent() -> Duration {
+    // SAFETY: clock_gettime only writes the timespec it is given.
+    let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    assert_eq!(read, 0, "the thread's CPU clock could not be read");
+    Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+}
+
+#[cfg(not(unix))]
+fn spent() -> Duration {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed()
+}
+
+/// What one reading of `line` by `read` took.
+fn reading(read: &dyn Fn(&str), line: &str) -> Duration {
+    let start = spent();
+    read(black_box(line));
+    spent().saturating_sub(start)
 }
 
 /// Whether the long line took more than the short one's time allows it.
 fn too_slow(short: Duration, long: Duration) -> bool {
-    long > (TIMES * short.max(SHORT_FLOOR)).min(LONG_CEILING)
+    long > TIMES * short.max(SHORT_FLOOR)
+}
+
+/// The fastest readings of the short and the long line, read in turn until
+/// the long one is within the bound or [`ROUNDS`] have been read.
+fn measured(read: &dyn Fn(&str), short_line: &str, long_line: &str) -> (Duration, Duration) {
+    let (mut short, mut long) = (Duration::MAX, Duration::MAX);
+    for _ in 0..ROUNDS {
+        short = short.min(reading(read, short_line));
+        long = long.min(reading(read, long_line));
+        if !too_slow(short, long) {
+            break;
+        }
+    }
+    (short, long)
+}
+
+fn check(line: &str) {
+    black_box(check_guard_self_disable(line));
 }
 
 /// FAILS ON REVERT: take the payment for the words after each name out of
@@ -308,34 +339,32 @@ fn too_slow(short: Duration, long: Duration) -> bool {
 /// command's expansions are held to; the test that fails on that revert
 /// in good time is `the_rewrite_leaves_a_word_too_large_as_written_and_says_so`.
 /// Look a name's values up among every assignment of the line
-/// (`with_values_assigned`) and "a name assigned its own value" takes more
-/// than the ceiling. Ask every name the line gave the guard at each word
+/// (`with_values_assigned`) and "a name assigned its own value" took more
+/// than the ceiling in seconds this test had until 2026-11-21; that revert
+/// has not been measured against the ratio. Ask every name the line gave the guard at each word
 /// (`guard_program`) and "the guard given, a value read" takes twelve times
 /// as long (19 s in a debug build on the lab box, 2026-11-10).
 #[test]
 #[cfg_attr(
     tarpaulin,
-    ignore = "a perf ceiling under instrumentation measures the instrumentation"
+    ignore = "a cost measured under instrumentation measures the instrumentation"
 )]
 fn the_check_costs_what_the_lines_length_costs() {
     if !ceilings_are_asserted() {
         return;
     }
+    // The first reading builds what the check keeps for every later one
+    // (its patterns); it is not part of any line's cost.
+    check("innerwarden status");
     let mut report = Vec::new();
     let mut slow = Vec::new();
     for ((name, short_line), (_, long_line)) in shapes(SHORT).into_iter().zip(shapes(LONG)) {
-        let mut short = fastest(&short_line);
-        let mut long = fastest(&long_line);
-        if too_slow(short, long) {
-            // Once more before it counts: a runner that stalled during the
-            // one reading of a slow line is not a slow reading.
-            short = short.min(fastest(&short_line));
-            long = long.min(fastest(&long_line));
-        }
+        let (short, long) = measured(&check, &short_line, &long_line);
         report.push(format!(
-            "  {:>8.1} ms  {:>8.1} ms  {name}",
+            "  {:>8.1} ms  {:>8.1} ms  {:>5.1}x  {name}",
             short.as_secs_f64() * 1e3,
             long.as_secs_f64() * 1e3,
+            long.as_secs_f64() / short.max(SHORT_FLOOR).as_secs_f64(),
         ));
         if too_slow(short, long) {
             slow.push(name);
@@ -343,12 +372,80 @@ fn the_check_costs_what_the_lines_length_costs() {
     }
     assert!(
         slow.is_empty(),
-        "the check took more than {TIMES} times as long at four times the length \
-         (or more than {LONG_CEILING:?}) on: {slow:?}\n\
-         short, long, shape:\n{}",
+        "the check took more than {TIMES} times as long at four times the length on: {slow:?}\n\
+         short, long, ratio, shape:\n{}",
         report.join("\n")
     );
     if std::env::var_os("IW_PRINT_GUARD_CHECK_COST").is_some() {
         println!("{}", report.join("\n"));
     }
+}
+
+/// One pass over `bytes`, counting the spaces.
+fn scan(bytes: &[u8]) -> usize {
+    let mut spaces = 0;
+    for byte in bytes {
+        spaces += usize::from(*byte == b' ');
+    }
+    spaces
+}
+
+/// `read`, done as many times (a power of two) as the short line needs to
+/// take four times [`SHORT_FLOOR`].
+fn repeated_until_measurable(short_line: &str, read: impl Fn(&str)) -> impl Fn(&str) {
+    let mut times = 1usize;
+    loop {
+        let start = spent();
+        for _ in 0..times {
+            read(black_box(short_line));
+        }
+        if spent().saturating_sub(start) >= 4 * SHORT_FLOOR {
+            break;
+        }
+        times *= 2;
+    }
+    move |text: &str| {
+        for _ in 0..times {
+            read(text);
+        }
+    }
+}
+
+/// The measure, given a reading that grows with the line's length and one
+/// that reads the rest of the line again at each word (as the slow readings
+/// the shapes stand for did), passes the first and fails the second. Without
+/// it, a measure that could not tell them apart (a clock too coarse, a floor
+/// too high, a bound too loose) would pass every shape and prove nothing.
+#[test]
+#[cfg_attr(
+    tarpaulin,
+    ignore = "a cost measured under instrumentation measures the instrumentation"
+)]
+fn the_measure_tells_a_square_from_a_line() {
+    if !ceilings_are_asserted() {
+        return;
+    }
+    let words = |bytes| repeated("", &format!("{} ", "x".repeat(63)), "", bytes);
+    let (short_line, long_line) = (words(SHORT), words(LONG));
+    // Each reading is repeated until the short line costs well over the
+    // floor, so the floor does not decide the ratio in a build where one
+    // pass is fast (an optimised one).
+    let line = repeated_until_measurable(&short_line, |text: &str| {
+        black_box(scan(black_box(text.as_bytes())));
+    });
+    let square = repeated_until_measurable(&short_line, |text: &str| {
+        for (at, _) in text.match_indices(' ') {
+            black_box(scan(black_box(&text.as_bytes()[at..])));
+        }
+    });
+    let (short, long) = measured(&line, &short_line, &long_line);
+    assert!(
+        short > SHORT_FLOOR && !too_slow(short, long),
+        "a reading that grows with the length: {short:?} then {long:?}"
+    );
+    let (short, long) = measured(&square, &short_line, &long_line);
+    assert!(
+        short > SHORT_FLOOR && too_slow(short, long),
+        "a reading that grows with the square of the length: {short:?} then {long:?}"
+    );
 }
