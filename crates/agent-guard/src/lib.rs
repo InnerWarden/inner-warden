@@ -55,6 +55,7 @@ pub mod codex_trust;
 // observe`), which reads a person's message for a plain-language request the
 // same way the injection scan reads text: invisible characters out, NFKC
 // folded, Tags-block and base64 payloads recovered.
+pub mod antigravity_hook;
 pub mod cursor_hook;
 pub mod deobfuscate;
 pub mod file_tools;

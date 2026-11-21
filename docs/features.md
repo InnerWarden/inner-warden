@@ -429,6 +429,7 @@ posture):
 | Hermes Agent | runs | asks you through its approval gate (`action: "approve"`); refused when nobody is there to approve | refused |
 | Codex CLI | runs | runs, and Codex shows you a warning with the reason (`systemMessage`) | refused |
 | Cursor | runs (`permission: "allow"`) | a shell command or an MCP call asks you (`permission: "ask"`, with the reason); a file read is refused, with the reason | refused (exit 2 and `permission: "deny"`, with the reason) |
+| Antigravity CLI | runs (`decision: "allow"`) | asks you (`decision: "force_ask"`, with the reason) | refused (`decision: "deny"`, with the reason, exit 0) |
 | any other agent | runs | refused, with the reason | refused |
 
 Codex CLI has no way for a hook to ask the person: it reads an `ask` as
@@ -442,6 +443,17 @@ reach a person: a tool with no confirmation to show runs at once, and the
 non-interactive path was not followed. So on Gemini a review is refused with
 the reason, as a deny is. The same holds for any agent this table does not
 list: an answer it may not read would let the review run unseen.
+
+The Antigravity CLI reads a JSON `decision` on stdout. What it does with a
+hook that exits with another code than 0, times out or prints no decision
+is not in its hooks documentation, and the Gemini API's own agent hooks run
+the tool then. So the guard answers every Antigravity call with a decision
+and exit 0, a refusal included; the deadline, a fault and an internal error
+answer with a deny on stdout too; and in enforce mode the hook line (Linux
+and macOS) prints a deny itself when the innerwarden program is missing,
+cannot start or is killed. A review is `force_ask`, which asks even where
+an earlier "Always Allow" would skip `ask`; what Antigravity does with it
+when nobody is there to ask (`agy -p`) was not measured.
 
 Cursor blocks a call whose hook says nothing on stdout, so every call the
 guard lets through is answered `allow` in JSON. Its `beforeReadFile` takes
@@ -479,7 +491,8 @@ recorded, and nothing is asked.
 
 What each agent does with the answer is read from its own source (Claude
 Code's hooks reference, Gemini CLI 0.68.0, Hermes Agent v0.23.1, Codex CLI
-0.167.2, Cursor's hooks documentation as published on 2026-11-20) and held by tests that feed each agent's payload through the line
+0.167.2, Cursor's hooks documentation as published on 2026-11-20, the
+Antigravity CLI's hooks documentation as published on 2026-11-21) and held by tests that feed each agent's payload through the line
 `agents connect` writes; it was not measured in a running chat of each agent.
 
 ### Where decisions are recorded

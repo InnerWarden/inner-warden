@@ -10,6 +10,11 @@
 //! | Codex  | `~/.codex/hooks.json`     | `PreToolUse` | seconds      |
 //! | Gemini | `~/.gemini/settings.json` | `BeforeTool` | milliseconds |
 //! | Cursor | `~/.cursor/hooks.json`    | `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile` | seconds |
+//! | Antigravity | `~/.gemini/config/hooks.json` | `PreToolUse` under the hook name `innerwarden` | seconds |
+//!
+//! Antigravity's file maps a hook's name to its events, so the guard's group
+//! sits under its own name instead of under `hooks`, and Antigravity reads a
+//! JSON `decision` on stdout ([`crate::antigravity_hook`]).
 //!
 //! Cursor's file lists the hooks flat under each event (no group, no
 //! matcher), carries `version: 1` and a `failClosed` switch per entry, and
@@ -70,6 +75,7 @@ pub enum Host {
     Codex,
     Gemini,
     Cursor,
+    Antigravity,
 }
 
 /// Where one agent keeps its hook, and what the entry written there holds.
@@ -163,9 +169,31 @@ pub static CURSOR: HookSpec = HookSpec {
               refuses in enforce mode on Linux and macOS, where the line ends in exit 2.",
 };
 
+/// The Antigravity CLI. The timeout is in seconds. Read in Antigravity's
+/// hooks documentation (antigravity.google/docs/hooks, as published on
+/// 2026-11-21), not measured on a running `agy`. It has no MCP config here:
+/// where the CLI keeps its MCP servers is not confirmed, so no proxy is
+/// wired for it.
+pub static ANTIGRAVITY: HookSpec = HookSpec {
+    agent: crate::antigravity_hook::AGENT,
+    product: "Antigravity",
+    host: Host::Antigravity,
+    file: crate::antigravity_hook::FILE,
+    event: crate::antigravity_hook::EVENT,
+    more_events: &[],
+    timeout: 60,
+    mcp_config: "",
+    file_tools: "`write_to_file`, `replace_file_content` and `multi_replace_file_content`",
+    measured: "Judged only by the payloads Antigravity's hooks documentation gives \
+               (antigravity.google/docs/hooks, read on 2026-11-21), not on a running \
+               Antigravity CLI, which needs a Google login.",
+    minimum: "an Antigravity CLI that runs hooks from ~/.gemini/config/hooks.json (its hooks \
+              documentation of 2026-11; it names no version).",
+};
+
 /// The hook wiring for the agent the listing calls `agent`, when it has one.
 pub fn spec_for(agent: &str) -> Option<&'static HookSpec> {
-    [&CODEX, &GEMINI, &CURSOR]
+    [&CODEX, &GEMINI, &CURSOR, &ANTIGRAVITY]
         .into_iter()
         .find(|spec| spec.agent == agent)
 }
@@ -212,6 +240,21 @@ impl HookSpec {
         home.join(self.file)
     }
 
+    /// The key at the top of the file the events sit under: `hooks`, or for
+    /// Antigravity, whose file maps a hook's name to its events, the guard's
+    /// own name.
+    fn container(&self) -> &'static str {
+        match self.host {
+            Host::Antigravity => crate::antigravity_hook::HOOK_NAME,
+            Host::Codex | Host::Gemini | Host::Cursor => "hooks",
+        }
+    }
+
+    /// Whether the agent has an MCP config the proxy is wired through.
+    pub fn has_mcp_config(&self) -> bool {
+        !self.mcp_config.is_empty()
+    }
+
     /// The hook line: the program, `hook`, the mode flag and this agent's id.
     ///
     /// Nothing in it changes from one release to the next for one install
@@ -230,7 +273,7 @@ impl HookSpec {
     /// How long the agent waits for the hook before it runs the tool.
     pub fn wait(&self) -> Duration {
         match self.host {
-            Host::Codex | Host::Cursor => Duration::from_secs(self.timeout),
+            Host::Codex | Host::Cursor | Host::Antigravity => Duration::from_secs(self.timeout),
             Host::Gemini => Duration::from_millis(self.timeout),
         }
     }
@@ -251,6 +294,13 @@ impl HookSpec {
         }
         let mut hook = Map::new();
         hook.insert("type".to_string(), Value::from("command"));
+        if self.host == Host::Antigravity {
+            // `""` matches every tool (its hooks documentation). With no
+            // matcher at all what it runs for is not documented.
+            hook.insert("command".to_string(), Value::from(command));
+            hook.insert("timeout".to_string(), Value::from(self.timeout));
+            return json!({ "matcher": "", "hooks": [Value::Object(hook)] });
+        }
         if self.host == Host::Gemini {
             hook.insert("name".to_string(), Value::from(GEMINI_HOOK_NAME));
         }
@@ -271,6 +321,7 @@ impl HookSpec {
             }
             Host::Codex => "",
             Host::Cursor => return crate::cursor_hook::screened(),
+            Host::Antigravity => return crate::antigravity_hook::screened(),
         };
         format!(
             "shell commands, changes to privileged files through {}{reads}, and calls to MCP \
@@ -344,6 +395,19 @@ impl HookSpec {
                 lines.push(self.measured.to_string());
                 return lines;
             }
+            Host::Antigravity => {
+                lines.extend(crate::antigravity_hook::gaps());
+                lines.push(format!(
+                    "The guard answers within {GUARD_DEADLINE_SECS} seconds (more only while it \
+                     waits on a second opinion you turned on), with a deny in enforce mode when \
+                     it runs out of time. Antigravity gives the hook {} seconds (the entry's \
+                     `timeout`).",
+                    self.wait().as_secs()
+                ));
+                lines.push(format!("Needs {}", self.minimum));
+                lines.push(self.measured.to_string());
+                return lines;
+            }
         }
         if self.host == Host::Gemini {
             lines.push(fail_closed_gap(self.product));
@@ -382,7 +446,7 @@ fn found(settings: &Value, spec: &HookSpec) -> Vec<Found> {
     let mut out = Vec::new();
     for event in spec.events() {
         let Some(groups) = settings
-            .get("hooks")
+            .get(spec.container())
             .and_then(|hooks| hooks.get(event))
             .and_then(Value::as_array)
         else {
@@ -474,7 +538,7 @@ fn program_of(command: &str) -> Option<String> {
 /// its place when that cannot be shown.
 fn theirs_at(settings: &Value, spec: &HookSpec) -> Vec<((usize, usize), String)> {
     let Some(groups) = settings
-        .get("hooks")
+        .get(spec.container())
         .and_then(|hooks| hooks.get(spec.event))
         .and_then(Value::as_array)
     else {
@@ -621,16 +685,22 @@ pub fn merge(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, S
     let root = settings
         .as_object_mut()
         .ok_or("its top level is not a JSON object")?;
+    let container = spec.container();
     let hooks = root
-        .entry("hooks")
+        .entry(container)
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .ok_or("`hooks` is not a JSON object")?;
+        .ok_or_else(|| format!("`{container}` is not a JSON object"))?;
+    // Antigravity skips a hook whose `enabled` is false. A person who runs
+    // `agents connect` asks for the guard to run: the switch comes out.
+    if spec.host == Host::Antigravity && hooks.get("enabled") == Some(&Value::Bool(false)) {
+        hooks.remove("enabled");
+    }
     let groups = hooks
         .entry(spec.event)
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        .ok_or_else(|| format!("`hooks.{}` is not a list", spec.event))?;
+        .ok_or_else(|| format!("`{container}.{}` is not a list", spec.event))?;
     let entry = spec.entry(command);
     let keep_places = spec.host == Host::Codex;
     let mut placed = false;
@@ -792,6 +862,118 @@ fn vacate_flat(mut settings: Value, spec: &HookSpec) -> (Value, usize) {
     (settings, removed)
 }
 
+/// PURE: take every hook of ours out of Antigravity's file. Under the
+/// guard's own name a group left with no hook goes, an event left with no
+/// group goes, and the name goes once no event is left under it. Every other
+/// name, and what the person added under ours, stays.
+fn vacate_named(mut settings: Value, spec: &HookSpec) -> (Value, usize) {
+    let container = spec.container();
+    let Some(hooks) = settings.get_mut(container).and_then(Value::as_object_mut) else {
+        return (settings, 0);
+    };
+    let mut removed = 0usize;
+    if let Some(groups) = hooks.get_mut(spec.event).and_then(Value::as_array_mut) {
+        groups.retain_mut(|group| {
+            let Some(list) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                return true;
+            };
+            let before = list.len();
+            list.retain(|hook| hook::read_hook_line(hook).is_none());
+            removed += before - list.len();
+            before == list.len() || !list.is_empty()
+        });
+        if groups.is_empty() && removed > 0 {
+            hooks.remove(spec.event);
+        }
+    }
+    let events_left = hooks.keys().any(|key| key != "enabled");
+    if removed > 0 && !events_left {
+        if let Some(root) = settings.as_object_mut() {
+            root.remove(container);
+        }
+    }
+    (settings, removed)
+}
+
+/// What to write for Antigravity's file going from `settings` (read from
+/// `before`) to `merged`: `Some(body)`, or `None` to remove the file.
+///
+/// Only the guard's member changes, so it is taken out and put back as text
+/// ([`crate::antigravity_hook::splice_in`]): every byte of the person's
+/// stays where it was, and a disconnect gives back the file a connect found,
+/// to the byte. A file connect created is removed by the disconnect that
+/// empties it (a file that held only `{}` before reads the same, and goes
+/// too: Antigravity reads no hook from either). Whenever the text is not
+/// what this wrote, or the result does not read as `merged`, the file is
+/// written whole in the person's key order, as for the other agents.
+fn antigravity_body(
+    before: Option<&[u8]>,
+    settings: &Value,
+    merged: &Value,
+) -> Result<Option<String>, String> {
+    use crate::antigravity_hook::{fresh_file, splice_in, splice_out, HOOK_NAME};
+    let whole = || crate::json_order::pretty_in_order(before, merged).map(Some);
+    let text = match before.map(std::str::from_utf8) {
+        None => None,
+        Some(Ok(text)) if text.trim().is_empty() => None,
+        Some(Ok(text)) => Some(text),
+        Some(Err(_)) => return whole(),
+    };
+    let reads_as = |body: &str, want: &Value| {
+        serde_json::from_str::<Value>(body).is_ok_and(|read| &read == want)
+    };
+    let without = |value: &Value| {
+        let mut value = value.clone();
+        if let Some(root) = value.as_object_mut() {
+            root.remove(HOOK_NAME);
+        }
+        value
+    };
+    let old = settings.get(HOOK_NAME);
+    // The file as it would be without our member, to the byte.
+    let base = match (text, old) {
+        (None, _) => None,
+        (Some(text), None) => Some(text.to_string()),
+        (Some(text), Some(old)) => match splice_out(text, old) {
+            Some(base) => Some(base),
+            None => return whole(),
+        },
+    };
+    let rest = without(settings);
+    if base.as_deref().is_some_and(|base| !reads_as(base, &rest)) || without(merged) != rest {
+        return whole();
+    }
+    match merged.get(HOOK_NAME) {
+        None => match (text, old) {
+            (Some(text), Some(old)) if fresh_file(old).as_deref() == Some(text) => Ok(None),
+            _ => match base {
+                Some(base) => Ok(Some(base)),
+                None => whole(),
+            },
+        },
+        Some(new) => {
+            let body = match base {
+                Some(base) => splice_in(&base, new),
+                None => fresh_file(new),
+            };
+            match body {
+                Some(body) if reads_as(&body, merged) => Ok(Some(body)),
+                _ => whole(),
+            }
+        }
+    }
+}
+
+/// Write `body` to `path` (or remove the file, for `None`), refused when
+/// the file changed since it was read as `before`.
+fn commit(path: &Path, before: Option<&[u8]>, body: Option<String>) -> Result<(), String> {
+    match (body, before) {
+        (Some(body), _) => file_update::replace_if_unchanged(path, before, body.as_bytes()),
+        (None, Some(before)) => file_update::remove_if_unchanged(path, before),
+        (None, None) => Ok(()),
+    }
+}
+
 /// Read the settings file as JSON. A missing or blank file is `Null`: there
 /// is nothing in it to keep.
 fn parse(path: &Path, bytes: Option<&[u8]>) -> Result<Value, String> {
@@ -838,8 +1020,14 @@ fn install_noting_moved(
     if merged == settings {
         return Ok((false, Vec::new()));
     }
-    let body = crate::json_order::pretty_in_order(before.as_deref(), &merged)?;
-    file_update::replace_if_unchanged(&path, before.as_deref(), body.as_bytes())?;
+    let body = match spec.host {
+        Host::Antigravity => antigravity_body(before.as_deref(), &settings, &merged)?,
+        _ => Some(crate::json_order::pretty_in_order(
+            before.as_deref(),
+            &merged,
+        )?),
+    };
+    commit(&path, before.as_deref(), body)?;
     Ok((true, moved(&settings, &merged, spec)))
 }
 
@@ -865,12 +1053,19 @@ pub fn uninstall_noting_moved(
         Host::Codex => vacate(settings.clone(), spec.event),
         Host::Gemini => hook::remove_iwguard_hooks_for_event(settings.clone(), spec.event),
         Host::Cursor => vacate_flat(settings.clone(), spec),
+        Host::Antigravity => vacate_named(settings.clone(), spec),
     };
     if removed == 0 {
         return Ok((0, Vec::new()));
     }
-    let body = crate::json_order::pretty_in_order(before.as_deref(), &cleaned)?;
-    file_update::replace_if_unchanged(&path, before.as_deref(), body.as_bytes())?;
+    let body = match spec.host {
+        Host::Antigravity => antigravity_body(before.as_deref(), &settings, &cleaned)?,
+        _ => Some(crate::json_order::pretty_in_order(
+            before.as_deref(),
+            &cleaned,
+        )?),
+    };
+    commit(&path, before.as_deref(), body)?;
     if spec.host == Host::Codex {
         forget_trust(home, &path, &ours);
     }
@@ -932,7 +1127,7 @@ pub struct LeftBehind {
 /// settings when its text holds an InnerWarden hook line. Neither rules the
 /// hook out: which copy such a line runs cannot be told from the text.
 pub fn left_behind(home: &Path, binary: &Path) -> Vec<LeftBehind> {
-    [&CODEX, &GEMINI, &CURSOR]
+    [&CODEX, &GEMINI, &CURSOR, &ANTIGRAVITY]
         .into_iter()
         .filter_map(|spec| {
             let seen = still_runs(&spec.path(home), spec, binary)?;
@@ -1020,6 +1215,12 @@ pub fn left_behind_lines(left: &[LeftBehind]) -> Vec<String> {
                      (`failClosed`) it refuses every one, in monitor mode it runs them \
                      unscreened."
                 }
+                Host::Antigravity => {
+                    "Antigravity would start a hook whose program is gone before every tool \
+                     call: in enforce mode the hook line answers each with a deny on Linux and \
+                     macOS; in monitor mode, and on Windows, what Antigravity does with it is \
+                     not measured."
+                }
             }
             .to_string(),
         );
@@ -1079,6 +1280,8 @@ pub enum Reason {
     GeminiHooksOff,
     /// Gemini's settings disable this hook by name.
     GeminiHookDisabled,
+    /// Antigravity's file sets the guard's `enabled` to false.
+    AntigravityDisabled,
     /// Cursor's entries are the shape `agents connect` writes, and run
     /// another program than this innerwarden: an edit of the file (Cursor
     /// screens none) can point them anywhere. Holds that program and this
@@ -1112,6 +1315,10 @@ impl Reason {
                  of {} reaches the guard",
                 spec.product
             ),
+            Self::AntigravityDisabled => format!(
+                "Antigravity skips it: its `enabled` is false in ~/{}",
+                spec.file
+            ),
         }
     }
 
@@ -1119,6 +1326,7 @@ impl Reason {
     fn step(&self, spec: &HookSpec) -> String {
         match self {
             Self::Altered
+            | Self::AntigravityDisabled
             | Self::OtherProgram { .. }
             | Self::Broken { .. }
             | Self::Unchecked { .. }
@@ -1320,7 +1528,7 @@ fn guard_programs(home: &Path, binary: &Path) -> Vec<String> {
     {
         programs.extend(hook::effective_iwguard_hook_programs(&settings));
     }
-    for spec in [&CODEX, &GEMINI] {
+    for spec in [&CODEX, &GEMINI, &ANTIGRAVITY] {
         let path = spec.path(home);
         if let Ok(settings) = parse(
             &path,
@@ -1401,7 +1609,7 @@ fn state_with(home: &Path, spec: &HookSpec, fact: impl Fn(&str) -> hook::Program
     };
     let config = match spec.host {
         Host::Codex => codex_config(home),
-        Host::Gemini | Host::Cursor => None,
+        Host::Gemini | Host::Cursor | Host::Antigravity => None,
     };
     judge(&settings, spec, &path, config.as_ref(), fact)
 }
@@ -1440,7 +1648,7 @@ fn judge(
         only.line.block_review,
         only.line.monitor,
     );
-    if current(&settings["hooks"][spec.event][only.group]) != spec.entry(&command) {
+    if current(&settings[spec.container()][spec.event][only.group]) != spec.entry(&command) {
         return HookState::Off(Reason::Altered);
     }
     // Gemini reads its switches before it starts a hook. One that is set
@@ -1448,6 +1656,9 @@ fn judge(
     // started, so its program cannot hold a call up.
     let switched_off = match spec.host {
         Host::Gemini => gemini_switch(settings, &command),
+        Host::Antigravity => (settings[spec.container()].get("enabled")
+            == Some(&Value::Bool(false)))
+        .then_some(Reason::AntigravityDisabled),
         Host::Codex | Host::Cursor => None,
     };
     if let Some(reason) = switched_off {
@@ -1489,7 +1700,7 @@ fn judge(
                 Trust::Skipped(skip) => Some(Reason::Codex(skip)),
             }
         }
-        Host::Gemini | Host::Cursor => None,
+        Host::Gemini | Host::Cursor | Host::Antigravity => None,
     };
     match skipped {
         Some(reason) => HookState::Off(reason),
@@ -1805,6 +2016,10 @@ pub fn connect_line(
 pub fn connect_notes(spec: &HookSpec, outcome: &Outcome) -> Vec<String> {
     match outcome {
         Outcome::Active { .. } => spec.coverage(),
+        Outcome::NotActive { .. } if !spec.has_mcp_config() => vec![format!(
+            "Until the hook is active, none of {}'s tool calls are screened.",
+            spec.product
+        )],
         Outcome::NotActive { .. } => vec![format!(
             "Until the hook is active, only calls to MCP servers behind the proxy are screened. \
              {}'s shell commands and file changes run unscreened.",
@@ -4102,5 +4317,206 @@ mod tests {
             "{text}"
         );
         assert!(at("stop") < at("afterFileEdit"), "{text}");
+    }
+}
+
+/// The Antigravity CLI's wiring: the guard's own name in its hooks file, a
+/// disconnect that gives back the file it found to the byte, and the switch
+/// that turns the hook off.
+#[cfg(test)]
+mod antigravity_tests {
+    use super::*;
+
+    const BIN: &str = "/opt/iw/innerwarden";
+
+    fn runs(_: &str) -> hook::ProgramFact {
+        hook::ProgramFact::Executable
+    }
+
+    fn file(home: &Path) -> PathBuf {
+        ANTIGRAVITY.path(home)
+    }
+
+    fn put(home: &Path, body: &str) {
+        let path = file(home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn bytes(home: &Path) -> String {
+        std::fs::read_to_string(file(home)).unwrap()
+    }
+
+    fn state_of(home: &Path) -> HookState {
+        state_with(home, &ANTIGRAVITY, runs)
+    }
+
+    /// A hooks file as a person keeps it: four spaces, a hook of their own
+    /// under another name, keys in their order.
+    const THEIRS: &str = "{\n    \"my-linter\": {\n        \"PostToolUse\": [\n            {\n                \"matcher\": \"write_to_file\",\n                \"hooks\": [{\"command\": \"./lint.sh\"}]\n            }\n        ]\n    },\n    \"enabled-gate\": {\"enabled\": false, \"PreToolUse\": []}\n}\n";
+
+    /// Connect writes one group under the guard's own name, matching every
+    /// tool, and touches no byte of the person's; the hook is on; a second
+    /// connect writes nothing; disconnect gives back the file it found, to
+    /// the byte.
+    ///
+    /// FAILS ON REVERT: write the file whole (`pretty_in_order`) instead of
+    /// `antigravity_body`, and the person's four-space file comes back in two.
+    #[test]
+    fn connect_adds_only_our_name_and_disconnect_gives_the_bytes_back() {
+        let home = tempfile::TempDir::new().unwrap();
+        put(home.path(), THEIRS);
+        assert!(install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, false).unwrap());
+        let written = bytes(home.path());
+        assert!(
+            written.starts_with(THEIRS.trim_end().trim_end_matches('}').trim_end()),
+            "the person's bytes stay first, as they were: {written}"
+        );
+        let value: Value = serde_json::from_str(&written).unwrap();
+        let command = ANTIGRAVITY.command(Path::new(BIN), false, false);
+        assert_eq!(
+            value[crate::antigravity_hook::HOOK_NAME],
+            json!({"PreToolUse": [{
+                "matcher": "",
+                "hooks": [{"type": "command", "command": command, "timeout": 60}],
+            }]})
+        );
+        assert_eq!(
+            state_of(home.path()),
+            HookState::On {
+                monitor: false,
+                block_review: false
+            }
+        );
+        assert!(!install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, false).unwrap());
+        assert_eq!(
+            bytes(home.path()),
+            written,
+            "a second connect writes nothing"
+        );
+
+        assert_eq!(uninstall(home.path(), &ANTIGRAVITY).unwrap(), 1);
+        assert_eq!(bytes(home.path()), THEIRS);
+        assert_eq!(state_of(home.path()), HookState::Absent);
+        assert_eq!(uninstall(home.path(), &ANTIGRAVITY).unwrap(), 0);
+    }
+
+    /// A mode switch rewrites our member and nothing else, and the
+    /// disconnect after it still gives back the file it first found.
+    #[test]
+    fn a_mode_switch_and_then_a_disconnect_give_the_bytes_back() {
+        let home = tempfile::TempDir::new().unwrap();
+        put(home.path(), "{\"a\":1}");
+        install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, false).unwrap();
+        assert!(install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, true).unwrap());
+        assert_eq!(
+            state_of(home.path()),
+            HookState::On {
+                monitor: true,
+                block_review: false
+            }
+        );
+        assert!(bytes(home.path()).starts_with("{\"a\":1,\n  \"innerwarden\""));
+        uninstall(home.path(), &ANTIGRAVITY).unwrap();
+        assert_eq!(bytes(home.path()), "{\"a\":1}");
+    }
+
+    /// With no file, connect creates one that holds only our name, and the
+    /// disconnect that empties it removes it.
+    #[test]
+    fn a_file_connect_created_goes_with_the_disconnect() {
+        let home = tempfile::TempDir::new().unwrap();
+        install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, false).unwrap();
+        assert!(file(home.path()).is_file());
+        assert_eq!(uninstall(home.path(), &ANTIGRAVITY).unwrap(), 1);
+        assert!(!file(home.path()).exists());
+    }
+
+    /// A file the person reformatted after the connect is still put right:
+    /// our name comes out, everything else reads as it did.
+    #[test]
+    fn a_reformatted_file_is_still_disconnected() {
+        let home = tempfile::TempDir::new().unwrap();
+        put(home.path(), THEIRS);
+        install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, false).unwrap();
+        let value: Value = serde_json::from_str(&bytes(home.path())).unwrap();
+        put(home.path(), &value.to_string());
+        assert_eq!(uninstall(home.path(), &ANTIGRAVITY).unwrap(), 1);
+        assert_eq!(
+            serde_json::from_str::<Value>(&bytes(home.path())).unwrap(),
+            serde_json::from_str::<Value>(THEIRS).unwrap()
+        );
+    }
+
+    /// `enabled: false` under our name is a hook Antigravity skips: off,
+    /// with the reason; a connect takes the switch out and it is on again.
+    /// A hook the person put under our name stays through the disconnect.
+    ///
+    /// FAILS ON REVERT: drop the Antigravity arm of `switched_off` in
+    /// `judge`, and a hook Antigravity skips reads as on.
+    #[test]
+    fn enabled_false_is_off_and_connect_turns_it_back_on() {
+        let home = tempfile::TempDir::new().unwrap();
+        install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, false).unwrap();
+        let mut value: Value = serde_json::from_str(&bytes(home.path())).unwrap();
+        value["innerwarden"]["enabled"] = json!(false);
+        value["innerwarden"]["Stop"] = json!([{"command": "./mine.sh"}]);
+        put(home.path(), &value.to_string());
+        assert_eq!(
+            state_of(home.path()),
+            HookState::Off(Reason::AntigravityDisabled)
+        );
+        let line = state_line(&ANTIGRAVITY, &state_of(home.path()));
+        assert!(
+            line.contains("enabled") && line.contains("agents connect antigravity"),
+            "{line}"
+        );
+
+        install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, false).unwrap();
+        assert!(state_of(home.path()).is_on());
+        uninstall(home.path(), &ANTIGRAVITY).unwrap();
+        let left: Value = serde_json::from_str(&bytes(home.path())).unwrap();
+        assert_eq!(
+            left,
+            json!({"innerwarden": {"Stop": [{"command": "./mine.sh"}]}})
+        );
+    }
+
+    /// A group of ours with a matcher of someone else's, or a second copy,
+    /// is not the entry connect writes: off, so `status` says so.
+    #[test]
+    fn an_altered_entry_is_off() {
+        let home = tempfile::TempDir::new().unwrap();
+        install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, false).unwrap();
+        let mut value: Value = serde_json::from_str(&bytes(home.path())).unwrap();
+        value["innerwarden"]["PreToolUse"][0]["matcher"] = json!("view_file");
+        put(home.path(), &value.to_string());
+        assert_eq!(state_of(home.path()), HookState::Off(Reason::Altered));
+    }
+
+    /// The enforcing line is the script that answers with a deny of its own
+    /// when the guard does not; the monitor line is the guard alone. Both are
+    /// read back as ours, in their mode, for this agent.
+    #[test]
+    fn the_lines_are_read_back_as_ours() {
+        let enforce = ANTIGRAVITY.command(Path::new(BIN), false, false);
+        if cfg!(unix) {
+            assert!(
+                enforce.starts_with("/bin/sh -c '\"$0\" hook --agent antigravity; s=$?"),
+                "{enforce}"
+            );
+            assert!(enforce.contains("decision"), "{enforce}");
+        }
+        let monitor = ANTIGRAVITY.command(Path::new(BIN), false, true);
+        assert_eq!(
+            monitor,
+            "\"/opt/iw/innerwarden\" hook --monitor --agent antigravity"
+        );
+        for (line, is_monitor) in [(enforce, false), (monitor, true)] {
+            let read = hook::read_hook_line(&json!({ "command": line })).expect("ours");
+            assert_eq!(read.monitor, is_monitor);
+            assert_eq!(read.agent.as_deref(), Some("antigravity"));
+            assert_eq!(read.program, BIN);
+        }
     }
 }

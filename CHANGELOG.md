@@ -5,6 +5,22 @@ follows semantic versioning.
 
 ## Unreleased
 
+`innerwarden agents connect antigravity` wires the guard into the
+Antigravity CLI (`agy`), which took Gemini CLI's place for its free and
+individual users: one `PreToolUse` group under the name `innerwarden` in
+`~/.gemini/config/hooks.json`, matching every tool. The hook reads its
+camelCase payload (`toolCall.name`, `toolCall.args` in each tool's own
+argument names) and judges `run_command` as a shell command, its file tools
+as file changes and its reads and searches as reads. It answers every call
+with a JSON `decision` and exit 0, a refusal included; the deadline, a
+fault, a panic and, in enforce mode, a missing guard answer with a deny on
+stdout too, because what Antigravity does with an exit code or no answer
+is not documented. A review asks with `force_ask`. `agents disconnect
+antigravity` gives back the hooks file it found, to the byte, and removes
+a file connect created. Judged only by the payloads its hooks documentation
+gives (read on 2026-11-21), not on a running Antigravity CLI. Its MCP
+servers are not behind the proxy: where it keeps them is not confirmed.
+
 The MCP proxy no longer reads a page that explains how a chat is written as
 an order to the assistant. A fenced code block (three backticks or `~~~`)
 that orders nothing is an example: the turns, system messages, tags and

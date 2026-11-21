@@ -24,8 +24,8 @@ the agent is about to do, and gives a verdict a hook or a proxy can enforce.
   notification channel only if you set one up), and the dashboard is on
   loopback.
 - **Works with the agents you use:** a hook for Claude Code, Codex CLI,
-  Gemini CLI, Hermes Agent and Cursor, an MCP proxy for OpenClaw or any MCP
-  client, and an AI Jail for anything else.
+  Gemini CLI, Antigravity CLI, Hermes Agent and Cursor, an MCP proxy for
+  OpenClaw or any MCP client, and an AI Jail for anything else.
 - **Open rules, open engine.** Written in Rust, Apache-2.0, with YAML rules
   you can read and extend.
 
@@ -125,7 +125,7 @@ Connect the agent you use:
 
 ```sh
 innerwarden install claude-code       # Claude Code's PreToolUse hook
-innerwarden agents connect cursor    # or: codex, gemini, hermes, openclaw
+innerwarden agents connect cursor    # or: antigravity, codex, gemini, hermes, openclaw
 ```
 
 See what the guard refuses for each connected agent, without running anything:
@@ -252,8 +252,8 @@ Whatever agent you run, there is a mechanism and a command for it:
   Reversible with `agents disconnect hermes`.
 - **What the hook does with a verdict.** In enforce mode a `deny` is
   refused and an `allow` runs on every agent. A `review` asks you on
-  Claude Code, Hermes Agent and Cursor (its shell commands and MCP calls),
-  with the guard's reason. Codex CLI has no
+  Claude Code, Hermes Agent, Cursor (its shell commands and MCP calls) and
+  the Antigravity CLI (`force_ask`), with the guard's reason. Codex CLI has no
   way for a hook to ask, so there a review runs with a warning Codex shows
   you. On Gemini CLI and every other agent a review is refused with the
   reason. `--block-review` refuses every review; monitor mode never
@@ -290,6 +290,21 @@ Whatever agent you run, there is a mechanism and a command for it:
   other tools. Judged only by the payloads Cursor's hooks documentation gives
   (read on 2026-11-20), not on a running Cursor. Reversible with
   `agents disconnect cursor`, which takes out only the guard's entries.
+- **Antigravity CLI** (`agy`, Gemini CLI's successor for its free and
+  individual users) - its own `PreToolUse` hook, in
+  `~/.gemini/config/hooks.json` under the name `innerwarden`, judges its
+  shell commands (`run_command`), its changes to privileged files
+  (`write_to_file`, `replace_file_content`, `multi_replace_file_content`)
+  and its reads of secrets (`view_file`, `grep_search`, `find_by_name`):
+  `innerwarden agents connect antigravity`. The guard answers every call
+  with a JSON `decision` and exit 0, a refusal included, and in enforce mode
+  the hook line prints a deny itself when the guard ends without an answer:
+  what Antigravity does with another exit, a timeout or no decision is not
+  documented. Not screened: its MCP servers (where it keeps them is not
+  confirmed, so the proxy is not wired). Judged only by the payloads its
+  hooks documentation gives (read on 2026-11-21), not on a running
+  Antigravity CLI. Reversible with `agents disconnect antigravity`, which
+  gives back the hooks file it found, to the byte.
   OpenClaw has one more surface, and it observes rather than enforces: its
   message hooks see the inbound prompt and the reply, so
   `innerwarden observe install` records a dangerous ask even when the model,

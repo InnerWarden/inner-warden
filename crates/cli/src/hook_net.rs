@@ -70,6 +70,21 @@ static MONITOR: AtomicBool = AtomicBool::new(false);
 /// Set for a run on the person's prompt: every end is 0 and silent.
 static QUIET: AtomicBool = AtomicBool::new(false);
 
+/// Set for an agent that reads its hook's answer as JSON on stdout only (the
+/// Antigravity CLI): every end of the net writes [`JSON_DENY`] (or, in
+/// monitor mode, [`JSON_ALLOW`]) there and exits 0.
+static JSON_ANSWER: AtomicBool = AtomicBool::new(false);
+
+/// The refusal an end of the net writes on stdout in JSON mode, in the
+/// Antigravity CLI's shape (`innerwarden_agent_guard::antigravity_hook::deny`).
+const JSON_DENY: &str = "{\"decision\":\"deny\",\"reason\":\"InnerWarden hook: the screening of \
+this tool call did not finish (it ran out of time, or a fault or an internal error stopped it); \
+refusing it rather than letting it run unscreened.\"}\n";
+
+/// What an end of the net writes on stdout in JSON mode while monitoring:
+/// the call runs, as monitor mode never refuses.
+const JSON_ALLOW: &str = "{\"decision\":\"allow\"}\n";
+
 /// Milliseconds of screening after [`arm`] at which the watchdog ends the
 /// hook. Zero while no deadline is armed.
 static DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
@@ -180,6 +195,29 @@ pub fn is_quiet() -> bool {
     QUIET.load(Ordering::SeqCst)
 }
 
+/// From here on every end of the net, and the panic guard's, answers on
+/// stdout as JSON with exit 0 ([`json_answer`]), for an agent that reads
+/// nothing else. `monitor` is the run's mode, kept for an end that comes
+/// before [`arm`].
+pub fn set_json_answer(on: bool, monitor: bool) {
+    JSON_ANSWER.store(on, Ordering::SeqCst);
+    if on {
+        MONITOR.store(monitor, Ordering::SeqCst);
+    }
+}
+
+/// The JSON an end of the net writes on stdout: a refusal, or in monitor
+/// mode a pass. `None` unless [`set_json_answer`] turned it on.
+pub fn json_answer() -> Option<&'static str> {
+    JSON_ANSWER.load(Ordering::SeqCst).then(|| {
+        if MONITOR.load(Ordering::SeqCst) {
+            JSON_ALLOW
+        } else {
+            JSON_DENY
+        }
+    })
+}
+
 /// The hook is about to make a wait it bounds itself by `bound`: move the
 /// deadline and the limit on the clock by as much. Nothing to move when no
 /// deadline is armed (the same code runs under `innerwarden check`).
@@ -271,6 +309,13 @@ fn watch(armed: Instant, queue: &RunQueue) -> ! {
             None => {
                 if QUIET.load(Ordering::SeqCst) {
                     end("", 0)
+                } else if let Some(answer) = json_answer() {
+                    let said = if MONITOR.load(Ordering::SeqCst) {
+                        OUT_OF_TIME_MONITOR
+                    } else {
+                        OUT_OF_TIME_ENFORCE
+                    };
+                    end_answering(said, answer)
                 } else if MONITOR.load(Ordering::SeqCst) {
                     end(OUT_OF_TIME_MONITOR, crate::unreadable_exit_code(true))
                 } else {
@@ -305,6 +350,28 @@ fn end(message: &'static str, code: u8) -> ! {
     std::process::exit(i32::from(code))
 }
 
+/// [`end`] for JSON mode: `message` on stderr, `answer` on stdout, exit 0.
+/// The same two calls and nothing else, so it may run in a signal handler.
+#[cfg(unix)]
+fn end_answering(message: &'static str, answer: &'static str) -> ! {
+    // SAFETY: both are live buffers of their own length; `write` and
+    // `_exit` are async-signal-safe and `_exit` does not return.
+    unsafe {
+        libc::write(2, message.as_ptr().cast(), message.len());
+        libc::write(1, answer.as_ptr().cast(), answer.len());
+        libc::_exit(0)
+    }
+}
+
+/// Where there is no `_exit`: say it, answer, and end the process.
+#[cfg(not(unix))]
+fn end_answering(message: &'static str, answer: &'static str) -> ! {
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), message.as_bytes());
+    let _ = std::io::Write::write_all(&mut std::io::stdout(), answer.as_bytes());
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    std::process::exit(0)
+}
+
 #[cfg(unix)]
 mod fault {
     use std::sync::atomic::Ordering;
@@ -330,6 +397,13 @@ mod fault {
         // Only what a signal handler may do: read an atomic, `write`, `_exit`.
         if super::QUIET.load(Ordering::SeqCst) {
             super::end("", 0)
+        } else if let Some(answer) = super::json_answer() {
+            let said = if super::MONITOR.load(Ordering::SeqCst) {
+                super::FAULT_MONITOR
+            } else {
+                super::FAULT_ENFORCE
+            };
+            super::end_answering(said, answer)
         } else if super::MONITOR.load(Ordering::SeqCst) {
             super::end(super::FAULT_MONITOR, crate::unreadable_exit_code(true))
         } else {
@@ -385,10 +459,12 @@ mod tests {
     /// FAILS ON REVERT: change either number alone.
     #[test]
     fn the_deadline_connect_states_is_this_one_and_inside_the_agents_wait() {
-        use innerwarden_agent_guard::agent_hooks::{CODEX, GEMINI, GUARD_DEADLINE_SECS};
+        use innerwarden_agent_guard::agent_hooks::{
+            ANTIGRAVITY, CODEX, GEMINI, GUARD_DEADLINE_SECS,
+        };
         assert_eq!(DEADLINE, Duration::from_secs(GUARD_DEADLINE_SECS));
         let second_opinion = crate::second_opinion_io::LLM_ANSWER_BOUND;
-        for spec in [&CODEX, &GEMINI] {
+        for spec in [&CODEX, &GEMINI, &ANTIGRAVITY] {
             assert!(DEADLINE + second_opinion < spec.wait(), "{}", spec.agent);
         }
     }
@@ -467,6 +543,18 @@ mod tests {
             }
             "queued-work" => {
                 queued_work_as_child();
+            }
+            "json-stall" => {
+                set_json_answer(true, monitor);
+                arm_with(monitor, Duration::from_millis(200)).expect("arm");
+                loop {
+                    std::hint::black_box(0u8);
+                }
+            }
+            "json-abort" => {
+                set_json_answer(true, monitor);
+                arm_with(monitor, DEADLINE).expect("arm");
+                std::process::abort();
             }
             "allowed-wait" => {
                 arm_with(monitor, Duration::from_millis(200)).expect("arm");
@@ -557,6 +645,77 @@ mod tests {
             let _ = std::io::Read::read_to_string(&mut stderr, &mut said);
         }
         (status.code(), said, took)
+    }
+
+    /// [`child`], with what the child wrote on stdout as well.
+    fn child_with_stdout(test: &str, asked: &str) -> (Option<i32>, String, String) {
+        let out = tempfile::NamedTempFile::new().expect("a file for stdout");
+        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                &format!("hook_net::tests::{test}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, asked)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(out.reopen().expect("reopen")))
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run the child");
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("wait") {
+                break status;
+            }
+            if started.elapsed() > GIVE_UP {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("{asked}: the child was still running after {GIVE_UP:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let mut said = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut said);
+        }
+        let stdout = std::fs::read_to_string(out.path()).unwrap_or_default();
+        (status.code(), stdout, said)
+    }
+
+    /// For an agent that reads only JSON on stdout (Antigravity), the
+    /// deadline and a fault answer there, with exit 0: a deny in enforce, an
+    /// allow in monitor, in the shape Antigravity reads.
+    ///
+    /// FAILS ON REVERT: take the `json_answer` arm out of `watch`, and the
+    /// enforcing child ends with 2 and no decision on stdout.
+    #[test]
+    fn json_mode_answers_every_end_of_the_net_on_stdout() {
+        const TEST: &str = "json_mode_answers_every_end_of_the_net_on_stdout";
+        act_as_child(TEST);
+        let mut ends = vec!["json-stall"];
+        if cfg!(unix) {
+            ends.push("json-abort");
+        }
+        for end in ends {
+            for (mode, decision) in [("enforce", "deny"), ("monitor", "allow")] {
+                let (code, stdout, said) = child_with_stdout(TEST, &format!("{mode}:{end}"));
+                assert_eq!(code, Some(0), "{mode}:{end}: {said}");
+                // The test harness names the test on stdout before the child's
+                // answer, on the same line.
+                let line = stdout
+                    .lines()
+                    .find_map(|line| line.find("{\"decision\"").map(|at| &line[at..]))
+                    .unwrap_or_else(|| panic!("{mode}:{end}: no decision on stdout: {stdout:?}"));
+                let answer: serde_json::Value = serde_json::from_str(line).expect("JSON");
+                assert_eq!(answer["decision"], decision, "{mode}:{end}");
+                assert!(!said.trim().is_empty(), "{mode}:{end}: stderr says why");
+            }
+        }
+        let deny: serde_json::Value = serde_json::from_str(JSON_DENY.trim()).unwrap();
+        assert!(deny["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("refusing it")));
     }
 
     /// A stack overflow and an abort while screening refuse the call (2) in
