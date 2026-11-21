@@ -177,8 +177,12 @@ pub fn read(payload: &str) -> CursorCall {
 
 /// How much of a Cursor payload the hook reads in all, the `content` it
 /// throws away included. Past it the call is not read, and is refused in
-/// enforce, as any call the hook cannot read is.
-pub const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024 * 1024;
+/// enforce, as any call the hook cannot read is. A `beforeReadFile` carries
+/// the whole file it is about; 64 MiB covers the files an agent reads, and
+/// keeps what one call can make the hook read (it reads it all, at disk and
+/// pipe speed, before it answers) well inside the 60 s Cursor gives the hook,
+/// past which an entry with `failClosed: true` refuses the call.
+pub const MAX_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A Cursor payload as the hook read it: the call with the file's `content`
 /// left out (`Whole`), or the head of one whose other fields are longer
@@ -189,17 +193,162 @@ pub enum Payload {
     TooLong(Vec<u8>),
 }
 
+/// The grammar of a JSON string, checked one byte at a time over a value the
+/// reader does not keep, so that one it throws away is still one
+/// `serde_json` would have read: no byte below 0x20, only the escapes JSON
+/// has, four hex digits after `\u`, surrogates in pairs, and UTF-8 that is
+/// well formed (no overlong form, no surrogate, nothing past U+10FFFF).
+#[derive(Debug, Default)]
+struct StringCheck {
+    escape: Escape,
+    /// Continuation bytes the UTF-8 sequence still needs, and the range the
+    /// next one must fall in.
+    need: u8,
+    low: u8,
+    high: u8,
+    /// A `\uD800`-`\uDBFF` escape that waits for its low half.
+    lead_surrogate: bool,
+    /// Something in the string is not JSON.
+    broken: bool,
+}
+
+#[derive(Debug, Default)]
+enum Escape {
+    #[default]
+    None,
+    Backslash,
+    Hex {
+        left: u8,
+        code: u16,
+    },
+}
+
+impl StringCheck {
+    /// Take the next byte of the string's body. True when it is the quote
+    /// that ends the string.
+    fn step(&mut self, byte: u8) -> bool {
+        if self.need > 0 {
+            if (self.low..=self.high).contains(&byte) {
+                self.need -= 1;
+                self.low = 0x80;
+                self.high = 0xBF;
+                return false;
+            }
+            // A sequence cut short: the byte is read on its own below.
+            self.broken = true;
+            self.need = 0;
+        }
+        match self.escape {
+            Escape::None => {}
+            Escape::Backslash => {
+                self.escape = Escape::None;
+                match byte {
+                    b'u' => {
+                        self.escape = Escape::Hex { left: 4, code: 0 };
+                        return false;
+                    }
+                    b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {
+                        self.broken |= std::mem::take(&mut self.lead_surrogate);
+                        return false;
+                    }
+                    _ => {
+                        self.broken = true;
+                        return false;
+                    }
+                }
+            }
+            Escape::Hex { left, code } => match (byte as char).to_digit(16) {
+                Some(digit) => {
+                    let code = code * 16 + digit as u16;
+                    if left > 1 {
+                        self.escape = Escape::Hex {
+                            left: left - 1,
+                            code,
+                        };
+                        return false;
+                    }
+                    self.escape = Escape::None;
+                    let lead = std::mem::take(&mut self.lead_surrogate);
+                    match code {
+                        0xD800..=0xDBFF => {
+                            self.broken |= lead;
+                            self.lead_surrogate = true;
+                        }
+                        0xDC00..=0xDFFF => self.broken |= !lead,
+                        _ => self.broken |= lead,
+                    }
+                    return false;
+                }
+                None => {
+                    // Fewer than four digits: the byte is read on its own.
+                    self.broken = true;
+                    self.escape = Escape::None;
+                }
+            },
+        }
+        // A lead surrogate is followed by the `\u` of its low half, and by
+        // nothing else.
+        if self.lead_surrogate && byte != b'\\' {
+            self.broken = true;
+            self.lead_surrogate = false;
+        }
+        match byte {
+            b'"' => return true,
+            b'\\' => self.escape = Escape::Backslash,
+            0x00..=0x1F => self.broken = true,
+            0x80..=0xFF => {
+                let (need, low, high) = match byte {
+                    0xC2..=0xDF => (1, 0x80, 0xBF),
+                    0xE0 => (2, 0xA0, 0xBF),
+                    0xE1..=0xEC | 0xEE..=0xEF => (2, 0x80, 0xBF),
+                    0xED => (2, 0x80, 0x9F),
+                    0xF0 => (3, 0x90, 0xBF),
+                    0xF1..=0xF3 => (3, 0x80, 0xBF),
+                    0xF4 => (3, 0x80, 0x8F),
+                    _ => {
+                        self.broken = true;
+                        (0, 0x80, 0xBF)
+                    }
+                };
+                self.need = need;
+                self.low = low;
+                self.high = high;
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
+/// One top-level `content` string the reader took out of the payload: where
+/// its value was (just after the opening quote), its bytes for as long as
+/// they fit beside what is kept, and whether it was valid JSON.
+struct Dropped {
+    at: usize,
+    bytes: Vec<u8>,
+    broken: bool,
+}
+
 /// Read a Cursor payload from `reader`, keeping at most `keep` bytes, with
 /// the string value of the top-level `content` key (the text of the file a
 /// `beforeReadFile` is about, which the guard never judges) read through and
 /// thrown away as it streams, so a large file costs no memory and does not
 /// count toward `keep`. What is kept is the payload with `"content": ""`.
 ///
-/// Nothing is parsed here beyond what finds that one value: the kept bytes
-/// are read as JSON afterwards, and a payload that is not JSON (one cut short
-/// inside the content too) stays unreadable. A `content` inside another
-/// object, or one whose value is not a string, is kept as it is. Past
-/// `total` bytes in all, the call is `TooLong`.
+/// Only a `beforeReadFile` loses its content. The value is held while it
+/// fits within `keep` beside the rest, and once the whole payload is read
+/// it goes back where it was for any other event: such a call is kept as it
+/// came, or is `TooLong` when it does not fit.
+///
+/// A value that is thrown away is still checked as a JSON string
+/// ([`StringCheck`]): a byte below 0x20, an escape JSON does not have, a
+/// lone surrogate or broken UTF-8 in it leaves what is kept not JSON, as the
+/// payload was, so the call stays unreadable. Nothing else is parsed here
+/// beyond what finds that one value: the kept bytes are read as JSON
+/// afterwards, and a payload that is not JSON (one cut short inside the
+/// content too) stays unreadable. A `content` inside another object, or one
+/// whose value is not a string, is kept as it is. Past `total` bytes in all,
+/// the call is `TooLong`.
 pub fn read_without_content(
     reader: impl std::io::Read,
     keep: usize,
@@ -216,12 +365,15 @@ pub fn read_without_content(
     let mut key: Option<Vec<u8>> = None;
     let mut key_is_content = false;
     let mut want_value = false;
-    let mut skipping = false;
-    let mut skip_escaped = false;
+    let mut skipping: Option<StringCheck> = None;
+    let mut dropped: Vec<Dropped> = Vec::new();
+    // Bytes of every dropped value still held, and whether one did not fit.
+    let mut held = 0usize;
+    let mut overflow = false;
     loop {
         let chunk = reader.fill_buf()?;
         if chunk.is_empty() {
-            return Ok(Payload::Whole(out));
+            return Ok(put_back(out, dropped, overflow, keep));
         }
         let len = chunk.len();
         seen += len as u64;
@@ -230,14 +382,20 @@ pub fn read_without_content(
             return Ok(Payload::TooLong(out));
         }
         for &byte in chunk {
-            if skipping {
-                if skip_escaped {
-                    skip_escaped = false;
-                } else if byte == b'\\' {
-                    skip_escaped = true;
-                } else if byte == b'"' {
-                    skipping = false;
+            if let Some(check) = skipping.as_mut() {
+                let ended = check.step(byte);
+                let value = dropped.last_mut().expect("a value being dropped");
+                if ended {
+                    value.broken = check.broken;
+                    skipping = None;
                     out.push(b'"');
+                } else if !overflow {
+                    if out.len() + held + 1 > keep {
+                        overflow = true;
+                    } else {
+                        value.bytes.push(byte);
+                        held += 1;
+                    }
                 }
                 continue;
             }
@@ -249,7 +407,12 @@ pub fn read_without_content(
                 want_value = false;
                 if byte == b'"' {
                     out.push(b'"');
-                    skipping = true;
+                    skipping = Some(StringCheck::default());
+                    dropped.push(Dropped {
+                        at: out.len(),
+                        bytes: Vec::new(),
+                        broken: false,
+                    });
                     continue;
                 }
             }
@@ -299,6 +462,38 @@ pub fn read_without_content(
         }
         reader.consume(len);
     }
+}
+
+/// The payload once it is all read: a `beforeReadFile` keeps its content
+/// out (a value that was not a JSON string leaves a control byte in its
+/// place, so the call stays unreadable); any other event, or a payload that
+/// names none, gets each dropped value back where it was. A payload that is
+/// not JSON without its content is kept as it is: it cannot be read either
+/// way.
+fn put_back(mut out: Vec<u8>, dropped: Vec<Dropped>, overflow: bool, keep: usize) -> Payload {
+    if dropped.is_empty() {
+        return Payload::Whole(out);
+    }
+    // What is kept is not JSON (cut short, broken outside the content): the
+    // call is unreadable whatever its content held, and stays so as it is.
+    let Ok(value) = serde_json::from_slice::<Value>(&out) else {
+        return Payload::Whole(out);
+    };
+    let event = value.get("hook_event_name").and_then(Value::as_str);
+    if event == Some(READ_EVENT) {
+        for value in dropped.iter().rev().filter(|value| value.broken) {
+            out.insert(value.at, 0x01);
+        }
+        return Payload::Whole(out);
+    }
+    for value in dropped.into_iter().rev() {
+        out.splice(value.at..value.at, value.bytes);
+    }
+    if overflow || out.len() > keep {
+        out.truncate(keep);
+        return Payload::TooLong(out);
+    }
+    Payload::Whole(out)
 }
 
 /// The answer that lets a call run.
@@ -557,6 +752,144 @@ mod tests {
             read_without_content(payload.as_bytes(), 4096, 100).unwrap(),
             Payload::TooLong(_)
         ));
+    }
+
+    fn kept_bytes(payload: &[u8], keep: usize) -> Payload {
+        read_without_content(payload, keep, MAX_PAYLOAD_BYTES).unwrap()
+    }
+
+    /// A read whose content is `body`, the raw bytes of a JSON string's
+    /// inside.
+    fn read_with_raw_content(body: &[u8]) -> Vec<u8> {
+        let mut payload =
+            br#"{"hook_event_name":"beforeReadFile","file_path":"/a","content":""#.to_vec();
+        payload.extend_from_slice(body);
+        payload.extend_from_slice(br#"","attachments":[]}"#);
+        payload
+    }
+
+    /// A content that is not a JSON string is thrown away all the same, but
+    /// what is kept stays a call that cannot be read, as the payload was: a
+    /// control byte, an escape JSON does not have, a short `\u`, a lone
+    /// surrogate, broken UTF-8. A content that is a JSON string, however
+    /// odd, leaves a call that reads.
+    #[test]
+    fn a_dropped_content_must_still_be_a_json_string() {
+        let broken: &[&[u8]] = &[
+            b"a\x01b",
+            b"tab\there",
+            b"\\q",
+            b"\\u12",
+            b"\\u12\"",
+            b"\\ud800",
+            b"\\ud800x",
+            b"\\ud800\\n",
+            b"\\ud800\\u0041",
+            b"\\udc00",
+            b"\xff",
+            b"\xc0\x80",
+            b"\xe0\x80\x80",
+            b"\xed\xa0\x80",
+            b"\xf4\x90\x80\x80",
+            b"\xe2\x82",
+            b"\xc3",
+        ];
+        for body in broken {
+            let payload = read_with_raw_content(body);
+            assert!(
+                serde_json::from_slice::<Value>(&payload).is_err(),
+                "{body:?} is not JSON"
+            );
+            let Payload::Whole(kept) = kept_bytes(&payload, 4096) else {
+                panic!("{body:?}");
+            };
+            assert!(
+                serde_json::from_slice::<Value>(&kept).is_err(),
+                "{body:?}: {}",
+                String::from_utf8_lossy(&kept)
+            );
+            assert!(
+                !matches!(
+                    std::str::from_utf8(&kept).map(read),
+                    Ok(CursorCall::Call(..))
+                ),
+                "{body:?} must not read as a call"
+            );
+        }
+        let fine: &[&[u8]] = &[
+            "caf\u{e9} \u{1f600} \u{4e2d}".as_bytes(),
+            b"\\ud83d\\ude00 \\u00e9 \\\" \\\\ \\/ \\b \\f \\n \\r \\t",
+            b"\x7f",
+            b"",
+        ];
+        for body in fine {
+            let payload = read_with_raw_content(body);
+            assert!(
+                serde_json::from_slice::<Value>(&payload).is_ok(),
+                "{body:?} is JSON"
+            );
+            let Payload::Whole(kept) = kept_bytes(&payload, 4096) else {
+                panic!("{body:?}");
+            };
+            let value: Value = serde_json::from_slice(&kept).unwrap();
+            assert_eq!(value["content"], "");
+            assert_eq!(value["file_path"], "/a");
+        }
+    }
+
+    /// Only a `beforeReadFile` loses its content, wherever its event name
+    /// comes in the payload. Any other call keeps it as it came, and one
+    /// whose content does not fit is `TooLong`, as before the content was
+    /// ever dropped.
+    #[test]
+    fn only_a_read_loses_its_content() {
+        let late =
+            br#"{"content":"secret text","file_path":"/a","hook_event_name":"beforeReadFile"}"#;
+        let Payload::Whole(late_kept) = kept_bytes(late, 4096) else {
+            panic!();
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&late_kept).unwrap()["content"],
+            ""
+        );
+
+        for event in [SHELL_EVENT, MCP_EVENT, "beforeTabFileRead", "preToolUse"] {
+            let payload =
+                json!({"content": "keep \"me\" \u{e9}", "hook_event_name": event, "command": "ls"})
+                    .to_string();
+            assert_eq!(
+                kept(&payload, 4096),
+                Payload::Whole(payload.as_bytes().to_vec()),
+                "{event}"
+            );
+            let big = json!({"hook_event_name": event, "content": "x".repeat(10_000)}).to_string();
+            assert!(matches!(kept(&big, 4096), Payload::TooLong(_)), "{event}");
+            // Two values, put back in their places.
+            let two = format!(r#"{{"content":"one","hook_event_name":"{event}","content":"two"}}"#);
+            assert_eq!(kept(&two, 4096), Payload::Whole(two.as_bytes().to_vec()));
+        }
+        // No event at all: kept as it came.
+        let none = r#"{"content":"x","file_path":"/a"}"#;
+        assert_eq!(kept(none, 4096), Payload::Whole(none.as_bytes().to_vec()));
+        // A broken content in another event stays broken.
+        let mut shell =
+            br#"{"hook_event_name":"beforeShellExecution","command":"ls","content":"a"#.to_vec();
+        shell.push(0x01);
+        shell.extend_from_slice(br#""}"#);
+        let Payload::Whole(shell_kept) = kept_bytes(&shell, 4096) else {
+            panic!();
+        };
+        assert_eq!(shell_kept, shell);
+    }
+
+    #[test]
+    fn the_hook_reads_at_most_64_mib_of_a_payload() {
+        assert_eq!(MAX_PAYLOAD_BYTES, 64 * 1024 * 1024);
+        let mut payload =
+            br#"{"hook_event_name":"beforeReadFile","file_path":"/a","content":""#.to_vec();
+        payload.resize(payload.len() + MAX_PAYLOAD_BYTES as usize, b'x');
+        payload.extend_from_slice(br#""}"#);
+        assert!(matches!(kept_bytes(&payload, 4096), Payload::TooLong(_)));
     }
 
     #[test]
