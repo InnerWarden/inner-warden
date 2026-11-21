@@ -15,6 +15,22 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Added
 
+- **The MCP proxy reads more shapes of an order to the assistant.** The
+  reading of a server's text as an order (what raises a call that acts with a
+  value said in it) now finds the assistant called after a data key, a label
+  or a code comment, named with what it does ("the assistant reading this
+  must send"), a block dressed as the system or a tool, the task set aside or
+  replaced ("the user now wants you to", instructions ignored), an act kept
+  from the user, a role taken into the real world, a softened imperative, and
+  letters spaced out. A quote, a procedure's heading, a data key and a
+  greeting with a name take no mark away. On a private held-out set written
+  independently and run once: 31 of 80 attacks (main 10); benign flagged 3 of
+  80 (main 0). Those numbers were measured before the review that made the
+  reading only add marks; they change with it and were not measured again.
+  AgentDojo's 35 texts are all still found. A polite request, a claim of
+  authority or a role with only a sending is still not read as an order:
+  people write those to people in the same words. A text longer than the
+  1 MiB read for this structure is said to be read in its start only.
 - **Goose's MCP servers are wired through the proxy.** `innerwarden agents
   connect goose` now routes every `type: stdio` extension in
   `~/.config/goose/config.yaml` through `innerwarden proxy`, naming Goose,
