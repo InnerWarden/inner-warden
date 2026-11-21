@@ -624,6 +624,16 @@ fn valid_guardable_config(
                 innerwarden_agent_guard::mcp_wire_toml::is_automatic_wrap_safe_toml(&config)
             });
     }
+    if let Some(rel) = &agent.mcp_yaml {
+        let path = home.join(rel);
+        return innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &path)
+            .ok()
+            .flatten()
+            .and_then(|body| innerwarden_agent_guard::mcp_wire_yaml::view_of_bytes(&body))
+            .is_some_and(|config| {
+                innerwarden_agent_guard::mcp_wire::is_automatic_wrap_safe(&config)
+            });
+    }
     false
 }
 
@@ -640,6 +650,7 @@ pub fn is_reviewed_integration(agent: &innerwarden_agent_guard::agents::AgentSta
     agent.hookable == known.hookable
         && agent.mcp_json.as_deref() == known.mcp_json
         && agent.mcp_toml.as_deref() == known.mcp_toml
+        && agent.mcp_yaml.as_deref() == known.mcp_yaml
 }
 
 fn is_excluded(policy: &AgentPolicy, canonical_name: &str) -> bool {
@@ -2410,6 +2421,7 @@ mod openclaw_eligibility_tests {
             hookable: known.hookable,
             mcp_json: known.mcp_json.map(str::to_string),
             mcp_toml: known.mcp_toml.map(str::to_string),
+            mcp_yaml: known.mcp_yaml.map(str::to_string),
             pids: Vec::new(),
             evidence: Vec::new(),
             guarded: false,
@@ -2491,6 +2503,7 @@ mod partial_eligibility_tests {
             hookable: known.hookable,
             mcp_json: known.mcp_json.map(str::to_string),
             mcp_toml: known.mcp_toml.map(str::to_string),
+            mcp_yaml: known.mcp_yaml.map(str::to_string),
             pids: Vec::new(),
             evidence: Vec::new(),
             guarded: false,

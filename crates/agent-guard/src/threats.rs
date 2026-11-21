@@ -28706,6 +28706,7 @@ mod privileged_write_target_tests {
             }
             wired.extend(known.mcp_json.map(str::to_string));
             wired.extend(known.mcp_toml.map(str::to_string));
+            wired.extend(known.mcp_yaml.map(str::to_string));
             if let Some(profile) = known.profile_config {
                 wired.push(format!(
                     "{}work/{}",
