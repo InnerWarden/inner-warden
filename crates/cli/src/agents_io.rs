@@ -7,11 +7,12 @@ use crate::agent_policy::{self, DesiredMode};
 
 /// `innerwarden agents [connect|disconnect [--all|<name>]]` - discover + connect.
 /// PURE. Whether `innerwarden agents <rest>` lowers a guard: a disconnect, or
-/// a connect in monitor.
+/// a connect in monitor or in the default posture asked for by name
+/// (`--guard`, which moves a strict install to it).
 pub(crate) fn lowers_a_guard(rest: &[String]) -> bool {
     match rest.first().map(String::as_str) {
         Some("disconnect") => true,
-        Some("connect") => rest.iter().any(|a| a == "--monitor"),
+        Some("connect") => rest.iter().any(|a| a == "--monitor" || a == "--guard"),
         _ => false,
     }
 }
@@ -113,6 +114,34 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     if rest.first().map(String::as_str) == Some("rewire") {
         return cmd_rewire();
     }
+    // The posture flags are this command's own: the wiring engine, which
+    // Active Defence shares, reads `--strict` as `--block-review`.
+    let original = rest;
+    let connecting = rest.first().map(String::as_str) == Some("connect");
+    let posture_asked = if connecting {
+        match crate::posture_io::requested(rest) {
+            Ok(asked) => asked,
+            Err(error) => {
+                eprintln!("innerwarden agents: {error}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    if posture_asked.is_some() && rest.iter().any(|a| a == "--monitor") {
+        eprintln!(
+            "innerwarden agents: `--monitor` refuses nothing, so it takes no posture; \
+             choose `--monitor` or a posture"
+        );
+        return std::process::ExitCode::from(2);
+    }
+    let stripped = if connecting {
+        crate::posture_io::without_posture_flags(rest)
+    } else {
+        rest.to_vec()
+    };
+    let rest = stripped.as_slice();
     if rest.first().map(String::as_str) != Some("auto-connect") {
         if let Err(error) = agents_ops::validate_args(rest) {
             eprintln!("innerwarden agents: {error}");
@@ -135,11 +164,11 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     // guard that screens it: the person's, never a command an AI agent's
     // shell runs (live gate of Active Defence 0.17.4, G1). The guard refuses
     // the agent running it; this holds where the guard cannot see the call.
-    if lowers_a_guard(rest) && crate::suppress_io::in_agent_shell() {
+    if lowers_a_guard(original) && crate::suppress_io::in_agent_shell() {
         eprintln!(
             "innerwarden agents: refused inside an AI agent's shell. Disconnecting an agent, \
-             or connecting it in monitor, lowers the guard that screens it, so it is done \
-             by the person, from their own terminal. Nothing was changed."
+             or connecting it in monitor or with --guard, lowers the guard that screens it, so \
+             it is done by the person, from their own terminal. Nothing was changed."
         );
         return std::process::ExitCode::from(1);
     }
@@ -178,6 +207,8 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             }
         }
     }
+    // Read before anything is wired: whether this is a new install.
+    let was_wired = connecting && crate::posture_io::already_wired(&home);
     let outcome = if mutating {
         match agent_policy::with_lock(&home, || {
             prepare_policy_for_agent_command(&home, rest)?;
@@ -199,6 +230,15 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     let failed = outcome.lines.iter().any(|line| line.contains("failed:"));
     for line in &outcome.lines {
         println!("{line}");
+    }
+    if connecting && !failed {
+        match crate::posture_io::settle(&home, posture_asked, was_wired) {
+            Ok(line) => println!("{line}"),
+            Err(error) => {
+                eprintln!("innerwarden agents: the posture was not written: {error}");
+                return std::process::ExitCode::from(1);
+            }
+        }
     }
     if matches!(rest.first().map(String::as_str), None | Some("list"))
         && crate::observe_io::openclaw_config(&home).is_file()
@@ -299,12 +339,22 @@ pub(crate) fn help_text() -> String {
     let p = crate::prog();
     format!(
         "{p} agents [list]\n\
-         {p} agents connect [<name>|--all] [--monitor|--strict]\n\
+         {p} agents connect [<name>|--all] [--monitor|--strict|--guard|--block-review]\n\
          {p} agents disconnect [<name>|--all]\n\
          {p} agents auto-connect [--monitor|--off|status]\n\
          {decisions}\n\
          \n  \
          Find the AI agents on this machine and wire the guard into them.\n  \
+         A new install starts in the default posture: it refuses a hard secret read,\n  \
+         destruction of the system or a home, an act that takes the guard down, a\n  \
+         reverse shell and download-and-run; every other deny or review runs with a\n  \
+         one-line warning and is recorded. An install from an earlier version keeps\n  \
+         refusing every deny.\n  \
+         --strict        refuse every deny and every review (the --block-review\n  \
+         \x20               wiring of earlier versions' --strict)\n  \
+         --guard         move a strict install to the default posture (your terminal only)\n  \
+         --block-review  refuse every review too\n  \
+         --monitor       record every call and refuse nothing\n  \
          Automatic setup is opt-in and monitor-only; unknown flags fail without\n  \
          changing anything.\n  \
          approve, profile, allow and revoke record your decisions about a type of\n  \

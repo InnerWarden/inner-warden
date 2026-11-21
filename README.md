@@ -137,14 +137,44 @@ innerwarden demo
 For command options, JSON output and exit codes, see the
 [CLI reference](crates/cli/README.md).
 
+### What the hook refuses: the posture
+
+The rules read the text of a command, so they are triage, not a boundary. A
+new install starts in the **default posture**, which refuses only what the
+guard is highly certain of:
+
+- a read of a secret of the hard class (SSH and GPG keys, cloud and tool
+  logins, `/etc/shadow`, paths you declared protected) and a secrets file
+  read from outside the project;
+- destruction of the system or of a home (`rm -rf /`, `rm -rf ~`, a disk
+  overwritten or formatted, every process killed);
+- an act that takes the guard down: its files or an agent's settings
+  written or removed, the guard stopped or killed, security monitoring
+  turned off;
+- a reverse shell;
+- something downloaded and run (`curl ... | sh`, a download made executable
+  and started).
+
+Every other `deny` and every `review` runs. It is recorded (as
+`would_block`) and the agent shows you one line saying what the guard saw.
+A call the guard cannot read is still refused.
+
+To refuse every `deny`, as earlier versions did, run
+`innerwarden agents connect --strict` (or `install --strict`); a `review`
+then asks you or is refused, by agent. `--block-review` refuses every review
+too, and `--monitor` refuses nothing. An install from before the posture
+existed keeps refusing every `deny` after an upgrade; `agents connect
+--guard`, from your own terminal, moves it to the default posture.
+`innerwarden status` says which posture is in force and what it refuses.
+
 ## What it does
 
 - **Screens** shell commands and MCP/tool calls and returns a verdict
   (`allow` / `review` / `deny`) with a risk score and the signals behind it.
-  `innerwarden check` only reports. The hook `innerwarden install` writes
-  refuses a `deny` before the action runs (`--block-review` adds `review`,
-  `--monitor` refuses nothing), and the proxy starts in `guard` mode, which
-  refuses a disallowed call before it reaches the server.
+  `innerwarden check` only reports. The hook `innerwarden install` and
+  `agents connect` write starts in the default posture (see below), and the
+  proxy starts in `guard` mode, which refuses a disallowed call before it
+  reaches the server.
 - **MCP proxy**: `innerwarden proxy -- <server>` sits in front of an MCP
   server, reads every JSON-RPC message and refuses a disallowed tool call
   inline.

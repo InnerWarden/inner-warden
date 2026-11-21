@@ -163,7 +163,14 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              is never wedged.\n\
              \n  \
              --block-review   refuse `review` verdicts everywhere (default: a review asks you on Claude Code and Hermes, runs with a warning on Codex, is refused elsewhere)\n  \
-             --monitor        record every command and never block"
+             --monitor        record every command and never block\n\
+             \n  \
+             With no flag the hook runs in the posture kept in\n  \
+             ~/.config/innerwarden/posture: `guard` (the default of a new install)\n  \
+             refuses only a hard secret read, destruction of the system or a home, an\n  \
+             act that takes the guard down, a reverse shell and download-and-run, and\n  \
+             every other deny or review runs with a one-line warning, recorded as\n  \
+             would_block; `strict`, or no file, refuses every deny as earlier versions did."
         ),
         "setup" => format!(
             "{p} setup\n  \
@@ -175,7 +182,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         "dashboard" => crate::dashboard::help_text(),
         "upgrade" | "update" | "self-update" => crate::upgrade::help_text(verb),
         "install" => format!(
-            "{p} install [<agent>] [--settings PATH] [--block-review] [--monitor]\n  \
+            "{p} install [<agent>] [--settings PATH] [--strict|--guard] [--block-review] [--monitor]\n  \
              Wire the guardrail into an agent as a blocking PreToolUse hook, so every\n  \
              shell command it proposes is screened before it runs, and its file tools\n  \
              cannot change a privileged file. Idempotent, and it preserves the settings\n  \
@@ -184,6 +191,10 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              none is refused rather than assumed.\n\
              \n  \
              --settings PATH   write to this settings file instead of the default\n  \
+             --strict          refuse every deny (the enforce of earlier versions); a new\n  \
+             \x20                 install otherwise starts in the default posture, which\n  \
+             \x20                 refuses only the high-certainty class and warns of the rest\n  \
+             --guard           move a strict install to the default posture (your terminal only)\n  \
              --block-review    refuse `review` verdicts everywhere (default: a review asks you on Claude Code and Hermes, runs with a warning on Codex, is refused elsewhere)\n  \
              --monitor         record every command and never block"
         ),

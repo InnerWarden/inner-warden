@@ -34,6 +34,19 @@ floor for this harness: in a real session a value a tool listed keeps the
 refusal. `--mode kill` keeps every refusal of
 before. Details: [What InnerWarden does](docs/features.md).
 
+A new install starts in a default posture that refuses only what the guard is
+highly certain of: a hard-class secret read, destruction of the system or a
+home, an act that takes the guard down, a reverse shell, and download and run.
+Every other deny and every review runs, is recorded as `would_block`, and the
+agent shows one line about it. `agents connect --strict` and `install
+--strict` keep the enforce of earlier versions (every deny refused); an install
+wired before this release keeps it on upgrade, and `--guard`, from the person's
+terminal, moves it to the default posture. `innerwarden status` says the
+posture in force and what it refuses. In the Community CLI `--strict` now
+names that posture: it used to be another name for `--block-review`, which
+stays the way to refuse every review. Wiring already on a host is not
+rewritten. [The posture](docs/features.md#the-posture-what-an-enforcing-hook-refuses).
+
 A here-document is read as the input of the command it is written after, and
 what a pipe hands a shell on its input is read as that shell's script. A
 narrow `Grep` of the home is held for review instead of refused. Every pull

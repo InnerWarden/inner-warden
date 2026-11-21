@@ -51,6 +51,7 @@ mod observe;
 mod observe_io;
 mod openclaw_guard;
 mod openclaw_guard_io;
+mod posture_io;
 mod record_health;
 mod release_verify;
 mod safer_alternative;
@@ -399,6 +400,9 @@ fn status_io_cmd_rest(
         })
         .unwrap_or_default();
     let facts = status::Facts {
+        posture: home
+            .as_deref()
+            .map(innerwarden_agent_guard::posture::posture_in_force),
         never_configured,
         mode,
         wired_agents,
@@ -2180,6 +2184,7 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         record: true,
         demo,
         host: None,
+        posture: hook_posture(monitor, block_review),
     };
     let screened = match screen_shell(&buf, rest, &options) {
         ShellScreen::Nothing => return std::process::ExitCode::SUCCESS,
@@ -2191,6 +2196,8 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         command,
         verdict,
         blocks: would_block_under_policy,
+        warned,
+        posture,
         ..
     } = screened;
     if demo {
@@ -2240,6 +2247,23 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         // here was an instruction the agent could follow to lift its own block.
         eprintln!("{}", hook_block_remedy(&verdict));
         std::process::ExitCode::from(2)
+    } else if !monitor && runs_with_a_warning(warned, &verdict, posture) {
+        // The default posture: a refusal outside the high-certainty class,
+        // or a review outside it, runs. It is in the record, and the agent
+        // shows the person one line. No ask and no exit 2.
+        let rec = verdict
+            .get("recommendation")
+            .and_then(|r| r.as_str())
+            .unwrap_or("review");
+        let expl = verdict
+            .get("explanation")
+            .and_then(|e| e.as_str())
+            .unwrap_or("");
+        let line = innerwarden_agent_guard::posture::warning_line(rec, expl);
+        if warn_agent(agent_flag(rest).as_deref(), &line) {
+            HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        std::process::ExitCode::SUCCESS
     } else if !monitor && is_review(&verdict) {
         // A review no policy refuses goes to the person where the agent can
         // ask, is shown to them on Codex, which cannot ask, and is refused
@@ -2264,6 +2288,24 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     } else {
         std::process::ExitCode::SUCCESS
     }
+}
+
+/// PURE. Whether the default posture lets a screened call run with a
+/// one-line warning: a refusal it does not hold (`warned`), or a review
+/// outside the high-certainty class. A review that carries a signal of the
+/// class (a download run as code, a secrets file outside the project) goes
+/// on to the strict review: the person is asked or it is refused, as the
+/// strict posture does. The class decides a review exactly as it decides a
+/// deny (`posture::refuses`).
+fn runs_with_a_warning(
+    warned: bool,
+    verdict: &serde_json::Value,
+    posture: innerwarden_agent_guard::posture::Posture,
+) -> bool {
+    warned
+        || (is_review(verdict)
+            && posture == innerwarden_agent_guard::posture::Posture::Guard
+            && !innerwarden_agent_guard::posture::verdict_is_high_certainty(verdict))
 }
 
 /// The agents that type into a running command in a call their hook never
@@ -2345,6 +2387,11 @@ pub(crate) struct ShellScreenOptions<'a> {
     /// ([`stricter_with_host`]). `None` here asks no host, as the Claude Code
     /// hook always did.
     pub host: Option<HostAsk<'a>>,
+    /// What an enforcing line refuses ([`innerwarden_agent_guard::posture`]).
+    /// The default posture lets a refusal outside the high-certainty class
+    /// run, recorded as `would_block`; where per-agent profiles are in force
+    /// the posture is strict, as the operator's profiles decide.
+    pub posture: innerwarden_agent_guard::posture::Posture,
 }
 
 /// The host's reading of one command (see [`ShellScreenOptions::host`]).
@@ -2356,8 +2403,14 @@ pub(crate) struct ShellScreened {
     /// The verdict that stands, as it was recorded.
     pub verdict: serde_json::Value,
     /// Whether the policy refuses it (deny, or a review under
-    /// `block_review`), whatever the mode.
+    /// `block_review`), whatever the mode, in the posture that applied.
     pub blocks: bool,
+    /// The strict policy refuses it and the default posture let it run:
+    /// recorded as `would_block`, and the agent shown a warning.
+    pub warned: bool,
+    /// The posture that applied to this call (strict where profiles are in
+    /// force, whatever the file says).
+    pub posture: innerwarden_agent_guard::posture::Posture,
     /// The layer that decided, where per-agent profiles are in force.
     pub layer: Option<graph_io::LayerLabel>,
 }
@@ -2391,6 +2444,7 @@ pub(crate) fn screen_shell(
         record,
         demo,
         host,
+        posture,
     } = *options;
     let (lines, file_read) = match classify_hook_input(buf) {
         HookInput::Command(command) => (vec![command], false),
@@ -2542,6 +2596,8 @@ pub(crate) fn screen_shell(
             command,
             verdict,
             blocks: would_block_under_policy,
+            warned: false,
+            posture,
             layer: deciding_layer,
         };
         let stricter = match &strictest {
@@ -2557,10 +2613,20 @@ pub(crate) fn screen_shell(
         verdict,
         blocks: would_block_under_policy,
         layer: deciding_layer,
+        ..
     }) = strictest
     else {
         return ShellScreen::Nothing;
     };
+    // The posture: per-agent profiles are the operator's own rules, so where
+    // they are in force the call is held to them as strict holds it.
+    let posture = match &profiles_state {
+        agent_profiles::ProfilesState::On(_) => innerwarden_agent_guard::posture::Posture::Strict,
+        _ => posture,
+    };
+    let refused =
+        innerwarden_agent_guard::posture::refuses(posture, would_block_under_policy, &verdict);
+    let warned = !monitor && would_block_under_policy && !refused;
 
     // Record EVERY screened command into the narrative graph (allow AND deny).
     // Persist recommendation and real outcome separately: monitor records a deny
@@ -2574,21 +2640,31 @@ pub(crate) fn screen_shell(
     // all day, and a record of each would bury the decisions that matter.
     let said_something = verdict.get("recommendation").and_then(|r| r.as_str()) != Some("allow");
     if record && (!file_read || said_something) {
-        record_shell(
-            buf,
-            rest,
-            &command,
-            &verdict,
-            monitor,
-            would_block_under_policy,
-            deciding_layer.clone(),
-            demo,
-        );
+        if warned {
+            record_shell_warned(buf, rest, &command, &verdict, deciding_layer.clone(), demo);
+        } else {
+            record_shell(
+                buf,
+                rest,
+                &command,
+                &verdict,
+                monitor,
+                would_block_under_policy,
+                deciding_layer.clone(),
+                demo,
+            );
+        }
     }
     ShellScreen::Screened(ShellScreened {
         command,
         verdict,
-        blocks: would_block_under_policy,
+        blocks: if monitor {
+            would_block_under_policy
+        } else {
+            refused
+        },
+        warned,
+        posture,
         layer: deciding_layer,
     })
 }
@@ -2628,6 +2704,70 @@ pub(crate) fn record_shell(
         // In monitor mode this is a would-block alert; in enforce it accompanies
         // the real block. Alerting must not change the hook outcome.
         notify_io::fire(command, verdict);
+    }
+}
+
+/// [`record_shell`] for a call the strict policy refuses and the default
+/// posture let run: recorded as `would_block` on an enforcing line, and
+/// alerted on as a would-block is, since it ran.
+pub(crate) fn record_shell_warned(
+    buf: &str,
+    rest: &[String],
+    command: &str,
+    verdict: &serde_json::Value,
+    layer: Option<graph_io::LayerLabel>,
+    demo: bool,
+) {
+    let source_session = hook_session(buf);
+    let identity = hook_identity::current(agent_flag(rest).as_deref(), source_session.as_deref());
+    graph_io::record_hook_warned(
+        command,
+        verdict,
+        source_session.as_deref(),
+        hook_event_id(buf).as_deref(),
+        agent_flag(rest).as_deref(),
+        hook_cwd(buf).as_deref(),
+        identity.as_ref(),
+        layer,
+        demo,
+    );
+    if !demo {
+        notify_io::fire(command, verdict);
+    }
+}
+
+/// The posture an enforcing hook line runs in: the file's
+/// (`innerwarden_agent_guard::posture`) for a line with no mode flag, and
+/// strict for `--block-review` and in monitor, which refuses nothing.
+fn hook_posture(monitor: bool, block_review: bool) -> innerwarden_agent_guard::posture::Posture {
+    use innerwarden_agent_guard::posture::{posture_in_force, Posture};
+    if monitor || block_review {
+        return Posture::Strict;
+    }
+    hook::home_dir()
+        .map(|home| posture_in_force(&home))
+        .unwrap_or(Posture::Strict)
+}
+
+/// The default posture's warning, written where `agent` shows a hook's
+/// words without refusing or asking: a `systemMessage` on stdout for Claude
+/// Code, Codex and Gemini CLI, Cursor's `allow` with the words, and stderr
+/// (exit 0) for every other agent. `true` when stdout was written.
+fn warn_agent(agent: Option<&str>, line: &str) -> bool {
+    use innerwarden_agent_guard::cursor_hook;
+    match agent {
+        None | Some("claude-code" | "codex" | "gemini") => {
+            println!("{}", serde_json::json!({ "systemMessage": line }));
+            true
+        }
+        Some(cursor_hook::AGENT) => {
+            println!("{}", cursor_hook::allow_with_warning(line));
+            true
+        }
+        Some(_) => {
+            eprintln!("{line}");
+            false
+        }
     }
 }
 
@@ -3191,6 +3331,10 @@ fn parse_install_args(rest: &[String]) -> InstallArgs {
             }
             "--block-review" => block_review = true,
             "--monitor" => monitor = true,
+            // The posture (`posture_io`), read by `cmd_install`. `--strict`
+            // is also the wiring of earlier versions' strict, `--block-review`.
+            "--strict" => block_review = true,
+            "--guard" => {}
             other if !other.starts_with('-') => agent = other.to_string(),
             other => return InstallArgs::Err(format!("unexpected argument `{other}`")),
         }
@@ -3216,11 +3360,26 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::from(2);
         }
     };
+    let posture_asked = match posture_io::requested(rest) {
+        Ok(asked) => asked,
+        Err(msg) => {
+            eprintln!("innerwarden install: {msg}");
+            return std::process::ExitCode::from(2);
+        }
+    };
+    if monitor && posture_asked.is_some() {
+        eprintln!(
+            "innerwarden install: `--monitor` refuses nothing, so it takes no posture; choose one"
+        );
+        return std::process::ExitCode::from(2);
+    }
+    let guard_asked = posture_asked == Some(innerwarden_agent_guard::posture::Posture::Guard);
     // Installing the hook in monitor rewires it to record only, as `agents
     // connect --monitor` does: the person's, never a command an AI agent's
     // shell runs (review of 1.6.6, H1). The guard refuses the agent running
-    // it; this holds where the guard cannot see the call.
-    if monitor && suppress_io::in_agent_shell() {
+    // it; this holds where the guard cannot see the call. `--guard` moves a
+    // strict install to the default posture, which refuses less: the same.
+    if (monitor || guard_asked) && suppress_io::in_agent_shell() {
         eprintln!(
             "innerwarden install: refused inside an AI agent's shell. Installing the hook in \
              monitor lowers the guard that screens the agent, so it is done by the person, \
@@ -3255,6 +3414,7 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
         }
     };
 
+    let was_wired = posture_io::already_wired(&home);
     match hook::install_hook(
         &home,
         &agent,
@@ -3264,6 +3424,13 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
         monitor,
     ) {
         Ok(report) => {
+            let posture = match posture_io::settle(&home, posture_asked, was_wired) {
+                Ok(_) => innerwarden_agent_guard::posture::posture_in_force(&home),
+                Err(e) => {
+                    eprintln!("innerwarden install: the posture was not written: {e}");
+                    return std::process::ExitCode::from(1);
+                }
+            };
             println!("InnerWarden guard hook installed for {agent}");
             println!("  settings : {}", report.settings_path.display());
             println!("  hook     : {}", report.hook_command);
@@ -3273,10 +3440,20 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
                     "nothing (monitor: records every command, never blocks)"
                 } else if report.block_review {
                     "deny + review"
+                } else if posture == innerwarden_agent_guard::posture::Posture::Guard {
+                    "the high-certainty class (default posture); every other deny or review runs with a warning"
                 } else {
                     "deny"
                 }
             );
+            // A `--block-review` line refuses more than either posture, so a
+            // guard posture is not said over it; `--strict` is both.
+            if !report.monitor
+                && (!report.block_review
+                    || posture == innerwarden_agent_guard::posture::Posture::Strict)
+            {
+                println!("{}", posture_io::line(posture));
+            }
             println!();
             if report.claude_code_detected {
                 println!("Every Bash command Claude Code proposes is now screened in-process");
@@ -4189,13 +4366,13 @@ fn help_text() -> String {
            {p} serve [--bind IP:PORT]   serve POST /api/agent/check-command (plain HTTP, loopback)\n  \
            {p} proxy [--mode M] -- <server> [args]\n  \
            \x20                                enforcing MCP guard: wrap a server, block bad tool calls\n  \
-           {p} install claude-code [--monitor]\n  \
+           {p} install claude-code [--strict|--monitor]\n  \
            \x20                                wire a PreToolUse hook into Claude Code (--monitor = records, never blocks)\n  \
            {p} uninstall claude-code     remove that hook (leaves other settings untouched)\n  \
            {p} upgrade                   update to the latest signed release (verifies before replacing)\n  \
          {p} host <command>            run a command in the InnerWarden Pro host layer\n  \
            {p} uninstall                 remove InnerWarden entirely: hook, config, binary and its iw shortcuts\n  \
-           {p} agents [connect [--monitor]|disconnect [--all|<name>]]\n  \
+           {p} agents [connect [--strict|--monitor]|disconnect [--all|<name>]]\n  \
            \x20                                find AI agents on this machine + connect the guard\n  \
            {p} agents auto-connect [--monitor|--off|status]\n  \
            \x20                                opt-in monitor-only discovery while dashboard runs\n  \
@@ -5195,6 +5372,50 @@ mod tests {
         ] {
             assert!(!review_answer_line(answer, "").unwrap().contains('\n'));
         }
+    }
+
+    /// A review of the high-certainty class is never waved through by the
+    /// default posture: it goes on to the strict review (ask or refuse). Only
+    /// a review outside the class, or a refusal the posture does not hold,
+    /// runs with a warning.
+    ///
+    /// FAILS ON REVERT: drop the `verdict_is_high_certainty` check from
+    /// `runs_with_a_warning` and the class reviews below run.
+    #[test]
+    fn a_review_of_the_class_is_not_run_with_a_warning() {
+        use innerwarden_agent_guard::posture::Posture;
+        let review = |signal: &str, score: u64| {
+            serde_json::json!({
+                "recommendation": "review",
+                "signals": [{"signal": signal, "score": score, "detail": "x"}],
+            })
+        };
+        for (signal, score) in [
+            ("fetch_exec_unparsed", 25),
+            ("credential_read_outside_project", 10),
+            ("download_chmod_execute", 25),
+            ("dynamic_code_execution", 20),
+            ("fetch_exec_unanalyzable", 25),
+        ] {
+            let verdict = review(signal, score);
+            assert!(
+                !runs_with_a_warning(false, &verdict, Posture::Guard),
+                "{signal} ran with a warning under the default posture"
+            );
+            assert!(!runs_with_a_warning(false, &verdict, Posture::Strict));
+        }
+        // Outside the class, a review runs with a warning under guard only.
+        let plain = review("network_exfil_hint", 15);
+        assert!(runs_with_a_warning(false, &plain, Posture::Guard));
+        assert!(!runs_with_a_warning(false, &plain, Posture::Strict));
+        // A subsumed signal of the class does not decide.
+        assert!(runs_with_a_warning(
+            false,
+            &review("download_chmod_execute", 0),
+            Posture::Guard
+        ));
+        // A refusal the posture does not hold runs with a warning either way.
+        assert!(runs_with_a_warning(true, &plain, Posture::Guard));
     }
 
     #[test]
