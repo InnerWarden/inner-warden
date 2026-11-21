@@ -1009,6 +1009,7 @@ fn check_as_the_hook(command: &str, agent: Option<&str>, block_review: bool) -> 
         record: false,
         demo: false,
         host: None,
+        posture: hook_posture(false, block_review),
     };
     let unread = |why: String| {
         serde_json::json!({
