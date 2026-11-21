@@ -1,6 +1,9 @@
 import { test as base } from "@playwright/test";
 import { FIXTURE_NOW_MS } from "./support";
 
+/** The most opening a tab, or installing its clock, may take. */
+const BROWSER_START_MS = 60_000;
+
 /**
  * Every Community journey runs at the fixture record's clock, never the wall
  * clock.
@@ -20,11 +23,23 @@ import { FIXTURE_NOW_MS } from "./support";
  * each time, so no journey depends on the date it runs today; this keeps it so.
  */
 export const test = base.extend<{ fixtureClock: void }>({
+  // Opening the tab, and installing the clock below, are the browser's
+  // start, not the journey: on a loaded runner one tab took 10 s to open
+  // (2026-11-21), and charged to the test's 15 s it timed j001 out before its
+  // first step. Each gets a budget of its own, so the test's timeout bounds
+  // what the journey itself waits for. The page is the built-in one,
+  // opened in the test's own context.
+  page: [
+    async ({ context }, use) => {
+      await use(await context.newPage());
+    },
+    { timeout: BROWSER_START_MS },
+  ],
   fixtureClock: [
     async ({ page }, use) => {
       await page.clock.install({ time: FIXTURE_NOW_MS });
       await use();
     },
-    { auto: true },
+    { auto: true, timeout: BROWSER_START_MS },
   ],
 });
