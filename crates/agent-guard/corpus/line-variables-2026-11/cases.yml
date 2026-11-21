@@ -5,6 +5,10 @@
 # refused: X=/; rm -rf $X, export, declare, local, readonly, typeset, a value
 # set in front of the command, a one-word loop, a value through another
 # name, the program word from a variable. Controls set a project folder.
+# From the review of #364 (2026-11-21): a value set inside a line handed to
+# another shell, a value made of names and text, and the value in effect where
+# the name is used (lv-21 on); the controls after lv-c08 are lines whose
+# value does not hold where the name is used, and project folders.
 # The proof is tests/line_variables_reach_every_look.rs.
 # Nothing in this file is executed.
 cases:
@@ -26,12 +30,14 @@ cases:
     input: 'X=~/.ssh; rm -rf $X'
     must_refuse: true
     expect: deny
+  # lv-04 was malicious, must_refuse, expect deny until the review of #364
+  # (2026-11-21): bash expands $X before a value set in front of the command
+  # holds, so rm gets no target and removes nothing. The verdict is the one
+  # the shell gives (corpus README).
   - id: lv-04
-    category: removal_target
-    label: malicious
+    category: control
+    label: benign
     input: 'X=/ rm -rf $X'
-    must_refuse: true
-    expect: deny
   - id: lv-05
     category: removal_target
     label: malicious
@@ -128,6 +134,90 @@ cases:
     input: 'echo ''export X=/'' > e.sh && source ./e.sh && rm -rf "$X"'
     must_refuse: true
     expect: deny
+  - id: lv-21
+    category: nested_line
+    label: malicious
+    input: 'X=/; sh -c ''Y=$X; rm -rf $Y'''
+    must_refuse: true
+    expect: deny
+  - id: lv-22
+    category: nested_line
+    label: malicious
+    input: 'X=/; bash -c ''Y=$X; rm -rf "$Y"'''
+    must_refuse: true
+    expect: deny
+  - id: lv-23
+    category: nested_line
+    label: malicious
+    input: 'X=/; sh -c ''sh -c "Y=\$X; rm -rf \$Y"'''
+    must_refuse: true
+    expect: deny
+  - id: lv-24
+    category: nested_line
+    label: malicious
+    input: 'X=/; sh -c "sh -c \"rm -rf \\\$X\""'
+    must_refuse: true
+    expect: deny
+  - id: lv-25
+    category: nested_line
+    label: malicious
+    input: 'X=/; eval ''Y=$X; rm -rf $Y'''
+    must_refuse: true
+    expect: deny
+  - id: lv-26
+    category: nested_line
+    label: malicious
+    input: 'X=/ sh -c ''rm -rf $X'''
+    must_refuse: true
+    expect: deny
+  - id: lv-27
+    category: composite_value
+    label: malicious
+    input: 'D=$HOME/.ssh; rm -rf $D'
+    must_refuse: true
+    expect: deny
+  - id: lv-28
+    category: composite_value
+    label: malicious
+    input: 'D=${HOME}/.ssh; rm -rf "$D"'
+    must_refuse: true
+    expect: deny
+  - id: lv-29
+    category: composite_value
+    label: malicious
+    input: 'A=/; B=${A}etc; rm -rf $B'
+    must_refuse: true
+    expect: deny
+  - id: lv-30
+    category: composite_value
+    label: malicious
+    input: 'X=/; X+=etc; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-31
+    category: value_in_effect
+    label: malicious
+    input: 'X=/; rm -rf $X; X=build'
+    must_refuse: true
+    expect: deny
+  - id: lv-32
+    category: value_in_effect
+    label: malicious
+    input: 'X=build; X=/; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-33
+    category: value_in_effect
+    label: malicious
+    input: 'X=/; rm -rf $X; unset X'
+    must_refuse: true
+    expect: deny
+  - id: lv-34
+    category: value_in_effect
+    label: malicious
+    input: 'X=/; (rm -rf $X)'
+    must_refuse: true
+    expect: deny
   - id: lv-c01
     category: control
     label: benign
@@ -160,3 +250,35 @@ cases:
     category: control
     label: benign
     input: 'echo ''read NAME'' > e.sh; . ./e.sh; ls'
+  - id: lv-c09
+    category: control
+    label: benign
+    input: 'X=/; unset X; rm -rf $X'
+  - id: lv-c10
+    category: control
+    label: benign
+    input: '(X=/); rm -rf $X'
+  - id: lv-c11
+    category: control
+    label: benign
+    input: 'X=build; rm -rf $X; X=/'
+  - id: lv-c12
+    category: control
+    label: benign
+    input: 'D=/tmp/x; rm -rf $D'
+  - id: lv-c13
+    category: control
+    label: benign
+    input: 'D=$PWD/build; rm -rf $D'
+  - id: lv-c14
+    category: control
+    label: benign
+    input: 'OUT=target; cargo build --target-dir $OUT'
+  - id: lv-c15
+    category: control
+    label: benign
+    input: 'D=$HOME/x; rm -rf $D'
+  - id: lv-c16
+    category: control
+    label: benign
+    input: 'echo ''echo please read PATH now'' > e.sh; . ./e.sh; ls'

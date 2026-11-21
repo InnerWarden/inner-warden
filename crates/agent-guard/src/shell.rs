@@ -3288,10 +3288,9 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                     // A shell file loaded in this shell (`. ./env.sh`): what it
                     // sets is judged as if written where it is loaded.
                     if loads_here && matches!(language, runners::Language::Shell) {
-                        if names_set_by(&text)
-                            .iter()
-                            .any(|name| unread_parts::read_specially(name))
-                        {
+                        if names_set_by(&text).is_none_or(|names| {
+                            names.iter().any(|name| unread_parts::read_specially(name))
+                        }) {
                             handed.loads_special = true;
                         }
                         handed.lines.push(loaded_in_place(
@@ -4224,8 +4223,13 @@ fn loaded_in_place(source: &[u8], loader: tree_sitter::Node<'_>, code: &str) -> 
 /// `A=1`, `export B=2`, `declare -x C=3`, `export D`, `read E`, `mapfile
 /// F`, `getopts ab G`, `unset H`, `printf -v I x`, `for J in ...`. Every
 /// plain word after a reader or `unset` counts: a prompt or an option's value
-/// taken for a name only adds one.
-fn names_set_by(text: &str) -> Vec<String> {
+/// taken for a name only adds one. A reader or `unset` counts only where a
+/// command stands (the start, after `;`, `&`, `|`, `(`, `{`, a new line or
+/// a keyword such as `then`): `echo please read the notes` sets nothing.
+///
+/// `None` when a pattern does not build: the caller then holds the text as
+/// one that sets every name it watches (review of #364).
+fn names_set_by(text: &str) -> Option<Vec<String>> {
     static PATTERNS: std::sync::OnceLock<Option<[regex::Regex; 4]>> = std::sync::OnceLock::new();
     let Some([assignment, exported, listed, single]) = PATTERNS.get_or_init(|| {
         let setters = crate::threats::VARIABLE_SETTERS.join("|");
@@ -4241,15 +4245,17 @@ fn names_set_by(text: &str) -> Vec<String> {
                 r"(?:^|[\s;&|({{])(?:{setters})(?:\s+-[A-Za-z]+)*((?:\s+[A-Za-z_][A-Za-z0-9_]*)+)"
             ))
             .ok()?,
-            regex::Regex::new(&format!(r"(?:^|[\s;&|({{])(?:{listers})((?:[ \t]+[^\s;&|()<>]+)+)"))
-                .ok()?,
+            regex::Regex::new(&format!(
+                r"(?:^|[;&|({{\n!]|\b(?:then|do|else|elif|if|while|until|time)\b)[ \t]*(?:{listers})((?:[ \t]+[^\s;&|()<>]+)+)"
+            ))
+            .ok()?,
             regex::Regex::new(
                 r"(?:^|[\s;&|({])(?:printf[ \t]+(?:-[A-Za-z]*[ \t]+)*-v[ \t]*|for[ \t]+)([A-Za-z_][A-Za-z0-9_]*)",
             )
             .ok()?,
         ])
     }) else {
-        return Vec::new();
+        return None;
     };
     let identifier = |word: &str| {
         let mut chars = word.chars();
@@ -4278,7 +4284,7 @@ fn names_set_by(text: &str) -> Vec<String> {
             );
         }
     }
-    names
+    Some(names)
 }
 
 /// The variable a line of [`assignments_written`] sets.

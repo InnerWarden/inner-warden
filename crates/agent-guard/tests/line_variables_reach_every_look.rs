@@ -4,9 +4,8 @@
 //! allowed where the line typed out with the value is refused:
 //!
 //! * `X=/; rm -rf $X`, `X=/; rm -rf "$X"`, `X=~/.ssh; rm -rf $X`, with
-//!   `export`, `declare`, `local`, `readonly`, `typeset` in front, the
-//!   value set before the command (`X=/ rm -rf $X`), a one-word loop, a
-//!   value through another name;
+//!   `export`, `declare`, `local`, `readonly`, `typeset` in front, a
+//!   one-word loop, a value through another name;
 //! * `X=/dev/sda; dd if=/dev/zero of=$X`;
 //! * the program word from a variable (`P=rm; $P -rf /`);
 //! * a file the line writes and then loads (`echo 'X=/' > e.sh; . ./e.sh;
@@ -36,7 +35,6 @@ fn a_value_the_line_assigns_reaches_the_target_of_a_removal() {
         "X=/; rm -rf \"${X}\"",
         "X='/'; rm -rf \"$X\"",
         "X=~/.ssh; rm -rf $X",
-        "X=/ rm -rf $X",
         "export X=/; rm -rf $X",
         "export X=/ && rm -rf \"$X\"",
         "declare X=/; rm -rf $X",
@@ -138,4 +136,114 @@ fn a_project_folder_in_a_variable_stays_allowed() {
     ] {
         assert_eq!(verdict(line), "allow", "{line}");
     }
+}
+
+// The review of #364 (2026-11-21). Measured with analyze_command and an
+// empty home; "before" is the branch of #368 this one is built on, which
+// holds #364.
+
+/// A value a line handed to another shell sets from the values around it
+/// (before: deny 50 through the place a removal runs; review on main), two
+/// shells deep, and through `eval`: read at the line's own level.
+#[test]
+fn a_value_set_inside_a_line_handed_on_is_read() {
+    for line in [
+        "X=/; sh -c 'Y=$X; rm -rf $Y'",
+        "X=/; bash -c 'Y=$X; rm -rf \"$Y\"'",
+        "X=/; sh -c 'sh -c \"Y=\\$X; rm -rf \\$Y\"'",
+        "X=/; sh -c \"sh -c \\\"rm -rf \\\\\\$X\\\"\"",
+        "X=/; eval 'Y=$X; rm -rf $Y'",
+        "X=/; eval 'rm -rf $X'",
+        "X=/ sh -c 'rm -rf $X'",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// A value made of names and plain text (before: allowed, the value was
+/// not read).
+#[test]
+fn a_value_made_of_names_and_text_is_read() {
+    for line in [
+        "D=$HOME/.ssh; rm -rf $D",
+        "D=${HOME}/.ssh; rm -rf \"$D\"",
+        "D=$HOME; rm -rf $D/..",
+        "A=/; B=${A}etc; rm -rf $B",
+        "X=/; X+=etc; rm -rf $X",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// The value in effect where the name is used, not the first nor the last
+/// the line gives it (before: deny 50; review on main: a name given two
+/// values was not read).
+#[test]
+fn the_value_in_effect_where_the_name_is_used_is_read() {
+    for line in [
+        "X=/; rm -rf $X; X=build",
+        "X=/; rm -rf $X; X=build; echo $X",
+        "X=build; X=/; rm -rf $X",
+        "X=/; rm -rf $X; unset X",
+        "X=/; (rm -rf $X)",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// What the shell does: a name used before it is set, taken away, set in a
+/// subshell that has closed, or set in front of the command that uses it
+/// (bash expands `$X` before the value holds: `rm` gets no target) does not
+/// hold the value. Before: deny 90 each, from the first value the line gave
+/// the name.
+///
+/// `X=/ rm -rf $X` was asserted deny above until this review: the
+/// expectation moved with the corpus case lv-04 (corpus README).
+#[test]
+fn a_value_that_does_not_hold_where_the_name_is_used_is_not_read() {
+    for line in [
+        "X=/; unset X; rm -rf $X",
+        "(X=/); rm -rf $X",
+        "X=/ rm -rf $X",
+        "X=build; rm -rf $X; X=/",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+    // A value the line does not show: held, as `rm -rf $X` alone is.
+    for line in [
+        "rm -rf $X; X=/",
+        "sh -c 'X=/'; rm -rf $X",
+        "X=/; read X; rm -rf $X",
+        "X=/; read X <<< build; rm -rf $X",
+    ] {
+        assert_eq!(verdict(line), "review", "{line}");
+    }
+}
+
+/// Item 7: a project folder set through a name stays the person's.
+#[test]
+fn a_project_folder_through_a_composite_value_stays_allowed() {
+    for line in [
+        "D=/tmp/x; rm -rf $D",
+        "D=$PWD/build; rm -rf $D",
+        "OUT=target; cargo build --target-dir $OUT",
+        "D=$HOME/x; rm -rf $D",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// A loaded file whose text says `read` in prose sets nothing: only a reader
+/// where a command stands counts (before: review).
+#[test]
+fn prose_after_read_in_a_loaded_file_sets_no_name() {
+    assert_eq!(
+        verdict("echo 'echo please read PATH now' > e.sh; . ./e.sh; ls"),
+        "allow"
+    );
+    assert_ne!(verdict("echo 'read PATH' > e.sh; . ./e.sh; ls"), "allow");
+    assert_ne!(
+        verdict("echo 'true; unset PATH' > e.sh; . ./e.sh; ls"),
+        "allow"
+    );
 }

@@ -6,6 +6,11 @@
 # rm -rf ./*, chown -R nobody / (directly and through a variable), and
 # chmod -R 777 / held only for review. Controls change to a project folder
 # or a folder the line does not spell out, or change a project folder.
+# From cg-39 (review of #364, 2026-11-21): find handing every file of
+# the root, a system directory or a home to chown, chgrp or chmod (-exec,
+# -execdir, -ok, -okdir), allowed on the branch of #368; the controls after
+# cg-c18 pick some files out, keep to the starting point or start in a
+# project folder.
 # The proof is tests/cd_then_glob_and_recursive_owner.rs.
 # Nothing in this file is executed.
 cases:
@@ -183,6 +188,60 @@ cases:
     input: 'cd / && chown -R nobody .'
     must_refuse: true
     expect: deny
+  - id: cg-39
+    category: owner_change_by_find
+    label: malicious
+    input: 'find / -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-40
+    category: owner_change_by_find
+    label: malicious
+    input: 'find / -execdir chown nobody {} \;'
+    must_refuse: true
+    expect: deny
+  - id: cg-41
+    category: owner_change_by_find
+    label: malicious
+    input: 'find / -ok chgrp nobody {} \;'
+    must_refuse: true
+    expect: deny
+  - id: cg-42
+    category: owner_change_by_find
+    label: malicious
+    input: 'find ~ -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-43
+    category: owner_change_by_find
+    label: malicious
+    input: 'find /etc -type f -exec chown nobody {} \;'
+    must_refuse: true
+    expect: deny
+  - id: cg-44
+    category: owner_change_by_find
+    label: malicious
+    input: 'sudo find /home -exec chgrp staff {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-45
+    category: owner_change_by_find
+    label: malicious
+    input: 'find / -exec sudo chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-46
+    category: owner_change_by_find
+    label: malicious
+    input: 'find / -name ''*'' -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-47
+    category: owner_change_by_find
+    label: malicious
+    input: 'find /usr -okdir chown nobody {} \;'
+    must_refuse: true
+    expect: deny
   - id: cg-c01
     category: control
     label: benign
@@ -255,3 +314,19 @@ cases:
     category: control
     label: benign
     input: 'chown -R dev ~/.cache/pip'
+  - id: cg-c19
+    category: control
+    label: benign
+    input: 'find build -exec chown me {} +'
+  - id: cg-c20
+    category: control
+    label: benign
+    input: 'find / -maxdepth 0 -exec chown nobody {} +'
+  - id: cg-c21
+    category: control
+    label: benign
+    input: 'find / -user olduser -exec chown newuser {} +'
+  - id: cg-c22
+    category: control
+    label: benign
+    input: 'find /srv/app -exec chgrp www-data {} +'

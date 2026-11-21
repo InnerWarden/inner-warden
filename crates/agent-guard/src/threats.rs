@@ -2895,7 +2895,7 @@ fn with_assignments_expanded(content: &str, limit: usize) -> Assigned {
 /// `F=~/.ssh/id_rsa.pub; cat ${F%.pub}` reads the private key: measured
 /// 2026-11-16, six of eight such forms were allowed, one of them handing
 /// the key to an upload.
-fn parameter_operation(value: &str, operation: &str) -> Option<(String, usize)> {
+pub(crate) fn parameter_operation(value: &str, operation: &str) -> Option<(String, usize)> {
     let close = operation.find('}')?;
     let body = &operation[..close];
     if body.contains(['$', '`', '{']) {
@@ -3067,7 +3067,7 @@ fn replaced_in(value: &str, operation: &str) -> String {
 /// with any `$NAME` still in it, and how many bytes of `text` the word
 /// took. No value when the text does not show it: a command substitution,
 /// an array.
-fn assigned_value(text: &str) -> (Option<String>, usize) {
+pub(crate) fn assigned_value(text: &str) -> (Option<String>, usize) {
     let mut value = String::new();
     let mut shown = true;
     let mut end = text.len();
@@ -3119,7 +3119,7 @@ fn assigned_value(text: &str) -> (Option<String>, usize) {
 /// `$(printf innerwarden-agent)`, `$(echo 'x')`, with or without double
 /// quotes around the substitution. A `printf` format with `%` or `\\` is
 /// not a literal. `(value, bytes taken)`.
-fn printed_literal_value(text: &str) -> Option<(String, usize)> {
+pub(crate) fn printed_literal_value(text: &str) -> Option<(String, usize)> {
     static PRINTED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let printed = PRINTED.get_or_init(|| {
         regex::Regex::new(
@@ -13821,6 +13821,9 @@ pub fn recursive_owner_change_of_system(hay: &str, cwd: &str, home: Option<&str>
                 return false;
             };
             let command = token_basename(&words[index]).to_ascii_lowercase();
+            if command == "find" {
+                return find_changes_owner_of_system(&place, &words[index + 1..], home);
+            }
             if !matches!(command.as_str(), "chown" | "chgrp" | "chmod") {
                 return false;
             }
@@ -13868,6 +13871,119 @@ pub fn recursive_owner_change_of_system(hay: &str, cwd: &str, home: Option<&str>
         || substitution_bodies(hay)
             .into_iter()
             .any(|body| changes(shell_command_segments(body)))
+}
+
+/// The tests of `find` that pick some files out of the tree: with one of
+/// them the change reaches the files it names, not the whole tree.
+const FIND_SELECTING_TESTS: &[&str] = &[
+    "-name",
+    "-iname",
+    "-path",
+    "-ipath",
+    "-wholename",
+    "-iwholename",
+    "-regex",
+    "-iregex",
+    "-user",
+    "-group",
+    "-uid",
+    "-gid",
+    "-nouser",
+    "-nogroup",
+    "-perm",
+    "-newer",
+    "-anewer",
+    "-cnewer",
+    "-mtime",
+    "-mmin",
+    "-atime",
+    "-amin",
+    "-ctime",
+    "-cmin",
+    "-size",
+    "-inum",
+    "-samefile",
+    "-links",
+    "-lname",
+    "-ilname",
+    "-empty",
+];
+
+/// Whether `find` with `words` after it hands every file of the root, a
+/// system directory or a home to `chown`, `chgrp` or `chmod` (`-exec`,
+/// `-execdir`, `-ok`, `-okdir`): the same change of the whole tree as
+/// `chown -R` ([`recursive_owner_change_of_system`]). Not when a test picks
+/// some files out (`-name '*.sh'`, `-user old`; a name test of `*` alone
+/// picks every file and counts as none), or `-maxdepth 0` keeps it to the
+/// starting point. Measured 2026-11-21: `find / -exec chown nobody {} +`
+/// was allowed, `-execdir`, `-ok` and `chgrp` too.
+fn find_changes_owner_of_system(
+    place: &CommandPlace<'_>,
+    words: &[String],
+    home: Option<&str>,
+) -> bool {
+    let bare: Vec<&str> = words
+        .iter()
+        .map(|word| word.trim_matches(['\'', '"']))
+        .collect();
+    // The starting points: the words before the first option, test or
+    // parenthesis, `.` when there are none.
+    let starts: Vec<&str> = bare
+        .iter()
+        .take_while(|word| {
+            !(word.starts_with('-')
+                || word.starts_with('(')
+                || word.starts_with('!')
+                || **word == "\\(")
+        })
+        .copied()
+        .collect();
+    let mut changes = false;
+    let mut selected = false;
+    let mut at = starts.len();
+    while at < bare.len() {
+        let word = bare[at];
+        match word {
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                // The program run, past `sudo` and the like.
+                let program = bare[at + 1..]
+                    .iter()
+                    .find(|word| !matches!(**word, "sudo" | "doas" | "env" | "command" | "nice"))
+                    .map(|word| token_basename(word).to_ascii_lowercase());
+                if program
+                    .as_deref()
+                    .is_some_and(|program| matches!(program, "chown" | "chgrp" | "chmod"))
+                {
+                    changes = true;
+                }
+                // Past the command, to its `;` or `+`.
+                while at < bare.len() && !matches!(bare[at], ";" | "\\;" | "+") {
+                    at += 1;
+                }
+            }
+            "-maxdepth" if bare.get(at + 1) == Some(&"0") => return false,
+            _ if FIND_SELECTING_TESTS.contains(&word) => {
+                let pattern = bare.get(at + 1).copied().unwrap_or("");
+                let everything = matches!(
+                    word,
+                    "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename"
+                ) && pattern.chars().all(|c| c == '*');
+                if !everything {
+                    selected = true;
+                }
+                at += 1;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    if !changes || selected {
+        return false;
+    }
+    let starts = if starts.is_empty() { vec!["."] } else { starts };
+    starts
+        .iter()
+        .any(|start| owner_change_target_is_system_or_home(place, start, home))
 }
 
 /// Whether one operand of a recursive owner or mode change names the root, a
@@ -14022,9 +14138,10 @@ struct CommandPlace<'a> {
     cwd: Option<String>,
     home: Option<&'a str>,
     variables: std::collections::HashMap<String, String>,
-    /// The directory outside each subshell the list is in: a `cd` inside
-    /// `( ... )` or `$( ... )` ends with it.
-    outside: Vec<Option<String>>,
+    /// The directory and the variables outside each subshell the list is
+    /// in: a `cd` or an assignment inside `( ... )` or `$( ... )` ends with
+    /// it.
+    outside: Vec<(Option<String>, std::collections::HashMap<String, String>)>,
     /// Subshells the last segment closed, left once that segment is judged.
     closing: usize,
 }
@@ -14047,13 +14164,15 @@ impl<'a> CommandPlace<'a> {
     /// it opens or closes; the place goes back out after it.
     fn step(&mut self, segment: &str) -> Option<Vec<String>> {
         for _ in 0..std::mem::take(&mut self.closing) {
-            if let Some(outside) = self.outside.pop() {
-                self.cwd = outside;
+            if let Some((cwd, variables)) = self.outside.pop() {
+                self.cwd = cwd;
+                self.variables = variables;
             }
         }
         let (opens, closes) = unquoted_parentheses(segment);
         for _ in 0..opens {
-            self.outside.push(self.cwd.clone());
+            self.outside
+                .push((self.cwd.clone(), self.variables.clone()));
         }
         self.closing = closes;
         self.step_inside(segment)
@@ -14062,11 +14181,30 @@ impl<'a> CommandPlace<'a> {
     /// [`Self::step`] once the subshells are accounted for.
     fn step_inside(&mut self, segment: &str) -> Option<Vec<String>> {
         let words = shell_tokens(&fold_braced_names(segment));
-        record_literal_assignments(&words, &mut self.variables);
-        let Some(index) = effective_command_index(&words) else {
+        let index = effective_command_index(&words);
+        // A value set in front of a command is that command's alone, and
+        // the shell expands the command's words before it holds (`X=/ rm
+        // -rf $X` removes nothing): only a segment of assignments alone
+        // sets them for what follows (review of #364).
+        let in_front = index.is_some_and(|index| {
+            words[..index]
+                .iter()
+                .any(|word| is_environment_assignment(word))
+        });
+        if !in_front {
+            record_literal_assignments(&words, &mut self.variables);
+        }
+        let Some(index) = index else {
             return Some(words);
         };
         let command = token_basename(&words[index]).to_ascii_lowercase();
+        // A name taken away or given a value the text does not show
+        // (`unset X`, `read X`) no longer holds the value it had.
+        if let Some(taken) = names_given_unshown_values(&command, &words[index + 1..]) {
+            for name in taken {
+                self.variables.remove(&name);
+            }
+        }
         match command.as_str() {
             "cd" | "pushd" => {
                 let operand = words[index + 1..]
@@ -14116,6 +14254,57 @@ impl<'a> CommandPlace<'a> {
         }
         Some(collapse_path(&joined))
     }
+}
+
+/// The names `unset` takes away (not `unset -f`, which takes functions) or
+/// `read`, `mapfile`, `readarray`, `getopts` and `printf -v` give a value
+/// the text does not show; `None` for another command. Every word that is a
+/// name counts: a prompt taken for one only forgets a value.
+fn names_given_unshown_values(command: &str, arguments: &[String]) -> Option<Vec<String>> {
+    if !matches!(
+        command,
+        "unset" | "read" | "mapfile" | "readarray" | "getopts" | "printf"
+    ) {
+        return None;
+    }
+    let bare: Vec<&str> = arguments
+        .iter()
+        .map(|word| word.trim_matches(['\'', '"']))
+        .collect();
+    if command == "unset"
+        && bare
+            .iter()
+            .any(|word| word.starts_with('-') && word.contains('f'))
+    {
+        return Some(Vec::new());
+    }
+    let name = |word: &str| {
+        let mut chars = word.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    if command == "printf" {
+        return Some(
+            bare.windows(2)
+                .filter(|pair| pair[0] == "-v" && name(pair[1]))
+                .map(|pair| pair[1].to_owned())
+                .chain(
+                    bare.iter()
+                        .filter_map(|word| word.strip_prefix("-v"))
+                        .filter(|rest| name(rest))
+                        .map(str::to_owned),
+                )
+                .collect(),
+        );
+    }
+    Some(
+        bare.iter()
+            .filter(|word| name(word))
+            .map(|word| (*word).to_owned())
+            .collect(),
+    )
 }
 
 /// How many `(` and `)` a segment holds outside quotes: a subshell or a

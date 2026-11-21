@@ -93,6 +93,7 @@ pub mod user_prompt;
 // deliberate decision to widen the surface, rather than finding it already open.
 mod arg_chain;
 mod description_poison;
+mod line_values;
 mod shell;
 mod shell_words;
 mod typosquat;
