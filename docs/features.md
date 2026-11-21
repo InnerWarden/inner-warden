@@ -203,8 +203,14 @@ list, with every limit.
   the folder it names is taken as your `~/.claude`: `contain` checks the
   settings there, arms the guard's hook there, gives the jail copies of
   them and covers that folder, and in the jail the variable names the
-  jail's own folder. A value that is not a full path (relative, or with a
-  `..` in it) refuses the start. Not handed in, the variable stays out of
+  jail's own folder (on Linux and on macOS). A value that is not a full
+  path (relative, or with a `..` in it) refuses the start, and so does a
+  folder the jail could not guard: `/`, your home or a folder above it, the
+  project or a folder in it, a folder the jail writes (`~/.local`,
+  `~/.cache`, `~/.cargo`, `~/.rustup`, `~/.npm`, or `~/.config` itself; a
+  folder in `~/.config` such as `~/.config/claude` is covered in place), a
+  folder that is not there, a link or a file. `contain --setup` checks the
+  same before it arms anything. Not handed in, the variable stays out of
   the jail and `~/.claude` is your folder, as before.
   Limit: a second Claude Code an agent starts in the jail with another
   `CLAUDE_CONFIG_DIR` reads the settings in that folder, not the jail's

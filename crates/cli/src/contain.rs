@@ -2340,6 +2340,75 @@ pub fn persons_claude_dir(
     Ok(path.components().collect())
 }
 
+/// The dotdirs a jail writes in which a folder `CLAUDE_CONFIG_DIR` names is
+/// refused: every one of [`DOTDIR_RW`] but `.config`, whose folders a jail
+/// does not reach are covered in place as `~/.config/innerwarden` is (and
+/// `~/.config` itself is refused).
+fn claude_dir_in_jail_dotdir(home: &Path, dir: &Path) -> Option<PathBuf> {
+    DOTDIR_RW
+        .iter()
+        .map(|name| home.join(name))
+        .find(|rw| dir == rw.as_path() || (dir.starts_with(rw) && !rw.ends_with(".config")))
+}
+
+/// PURE. Why the folder `dir` named by `CLAUDE_CONFIG_DIR` cannot be the
+/// person's Claude Code folder for a jail of `project` from `home`, by its
+/// name alone: `/`, the home or a folder above it (the jail would cover the
+/// home), in the project, or a folder the jail writes ([`DOTDIR_RW`]).
+/// `project` is `None` for `contain --setup`, which has none.
+pub fn claude_dir_name_refusal(home: &Path, project: Option<&Path>, dir: &Path) -> Option<String> {
+    let why = if dir.parent().is_none() || home.starts_with(dir) {
+        "is / or your home folder or a folder above it".to_string()
+    } else if project.is_some_and(|project| paths_overlap(dir, project)) {
+        "is in the project or holds it, and the jail writes the project".to_string()
+    } else {
+        let rw = claude_dir_in_jail_dotdir(home, dir)?;
+        format!("is in {}, which the jail writes", printable(&rw))
+    };
+    Some(format!(
+        "refusing to start: CLAUDE_CONFIG_DIR names {}, which {why}; name a folder of its own \
+         for Claude Code (for example ~/.config/claude)",
+        printable(dir)
+    ))
+}
+
+/// Why the folder `dir` named by `CLAUDE_CONFIG_DIR` cannot be the
+/// person's Claude Code folder ([`claude_dir_name_refusal`], as named and
+/// where it leads), or that it is not there, is not a folder or is a link:
+/// checked before anything is written, so a refused folder is never made
+/// or armed. `None` for `~/.claude`, checked as it always was.
+pub fn claude_dir_refusal(home: &Path, project: Option<&Path>, dir: &Path) -> Option<String> {
+    if dir == home.join(CLAUDE_DIR) {
+        return None;
+    }
+    let project_real =
+        project.map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf()));
+    if let Some(why) = claude_dir_name_refusal(home, project_real.as_deref(), dir) {
+        return Some(why);
+    }
+    let said = |what: &str| {
+        Some(format!(
+            "refusing to start: CLAUDE_CONFIG_DIR names {}, which {what}; make the folder \
+             (not a link) and start again",
+            printable(dir)
+        ))
+    };
+    match std::fs::symlink_metadata(dir) {
+        Err(_) => return said("is not there"),
+        Ok(meta) if meta.file_type().is_symlink() => return said("is a link"),
+        Ok(meta) if !meta.is_dir() => return said("is not a folder"),
+        Ok(_) => {}
+    }
+    let real = std::fs::canonicalize(dir).ok()?;
+    let home_real = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    if real != dir {
+        if let Some(why) = claude_dir_name_refusal(&home_real, project_real.as_deref(), &real) {
+            return Some(why);
+        }
+    }
+    None
+}
+
 /// The launcher's copy, in the jail's own `~/.claude` (`source`), of the
 /// person's Claude Code settings file `at` (one of
 /// [`CLAUDE_GUARD_SETTINGS`]).
@@ -4388,6 +4457,9 @@ pub fn build_macos_profile(input: &JailInputs) -> Result<MacosJailPlan, ContainE
 
     let mut env = compute_jail_env(input);
     if let Some(claude) = &input.project_claude {
+        // One value, the jail's own folder, also where the person's was
+        // handed in (NEW-20261020-jail-config-dir-not-covered).
+        env.retain(|(name, _)| name != CLAUDE_CONFIG_ENV);
         env.push((
             "CLAUDE_CONFIG_DIR".to_string(),
             claude.source.to_string_lossy().to_string(),
@@ -9175,6 +9247,100 @@ mod tests {
             .position(|w| w[0] == "--bind" && w[2] == "/home/dev/.claude")
             .unwrap();
         assert!(cover < own, "{got:?}");
+        // macOS: the jail's Claude Code gets the jail's own folder, one value.
+        let mut mac = inputs(&["claude"]);
+        mac.claude_host_dir = PathBuf::from("/Users/dev/.config/claude");
+        let source = PathBuf::from("/Users/dev/.local/state/innerwarden/jail-claude/p-0123");
+        mac.project_claude = Some(ProjectClaude {
+            covered: vec![],
+            folder: source.clone(),
+            source: source.clone(),
+        });
+        let env = build_macos_profile(&mac).unwrap().env;
+        let named: Vec<&String> = env
+            .iter()
+            .filter(|(name, _)| name == CLAUDE_CONFIG_ENV)
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(named, [&source.to_string_lossy().to_string()], "{env:?}");
+    }
+
+    /// Review of #357, items 4 and 6: `CLAUDE_CONFIG_DIR` naming `/`, the
+    /// home or a folder above it, the project or a folder in it, or a
+    /// folder the jail writes (`~/.local`, `~/.cache`, `~/.config` itself)
+    /// is refused by name; a folder in `~/.config` (covered in place) or
+    /// out of the home is not. `--setup` has no project.
+    ///
+    /// FAILS ON REVERT: take any absolute folder.
+    #[test]
+    fn a_claude_config_dir_the_jail_would_cover_or_write_is_refused_by_name() {
+        let home = Path::new("/home/dev");
+        let project = Some(Path::new("/home/dev/proj"));
+        for bad in [
+            "/",
+            "/home",
+            "/home/dev",
+            "/home/dev/proj",
+            "/home/dev/proj/.claude-cfg",
+            "/home/dev/.local",
+            "/home/dev/.local/claude",
+            "/home/dev/.cache/claude",
+            "/home/dev/.npm/c",
+            "/home/dev/.config",
+        ] {
+            let why = claude_dir_name_refusal(home, project, Path::new(bad))
+                .unwrap_or_else(|| panic!("{bad} taken"));
+            assert!(
+                why.contains("refusing to start") && why.contains(bad),
+                "{bad}: {why}"
+            );
+        }
+        for good in ["/home/dev/.config/claude", "/srv/claude", "/home/dev/cfg"] {
+            assert_eq!(
+                claude_dir_name_refusal(home, project, Path::new(good)),
+                None,
+                "{good}"
+            );
+        }
+        assert_eq!(
+            claude_dir_name_refusal(home, None, Path::new("/home/dev/proj/.claude-cfg")),
+            None
+        );
+    }
+
+    /// Review of #357, items 3 and 7: a folder that is not there, a link,
+    /// or a file is refused before anything is written, and a link is
+    /// judged where it leads too. `~/.claude` is checked as before.
+    ///
+    /// FAILS ON REVERT: take the folder as named, or follow the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_config_dir_not_there_a_link_or_a_file_is_refused() {
+        let root = tempfile::TempDir::new().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("proj");
+        std::fs::create_dir_all(home.join("cfg")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(home.join("file"), "x").unwrap();
+        std::os::unix::fs::symlink(home.join("cfg"), home.join("link")).unwrap();
+        let p = Some(project.as_path());
+        for (name, said) in [
+            ("missing", "is not there"),
+            ("link", "is a link"),
+            ("file", "is not a folder"),
+        ] {
+            let why = claude_dir_refusal(&home, p, &home.join(name))
+                .unwrap_or_else(|| panic!("{name} taken"));
+            assert!(why.contains(said), "{name}: {why}");
+        }
+        assert!(!home.join("missing").exists());
+        assert_eq!(claude_dir_refusal(&home, p, &home.join("cfg")), None);
+        assert_eq!(claude_dir_refusal(&home, p, &home.join(".claude")), None);
+        // A folder under a link that leads into the project.
+        std::os::unix::fs::symlink(&project, home.join("via")).unwrap();
+        std::fs::create_dir_all(project.join("c")).unwrap();
+        let why = claude_dir_refusal(&home, p, &home.join("via/c")).unwrap();
+        assert!(why.contains("project"), "{why}");
     }
 
     /// Second review of #352: a hook of the person's that runs a file in

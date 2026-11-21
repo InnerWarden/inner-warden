@@ -101,6 +101,16 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Checked before anything is written: a refused folder is never made
+    // or armed (`hook::install_hook` makes the folder it is given).
+    if let Some(why) = crate::contain::claude_dir_refusal(
+        &home,
+        (!args.setup_only).then_some(args.project.as_path()),
+        &claude_dir,
+    ) {
+        eprintln!("innerwarden contain: {why}");
+        return ExitCode::from(2);
+    }
     let claude_settings = claude_dir.join("settings.json");
     let claude_settings_arg = claude_settings.to_string_lossy().to_string();
     let settings_named = (claude_dir != home.join(crate::contain::CLAUDE_DIR))
