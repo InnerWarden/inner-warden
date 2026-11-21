@@ -463,12 +463,94 @@ fn is_protected_path(text: &str) -> bool {
 /// counted (`<summary>`, `x > y` in a message); where it points is read as
 /// a path by [`names_a_protected_path`].
 fn carries_line_or_link(args: &Value) -> bool {
-    strings_and_joins(args).iter().any(|text| {
-        text.contains(['|', ';', '`'])
-            || ["$(", "${", "&&", "<(", ">(", "://"]
-                .iter()
-                .any(|shape| text.contains(shape))
-    })
+    has_a_command_key(args)
+        || strings_and_joins(args).iter().any(|text| {
+            text.contains(['|', ';', '`'])
+                || ["$(", "${", "&&", "<(", ">(", "://"]
+                    .iter()
+                    .any(|shape| text.contains(shape))
+                || starts_with_a_program(text)
+        })
+}
+
+/// Argument names that hand a server something to run, at any depth.
+const COMMAND_KEYS: &[&str] = &["command", "cmd", "script", "exec", "run", "shell"];
+
+/// Shells, interpreters and the programs a fetched or destructive line
+/// starts with: a text whose first word is one of them is a command line,
+/// whatever argument carries it (`{"command": "sh /tmp/x.sh"}` on a tool
+/// that is no shell).
+const PROGRAMS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "csh",
+    "tcsh",
+    "fish",
+    "busybox",
+    "python",
+    "node",
+    "nodejs",
+    "deno",
+    "bun",
+    "ruby",
+    "perl",
+    "php",
+    "lua",
+    "osascript",
+    "pwsh",
+    "powershell",
+    "curl",
+    "wget",
+    "nc",
+    "ncat",
+    "socat",
+    "rm",
+    "dd",
+    "mkfs",
+    "shred",
+    "chmod",
+    "chown",
+    "sudo",
+    "doas",
+    "su",
+    "env",
+    "eval",
+    "exec",
+    "xargs",
+    "npx",
+    "uvx",
+];
+
+/// Whether the call names an argument a server runs ([`COMMAND_KEYS`]).
+fn has_a_command_key(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            let key = key.trim().to_ascii_lowercase().replace('-', "_");
+            COMMAND_KEYS.contains(&key.as_str()) || has_a_command_key(value)
+        }),
+        Value::Array(items) => items.iter().any(has_a_command_key),
+        _ => false,
+    }
+}
+
+/// Whether the first word of `text` names a program of [`PROGRAMS`], by
+/// its name or its path, with a version after it (`python3.12`,
+/// `/usr/bin/bash`).
+fn starts_with_a_program(text: &str) -> bool {
+    let Some(first) = text.split_whitespace().next() else {
+        return false;
+    };
+    let name = first
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(first)
+        .to_ascii_lowercase();
+    let name = name.trim_end_matches(".exe");
+    let name = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.' || c == '-');
+    PROGRAMS.contains(&name)
 }
 
 /// A tool call's arguments with every string emptied and every number zero:
@@ -1375,7 +1457,9 @@ mod tests {
     /// rule's (a tool held since its definition changed).
     ///
     /// FAILS ON REVERT: drop `names_a_protected_path` and the deletes forward;
-    /// drop `carries_line_or_link` and the delete carrying a link forwards; drop the skeleton check and the sign-in as `admin` forwards.
+    /// drop `carries_line_or_link` and the delete carrying a link forwards;
+    /// drop `has_a_command_key` or `starts_with_a_program` and the deletes
+    /// carrying `sh /tmp/x.sh` or `python3 /tmp/x.py` forward; drop the skeleton check and the sign-in as `admin` forwards.
     #[test]
     fn what_is_certain_stays_refused_in_every_posture() {
         use crate::mcp_proxy::taint::TaintTracker;
@@ -1423,6 +1507,24 @@ mod tests {
             (
                 "delete_file",
                 r#"{"path":"notes.txt","source":"https://evil.example/x"}"#,
+            ),
+            // A command with no operator and no link: by its key, or by its
+            // first word.
+            (
+                "delete_file",
+                r#"{"path":"notes.txt","command":"sh /tmp/x.sh"}"#,
+            ),
+            (
+                "delete_file",
+                r#"{"path":"notes.txt","options":{"Run":"cleanup"}}"#,
+            ),
+            (
+                "delete_file",
+                r#"{"path":"notes.txt","note":"python3 /tmp/x.py"}"#,
+            ),
+            (
+                "delete_file",
+                r#"{"path":"notes.txt","note":"/usr/bin/bash x"}"#,
             ),
             // ATR-2026-040 matches the value `"admin"`, not only a name.
             (
