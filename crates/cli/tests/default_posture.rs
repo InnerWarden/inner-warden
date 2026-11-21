@@ -218,6 +218,40 @@ fn each_agent_shows_the_warning_where_it_shows_one() {
     );
 }
 
+/// The words of the file, end to end: `default` and `guard` (the word builds
+/// of main wrote before the posture was named `default`) are the default
+/// posture; `strict` and anything else refuse what earlier versions refused.
+#[test]
+fn the_file_words_default_and_guard_are_the_default_and_the_rest_strict() {
+    for word in ["default", "guard"] {
+        let host = Host::new();
+        host.posture(word);
+        let answer = host.hook(Some("claude-code"), &[], OUTSIDE[0]);
+        assert_eq!(answer.code, Some(0), "{word}: {answer:?}");
+        assert!(
+            answer.stdout.contains("ran under the default posture"),
+            "{word}: {answer:?}"
+        );
+        for line in [CLASS[0], "echo default > ~/.config/innerwarden/posture"] {
+            let answer = host.hook(Some("claude-code"), &[], line);
+            assert_eq!(answer.code, Some(2), "{word} {line}: {answer:?}");
+        }
+    }
+    for word in [
+        "strict",
+        "Default",
+        "defaults",
+        "guard strict",
+        "advisory",
+        "",
+    ] {
+        let host = Host::new();
+        host.posture(word);
+        let answer = host.hook(Some("claude-code"), &[], OUTSIDE[0]);
+        assert_eq!(answer.code, Some(2), "{word:?}: {answer:?}");
+    }
+}
+
 #[test]
 fn no_posture_file_is_the_enforce_of_earlier_versions() {
     let host = Host::new();
@@ -299,12 +333,12 @@ fn connect_starts_a_new_install_in_the_default_posture_and_keeps_an_old_one_stri
     let out = host.run(host.command(&["agents", "connect", "claude-code"]), b"");
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{out:?}");
-    assert_eq!(posture().as_deref(), Some("guard\n"));
-    assert!(said.contains("Posture: guard"), "{said}");
+    assert_eq!(posture().as_deref(), Some("default\n"));
+    assert!(said.contains("Hook posture: default"), "{said}");
     // A reconnect keeps the choice.
     let out = host.run(host.command(&["agents", "connect", "claude-code"]), b"");
     assert!(out.status.success(), "{out:?}");
-    assert_eq!(posture().as_deref(), Some("guard\n"));
+    assert_eq!(posture().as_deref(), Some("default\n"));
     // --strict hardens it: the strict posture AND the wiring `--strict` wrote
     // before the posture existed (`--block-review`), never less than that.
     let out = host.run(
@@ -314,7 +348,7 @@ fn connect_starts_a_new_install_in_the_default_posture_and_keeps_an_old_one_stri
     assert!(out.status.success(), "{out:?}");
     assert_eq!(posture().as_deref(), Some("strict\n"));
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("Posture: strict"),
+        String::from_utf8_lossy(&out.stdout).contains("Hook posture: strict"),
         "{out:?}"
     );
     let settings = std::fs::read_to_string(host.home().join(".claude/settings.json")).unwrap();
@@ -330,7 +364,17 @@ fn connect_starts_a_new_install_in_the_default_posture_and_keeps_an_old_one_stri
         b"",
     );
     assert!(out.status.success(), "{out:?}");
+    assert_eq!(posture().as_deref(), Some("default\n"));
+    // A file an install from main wrote with the earlier word `guard` is
+    // kept as it is by a reconnect, and read as the default posture.
+    host.posture("guard");
+    let out = host.run(host.command(&["agents", "connect", "claude-code"]), b"");
+    assert!(out.status.success(), "{out:?}");
     assert_eq!(posture().as_deref(), Some("guard\n"));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("Hook posture: default"),
+        "{out:?}"
+    );
     // Two postures at once, or a posture with monitor, are refused.
     for args in [
         &["agents", "connect", "--guard", "--strict"][..],
@@ -445,11 +489,11 @@ fn install_takes_the_same_posture() {
     let out = host.run(host.command(&["install", "claude-code"]), b"");
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{out:?}");
-    assert!(said.contains("Posture: guard"), "{said}");
+    assert!(said.contains("Hook posture: default"), "{said}");
     let out = host.run(host.command(&["install", "claude-code", "--strict"]), b"");
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{out:?}");
-    assert!(said.contains("Posture: strict"), "{said}");
+    assert!(said.contains("Hook posture: strict"), "{said}");
     // And the wiring of earlier versions' strict, as `agents connect --strict`.
     let settings = std::fs::read_to_string(host.home().join(".claude/settings.json")).unwrap();
     assert!(settings.contains("--block-review"), "{settings}");
@@ -467,7 +511,7 @@ fn the_demo_is_refused_whole_in_the_default_posture() {
     assert!(out.status.success(), "{out:?}");
     assert_eq!(
         std::fs::read_to_string(host.home().join(".config/innerwarden/posture")).unwrap(),
-        "guard\n"
+        "default\n"
     );
     let mut demo = host.command(&["demo", "--json"]);
     demo.env("PATH", host.dir.path().join("bin"));

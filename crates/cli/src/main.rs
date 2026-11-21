@@ -2579,7 +2579,7 @@ fn runs_with_a_warning(
 ) -> bool {
     warned
         || (is_review(verdict)
-            && posture == innerwarden_agent_guard::posture::Posture::Guard
+            && posture == innerwarden_agent_guard::posture::Posture::Default
             && !innerwarden_agent_guard::posture::verdict_is_high_certainty(verdict))
 }
 
@@ -3666,7 +3666,7 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
         );
         return std::process::ExitCode::from(2);
     }
-    let guard_asked = posture_asked == Some(innerwarden_agent_guard::posture::Posture::Guard);
+    let guard_asked = posture_asked == Some(innerwarden_agent_guard::posture::Posture::Default);
     // Installing the hook in monitor rewires it to record only, as `agents
     // connect --monitor` does: the person's, never a command an AI agent's
     // shell runs (review of 1.6.6, H1). The guard refuses the agent running
@@ -3733,7 +3733,7 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
                     "nothing (monitor: records every command, never blocks)"
                 } else if report.block_review {
                     "deny + review"
-                } else if posture == innerwarden_agent_guard::posture::Posture::Guard {
+                } else if posture == innerwarden_agent_guard::posture::Posture::Default {
                     "the high-certainty class (default posture); every other deny or review runs with a warning"
                 } else {
                     "deny"
@@ -5692,23 +5692,23 @@ mod tests {
         ] {
             let verdict = review(signal, score);
             assert!(
-                !runs_with_a_warning(false, &verdict, Posture::Guard),
+                !runs_with_a_warning(false, &verdict, Posture::Default),
                 "{signal} ran with a warning under the default posture"
             );
             assert!(!runs_with_a_warning(false, &verdict, Posture::Strict));
         }
         // Outside the class, a review runs with a warning under guard only.
         let plain = review("network_exfil_hint", 15);
-        assert!(runs_with_a_warning(false, &plain, Posture::Guard));
+        assert!(runs_with_a_warning(false, &plain, Posture::Default));
         assert!(!runs_with_a_warning(false, &plain, Posture::Strict));
         // A subsumed signal of the class does not decide.
         assert!(runs_with_a_warning(
             false,
             &review("download_chmod_execute", 0),
-            Posture::Guard
+            Posture::Default
         ));
         // A refusal the posture does not hold runs with a warning either way.
-        assert!(runs_with_a_warning(true, &plain, Posture::Guard));
+        assert!(runs_with_a_warning(true, &plain, Posture::Default));
     }
 
     #[test]

@@ -146,7 +146,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              This is the ENFORCING guardrail: in guard/kill/strict mode a disallowed call\n  \
              is blocked inline. stdout stays pure MCP bytes; alerts go to stderr.\n\
              \n  \
-             --mode             advisory | warn | guard (default) | kill | strict\n  \
+             --mode             MCP proxy mode: advisory | warn | guard (default) | kill | strict\n  \
+             \x20                  (not the hook posture, default | strict, which only `hook` reads)\n  \
              \x20                  (strict: as guard, but a refusal by the tool's name or its\n  \
              \x20                  argument names stays a refusal; kill also stops the server)\n  \
              --label            name carried on the alert lines (default: innerwarden)\n  \
@@ -173,12 +174,15 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              --block-review   refuse `review` verdicts everywhere (default: a review asks you on Claude Code and Hermes, runs with a warning on Codex, is refused elsewhere)\n  \
              --monitor        record every command and never block\n\
              \n  \
-             With no flag the hook runs in the posture kept in\n  \
-             ~/.config/innerwarden/posture: `guard` (the default of a new install)\n  \
+             Hook posture. With no flag the hook runs in the posture kept in\n  \
+             ~/.config/innerwarden/posture: `default` (a new install's; `guard`, its\n  \
+             earlier word, is read the same)\n  \
              refuses only a hard secret read, destruction of the system or a home, an\n  \
              act that takes the guard down, a reverse shell and download-and-run, and\n  \
              every other deny or review runs with a one-line warning, recorded as\n  \
-             would_block; `strict`, or no file, refuses every deny as earlier versions did."
+             would_block; `strict`, or no file, refuses every deny as earlier versions did.\n  \
+             The MCP proxy's modes (`proxy --mode`) are its own; its `guard` is not\n  \
+             this posture."
         ),
         "setup" => format!(
             "{p} setup\n  \
@@ -203,7 +207,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              \x20                 wired with --block-review); a new\n  \
              \x20                 install otherwise starts in the default posture, which\n  \
              \x20                 refuses only the high-certainty class and warns of the rest\n  \
-             --guard           move a strict install to the default posture (your terminal only)\n  \
+             --guard           move a strict install to the default hook posture (your terminal only)\n  \
              --block-review    refuse `review` verdicts everywhere (default: a review asks you on Claude Code and Hermes, runs with a warning on Codex, is refused elsewhere)\n  \
              --monitor         record every command and never block"
         ),

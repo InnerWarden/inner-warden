@@ -1441,14 +1441,29 @@ pub fn posture_line(facts: &Facts) -> Option<String> {
         return None;
     }
     let harden = match posture {
-        Posture::Guard => {
+        Posture::Default => {
             "\n  Refuse every deny and every review instead: \
              innerwarden agents connect --strict"
         }
         Posture::Strict => "",
     };
+    // The MCP proxy has modes of its own, one of them also called `guard`:
+    // where a wired agent goes through it, say that the posture is not them.
+    let proxy = if facts.tool_classes.iter().any(|t| {
+        matches!(
+            t,
+            ToolClasses::Proxy { .. }
+                | ToolClasses::HookAndProxy { .. }
+                | ToolClasses::OpenClawPlugin { proxy: true, .. }
+        )
+    }) {
+        "\n  MCP proxy mode: set per server by `proxy --mode` (advisory, warn, guard, \
+         strict, kill; wiring writes guard); the hook posture does not change it."
+    } else {
+        ""
+    };
     Some(format!(
-        "  Posture: {} ({}).{harden}",
+        "  Hook posture: {} ({}).{harden}{proxy}",
         posture.word(),
         refuses_summary(posture)
     ))
@@ -1486,19 +1501,28 @@ mod tests {
     fn status_says_the_posture_where_a_hook_enforces() {
         use innerwarden_agent_guard::posture::Posture;
         let mut facts = Facts {
-            posture: Some(Posture::Guard),
+            posture: Some(Posture::Default),
             mode: Some("enforce".into()),
             wired_agents: vec!["claude-code".into()],
             ..Facts::default()
         };
         let line = posture_line(&facts).expect("said");
-        assert!(line.contains("Posture: guard"), "{line}");
+        assert!(line.contains("Hook posture: default"), "{line}");
+        assert!(!line.contains("MCP proxy mode"), "{line}");
         assert!(line.contains("reverse shells"), "{line}");
         assert!(line.contains("connect --strict"), "{line}");
-        assert!(render(&facts).contains("Posture: guard"));
+        assert!(render(&facts).contains("Hook posture: default"));
+        // An agent wired through the proxy: its mode is named apart.
+        facts.tool_classes = vec![ToolClasses::Proxy {
+            agent: "cursor".into(),
+        }];
+        let line = posture_line(&facts).expect("said");
+        assert!(line.contains("MCP proxy mode:"), "{line}");
+        assert!(line.contains("hook posture does not change it"), "{line}");
+        facts.tool_classes.clear();
         facts.posture = Some(Posture::Strict);
         let line = posture_line(&facts).expect("said");
-        assert!(line.contains("Posture: strict"), "{line}");
+        assert!(line.contains("Hook posture: strict"), "{line}");
         assert!(line.contains("refuses every deny"), "{line}");
         facts.mode = Some("monitor".into());
         assert_eq!(posture_line(&facts), None);

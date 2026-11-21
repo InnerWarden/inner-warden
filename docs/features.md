@@ -393,7 +393,7 @@ Operator decision of 2026-11-21: the text rules are triage, not the boundary.
 An enforcing hook line with no mode flag runs in the posture kept in
 `~/.config/innerwarden/posture`:
 
-- `guard`, the default posture, written by the first `agents connect`,
+- `default`, the default posture, written by the first `agents connect`,
   `install` or `setup` on a home with no wiring yet. A shell call is refused
   only when the strict policy below refuses it AND one of its signals is in
   the high-certainty class:
@@ -424,8 +424,11 @@ An enforcing hook line with no mode flag runs in the posture kept in
   hardens the guard.
 
 `agents connect --strict` and `install --strict` write `strict`;
-`--guard` writes `guard` and, since it lowers what the hook refuses, is
-refused in an agent's shell and by the guard when an agent runs it. With no
+`--guard` writes `default` and, since it lowers what the hook refuses, is
+refused in an agent's shell and by the guard when an agent runs it. A file
+that says `guard`, the word builds of main wrote before the posture was named
+`default`, is read as `default`. `innerwarden status` prints it as
+`Hook posture: default` or `Hook posture: strict`. With no
 flag a posture already chosen stays. The file is in the guard's own folder,
 which an agent cannot write (the file rules and the shell rules refuse it).
 
@@ -434,7 +437,11 @@ unreadable, past its deadline) is refused in both; a write of a file tool
 to a privileged file is refused in both; a `--block-review` line refuses
 every review and a `--monitor` line refuses nothing, whatever the file
 says; where per-agent profiles are in force the call is held to them as
-strict holds it; the MCP proxy and the OpenClaw plugin keep their own modes.
+strict holds it; the MCP proxy and the OpenClaw plugin keep their own modes. The MCP proxy's
+modes (`advisory`, `warn`, `guard`, `strict`, `kill`, set by `proxy --mode`)
+are not this posture: its `guard` is a proxy mode, and the hook posture is
+only ever `default` or `strict`. Where an agent goes through the proxy,
+`status` says so under the posture, as `MCP proxy mode`.
 
 Measured with the release safety suite on 2026-11-21
 (`cargo test -p innerwarden-agent-guard --test release_eval_posture -- --nocapture`;
