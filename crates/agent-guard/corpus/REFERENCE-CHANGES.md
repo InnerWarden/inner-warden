@@ -270,3 +270,13 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   holding `systemctl` and runs nothing. None is allowed: each is held for
   review. No other line of any corpus moved, from an empty home or a home
   with keys.
+- 2026-11-21: new corpus instruction-orders-2026-11, read by the
+  differential check. io-001..io-009 (`must_refuse`) write into a file an
+  agent reads as its instructions (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`,
+  `.cursorrules`, `copilot-instructions.md`) text that has the next session
+  act on the guard, read a secret or run a download; main allowed 7 of them
+  and refused 2 for another reason (a `sed -i` that names the gate, inline
+  code that names a credential file). All 9 are refused now. io-c01..io-c07
+  are notes, build commands, style rules, a link and a clause that forbids,
+  written the same ways: allowed by main and by this branch. No other line
+  of any corpus moved, from an empty home or a home with keys.

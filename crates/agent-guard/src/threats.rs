@@ -4,7 +4,10 @@ mod glob_names;
 mod guard_doubt;
 mod guard_lowering;
 mod guard_takedown;
+mod instruction_files;
 mod words_after;
+
+pub(crate) use instruction_files::{instruction_file_payloads, order_reading};
 
 /// Prompt injection markers in tool descriptions or responses.
 pub const INJECTION_PATTERNS: &[&str] = &[

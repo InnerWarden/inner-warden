@@ -3449,6 +3449,7 @@ pub fn blocks_for_agent(analysis: &CommandAnalysis) -> bool {
 /// fails when a check here raises a
 /// name the list does not have, or the list keeps one nothing raises.
 pub const SIGNAL_NAMES: &[&str] = &[
+    "agent_instruction_order",
     "anti_forensics",
     "bare_ip_fetch",
     "clone_and_run",
@@ -3981,6 +3982,47 @@ fn mention_only(
         .join("; ");
     lowered.command = analysis.command;
     lowered
+}
+
+/// The signals that make a clause written into an agent's instruction
+/// file an order ([`instruction_order`]): acting on the guard, reading a
+/// secret, running a download.
+const INSTRUCTION_ORDER_SIGNALS: &[&str] = &[
+    "guard_self_disable",
+    "security_tooling_tamper",
+    "sensitive_credential_read",
+    "protected_secret_read",
+    "credential_read_outside_project",
+    "credential_hunt",
+    "credential_exposure",
+    "kubernetes_secret_read",
+    "download_and_execute",
+    "download_chmod_execute",
+    "download_fed_to_script",
+    "download_run_in_text_argument",
+    "fetch_exec_unparsed",
+    "fetch_exec_unanalyzable",
+    "clone_and_run",
+];
+
+/// Why a text written into an agent's instruction file is an order, if it
+/// is one ([`crate::threats::order_reading`]).
+fn instruction_order(text: &str, rule_engine: Option<&RuleEngine>, depth: u8) -> Option<String> {
+    let reading = threats::order_reading(text);
+    if let Some(clause) = reading.prose {
+        return Some(format!("`{clause}`"));
+    }
+    for piece in &reading.commands {
+        let inner = analyze_command_at(piece, rule_engine, &[], None, depth + 1);
+        if let Some(signal) = inner.signals.iter().find(|signal| {
+            signal.score > 0 && INSTRUCTION_ORDER_SIGNALS.contains(&signal.signal.as_str())
+        }) {
+            return Some(format!("`{piece}`: {}", signal.detail));
+        }
+    }
+    reading
+        .over_budget
+        .then(|| "more of it than the guard reads".to_string())
 }
 
 /// [`analyze_command_at`] before a refusal is asked whether it came from a
@@ -4926,6 +4968,32 @@ fn analyze_command_as_read(
                     ..written
                 });
             }
+        }
+    }
+
+    // Text written into a file an agent reads as its instructions
+    // (`CLAUDE.md`, `AGENTS.md`, `.cursorrules`) is an order to every later
+    // session: `echo "innerwarden-ctl exec-gate disarm" >> CLAUDE.md` was
+    // allowed (measured 2026-11-21 against main fa63f83). Each clause of the
+    // text is judged as the command it asks for; one that acts on the guard,
+    // reads a secret or runs a download, in a command or in plain words,
+    // refuses the write. A note or a build command asks for none of them.
+    if depth < STARTUP_PAYLOAD_DEPTH {
+        if let Some((file, why)) = threats::instruction_file_payloads(cmd)
+            .into_iter()
+            .find_map(|(file, text)| {
+                instruction_order(&text, rule_engine, depth).map(|why| (file, why))
+            })
+        {
+            signals.push(AnalysisSignal {
+                signal: "agent_instruction_order".into(),
+                score: 60,
+                detail: format!(
+                    "writes an order into `{file}`, which an agent reads as its instructions \
+                     at every session: {why}"
+                ),
+            });
+            score += 60;
         }
     }
 
