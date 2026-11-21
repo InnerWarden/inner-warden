@@ -460,7 +460,8 @@ fn restore_remote(obj: &mut serde_json::Map<String, Value>, url: &str, words: &[
             Some("--env") => had_env = true,
             // Goose's extension keeps its `headers` where they were; the
             // proxy reads them there (`mcp_wire_yaml`).
-            Some("--goose-headers") if it.next().and_then(Value::as_str).is_some() => {}
+            Some("--goose-headers" | "--goose-config")
+                if it.next().and_then(Value::as_str).is_some() => {}
             Some(flag @ ("--key" | "--type")) => match (flag, it.next().and_then(Value::as_str)) {
                 ("--key", Some(value)) if REMOTE_URL_KEYS.contains(&value) => key = value.into(),
                 ("--type", Some(value)) => kind = Some(value.to_string()),

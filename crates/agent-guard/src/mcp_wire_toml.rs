@@ -30,7 +30,9 @@
 
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value};
 
-use crate::mcp_proxy::remote::{is_env_name, is_header_name, is_remote_url, HEADER_ENV_PREFIX};
+use crate::mcp_proxy::remote::{
+    is_env_name, is_header_name, is_remote_url, HEADER_ENV_PREFIX, MAX_HEADERS,
+};
 use crate::mcp_wire::{is_guard_command, is_wrapper_name, naming, proxy_agent, wrapper_blocks};
 
 /// Effective enforcement of MCP servers wired through the local proxy.
@@ -369,10 +371,70 @@ fn remote_entry(server: &Table) -> Option<RemoteEntry> {
             _ => {}
         }
     }
+    // The proxy sends at most MAX_HEADERS headers: a table with more is left
+    // as it was, never carried with some of its headers dropped.
+    if header_count(&keys) > MAX_HEADERS {
+        return None;
+    }
     Some(RemoteEntry {
         url: url.to_string(),
         keys,
     })
+}
+
+/// How many headers the keys of a remote table send: the token is one.
+fn header_count(keys: &[RemoteKey]) -> usize {
+    keys.iter()
+        .map(|key| match key {
+            RemoteKey::Bearer(_) => 1,
+            RemoteKey::Headers(pairs) | RemoteKey::EnvHeaders(pairs) => pairs.len(),
+        })
+        .sum()
+}
+
+/// Why the proxy does not carry a server reached by URL, in a word a person
+/// finds in the table: the first key of [`NOT_CARRIED_KEYS`] it holds, or
+/// what else [`remote_entry`] refused. Names and keys only, never a value.
+fn not_carried_because(server: &Table) -> String {
+    if let Some(key) = NOT_CARRIED_KEYS.iter().find(|key| server.contains_key(key)) {
+        return (*key).to_string();
+    }
+    match server.get("url").and_then(Item::as_str) {
+        Some(url) if !is_remote_url(url) => return "url".to_string(),
+        None => return "url".to_string(),
+        _ => {}
+    }
+    let count: usize = ["http_headers", "env_http_headers"]
+        .iter()
+        .filter_map(|key| server.get(key).and_then(text_pairs))
+        .map(|pairs| pairs.len())
+        .sum::<usize>()
+        + usize::from(server.contains_key("bearer_token_env_var"));
+    if count > MAX_HEADERS {
+        return format!("more than {MAX_HEADERS} headers");
+    }
+    for key in ["bearer_token_env_var", "http_headers", "env_http_headers"] {
+        if server.contains_key(key) {
+            return key.to_string();
+        }
+    }
+    "url".to_string()
+}
+
+/// The servers of a Codex config reached by URL that the proxy does not
+/// carry, each as `name (key)`: the key that keeps it out
+/// ([`not_carried_because`]). For the line `agents connect` prints, as Goose's
+/// names its own. Pure.
+pub fn unscreened_remote_toml(doc: &DocumentMut) -> Vec<String> {
+    let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table) else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .filter_map(|(name, item)| Some((name, item.as_table()?)))
+        .filter(|(_, table)| table.contains_key("url") && !is_proxyable_server(table))
+        .map(|(name, table)| format!("{name} ({})", not_carried_because(table)))
+        .collect()
 }
 
 /// A table that runs a local command, or a remote server the proxy carries.
@@ -498,7 +560,10 @@ fn remote_as_local(server: &mut Table, remote: &RemoteEntry) {
                 server.insert("args", value(words.clone()));
             }
             "bearer_token_env_var" | "env_http_headers" => {
-                if vars_placed || unique.is_empty() {
+                // Placed even when it names no variable (`env_http_headers
+                // = {}`): disconnect reads `--env-headers` as a key that
+                // stands where `env_vars` is.
+                if vars_placed {
                     continue;
                 }
                 vars_placed = true;
@@ -1721,6 +1786,79 @@ args = ["-y", "srv"]
             .unwrap();
         assert!(is_guardable_toml(&remote_only));
         assert!(!is_automatic_wrap_safe_toml(&remote_only));
+    }
+
+    /// `env_http_headers = {}` names no variable: the wrapper still has
+    /// `env_vars` where it stood, so disconnect gives the table back byte for
+    /// byte. FAILS ON REVERT: skip `env_vars` when no variable is named, and
+    /// the table comes back as `command = "https://..."`, which Codex does
+    /// not load.
+    #[test]
+    fn an_empty_env_http_headers_comes_back_byte_for_byte() {
+        for text in [
+            "[mcp_servers.x]\nurl = \"https://x.example/mcp\"\nenv_http_headers = {}\n",
+            "[mcp_servers.x]\nurl = \"https://x.example/mcp\"\nhttp_headers = { A = \"1\" }\nenv_http_headers = {}\n",
+        ] {
+            let mut doc: DocumentMut = text.parse().unwrap();
+            assert_eq!(wrap_toml(&mut doc, BIN, false, "codex"), 1, "{text}");
+            assert!(
+                doc["mcp_servers"]["x"]["env_vars"].as_array().is_some(),
+                "{doc}"
+            );
+            assert_eq!(unwrap_toml(&mut doc), 1, "{doc}");
+            assert_eq!(doc.to_string(), text);
+        }
+    }
+
+    /// More headers than the proxy sends: the table is left as it was, never
+    /// carried with some of them dropped, and named with why.
+    #[test]
+    fn a_table_with_more_headers_than_the_proxy_sends_is_left_alone() {
+        let headers: Vec<String> = (0..=MAX_HEADERS)
+            .map(|n| format!("X-H{n} = \"v\""))
+            .collect();
+        let text = format!(
+            "[mcp_servers.many]\nurl = \"https://x.example/mcp\"\nhttp_headers = {{ {} }}\n",
+            headers.join(", ")
+        );
+        let mut doc: DocumentMut = text.parse().unwrap();
+        assert_eq!(wrap_toml(&mut doc, BIN, false, "codex"), 0);
+        assert_eq!(doc.to_string(), text);
+        assert_eq!(
+            unscreened_remote_toml(&doc),
+            [format!("many (more than {MAX_HEADERS} headers)")]
+        );
+        let at_the_cap: Vec<String> = (1..=MAX_HEADERS)
+            .map(|n| format!("X-H{n} = \"v\""))
+            .collect();
+        let text = format!(
+            "[mcp_servers.many]\nurl = \"https://x.example/mcp\"\nhttp_headers = {{ {} }}\n",
+            at_the_cap.join(", ")
+        );
+        let mut doc: DocumentMut = text.parse().unwrap();
+        assert_eq!(wrap_toml(&mut doc, BIN, false, "codex"), 1);
+    }
+
+    /// Each server reached by URL the proxy does not carry is named with the
+    /// key that keeps it out, and a carried or local one is not.
+    #[test]
+    fn the_servers_left_out_are_named_with_their_key() {
+        let mut doc: DocumentMut = CODEX.parse().unwrap();
+        assert_eq!(unscreened_remote_toml(&doc), ["signin (scopes)"]);
+        wrap_toml(&mut doc, BIN, false, "codex");
+        assert_eq!(unscreened_remote_toml(&doc), ["signin (scopes)"]);
+        let text = "[mcp_servers.a]\nurl = \"https://x.example/mcp\"\nbearer_token = \"t\"\n\n[mcp_servers.b]\nurl = \"https://x.example/mcp\"\nhttp_headers_helper = \"/bin/mint\"\n\n[mcp_servers.c]\nurl = \"https://x.example/mcp\"\nenvironment_id = \"e\"\n";
+        let doc: DocumentMut = text.parse().unwrap();
+        let named = unscreened_remote_toml(&doc);
+        assert_eq!(
+            named,
+            [
+                "a (bearer_token)",
+                "b (http_headers_helper)",
+                "c (environment_id)"
+            ]
+        );
+        assert!(named.iter().all(|line| !line.contains("\"t\"")));
     }
 
     /// A table the proxy cannot carry is left exactly as it was and counted

@@ -59,7 +59,7 @@ use tokio::sync::mpsc::{
 pub const HEADER_ENV_PREFIX: &str = "INNERWARDEN_MCP_HEADER_";
 
 /// Most headers read from the environment.
-const MAX_HEADERS: usize = 64;
+pub(crate) const MAX_HEADERS: usize = 64;
 
 /// Longest message the bridge relays: the loop's own cap on a line.
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
@@ -219,8 +219,9 @@ impl RemoteSpec {
     /// `Authorization: Bearer`, the variable must be set) and
     /// `--header-env <Name> <VAR>` (sent when the variable is set). A Goose
     /// server adds `--goose-headers <extension>`: the headers that
-    /// extension has in Goose's configuration, `$VAR` filled from the
-    /// environment Goose gives its servers. A value is only ever read where
+    /// extension has in Goose's configuration (the file `--goose-config
+    /// <path>` names, else `$HOME/.config/goose/config.yaml`), `$VAR` filled
+    /// from the environment Goose gives its servers. A value is only ever read where
     /// the agent itself would read it; none is written in the wrapper.
     pub fn from_cmd(
         cmd: &[String],
@@ -251,6 +252,8 @@ impl RemoteSpec {
         let mut legacy_sse = false;
         let mut headers = Vec::new();
         let mut from_vars: Vec<(String, String)> = Vec::new();
+        let mut goose_config: Option<String> = None;
+        let mut goose_extension: Option<String> = None;
         let mut words = rest.iter();
         let value_of = |word: &str, words: &mut std::slice::Iter<'_, String>| {
             words
@@ -295,21 +298,31 @@ impl RemoteSpec {
                         from_vars.push((name, value.trim().to_string()));
                     }
                 }
-                "--goose-headers" => {
-                    let extension = value_of(word, &mut words)?;
-                    let home = env("HOME").filter(|home| !home.is_empty()).ok_or(
-                        "HOME is not set, so Goose's configuration cannot be found".to_string(),
-                    )?;
-                    let config = read(&std::path::Path::new(&home).join(GOOSE_CONFIG))
-                        .ok_or("Goose's configuration could not be read".to_string())?;
-                    from_vars.extend(goose_headers(&config, &extension, &env)?);
-                }
+                "--goose-config" => goose_config = Some(value_of(word, &mut words)?),
+                "--goose-headers" => goose_extension = Some(value_of(word, &mut words)?),
                 other => {
                     return Err(format!(
                         "unexpected word `{other}` after the remote server's address"
                     ))
                 }
             }
+        }
+        if let Some(extension) = goose_extension {
+            // The file the wrapper names (`--goose-config`, written by
+            // connect), else Goose's own place under `HOME` (a wrapper
+            // written before the file was named).
+            let path = match goose_config {
+                Some(path) => std::path::PathBuf::from(path),
+                None => {
+                    let home = env("HOME").filter(|home| !home.is_empty()).ok_or(
+                        "HOME is not set, so Goose's configuration cannot be found".to_string(),
+                    )?;
+                    std::path::Path::new(&home).join(GOOSE_CONFIG)
+                }
+            };
+            let config =
+                read(&path).ok_or("Goose's configuration could not be read".to_string())?;
+            from_vars.extend(goose_headers(&config, &extension, &env)?);
         }
         for n in 1..=MAX_HEADERS {
             let name = format!("{HEADER_ENV_PREFIX}{n}");

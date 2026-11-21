@@ -1957,11 +1957,19 @@ fn connect_by_one_mechanism(
                 ),
             );
         }
+        // A server reached by URL the proxy does not carry is named, with
+        // the key that keeps it out, as Goose's line names its own.
+        let unscreened = mcp_wire_toml::unscreened_remote_toml(&doc);
+        let unscreened = if unscreened.is_empty() {
+            String::new()
+        } else {
+            format!("; not screened by the proxy: {}", unscreened.join(", "))
+        };
         return match write_toml(home, &path, &doc, &source, reject_symlinks) {
             Ok(()) if n == 0 => ConnectResult::new(
                 ConnectEffect::Unchanged,
                 format!(
-                    "  {} - already guarded (MCP proxy, {})",
+                    "  {} - already guarded (MCP proxy, {}{unscreened})",
                     r.name,
                     if monitor { "monitor" } else { "enforce" }
                 ),
@@ -1969,7 +1977,7 @@ fn connect_by_one_mechanism(
             Ok(()) => ConnectResult::new(
                 ConnectEffect::Connected,
                 format!(
-                    "  {} - connected ({n} MCP server{} routed through the guard proxy, {})",
+                    "  {} - connected ({n} MCP server{} routed through the guard proxy, {}{unscreened})",
                     r.name,
                     if n == 1 { "" } else { "s" },
                     if monitor { "monitor" } else { "enforce" }
@@ -1985,7 +1993,14 @@ fn connect_by_one_mechanism(
         // read as a JSON client's servers and written back line by line: only
         // the `cmd` and `args` lines of the servers that change are touched.
         let path = home.join(rel);
-        let (mut doc, source) = match read_yaml_for_update(home, &path, reject_symlinks) {
+        let doc_and_source = match read_yaml_for_update(home, &path, reject_symlinks) {
+            Ok(Some((mut doc, source))) => {
+                doc.set_path(&path);
+                Ok(Some((doc, source)))
+            }
+            other => other,
+        };
+        let (mut doc, source) = match doc_and_source {
             Ok(Some(pair)) => pair,
             Ok(None) => {
                 return ConnectResult::new(
@@ -4732,6 +4747,33 @@ mod tests {
             disconnect_one(home.path(), &row),
             "  gemini, was not connected"
         );
+    }
+
+    /// The Codex connect line names each server reached by URL that the
+    /// proxy does not carry, with the key that keeps it out, and no value.
+    ///
+    /// FAILS ON REVERT: print the Codex line without
+    /// `unscreened_remote_toml`, and a server Codex signs in to by itself is
+    /// left out of the line without a word.
+    #[test]
+    fn connect_codex_names_the_remote_servers_the_proxy_leaves_out() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "[mcp_servers.icm]\ncommand = \"icm\"\n\n[mcp_servers.signin]\nurl = \"https://x.example/mcp\"\nscopes = [\"read\"]\n\n[mcp_servers.raw]\nurl = \"https://y.example/mcp\"\nbearer_token = \"sk-not-a-token\"\n",
+        )
+        .unwrap();
+        let row = known_row(home.path(), "codex");
+        let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert!(
+            result.line.contains(
+                "codex - connected (1 MCP server routed through the guard proxy, enforce; not screened by the proxy: signin (scopes), raw (bearer_token))"
+            ),
+            "{}",
+            result.line
+        );
+        assert!(!result.line.contains("sk-not-a-token"), "{}", result.line);
     }
 
     /// Codex runs a hook only once it trusts it. With nobody to ask and no

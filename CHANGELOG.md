@@ -126,8 +126,11 @@ Codex's and Goose's MCP servers reached by URL are screened too. `agents
 connect` routes a Codex `[mcp_servers.x]` with `url` (its token named by
 `bearer_token_env_var`, headers in `http_headers` and `env_http_headers`) and
 a Goose extension of `type: streamable_http` or `sse` through the same proxy.
-The token is read from the variable the agent reads and is never written in
-the file, the wrapper or a log. `agents disconnect` gives each file back as it
+A token named by `bearer_token_env_var`, and a header named by
+`env_http_headers`, is read from the variable the agent reads and is never
+written in the file, the wrapper or a log; a header written out in
+`http_headers` (an `Authorization = "Bearer ..."` among them) stays in the
+same file, in the wrapper's `env`, as it was in the table. `agents disconnect` gives each file back as it
 was. A server the agent signs in to by itself is left as it was.
 
 Ordinary agent work is refused less. In a set of commands from public

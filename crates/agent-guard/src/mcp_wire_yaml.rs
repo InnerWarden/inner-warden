@@ -53,6 +53,10 @@ const OWN_OR_WRAPPED_TYPES: &[&str] = &["stdio", "builtin", "platform"];
 pub struct YamlDoc {
     text: String,
     value: Yaml,
+    /// Where this configuration is read from, when the caller said: a remote
+    /// extension's wrapper names it (`--goose-config`) so its proxy finds the
+    /// headers without `HOME`.
+    path: Option<String>,
 }
 
 impl YamlDoc {
@@ -84,7 +88,16 @@ impl YamlDoc {
         Ok(Self {
             text: text.to_string(),
             value,
+            path: None,
         })
+    }
+
+    /// Say where this configuration is read from: a remote extension wrapped
+    /// from here on names the file (`--goose-config`), so its proxy reads the
+    /// headers there and not under `HOME`, which a Goose started without it
+    /// does not have.
+    pub fn set_path(&mut self, path: &std::path::Path) {
+        self.path = Some(path.to_string_lossy().into_owned());
     }
 
     /// The text to write back.
@@ -320,6 +333,10 @@ impl YamlDoc {
                 .unwrap_or(Some(Vec::new()))
                 .ok_or_else(|| format!("extension `{name}` has arguments that are not text"))?;
             if extension.contains_key("headers") {
+                if let Some(path) = &self.path {
+                    args.push("--goose-config".to_string());
+                    args.push(path.clone());
+                }
                 args.push("--goose-headers".to_string());
                 args.push(name.to_string());
             }
@@ -1275,5 +1292,52 @@ mod remote_wiring_tests {
         let before = moved.text().to_string();
         assert!(moved.apply(&restored).is_err());
         assert_eq!(moved.text(), before);
+    }
+
+    /// Connect names Goose's configuration in the wrapper
+    /// (`--goose-config`), so the proxy reads the headers there when Goose
+    /// starts it with no `HOME`; disconnect still gives the file back byte
+    /// for byte. FAILS ON REVERT: leave the path out of the wrapper, and the
+    /// proxy started without `HOME` refuses to start.
+    #[test]
+    fn the_wrapper_names_gooses_configuration() {
+        let text = "extensions:\n  remote:\n    headers:\n      X-Team: blue\n    name: remote\n    type: streamable_http\n    uri: https://example.test/mcp\n";
+        let mut doc = YamlDoc::parse(text).unwrap();
+        doc.set_path(std::path::Path::new("/cfg/goose/config.yaml"));
+        let (wrapped, n) = mcp_wire::wrap(doc.view(), BIN, false, "goose");
+        assert_eq!(n, 1);
+        assert_eq!(doc.apply(&wrapped).unwrap(), 1);
+        let view = doc.view();
+        let args: Vec<String> = view["mcpServers"]["remote"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect();
+        let at = args.iter().position(|a| a == "--").unwrap();
+        let words = args[at + 1..].to_vec();
+        assert!(
+            words.ends_with(&[
+                "--goose-config".to_string(),
+                "/cfg/goose/config.yaml".to_string(),
+                "--goose-headers".to_string(),
+                "remote".to_string()
+            ]),
+            "{words:?}"
+        );
+        let spec = crate::mcp_proxy::remote::RemoteSpec::from_cmd_reading(
+            &words,
+            |_| None,
+            |path| {
+                (path == std::path::Path::new("/cfg/goose/config.yaml")).then(|| text.to_string())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(spec.headers, [("X-Team".to_string(), "blue".to_string())]);
+        let (restored, n) = mcp_wire::unwrap(doc.view());
+        assert_eq!(n, 1);
+        assert_eq!(doc.apply(&restored).unwrap(), 1);
+        assert_eq!(doc.text(), text);
     }
 }
