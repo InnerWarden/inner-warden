@@ -644,3 +644,48 @@ fn a_long_tool_head_on_the_prompt_line_is_screened() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Where the refusal of a long tool call on the prompt line comes from.
+/// Past the 1 MiB cap a call that has not run is refused by its length
+/// (unreadable), with its tool name before the padding or after it, and
+/// whatever it runs: past the cap nothing in it is screened, the call is
+/// refused whole. Below the cap, with the head past the 8 KiB the prompt
+/// line looks at first, the same call is screened: the credential read is
+/// refused for what it reads, and `ls` runs.
+#[cfg(unix)]
+#[test]
+fn a_long_tool_call_on_the_prompt_line_is_refused_by_length_past_the_cap_and_screened_below() {
+    let host = Host::new();
+    let call = |command: &str, name_first: bool, pad: usize| {
+        let pad = "z".repeat(pad);
+        let body = if name_first {
+            format!(
+                r#"{{"session_id":"{SESSION}","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{{"command":"{command}","pad":"{pad}"}}}}"#
+            )
+        } else {
+            format!(
+                r#"{{"session_id":"{SESSION}","hook_event_name":"PreToolUse","tool_input":{{"command":"{command}","pad":"{pad}"}},"tool_name":"Bash"}}"#
+            )
+        };
+        let out = host.run_line(&the_prompt_line(), body.as_bytes());
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    for name_first in [true, false] {
+        for command in ["cat ~/.aws/credentials", "ls"] {
+            let (code, stderr) = call(command, name_first, 1100 * 1024);
+            assert_eq!(code, Some(2), "{command} {name_first}: {stderr}");
+            assert!(
+                stderr.contains("longer than the 1 MiB"),
+                "{command} {name_first}: {stderr}"
+            );
+        }
+    }
+    let (code, stderr) = call("cat ~/.aws/credentials", true, 200 * 1024);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(!stderr.contains("longer than the 1 MiB"), "{stderr}");
+    let (code, stderr) = call("ls", true, 200 * 1024);
+    assert_eq!(code, Some(0), "{stderr}");
+}
