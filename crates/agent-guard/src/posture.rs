@@ -350,6 +350,7 @@ mod tests {
         let lines = [
             "cat .env",
             "docker run --rm --privileged alpine sh",
+            "docker run --rm -v /:/host alpine chroot /host sh",
             "git grep -n \"eval '\" -- crates",
             "pip install reqeusts",
             "eval \"$(direnv hook bash)\"",

@@ -135,7 +135,7 @@ const CLASS: &[&str] = &[
 const OUTSIDE: &[&str] = &[
     "docker run --rm --privileged alpine sh",
     "pip install reqeusts",
-    "git grep -n -E -e \"exec(File)?(Sync)?\\(\" -- src | head",
+    "docker run --rm -v /:/host alpine chroot /host sh",
 ];
 
 /// A review of the rules today.
