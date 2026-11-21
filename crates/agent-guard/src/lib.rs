@@ -55,12 +55,14 @@ pub mod codex_trust;
 // observe`), which reads a person's message for a plain-language request the
 // same way the injection scan reads text: invisible characters out, NFKC
 // folded, Tags-block and base64 payloads recovered.
+pub mod cursor_hook;
 pub mod deobfuscate;
 pub mod file_tools;
 pub mod file_update;
 pub mod hermes_hook;
 pub mod hook;
 pub mod hook_targets;
+pub mod json_order;
 // Contract types and pure decisions for agent identity.
 pub mod identity;
 pub mod interactive;

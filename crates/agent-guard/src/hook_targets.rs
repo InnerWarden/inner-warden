@@ -171,8 +171,11 @@ pub static TARGETS: &[HookTarget] = &[
         id: "cursor",
         display: "Cursor",
         aliases: &[],
+        // Cursor runs commands from ~/.cursor/hooks.json before its agent's
+        // shell commands, MCP calls and file reads ([`crate::cursor_hook`]),
+        // and `agents connect` wires them with the proxy, as for Codex.
         mechanism: Mechanism::McpProxy {
-            why: "commands run inside the editor process; there is no host-side hook",
+            why: "its shell commands, MCP calls and file reads are screened by the hooks `agents connect` installs, and its MCP servers through the proxy; its file edits are not",
             connect: "cursor",
         },
         markers: &[".cursor"],

@@ -159,7 +159,7 @@ struct AgentView {
     #[serde(skip_serializing_if = "Option::is_none")]
     more_instances: Option<usize>,
     /// What its wiring judges before a call runs (`shell_and_privileged_files`,
-    /// `shell_only` or `mcp_server_calls`) and the sentence `status` prints
+    /// `shell_only`, `shell_mcp_and_reads` or `mcp_server_calls`) and the sentence `status` prints
     /// for it. Only for an agent connected in one mode; absent when its
     /// settings cannot be read.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2634,8 +2634,11 @@ mod tests {
                 crate::status::Finding::Working(text) => text,
                 other => panic!("{other:?}"),
             };
+            // The first line: a hook beside the proxy (Cursor's) prints its
+            // gaps on the lines after it.
+            let first = printed.lines().next().unwrap_or_default();
             assert!(
-                printed
+                first
                     .to_lowercase()
                     .ends_with(&row["judges_line"].as_str().unwrap().to_lowercase()),
                 "{printed}"
@@ -2645,7 +2648,9 @@ mod tests {
             row_of(&payload, "claude-code")["judges"],
             "shell_and_privileged_files"
         );
-        assert_eq!(row_of(&payload, "cursor")["judges"], "mcp_server_calls");
+        // Cursor's hooks are on beside the proxy since `agents connect` wires
+        // them; they do not judge its file edits.
+        assert_eq!(row_of(&payload, "cursor")["judges"], "shell_mcp_and_reads");
     }
 
     /// FAILS ON REVERT: a Bash hook that runs beside file-tool and result

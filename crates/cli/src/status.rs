@@ -375,7 +375,9 @@ pub fn tool_classes_finding(classes: &ToolClasses) -> Finding {
 /// PURE: what one agent's wiring judges, as a key and as the sentence
 /// `status` prints for it without the agent's name, so the dashboard and
 /// `status` say one thing. The keys: `shell_and_privileged_files` (with or
-/// without the reads, which the sentence says), `shell_only` and
+/// without the reads, which the sentence says), `shell_only`,
+/// `shell_mcp_and_reads` (Cursor's hooks: shell, MCP calls and reads, never
+/// its file edits) and
 /// `mcp_server_calls`. A hook beside the proxy has no key of its own: on, it
 /// is the first; not on, the proxy is all that judges, which is the last.
 pub fn judges(classes: &ToolClasses) -> (&'static str, String) {
@@ -409,6 +411,13 @@ pub fn judges(classes: &ToolClasses) -> (&'static str, String) {
             file_tools: false, ..
         } => ("shell_only", sentence(&hook_shell_only_words())),
         ToolClasses::Proxy { .. } => ("mcp_server_calls", sentence(PROXY_WORDS)),
+        // Cursor's hooks judge its shell commands, MCP calls and reads, never
+        // its file edits: the short label must not say privileged files.
+        ToolClasses::HookAndProxy {
+            agent, screened, ..
+        } if agent == innerwarden_agent_guard::cursor_hook::AGENT => {
+            ("shell_mcp_and_reads", sentence(screened))
+        }
         ToolClasses::HookAndProxy { screened, .. } => {
             ("shell_and_privileged_files", sentence(screened))
         }
@@ -1656,10 +1665,13 @@ mod tests {
     fn status_tool_classes_for_matches_the_old_inline_read() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".claude")).unwrap();
-        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        // The MCP agent here is Goose, judged through the proxy alone. Cursor
+        // was this row until it got a hook of its own: it now reads as a hook
+        // agent and is filtered out below with Codex and Gemini.
+        std::fs::create_dir_all(home.path().join(".config/goose")).unwrap();
         std::fs::write(
-            home.path().join(".cursor/mcp.json"),
-            r#"{"mcpServers":{"fs":{"command":"npx"}}}"#,
+            home.path().join(".config/goose/config.yaml"),
+            "extensions: {}\n",
         )
         .unwrap();
         let old_inline = |home: &std::path::Path,
@@ -1692,7 +1704,7 @@ mod tests {
             "not json",
         ] {
             std::fs::write(home.path().join(".claude/settings.json"), settings).unwrap();
-            // Codex and Gemini are read by their hook too, which the inline
+            // Codex, Gemini and Cursor are read by their hook too, which the inline
             // block never did. A host with one of them installed lists it
             // here, so those rows are left to their own test.
             let rows: Vec<_> = innerwarden_agent_guard::agents_ops::rows(home.path())
@@ -1702,7 +1714,12 @@ mod tests {
                 })
                 .collect();
             assert!(rows.iter().any(|r| r.hookable), "a hook agent row");
-            assert!(rows.iter().any(|r| !r.hookable), "an MCP agent row");
+            // The row comes from this home, not from an agent running on the
+            // host the test runs on.
+            assert!(
+                rows.iter().any(|r| r.name == "goose" && !r.hookable),
+                "an MCP agent row"
+            );
             let classes = tool_classes_for(home.path(), &rows);
             assert_eq!(classes, old_inline(home.path(), &rows), "{settings}");
             assert_eq!(

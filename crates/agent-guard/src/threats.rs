@@ -3586,7 +3586,7 @@ fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)]
         // Removing or rewriting the hook that carries the screening. Covers the
         // file being deleted, moved aside, or edited to drop the hook array.
         add(
-            r#"(?i)(?:\brm\b|\bmv\b|\bunlink\b|\btruncate\b)[^|;&]*(?:\.claude/settings(?:\.local)?\.json|\.claude\.json|\.codex/(?:config|hooks\.json)|\.cursor/mcp\.json|\.gemini/settings\.json)"#,
+            r#"(?i)(?:\brm\b|\bmv\b|\bunlink\b|\btruncate\b)[^|;&]*(?:\.claude/settings(?:\.local)?\.json|\.claude\.json|\.codex/(?:config|hooks\.json)|\.cursor/(?:mcp|hooks)\.json|\.gemini/settings\.json)"#,
             "removes or moves aside the configuration that carries the guard's hook",
             60,
         );
@@ -3631,12 +3631,12 @@ fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)]
         // `os` and `shutil` remove and move, node's `fs` does each of those.
         // A rename, replace or move counts with the settings on either side.
         add(
-            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|\.codex/hooks\.json|\.codex/config\.toml).*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\(|\bwrite\b|\bwritelines\b|\bdel\b|\bunlink\b|\.truncate\(|\.write_(?:text|bytes)\(|\.rename\(|\.symlink_to\()"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|\.codex/hooks\.json|\.cursor/hooks\.json|\.codex/config\.toml).*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\(|\bwrite\b|\bwritelines\b|\bdel\b|\bunlink\b|\.truncate\(|\.write_(?:text|bytes)\(|\.rename\(|\.symlink_to\()"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
         add(
-            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\().*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|\.codex/hooks\.json|\.codex/config\.toml)"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\().*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|\.codex/hooks\.json|\.cursor/hooks\.json|\.codex/config\.toml)"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
@@ -8439,6 +8439,7 @@ const GUARD_FIND_PLACES: &[(&str, &[&str])] = &[
     ("~/.claude.json", &[]),
     ("~/.codex/config.toml", &[]),
     ("~/.cursor/mcp.json", &[]),
+    ("~/.cursor/hooks.json", &[]),
     ("~/.gemini/settings.json", &[]),
     ("~/.openclaw/openclaw.json", &[]),
     ("~/.config/goose/config.yaml", &[]),

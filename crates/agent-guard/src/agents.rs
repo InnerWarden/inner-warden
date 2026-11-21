@@ -10,8 +10,8 @@
 //! gets the blocking PreToolUse hook (in enforce it refuses a deny and a call
 //! it could not screen: see `cmd_install`);
 //! Cursor and Gemini use their JSON MCP configuration, and Codex uses TOML.
-//! Codex and Gemini also get their own blocking hook beside the proxy, on a
-//! connect a person ran (see [`crate::agent_hooks`]).
+//! Codex, Gemini and Cursor also get their own blocking hook beside the proxy,
+//! on a connect a person ran (see [`crate::agent_hooks`]).
 //! Other detected agents remain visible but are not modified automatically until
 //! InnerWarden has an integration for their real configuration format.
 //!

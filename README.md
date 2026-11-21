@@ -24,7 +24,7 @@ the agent is about to do, and gives a verdict a hook or a proxy can enforce.
   notification channel only if you set one up), and the dashboard is on
   loopback.
 - **Works with the agents you use:** a hook for Claude Code, Codex CLI,
-  Gemini CLI and Hermes Agent, an MCP proxy for Cursor, OpenClaw or any MCP
+  Gemini CLI, Hermes Agent and Cursor, an MCP proxy for OpenClaw or any MCP
   client, and an AI Jail for anything else.
 - **Open rules, open engine.** Written in Rust, Apache-2.0, with YAML rules
   you can read and extend.
@@ -222,14 +222,15 @@ Whatever agent you run, there is a mechanism and a command for it:
   Reversible with `agents disconnect hermes`.
 - **What the hook does with a verdict.** In enforce mode a `deny` is
   refused and an `allow` runs on every agent. A `review` asks you on
-  Claude Code and Hermes Agent, with the guard's reason. Codex CLI has no
+  Claude Code, Hermes Agent and Cursor (its shell commands and MCP calls),
+  with the guard's reason. Codex CLI has no
   way for a hook to ask, so there a review runs with a warning Codex shows
   you. On Gemini CLI and every other agent a review is refused with the
   reason. `--block-review` refuses every review; monitor mode never
   refuses: every call runs and nothing is asked. Details:
   [docs/features.md](docs/features.md).
 - **The hook line fails closed.** On Linux and macOS an enforcing hook line
-  (Claude Code, Codex, Gemini) runs the guard inside a small `/bin/sh`
+  (Claude Code, Codex, Gemini, Cursor) runs the guard inside a small `/bin/sh`
   script: if the innerwarden program is missing, cannot start, is killed or
   ends without its answer, the call is refused with that reason. The guard
   refuses on its own when it has not answered in 10 seconds (longer while a
@@ -248,9 +249,17 @@ Whatever agent you run, there is a mechanism and a command for it:
   `innerwarden enforce` a deny is refused (the model is told only "Refused by
   InnerWarden.") and a review asks you to allow it once or deny it.
   Reversible with `agents disconnect openclaw`.
-- **Cursor** - no pre-execution hook exists, so the guard wires its MCP
-  configuration to run through its proxy: `innerwarden agents connect
-  cursor`. Reversible with `agents disconnect`.
+- **Cursor** - its own hooks, in `~/.cursor/hooks.json`, judge its agent's
+  shell commands (`beforeShellExecution`), the command lines and file paths
+  in its MCP tool calls (`beforeMCPExecution`) and its reads of secrets
+  (`beforeReadFile`), and the MCP proxy carries its local MCP servers:
+  `innerwarden agents connect cursor`. In enforce mode each entry carries
+  `failClosed: true`. Not screened: its file edits (Cursor has no hook
+  before an edit, so an edit can even take the hook out of
+  `~/.cursor/hooks.json`; a shell command that does is refused), Tab, and its
+  other tools. Judged only by the payloads Cursor's hooks documentation gives
+  (read on 2026-11-20), not on a running Cursor. Reversible with
+  `agents disconnect cursor`, which takes out only the guard's entries.
   OpenClaw has one more surface, and it observes rather than enforces: its
   message hooks see the inbound prompt and the reply, so
   `innerwarden observe install` records a dangerous ask even when the model,

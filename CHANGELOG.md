@@ -13,6 +13,49 @@ guard, and refused if it lets through a line main stops. The guard still reads
 the text of a command; what it does not see is written down, as measured:
 [Where this ends](docs/features.md#where-this-ends).
 
+### Added
+
+- **Cursor is screened through its own hooks.** `innerwarden agents connect
+  cursor` now writes an entry under `beforeShellExecution`,
+  `beforeMCPExecution` and `beforeReadFile` in `~/.cursor/hooks.json`,
+  beside the MCP proxy it already wired, so Cursor's shell commands, the
+  command lines and paths in its MCP calls and its reads of secrets are judged
+  before they run. Every call the guard lets through is answered
+  `permission: "allow"`, a refusal is exit 2 with the reason, and a review of a
+  shell command or an MCP call asks you. Enforce writes `failClosed: true`,
+  monitor does not. `agents disconnect cursor` and `innerwarden uninstall`
+  take out only the guard's entries; `agents` and `status` say what is
+  screened and what is not (its file edits are not: Cursor has no hook before
+  an edit). A shell command that rewrites or removes `~/.cursor/hooks.json` is
+  refused. Judged only by the payloads Cursor's hooks documentation gives,
+  not on a running Cursor.
+- **A Cursor hooks file that lost part of the guard is refused until it is put
+  back.** Cursor's file edits are not screened, so an edit can take one
+  event's entry out of `~/.cursor/hooks.json` (or turn `failClosed` off). On
+  every Cursor call it still sees, the hook reads the file again and, in
+  enforce mode, refuses the call with the reason until `innerwarden agents
+  connect cursor` restores it (monitor mode only says so). An edit that takes
+  every entry out at once is not seen: Cursor then starts no hook of ours.
+  `status`, `agents` and the dashboard say it instead: Cursor's hooks are not
+  in the file (while its MCP servers still run behind the guard), or its
+  hooks run another program than the guard, named with the guard's. The
+  dashboard labels what Cursor's hooks judge "Shell commands, MCP calls and
+  reads".
+- **A large file read by Cursor is judged by its path.** Cursor sends the
+  whole file with a `beforeReadFile`; the hook reads that `content` through
+  and drops it as it streams, without keeping it or counting it toward the
+  1 MiB a call may take, so a read of a 5 MiB file is judged like any other
+  (before, every read past 1 MiB was refused as unreadable). A payload that
+  is not JSON, one cut short inside the content included, is still refused.
+- **Connect keeps your keys in their order.** `agents connect` and
+  `disconnect` write `~/.cursor/hooks.json`, `~/.gemini/settings.json` and
+  the MCP configs back in the order you wrote them; only the guard's entries
+  move. They used to come back sorted.
+- The refusal of a hook whose program is gone now names `~/.cursor/hooks.json`
+  too. A hook line written by 1.6.15 is still read as the guard's (status,
+  repair and uninstall); `agents connect` brings it up to date, and Codex asks
+  to trust the new line once.
+
 ### Security
 
 - **A project's Cursor hooks are held as its other agent settings are.** An

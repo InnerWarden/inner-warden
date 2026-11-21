@@ -1,5 +1,5 @@
 //! The blocking hook for the agents that keep it outside Claude Code's
-//! settings: Codex CLI and Gemini CLI.
+//! settings: Codex CLI, Gemini CLI and Cursor.
 //!
 //! Both run a command before a tool call and refuse the call when the command
 //! exits 2 with text on stderr, which is what `innerwarden hook` answers. So
@@ -9,6 +9,11 @@
 //! |--------|---------------------------|--------------|--------------|
 //! | Codex  | `~/.codex/hooks.json`     | `PreToolUse` | seconds      |
 //! | Gemini | `~/.gemini/settings.json` | `BeforeTool` | milliseconds |
+//! | Cursor | `~/.cursor/hooks.json`    | `beforeShellExecution`, `beforeMCPExecution`, `beforeReadFile` | seconds |
+//!
+//! Cursor's file lists the hooks flat under each event (no group, no
+//! matcher), carries `version: 1` and a `failClosed` switch per entry, and
+//! Cursor reads a JSON `permission` on stdout ([`crate::cursor_hook`]).
 //!
 //! The entry carries no matcher, so every tool call reaches the hook and the
 //! guard lets through what it does not screen. It carries an explicit timeout,
@@ -64,6 +69,7 @@ const CODEX_HOME_VAR: &str = "CODEX_HOME";
 pub enum Host {
     Codex,
     Gemini,
+    Cursor,
 }
 
 /// Where one agent keeps its hook, and what the entry written there holds.
@@ -76,8 +82,11 @@ pub struct HookSpec {
     pub host: Host,
     /// The file that holds the hook, relative to the home directory.
     pub file: &'static str,
-    /// The event the hook is listed under.
+    /// The event the hook is listed under, and the name the listing gives it.
     pub event: &'static str,
+    /// Further events the same entry is listed under (Cursor's), each of
+    /// which must hold it for the hook to be on.
+    pub more_events: &'static [&'static str],
     /// How long the agent waits for the hook, in the agent's own unit:
     /// seconds for Codex, milliseconds for Gemini.
     pub timeout: u64,
@@ -101,6 +110,7 @@ pub static CODEX: HookSpec = HookSpec {
     host: Host::Codex,
     file: ".codex/hooks.json",
     event: "PreToolUse",
+    more_events: &[],
     timeout: 60,
     mcp_config: CODEX_CONFIG,
     file_tools: "`apply_patch`",
@@ -118,6 +128,7 @@ pub static GEMINI: HookSpec = HookSpec {
     host: Host::Gemini,
     file: ".gemini/settings.json",
     event: "BeforeTool",
+    more_events: &[],
     timeout: 60_000,
     mcp_config: ".gemini/settings.json",
     file_tools: "`write_file` and `replace`",
@@ -128,9 +139,33 @@ pub static GEMINI: HookSpec = HookSpec {
               the guard into 1.",
 };
 
+/// Cursor. The timeout is in seconds. Read in Cursor's hooks documentation
+/// (cursor.com/docs/agent/hooks, as published on 2026-11-20), not measured
+/// on a running Cursor.
+pub static CURSOR: HookSpec = HookSpec {
+    agent: "cursor",
+    product: "Cursor",
+    host: Host::Cursor,
+    file: ".cursor/hooks.json",
+    event: crate::cursor_hook::SHELL_EVENT,
+    more_events: &[
+        crate::cursor_hook::MCP_EVENT,
+        crate::cursor_hook::READ_EVENT,
+    ],
+    timeout: 60,
+    mcp_config: ".cursor/mcp.json",
+    file_tools: "",
+    measured: "Judged only by the payloads Cursor's hooks documentation gives \
+               (cursor.com/docs/agent/hooks, read on 2026-11-20), not on a running Cursor.",
+    minimum: "a Cursor that runs hooks from ~/.cursor/hooks.json with `failClosed` \
+              (its hooks documentation of 2026-11; the version that added `failClosed` is \
+              not named there). On a Cursor without it, a guard that cannot answer still \
+              refuses in enforce mode on Linux and macOS, where the line ends in exit 2.",
+};
+
 /// The hook wiring for the agent the listing calls `agent`, when it has one.
 pub fn spec_for(agent: &str) -> Option<&'static HookSpec> {
-    [&CODEX, &GEMINI]
+    [&CODEX, &GEMINI, &CURSOR]
         .into_iter()
         .find(|spec| spec.agent == agent)
 }
@@ -167,6 +202,11 @@ fn fail_closed_gap(product: &str) -> String {
 }
 
 impl HookSpec {
+    /// Every event the entry is listed under: [`HookSpec::event`] first.
+    pub fn events(&self) -> impl Iterator<Item = &'static str> {
+        std::iter::once(self.event).chain(self.more_events.iter().copied())
+    }
+
     /// The file that holds the hook, under `home`.
     pub fn path(&self, home: &Path) -> PathBuf {
         home.join(self.file)
@@ -190,14 +230,25 @@ impl HookSpec {
     /// How long the agent waits for the hook before it runs the tool.
     pub fn wait(&self) -> Duration {
         match self.host {
-            Host::Codex => Duration::from_secs(self.timeout),
+            Host::Codex | Host::Cursor => Duration::from_secs(self.timeout),
             Host::Gemini => Duration::from_millis(self.timeout),
         }
     }
 
     /// The one group `agents connect` writes under the event: a command hook
-    /// with a timeout and no matcher.
+    /// with a timeout and no matcher. For Cursor it is the hook itself, flat
+    /// in the event's list, with `failClosed` on in enforce mode and off in
+    /// monitor, which never refuses.
     fn entry(&self, command: &str) -> Value {
+        if self.host == Host::Cursor {
+            let monitor = hook::read_hook_line(&json!({ "command": command }))
+                .is_some_and(|line| line.monitor);
+            return json!({
+                "command": command,
+                "timeout": self.timeout,
+                "failClosed": !monitor,
+            });
+        }
         let mut hook = Map::new();
         hook.insert("type".to_string(), Value::from("command"));
         if self.host == Host::Gemini {
@@ -219,6 +270,7 @@ impl HookSpec {
                  `grep_search`"
             }
             Host::Codex => "",
+            Host::Cursor => return crate::cursor_hook::screened(),
         };
         format!(
             "shell commands, changes to privileged files through {}{reads}, and calls to MCP \
@@ -286,6 +338,12 @@ impl HookSpec {
                  here."
                     .to_string(),
             ),
+            Host::Cursor => {
+                lines.extend(crate::cursor_hook::gaps());
+                lines.push(format!("Needs {}", self.minimum));
+                lines.push(self.measured.to_string());
+                return lines;
+            }
         }
         if self.host == Host::Gemini {
             lines.push(fail_closed_gap(self.product));
@@ -307,6 +365,8 @@ impl HookSpec {
 
 /// One InnerWarden hook found under the event, with where it sits.
 struct Found {
+    /// The event it is listed under.
+    event: &'static str,
     group: usize,
     index: usize,
     line: hook::HookLine,
@@ -316,25 +376,42 @@ struct Found {
     timeout: Option<u64>,
 }
 
-/// Every InnerWarden hook under the spec's event, in file order.
+/// Every InnerWarden hook under the spec's events, in file order. In
+/// Cursor's flat lists each hook is its own group, at index 0.
 fn found(settings: &Value, spec: &HookSpec) -> Vec<Found> {
-    let Some(groups) = settings
-        .get("hooks")
-        .and_then(|hooks| hooks.get(spec.event))
-        .and_then(Value::as_array)
-    else {
-        return Vec::new();
-    };
     let mut out = Vec::new();
-    for (group, entry) in groups.iter().enumerate() {
-        let Some(list) = entry.get("hooks").and_then(Value::as_array) else {
+    for event in spec.events() {
+        let Some(groups) = settings
+            .get("hooks")
+            .and_then(|hooks| hooks.get(event))
+            .and_then(Value::as_array)
+        else {
             continue;
+        };
+        found_in(groups, spec, event, &mut out);
+    }
+    out
+}
+
+/// [`found`] for one event's list.
+fn found_in(groups: &[Value], spec: &HookSpec, event: &'static str, out: &mut Vec<Found>) {
+    for (group, entry) in groups.iter().enumerate() {
+        let flat;
+        let list: &[Value] = if spec.host == Host::Cursor {
+            flat = [entry.clone()];
+            &flat
+        } else {
+            match entry.get("hooks").and_then(Value::as_array) {
+                Some(list) => list,
+                None => continue,
+            }
         };
         for (index, hook) in list.iter().enumerate() {
             let Some(line) = hook::read_hook_line(hook) else {
                 continue;
             };
             out.push(Found {
+                event,
                 group,
                 index,
                 line,
@@ -347,7 +424,6 @@ fn found(settings: &Value, spec: &HookSpec) -> Vec<Found> {
             });
         }
     }
-    out
 }
 
 /// Whether a group holds a hook of ours, and whether it holds nothing else
@@ -535,6 +611,9 @@ fn vacate(mut settings: Value, event: &str) -> (Value, usize) {
 /// its place. Otherwise the entry goes at the end, behind every hook that is
 /// already there. Every other key, group and hook stays as it was.
 pub fn merge(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, String> {
+    if spec.host == Host::Cursor {
+        return merge_flat(settings, spec, command);
+    }
     let mut settings = match settings {
         Value::Null => json!({}),
         other => other,
@@ -592,6 +671,127 @@ pub fn merge(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, S
     Ok(settings)
 }
 
+/// Why Cursor's hooks file under `home` no longer holds the guard as
+/// `agents connect cursor` wrote it, when it still holds some of it: an
+/// event without the entry, an entry changed (`failClosed` turned off, another
+/// timeout, another mode), a `version` Cursor does not read, or a file that
+/// is no longer JSON. `None` when it is whole, and when no entry of ours is
+/// left at all.
+///
+/// The hook asks this on every Cursor call it is started for, because
+/// Cursor's file edits are not screened (it has no hook before an edit): an
+/// agent can take one event's entry out of the file with an edit, and the
+/// entries left behind are the guard's only chance to see it. With every
+/// entry gone Cursor starts no hook of ours, so there is no call to refuse.
+/// The program is not looked at here: it is the one asking.
+pub fn cursor_wiring_lost(home: &Path) -> Option<String> {
+    let binary = std::env::current_exe().ok();
+    cursor_wiring_lost_for(home, binary.as_deref(), std::env::var_os("PATH").as_deref())
+}
+
+/// [`cursor_wiring_lost`], with this program (`binary`, when it is known)
+/// and the `PATH` a bare program name is looked up on handed in.
+fn cursor_wiring_lost_for(
+    home: &Path,
+    binary: Option<&Path>,
+    path_env: Option<&OsStr>,
+) -> Option<String> {
+    let file = CURSOR.path(home);
+    let events = CURSOR.events().collect::<Vec<_>>().join(", ");
+    let state = state_with(home, &CURSOR, |_| hook::ProgramFact::Executable);
+    let state = match binary {
+        Some(binary) => cursor_runs_this(home, state, binary, path_env),
+        None => state,
+    };
+    match state {
+        HookState::Off(reason @ Reason::OtherProgram { .. }) => {
+            Some(format!("{}: {}", file.display(), reason.why(&CURSOR)))
+        }
+        HookState::Off(Reason::Altered) => Some(format!(
+            "{} no longer lists the InnerWarden entry, as `innerwarden agents connect cursor` \
+             wrote it, under each of {events}",
+            file.display()
+        )),
+        HookState::Unreadable => Some(format!(
+            "{} can no longer be read as Cursor's hooks",
+            file.display()
+        )),
+        _ => None,
+    }
+}
+
+/// Whether Cursor reads hooks from a file with this `version`: a positive
+/// whole number, as its documentation requires.
+fn cursor_version_ok(settings: &Value) -> bool {
+    settings
+        .get("version")
+        .and_then(Value::as_u64)
+        .is_some_and(|version| version > 0)
+}
+
+/// PURE: [`merge`] for Cursor's flat lists. Under each event every hook of
+/// ours comes out and one entry goes where the first of them was, else at
+/// the end: no hook of the person's moves, and a re-run writes nothing. A
+/// `version` Cursor would not read becomes 1. Every other key and hook stays
+/// as it was.
+fn merge_flat(settings: Value, spec: &HookSpec, command: &str) -> Result<Value, String> {
+    let mut settings = match settings {
+        Value::Null => json!({}),
+        other => other,
+    };
+    let version_ok = cursor_version_ok(&settings);
+    let root = settings
+        .as_object_mut()
+        .ok_or("its top level is not a JSON object")?;
+    if !version_ok {
+        root.insert("version".to_string(), json!(1));
+    }
+    let hooks = root
+        .entry("hooks")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or("`hooks` is not a JSON object")?;
+    let entry = spec.entry(command);
+    for event in spec.events() {
+        let list = hooks
+            .entry(event)
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .ok_or_else(|| format!("`hooks.{event}` is not a list"))?;
+        let first = list
+            .iter()
+            .position(|hook| hook::read_hook_line(hook).is_some());
+        list.retain(|hook| hook::read_hook_line(hook).is_none());
+        match first {
+            Some(at) => list.insert(at, entry.clone()),
+            None => list.push(entry.clone()),
+        }
+    }
+    Ok(settings)
+}
+
+/// PURE: take every hook of ours out of Cursor's flat lists. A list that
+/// held only hooks of ours goes; every other key and hook stays.
+fn vacate_flat(mut settings: Value, spec: &HookSpec) -> (Value, usize) {
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return (settings, 0);
+    };
+    let mut removed = 0usize;
+    for event in spec.events() {
+        let Some(list) = hooks.get_mut(event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let before = list.len();
+        list.retain(|hook| hook::read_hook_line(hook).is_none());
+        let gone = before - list.len();
+        removed += gone;
+        if gone > 0 && list.is_empty() {
+            hooks.remove(event);
+        }
+    }
+    (settings, removed)
+}
+
 /// Read the settings file as JSON. A missing or blank file is `Null`: there
 /// is nothing in it to keep.
 fn parse(path: &Path, bytes: Option<&[u8]>) -> Result<Value, String> {
@@ -603,12 +803,6 @@ fn parse(path: &Path, bytes: Option<&[u8]>) -> Result<Value, String> {
     }
     serde_json::from_slice(bytes)
         .map_err(|error| format!("{} is not valid JSON: {error}", path.display()))
-}
-
-fn pretty(settings: &Value) -> Result<String, String> {
-    let mut body = serde_json::to_string_pretty(settings).map_err(|error| error.to_string())?;
-    body.push('\n');
-    Ok(body)
 }
 
 /// Write the hook into the agent's file under `home`. Returns whether the
@@ -644,7 +838,8 @@ fn install_noting_moved(
     if merged == settings {
         return Ok((false, Vec::new()));
     }
-    file_update::replace_if_unchanged(&path, before.as_deref(), pretty(&merged)?.as_bytes())?;
+    let body = crate::json_order::pretty_in_order(before.as_deref(), &merged)?;
+    file_update::replace_if_unchanged(&path, before.as_deref(), body.as_bytes())?;
     Ok((true, moved(&settings, &merged, spec)))
 }
 
@@ -669,11 +864,13 @@ pub fn uninstall_noting_moved(
     let (cleaned, removed) = match spec.host {
         Host::Codex => vacate(settings.clone(), spec.event),
         Host::Gemini => hook::remove_iwguard_hooks_for_event(settings.clone(), spec.event),
+        Host::Cursor => vacate_flat(settings.clone(), spec),
     };
     if removed == 0 {
         return Ok((0, Vec::new()));
     }
-    file_update::replace_if_unchanged(&path, before.as_deref(), pretty(&cleaned)?.as_bytes())?;
+    let body = crate::json_order::pretty_in_order(before.as_deref(), &cleaned)?;
+    file_update::replace_if_unchanged(&path, before.as_deref(), body.as_bytes())?;
     if spec.host == Host::Codex {
         forget_trust(home, &path, &ours);
     }
@@ -735,7 +932,7 @@ pub struct LeftBehind {
 /// settings when its text holds an InnerWarden hook line. Neither rules the
 /// hook out: which copy such a line runs cannot be told from the text.
 pub fn left_behind(home: &Path, binary: &Path) -> Vec<LeftBehind> {
-    [&CODEX, &GEMINI]
+    [&CODEX, &GEMINI, &CURSOR]
         .into_iter()
         .filter_map(|spec| {
             let seen = still_runs(&spec.path(home), spec, binary)?;
@@ -817,6 +1014,12 @@ pub fn left_behind_lines(left: &[LeftBehind]) -> Vec<String> {
                      in enforce mode it refuses every call, in monitor mode it runs them \
                      unscreened on Linux and macOS and refuses them on Windows."
                 }
+                Host::Cursor => {
+                    "Cursor would start a hook whose program is gone before every shell \
+                     command, MCP call and file read of its agent: in enforce mode \
+                     (`failClosed`) it refuses every one, in monitor mode it runs them \
+                     unscreened."
+                }
             }
             .to_string(),
         );
@@ -876,6 +1079,11 @@ pub enum Reason {
     GeminiHooksOff,
     /// Gemini's settings disable this hook by name.
     GeminiHookDisabled,
+    /// Cursor's entries are the shape `agents connect` writes, and run
+    /// another program than this innerwarden: an edit of the file (Cursor
+    /// screens none) can point them anywhere. Holds that program and this
+    /// one.
+    OtherProgram { program: String, ours: String },
 }
 
 impl Reason {
@@ -899,6 +1107,11 @@ impl Reason {
             Self::GeminiHookDisabled => {
                 "Gemini skips it: it is listed under `hooksConfig.disabled`".to_string()
             }
+            Self::OtherProgram { program, ours } => format!(
+                "it runs another program ({program}), not this innerwarden ({ours}), so no call \
+                 of {} reaches the guard",
+                spec.product
+            ),
         }
     }
 
@@ -906,6 +1119,7 @@ impl Reason {
     fn step(&self, spec: &HookSpec) -> String {
         match self {
             Self::Altered
+            | Self::OtherProgram { .. }
             | Self::Broken { .. }
             | Self::Unchecked { .. }
             | Self::Codex(Skip::NotTrusted | Skip::Changed) => {
@@ -977,6 +1191,16 @@ pub fn not_on(spec: &HookSpec, state: &HookState) -> Option<(String, String)> {
     let connect = format!("innerwarden agents connect {}", spec.agent);
     match state {
         HookState::On { .. } => None,
+        // Cursor's file edits are not screened: an edit can take every entry
+        // out at once, and the guard never runs again to see it.
+        HookState::Absent if spec.host == Host::Cursor => Some((
+            format!(
+                "hooks are not in ~/{} (removed, or never connected; an edit of that file \
+                 by the agent can take them out, since Cursor screens no edit)",
+                spec.file
+            ),
+            connect,
+        )),
         HookState::Absent => Some((format!("{} hook is not installed", spec.event), connect)),
         HookState::Unreadable => Some((
             format!(
@@ -1034,7 +1258,97 @@ pub fn state(home: &Path, spec: &HookSpec, path_env: Option<&OsStr>) -> HookStat
     let state = state_with(home, spec, |program| {
         agents_ops::program_fact(program, path_env)
     });
-    where_codex_reads(home, spec, state)
+    let state = where_codex_reads(home, spec, state);
+    match std::env::current_exe() {
+        Ok(binary) if spec.host == Host::Cursor => cursor_runs_this(home, state, &binary, path_env),
+        _ => state,
+    }
+}
+
+/// Cursor's `state`, once the program its entries run is compared with
+/// `binary` (this innerwarden), as written or resolved (a link to it runs
+/// it, a bare name is looked up on `path_env`). Cursor's file edits are not
+/// screened, so an edit can keep every entry in the shape `agents connect`
+/// writes and point it at another program, and that program then answers
+/// every call: the guard never runs to see it. `status` and `agents` are
+/// where it shows. A state that is not installed, or already altered, stays
+/// what it was.
+fn cursor_runs_this(
+    home: &Path,
+    state: HookState,
+    binary: &Path,
+    path_env: Option<&OsStr>,
+) -> HookState {
+    if !state.installed() || state == HookState::Off(Reason::Altered) {
+        return state;
+    }
+    let path = CURSOR.path(home);
+    let Ok(Some(bytes)) = file_update::read_config(&path) else {
+        return state;
+    };
+    let Ok(settings) = parse(&path, Some(bytes.as_slice())) else {
+        return state;
+    };
+    let Some(first) = found(&settings, &CURSOR).into_iter().next() else {
+        return state;
+    };
+    if guard_programs(home, binary)
+        .iter()
+        .any(|ours| runs_binary(&first.line.program, Path::new(ours), path_env))
+    {
+        return state;
+    }
+    HookState::Off(Reason::OtherProgram {
+        program: first.line.program,
+        ours: binary.display().to_string(),
+    })
+}
+
+/// The programs this machine runs as its guard: `binary` (the one asking)
+/// and every program Claude Code's, Codex's and Gemini's hooks of ours run.
+/// `status` may be started from another copy of the guard than the one
+/// `agents connect` wired (an npm install beside a package, say): a Cursor
+/// hook that runs any of them is ours. Cursor's own files are not counted:
+/// its agent can edit them unscreened.
+fn guard_programs(home: &Path, binary: &Path) -> Vec<String> {
+    let mut programs = vec![binary.display().to_string()];
+    let claude = home.join(".claude/settings.json");
+    if let Some(settings) = file_update::read_config(&claude)
+        .ok()
+        .flatten()
+        .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+    {
+        programs.extend(hook::effective_iwguard_hook_programs(&settings));
+    }
+    for spec in [&CODEX, &GEMINI] {
+        let path = spec.path(home);
+        if let Ok(settings) = parse(
+            &path,
+            file_update::read_config(&path).ok().flatten().as_deref(),
+        ) {
+            programs.extend(
+                found(&settings, spec)
+                    .into_iter()
+                    .map(|hook| hook.line.program),
+            );
+        }
+    }
+    programs
+}
+
+/// Whether a hook line's `program` is `binary`: as written, through a link,
+/// or, for a bare name, the first file of that name on `path_env`.
+fn runs_binary(program: &str, binary: &Path, path_env: Option<&OsStr>) -> bool {
+    if Path::new(program).components().count() > 1 {
+        return is_program(program, binary);
+    }
+    path_env
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .is_some_and(|found| is_program(&found.to_string_lossy(), binary))
 }
 
 /// `state`, once the folder Codex reads is taken into account.
@@ -1087,7 +1401,7 @@ fn state_with(home: &Path, spec: &HookSpec, fact: impl Fn(&str) -> hook::Program
     };
     let config = match spec.host {
         Host::Codex => codex_config(home),
-        Host::Gemini => None,
+        Host::Gemini | Host::Cursor => None,
     };
     judge(&settings, spec, &path, config.as_ref(), fact)
 }
@@ -1108,6 +1422,9 @@ fn judge(
     fact: impl Fn(&str) -> hook::ProgramFact,
 ) -> HookState {
     let ours = found(settings, spec);
+    if spec.host == Host::Cursor {
+        return judge_flat(settings, spec, &ours, fact);
+    }
     let [only] = ours.as_slice() else {
         return if ours.is_empty() {
             HookState::Absent
@@ -1123,7 +1440,7 @@ fn judge(
         only.line.block_review,
         only.line.monitor,
     );
-    if settings["hooks"][spec.event][only.group] != spec.entry(&command) {
+    if current(&settings["hooks"][spec.event][only.group]) != spec.entry(&command) {
         return HookState::Off(Reason::Altered);
     }
     // Gemini reads its switches before it starts a hook. One that is set
@@ -1131,7 +1448,7 @@ fn judge(
     // started, so its program cannot hold a call up.
     let switched_off = match spec.host {
         Host::Gemini => gemini_switch(settings, &command),
-        Host::Codex => None,
+        Host::Codex | Host::Cursor => None,
     };
     if let Some(reason) = switched_off {
         return HookState::Off(reason);
@@ -1162,7 +1479,9 @@ fn judge(
                 file,
                 group: only.group,
                 index: only.index,
-                command: &command,
+                // The line as the file holds it: Codex trusts the bytes it
+                // read, and a 1.6.15 line differs from `command` in its tail.
+                command: &only.command,
                 timeout: spec.timeout,
             };
             match codex_trust::offline(codex_config, place) {
@@ -1170,7 +1489,7 @@ fn judge(
                 Trust::Skipped(skip) => Some(Reason::Codex(skip)),
             }
         }
-        Host::Gemini => None,
+        Host::Gemini | Host::Cursor => None,
     };
     match skipped {
         Some(reason) => HookState::Off(reason),
@@ -1178,6 +1497,72 @@ fn judge(
             monitor: only.line.monitor,
             block_review: only.line.block_review,
         },
+    }
+}
+
+/// PURE: a group (or Cursor's flat entry) with every hook line in it given
+/// today's fail-closed tail ([`hook::with_current_tail`]): a line an earlier
+/// version wrote is the entry `agents connect` writes, as long as nothing
+/// else in it changed.
+fn current(entry: &Value) -> Value {
+    fn mend(hook: &mut Value) {
+        if let Some(line) = hook.get("command").and_then(Value::as_str) {
+            if let std::borrow::Cow::Owned(line) = hook::with_current_tail(line) {
+                hook["command"] = Value::String(line);
+            }
+        }
+    }
+    let mut entry = entry.clone();
+    match entry.get_mut("hooks").and_then(Value::as_array_mut) {
+        Some(list) => list.iter_mut().for_each(mend),
+        None => mend(&mut entry),
+    }
+    entry
+}
+
+/// PURE: [`judge`] for Cursor. The hook is on only when each of its events
+/// lists exactly the entry `agents connect` writes, all for one program and
+/// mode, in a file whose `version` Cursor reads, and the program is there.
+/// One event without it leaves that kind of call unscreened, so it is not
+/// on. Every doubt is "off", as for the others.
+fn judge_flat(
+    settings: &Value,
+    spec: &HookSpec,
+    ours: &[Found],
+    fact: impl Fn(&str) -> hook::ProgramFact,
+) -> HookState {
+    let Some(first) = ours.first() else {
+        return HookState::Absent;
+    };
+    let command = spec.command(
+        Path::new(&first.line.program),
+        first.line.block_review,
+        first.line.monitor,
+    );
+    let expected = spec.entry(&command);
+    let each_once = spec.events().all(|event| {
+        let mine: Vec<&Found> = ours.iter().filter(|hook| hook.event == event).collect();
+        matches!(mine.as_slice(), [only] if current(&settings["hooks"][event][only.group]) == expected)
+    });
+    if !each_once || !cursor_version_ok(settings) {
+        return HookState::Off(Reason::Altered);
+    }
+    // The enforcing entry carries `failClosed`: Cursor refuses the call when
+    // the program does not start. The monitor entry never refuses.
+    let refuses = !first.line.monitor;
+    match hook::judge_hook_program(&first.line.program, fact(&first.line.program)) {
+        hook::HookProgram::Runs => HookState::On {
+            monitor: first.line.monitor,
+            block_review: first.line.block_review,
+        },
+        hook::HookProgram::Broken { problem, .. } => HookState::Off(Reason::Broken {
+            clause: problem,
+            refuses,
+        }),
+        hook::HookProgram::Unknown { why, .. } => HookState::Off(Reason::Unchecked {
+            clause: why,
+            refuses,
+        }),
     }
 }
 
@@ -3465,5 +3850,234 @@ mod tests {
                 "Take it out of that list in ~/.gemini/settings.json"
             )
         );
+    }
+
+    /// A Codex hook 1.6.15 wrote, whose refusal does not name Cursor's file
+    /// yet, is the entry `agents connect` writes: on when Codex trusts the
+    /// line the file holds, and skipped when Codex only trusts today's line
+    /// (Codex trusts the bytes it read).
+    ///
+    /// FAILS ON REVERT of `current` in `judge` (the old line is "altered"),
+    /// or of the file's own line in the trust check (a trusted old line is
+    /// reported skipped).
+    #[cfg(unix)]
+    #[test]
+    fn a_1615_line_is_judged_as_todays() {
+        let old = CODEX_LINE.replacen(hook::FAIL_CLOSED_TAIL, hook::FAIL_CLOSED_TAIL_1615, 1);
+        assert_ne!(old, *CODEX_LINE);
+        let settings = json!({"hooks": {"PreToolUse": [codex_entry(&old)]}});
+        let file = Path::new("/home/me/.codex/hooks.json");
+        assert_eq!(
+            judged_codex(&settings, Some(&trusting(file, 0, &old))),
+            HookState::On {
+                monitor: false,
+                block_review: false
+            }
+        );
+        assert!(matches!(
+            judged_codex(&settings, Some(&trusting(file, 0, &CODEX_LINE))),
+            HookState::Off(Reason::Codex(_))
+        ));
+    }
+
+    /// Entries of the shape connect writes that run another program are
+    /// "another program", named with this one; a link to this program, and
+    /// the program itself, are this one; a state that is not installed or is
+    /// already altered stays as it was.
+    #[cfg(unix)]
+    #[test]
+    fn a_cursor_hook_that_runs_another_program_is_said() {
+        let home = tempfile::TempDir::new().unwrap();
+        let home = home.path();
+        let real = home.join("bin/innerwarden");
+        std::fs::create_dir_all(real.parent().unwrap()).unwrap();
+        std::fs::write(&real, "").unwrap();
+        let link = home.join("bin/iw-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let on = HookState::On {
+            monitor: false,
+            block_review: false,
+        };
+        let wire = |program: &Path| {
+            let line = CURSOR.command(program, false, false);
+            write(
+                home,
+                CURSOR.file,
+                &merge(json!(null), &CURSOR, &line).unwrap().to_string(),
+            );
+        };
+
+        wire(Path::new(BIN));
+        let said = cursor_runs_this(home, on.clone(), &real, None);
+        let HookState::Off(reason @ Reason::OtherProgram { .. }) = &said else {
+            panic!("{said:?}");
+        };
+        let why = reason.why(&CURSOR);
+        assert!(
+            why.contains(BIN) && why.contains(&real.display().to_string()),
+            "{why}"
+        );
+        assert!(not_on(&CURSOR, &said).is_some());
+
+        wire(&real);
+        assert_eq!(cursor_runs_this(home, on.clone(), &real, None), on);
+        wire(&link);
+        assert_eq!(
+            cursor_runs_this(home, on.clone(), &real, None),
+            on,
+            "a link to it"
+        );
+        // A program Codex's hook of ours runs is the guard too: status may be
+        // started from another copy than the one connect wired.
+        write(
+            home,
+            CODEX.file,
+            &json!({"hooks": {"PreToolUse": [codex_entry(&CODEX_LINE)]}}).to_string(),
+        );
+        wire(Path::new(BIN));
+        assert_eq!(
+            cursor_runs_this(home, on.clone(), &real, None),
+            on,
+            "Codex's program"
+        );
+        std::fs::remove_file(home.join(CODEX.file)).unwrap();
+        let altered = HookState::Off(Reason::Altered);
+        assert_eq!(
+            cursor_runs_this(home, altered.clone(), &real, None),
+            altered
+        );
+        assert_eq!(
+            cursor_runs_this(home, HookState::Absent, &real, None),
+            HookState::Absent
+        );
+    }
+
+    /// A bare program name is the first file of that name on PATH.
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_program_name_is_looked_up_on_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real = dir.path().join("innerwarden");
+        std::fs::write(&real, "").unwrap();
+        let path = std::ffi::OsString::from(dir.path());
+        assert!(runs_binary("innerwarden", &real, Some(&path)));
+        assert!(!runs_binary("innerwarden", &real, None));
+        assert!(!runs_binary("other", &real, Some(&path)));
+    }
+
+    /// Status says Cursor's hooks are gone from the file, and that an edit
+    /// of the agent's can take them out.
+    #[test]
+    fn cursor_hooks_not_in_the_file_are_said_as_such() {
+        let (what, next) = not_on(&CURSOR, &HookState::Absent).unwrap();
+        assert!(what.contains("not in ~/.cursor/hooks.json"), "{what}");
+        assert!(what.contains("edit"), "{what}");
+        assert_eq!(next, "innerwarden agents connect cursor");
+    }
+
+    fn cursor_file() -> Value {
+        let line = CURSOR.command(Path::new(BIN), false, false);
+        merge(json!(null), &CURSOR, &line).unwrap()
+    }
+
+    /// The hook refuses while Cursor's file has lost part of the guard: one
+    /// event's entry taken out, `failClosed` turned off, a file that is not
+    /// JSON. A whole file, and a file with nothing of ours left, are not
+    /// refused here (Cursor runs no hook of ours from the second).
+    #[test]
+    fn cursor_wiring_lost_is_said_until_it_is_put_back() {
+        let home = tempfile::TempDir::new().unwrap();
+        let home = home.path();
+        let lost = |home: &Path| cursor_wiring_lost_for(home, Some(Path::new(BIN)), None);
+        assert_eq!(lost(home), None, "no file");
+        let whole = cursor_file();
+        write(home, CURSOR.file, &whole.to_string());
+        assert_eq!(lost(home), None, "whole");
+
+        let mut no_read = whole.clone();
+        no_read["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove(crate::cursor_hook::READ_EVENT);
+        write(home, CURSOR.file, &no_read.to_string());
+        let why = lost(home).expect("an event without the entry");
+        assert!(why.contains(".cursor/hooks.json"), "{why}");
+        assert!(why.contains(crate::cursor_hook::READ_EVENT), "{why}");
+
+        let mut open = whole.clone();
+        open["hooks"][crate::cursor_hook::MCP_EVENT][0]["failClosed"] = json!(false);
+        write(home, CURSOR.file, &open.to_string());
+        assert!(lost(home).is_some(), "failClosed off");
+
+        write(home, CURSOR.file, "{ not json");
+        assert!(lost(home).is_some(), "unreadable");
+
+        write(
+            home,
+            CURSOR.file,
+            &json!({"version": 1, "hooks": {}}).to_string(),
+        );
+        assert_eq!(lost(home), None, "nothing of ours left");
+
+        write(home, CURSOR.file, &whole.to_string());
+        assert_eq!(lost(home), None, "put back");
+
+        // The whole file, for another program than this one.
+        let elsewhere = cursor_wiring_lost_for(home, Some(Path::new("/usr/local/bin/iw")), None)
+            .expect("another program");
+        assert!(elsewhere.contains("another program"), "{elsewhere}");
+    }
+
+    /// Connect and disconnect keep the person's keys in their order in
+    /// Cursor's and Gemini's files: only the hook goes in or out.
+    ///
+    /// FAILS ON REVERT of `json_order::pretty_in_order` in `install` and
+    /// `uninstall`: the keys come back sorted.
+    #[test]
+    fn connect_keeps_the_order_of_the_persons_keys() {
+        let home = tempfile::TempDir::new().unwrap();
+        let home = home.path();
+        let cursor = r#"{"version":1,"zeta":true,"hooks":{"stop":[{"command":"./after.sh"}],"afterFileEdit":[{"command":"./fmt.sh"}]},"alpha":2}"#;
+        let gemini = r#"{"theme":"dark","model":{"name":"x"},"auth":{"type":"y"}}"#;
+        write(home, CURSOR.file, cursor);
+        write(home, GEMINI.file, gemini);
+        for spec in [&CURSOR, &GEMINI] {
+            assert!(install(home, spec, Path::new(BIN), false, false).unwrap());
+        }
+        let text = std::fs::read_to_string(home.join(CURSOR.file)).unwrap();
+        let at = |key: &str| {
+            text.find(&format!("\"{key}\""))
+                .unwrap_or_else(|| panic!("{key} in {text}"))
+        };
+        assert!(
+            at("version") < at("zeta") && at("zeta") < at("hooks") && at("hooks") < at("alpha"),
+            "{text}"
+        );
+        assert!(
+            at("stop") < at("afterFileEdit")
+                && at("afterFileEdit") < at(crate::cursor_hook::SHELL_EVENT),
+            "{text}"
+        );
+        let text = std::fs::read_to_string(home.join(GEMINI.file)).unwrap();
+        let at = |key: &str| {
+            text.find(&format!("\"{key}\""))
+                .unwrap_or_else(|| panic!("{key} in {text}"))
+        };
+        assert!(
+            at("theme") < at("model") && at("model") < at("auth") && at("auth") < at("hooks"),
+            "{text}"
+        );
+
+        assert!(uninstall(home, &CURSOR).unwrap() > 0);
+        let text = std::fs::read_to_string(home.join(CURSOR.file)).unwrap();
+        let at = |key: &str| {
+            text.find(&format!("\"{key}\""))
+                .unwrap_or_else(|| panic!("{key} in {text}"))
+        };
+        assert!(
+            at("version") < at("zeta") && at("zeta") < at("hooks") && at("hooks") < at("alpha"),
+            "{text}"
+        );
+        assert!(at("stop") < at("afterFileEdit"), "{text}");
     }
 }
