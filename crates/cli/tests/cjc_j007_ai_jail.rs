@@ -646,23 +646,17 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
         let mode = std::fs::metadata(&records).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
     }
-    // This project's folder, and beside it the launcher's note of which of
-    // the project's Claude Code files were not there (final review of
-    // #352), out of the jail's reach.
+    // This project's folder, and nothing beside it: the launch's note of
+    // which of the project's Claude Code files were not there
+    // (`<folder>.run.<pid>`, beside the folder, out of the jail's reach) is
+    // taken away as the launch ends cleanly, and a jail that made nothing
+    // leaves no `<folder>.made` (T-109; before, a `<folder>.absent` stayed).
     let projects: Vec<_> = std::fs::read_dir(state.join("jail-claude"))
         .expect("this project's folder for Claude Code's settings file")
         .map(|e| e.unwrap().path())
         .collect();
-    assert_eq!(projects.len(), 2, "{projects:?}");
-    let folder = projects.iter().find(|p| p.is_dir()).expect("the folder");
-    let mut note = folder.clone().into_os_string();
-    note.push(".absent");
-    assert!(
-        projects
-            .iter()
-            .any(|p| p.as_os_str() == note && p.is_file()),
-        "{projects:?}"
-    );
+    assert_eq!(projects.len(), 1, "{projects:?}");
+    assert!(projects[0].is_dir(), "{projects:?}");
     let mut entries: Vec<String> = std::fs::read_dir(&state)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -4585,9 +4579,11 @@ fn every_doubt_in_the_persons_claude_settings_refuses_the_start() {
 fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
-    // The project's folder, and beside it, out of the jail's reach, the
-    // launcher's note of which of the project's Claude Code files were not
-    // there (`<folder>.absent`, final review of #352).
+    // The project's folder, and nothing beside it once the launch ended
+    // cleanly: the launch's note of which of the project's Claude Code files
+    // were not there (`<folder>.run.<pid>`, beside the folder, out of the
+    // jail's reach) is taken away at its end, and a jail that made nothing
+    // leaves no `<folder>.made` (T-109; before, `<folder>.absent` stayed).
     let entries = |h: &std::path::Path| -> Vec<std::path::PathBuf> {
         std::fs::read_dir(h.join(".local/state/innerwarden/jail-claude"))
             .map(|dir| dir.map(|e| e.unwrap().path()).collect())
@@ -4607,10 +4603,7 @@ fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     let made_one = |h: &std::path::Path, when: &str| {
         let made = folders(h);
         assert_eq!(made.len(), 1, "{when}: {made:?}");
-        let mut note = made[0].clone().into_os_string();
-        note.push(".absent");
-        assert_eq!(entries(h).len(), 2, "{when}: {:?}", entries(h));
-        assert!(std::path::Path::new(&note).is_file(), "{when}: {note:?}");
+        assert_eq!(entries(h).len(), 1, "{when}: {:?}", entries(h));
         let meta = std::fs::symlink_metadata(&made[0]).unwrap();
         assert!(meta.is_dir(), "{when}");
         assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{when}");
