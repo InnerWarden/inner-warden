@@ -194,10 +194,16 @@ fn a_kill_beside_a_folder_named_for_the_guard_is_not_disabling_it() {
         "pkill -f cargo; cd ~/innerwarden/wt && ls",
         "kill %1 && cd /opt/innerwarden",
     ]);
-    // Held for review since 2026-11-20, no longer allowed: what `kill` stops is what `pgrep` prints
-    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    // Held for review from 2026-11-20 to 2026-11-21 (what `kill` stops is
+    // what `pgrep` prints); allowed since: a `pgrep` written out that finds
+    // no process of the guard and names no other security control prints
+    // another program's ids. A pattern the guard cannot read is still held.
     assert_eq!(
         verdict("kill $(pgrep -f vite); cd ~/innerwarden/site").0,
+        "allow"
+    );
+    assert_eq!(
+        verdict("kill $(pgrep -f \"$P\"); cd ~/innerwarden/site").0,
         "review"
     );
 }

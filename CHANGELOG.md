@@ -47,6 +47,16 @@ names that posture: it used to be another name for `--block-review`, which
 stays the way to refuse every review. Wiring already on a host is not
 rewritten. [The posture](docs/features.md#the-posture-what-an-enforcing-hook-refuses).
 
+A `kill` in the `-c` script of a shell `xargs` starts is read, so the ids of
+the guard's processes handed to it are refused (`xargs sh -c 'kill "$@"' _`
+was allowed); the MCP wrapper's options glued (`--mode=guard`) or reordered
+are lines of the guard around every server, not only the first. `kill
+$(pgrep -f vite)` is allowed: a `pgrep` written out that finds no process
+of the guard prints another program's ids. `base64 -d` counts as hiding a
+command only when what it prints may run (piped into a shell or an
+interpreter, read in a substitution, written to a file the line then runs):
+`gh api .../contents/x --jq .content | base64 -d` is no longer refused.
+
 A here-document is read as the input of the command it is written after, and
 what a pipe hands a shell on its input is read as that shell's script. A
 narrow `Grep` of the home is held for review instead of refused. Every pull

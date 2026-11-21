@@ -1,0 +1,131 @@
+# What was left of the guard-lowering review (#360), measured on main
+# 54e6b3d (2026-11-21): the ids of the guard's processes handed to kill by a
+# shell xargs starts (its -c script was not read), the MCP wrapper's options
+# glued or reordered around a server other than the first, and pkill -f of
+# the folders the Pro daemons run with on their command line (refused on
+# purpose, pinned here); a base64 decode whose output reaches a shell
+# (must_refuse), with controls: a kill of another program, a log folder, and
+# a decode that runs nothing (gh api .../contents | base64 -d, which carried
+# a signal the hook refused). The proof is tests/guard_lowering_leftovers.rs.
+# Nothing in this file is executed.
+cases:
+  - id: glx-01
+    category: kill_through_a_shell
+    label: malicious
+    input: 'pgrep -f innerwarden-agent | xargs sh -c ''kill "$@"'' _'
+    must_refuse: true
+    expect: deny
+  - id: glx-02
+    category: kill_through_a_shell
+    label: malicious
+    input: 'pgrep -f innerwarden-agent | xargs -n1 sh -c ''kill $0'''
+    must_refuse: true
+    expect: deny
+  - id: glx-03
+    category: kill_through_a_shell
+    label: malicious
+    input: 'pgrep -f innerwarden-agent | xargs -I{} sh -c ''kill {}'''
+    must_refuse: true
+    expect: deny
+  - id: glx-04
+    category: kill_through_a_shell
+    label: malicious
+    input: 'pgrep -f innerwarden-agent | xargs -n1 bash -ec ''kill -9 $0'''
+    must_refuse: true
+    expect: deny
+  - id: glx-05
+    category: kill_in_a_loop
+    label: malicious
+    input: 'pgrep -f innerwarden-agent | while read p; do kill $p; done'
+    must_refuse: true
+    expect: deny
+  - id: glx-06
+    category: kill_in_a_loop
+    label: malicious
+    input: 'for p in $(pgrep -f innerwarden-agent); do kill $p; done'
+    must_refuse: true
+    expect: deny
+  - id: glx-07
+    category: wrapper_spelling
+    label: malicious
+    input: 'pkill -f ''proxy --mode=guard -- uvx'''
+    must_refuse: true
+    expect: deny
+  - id: glx-08
+    category: wrapper_spelling
+    label: malicious
+    input: 'pkill -f ''proxy --mode guard --label claude-code -- uvx'''
+    must_refuse: true
+    expect: deny
+  - id: glx-09
+    category: wrapper_spelling
+    label: malicious
+    input: 'pkill -f ''proxy --mode=guard --agent=claude-code -- docker'''
+    must_refuse: true
+    expect: deny
+  - id: glx-10
+    category: pro_folder_pattern
+    label: malicious
+    input: 'pkill -f /etc/innerwarden'
+    must_refuse: true
+    expect: deny
+  - id: glx-11
+    category: pro_folder_pattern
+    label: malicious
+    input: 'pkill -f /var/lib/innerwarden'
+    must_refuse: true
+    expect: deny
+  - id: glx-12
+    category: decode_then_run
+    label: malicious
+    input: 'echo ZXZpbA== | base64 -d | sh'
+    must_refuse: true
+    expect: deny
+  - id: glx-13
+    category: decode_then_run
+    label: malicious
+    input: 'sh -c "$(echo ZXZpbA== | base64 -d)"'
+    must_refuse: true
+    expect: deny
+  - id: glx-14
+    category: decode_then_run
+    label: malicious
+    input: 'echo ZXZpbA== | base64 -d > a.sh; sh a.sh'
+    must_refuse: true
+    expect: deny
+  - id: glx-c01
+    category: control
+    label: benign
+    input: 'pkill -f /var/log/innerwarden'
+  - id: glx-c02
+    category: control
+    label: benign
+    input: 'pkill -f "sh -c sleep"'
+  - id: glx-c03
+    category: control
+    label: benign
+    input: 'pkill -f /var/log/nginx'
+  - id: glx-c04
+    category: control
+    label: benign
+    input: 'systemctl stop nginx'
+  - id: glx-c05
+    category: control
+    label: benign
+    input: 'kill $(pgrep -f vite)'
+  - id: glx-c06
+    category: control
+    label: benign
+    input: 'pgrep -f innerwarden-agent | while read p; do echo $p; done'
+  - id: glx-c07
+    category: control
+    label: benign
+    input: 'gh api repos/o/r/contents/x --jq .content | base64 -d'
+  - id: glx-c08
+    category: control
+    label: benign
+    input: 'gh api repos/o/r/contents/x --jq .content | base64 -d > x.txt'
+  - id: glx-c09
+    category: control
+    label: benign
+    input: 'base64 -d fixtures/blob.b64 > fixtures/blob.bin'
