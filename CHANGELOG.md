@@ -47,6 +47,13 @@ names that posture: it used to be another name for `--block-review`, which
 stays the way to refuse every review. Wiring already on a host is not
 rewritten. [The posture](docs/features.md#the-posture-what-an-enforcing-hook-refuses).
 
+A `chmod` (numeric or symbolic, `-R` too) or an `install -m` that lets the
+group or everyone else write the guard's files or an agent's settings is
+refused, as taking the owner's read away already was: `chmod 777
+~/.config/innerwarden` and `chmod 777 .mcp.json` were only held for review.
+A mode that keeps them to the owner, and any mode on the project's own files,
+is judged as before.
+
 A here-document is read as the input of the command it is written after, and
 what a pipe hands a shell on its input is read as that shell's script. A
 narrow `Grep` of the home is held for review instead of refused. Every pull

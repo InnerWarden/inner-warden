@@ -8148,13 +8148,16 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                     _ => (None, &positional[..]),
                 };
                 // A program or a folder needs its owner's `x`; a settings
-                // file does not.
+                // file does not. A mode that lets the group or everyone else
+                // write it (`777`, `go+w`) hands the place to them, which is
+                // a write as much as one made now.
                 taken.extend(
                     files
                         .iter()
                         .filter(|path| {
                             !mode.is_some_and(|mode| {
                                 mode_keeps_owner(mode, !names_settings_file(path))
+                                    && !mode_opens_to_others(mode)
                             })
                         })
                         .map(|path| path.to_string()),
@@ -9069,6 +9072,32 @@ fn mode_keeps_owner(mode: &str, runs: bool) -> bool {
                     && bits.contains('w')
                     && (!runs || bits.contains(['x', 'X'])))
         }
+    })
+}
+
+/// Whether a `chmod` mode lets the group or everyone else write the file:
+/// a `2` bit in either of the last two digits (`777`, `0666`, `1777`, `70`),
+/// or a clause for `g`, `o` or `a` that adds or sets `w` (`go+w`, `a+w`,
+/// `o=rwx`), or that copies another class's bits to them (`o=u`). A clause
+/// with no class (`+w`) follows the umask, which leaves the others out.
+fn mode_opens_to_others(mode: &str) -> bool {
+    if !mode.is_empty() && mode.bytes().all(|b| b.is_ascii_digit()) {
+        return mode
+            .bytes()
+            .rev()
+            .take(2)
+            .any(|digit| (digit - b'0') & 2 != 0);
+    }
+    mode.split(',').any(|clause| {
+        let Some(at) = clause.find(['+', '=']) else {
+            return false;
+        };
+        if clause[..at].contains('-') {
+            return false;
+        }
+        let (who, change) = clause.split_at(at);
+        let bits = &change[1..];
+        who.contains(['g', 'o', 'a']) && bits.contains(['w', 'u', 'g', 'o'])
     })
 }
 
@@ -32816,6 +32845,38 @@ mod redirect_fallback_tests {
             "hook.sh",
         ] {
             assert!(!names_settings_file(other), "{other}");
+        }
+    }
+
+    /// A mode that lets the group or everyone else write: a `2` bit in
+    /// either of the last two digits, or a clause for `g`, `o` or `a` that
+    /// adds, sets or copies in `w`. FAILS ON REVERT of [`mode_opens_to_others`].
+    #[test]
+    fn a_mode_that_lets_others_write_is_told_apart() {
+        for mode in [
+            "777", "0777", "1777", "666", "0662", "620", "70", "go+w", "a+w", "o=rwx", "g+rw",
+            "u+x,o+w", "o=u", "g=o", "ug+w", "a=rwX",
+        ] {
+            assert!(super::mode_opens_to_others(mode), "{mode}");
+        }
+        for mode in [
+            "755",
+            "700",
+            "0644",
+            "600",
+            "4755",
+            "+w",
+            "u+w",
+            "go-w",
+            "a-w",
+            "o=r",
+            "g=rx",
+            "go=",
+            "u=rwx,go=",
+            "",
+            "~/.claude",
+        ] {
+            assert!(!super::mode_opens_to_others(mode), "{mode}");
         }
     }
 
