@@ -490,11 +490,14 @@ pub(crate) fn shell_lines(language: Language, text: &str, program: &str) -> Vec<
             if language == Language::Php {
                 return vec![format!("{program} {} {}", row.1, single_quoted(&code))];
             }
-            let mut end = String::from("IW_CODE");
-            while code
+            // The lines of the code are read once: the delimiter grows past
+            // every line that would end the here-document early.
+            let taken: std::collections::HashSet<&str> = code
                 .lines()
-                .any(|line| line.trim_start_matches('\t') == end)
-            {
+                .map(|line| line.trim_start_matches('\t'))
+                .collect();
+            let mut end = String::from("IW_CODE");
+            while taken.contains(end.as_str()) {
                 end.push('_');
             }
             vec![format!("{program} - <<'{end}'\n{code}\n{end}")]

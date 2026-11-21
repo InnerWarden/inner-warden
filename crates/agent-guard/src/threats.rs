@@ -14086,6 +14086,9 @@ fn feeder_reading(feeder: &crate::shell_words::Command) -> Option<XargsRemoval> 
             // the homes' (those are `ListsProtectedPlace` above).
             // Never inside a folder of the system's own (`/etc/nginx`,
             // `/usr/lib/x`): what the system keeps there is not the work's.
+            // Never in a home at any depth (`/home/u/Documents`,
+            // `/Users/u/Library/Keychains`), nor on a mounted disk
+            // (`/mnt`, `/media`): that is the person's, not the project's.
             let named_folder = |root: &&String| {
                 let first = root.trim_start_matches('/').split('/').next().unwrap_or("");
                 root.starts_with('/')
@@ -14096,6 +14099,10 @@ fn feeder_reading(feeder: &crate::shell_words::Command) -> Option<XargsRemoval> 
                     && !matches!(
                         first,
                         "etc"
+                            | "home"
+                            | "users"
+                            | "mnt"
+                            | "media"
                             | "usr"
                             | "bin"
                             | "sbin"

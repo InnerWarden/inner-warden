@@ -2013,7 +2013,26 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
     if evaluated_fetch || fetched_value_is_evaluated(tree.root_node(), source.as_bytes()) {
         return Some(DataFlow::EvaluatedFetch);
     }
-    local_text.then_some(DataFlow::LocalTextIntoCode)
+    // Text a line downloaded and then reads with `grep` is not the
+    // project's: what xargs places from it into a shell's code is fetched
+    // code, refused as before.
+    local_text.then(|| {
+        if line_downloads_to_file(tree.root_node(), source.as_bytes()) {
+            DataFlow::Fed
+        } else {
+            DataFlow::LocalTextIntoCode
+        }
+    })
+}
+
+/// Whether a command of the line writes what it downloads to a file
+/// (`curl -o`, `wget -O` and their kin).
+fn line_downloads_to_file(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    commands
+        .into_iter()
+        .any(|command| !command_download_output_targets(command, source).is_empty())
 }
 
 /// Programs that only print text they read from the files they are named
@@ -2093,13 +2112,23 @@ fn only_reads_text(command: tree_sitter::Node<'_>, source: &[u8], sed_too: bool)
         return false;
     };
     if sed_too && name == "sed" {
-        return !words[1..].iter().any(|word| {
+        let options_read = !words[1..].iter().any(|word| {
             word.starts_with("--in-place")
                 || (word.starts_with('-') && !word.starts_with("--") && word.contains('i'))
                 || word.starts_with("--expression")
                 || word.starts_with("--file")
                 || word == "-f"
+                || word == "-e"
         });
+        // The script is the first word that is not an option; it only
+        // prints or drops lines (`p`, `d`, `=` on addresses and ranges).
+        // `w`, `W`, `e`, `r`, `R`, `F` and `s///` write, run or read
+        // other files, so the command does not only read text.
+        return options_read
+            && words[1..]
+                .iter()
+                .find(|word| !word.starts_with('-'))
+                .is_some_and(|script| sed_script_only_prints(&one_quote_level_off(script)));
     }
     if !LOCAL_TEXT_READERS.contains(&name.as_str()) {
         return false;
@@ -2110,6 +2139,47 @@ fn only_reads_text(command: tree_sitter::Node<'_>, source: &[u8], sed_too: bool)
                 .iter()
                 .any(|bad| word.contains(bad))
         }))
+}
+
+/// Whether a `sed` script is only addressed `p`, `d` and `=` commands:
+/// line numbers, `$`, `/regex/`, ranges (`,`, `+N`, `~N`), `!` and the
+/// `{}` an `xargs -I {}` replaces, separated by `;` or new lines.
+fn sed_script_only_prints(script: &str) -> bool {
+    let commands: Vec<&str> = script
+        .split([';', '\n'])
+        .map(str::trim)
+        .filter(|command| !command.is_empty())
+        .collect();
+    !commands.is_empty()
+        && commands.iter().all(|command| {
+            let mut rest = *command;
+            loop {
+                rest = rest.trim_start();
+                if let Some(after) = rest.strip_prefix("{}") {
+                    rest = after;
+                } else if let Some(after) = rest.strip_prefix('/') {
+                    // A regex address, to its unescaped closing slash.
+                    let mut escaped = false;
+                    let Some(end) = after.char_indices().find_map(|(at, c)| {
+                        let close = c == '/' && !escaped;
+                        escaped = c == '\\' && !escaped;
+                        close.then_some(at)
+                    }) else {
+                        return false;
+                    };
+                    rest = &after[end + 1..];
+                } else if rest
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_digit() || matches!(c, '$' | ',' | '+' | '~' | '!'))
+                {
+                    rest = &rest[1..];
+                } else {
+                    break;
+                }
+            }
+            matches!(rest.trim(), "p" | "d" | "=")
+        })
 }
 
 /// A word as the shell hands it on when it is one quoted string: the text
