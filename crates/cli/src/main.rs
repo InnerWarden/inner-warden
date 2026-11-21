@@ -1517,6 +1517,13 @@ mod json_head {
 /// other payload.
 ///
 /// [`user_prompt`]: innerwarden_agent_guard::user_prompt
+// A prompt write that waits out its deadline still ends with the lost mark
+// written, before the hook's limit on the clock ends the run.
+const _: () = assert!(
+    innerwarden_agent_guard::user_prompt::UPDATE_DEADLINE.as_millis()
+        < hook_net::WALL_CAP.as_millis()
+);
+
 fn keep_the_prompt(buf: &str, rest: &[String]) -> Option<std::process::ExitCode> {
     use innerwarden_agent_guard::user_prompt;
     let value: serde_json::Value = serde_json::from_str(buf).ok()?;

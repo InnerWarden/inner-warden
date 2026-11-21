@@ -372,6 +372,34 @@ pub fn tool_classes_finding(classes: &ToolClasses) -> Finding {
     }
 }
 
+/// PURE: what `status` says of the prompt channel of an agent with a hook
+/// beside the MCP proxy (Codex, Gemini, Cursor, Hermes) when the channel is
+/// off ([`innerwarden_agent_guard::user_prompt::prompt_channel`]): the proxy
+/// has no session to read what the person asked in. An extra that is not
+/// there, never a fault: nothing the person can do turns it on, and the
+/// channel never lowers a refusal anyway. `None` for any other wiring, and
+/// for an agent whose channel is on.
+pub fn prompt_channel_finding(classes: &ToolClasses) -> Option<Finding> {
+    use innerwarden_agent_guard::user_prompt::{prompt_channel, PromptChannel};
+    let (ToolClasses::HookAndProxy { agent, .. } | ToolClasses::HookNotOn { agent, .. }) = classes
+    else {
+        return None;
+    };
+    match prompt_channel(agent) {
+        PromptChannel::On { .. } => None,
+        PromptChannel::Off { why } => Some(Finding::Optional {
+            what: format!(
+                "{agent}: prompt channel off: the MCP proxy cannot match a call to what the \
+                 person asked, because {why}."
+            ),
+            next: format!(
+                "nothing to set here: it turns on once {agent} hands its MCP servers the \
+                 session id its prompt hook gets"
+            ),
+        }),
+    }
+}
+
 /// PURE: what one agent's wiring judges, as a key and as the sentence
 /// `status` prints for it without the agent's name, so the dashboard and
 /// `status` say one thing. The keys: `shell_and_privileged_files` (with or
@@ -1194,6 +1222,7 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     // Printed with no wired agent too: a hook that is in the file of an agent
     // with no MCP servers, and is not on, is the only line that agent gets.
     out.extend(facts.tool_classes.iter().map(tool_classes_finding));
+    out.extend(facts.tool_classes.iter().filter_map(prompt_channel_finding));
     // A project's own settings can switch the hook above off in its folder:
     // the person's wiring reads as on while the agent there runs unscreened.
     out.extend(facts.project_settings.iter().map(project_settings_finding));
@@ -1949,6 +1978,59 @@ mod tests {
                 "{settings}"
             );
         }
+    }
+
+    /// `status` says the prompt channel is off for Codex, Gemini, Cursor and
+    /// Hermes, beside what their wiring judges, without turning a healthy
+    /// install into a fault; Claude Code and a proxy-only agent get no line.
+    ///
+    /// FAILS ON REVERT: drop the `prompt_channel_finding` line from `assess`
+    /// and no agent's channel is named.
+    #[test]
+    fn status_says_where_the_prompt_channel_is_off() {
+        let mut facts = healthy();
+        facts.tool_classes = ["codex", "gemini", "cursor", "hermes"]
+            .into_iter()
+            .map(|agent| ToolClasses::HookAndProxy {
+                agent: agent.into(),
+                screened: "shell commands.".into(),
+                gaps: Vec::new(),
+            })
+            .chain([
+                ToolClasses::Hook {
+                    agent: "claude-code".into(),
+                    file_tools: true,
+                    reads: true,
+                    next: String::new(),
+                },
+                ToolClasses::Proxy {
+                    agent: "goose".into(),
+                },
+            ])
+            .collect();
+        let findings = assess(&facts);
+        let off: Vec<String> = findings
+            .iter()
+            .filter_map(|f| match f {
+                Finding::Optional { what, .. } if what.contains("prompt channel off") => {
+                    Some(what.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(off.len(), 4, "{off:?}");
+        for agent in ["codex", "gemini", "cursor", "hermes"] {
+            assert!(
+                off.iter()
+                    .any(|line| line.starts_with(&format!("{agent}: "))),
+                "{agent}: {off:?}"
+            );
+        }
+        assert!(
+            off.iter().any(|line| line.contains("not measured")),
+            "{off:?}"
+        );
+        assert_eq!(headline(&findings), "InnerWarden is on and screening.");
     }
 
     /// The dashboard's words for what an agent judges are the words `status`

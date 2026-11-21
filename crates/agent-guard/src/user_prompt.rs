@@ -57,8 +57,10 @@
 //! The hook reads `session_id` from Claude Code's payload. Claude Code sets
 //! `CLAUDE_CODE_SESSION_ID` to the same id in the environment of the
 //! processes it starts, so a proxy it started reads it there
-//! ([`proxy_session`]). No other agent is known to hand its MCP servers a
-//! session id, so for them the answer is always "unknown".
+//! ([`proxy_session`]). Codex, Gemini CLI and Hermes hand their prompt hook
+//! a session id and their MCP servers none (read in their source), and
+//! Cursor was not measured: for them the channel is off ([`prompt_channel`]),
+//! their prompts are not kept, and `status` says so.
 //!
 //! # The answer
 //!
@@ -180,12 +182,86 @@ pub fn default_dir() -> Option<PathBuf> {
     Some(dir_in(Path::new(&home)))
 }
 
-/// The session id the proxy runs in: the one Claude Code hands the
-/// processes it starts. `None` for any other agent.
+/// Whether the proxy can match an agent's calls to what the person asked:
+/// on only where the prompt hook and the MCP server are handed the same
+/// session id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptChannel {
+    /// The agent hands the processes it starts the session id its prompt
+    /// hook gets, in this variable.
+    On { session_env: &'static str },
+    /// No id both sides know: every answer for this agent would be
+    /// "unknown", so its prompts are not kept. `why` says what was found.
+    Off { why: &'static str },
+}
+
+/// Each agent's channel, as found in November 2026 (one line each in
+/// `docs/prompt-record.md`). An agent turns on only when both sides were
+/// seen with the same id; an agent not named here is off.
+const CHANNELS: &[(&str, PromptChannel)] = &[
+    (
+        "claude-code",
+        PromptChannel::On {
+            session_env: CLAUDE_CODE_SESSION_ENV,
+        },
+    ),
+    (
+        "codex",
+        PromptChannel::Off {
+            why: "Codex hands its prompt hook a session_id, and starts an MCP server with a \
+                  fixed list of variables (HOME, PATH, USER and the like) that holds no \
+                  session id (read in Codex's source, not measured on a running Codex)",
+        },
+    ),
+    (
+        "gemini",
+        PromptChannel::Off {
+            why: "Gemini CLI hands its prompt hook a session_id, and no session id was found \
+                  in what it hands an MCP server it starts (read in Gemini CLI's source, not \
+                  measured on a running Gemini CLI)",
+        },
+    ),
+    (
+        "hermes",
+        PromptChannel::Off {
+            why: "Hermes starts an MCP server with a fixed list of variables that holds no \
+                  session id (read in the source of Hermes v0.23.1, not measured on a \
+                  running Hermes)",
+        },
+    ),
+    (
+        "cursor",
+        PromptChannel::Off {
+            why: "not measured: Cursor's source is closed and no Cursor was at hand to \
+                  measure",
+        },
+    ),
+];
+
+/// Why an agent with no line in [`CHANNELS`] is off.
+const NO_CHANNEL: &str = "no session id this agent hands its MCP servers is known";
+
+/// The prompt channel of `agent` (an agent name as `innerwarden agents`
+/// lists it).
+pub fn prompt_channel(agent: &str) -> PromptChannel {
+    CHANNELS
+        .iter()
+        .find(|(name, _)| *name == agent)
+        .map_or(PromptChannel::Off { why: NO_CHANNEL }, |(_, channel)| {
+            *channel
+        })
+}
+
+/// The session id the proxy runs in: the one an agent whose channel is on
+/// ([`prompt_channel`]) hands the processes it starts. `None` under any
+/// other agent.
 pub fn proxy_session() -> Option<String> {
-    std::env::var(CLAUDE_CODE_SESSION_ENV)
-        .ok()
-        .and_then(|session| usable_session(&session).map(str::to_string))
+    CHANNELS.iter().find_map(|(_, channel)| match channel {
+        PromptChannel::On { session_env } => std::env::var(session_env)
+            .ok()
+            .and_then(|session| usable_session(&session).map(str::to_string)),
+        PromptChannel::Off { .. } => None,
+    })
 }
 
 fn usable_session(session: &str) -> Option<&str> {
@@ -226,53 +302,87 @@ fn kept_text_and_cut(prompt: &str) -> (String, bool) {
     }
 }
 
-/// How long a write waits for the update lock of a record.
-const UPDATE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long, on the clock, a write waits in all for the update lock of a
+/// record: one wait for the whole write, never a count of tries. Writers at
+/// once each wait their turn inside it, however many there are and however
+/// loaded the machine is; under load a count of short waits ran out
+/// (`a write gave up` in `more_prompts_at_once_than_attempts_are_all_kept`)
+/// while the lock was only ever held by other writers of the same session.
+///
+/// Wide, and still under the hook's own limit on the clock (`WALL_CAP` in the
+/// CLI's `hook_net`, checked there), so a write that waits it out ends with
+/// the lost mark written rather than with the hook killed. A lock held the
+/// whole time is a holder that is not one of these writers (the record's
+/// lock can be opened by the agent's own account): the prompt is then marked
+/// lost, never waited on for ever.
+pub const UPDATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// How many times a write reads the record again when another writer
-/// changed it between the read and the write, or held the lock for the
-/// whole of [`UPDATE_LOCK_WAIT`]. Inside the hook's own deadline.
+/// How long a trim of an expired record ([`prune`]) waits for its update
+/// lock. A trim is housekeeping: one that finds the lock held leaves the
+/// record to the next write, which trims it.
+const TRIM_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many times a write is tried again when a writer that does not take
+/// the lock (an editor, the agent's own process) changed the record between
+/// the read and the rename. A busy lock is not counted here: it is waited on
+/// until [`UPDATE_DEADLINE`].
 const UPDATE_ATTEMPTS: usize = 8;
 
-/// Read the record of `session`, change it, and write it back under the
-/// guard's update lock (`crate::file_update::replace_owned_store_no_symlinks`,
-/// the lock and the compare-and-replace the guard's own record uses): the
-/// write lands only if the file still holds what was read, and is tried again
-/// from a fresh read otherwise, so two hook runs of one session never lose a
-/// prompt. A record that cannot be read is started again.
+/// Read the record of `session`, change it, and write it back, the guard's
+/// update lock held from the read to the rename
+/// (`crate::file_update::update_owned_store_no_symlinks`, the lock the guard's
+/// own record uses): two hook runs of one session never read the same record,
+/// so neither loses its prompt and neither has to read again. A record that
+/// cannot be read is started again.
+///
+/// The read was once made before the lock and compared after it: with many
+/// hook runs at once each round had one winner, and under load a run could
+/// lose every one of its attempts (`prompts_written_at_once_are_all_kept`).
+/// Then the lock was waited on a second at a time, eight times at most, and
+/// under load a writer still gave up while the others took turns ahead of
+/// it. `deadline` is now the one wait of the whole write.
 fn update_record_waiting(
     dir: &Path,
     session: &str,
-    lock_wait: std::time::Duration,
+    deadline: std::time::Duration,
     change: impl Fn(&mut Record),
 ) -> std::io::Result<PathBuf> {
-    use crate::file_update::{replace_owned_store_no_symlinks, ReplaceError};
+    use crate::file_update::{update_owned_store_no_symlinks, ReplaceError};
     make_dir(dir)?;
     let path = file_for(dir, session);
+    let started = std::time::Instant::now();
     let mut last = String::from("the record kept changing under the write");
     for _ in 0..UPDATE_ATTEMPTS {
-        let expected = match fs::symlink_metadata(&path) {
+        let Some(lock_wait) = deadline.checked_sub(started.elapsed()) else {
+            break;
+        };
+        match fs::symlink_metadata(&path) {
             Ok(meta) if !meta.is_file() => {
                 return Err(std::io::Error::other("the record is not a plain file"));
             }
-            Ok(_) => Some(fs::read(&path)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
+        }
+        let mut changed = |current: Option<&[u8]>| {
+            let mut record = current
+                .and_then(|bytes| serde_json::from_slice::<Record>(bytes).ok())
+                .filter(|record| record.session == session)
+                .unwrap_or_else(|| Record {
+                    session: session.to_string(),
+                    ..Record::default()
+                });
+            change(&mut record);
+            serde_json::to_vec(&record).map_err(|e| e.to_string())
         };
-        let mut record = expected
-            .as_deref()
-            .and_then(|bytes| serde_json::from_slice::<Record>(bytes).ok())
-            .filter(|record| record.session == session)
-            .unwrap_or_else(|| Record {
-                session: session.to_string(),
-                ..Record::default()
-            });
-        change(&mut record);
-        let body = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
-        match replace_owned_store_no_symlinks(dir, &path, expected.as_deref(), &body, lock_wait) {
+        match update_owned_store_no_symlinks(dir, &path, lock_wait, &mut changed) {
             Ok(()) => return Ok(path),
+            // Held for the whole of what was left of the deadline: there is
+            // no time left to try again in.
             Err(ReplaceError::LockBusy { .. }) => {
-                last = String::from("the record's update lock was busy");
+                return Err(std::io::Error::other(
+                    "the record's update lock was held past the write's deadline",
+                ));
             }
             Err(ReplaceError::Failed(why)) => last = why,
         }
@@ -373,11 +483,11 @@ pub fn record_in(
     if prompt.trim().is_empty() {
         return Ok(());
     }
-    record_in_waiting(dir, session, agent, prompt, now_ms, UPDATE_LOCK_WAIT)
+    record_in_waiting(dir, session, agent, prompt, now_ms, UPDATE_DEADLINE)
 }
 
-/// [`record_in`] with the wait for the update lock handed in. A prompt that
-/// could not be written (the lock held through every attempt, a write that
+/// [`record_in`] with the deadline of the write handed in. A prompt that
+/// could not be written (the lock held past the deadline, a write that
 /// failed) leaves the lost mark, so a value it held answers "unknown",
 /// never "no".
 fn record_in_waiting(
@@ -386,10 +496,10 @@ fn record_in_waiting(
     agent: Option<&str>,
     prompt: &str,
     now_ms: i64,
-    lock_wait: std::time::Duration,
+    deadline: std::time::Duration,
 ) -> std::io::Result<()> {
     let (text, cut) = kept_text_and_cut(prompt);
-    let written = update_record_waiting(dir, session, lock_wait, |record| {
+    let written = update_record_waiting(dir, session, deadline, |record| {
         if let Some(agent) = agent {
             record.agent = Some(agent.to_string());
         }
@@ -583,7 +693,7 @@ fn drop_expired(path: &Path, read_from: &[u8], record: &Record, now_ms: i64) {
             path,
             Some(read_from),
             &body,
-            UPDATE_LOCK_WAIT,
+            TRIM_LOCK_WAIT,
         );
     }
 }
@@ -889,6 +999,73 @@ mod tests {
                 "prompt {i} was lost"
             );
         }
+    }
+
+    /// More hook runs of one session at once than a write has attempts, all
+    /// let go at the same instant: every prompt is kept. Each run reads the
+    /// record under the update lock, so none loses a round to another, and
+    /// waits for its turn until the write's deadline, not for a count of
+    /// tries: on a loaded machine (other builds and suites beside it,
+    /// 2026-11-21) eight one-second waits gave up and the prompt was lost.
+    ///
+    /// FAILS ON REVERT: read the record before the lock and compare after it,
+    /// and with every run reading at once each round has few winners; runs
+    /// that lose all of their attempts lose their prompt (the write fails).
+    #[test]
+    fn more_prompts_at_once_than_attempts_are_all_kept() {
+        let (_tmp, dir) = dir();
+        const RUNS: usize = 4 * UPDATE_ATTEMPTS;
+        let start = std::sync::Barrier::new(RUNS);
+        let failed = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for i in 0..RUNS {
+                let (dir, start, failed) = (&dir, &start, &failed);
+                scope.spawn(move || {
+                    start.wait();
+                    if record_in(
+                        dir,
+                        Some(SESSION),
+                        None,
+                        &format!("open ticket-{i} now"),
+                        NOW,
+                    )
+                    .is_err()
+                    {
+                        failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(failed.into_inner(), 0, "a write gave up");
+        for i in 0..RUNS {
+            assert_eq!(
+                ask(&dir, Some(SESSION), &format!("ticket-{i}")),
+                UserAsked::Yes,
+                "prompt {i} was lost"
+            );
+        }
+    }
+
+    /// Only an agent seen handing the same id to both sides is on; every
+    /// other agent is off with the reason, and an agent never named is off.
+    #[test]
+    fn the_channel_is_on_only_where_both_sides_know_the_session() {
+        assert_eq!(
+            prompt_channel("claude-code"),
+            PromptChannel::On {
+                session_env: CLAUDE_CODE_SESSION_ENV
+            }
+        );
+        for agent in ["codex", "gemini", "hermes", "cursor", "goose", ""] {
+            let PromptChannel::Off { why } = prompt_channel(agent) else {
+                panic!("{agent} must be off");
+            };
+            assert!(!why.is_empty(), "{agent} is off without a reason");
+        }
+        assert!(matches!(
+            prompt_channel("cursor"),
+            PromptChannel::Off { why } if why.starts_with("not measured")
+        ));
     }
 
     #[test]

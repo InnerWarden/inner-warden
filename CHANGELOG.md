@@ -99,6 +99,23 @@ keys is refused in every posture that refuses (`AG-PROTECTED-TARGET`);
 `delete_directory {"path": "/etc"}` used to pass. Details:
 [What InnerWarden does](docs/features.md).
 
+`innerwarden status` says, under Codex, Gemini CLI, Cursor and Hermes, that
+the prompt channel is off and why: none of them hands its MCP servers the
+session id its prompt hook gets (read in their source; Cursor not measured),
+so the MCP proxy cannot match their calls to what the person asked. Claude
+Code stays the only agent with the channel on. The channel never lowers a
+refusal. Details: [What the person asked](docs/prompt-record.md).
+
+Prompts submitted at the same moment in one session are all kept. A write
+used to read the record before taking its lock and compare after, and with
+many writers at once under load one could lose all 8 attempts and drop its
+prompt (the session was then marked as having lost words). The record is now
+read with the lock held, and a write waits for its turn at the lock until one
+deadline of 20 seconds, under the hook's own limit, instead of eight waits of
+a second: on a loaded machine (two busy loops per CPU and two writers
+syncing files) the concurrent-writer tests failed in 9 of 10 runs before and
+in 0 of 20 after. A lock held past the deadline still marks the prompt lost.
+
 Ordinary agent work is refused less. In a set of commands from public
 coding-agent runs with no attack among them, main refused 69 lines; this
 change allows 26 of them, holds 42 for review and still refuses 1 (a line
