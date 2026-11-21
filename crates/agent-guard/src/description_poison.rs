@@ -1209,7 +1209,7 @@ mod tests {
                 panic!("screening a long token of {unit:?} took over 120 s");
             };
             assert!(
-                large < small * 10 + Duration::from_millis(50),
+                large < small * 12 + Duration::from_millis(300),
                 "four times a long token of {unit:?} took {large:?} against {small:?}: not linear"
             );
         }

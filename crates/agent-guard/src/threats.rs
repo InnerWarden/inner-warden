@@ -20069,7 +20069,7 @@ fn named_path(argument: &str) -> Option<NamedPath> {
 
 /// Decode `%XX` escapes, as a server taking a `file:` URL does before it
 /// opens the path. An escape that is not two hex digits is kept as written.
-fn percent_decode(text: &str) -> String {
+pub(crate) fn percent_decode(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
