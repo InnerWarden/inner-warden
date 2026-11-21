@@ -812,8 +812,10 @@ Also not seen today, and not promised for any date:
   guard ends (`exit 2`, `case $s in`), which any script holds, is left to
   the other checks; process ids of the guard handed to a `kill` on a later
   line, or by a program the line does not show, are not followed. A
-  restart of a service of the guard (`systemctl restart`) runs, as ordinary
-  maintenance, while a restart asked of systemd over D-Bus is refused. The
+  restart of a service of the guard runs, as ordinary maintenance, whether
+  asked of `systemctl` (`restart`, `try-restart`, `reload-or-restart`) or
+  of systemd over D-Bus (`RestartUnit`, `TryRestartUnit`,
+  `ReloadOrRestartUnit`): the guard runs again after it. The
   Cursor CLI's own flags are not read.
 - A path that steps back with `..` after a symbolic link. The MCP proxy
   reads a path where a call writes by its text, with `.` and `..` taken

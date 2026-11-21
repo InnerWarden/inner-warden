@@ -170,16 +170,22 @@ fn systemd_over_dbus_taking_a_guard_unit_down_is_stopping_the_guard() {
     for command in [
         format!("busctl call {MANAGER} StopUnit ss innerwarden-agent.service replace"),
         format!("busctl call {MANAGER} KillUnit ssi innerwarden-agent.service all 9"),
-        format!("busctl call {MANAGER} RestartUnit ss innerwarden-sensor.service replace"),
         format!("busctl call {MANAGER} MaskUnitFiles asbb 1 innerwarden-agent.service false true"),
         "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/innerwarden_2dagent_2eservice org.freedesktop.systemd1.Unit Stop s replace".to_owned(),
         "dbus-send --system --print-reply --dest=org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager.StopUnit string:innerwarden-agent.service string:replace".to_owned(),
-        "gdbus call --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 --method org.freedesktop.systemd1.Manager.RestartUnit innerwarden-agent.service replace".to_owned(),
     ] {
         assert_eq!(verdict(&command), "deny", "{command}");
     }
+    // A restart keeps the guard running: allowed over D-Bus as with
+    // `systemctl restart` (decision of 2026-11-21; it was refused here
+    // before).
     for command in [
         format!("busctl call {MANAGER} GetUnit s innerwarden-agent.service"),
+        format!("busctl call {MANAGER} RestartUnit ss innerwarden-sensor.service replace"),
+        format!("busctl call {MANAGER} TryRestartUnit ss innerwarden-agent.service replace"),
+        format!("busctl call {MANAGER} ReloadOrRestartUnit ss innerwarden-agent.service replace"),
+        "gdbus call --system --dest org.freedesktop.systemd1 --object-path /org/freedesktop/systemd1 --method org.freedesktop.systemd1.Manager.RestartUnit innerwarden-agent.service replace".to_owned(),
+        "dbus-send --system --print-reply --dest=org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager.RestartUnit string:innerwarden-agent.service string:replace".to_owned(),
         format!("busctl call {MANAGER} RestartUnit ss nginx.service replace"),
         "busctl status".to_owned(),
     ] {

@@ -242,7 +242,6 @@ const SERVICE_AND_PROCESS_LINES: &[&str] = &[
     "launchctl unload>/dev/null ~/Library/LaunchAgents/com.innerwarden.agent.plist",
     "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StopUnit ss innerwarden-agent.service replace",
     "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager KillUnit ssi innerwarden-agent.service all 9",
-    "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss innerwarden-sensor.service replace",
     "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager MaskUnitFiles asbb 1 innerwarden-agent.service false true",
     "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/innerwarden_2dagent_2eservice org.freedesktop.systemd1.Unit Stop s replace",
     "dbus-send --system --print-reply --dest=org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager.StopUnit string:innerwarden-agent.service string:replace",
@@ -589,6 +588,12 @@ fn allow_cases() -> Vec<(String, String)> {
         (
             "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss nginx.service replace".into(),
             "control|dbus-restart-other".into(),
+        ),
+        // A restart of the guard's unit keeps it running: allowed over
+        // D-Bus as with `systemctl restart` (decision of 2026-11-21).
+        (
+            "busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss innerwarden-sensor.service replace".into(),
+            "maintenance|dbus-restart-guard".into(),
         ),
     ]
 }

@@ -1809,8 +1809,6 @@ DENY	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesk
 DENY	sudo busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager StopUnit ss innerwarden-agent.service replace
 DENY	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager KillUnit ssi innerwarden-agent.service all 9
 DENY	sudo busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager KillUnit ssi innerwarden-agent.service all 9
-DENY	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss innerwarden-sensor.service replace
-DENY	sudo busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss innerwarden-sensor.service replace
 DENY	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager MaskUnitFiles asbb 1 innerwarden-agent.service false true
 DENY	sudo busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager MaskUnitFiles asbb 1 innerwarden-agent.service false true
 DENY	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/innerwarden_2dagent_2eservice org.freedesktop.systemd1.Unit Stop s replace
@@ -1868,3 +1866,4 @@ ALLOW	systemctl stop>&2 nginx
 ALLOW	systemctl status innerwarden-agent
 ALLOW	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager GetUnit s innerwarden-agent.service
 ALLOW	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss nginx.service replace
+ALLOW	busctl call org.freedesktop.systemd1 /org/freedesktop/systemd1 org.freedesktop.systemd1.Manager RestartUnit ss innerwarden-sensor.service replace

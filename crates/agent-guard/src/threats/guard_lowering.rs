@@ -12,8 +12,9 @@
 //!   disable, mask or kill a unit of the guard, its verb and unit read past
 //!   a redirection glued to the verb (`stop>&2`, `unload>/dev/null`);
 //! * systemd's manager reached over D-Bus (`busctl`, `dbus-send`, `gdbus`,
-//!   `qdbus`), asked to stop, kill, restart, freeze, mask or disable a unit of
-//!   the guard.
+//!   `qdbus`), asked to stop, kill, freeze, mask or disable a unit of the
+//!   guard. A restart keeps the guard running and is allowed, over D-Bus as
+//!   with `systemctl restart`.
 
 use super::{
     effective_command_index, launched_command_index, program_name, PkillReach, PROTECTED_TARGETS,
@@ -1133,15 +1134,13 @@ const SYSTEMCTL_VALUED: &[&str] = &[
 ];
 
 /// The methods of systemd's manager and of its units that take a unit out
-/// of service, in lower case: stopped, killed, restarted, frozen, masked or
-/// disabled.
+/// of service, in lower case: stopped, killed, frozen, masked or disabled.
+/// A restart (`RestartUnit`, `TryRestartUnit`, `ReloadOrRestartUnit`) is
+/// not one: the unit runs again, as after `systemctl restart`, which is
+/// ordinary maintenance.
 const LOWERING_METHODS: &[&str] = &[
     "stopunit",
     "killunit",
-    "restartunit",
-    "tryrestartunit",
-    "reloadorrestartunit",
-    "reloadortryrestartunit",
     "freezeunit",
     "maskunitfiles",
     "disableunitfiles",
@@ -1149,10 +1148,6 @@ const LOWERING_METHODS: &[&str] = &[
     "disableunitfileswithflagsandinstallinfo",
     "stop",
     "kill",
-    "restart",
-    "tryrestart",
-    "reloadorrestart",
-    "reloadortryrestart",
     "freeze",
 ];
 
