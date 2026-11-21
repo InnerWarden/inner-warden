@@ -829,13 +829,30 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
     // / `--human` force it either way.
     let force_json = rest.iter().any(|a| a == "--json");
     let force_human = rest.iter().any(|a| a == "--human");
+    let block_review = rest.iter().any(|a| a == "--block-review");
     let as_json =
         force_json || (!force_human && !std::io::IsTerminal::is_terminal(&std::io::stdout()));
-    let words: Vec<String> = rest
-        .iter()
-        .filter(|a| *a != "--json" && *a != "--human")
-        .cloned()
-        .collect();
+    let agent = agent_flag(rest);
+    if agent.is_none()
+        && rest
+            .iter()
+            .any(|a| a == "--agent" || a.starts_with("--agent="))
+    {
+        eprintln!("innerwarden: --agent takes an agent id (claude-code, codex, cursor, gemini, hermes, openclaw)");
+        return std::process::ExitCode::from(2);
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut it = rest.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--json" | "--human" | "--block-review" => {}
+            "--agent" => {
+                it.next();
+            }
+            _ if arg.starts_with("--agent=") => {}
+            _ => words.push(arg.clone()),
+        }
+    }
     let command = if words.is_empty() {
         if let Some(hint) = check_stdin_hint(std::io::IsTerminal::is_terminal(&std::io::stdin())) {
             eprintln!("{hint}");
@@ -854,28 +871,213 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
-    // Shell surface only: an engine that holds just the rules a command can
-    // match, on a process that runs per tool call. See
-    // `RuleEngine::load_embedded_for`.
-    let engine =
-        RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
-    let rules = analyze(&command, &engine);
-    // User suppression first (a command the user trusts neither escalates nor
-    // alerts); then, for a still-ambiguous case, an optional LLM second opinion.
-    let value = suppress_io::consider_reporting(&command, &rules)
-        .or_else(|| second_opinion_io::consider(&command, &rules))
-        .unwrap_or(rules);
-    println!("{}", render_verdict(&command, &value, as_json));
+    // Judged by the hook's own path (NEW-20261120-check-disagrees-with-hook):
+    // the folder it runs in, the person's suppressions, the second opinion,
+    // the agent profiles and the agent the hook line names. What the hook
+    // knows and `check` cannot (the session) is said beside the verdict.
+    suppress_io::report_load();
+    let checked = check_as_the_hook(&command, agent.as_deref(), block_review);
 
     // Record into the narrative graph (best-effort) and fire configured
     // notifications (best-effort no-op when nothing is wired / not warranted).
-    graph_io::record_check(&command, &value);
-    notify_io::fire(&command, &value);
+    graph_io::record_check(&command, &checked.verdict);
+    notify_io::fire(&command, &checked.verdict);
 
-    if is_deny(&value) {
+    let mut shown = checked.verdict.clone();
+    if let Some(obj) = shown.as_object_mut() {
+        obj.insert(
+            "hook".into(),
+            checked.hook_json(agent.as_deref(), block_review),
+        );
+    }
+    println!("{}", render_verdict(&command, &shown, as_json));
+    if !as_json {
+        if let Some(line) = checked.differs_line(agent.as_deref()) {
+            println!("{line}");
+        }
+    }
+
+    if checked.outcome == HookOutcome::Refuse {
         std::process::ExitCode::from(1)
     } else {
         std::process::ExitCode::SUCCESS
+    }
+}
+
+/// What the hook does with a verdict, in enforce mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookOutcome {
+    Allow,
+    /// It asks the person, and the call runs only if they approve.
+    Ask,
+    /// It lets the call run and shows the person a warning (Codex).
+    Warn,
+    Refuse,
+}
+
+impl HookOutcome {
+    fn word(self) -> &'static str {
+        match self {
+            HookOutcome::Allow => "allow",
+            HookOutcome::Ask => "ask",
+            HookOutcome::Warn => "warn",
+            HookOutcome::Refuse => "refuse",
+        }
+    }
+}
+
+/// `innerwarden check`'s reading of one command: the verdict the hook
+/// reaches and what the hook does with it.
+#[derive(Debug)]
+struct CheckedAsHook {
+    verdict: serde_json::Value,
+    outcome: HookOutcome,
+    /// Why the outcome is not the verdict's word, when it is not.
+    why: Option<String>,
+}
+
+/// What `check` cannot know that the hook does: it judges with no session.
+const CHECK_UNSEEN: &str = "judged with no session: a value that came in a tool result earlier in a session, or a burst of calls, can make the hook stricter than this";
+
+impl CheckedAsHook {
+    fn hook_json(&self, agent: Option<&str>, block_review: bool) -> serde_json::Value {
+        let mut hook = serde_json::json!({
+            "mode": "enforce",
+            "agent": agent.unwrap_or("claude-code"),
+            "block_review": block_review,
+            "outcome": self.outcome.word(),
+            "unseen": CHECK_UNSEEN,
+        });
+        if let Some(why) = &self.why {
+            hook["why"] = why.clone().into();
+        }
+        hook
+    }
+
+    /// The line a person reads when the hook would not simply do what the
+    /// verdict's word says.
+    fn differs_line(&self, agent: Option<&str>) -> Option<String> {
+        let why = self.why.as_deref()?;
+        let agent = agent.unwrap_or("claude-code");
+        let does = match self.outcome {
+            HookOutcome::Allow => "let it run",
+            HookOutcome::Ask => "ask you first",
+            HookOutcome::Warn => "let it run with a warning",
+            HookOutcome::Refuse => "refuse it",
+        };
+        Some(format!(
+            "   The hook ({agent}, enforce) would {does}: {why}."
+        ))
+    }
+}
+
+/// Screen `command` as the hook screens a shell call of `agent` started in
+/// this folder ([`screen_shell`] and, for an agent that types into a running
+/// command, [`waiting_interpreter`]), with no session, recording nothing,
+/// and say what the hook would do with it in enforce.
+fn check_as_the_hook(command: &str, agent: Option<&str>, block_review: bool) -> CheckedAsHook {
+    let mut payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": command },
+    });
+    if let Some(dir) = own_dir() {
+        payload["cwd"] = dir.into();
+    }
+    let buf = payload.to_string();
+    let refused = |verdict: serde_json::Value, why: String| CheckedAsHook {
+        verdict,
+        outcome: HookOutcome::Refuse,
+        why: Some(why),
+    };
+    if let Some((_, _, verdict)) = waiting_interpreter(&buf, agent) {
+        let why = verdict["explanation"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        return refused(verdict, why);
+    }
+    let rest: Vec<String> = agent
+        .map(|agent| vec!["--agent".to_string(), agent.to_string()])
+        .unwrap_or_default();
+    let options = ShellScreenOptions {
+        monitor: false,
+        block_review,
+        record: false,
+        demo: false,
+        host: None,
+    };
+    let unread = |why: String| {
+        serde_json::json!({
+            "command": command,
+            "risk_score": 0,
+            "signals": [],
+            "recommendation": "deny",
+            "explanation": why,
+        })
+    };
+    let (verdict, blocks) = match screen_shell(&buf, &rest, &options) {
+        ShellScreen::Screened(screened) => (screened.verdict, screened.blocks),
+        ShellScreen::Unreadable(why) => {
+            let why = format!("the hook cannot read this call ({why})");
+            return refused(unread(why.clone()), why);
+        }
+        ShellScreen::ProfilesInvalid(why) => {
+            let why = format!("the agent profiles cannot be used ({why})");
+            return refused(unread(why.clone()), why);
+        }
+        ShellScreen::Nothing => (analyze(command, shell_engine()), false),
+    };
+    let (outcome, why) = hook_outcome(&verdict, blocks, block_review, agent);
+    CheckedAsHook {
+        verdict,
+        outcome,
+        why,
+    }
+}
+
+/// PURE: what the enforcing hook of `agent` does with `verdict` on a shell
+/// call, given whether its policy refuses it (`blocks`), and why when that is
+/// not the verdict's own word.
+fn hook_outcome(
+    verdict: &serde_json::Value,
+    blocks: bool,
+    block_review: bool,
+    agent: Option<&str>,
+) -> (HookOutcome, Option<String>) {
+    let deny = is_deny(verdict);
+    if blocks {
+        let why = if deny {
+            None
+        } else if block_review {
+            Some("its hook line has --block-review, which refuses every review".to_string())
+        } else {
+            Some(
+                "this review carries a signal the hook always refuses, whatever the agent"
+                    .to_string(),
+            )
+        };
+        return (HookOutcome::Refuse, why);
+    }
+    if !is_review(verdict) {
+        return (HookOutcome::Allow, None);
+    }
+    let shell = Some(innerwarden_agent_guard::cursor_hook::Event::Shell);
+    match review_answer_for(agent, shell) {
+        ReviewAnswer::AskClaudeCode | ReviewAnswer::AskHermes | ReviewAnswer::AskCursor => (
+            HookOutcome::Ask,
+            Some("a review runs only if you approve it".to_string()),
+        ),
+        ReviewAnswer::WarnCodex => (
+            HookOutcome::Warn,
+            Some("Codex cannot ask you first, so a review runs and you are shown it".to_string()),
+        ),
+        ReviewAnswer::Refuse => (
+            HookOutcome::Refuse,
+            Some(
+                "this agent cannot be relied on to ask you first, so a review is refused"
+                    .to_string(),
+            ),
+        ),
     }
 }
 
@@ -1560,6 +1762,47 @@ fn hook_verdict(payload: &str) -> Option<(String, serde_json::Value)> {
     hook_verdict_for(&hook_command(payload), hook_context(payload).as_ref())
 }
 
+/// The shell surface's rule engine, loaded once per process: an engine that
+/// holds just the rules a command can match (`RuleEngine::load_embedded_for`),
+/// whose regexes compile the first time a command reaches them and stay
+/// compiled. A call that carries several command lines loaded it once per
+/// line, and paid each rule's compilation again for each.
+fn shell_engine() -> &'static RuleEngine {
+    static ENGINE: std::sync::OnceLock<RuleEngine> = std::sync::OnceLock::new();
+    ENGINE.get_or_init(|| {
+        RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand)
+    })
+}
+
+/// Before the first line is judged: load the ATR engine ([`shell_engine`])
+/// on its own thread while this one compiles the built-in rules' patterns,
+/// by judging the first line once without the ATR rules and throwing that
+/// verdict away. The two are the fixed cost of a hook process (measured on a
+/// read, release build, idle 4-core host: about 15 ms to load the engine and
+/// 38 ms to compile the built-in patterns, against 0.5 ms for a warm
+/// judgement), and they do not depend on each other. Nothing is decided
+/// here: every line is then judged in full, as before. A thread that cannot
+/// start, or ends in a panic, leaves the engine to load on this thread.
+fn warm_up_in_parallel(
+    lines: &[String],
+    context: Option<&innerwarden_agent_guard::mcp::WorkingContext>,
+) {
+    let Some(first) = lines.iter().find(|line| !line.trim().is_empty()) else {
+        return;
+    };
+    std::thread::scope(|scope| {
+        let engine = std::thread::Builder::new()
+            .name("iw-rules-load".into())
+            .spawn_scoped(scope, || {
+                let _ = shell_engine();
+            });
+        let _ = innerwarden_agent_guard::mcp::analyze_command_in(first, None, context);
+        if let Ok(engine) = engine {
+            let _ = engine.join();
+        }
+    });
+}
+
 /// The verdict for one command string (the payload already read), judged in
 /// the place it runs when that is known (see [`hook_context`]).
 fn hook_verdict_for(
@@ -1570,13 +1813,8 @@ fn hook_verdict_for(
     if command.trim().is_empty() {
         return None;
     }
-    // Shell surface only: an engine that holds just the rules a command can
-    // match, on a process that runs per tool call. See
-    // `RuleEngine::load_embedded_for`.
-    let engine =
-        RuleEngine::load_embedded_for(innerwarden_agent_guard::rules::AtrSource::ShellCommand);
     let analysis =
-        innerwarden_agent_guard::mcp::analyze_command_in(&command, Some(&engine), context);
+        innerwarden_agent_guard::mcp::analyze_command_in(&command, Some(shell_engine()), context);
     let verdict = serde_json::to_value(&analysis).unwrap_or(serde_json::Value::Null);
     Some((command, verdict))
 }
@@ -2283,12 +2521,37 @@ fn refuse_a_waiting_interpreter(
     monitor: bool,
     demo: bool,
 ) -> Option<std::process::ExitCode> {
-    use innerwarden_agent_guard::interactive::{interactive_interpreter, INTERACTIVE_REFUSAL};
     if monitor {
         return None;
     }
-    let agent = agent_flag(rest)?;
-    if !AGENTS_THAT_TYPE_INTO_A_COMMAND.contains(&agent.as_str()) {
+    let (command, program, verdict) = waiting_interpreter(buf, agent_flag(rest).as_deref())?;
+    let command = command.as_str();
+    let explanation = verdict["explanation"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    // Recorded as every refusal of the hook is, so the record, `status` and
+    // the dashboard show it: a refusal said only to the agent was not there.
+    record_shell(buf, rest, command, &verdict, false, true, None, demo);
+    eprintln!(
+        "InnerWarden blocked this command (recommendation=deny): {explanation}.\n  \
+         Give it its script or its code on the same line (`{program} script`, `{program} -c '...'`) \
+         so the guard reads what runs."
+    );
+    Some(std::process::ExitCode::from(2))
+}
+
+/// PURE but for the folder a call names: the first line of `buf` that starts
+/// an interpreter with nothing to run, for an agent of
+/// [`AGENTS_THAT_TYPE_INTO_A_COMMAND`], as `(command, program, deny verdict)`.
+/// What [`refuse_a_waiting_interpreter`] refuses in enforce, and what
+/// `innerwarden check --agent` says the hook would refuse.
+fn waiting_interpreter(
+    buf: &str,
+    agent: Option<&str>,
+) -> Option<(String, String, serde_json::Value)> {
+    use innerwarden_agent_guard::interactive::{interactive_interpreter, INTERACTIVE_REFUSAL};
+    if !AGENTS_THAT_TYPE_INTO_A_COMMAND.contains(&agent?) {
         return None;
     }
     let lines = match classify_hook_input(buf) {
@@ -2296,12 +2559,10 @@ fn refuse_a_waiting_interpreter(
         HookInput::Commands(lines) => lines,
         _ => return None,
     };
-    let (command, program) = lines.iter().find_map(|command| {
-        interactive_interpreter(command).map(|program| (command.as_str(), program))
-    })?;
+    let (command, program) = lines
+        .into_iter()
+        .find_map(|command| interactive_interpreter(&command).map(|program| (command, program)))?;
     let explanation = format!("`{program}` {INTERACTIVE_REFUSAL}");
-    // Recorded as every refusal of the hook is, so the record, `status` and
-    // the dashboard show it: a refusal said only to the agent was not there.
     let verdict = serde_json::json!({
         "command": command,
         "risk_score": 60,
@@ -2314,13 +2575,7 @@ fn refuse_a_waiting_interpreter(
         "recommendation": "deny",
         "explanation": explanation,
     });
-    record_shell(buf, rest, command, &verdict, false, true, None, demo);
-    eprintln!(
-        "InnerWarden blocked this command (recommendation=deny): {explanation}.\n  \
-         Give it its script or its code on the same line (`{program} script`, `{program} -c '...'`) \
-         so the guard reads what runs."
-    );
-    Some(std::process::ExitCode::from(2))
+    Some((command, program, verdict))
 }
 
 /// How a caller of [`screen_shell`] wants one shell command screened.
@@ -2405,6 +2660,7 @@ pub(crate) fn screen_shell(
     // opinion, a profile's relaxation) never lifts another line of the
     // same call.
     let context = hook_context(buf);
+    warm_up_in_parallel(&lines, context.as_ref());
     let judged: Vec<(String, serde_json::Value)> = lines
         .iter()
         .filter_map(|line| hook_verdict_for(line, context.as_ref()))
@@ -5797,6 +6053,52 @@ mod flag_parse_tests {
 }
 
 #[cfg(test)]
+mod check_outcome_tests {
+    use super::{hook_outcome, HookOutcome};
+    use serde_json::json;
+
+    /// What the enforcing hook does with each verdict, per agent, as
+    /// `check` reports it: a deny and a review its policy refuses are
+    /// refused for every agent; any other review asks where the agent can
+    /// ask, warns on Codex, and is refused elsewhere.
+    #[test]
+    fn hook_outcome_follows_the_hook() {
+        let deny = json!({"recommendation": "deny"});
+        let review = json!({"recommendation": "review"});
+        let allow = json!({"recommendation": "allow"});
+        for agent in [
+            None,
+            Some("codex"),
+            Some("gemini"),
+            Some("hermes"),
+            Some("cursor"),
+        ] {
+            assert_eq!(
+                hook_outcome(&deny, true, false, agent),
+                (HookOutcome::Refuse, None)
+            );
+            assert_eq!(
+                hook_outcome(&allow, false, false, agent).0,
+                HookOutcome::Allow
+            );
+            let (outcome, why) = hook_outcome(&review, true, false, agent);
+            assert_eq!(outcome, HookOutcome::Refuse);
+            assert!(why.unwrap().contains("always refuses"));
+            let (_, why) = hook_outcome(&review, true, true, agent);
+            assert!(why.unwrap().contains("--block-review"));
+        }
+        let open_review = |agent| hook_outcome(&review, false, false, agent).0;
+        assert_eq!(open_review(None), HookOutcome::Ask);
+        assert_eq!(open_review(Some("claude-code")), HookOutcome::Ask);
+        assert_eq!(open_review(Some("hermes")), HookOutcome::Ask);
+        assert_eq!(open_review(Some("cursor")), HookOutcome::Ask);
+        assert_eq!(open_review(Some("codex")), HookOutcome::Warn);
+        assert_eq!(open_review(Some("gemini")), HookOutcome::Refuse);
+        assert_eq!(open_review(Some("openclaw")), HookOutcome::Refuse);
+    }
+}
+
+#[cfg(test)]
 mod host_reading_tests {
     use super::stricter_with_host;
     use serde_json::json;
@@ -5841,5 +6143,92 @@ mod host_reading_tests {
             stricter_with_host(allowed.clone(), Some("loud"), false),
             allowed
         );
+    }
+}
+
+/// Where the time of one hook call goes, phase by phase, cold, as a hook
+/// process pays it (each phase's first call in this process). Ignored: run
+/// on purpose with `cargo test -p innerwarden --bin innerwarden --release --
+/// --ignored --nocapture phase_timing`, once per sample, since only the first
+/// call of a process is cold.
+#[cfg(test)]
+mod phase_timing_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn phase_timing_of_a_read() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let buf = serde_json::json!({
+            "session_id": "timing",
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": format!("{cwd}/README.md")},
+            "cwd": cwd,
+        })
+        .to_string();
+        let mut phases: Vec<(&str, f64)> = Vec::new();
+        let mut time = |name: &'static str, run: &mut dyn FnMut()| {
+            let start = std::time::Instant::now();
+            run();
+            phases.push((name, start.elapsed().as_secs_f64() * 1000.0));
+        };
+        let mut line = String::new();
+        time("classify", &mut || {
+            if let HookInput::FileRead(command) = classify_hook_input(&buf) {
+                line = command;
+            }
+        });
+        assert!(!line.is_empty());
+        let mut context = None;
+        time("context", &mut || context = hook_context(&buf));
+        if std::env::var_os("IW_TIMING_PARALLEL").is_some() {
+            time("parallel_warm_up", &mut || {
+                warm_up_in_parallel(std::slice::from_ref(&line), context.as_ref())
+            });
+            time("judge_after_warm_up", &mut || {
+                let _ = hook_verdict_for(&line, context.as_ref());
+            });
+        }
+        let mut engine = None;
+        time("engine_load", &mut || {
+            engine = Some(RuleEngine::load_embedded_for(
+                innerwarden_agent_guard::rules::AtrSource::ShellCommand,
+            ))
+        });
+        let engine = engine.unwrap();
+        let mut verdict = serde_json::Value::Null;
+        time("analyze_no_rules_cold", &mut || {
+            let _ = innerwarden_agent_guard::mcp::analyze_command_in(&line, None, context.as_ref());
+        });
+        time("analyze_cold", &mut || {
+            verdict = serde_json::to_value(innerwarden_agent_guard::mcp::analyze_command_in(
+                &line,
+                Some(&engine),
+                context.as_ref(),
+            ))
+            .unwrap()
+        });
+        time("analyze_warm", &mut || {
+            let _ = innerwarden_agent_guard::mcp::analyze_command_in(
+                &line,
+                Some(&engine),
+                context.as_ref(),
+            );
+        });
+        time("profiles", &mut || {
+            let _ = agent_profiles_io::load();
+        });
+        time("suppress", &mut || {
+            let _ = suppress_io::consider(&line, &verdict);
+        });
+        time("second_opinion", &mut || {
+            let _ = second_opinion_io::consider(&line, &verdict);
+        });
+        let json: serde_json::Map<String, serde_json::Value> = phases
+            .iter()
+            .map(|(name, ms)| (name.to_string(), ((ms * 100.0).round() / 100.0).into()))
+            .collect();
+        println!("PHASES {}", serde_json::Value::Object(json));
     }
 }

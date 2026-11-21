@@ -27,7 +27,7 @@ pub const EXTRAS: &[SetupOption] = &[
     },
     SetupOption {
         label: "Second opinion from my own AI model",
-        blurb: "for the few AMBIGUOUS commands, let your own model auto-decide instead of alerting you. Needs your API endpoint + key, and costs one API call per ambiguous command. Fewer alerts reach you. (optional)",
+        blurb: "ask your own model about each command rated review. The command text is sent to the endpoint you set; its answer can only make the verdict stricter, never lower it. Needs your API endpoint + key, and costs one API call per review. (optional)",
     },
     SetupOption {
         label: "Start Claude Code in the AI Jail every time",

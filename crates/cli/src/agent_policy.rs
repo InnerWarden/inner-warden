@@ -911,11 +911,15 @@ fn same_program(a: &str, b: &str) -> bool {
         )
 }
 
-/// PURE but for reading two marker files: whether `program` sits in a cargo
+/// PURE but for reading marker files: whether `program` sits in a cargo
 /// target directory. Cargo marks the root of every target directory, the
-/// default `target/` and any `CARGO_TARGET_DIR`, with `CACHEDIR.TAG` and
-/// `.rustc_info.json`; a path through `target/{debug,release}` counts too,
-/// so a tree that was cleaned still reads as one.
+/// default `target/` and any `CARGO_TARGET_DIR`, with `.rustc_info.json`,
+/// and with `CACHEDIR.TAG` only when cargo itself created the folder: a
+/// `CARGO_TARGET_DIR` made beforehand has no tag. So a root counts when it
+/// holds both files, or `.rustc_info.json` alone when `program` is under its
+/// `debug/` or `release/` (or `<target triple>/debug|release`), the layout
+/// only cargo writes. A path through `target/{debug,release}` counts too, so
+/// a tree that was cleaned still reads as one.
 pub fn is_cargo_build_output(program: &Path) -> bool {
     let words: Vec<_> = program
         .components()
@@ -928,10 +932,26 @@ pub fn is_cargo_build_output(program: &Path) -> bool {
             .windows(3)
             .any(|w| w[0] == "target" && matches!(w[2].as_str(), "debug" | "release"));
     through_target
-        || program
-            .ancestors()
-            .skip(1)
-            .any(|dir| dir.join("CACHEDIR.TAG").is_file() && dir.join(".rustc_info.json").is_file())
+        || program.ancestors().skip(1).any(|dir| {
+            if !dir.join(".rustc_info.json").is_file() {
+                return false;
+            }
+            if dir.join("CACHEDIR.TAG").is_file() {
+                return true;
+            }
+            let below: Vec<_> = program
+                .strip_prefix(dir)
+                .map(|rest| {
+                    rest.components()
+                        .map(|c| c.as_os_str().to_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let profile = |word: &std::ffi::OsString| word == "debug" || word == "release";
+            // `<dir>/debug/<bin>`, or `<dir>/<triple>/debug/<bin>`, and
+            // deeper (`debug/deps/<bin>`).
+            (below.len() >= 2 && profile(&below[0])) || (below.len() >= 3 && profile(&below[1]))
+        })
 }
 
 fn reconcile_current(
@@ -1285,6 +1305,32 @@ mod tests {
         std::fs::write(custom.path().join(".rustc_info.json"), "{}").unwrap();
         assert!(is_cargo_build_output(
             &custom.path().join("debug/innerwarden")
+        ));
+        // A CARGO_TARGET_DIR made before cargo ran has no CACHEDIR.TAG: its
+        // `.rustc_info.json` beside `debug/` or `release/` is enough.
+        let made_before = tempfile::TempDir::new().unwrap();
+        std::fs::write(made_before.path().join(".rustc_info.json"), "{}").unwrap();
+        for build in [
+            "debug/innerwarden",
+            "release/innerwarden",
+            "debug/deps/innerwarden-0123abcd",
+            "x86_64-unknown-linux-gnu/release/innerwarden",
+        ] {
+            assert!(
+                is_cargo_build_output(&made_before.path().join(build)),
+                "{build}"
+            );
+        }
+        // The file alone does not make every folder under it a build.
+        for not_a_build in ["innerwarden", "bin/innerwarden", "opt/tools/innerwarden"] {
+            assert!(
+                !is_cargo_build_output(&made_before.path().join(not_a_build)),
+                "{not_a_build}"
+            );
+        }
+        let plain = tempfile::TempDir::new().unwrap();
+        assert!(!is_cargo_build_output(
+            &plain.path().join("debug/innerwarden")
         ));
 
         let home = tempfile::TempDir::new().unwrap();

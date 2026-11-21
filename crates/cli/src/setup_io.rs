@@ -188,14 +188,14 @@ pub fn cmd(_rest: &[String]) -> ExitCode {
         configure_alerts(&theme, &prog);
     }
 
-    // ── 3. Second opinion / own AI model (optional - FEWER alerts) ───────────
+    // ── 3. Second opinion / own AI model (optional, only ever stricter) ──────
     println!();
     if crate::second_opinion_io::is_configured() && crate::second_opinion_io::has_key() {
         println!("  Second opinion - already set (change:  {prog} llm set-key)");
     } else {
         let want_llm = Confirm::with_theme(&theme)
             .with_prompt(
-                "  Add your own AI model to auto-decide the AMBIGUOUS commands? (fewer alerts reach you)",
+                "  Ask your own AI model about each REVIEW? (the command is sent to it; it can only make a verdict stricter)",
             )
             .default(false)
             .interact()
