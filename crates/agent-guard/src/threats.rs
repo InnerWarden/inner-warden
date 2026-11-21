@@ -9171,6 +9171,11 @@ fn names_guard_carrier(target: &str) -> bool {
         && GUARD_PROGRAMS.contains(&program)
 }
 
+/// [`names_guard_carrier`] for the mention reading ([`crate::mention`]).
+pub(crate) fn names_guard_carrier_path(target: &str) -> bool {
+    names_guard_carrier(target)
+}
+
 /// The programs the agent's settings run as the guard's hook, wherever they
 /// are: the guard's own binary at any path (`/opt/iw/innerwarden hook`), or
 /// a script a hook runs whose line names the guard (`bash

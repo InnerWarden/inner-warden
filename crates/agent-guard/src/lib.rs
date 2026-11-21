@@ -94,6 +94,7 @@ pub mod user_prompt;
 mod arg_chain;
 mod description_poison;
 mod line_values;
+mod mention;
 mod shell;
 mod shell_words;
 mod typosquat;
