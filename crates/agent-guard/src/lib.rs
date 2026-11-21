@@ -71,6 +71,7 @@ pub mod mcp_wire_toml;
 pub mod mcp_wire_yaml;
 // Profiles per type of agent: the layer between the general policy and an
 // instance. Read only where a profiles file exists.
+pub mod posture;
 pub mod profiles;
 pub mod redact;
 pub mod render;

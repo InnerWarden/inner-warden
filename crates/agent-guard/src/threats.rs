@@ -7088,7 +7088,8 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
                         // record only, lowers the guard that screens it
                         // (live gate of Active Defence 0.17.4, G1).
                         || sub == "disconnect"
-                        || (sub == "connect" && rest.contains(&"--monitor"))
+                        || (sub == "connect"
+                            && (rest.contains(&"--monitor") || rest.contains(&"--guard")))
                 })
         }
         // `innerwarden contain` rewires the agent's hook (`--setup` too): a
@@ -7105,8 +7106,10 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         }
         // `innerwarden install <agent> --monitor` rewires the agent's hook to
         // record only, as `agents connect --monitor` does (review of 1.6.6,
-        // H1). Installing in enforce, or asking for help, lowers nothing.
-        "install" => !asks_for_help && rest.contains(&"--monitor"),
+        // H1). `--guard` moves a strict install to the default posture,
+        // which refuses less (`crate::posture`). Installing in enforce, or
+        // asking for help, lowers nothing.
+        "install" => !asks_for_help && (rest.contains(&"--monitor") || rest.contains(&"--guard")),
         // `innerwarden-ctl agent disconnect` and `agent install-hook
         // --remove` take the guard off an agent, and `install-hook
         // --monitor` rewires it to record only (`innerwarden agent ...`
