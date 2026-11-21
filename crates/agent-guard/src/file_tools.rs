@@ -285,9 +285,17 @@ pub(crate) fn patch_paths(patch: &str) -> Option<Vec<String>> {
 
 /// Where a file tool carries the text it writes: `content` (`Write`,
 /// `write_file`), `new_string` (`Edit`, `replace`, Hermes's `patch` in
-/// replace mode), `new_source` (`NotebookEdit`). `MultiEdit` carries a
-/// `new_string` in each of its `edits`.
-const TEXT_KEYS: &[&str] = &["content", "new_string", "new_source"];
+/// replace mode), `new_source` (`NotebookEdit`), `file_text`, `new_str` and
+/// `insert_text` (the text editor tool's `create`, `str_replace` and
+/// `insert`). `MultiEdit` carries a `new_string` in each of its `edits`.
+const TEXT_KEYS: &[&str] = &[
+    "content",
+    "new_string",
+    "new_source",
+    "file_text",
+    "new_str",
+    "insert_text",
+];
 
 /// PURE: the text one file tool call writes, with the file it writes it
 /// to: what a `Write`, `Edit`, `MultiEdit` or `NotebookEdit` (Claude

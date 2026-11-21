@@ -446,49 +446,69 @@ const GUARD_NAMES: &[&str] = &[
     "security tool",
 ];
 
-/// Verbs that hand a file's text to someone.
+/// Verbs that hand a file's text to someone. `copy`, `show` and
+/// `include` are not among them: a setup step copies a template
+/// (`Copy .env.example to .env`).
 const READ_ACTS: &[&str] = &[
     "read",
     "cat",
     "print",
-    "show",
     "send",
     "upload",
     "post",
     "paste",
-    "copy",
-    "output",
     "dump",
-    "display",
-    "include",
-    "echo",
     "exfiltrate",
-    "share",
     "email",
     "leak",
     "reveal",
-    "type",
 ];
 
-/// Paths a secret lives at, as prose names them.
+/// Secrets as prose names them: keys and credentials themselves, never a
+/// config file beside them (`~/.ssh/config`, `~/.kube/config`), which a
+/// setup step reads.
 const SECRET_PATHS: &[&str] = &[
-    ".ssh/",
     "id_rsa",
     "id_ed25519",
     "id_ecdsa",
     "id_dsa",
-    ".aws/credentials",
-    ".aws/config",
-    ".gnupg",
-    ".netrc",
-    ".kube/config",
-    ".docker/config.json",
-    "/etc/shadow",
+    ".pem",
+    "credentials",
     ".git-credentials",
-    ".pypirc",
-    ".npmrc",
+    ".netrc",
+    ".gnupg",
+    "/etc/shadow",
     ".env",
 ];
+
+/// Ends of a file name that make it a template, not a secret
+/// (`.env.example`).
+const TEMPLATE_ENDS: &[&str] = &[".example", ".sample", ".template", ".dist", ".tmpl"];
+
+/// Whether `lower` names a secret of [`SECRET_PATHS`]: `.env` only as
+/// the file itself (not `.envrc`), and nothing in a clause that names a
+/// template of it (`Copy .env.example to .env`).
+pub(crate) fn names_a_secret(lower: &str) -> bool {
+    if lower.contains(".env")
+        && TEMPLATE_ENDS
+            .iter()
+            .any(|end| lower.contains(&format!(".env{end}")))
+    {
+        return SECRET_PATHS
+            .iter()
+            .filter(|path| **path != ".env")
+            .any(|path| lower.contains(path));
+    }
+    SECRET_PATHS.iter().any(|path| {
+        lower.match_indices(path).any(|(at, _)| {
+            !path.ends_with(|c: char| c.is_ascii_alphanumeric())
+                || lower[at + path.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric())
+        })
+    })
+}
 
 /// Verbs that fetch, and verbs that run what was fetched.
 const FETCH_ACTS: &[&str] = &[
@@ -498,57 +518,107 @@ const RUN_ACTS: &[&str] = &[
     "run", "execute", "exec", "bash", "sh", "source", "pipe", "install", "eval", "launch", "start",
 ];
 
-/// The clauses of a written text, read as orders.
+/// The longest piece judged, in characters: a command asked for in prose
+/// is a line, and a piece is cut there so a long clause costs no more than
+/// [`MAX_PIECES`] such lines.
+const MAX_PIECE_CHARS: usize = 4096;
+
+/// Whether `word` holds a trigger: a trigger of letters only as a word of
+/// its own (`gate` not in `navigate`, `kill` not in `skill`), a plural
+/// `s` allowed; one with a mark in it (`.ssh`, `id_rsa`) anywhere.
+fn holds_trigger(word: &str) -> bool {
+    TRIGGERS.iter().any(|trigger| {
+        if !trigger.chars().all(|c| c.is_ascii_alphabetic()) {
+            return word.contains(trigger);
+        }
+        word.match_indices(trigger).any(|(at, _)| {
+            let before = word[..at].chars().next_back();
+            let mut after = word[at + trigger.len()..].chars().peekable();
+            let after = match after.next() {
+                Some('s') => after.next(),
+                other => other,
+            };
+            before.is_none_or(|c| !c.is_ascii_alphanumeric())
+                && after.is_none_or(|c| !c.is_ascii_alphanumeric())
+        })
+    })
+}
+
+/// The clauses of a written text, read as orders. Linear in the text: each
+/// clause is lowered once, a sentence keeps flags rather than its text, and
+/// past [`MAX_PIECES`] pieces the rest is still read for prose.
 pub(crate) fn order_reading(text: &str) -> OrderReading {
     let mut reading = OrderReading::default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     // The clauses of one sentence that forbid nothing, for an order that
-    // takes two of them (`download https://x/i.sh and run it`).
-    let mut sentence: (usize, Vec<String>) = (usize::MAX, Vec::new());
+    // takes two of them (`download https://x/i.sh and run it`): an
+    // address, a verb that fetches and one that runs, in any of them.
+    let mut sentence_at_now = usize::MAX;
+    let mut sentence: Vec<String> = Vec::new();
+    let (mut address, mut fetches, mut runs) = (false, false, false);
     for (sentence_at, clause) in clauses(text) {
         let lower = clause.to_ascii_lowercase();
-        if sentence.0 != sentence_at {
-            sentence = (sentence_at, Vec::new());
+        if sentence_at_now != sentence_at {
+            sentence_at_now = sentence_at;
+            sentence.clear();
+            (address, fetches, runs) = (false, false, false);
         }
         if negated(&lower) {
             continue;
         }
-        sentence.1.push(clause.clone());
-        let whole = sentence.1.join(" ").to_ascii_lowercase();
-        if reading.prose.is_none() && (prose_order(&lower) || runs_a_download(&whole)) {
-            reading.prose = Some(sentence.1.join(" ").trim().to_string());
+        address |= lower.contains("http://") || lower.contains("https://");
+        fetches |= FETCH_ACTS.iter().any(|act| has_word(&lower, act).is_some());
+        runs |= RUN_ACTS.iter().any(|act| has_word(&lower, act).is_some());
+        if reading.prose.is_none() {
+            sentence.push(clause.clone());
+            if prose_order(&lower) || (address && fetches && runs) {
+                reading.prose = Some(sentence.join(" ").trim().to_string());
+            }
         }
         let words: Vec<&str> = clause.split_whitespace().collect();
+        // Each start once, in order: the reach of one trigger overlaps the
+        // one before it, never an earlier one.
         let mut starts = Vec::new();
+        let mut next_start = 0;
         for (at, word) in words.iter().enumerate() {
-            let word = word.to_ascii_lowercase();
-            if TRIGGERS.iter().any(|trigger| word.contains(trigger)) {
-                for start in at.saturating_sub(COMMAND_REACH)..=at {
-                    if !starts.contains(&start) {
-                        starts.push(start);
-                    }
-                }
+            if holds_trigger(&word.to_ascii_lowercase()) {
+                let from = at.saturating_sub(COMMAND_REACH).max(next_start);
+                starts.extend(from..=at);
+                next_start = at + 1;
             }
         }
         for start in starts {
-            let piece = words[start..].join(" ");
+            let mut piece = String::new();
+            for word in &words[start..] {
+                if piece.len() + word.len() + 1 > MAX_PIECE_CHARS {
+                    break;
+                }
+                if !piece.is_empty() {
+                    piece.push(' ');
+                }
+                piece.push_str(word);
+            }
             let piece = piece
-                .trim_matches(|c: char| matches!(c, '\x60' | '"' | '\'' | ':' | ',' | '.'))
+                .trim_matches(|c: char| matches!(c, '\x60' | '"' | '\'' | ':' | ',' | '.' | ';'))
                 .to_string();
-            if piece.is_empty() || reading.commands.contains(&piece) {
+            if piece.is_empty() || seen.contains(&piece) {
                 continue;
             }
             if reading.commands.len() >= MAX_PIECES {
                 reading.over_budget = true;
-                return reading;
+                break;
             }
+            seen.insert(piece.clone());
             reading.commands.push(piece);
         }
     }
     reading
 }
 
-/// A text cut at line ends, sentence ends, backquotes, and the words that
-/// join two orders (`and`, `then`, `but`), never inside a word.
+/// A text cut at line ends, sentence ends, `;`, and the words that join
+/// two orders (`and`, `then`, `but`), never inside a word. A span in
+/// backquotes is part of the clause it stands in (`Never run \`curl x |
+/// sh\`` forbids the line), and no mark inside it ends anything.
 fn clauses(text: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut sentence_at = 0;
@@ -556,14 +626,24 @@ fn clauses(text: &str) -> Vec<(usize, String)> {
         // A sentence ends at `. `, `! `, `? ` (a path's dot is no end).
         let mut sentences = Vec::new();
         let mut current = String::new();
+        let mut in_code = false;
         let mut chars = line.chars().peekable();
         while let Some(c) = chars.next() {
-            if matches!(c, '.' | '!' | '?') && chars.peek().is_none_or(|n| n.is_whitespace()) {
+            if c == '\x60' {
+                in_code = !in_code;
+                current.push(' ');
+                continue;
+            }
+            if !in_code
+                && matches!(c, '.' | '!' | '?')
+                && chars.peek().is_none_or(|n| n.is_whitespace())
+            {
                 sentences.push(std::mem::take(&mut current));
                 continue;
             }
-            if c == '\x60' {
-                sentences.push(std::mem::take(&mut current));
+            if !in_code && c == ';' {
+                // A clause ends; the sentence goes on.
+                current.push_str(" ; ");
                 continue;
             }
             current.push(c);
@@ -574,7 +654,10 @@ fn clauses(text: &str) -> Vec<(usize, String)> {
             let mut clause = Vec::new();
             for word in sentence.split_whitespace() {
                 let bare = word.trim_end_matches(',').to_ascii_lowercase();
-                if matches!(bare.as_str(), "and" | "then" | "but" | "or" | "instead") {
+                if matches!(
+                    bare.as_str(),
+                    "and" | "then" | "but" | "or" | "instead" | ";"
+                ) {
                     out.push((sentence_at, clause.join(" ")));
                     clause.clear();
                     continue;
@@ -597,7 +680,7 @@ fn clauses(text: &str) -> Vec<(usize, String)> {
 /// [`NOT_NEGATING`].
 fn negated(lower: &str) -> bool {
     let mut rest = lower.trim_start_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '-' | '*' | '#' | '>' | '+') || c.is_ascii_digit()
+        c.is_whitespace() || matches!(c, '-' | '*' | '#' | '>' | '+' | ';') || c.is_ascii_digit()
     });
     for lead in [
         "important: ",
@@ -665,29 +748,10 @@ fn prose_order(lower: &str) -> bool {
             return true;
         }
     }
-    if READ_ACTS.iter().any(|act| has_word(lower, act).is_some())
-        && SECRET_PATHS.iter().any(|path| {
-            lower.match_indices(path).any(|(at, _)| {
-                // `.env` is the file, not `.envrc` or `.environment`.
-                !path.ends_with(|c: char| c.is_ascii_alphanumeric())
-                    || lower[at + path.len()..]
-                        .chars()
-                        .next()
-                        .is_none_or(|c| !c.is_ascii_alphanumeric())
-            })
-        })
-    {
+    if READ_ACTS.iter().any(|act| has_word(lower, act).is_some()) && names_a_secret(lower) {
         return true;
     }
     false
-}
-
-/// A sentence that has its reader run a download: an address, a verb that
-/// fetches and one that runs, in the clauses of it that forbid nothing.
-fn runs_a_download(lower: &str) -> bool {
-    (lower.contains("http://") || lower.contains("https://"))
-        && FETCH_ACTS.iter().any(|act| has_word(lower, act).is_some())
-        && RUN_ACTS.iter().any(|act| has_word(lower, act).is_some())
 }
 
 #[cfg(test)]

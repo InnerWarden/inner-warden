@@ -37,6 +37,7 @@ pub(crate) const INSTRUCTION_NAMES: &[&str] = &[
 
 /// Folders whose every file an agent reads as its rules.
 pub(crate) const INSTRUCTION_FOLDERS: &[&str] = &[
+    ".claude/rules/",
     ".cursor/rules/",
     ".windsurf/rules/",
     ".clinerules/",
