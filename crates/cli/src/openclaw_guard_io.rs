@@ -248,6 +248,8 @@ fn screen_command(
         record: false,
         demo: false,
         host: pro_installed.then_some(&ask_pro as crate::HostAsk<'_>),
+        // The OpenClaw plugin keeps its own modes; the posture is the hook's.
+        posture: innerwarden_agent_guard::posture::Posture::Strict,
     };
     let screened = match crate::screen_shell(buf, rest, &options) {
         crate::ShellScreen::Nothing => {

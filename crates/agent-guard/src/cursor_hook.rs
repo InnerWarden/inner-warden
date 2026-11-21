@@ -306,6 +306,17 @@ pub fn allow() -> String {
     json!({ "permission": "allow" }).to_string()
 }
 
+/// The answer that lets a call run with a warning for the person and the
+/// agent (the default posture's, `crate::posture::warning_line`).
+pub fn allow_with_warning(message: &str) -> String {
+    json!({
+        "permission": "allow",
+        "user_message": message,
+        "agent_message": message,
+    })
+    .to_string()
+}
+
 /// The answer that asks the person, with the guard's words.
 pub fn ask(message: &str) -> String {
     json!({
