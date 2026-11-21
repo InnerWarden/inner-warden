@@ -1026,9 +1026,44 @@ fn command_unread(
                 )
             })
             .then_some(UNREAD_ARGUMENT),
+        // `kill $(pgrep -f vite)`: the ids are another program's.
+        "kill"
+            if nodes[offset + 1..]
+                .iter()
+                .zip(argument_flags)
+                .all(|(node, unread)| !unread || lists_other_processes(*node, source)) =>
+        {
+            None
+        }
         _ if only_reads(&name, arguments, argument_flags) => None,
         _ => Some(UNREAD_ARGUMENT),
     }
+}
+
+/// A word that is one command substitution, quoted or not, of a `pgrep` or
+/// `pidof` that finds no process of the guard nor of another security
+/// control ([`crate::threats::lists_only_other_processes`]).
+fn lists_other_processes(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut substitutions = Vec::new();
+    collect_nodes_of_kind(node, "command_substitution", &mut substitutions, 0);
+    let [substitution] = substitutions.as_slice() else {
+        return false;
+    };
+    let (Ok(word), Ok(inner)) = (node.utf8_text(source), substitution.utf8_text(source)) else {
+        return false;
+    };
+    if word.trim_matches('"') != inner {
+        return false;
+    }
+    inner
+        .strip_prefix("$(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .or_else(|| {
+            inner
+                .strip_prefix('`')
+                .and_then(|rest| rest.strip_suffix('`'))
+        })
+        .is_some_and(crate::threats::lists_only_other_processes)
 }
 
 /// The word holds a process substitution, or a command substitution (a

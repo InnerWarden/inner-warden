@@ -3,6 +3,7 @@
 mod glob_names;
 mod guard_doubt;
 mod guard_lowering;
+pub(crate) use guard_lowering::lists_only_other_processes;
 mod guard_takedown;
 mod words_after;
 
@@ -18114,22 +18115,17 @@ fn is_external_ip_literal(ip: &str) -> bool {
 /// Check for obfuscation patterns. Returns (indicator, score).
 pub fn check_obfuscation(content: &str) -> Option<(&'static str, u32)> {
     let lower = content.to_ascii_lowercase();
-    if let Some(i) = OBFUSCATION_INDICATORS.iter().find(|i| lower.contains(*i)) {
-        // Decoding a fixture or artifact is common developer work. It becomes
-        // strong executable evidence only when the decoded bytes flow into an
-        // interpreter/eval; otherwise retain a low-severity audit signal.
+    for i in OBFUSCATION_INDICATORS.iter().filter(|i| lower.contains(*i)) {
+        // Decoding a fixture, an artifact or a file the GitHub API hands back
+        // in base64 (`gh api .../contents/x --jq .content | base64 -d`) is
+        // common developer work and hides nothing: it counts only when the
+        // decoded bytes may reach a shell, an interpreter or an exec
+        // ([`decoded_bytes_may_run`]).
         let decode_only = matches!(*i, "base64 -d" | "base64 --decode");
-        let strong_decode = lower.contains("eval $(base64")
-            || lower.contains("eval `base64")
-            || decode_pipeline_reaches_executor(&lower);
-        return Some((
-            *i,
-            if decode_only && !strong_decode {
-                10
-            } else {
-                30
-            },
-        ));
+        if decode_only && !decoded_bytes_may_run(&lower) {
+            continue;
+        }
+        return Some((*i, 30));
     }
     // Multiple `\xNN` hex escapes (e.g. building a command from hex bytes:
     // `p=\x72\x6d; $p -rf /`). Two or more is well past coincidence in a
@@ -18781,6 +18777,177 @@ fn runs_a_file_from_the_working_directory(words: &[String]) -> bool {
         .is_some_and(|script| relative(script))
 }
 
+/// Whether what a `base64 -d` of `lower` prints may be run: piped into a
+/// shell, an interpreter or an exec ([`decode_pipeline_reaches_executor`]),
+/// read in a substitution (`sh -c "$(... | base64 -d)"`, `bash <(...)`),
+/// which hands it to whatever stands around it, or written to a file the
+/// line then runs (`> a.sh; sh a.sh`, `./a.sh`).
+fn decoded_bytes_may_run(lower: &str) -> bool {
+    lower.contains("eval $(base64")
+        || lower.contains("eval `base64")
+        || decode_pipeline_reaches_executor(lower)
+        || ["$(", "`", "<(", ">("]
+            .iter()
+            .any(|open| lower.contains(open))
+        || decoded_file_is_run(lower)
+}
+
+/// Whether a `base64 -d` of `lower` writes what it decodes to a file (`>`,
+/// `>>`, `tee`) in its own command that the line then runs
+/// ([`file_runs_in`]). A file only read again (`openssl ... -sigfile
+/// sig.bin`) runs nothing.
+fn decoded_file_is_run(lower: &str) -> bool {
+    ["base64 -d", "base64 --decode"].iter().any(|decode| {
+        lower.match_indices(decode).any(|(at, _)| {
+            let words = decode_tokens(&lower[at + decode.len()..]);
+            let own = words
+                .iter()
+                .position(|word| word == ";")
+                .unwrap_or(words.len());
+            (0..own).any(|index| {
+                let target = match words[index].as_str() {
+                    ">" => words.get(index + 1).map(String::as_str),
+                    "tee" => words[index + 1..own]
+                        .iter()
+                        .map(String::as_str)
+                        .find(|next| !next.starts_with('-') && *next != "|"),
+                    _ => None,
+                };
+                let Some(target) = target else {
+                    return false;
+                };
+                if target.is_empty()
+                    || target.starts_with('&')
+                    || matches!(
+                        target,
+                        "/dev/null" | "/dev/stderr" | "/dev/stdout" | "|" | ";"
+                    )
+                {
+                    return false;
+                }
+                file_runs_in(&words[index + 2..], target)
+            })
+        })
+    })
+}
+
+/// The words of `text` as the checks above read them: quotes taken off,
+/// `;`, `&&`, `||`, a background `&` and a new line as `;`, a pipe as
+/// `|`, `&>` as `>`, and a
+/// redirection split from its file (`>a.sh` is `>` and `a.sh`; `<` too;
+/// `2>` sends no decoded output and is kept as written).
+fn decode_tokens(text: &str) -> Vec<String> {
+    let spaced = background_as_separator(&text.replace("&&", " ; ").replace("&>", ">"))
+        .replace("||", " ; ")
+        .replace([';', '\n'], " ; ")
+        .replace('|', " | ");
+    let mut words = Vec::new();
+    for raw in spaced.split_whitespace() {
+        let word = raw.trim_matches(['\'', '"']);
+        let (operator, rest) = if let Some(rest) = word.strip_prefix("&>") {
+            (Some(">"), rest)
+        } else if let Some(rest) = word.strip_prefix("1>") {
+            (Some(">"), rest)
+        } else if word.starts_with("2>") {
+            (None, word)
+        } else if word.starts_with('>') {
+            (Some(">"), word.trim_start_matches('>'))
+        } else if word.starts_with('<') && !word.starts_with("<(") {
+            (Some("<"), word.trim_start_matches('<'))
+        } else {
+            (None, word)
+        };
+        if let Some(operator) = operator {
+            words.push(operator.to_owned());
+        }
+        let rest = rest.trim_matches(['\'', '"']);
+        if !rest.is_empty() {
+            words.push(rest.to_owned());
+        }
+    }
+    words
+}
+
+/// `text` with each `&` that sends a command to the background, as
+/// `;`: the command after it runs next (`base64 -d > a.sh & sh a.sh`). A
+/// `&` of a redirection (`2>&1`, `<&3`) is kept.
+fn background_as_separator(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut previous = ' ';
+    for c in text.chars() {
+        if c == '&' && !matches!(previous, '>' | '<') {
+            out.push_str(" ; ");
+        } else {
+            out.push(c);
+        }
+        previous = c;
+    }
+    out
+}
+
+/// Words that start a command and run the one after them.
+const RUN_LAUNCHERS: &[&str] = &[
+    "sudo", "env", "nohup", "command", "time", "nice", "exec", "then", "do", "else", "{", "(", "!",
+    "doas", "timeout", "stdbuf", "setsid",
+];
+
+/// Whether `words` (after the write) run the file `target`: a command whose
+/// program is the file (`./a.sh`, `/tmp/a`, behind `sudo` or `env`), or
+/// whose program is a shell, an interpreter or a runner ([`EXECUTORS`],
+/// [`DECODE_RUNNERS`]) given the file anywhere after it, as an argument or
+/// on its input (`sh -e a.sh`, `sh < a.sh`, `python3 -I a.py`, `sh --
+/// a.sh`). Each word is compared whole.
+fn file_runs_in(words: &[String], target: &str) -> bool {
+    let name = target.rsplit('/').next().unwrap_or(target);
+    let names_it = |word: &str| {
+        word == target
+            || word.strip_prefix("./") == Some(name)
+            || (word.contains('/') && word.rsplit('/').next() == Some(name))
+    };
+    words
+        .split(|word| word == ";" || word == "|")
+        .any(|command| {
+            let mut at = 0usize;
+            while at < command.len() {
+                let word = command[at].as_str();
+                let assignment = word
+                    .split_once('=')
+                    .is_some_and(|(left, _)| !left.is_empty() && !left.starts_with('-'));
+                if RUN_LAUNCHERS.contains(&word) || assignment || (at > 0 && word.starts_with('-'))
+                {
+                    at += 1;
+                } else {
+                    break;
+                }
+            }
+            let Some(program) = command.get(at) else {
+                return false;
+            };
+            if names_it(program) {
+                return true;
+            }
+            let base = program.rsplit('/').next().unwrap_or(program);
+            let base = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+            (EXECUTORS.contains(&base) || DECODE_RUNNERS.contains(&base))
+                && command[at + 1..].iter().any(|word| names_it(word))
+        })
+}
+
+/// Programs that run what they read besides [`EXECUTORS`]: a shell's
+/// `source` and `.`, `eval`, `exec`, and runtimes the list does not hold.
+const DECODE_RUNNERS: &[&str] = &[
+    "source",
+    ".",
+    "eval",
+    "exec",
+    "busybox",
+    "pwsh",
+    "osascript",
+    "deno",
+    "bun",
+    "xargs",
+];
+
 fn decode_pipeline_reaches_executor(lower: &str) -> bool {
     let parts: Vec<&str> = lower.split('|').collect();
     parts.iter().enumerate().any(|(index, part)| {
@@ -18794,7 +18961,7 @@ fn decode_pipeline_reaches_executor(lower: &str) -> bool {
                         .next()
                         .unwrap_or(word)
                         .trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-                    EXECUTORS.contains(&base)
+                    EXECUTORS.contains(&base) || DECODE_RUNNERS.contains(&base)
                 })
             })
     })

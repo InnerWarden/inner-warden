@@ -85,6 +85,14 @@ impl GuardLine {
         if touches_name(&self.text, &range) {
             return PkillReach::NamesGuard;
         }
+        // The file name of a shortcut (`iw-guard`), covered whole.
+        let program_end = self.text.find(' ').unwrap_or(self.text.len());
+        if GUARD_SHORTCUTS.contains(&&self.text[self.folder_end..program_end])
+            && range.start <= self.folder_end
+            && range.end >= program_end
+        {
+            return PkillReach::NamesGuard;
+        }
         let owned = |at: usize| !self.shared.iter().any(|shared| shared.contains(&at));
         if range
             .clone()
@@ -140,7 +148,19 @@ const GUARD_PROGRAMS: &[&str] = &[
     "/home/user/.local/bin/innerwarden",
     "/opt/homebrew/bin/innerwarden",
     "innerwarden",
+    // The installer's shortcuts to the same binary
+    // (`crate::mcp_wire`'s command names): an MCP wrapper may start
+    // `/abs/iw-guard proxy`.
+    "/usr/local/bin/iw-guard",
+    "/usr/local/bin/iw",
+    "iw-guard",
+    "iw",
 ];
+
+/// The installer's shortcuts to the guard's binary, which carry no
+/// [`GUARD_NAME`]: a match that covers one whole, as a program's file name,
+/// names the guard.
+const GUARD_SHORTCUTS: &[&str] = &["iw", "iw-guard"];
 
 /// [`GUARD_PROGRAMS`], and where the CLI is on this machine: the binary
 /// running now when it is the CLI (the path the CLI wrote into the hooks it
@@ -151,13 +171,18 @@ fn guard_programs() -> Vec<String> {
         let home = home.trim_end_matches('/');
         if !home.is_empty() {
             for folder in [".local/bin", ".cargo/bin", "bin"] {
-                programs.push(format!("{home}/{folder}/innerwarden"));
+                for name in std::iter::once(GUARD_NAME).chain(GUARD_SHORTCUTS.iter().copied()) {
+                    programs.push(format!("{home}/{folder}/{name}"));
+                }
             }
         }
     }
     if let Ok(exe) = std::env::current_exe() {
         let name = exe.file_name().and_then(|name| name.to_str());
-        if matches!(name, Some("innerwarden" | "innerwarden.exe")) {
+        if matches!(
+            name,
+            Some("innerwarden" | "innerwarden.exe" | "iw" | "iw.exe" | "iw-guard" | "iw-guard.exe")
+        ) {
             if let Some(path) = exe.to_str() {
                 programs.push(path.to_owned());
             }
@@ -328,9 +353,8 @@ fn build_guard_lines() -> Vec<GuardLine> {
             }
             // The layouts older CLIs wrote ([`WRAPPER_LAYOUTS`]), in each mode,
             // their options in any order and as `--mode=guard` too (the
-            // proxy reads both): around the first server and after the
-            // first program, which stand for the rest, the options being
-            // the guard's part.
+            // proxy reads both), after every program and around every
+            // server, the options being the guard's part.
             for (layout, agent, mode) in WRAPPER_LAYOUTS.iter().flat_map(|layout| {
                 agents.iter().flat_map(move |agent| {
                     ["guard", "advisory"]
@@ -342,11 +366,7 @@ fn build_guard_lines() -> Vec<GuardLine> {
                     .iter()
                     .map(|word| word.replace("{mode}", mode).replace("{agent}", agent))
                     .collect();
-                let spellings = if index == 0 && program == programs[0] {
-                    option_spellings(&options)
-                } else {
-                    vec![options]
-                };
+                let spellings = option_spellings(&options);
                 for options in spellings {
                     let mut words: Vec<String> = vec![program.to_owned(), "proxy".into()];
                     words.extend(options);
@@ -626,7 +646,7 @@ fn guard_process_names() -> &'static [String] {
         for line in guard_lines() {
             let program = line.text.split(' ').next().unwrap_or_default();
             let name = program.rsplit('/').next().unwrap_or(program);
-            if name.contains(GUARD_NAME) {
+            if name.contains(GUARD_NAME) || GUARD_SHORTCUTS.contains(&name) {
                 names.push(name.to_owned());
                 names.push(name.chars().take(15).collect());
             }
@@ -652,7 +672,9 @@ fn name_reach(regex: &regex::Regex) -> PkillReach {
             let Some(found) = regex.find_at(name, from) else {
                 break;
             };
-            if touches_name(name, &found.range()) {
+            if touches_name(name, &found.range())
+                || (GUARD_SHORTCUTS.contains(&name.as_str()) && found.len() == name.len())
+            {
                 return PkillReach::NamesGuard;
             }
             reach = PkillReach::Broad;
@@ -853,19 +875,223 @@ fn listed_reach(command: &Command) -> PkillReach {
 }
 
 /// Whether `command` runs `kill` on what it is handed: `kill` itself, or
-/// `xargs` starting it, behind any launcher the shell reads.
+/// `xargs` starting it, behind any launcher the shell reads, or a shell
+/// `xargs` starts whose `-c` script runs one (`xargs -I{} sh -c 'kill
+/// {}'`, `xargs sh -c 'kill "$@"' _`): the script is read as a line.
 fn runs_kill(command: &Command) -> bool {
+    runs_kill_at(command, 0)
+}
+
+fn runs_kill_at(command: &Command, depth: u8) -> bool {
     let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
     let Some(at) = effective_command_index(&words) else {
         return false;
     };
     match program_name(&words[at]).as_str() {
         "kill" => true,
-        "xargs" => words[at + 1..]
-            .iter()
-            .any(|word| program_name(word) == "kill"),
+        "xargs" => {
+            let launched = &words[at + 1..];
+            launched.iter().any(|word| program_name(word) == "kill")
+                || (depth < NESTED_DEPTH
+                    && shell_script(launched).is_some_and(|script| {
+                        let line = read_line(script);
+                        line.commands
+                            .iter()
+                            .any(|inner| runs_kill_at(inner, depth + 1))
+                            || line.nested.iter().any(|nested| {
+                                read_line(nested)
+                                    .commands
+                                    .iter()
+                                    .any(|inner| runs_kill_at(inner, depth + 1))
+                            })
+                    }))
+        }
         _ => false,
     }
+}
+
+/// The shells a line hands a `-c` script to.
+const SCRIPT_SHELLS: &[&str] = &["sh", "bash", "dash", "zsh", "ksh", "ash", "mksh", "busybox"];
+
+/// The `-c` script of the first shell among `words` (the words `xargs`
+/// is given): the word after an option that holds `c` (`-c`, `-ec`,
+/// `-xc`).
+fn shell_script(words: &[String]) -> Option<&str> {
+    let start = words
+        .iter()
+        .position(|word| SCRIPT_SHELLS.contains(&program_name(word).as_str()))?;
+    let mut rest = words[start + 1..].iter();
+    while let Some(word) = rest.next() {
+        if word == "sh" && program_name(&words[start]) == "busybox" {
+            continue;
+        }
+        match word.as_str() {
+            // An option's value is no script (`-o pipefail`, `--rcfile f`).
+            "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file" => {
+                rest.next();
+                continue;
+            }
+            "--" => return None,
+            long if long.starts_with("--") => continue,
+            _ => {}
+        }
+        if !word.starts_with(['-', '+']) {
+            return None;
+        }
+        if word.starts_with('-') && word[1..].contains('c') {
+            return rest.next().map(String::as_str);
+        }
+    }
+    None
+}
+
+/// The development programs whose processes an agent stops as ordinary
+/// work: dev servers, bundlers, test runners and watchers. A `kill` fed by
+/// a `pgrep` or `pidof` leaves review only for these: a list of the
+/// controls not to stop is never whole (`clamd`, `fail2ban`, `suricata`,
+/// a shortcut of the guard), a list of what may be stopped is.
+const DEV_PROCESSES: &[&str] = &[
+    "vite",
+    "node",
+    "npm",
+    "npx",
+    "pnpm",
+    "yarn",
+    "bun",
+    "deno",
+    "webpack",
+    "jest",
+    "vitest",
+    "pytest",
+    "cargo",
+    "rustc",
+    "next",
+    "nuxt",
+    "tsc",
+    "tsx",
+    "esbuild",
+    "rollup",
+    "parcel",
+    "nodemon",
+    "gunicorn",
+    "uvicorn",
+    "flask",
+    "rails",
+    "puma",
+    "hugo",
+    "jekyll",
+    "storybook",
+    "playwright",
+    "karma",
+    "mocha",
+    "turbo",
+    "astro",
+    "remix",
+    "svelte-kit",
+    "ng",
+];
+
+/// Whether a `pgrep` pattern or a `pidof` name names one of
+/// [`DEV_PROCESSES`] and nothing more: plain words (no regular-expression
+/// sign but `.`, `-`, `/`), the first of them a development program by
+/// its file name (`vite`, `next dev`, `node_modules/.bin/vite`).
+fn names_a_dev_process(pattern: &str) -> bool {
+    if pattern.is_empty()
+        || !pattern
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '.' | '-' | '_' | '/' | ':'))
+    {
+        return false;
+    }
+    pattern
+        .split_whitespace()
+        .next()
+        .and_then(|first| first.rsplit('/').next())
+        .is_some_and(|name| DEV_PROCESSES.contains(&name))
+}
+
+/// The options of `pgrep` that take the next word as their value.
+const PGREP_VALUED: &[&str] = &[
+    "-d",
+    "--delimiter",
+    "-g",
+    "--pgroup",
+    "-G",
+    "--group",
+    "-P",
+    "--parent",
+    "-s",
+    "--session",
+    "-t",
+    "--terminal",
+    "-u",
+    "--euid",
+    "-U",
+    "--uid",
+    "-F",
+    "--pidfile",
+    "--ns",
+    "--nslist",
+    "-r",
+    "--runstates",
+    "--signal",
+];
+
+/// Whether `text` (what a substitution in a `kill`'s words runs) is one
+/// `pgrep` or `pidof`, its words written out, that finds no process of
+/// the guard ([`PkillReach::Misses`]) and lists only a development program
+/// ([`names_a_dev_process`]) by its process name, without `-f`: the ids
+/// it prints are that program's (`kill $(pgrep vite)`).
+pub(crate) fn lists_only_other_processes(text: &str) -> bool {
+    let line = read_line(text);
+    let [command] = line.commands.as_slice() else {
+        return false;
+    };
+    if !line.nested.is_empty() {
+        return false;
+    }
+    let Some(words) = plain_words(command) else {
+        return false;
+    };
+    let Some(at) = launched_command_index(&words) else {
+        return false;
+    };
+    let program = program_name(&words[at]);
+    if !matches!(program.as_str(), "pgrep" | "pidof") {
+        return false;
+    }
+    let mut operands = Vec::new();
+    let mut full_line = false;
+    let mut rest = words[at + 1..].iter();
+    while let Some(word) = rest.next() {
+        if PGREP_VALUED.contains(&word.as_str()) || (program == "pidof" && word == "-o") {
+            rest.next();
+        } else if !word.starts_with('-') {
+            operands.push(word.as_str());
+        } else {
+            full_line |= word == "--full" || (!word.starts_with("--") && word[1..].contains('f'));
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    // `pgrep -f` matches a whole command line, and a line of the guard
+    // holds the server it wraps (`proxy -- npx vite-mcp`): a development
+    // program counts only by its process name.
+    !full_line
+        && !operands.is_empty()
+        && (program == "pidof" || operands.len() == 1)
+        && operands.iter().all(|operand| names_a_dev_process(operand))
+        && if program == "pgrep" {
+            // Without `-f` the pattern is matched against process names.
+            operands
+                .iter()
+                .all(|operand| reach_of_pattern(operand, false) == PkillReach::Misses)
+        } else {
+            listed_reach(command) == PkillReach::Misses
+        }
+        && !lower.contains(GUARD_NAME)
+        && !PROTECTED_TARGETS
+            .iter()
+            .any(|target| lower.contains(target))
 }
 
 /// What a `pgrep` or `pidof` that finds the guard's processes
@@ -1537,6 +1763,31 @@ mod tests {
                     .collect();
                 assert_eq!(args[0], "proxy", "{args:?}");
                 assert_eq!(args[1..separator], expected[..], "{agent}: {args:?}");
+            }
+        }
+    }
+
+    /// The glued and reordered spellings of every layout are lines of the
+    /// guard after every program and around every server, not only the
+    /// first of each.
+    #[test]
+    fn every_spelling_is_built_for_every_program_and_server() {
+        let texts: Vec<&str> = guard_lines()
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect();
+        for program in guard_programs() {
+            for server in SERVER_LINES {
+                let server = server.join(" ");
+                for options in [
+                    "--mode=guard",
+                    "--mode=advisory",
+                    "--mode guard --label claude-code",
+                    "--mode=guard --agent=claude-code --label=claude-code",
+                ] {
+                    let line = format!("{program} proxy {options} -- {server}");
+                    assert!(texts.contains(&line.as_str()), "{line}");
+                }
             }
         }
     }

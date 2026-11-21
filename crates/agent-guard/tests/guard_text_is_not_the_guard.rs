@@ -196,8 +196,14 @@ fn a_kill_beside_a_folder_named_for_the_guard_is_not_disabling_it() {
     ]);
     // Held for review since 2026-11-20, no longer allowed: what `kill` stops is what `pgrep` prints
     // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    // `pgrep -f` matches whole command lines, and a line of the guard holds
+    // the server it wraps; a pattern the guard cannot read is held too.
     assert_eq!(
         verdict("kill $(pgrep -f vite); cd ~/innerwarden/site").0,
+        "review"
+    );
+    assert_eq!(
+        verdict("kill $(pgrep -f \"$P\"); cd ~/innerwarden/site").0,
         "review"
     );
 }
