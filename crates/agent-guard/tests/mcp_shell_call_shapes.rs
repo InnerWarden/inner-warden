@@ -244,3 +244,118 @@ fn shell_and_interpreter_forms_in_argv_are_judged_by_their_line() {
         }
     }
 }
+
+/// Review of #369, item 1: the folder a call names is where its relative
+/// operands are, read as written, with `..` taken lexically, `~` as the
+/// home, and through a link to where it points. Each was judged as the bare
+/// operand (`cat shadow`) and `run_command` let `/etc` and `/` through.
+///
+/// FAILS ON REVERT of `operands_in_folder` in `read_call_shape`.
+#[test]
+fn relative_operands_are_read_in_the_folder_the_call_names() {
+    let mut dangerous = vec![
+        json!({"argv": ["cat", "shadow"], "cwd": "/etc"}),
+        json!({"command": "cat", "args": ["shadow"], "cwd": "/etc"}),
+        json!({"command": "cat shadow", "cwd": "/etc"}),
+        json!({"argv": ["cat", "shadow"], "cwd": "../../../../etc"}),
+        json!({"argv": ["cat", "shadow"], "cwd": "/home/u/../../etc"}),
+        json!({"argv": ["rm", "-rf", "."], "cwd": "/"}),
+        json!({"command": "rm -rf *", "cwd": "/home/u"}),
+        json!({"argv": ["rm", "-rf", "*"], "cwd": "~"}),
+        json!({"argv": ["cat", "id_rsa"], "cwd": "~/.ssh"}),
+        json!({"argv": ["cat", "credentials"], "working_directory": "~/.aws"}),
+        json!({"argv": ["cat", "*"], "cwd": "/home/u/.ssh"}),
+    ];
+    // A link to /etc is /etc.
+    #[cfg(unix)]
+    let _link_dir = {
+        let dir = tempfile::TempDir::new().unwrap();
+        let link = dir.path().join("conf");
+        std::os::unix::fs::symlink("/etc", &link).unwrap();
+        dangerous.push(json!({"argv": ["cat", "shadow"], "cwd": link.to_string_lossy()}));
+        dir
+    };
+    for tool in ["run_command", "run_shell", "subprocess"] {
+        for args in &dangerous {
+            refused(tool, args);
+        }
+        for args in [
+            json!({"argv": ["git", "status"], "cwd": "/home/u/app"}),
+            json!({"argv": ["cat", "README.md"], "cwd": "/home/u/app"}),
+            json!({"argv": ["rm", "-rf", "node_modules"], "cwd": "/home/u/app"}),
+            json!({"argv": ["npm", "test"], "cwd": "~/app"}),
+            json!({"argv": ["ls", "-la"], "cwd": "src"}),
+        ] {
+            allowed(tool, &args);
+        }
+    }
+}
+
+/// Review of #369, item 2: a call that asks for a shell (`shell: true`),
+/// or whose words hold a glob, a redirection or a variable, is also judged
+/// as the line its words make joined, as a server that joins them runs it.
+/// The flag is not counted as read: such a call keeps its tool's name
+/// conditions, as on main.
+///
+/// FAILS ON REVERT of the joined reading in `read_call_shape` (the folder
+/// glob through `command` + `args` is judged as `cat '*'`).
+#[test]
+fn words_a_shell_would_join_are_judged_joined() {
+    for tool in ["run_command", "run_shell"] {
+        for args in [
+            json!({"argv": ["cat", "*"], "cwd": "/home/u/.ssh", "shell": true}),
+            json!({"argv": ["echo", "x", ">/home/u/.bashrc"], "shell": true}),
+            json!({"argv": ["cat", "$HOME/.aws/cred*"], "shell": true}),
+            json!({"command": "cat", "args": ["*"], "cwd": "/home/u/.ssh"}),
+            json!({"argv": ["cat", "~/.ssh/id_*"], "use_shell": "true"}),
+            json!({"argv": ["sh", "-c", "x", ";", "rm", "-rf", "/"], "shell": true}),
+            json!({"argv": ["ls", "; rm -rf /"]}),
+            json!({"argv": ["ls", "$(rm -rf /)"]}),
+            json!({"program": "ls", "args": "; rm -rf /"}),
+            json!({"program": "cat", "args": "~/.ssh/id_rsa"}),
+        ] {
+            refused(tool, &args);
+        }
+        allowed(tool, &json!({"argv": ["ls", "*.rs"]}));
+        allowed(tool, &json!({"argv": ["grep", "-rn", "TODO", "src"]}));
+    }
+}
+
+/// Review of #369, item 3: an argv item that is not text is refused, even
+/// when the text in it is harmless.
+#[test]
+fn an_argv_item_that_is_no_text_is_refused() {
+    for tool in ["run_command", "run_shell", "subprocess"] {
+        refused(tool, &json!({"argv": ["ls", {"x": "; rm -rf /"}]}));
+        refused(tool, &json!({"argv": ["ls", ["-la"]]}));
+        refused(tool, &json!({"command": "ls", "args": [{"x": "y"}]}));
+    }
+}
+
+/// Review of #369, item 4: arguments past what the guard reads are refused
+/// unread, by bytes and by words; under it the same call is read.
+///
+/// FAILS ON REVERT of AG-ARGV-LONG in `inspect_declared_tool_call`.
+#[test]
+fn arguments_past_the_cap_are_refused_unread() {
+    let many: Vec<String> = (0..5000).map(|n| format!("f{n}")).collect();
+    let long = "a".repeat(300 * 1024);
+    for tool in ["run_command", "run_shell", "subprocess"] {
+        let v = verdict(tool, &json!({"command": "ls", "args": many}));
+        assert!(
+            !v.allowed && v.alerts.iter().any(|a| a.rule == "AG-ARGV-LONG"),
+            "{:?}",
+            rules(&v)
+        );
+        let v = verdict(tool, &json!({"argv": ["echo", long]}));
+        assert!(
+            !v.allowed && v.alerts.iter().any(|a| a.rule == "AG-ARGV-LONG"),
+            "{:?}",
+            rules(&v)
+        );
+        allowed(
+            tool,
+            &json!({"command": "ls", "args": many[..100].to_vec()}),
+        );
+    }
+}

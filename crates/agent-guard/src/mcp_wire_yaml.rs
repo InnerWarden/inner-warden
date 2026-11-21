@@ -140,6 +140,18 @@ impl YamlDoc {
             .collect()
     }
 
+    /// The extensions that run code inside Goose and are no server at all
+    /// (`inline_python`, `frontend`, a type this reader does not know, no
+    /// type): no proxy sees what they do, so a config that holds one is never
+    /// fully guarded. Remote servers (`streamable_http`, `sse`) and Goose's
+    /// own (`builtin`, `platform`) are not among them. Pure.
+    pub fn runs_inside(&self) -> Vec<(String, String)> {
+        self.unscreened()
+            .into_iter()
+            .filter(|(_, kind)| !matches!(kind.as_str(), "streamable_http" | "sse"))
+            .collect()
+    }
+
     /// Make the file say what `wanted` (a [`Self::view`] changed by
     /// [`crate::mcp_wire::wrap`] or [`crate::mcp_wire::unwrap`]) says: each
     /// server whose `command` or `args` differ gets its `cmd` and `args`
@@ -797,6 +809,33 @@ extensions:
             );
         let doc = YamlDoc::parse(&anchors).unwrap();
         assert_eq!(mcp_wire::server_counts(&doc.view()).stdio, 1);
+    }
+
+    /// Review of #369, item 7: a key written twice in an extension (a second
+    /// `type:` or `cmd:`), or an extension named twice, is refused by the
+    /// parser (serde_yaml 0.9, Goose's too), so the file is not read and
+    /// nothing is written.
+    #[test]
+    fn a_key_written_twice_refuses_the_file() {
+        for text in [
+            "extensions:\n  gh:\n    type: builtin\n    cmd: npx\n    type: stdio\n",
+            "extensions:\n  gh:\n    type: stdio\n    cmd: npx\n    cmd: /tmp/evil\n",
+            "extensions:\n  gh:\n    type: stdio\n    cmd: npx\n  gh:\n    type: sse\n",
+        ] {
+            let error = YamlDoc::parse(text).unwrap_err();
+            assert!(error.contains("duplicate"), "{error}");
+        }
+    }
+
+    /// Review of #369, item 5: code that runs inside Goose (`inline_python`,
+    /// `frontend`, an unknown or missing type) is named apart from the remote
+    /// servers: no proxy sees it, so the config is never fully guarded.
+    #[test]
+    fn code_that_runs_inside_goose_is_named_apart() {
+        let text = "extensions:\n  a:\n    type: sse\n  b:\n    type: inline_python\n  c:\n    type: frontend\n  d:\n    name: d\n  e:\n    type: builtin\n";
+        let doc = YamlDoc::parse(text).unwrap();
+        let inside: Vec<String> = doc.runs_inside().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(inside, ["b", "c", "d"]);
     }
 
     /// A file of more than one document is not read: the parser Goose uses

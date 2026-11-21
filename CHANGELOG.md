@@ -187,13 +187,25 @@ the text of a command; what it does not see is written down, as measured:
   is that shell's lines: `{"argv": ["sh"], "stdin": "ls -la"}` runs and
   `rm -rf /` there is refused. The hook still refuses the shapes it could
   not read before.
-- **A working folder named plainly is where a command runs.**
-  `run_command {"argv": ["git", "status"], "cwd": "/home/u/app"}` was refused
-  (AG-EXEC, "not plain data") while `run_shell` ran it. A folder named with
-  letters, digits, spaces and the characters of a path is now judged as a path
-  by the checks on the call's arguments (a command run in the SSH keys' folder
-  is still refused); one holding shell syntax (`$(...)`, `;`, a backtick) is
-  also judged as the line a server would join it into, `cd <folder> && <line>`.
+- **A working folder is where a command runs, and its operands are read
+  there.** `run_command {"argv": ["git", "status"], "cwd": "/home/u/app"}` was
+  refused (AG-EXEC, "not plain data") while `run_shell` ran it; it runs now.
+  Each operand a line writes relative to the folder is also read joined to it,
+  the folder as written with `..` taken lexically (one that climbs above
+  where it starts is read from `/`), `~` as the home, and through a link
+  to where it points: `cat shadow` in `/etc` is `cat /etc/shadow`, `rm -rf
+  .` in `/` is `rm -rf /`, `rm -rf *` in the home is a wipe of it, in
+  `run_shell` as in `run_command` and for a command string too (main judged
+  these as `cat shadow`). A folder holding shell syntax (`$(...)`, `;`, a
+  backtick) is also judged as the line a server would join it into, `cd
+  <folder> && <line>`.
+- **Words a server may join into a shell line are judged joined.** A call
+  that asks for a shell (`shell`, `use_shell`: true), or whose words hold a
+  glob, a redirection or a variable, is also judged as its words joined as
+  written (`cat *` in `~/.ssh`, `echo x >~/.bashrc`); the flag keeps the
+  call's other checks, its tool's name among them. A word that is not text
+  beside a command string no longer lets that string be judged alone.
+  Arguments past 256 KiB or 4096 words are refused unread (AG-ARGV-LONG).
 - **Goose's config: a merge key, an unreadable file, remote extensions and
   `args`.** An extension holding a YAML merge key (`<<: *base`), which
   Goose does not apply, was read without it, so a stdio server whose `type`
@@ -206,7 +218,11 @@ the text of a command; what it does not see is written down, as measured:
   with their type on the connect line and in `innerwarden agents`. A stdio
   server with no `args` got one on connect and kept `args: []` after
   disconnect; the line connect adds is marked, and disconnect takes it out, so
-  the file is as it was. The tests read Goose 1.60.2's documented extension
+  the file is as it was. Code that runs inside Goose (`inline_python`,
+  `frontend`, an extension of an unknown type) is seen by no proxy: connect
+  says "wired" and "Partly guarded" and names it, and the agent is never
+  counted guarded. A key written twice in an extension is refused by the
+  parser, as Goose's is. The tests read Goose 1.60.2's documented extension
   shapes.
 
 - **A shell tool's call that names its program in `argv` is judged by its

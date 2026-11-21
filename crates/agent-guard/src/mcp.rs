@@ -141,9 +141,13 @@ pub(crate) fn inspect_declared_tool_call(
     // carries is judged and the strictest verdict stands, so a command
     // string read as it always was is never lowered by another shape of the
     // same call ([`tool_commands`]).
-    let (commands, read_keys) = match tool_call_read(tool_name, args) {
-        Some(read) => (read.commands, read.read_keys),
-        None => (Vec::new(), Vec::new()),
+    let (commands, read_keys, unreadable) = match tool_call_read(tool_name, args) {
+        Some(read) => {
+            let mut commands = read.commands;
+            add_proxy_readings(args, &mut commands);
+            (commands, read.read_keys, read.unreadable)
+        }
+        None => (Vec::new(), Vec::new(), None),
     };
     // Standard input past what the guard reads as code, handed to a shell,
     // which runs it: what it runs is not known, so it is refused unread.
@@ -175,6 +179,20 @@ pub(crate) fn inspect_declared_tool_call(
             false,
         ));
     }
+    // Arguments past what the guard reads as words, handed to a shell or a
+    // process tool: what runs is not read whole, so the call is refused.
+    if names_a_shell_tool(tool_name) || names_a_process_tool(tool_name) {
+        if let Some((bytes, items)) = arguments_past_cap(args) {
+            alerts.push(VerdictAlert::builtin(
+                "AG-ARGV-LONG",
+                format!(
+                    "arguments of {bytes} bytes in {items} words are more than the {MAX_ARGUMENT_READ_BYTES} \
+                     bytes or {MAX_ARGUMENT_WORDS} words the guard reads; refused unread"
+                ),
+                true,
+            ));
+        }
+    }
     if !commands.is_empty() {
         let mut blocks = false;
         for command in &commands {
@@ -193,7 +211,11 @@ pub(crate) fn inspect_declared_tool_call(
                 }
             }
         }
-        if commands.iter().all(|command| command.exclusive) {
+        // A part that could not be read as words beside a command string:
+        // the string is not all the call runs, so the checks on the call's
+        // arguments (its tool's name among them) still run.
+        // `{"command": "ls", "args": [{"x": "; rm -rf /"}]}` was judged as `ls`.
+        if unreadable.is_none() && commands.iter().all(|command| command.exclusive) {
             return Verdict {
                 allowed: !blocks && long_stdin.is_none(),
                 alerts,
@@ -718,6 +740,41 @@ const STDIN_KEYS: &[&str] = &["stdin", "standardinput", "stdindata"];
 /// as it was before standard input was read at all (its name conditions and
 /// the checks on its arguments).
 pub(crate) const MAX_STDIN_READ_BYTES: usize = 64 * 1024;
+
+/// The most bytes, and the most words, a call's argument vector (`argv`,
+/// `args`, `arguments`) may hold and still be read: past either the call is
+/// refused unread (AG-ARGV-LONG). Well under the proxy's line cap (4 MiB), so
+/// a reading never builds a line the analyzer would not read whole.
+pub(crate) const MAX_ARGUMENT_READ_BYTES: usize = 256 * 1024;
+/// See [`MAX_ARGUMENT_READ_BYTES`].
+pub(crate) const MAX_ARGUMENT_WORDS: usize = 4096;
+
+/// The size (bytes, words) of a call's argument vectors when past
+/// [`MAX_ARGUMENT_READ_BYTES`] or [`MAX_ARGUMENT_WORDS`].
+fn arguments_past_cap(args: &serde_json::Value) -> Option<(usize, usize)> {
+    let object = args.as_object()?;
+    let (mut bytes, mut items) = (0usize, 0usize);
+    for key in ARGUMENT_KEYS {
+        match object.get(*key) {
+            Some(serde_json::Value::Array(words)) => {
+                items += words.len();
+                bytes += words
+                    .iter()
+                    .map(|word| match word {
+                        serde_json::Value::String(text) => text.len(),
+                        other => other.to_string().len(),
+                    })
+                    .sum::<usize>();
+            }
+            Some(serde_json::Value::String(text)) => {
+                items += 1;
+                bytes += text.len();
+            }
+            _ => {}
+        }
+    }
+    (bytes > MAX_ARGUMENT_READ_BYTES || items > MAX_ARGUMENT_WORDS).then_some((bytes, items))
+}
 
 /// The length of the longest standard input a call hands a program that is
 /// a shell, when it is past [`MAX_STDIN_READ_BYTES`] and so not read.
@@ -1492,6 +1549,72 @@ fn read_call_shape<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCal
     }
 }
 
+/// The readings only the MCP proxy adds to a shell or process tool call's
+/// lines ([`read_tool_call`]); the agent hooks read the folder a call names
+/// their own way (`command_dir`).
+///
+/// * A server that joins the words it hands its program into a shell line
+///   (it says so with `shell: true`, or may do so unasked) runs what a glob,
+///   a redirection or a variable in a word does there: the words joined as
+///   written are judged as well. Read so when the call asks for a shell, or
+///   when a word other than the program's holds such a character and no
+///   space, and the program is no shell (a shell's word is already a line,
+///   and code with spaces would be torn apart for nothing).
+/// * The folder a call names for its command is where the command's
+///   relative operands are: each is also read joined to it
+///   ([`folder_readings`], [`operands_in_folder`]). Before,
+///   `{"argv": ["cat", "shadow"], "cwd": "/etc"}` was judged as `cat shadow`.
+fn add_proxy_readings<'a>(args: &'a serde_json::Value, commands: &mut Vec<ToolCommand<'a>>) {
+    use std::borrow::Cow;
+    let Some(original) = args.as_object() else {
+        return;
+    };
+    let canonical = canonical_call(original);
+    let object = canonical.as_ref().map_or(original, |(object, _)| object);
+    let shell_asked = asks_for_a_shell(object);
+    if let Some(words) = words_handed(object) {
+        let meta = !program_is_a_shell(object)
+            && words.iter().skip(1).any(|word| {
+                word.contains(['*', '?', '[', '<', '>', '$', '`'])
+                    && !word.contains(char::is_whitespace)
+            });
+        if shell_asked || meta {
+            let line = words.join(" ");
+            if !commands.iter().any(|known| known.line == line.as_str()) {
+                commands.push(ToolCommand {
+                    line: Cow::Owned(line),
+                    exclusive: false,
+                });
+            }
+        }
+    }
+    let folders: Vec<String> = object
+        .iter()
+        .filter(|(key, _)| WORKING_FOLDER_KEYS.contains(&canonical_key(key).as_str()))
+        .filter_map(|(_, value)| scalar_text(value))
+        .flat_map(|folder| folder_readings(&folder))
+        .collect();
+    if folders.is_empty() {
+        return;
+    }
+    let joined: Vec<ToolCommand<'a>> = commands
+        .iter()
+        .flat_map(|command| {
+            folders.iter().filter_map(move |folder| {
+                operands_in_folder(&command.line, folder).map(|line| ToolCommand {
+                    line: Cow::Owned(line),
+                    exclusive: command.exclusive,
+                })
+            })
+        })
+        .collect();
+    for command in joined {
+        if !commands.iter().any(|known| known.line == command.line) {
+            commands.push(command);
+        }
+    }
+}
+
 /// Every command line a shell or process tool call carries, as
 /// [`inspect_tool_call`] judges them ([`read_tool_call`]). Empty for a tool
 /// that is neither.
@@ -1849,6 +1972,158 @@ fn is_runnable_arg(key: &str) -> bool {
     name_words(key)
         .iter()
         .any(|word| RUNNABLE_ARG_WORDS.contains(&word.as_str()))
+}
+
+/// The keys a call says with whether its program is started through a
+/// shell, as [`canonical_key`] gives them: `shell`, `use_shell`,
+/// `shell_true`, `run_in_shell`.
+const SHELL_FLAG_KEYS: &[&str] = &["shell", "useshell", "shelltrue", "runinshell"];
+
+/// Whether the call asks for its program to be started through a shell
+/// (`"shell": true`, `"use_shell": "true"`).
+fn asks_for_a_shell(object: &serde_json::Map<String, serde_json::Value>) -> bool {
+    use serde_json::Value;
+    object.iter().any(|(key, value)| {
+        SHELL_FLAG_KEYS.contains(&canonical_key(key).as_str())
+            && match value {
+                Value::Bool(flag) => *flag,
+                Value::String(text) => matches!(
+                    text.trim().to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes"
+                ),
+                Value::Number(number) => number.as_u64().is_some_and(|n| n != 0),
+                _ => false,
+            }
+    })
+}
+
+/// The words a call hands its program one by one, the program first: an
+/// `argv` that is the program's whole vector, or a program named as one word
+/// (`program`, `executable`, or `command`/`cmd` with no space) and a list
+/// of arguments. `None` for any other shape or a word that is no text.
+fn words_handed(object: &serde_json::Map<String, serde_json::Value>) -> Option<Vec<String>> {
+    use serde_json::Value;
+    if let Some(argv) = program_argv(object) {
+        return scalar_words(argv.as_array()?).map(|words| {
+            words
+                .into_iter()
+                .map(std::borrow::Cow::into_owned)
+                .collect()
+        });
+    }
+    let program = ["program", "executable", "command", "cmd"]
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_str))
+        .filter(|program| !program.trim().contains(char::is_whitespace))?;
+    let arguments = ARGUMENT_KEYS
+        .iter()
+        .find_map(|key| object.get(*key).and_then(Value::as_array))?;
+    let mut words = vec![program.trim().to_string()];
+    words.extend(
+        scalar_words(arguments)?
+            .into_iter()
+            .map(std::borrow::Cow::into_owned),
+    );
+    Some(words)
+}
+
+/// The folders a working folder stands for, each as an absolute path or one
+/// under `~`: as written, its `.` and `..` taken lexically (a folder that
+/// climbs above where it starts is read from `/`), and its real path where
+/// it is there and differs (a link to `/etc` is `/etc`). A plain relative
+/// folder (`src`) stays relative to where the server runs, which is not
+/// known: it gives nothing.
+fn folder_readings(folder: &str) -> Vec<String> {
+    let folder = folder.trim();
+    if folder.is_empty() {
+        return Vec::new();
+    }
+    let (prefix, rest) = if folder == "~" {
+        ("~", "")
+    } else if let Some(rest) = folder.strip_prefix("~/") {
+        ("~", rest)
+    } else if let Some(rest) = folder.strip_prefix('/') {
+        ("", rest)
+    } else {
+        ("", folder)
+    };
+    let absolute = folder.starts_with('/') || prefix == "~";
+    let mut parts: Vec<&str> = Vec::new();
+    let mut climbed = false;
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => climbed |= parts.pop().is_none(),
+            other => parts.push(other),
+        }
+    }
+    if !absolute && !climbed {
+        return Vec::new();
+    }
+    let lexical = if prefix == "~" && !climbed {
+        format!("~/{}", parts.join("/"))
+    } else {
+        format!("/{}", parts.join("/"))
+    };
+    let mut out = vec![lexical];
+    if folder.starts_with('/') {
+        if let Ok(real) = std::fs::canonicalize(folder) {
+            let real = real.to_string_lossy().into_owned();
+            if !out.contains(&real) {
+                out.push(real);
+            }
+        }
+    }
+    out
+}
+
+/// `line` with each operand written relative to where it runs joined to
+/// `folder` (`cat shadow` in `/etc` is `cat /etc/shadow`; `rm -rf .` in
+/// `/` is `rm -rf /`). An operand is a word after the program that is not
+/// an option, not a path from `/` or `~`, not a variable and not an
+/// assignment. `None` for a line with shell syntax beyond words (an
+/// operator, a quote, a substitution), whose words are not read here, or
+/// with no such operand.
+fn operands_in_folder(line: &str, folder: &str) -> Option<String> {
+    if line.contains([
+        ';', '&', '|', '<', '>', '(', ')', '`', '"', '\'', '\\', '\n', '{', '}',
+    ]) {
+        return None;
+    }
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let program = words.iter().position(|word| {
+        !word
+            .split_once('=')
+            .is_some_and(|(name, _)| threats::is_shell_name(name))
+    })?;
+    let mut changed = false;
+    let joined: Vec<String> = words
+        .iter()
+        .enumerate()
+        .map(|(at, word)| {
+            let relative = at > program
+                && !word.starts_with(['-', '/', '~', '$'])
+                && !word.contains('=')
+                && !word.contains("://");
+            if !relative {
+                return (*word).to_string();
+            }
+            changed = true;
+            let base = folder.trim_end_matches('/');
+            let path = match *word {
+                "." | "./" => {
+                    if base.is_empty() {
+                        "/".to_string()
+                    } else {
+                        base.to_string()
+                    }
+                }
+                _ => format!("{base}/{}", word.trim_start_matches("./")),
+            };
+            path
+        })
+        .collect();
+    changed.then(|| joined.join(" "))
 }
 
 /// Whether `text` is a folder named as plainly as a path can be: letters,

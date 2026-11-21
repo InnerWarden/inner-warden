@@ -905,6 +905,23 @@ fn yaml_unscreened(path: &Path) -> Vec<String> {
         .map(|doc| {
             doc.unscreened()
                 .into_iter()
+                .filter(|(_, kind)| matches!(kind.as_str(), "streamable_http" | "sse"))
+                .map(|(name, kind)| format!("{name} ({kind})"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The extensions of a YAML MCP config that run code inside the agent
+/// ([`mcp_wire_yaml::YamlDoc::runs_inside`]), as a line says them.
+fn yaml_runs_inside(path: &Path) -> Vec<String> {
+    crate::file_update::read_config(path)
+        .ok()
+        .flatten()
+        .and_then(|bytes| mcp_wire_yaml::YamlDoc::parse(std::str::from_utf8(&bytes).ok()?).ok())
+        .map(|doc| {
+            doc.runs_inside()
+                .into_iter()
                 .map(|(name, kind)| format!("{name} ({kind})"))
                 .collect()
         })
@@ -1086,12 +1103,16 @@ fn is_guarded(home: &Path, agent: &str, path_env: Option<&OsStr>) -> bool {
             .unwrap_or(false);
     }
     if let Some(rel) = k.mcp_yaml {
-        return read_yaml(&home.join(rel))
+        // An extension that runs code inside Goose is seen by no proxy: a
+        // config that holds one is never counted guarded.
+        let path = home.join(rel);
+        return read_yaml(&path)
             .map(|v| {
                 mcp_wire::is_guarded(&v)
                     && !proxy_is_broken(&mcp_wire::guard_wrapper_commands(&v), path_env)
             })
-            .unwrap_or(false);
+            .unwrap_or(false)
+            && yaml_runs_inside(&path).is_empty();
     }
     false
 }
@@ -1924,6 +1945,7 @@ fn connect_by_one_mechanism(
         let unscreened: String = doc
             .unscreened()
             .iter()
+            .filter(|(_, kind)| matches!(kind.as_str(), "streamable_http" | "sse"))
             .map(|(name, kind)| format!("{name} ({kind})"))
             .collect::<Vec<_>>()
             .join(", ");
@@ -1931,6 +1953,22 @@ fn connect_by_one_mechanism(
             String::new()
         } else {
             format!("; not screened by the proxy: {unscreened}")
+        };
+        // Code that runs inside Goose: the wiring is done, the agent is not
+        // guarded, and the line says "partly", never "connected" alone.
+        let inside: Vec<String> = doc
+            .runs_inside()
+            .iter()
+            .map(|(name, kind)| format!("{name} ({kind})"))
+            .collect();
+        let partly = if inside.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ". Partly guarded: {} run{} code inside Goose that no proxy sees",
+                inside.join(", "),
+                if inside.len() == 1 { "s" } else { "" }
+            )
         };
         if reject_symlinks && mcp_wire::has_guard_wiring(&cfg) {
             return ConnectResult::new(
@@ -1978,16 +2016,18 @@ fn connect_by_one_mechanism(
             Ok(()) if n == 0 => ConnectResult::new(
                 ConnectEffect::Unchanged,
                 format!(
-                    "  {} - already guarded (MCP proxy, {}){unscreened}",
+                    "  {} - {} (MCP proxy, {}){unscreened}{partly}",
                     r.name,
+                    if partly.is_empty() { "already guarded" } else { "already wired" },
                     if monitor { "monitor" } else { "enforce" }
                 ),
             ),
             Ok(()) => ConnectResult::new(
                 ConnectEffect::Connected,
                 format!(
-                    "  {} - connected ({n} MCP server{} routed through the guard proxy, {}; built-in extensions are not screened by it{unscreened})",
+                    "  {} - {} ({n} MCP server{} routed through the guard proxy, {}; built-in extensions are not screened by it{unscreened}){partly}",
                     r.name,
+                    if partly.is_empty() { "connected" } else { "wired" },
                     if n == 1 { "" } else { "s" },
                     if monitor { "monitor" } else { "enforce" }
                 ),
@@ -2214,6 +2254,10 @@ fn list_lines_of(home: &Path, rows: &[AgentStatus]) -> Vec<String> {
                 .as_deref()
                 .map(yaml_unscreened)
                 .unwrap_or_default();
+            let runs_inside = yaml_path
+                .as_deref()
+                .map(yaml_runs_inside)
+                .unwrap_or_default();
             let guard = if !r.guardable() {
                 "detected (guard manually)".to_string()
             } else if broken.is_some() {
@@ -2224,6 +2268,8 @@ fn list_lines_of(home: &Path, rows: &[AgentStatus]) -> Vec<String> {
                 "✗ wired, but its MCP proxy cannot run".to_string()
             } else if yaml_problem.is_some() {
                 "? its MCP config cannot be read".to_string()
+            } else if !runs_inside.is_empty() && mcp_has_guard_wiring(home, r) {
+                "partly guarded (MCP proxy)".to_string()
             } else if let Some((_, state)) = hooked {
                 two_way_label(home, r, state)
             } else if r.guarded {
@@ -2257,6 +2303,13 @@ fn list_lines_of(home: &Path, rows: &[AgentStatus]) -> Vec<String> {
                     "  {:<13} {} cannot be read ({problem}), so whether its MCP servers are behind the proxy is not known",
                     "",
                     path.display()
+                ));
+            }
+            if !runs_inside.is_empty() {
+                out.push(format!(
+                    "  {:<13} runs code inside the agent that no proxy sees: {}",
+                    "",
+                    runs_inside.join(", ")
                 ));
             }
             if !unscreened.is_empty() {
@@ -3949,6 +4002,55 @@ mod tests {
             assert_eq!(result.effect, ConnectEffect::Failed, "{}", result.line);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
         }
+    }
+
+    /// Review of #369, item 5: a Goose config with code that runs inside
+    /// Goose (`inline_python`) is wired, and never said to be guarded: the
+    /// connect line says "wired" and "Partly guarded" and names it, a second
+    /// connect does not say "already guarded", the row is not counted
+    /// guarded and the listing says "partly guarded".
+    ///
+    /// FAILS ON REVERT of `runs_inside` in `is_guarded` or on the lines.
+    #[test]
+    fn goose_code_run_inside_it_is_never_counted_guarded() {
+        let text = "extensions:\n  filesystem:\n    type: stdio\n    name: filesystem\n    enabled: true\n    cmd: npx\n    args: [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]\n  helper:\n    type: inline_python\n    name: helper\n    enabled: true\n    code: \"print(1)\"\n";
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/goose")).unwrap();
+        std::fs::write(home.path().join(".config/goose/config.yaml"), text).unwrap();
+        // A guard program that is there, so the wiring is not "cannot run".
+        let bin = home.path().join("bin/innerwarden");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let bin = bin.to_string_lossy().into_owned();
+        let row = known_row(home.path(), "goose");
+        let result = connect_one_result(home.path(), &row, &bin, false, false);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+        assert!(result.line.contains("goose - wired ("), "{}", result.line);
+        assert!(
+            result
+                .line
+                .contains("Partly guarded: helper (inline_python) runs code inside Goose"),
+            "{}",
+            result.line
+        );
+        assert!(!result.line.contains("connected"), "{}", result.line);
+        let again = connect_one_result(home.path(), &row, &bin, false, false);
+        assert!(!again.line.contains("already guarded"), "{}", again.line);
+        assert!(again.line.contains("Partly guarded"), "{}", again.line);
+        assert!(!is_guarded(home.path(), "goose", None));
+        let row = known_row(home.path(), "goose");
+        assert!(!row.guarded);
+        let lines = list_lines_of(home.path(), std::slice::from_ref(&row)).join("\n");
+        assert!(lines.contains("partly guarded (MCP proxy)"), "{lines}");
+        assert!(
+            lines.contains("runs code inside the agent that no proxy sees: helper (inline_python)"),
+            "{lines}"
+        );
     }
 
     /// Goose's remote extensions are named, with their type, on the connect
