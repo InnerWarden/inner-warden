@@ -202,3 +202,62 @@ fn structure_corpus_development_and_benign() {
         "development attacks found {af} < {DEVELOPMENT_FLOOR}"
     );
 }
+
+/// `text` on one line, cut at 600 characters, for the measure's listing.
+fn one_line(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .take(600)
+        .collect()
+}
+
+/// The reading measured on a texts file of public sources (JSON lines with
+/// `source`, `label` and `text`) named by `IW_STRUCTURE_HELDOUT`; with
+/// `IW_STRUCTURE_SHOW`, each miss and each benign text marked is printed.
+#[test]
+fn structure_heldout_measure() {
+    let Some(path) = std::env::var_os("IW_STRUCTURE_HELDOUT") else {
+        return;
+    };
+    let show = std::env::var_os("IW_STRUCTURE_SHOW").is_some();
+    let text = std::fs::read_to_string(&path).expect("held-out file");
+    let mut per: BTreeMap<String, (usize, usize, usize, usize)> = BTreeMap::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line).expect("json line");
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let (source, label, body, id) = (s("source"), s("label"), s("text"), s("id"));
+        let found = injection_structure(&body).is_some();
+        let row = per.entry(source).or_default();
+        if label == "malicious" {
+            row.1 += 1;
+            row.0 += usize::from(found);
+            if show && !found {
+                println!("MISS {id} {}", one_line(&body));
+            }
+        } else {
+            row.3 += 1;
+            row.2 += usize::from(found);
+            if show && found {
+                println!("MARK {id} {}", one_line(&body));
+            }
+        }
+    }
+    let (mut af, mut at, mut bm, mut bt) = (0, 0, 0, 0);
+    for (source, (f, a, m, b)) in &per {
+        println!("HELDOUT {source:<20} attacks {f:>4} / {a:<4} benign marked {m:>3} / {b}");
+        af += f;
+        at += a;
+        bm += m;
+        bt += b;
+    }
+    println!(
+        "HELDOUT {:<20} attacks {af:>4} / {at:<4} benign marked {bm:>3} / {bt}",
+        "total"
+    );
+}
