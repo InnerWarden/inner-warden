@@ -672,6 +672,10 @@ const PYTHON_FILE_CALLS: &[&str] = &[
 /// `None` when one is not a literal, a name given a literal, or an argument.
 fn python_file_targets(code: &str, lower: &str, argv: &[String]) -> Option<Vec<String>> {
     let mut targets = Vec::new();
+    // A name read once: code that opens the same name in every line of a
+    // long edit is not scanned again for each.
+    let mut known: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     for call in PYTHON_FILE_CALLS {
         for (at, _) in lower.match_indices(call) {
             let open = at + call.len();
@@ -682,7 +686,16 @@ fn python_file_targets(code: &str, lower: &str, argv: &[String]) -> Option<Vec<S
                 open + code[open..].find('(')? + 1
             };
             for piece in call_arguments(&code[open..])? {
-                targets.push(python_value(code, piece.trim(), argv, 0)?);
+                let piece = piece.trim();
+                let value = match known.get(piece) {
+                    Some(value) => value.clone(),
+                    None => {
+                        let value = python_value(code, piece, argv, 0);
+                        known.insert(piece.to_string(), value.clone());
+                        value
+                    }
+                };
+                targets.push(value?);
             }
         }
     }
@@ -1468,7 +1481,14 @@ fn runs_a_file_code_names(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
             | "raw_string"
             | "word"
             | "concatenation" => {
-                let shown = text(node, source);
+                // The text the program gets: a word's own quotes are not a
+                // string of the code it holds.
+                let shown_owned = if node.kind() == "heredoc_body" {
+                    text(node, source).to_string()
+                } else {
+                    unquoted(node, source)
+                };
+                let shown = shown_owned.as_str();
                 for (at, _) in shown
                     .match_indices("open(")
                     .chain(shown.match_indices("Path("))
@@ -1491,6 +1511,13 @@ fn runs_a_file_code_names(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
                         }
                     }
                 }
+                // Every string the code holds may be a file it writes, by a
+                // call this reading does not list (`shutil.copy`, `os.rename`).
+                named.extend(
+                    string_literals(shown)
+                        .iter()
+                        .filter_map(|path| last_part(path)),
+                );
             }
             "command" => commands.push(node),
             _ => {}
@@ -1503,12 +1530,13 @@ fn runs_a_file_code_names(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     if named.is_empty() {
         return false;
     }
+    let names = |word: &str| last_part(word).is_some_and(|part| named.contains(&part));
     commands.into_iter().any(|command| {
         let Some(name) = command.child_by_field_name("name") else {
             return false;
         };
         let program = unquoted(name, source);
-        if last_part(&program).is_some_and(|part| named.contains(&part)) {
+        if names(&program) {
             return true;
         }
         let program = program
@@ -1517,17 +1545,74 @@ fn runs_a_file_code_names(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
             .unwrap_or("")
             .to_ascii_lowercase();
         let bare = program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-        if !FILE_RUNNERS.contains(&bare) && !FILE_RUNNERS.contains(&program.as_str()) {
+        let runner = FILE_RUNNERS.contains(&bare) || FILE_RUNNERS.contains(&program.as_str());
+        // What the command is handed: its words, and the files its redirects
+        // name, on the command or on the statement around it (`sh < x.sh`,
+        // `bash -s < x.sh`).
+        let mut cursor = command.walk();
+        let mut touched: Vec<String> = command
+            .children_by_field_name("argument", &mut cursor)
+            .map(|argument| unquoted(argument, source))
+            .collect();
+        touched.extend(redirect_targets(command, source));
+        if !touched.iter().any(|word| names(word)) {
             return false;
         }
-        let mut cursor = command.walk();
-        let ran = command
-            .children_by_field_name("argument", &mut cursor)
-            .any(|argument| {
-                last_part(&unquoted(argument, source)).is_some_and(|part| named.contains(&part))
-            });
-        ran
+        // Run by it, or printed to a runner (`cat x.sh | sh`).
+        runner || !output_stays(command, source)
     })
+}
+
+/// The files the redirects of a command name, on the command itself and on
+/// each statement around it that hangs redirects on it.
+fn redirect_targets(command: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut node = Some(command);
+    let mut steps = 0;
+    while let Some(at) = node {
+        steps += 1;
+        if steps > 64 {
+            break;
+        }
+        let mut cursor = at.walk();
+        for child in at.children(&mut cursor) {
+            if child.kind() == "file_redirect" {
+                if let Some(destination) = child.child_by_field_name("destination") {
+                    targets.push(unquoted(destination, source));
+                } else if let Some(last) =
+                    child.named_child((child.named_child_count() as u32).saturating_sub(1))
+                {
+                    targets.push(unquoted(last, source));
+                }
+            }
+        }
+        node = at
+            .parent()
+            .filter(|parent| matches!(parent.kind(), "redirected_statement" | "pipeline" | "list"));
+    }
+    targets
+}
+
+/// The quoted strings of a text, read loosely: each run between a quote and
+/// the same quote on one line.
+fn string_literals(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for line in text.lines() {
+        let mut rest = line;
+        while let Some(start) = rest.find(['\'', '"']) {
+            let quote = rest[start..].chars().next().unwrap_or('\'');
+            let after = &rest[start + 1..];
+            let Some(end) = after.find(quote) else {
+                break;
+            };
+            let inner = &after[..end];
+            if !inner.is_empty() && !inner.contains(char::is_whitespace) {
+                found.push(inner.to_string());
+            }
+            rest = &after[end + 1..];
+        }
+    }
+    found
 }
 
 /// The last part of a path, lowercase; none for an empty one.

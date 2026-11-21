@@ -3929,9 +3929,11 @@ fn analyze_command_at(
 /// The line is written again with every slot that only names something
 /// masked ([`crate::mention::masked`]) and judged again. The refusal is
 /// lowered only when every charged signal of the line is one of the guard's
-/// own families ([`GUARD_WORD_SIGNALS`]) and the masked line is not
-/// refused: a secret read, a download run or any other finding keeps the
-/// refusal whatever slot it stands in.
+/// own families ([`GUARD_WORD_SIGNALS`]) and the masked line is allowed:
+/// a secret read, a download run or any other finding keeps the refusal
+/// whatever slot it stands in, and so does a line the masked reading still
+/// holds for review (a file the line reads by a path that is no argument,
+/// measured 2026-11-21: no line of the corpora's gain is lost by it).
 fn mention_only(
     command: &str,
     cwd: Option<&str>,
@@ -3950,7 +3952,7 @@ fn mention_only(
         return analysis;
     };
     let mut lowered = judge(&masked);
-    if lowered.recommendation == "deny" {
+    if lowered.recommendation != "allow" {
         return analysis;
     }
     let lift = 20u32.saturating_sub(lowered.risk_score);

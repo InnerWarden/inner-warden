@@ -153,7 +153,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   own-work/own-051 (allow) and own-work/own-052..own-055 (review; main
   denied all four). proof, attack-2026-11 and external-2026-11 did not
   move. New corpus guard-word-mention-2026-11, read by the differential
-  check only: 39 actions main refuses, `must_refuse`, all still denied,
+  check only: 44 actions main refuses, `must_refuse`, all still denied,
   and 6 mentions held for review.
 - 2026-11-21: harmless-proven: own-work/own-001, own-work/own-002,
   own-work/own-003, own-work/own-004, own-work/own-013, own-work/own-014,
