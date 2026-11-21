@@ -373,9 +373,35 @@ pub(crate) struct OrderReading {
     /// A clause that, in plain words, has the reader act on the guard, read
     /// a secret or run a download.
     pub(crate) prose: Option<String>,
-    /// More pieces than [`MAX_PIECES`].
+    /// More pieces than [`MAX_PIECES`], or past [`MAX_FIRM_TEXT`].
     pub(crate) over_budget: bool,
+    /// Past [`MAX_PIECES`]: the pieces that start at a word of
+    /// [`FIRM_TRIGGERS`], judged only for a command that takes the guard
+    /// down or runs a download. Padding a file with links never hides such
+    /// a line: these are bound by cost ([`MAX_FIRM_TEXT`]), not by count.
+    pub(crate) firm_only: Vec<String>,
 }
+
+/// Words a command that takes the guard down or runs a download starts
+/// with, as [`holds_trigger`] reads a trigger.
+const FIRM_TRIGGERS: &[&str] = &[
+    "innerwarden",
+    "systemctl",
+    "launchctl",
+    "pkill",
+    "killall",
+    "kill",
+    "curl",
+    "wget",
+    "iwr",
+    "irm",
+    "iex",
+    "invoke-webrequest",
+    "invoke-restmethod",
+];
+
+/// The most text, in bytes, of the pieces judged past [`MAX_PIECES`].
+pub(crate) const MAX_FIRM_TEXT: usize = 2 * 1024 * 1024;
 
 /// Verbs a clause that forbids starts with.
 const NEGATIONS: &[&str] = &[
@@ -446,28 +472,35 @@ const GUARD_NAMES: &[&str] = &[
     "security tool",
 ];
 
-/// Verbs that hand a file's text to someone. `copy`, `show` and
-/// `include` are not among them: a setup step copies a template
-/// (`Copy .env.example to .env`).
+/// Verbs that hand a file's text to someone. `copy` is not among them: a
+/// setup step copies a template (`Copy .env.example to .env`).
 const READ_ACTS: &[&str] = &[
     "read",
     "cat",
     "print",
+    "show",
     "send",
     "upload",
     "post",
     "paste",
+    "output",
     "dump",
+    "display",
+    "include",
+    "echo",
     "exfiltrate",
+    "share",
     "email",
     "leak",
     "reveal",
+    "type",
 ];
 
-/// Secrets as prose names them: keys and credentials themselves, never a
-/// config file beside them (`~/.ssh/config`, `~/.kube/config`), which a
-/// setup step reads.
+/// Secrets as prose names them: keys, credentials and the files that keep
+/// tokens. In `.ssh/`, `config` and `known_hosts` are not secrets
+/// ([`SSH_NOT_SECRET`]): a setup step reads them.
 const SECRET_PATHS: &[&str] = &[
+    ".ssh/",
     "id_rsa",
     "id_ed25519",
     "id_ecdsa",
@@ -475,34 +508,55 @@ const SECRET_PATHS: &[&str] = &[
     ".pem",
     "credentials",
     ".git-credentials",
+    ".aws/config",
     ".netrc",
     ".gnupg",
+    ".kube/config",
+    ".docker/config.json",
     "/etc/shadow",
+    ".pypirc",
+    ".npmrc",
     ".env",
 ];
+
+/// The files of `.ssh/` a setup step reads that hold no key.
+const SSH_NOT_SECRET: &[&str] = &["config", "known_hosts"];
 
 /// Ends of a file name that make it a template, not a secret
 /// (`.env.example`).
 const TEMPLATE_ENDS: &[&str] = &[".example", ".sample", ".template", ".dist", ".tmpl"];
 
 /// Whether `lower` names a secret of [`SECRET_PATHS`]: `.env` only as
-/// the file itself (not `.envrc`), and nothing in a clause that names a
-/// template of it (`Copy .env.example to .env`).
+/// the file itself (not `.envrc`) and not in a clause that names a
+/// template of it (`Copy .env.example to .env`); `.ssh/` not for its
+/// `config` or `known_hosts`.
 pub(crate) fn names_a_secret(lower: &str) -> bool {
-    if lower.contains(".env")
-        && TEMPLATE_ENDS
-            .iter()
-            .any(|end| lower.contains(&format!(".env{end}")))
-    {
-        return SECRET_PATHS
-            .iter()
-            .filter(|path| **path != ".env")
-            .any(|path| lower.contains(path));
-    }
+    let env_template = TEMPLATE_ENDS
+        .iter()
+        .any(|end| lower.contains(&format!(".env{end}")));
+    // A name ends where no letter, digit, `_` or `-` follows, nor a `.`
+    // that goes on into another word (`config.bak`).
+    let ends_here = |rest: &str| {
+        let mut chars = rest.chars();
+        match chars.next() {
+            None => true,
+            Some('.') => chars.next().is_none_or(|c| !c.is_ascii_alphanumeric()),
+            Some(c) => !c.is_ascii_alphanumeric() && c != '_' && c != '-',
+        }
+    };
     SECRET_PATHS.iter().any(|path| {
+        if *path == ".env" && env_template {
+            return false;
+        }
         lower.match_indices(path).any(|(at, _)| {
+            let after = &lower[at + path.len()..];
+            if *path == ".ssh/" {
+                return !SSH_NOT_SECRET
+                    .iter()
+                    .any(|name| after.strip_prefix(name).is_some_and(ends_here));
+            }
             !path.ends_with(|c: char| c.is_ascii_alphanumeric())
-                || lower[at + path.len()..]
+                || after
                     .chars()
                     .next()
                     .is_none_or(|c| !c.is_ascii_alphanumeric())
@@ -527,7 +581,12 @@ const MAX_PIECE_CHARS: usize = 4096;
 /// its own (`gate` not in `navigate`, `kill` not in `skill`), a plural
 /// `s` allowed; one with a mark in it (`.ssh`, `id_rsa`) anywhere.
 fn holds_trigger(word: &str) -> bool {
-    TRIGGERS.iter().any(|trigger| {
+    holds_one_of(word, TRIGGERS)
+}
+
+/// [`holds_trigger`] for any list of triggers.
+fn holds_one_of(word: &str, triggers: &[&str]) -> bool {
+    triggers.iter().any(|trigger| {
         if !trigger.chars().all(|c| c.is_ascii_alphabetic()) {
             return word.contains(trigger);
         }
@@ -550,6 +609,7 @@ fn holds_trigger(word: &str) -> bool {
 pub(crate) fn order_reading(text: &str) -> OrderReading {
     let mut reading = OrderReading::default();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut firm_text = 0usize;
     // The clauses of one sentence that forbid nothing, for an order that
     // takes two of them (`download https://x/i.sh and run it`): an
     // address, a verb that fetches and one that runs, in any of them.
@@ -580,8 +640,16 @@ pub(crate) fn order_reading(text: &str) -> OrderReading {
         // one before it, never an earlier one.
         let mut starts = Vec::new();
         let mut next_start = 0;
+        let past_budget = reading.commands.len() >= MAX_PIECES;
         for (at, word) in words.iter().enumerate() {
-            if holds_trigger(&word.to_ascii_lowercase()) {
+            let word = word.to_ascii_lowercase();
+            if past_budget {
+                if holds_one_of(&word, FIRM_TRIGGERS) {
+                    starts.push(at);
+                }
+                continue;
+            }
+            if holds_trigger(&word) {
                 let from = at.saturating_sub(COMMAND_REACH).max(next_start);
                 starts.extend(from..=at);
                 next_start = at + 1;
@@ -605,8 +673,25 @@ pub(crate) fn order_reading(text: &str) -> OrderReading {
                 continue;
             }
             if reading.commands.len() >= MAX_PIECES {
+                // Past the count, only a firm command is looked for.
                 reading.over_budget = true;
-                break;
+                if !holds_one_of(
+                    &piece
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase(),
+                    FIRM_TRIGGERS,
+                ) {
+                    continue;
+                }
+                if firm_text + piece.len() > MAX_FIRM_TEXT {
+                    continue;
+                }
+                firm_text += piece.len();
+                seen.insert(piece.clone());
+                reading.firm_only.push(piece);
+                continue;
             }
             seen.insert(piece.clone());
             reading.commands.push(piece);

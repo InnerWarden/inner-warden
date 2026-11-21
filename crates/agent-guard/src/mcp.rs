@@ -4077,6 +4077,19 @@ fn instruction_order(
             soft.get_or_insert(why);
         }
     }
+    // Past the count of pieces, a command that takes the guard down or
+    // runs a download is still looked for in the whole text.
+    for piece in &reading.firm_only {
+        let inner = analyze_command_at(piece, rule_engine, &[], None, depth + 1);
+        if let Some(signal) = inner.signals.iter().find(|signal| {
+            signal.score > 0 && INSTRUCTION_FIRM_SIGNALS.contains(&signal.signal.as_str())
+        }) {
+            return Some((
+                format!("`{piece}`: {}", signal.detail),
+                INSTRUCTION_ORDER_FIRM_SCORE,
+            ));
+        }
+    }
     if let Some(clause) = reading.prose {
         return Some((format!("`{clause}`"), INSTRUCTION_ORDER_SCORE));
     }
