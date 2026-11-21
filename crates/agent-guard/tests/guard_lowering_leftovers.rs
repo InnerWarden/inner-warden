@@ -126,9 +126,9 @@ fn stopping_other_programs_stays_allowed() {
             "pkill -f \"sh -c sleep\"",
             "pkill -f /var/log/nginx",
             "systemctl stop nginx",
-            "kill $(pgrep -f vite)",
-            "kill -9 $(pgrep -f 'next dev')",
-            "kill `pgrep -f vite`",
+            "kill $(pgrep vite)",
+            "kill -9 $(pgrep node)",
+            "kill `pgrep vite`",
             "kill $(pidof node)",
         ],
         "allow",
@@ -195,13 +195,58 @@ fn a_kill_through_pgrep_leaves_review_only_for_a_dev_program() {
     }
     assert_verdict(
         &[
-            "kill $(pgrep -f webpack)",
-            "kill $(pgrep -u me -f vite)",
-            "kill $(pgrep -f 'vite --port 5173')",
+            "kill $(pgrep webpack)",
+            "kill $(pgrep -u me vite)",
+            "kill $(pgrep -x vite)",
             "kill $(pidof node)",
         ],
         "allow",
     );
+}
+
+/// Round 2 of the review: `pgrep -f` matches a whole command line, and a
+/// line of the guard holds the server it wraps (`proxy -- npx vite-mcp`
+/// has `vite` in it), so a development program counts only by its
+/// process name; with `-f` the kill is held as on main.
+#[test]
+fn a_dev_program_counts_only_by_its_process_name() {
+    for line in [
+        "kill $(pgrep -f vite)",
+        "kill $(pgrep -af vite)",
+        "kill $(pgrep --full vite)",
+        "kill $(pgrep -u me -f vite)",
+        "kill -9 $(pgrep -f 'next dev')",
+        "kill `pgrep -f vite`",
+        "kill $(pgrep -f webpack)",
+    ] {
+        assert_ne!(verdict(line), "allow", "{line}");
+        assert_ne!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// Round 2 of the review: a decode written to a file in a command sent to
+/// the background (`&`) and run by the next one keeps the signal main gave
+/// it, and `&>` writes the file as `>` does.
+#[test]
+fn a_decoded_file_run_after_a_background_command_keeps_the_signal() {
+    for line in [
+        "echo eA== | base64 -d > a.sh & sh a.sh",
+        "echo eA== | base64 -d &> a.sh; sh a.sh",
+        "echo eA== | base64 -d > a.sh 2>&1 & bash -x a.sh",
+        "echo eA== | base64 -d > a.py & python3 -I a.py",
+    ] {
+        let analysis = analyze_command(line, None);
+        assert_ne!(analysis.recommendation, "allow", "{line}");
+        assert!(
+            analysis
+                .signals
+                .iter()
+                .any(|signal| signal.signal == "obfuscated_command" && signal.score >= 30),
+            "{line}: {:#?}",
+            analysis.signals
+        );
+    }
+    assert_verdict(&["echo eA== | base64 -d > a.sh 2>&1 & cat a.sh"], "allow");
 }
 
 #[test]

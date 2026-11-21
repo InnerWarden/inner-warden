@@ -18758,12 +18758,12 @@ fn decoded_file_is_run(lower: &str) -> bool {
 }
 
 /// The words of `text` as the checks above read them: quotes taken off,
-/// `;`, `&&`, `||` and a new line as `;`, a pipe as `|`, and a
+/// `;`, `&&`, `||`, a background `&` and a new line as `;`, a pipe as
+/// `|`, `&>` as `>`, and a
 /// redirection split from its file (`>a.sh` is `>` and `a.sh`; `<` too;
 /// `2>` sends no decoded output and is kept as written).
 fn decode_tokens(text: &str) -> Vec<String> {
-    let spaced = text
-        .replace("&&", " ; ")
+    let spaced = background_as_separator(&text.replace("&&", " ; ").replace("&>", ">"))
         .replace("||", " ; ")
         .replace([';', '\n'], " ; ")
         .replace('|', " | ");
@@ -18792,6 +18792,23 @@ fn decode_tokens(text: &str) -> Vec<String> {
         }
     }
     words
+}
+
+/// `text` with each `&` that sends a command to the background, as
+/// `;`: the command after it runs next (`base64 -d > a.sh & sh a.sh`). A
+/// `&` of a redirection (`2>&1`, `<&3`) is kept.
+fn background_as_separator(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut previous = ' ';
+    for c in text.chars() {
+        if c == '&' && !matches!(previous, '>' | '<') {
+            out.push_str(" ; ");
+        } else {
+            out.push(c);
+        }
+        previous = c;
+    }
+    out
 }
 
 /// Words that start a command and run the one after them.

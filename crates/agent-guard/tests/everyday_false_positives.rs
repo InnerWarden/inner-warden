@@ -223,13 +223,13 @@ fn the_guards_name_in_a_working_path_is_not_a_kernel_change() {
         ],
         "allow",
     );
-    // Held for review from 2026-11-20 to 2026-11-21 (what `kill` stops is
-    // what `pgrep` prints); allowed since: the `pgrep` is written out and
-    // finds no process of the guard. A pattern the guard cannot read is
-    // still held.
+    // Held for review since 2026-11-20, no longer allowed: what `kill` stops is what `pgrep` prints
+    // (fail closed on what the guard cannot read, `src/shell/unread_parts.rs`).
+    // `pgrep -f` matches whole command lines, and a line of the guard holds
+    // the server it wraps; a pattern the guard cannot read is held too.
     assert_verdict(
         &["kill $(pgrep -f vite); cd ~/innerwarden/site && npm run dev"],
-        "allow",
+        "review",
     );
     assert_verdict(
         &["kill $(pgrep -f \"$P\"); cd ~/innerwarden/site && npm run dev"],

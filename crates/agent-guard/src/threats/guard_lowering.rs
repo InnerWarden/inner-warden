@@ -1040,8 +1040,8 @@ const PGREP_VALUED: &[&str] = &[
 /// Whether `text` (what a substitution in a `kill`'s words runs) is one
 /// `pgrep` or `pidof`, its words written out, that finds no process of
 /// the guard ([`PkillReach::Misses`]) and lists only a development program
-/// ([`names_a_dev_process`]): the ids it prints are that program's
-/// (`kill $(pgrep -f vite)`).
+/// ([`names_a_dev_process`]) by its process name, without `-f`: the ids
+/// it prints are that program's (`kill $(pgrep vite)`).
 pub(crate) fn lists_only_other_processes(text: &str) -> bool {
     let line = read_line(text);
     let [command] = line.commands.as_slice() else {
@@ -1061,19 +1061,33 @@ pub(crate) fn lists_only_other_processes(text: &str) -> bool {
         return false;
     }
     let mut operands = Vec::new();
+    let mut full_line = false;
     let mut rest = words[at + 1..].iter();
     while let Some(word) = rest.next() {
         if PGREP_VALUED.contains(&word.as_str()) || (program == "pidof" && word == "-o") {
             rest.next();
         } else if !word.starts_with('-') {
             operands.push(word.as_str());
+        } else {
+            full_line |= word == "--full" || (!word.starts_with("--") && word[1..].contains('f'));
         }
     }
     let lower = text.to_ascii_lowercase();
-    !operands.is_empty()
+    // `pgrep -f` matches a whole command line, and a line of the guard
+    // holds the server it wraps (`proxy -- npx vite-mcp`): a development
+    // program counts only by its process name.
+    !full_line
+        && !operands.is_empty()
         && (program == "pidof" || operands.len() == 1)
         && operands.iter().all(|operand| names_a_dev_process(operand))
-        && listed_reach(command) == PkillReach::Misses
+        && if program == "pgrep" {
+            // Without `-f` the pattern is matched against process names.
+            operands
+                .iter()
+                .all(|operand| reach_of_pattern(operand, false) == PkillReach::Misses)
+        } else {
+            listed_reach(command) == PkillReach::Misses
+        }
         && !lower.contains(GUARD_NAME)
         && !PROTECTED_TARGETS
             .iter()
