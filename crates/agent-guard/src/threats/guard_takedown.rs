@@ -204,7 +204,7 @@ fn without_copy_sources(code: &str) -> String {
 pub(super) fn inline_code_changes_agent_settings(content: &str) -> bool {
     static SETTINGS: LazyLock<regex::Regex> = LazyLock::new(|| {
         regex::Regex::new(
-            r"\.claude/settings(?:\.local)?\.json|\.claude\.json|\.codex/(?:config\.toml|hooks\.json)|\.cursor/(?:mcp|hooks)\.json|\.gemini/settings\.json|openclaw\.json",
+            r"\.claude/settings(?:\.local)?\.json|\.claude\.json|\.codex/(?:config\.toml|hooks\.json)|\.cursor/(?:mcp|hooks)\.json|\.gemini/settings\.json|\.gemini/config/hooks\.json|openclaw\.json",
         )
         .expect("static agent settings regex")
     });
