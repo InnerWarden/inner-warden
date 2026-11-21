@@ -873,10 +873,111 @@ fn runs_kill(command: &Command) -> bool {
 /// a pipe into `kill` or `xargs kill`, or as a substitution in a `kill`'s
 /// words. The strongest such hand-over of the line.
 pub(super) fn pgrep_feeds_a_kill_of_the_guard(text: &str) -> PkillReach {
-    if !text.contains("pgrep") && !text.contains("pidof") {
+    if !text.contains("grep") && !text.contains("pidof") && !text.contains("awk") {
         return PkillReach::Misses;
     }
     feeds_kill(text, 0)
+}
+
+/// What a pipe of filters ending right before a `kill` hands it: a
+/// `grep`, `egrep`, `fgrep` or `rg` whose pattern matches the guard's
+/// processes, read as a `pkill -f` pattern is (`ps aux | grep innerwarden |
+/// awk '{print $2}' | xargs kill`, `grep -e innerwarden pids | xargs kill`),
+/// or an `awk` whose program names the guard. `index` is the command piped
+/// into the `kill`; the filters before it are followed back through the
+/// pipe. A `grep -v` lists what does NOT match, so its pattern names
+/// nothing it hands on.
+fn filtered_list_reach(commands: &[Command], index: usize) -> PkillReach {
+    let mut reach = PkillReach::Misses;
+    let mut at = index;
+    loop {
+        let command = &commands[at];
+        reach = reach.max(listed_reach(command)).max(search_reach(command));
+        let filter = plain_words(command)
+            .and_then(|words| launched_command_index(&words).map(|at| program_name(&words[at])))
+            .is_some_and(|name| {
+                matches!(
+                    name.as_str(),
+                    "grep"
+                        | "egrep"
+                        | "fgrep"
+                        | "rg"
+                        | "awk"
+                        | "gawk"
+                        | "mawk"
+                        | "cut"
+                        | "sed"
+                        | "tr"
+                        | "head"
+                        | "tail"
+                        | "sort"
+                        | "uniq"
+                        | "tee"
+                )
+            });
+        if !filter || at == 0 || !commands[at - 1].piped {
+            return reach;
+        }
+        at -= 1;
+    }
+}
+
+/// [`filtered_list_reach`] of one search or `awk`.
+fn search_reach(command: &Command) -> PkillReach {
+    let Some(words) = plain_words(command) else {
+        return PkillReach::Misses;
+    };
+    let Some(at) = launched_command_index(&words) else {
+        return PkillReach::Misses;
+    };
+    let name = program_name(&words[at]);
+    let arguments = &words[at + 1..];
+    match name.as_str() {
+        "grep" | "egrep" | "fgrep" | "rg" => {
+            let inverted = arguments.iter().any(|word| {
+                word == "--invert-match"
+                    || (word.starts_with('-') && !word.starts_with("--") && word.contains('v'))
+            });
+            if inverted {
+                return PkillReach::Misses;
+            }
+            let mut patterns = Vec::new();
+            let mut rest = arguments.iter();
+            while let Some(word) = rest.next() {
+                if word == "-e" || word == "--regexp" {
+                    patterns.extend(rest.next().cloned());
+                } else if let Some(value) = word.strip_prefix("--regexp=") {
+                    patterns.push(value.to_owned());
+                } else if let Some(value) = word.strip_prefix("-e").filter(|v| !v.is_empty()) {
+                    patterns.push(value.to_owned());
+                }
+            }
+            if patterns.is_empty() {
+                patterns.extend(
+                    arguments
+                        .iter()
+                        .find(|word| !word.starts_with('-'))
+                        .cloned(),
+                );
+            }
+            patterns
+                .iter()
+                .map(|pattern| super::pkill_reach(&format!("pkill -f {}", quoted(pattern))))
+                .max()
+                .unwrap_or(PkillReach::Misses)
+        }
+        "awk" | "gawk" | "mawk" => {
+            if arguments
+                .iter()
+                .any(|word| word.to_ascii_lowercase().contains("warden"))
+            {
+                PkillReach::NamesGuard
+            } else {
+                PkillReach::Misses
+            }
+        }
+        _ => PkillReach::Misses,
+    }
 }
 
 fn feeds_kill(text: &str, depth: u8) -> PkillReach {
@@ -905,7 +1006,7 @@ fn feeds_kill(text: &str, depth: u8) -> PkillReach {
     }
     for (index, command) in line.commands.iter().enumerate() {
         if command.piped && line.commands.get(index + 1).is_some_and(runs_kill) {
-            reach = reach.max(listed_reach(command));
+            reach = reach.max(filtered_list_reach(&line.commands, index));
         }
         if runs_kill(command) {
             for inner in command.words.iter().flat_map(|word| &word.substitutions) {

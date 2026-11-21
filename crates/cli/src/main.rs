@@ -1020,8 +1020,8 @@ fn check_as_the_hook(command: &str, agent: Option<&str>, block_review: bool) -> 
             "explanation": why,
         })
     };
-    let (verdict, blocks) = match screen_shell(&buf, &rest, &options) {
-        ShellScreen::Screened(screened) => (screened.verdict, screened.blocks),
+    let (verdict, blocks, warned) = match screen_shell(&buf, &rest, &options) {
+        ShellScreen::Screened(screened) => (screened.verdict, screened.blocks, screened.warned),
         ShellScreen::Unreadable(why) => {
             let why = format!("the hook cannot read this call ({why})");
             return refused(unread(why.clone()), why);
@@ -1030,9 +1030,19 @@ fn check_as_the_hook(command: &str, agent: Option<&str>, block_review: bool) -> 
             let why = format!("the agent profiles cannot be used ({why})");
             return refused(unread(why.clone()), why);
         }
-        ShellScreen::Nothing => (analyze(command, shell_engine()), false),
+        ShellScreen::Nothing => (analyze(command, shell_engine()), false, false),
     };
-    let (outcome, why) = hook_outcome(&verdict, blocks, block_review, agent);
+    let (outcome, why) = if warned {
+        (
+            HookOutcome::Warn,
+            Some(
+                "the default posture refuses only the high-certainty class, so this runs and the agent is shown a warning"
+                    .to_string(),
+            ),
+        )
+    } else {
+        hook_outcome(&verdict, blocks, block_review, agent)
+    };
     CheckedAsHook {
         verdict,
         outcome,
