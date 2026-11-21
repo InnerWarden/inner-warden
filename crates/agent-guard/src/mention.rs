@@ -488,6 +488,13 @@ const TEXT_FILTERS: &[&str] = &[
 /// nothing). A mention masked in a command whose output is run (`cat
 /// <<'EOF' | sh`, `f() { ... }; f | at now`) would hide the command run.
 fn output_stays(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    output_stays_or_in_files(command, source, false)
+}
+
+/// [`output_stays`], where `files_ok` lets the output be written to a file
+/// the line names: the redirect stays in the masked line, and is judged
+/// there.
+fn output_stays_or_in_files(command: tree_sitter::Node<'_>, source: &[u8], files_ok: bool) -> bool {
     let mut node = command;
     let mut steps = 0;
     while let Some(parent) = node.parent() {
@@ -507,7 +514,7 @@ fn output_stays(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
                         .any(|redirect| {
                             redirect.kind() == "file_redirect" && writes_output(redirect, source)
                         });
-                if writes {
+                if writes && !files_ok {
                     return false;
                 }
                 // The grammar hangs what follows a here-document's start on
@@ -693,7 +700,7 @@ pub(crate) fn code_may_act(
         // A name built from escapes, character codes, a variable's sigil or
         // an index (`'\x65xecSync'`, `String.fromCharCode`, `&$f(...)`) is
         // a call the text does not show.
-        return OTHER_RUNS.iter().any(|word| lower.contains(word))
+        return OTHER_RUNS.iter().any(|word| other_runs_word(&lower, word))
             || CHANGES_A_FILE.iter().any(|word| lower.contains(word))
             || lower.contains(['\\', '$', '[', '&', '%', '@'])
             || [
@@ -727,6 +734,19 @@ pub(crate) fn code_may_act(
             .all(|target| project_path(target, relative_ok)),
         None => true,
     }
+}
+
+/// Whether code holds one of [`OTHER_RUNS`]. `system` counts only as a word
+/// of its own: `systemctl` in a string the code prints runs nothing
+/// (`node -e "console.log('systemctl ...')"`, BI
+/// FP-20261120-guard-words-in-interpreter-code).
+fn other_runs_word(lower: &str, word: &str) -> bool {
+    if word != "system" {
+        return lower.contains(word);
+    }
+    lower.match_indices(word).any(|(at, _)| {
+        !lower[at + word.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+    })
 }
 
 /// The calls of Python that open or change a file, lowercase.
@@ -1171,7 +1191,8 @@ fn command_edits(
     relative_ok: bool,
     edits: &mut Vec<(usize, usize, String)>,
 ) {
-    if !output_stays(command, source) {
+    let stays = output_stays(command, source);
+    if !stays && !output_stays_or_in_files(command, source, true) {
         return;
     }
     let Some((program, arguments)) = program_and_arguments(command, source) else {
@@ -1179,6 +1200,29 @@ fn command_edits(
     };
     let words: Vec<String> = arguments.iter().map(|a| unquoted(*a, source)).collect();
     let literal_at = |at: usize| arguments.get(at).is_some_and(|a| literal(*a, source));
+    if !stays {
+        // What the line writes to a file it names is kept, with its
+        // redirect, in the masked line: a build's output to a log, and a
+        // note's text to a note.
+        if program == "cargo" {
+            let mut mask = |at: usize, with: &str| {
+                if let Some(node) = arguments.get(at) {
+                    edits.push((node.start_byte(), node.end_byte(), with.to_string()));
+                }
+            };
+            build_target_edits(&words, &literal_at, &mut mask);
+        } else if matches!(program.as_str(), "echo" | "printf")
+            && !words.iter().any(|word| word == "-v")
+            && writes_only_notes(command, source, relative_ok)
+        {
+            for argument in &arguments {
+                if !unquoted(*argument, source).starts_with('-') {
+                    note_text_edits(*argument, source, edits);
+                }
+            }
+        }
+        return;
+    }
     let mut mask = |at: usize, with: &str| {
         if let Some(node) = arguments.get(at) {
             edits.push((node.start_byte(), node.end_byte(), with.to_string()));
@@ -1253,6 +1297,7 @@ fn command_edits(
         _ if SEARCHERS.contains(&program.as_str()) => {
             search_pattern_edits(&words, 0, &literal_at, &mut mask);
         }
+        "cargo" => build_target_edits(&words, &literal_at, &mut mask),
         _ => {}
     }
     // A path through a folder whose name holds the guard's, in a project or
@@ -1281,6 +1326,168 @@ fn command_edits(
             if renamed != shown {
                 edits.push((node.start_byte(), node.end_byte(), renamed));
             }
+        }
+    }
+}
+
+/// Subcommands of `cargo` that build, check or test what the project holds
+/// and run none of its programs as the line asks: `run` and `install` are
+/// not here.
+const CARGO_BUILDS: &[&str] = &[
+    "test", "t", "build", "b", "check", "c", "clippy", "bench", "doc", "d", "nextest", "tree",
+];
+
+/// Options of `cargo` whose value names a package or a target of the
+/// project.
+const CARGO_TARGET_OPTIONS: &[&str] =
+    &["-p", "--package", "--bin", "--test", "--example", "--bench"];
+
+/// A package or a target named after the guard, in a build, a check or a
+/// test of the project: `cargo test -p innerwarden --bin innerwarden contain`
+/// filters the project's tests by `contain`, it starts no jail (BI
+/// FP-20261120-repo-name-and-literal-variable, measured 2026-11-21 against
+/// main fa63f83). `cargo run` keeps the name: it runs what it builds.
+fn build_target_edits(
+    words: &[String],
+    literal_at: &dyn Fn(usize) -> bool,
+    mask: &mut dyn FnMut(usize, &str),
+) {
+    let verb = words
+        .iter()
+        .find(|word| !word.starts_with('-') && !word.starts_with('+'));
+    if !verb.is_some_and(|verb| CARGO_BUILDS.contains(&verb.as_str())) {
+        return;
+    }
+    for (at, word) in words.iter().enumerate() {
+        if CARGO_TARGET_OPTIONS.contains(&word.as_str())
+            && literal_at(at + 1)
+            && words
+                .get(at + 1)
+                .is_some_and(|value| GUARD_PROGRAMS.contains(&value.as_str()))
+        {
+            mask(at + 1, "proj");
+        } else if let Some((option, value)) = word.split_once('=') {
+            if CARGO_TARGET_OPTIONS.contains(&option)
+                && literal_at(at)
+                && GUARD_PROGRAMS.contains(&value)
+            {
+                mask(at, &format!("{option}=proj"));
+            }
+        }
+    }
+}
+
+/// Files an agent reads as its instructions: text written to one is an
+/// order, not a note.
+const INSTRUCTION_FILES: &[&str] = &[
+    "claude.md",
+    "claude.local.md",
+    "agents.md",
+    "gemini.md",
+    "copilot-instructions.md",
+];
+
+/// Whether every file the command's output is written to is a note: a
+/// `.md`, `.txt` or `.log` file under the home or in the project, through
+/// no hidden folder, and not one an agent reads as its instructions.
+fn writes_only_notes(command: tree_sitter::Node<'_>, source: &[u8], relative_ok: bool) -> bool {
+    let Some(parent) = command
+        .parent()
+        .filter(|p| p.kind() == "redirected_statement")
+    else {
+        return false;
+    };
+    let mut cursor = parent.walk();
+    let redirects: Vec<tree_sitter::Node<'_>> = parent
+        .children_by_field_name("redirect", &mut cursor)
+        .collect();
+    let mut wrote = false;
+    for redirect in redirects {
+        if redirect.kind() != "file_redirect" {
+            return false;
+        }
+        if !writes_output(redirect, source) {
+            continue;
+        }
+        let Some(destination) = redirect.child_by_field_name("destination") else {
+            return false;
+        };
+        if !literal_or_home(destination, source) && !text(destination, source).starts_with("~/") {
+            return false;
+        }
+        let path = unquoted(destination, source);
+        if !note_path(&path, relative_ok) {
+            return false;
+        }
+        wrote = true;
+    }
+    wrote
+}
+
+/// Whether a path is a note ([`writes_only_notes`]).
+fn note_path(path: &str, relative_ok: bool) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let rest = if let Some(rest) = lower
+        .strip_prefix("~/")
+        .or_else(|| lower.strip_prefix("$home/"))
+    {
+        rest
+    } else if lower.starts_with('/') || lower.starts_with('~') || lower.starts_with('$') {
+        return false;
+    } else if relative_ok {
+        lower.as_str()
+    } else {
+        return false;
+    };
+    if rest.contains(['$', '`', '\\', '*', '?', '[', '{']) || rest.contains(char::is_whitespace) {
+        return false;
+    }
+    let mut parts = rest
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".");
+    if parts.clone().any(|part| part.starts_with('.')) {
+        return false;
+    }
+    let Some(name) = parts.next_back() else {
+        return false;
+    };
+    [".md", ".txt", ".log"]
+        .iter()
+        .any(|end| name.ends_with(end))
+        && !INSTRUCTION_FILES.contains(&name)
+        && !lower.contains("innerwarden/guard")
+}
+
+/// The text of a note (`echo`, `printf`) masked, with every expansion and
+/// substitution in it kept: bash runs a substitution whatever word it
+/// stands in (`echo "$(date -u) ..." >> notes.md`).
+fn note_text_edits(
+    node: tree_sitter::Node<'_>,
+    source: &[u8],
+    edits: &mut Vec<(usize, usize, String)>,
+) {
+    if literal(node, source) {
+        let with = if node.kind() == "string_content" {
+            "text"
+        } else {
+            "'text'"
+        };
+        edits.push((node.start_byte(), node.end_byte(), with.to_string()));
+        return;
+    }
+    if !matches!(node.kind(), "string" | "concatenation") {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string_content" => {
+                edits.push((child.start_byte(), child.end_byte(), "text".to_string()));
+            }
+            "string" | "concatenation" | "word" | "raw_string" => {
+                note_text_edits(child, source, edits);
+            }
+            _ => {}
         }
     }
 }
@@ -1436,6 +1643,34 @@ const WORD_RUNNERS: &[&str] = &[
     "xargs", "parallel", "eval", "source", ".", "exec", "rush", "sem",
 ];
 
+/// Whether a substitution runs only `date`, with literal arguments and no
+/// option that reads a file or sets the clock.
+fn only_the_date(substitution: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut cursor = substitution.walk();
+    let inner: Vec<tree_sitter::Node<'_>> = substitution
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect();
+    let [command] = inner.as_slice() else {
+        return false;
+    };
+    if command.kind() != "command" || sets_its_environment(*command) {
+        return false;
+    }
+    let Some((program, arguments)) = program_and_arguments(*command, source) else {
+        return false;
+    };
+    program == "date"
+        && arguments.iter().all(|argument| {
+            literal(*argument, source) && {
+                let word = unquoted(*argument, source);
+                !["-f", "--file", "-r", "--reference", "-s", "--set"]
+                    .iter()
+                    .any(|option| word.starts_with(option))
+            }
+        })
+}
+
 /// Whether the line can be masked at all: it expands nothing (no variable,
 /// substitution or arithmetic the shell fills in, so no `$_`, `$PWD` or
 /// `$(pwd)` hands a masked word on to a later command), runs no program
@@ -1450,6 +1685,9 @@ fn reads_whole(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
             return false;
         }
         match node.kind() {
+            // `$(date -u '+%F')` in a note: its output is the time, whatever
+            // word the line masks.
+            "command_substitution" if only_the_date(node, source) => continue,
             "expansion"
             | "simple_expansion"
             | "command_substitution"
@@ -1619,6 +1857,12 @@ fn runs_a_file_code_names(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     }
     let names = |word: &str| last_part(word).is_some_and(|part| named.contains(&part));
     commands.into_iter().any(|command| {
+        // The `date` of a note's time runs nothing it is handed.
+        if command.parent().is_some_and(|parent| {
+            parent.kind() == "command_substitution" && only_the_date(parent, source)
+        }) {
+            return false;
+        }
         let Some(name) = command.child_by_field_name("name") else {
             return false;
         };

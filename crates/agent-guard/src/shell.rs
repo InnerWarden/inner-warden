@@ -11679,8 +11679,155 @@ fn runner_shell_line(name: &str, args: &[String]) -> Option<String> {
                 .collect();
             (!lines.is_empty()).then(|| lines.join("\n"))
         }
+        "sed" | "gsed" => sed_shell_lines(args),
+        _ if TERMINALS.contains(&name) => terminal_command_line(args),
         _ => None,
     }
+}
+
+/// Terminal emulators: each runs the command after its `-e` (`-x`,
+/// `--command`, `--execute`, or `--`).
+const TERMINALS: &[&str] = &[
+    "xterm",
+    "uxterm",
+    "lxterm",
+    "rxvt",
+    "urxvt",
+    "rxvt-unicode",
+    "konsole",
+    "gnome-terminal",
+    "mate-terminal",
+    "xfce4-terminal",
+    "lxterminal",
+    "terminator",
+    "tilix",
+    "alacritty",
+    "kitty",
+    "foot",
+    "footclient",
+    "wezterm",
+    "st",
+    "sakura",
+    "terminology",
+    "qterminal",
+    "x-terminal-emulator",
+    "eterm",
+    "aterm",
+    "cool-retro-term",
+];
+
+/// The line a terminal emulator runs ([`TERMINALS`]): every word after its
+/// `-e`, `-x`, `--command`, `--execute` or `--`, a word holding a space
+/// quoted again; one word alone is the line itself (`xterm -e 'rm -rf ~'`).
+/// Measured 2026-11-21 against main fa63f83: `xterm -e 'rm -rf ~'` was
+/// allowed while `watch 'rm -rf ~'` was refused (BI
+/// NEW-20261119-guard-code-flag-programs-sed-expect-xterm).
+fn terminal_command_line(args: &[String]) -> Option<String> {
+    for (at, argument) in args.iter().enumerate() {
+        if let Some(value) = ["--command=", "--execute=", "-e="]
+            .iter()
+            .find_map(|prefix| argument.strip_prefix(prefix))
+        {
+            // The value keeps its quotes in the word (`--command='cmd'`).
+            return Some(shell_literal_word(value));
+        }
+        if matches!(
+            argument.as_str(),
+            "-e" | "-x" | "--command" | "--execute" | "--exec" | "--"
+        ) {
+            let rest = &args[at + 1..];
+            return match rest {
+                [] => None,
+                [line] => Some(line.clone()),
+                words => Some(
+                    words
+                        .iter()
+                        .map(|word| {
+                            if word
+                                .contains(|c: char| c.is_whitespace() || "'\";&|<>$`".contains(c))
+                            {
+                                format!("'{}'", word.replace('\'', "'\\''"))
+                            } else {
+                                word.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                ),
+            };
+        }
+    }
+    None
+}
+
+/// The lines GNU sed runs through a shell: the text of an `e` command and
+/// the replacement of an `s` command with the `e` flag, in every script of
+/// the line (each `-e`, `--expression`, else the first word that is not an
+/// option). Measured 2026-11-21 against main fa63f83: `sed '1e rm -rf ~' f`
+/// was allowed; only a download it ran was refused.
+fn sed_shell_lines(args: &[String]) -> Option<String> {
+    let mut scripts: Vec<String> = Vec::new();
+    let mut given = false;
+    let mut at = 0;
+    while let Some(argument) = args.get(at) {
+        let argument = argument.as_str();
+        if argument == "--" {
+            if !given {
+                scripts.extend(args.get(at + 1).cloned());
+            }
+            break;
+        }
+        if let Some(script) = argument.strip_prefix("--expression=") {
+            // The value keeps its quotes in the word (`--expression='1e cmd'`).
+            scripts.push(shell_literal_word(script));
+            given = true;
+        } else if matches!(argument, "--expression" | "-e") {
+            scripts.extend(args.get(at + 1).cloned());
+            given = true;
+            at += 1;
+        } else if matches!(argument, "-f" | "--file" | "-l" | "--line-length") {
+            given |= argument != "-l" && argument != "--line-length";
+            at += 1;
+        } else if argument.starts_with("--file=") {
+            given = true;
+        } else if argument.starts_with("--") {
+        } else if argument.len() > 1 && argument.starts_with('-') {
+            // A group ending in `e` (`-ne`) takes the script next; read as
+            // `-i` with the suffix `e` (`-ie`), the next word is the script
+            // all the same.
+            if argument.ends_with('e') {
+                scripts.extend(args.get(at + 1).cloned());
+                given = true;
+                at += 1;
+            }
+        } else if !given {
+            scripts.push(argument.to_string());
+            given = true;
+        }
+        at += 1;
+    }
+    let mut lines = Vec::new();
+    for script in &scripts {
+        for piece in script.split(['\n', ';']) {
+            let mut piece = piece.trim_start_matches(|c: char| {
+                c.is_ascii_digit() || matches!(c, ',' | '$' | '+' | '~' | '!' | ' ' | '\t')
+            });
+            // A regular expression address (`/x/e cmd`).
+            if let Some(rest) = piece.strip_prefix('/') {
+                let mut escaped = false;
+                let end = rest.char_indices().find_map(|(index, c)| {
+                    let found = !escaped && c == '/';
+                    escaped = !escaped && c == '\\';
+                    found.then_some(index)
+                });
+                if let Some(end) = end {
+                    piece = rest[end + 1..].trim_start_matches(['!', ' ', '\t']);
+                }
+            }
+            lines.extend(sed_executable_payload(piece));
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
 /// The flags by which programs take code to run on the line: a shell's
@@ -11786,6 +11933,7 @@ const CODE_FLAG_PROGRAMS: &[&str] = &[
     "scala",
     "tclsh",
     "wish",
+    "expect",
     "octave",
     "guile",
     "racket",
