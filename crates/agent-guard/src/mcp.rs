@@ -3945,7 +3945,10 @@ fn mention_only(
         .iter()
         .filter(|signal| signal.score > 0)
         .all(|signal| GUARD_WORD_SIGNALS.contains(&signal.signal.as_str()));
-    if !only_guard_words {
+    // An action on the guard read whole (inline code that changes its
+    // files or signals it, a copy onto its places, a program a search runs
+    // on them) is never a mention, in a language the masking reads or not.
+    if !only_guard_words || threats::check_guard_takedown(command).is_some() {
         return analysis;
     }
     let Some(masked) = crate::mention::masked(command, cwd) else {
@@ -4597,7 +4600,11 @@ fn analyze_command_as_read(
             crate::shell::interpreter_input_as_inline_code(cmd)
                 .iter()
                 .find_map(|line| threats::check_code_rewrites_guard_carrier(line))
-        });
+        })
+        // Inline code that writes, removes or moves a place of the guard or
+        // signals its processes, a copy onto one of its places, and a
+        // program a search runs that does either ([`threats::check_guard_takedown`]).
+        .or_else(|| threats::check_guard_takedown(cmd));
     if let Some((what, s)) = self_disable {
         signals.push(AnalysisSignal {
             signal: "guard_self_disable".into(),

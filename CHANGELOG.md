@@ -21,6 +21,20 @@ LLMail-Inject stays 17 of 107. Direct jailbreaks aimed at the chat (deepset,
 Gandalf), a polite request in a data field (InjecAgent) and a task given as
 a question (BIPIA) are still not read as orders.
 
+Inline code (Python, Node, Ruby, Perl, PHP, Lua; `-c`, `-e`, `-r`, a
+here-document or standard input) that writes, removes, moves or copies onto
+a file of the guard (its configuration, state, program, unit or hook), or
+signals one of its processes, is refused in every posture, and so is code
+that writes an agent's settings by a Perl `open` or a copy onto them. A copy,
+install, link or `tee` onto a place of the guard, a `grep` or `awk` that
+finds the guard's processes and hands them to `kill`, and the program
+`rg --pre` or `git grep -O` runs, read as a command with the files it is
+handed, are refused too. Code that only reads or prints those names is not.
+A `sed` that writes a home's startup file with its `w` command, and inline
+code that writes one, are held for review, as a copy of an unseen file onto
+it is. Measured on every corpus line and its variants (34,954, an empty home
+and a home with keys): no benign line newly refused.
+
 Ordinary agent work is refused less. In a set of commands from public
 coding-agent runs with no attack among them, main refused 69 lines; this
 change allows 26 of them, holds 42 for review and still refuses 1 (a line

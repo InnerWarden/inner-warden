@@ -3,6 +3,7 @@
 mod glob_names;
 mod guard_doubt;
 mod guard_lowering;
+mod guard_takedown;
 mod words_after;
 
 /// Prompt injection markers in tool descriptions or responses.
@@ -3321,6 +3322,36 @@ pub(crate) fn check_code_rewrites_guard_carrier(content: &str) -> Option<(&'stat
     }
     guard_carrier_refusal(content)
 }
+
+/// A line that takes the guard down by inline code, by a copy onto one of
+/// its places, or by a program a search runs on each file
+/// ([`guard_takedown`]): the program `rg --pre` or `git grep -O` runs is
+/// read as a command with the paths it is handed, by this check, by
+/// [`check_guard_self_disable`] and by [`check_security_tamper`].
+pub(crate) fn check_guard_takedown(content: &str) -> Option<(&'static str, u32)> {
+    if let Some(what) = guard_takedown::inline_code_takes_guard_down(content) {
+        return Some((what, 60));
+    }
+    if guard_takedown::inline_code_changes_agent_settings(content) {
+        return Some((SETTINGS_REWRITTEN_BY_INTERPRETER, 60));
+    }
+    if guard_takedown::copies_onto_guard_place(content) {
+        return Some((guard_takedown::COPIED_ONTO_GUARD_PLACE, 60));
+    }
+    guard_takedown::programs_searches_run(content)
+        .iter()
+        .find_map(|line| {
+            check_guard_takedown(line)
+                .or_else(|| check_guard_self_disable(line))
+                .or_else(|| check_security_tamper(line))
+        })
+        .map(|_| (SEARCH_RUNS_TAKEDOWN, 60))
+}
+
+/// What [`check_guard_takedown`] says of a search whose program takes the
+/// guard down.
+const SEARCH_RUNS_TAKEDOWN: &str =
+    "a search runs a program on each file it reads (rg --pre, git grep -O), and that program with those files takes the guard down";
 
 /// What [`guard_self_disable_patterns`] says of interpreter code that
 /// rewrites an agent's settings.
@@ -7548,6 +7579,14 @@ fn shows_what_it_writes(
 /// `echo 'export PATH=...' >> ~/.bashrc` is ordinary setup. A removal, a
 /// move away and a copy from one are not counted.
 pub fn replaces_startup_file_unseen(content: &str) -> bool {
+    // A `sed` that writes lines of a file into one with its `w` command,
+    // and inline code that writes one: what lands there is not on the line
+    // as text a shell would run, so it is held as a copy of an unseen file.
+    if guard_takedown::sed_writes_startup_file(content)
+        || guard_takedown::inline_code_writes_startup_file(content)
+    {
+        return true;
+    }
     let lower = content.to_ascii_lowercase();
     if ![
         ".bash",
