@@ -25,17 +25,25 @@ will not until the record has a writer the agent cannot imitate.
 
 ## Which agents
 
-| Agent | Event that carries the prompt | Wired by `innerwarden install` | Can the proxy match the session? |
-|---|---|---|---|
-| Claude Code | `UserPromptSubmit` | yes | yes: Claude Code sets `CLAUDE_CODE_SESSION_ID` in the processes it starts |
-| Codex CLI | not wired | no | no: no session id handed to MCP servers is known |
-| Gemini CLI | not wired | no | no: no session id handed to MCP servers is known |
-| Hermes Agent | not wired | no | no: no session id handed to MCP servers is known |
-| Cursor | not wired | no | no: no session id handed to MCP servers is known |
+| Agent | Session id its prompt hook gets | Session id its MCP servers get | Channel | How it was found |
+|---|---|---|---|---|
+| Claude Code | `session_id` in the `UserPromptSubmit` payload | `CLAUDE_CODE_SESSION_ID` in the environment | on | read in the environment of the processes it starts |
+| Codex CLI | `session_id` in the `UserPromptSubmit` payload (the thread id) | none: a stdio server gets a fixed list (`HOME`, `LOGNAME`, `PATH`, `SHELL`, `USER`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `TZ`) plus its own `env` | off | Codex's source (`codex-rs/hooks`, `codex-rs/rmcp-client`); not measured on a running Codex |
+| Gemini CLI | `session_id` in the hook payload | none found | off | Gemini CLI's source (`packages/core`); not measured on a running Gemini CLI |
+| Hermes Agent | `session_id` in the `pre_llm_call` payload | none: a stdio server gets `PATH`, `HOME`, `USER`, `LANG`, `LC_ALL`, `TERM`, `SHELL`, `TMPDIR`, `HERMES_HOME` plus its own `env` | off | Hermes v0.23.1 source (`tools/mcp_tool_config.py`); not measured on a running Hermes |
+| Cursor | not measured | not measured | off | not measured: closed source, no Cursor at hand |
 
-Only Claude Code is wired. For the other agents a record could never be read
-for the call it was meant for, because the proxy has no session id to match it
-with, so the answer would always be "unknown". Their prompts are not kept.
+"Not measured on a running agent": starting one of these agents from an
+agent session, with a hook and an MCP server that only record what they get,
+is refused by the guard (an agent starting another agent with its hook moved
+away), rightly. What the table says comes from the agents' own source.
+
+The channel is on only where both columns hold the same id. For the other
+agents a record could never be read for the call it was meant for, because the
+proxy has no session id to match it with, so the answer would always be
+"unknown": their prompts are not kept, and `innerwarden status` says, under
+each of them, that the prompt channel is off and why. An agent turns on the
+day it hands its MCP servers the id its prompt hook gets, and it is measured.
 
 That Claude Code hands `CLAUDE_CODE_SESSION_ID` to an MCP server it starts was
 read in the environment of the processes it starts, not measured on a running
@@ -86,9 +94,11 @@ are hashes. A folder that is a symbolic link is never written through.
 | A prompt longer than 1 MiB as the hook reads it | not kept; its session is marked as having lost words |
 
 Two hook runs of one session at once do not write over each other: a record
-is read, changed and written back under the update lock the guard uses for
-its own record, and written only if the file still holds what was read
-(tried again, up to 8 times, waiting up to 1 s for the lock each time). A
+is read, changed and written back with the update lock the guard uses for
+its own record held from the read to the write, so no run reads what another
+is about to replace. The write is tried again, up to 8 times, waiting up to
+1 s for the lock each time, when the lock stays held or a writer that does not
+take it changed the file in between. A
 prompt that still cannot be written is not kept: an empty mark beside the
 record (`.<name>.json.lost`) says the session lost a prompt, and a value not
 found answers "unknown", never "no". A mark with no record beside it goes after

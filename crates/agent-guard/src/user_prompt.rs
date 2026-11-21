@@ -57,8 +57,10 @@
 //! The hook reads `session_id` from Claude Code's payload. Claude Code sets
 //! `CLAUDE_CODE_SESSION_ID` to the same id in the environment of the
 //! processes it starts, so a proxy it started reads it there
-//! ([`proxy_session`]). No other agent is known to hand its MCP servers a
-//! session id, so for them the answer is always "unknown".
+//! ([`proxy_session`]). Codex, Gemini CLI and Hermes hand their prompt hook
+//! a session id and their MCP servers none (read in their source), and
+//! Cursor was not measured: for them the channel is off ([`prompt_channel`]),
+//! their prompts are not kept, and `status` says so.
 //!
 //! # The answer
 //!
@@ -180,12 +182,86 @@ pub fn default_dir() -> Option<PathBuf> {
     Some(dir_in(Path::new(&home)))
 }
 
-/// The session id the proxy runs in: the one Claude Code hands the
-/// processes it starts. `None` for any other agent.
+/// Whether the proxy can match an agent's calls to what the person asked:
+/// on only where the prompt hook and the MCP server are handed the same
+/// session id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptChannel {
+    /// The agent hands the processes it starts the session id its prompt
+    /// hook gets, in this variable.
+    On { session_env: &'static str },
+    /// No id both sides know: every answer for this agent would be
+    /// "unknown", so its prompts are not kept. `why` says what was found.
+    Off { why: &'static str },
+}
+
+/// Each agent's channel, as found in November 2026 (one line each in
+/// `docs/prompt-record.md`). An agent turns on only when both sides were
+/// seen with the same id; an agent not named here is off.
+const CHANNELS: &[(&str, PromptChannel)] = &[
+    (
+        "claude-code",
+        PromptChannel::On {
+            session_env: CLAUDE_CODE_SESSION_ENV,
+        },
+    ),
+    (
+        "codex",
+        PromptChannel::Off {
+            why: "Codex hands its prompt hook a session_id, and starts an MCP server with a \
+                  fixed list of variables (HOME, PATH, USER and the like) that holds no \
+                  session id (read in Codex's source, not measured on a running Codex)",
+        },
+    ),
+    (
+        "gemini",
+        PromptChannel::Off {
+            why: "Gemini CLI hands its prompt hook a session_id, and no session id was found \
+                  in what it hands an MCP server it starts (read in Gemini CLI's source, not \
+                  measured on a running Gemini CLI)",
+        },
+    ),
+    (
+        "hermes",
+        PromptChannel::Off {
+            why: "Hermes starts an MCP server with a fixed list of variables that holds no \
+                  session id (read in the source of Hermes v0.23.1, not measured on a \
+                  running Hermes)",
+        },
+    ),
+    (
+        "cursor",
+        PromptChannel::Off {
+            why: "not measured: Cursor's source is closed and no Cursor was at hand to \
+                  measure",
+        },
+    ),
+];
+
+/// Why an agent with no line in [`CHANNELS`] is off.
+const NO_CHANNEL: &str = "no session id this agent hands its MCP servers is known";
+
+/// The prompt channel of `agent` (an agent name as `innerwarden agents`
+/// lists it).
+pub fn prompt_channel(agent: &str) -> PromptChannel {
+    CHANNELS
+        .iter()
+        .find(|(name, _)| *name == agent)
+        .map_or(PromptChannel::Off { why: NO_CHANNEL }, |(_, channel)| {
+            *channel
+        })
+}
+
+/// The session id the proxy runs in: the one an agent whose channel is on
+/// ([`prompt_channel`]) hands the processes it starts. `None` under any
+/// other agent.
 pub fn proxy_session() -> Option<String> {
-    std::env::var(CLAUDE_CODE_SESSION_ENV)
-        .ok()
-        .and_then(|session| usable_session(&session).map(str::to_string))
+    CHANNELS.iter().find_map(|(_, channel)| match channel {
+        PromptChannel::On { session_env } => std::env::var(session_env)
+            .ok()
+            .and_then(|session| usable_session(&session).map(str::to_string)),
+        PromptChannel::Off { .. } => None,
+    })
 }
 
 fn usable_session(session: &str) -> Option<&str> {
@@ -915,8 +991,14 @@ mod tests {
                 let (dir, start, failed) = (&dir, &start, &failed);
                 scope.spawn(move || {
                     start.wait();
-                    if record_in(dir, Some(SESSION), None, &format!("open ticket-{i} now"), NOW)
-                        .is_err()
+                    if record_in(
+                        dir,
+                        Some(SESSION),
+                        None,
+                        &format!("open ticket-{i} now"),
+                        NOW,
+                    )
+                    .is_err()
                     {
                         failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     }
@@ -931,6 +1013,28 @@ mod tests {
                 "prompt {i} was lost"
             );
         }
+    }
+
+    /// Only an agent seen handing the same id to both sides is on; every
+    /// other agent is off with the reason, and an agent never named is off.
+    #[test]
+    fn the_channel_is_on_only_where_both_sides_know_the_session() {
+        assert_eq!(
+            prompt_channel("claude-code"),
+            PromptChannel::On {
+                session_env: CLAUDE_CODE_SESSION_ENV
+            }
+        );
+        for agent in ["codex", "gemini", "hermes", "cursor", "goose", ""] {
+            let PromptChannel::Off { why } = prompt_channel(agent) else {
+                panic!("{agent} must be off");
+            };
+            assert!(!why.is_empty(), "{agent} is off without a reason");
+        }
+        assert!(matches!(
+            prompt_channel("cursor"),
+            PromptChannel::Off { why } if why.starts_with("not measured")
+        ));
     }
 
     #[test]

@@ -903,6 +903,10 @@ fn replace_inner(
     )
 }
 
+/// Makes the new body of a store from what it holds (`None`: no file);
+/// an error writes nothing.
+pub type ChangeBody<'a> = dyn FnMut(Option<&[u8]>) -> Result<Vec<u8>, String> + 'a;
+
 /// What a write puts in the file.
 enum Content<'a> {
     /// This body, when the file holds `expected` (`Some(None)`: no file;
@@ -913,7 +917,7 @@ enum Content<'a> {
     },
     /// The body this makes of what the file holds, read under the update lock
     /// (`None`: no file). An error writes nothing.
-    Update(&'a mut dyn FnMut(Option<&[u8]>) -> Result<Vec<u8>, String>),
+    Update(&'a mut ChangeBody<'a>),
 }
 
 /// Read a store under its update lock, make the new body of what it holds,
@@ -931,7 +935,7 @@ pub fn update_owned_store_no_symlinks(
     trusted_root: &Path,
     path: &Path,
     lock_wait: Duration,
-    change: &mut dyn FnMut(Option<&[u8]>) -> Result<Vec<u8>, String>,
+    change: &mut ChangeBody<'_>,
 ) -> Result<(), ReplaceError> {
     write_inner_with(
         path,
