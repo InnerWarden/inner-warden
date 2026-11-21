@@ -35,7 +35,10 @@
 //!   a folder of the guard's, a home itself or a dot entry at the top of a
 //!   home, read after `..` and `/private` are taken out
 //!   ([`names_a_protected_path`]): `delete_file {"path": "/etc/passwd"}`
-//!   was refused by name only, and those places are no ambiguous case;
+//!   was refused by name only, and those places are no ambiguous case. A
+//!   delete, move or write of the root, a folder of the system, a whole home
+//!   or a store of keys is refused by a builtin rule of its own in every
+//!   posture that refuses ([`crate::mcp_targets`], `AG-PROTECTED-TARGET`);
 //! * a value it carries is written like a shell line or a link
 //!   ([`carries_line_or_link`]): a server may join it into a line;
 //! * any other refusal stands beside it: a secret read (`AG-FILE`,
@@ -161,11 +164,21 @@ pub fn apply_mode(d: &ProxyDecision, mode: ProxyMode, as_protocol_error: bool) -
 
 /// The rules whose refusal of a tool call is a hard rule's: a change to a
 /// privileged file, and (when it blocks) a read of a secret store.
-const HARD_RULES: &[&str] = &["AG-PRIV-WRITE", "AG-FILE"];
+const HARD_RULES: &[&str] = &[
+    "AG-PRIV-WRITE",
+    "AG-FILE",
+    crate::mcp_targets::PROTECTED_TARGET_RULE,
+];
 
 /// The rules of the hard layer, which decide a refusal before any other
 /// (`identity::decide`): the reason a refusal gives when one of them blocks.
-const DECIDES_FIRST: &[&str] = &[REVOKED_RULE, LLM_KEY_RULE, "AG-PRIV-WRITE", "AG-FILE"];
+const DECIDES_FIRST: &[&str] = &[
+    REVOKED_RULE,
+    LLM_KEY_RULE,
+    "AG-PRIV-WRITE",
+    "AG-FILE",
+    crate::mcp_targets::PROTECTED_TARGET_RULE,
+];
 
 /// The rule a profile's refusal of a tool call is reported under.
 pub const PROFILE_DENY_RULE: &str = "AG-PROFILE-DENY";
@@ -1579,6 +1592,81 @@ mod tests {
             .iter()
             .filter(|a| a.rule.starts_with("ATR-"))
             .any(|a| a.block));
+    }
+
+    /// A delete, move or write of the root, a folder of the system, a whole
+    /// home or a store of keys is refused by its own builtin rule in every
+    /// posture that refuses, and recorded in the monitor modes. Before it,
+    /// `delete_directory {"path":"/etc"}` matched only ATR-2026-099, which
+    /// does not refuse, and was forwarded in every mode.
+    ///
+    /// FAILS ON REVERT: drop the `mcp_targets::protected_target_alert` call
+    /// in `mcp::inspect_declared_tool_call`.
+    #[test]
+    fn a_change_to_a_protected_place_is_refused_in_every_posture() {
+        use crate::mcp_proxy::taint::TaintTracker;
+        use crate::mcp_targets::PROTECTED_TARGET_RULE;
+        let calls: &[(&str, &str)] = &[
+            ("delete_directory", r#"{"path":"/etc"}"#),
+            ("delete_directory", r#"{"path":"/usr/lib"}"#),
+            ("remove_directory", r#"{"path":"/"}"#),
+            (
+                "move_file",
+                r#"{"source":"/home/dev","destination":"/tmp/x"}"#,
+            ),
+            (
+                "move_file",
+                r#"{"source":"/tmp/x","destination":"/Users/dev/.ssh"}"#,
+            ),
+            (
+                "write_file",
+                r#"{"path":"~/.aws/credentials","content":"x"}"#,
+            ),
+            ("create_directory", r#"{"path":"/etc/cron.hourly/x"}"#),
+        ];
+        for (tool, args) in calls {
+            for mode in [ProxyMode::Guard, ProxyMode::Strict, ProxyMode::Kill] {
+                let (d, action) = posture(tool, args, mode, &mut TaintTracker::new());
+                assert!(
+                    matches!(action, ProxyAction::Block { .. } | ProxyAction::Kill { .. }),
+                    "{mode:?} {tool} {args}: {:?}",
+                    d.verdict.alerts
+                );
+                assert!(
+                    d.verdict
+                        .alerts
+                        .iter()
+                        .any(|a| a.rule == PROTECTED_TARGET_RULE && a.block),
+                    "{mode:?} {tool} {args}: {:?}",
+                    d.verdict.alerts
+                );
+            }
+            for mode in [ProxyMode::Advisory, ProxyMode::Warn] {
+                let (d, action) = posture(tool, args, mode, &mut TaintTracker::new());
+                assert_eq!(action, ProxyAction::ForwardWithAlert, "{mode:?} {tool}");
+                assert!(d
+                    .verdict
+                    .alerts
+                    .iter()
+                    .any(|a| a.rule == PROTECTED_TARGET_RULE));
+            }
+        }
+        // Ordinary work in the same tools is not this rule's.
+        for (tool, args) in [
+            ("delete_directory", r#"{"path":"/home/dev/proj/build"}"#),
+            ("move_file", r#"{"source":"a.txt","destination":"b.txt"}"#),
+            ("delete_file", r#"{"file_id":"13"}"#),
+        ] {
+            let (d, _) = posture(tool, args, ProxyMode::Guard, &mut TaintTracker::new());
+            assert!(
+                !d.verdict
+                    .alerts
+                    .iter()
+                    .any(|a| a.rule == PROTECTED_TARGET_RULE),
+                "{tool} {args}: {:?}",
+                d.verdict.alerts
+            );
+        }
     }
 
     /// A value of any length a server said this session as a whole word, in

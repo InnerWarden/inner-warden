@@ -123,19 +123,19 @@ enum Ended {
 /// Length-capped async line reader. Drop-in for `tokio::io::Lines`'
 /// `next_line()` shape, but refuses a line longer than `max` instead of
 /// accumulating it unbounded.
-struct CappedLines<R> {
+pub(super) struct CappedLines<R> {
     inner: R,
     max: usize,
 }
 
 impl<R: AsyncBufRead + Unpin> CappedLines<R> {
-    fn new(inner: R, max: usize) -> Self {
+    pub(super) fn new(inner: R, max: usize) -> Self {
         Self { inner, max }
     }
 
     /// Read the next line (without the `\n`/`\r\n`). `Ok(None)` at EOF;
     /// `Err(InvalidData)` if the line exceeds `max` bytes.
-    async fn next_line(&mut self) -> std::io::Result<Option<String>> {
+    pub(super) async fn next_line(&mut self) -> std::io::Result<Option<String>> {
         let mut buf: Vec<u8> = Vec::new();
         loop {
             // Scope the fill_buf borrow so it ends before `consume`.
@@ -1428,19 +1428,44 @@ where
         ));
     }
 
-    let mut server = Server::spawn(&cfg.server_cmd)?;
-    let child = &mut server.child;
+    // A server reached by URL is not spawned: the bridge in
+    // `super::remote` stands where its process would, and every line goes
+    // through this same loop.
+    let remote =
+        match super::remote::RemoteSpec::from_cmd(&cfg.server_cmd, |name| std::env::var(name).ok())
+        {
+            None => None,
+            Some(Ok(spec)) => Some(spec),
+            Some(Err(why)) => {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why));
+            }
+        };
+    let mut upstream = match remote {
+        Some(spec) => Upstream::Remote(super::remote::Remote::start(spec)),
+        None => Upstream::Local(Server::spawn(&cfg.server_cmd)?),
+    };
+    type Writer = Box<dyn AsyncWrite + Unpin + Send>;
+    type Reader = Box<dyn AsyncRead + Unpin + Send>;
+    let (to_server, from_server, server_err): (Writer, Reader, Reader) = match &mut upstream {
+        Upstream::Local(server) => {
+            let child = &mut server.child;
+            (
+                Box::new(child.stdin.take().expect("child stdin piped")),
+                Box::new(child.stdout.take().expect("child stdout piped")),
+                Box::new(child.stderr.take().expect("child stderr piped")),
+            )
+        }
+        Upstream::Remote(remote) => (
+            Box::new(remote.input.take().expect("bridge input")),
+            Box::new(remote.output.take().expect("bridge output")),
+            Box::new(tokio::io::empty()),
+        ),
+    };
 
-    let mut child_stdin = Some(child.stdin.take().expect("child stdin piped"));
+    let mut child_stdin = Some(to_server);
     let mut client_lines = CappedLines::new(BufReader::new(client_in), MAX_LINE_BYTES);
-    let mut server_lines = CappedLines::new(
-        BufReader::new(child.stdout.take().expect("child stdout piped")),
-        MAX_LINE_BYTES,
-    );
-    let mut err_lines = CappedLines::new(
-        BufReader::new(child.stderr.take().expect("child stderr piped")),
-        MAX_LINE_BYTES,
-    );
+    let mut server_lines = CappedLines::new(BufReader::new(from_server), MAX_LINE_BYTES);
+    let mut err_lines = CappedLines::new(BufReader::new(server_err), MAX_LINE_BYTES);
     let engine = engine.as_deref();
     let mut map = IdRequestMap::new();
     // Per-connection session state for confused-deputy detection: tool results
@@ -1577,20 +1602,36 @@ where
     // Whatever ended the session, the server's input closes before any signal,
     // the way an MCP client ends one.
     drop(child_stdin);
+    let server = match &mut upstream {
+        Upstream::Local(server) => server,
+        // A remote server has no process to stop: the bridge stops, and a
+        // session the server gave an id for was ended when the client left.
+        Upstream::Remote(remote) => {
+            remote.stop();
+            ended?;
+            return Ok(0);
+        }
+    };
     let status = match &ended {
         Ok(Ended::KillMode) => {
             server.kill();
             server.wait().await
         }
         // It is on its way out: give it the grace to exit on its own.
-        Ok(Ended::ServerClosed) => stop_server(&mut server, STOP_GRACE).await,
+        Ok(Ended::ServerClosed) => stop_server(server, STOP_GRACE).await,
         // It already had the drain window, or the session is over now.
         Ok(Ended::ClientLeft) | Ok(Ended::Stopped) | Err(_) => {
-            stop_server(&mut server, Duration::ZERO).await
+            stop_server(server, Duration::ZERO).await
         }
     };
     ended?;
     Ok(status?.code().unwrap_or(0))
+}
+
+/// What the proxy forwards to: a server it spawned, or one reached by URL.
+enum Upstream {
+    Local(Server),
+    Remote(super::remote::Remote),
 }
 
 /// The spawned server: its process and, on unix, the process group it leads

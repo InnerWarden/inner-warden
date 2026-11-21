@@ -48,6 +48,19 @@ code that writes one, are held for review, as a copy of an unseen file onto
 it is. Measured on every corpus line and its variants (34,954, an empty home
 and a home with keys): no benign line newly refused.
 
+MCP servers reached by URL are screened. `innerwarden agents connect` now
+routes a JSON client's remote server (`url`, `httpUrl`, `serverUrl`) through
+`innerwarden proxy`, which talks Streamable HTTP or HTTP with SSE to it, so
+its calls get the same checks as a local server's; before, a remote server
+was only counted as not screened. `agents disconnect` gives the entry back
+with its URL, type and headers. The proxy opens no port; headers travel in
+the wrapper's environment; redirects are not followed. An entry whose client
+signs in by itself (`oauth`) is left as it was. A tool call that deletes,
+moves or writes the root, a folder of the system, a whole home or a store of
+keys is refused in every posture that refuses (`AG-PROTECTED-TARGET`);
+`delete_directory {"path": "/etc"}` used to pass. Details:
+[What InnerWarden does](docs/features.md).
+
 Ordinary agent work is refused less. In a set of commands from public
 coding-agent runs with no attack among them, main refused 69 lines; this
 change allows 26 of them, holds 42 for review and still refuses 1 (a line

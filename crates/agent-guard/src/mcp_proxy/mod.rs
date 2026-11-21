@@ -23,6 +23,7 @@ pub mod effect;
 pub mod enforce;
 pub mod jsonrpc;
 pub mod pins;
+pub mod remote;
 pub mod router;
 pub(crate) mod structure;
 #[cfg(test)]

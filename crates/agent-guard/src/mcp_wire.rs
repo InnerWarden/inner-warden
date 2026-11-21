@@ -6,8 +6,19 @@
 //! before it reaches the server. Fully reversible (`unwrap`) and idempotent.
 //!
 //! This is the honest cross-agent mechanism: Claude Code gets a native pre-exec
-//! hook (its shell), while supported JSON MCP clients are guarded here. A
-//! remote (`url`) MCP server has no local command to wrap, so it is left alone.
+//! hook (its shell), while supported JSON MCP clients are guarded here.
+//!
+//! A remote server (`url`, Gemini CLI's `httpUrl`, `serverUrl`; Streamable
+//! HTTP or SSE) goes through the same proxy: its entry becomes a wrapper whose
+//! server is the address (`innerwarden proxy --mode guard -- https://...`),
+//! and the proxy talks HTTP(S) to it where it would spawn a local one
+//! ([`crate::mcp_proxy::remote`]). The wrapper keeps what disconnect needs to
+//! write the entry back as it was: the address, the key it was under
+//! (`--key`), the entry's `type` (`--type`), and each header in the
+//! entry's `env` (`INNERWARDEN_MCP_HEADER_<n>`). An entry the proxy cannot
+//! carry is left alone and counted remote: one whose client signs in by
+//! itself (`oauth`, `auth`, `authProviderType`), a header that is not text,
+//! an address that is not http(s).
 //!
 //! Two schema keys are handled: `mcpServers` (Cursor/Gemini and compatible
 //! clients) and `servers` (VS Code style). All logic here is pure/tested.
@@ -313,6 +324,170 @@ pub(crate) fn naming(options: &[Option<&str>], agent: Option<&str>) -> Naming {
     out
 }
 
+/// The keys a remote server's address is written under.
+const REMOTE_URL_KEYS: &[&str] = &["url", "httpUrl", "serverUrl"];
+
+/// Entry types a remote server may carry.
+const REMOTE_TYPES: &[&str] = &[
+    "http",
+    "sse",
+    "streamable-http",
+    "streamable_http",
+    "streamableHttp",
+];
+
+/// Keys that say the client signs in to the server by itself: the proxy
+/// cannot do that for it, so such an entry is left as it is.
+const CLIENT_SIGN_IN_KEYS: &[&str] = &["oauth", "auth", "authProviderType"];
+
+use crate::mcp_proxy::remote::{is_remote_url, HEADER_ENV_PREFIX};
+
+/// A remote server entry the proxy can carry, as read from its config.
+struct RemoteEntry {
+    key: String,
+    url: String,
+    kind: Option<String>,
+    headers: Vec<(String, String)>,
+}
+
+/// The remote server an entry names, when the proxy can carry it (see the
+/// module documentation); `None` for a local server and for every entry it
+/// cannot.
+fn remote_entry(server: &Value) -> Option<RemoteEntry> {
+    let obj = server.as_object()?;
+    if is_stdio_server(server) || obj.contains_key("command") {
+        return None;
+    }
+    if CLIENT_SIGN_IN_KEYS.iter().any(|key| obj.contains_key(*key)) {
+        return None;
+    }
+    let mut found = REMOTE_URL_KEYS.iter().filter(|key| obj.contains_key(**key));
+    let key = *found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let url = obj.get(key)?.as_str()?.trim();
+    if !is_remote_url(url) {
+        return None;
+    }
+    let kind = match obj.get("type") {
+        None => None,
+        Some(Value::String(kind)) if REMOTE_TYPES.contains(&kind.as_str()) => Some(kind.clone()),
+        Some(_) => return None,
+    };
+    let mut headers = Vec::new();
+    match obj.get("headers") {
+        None => {}
+        Some(Value::Object(map)) => {
+            for (name, value) in map {
+                let value = value.as_str()?;
+                if name.trim().is_empty()
+                    || name.contains(':')
+                    || value.contains(['\r', '\n', '\0'])
+                {
+                    return None;
+                }
+                headers.push((name.clone(), value.to_string()));
+            }
+        }
+        Some(_) => return None,
+    }
+    if obj.get("env").is_some_and(|env| !env.is_object()) {
+        return None;
+    }
+    Some(RemoteEntry {
+        key: key.to_string(),
+        url: url.to_string(),
+        kind,
+        headers,
+    })
+}
+
+/// A remote entry written as a local one whose command is its address, the
+/// shape [`wrap_server`] then wraps like any other.
+fn remote_as_local(server: &Value, remote: &RemoteEntry) -> Option<Value> {
+    let mut obj = server.as_object()?.clone();
+    obj.remove(&remote.key);
+    obj.remove("headers");
+    let mut args: Vec<Value> = Vec::new();
+    if remote.key != "url" {
+        args.extend([json!("--key"), json!(remote.key)]);
+    }
+    if let Some(kind) = &remote.kind {
+        args.extend([json!("--type"), json!(kind)]);
+        obj.insert("type".into(), json!("stdio"));
+    }
+    if !remote.headers.is_empty() {
+        let env = obj
+            .entry("env")
+            .or_insert_with(|| Value::Object(Default::default()))
+            .as_object_mut()?;
+        for (n, (name, value)) in remote.headers.iter().enumerate() {
+            env.insert(
+                format!("{HEADER_ENV_PREFIX}{}", n + 1),
+                json!(format!("{name}: {value}")),
+            );
+        }
+    }
+    obj.insert("command".into(), json!(remote.url));
+    obj.insert("args".into(), json!(args));
+    Some(Value::Object(obj))
+}
+
+/// Write a wrapped remote entry back as it was: `url` (or the key it was
+/// under), its `type` and its `headers`. `false`, touching nothing, when
+/// the words after the address are not the ones [`remote_as_local`]
+/// writes.
+fn restore_remote(obj: &mut serde_json::Map<String, Value>, url: &str, words: &[Value]) -> bool {
+    let mut key = "url".to_string();
+    let mut kind: Option<String> = None;
+    let mut it = words.iter();
+    while let Some(word) = it.next() {
+        let value = it.next().and_then(Value::as_str);
+        match (word.as_str(), value) {
+            (Some("--key"), Some(value)) if REMOTE_URL_KEYS.contains(&value) => key = value.into(),
+            (Some("--type"), Some(value)) => kind = Some(value.to_string()),
+            _ => return false,
+        }
+    }
+    obj.remove("command");
+    obj.remove("args");
+    match kind {
+        Some(kind) => {
+            obj.insert("type".into(), json!(kind));
+        }
+        None => {
+            if obj.get("type").and_then(Value::as_str) == Some("stdio") {
+                obj.remove("type");
+            }
+        }
+    }
+    let mut headers = serde_json::Map::new();
+    if let Some(env) = obj.get_mut("env").and_then(Value::as_object_mut) {
+        let mut n = 1;
+        while let Some(line) = env.remove(&format!("{HEADER_ENV_PREFIX}{n}")) {
+            if let Some((name, value)) = line.as_str().and_then(|line| line.split_once(':')) {
+                headers.insert(name.to_string(), json!(value.trim_start()));
+            }
+            n += 1;
+        }
+        if env.is_empty() {
+            obj.remove("env");
+        }
+    }
+    if !headers.is_empty() {
+        obj.insert("headers".into(), Value::Object(headers));
+    }
+    obj.insert(key, json!(url));
+    true
+}
+
+/// A server the proxy can carry: a local one, or a remote one it reaches by
+/// URL ([`remote_entry`]).
+fn is_proxyable_server(server: &Value) -> bool {
+    is_stdio_server(server) || remote_entry(server).is_some()
+}
+
 /// A stdio server is one we can wrap: it has a local `command` (not a remote
 /// `url`-only server).
 fn is_stdio_server(server: &Value) -> bool {
@@ -325,7 +500,16 @@ fn is_stdio_server(server: &Value) -> bool {
 
 fn wrap_server(server: &mut Value, guard_bin: &str, monitor: bool, agent: Option<&str>) -> bool {
     if !is_stdio_server(server) {
-        return false;
+        let Some(mut local) =
+            remote_entry(server).and_then(|remote| remote_as_local(server, &remote))
+        else {
+            return false;
+        };
+        if !wrap_server(&mut local, guard_bin, monitor, agent) {
+            return false;
+        }
+        *server = local;
+        return true;
     }
     let current_command = server
         .get("command")
@@ -406,6 +590,10 @@ fn unwrap_server(server: &mut Value) -> bool {
     }
     let orig_cmd = args[separator + 1].as_str().unwrap_or_default().to_string();
     let orig_args: Vec<Value> = args[separator + 2..].to_vec();
+    // A remote server goes back to the address it had.
+    if is_remote_url(&orig_cmd) && restore_remote(obj, &orig_cmd, &orig_args) {
+        return true;
+    }
     obj.insert("command".into(), json!(orig_cmd));
     // A server that had no arguments goes back without an `args` entry
     // (NEW-20261121-mcp-json-disconnect-leaves-empty-args): connect wrote
@@ -468,11 +656,12 @@ fn for_each_server(root: &mut Value, mut f: impl FnMut(&mut Value) -> bool) -> u
 }
 
 /// How many MCP servers a configuration names, by how the proxy can reach
-/// them: `stdio` servers run a local command and can be wrapped, `wrapped`
-/// of those already run through the proxy, and `remote` is every other
-/// server entry: it has no local command to wrap, so the proxy never sees
-/// its calls, whatever key names its address (`url`, Gemini CLI's `httpUrl`,
-/// `serverUrl`, a `type` of http or sse, or none at all).
+/// them: `stdio` servers are the ones the proxy can carry (a local command,
+/// or a remote server it reaches by URL, [`remote_entry`]), `wrapped` of
+/// those already run through the proxy, and `remote` is every other server
+/// entry: one the proxy cannot carry, so it never sees its calls, whatever
+/// key names its address (a client that signs in by itself, an address that
+/// is not http(s), an entry with no address at all).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ServerCounts {
     pub stdio: usize,
@@ -480,11 +669,11 @@ pub struct ServerCounts {
     pub remote: usize,
 }
 
-/// A server entry with no local command: one the proxy cannot wrap, so its
-/// calls are never screened. Counted whatever names its address, so no
-/// unscreened server is left uncounted (a Gemini CLI `httpUrl` server was).
+/// A server entry the proxy cannot carry, so its calls are never screened.
+/// Counted whatever names its address, so no unscreened server is left
+/// uncounted (a Gemini CLI `httpUrl` server was).
 fn is_remote_server(server: &Value) -> bool {
-    server.is_object() && !is_stdio_server(server)
+    server.is_object() && !is_proxyable_server(server)
 }
 
 /// The servers of a configuration, counted across every table this module
@@ -512,7 +701,7 @@ fn counts(root: &Value) -> (usize, usize) {
     for path in SERVER_TABLE_PATHS {
         if let Some(map) = table_at(root, path) {
             for (_name, server) in map {
-                if is_stdio_server(server) {
+                if is_proxyable_server(server) {
                     stdio += 1;
                     if is_wrapped_server(server) {
                         wrapped += 1;
@@ -532,6 +721,36 @@ fn counts(root: &Value) -> (usize, usize) {
 /// the new config and how many server entries changed. Pure.
 pub fn wrap(root: Value, guard_bin: &str, monitor: bool, agent: &str) -> (Value, usize) {
     wrap_naming(root, guard_bin, monitor, Some(agent))
+}
+
+/// [`wrap`] for automatic setup: only the servers that run a local command.
+/// A remote server is carried through the proxy only on a connect a person
+/// runs: it changes how the agent reaches that server, and one that wants a
+/// sign-in the client would have done stops working through the proxy, so
+/// background setup never decides that.
+pub fn wrap_local(mut root: Value, guard_bin: &str, monitor: bool, agent: &str) -> (Value, usize) {
+    let n = for_each_server(&mut root, |s| {
+        is_stdio_server(s) && wrap_server(s, guard_bin, monitor, Some(agent))
+    });
+    (root, n)
+}
+
+/// Whether every server of this config that runs a local command goes
+/// through the proxy, and there is one: what [`wrap_local`] guarantees.
+pub fn local_servers_guarded(root: &Value) -> bool {
+    let mut local = 0;
+    let mut wrapped = 0;
+    for path in SERVER_TABLE_PATHS {
+        if let Some(map) = table_at(root, path) {
+            for server in map.values().filter(|s| is_stdio_server(s)) {
+                local += 1;
+                if is_wrapped_server(server) {
+                    wrapped += 1;
+                }
+            }
+        }
+    }
+    local > 0 && local == wrapped
 }
 
 fn wrap_naming(
@@ -678,6 +897,8 @@ pub fn is_guardable(root: &Value) -> bool {
 /// Strict shape required by background setup. Manual connect remains able to
 /// repair permissive legacy configs, but automatic wrapping never normalizes a
 /// malformed server entry or drops a non-array/non-string `args` value.
+/// Background setup wraps only local servers ([`wrap_local`]), so a config
+/// with none (remote servers only) is not one it takes.
 pub fn is_automatic_wrap_safe(root: &Value) -> bool {
     if !root.is_object() {
         return false;
@@ -717,7 +938,10 @@ pub fn is_automatic_wrap_safe(root: &Value) -> bool {
             }
         }
     }
-    is_guardable(root)
+    SERVER_TABLE_PATHS
+        .iter()
+        .filter_map(|path| table_at(root, path))
+        .any(|map| map.values().any(is_stdio_server))
 }
 
 #[cfg(test)]
@@ -734,26 +958,27 @@ mod tests {
         })
     }
 
-    /// A remote server is counted apart and never as a local one, before
-    /// and after a wrap, in every table the module wires. FAILS ON REVERT of
-    /// the `url` test: the remote server is not counted at all.
+    /// A remote server the proxy can carry is counted with the servers it
+    /// wraps, before and after a wrap; one it cannot carry is counted apart,
+    /// in every table the module wires. FAILS ON REVERT of the `url` test:
+    /// the remote server is not counted at all.
     #[test]
     fn server_counts_counts_remote_servers_apart() {
         assert_eq!(
             server_counts(&cfg()),
             ServerCounts {
-                stdio: 2,
+                stdio: 3,
                 wrapped: 0,
-                remote: 1
+                remote: 0
             }
         );
         let (wrapped, _) = wrap(cfg(), "/abs/innerwarden", true, "cursor");
         assert_eq!(
             server_counts(&wrapped),
             ServerCounts {
-                stdio: 2,
-                wrapped: 2,
-                remote: 1
+                stdio: 3,
+                wrapped: 3,
+                remote: 0
             }
         );
         let nested = json!({
@@ -763,20 +988,20 @@ mod tests {
         assert_eq!(
             server_counts(&nested),
             ServerCounts {
-                stdio: 1,
+                stdio: 2,
                 wrapped: 0,
-                remote: 3
+                remote: 2
             },
-            "every entry with no local command is counted unscreened; a value that is not an entry is not"
+            "every entry the proxy cannot carry is counted unscreened; a value that is not an entry is not"
         );
         assert_eq!(server_counts(&json!({})), ServerCounts::default());
     }
 
     /// Gemini CLI declares a streamable HTTP server with `httpUrl`, others
-    /// with `serverUrl` or a `type`: none runs a local command, so none is
-    /// screened, and each is counted remote. FAILS ON REVERT of the `url`
-    /// only test: they were counted as nothing, and the page said "No MCP
-    /// server to screen" while their calls ran unscreened.
+    /// with `serverUrl` or a `type`: the proxy carries the first two, and
+    /// an entry with no address it reads is counted remote. FAILS ON REVERT
+    /// of the `url` only test: they were counted as nothing, and the page
+    /// said "No MCP server to screen" while their calls ran unscreened.
     #[test]
     fn server_counts_counts_every_remote_form_as_remote() {
         let gemini = json!({
@@ -790,27 +1015,37 @@ mod tests {
         assert_eq!(
             server_counts(&gemini),
             ServerCounts {
-                stdio: 1,
+                stdio: 3,
                 wrapped: 0,
-                remote: 3
+                remote: 1
             }
         );
         let only_http = json!({"mcpServers": {"http": {"httpUrl": "https://api.example.com/mcp"}}});
         assert_eq!(
             server_counts(&only_http),
             ServerCounts {
+                stdio: 1,
+                wrapped: 0,
+                remote: 0
+            },
+            "a configuration of remote servers only is never \"no server\""
+        );
+        let signs_in = json!({"mcpServers": {"http": {"httpUrl": "https://api.example.com/mcp", "oauth": {"enabled": true}}}});
+        assert_eq!(
+            server_counts(&signs_in),
+            ServerCounts {
                 stdio: 0,
                 wrapped: 0,
                 remote: 1
             },
-            "a configuration of remote servers only is never \"no server\""
+            "a server the client signs in to by itself is not carried, and is counted unscreened"
         );
     }
 
     #[test]
-    fn wrap_routes_stdio_servers_through_the_proxy_and_leaves_remote_alone() {
+    fn wrap_routes_stdio_and_remote_servers_through_the_proxy() {
         let (out, n) = wrap(cfg(), "/abs/innerwarden", false, "cursor");
-        assert_eq!(n, 2, "two stdio servers wrapped, the url server skipped");
+        assert_eq!(n, 3, "two stdio servers and the url server wrapped");
         let fs = &out["mcpServers"]["fs"];
         assert_eq!(fs["command"], "/abs/innerwarden");
         assert_eq!(
@@ -830,10 +1065,16 @@ mod tests {
                 "/tmp"
             ])
         );
-        // remote untouched
+        // The remote server's proxy talks to its address.
         assert_eq!(
-            out["mcpServers"]["remote"]["url"],
-            "https://example.com/sse"
+            out["mcpServers"]["remote"],
+            json!({
+                "command": "/abs/innerwarden",
+                "args": [
+                    "proxy", "--label", "cursor", "--agent", "cursor", "--mode", "guard", "--",
+                    "https://example.com/sse"
+                ]
+            })
         );
         assert!(is_guarded(&out));
         assert_eq!(guarded_mode(&out), Some(WiringMode::Enforce));
@@ -858,7 +1099,7 @@ mod tests {
     fn wrap_is_idempotent() {
         let (once, n1) = wrap(cfg(), "/abs/innerwarden", false, "cursor");
         let (twice, n2) = wrap(once.clone(), "/abs/innerwarden", false, "cursor");
-        assert_eq!(n1, 2);
+        assert_eq!(n1, 3);
         assert_eq!(n2, 0, "already wrapped: nothing to do");
         assert_eq!(once, twice);
     }
@@ -868,7 +1109,7 @@ mod tests {
         let original = cfg();
         let (wrapped, _) = wrap(original.clone(), "/abs/innerwarden", false, "cursor");
         let (restored, n) = unwrap(wrapped);
-        assert_eq!(n, 2);
+        assert_eq!(n, 3);
         assert_eq!(restored, original);
         assert!(!is_guarded(&restored));
     }
@@ -884,8 +1125,13 @@ mod tests {
 
     #[test]
     fn only_remote_or_empty_is_not_guardable() {
-        assert!(!is_guardable(
+        // A remote server the proxy carries is guardable; one the client
+        // signs in to by itself is not.
+        assert!(is_guardable(
             &json!({ "mcpServers": { "r": { "url": "https://x" } } })
+        ));
+        assert!(!is_guardable(
+            &json!({ "mcpServers": { "r": { "url": "https://x", "oauth": {} } } })
         ));
         assert!(!is_guardable(&json!({ "mcpServers": {} })));
         assert!(!is_guardable(&json!({})));
@@ -997,7 +1243,7 @@ mod tests {
     fn switching_monitor_and_enforce_rewrites_one_proxy_without_nesting() {
         let original = cfg();
         let (monitor, n) = wrap(original.clone(), "innerwarden", true, "cursor");
-        assert_eq!(n, 2);
+        assert_eq!(n, 3);
         assert_eq!(guarded_mode(&monitor), Some(WiringMode::Monitor));
         assert_eq!(
             monitor["mcpServers"]["fs"]["args"],
@@ -1018,7 +1264,7 @@ mod tests {
         );
 
         let (enforce, changed) = wrap(monitor, "innerwarden", false, "cursor");
-        assert_eq!(changed, 2);
+        assert_eq!(changed, 3);
         assert_eq!(guarded_mode(&enforce), Some(WiringMode::Enforce));
         assert_eq!(
             enforce["mcpServers"]["fs"]["args"],
@@ -1038,7 +1284,7 @@ mod tests {
             ])
         );
         let (restored, n) = unwrap(enforce);
-        assert_eq!(n, 2);
+        assert_eq!(n, 3);
         assert_eq!(restored, original);
     }
 
@@ -1299,11 +1545,14 @@ mod partial_wiring_tests {
         assert!(has_unguarded_stdio_server(&cfg));
     }
 
-    /// A remote-only config has no local command to wrap, so there is nothing to
-    /// do and offering it would be noise.
+    /// A remote-only config is offered: the proxy carries a remote server.
+    /// One whose servers the client signs in to by itself has nothing the
+    /// proxy can carry, and offering it would be noise.
     #[test]
     fn a_remote_only_config_has_nothing_to_wrap() {
         let cfg = json!({"mcpServers": {"remote": {"url": "https://example.com/mcp"}}});
+        assert!(has_unguarded_stdio_server(&cfg));
+        let cfg = json!({"mcpServers": {"remote": {"url": "https://example.com/mcp", "auth": {}}}});
         assert!(!has_unguarded_stdio_server(&cfg));
     }
 
@@ -1772,5 +2021,108 @@ mod agent_naming_tests {
         // Nothing wired at all.
         let bare = json!({"mcpServers": {"a": {"command": "npx"}}});
         assert_eq!(unnamed_reconnect_flag(&bare, BIN, "cursor"), None);
+    }
+}
+
+#[cfg(test)]
+mod remote_wiring_tests {
+    use super::*;
+
+    /// A remote entry becomes a wrapper whose server is its address, and
+    /// disconnect writes it back as it was: the key it was under, its type,
+    /// its headers, and every other key it had. FAILS ON REVERT of
+    /// `remote_as_local` (nothing wrapped) or `restore_remote` (the entry
+    /// comes back as a command named after its address).
+    #[test]
+    fn a_remote_entry_is_wrapped_and_disconnect_gives_its_url_back() {
+        let original = json!({"mcpServers": {
+            "gem": {"httpUrl": "https://api.example.com/mcp", "headers": {"Authorization": "Bearer t0k", "X-Team": "blue"}, "timeout": 30000},
+            "vsc": {"type": "sse", "url": "https://sse.example.com/sse"},
+            "cur": {"serverUrl": "http://127.0.0.1:9000/mcp", "type": "http", "env": {"KEEP": "1"}}
+        }});
+        let (wrapped, n) = wrap(original.clone(), "/abs/innerwarden", false, "gemini");
+        assert_eq!(n, 3);
+        assert!(is_guarded(&wrapped));
+        assert_eq!(server_counts(&wrapped).remote, 0);
+        let gem = &wrapped["mcpServers"]["gem"];
+        assert_eq!(
+            gem["args"],
+            json!([
+                "proxy",
+                "--label",
+                "gemini",
+                "--agent",
+                "gemini",
+                "--mode",
+                "guard",
+                "--",
+                "https://api.example.com/mcp",
+                "--key",
+                "httpUrl"
+            ])
+        );
+        assert_eq!(
+            gem["env"],
+            json!({
+                "INNERWARDEN_MCP_HEADER_1": "Authorization: Bearer t0k",
+                "INNERWARDEN_MCP_HEADER_2": "X-Team: blue"
+            })
+        );
+        assert!(gem.get("httpUrl").is_none() && gem.get("headers").is_none());
+        assert_eq!(gem["timeout"], 30000);
+        let vsc = &wrapped["mcpServers"]["vsc"];
+        assert_eq!(vsc["type"], "stdio");
+        assert_eq!(
+            vsc["args"].as_array().unwrap()[8..].to_vec(),
+            vec![
+                json!("https://sse.example.com/sse"),
+                json!("--type"),
+                json!("sse")
+            ]
+        );
+        // What the proxy reads from the wrapper is what the entry said.
+        let words: Vec<String> = gem["args"].as_array().unwrap()[8..]
+            .iter()
+            .map(|w| w.as_str().unwrap().to_string())
+            .collect();
+        let env = gem["env"].clone();
+        let spec = crate::mcp_proxy::remote::RemoteSpec::from_cmd(&words, |name| {
+            env.get(name).and_then(Value::as_str).map(str::to_string)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(spec.url, "https://api.example.com/mcp");
+        assert_eq!(spec.headers.len(), 2);
+
+        // Monitor and back rewrites the same wrappers without nesting.
+        let (monitor, changed) = wrap(wrapped.clone(), "/abs/innerwarden", true, "gemini");
+        assert_eq!(changed, 3);
+        assert_eq!(guarded_mode(&monitor), Some(WiringMode::Monitor));
+
+        let (restored, n) = unwrap(monitor);
+        assert_eq!(n, 3);
+        assert_eq!(restored, original);
+    }
+
+    /// Entries the proxy cannot carry are left as they are and counted
+    /// unscreened.
+    #[test]
+    fn an_entry_the_proxy_cannot_carry_is_left_alone() {
+        for server in [
+            json!({"url": "https://x.example/mcp", "oauth": {"clientId": "a"}}),
+            json!({"httpUrl": "https://x.example/mcp", "authProviderType": "google_credentials"}),
+            json!({"url": "https://x.example/mcp", "headers": {"A": 1}}),
+            json!({"url": "https://x.example/mcp", "headers": {"A": "x\ny"}}),
+            json!({"url": "ws://x.example/mcp"}),
+            json!({"url": "https://a.example", "httpUrl": "https://b.example"}),
+            json!({"url": "https://x.example/mcp", "type": "websocket"}),
+            json!({"url": "https://x.example/mcp", "command": ""}),
+        ] {
+            let cfg = json!({"mcpServers": {"r": server.clone()}});
+            let (out, n) = wrap(cfg.clone(), "/abs/innerwarden", false, "cursor");
+            assert_eq!(n, 0, "{server}");
+            assert_eq!(out, cfg);
+            assert_eq!(server_counts(&cfg).remote, 1, "{server}");
+        }
     }
 }

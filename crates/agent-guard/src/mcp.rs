@@ -344,6 +344,11 @@ pub(crate) fn inspect_declared_tool_call(
     if let Some(alert) = privileged_write_alert(tool_name, file_args, declared) {
         alerts.push(alert);
     }
+    // A delete, move or write of the root, a folder of the system, a whole
+    // home or a store of keys: refused in every posture that refuses.
+    if let Some(alert) = crate::mcp_targets::protected_target_alert(tool_name, args) {
+        alerts.push(alert);
+    }
 
     // Lowercase the (possibly large) args once, not once per IOC.
     let args_lower = args_str.to_lowercase();
