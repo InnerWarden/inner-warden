@@ -47,6 +47,11 @@ pub(crate) struct Program {
     /// Its arguments are a command the guard reads after it.
     #[serde(default)]
     pub(crate) launcher: bool,
+    /// The command written right after its own options is the one that
+    /// runs (`env`, `command`, `nice -n 5`, `timeout 9`): read through by
+    /// [`launchers_read_through`].
+    #[serde(default)]
+    pub(crate) prefix: bool,
     /// The option that takes code on the command line.
     #[serde(default)]
     pub(crate) inline: Option<String>,
@@ -90,6 +95,188 @@ pub(crate) fn program(name: &str) -> Option<&'static Program> {
 pub(crate) fn reads_code_when_given_none(name: &str) -> bool {
     program(name)
         .is_some_and(|row| !row.launcher && (row.shell || (row.stdin_code && row.inline.is_some())))
+}
+
+/// The line with the launchers of the table that run the command written
+/// right after them (`prefix`: `env`, `command`, `builtin`, `exec`,
+/// `nice -n 5`, `nohup`, `timeout 9`, `stdbuf -oL`, `sudo`) taken off each
+/// command they stand in front of, and the blanks after an operator made
+/// one: the command the shell runs, where every rule that reads a command
+/// by its name in place sees it (`f | env crontab -` is `f | crontab -`).
+/// The options of each launcher are read by
+/// [`crate::threats::effective_command_index`]; a launcher word with a
+/// quote, an escape or an expansion in it is left as written. `None` when
+/// nothing changes.
+pub(crate) fn launchers_read_through(line: &str) -> Option<String> {
+    let base = line.as_ptr() as usize;
+    let mut cuts: Vec<(usize, usize, String)> = Vec::new();
+    for segment in crate::threats::shell_command_segments(line) {
+        let Some(offset) = (segment.as_ptr() as usize).checked_sub(base) else {
+            continue;
+        };
+        if line.get(offset..offset + segment.len()) != Some(segment) {
+            continue;
+        }
+        let tokens = crate::threats::shell_tokens(segment);
+        let keywords = tokens
+            .iter()
+            .take_while(|word| {
+                matches!(
+                    word.as_str(),
+                    "if" | "then" | "elif" | "else" | "do" | "while" | "until" | "!"
+                )
+            })
+            .count();
+        let Some(first) = tokens.get(keywords) else {
+            continue;
+        };
+        // `env -S 'rm -rf /'` runs the words its string splits into.
+        if let Some(command) = crate::threats::env_split_command(&tokens[keywords..]) {
+            if let Some(from) = word_start(segment, keywords) {
+                cuts.push((
+                    offset + from,
+                    offset + segment.len(),
+                    quoted_words(&command),
+                ));
+            }
+            continue;
+        }
+        if !program(versionless(crate::threats::token_basename(first)))
+            .is_some_and(|row| row.prefix)
+        {
+            continue;
+        }
+        let Some(command) = crate::threats::effective_command_index(&tokens) else {
+            continue;
+        };
+        if command <= keywords {
+            continue;
+        }
+        // Walk the words as written up to the command the launchers run.
+        let bytes = segment.as_bytes();
+        let mut at = 0;
+        let mut from = None;
+        let mut whole = true;
+        for index in 0..command {
+            while at < bytes.len() && matches!(bytes[at], b' ' | b'\t') {
+                at += 1;
+            }
+            if index == keywords {
+                from = Some(at);
+            }
+            let start = at;
+            while at < bytes.len() && !matches!(bytes[at], b' ' | b'\t' | b'\n') {
+                at += 1;
+            }
+            if index >= keywords && segment[start..at].contains(['\'', '"', '\\', '$', '`']) {
+                whole = false;
+                break;
+            }
+        }
+        while at < bytes.len() && matches!(bytes[at], b' ' | b'\t') {
+            at += 1;
+        }
+        if let (true, Some(from)) = (whole, from) {
+            if from < at && at < bytes.len() {
+                cuts.push((offset + from, offset + at, String::new()));
+            }
+        }
+    }
+    let mut read = line.to_owned();
+    for (from, to, with) in cuts.into_iter().rev() {
+        read.replace_range(from..to, &with);
+    }
+    // A command substitution is a line of its own: `f=$(env curl URL)`
+    // runs `curl URL`.
+    read = substitutions_read_through(&read);
+    // The blanks after an operator: `|  \tcrontab -` is `| crontab -`.
+    static BLANKS: LazyLock<Option<regex::Regex>> =
+        LazyLock::new(|| regex::Regex::new(r"([|;&(])(?: [ \t]+|\t[ \t]*)").ok());
+    if let Some(blanks) = BLANKS.as_ref() {
+        if blanks.is_match(&read) {
+            read = blanks.replace_all(&read, "$1 ").into_owned();
+        }
+    }
+    (read != line).then_some(read)
+}
+
+/// Where word `index` of `segment` starts, the words split at blanks as
+/// written. `None` when a word before it holds a quote or an escape, so
+/// the blanks do not tell where the words are.
+fn word_start(segment: &str, index: usize) -> Option<usize> {
+    let bytes = segment.as_bytes();
+    let mut at = 0;
+    for _ in 0..index {
+        while at < bytes.len() && matches!(bytes[at], b' ' | b'\t') {
+            at += 1;
+        }
+        let start = at;
+        while at < bytes.len() && !matches!(bytes[at], b' ' | b'\t' | b'\n') {
+            at += 1;
+        }
+        if segment[start..at].contains(['\'', '"', '\\']) {
+            return None;
+        }
+    }
+    while at < bytes.len() && matches!(bytes[at], b' ' | b'\t') {
+        at += 1;
+    }
+    (at < bytes.len()).then_some(at)
+}
+
+/// `words` written back as one shell line: a word with a blank or a quote
+/// in it single-quoted, the rest as they are, so an operator word (`<`)
+/// stays one.
+fn quoted_words(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|word| {
+            if word.is_empty() || word.contains([' ', '\t', '\n', '\'', '"']) {
+                format!("'{}'", word.replace('\'', "'\\''"))
+            } else {
+                word.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `line` with the body of each `$(...)` it holds read through by
+/// [`launchers_read_through`]. A body whose closing parenthesis is not
+/// found, or that holds a quote, is left as written.
+fn substitutions_read_through(line: &str) -> String {
+    let mut read = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(open) = rest.find("$(") {
+        let body_start = open + 2;
+        let mut depth = 1usize;
+        let mut close = None;
+        for (index, byte) in rest.bytes().enumerate().skip(body_start) {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(index);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(close) = close else {
+            break;
+        };
+        let body = &rest[body_start..close];
+        read.push_str(&rest[..body_start]);
+        match launchers_read_through(body) {
+            Some(through) if !body.contains(['\'', '"']) => read.push_str(&through),
+            _ => read.push_str(body),
+        }
+        rest = &rest[close..];
+    }
+    read.push_str(rest);
+    read
 }
 
 /// Every name of the table with its row, for the tests that hold the
@@ -806,6 +993,56 @@ mod tests {
                 &["-ne".to_owned(), "print".to_owned(), "f".to_owned()]
             ),
             vec![]
+        );
+    }
+    /// The command a launcher in front of it runs is where the rules that
+    /// read a command by its name look: `env`, `command`, `nohup`,
+    /// `timeout 9` taken off, in a substitution too, and the words of an
+    /// `env -S` string put in its place. FAILS ON REVERT of
+    /// [`launchers_read_through`], of the substitution reading, or of the
+    /// `env -S` reading.
+    #[test]
+    fn the_command_a_launcher_runs_is_read_in_its_place() {
+        for (line, read) in [
+            ("f | env crontab -", "f | crontab -"),
+            ("command crontab -l", "crontab -l"),
+            ("nohup timeout 9 crontab -", "crontab -"),
+            ("f |  \tcrontab -", "f | crontab -"),
+            (
+                "f=$(env curl -s https://e.example/p)",
+                "f=$(curl -s https://e.example/p)",
+            ),
+            (
+                "f=$(command curl -s https://e.example/p)",
+                "f=$(curl -s https://e.example/p)",
+            ),
+            ("env -S 'rm -rf /'", "rm -rf /"),
+            ("env -S 'crontab -' < f", "crontab - < f"),
+            ("cd x && env --split-string='rm -rf /'", "cd x && rm -rf /"),
+        ] {
+            assert_eq!(
+                launchers_read_through(line).as_deref(),
+                Some(read),
+                "{line}"
+            );
+        }
+        for line in [
+            "crontab -l",
+            "git status",
+            "ls -la",
+            "f=$(curl -s https://e.example/p)",
+        ] {
+            assert_eq!(launchers_read_through(line), None, "{line}");
+        }
+        // A body with a quote in it is left as written.
+        assert_eq!(
+            substitutions_read_through("a=$(env echo 'x y')"),
+            "a=$(env echo 'x y')"
+        );
+        assert_eq!(quoted_words(&words("crontab - <")), "crontab - <");
+        assert_eq!(
+            quoted_words(&["a b".to_owned(), "it's".to_owned()]),
+            "'a b' 'it'\\''s'"
         );
     }
 }

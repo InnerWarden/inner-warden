@@ -2648,7 +2648,7 @@ fn json_escapes_decoded(text: &str) -> String {
 
 /// The words of the command `env -S` runs, after the variables set in front
 /// of `env` and among its options: `None` when `words` are no such `env`.
-fn env_split_command(words: &[String]) -> Option<Vec<String>> {
+pub(crate) fn env_split_command(words: &[String]) -> Option<Vec<String>> {
     let env = words
         .iter()
         .position(|word| !is_environment_assignment(word))?;

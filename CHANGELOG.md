@@ -186,6 +186,17 @@ command only when what it prints may run (piped into a shell or an
 interpreter, read in a substitution, written to a file the line then runs):
 `gh api .../contents/x --jq .content | base64 -d` is no longer refused.
 
+The same line written another way gets at least the verdict of the line as
+first written. A launcher in front of a command (`env`, `command`,
+`builtin`, `exec`, `nice`, `nohup`, `timeout`, `stdbuf`, `sudo`, read
+from the program table), in a command substitution too, is read through to
+the command it runs; `env -S STRING` is read as the command its string
+splits into (`env -S 'rm -rf /'` was allowed); and a `bash -c` string that
+closes and reopens its quote (`'\''`) is read as the shell hands it on.
+Measured on the metamorphic corpus: 12 of 1603 variants were judged weaker
+than their original on main, none are now, and a test keeps it so; no
+verdict of the release safety suite moved.
+
 A here-document is read as the input of the command it is written after, and
 what a pipe hands a shell on its input is read as that shell's script. A
 narrow `Grep` of the home is held for review instead of refused. Every pull

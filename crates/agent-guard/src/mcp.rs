@@ -4070,7 +4070,50 @@ fn analyze_command_as_sent(
 
 /// [`analyze_command_at`] past the `innerwarden check` and `$'...'`
 /// readings: a sole literal handed to `eval` or a shell, else the line.
+///
+/// A line with a single-quoted word that closes and reopens its quote
+/// (`'\''`, `'"'"'`) is judged twice: with that word read as the shell
+/// hands it on, and as it was read before (outer quotes taken off only).
+/// The stronger verdict stands: reading the quote right only adds what the
+/// line hid, it never takes away a stop the earlier reading gave (measured
+/// 2026-11-21: `bash -c 'echo '\''id'\'' > x.sh && sed -i ... && sh x.sh'`
+/// went from a stopped review to a review that does not stop).
 fn analyze_command_unwrapped(
+    command: &str,
+    rule_engine: Option<&RuleEngine>,
+    protected_reads: &[String],
+    context: Option<&WorkingContext>,
+    depth: u8,
+) -> CommandAnalysis {
+    let read =
+        analyze_command_unwrapped_once(command, rule_engine, protected_reads, context, depth);
+    if crate::shell::reading_quotes_as_before()
+        || !(command.contains("'\\''") || command.contains("'\"'\"'"))
+    {
+        return read;
+    }
+    let before = crate::shell::with_quotes_as_before(|| {
+        analyze_command_unwrapped_once(command, rule_engine, protected_reads, context, depth)
+    });
+    if verdict_strength(&before) > verdict_strength(&read) {
+        before
+    } else {
+        read
+    }
+}
+
+/// How strongly an analysis holds a line: its verdict, then whether it
+/// stops an agent ([`blocks_for_agent`]), then its score.
+fn verdict_strength(analysis: &CommandAnalysis) -> (u8, bool, u32) {
+    let rank = match analysis.recommendation.as_str() {
+        "deny" => 2,
+        "review" => 1,
+        _ => 0,
+    };
+    (rank, blocks_for_agent(analysis), analysis.risk_score)
+}
+
+fn analyze_command_unwrapped_once(
     command: &str,
     rule_engine: Option<&RuleEngine>,
     protected_reads: &[String],
@@ -4100,9 +4143,65 @@ fn analyze_command_unwrapped(
     }
     let whole =
         analyze_command_with_its_values(command, rule_engine, protected_reads, context, depth);
+    let whole =
+        with_launchers_read_through(command, whole, rule_engine, protected_reads, context, depth);
     match literal {
         Some(analysis) if analysis.risk_score >= whole.risk_score => analysis,
         _ => whole,
+    }
+}
+
+/// The line judged once more with the launchers in front of its commands
+/// read through ([`crate::shell::runners::launchers_read_through`]): `f |
+/// env crontab -` is `f | crontab -` to the shell, so to every rule that
+/// reads a command by its name in place. The higher of the two verdicts
+/// stands; the reading only adds what the line as written hid. Measured
+/// 2026-11-21: `env`, `command` or a tab in front of `crontab -` took a
+/// refused line to review.
+fn with_launchers_read_through(
+    command: &str,
+    as_written: CommandAnalysis,
+    rule_engine: Option<&RuleEngine>,
+    protected_reads: &[String],
+    context: Option<&WorkingContext>,
+    depth: u8,
+) -> CommandAnalysis {
+    if READING_THROUGH_LAUNCHERS.with(std::cell::Cell::get) {
+        return as_written;
+    }
+    let Some(read) = crate::shell::runners::launchers_read_through(command) else {
+        return as_written;
+    };
+    READING_THROUGH_LAUNCHERS.with(|reading| reading.set(true));
+    let _clear = LaunchersReadThrough;
+    let through =
+        analyze_command_with_its_values(&read, rule_engine, protected_reads, context, depth);
+    if through.risk_score > as_written.risk_score {
+        CommandAnalysis {
+            command: as_written.command,
+            explanation: format!(
+                "with the launchers in front of its commands read through: {}",
+                through.explanation
+            ),
+            ..through
+        }
+    } else {
+        as_written
+    }
+}
+
+thread_local! {
+    /// Set while [`with_launchers_read_through`] judges its reading, so the
+    /// lines it hands on are not read through again from inside it.
+    static READING_THROUGH_LAUNCHERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clears [`READING_THROUGH_LAUNCHERS`] when the reading ends, unwinding too.
+struct LaunchersReadThrough;
+
+impl Drop for LaunchersReadThrough {
+    fn drop(&mut self) {
+        READING_THROUGH_LAUNCHERS.with(|reading| reading.set(false));
     }
 }
 
