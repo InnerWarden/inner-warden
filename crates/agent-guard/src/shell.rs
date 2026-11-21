@@ -4310,9 +4310,6 @@ fn unpacks_files(name: &str, args: &[String]) -> bool {
     }
 }
 
-/// Whether `sed` edits its files in place: `-i`, `-i.bak`, `--in-place`, or
-/// `i` in a group of short flags before one that takes a value (`-Ei`,
-/// `-ni`; the `i` of `-ei` is the script).
 /// The texts the edits in place before `reader` put in `path`: the
 /// replacement of a `sed` or `perl` `s///`, the text of a `sed` `a`,
 /// `i` or `c`, the command of a `sed` `e`, and the strings an `awk -i
@@ -4599,6 +4596,9 @@ fn double_quoted_strings(code: &str) -> Vec<String> {
     found
 }
 
+/// Whether `sed` edits its files in place: `-i`, `-i.bak`, `--in-place`, or
+/// `i` in a group of short flags before one that takes a value (`-Ei`,
+/// `-ni`; the `i` of `-ei` is the script).
 fn sed_in_place(args: &[String]) -> bool {
     args.iter().any(|arg| {
         if arg == "--in-place" || arg.starts_with("--in-place=") {
