@@ -3396,13 +3396,16 @@ fn guard_self_disable_in(content: &str) -> Option<(&'static str, u32)> {
 /// Whether inline interpreter code copies or links a file ONTO an agent's
 /// settings: `shutil.copy*`, `os.symlink`, `copyFileSync`, `symlinkSync`
 /// with the settings, or a variable assigned them, as the destination.
-/// A copy FROM the settings is a backup, a read, and stays out.
+/// A copy FROM the settings is a backup, a read, and stays out, and so is a
+/// copy onto a file of that name in a folder no agent reads
+/// (`backup/settings.json`): [`copy_destination_is_agent_settings`].
 fn interpreter_code_puts_file_onto_settings(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
     if !(lower.contains("copy") || lower.contains("symlink"))
         || !(lower.contains("settings")
             || lower.contains(".claude.json")
-            || lower.contains("mcp.json"))
+            || lower.contains("mcp.json")
+            || lower.contains(".codex"))
     {
         return false;
     }
@@ -3410,7 +3413,8 @@ fn interpreter_code_puts_file_onto_settings(content: &str) -> bool {
     static ONTO: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static ASSIGNED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static ONTO_NAME: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    const SETTINGS: &str = r#"(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json)"#;
+    const SETTINGS: &str =
+        r#"(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|config\.toml)"#;
     // The first argument, with one level of calls inside it
     // (`os.path.expanduser('~/x')`), then the destination.
     const CALL: &str = r#"\b(?:copy\w*|symlink(?:sync)?)\s*\(\s*[^,()]*(?:\([^()]*\)[^,()]*)*,\s*"#;
@@ -3424,18 +3428,26 @@ fn interpreter_code_puts_file_onto_settings(content: &str) -> bool {
         return false;
     }
     let onto = ONTO.get_or_init(|| {
-        regex::Regex::new(&format!(r#"(?s){CALL}[^,)]*?{SETTINGS}"#))
+        regex::Regex::new(&format!(r#"(?s){CALL}([^,)]*?{SETTINGS})"#))
             .expect("static copy onto settings regex")
     });
-    if onto.is_match(&lower) {
+    if onto
+        .captures_iter(&lower)
+        .filter_map(|c| c.get(1))
+        .any(|m| copy_destination_is_agent_settings(m.as_str()))
+    {
         return true;
     }
     let assigned = ASSIGNED.get_or_init(|| {
-        regex::Regex::new(&format!(r#"\b([a-z_]\w*)\s*=\s*[^;\n=]*?{SETTINGS}"#))
+        regex::Regex::new(&format!(r#"\b([a-z_]\w*)\s*=\s*([^;\n=]*?{SETTINGS})"#))
             .expect("static settings assignment regex")
     });
     let names: Vec<&str> = assigned
         .captures_iter(&lower)
+        .filter(|c| {
+            c.get(2)
+                .is_some_and(|m| copy_destination_is_agent_settings(m.as_str()))
+        })
         .filter_map(|c| c.get(1).map(|m| m.as_str()))
         .collect();
     if names.is_empty() {
@@ -3449,6 +3461,68 @@ fn interpreter_code_puts_file_onto_settings(content: &str) -> bool {
         .captures_iter(&lower)
         .filter_map(|c| c.get(1))
         .any(|m| names.contains(&m.as_str()))
+}
+
+/// Whether the destination of a copy, as code writes it up to a settings
+/// file name (lowercased, quotes and joins kept), is an agent's settings: a
+/// name is settings only in a folder an agent reads it from.
+///
+/// - In `.claude`, `.codex`, `.gemini`, `.cursor` or under `.config`
+///   (`~/.config/<agent>`): settings, whatever the name.
+/// - `config.toml`: only in `.codex`; elsewhere it is any tool's config.
+/// - A bare name (`'settings.json'`, `'./.mcp.json'`): settings, since
+///   the folder the code runs in is not known.
+/// - `.claude.json` or `mcp.json` in the home folder, and `mcp.json` at an
+///   absolute path (any folder can be a project's root): settings.
+/// - Any other folder (`backup/settings.json`,
+///   `/home/u/bkp/settings.local.json`, `backup/.mcp.json`): a copy.
+fn copy_destination_is_agent_settings(destination: &str) -> bool {
+    use std::sync::OnceLock;
+    static AGENT_FOLDER: OnceLock<regex::Regex> = OnceLock::new();
+    static NAME: OnceLock<regex::Regex> = OnceLock::new();
+    static HOME: OnceLock<regex::Regex> = OnceLock::new();
+    let agent_folder = AGENT_FOLDER.get_or_init(|| {
+        regex::Regex::new(r#"\.(?:claude|codex|gemini|cursor|config)(?:$|[/\\'"`\s+])"#)
+            .expect("static agent folder regex")
+    });
+    let name = NAME.get_or_init(|| {
+        regex::Regex::new(
+            r#"(settings(?:\.local)?\.json|\.claude\.json|\.?mcp\.json|config\.toml)$"#,
+        )
+        .expect("static settings name regex")
+    });
+    let Some(found) = name.find(destination) else {
+        return false;
+    };
+    let file = found.as_str();
+    let folder = &destination[..found.start()];
+    if file == "config.toml" {
+        return folder.contains(".codex");
+    }
+    if agent_folder.is_match(folder) {
+        return true;
+    }
+    // The folder with the quotes, joins and separators around the name
+    // taken off: empty or `.` for a bare name.
+    let trimmed = folder
+        .trim_end_matches(|c: char| "/\\'\"` +".contains(c) || c.is_whitespace())
+        .trim_start_matches(|c: char| "'\"`\\".contains(c) || c.is_whitespace());
+    if trimmed.is_empty() || trimmed == "." {
+        return true;
+    }
+    if file == "settings.json" || file == "settings.local.json" {
+        return false;
+    }
+    let home = HOME.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?:^|[^\w.])(?:/(?:home|users)/[\w.-]+|/root|~|\$\{?home\}?)$|\benv\.home$"#,
+        )
+        .expect("static home folder regex")
+    });
+    if home.is_match(trimmed) {
+        return true;
+    }
+    file.ends_with("mcp.json") && trimmed.starts_with(['/', '~', '$'])
 }
 
 /// Whether inline interpreter code writes an agent's settings in a way the
