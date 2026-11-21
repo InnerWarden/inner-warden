@@ -802,6 +802,24 @@ pub fn replace_if_unchanged(
     .map_err(String::from)
 }
 
+/// Remove `path` when it still holds exactly `expected`, under the same
+/// update lock the writes take: a file an editor or agent changed since it was
+/// read is left in place, and the caller is told to retry. A link is resolved
+/// and its target removed, as [`replace`] writes through one. The lock's
+/// sibling file stays, as it does after every write.
+pub fn remove_if_unchanged(path: &Path, expected: &[u8]) -> Result<(), String> {
+    let target = resolve_target(path)?;
+    let _lock = UpdateLock::acquire(&target, Ownership::Preserve, CONFIG_LOCK_WAIT)
+        .map_err(String::from)?;
+    if current_bytes(&target, MAX_CONFIG_BYTES)?.as_deref() != Some(expected) {
+        return Err(format!(
+            "{} changed while InnerWarden was preparing the update; retry",
+            path.display()
+        ));
+    }
+    fs::remove_file(&target).map_err(|error| format!("removing {}: {error}", target.display()))
+}
+
 /// Automatic/background variant. Unlike explicit commands, it rejects observed
 /// file symlinks/reparse points, opens the final file with no-follow semantics,
 /// and rechecks path components immediately before commit. A hostile same-user

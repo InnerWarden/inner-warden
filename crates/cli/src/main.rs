@@ -842,7 +842,7 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
             .iter()
             .any(|a| a == "--agent" || a.starts_with("--agent="))
     {
-        eprintln!("innerwarden: --agent takes an agent id (claude-code, codex, cursor, gemini, hermes, openclaw)");
+        eprintln!("innerwarden: --agent takes an agent id (antigravity, claude-code, codex, cursor, gemini, hermes, openclaw)");
         return std::process::ExitCode::from(2);
     }
     let mut words: Vec<String> = Vec::new();
@@ -1097,7 +1097,10 @@ fn hook_outcome(
     }
     let shell = Some(innerwarden_agent_guard::cursor_hook::Event::Shell);
     match review_answer_for(agent, shell) {
-        ReviewAnswer::AskClaudeCode | ReviewAnswer::AskHermes | ReviewAnswer::AskCursor => (
+        ReviewAnswer::AskClaudeCode
+        | ReviewAnswer::AskHermes
+        | ReviewAnswer::AskCursor
+        | ReviewAnswer::AskAntigravity => (
             HookOutcome::Ask,
             Some("a review runs only if you approve it".to_string()),
         ),
@@ -1607,6 +1610,12 @@ fn unreadable_exit_code(monitor: bool) -> u8 {
 /// as a refusal (`unreadable`), so the operator sees it beside the others.
 /// `buf` is what was read of the call, empty when nothing was.
 fn hook_unreadable(buf: &str, rest: &[String], why: &str, monitor: bool) -> std::process::ExitCode {
+    // An agent that reads the reason in JSON (Cursor, Antigravity) gets this
+    // one, whichever read failed: the payload, stdin, a call too long, a
+    // file tool's.
+    note_refusal(format!(
+        "InnerWarden could not read this call ({why}) and refused it."
+    ));
     let explanation = format!("unreadable: could not read this tool call ({why})");
     let label = format!("(unreadable tool call: {why})");
     let verdict = serde_json::json!({
@@ -1672,6 +1681,13 @@ fn install_hook_panic_guard(monitor: bool) {
         // Never `eprintln!` here: it panics when stderr is gone, and a panic
         // inside the panic hook aborts, which is the outcome this prevents.
         let _ = std::io::Write::write_all(&mut std::io::stderr(), message.as_bytes());
+        // An agent that reads its answer as JSON (Antigravity) is answered on
+        // stdout, with exit 0.
+        if let Some(answer) = hook_net::json_answer() {
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), answer.as_bytes());
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            std::process::exit(0);
+        }
         std::process::exit(i32::from(code));
     }));
 }
@@ -2115,6 +2131,10 @@ enum ReviewAnswer {
     /// `beforeMCPExecution`). A read takes allow or deny only, so a review
     /// of a read is [`ReviewAnswer::Refuse`].
     AskCursor,
+    /// The Antigravity CLI: `decision: "force_ask"` on stdout (its hooks
+    /// documentation, `PreToolUse`), which asks the person even where an
+    /// earlier "Always Allow" would skip `ask`.
+    AskAntigravity,
     /// Every other agent: refused, exit 2 with the reason on stderr, as a
     /// `deny` is. That is Gemini CLI, whose `decision: "ask"` is not proven
     /// to reach a person: in 0.68.0 (`scheduler/scheduler.ts`,
@@ -2141,6 +2161,7 @@ fn review_answer_for(
     match agent {
         None | Some("claude-code") => ReviewAnswer::AskClaudeCode,
         Some(innerwarden_agent_guard::hermes_hook::AGENT) => ReviewAnswer::AskHermes,
+        Some(innerwarden_agent_guard::antigravity_hook::AGENT) => ReviewAnswer::AskAntigravity,
         Some("codex") => ReviewAnswer::WarnCodex,
         Some(innerwarden_agent_guard::cursor_hook::AGENT) => match cursor {
             Some(event) if event.can_ask() => ReviewAnswer::AskCursor,
@@ -2186,6 +2207,9 @@ fn review_answer_line(answer: ReviewAnswer, explanation: &str) -> Option<String>
             ),
         }),
         ReviewAnswer::AskCursor => return Some(innerwarden_agent_guard::cursor_hook::ask(&ask)),
+        ReviewAnswer::AskAntigravity => {
+            return Some(innerwarden_agent_guard::antigravity_hook::ask(&ask))
+        }
         ReviewAnswer::Refuse => return None,
     };
     Some(json.to_string())
@@ -2293,12 +2317,108 @@ fn cursor_wiring_lost(buf: &str, rest: &[String], monitor: bool) -> Option<std::
     Some(std::process::ExitCode::from(2))
 }
 
+/// What the hook writes for the Antigravity CLI once the screening ended
+/// with `exit`, and the exit it ends with: always 0.
+///
+/// Antigravity reads a JSON `decision` on stdout. What it does with any other
+/// exit, or with no decision, is not documented, and the Gemini API's own
+/// hooks run the tool then (see `antigravity_hook`). So every call is
+/// answered here, on stdout, with exit 0: a call the guard lets through is
+/// `allow`; a refusal (exit 2, or any other end of an enforcing run) is
+/// `deny` with its reason; in monitor mode every end is `allow`. An answer
+/// already written (an ask, a warning) stands.
+fn antigravity_answer(exit: std::process::ExitCode, monitor: bool) -> std::process::ExitCode {
+    use innerwarden_agent_guard::antigravity_hook;
+    if HOOK_ANSWERED.load(std::sync::atomic::Ordering::SeqCst) {
+        return std::process::ExitCode::SUCCESS;
+    }
+    if exit == std::process::ExitCode::SUCCESS || monitor {
+        println!("{}", antigravity_hook::allow());
+    } else {
+        let reason = HOOK_REFUSAL
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .unwrap_or_else(|| CURSOR_REFUSED.to_string());
+        println!("{}", antigravity_hook::deny(&reason));
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// An Antigravity tool the guard does not read (`AgyCall::Unknown`): never
+/// let through as a call that names nothing. In enforce mode the person is
+/// asked (`force_ask`, which no earlier "Always Allow" skips), or with
+/// `--block-review` it is refused; in monitor mode it runs, unscreened, and
+/// says so. Recorded as a review in every mode.
+fn antigravity_unknown_tool(
+    buf: &str,
+    rest: &[String],
+    tool: &str,
+    monitor: bool,
+    block_review: bool,
+) -> std::process::ExitCode {
+    let explanation = format!(
+        "review: {tool} is an Antigravity tool the guard does not read; it was not screened"
+    );
+    let label = format!("(Antigravity tool the guard does not read: {tool})");
+    let verdict = serde_json::json!({
+        "command": label,
+        "risk_score": 40,
+        "severity": "medium",
+        "signals": [{
+            "signal": "unread_tool",
+            "score": 40,
+            "detail": explanation,
+        }],
+        "recommendation": "review",
+        "explanation": explanation,
+    });
+    record_shell(
+        buf,
+        rest,
+        &label,
+        &verdict,
+        monitor,
+        block_review,
+        None,
+        false,
+    );
+    if monitor {
+        eprintln!(
+            "InnerWarden hook: {tool} is an Antigravity tool the guard does not read; it was NOT \
+             screened (monitor mode never blocks)."
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
+    if block_review {
+        let line = format!(
+            "InnerWarden refused {tool}: an Antigravity tool the guard does not read, and this \
+             hook refuses every review (--block-review)."
+        );
+        eprintln!("{line}");
+        note_refusal(line);
+        return std::process::ExitCode::from(2);
+    }
+    println!(
+        "{}",
+        innerwarden_agent_guard::antigravity_hook::ask(&format!(
+            "InnerWarden does not read the Antigravity tool {tool}, so it did not screen this \
+             call. Allow it only if you expected it."
+        ))
+    );
+    HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::process::ExitCode::SUCCESS
+}
+
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let exit = cmd_hook_screen(rest);
-    if agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::cursor_hook::AGENT) {
-        return cursor_answer(exit);
+    match agent_flag(rest).as_deref() {
+        Some(innerwarden_agent_guard::cursor_hook::AGENT) => cursor_answer(exit),
+        Some(innerwarden_agent_guard::antigravity_hook::AGENT) => {
+            antigravity_answer(exit, rest.iter().any(|a| a == "--monitor"))
+        }
+        _ => exit,
     }
-    exit
 }
 
 fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
@@ -2313,10 +2433,16 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     // The flag counts as the line's last word only, as the grammar of a line
     // of ours reads it (`hook::is_iwguard_prompt_hook`), and never for
     // Cursor, whose wiring has no prompt line.
+    let json_answer =
+        agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::antigravity_hook::AGENT);
     let prompt_line = rest.last().map(String::as_str)
         == Some(innerwarden_agent_guard::user_prompt::PROMPT_LINE_FLAG)
-        && agent_flag(rest).as_deref() != Some(innerwarden_agent_guard::cursor_hook::AGENT);
+        && agent_flag(rest).as_deref() != Some(innerwarden_agent_guard::cursor_hook::AGENT)
+        && !json_answer;
     hook_net::set_quiet(prompt_line);
+    // Antigravity reads its answer as JSON on stdout only: every end the net
+    // gives (the deadline, a fault, a panic) answers it there.
+    hook_net::set_json_answer(json_answer, monitor);
     install_hook_panic_guard(monitor);
     // Before stdin is read: a caller that never closes it is one of the
     // ends the net is for.
@@ -2403,11 +2529,17 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
                 buf
             }
             CursorCall::Other => return std::process::ExitCode::SUCCESS,
-            CursorCall::Unreadable(why) => {
-                note_refusal(format!(
-                    "InnerWarden could not read this call ({why}) and refused it."
-                ));
-                return hook_unreadable(&buf, rest, why, monitor);
+            CursorCall::Unreadable(why) => return hook_unreadable(&buf, rest, why, monitor),
+        }
+    } else if json_answer {
+        // The Antigravity CLI sends its own camelCase shape: read as the
+        // call every other agent's hook carries.
+        use innerwarden_agent_guard::antigravity_hook::{self, AgyCall};
+        match antigravity_hook::read(&buf) {
+            AgyCall::Call(call) => call.to_string(),
+            AgyCall::Unreadable(why) => return hook_unreadable(&buf, rest, why, monitor),
+            AgyCall::Unknown(tool) => {
+                return antigravity_unknown_tool(&buf, rest, &tool, monitor, block_review)
             }
         }
     } else {
@@ -3055,6 +3187,13 @@ fn warn_agent(agent: Option<&str>, line: &str) -> bool {
         }
         Some(cursor_hook::AGENT) => {
             println!("{}", cursor_hook::allow_with_warning(line));
+            true
+        }
+        Some(innerwarden_agent_guard::antigravity_hook::AGENT) => {
+            println!(
+                "{}",
+                innerwarden_agent_guard::antigravity_hook::allow_with_warning(line)
+            );
             true
         }
         Some(_) => {

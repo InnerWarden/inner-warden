@@ -1014,6 +1014,11 @@ fn hook_spec(
     mcp_toml: Option<&str>,
 ) -> Option<&'static HookSpec> {
     let spec = agent_hooks::spec_for(name)?;
+    // An agent wired by its hook alone (Antigravity) has no MCP config to
+    // match: a row that names one is not that agent.
+    if !spec.has_mcp_config() {
+        return (mcp_json.is_none() && mcp_toml.is_none()).then_some(spec);
+    }
     (mcp_json.or(mcp_toml) == Some(spec.mcp_config)).then_some(spec)
 }
 
@@ -1180,6 +1185,10 @@ pub fn status_has_unguarded_server(home: &Path, agent: &AgentStatus) -> bool {
     if agent.name == hermes_hook::AGENT {
         return !hermes_hook::state(home, None).installed();
     }
+    // Wired by its hook alone: the hook is the work left.
+    if let Some(spec) = hook_spec_of(agent).filter(|spec| !spec.has_mcp_config()) {
+        return !agent_hooks::state(home, spec, None).installed();
+    }
     if agent.hookable {
         return !read_json(&home.join(".claude/settings.json"))
             .map(|value| hook::has_iwguard_wiring(&value))
@@ -1259,6 +1268,12 @@ pub fn status_is_effectively_guarded(home: &Path, agent: &AgentStatus) -> bool {
         return read_json(&home.join(".claude/settings.json"))
             .map(|value| claude_hook_screens(&value, path_env.as_deref()))
             .unwrap_or(false);
+    }
+    // An agent wired by its hook alone (Antigravity) has nothing else to
+    // count: its hook, when the agent runs it.
+    if let Some(spec) = hook_spec_of(agent).filter(|spec| !spec.has_mcp_config()) {
+        let path_env = std::env::var_os("PATH");
+        return agent_hooks::state(home, spec, path_env.as_deref()).is_on();
     }
     // The MCP wiring alone: the dashboard reads the mode of these rows from
     // their MCP config, so the hook of Codex or Gemini is not counted here.
@@ -1374,7 +1389,7 @@ pub fn guard_bin() -> String {
 }
 
 fn mechanism(r: &AgentStatus) -> &'static str {
-    if r.hookable || r.name == hermes_hook::AGENT {
+    if r.hookable || r.name == hermes_hook::AGENT || r.name == crate::antigravity_hook::AGENT {
         "hook"
     } else if r.mcp_json.is_some() || r.mcp_toml.is_some() || r.mcp_yaml.is_some() {
         "MCP proxy"
@@ -1398,6 +1413,9 @@ fn two_way_label(home: &Path, r: &AgentStatus, state: &HookState) -> String {
         (true, true) => format!("✓ guarded (hook, {})", mode(r.mode)),
         (true, false) => format!("partly guarded (MCP proxy, {})", mode(r.mode)),
         (false, true) => format!("partly guarded (hook, {})", mode(hook_guard_mode(state))),
+        (false, false) if hook_spec_of(r).is_some_and(|spec| !spec.has_mcp_config()) => {
+            "not guarded, connect via hook".to_string()
+        }
         (false, false) => "not guarded, connect via hook + proxy".to_string(),
     }
 }
@@ -1605,7 +1623,19 @@ fn connect_hook_and_proxy(
         monitor,
         codex.as_deref(),
     );
-    let proxy = connect_by_one_mechanism(home, r, guard_bin, strict, monitor, false);
+    // An agent with no MCP config here (Antigravity) gets its hook alone.
+    let proxy = if spec.has_mcp_config() {
+        connect_by_one_mechanism(home, r, guard_bin, strict, monitor, false)
+    } else {
+        ConnectResult::new(
+            ConnectEffect::Skipped,
+            format!(
+                "  {} - its MCP servers are not routed through the guard proxy (where {} keeps \
+                 them is not confirmed)",
+                r.name, spec.product
+            ),
+        )
+    };
 
     let mut lines = Vec::new();
     let mut hook_stopped = None;
@@ -1649,14 +1679,16 @@ fn connect_hook_and_proxy(
     // On a connect a person ran, the proxy step is skipped for one reason
     // only: the agent has no stdio server to wrap. Its own words for that end
     // in "nothing to guard", which is not true beside a hook.
-    lines.push(if proxy.effect == ConnectEffect::Skipped {
-        format!(
-            "  {} - no local MCP servers to route through the guard proxy",
-            r.name
-        )
-    } else {
-        proxy.line
-    });
+    lines.push(
+        if proxy.effect == ConnectEffect::Skipped && spec.has_mcp_config() {
+            format!(
+                "  {} - no local MCP servers to route through the guard proxy",
+                r.name
+            )
+        } else {
+            proxy.line
+        },
+    );
     if let Ok(connected) = &hooked {
         lines.extend(
             agent_hooks::connect_notes(spec, &connected.outcome)
@@ -2080,6 +2112,14 @@ fn disconnect_one(home: &Path, r: &AgentStatus) -> String {
         return disconnect_by_one_mechanism(home, r);
     };
     let unhooked = agent_hooks::uninstall_noting_moved(home, spec);
+    // An agent wired by its hook alone (Antigravity) has no proxy step.
+    if !spec.has_mcp_config() {
+        return match unhooked {
+            Ok((0, _)) => format!("  {}, was not connected", r.name),
+            Ok(_) => format!("  {}, disconnected", r.name),
+            Err(error) => format!("  {}, failed: {error}", r.name),
+        };
+    }
     let proxy = disconnect_by_one_mechanism(home, r);
     let (removed, moved) = match unhooked {
         Ok(done) => done,

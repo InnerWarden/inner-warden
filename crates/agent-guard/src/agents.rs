@@ -11,6 +11,7 @@
 //! it could not screen: see `cmd_install`);
 //! Cursor and Gemini use their JSON MCP configuration, and Codex uses TOML.
 //! Codex, Gemini and Cursor also get their own blocking hook beside the proxy,
+//! and the Antigravity CLI gets its hook alone,
 //! on a connect a person ran (see [`crate::agent_hooks`]).
 //! Other detected agents remain visible but are not modified automatically until
 //! InnerWarden has an integration for their real configuration format.
@@ -116,6 +117,28 @@ pub const KNOWN: &[Known] = &[
         hookable: false,
         // Gemini CLI stores MCP servers in the top-level `mcpServers` key here.
         mcp_json: Some(".gemini/settings.json"),
+        mcp_toml: None,
+        mcp_yaml: None,
+    },
+    // The Antigravity CLI (`agy`), Gemini CLI's successor for its free and
+    // individual users. Wired through its own hook in
+    // ~/.gemini/config/hooks.json ([`crate::antigravity_hook`]); where it keeps
+    // its MCP servers is not confirmed, so there is no MCP config to wrap.
+    Known {
+        name: "antigravity",
+        aliases: &["antigravity", "agy", "antigravity-cli", "antigravity cli"],
+        executables: &["agy"],
+        config_dir: ".gemini/antigravity-cli",
+        config_files: &[
+            (
+                ".gemini/antigravity-cli/settings.json",
+                ConfigFormat::JsonObject,
+            ),
+            (".gemini/config/hooks.json", ConfigFormat::JsonObject),
+        ],
+        profile_config: None,
+        hookable: false,
+        mcp_json: None,
         mcp_toml: None,
         mcp_yaml: None,
     },
@@ -323,6 +346,7 @@ impl AgentStatus {
             || self.mcp_yaml.is_some()
             || self.mcp_toml.is_some()
             || self.name == crate::hermes_hook::AGENT
+            || self.name == crate::antigravity_hook::AGENT
     }
 
     pub fn has_evidence(&self, evidence: DiscoveryEvidence) -> bool {

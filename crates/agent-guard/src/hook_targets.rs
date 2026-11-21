@@ -21,6 +21,9 @@
 //! * [`Mechanism::McpProxy`] — the agent speaks MCP and its config has a
 //!   lossless editor, so `agents connect` rewrites it to run through the proxy.
 //!   Automatic and reversible; covers agents with no hook surface at all.
+//! * [`Mechanism::AgentHook`]: the agent's own pre-tool hook, outside
+//!   Claude Code's settings, written by `agents connect` with no proxy
+//!   beside it, for an agent whose MCP config is not confirmed.
 //! * [`Mechanism::NotYetWirable`] — no hook AND no lossless editor for its
 //!   config format, so nothing can be wired without risking the user's file.
 //!   This is the honest gap, and naming it is what stops it being forgotten.
@@ -51,6 +54,14 @@ pub enum Mechanism {
     /// "no guardable agent named `codex-cli` was found" - advice that fails is
     /// worse than no advice, because it reads as "this cannot be protected".
     McpProxy {
+        why: &'static str,
+        connect: &'static str,
+    },
+    /// Its own pre-tool hook, outside Claude Code's settings, with no MCP
+    /// config to route through the proxy (the Antigravity CLI): `agents
+    /// connect` writes the hook alone. `why` says what it screens; `connect`
+    /// is the name `agents connect` accepts.
+    AgentHook {
         why: &'static str,
         connect: &'static str,
     },
@@ -148,6 +159,16 @@ pub static TARGETS: &[HookTarget] = &[
             connect: "gemini",
         },
         markers: &[".gemini"],
+    },
+    HookTarget {
+        id: "antigravity",
+        display: "Antigravity CLI",
+        aliases: &["agy"],
+        mechanism: Mechanism::AgentHook {
+            why: "its shell commands, file changes and file reads are screened by the hook `agents connect` installs in ~/.gemini/config/hooks.json; its MCP servers are not behind the proxy",
+            connect: "antigravity",
+        },
+        markers: &[".gemini/antigravity-cli"],
     },
     HookTarget {
         id: "aider",
@@ -253,7 +274,7 @@ pub fn guidance(target: &HookTarget) -> String {
         // the proxy, reversibly and idempotently. Telling the operator to invoke
         // `innerwarden proxy` by hand would send them the long way round a thing
         // the product already does for them.
-        Mechanism::McpProxy { why, connect } => format!(
+        Mechanism::McpProxy { why, connect } | Mechanism::AgentHook { why, connect } => format!(
             "{}: {why}. Guard it with:  innerwarden agents connect {connect}",
             target.display
         ),
@@ -471,5 +492,42 @@ mod tests {
             );
             assert!(crate::agent_hooks::spec_for(connect).is_some(), "{connect}");
         }
+    }
+}
+
+/// The targets wired by their own hook alone ([`Mechanism::AgentHook`]).
+#[cfg(test)]
+mod agent_hook_tests {
+    use super::*;
+
+    /// Each prints a connect that resolves: a known agent with the hook
+    /// `agents connect` writes, and no MCP config (else it would be offered
+    /// the proxy as well).
+    ///
+    /// FAILS ON REVERT: take `ANTIGRAVITY` out of `agent_hooks::spec_for`,
+    /// and the connect this prints has no hook to write.
+    #[test]
+    fn every_agent_hook_target_resolves_to_its_hook() {
+        let mut seen = 0;
+        for target in TARGETS {
+            let Mechanism::AgentHook { connect, .. } = target.mechanism else {
+                continue;
+            };
+            seen += 1;
+            let known = crate::agents::KNOWN
+                .iter()
+                .find(|k| k.name == connect)
+                .unwrap_or_else(|| panic!("{} points at unknown `{connect}`", target.id));
+            assert!(
+                known.mcp_json.is_none() && known.mcp_toml.is_none() && known.mcp_yaml.is_none(),
+                "{connect} has an MCP config: offer it the proxy"
+            );
+            let spec = crate::agent_hooks::spec_for(connect)
+                .unwrap_or_else(|| panic!("{connect} has no hook to connect"));
+            assert!(!spec.has_mcp_config(), "{connect}");
+            assert!(guidance(target).contains(&format!("innerwarden agents connect {connect}")));
+        }
+        assert_eq!(seen, 1, "the Antigravity CLI is the one such target today");
+        assert_eq!(by_id("agy").map(|t| t.id), Some("antigravity"));
     }
 }

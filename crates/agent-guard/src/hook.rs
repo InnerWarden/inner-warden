@@ -690,6 +690,28 @@ screened (monitor mode never blocks).\" >&2; exit 1";
 /// refuses a call on an exit a plain monitor line can end with.
 const FAIL_OPEN_AGENT: &str = "gemini";
 
+/// The agent that reads its hook's answer only as JSON on stdout: the
+/// Antigravity CLI ([`crate::antigravity_hook`]). What it does with an exit
+/// other than 0 is not documented, and the Gemini API's own hooks run the
+/// tool on one, so its enforcing line ends in [`JSON_FAIL_CLOSED_TAIL`].
+const JSON_ANSWER_AGENT: &str = crate::antigravity_hook::AGENT;
+
+/// What the enforcing line of [`JSON_ANSWER_AGENT`] runs after the guard.
+/// The guard answers that agent with a JSON decision and exit 0, a refusal
+/// included; any other end means it did not answer, and the script prints the
+/// refusal itself, as JSON on stdout, and ends with 0 so the agent reads it.
+/// No `'` in it, as in the other tails. It holds `\042` (a double quote,
+/// for printf) where the other tails have none: a backslash inside single
+/// quotes is kept as it is by sh, bash, zsh and fish alike (fish reads only
+/// `\\` and `\'` there), and inside the script's double quotes sh keeps it
+/// too, so printf is handed `\042`.
+const JSON_FAIL_CLOSED_TAIL: &str =
+    "; s=$?; case $s in 0) exit 0;; esac; printf \"{\\042decision\\042: \
+\\042deny\\042, \\042reason\\042: \\042InnerWarden hook: the innerwarden program ended without an \
+answer (exit %s); refusing this tool call rather than letting it run unscreened. To stop this, put \
+the innerwarden program back, or remove the innerwarden entry from ~/.gemini/config/hooks.json by \
+hand.\\042}\\n\" \"$s\"; exit 0";
+
 /// PURE: the hook line for Codex CLI, Gemini CLI and Hermes Agent, with its
 /// shape chosen by the caller. Codex starts a hook line with the person's
 /// login shell (`$SHELL -lc`), which may be one that cannot read the
@@ -715,6 +737,7 @@ pub fn hook_command_shaped(
 ) -> String {
     let words = hook_words(block_review, monitor, agent);
     let tail = match (monitor, agent) {
+        (false, Some(JSON_ANSWER_AGENT)) => JSON_FAIL_CLOSED_TAIL,
         (false, _) => FAIL_CLOSED_TAIL,
         (true, Some(FAIL_OPEN_AGENT)) => FAIL_OPEN_TAIL,
         (true, _) => "",
@@ -1162,6 +1185,7 @@ fn guard_words(command: &str) -> Option<(Vec<String>, LineShape)> {
     let (guard, shape) = match guard
         .strip_suffix(FAIL_CLOSED_TAIL)
         .or_else(|| guard.strip_suffix(FAIL_CLOSED_TAIL_1615))
+        .or_else(|| guard.strip_suffix(JSON_FAIL_CLOSED_TAIL))
     {
         Some(guard) => (guard, LineShape::FailClosed),
         None => (guard.strip_suffix(FAIL_OPEN_TAIL)?, LineShape::FailOpen),
