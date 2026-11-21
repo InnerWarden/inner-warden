@@ -2999,7 +2999,7 @@ mod tests {
         );
         assert_eq!(
             row_of(&payload, "cursor")["mcp"],
-            serde_json::json!({"stdio": 2, "wrapped": 2, "remote": 1})
+            serde_json::json!({"stdio": 3, "wrapped": 3, "remote": 0})
         );
     }
 

@@ -929,6 +929,7 @@ dependencies = [
  "tree-sitter",
  "tree-sitter-bash",
  "unicode-normalization",
+ "ureq",
  "windows-sys 0.61.2",
  "xattr",
 ]

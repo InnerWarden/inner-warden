@@ -1797,8 +1797,17 @@ fn connect_by_one_mechanism(
         // a person ran. Automatic setup never reaches this for existing wiring
         // (it stops at "existing MCP wiring left unchanged" above), exactly as
         // it never adds a name to an existing hook.
-        let (wrapped, n) = mcp_wire::wrap(cfg, guard_bin, monitor, &r.name);
-        let fully_guarded = mcp_wire::is_guarded(&wrapped);
+        // Automatic setup wraps only local servers; a remote server goes
+        // through the proxy on a connect a person runs (`mcp_wire::wrap_local`).
+        let (wrapped, n, fully_guarded) = if reject_symlinks {
+            let (wrapped, n) = mcp_wire::wrap_local(cfg, guard_bin, monitor, &r.name);
+            let guarded = mcp_wire::local_servers_guarded(&wrapped);
+            (wrapped, n, guarded)
+        } else {
+            let (wrapped, n) = mcp_wire::wrap(cfg, guard_bin, monitor, &r.name);
+            let guarded = mcp_wire::is_guarded(&wrapped);
+            (wrapped, n, guarded)
+        };
         if !fully_guarded {
             return ConnectResult::new(
                 ConnectEffect::Failed,
@@ -3879,9 +3888,21 @@ mod tests {
                 "/abs/innerwarden"
             );
         }
+        // A connect a person runs carries the remote server too
+        // (`mcp_proxy::remote`); its proxy names OpenClaw and its address.
         assert_eq!(
-            config["mcp"]["servers"]["remote"],
-            serde_json::json!({"url": "https://example.com/sse"})
+            openclaw_server_args(&config, "remote"),
+            vec![
+                "proxy",
+                "--label",
+                "openclaw",
+                "--agent",
+                "openclaw",
+                "--mode",
+                "advisory",
+                "--",
+                "https://example.com/sse"
+            ]
         );
         assert_eq!(config["gateway"], serde_json::json!({"port": 18789}));
     }

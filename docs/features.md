@@ -31,6 +31,43 @@ list, with every limit.
   `stats://tokens`) and a file in a folder that names one are read with an
   alert. In `advisory` and `warn` every one of these is alerted and passes,
   and so is every one in 1.6.15, in any mode.
+- From the release after 1.6.15, MCP servers reached by URL go through the
+  same proxy as local ones. `innerwarden agents connect` rewrites a JSON
+  client's remote entry (`url`, Gemini CLI's `httpUrl`, `serverUrl`; a
+  `type` of `http`, `sse` or `streamable-http`) into
+  `innerwarden proxy --mode guard -- <address>`, and the proxy talks HTTP(S)
+  to the server: Streamable HTTP, falling back to the older HTTP with SSE when
+  the server answers the first POST with 400, 404 or 405 (or from the start
+  for `"type": "sse"`). The calls get every check a local server's get
+  (pinned definitions, effect and provenance, secrets in answers, the
+  posture). The proxy opens no port and serves no TLS of its own: the client
+  reaches it through a pipe, and it reaches the server with the system's
+  certificates. The entry's headers travel in the wrapper's `env`
+  (`INNERWARDEN_MCP_HEADER_1`, ...), redirects are not followed, no proxy from
+  the environment (`HTTP_PROXY`) is used, an error names only the server's
+  host, and an SSE
+  endpoint on another origin is refused. `agents disconnect` writes the entry
+  back with its address, key, type and headers. Limits: the proxy cannot sign
+  in for the client, so an entry with `oauth`, `auth` or
+  `authProviderType` is left as it was (and counted as not screened), and a
+  server that asks for a sign-in the client would have done (HTTP 401) gets an
+  error that says to put its token in the entry's headers; Codex's TOML and
+  Goose's YAML remote servers are not carried yet.
+- From the release after 1.6.15, a tool call whose tool's name says it
+  deletes, moves or writes (`delete_directory`, `move_file`, `write_file`,
+  `fs.rmdir`, ...) is refused in `guard`, `strict` and `kill`
+  (`AG-PROTECTED-TARGET`) when the path it names, as a whole argument, is the
+  root, a folder of the operating system (`/etc`, `/usr` above
+  `/usr/local/<dir>`, `/bin`, `/lib*`, `/boot`, `/System`,
+  `C:\Windows`, at any depth), a top folder of the system tree or one level
+  into it (`/var`, `/var/lib`, `/opt/app`, `/mnt/backup`, `/Volumes/disk`),
+  a whole home (`~`, `/home/u`, `/Users/u`, `/root`) or a store of keys
+  (`.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.pki`,
+  `.password-store`, `.config/gcloud`, `.local/share/keyrings`,
+  `Library/Keychains`). `advisory` and `warn` record it. Before,
+  `delete_directory {"path": "/etc"}` matched only a rule that does not refuse.
+  A relative path is not judged, and deeper paths (`/var/www/site/x`,
+  `/usr/local/bin/tool`, `/tmp/x`) are ordinary work.
 - The MCP proxy's default posture (`guard`, from the release after 1.6.15): a
   rule that matches a tool call by the tool's name or by its argument names
   alone (ATR-2026-098 on every `send_money` and every `"recipient":`,

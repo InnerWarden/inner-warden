@@ -489,7 +489,15 @@ httpUrl = "https://example.com/stream"
             remote: 2,
         };
         assert_eq!(server_counts_toml(&doc), expected);
-        assert_eq!(crate::mcp_wire::server_counts(&json_cfg), expected);
+        // The JSON wiring carries a remote server through the proxy
+        // (`mcp_proxy::remote`); Codex's TOML does not yet, so there the two
+        // remote servers stay counted unscreened.
+        let json_expected = crate::mcp_wire::ServerCounts {
+            stdio: 5,
+            wrapped: 0,
+            remote: 0,
+        };
+        assert_eq!(crate::mcp_wire::server_counts(&json_cfg), json_expected);
         wrap_toml(&mut doc, "/abs/innerwarden", true, "codex");
         let (wrapped_json, _) = crate::mcp_wire::wrap(json_cfg, "/abs/innerwarden", true, "codex");
         let after = crate::mcp_wire::ServerCounts {
@@ -497,7 +505,13 @@ httpUrl = "https://example.com/stream"
             ..expected
         };
         assert_eq!(server_counts_toml(&doc), after);
-        assert_eq!(crate::mcp_wire::server_counts(&wrapped_json), after);
+        assert_eq!(
+            crate::mcp_wire::server_counts(&wrapped_json),
+            crate::mcp_wire::ServerCounts {
+                wrapped: 5,
+                ..json_expected
+            }
+        );
         let empty: DocumentMut = "model = \"x\"\n".parse().expect("toml");
         assert_eq!(
             server_counts_toml(&empty),
