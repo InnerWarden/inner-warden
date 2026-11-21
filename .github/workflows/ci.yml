@@ -568,10 +568,23 @@ jobs:
         # struggles with tests that fork and exec. This job failed twice with
         # `Error: "Test failed during run"` and no failing test named while the
         # config alone carried the engine key.
-        # `--timeout 300`: the default is 60 seconds without a response from a
-        # test binary, and `conversation_attempts` spawns the CLI hundreds of
-        # times under instrumentation, so it ran past that on a healthy tree.
-        run: cargo tarpaulin --engine llvm --skip-clean --timeout 300 --out Xml
+        # `--timeout 900`: under the llvm engine this is NOT a per-test limit.
+        # tarpaulin starts the clock when it launches a test binary and only
+        # stops it when the process exits (statemachine Waiting state, 0.37.6),
+        # so it bounds the WHOLE binary. The default is 60 seconds;
+        # `conversation_attempts` spawns the CLI hundreds of times under
+        # instrumentation, which is why it became 300. Since then the
+        # agent-guard unit binary grew to 1,730 tests: 125 s of wall time
+        # uninstrumented and 162 s under tarpaulin on a 4-core lab host
+        # (2026-11-21), about 412 s of summed per-test time. On the runner it
+        # crossed 300 s, and three PRs failed with "Timed out waiting for test
+        # response" naming whichever rules tests happened to be running at the
+        # time; the same tests pass in the build job and on a rerun.
+        # Compiling the embedded rules again in each test is not the cause: a
+        # full compile costs about 2.3 s, and the slow tests spend their time
+        # matching the whole corpus against every test case. A hang still fails
+        # here, just at 15 minutes instead of 5.
+        run: cargo tarpaulin --engine llvm --skip-clean --timeout 900 --out Xml
 
       - name: Upload coverage report
         if: always()
