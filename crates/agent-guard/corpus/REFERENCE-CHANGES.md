@@ -149,6 +149,32 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   maybe (under `if`, `&&`, `||`, in a function body, in a pipeline, or
   read from input) keeps the value before it, so the lines beside these
   stay refused (lv-35..lv-47).
+- 2026-11-21: the benign cases added beside the line above, named one by one
+  (the check expands a run only of ids that end in digits, so lv-c01..lv-c20
+  and cg-c01..cg-c25 did not name them). Each is new to the suite, not a
+  verdict that moved: line-variables cases allow, cd-glob-owner cases allow
+  but the last three, which are review.
+  line-variables-2026-11/lv-c01, line-variables-2026-11/lv-c02,
+  line-variables-2026-11/lv-c03, line-variables-2026-11/lv-c04,
+  line-variables-2026-11/lv-c05, line-variables-2026-11/lv-c06,
+  line-variables-2026-11/lv-c07, line-variables-2026-11/lv-c08,
+  line-variables-2026-11/lv-c12, line-variables-2026-11/lv-c13,
+  line-variables-2026-11/lv-c14, line-variables-2026-11/lv-c15,
+  line-variables-2026-11/lv-c16, line-variables-2026-11/lv-c17,
+  line-variables-2026-11/lv-c18, line-variables-2026-11/lv-c19,
+  line-variables-2026-11/lv-c20, cd-glob-owner-2026-11/cg-c01,
+  cd-glob-owner-2026-11/cg-c02, cd-glob-owner-2026-11/cg-c03,
+  cd-glob-owner-2026-11/cg-c04, cd-glob-owner-2026-11/cg-c05,
+  cd-glob-owner-2026-11/cg-c06, cd-glob-owner-2026-11/cg-c07,
+  cd-glob-owner-2026-11/cg-c08, cd-glob-owner-2026-11/cg-c09,
+  cd-glob-owner-2026-11/cg-c10, cd-glob-owner-2026-11/cg-c11,
+  cd-glob-owner-2026-11/cg-c12, cd-glob-owner-2026-11/cg-c13,
+  cd-glob-owner-2026-11/cg-c14, cd-glob-owner-2026-11/cg-c15,
+  cd-glob-owner-2026-11/cg-c16, cd-glob-owner-2026-11/cg-c17,
+  cd-glob-owner-2026-11/cg-c18, cd-glob-owner-2026-11/cg-c19,
+  cd-glob-owner-2026-11/cg-c20, cd-glob-owner-2026-11/cg-c21,
+  cd-glob-owner-2026-11/cg-c22, cd-glob-owner-2026-11/cg-c23,
+  cd-glob-owner-2026-11/cg-c24, cd-glob-owner-2026-11/cg-c25
 - 2026-11-21: decision of the operator of 2026-11-21: the guard refuses the
   action on its files, processes and settings and on an agent's settings,
   not the mention of the name; this replaces the decision of 2026-11-18 that
