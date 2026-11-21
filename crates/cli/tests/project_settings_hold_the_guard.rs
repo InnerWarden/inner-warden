@@ -234,6 +234,27 @@ fn every_shape_of_a_project_settings_write_is_refused() {
             r#"{"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"cargo fmt"}]}]}}"#,
         ),
         host.write_tool(".codex/hooks.json", r#"{"hooks":{}}"#),
+        // What a folder holds copied into an agent's folder, and an archive
+        // unpacked into one: the names written are not on the line, and a
+        // `settings.json` written first in `../x` lands in the settings.
+        host.bash("rsync -a ../x/ .claude"),
+        host.bash("rsync -a ../x/ .claude/"),
+        host.bash("rsync -r ../x/. .codex/"),
+        host.bash("cp -r ../x/. .claude/"),
+        host.bash("cp -r ../x/. .claude"),
+        host.bash("cp -r ../x/* .claude/"),
+        host.bash("cp ../x/*.json .claude/"),
+        host.bash("cp -R ../x/ .claude/"),
+        host.bash("cd .claude && cp -r ../../x/. ."),
+        host.bash("tar -xf x.tar -C .claude"),
+        host.bash("tar -C .gemini -xzf x.tgz"),
+        host.bash("tar --extract --file x.tar --directory=.claude/"),
+        host.bash("cd .claude && tar -xf ../x.tar"),
+        host.bash("unzip x.zip -d .claude"),
+        host.bash("unzip -o x.zip -d .cursor/"),
+        host.bash("bsdtar -xf x.tar -C .claude"),
+        host.bash("7z x x.7z -o.claude"),
+        host.bash("7za e x.7z -o.codex"),
     ];
     let mut let_through = Vec::new();
     for payload in &shapes {
@@ -260,6 +281,16 @@ fn ordinary_links_copies_and_moves_in_a_project_still_run() {
         "cp -r ../tpl .",
         "mv build .",
         "mv notes.md .claude/",
+        // A single file into an agent's folder under a name that is not a
+        // settings file, and copies and unpacks into other folders.
+        "cp notes.md .claude/notes.md",
+        "cp docs/*.md .claude/",
+        "rsync -a src/ build/",
+        "cp -r ../tpl/. src/",
+        "tar -xf x.tar -C vendor",
+        "unzip x.zip -d vendor",
+        "tar -xf x.tar",
+        "7z x x.7z -ovendor",
     ];
     let mut stopped = Vec::new();
     for command in ordinary {
@@ -289,4 +320,80 @@ fn a_move_onto_an_agent_folder_by_its_bare_name_is_refused_and_says_why() {
             "{command}: {stderr}"
         );
     }
+}
+
+/// A copy of what a folder holds into an agent's folder is refused with its
+/// `/` too, so the refusal does not tell the agent to end the folder with a
+/// slash.
+#[test]
+fn a_copy_of_a_folders_contents_onto_an_agent_folder_does_not_say_add_a_slash() {
+    let host = Host::new();
+    for command in ["cp -r ../x/. .claude", "rsync -a ../x/ .claude"] {
+        let (code, stderr) = host.hook(&host.bash(command));
+        assert_eq!(code, Some(2), "{command}: {stderr}");
+        assert!(
+            !stderr.contains("end the folder with a slash"),
+            "{command}: {stderr}"
+        );
+    }
+}
+
+/// Interpreter code that opens a project settings file to write: Python's
+/// `open(path, "w")` and Ruby's `File.new(path, "w")` are refused by the
+/// interpreter rule that names the file before the write (the one that
+/// names the write first, `FileUtils` among it, would not see them), and
+/// Ruby's `FileUtils` with the file named first, through a variable, is
+/// refused too.
+#[test]
+fn interpreter_writes_to_project_settings_are_refused_with_the_interpreter_reason() {
+    let host = Host::new();
+    for command in [
+        r#"python3 -c 'open(".claude/settings.json","w")'"#,
+        r#"ruby -e 'File.new(".claude/settings.json","w")'"#,
+        r#"node -e 'require("fs").writeFileSync(".claude/settings.json","{}")'"#,
+        r#"ruby -e 'p=".claude/settings.json"; FileUtils.cp("x.json", p)'"#,
+    ] {
+        let (code, stderr) = host.hook(&host.bash(command));
+        assert_eq!(code, Some(2), "{command}: {stderr}");
+        assert!(
+            stderr.contains("rewrites an agent's configuration through an interpreter"),
+            "{command}: {stderr}"
+        );
+    }
+}
+
+/// The PreToolUse entry of a settings file, the person's and the project's,
+/// rewritten the four ways an agent reaches for: `jq` to a temporary file
+/// and `mv` back, `sed -i`, `python3` with `json.dump`, and `jq` into
+/// `sponge`. Each is refused.
+#[test]
+fn the_pre_tool_use_entry_rewritten_four_ways_is_refused() {
+    let host = Host::new();
+    let home = host.home().join(".claude/settings.json");
+    let home = home.display().to_string();
+    let mut let_through = Vec::new();
+    for file in [
+        "~/.claude/settings.json",
+        home.as_str(),
+        ".claude/settings.json",
+    ] {
+        for command in [
+            format!("jq '.hooks.PreToolUse = []' {file} > /tmp/s.json && mv /tmp/s.json {file}"),
+            format!("sed -i '/PreToolUse/d' {file}"),
+            format!(
+                r#"python3 -c 'import json,os;p=os.path.expanduser("{file}");d=json.load(open(p));d["hooks"]["PreToolUse"]=[];json.dump(d,open(p,"w"))'"#
+            ),
+            format!("jq 'del(.hooks.PreToolUse)' {file} | sponge {file}"),
+        ] {
+            let (code, stderr) = host.hook(&host.bash(&command));
+            if code != Some(2) {
+                let_through.push(format!("{code:?} {command} :: {stderr}"));
+            }
+        }
+    }
+    assert!(
+        let_through.is_empty(),
+        "let through:\n{}",
+        let_through.join("\n")
+    );
 }

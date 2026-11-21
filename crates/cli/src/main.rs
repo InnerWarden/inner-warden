@@ -455,7 +455,15 @@ fn project_settings_in(
     home: Option<&std::path::Path>,
 ) -> Vec<status::ProjectSettings> {
     let mut found = Vec::new();
-    for folder in project_folders(dir, home) {
+    let (folders, unchecked) = project_folders(dir, home);
+    for (marker, why) in unchecked {
+        found.push(status::ProjectSettings {
+            agent: "",
+            file: marker.display().to_string(),
+            effect: status::ProjectEffect::RootUnchecked(why),
+        });
+    }
+    for folder in folders {
         for (agent, file) in status::PROJECT_SETTINGS_FILES {
             let Some(effect) = project_settings_effect_at(&folder.join(file), file) else {
                 continue;
@@ -480,18 +488,59 @@ fn project_settings_in(
 /// such a folder is above `dir` (a folder outside the home with no `.git`
 /// over it), `dir` alone: what lies above it, up to `/`, is no project's.
 /// Empty when `dir` is the home.
+///
+/// A `.git` or `.claude` that could not be looked at (permission denied)
+/// is not taken for missing in silence: its folder is handed back with the
+/// reason, and the climb goes on past it, so a folder above is still read.
+#[allow(clippy::type_complexity)]
 fn project_folders<'a>(
     dir: &'a std::path::Path,
     home: Option<&std::path::Path>,
-) -> Vec<&'a std::path::Path> {
+) -> (
+    Vec<&'a std::path::Path>,
+    Vec<(std::path::PathBuf, &'static str)>,
+) {
     let same = |a: &std::path::Path, b: &std::path::Path| {
         a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
     };
-    folders_up_to_root(
+    let unchecked = std::cell::RefCell::new(Vec::new());
+    let marks = |folder: &std::path::Path, name: &str, folder_only: bool| {
+        let marker = folder.join(name);
+        match std::fs::metadata(&marker) {
+            Ok(meta) => !folder_only || meta.is_dir(),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                false
+            }
+            Err(e) => {
+                let mut unchecked = unchecked.borrow_mut();
+                if !unchecked.iter().any(|(seen, _)| seen == folder) {
+                    unchecked.push((folder.to_path_buf(), root_unchecked_reason(&e)));
+                }
+                false
+            }
+        }
+    };
+    let folders = folders_up_to_root(
         dir,
         |folder| home.is_some_and(|home| same(folder, home)),
-        |folder| folder.join(".git").exists() || folder.join(".claude").is_dir(),
-    )
+        |folder| marks(folder, ".git", false) | marks(folder, ".claude", true),
+    );
+    (folders, unchecked.into_inner())
+}
+
+/// Why a project's `.git` or `.claude` could not be looked at, as `status`
+/// says it.
+fn root_unchecked_reason(e: &std::io::Error) -> &'static str {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        "permission denied"
+    } else {
+        "it could not be looked at"
+    }
 }
 
 /// PURE: [`project_folders`] with what is the home and what is a project's
@@ -518,9 +567,11 @@ fn folders_up_to_root(
 
 /// What the project settings file at `path` does to its agent's hooks. A
 /// missing file says nothing. The file is opened once, without following a
-/// link and without waiting (`O_NOFOLLOW | O_NONBLOCK` on unix), and what is
-/// judged is the file that was opened (`fstat` of it), so nothing can be put
-/// in its place between a check and the open. Only a regular file is read,
+/// link and without waiting (`O_NOFOLLOW | O_NONBLOCK` on unix; on Windows
+/// `FILE_FLAG_OPEN_REPARSE_POINT`, which opens a link itself), and what is
+/// judged is the file that was opened (`fstat` of it, or the handle's own
+/// information on Windows), so nothing can be put in its place between a
+/// check and the open. Only a regular file is read,
 /// and no more of it than the most that is read: a link, a pipe or a device
 /// (a link to `/dev/zero`, a FIFO) is named as not read, never waited on. A
 /// file that is there and cannot be opened (permission denied) is named too,
@@ -530,7 +581,9 @@ fn project_settings_effect_at(path: &std::path::Path, file: &str) -> Option<stat
     const MOST: u64 = 1 << 20;
     const NOT_REGULAR: &str =
         "is not a regular file (a link, a pipe or a device), so it was not opened";
-    #[cfg(not(unix))]
+    // Neither unix nor Windows: no flag keeps the open off a link, so the
+    // link is looked for first, with a window between the two.
+    #[cfg(not(any(unix, windows)))]
     if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_file()) {
         return Some(status::ProjectEffect::Unread(NOT_REGULAR));
     }
@@ -540,6 +593,13 @@ fn project_settings_effect_at(path: &std::path::Path, file: &str) -> Option<stat
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: a link is opened as itself, and the
+        // handle's information below names it a link, not a file.
+        options.custom_flags(0x0020_0000);
     }
     let opened = match options.open(path) {
         Ok(opened) => opened,
@@ -4542,6 +4602,49 @@ mod tests {
         );
         // The home itself: nothing.
         assert!(super::folders_up_to_root(dir, at("/srv/work/proj/src/module"), never).is_empty());
+    }
+
+    /// A folder whose `.git` and `.claude` cannot be looked at (a parent
+    /// with no search permission) is named with the reason, once, and the
+    /// climb goes on to the project's root above it.
+    ///
+    /// FAILS ON REVERT: with `exists()` and `is_dir()` back, `unchecked` is
+    /// empty and the denial passes in silence.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_that_cannot_be_looked_at_is_named_and_the_climb_goes_on() {
+        use std::os::unix::fs::PermissionsExt;
+        // geteuid takes no arguments, touches no memory, and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root looks through any mode
+        }
+        let base = tempfile::tempdir().expect("tempdir");
+        let proj = base.path().join("proj");
+        let locked = proj.join("locked");
+        let inner = locked.join("inner");
+        std::fs::create_dir_all(proj.join(".git")).expect("git");
+        std::fs::create_dir_all(&inner).expect("inner");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600)).expect("lock");
+        let (folders, unchecked) = super::project_folders(&inner, None);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).expect("unlock");
+        assert_eq!(folders, [inner.as_path(), locked.as_path(), proj.as_path()]);
+        assert_eq!(
+            unchecked,
+            [
+                (inner.clone(), "permission denied"),
+                (locked.clone(), "permission denied")
+            ]
+        );
+        let said = super::status::project_settings_finding(&super::status::ProjectSettings {
+            agent: "",
+            file: locked.display().to_string(),
+            effect: super::status::ProjectEffect::RootUnchecked("permission denied"),
+        });
+        assert!(
+            matches!(&said, super::status::Finding::Unknown { what, .. }
+                if what.contains("permission denied") && what.contains("locked")),
+            "{said:?}"
+        );
     }
 
     #[test]
