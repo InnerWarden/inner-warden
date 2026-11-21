@@ -3393,6 +3393,31 @@ mod tests {
         );
     }
 
+    /// The processes left in the group of the server whose pid `pid_file`
+    /// holds, as `ps` lists them (pid, group, state, command), for a test
+    /// that hung waiting for that group.
+    #[cfg(unix)]
+    fn group_members(pid_file: &std::path::Path) -> String {
+        let Some(group) = std::fs::read_to_string(pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        else {
+            return "no server pid".to_string();
+        };
+        let Ok(out) = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,pgid=,stat=,comm="])
+            .output()
+        else {
+            return "ps did not run".to_string();
+        };
+        let members: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|line| line.split_whitespace().nth(1) == Some(group.to_string().as_str()))
+            .map(|line| line.trim().to_string())
+            .collect();
+        format!("{members:?}")
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_error_asks_the_server_to_stop_before_it_is_reported() {
@@ -3418,7 +3443,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("server.pid");
         let asked = dir.path().join("asked-to-stop");
-        let script = r#"echo $$ > "$1"; trap 'echo yes > "$2"; kill $! 2>/dev/null; exit 0' TERM; printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'; sleep 60 & wait"#;
+        // The server waits in the foreground, a second at a time: the group's
+        // SIGTERM ends the \`sleep\` it waits on and the trap runs at once. A
+        // \`sleep 60 &\` killed by \`$!\` from the trap could outlive it: bash
+        // 3.2, macOS's \`sh\`, can run the trap before \`$!\` names the job just
+        // started, and the sleep then held the group for its whole minute
+        // (CI macOS, 2026-11-21: trap written, one SIGTERM sent, proxy still
+        // waiting for the group).
+        let script = r#"echo $$ > "$1"; trap 'echo yes > "$2"; exit 0' TERM; printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'; while :; do sleep 1; done"#;
         let (_to_proxy, proxy_in) = duplex(16384);
         let (proxy_out, from_proxy) = duplex(16384);
         drop(from_proxy);
@@ -3450,10 +3482,11 @@ mod tests {
         .unwrap_or_else(|_| {
             panic!(
                 "the proxy hung on an error (SIGTERM ignored in this process: {}; \
-                 signals sent: {:?}; trap wrote: {:?})",
+                 signals sent: {:?}; trap wrote: {:?}; left in the server's group: {})",
                 ignored_from_the_start(libc::SIGTERM),
                 sent.lock().unwrap(),
-                std::fs::read_to_string(&asked).ok()
+                std::fs::read_to_string(&asked).ok(),
+                group_members(&pid_file)
             )
         });
         // Read the moment the error is reported, before anything else runs.
