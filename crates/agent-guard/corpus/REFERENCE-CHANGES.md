@@ -130,6 +130,51 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   guard reads in its own way (the home, the search path, `IFS`, `PS4`,
   `SHELLOPTS`, a setting that loads code) is held, since the rest of the
   line is not read with it (`tests/write_then_run_gaps.rs`). No waiver.
+- 2026-11-21: line-variables-2026-11 and cd-glob-owner-2026-11 join the
+  release safety suite (review of the pull request that reads a line's
+  values where each name is used); nothing already in the reference moved.
+  Added line-variables-2026-11/lv-01..lv-51 (malicious, each deny) with
+  lv-c01..lv-c20 (benign, each allow), and cd-glob-owner-2026-11/cg-01..cg-66
+  (malicious, each deny) with cg-c01..cg-c22 (benign, each allow) and
+  cg-c23..cg-c25 (benign, `expect: review`, each review: a `find` whose
+  starting point the line does not spell out, as main holds it).
+- 2026-11-21: harmless-proven: line-variables-2026-11/lv-c09,
+  line-variables-2026-11/lv-c10 and line-variables-2026-11/lv-c11 go from
+  deny to allow; the shell gives the name no value where it is used.
+  lv-c09 (`X=/; unset X; rm -rf $X`): an `unset` that surely runs takes
+  the value away, and `rm -rf` with no operand removes nothing. lv-c10
+  (`(X=/); rm -rf $X`): the value is set in a subshell that has closed.
+  lv-c11 (`X=build; rm -rf $X; X=/`): the removal reads `build`, the value
+  in effect there; `/` is set after it. A value taken away or read only
+  maybe (under `if`, `&&`, `||`, in a function body, in a pipeline, or
+  read from input) keeps the value before it, so the lines beside these
+  stay refused (lv-35..lv-47).
+- 2026-11-21: the benign cases added beside the line above, named one by one
+  (the check expands a run only of ids that end in digits, so lv-c01..lv-c20
+  and cg-c01..cg-c25 did not name them). Each is new to the suite, not a
+  verdict that moved: line-variables cases allow, cd-glob-owner cases allow
+  but the last three, which are review.
+  line-variables-2026-11/lv-c01, line-variables-2026-11/lv-c02,
+  line-variables-2026-11/lv-c03, line-variables-2026-11/lv-c04,
+  line-variables-2026-11/lv-c05, line-variables-2026-11/lv-c06,
+  line-variables-2026-11/lv-c07, line-variables-2026-11/lv-c08,
+  line-variables-2026-11/lv-c12, line-variables-2026-11/lv-c13,
+  line-variables-2026-11/lv-c14, line-variables-2026-11/lv-c15,
+  line-variables-2026-11/lv-c16, line-variables-2026-11/lv-c17,
+  line-variables-2026-11/lv-c18, line-variables-2026-11/lv-c19,
+  line-variables-2026-11/lv-c20, cd-glob-owner-2026-11/cg-c01,
+  cd-glob-owner-2026-11/cg-c02, cd-glob-owner-2026-11/cg-c03,
+  cd-glob-owner-2026-11/cg-c04, cd-glob-owner-2026-11/cg-c05,
+  cd-glob-owner-2026-11/cg-c06, cd-glob-owner-2026-11/cg-c07,
+  cd-glob-owner-2026-11/cg-c08, cd-glob-owner-2026-11/cg-c09,
+  cd-glob-owner-2026-11/cg-c10, cd-glob-owner-2026-11/cg-c11,
+  cd-glob-owner-2026-11/cg-c12, cd-glob-owner-2026-11/cg-c13,
+  cd-glob-owner-2026-11/cg-c14, cd-glob-owner-2026-11/cg-c15,
+  cd-glob-owner-2026-11/cg-c16, cd-glob-owner-2026-11/cg-c17,
+  cd-glob-owner-2026-11/cg-c18, cd-glob-owner-2026-11/cg-c19,
+  cd-glob-owner-2026-11/cg-c20, cd-glob-owner-2026-11/cg-c21,
+  cd-glob-owner-2026-11/cg-c22, cd-glob-owner-2026-11/cg-c23,
+  cd-glob-owner-2026-11/cg-c24, cd-glob-owner-2026-11/cg-c25
 - 2026-11-21: decision of the operator of 2026-11-21: the guard refuses the
   action on its files, processes and settings and on an agent's settings,
   not the mention of the name; this replaces the decision of 2026-11-18 that

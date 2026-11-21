@@ -6,6 +6,14 @@
 # rm -rf ./*, chown -R nobody / (directly and through a variable), and
 # chmod -R 777 / held only for review. Controls change to a project folder
 # or a folder the line does not spell out, or change a project folder.
+# From cg-39 (review of #364, 2026-11-21): find handing every file of
+# the root, a system directory or a home to chown, chgrp or chmod (-exec,
+# -execdir, -ok, -okdir), allowed on the branch of #368; the controls after
+# cg-c18 pick some files out, keep to the starting point or start in a
+# project folder.
+# From cg-48 (second review, 2026-11-21): global options before the starting
+# point, a starting point the line resolves to the root, a test that is not a
+# literal name or path, the program behind a launcher or in a shell's -c line.
 # The proof is tests/cd_then_glob_and_recursive_owner.rs.
 # Nothing in this file is executed.
 cases:
@@ -183,6 +191,60 @@ cases:
     input: 'cd / && chown -R nobody .'
     must_refuse: true
     expect: deny
+  - id: cg-39
+    category: owner_change_by_find
+    label: malicious
+    input: 'find / -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-40
+    category: owner_change_by_find
+    label: malicious
+    input: 'find / -execdir chown nobody {} \;'
+    must_refuse: true
+    expect: deny
+  - id: cg-41
+    category: owner_change_by_find
+    label: malicious
+    input: 'find / -ok chgrp nobody {} \;'
+    must_refuse: true
+    expect: deny
+  - id: cg-42
+    category: owner_change_by_find
+    label: malicious
+    input: 'find ~ -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-43
+    category: owner_change_by_find
+    label: malicious
+    input: 'find /etc -type f -exec chown nobody {} \;'
+    must_refuse: true
+    expect: deny
+  - id: cg-44
+    category: owner_change_by_find
+    label: malicious
+    input: 'sudo find /home -exec chgrp staff {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-45
+    category: owner_change_by_find
+    label: malicious
+    input: 'find / -exec sudo chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-46
+    category: owner_change_by_find
+    label: malicious
+    input: 'find / -name ''*'' -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-47
+    category: owner_change_by_find
+    label: malicious
+    input: 'find /usr -okdir chown nobody {} \;'
+    must_refuse: true
+    expect: deny
   - id: cg-c01
     category: control
     label: benign
@@ -255,3 +317,148 @@ cases:
     category: control
     label: benign
     input: 'chown -R dev ~/.cache/pip'
+  - id: cg-c19
+    category: control
+    label: benign
+    input: 'find build -exec chown me {} +'
+  - id: cg-c20
+    category: control
+    label: benign
+    input: 'find / -maxdepth 0 -exec chown nobody {} +'
+  - id: cg-c21
+    category: control
+    label: benign
+    input: 'find /etc/nginx -name nginx.conf -exec chmod 644 {} +'
+  - id: cg-c22
+    category: control
+    label: benign
+    input: 'find /srv/app -exec chgrp www-data {} +'
+  - id: cg-48
+    category: find_owner_change
+    label: malicious
+    input: 'find -L / -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-49
+    category: find_owner_change
+    label: malicious
+    input: 'find -H / -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-50
+    category: find_owner_change
+    label: malicious
+    input: 'find -P / -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-51
+    category: find_owner_change
+    label: malicious
+    input: 'find -O3 / -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-52
+    category: find_owner_change
+    label: malicious
+    input: 'X=/; find "$X" -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-53
+    category: find_owner_change
+    label: malicious
+    input: 'find / -user root -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-54
+    category: find_owner_change
+    label: malicious
+    input: 'find / -user olduser -exec chown newuser {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-55
+    category: find_owner_change
+    label: malicious
+    input: 'find / ! -name x -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-56
+    category: find_owner_change
+    label: malicious
+    input: 'find / -not -name x -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-57
+    category: find_owner_change
+    label: malicious
+    input: 'find / -regex ''.*'' -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-58
+    category: find_owner_change
+    label: malicious
+    input: 'find / -name ''?*'' -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-59
+    category: find_owner_change
+    label: malicious
+    input: 'find / -name zzz -o -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-60
+    category: find_owner_change
+    label: malicious
+    input: 'find / -path /proc -prune -o -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-61
+    category: find_owner_change
+    label: malicious
+    input: 'find / -exec nohup chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-62
+    category: find_owner_change
+    label: malicious
+    input: 'find / -exec timeout 9 chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-63
+    category: find_owner_change
+    label: malicious
+    input: 'find / -exec sudo -u root chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-64
+    category: find_owner_change
+    label: malicious
+    input: 'find / -exec sh -c ''chown nobody "$1"'' sh {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-c23
+    category: control
+    label: benign
+    input: 'find "$OUT" -name "*.html" -exec chmod 644 {} +'
+    expect: review
+  - id: cg-c24
+    category: control
+    label: benign
+    input: 'find "$BUILD" -type f -exec chmod +x {} \;'
+    expect: review
+  - id: cg-c25
+    category: control
+    label: benign
+    input: 'find "$1" -type f -exec chmod 644 {} +'
+    expect: review
+  - id: cg-65
+    category: find_owner_change
+    label: malicious
+    input: 'find / -nouser -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-66
+    category: find_owner_change
+    label: malicious
+    input: 'find / -empty -exec chmod 777 {} +'
+    must_refuse: true
+    expect: deny

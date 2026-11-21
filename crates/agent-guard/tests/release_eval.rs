@@ -1,6 +1,6 @@
 //! The release safety suite: one measure of the guard per release.
 //!
-//! Runs five corpora through the same inspectors as the proof benchmark
+//! Runs seven corpora through the same inspectors as the proof benchmark
 //! (`benchmark::run`, embedded rules):
 //!
 //! - `benchmarks/agent_attack_corpus.yml`: the curated proof corpus;
@@ -11,7 +11,11 @@
 //!   its cases stay out for licence), with benign controls from the same
 //!   sources;
 //! - `corpus/own-work/cases.yml`: clean versions of ordinary work the guard
-//!   refused to its own developers, all benign, all meant to be allowed.
+//!   refused to its own developers, all benign, all meant to be allowed;
+//! - `corpus/line-variables-2026-11/cases.yml`: a value the line gives a name,
+//!   read where the name is used, with project-folder controls;
+//! - `corpus/cd-glob-owner-2026-11/cases.yml`: a `cd` that sets where a glob
+//!   removal runs, and owner or mode changes of the whole system.
 //!
 //! It prints, per corpus, attacks caught / total, attacks stopped for an agent,
 //! false positives / benign total, and every case whose verdict differs from
@@ -36,7 +40,7 @@ use std::fmt::Write as _;
 use innerwarden_agent_guard::benchmark::{run, CaseResult, Corpus, Label, Outcome, Scoreboard};
 use innerwarden_agent_guard::rules::RuleEngine;
 
-const CORPORA: [(&str, &str); 5] = [
+const CORPORA: [(&str, &str); 7] = [
     (
         "proof",
         include_str!("../benchmarks/agent_attack_corpus.yml"),
@@ -51,6 +55,14 @@ const CORPORA: [(&str, &str); 5] = [
         include_str!("../corpus/external-2026-11/cases.yml"),
     ),
     ("own-work", include_str!("../corpus/own-work/cases.yml")),
+    (
+        "line-variables-2026-11",
+        include_str!("../corpus/line-variables-2026-11/cases.yml"),
+    ),
+    (
+        "cd-glob-owner-2026-11",
+        include_str!("../corpus/cd-glob-owner-2026-11/cases.yml"),
+    ),
 ];
 
 const REFERENCE_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/corpus/reference.tsv");

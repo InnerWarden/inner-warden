@@ -4072,14 +4072,25 @@ impl Drop for LineValuesRead {
 }
 
 /// [`analyze_command_both_readings`] of the line as written and of the line
-/// with its own assignments read into it, one entry per round
-/// ([`threats::assignment_readings_past_written`]): the one that scores
-/// higher. A value the line gives a name (`X=/`, `export X=/`, `declare
+/// with its own assignments read into it, each name with the value in
+/// effect where it is used ([`crate::line_values::readings_in_effect`]):
+/// the one that scores higher. A value the line gives a name (`X=/`, `export X=/`, `declare
 /// X=/`, `X=/ cmd`, `for X in /`) reaches every look the line gets, not
 /// only the ones that read assignments themselves: the target of a removal,
 /// a mode or owner change, a `dd` or `mkfs`, the program word, a secret
 /// path, a URL. Measured 2026-11-21: `X=/; rm -rf $X` and `P=rm; $P -rf /`
 /// were allowed where `rm -rf /` is refused.
+///
+/// The value is the one in effect where the name is used, as the shell has
+/// it (review of #364): a name set again later (`X=/; rm -rf $X; X=build`)
+/// is read with the value it holds at the removal; one used before it is
+/// set, taken away by `unset` or `read`, set in a subshell that has closed,
+/// or set in front of the command that uses it (`X=/ rm -rf $X`, which the
+/// shell expands before the value holds) is not read as that value. A line
+/// handed to another shell reads the values around it, so a value it sets
+/// from them (`X=/; sh -c 'Y=$X; rm -rf $Y'`) is read here, at the line's
+/// own level, and not left to the reading of the inner line, which does not
+/// read values again.
 fn analyze_command_with_its_values(
     command: &str,
     rule_engine: Option<&RuleEngine>,
@@ -4092,10 +4103,7 @@ fn analyze_command_with_its_values(
     if READING_LINE_VALUES.with(std::cell::Cell::get) {
         return as_written;
     }
-    if !values_read_in_plainly(command) {
-        return as_written;
-    }
-    let readings = threats::assignment_readings_past_written(command);
+    let readings = crate::line_values::readings_in_effect(command);
     if readings.is_empty() {
         return as_written;
     }
@@ -4118,70 +4126,6 @@ fn analyze_command_with_its_values(
         },
         _ => as_written,
     }
-}
-
-/// Whether the line's own values can be read into it as text
-/// ([`analyze_command_with_its_values`]): every name the line both sets and
-/// uses is set to one value, however often (`C='rm -rf /'; C='echo ok'; sh
-/// -c "$C"` runs the second, which a reading of the first value would not
-/// show), and that value is plain: a path, a word, an option, or another
-/// name (`$HOME`, `${X}`).
-/// A value with quotes, a substitution, a blank or a glob in it is text the
-/// shell never reads again once expanded (`X='a[$(curl ...)]'; echo "$X"`
-/// prints it), which a reading as text would turn into code; those lines
-/// keep the rules that read values themselves.
-fn values_read_in_plainly(command: &str) -> bool {
-    static PATTERNS: std::sync::OnceLock<Option<(regex::Regex, regex::Regex, regex::Regex)>> =
-        std::sync::OnceLock::new();
-    let Some((assigned, looped, used)) = PATTERNS.get_or_init(|| {
-        Some((
-            regex::Regex::new(
-                r#"(?:^|[\s;&|({])(?:(?:export|local|readonly|declare|typeset)\s+(?:-[A-Za-z]+\s+)*)?([A-Za-z_][A-Za-z0-9_]*)\+?=([^\s;&|()<>]*)"#,
-            )
-            .ok()?,
-            regex::Regex::new(r"(?:^|[\s;&|(])for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^\s;&|()]+)").ok()?,
-            regex::Regex::new(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)").ok()?,
-        ))
-    }) else {
-        return false;
-    };
-    let plain = |value: &str| {
-        let name = |text: &str| {
-            text.strip_prefix('$')
-                .map(|rest| {
-                    rest.strip_prefix('{')
-                        .and_then(|rest| rest.strip_suffix('}'))
-                        .unwrap_or(rest)
-                })
-                .is_some_and(|rest| {
-                    !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                })
-        };
-        name(value)
-            || value.chars().all(|c| {
-                c.is_ascii_alphanumeric()
-                    || matches!(
-                        c,
-                        '/' | '.' | '_' | '-' | '~' | '+' | ':' | ',' | '@' | '%' | '='
-                    )
-            })
-    };
-    let mut values: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    for found in assigned
-        .captures_iter(command)
-        .chain(looped.captures_iter(command))
-    {
-        if let (Some(name), Some(value)) = (found.get(1), found.get(2)) {
-            // Quotes around a value, or one left from the text it was
-            // printed in (`echo 'export X=/'`), are no part of it.
-            let value = value.as_str().trim_matches(['\'', '"']);
-            values.entry(name.as_str()).or_default().push(value);
-        }
-    }
-    used.captures_iter(command)
-        .filter_map(|found| found.get(1))
-        .filter_map(|name| values.get(name.as_str()))
-        .all(|given| given.iter().all(|value| *value == given[0]) && plain(given[0]))
 }
 
 /// The bash reading and, where they differ, the sh and dash reading of
