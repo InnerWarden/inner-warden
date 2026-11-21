@@ -705,8 +705,12 @@ mod tests {
         // allowed (`shell/unread_parts.rs`): these benign controls are held
         // for review, by decision, and are counted here as the cost of it.
         // Any other false positive fails, as before.
+        // bn-116 (`python3 gen.py > r.sh && bash r.sh`) by the decision of
+        // 2026-11-20 on the reading of a file written then run: a program's
+        // output run as a script is not shown, so it is held for review.
         let held_by_unread_rule = [
-            "bn-033", "bn-128", "bn-129", "bn-130", "bn-131", "bn-132", "bn-133", "bn-134",
+            "bn-033", "bn-116", "bn-128", "bn-129", "bn-130", "bn-131", "bn-132", "bn-133",
+            "bn-134",
         ];
         let false_positives: Vec<&str> = results
             .iter()

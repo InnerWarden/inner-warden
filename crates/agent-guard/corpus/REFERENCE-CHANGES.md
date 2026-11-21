@@ -115,3 +115,18 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   belongs to the command it is written after): the text `cat >> log.md`
   appends is a note, not a stop of the guard; measured deny at guard-v1.6.15
   and allow from ec7f764 on.
+- 2026-11-20: the review of pull requests #350 and #351 (a file written
+  then run, and the reading of substitutions). proof/bn-116 (`python3 gen.py
+  > r.sh && bash r.sh`) goes from allow to review, by decision: a file a
+  program writes, or a copy, then run, is not shown by the line, and is held
+  for review; it is counted as a false positive of the proof corpus, beside
+  the lines the unread rule holds. proof/dx-084 (`curl ... | bash -c 'dd
+  of=.iw-p; python .iw-p'`) goes from review to deny: `dd` now counts as a
+  write the line does not show of the file then run. No other case of this
+  suite moved. runners-2026-11/run-c21 (`echo "export PATH=$PATH:$HOME/bin"
+  > env.sh && . ./env.sh`) stays held for review, as on main: by the review
+  of #355 the assignments of a file the line writes and then loads are
+  judged as if written where it is loaded, and one that sets a variable the
+  guard reads in its own way (the home, the search path, `IFS`, `PS4`,
+  `SHELLOPTS`, a setting that loads code) is held, since the rest of the
+  line is not read with it (`tests/write_then_run_gaps.rs`). No waiver.

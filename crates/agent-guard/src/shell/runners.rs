@@ -82,6 +82,16 @@ pub(crate) fn program(name: &str) -> Option<&'static Program> {
     table().get(name)
 }
 
+/// Whether `name` (without version) is a shell or a language of the table
+/// that reads code when it is given none: a shell, or a program with an
+/// option for inline code that reads stdin as code (`python`, `node`,
+/// `perl`). Started with nothing to run, it waits for input
+/// (`crate::interactive`).
+pub(crate) fn reads_code_when_given_none(name: &str) -> bool {
+    program(name)
+        .is_some_and(|row| !row.launcher && (row.shell || (row.stdin_code && row.inline.is_some())))
+}
+
 /// Every name of the table with its row, for the tests that hold the
 /// readings to it.
 #[cfg(test)]
@@ -156,12 +166,9 @@ pub(crate) fn file_scripts(name: &str, args: &[String]) -> Vec<(String, Language
                     .collect()
             }
         }
-        Language::Crontab => args
-            .iter()
-            .filter(|arg| !arg.starts_with('-'))
-            .take(1)
-            .map(|file| (file.clone(), Language::Crontab))
-            .collect(),
+        Language::Crontab => crontab_file(args)
+            .map(|file| vec![(file, Language::Crontab)])
+            .unwrap_or_default(),
         Language::Awk => Vec::new(),
         _ if program.stdin_script => {
             let file = program.file_option.as_deref().unwrap_or("-f");
@@ -209,7 +216,7 @@ fn script_operand(args: &[String], program: &Program) -> Option<String> {
             if program.shell && (flags.contains(letter) || flags.contains('s')) {
                 return None;
             }
-            if !program.shell && (flags.starts_with(letter) || flags.starts_with('m')) {
+            if !program.shell && cluster_takes_code(flags, letter, program.language) {
                 return None;
             }
         }
@@ -235,6 +242,61 @@ fn script_operand(args: &[String], program: &Program) -> Option<String> {
             continue;
         }
         return (!is_stdin_path(arg)).then(|| arg.clone());
+    }
+    None
+}
+
+/// Whether a group of short flags of an interpreter (`-uc`, `-ne`, `-pe`,
+/// `-le`) holds the flag that takes code inline (`letter`), or Python's
+/// `-m`, wherever it stands in the group: read flag by flag up to the first
+/// one that takes the rest of the group as its value (`-W`, `-X`, `-I`,
+/// `-M`), so the `c` of `-Wignore::DeprecationWarning` is not read as `-c`.
+/// Measured 2026-11-20: `python3 -uc CODE` read `CODE` as the script's
+/// path, because only a group that starts with the letter was read.
+pub(crate) fn cluster_takes_code(flags: &str, letter: &str, language: Language) -> bool {
+    let Some(letter) = letter.chars().next() else {
+        return false;
+    };
+    let (values, more_code): (&str, &str) = match language {
+        Language::Python => ("WXQ", "m"),
+        Language::Perl => ("IMmxiCdD", "E"),
+        Language::Ruby => ("IrCEFxKTW", ""),
+        Language::Node => ("r", ""),
+        Language::Php => ("cdz", ""),
+        Language::Lua => ("l", ""),
+        _ => ("", ""),
+    };
+    let mut chars = flags.chars().peekable();
+    while let Some(flag) = chars.next() {
+        if flag == letter || more_code.contains(flag) {
+            return true;
+        }
+        if values.contains(flag) {
+            return false;
+        }
+        // Perl's `-l` takes octal digits, `-0` octal or `x` and hex ones.
+        if language == Language::Perl && matches!(flag, 'l' | '0') {
+            if flag == '0' && chars.next_if_eq(&'x').is_some() {
+                while chars.next_if(char::is_ascii_hexdigit).is_some() {}
+            }
+            while chars.next_if(|digit| ('0'..='7').contains(digit)).is_some() {}
+        }
+    }
+    false
+}
+
+/// The file `crontab` installs: its first operand past its options, with
+/// the value of `-u USER` and `-T` taken off (`crontab -u alice f`
+/// installs `f`, not `alice`).
+fn crontab_file(args: &[String]) -> Option<String> {
+    let mut at = 0;
+    while let Some(arg) = args.get(at) {
+        match arg.as_str() {
+            "-u" | "-T" => at += 2,
+            "--" => return args.get(at + 1).cloned(),
+            _ if arg.starts_with('-') => at += 1,
+            _ => return Some(arg.clone()),
+        }
     }
     None
 }
@@ -662,6 +724,67 @@ mod tests {
         assert_eq!(
             shell_lines(Language::Python, "import os\nos.system('id')", "python3"),
             vec!["python3 -c 'import os\nos.system('\\''id'\\'')'".to_owned()]
+        );
+    }
+
+    /// `crontab -u USER FILE` installs FILE, not USER; `-T FILE` only checks
+    /// FILE and installs nothing.
+    #[test]
+    fn the_file_crontab_installs_is_past_the_user() {
+        let files = |args: &[String]| file_scripts("crontab", args);
+        let crontab = |path: &str| vec![(path.to_owned(), Language::Crontab)];
+        assert_eq!(
+            files(&["-u".to_owned(), "alice".to_owned(), "c.txt".to_owned()]),
+            crontab("c.txt")
+        );
+        assert_eq!(
+            files(&["-ualice".to_owned(), "c.txt".to_owned()]),
+            crontab("c.txt")
+        );
+        assert_eq!(files(&["c.txt".to_owned()]), crontab("c.txt"));
+        assert_eq!(files(&["-T".to_owned(), "c.txt".to_owned()]), vec![]);
+        assert_eq!(files(&["-l".to_owned()]), vec![]);
+    }
+
+    /// The flag that takes code inline is read anywhere in a group of short
+    /// flags, up to the first flag that takes the rest as its value.
+    #[test]
+    fn inline_code_is_read_anywhere_in_a_group_of_flags() {
+        assert!(cluster_takes_code("uc", "c", Language::Python));
+        assert!(cluster_takes_code("Bc", "c", Language::Python));
+        assert!(cluster_takes_code("um", "c", Language::Python));
+        assert!(!cluster_takes_code(
+            "Wignore::DeprecationWarning",
+            "c",
+            Language::Python
+        ));
+        assert!(!cluster_takes_code(
+            "Xfrozen_modules=off",
+            "c",
+            Language::Python
+        ));
+        assert!(cluster_takes_code("ne", "e", Language::Perl));
+        assert!(cluster_takes_code("pe", "e", Language::Perl));
+        assert!(cluster_takes_code("le", "e", Language::Perl));
+        assert!(cluster_takes_code("lE", "e", Language::Perl));
+        assert!(cluster_takes_code("0777ne", "e", Language::Perl));
+        assert!(!cluster_takes_code("MLWP::Simple", "e", Language::Perl));
+        assert!(!cluster_takes_code("pi.bak", "e", Language::Perl));
+        // A script after such a group is not inline code: it is read.
+        assert_eq!(
+            file_scripts("python", &["-u".to_owned(), "x.py".to_owned()]),
+            vec![("x.py".to_owned(), Language::Python)]
+        );
+        assert_eq!(
+            file_scripts("python", &["-uc".to_owned(), "print(1)".to_owned()]),
+            vec![]
+        );
+        assert_eq!(
+            file_scripts(
+                "perl",
+                &["-ne".to_owned(), "print".to_owned(), "f".to_owned()]
+            ),
+            vec![]
         );
     }
 }

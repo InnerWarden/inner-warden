@@ -48,11 +48,19 @@ fn waits_for_input(program: &str) -> Option<Waits> {
         "--execute",
         "--eval",
     ];
+    // The shells and languages of the table (`data/programs.toml`), so a
+    // shell added there is known here too.
+    if crate::shell::runners::reads_code_when_given_none(program) {
+        return Some(Waits::Script);
+    }
     Some(match program {
-        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "mksh" | "ash" | "csh" | "tcsh"
-        | "nu" | "xonsh" | "elvish" | "pwsh" | "powershell" | "python" | "ipython" | "bpython"
-        | "pypy" | "node" | "nodejs" | "deno" | "bun" | "irb" | "pry" | "ruby" | "perl" | "php"
-        | "lua" | "luajit" | "julia" | "ghci" | "scala" | "jshell" | "tclsh" | "wish" | "guile"
+        // Programs that wait for input and that the table does not carry: the
+        // table holds the programs that run what a line hands them, which
+        // the shell reader reads through; these are prompts (REPLs,
+        // debuggers, other shells) a line does not hand code to in a form
+        // the reader follows, so they are listed here alone.
+        "nu" | "xonsh" | "elvish" | "pwsh" | "powershell" | "ipython" | "bpython" | "irb"
+        | "pry" | "luajit" | "julia" | "ghci" | "scala" | "jshell" | "tclsh" | "wish" | "guile"
         | "racket" | "iex" | "erl" | "osascript" | "gdb" | "lldb" => Waits::Script,
         "psql" | "mysql" | "mariadb" | "redis-cli" | "mongosh" | "mongo" | "clickhouse-client"
         | "cqlsh" => Waits::Client(DB_FLAGS),

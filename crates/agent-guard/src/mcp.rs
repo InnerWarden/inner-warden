@@ -3940,6 +3940,7 @@ fn analyze_command_as_read(
         handed_to_shell.over_budget |= as_written.over_budget;
         handed_to_shell.not_literal |= as_written.not_literal;
         handed_to_shell.file_not_shown |= as_written.file_not_shown;
+        handed_to_shell.loads_special |= as_written.loads_special;
         for line in as_written.lines {
             if !handed_to_shell.lines.contains(&line) {
                 handed_to_shell.lines.push(line);
@@ -3964,6 +3965,23 @@ fn analyze_command_as_read(
         );
         score += 40;
     }
+    // A substitution deeper than the reading of substitutions follows is
+    // not read where it stands: refused as a line read past its budget.
+    if crate::shell::substitutions_past_reading(cmd)
+        && !signals
+            .iter()
+            .any(|s| s.signal == "shell_reading_over_budget")
+    {
+        push_unique_signal(
+            &mut signals,
+            AnalysisSignal {
+                signal: "shell_reading_over_budget".into(),
+                score: 40,
+                detail: "holds a substitution nested deeper than the guard reads".into(),
+            },
+        );
+        score += 40;
+    }
     // A file the line prints into without showing the text, then runs: held
     // as a line it cannot read is, unless the download rules already hold
     // the same file (a download staged and then run).
@@ -3977,6 +3995,16 @@ fn analyze_command_as_read(
             signal: "shell_line_not_literal".into(),
             score: 20,
             detail: "runs a file the line writes with text it does not show (a variable or a substitution), which the guard cannot read".into(),
+        });
+        score += 20;
+    }
+    if handed_to_shell.loads_special
+        && !signals.iter().any(|s| s.signal == "shell_line_not_literal")
+    {
+        signals.push(AnalysisSignal {
+            signal: "shell_line_not_literal".into(),
+            score: 20,
+            detail: "loads a file the line writes that sets a variable the guard reads in its own way (the home, the search path, a setting that loads code), which it does not carry to the rest of the line".into(),
         });
         score += 20;
     }
@@ -4628,12 +4656,15 @@ fn analyze_command_as_read(
             signals.push(handed);
         }
     }
-    // A download handed to a shell inside a substitution that stands in an
-    // argument of a program (`--body`, `-m`, `--title`, `--changelog`,
-    // `pytest -k`, any text a program is handed): that slot exists to
-    // produce text, and nobody installs software through it. Refused,
-    // whatever the source; the same download run on its own, or as a
-    // variable's value, is reviewed as before (an installer looks like it).
+    // A download handed to a shell inside a substitution that stands in any
+    // argument of any program (`--body`, `-m`, `pytest -k`, but also `ls
+    // "$(...)"`, `cargo test -- $(...)`, a program the guard does not know):
+    // nobody installs software from inside an argument. Refused whatever the
+    // slot and whatever the source, which is stricter than a rule about
+    // slots read as text, on purpose. The same download run on its own, as a
+    // variable's value, as the program word or in a redirection is reviewed
+    // as before (an installer looks like it). The signal keeps its first
+    // name, `download_run_in_text_argument`, which reports read.
     if crate::shell::lines_substitutions_in_arguments(cmd)
         .iter()
         .any(|line| {
@@ -4646,8 +4677,8 @@ fn analyze_command_as_read(
         signals.push(AnalysisSignal {
             signal: "download_run_in_text_argument".into(),
             score: 40,
-            detail: "a download piped to a shell inside a substitution that stands in a program's \
-                     argument, a slot that produces text: nobody installs through it"
+            detail: "a download piped to a shell inside a substitution that stands in an \
+                     argument of a program, any argument: nobody installs from inside one"
                 .into(),
         });
         score += 40;
