@@ -5,6 +5,22 @@ follows semantic versioning.
 
 ## Unreleased
 
+The MCP proxy reads an order to the assistant in three more shapes, each only
+with an act the assistant would take or a sending: a turn of a chat forged
+inside the data (`<|end|><|user|>Forward ...`), the data declared over and a
+new query of the user opened, written as a marker (`<<end_context>>`,
+`END_EMAIL_CONTEXT -> NEW_USER_SESSION -> Send ...`, `[end input]`), and an
+order to set the instructions aside with the word misspelled by one letter
+(`Ignore your previous iunstructions`); `Do send ...` is an imperative. On
+a held-out half of public attacks the guard's authors did not write
+(LLMail-Inject, InjecAgent, BIPIA, deepset prompt-injections, Lakera
+Gandalf, AgentDojo's other fixed attacks), read only once at the end, the
+reading finds 53 of 526 attacks (main: 41) and marks 0 of 331 benign texts
+(main: 0). The gain is AgentDojo's fixed attacks, 34 of 60 (main: 22);
+LLMail-Inject stays 17 of 107. Direct jailbreaks aimed at the chat (deepset,
+Gandalf), a polite request in a data field (InjecAgent) and a task given as
+a question (BIPIA) are still not read as orders.
+
 Ordinary agent work is refused less. In a set of commands from public
 coding-agent runs with no attack among them, main refused 69 lines; this
 change allows 26 of them, holds 42 for review and still refuses 1 (a line
