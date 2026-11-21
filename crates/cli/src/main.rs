@@ -3284,7 +3284,10 @@ fn screen_file_tool(
         FileToolCall::Unreadable(why) => return Some(hook_unreadable(buf, rest, why, monitor)),
         FileToolCall::Writes { tool, paths } => (tool, paths),
     };
-    let screen = screen_file_writes(buf, rest, monitor, demo, &tool, &paths);
+    let screen = match screen_file_writes(buf, rest, monitor, demo, &tool, &paths) {
+        FileScreen::Pass => screen_instruction_orders(buf, rest, monitor, demo, &tool, &payload),
+        other => other,
+    };
     Some(
         file_screen_exit(buf, rest, screen, monitor, demo).unwrap_or_else(|| {
             if demo {
@@ -3449,6 +3452,75 @@ pub(crate) fn screen_file_writes(
     FileScreen::Refused {
         explanation: file_tools::refusal_explanation(tool, path, what),
     }
+}
+
+/// A file tool call that writes an order into a file an agent reads as its
+/// instructions (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursorrules`):
+/// judged as the same text written there by a shell line is
+/// (`agent_instruction_order`), in the posture the line runs in. A command
+/// written literally that takes the guard down or runs a download is
+/// refused in every posture that refuses; an order read in prose is refused
+/// under the strict posture and runs with a warning under the default one;
+/// a text longer than the guard reads, with no order in the part read, is a
+/// review. Each is recorded. A note, a build command or a style rule
+/// passes, unrecorded. The rule engine is loaded only for a call that writes
+/// such a file.
+fn screen_instruction_orders(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    demo: bool,
+    tool: &str,
+    payload: &serde_json::Value,
+) -> FileScreen {
+    use innerwarden_agent_guard::{file_tools, mcp, posture};
+    let Some((path, (why, score))) = file_tools::written_texts(payload)
+        .into_iter()
+        .filter_map(|(path, text)| {
+            mcp::written_instruction_order(&path, &text, Some(shell_engine()))
+                .map(|order| (path, order))
+        })
+        .max_by_key(|(_, (_, score))| *score)
+    else {
+        return FileScreen::Pass;
+    };
+    let recommendation = mcp::recommendation_for_score(score);
+    let explanation = format!(
+        "{tool} {why}. An agent may not write orders into its own instructions; if you meant \
+         the change, make it yourself"
+    );
+    let command = format!("{tool} {}", path.trim());
+    let verdict = serde_json::json!({
+        "command": command,
+        "risk_score": score,
+        "severity": if score >= 60 { "high" } else { "medium" },
+        "signals": [{
+            "signal": "agent_instruction_order",
+            "score": score,
+            "detail": why,
+        }],
+        "recommendation": recommendation,
+        "explanation": explanation,
+    });
+    let block_review = rest.iter().any(|a| a == "--block-review");
+    let in_force = match agent_profiles_io::load() {
+        agent_profiles::ProfilesState::On(_) => posture::Posture::Strict,
+        _ => hook_posture(monitor, block_review),
+    };
+    if !monitor && !posture::refuses(in_force, true, &verdict) {
+        // The default posture: it runs, it is in the record, and the agent
+        // shows the person one line.
+        record_shell_warned(buf, rest, &command, &verdict, None, demo);
+        if !demo {
+            let line = posture::warning_line(recommendation, &explanation);
+            if warn_agent(agent_flag(rest).as_deref(), &line) {
+                HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        return FileScreen::Pass;
+    }
+    record_shell(buf, rest, &command, &verdict, monitor, true, None, demo);
+    FileScreen::Refused { explanation }
 }
 
 /// A file change that is not to a privileged file: refused (outside monitor)

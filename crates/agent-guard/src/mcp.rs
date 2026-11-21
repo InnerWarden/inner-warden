@@ -3455,6 +3455,7 @@ pub fn blocks_for_agent(analysis: &CommandAnalysis) -> bool {
 /// name the list does not have, or the list keeps one nothing raises.
 pub const SIGNAL_NAMES: &[&str] = &[
     "agent_instruction_order",
+    "agent_instruction_overwrite",
     "anti_forensics",
     "bare_ip_fetch",
     "clone_and_run",
@@ -4010,24 +4011,125 @@ const INSTRUCTION_ORDER_SIGNALS: &[&str] = &[
     "clone_and_run",
 ];
 
+/// The signals of [`INSTRUCTION_ORDER_SIGNALS`] that read a file a rule
+/// takes for a secret: in an instruction file they count only for a piece
+/// that names a key or a credential itself (`cat ~/.ssh/config` is a setup
+/// step, `cat ~/.ssh/id_rsa` is not).
+const INSTRUCTION_SECRET_SIGNALS: &[&str] = &[
+    "sensitive_credential_read",
+    "credential_read_outside_project",
+    "credential_hunt",
+    "credential_exposure",
+];
+
+/// The signals of a command written literally into an instruction file
+/// that are refused in every posture: the guard taken down, a download run.
+const INSTRUCTION_FIRM_SIGNALS: &[&str] = &[
+    "guard_self_disable",
+    "security_tooling_tamper",
+    "download_and_execute",
+    "download_chmod_execute",
+    "download_fed_to_script",
+    "download_run_in_text_argument",
+    "fetch_exec_unparsed",
+    "fetch_exec_unanalyzable",
+];
+
+/// The score of `agent_instruction_order` for a command written literally
+/// that takes the guard down or runs a download: in the high-certainty
+/// class (`crate::posture::high_certainty_signal`), refused in every
+/// posture that refuses.
+pub const INSTRUCTION_ORDER_FIRM_SCORE: u32 = 70;
+/// The score for an order read in prose, or a command that reads a secret
+/// or clones and runs: a refusal under the strict posture, a warning under
+/// the default one. Prose in an instruction file is ambiguous by nature.
+pub const INSTRUCTION_ORDER_SCORE: u32 = 60;
+/// The score for a text longer than the guard reads whose read part holds
+/// no order: a review, never a refusal of its own.
+pub const INSTRUCTION_ORDER_UNREAD_SCORE: u32 = 25;
+
 /// Why a text written into an agent's instruction file is an order, if it
-/// is one ([`crate::threats::order_reading`]).
-fn instruction_order(text: &str, rule_engine: Option<&RuleEngine>, depth: u8) -> Option<String> {
-    let reading = threats::order_reading(text);
-    if let Some(clause) = reading.prose {
-        return Some(format!("`{clause}`"));
-    }
+/// is one, with the score it earns ([`crate::threats::order_reading`]).
+/// The text is read with invisible and format characters taken out and
+/// NFKC-folded, so a zero-width space or a fullwidth letter does not hide
+/// a word.
+fn instruction_order(
+    text: &str,
+    rule_engine: Option<&RuleEngine>,
+    depth: u8,
+) -> Option<(String, u32)> {
+    let folded = crate::deobfuscate::deobfuscate(text).normalized;
+    let reading = threats::order_reading(&folded);
+    let mut soft: Option<String> = None;
     for piece in &reading.commands {
         let inner = analyze_command_at(piece, rule_engine, &[], None, depth + 1);
-        if let Some(signal) = inner.signals.iter().find(|signal| {
-            signal.score > 0 && INSTRUCTION_ORDER_SIGNALS.contains(&signal.signal.as_str())
+        let lower = piece.to_ascii_lowercase();
+        for signal in inner.signals.iter().filter(|signal| {
+            signal.score > 0
+                && INSTRUCTION_ORDER_SIGNALS.contains(&signal.signal.as_str())
+                && (!INSTRUCTION_SECRET_SIGNALS.contains(&signal.signal.as_str())
+                    || threats::names_a_secret(&lower))
         }) {
-            return Some(format!("`{piece}`: {}", signal.detail));
+            let why = format!("`{piece}`: {}", signal.detail);
+            if INSTRUCTION_FIRM_SIGNALS.contains(&signal.signal.as_str()) {
+                return Some((why, INSTRUCTION_ORDER_FIRM_SCORE));
+            }
+            soft.get_or_insert(why);
         }
     }
-    reading
-        .over_budget
-        .then(|| "more of it than the guard reads".to_string())
+    // Past the count of pieces, a command that takes the guard down or
+    // runs a download is still looked for in the whole text.
+    for piece in &reading.firm_only {
+        let inner = analyze_command_at(piece, rule_engine, &[], None, depth + 1);
+        if let Some(signal) = inner.signals.iter().find(|signal| {
+            signal.score > 0 && INSTRUCTION_FIRM_SIGNALS.contains(&signal.signal.as_str())
+        }) {
+            return Some((
+                format!("`{piece}`: {}", signal.detail),
+                INSTRUCTION_ORDER_FIRM_SCORE,
+            ));
+        }
+    }
+    if let Some(clause) = reading.prose {
+        return Some((format!("`{clause}`"), INSTRUCTION_ORDER_SCORE));
+    }
+    if let Some(why) = soft {
+        return Some((why, INSTRUCTION_ORDER_SCORE));
+    }
+    reading.over_budget.then(|| {
+        (
+            "more of it than the guard reads, and the part read holds no order".to_string(),
+            INSTRUCTION_ORDER_UNREAD_SCORE,
+        )
+    })
+}
+
+/// Why `text`, written into `path` by an agent's own file tool (`Write`,
+/// `Edit`, `write_file`, `apply_patch`, ...), is an order to every later
+/// session, if `path` is a file an agent reads as its instructions and the
+/// text is one: the reading the shell side gives the text a line writes
+/// there (`agent_instruction_order`). `None` for any other file, and for a
+/// note, a build command, a style rule or a clause that forbids. The score
+/// is the one the shell side gives (`agent_instruction_order`):
+/// [`INSTRUCTION_ORDER_FIRM_SCORE`], [`INSTRUCTION_ORDER_SCORE`] or
+/// [`INSTRUCTION_ORDER_UNREAD_SCORE`].
+pub fn written_instruction_order(
+    path: &str,
+    text: &str,
+    rule_engine: Option<&RuleEngine>,
+) -> Option<(String, u32)> {
+    if text.trim().is_empty() || !crate::agent_instructions::is_instruction_file(path) {
+        return None;
+    }
+    let (why, score) = instruction_order(text, rule_engine, 0)?;
+    let shown: String = path.trim().chars().take(200).collect();
+    Some((
+        format!(
+            "writes an order into `{shown}`, which an agent reads as its instructions at \
+             every session: {why}"
+        ),
+        score,
+    ))
 }
 
 /// [`analyze_command_at`] before a refusal is asked whether it came from a
@@ -5083,21 +5185,47 @@ fn analyze_command_as_read(
     // reads a secret or runs a download, in a command or in plain words,
     // refuses the write. A note or a build command asks for none of them.
     if depth < STARTUP_PAYLOAD_DEPTH {
-        if let Some((file, why)) = threats::instruction_file_payloads(cmd)
+        if let Some((file, (why, order_score))) = threats::instruction_file_payloads(cmd)
             .into_iter()
-            .find_map(|(file, text)| {
-                instruction_order(&text, rule_engine, depth).map(|why| (file, why))
+            .filter_map(|(file, text)| {
+                instruction_order(&text, rule_engine, depth).map(|order| (file, order))
             })
+            .max_by_key(|(_, (_, score))| *score)
         {
             signals.push(AnalysisSignal {
                 signal: "agent_instruction_order".into(),
-                score: 60,
+                score: order_score,
                 detail: format!(
                     "writes an order into `{file}`, which an agent reads as its instructions \
                      at every session: {why}"
                 ),
             });
-            score += 60;
+            score += order_score;
+        } else if let Some(placed) = crate::agent_instructions::overwrites(cmd)
+            .into_iter()
+            .next()
+        {
+            // A copy, move or link over the same file writes text that is
+            // not on the line: what `/tmp/x.md` says is not known here. A
+            // review, not a refusal: restoring a CLAUDE.md from a backup is
+            // ordinary work. When this line wrote the copied file, its text
+            // was read above as written into the instruction file.
+            let sources: Vec<String> = placed
+                .sources
+                .iter()
+                .map(|source| format!("`{}`", source.chars().take(200).collect::<String>()))
+                .collect();
+            signals.push(AnalysisSignal {
+                signal: "agent_instruction_overwrite".into(),
+                score: 25,
+                detail: format!(
+                    "puts {} in the place of `{}`, which an agent reads as its instructions at \
+                     every session; what it says is not on this line",
+                    sources.join(", "),
+                    placed.file.chars().take(200).collect::<String>()
+                ),
+            });
+            score += 25;
         }
     }
 

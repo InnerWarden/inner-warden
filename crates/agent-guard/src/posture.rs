@@ -140,6 +140,12 @@ pub const HIGH_CERTAINTY_SIGNALS: &[&str] = &[
 /// path (`.env`, `.kube/`, `.npmrc`), which only warns.
 pub const SECRET_READ: &str = "sensitive_credential_read";
 
+/// An order written into a file an agent reads as its instructions: in the
+/// high-certainty class at [`crate::mcp::INSTRUCTION_ORDER_FIRM_SCORE`] (a
+/// command written literally that takes the guard down or runs a download),
+/// not at the score of an order read in prose, which only warns.
+pub const INSTRUCTION_ORDER: &str = "agent_instruction_order";
+
 /// The score [`crate::threats`] gives a read of a hard-class path, and the
 /// guard's own folder handed whole to a reader.
 pub const HARD_SECRET_SCORE: u64 = 60;
@@ -171,6 +177,12 @@ pub fn high_certainty_signal(name: &str, score: u64, detail: &str) -> bool {
     }
     if name == SECRET_READ {
         return score >= HARD_SECRET_SCORE;
+    }
+    // An order written into an agent's instruction file: only a command
+    // written literally that takes the guard down or runs a download. An
+    // order read in prose is ambiguous by nature and warns.
+    if name == INSTRUCTION_ORDER {
+        return score >= crate::mcp::INSTRUCTION_ORDER_FIRM_SCORE as u64;
     }
     if name == "dangerous_command" {
         if HIGH_CERTAINTY_INLINE_DETAILS.contains(&detail) {

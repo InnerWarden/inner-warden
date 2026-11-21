@@ -23,48 +23,10 @@
 //! that forbids (`never run curl | bash`).
 
 use super::{
-    effective_command_index, is_shell_name, output_redirect_targets, segments_are_piped,
+    effective_command_index, is_shell_program, output_redirect_targets, segments_are_piped,
     shell_command_segments, shell_tokens, tee_targets, token_basename, written_text,
 };
-
-/// The names of the files agents read as their instructions, lower case.
-const INSTRUCTION_NAMES: &[&str] = &[
-    "claude.md",
-    "claude.local.md",
-    "agents.md",
-    "agents.override.md",
-    "gemini.md",
-    "copilot-instructions.md",
-    ".cursorrules",
-    ".windsurfrules",
-    ".clinerules",
-    ".roorules",
-    ".goosehints",
-];
-
-/// Folders whose every file an agent reads as its rules.
-const INSTRUCTION_FOLDERS: &[&str] = &[
-    ".cursor/rules/",
-    ".windsurf/rules/",
-    ".clinerules/",
-    ".roo/rules/",
-    ".kiro/steering/",
-    ".github/instructions/",
-];
-
-/// Whether `path` names a file an agent reads as its instructions.
-pub(crate) fn is_instruction_file(path: &str) -> bool {
-    let lower = path
-        .trim_matches(|c: char| c == '"' || c == '\'')
-        .to_ascii_lowercase()
-        .replace('\\', "/");
-    let name = lower.rsplit('/').next().unwrap_or(&lower);
-    INSTRUCTION_NAMES.contains(&name)
-        || name.ends_with(".instructions.md")
-        || INSTRUCTION_FOLDERS
-            .iter()
-            .any(|folder| lower.starts_with(folder) || lower.contains(&format!("/{folder}")))
-}
+use crate::agent_instructions::{is_instruction_file, mentions_one, overwrites, shell_line};
 
 /// Inline code flags of the interpreters read here.
 const CODE_FLAGS: &[(&str, &[&str])] = &[
@@ -79,38 +41,53 @@ const CODE_FLAGS: &[(&str, &[&str])] = &[
 ];
 
 /// Text a line writes into an agent's instruction file, with the file.
+///
+/// A copy, move or link over an instruction file
+/// ([`crate::agent_instructions::overwrites`]) whose source the same line
+/// wrote carries that text into the instruction file: `echo X > /tmp/n.md &&
+/// cp /tmp/n.md CLAUDE.md` writes X into `CLAUDE.md`.
 pub(crate) fn instruction_file_payloads(content: &str) -> Vec<(String, String)> {
-    payloads_at(content, 0)
+    if !mentions_one(content) {
+        return Vec::new();
+    }
+    let mut payloads = payloads_at(content, 0, &is_instruction_file);
+    for placed in overwrites(content) {
+        let from_a_source = |target: &str| {
+            placed
+                .sources
+                .iter()
+                .any(|source| same_word(source, target))
+        };
+        payloads.extend(
+            payloads_at(content, 0, &from_a_source)
+                .into_iter()
+                .map(|(_, text)| (placed.file.clone(), text)),
+        );
+    }
+    payloads
+}
+
+/// Whether two words of a line name the same file as written: quotes and a
+/// leading `./` aside.
+fn same_word(a: &str, b: &str) -> bool {
+    let plain = |word: &str| {
+        let word = word.trim_matches(|c: char| c == '"' || c == '\'');
+        word.strip_prefix("./").unwrap_or(word).to_string()
+    };
+    plain(a) == plain(b)
 }
 
 /// How many shells deep a `-c` line is read.
 const SHELL_DEPTH: u8 = 3;
 
-/// The line a shell runs from its `-c` (`-lc`, `-ec`): the word after it.
-fn shell_line(args: &[String]) -> Option<&str> {
-    let at = args.iter().position(|arg| {
-        arg.len() > 1
-            && arg.starts_with('-')
-            && !arg.starts_with("--")
-            && arg[1..].chars().all(|c| c.is_ascii_alphabetic())
-            && arg.contains('c')
-    })?;
-    args.get(at + 1).map(String::as_str)
-}
-
-/// [`instruction_file_payloads`], `depth` shells deep.
-fn payloads_at(content: &str, depth: u8) -> Vec<(String, String)> {
-    let lower = content.to_ascii_lowercase();
-    if !INSTRUCTION_NAMES
-        .iter()
-        .chain(INSTRUCTION_FOLDERS)
-        .any(|name| lower.contains(name.trim_end_matches('/')))
-        && !lower.contains(".instructions.md")
-    {
-        return Vec::new();
-    }
+/// Which files a line writes are read: the instruction files, or the files
+/// a copy then puts in an instruction file's place.
+type Target<'a> = &'a dyn Fn(&str) -> bool;
+/// The text a line writes into each file `target` accepts, `depth` shells
+/// deep.
+fn payloads_at(content: &str, depth: u8, target: Target<'_>) -> Vec<(String, String)> {
     let mut payloads = Vec::new();
-    heredoc_payloads(content, &mut payloads);
+    heredoc_payloads(content, &mut payloads, target);
     let segments = shell_command_segments(content);
     for (index, segment) in segments.iter().enumerate() {
         let words = shell_tokens(segment);
@@ -119,13 +96,13 @@ fn payloads_at(content: &str, depth: u8) -> Vec<(String, String)> {
         };
         let name = token_basename(&words[command_index]).to_ascii_lowercase();
         if matches!(name.as_str(), "sed" | "gsed") {
-            sed_payloads(&words[command_index + 1..], &mut payloads);
+            sed_payloads(&words[command_index + 1..], &mut payloads, target);
             continue;
         }
         if let Some(code) = inline_code(&name, &words[command_index + 1..]) {
             if let Some(file) = string_literals(code)
                 .into_iter()
-                .find(|literal| is_instruction_file(literal))
+                .find(|literal| target(literal))
             {
                 let text: Vec<String> = string_literals(code)
                     .into_iter()
@@ -139,22 +116,20 @@ fn payloads_at(content: &str, depth: u8) -> Vec<(String, String)> {
         }
         // `bash -c 'echo ... >> CLAUDE.md'`: the line the shell is handed is
         // read the same way, a few levels deep.
-        if is_shell_name(&name) {
+        if is_shell_program(&name) {
             if let Some(line) = shell_line(&words[command_index + 1..]) {
                 if depth < SHELL_DEPTH {
-                    payloads.extend(payloads_at(line, depth + 1));
+                    payloads.extend(payloads_at(line, depth + 1, target));
                 }
                 continue;
             }
         }
         let file = if name == "tee" {
-            tee_targets(&words)
-                .into_iter()
-                .find(|t| is_instruction_file(t))
+            tee_targets(&words).into_iter().find(|t| target(t))
         } else {
             output_redirect_targets(&words)
                 .into_iter()
-                .find(|t| is_instruction_file(t))
+                .find(|t| target(t))
         };
         let Some(file) = file else {
             continue;
@@ -184,8 +159,8 @@ fn payloads_at(content: &str, depth: u8) -> Vec<(String, String)> {
 }
 
 /// The body of each here-document a line redirects, or hands to a `tee`,
-/// into an instruction file.
-fn heredoc_payloads(content: &str, payloads: &mut Vec<(String, String)>) {
+/// into a file `target` accepts.
+fn heredoc_payloads(content: &str, payloads: &mut Vec<(String, String)>, target: Target<'_>) {
     static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let heredoc = HEREDOC.get_or_init(|| {
         regex::Regex::new(r#"<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?"#)
@@ -217,25 +192,22 @@ fn heredoc_payloads(content: &str, payloads: &mut Vec<(String, String)>) {
                     .into_iter()
                     .flat_map(|segment| tee_targets(&shell_tokens(segment))),
             )
-            .find(|target| is_instruction_file(target));
+            .find(|file| target(file));
         if let (Some(file), false) = (file, body.is_empty()) {
             payloads.push((file, body.join("\n")));
         }
     }
 }
 
-/// The text a `sed -i` of an instruction file inserts (`a`, `i`, `c`) or
-/// substitutes (the replacement of `s`), each script of the line.
-fn sed_payloads(args: &[String], payloads: &mut Vec<(String, String)>) {
+/// The text a `sed -i` of a file `target` accepts inserts (`a`, `i`, `c`)
+/// or substitutes (the replacement of `s`), each script of the line.
+fn sed_payloads(args: &[String], payloads: &mut Vec<(String, String)>, target: Target<'_>) {
     let in_place = args.iter().any(|arg| {
         arg == "--in-place"
             || arg.starts_with("--in-place=")
             || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('i'))
     });
-    let Some(file) = args
-        .iter()
-        .find(|arg| !arg.starts_with('-') && is_instruction_file(arg))
-    else {
+    let Some(file) = args.iter().find(|arg| !arg.starts_with('-') && target(arg)) else {
         return;
     };
     if !in_place {
@@ -401,9 +373,35 @@ pub(crate) struct OrderReading {
     /// A clause that, in plain words, has the reader act on the guard, read
     /// a secret or run a download.
     pub(crate) prose: Option<String>,
-    /// More pieces than [`MAX_PIECES`].
+    /// More pieces than [`MAX_PIECES`], or past [`MAX_FIRM_TEXT`].
     pub(crate) over_budget: bool,
+    /// Past [`MAX_PIECES`]: the pieces that start at a word of
+    /// [`FIRM_TRIGGERS`], judged only for a command that takes the guard
+    /// down or runs a download. Padding a file with links never hides such
+    /// a line: these are bound by cost ([`MAX_FIRM_TEXT`]), not by count.
+    pub(crate) firm_only: Vec<String>,
 }
+
+/// Words a command that takes the guard down or runs a download starts
+/// with, as [`holds_trigger`] reads a trigger.
+const FIRM_TRIGGERS: &[&str] = &[
+    "innerwarden",
+    "systemctl",
+    "launchctl",
+    "pkill",
+    "killall",
+    "kill",
+    "curl",
+    "wget",
+    "iwr",
+    "irm",
+    "iex",
+    "invoke-webrequest",
+    "invoke-restmethod",
+];
+
+/// The most text, in bytes, of the pieces judged past [`MAX_PIECES`].
+pub(crate) const MAX_FIRM_TEXT: usize = 2 * 1024 * 1024;
 
 /// Verbs a clause that forbids starts with.
 const NEGATIONS: &[&str] = &[
@@ -474,7 +472,8 @@ const GUARD_NAMES: &[&str] = &[
     "security tool",
 ];
 
-/// Verbs that hand a file's text to someone.
+/// Verbs that hand a file's text to someone. `copy` is not among them: a
+/// setup step copies a template (`Copy .env.example to .env`).
 const READ_ACTS: &[&str] = &[
     "read",
     "cat",
@@ -484,7 +483,6 @@ const READ_ACTS: &[&str] = &[
     "upload",
     "post",
     "paste",
-    "copy",
     "output",
     "dump",
     "display",
@@ -498,25 +496,73 @@ const READ_ACTS: &[&str] = &[
     "type",
 ];
 
-/// Paths a secret lives at, as prose names them.
+/// Secrets as prose names them: keys, credentials and the files that keep
+/// tokens. In `.ssh/`, `config` and `known_hosts` are not secrets
+/// ([`SSH_NOT_SECRET`]): a setup step reads them.
 const SECRET_PATHS: &[&str] = &[
     ".ssh/",
     "id_rsa",
     "id_ed25519",
     "id_ecdsa",
     "id_dsa",
-    ".aws/credentials",
+    ".pem",
+    "credentials",
+    ".git-credentials",
     ".aws/config",
-    ".gnupg",
     ".netrc",
+    ".gnupg",
     ".kube/config",
     ".docker/config.json",
     "/etc/shadow",
-    ".git-credentials",
     ".pypirc",
     ".npmrc",
     ".env",
 ];
+
+/// The files of `.ssh/` a setup step reads that hold no key.
+const SSH_NOT_SECRET: &[&str] = &["config", "known_hosts"];
+
+/// Ends of a file name that make it a template, not a secret
+/// (`.env.example`).
+const TEMPLATE_ENDS: &[&str] = &[".example", ".sample", ".template", ".dist", ".tmpl"];
+
+/// Whether `lower` names a secret of [`SECRET_PATHS`]: `.env` only as
+/// the file itself (not `.envrc`) and not in a clause that names a
+/// template of it (`Copy .env.example to .env`); `.ssh/` not for its
+/// `config` or `known_hosts`.
+pub(crate) fn names_a_secret(lower: &str) -> bool {
+    let env_template = TEMPLATE_ENDS
+        .iter()
+        .any(|end| lower.contains(&format!(".env{end}")));
+    // A name ends where no letter, digit, `_` or `-` follows, nor a `.`
+    // that goes on into another word (`config.bak`).
+    let ends_here = |rest: &str| {
+        let mut chars = rest.chars();
+        match chars.next() {
+            None => true,
+            Some('.') => chars.next().is_none_or(|c| !c.is_ascii_alphanumeric()),
+            Some(c) => !c.is_ascii_alphanumeric() && c != '_' && c != '-',
+        }
+    };
+    SECRET_PATHS.iter().any(|path| {
+        if *path == ".env" && env_template {
+            return false;
+        }
+        lower.match_indices(path).any(|(at, _)| {
+            let after = &lower[at + path.len()..];
+            if *path == ".ssh/" {
+                return !SSH_NOT_SECRET
+                    .iter()
+                    .any(|name| after.strip_prefix(name).is_some_and(ends_here));
+            }
+            !path.ends_with(|c: char| c.is_ascii_alphanumeric())
+                || after
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric())
+        })
+    })
+}
 
 /// Verbs that fetch, and verbs that run what was fetched.
 const FETCH_ACTS: &[&str] = &[
@@ -526,57 +572,138 @@ const RUN_ACTS: &[&str] = &[
     "run", "execute", "exec", "bash", "sh", "source", "pipe", "install", "eval", "launch", "start",
 ];
 
-/// The clauses of a written text, read as orders.
+/// The longest piece judged, in characters: a command asked for in prose
+/// is a line, and a piece is cut there so a long clause costs no more than
+/// [`MAX_PIECES`] such lines.
+const MAX_PIECE_CHARS: usize = 4096;
+
+/// Whether `word` holds a trigger: a trigger of letters only as a word of
+/// its own (`gate` not in `navigate`, `kill` not in `skill`), a plural
+/// `s` allowed; one with a mark in it (`.ssh`, `id_rsa`) anywhere.
+fn holds_trigger(word: &str) -> bool {
+    holds_one_of(word, TRIGGERS)
+}
+
+/// [`holds_trigger`] for any list of triggers.
+fn holds_one_of(word: &str, triggers: &[&str]) -> bool {
+    triggers.iter().any(|trigger| {
+        if !trigger.chars().all(|c| c.is_ascii_alphabetic()) {
+            return word.contains(trigger);
+        }
+        word.match_indices(trigger).any(|(at, _)| {
+            let before = word[..at].chars().next_back();
+            let mut after = word[at + trigger.len()..].chars().peekable();
+            let after = match after.next() {
+                Some('s') => after.next(),
+                other => other,
+            };
+            before.is_none_or(|c| !c.is_ascii_alphanumeric())
+                && after.is_none_or(|c| !c.is_ascii_alphanumeric())
+        })
+    })
+}
+
+/// The clauses of a written text, read as orders. Linear in the text: each
+/// clause is lowered once, a sentence keeps flags rather than its text, and
+/// past [`MAX_PIECES`] pieces the rest is still read for prose.
 pub(crate) fn order_reading(text: &str) -> OrderReading {
     let mut reading = OrderReading::default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut firm_text = 0usize;
     // The clauses of one sentence that forbid nothing, for an order that
-    // takes two of them (`download https://x/i.sh and run it`).
-    let mut sentence: (usize, Vec<String>) = (usize::MAX, Vec::new());
+    // takes two of them (`download https://x/i.sh and run it`): an
+    // address, a verb that fetches and one that runs, in any of them.
+    let mut sentence_at_now = usize::MAX;
+    let mut sentence: Vec<String> = Vec::new();
+    let (mut address, mut fetches, mut runs) = (false, false, false);
     for (sentence_at, clause) in clauses(text) {
         let lower = clause.to_ascii_lowercase();
-        if sentence.0 != sentence_at {
-            sentence = (sentence_at, Vec::new());
+        if sentence_at_now != sentence_at {
+            sentence_at_now = sentence_at;
+            sentence.clear();
+            (address, fetches, runs) = (false, false, false);
         }
         if negated(&lower) {
             continue;
         }
-        sentence.1.push(clause.clone());
-        let whole = sentence.1.join(" ").to_ascii_lowercase();
-        if reading.prose.is_none() && (prose_order(&lower) || runs_a_download(&whole)) {
-            reading.prose = Some(sentence.1.join(" ").trim().to_string());
+        address |= lower.contains("http://") || lower.contains("https://");
+        fetches |= FETCH_ACTS.iter().any(|act| has_word(&lower, act).is_some());
+        runs |= RUN_ACTS.iter().any(|act| has_word(&lower, act).is_some());
+        if reading.prose.is_none() {
+            sentence.push(clause.clone());
+            if prose_order(&lower) || (address && fetches && runs) {
+                reading.prose = Some(sentence.join(" ").trim().to_string());
+            }
         }
         let words: Vec<&str> = clause.split_whitespace().collect();
+        // Each start once, in order: the reach of one trigger overlaps the
+        // one before it, never an earlier one.
         let mut starts = Vec::new();
+        let mut next_start = 0;
+        let past_budget = reading.commands.len() >= MAX_PIECES;
         for (at, word) in words.iter().enumerate() {
             let word = word.to_ascii_lowercase();
-            if TRIGGERS.iter().any(|trigger| word.contains(trigger)) {
-                for start in at.saturating_sub(COMMAND_REACH)..=at {
-                    if !starts.contains(&start) {
-                        starts.push(start);
-                    }
+            if past_budget {
+                if holds_one_of(&word, FIRM_TRIGGERS) {
+                    starts.push(at);
                 }
+                continue;
+            }
+            if holds_trigger(&word) {
+                let from = at.saturating_sub(COMMAND_REACH).max(next_start);
+                starts.extend(from..=at);
+                next_start = at + 1;
             }
         }
         for start in starts {
-            let piece = words[start..].join(" ");
+            let mut piece = String::new();
+            for word in &words[start..] {
+                if piece.len() + word.len() + 1 > MAX_PIECE_CHARS {
+                    break;
+                }
+                if !piece.is_empty() {
+                    piece.push(' ');
+                }
+                piece.push_str(word);
+            }
             let piece = piece
-                .trim_matches(|c: char| matches!(c, '\x60' | '"' | '\'' | ':' | ',' | '.'))
+                .trim_matches(|c: char| matches!(c, '\x60' | '"' | '\'' | ':' | ',' | '.' | ';'))
                 .to_string();
-            if piece.is_empty() || reading.commands.contains(&piece) {
+            if piece.is_empty() || seen.contains(&piece) {
                 continue;
             }
             if reading.commands.len() >= MAX_PIECES {
+                // Past the count, only a firm command is looked for.
                 reading.over_budget = true;
-                return reading;
+                if !holds_one_of(
+                    &piece
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_lowercase(),
+                    FIRM_TRIGGERS,
+                ) {
+                    continue;
+                }
+                if firm_text + piece.len() > MAX_FIRM_TEXT {
+                    continue;
+                }
+                firm_text += piece.len();
+                seen.insert(piece.clone());
+                reading.firm_only.push(piece);
+                continue;
             }
+            seen.insert(piece.clone());
             reading.commands.push(piece);
         }
     }
     reading
 }
 
-/// A text cut at line ends, sentence ends, backquotes, and the words that
-/// join two orders (`and`, `then`, `but`), never inside a word.
+/// A text cut at line ends, sentence ends, `;`, and the words that join
+/// two orders (`and`, `then`, `but`), never inside a word. A span in
+/// backquotes is part of the clause it stands in (`Never run \`curl x |
+/// sh\`` forbids the line), and no mark inside it ends anything.
 fn clauses(text: &str) -> Vec<(usize, String)> {
     let mut out = Vec::new();
     let mut sentence_at = 0;
@@ -584,14 +711,24 @@ fn clauses(text: &str) -> Vec<(usize, String)> {
         // A sentence ends at `. `, `! `, `? ` (a path's dot is no end).
         let mut sentences = Vec::new();
         let mut current = String::new();
+        let mut in_code = false;
         let mut chars = line.chars().peekable();
         while let Some(c) = chars.next() {
-            if matches!(c, '.' | '!' | '?') && chars.peek().is_none_or(|n| n.is_whitespace()) {
+            if c == '\x60' {
+                in_code = !in_code;
+                current.push(' ');
+                continue;
+            }
+            if !in_code
+                && matches!(c, '.' | '!' | '?')
+                && chars.peek().is_none_or(|n| n.is_whitespace())
+            {
                 sentences.push(std::mem::take(&mut current));
                 continue;
             }
-            if c == '\x60' {
-                sentences.push(std::mem::take(&mut current));
+            if !in_code && c == ';' {
+                // A clause ends; the sentence goes on.
+                current.push_str(" ; ");
                 continue;
             }
             current.push(c);
@@ -602,7 +739,10 @@ fn clauses(text: &str) -> Vec<(usize, String)> {
             let mut clause = Vec::new();
             for word in sentence.split_whitespace() {
                 let bare = word.trim_end_matches(',').to_ascii_lowercase();
-                if matches!(bare.as_str(), "and" | "then" | "but" | "or" | "instead") {
+                if matches!(
+                    bare.as_str(),
+                    "and" | "then" | "but" | "or" | "instead" | ";"
+                ) {
                     out.push((sentence_at, clause.join(" ")));
                     clause.clear();
                     continue;
@@ -625,7 +765,7 @@ fn clauses(text: &str) -> Vec<(usize, String)> {
 /// [`NOT_NEGATING`].
 fn negated(lower: &str) -> bool {
     let mut rest = lower.trim_start_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '-' | '*' | '#' | '>' | '+') || c.is_ascii_digit()
+        c.is_whitespace() || matches!(c, '-' | '*' | '#' | '>' | '+' | ';') || c.is_ascii_digit()
     });
     for lead in [
         "important: ",
@@ -693,29 +833,10 @@ fn prose_order(lower: &str) -> bool {
             return true;
         }
     }
-    if READ_ACTS.iter().any(|act| has_word(lower, act).is_some())
-        && SECRET_PATHS.iter().any(|path| {
-            lower.match_indices(path).any(|(at, _)| {
-                // `.env` is the file, not `.envrc` or `.environment`.
-                !path.ends_with(|c: char| c.is_ascii_alphanumeric())
-                    || lower[at + path.len()..]
-                        .chars()
-                        .next()
-                        .is_none_or(|c| !c.is_ascii_alphanumeric())
-            })
-        })
-    {
+    if READ_ACTS.iter().any(|act| has_word(lower, act).is_some()) && names_a_secret(lower) {
         return true;
     }
     false
-}
-
-/// A sentence that has its reader run a download: an address, a verb that
-/// fetches and one that runs, in the clauses of it that forbid nothing.
-fn runs_a_download(lower: &str) -> bool {
-    (lower.contains("http://") || lower.contains("https://"))
-        && FETCH_ACTS.iter().any(|act| has_word(lower, act).is_some())
-        && RUN_ACTS.iter().any(|act| has_word(lower, act).is_some())
 }
 
 #[cfg(test)]

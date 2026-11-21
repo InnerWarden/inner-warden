@@ -94,6 +94,7 @@ pub mod user_prompt;
 // ── 3. INTERNAL ──────────────────────────────────────────────────────────────
 // No consumer outside this crate. Kept private so a future caller has to make a
 // deliberate decision to widen the surface, rather than finding it already open.
+mod agent_instructions;
 mod arg_chain;
 mod description_poison;
 mod line_values;
