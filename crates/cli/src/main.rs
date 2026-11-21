@@ -980,7 +980,7 @@ fn check_as_the_hook(command: &str, agent: Option<&str>, block_review: bool) -> 
         "tool_name": "Bash",
         "tool_input": { "command": command },
     });
-    if let Some(dir) = own_dir() {
+    if let Some(dir) = check_dir() {
         payload["cwd"] = dir.into();
     }
     let buf = payload.to_string();
@@ -1033,6 +1033,25 @@ fn check_as_the_hook(command: &str, agent: Option<&str>, block_review: bool) -> 
         outcome,
         why,
     }
+}
+
+/// The folder `check` judges a line in: `$PWD` when it names the folder
+/// this process runs in, as the shell and the agent name it (a path through
+/// a link, macOS's `/var` for `/private/var`), else the folder itself. The
+/// hook is handed the agent's `cwd`, which is the shell's path: judged from
+/// the folder behind the link instead, `../.env` read as another file.
+fn check_dir() -> Option<String> {
+    let real = std::env::current_dir().ok()?;
+    let pwd = std::env::var_os("PWD")
+        .map(std::path::PathBuf::from)
+        .filter(|pwd| pwd.is_absolute())
+        .filter(|pwd| {
+            matches!(
+                (std::fs::canonicalize(pwd), std::fs::canonicalize(&real)),
+                (Ok(a), Ok(b)) if a == b
+            )
+        });
+    Some(pwd.unwrap_or(real).to_string_lossy().into_owned())
 }
 
 /// PURE: what the enforcing hook of `agent` does with `verdict` on a shell

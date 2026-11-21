@@ -47,6 +47,9 @@ impl Host {
             .env("IW_GRAPH_FILE", self.dir.path().join("graph.json"))
             .env("IW_SESSION_FILE", self.dir.path().join("sessions.json"))
             .env_remove("INNERWARDEN_HOOK_DEADLINE_MS")
+            // As a shell starts it: `PWD` is the path the agent sends as
+            // `cwd`, which on macOS goes through the `/var` link.
+            .env("PWD", self.project())
             .current_dir(self.project());
         command
     }
