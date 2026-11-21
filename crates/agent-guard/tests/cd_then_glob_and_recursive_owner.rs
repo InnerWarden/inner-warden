@@ -130,9 +130,44 @@ fn find_with_a_selection_or_in_a_project_stays_allowed() {
         "find . -exec chmod 644 {} +",
         "find /tmp/x -exec chown me {} +",
         "find / -maxdepth 0 -exec chown nobody {} +",
-        "find / -user olduser -exec chown newuser {} +",
         "find /srv/app -exec chgrp www-data {} +",
+        "find /etc/nginx -name nginx.conf -exec chmod 644 {} +",
+        "find . -name '*.sh' -exec sh -c 'chmod +x \"$1\"' sh {} \\;",
     ] {
         assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// Second review of this change (2026-11-21): global options before the
+/// starting point, a starting point the line does not spell out, a test
+/// that is not a literal name or path (an owner, a glob, a regex, a
+/// negation, `-o`, `-prune`), and the program behind its launchers or in
+/// a shell's `-c` line. Measured on the first version of this change,
+/// before the fix: allowed, except the unread starting point (review).
+/// `find / -user olduser -exec chown newuser {} +` was asserted allowed
+/// above in the first version: an owner test leaves every file of that
+/// owner in the whole system to the change.
+#[test]
+fn find_options_tests_and_launchers_do_not_free_a_whole_system_change() {
+    for line in [
+        "find -L / -exec chown nobody {} +",
+        "find -H / -exec chown nobody {} +",
+        "find -P / -exec chown nobody {} +",
+        "find -O3 / -exec chown nobody {} +",
+        "find -L $UNKNOWN -exec chown nobody {} +",
+        "find / -user root -exec chown nobody {} +",
+        "find / -user olduser -exec chown newuser {} +",
+        "find / ! -name x -exec chown nobody {} +",
+        "find / -not -name x -exec chown nobody {} +",
+        "find / -regex '.*' -exec chown nobody {} +",
+        "find / -name '?*' -exec chown nobody {} +",
+        "find / -name zzz -o -exec chown nobody {} +",
+        "find / -path /proc -prune -o -exec chown nobody {} +",
+        "find / -exec nohup chown nobody {} +",
+        "find / -exec timeout 9 chown nobody {} +",
+        "find / -exec sudo -u root chown nobody {} +",
+        "find / -exec sh -c 'chown nobody \"$1\"' sh {} +",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
     }
 }

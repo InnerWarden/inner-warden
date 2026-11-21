@@ -13912,11 +13912,19 @@ const FIND_SELECTING_TESTS: &[&str] = &[
 /// Whether `find` with `words` after it hands every file of the root, a
 /// system directory or a home to `chown`, `chgrp` or `chmod` (`-exec`,
 /// `-execdir`, `-ok`, `-okdir`): the same change of the whole tree as
-/// `chown -R` ([`recursive_owner_change_of_system`]). Not when a test picks
-/// some files out (`-name '*.sh'`, `-user old`; a name test of `*` alone
-/// picks every file and counts as none), or `-maxdepth 0` keeps it to the
-/// starting point. Measured 2026-11-21: `find / -exec chown nobody {} +`
-/// was allowed, `-execdir`, `-ok` and `chgrp` too.
+/// `chown -R` ([`recursive_owner_change_of_system`]). The global options
+/// before the starting points (`-H`, `-L`, `-P`, `-D`, `-O3`) are
+/// stepped over, and a starting point the line does not spell out (`$X`
+/// with no value) counts as such a place. The program run is read past its
+/// launchers (`sudo -u root`, `nohup`, `timeout 9`) and inside a shell's
+/// `-c` line. Only a test of a literal name or path (`-name app.conf`,
+/// `-path /etc/x`) picks some files out; an owner, a glob, a regex, a
+/// negation (`!`, `-not`), an `-o` or a `-prune` leaves the rest of the
+/// tree to the change. `-maxdepth 0` keeps it to the starting point.
+/// Measured 2026-11-21: `find / -exec chown nobody {} +` was allowed,
+/// `-execdir`, `-ok` and `chgrp` too; then (review of the fix)
+/// `find -L /`, `find / -user root`, `find / ! -name x` and
+/// `-exec nohup chown` still were.
 fn find_changes_owner_of_system(
     place: &CommandPlace<'_>,
     words: &[String],
@@ -13926,9 +13934,20 @@ fn find_changes_owner_of_system(
         .iter()
         .map(|word| word.trim_matches(['\'', '"']))
         .collect();
+    // The global options come before the starting points.
+    let mut first = 0;
+    while let Some(word) = bare.get(first) {
+        match *word {
+            "-H" | "-L" | "-P" => first += 1,
+            "-D" => first += 2,
+            _ if word.starts_with("-O") || (word.starts_with("-D") && word.len() > 2) => first += 1,
+            _ => break,
+        }
+    }
+    let first = first.min(bare.len());
     // The starting points: the words before the first option, test or
     // parenthesis, `.` when there are none.
-    let starts: Vec<&str> = bare
+    let starts: Vec<&str> = bare[first..]
         .iter()
         .take_while(|word| {
             !(word.starts_with('-')
@@ -13940,50 +13959,72 @@ fn find_changes_owner_of_system(
         .collect();
     let mut changes = false;
     let mut selected = false;
-    let mut at = starts.len();
+    let mut widened = false;
+    let mut at = first + starts.len();
     while at < bare.len() {
         let word = bare[at];
         match word {
             "-exec" | "-execdir" | "-ok" | "-okdir" => {
-                // The program run, past `sudo` and the like.
-                let program = bare[at + 1..]
-                    .iter()
-                    .find(|word| !matches!(**word, "sudo" | "doas" | "env" | "command" | "nice"))
-                    .map(|word| token_basename(word).to_ascii_lowercase());
-                if program
-                    .as_deref()
-                    .is_some_and(|program| matches!(program, "chown" | "chgrp" | "chmod"))
-                {
-                    changes = true;
-                }
+                let start = at + 1;
                 // Past the command, to its `;` or `+`.
                 while at < bare.len() && !matches!(bare[at], ";" | "\\;" | "+") {
                     at += 1;
                 }
+                if find_exec_changes_owner(&words[start.min(at)..at]) {
+                    changes = true;
+                }
             }
             "-maxdepth" if bare.get(at + 1) == Some(&"0") => return false,
-            _ if FIND_SELECTING_TESTS.contains(&word) => {
+            "!" | "-not" | "-o" | "-or" | "-prune" | "," => widened = true,
+            "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" => {
                 let pattern = bare.get(at + 1).copied().unwrap_or("");
-                let everything = matches!(
-                    word,
-                    "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename"
-                ) && pattern.chars().all(|c| c == '*');
-                if !everything {
+                if !pattern.is_empty() && !pattern.contains(['*', '?', '[', '$', '`']) {
                     selected = true;
                 }
                 at += 1;
             }
+            _ if FIND_SELECTING_TESTS.contains(&word) => at += 1,
             _ => {}
         }
         at += 1;
     }
-    if !changes || selected {
+    if !changes || (selected && !widened) {
         return false;
     }
     let starts = if starts.is_empty() { vec!["."] } else { starts };
-    starts
-        .iter()
-        .any(|start| owner_change_target_is_system_or_home(place, start, home))
+    starts.iter().any(|start| {
+        owner_change_target_is_system_or_home(place, start, home)
+            || (start.contains(['$', '`']) && place.resolve(start).is_none())
+    })
+}
+
+/// Whether the words of a `find -exec` run `chown`, `chgrp` or `chmod`:
+/// past the launchers a line runs a program through, or as a command of the
+/// `-c` line of a shell.
+fn find_exec_changes_owner(words: &[String]) -> bool {
+    let is_change = |words: &[String]| {
+        effective_command_index(words).is_some_and(|index| {
+            matches!(
+                token_basename(words[index].trim_matches(['\'', '"']))
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "chown" | "chgrp" | "chmod"
+            )
+        })
+    };
+    if is_change(words) {
+        return true;
+    }
+    let Some(index) = effective_command_index(words) else {
+        return false;
+    };
+    let Some(code_at) = crate::shell::shell_inline_code_place(&words[index..]) else {
+        return false;
+    };
+    let code = words[index + code_at].trim_matches(['\'', '"']);
+    shell_command_segments(code)
+        .into_iter()
+        .any(|segment| is_change(&shell_tokens(segment)))
 }
 
 /// Whether one operand of a recursive owner or mode change names the root, a
@@ -14258,8 +14299,9 @@ impl<'a> CommandPlace<'a> {
 
 /// The names `unset` takes away (not `unset -f`, which takes functions) or
 /// `read`, `mapfile`, `readarray`, `getopts` and `printf -v` give a value
-/// the text does not show; `None` for another command. Every word that is a
-/// name counts: a prompt taken for one only forgets a value.
+/// the text does not show; `None` for another command. The same reading as
+/// the values of a line ([`crate::line_values::names_taken_by`]): each
+/// builtin's options that take an argument are its own.
 fn names_given_unshown_values(command: &str, arguments: &[String]) -> Option<Vec<String>> {
     if !matches!(
         command,
@@ -14267,44 +14309,8 @@ fn names_given_unshown_values(command: &str, arguments: &[String]) -> Option<Vec
     ) {
         return None;
     }
-    let bare: Vec<&str> = arguments
-        .iter()
-        .map(|word| word.trim_matches(['\'', '"']))
-        .collect();
-    if command == "unset"
-        && bare
-            .iter()
-            .any(|word| word.starts_with('-') && word.contains('f'))
-    {
-        return Some(Vec::new());
-    }
-    let name = |word: &str| {
-        let mut chars = word.chars();
-        chars
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-    };
-    if command == "printf" {
-        return Some(
-            bare.windows(2)
-                .filter(|pair| pair[0] == "-v" && name(pair[1]))
-                .map(|pair| pair[1].to_owned())
-                .chain(
-                    bare.iter()
-                        .filter_map(|word| word.strip_prefix("-v"))
-                        .filter(|rest| name(rest))
-                        .map(str::to_owned),
-                )
-                .collect(),
-        );
-    }
-    Some(
-        bare.iter()
-            .filter(|word| name(word))
-            .map(|word| (*word).to_owned())
-            .collect(),
-    )
+    let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    Some(crate::line_values::names_taken_by(command, &words))
 }
 
 /// How many `(` and `)` a segment holds outside quotes: a subshell or a

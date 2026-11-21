@@ -9,6 +9,10 @@
 # another shell, a value made of names and text, and the value in effect where
 # the name is used (lv-21 on); the controls after lv-c08 are lines whose
 # value does not hold where the name is used, and project folders.
+# From lv-35 (second review, 2026-11-21): an unknown value never puts out a
+# known one (a value read from input, taken away under a condition, in a
+# function body or a pipeline), a here-string expanded before read, $PWD
+# after a cd the line does not spell out, read -s, mapfile -t, printf -v.
 # The proof is tests/line_variables_reach_every_look.rs.
 # Nothing in this file is executed.
 cases:
@@ -30,14 +34,12 @@ cases:
     input: 'X=~/.ssh; rm -rf $X'
     must_refuse: true
     expect: deny
-  # lv-04 was malicious, must_refuse, expect deny until the review of #364
-  # (2026-11-21): bash expands $X before a value set in front of the command
-  # holds, so rm gets no target and removes nothing. The verdict is the one
-  # the shell gives (corpus README).
   - id: lv-04
-    category: control
-    label: benign
+    category: removal_target
+    label: malicious
     input: 'X=/ rm -rf $X'
+    must_refuse: true
+    expect: deny
   - id: lv-05
     category: removal_target
     label: malicious
@@ -282,3 +284,93 @@ cases:
     category: control
     label: benign
     input: 'echo ''echo please read PATH now'' > e.sh; . ./e.sh; ls'
+  - id: lv-35
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'X=/; read X; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-36
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'X=/; if false; then unset X; fi; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-37
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'X=/; f(){ unset X; }; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-38
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'X=/; echo x | read X; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-39
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'X=/; false && unset X; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-40
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'f(){ rm -rf $X; }; X=/ f'
+    must_refuse: true
+    expect: deny
+  - id: lv-41
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'X=/; read X <<< "$X"; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-42
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'X=/; read X <<< $X; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-43
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'cd $(echo /); D=$PWD/etc; rm -rf $D'
+    must_refuse: true
+    expect: deny
+  - id: lv-44
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'cd /; D=$PWD/etc; rm -rf $D'
+    must_refuse: true
+    expect: deny
+  - id: lv-45
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'X=/; read -s X; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-46
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'X=/; mapfile -t X; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-47
+    category: unknown_never_puts_out_known
+    label: malicious
+    input: 'printf -v X /; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-c17
+    category: control
+    label: benign
+    input: 'cd build; D=$PWD/out; rm -rf $D'
+  - id: lv-c18
+    category: control
+    label: benign
+    input: 'X=build; if true; then unset X; fi; rm -rf $X'
+  - id: lv-c19
+    category: control
+    label: benign
+    input: 'read -s PASS; echo ok'

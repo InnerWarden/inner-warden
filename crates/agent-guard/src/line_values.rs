@@ -1,5 +1,9 @@
 //! The values a line gives its own names, each read in where the name is
-//! used: the value in effect at that point, as the shell has it.
+//! used: the value in effect at that point. Where the text cannot settle it
+//! (a value taken away under a condition, in a function body or a pipeline;
+//! a name made another name's with `declare -n`) the value before stays a
+//! candidate, or the name is left as written: an unknown value never puts
+//! out a known one.
 //!
 //! The reading [`crate::threats::assignment_readings`] gives a name the first
 //! value the line gives it, wherever it is used. That reads a name used
@@ -13,8 +17,9 @@
 //! in the scopes that are still open there: a subshell, a substitution and a
 //! quoted string (a line handed to another shell) each open one, whose
 //! assignments end with it; a string handed to `eval` runs in the same shell
-//! and opens none. A value set in front of a command reaches only what that
-//! command hands on unexpanded (`X=/ sh -c 'rm -rf $X'`). A value is read with
+//! and opens none. A value set in front of a command reaches only that
+//! command (`X=/ sh -c 'rm -rf $X'`; in `X=/ rm -rf $X` it stays a candidate
+//! beside the value from outside the line). A value is read with
 //! the values in effect where it is assigned, so names that refer to one
 //! another (`X=$Y; Y=$X`) end at once.
 //!
@@ -51,14 +56,14 @@ struct Event {
     until: usize,
     /// For a value set in front of a command, where that command ends.
     prefix_until: Option<usize>,
-    /// Whether the assignment stands where the shell does not expand it
-    /// (single quotes, a `\$`): a line handed on.
-    unexpanded: bool,
     effect: Effect,
     /// The value with its own names read, once worked out.
     resolved: Option<String>,
     /// Whether the value as written is plain ([`plain`]).
     plain: bool,
+    /// A value taken away or hidden only maybe: under a condition, in a
+    /// function body, in a pipeline. The value before stays a candidate.
+    maybe: bool,
 }
 
 /// Whether a value can be read into the line as text: a path, a word, an
@@ -218,7 +223,7 @@ fn layout(text: &str) -> Layout {
                 pop(&mut frames, &mut close, i + 1);
                 singles = singles.saturating_sub(1);
             }
-            b'\'' if frames.iter().any(|f| f.0 == Frame::Single) => {
+            b'\'' if singles > 0 => {
                 while let Some((kind, _, _, _)) = frames.last().copied() {
                     pop(&mut frames, &mut close, i + 1);
                     if kind == Frame::Single {
@@ -311,28 +316,51 @@ fn is_identifier(word: &str) -> bool {
 
 /// The names a builtin gives a value the line does not show, or takes away:
 /// `unset NAME` (not `unset -f`), `read [options] NAME...`, `mapfile NAME`,
-/// `getopts spec NAME`, `printf -v NAME`.
-fn names_taken(builtin: &str, words: &[(String, usize)]) -> Vec<String> {
+/// `getopts spec NAME`, `printf -v NAME`. The options that take an argument
+/// are each builtin's own (`read -s` and `mapfile -t` take none), so the
+/// name after them is read as the name. One reading for this module and
+/// [`crate::threats`].
+pub(crate) fn names_taken_by(builtin: &str, words: &[&str]) -> Vec<String> {
     let mut names = Vec::new();
     let mut takes_argument = false;
     let mut argument_is_name = false;
     let mut first_operand = true;
-    for (word, _) in words {
+    let mut options_done = false;
+    for word in words {
+        let word = word.trim_matches(['\'', '"']);
         if takes_argument {
             takes_argument = false;
             if argument_is_name && is_identifier(word) {
-                names.push(word.clone());
+                names.push(word.to_owned());
             }
             continue;
         }
-        if word.starts_with('-') && word.len() > 1 {
+        if word == "--" && !options_done {
+            options_done = true;
+            continue;
+        }
+        if !options_done && word.starts_with('-') && word.len() > 1 {
             match builtin {
                 "unset" if word.contains('f') => return Vec::new(),
                 "read" | "mapfile" | "readarray" => {
-                    let last = word.chars().last().unwrap_or('-');
-                    takes_argument = "pdnNtuiaOsCc".contains(last);
-                    // `read -a NAME` fills NAME.
-                    argument_is_name = builtin == "read" && last == 'a';
+                    let with_argument = if builtin == "read" {
+                        "adinNptu"
+                    } else {
+                        "dnOsuCc"
+                    };
+                    // The first letter in a cluster that takes an argument
+                    // takes the rest of the word, or the next word.
+                    let letters = &word[1..];
+                    if let Some(at) = letters.find(|c| with_argument.contains(c)) {
+                        let letter = letters.as_bytes()[at];
+                        let glued = &letters[at + 1..];
+                        if glued.is_empty() {
+                            takes_argument = true;
+                            argument_is_name = builtin == "read" && letter == b'a';
+                        } else if builtin == "read" && letter == b'a' && is_identifier(glued) {
+                            names.push(glued.to_owned());
+                        }
+                    }
                 }
                 "printf" => match word.strip_prefix("-v") {
                     Some("") => {
@@ -347,14 +375,33 @@ fn names_taken(builtin: &str, words: &[(String, usize)]) -> Vec<String> {
             continue;
         }
         match builtin {
-            "printf" => {}
+            "printf" => break,
             "getopts" if first_operand => {}
-            _ if is_identifier(word) => names.push(word.clone()),
+            _ if is_identifier(word) => names.push(word.to_owned()),
             _ => {}
         }
         first_operand = false;
     }
     names
+}
+
+fn names_taken(builtin: &str, words: &[(String, usize)]) -> Vec<String> {
+    let words: Vec<&str> = words.iter().map(|(word, _)| word.as_str()).collect();
+    names_taken_by(builtin, &words)
+}
+
+/// The value `printf -v NAME FORMAT` gives NAME when the format is plain
+/// text with nothing to fill in (`printf -v X /` gives `/`).
+fn printf_value(words: &[(String, usize)]) -> Option<(String, String)> {
+    let words: Vec<&str> = words.iter().map(|(word, _)| word.as_str()).collect();
+    let (name, format) = match words.as_slice() {
+        ["-v", name, format, ..] => (*name, *format),
+        [glued, format, ..] => (glued.strip_prefix("-v")?, *format),
+        _ => return None,
+    };
+    let format = format.trim_matches(['\'', '"']);
+    (is_identifier(name) && !format.is_empty() && plain(format) && !format.contains(['%', '$']))
+        .then(|| (name.to_owned(), format.to_owned()))
 }
 
 /// The patterns of the reading.
@@ -387,7 +434,7 @@ fn patterns() -> Option<&'static Patterns> {
                 )
                 .ok()?,
                 read_here: regex::Regex::new(
-                    r#"(?:^|[\s;&|('"])read\s+(?:-r\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*<<<\s*('[^']*'|"[^"$`\\]*"|[^\s;&|()$`'"\\]+)"#,
+                    r#"(?:^|[\s;&|('"])read\s+(?:-r\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*<<<\s*('[^']*'|"[^"`\\]*"|[^\s;&|()`'"\\]+)"#,
                 )
                 .ok()?,
                 reader: regex::Regex::new(
@@ -399,6 +446,91 @@ fn patterns() -> Option<&'static Patterns> {
         .as_ref()
 }
 
+/// Whether the command written from `start` to `end` may not run, or runs
+/// where what it does to a name does not reach the rest of the line: after
+/// `&&` or `||`, in a pipeline (each part a subshell in bash), or inside an
+/// `if`, a loop, a `case` or a `{ }` group still open (a function body
+/// among them). Read on the words outside single quotes; a mistake only
+/// keeps a value as a candidate, which can only raise a verdict.
+fn runs_only_maybe(text: &str, depths: &[i32], start: usize, end: usize) -> bool {
+    let before = text[..start].trim_end();
+    if before.ends_with("&&") || before.ends_with("||") || before.ends_with('|') {
+        return true;
+    }
+    let after = text[end.min(text.len())..].trim_start();
+    if after.starts_with('|') || after.starts_with("&&") || after.starts_with("||") {
+        return true;
+    }
+    depths.get(start).is_some_and(|depth| *depth > 0)
+}
+
+/// How many `if`, loop bodies, `case` and `{ }` groups are open at each
+/// byte, counting the words outside single quotes.
+fn block_depths(text: &str, layout: &Layout) -> Vec<i32> {
+    let b = text.as_bytes();
+    let mut depths = vec![0i32; b.len() + 1];
+    let mut depth: i32 = 0;
+    let mut word_start = None;
+    for at in 0..=b.len() {
+        let ends = at == b.len()
+            || b" \t\n;&|()".contains(&b[at])
+            || layout.single.get(at).copied().unwrap_or(false);
+        if ends {
+            if let Some(from) = word_start.take() {
+                match &text[from..at] {
+                    "if" | "do" | "case" | "{" => depth += 1,
+                    "fi" | "done" | "esac" | "}" => depth -= 1,
+                    _ => {}
+                }
+            }
+        } else if word_start.is_none() {
+            word_start = Some(at);
+        }
+        depths[at] = depth;
+    }
+    depths
+}
+
+/// Where the bodies of the functions the line defines are written
+/// (`f(){ ...; }`, `function f { ...; }`): a name used there takes the value
+/// it has where the function is called, which may be any the line gives.
+fn function_bodies(text: &str, layout: &Layout) -> Vec<(usize, usize)> {
+    static HEAD: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let Some(head) = HEAD
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"(?:^|[\s;&|(])(?:function\s+[A-Za-z_][A-Za-z0-9_:.-]*\s*(?:\(\s*\))?|[A-Za-z_][A-Za-z0-9_:.-]*\s*\(\s*\))\s*\{",
+            )
+            .ok()
+        })
+        .as_ref()
+    else {
+        return Vec::new();
+    };
+    let b = text.as_bytes();
+    let mut bodies = Vec::new();
+    for found in head.find_iter(text) {
+        let open = found.end();
+        let mut depth = 1usize;
+        let mut at = open;
+        while at < b.len() && depth > 0 {
+            if !layout.single.get(at).copied().unwrap_or(false) {
+                match b[at] {
+                    b'{' if at == 0 || b[at - 1] != b'$' => depth += 1,
+                    b'}' => depth -= 1,
+                    _ => {}
+                }
+            }
+            at += 1;
+        }
+        bodies.push((open, at));
+        if bodies.len() >= LOOK_BACK {
+            break;
+        }
+    }
+    bodies
+}
+
 /// Everything the line does to its names, sorted by where it takes effect.
 fn events_of(text: &str, layout: &Layout, patterns: &Patterns) -> Vec<(String, Event)> {
     let b = text.as_bytes();
@@ -407,9 +539,7 @@ fn events_of(text: &str, layout: &Layout, patterns: &Patterns) -> Vec<(String, E
         let scope = layout.scope.get(at).copied().unwrap_or(0) as usize;
         layout.close.get(scope).copied().unwrap_or(n)
     };
-    let unexpanded_at = |at: usize| {
-        layout.single.get(at).copied().unwrap_or(false) || (at > 0 && b[at - 1] == b'\\')
-    };
+    let depths = block_depths(text, layout);
     let mut events: Vec<(String, Event)> = Vec::new();
     // The end of the last command a value in front of it was found for:
     // values in a row in front of one command share it.
@@ -488,6 +618,15 @@ fn events_of(text: &str, layout: &Layout, patterns: &Patterns) -> Vec<(String, E
             }
         }
         let plain = value.as_deref().is_none_or(plain);
+        // `declare -n R=X` makes R another name for X, read where R is
+        // used: not a value the line shows here.
+        let nameref = found.get(1).is_some_and(|setter| {
+            setter
+                .as_str()
+                .split_whitespace()
+                .any(|flag| flag.starts_with('-') && flag.contains('n'))
+        });
+        let value = if nameref { None } else { value };
         let effect = match value {
             Some(value) if append => Effect::Append(value),
             Some(value) => Effect::Value(value),
@@ -500,10 +639,10 @@ fn events_of(text: &str, layout: &Layout, patterns: &Patterns) -> Vec<(String, E
                 from: end,
                 until,
                 prefix_until,
-                unexpanded: unexpanded_at(head),
                 effect,
                 resolved: None,
                 plain,
+                maybe: false,
             },
         ));
     }
@@ -519,10 +658,10 @@ fn events_of(text: &str, layout: &Layout, patterns: &Patterns) -> Vec<(String, E
                 from,
                 until: until_of(head),
                 prefix_until: None,
-                unexpanded: unexpanded_at(head),
                 effect,
                 resolved: None,
                 plain,
+                maybe: false,
             },
         )
     };
@@ -555,19 +694,41 @@ fn events_of(text: &str, layout: &Layout, patterns: &Patterns) -> Vec<(String, E
         };
         let words = words_from(text, builtin.end());
         let end = words.last().map_or(builtin.end(), |(_, end)| *end);
+        // A value read from input is unknown: it never puts out a known
+        // one, wherever it stands. Only `unset` that surely runs takes a
+        // value away.
+        let maybe =
+            builtin.as_str() != "unset" || runs_only_maybe(text, &depths, builtin.start(), end);
+        let shown = if builtin.as_str() == "printf" {
+            printf_value(&words)
+        } else {
+            None
+        };
         for name in names_taken(builtin.as_str(), &words) {
-            events.push(simple(&name, builtin.start(), end, Effect::Unknown));
+            let effect = match &shown {
+                Some((given, value)) if *given == name => Effect::Value(value.clone()),
+                _ => Effect::Unknown,
+            };
+            let mut event = simple(&name, builtin.start(), end, effect);
+            event.1.maybe = maybe;
+            events.push(event);
         }
     }
     for found in patterns.read_here.captures_iter(text) {
         if let (Some(whole), Some(name), Some(word)) = (found.get(0), found.get(1), found.get(2)) {
-            let word = word.as_str().trim_matches(['\'', '"']).to_owned();
-            events.push(simple(
-                name.as_str(),
-                name.start(),
-                whole.end(),
-                Effect::Value(word),
-            ));
+            // The word is expanded before `read` runs: `read X <<< "$X"`
+            // leaves X as it was.
+            let written = word.as_str();
+            let word = written.trim_matches(['\'', '"']).to_owned();
+            let effect = if written.starts_with('\'') && word.contains('$') {
+                Effect::Unknown
+            } else {
+                Effect::Value(word)
+            };
+            let maybe = runs_only_maybe(text, &depths, name.start(), whole.end());
+            let mut event = simple(name.as_str(), name.start(), whole.end(), effect);
+            event.1.maybe = maybe;
+            events.push(event);
         }
     }
     events.sort_by_key(|(_, event)| event.from);
@@ -581,12 +742,43 @@ struct Values {
     limit: usize,
     /// Set once a use reads a value that is not plain.
     unplain_read: std::cell::Cell<bool>,
+    /// The bodies of the functions the line defines ([`function_bodies`]).
+    bodies: Vec<(usize, usize)>,
 }
 
 impl Values {
-    /// The value of `name` in effect at `at`, for a use the shell expands
-    /// there (`unexpanded` false) or one handed on as written.
-    fn lookup(&self, name: &str, at: usize, unexpanded: bool) -> Option<String> {
+    /// The value of `name` at `at`: the one in effect there or, inside a
+    /// function body, any the line gives the name.
+    fn lookup(&self, name: &str, at: usize) -> Option<String> {
+        let found = self.lookup_in_order(name, at);
+        if found.is_some()
+            || !self
+                .bodies
+                .iter()
+                .any(|(open, close)| *open <= at && at < *close)
+        {
+            return found;
+        }
+        // In a function body: the value where the function is called,
+        // which may be any the line gives the name (`f(){ rm -rf $X; }; X=/ f`).
+        let list = self.by_name.get(name)?;
+        for &index in list.iter().rev().take(LOOK_BACK) {
+            let event = &self.events[index];
+            if let Some(value) = &event.resolved {
+                if !event.plain {
+                    self.unplain_read.set(true);
+                }
+                return Some(value.clone());
+            }
+        }
+        None
+    }
+
+    /// The value of `name` in effect at `at`, reading the events before it
+    /// in the scopes still open there. A value taken away only maybe
+    /// (`if c; then unset X; fi`) leaves the one before it in effect: an
+    /// unknown value never puts out a known one.
+    fn lookup_in_order(&self, name: &str, at: usize) -> Option<String> {
         let list = self.by_name.get(name)?;
         let before = list.partition_point(|&index| self.events[index].from <= at);
         for &index in list[..before].iter().rev().take(LOOK_BACK) {
@@ -594,10 +786,19 @@ impl Values {
             if at >= event.until {
                 continue;
             }
+            // A value set in front of a command holds for what that command
+            // hands on unexpanded. Its own `$X` the shell expands before the
+            // value holds, to a value from outside the line the text does not
+            // show: the value in front stays a candidate there (`X=/ rm -rf
+            // $X` is held as main holds it; an unknown value never puts out
+            // a known one).
             if let Some(stop) = event.prefix_until {
-                if !(unexpanded && at < stop) {
+                if at >= stop {
                     continue;
                 }
+            }
+            if event.maybe && event.resolved.is_none() {
+                continue;
             }
             if event.resolved.is_some() && !event.plain {
                 self.unplain_read.set(true);
@@ -609,7 +810,7 @@ impl Values {
 
     /// `text` with every name in it read, each at the place `place` gives
     /// for its offset, and whether anything was read; `None` past the limit.
-    fn expand(&self, text: &str, place: &dyn Fn(usize) -> (usize, bool)) -> Option<(String, bool)> {
+    fn expand(&self, text: &str, place: &dyn Fn(usize) -> usize) -> Option<(String, bool)> {
         let name_end = |text: &str| {
             text.bytes()
                 .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_')
@@ -622,12 +823,12 @@ impl Values {
             let at = offset + found;
             out.push_str(&text[offset..at]);
             let after = &text[at + 1..];
-            let (spot, unexpanded) = place(at);
+            let spot = place(at);
             let mut read = None;
             if let Some(braced) = after.strip_prefix('{') {
                 let end = name_end(braced);
                 if end > 0 {
-                    let held = self.lookup(&braced[..end], spot, unexpanded);
+                    let held = self.lookup(&braced[..end], spot);
                     if braced[end..].starts_with('}') {
                         read = held.map(|value| (value, end + 2));
                     } else {
@@ -641,9 +842,7 @@ impl Values {
             } else {
                 let end = name_end(after);
                 if end > 0 && !after.as_bytes()[0].is_ascii_digit() {
-                    read = self
-                        .lookup(&after[..end], spot, unexpanded)
-                        .map(|value| (value, end));
+                    read = self.lookup(&after[..end], spot).map(|value| (value, end));
                 }
             }
             match read {
@@ -671,13 +870,65 @@ impl Values {
     }
 }
 
-/// A value under the working directory (`$PWD/build`) as the relative path
-/// it is (`./build`): the rules read a relative path against the place the
-/// line is at, and would take `$PWD` for a name they cannot read (item 7 of
-/// the review of #364: `D=$PWD/build; rm -rf $D` stays the person's). Only a
-/// path below it, with no `..` and nothing else left to read; `$PWD`
+/// Where the line stands at a byte, as far as `$PWD` goes: where it
+/// started (no `cd` before), a folder a `cd` spells out, or a place the
+/// text does not settle (`cd $(echo /)`, `cd -`, a bare `cd`).
+#[derive(Clone)]
+enum Folder {
+    Start,
+    Known(String),
+    Unknown,
+}
+
+/// Every `cd`, `pushd` and `popd` of the line: where it ends and the
+/// folder it moves to, in order. Read once per line.
+fn folder_moves(text: &str) -> Vec<(usize, Folder)> {
+    static CD: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let Some(cd) = CD
+        .get_or_init(|| {
+            regex::Regex::new(r"(?:^|[\s;&|({])(?:cd|pushd|popd)\b[ \t]*([^\s;&|()]*)").ok()
+        })
+        .as_ref()
+    else {
+        return vec![(0, Folder::Unknown)];
+    };
+    cd.captures_iter(text)
+        .filter_map(|found| {
+            let whole = found.get(0)?;
+            let target = found.get(1).map_or("", |m| m.as_str());
+            let target = target.trim_matches(['\'', '"']);
+            let folder = if whole.as_str().contains("popd")
+                || target.is_empty()
+                || target.starts_with(['-', '~'])
+                || target.contains(['$', '`', '*', '?', '[', '\\'])
+            {
+                Folder::Unknown
+            } else {
+                Folder::Known(target.trim_end_matches('/').to_owned())
+            };
+            Some((whole.end(), folder))
+        })
+        .collect()
+}
+
+/// The folder the last move of [`folder_moves`] before `at` goes to.
+fn folder_at(moves: &[(usize, Folder)], at: usize) -> Folder {
+    let before = moves.partition_point(|(end, _)| *end <= at);
+    match before.checked_sub(1) {
+        Some(last) => moves[last].1.clone(),
+        None => Folder::Start,
+    }
+}
+
+/// A value under the working directory (`$PWD/build`) read against where
+/// the line stands where it is assigned: with no `cd` before it, the
+/// relative path it is (`./build`), which the rules read against the place
+/// the line is at (item 7 of the review of #364: `D=$PWD/build; rm -rf $D`
+/// stays the person's); after a `cd` the line spells out, under that folder
+/// (`cd /; D=$PWD/etc` is `/etc`); after one it does not, as written. Only
+/// a path below it, with no `..` and nothing else left to read; `$PWD`
 /// itself stays as written.
-fn below_working_directory(value: String) -> String {
+fn below_working_directory(value: String, folder: Folder) -> String {
     let rest = value
         .strip_prefix("$PWD/")
         .or_else(|| value.strip_prefix("${PWD}/"));
@@ -687,7 +938,13 @@ fn below_working_directory(value: String) -> String {
                 && !rest.contains('$')
                 && !rest.split('/').any(|part| part == "..") =>
         {
-            format!("./{rest}")
+            match folder {
+                Folder::Start => format!("./{rest}"),
+                Folder::Known(folder) if folder.is_empty() => format!("/{rest}"),
+                Folder::Known(folder) if folder.starts_with('/') => format!("{folder}/{rest}"),
+                Folder::Known(folder) => format!("./{folder}/{rest}"),
+                Folder::Unknown => value,
+            }
         }
         _ => value,
     }
@@ -724,22 +981,23 @@ pub(crate) fn readings_in_effect(content: &str) -> Vec<String> {
         by_name,
         limit,
         unplain_read: std::cell::Cell::new(false),
+        bodies: function_bodies(content, &layout),
     };
+    let moves = folder_moves(content);
     // All the values worked out together may hold four times the limit.
     let mut budget = limit.saturating_mul(4);
     // In the order they take effect: a value's own names are read where it
     // is assigned, against values already worked out.
     for (index, name) in names.iter().enumerate() {
         let head = values.events[index].head;
-        let unexpanded = values.events[index].unexpanded;
-        let place = move |_: usize| (head, unexpanded);
+        let place = move |_: usize| head;
         let resolved = match &values.events[index].effect {
             Effect::Unknown => None,
             Effect::Value(raw) => match values.expand(raw, &place) {
-                Some((read, _)) => Some(below_working_directory(read)),
+                Some((read, _)) => Some(below_working_directory(read, folder_at(&moves, head))),
                 None => return Vec::new(),
             },
-            Effect::Append(raw) => match values.lookup(name, head, unexpanded) {
+            Effect::Append(raw) => match values.lookup(name, head) {
                 None => None,
                 Some(mut before) => match values.expand(raw, &place) {
                     Some((read, _)) => {
@@ -758,15 +1016,7 @@ pub(crate) fn readings_in_effect(content: &str) -> Vec<String> {
         }
         values.events[index].resolved = resolved;
     }
-    let bytes = content.as_bytes();
-    let single = &layout.single;
-    let place = |at: usize| {
-        (
-            at,
-            single.get(at).copied().unwrap_or(false) || (at > 0 && bytes[at - 1] == b'\\'),
-        )
-    };
-    match values.expand(content, &place) {
+    match values.expand(content, &|at: usize| at) {
         Some((reading, true)) if reading != content && !values.unplain_read.get() => {
             vec![reading]
         }
@@ -795,8 +1045,14 @@ mod tests {
             Some("X=/; read X <<< build; rm -rf build")
         );
         assert_eq!(read("(X=/); rm -rf $X"), None);
-        assert_eq!(read("X=/ rm -rf $X"), None);
-        assert_eq!(read("X=/; read -r X; rm -rf $X"), None);
+        // Second review: the value in front stays a candidate for the
+        // command's own words, and a value read from input never puts out a
+        // known one.
+        assert_eq!(read("X=/ rm -rf $X").as_deref(), Some("X=/ rm -rf /"));
+        assert_eq!(
+            read("X=/; read -r X; rm -rf $X").as_deref(),
+            Some("X=/; read -r X; rm -rf /")
+        );
         assert_eq!(
             read("X=/; unset -f X; rm -rf $X").as_deref(),
             Some("X=/; unset -f X; rm -rf /")

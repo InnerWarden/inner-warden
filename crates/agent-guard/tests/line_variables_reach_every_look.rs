@@ -4,8 +4,9 @@
 //! allowed where the line typed out with the value is refused:
 //!
 //! * `X=/; rm -rf $X`, `X=/; rm -rf "$X"`, `X=~/.ssh; rm -rf $X`, with
-//!   `export`, `declare`, `local`, `readonly`, `typeset` in front, a
-//!   one-word loop, a value through another name;
+//!   `export`, `declare`, `local`, `readonly`, `typeset` in front, the
+//!   value set before the command (`X=/ rm -rf $X`), a one-word loop, a
+//!   value through another name;
 //! * `X=/dev/sda; dd if=/dev/zero of=$X`;
 //! * the program word from a variable (`P=rm; $P -rf /`);
 //! * a file the line writes and then loads (`echo 'X=/' > e.sh; . ./e.sh;
@@ -35,6 +36,7 @@ fn a_value_the_line_assigns_reaches_the_target_of_a_removal() {
         "X=/; rm -rf \"${X}\"",
         "X='/'; rm -rf \"$X\"",
         "X=~/.ssh; rm -rf $X",
+        "X=/ rm -rf $X",
         "export X=/; rm -rf $X",
         "export X=/ && rm -rf \"$X\"",
         "declare X=/; rm -rf $X",
@@ -191,20 +193,15 @@ fn the_value_in_effect_where_the_name_is_used_is_read() {
     }
 }
 
-/// What the shell does: a name used before it is set, taken away, set in a
-/// subshell that has closed, or set in front of the command that uses it
-/// (bash expands `$X` before the value holds: `rm` gets no target) does not
+/// What the shell does: a name used before it is set, taken away by an
+/// `unset` that surely runs, or set in a subshell that has closed does not
 /// hold the value. Before: deny 90 each, from the first value the line gave
 /// the name.
-///
-/// `X=/ rm -rf $X` was asserted deny above until this review: the
-/// expectation moved with the corpus case lv-04 (corpus README).
 #[test]
 fn a_value_that_does_not_hold_where_the_name_is_used_is_not_read() {
     for line in [
         "X=/; unset X; rm -rf $X",
         "(X=/); rm -rf $X",
-        "X=/ rm -rf $X",
         "X=build; rm -rf $X; X=/",
     ] {
         assert_eq!(verdict(line), "allow", "{line}");
@@ -213,10 +210,51 @@ fn a_value_that_does_not_hold_where_the_name_is_used_is_not_read() {
     for line in [
         "rm -rf $X; X=/",
         "sh -c 'X=/'; rm -rf $X",
-        "X=/; read X; rm -rf $X",
         "X=/; read X <<< build; rm -rf $X",
     ] {
         assert_eq!(verdict(line), "review", "{line}");
+    }
+}
+
+/// Second review of this change (2026-11-21): an unknown value never puts
+/// out a known one. A value read from input, or taken away only maybe (under
+/// `if`, `&&` or `||`, in a function body, in a pipeline, whose last part
+/// bash runs in a subshell), leaves the value before it a candidate; a
+/// function body reads any value the line gives the name, as it is called
+/// later; a here-string is expanded before `read` runs; `$PWD` after a
+/// `cd` the line does not spell out is not the starting folder; `read -s`
+/// and `mapfile -t` take no argument; `printf -v X /` gives `/`. Each
+/// line was measured on the first version of this change, before the fix:
+/// allow or review except where noted.
+#[test]
+fn an_unknown_value_never_puts_out_a_known_one() {
+    for line in [
+        "X=/; read X; rm -rf $X",
+        "X=/; if false; then unset X; fi; rm -rf $X",
+        "X=/; f(){ unset X; }; rm -rf $X",
+        "X=/; echo x | read X; rm -rf $X",
+        "X=/; false && unset X; rm -rf $X",
+        "f(){ rm -rf $X; }; X=/ f",
+        "X=/; read X <<< \"$X\"; rm -rf $X",
+        "X=/; read X <<< $X; rm -rf $X",
+        "cd $(echo /); D=$PWD/etc; rm -rf $D",
+        "cd /; D=$PWD/etc; rm -rf $D",
+        "X=/; read -s X; rm -rf $X",
+        "X=/; mapfile -t X; rm -rf $X",
+        "printf -v X /; rm -rf $X",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    // `declare -n R=X` makes R another name: not read as the text `X`.
+    assert_ne!(verdict("declare -n R=X; X=/; rm -rf $R"), "allow");
+    for line in [
+        "D=$PWD/build; rm -rf $D",
+        "cd build; D=$PWD/out; rm -rf $D",
+        "X=build; if true; then unset X; fi; rm -rf $X",
+        "read -s PASS; echo ok",
+        "mapfile -t lines < f.txt; echo \"${lines[0]}\"",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
     }
 }
 
