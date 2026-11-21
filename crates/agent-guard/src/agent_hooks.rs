@@ -1818,6 +1818,29 @@ mod tests {
     use super::*;
 
     const BIN: &str = "/opt/iw/innerwarden";
+
+    /// The prompt line is Claude Code's alone: no agent wired here (Cursor,
+    /// Codex, Gemini) is wired on a prompt event, and no line written for
+    /// one carries the prompt flag, in any mode.
+    #[test]
+    fn no_agent_wired_here_gets_the_prompt_line() {
+        for spec in [&CODEX, &GEMINI, &CURSOR] {
+            assert!(
+                spec.events()
+                    .all(|event| event != crate::user_prompt::PROMPT_EVENT),
+                "{}",
+                spec.agent
+            );
+            for (block_review, monitor) in [(false, false), (true, false), (false, true)] {
+                let line = spec.command(Path::new(BIN), block_review, monitor);
+                assert!(
+                    !line.contains(crate::user_prompt::PROMPT_LINE_FLAG),
+                    "{}: {line}",
+                    spec.agent
+                );
+            }
+        }
+    }
     /// The enforcing lines as `agents connect` writes them on this system:
     /// the fail-closed script on Linux and macOS.
     static CODEX_LINE: std::sync::LazyLock<String> =

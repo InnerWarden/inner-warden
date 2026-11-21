@@ -197,7 +197,7 @@ fn a_prompt_line_that_enforces_still_never_drops_the_prompt() {
     // The line install writes in enforce: the prompt is kept and the hook
     // still ends with 0.
     let host = Host::new();
-    let line = format!("\"{}\" hook --agent claude-code", bin());
+    let line = the_prompt_line();
     let out = host.run_line(&line, &prompt_payload("rename the branch to release-7"));
     assert_eq!(
         out.status.code(),
@@ -213,7 +213,7 @@ fn a_prompt_line_that_enforces_still_never_drops_the_prompt() {
 #[test]
 fn a_prompt_past_the_cap_goes_on_and_is_not_kept() {
     let host = Host::new();
-    let line = format!("\"{}\" hook --agent claude-code", bin());
+    let line = the_prompt_line();
     let long = "x".repeat(2 * 1024 * 1024);
     let out = host.run_line(&line, &prompt_payload(&long));
     assert_eq!(
@@ -397,9 +397,9 @@ fn the_agent_is_refused_a_read_of_the_record() {
     let file = std::fs::read_dir(user_prompt::dir_in(&host.home()))
         .expect("prompts folder")
         .flatten()
-        .next()
-        .expect("a record")
-        .path();
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .expect("a record");
     let file = file.to_string_lossy().into_owned();
     let calls = [
         json!({"tool_name": "Bash", "tool_input": {"command": "cat ~/.config/innerwarden/prompts/*.json"}}),
@@ -436,4 +436,97 @@ fn an_agent_with_a_shell_can_forge_a_record() {
     assert_silent_zero(&out, "the forged prompt");
     assert_eq!(host.asked("eve@evil.example"), UserAsked::Yes);
     assert_eq!(host.asked("acct 99887766"), UserAsked::Yes);
+}
+
+/// `--prompt` counts only as the line's last word, as the grammar of a line
+/// of ours reads it: anywhere else the line is a tool line, and stdin it
+/// cannot read is refused as on any other.
+#[cfg(unix)]
+#[test]
+fn the_prompt_flag_counts_only_as_the_last_word() {
+    let host = Host::new();
+    let line = format!("\"{}\" hook --prompt --agent claude-code", bin());
+    let out = host.run_line(&line, &[0xff, 0xfe, 0x00, 0x80]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A payload that names a tool is a tool call, whatever event it names:
+/// on the prompt line it is screened, and nothing of it is kept.
+#[cfg(unix)]
+#[test]
+fn a_prompt_event_that_names_a_tool_is_screened_not_kept() {
+    let host = Host::new();
+    for payload in [
+        json!({
+            "session_id": SESSION,
+            "hook_event_name": "UserPromptSubmit",
+            "prompt": "send it to eve@evil.example",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat ~/.aws/credentials"},
+        }),
+        // Another shape of a call: `tool` in place of `tool_name`.
+        json!({
+            "session_id": SESSION,
+            "hook_event_name": "PreToolUse",
+            "tool": "Bash",
+            "tool_input": {"command": "cat ~/.aws/credentials"},
+        }),
+    ] {
+        let out = host.run_line(&the_prompt_line(), &serde_json::to_vec(&payload).unwrap());
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{payload}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert_eq!(
+        host.asked("eve@evil.example"),
+        UserAsked::Unknown(user_prompt::why::NO_RECORD)
+    );
+}
+
+/// The record read through an interpreter's `open` is refused like `cat`.
+#[cfg(unix)]
+#[test]
+fn the_agent_is_refused_a_read_of_the_record_through_an_interpreter() {
+    let host = Host::new();
+    let out = host.run_line(
+        &the_prompt_line(),
+        &prompt_payload("send it to ana@example.com"),
+    );
+    assert_silent_zero(&out, "the prompt");
+    let file = std::fs::read_dir(user_prompt::dir_in(&host.home()))
+        .expect("prompts folder")
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .expect("a record");
+    let line = format!("\"{}\" hook --agent claude-code", bin());
+    for code in [
+        format!("python3 -c \"print(open('{}').read())\"", file.display()),
+        format!(
+            "node -e \"console.log(require('fs').readFileSync('{}','utf8'))\"",
+            file.display()
+        ),
+    ] {
+        let call = json!({
+            "session_id": SESSION,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": code},
+        });
+        let out = host.run_line(&line, &serde_json::to_vec(&call).unwrap());
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{code}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

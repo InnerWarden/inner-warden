@@ -9211,6 +9211,37 @@ fn hands_over_guard_config(word: &str, variables: &[String]) -> bool {
 mod guard_llm_key_tests {
     use super::names_guard_llm_key;
 
+    /// A reader handed the guard's whole folder is named as the folder,
+    /// which holds the LLM key as well as the prompts, and counts as a
+    /// reach of the key; a read of the prompts alone is named as them, and
+    /// so is an interpreter's open of one.
+    #[test]
+    fn a_read_of_the_guard_folder_is_named_by_what_it_reads() {
+        use super::check_sensitive_read;
+        for whole in [
+            "cp -r ~/.config/innerwarden /tmp/x",
+            "tar czf - ~/.config/innerwarden",
+            "cat ~/.config/innerwarden/*/*",
+        ] {
+            assert_eq!(
+                check_sensitive_read(whole),
+                Some((".config/innerwarden", 60)),
+                "{whole}"
+            );
+            assert!(names_guard_llm_key(whole), "{whole}");
+        }
+        for prompts in [
+            "cat ~/.config/innerwarden/prompts/ab.json",
+            "python3 -c \"print(open('/home/u/.config/innerwarden/prompts/ab.json').read())\"",
+        ] {
+            assert_eq!(
+                check_sensitive_read(prompts),
+                Some((".config/innerwarden/prompts", 60)),
+                "{prompts}"
+            );
+        }
+    }
+
     /// FAILS ON REVERT: return `false` from the path-component match and the
     /// direct reads pass.
     #[test]
@@ -15167,10 +15198,10 @@ pub(crate) fn check_sensitive_read_as_written(
     content: &str,
     as_written: &str,
 ) -> Option<(&'static str, u32)> {
-    // The guard's folder handed whole to a reader takes the person's
-    // prompts with it.
+    // The guard's folder handed whole to a reader: named as what is read,
+    // the whole folder, which holds the LLM key and the person's prompts.
     if guard_folder_handed_to_reader(content) {
-        return Some((".config/innerwarden/prompts", 60));
+        return Some((".config/innerwarden", 60));
     }
     sensitive_read_nested(content, as_written, 0)
 }

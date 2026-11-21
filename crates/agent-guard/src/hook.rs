@@ -233,7 +233,9 @@ fn has_iwguard_prompt_hook(settings: &Value) -> bool {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .any(is_iwguard_hook_entry)
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .any(is_iwguard_prompt_hook)
 }
 
 pub fn merge_pretooluse_bash_hook(mut settings: Value, hook_command: &str) -> Value {
@@ -377,7 +379,7 @@ pub fn iwguard_bash_hook_timeout(settings: &Value) -> Option<Option<u64>> {
         .filter(|entry| bash_matcher_coverage(entry) == BashMatcherCoverage::Includes)
         .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
         .flatten()
-        .filter(|hook| is_iwguard_hook(hook))
+        .filter(|hook| is_screening_iwguard_hook(hook))
         .map(|hook| {
             hook.get("timeout").and_then(|t| {
                 t.as_u64()
@@ -1243,9 +1245,23 @@ fn iwguard_hook_mode(hook: &Value) -> Option<HookProtection> {
 /// `--agent <id>`, alone or inside the fail-closed script ([`guard_words`]). A repeated flag, an unknown word or an agent id that is not
 /// a plain id means the line is not ours, exactly as before `--agent` existed:
 /// uninstall and repair must never claim an operator's own command.
+///
+/// The prompt line ([`prompt_hook_command`]) is not one of these: it screens
+/// no tool call, so wherever it stands it gives no mode and no screening
+/// ([`is_iwguard_prompt_hook`] reads it).
 fn iwguard_hook_parts(hook: &Value) -> Option<(HookProtection, Option<String>)> {
     let line = parse_guard_line(hook.get("command").and_then(Value::as_str)?)?;
-    Some((line.mode, line.agent))
+    (!line.prompt).then_some((line.mode, line.agent))
+}
+
+/// Whether a hook is the prompt line ([`prompt_hook_command`]): only under
+/// `UserPromptSubmit` is it a line in order. Anywhere else it is a line of
+/// ours that screens nothing, and it is replaced or removed with the others.
+pub fn is_iwguard_prompt_hook(hook: &Value) -> bool {
+    hook.get("command")
+        .and_then(Value::as_str)
+        .and_then(parse_guard_line)
+        .is_some_and(|line| line.prompt)
 }
 
 /// One line of ours, read apart by [`parse_guard_line`].
@@ -1254,6 +1270,8 @@ struct GuardLine {
     mode: HookProtection,
     agent: Option<String>,
     shape: LineShape,
+    /// The line ends with [`crate::user_prompt::PROMPT_LINE_FLAG`].
+    prompt: bool,
 }
 
 /// PURE: read a hook command as a line of ours, plain or fail-closed
@@ -1278,10 +1296,15 @@ fn parse_guard_words(words: &[String], shape: LineShape) -> Option<GuardLine> {
     }
     // The prompt line's last word ([`prompt_hook_command`]). A tool call
     // that arrives on a line carrying it is screened as on any other.
-    let flags = match flags.split_last() {
-        Some((last, before)) if last == crate::user_prompt::PROMPT_LINE_FLAG => before,
-        _ => flags,
+    let (flags, prompt) = match flags.split_last() {
+        Some((last, before)) if last == crate::user_prompt::PROMPT_LINE_FLAG => (before, true),
+        _ => (flags, false),
     };
+    // The prompt line is the guard alone ([`prompt_hook_command`]), never
+    // inside a script.
+    if prompt && shape != LineShape::Plain {
+        return None;
+    }
     let (mode_flag, agent_flags) = match flags.first().map(String::as_str) {
         Some("--monitor" | "--block-review") => (flags.first(), &flags[1..]),
         _ => (None, flags),
@@ -1309,10 +1332,19 @@ fn parse_guard_words(words: &[String], shape: LineShape) -> Option<GuardLine> {
         mode,
         agent,
         shape,
+        prompt,
     })
 }
 
+/// A line of ours in any form, the prompt line included: what a reinstall
+/// replaces and an uninstall removes. Whether it screens is
+/// [`iwguard_hook_mode`].
 fn is_iwguard_hook(hook: &Value) -> bool {
+    iwguard_hook_mode(hook).is_some() || is_iwguard_prompt_hook(hook)
+}
+
+/// A line of ours that screens tool calls: not the prompt line.
+fn is_screening_iwguard_hook(hook: &Value) -> bool {
     iwguard_hook_mode(hook).is_some()
 }
 
@@ -1341,8 +1373,14 @@ pub struct HookLine {
 
 /// Read one hook object as an InnerWarden hook line, `None` when its command
 /// is not one [`hook_command_for`] writes.
+///
+/// The prompt line is `None` here: it screens no tool call, and a tool
+/// event that carries it has no line of ours in order.
 pub fn read_hook_line(hook: &Value) -> Option<HookLine> {
     let line = parse_guard_line(hook.get("command").and_then(Value::as_str)?)?;
+    if line.prompt {
+        return None;
+    }
     let (block_review, monitor) = line.mode.flags();
     Some(HookLine {
         program: line.program,
@@ -1776,7 +1814,7 @@ pub fn iwguard_hook_commands_for_tool(settings: &Value, tool: &str) -> Vec<Vec<S
         .filter(|entry| tool_matcher_coverage(entry, tool) == BashMatcherCoverage::Includes)
         .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
         .flatten()
-        .filter(|hook| is_iwguard_hook(hook))
+        .filter(|hook| is_screening_iwguard_hook(hook))
         .filter_map(|hook| hook.get("command").and_then(Value::as_str))
         .filter_map(hook_command_words)
         .filter(|words| !words.is_empty())
@@ -1874,7 +1912,13 @@ pub fn unscreened_iwguard_hooks(
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter(|hook| is_iwguard_hook(hook))
+                .filter(|hook| {
+                    if event == crate::user_prompt::PROMPT_EVENT {
+                        is_iwguard_prompt_hook(hook)
+                    } else {
+                        is_screening_iwguard_hook(hook)
+                    }
+                })
                 .filter_map(|hook| hook.get("command").and_then(Value::as_str))
                 .filter_map(hook_command_words)
                 .filter_map(|words| words.into_iter().next())
@@ -4068,6 +4112,64 @@ mod tests {
             v["hooks"][crate::user_prompt::PROMPT_EVENT][0]["hooks"][0]["command"],
             json!(prompt_hook_command(new, false, false, Some("claude-code"))),
             "{v}"
+        );
+    }
+
+    /// The prompt line is in order only under `UserPromptSubmit`. Under a
+    /// tool event it screens nothing: it gives no mode and no line, so the
+    /// event reads as having no hook of ours that screens, and a reinstall
+    /// replaces it as a line of ours. `--prompt` anywhere but last is no
+    /// line of ours at all.
+    #[test]
+    fn a_prompt_line_under_a_tool_event_is_not_a_screening_line() {
+        let prompt = prompt_hook_command(
+            Path::new("/opt/innerwarden"),
+            false,
+            false,
+            Some("claude-code"),
+        );
+        let hook = json!({"type": "command", "command": prompt});
+        assert!(is_iwguard_prompt_hook(&hook));
+        assert_eq!(read_hook_line(&hook), None);
+        assert_eq!(iwguard_hook_mode(&hook), None);
+        assert!(is_iwguard_hook(&hook), "still ours, to replace or remove");
+        let settings = json!({"hooks": {"PreToolUse": [
+            {"matcher": "Bash", "hooks": [hook.clone()]}
+        ]}});
+        assert_eq!(effective_iwguard_hook_mode(&settings), None, "{settings}");
+        assert!(!has_iwguard_hook(&settings), "{settings}");
+        // A reinstall puts the screening line in its place.
+        let repaired = merge_pretooluse_bash_hook(
+            settings,
+            &hook_command_for(
+                Path::new("/opt/innerwarden"),
+                false,
+                false,
+                Some("claude-code"),
+            ),
+        );
+        let lines = repaired["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array()
+            .unwrap();
+        assert_eq!(lines.len(), 1, "{repaired}");
+        assert!(!is_iwguard_prompt_hook(&lines[0]), "{repaired}");
+        // Not last: no line of ours.
+        let misplaced = json!({"type": "command",
+            "command": "\"/opt/innerwarden\" hook --prompt --agent claude-code"});
+        assert!(!is_iwguard_hook(&misplaced));
+        // Inside the fail-closed script: no line of ours either.
+        let scripted = hook_command_shaped(
+            Path::new("/opt/innerwarden"),
+            false,
+            false,
+            Some("claude-code"),
+            true,
+        )
+        .replace(" --agent claude-code;", " --agent claude-code --prompt;");
+        assert!(scripted.contains("--prompt;"), "{scripted}");
+        assert!(
+            !is_iwguard_hook(&json!({"type": "command", "command": scripted})),
+            "{scripted}"
         );
     }
 

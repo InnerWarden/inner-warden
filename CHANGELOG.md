@@ -15,16 +15,21 @@ the text of a command; what it does not see is written down, as measured:
 
 `innerwarden install` wires a hook on Claude Code's prompts
 (`UserPromptSubmit`) that keeps what the person submitted (pasted text
-included), masked, per session, in `~/.config/innerwarden/prompts/` (0600,
-24 hours, bounded), so the MCP proxy can ask whether a value appears, whole,
-in the person's request. The answer is information only and never lets a
+included), up to its first 16,384 characters and 65,536 per session, masked,
+per session, in `~/.config/innerwarden/prompts/` (0600, 24 hours), so the MCP
+proxy can ask whether a value appears, whole, in the person's request. A
+session that lost words to those limits answers "unknown", never "no", for a
+value it does not hold. The answer is information only and never lets a
 refused call through: an agent with a shell on the same account can forge a
 record by running the hook itself, and the session id comes from a variable
 a process in between can change. The guard refuses an agent's reads of the
 folder as it refuses its writes (a `cd` into the folder and a glob in its
-name are not recognised). Every end of the prompt run is 0 and silent (a
-panic, unreadable stdin, the deadline); a guard whose program is gone ends the
-line with 127, shown as an error while the prompt goes on. An expired prompt
+name are not recognised). The prompt line ends with `--prompt` and is in
+order only under `UserPromptSubmit`; every end of its run is 0 and silent (a
+panic, unreadable stdin, the deadline), and any JSON on it that is not a prompt
+naming no tool is screened as a tool call. A guard whose program is gone ends
+the line with 127, shown as an error while the prompt goes on. Two prompts of
+one session written at once are both kept (the guard's update lock). An expired prompt
 is deleted when its session is written or read. Other agents are not wired:
 their MCP servers get no session id to match. Details and limits:
 [The prompt record](docs/prompt-record.md).

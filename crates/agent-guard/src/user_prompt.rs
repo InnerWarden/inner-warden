@@ -74,7 +74,6 @@
 //! would without the guard.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -141,6 +140,8 @@ pub mod why {
     pub const OTHER_SESSION: &str = "the record found belongs to another session";
     pub const TOO_SHORT: &str = "the value is too short to tell";
     pub const MASKED: &str = "the value is a secret, which the record keeps masked";
+    pub const LOST: &str = "this session lost or cut a prompt (past the length cap, the \
+         session cap or its day), so the value may have been in what is gone";
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -152,6 +153,12 @@ struct Record {
     agent: Option<String>,
     #[serde(default)]
     prompts: Vec<Prompt>,
+    /// The session lost words: a prompt cut to [`MAX_PROMPT_CHARS`], one
+    /// dropped for [`MAX_SESSION_CHARS`] or past its day, or one past the
+    /// hook's cap that was never kept. A value not found is then "unknown",
+    /// never "no".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    lost: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,11 +214,106 @@ fn now_ms() -> i64 {
 /// [`MAX_PROMPT_CHARS`]. Masked before the cut, so a secret the cut would
 /// split is still found whole.
 pub fn kept_text(prompt: &str) -> String {
+    kept_text_and_cut(prompt).0
+}
+
+/// [`kept_text`], and whether the cut took anything off.
+fn kept_text_and_cut(prompt: &str) -> (String, bool) {
     let masked = crate::redact::redact_secrets(prompt).text;
     match masked.char_indices().nth(MAX_PROMPT_CHARS) {
-        Some((at, _)) => masked[..at].to_string(),
-        None => masked,
+        Some((at, _)) => (masked[..at].to_string(), true),
+        None => (masked, false),
     }
+}
+
+/// How long a write waits for the update lock of a record.
+const UPDATE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many times a write reads the record again when another writer
+/// changed it between the read and the write, or held the lock for the
+/// whole of [`UPDATE_LOCK_WAIT`]. Inside the hook's own deadline.
+const UPDATE_ATTEMPTS: usize = 8;
+
+/// Read the record of `session`, change it, and write it back under the
+/// guard's update lock (`crate::file_update::replace_owned_store_no_symlinks`,
+/// the lock and the compare-and-replace the guard's own record uses): the
+/// write lands only if the file still holds what was read, and is tried again
+/// from a fresh read otherwise, so two hook runs of one session never lose a
+/// prompt. A record that cannot be read is started again.
+fn update_record(
+    dir: &Path,
+    session: &str,
+    change: impl Fn(&mut Record),
+) -> std::io::Result<PathBuf> {
+    use crate::file_update::{replace_owned_store_no_symlinks, ReplaceError};
+    make_dir(dir)?;
+    let path = file_for(dir, session);
+    let mut last = String::from("the record kept changing under the write");
+    for _ in 0..UPDATE_ATTEMPTS {
+        let expected = match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_file() => {
+                return Err(std::io::Error::other("the record is not a plain file"));
+            }
+            Ok(_) => Some(fs::read(&path)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let mut record = expected
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<Record>(bytes).ok())
+            .filter(|record| record.session == session)
+            .unwrap_or_else(|| Record {
+                session: session.to_string(),
+                ..Record::default()
+            });
+        change(&mut record);
+        let body = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
+        match replace_owned_store_no_symlinks(
+            dir,
+            &path,
+            expected.as_deref(),
+            &body,
+            UPDATE_LOCK_WAIT,
+        ) {
+            Ok(()) => return Ok(path),
+            Err(ReplaceError::LockBusy { .. }) => {
+                last = String::from("the record's update lock was busy");
+            }
+            Err(ReplaceError::Failed(why)) => last = why,
+        }
+    }
+    Err(std::io::Error::other(last))
+}
+
+/// The update lock [`update_record`] leaves beside a record.
+fn lock_for(record: &Path) -> PathBuf {
+    let name = record
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    record.with_file_name(format!(".{name}.innerwarden.lock"))
+}
+
+/// Remove a record and its update lock.
+fn remove_record(path: &Path) {
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(lock_for(path));
+}
+
+/// Say, in the record of `session` under `$HOME`, that one of its prompts
+/// was not kept (past the hook's cap): from then on a value not found is
+/// "unknown", never "no". Best effort, like [`record`].
+pub fn record_lost(session: Option<&str>) -> std::io::Result<()> {
+    let dir = default_dir().ok_or_else(|| std::io::Error::other(why::NO_HOME))?;
+    record_lost_in(&dir, session)
+}
+
+/// [`record_lost`] with the folder handed in.
+pub fn record_lost_in(dir: &Path, session: Option<&str>) -> std::io::Result<()> {
+    let Some(session) = session.and_then(usable_session) else {
+        return Ok(());
+    };
+    update_record(dir, session, |record| record.lost = true).map(|_| ())
 }
 
 /// Keep `prompt`, the person's words, for `session`, under `$HOME`.
@@ -236,29 +338,25 @@ pub fn record_in(
     if prompt.trim().is_empty() {
         return Ok(());
     }
-    make_dir(dir)?;
-    let path = file_for(dir, session);
-    let mut record = match read_record(&path) {
-        Ok(Some(record)) if record.session == session => record,
-        _ => Record {
-            session: session.to_string(),
-            ..Record::default()
-        },
-    };
-    if let Some(agent) = agent {
-        record.agent = Some(agent.to_string());
-    }
-    record.prompts.retain(|p| fresh(p.at_ms, now_ms));
-    record.prompts.push(Prompt {
-        at_ms: now_ms,
-        text: kept_text(prompt),
-    });
-    let mut total: usize = record.prompts.iter().map(|p| p.text.chars().count()).sum();
-    while total > MAX_SESSION_CHARS && record.prompts.len() > 1 {
-        total -= record.prompts.remove(0).text.chars().count();
-    }
-    let body = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
-    write_private(&path, &body)?;
+    let (text, cut) = kept_text_and_cut(prompt);
+    let path = update_record(dir, session, |record| {
+        if let Some(agent) = agent {
+            record.agent = Some(agent.to_string());
+        }
+        let before = record.prompts.len();
+        record.prompts.retain(|p| fresh(p.at_ms, now_ms));
+        let mut lost = cut || record.prompts.len() != before;
+        record.prompts.push(Prompt {
+            at_ms: now_ms,
+            text: text.clone(),
+        });
+        let mut total: usize = record.prompts.iter().map(|p| p.text.chars().count()).sum();
+        while total > MAX_SESSION_CHARS && record.prompts.len() > 1 {
+            total -= record.prompts.remove(0).text.chars().count();
+            lost = true;
+        }
+        record.lost |= lost;
+    })?;
     prune(dir, now_ms, Some(&path));
     Ok(())
 }
@@ -290,8 +388,11 @@ fn make_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Write `body` to `path` in one rename, the file 0600 from its creation.
+/// Write `body` to `path` in one rename, the file 0600 from its creation:
+/// the tests' way to put a record in place by hand.
+#[cfg(test)]
 fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -333,7 +434,7 @@ fn prune(dir: &Path, now_ms: i64, keep: Option<&Path>) {
             _ => true,
         };
         if stale {
-            let _ = fs::remove_file(&path);
+            remove_record(&path);
         } else {
             files.push((modified, path));
         }
@@ -344,7 +445,7 @@ fn prune(dir: &Path, now_ms: i64, keep: Option<&Path>) {
         files.sort();
         let over = kept - MAX_SESSIONS;
         for (_, path) in files.into_iter().take(over) {
-            let _ = fs::remove_file(path);
+            remove_record(&path);
         }
     }
 }
@@ -385,20 +486,28 @@ fn drop_expired(path: &Path, read_from: &[u8], record: &Record, now_ms: i64) {
             text: p.text.clone(),
         })
         .collect();
-    if fs::read(path).ok().as_deref() != Some(read_from) {
-        return;
-    }
     if kept.is_empty() {
-        let _ = fs::remove_file(path);
+        // Nothing fresh: the file goes, if it still holds what was read.
+        if fs::read(path).ok().as_deref() == Some(read_from) {
+            remove_record(path);
+        }
         return;
     }
     let left = Record {
         session: record.session.clone(),
         agent: record.agent.clone(),
         prompts: kept,
+        lost: true,
     };
-    if let Ok(body) = serde_json::to_vec(&left) {
-        let _ = write_private(path, &body);
+    if let (Ok(body), Some(dir)) = (serde_json::to_vec(&left), path.parent()) {
+        // Written only over the bytes that were read, under the update lock.
+        let _ = crate::file_update::replace_owned_store_no_symlinks(
+            dir,
+            path,
+            Some(read_from),
+            &body,
+            UPDATE_LOCK_WAIT,
+        );
     }
 }
 
@@ -524,7 +633,12 @@ pub fn user_asked_for_in(dir: &Path, session: Option<&str>, value: &str, now_ms:
             return UserAsked::Yes;
         }
     }
-    if any {
+    // Words this session lost (cut, dropped, past their day) may have held
+    // the value: not found is then unknown, never no.
+    let lost = record.lost || record.prompts.iter().any(|p| !fresh(p.at_ms, now_ms));
+    if lost {
+        UserAsked::Unknown(why::LOST)
+    } else if any {
         UserAsked::No
     } else {
         UserAsked::Unknown(why::NO_RECORD)
@@ -566,6 +680,79 @@ mod tests {
 
     fn ask(dir: &Path, session: Option<&str>, value: &str) -> UserAsked {
         user_asked_for_in(dir, session, value, NOW)
+    }
+
+    /// The session records in `dir`, beside their update locks.
+    fn records(dir: &Path) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// A prompt cut to its first [`MAX_PROMPT_CHARS`], or one the hook could
+    /// not keep at all: a value not found may have been in what is gone, so
+    /// the answer is unknown, never no.
+    #[test]
+    fn a_session_that_lost_words_answers_unknown_never_no() {
+        let (_tmp, first) = dir();
+        let long = format!(
+            "{} then mail eve@evil.example",
+            "a ".repeat(MAX_PROMPT_CHARS)
+        );
+        record_in(&first, Some(SESSION), None, &long, NOW).unwrap();
+        assert_eq!(
+            ask(&first, Some(SESSION), "eve@evil.example"),
+            UserAsked::Unknown(why::LOST)
+        );
+
+        let (_tmp2, dir2) = dir();
+        record_in(&dir2, Some(SESSION), None, "mail ana@example.com", NOW).unwrap();
+        assert_eq!(ask(&dir2, Some(SESSION), "eve@evil.example"), UserAsked::No);
+        record_lost_in(&dir2, Some(SESSION)).unwrap();
+        assert_eq!(
+            ask(&dir2, Some(SESSION), "eve@evil.example"),
+            UserAsked::Unknown(why::LOST)
+        );
+        // What is there is still found.
+        assert_eq!(ask(&dir2, Some(SESSION), "ana@example.com"), UserAsked::Yes);
+    }
+
+    /// Two hook runs of one session at once: each prompt is kept, none is
+    /// written over by the other's read of the record.
+    ///
+    /// FAILS ON REVERT: write the record with a plain read, change and
+    /// rename, and prompts go missing.
+    #[test]
+    fn prompts_written_at_once_are_all_kept() {
+        let (_tmp, dir) = dir();
+        const RUNS: usize = 16;
+        std::thread::scope(|scope| {
+            for i in 0..RUNS {
+                let dir = &dir;
+                scope.spawn(move || {
+                    record_in(
+                        dir,
+                        Some(SESSION),
+                        None,
+                        &format!("open ticket-{i} now"),
+                        NOW,
+                    )
+                    .unwrap();
+                });
+            }
+        });
+        for i in 0..RUNS {
+            assert_eq!(
+                ask(&dir, Some(SESSION), &format!("ticket-{i}")),
+                UserAsked::Yes,
+                "prompt {i} was lost"
+            );
+        }
     }
 
     #[test]
@@ -687,9 +874,15 @@ mod tests {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&file_for(&dir, SESSION)), 0o600);
-        // Nothing but the record is left in the folder.
-        let names: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
-        assert_eq!(names.len(), 1);
+        // Nothing but the record (and its update lock) is left in the folder.
+        assert_eq!(records(&dir), vec![file_for(&dir, SESSION)]);
+        let others: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| *p != file_for(&dir, SESSION) && *p != lock_for(&file_for(&dir, SESSION)))
+            .collect();
+        assert!(others.is_empty(), "{others:?}");
     }
 
     #[cfg(unix)]
@@ -717,14 +910,15 @@ mod tests {
             old,
         )
         .unwrap();
+        // Past its day the prompt is gone, and the value may have been in
+        // it: unknown, never no.
         assert_eq!(
             ask(&dir, Some(SESSION), "rotate the db"),
-            UserAsked::Unknown(why::NO_RECORD)
+            UserAsked::Unknown(why::LOST)
         );
         record_in(&dir, Some(SESSION), None, "now something else", NOW).unwrap();
         let raw = fs::read_to_string(file_for(&dir, SESSION)).unwrap();
         assert!(!raw.contains("rotate"), "{raw}");
-        assert_eq!(ask(&dir, Some(SESSION), "rotate the db"), UserAsked::No);
     }
 
     #[test]
@@ -747,8 +941,12 @@ mod tests {
         let record: Record = serde_json::from_str(&raw).unwrap();
         let total: usize = record.prompts.iter().map(|p| p.text.chars().count()).sum();
         assert!(total <= MAX_SESSION_CHARS, "{total}");
-        // The oldest prompt went first.
-        assert_eq!(ask(&dir, Some(SESSION), "zebra42"), UserAsked::No);
+        // The oldest prompt went first, and the record says words were lost:
+        // a value it no longer holds is unknown, never no.
+        assert_eq!(
+            ask(&dir, Some(SESSION), "zebra42"),
+            UserAsked::Unknown(why::LOST)
+        );
     }
 
     #[test]
@@ -757,8 +955,19 @@ mod tests {
         for i in 0..(MAX_SESSIONS + 5) {
             record_in(&dir, Some(&format!("s{i}")), None, "hello there", NOW).unwrap();
         }
-        let files = fs::read_dir(&dir).unwrap().count();
+        let files = records(&dir).len();
         assert!(files <= MAX_SESSIONS, "{files}");
+        // A record removed takes its update lock with it.
+        let locks = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .ends_with(".innerwarden.lock")
+            })
+            .count();
+        assert!(locks <= MAX_SESSIONS, "{locks}");
         // The session written last is kept.
         let last = format!("s{}", MAX_SESSIONS + 4);
         assert_eq!(ask(&dir, Some(&last), "hello"), UserAsked::Yes);
@@ -768,10 +977,9 @@ mod tests {
     fn an_id_cannot_name_a_path() {
         let (_tmp, dir) = dir();
         record_in(&dir, Some("../../escape"), None, "hello there", NOW).unwrap();
-        let names: Vec<String> = fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
+        let names: Vec<String> = records(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names.len(), 1);
         assert!(
@@ -866,6 +1074,7 @@ mod tests {
                     text: "and open issue 7781".into(),
                 },
             ],
+            lost: false,
         };
         write_private(&path, &serde_json::to_vec(&both).unwrap()).unwrap();
         assert_eq!(ask(&dir, Some(SESSION), "issue 7781"), UserAsked::Yes);
@@ -889,9 +1098,10 @@ mod tests {
         assert!(path.exists());
         assert_eq!(
             ask(&dir, Some(SESSION), "rotate the db"),
-            UserAsked::Unknown(why::NO_RECORD)
+            UserAsked::Unknown(why::LOST)
         );
         assert!(!path.exists(), "an expired record outlived its read");
+        assert!(!lock_for(&path).exists(), "its update lock outlived it");
     }
 
     #[test]
@@ -910,6 +1120,7 @@ mod tests {
                     at_ms: old,
                     text: "hello there".into(),
                 }],
+                lost: false,
             };
             write_private(
                 &file_for(&dir, session),
@@ -917,14 +1128,9 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
+        assert_eq!(records(&dir).len(), 3);
         forget_expired_in(&dir, NOW);
-        let left: Vec<PathBuf> = fs::read_dir(&dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .collect();
-        assert_eq!(left, vec![file_for(&dir, SESSION)]);
+        assert_eq!(records(&dir), vec![file_for(&dir, SESSION)]);
     }
 
     #[test]

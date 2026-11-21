@@ -43,9 +43,12 @@ MCP server.
 
 ## What is kept
 
-- The prompt the person submitted, as submitted: text the person pasted into
-  it counts as theirs, wherever it came from (a web page, an email, a file).
-  It is masked first: obvious secrets (provider
+- What the person submitted, up to the limits below (its first 16,384
+  characters, 65,536 per session): text the person pasted into the prompt
+  counts as theirs, wherever it came from (a web page, an email, a file).
+  When a limit takes words off, the record says so, and a value not found is
+  then "unknown", never "no" (see [The answer](#the-answer)). Each prompt is
+  masked first: obvious secrets (provider
   tokens, private keys, passwords in URLs, `password=` and similar values,
   authorization headers) are replaced with `[REDACTED]` by the same masking the
   guard's record uses, before anything is written. A secret that masking does
@@ -64,7 +67,8 @@ own writes under `~/.config/innerwarden`, and it refuses an agent's reads of
 the prompts folder: a file tool (Read, Grep) pointed into it, and a shell line
 that reads a file in it (`cat`, `head`, `tar`, an interpreter's `open`), or
 hands a reading program the whole `~/.config/innerwarden` folder or a glob
-inside it (`cp -r ~/.config/innerwarden x`, `cat ~/.config/innerwarden/*/*`).
+inside it (`cp -r ~/.config/innerwarden x`, `cat ~/.config/innerwarden/*/*`;
+the refusal names the whole folder, which holds the LLM key too).
 The rule reads the command's text: a name relative to a `cd` into the folder
 (`cd ~/.config/innerwarden && cat prompts/x.json`) and a glob in the folder's
 own name (`cat ~/.config/inner*/prompts/*`) are not recognised (measured with
@@ -79,7 +83,13 @@ are hashes. A folder that is a symbolic link is never written through.
 | Most of one prompt kept | its first 16,384 characters |
 | Most kept per session | 65,536 characters; the oldest prompts go first |
 | Most sessions kept | 64; the least recently written go first |
-| A prompt longer than 1 MiB as the hook reads it | not kept |
+| A prompt longer than 1 MiB as the hook reads it | not kept; its session is marked as having lost words |
+
+Two hook runs of one session at once each keep their prompt: a record is
+read, changed and written back under the update lock the guard uses for its
+own record, and written only if the file still holds what was read (tried
+again otherwise). Each record has its lock file beside it
+(`.<name>.json.innerwarden.lock`), removed with the record.
 
 A prompt past 24 hours is never read. It is deleted:
 
@@ -102,10 +112,15 @@ still holds what it read, so a prompt written at the same moment is not lost.
   `ana@example.com.au` nor in `joana@example.com`, and `issue 4512` is not
   found in `issue 45123`. A mark that ends a sentence after it
   (`ana@example.com.`) is not part of it.
-- `No`: the session has prompts in the record, and none holds the value.
+- `No`: the session has prompts in the record, none holds the value, and the
+  session lost no words: no prompt was cut to 16,384 characters, dropped for
+  the 65,536 per session or past its day, or left unkept past the hook's
+  1 MiB cap.
 - `Unknown(reason)`: no session id, no record for the session, a record of
   another session, a value shorter than 4 characters, a value that is a secret
-  (kept masked, so never found), or a record that could not be read.
+  (kept masked, so never found), a record that could not be read, or a value
+  not found in a session that lost words (any of the cuts above): it may
+  have been in what is gone.
 
 `user_asked_for_in_this_session(value)` reads the session from
 `CLAUDE_CODE_SESSION_ID` in the proxy's environment. Any process between
@@ -119,12 +134,21 @@ pass.
 Claude Code drops the person's prompt when a `UserPromptSubmit` hook exits 2,
 shows an error for any other end but 0, and adds what a hook prints on exit 0
 to the conversation. The line is the guard alone, without the fail-closed
-script the tool hooks use, and it ends with `--prompt`. With that word the
-guard knows, before it reads anything, that it runs on a prompt, and every end
-of the run is 0 with nothing printed: the prompt kept or not, stdin it cannot
-read, text that is not a payload, a payload past the 1 MiB cap, a panic, the
-deadline, a fault. A tool call that arrives on that line is screened as on any
-other.
+script the tool hooks use, and it ends with `--prompt`. With that last word
+the guard knows, before it reads anything, that it runs on a prompt, and every
+end of the run is 0 with nothing printed: the prompt kept or not, stdin it
+cannot read, text that is not JSON, a prompt past the 1 MiB cap, a panic, the
+deadline, a fault. Only a payload whose event is `UserPromptSubmit` and that
+names no tool is kept as a prompt. Any other JSON on that line (a tool call of
+any shape, a prompt event that names a tool) goes to the screening every line
+gives a call, and is refused or allowed as there.
+
+The flag counts only as the line's last word, and the line is in order only
+under `UserPromptSubmit`. The same line under a tool event screens nothing:
+`innerwarden status` does not count it as a hook of ours that screens, and
+`innerwarden install` replaces it. Its run would still end with 0 on stdin it
+cannot read, which is why it is not counted. Cursor's wiring has no prompt
+line, and the flag is ignored on a line that names Cursor.
 
 The one end the guard cannot answer for: if its program is gone, the shell
 ends the line with 127, which Claude Code shows as an error while the prompt
