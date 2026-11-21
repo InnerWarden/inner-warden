@@ -19760,6 +19760,8 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
             Place::Components(".mcp.json"),
             Place::Components("claude_desktop_config.json"),
             Place::Components(".cursor/mcp.json"),
+            // Where Cursor reads the guard's hook from.
+            Place::Components(".cursor/hooks.json"),
             Place::Components(".codex/config.toml"),
             // Where Codex reads the guard's hook from.
             Place::Components(".codex/hooks.json"),

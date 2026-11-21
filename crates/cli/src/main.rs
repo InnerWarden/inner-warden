@@ -432,6 +432,9 @@ fn status_io_cmd_rest(
             account_problem: place.account_problem,
             pro_reads: place.pro_reads,
         }),
+        project_settings: std::env::current_dir()
+            .map(|dir| project_settings_in(&dir, home.as_deref()))
+            .unwrap_or_default(),
     };
     print!("{}", status::render(&facts));
     // Said once: the note that made this line is dropped once it is printed.
@@ -439,6 +442,39 @@ fn status_io_cmd_rest(
         graph_io::forget_kept_apart(dir);
     }
     std::process::ExitCode::SUCCESS
+}
+
+/// The project settings files in `dir` that switch an agent's hooks off or
+/// add hooks of their own ([`status::project_settings_effect`]). A file that
+/// is missing, too large or not JSON says nothing here: the guard's own
+/// wiring lines are read from the home. Run in the home itself, these files
+/// are the person's own settings, read by the lines above, not a project's.
+fn project_settings_in(
+    dir: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<status::ProjectSettings> {
+    const MOST: u64 = 1 << 20;
+    let same = |a: &std::path::Path, b: &std::path::Path| {
+        a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
+    };
+    if home.is_some_and(|home| same(dir, home)) {
+        return Vec::new();
+    }
+    status::PROJECT_SETTINGS_FILES
+        .iter()
+        .filter_map(|(agent, file)| {
+            let path = dir.join(file);
+            if std::fs::metadata(&path).ok()?.len() > MOST {
+                return None;
+            }
+            let settings = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
+            Some(status::ProjectSettings {
+                agent,
+                file: (*file).to_string(),
+                effect: status::project_settings_effect(file, &settings)?,
+            })
+        })
+        .collect()
 }
 
 /// Does a local InnerWarden dashboard answer on `bind`?
