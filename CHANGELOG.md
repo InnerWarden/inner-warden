@@ -83,17 +83,31 @@ the text of a command; what it does not see is written down, as measured:
   folder or to a settings file and written through later (the line that
   makes the link is refused: `ln -s .claude c`), the absolute path, node
   and ruby code, and the folder spelled in capitals, which is the same folder
-  on a macOS disk. Not held: a branch switched, pulled or merged that changes
-  one of these files.
+  on a macOS disk. A move, link or copy onto the folder by its bare name
+  (`mv notes.md .claude`) is refused too, since with no folder there it
+  becomes the folder, and the refusal says to end the folder with a slash
+  (`mv notes.md .claude/`) to move a file into it. Not read, and so not
+  held: a target the shell builds (a glob, a brace, a substitution), a copy
+  of a whole folder that holds one of these files into a place other than
+  the agent's folder, an archive unpacked over one, a download that takes its
+  name from the URL, a branch switched, pulled or merged that changes one
+  (`git checkout <tree> -- <file>` and `git restore` of one are read), a
+  change of owner (`chown`), and a write made by interpreter code other than
+  the rewrites listed above.
 - **`status` reads a project's settings from anywhere inside it.** Run in a
-  subfolder, it reads each folder up to the project's root (the one with
-  `.git`), never the home or above. It also reads Codex's project
-  `.codex/config.toml` (`codex_hooks = false` or `hooks = false` under
-  `[features]`) and `.codex/hooks.json`, and says when a file is there and
-  could not be read: JSON with a comment or a trailing comma, a file over
-  1 MiB, or something that is not a regular file. A link, a pipe or a device
-  in the place of one of these files is never opened, so a FIFO or a link to
-  `/dev/zero` no longer makes `status` wait.
+  subfolder, it reads each folder up to the project's root, the first one
+  that holds `.git` or `.claude`, and never the home or above it. Outside
+  the home, in a folder with no such root above it, it reads that folder
+  alone and never climbs to `/`. It also reads Codex's project
+  `.codex/config.toml` (`hooks = false` under `[features]`, or
+  `codex_hooks = false`, its older name, as read in Codex's source at
+  `rust-v0.171.0`) and `.codex/hooks.json`, and says when a file is there
+  and could not be read: JSON with a comment or a trailing comma, a file over
+  1 MiB, a file it was denied, or something that is not a regular file. Each
+  file is opened once, without following a link and without waiting, and
+  judged by what was opened, so a FIFO or a link to `/dev/zero` no longer
+  makes `status` wait and nothing can be swapped in between a check and the
+  open.
 - **A review asks you instead of passing unseen.** In enforce mode the hook
   used to refuse a `deny` and let a `review` run without a word (`chmod 777`
   on a folder, for one). It now hands a review to the person: Claude Code

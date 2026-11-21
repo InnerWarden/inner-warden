@@ -3305,7 +3305,7 @@ pub(crate) fn check_code_rewrites_guard_carrier(content: &str) -> Option<(&'stat
     if code_names_and_writes_guard_config(&content.to_ascii_lowercase()) {
         return Some((GUARD_CONFIG_WRITTEN, 60));
     }
-    writes_guard_carrier(content).then_some((GUARD_CARRIER_WRITTEN, 60))
+    guard_carrier_refusal(content)
 }
 
 /// What [`guard_self_disable_patterns`] says of interpreter code that
@@ -3724,7 +3724,7 @@ fn guard_self_disable_after_patterns(content: &str) -> Option<(&'static str, u32
     }
     // A line that names no guard program can still name the settings that
     // load the guard, and writing those is the quiet way out.
-    let carrier = || writes_guard_carrier(content).then_some((GUARD_CARRIER_WRITTEN, 60));
+    let carrier = || guard_carrier_refusal(content);
     if !content.to_ascii_lowercase().contains("innerwarden")
         && !names_guard_alias(content)
         && !content.contains(['*', '?', '['])
@@ -7685,6 +7685,54 @@ fn code_writes_persistence_file(content: &str) -> bool {
 const GUARD_CARRIER_WRITTEN: &str =
     "changes or removes the agent settings that load the guard, or the guard's own program";
 
+/// What the shell side says of a move, link or copy whose destination is an
+/// agent's own folder named bare ([`names_agent_folder_as_destination`]).
+const AGENT_FOLDER_NAMED_AS_DESTINATION: &str = "moves, links or copies something onto an \
+     agent's own folder by its bare name (`mv notes.md .claude`), which puts it in the \
+     folder's place, settings included, when the folder is not there; to move a file into \
+     the folder, end the folder with a slash (`mv notes.md .claude/`)";
+
+/// Whether a `mv`, `ln` or `cp` of one source names an agent's own folder
+/// ([`names_agent_home`]) as its destination with no `/` at the end. The
+/// line cannot say whether the folder is there or what the source is: with
+/// no folder, `mv x .claude` makes `x` the folder, and a folder named `x.md`
+/// with a `settings.json` in it becomes the project's settings. So it is
+/// refused as [`writes_guard_carrier`] refuses it, and this names why and
+/// the spelling that moves a file into the folder instead.
+fn names_agent_folder_as_destination(content: &str) -> bool {
+    shell_command_segments(content).into_iter().any(|segment| {
+        let words = shell_tokens(segment);
+        let Some(at) = effective_command_index(&words) else {
+            return false;
+        };
+        let command = token_basename(&words[at]).to_ascii_lowercase();
+        if !matches!(command.as_str(), "mv" | "ln" | "cp") {
+            return false;
+        }
+        let positional: Vec<&String> = words[at + 1..]
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .collect();
+        let Some((last, sources)) = positional.split_last() else {
+            return false;
+        };
+        sources.len() == 1
+            && !last.trim_matches(['"', '\'']).ends_with('/')
+            && names_agent_home(last)
+    })
+}
+
+/// [`writes_guard_carrier`], with the words that say why.
+fn guard_carrier_refusal(content: &str) -> Option<(&'static str, u32)> {
+    if !writes_guard_carrier(content) {
+        return None;
+    }
+    if names_agent_folder_as_destination(content) {
+        return Some((AGENT_FOLDER_NAMED_AS_DESTINATION, 60));
+    }
+    Some((GUARD_CARRIER_WRITTEN, 60))
+}
+
 /// Whether a command line writes what the guard is carried by: the agent
 /// settings that load its hook, or its own program ([`names_guard_carrier`]),
 /// or removes, moves or locks an agent's own folder, which takes those
@@ -7699,6 +7747,7 @@ const GUARD_CARRIER_WRITTEN: &str =
 /// merged that changes one (`git checkout <tree> -- <path>` and `git restore`
 /// of one are read), a change of owner, and a write made by
 /// interpreter code other than the rewrites [`guard_self_disable_in`] names.
+/// The CHANGELOG lists the same; keep the two together.
 fn writes_guard_carrier(content: &str) -> bool {
     if !may_name_guard_carrier(content) {
         return false;

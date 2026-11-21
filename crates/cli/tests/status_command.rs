@@ -672,3 +672,82 @@ fn status_reads_a_projects_settings_from_a_subfolder_and_says_what_it_could_not_
         }
     }
 }
+
+/// `status` stops climbing at a folder that holds `.claude` (the
+/// project's root, read) and at the home (never read as a project), and
+/// names a project settings file it was denied instead of passing over it.
+///
+/// FAILS ON REVERT: stop only at `.git`, and the `.gemini` file above the
+/// `.claude` folder is read as this project's; read with `symlink_metadata`
+/// and `.ok()?`, and the denied file says nothing.
+#[test]
+fn status_stops_at_claude_and_at_the_home_and_names_a_denied_file() {
+    let home = tempfile::TempDir::new().expect("temp home");
+    let off = r#"{"hooksConfig": {"enabled": false}}"#;
+    // A folder with `.claude` and no `.git` is the project's root.
+    let app = home.path().join("work/app");
+    let deep = app.join("src");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::create_dir_all(app.join(".claude")).unwrap();
+    std::fs::write(
+        app.join(".claude/settings.json"),
+        r#"{"disableAllHooks": true}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.path().join("work/.gemini")).unwrap();
+    std::fs::write(home.path().join("work/.gemini/settings.json"), off).unwrap();
+    let from_deep = status_within(home.path(), &deep);
+    assert!(
+        from_deep.contains(&format!(
+            "This project's {} sets \"disableAllHooks\"",
+            app.join(".claude/settings.json").display()
+        )),
+        "{from_deep}"
+    );
+    assert!(!from_deep.contains("work/.gemini"), "{from_deep}");
+
+    // No root up to the home: every folder below the home is read, the
+    // home's own files are not a project's.
+    let loose = home.path().join("loose/sub");
+    std::fs::create_dir_all(&loose).unwrap();
+    std::fs::create_dir_all(home.path().join(".gemini")).unwrap();
+    std::fs::write(home.path().join(".gemini/settings.json"), off).unwrap();
+    std::fs::create_dir_all(home.path().join("loose/.gemini")).unwrap();
+    std::fs::write(home.path().join("loose/.gemini/settings.json"), off).unwrap();
+    let from_loose = status_within(home.path(), &loose);
+    assert!(
+        from_loose.contains(&format!(
+            "{}",
+            home.path().join("loose/.gemini/settings.json").display()
+        )),
+        "{from_loose}"
+    );
+    assert!(
+        !from_loose.contains(&format!(
+            "This project's {}",
+            home.path().join(".gemini/settings.json").display()
+        )),
+        "{from_loose}"
+    );
+
+    // A file it is denied: named, never passed over. Root reads anything,
+    // so this part runs only as another user.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let uid = Command::new("id").arg("-u").output().expect("id -u");
+        if String::from_utf8_lossy(&uid.stdout).trim() != "0" {
+            let folder = app.join(".claude");
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let denied = status_within(home.path(), &app);
+            std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                denied.contains(
+                    "Could not read this project's .claude/settings.json: it could not be \
+                     opened: permission denied"
+                ),
+                "{denied}"
+            );
+        }
+    }
+}

@@ -780,8 +780,11 @@ pub const PROJECT_SETTINGS_FILES: &[(&str, &str)] = &[
 /// it holds: [`project_settings_effect`] once they are parsed, or
 /// [`ProjectEffect::Unread`] when they are not JSON (or TOML, for Codex's
 /// `config.toml`) this can read: a comment or a trailing comma, for one.
-/// For Codex's `config.toml`, `codex_hooks = false` or `hooks = false`
-/// under `[features]` switches every hook off.
+/// For Codex's `config.toml`, `hooks = false` under `[features]` switches
+/// every hook off, and so does `codex_hooks = false`, its older name. Read in
+/// Codex's source at `rust-v0.171.0`: `codex-rs/features/src/lib.rs` gives
+/// `Feature::CodexHooks` the key `hooks` (stable, on by default), and
+/// `codex-rs/features/src/legacy.rs` keeps `codex_hooks` as an alias of it.
 pub fn project_settings_read(file: &str, body: &[u8]) -> Option<ProjectEffect> {
     if file.ends_with(".toml") {
         let Some(config) = std::str::from_utf8(body)

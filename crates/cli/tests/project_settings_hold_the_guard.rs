@@ -248,3 +248,45 @@ fn every_shape_of_a_project_settings_write_is_refused() {
         let_through.join("\n")
     );
 }
+
+/// The ordinary side: a link, a copy and a move near a project that name no
+/// agent folder and no settings file still run, and a file moved INTO an
+/// agent's folder (the folder ending with `/`) runs too.
+#[test]
+fn ordinary_links_copies_and_moves_in_a_project_still_run() {
+    let host = Host::new();
+    let ordinary = [
+        "ln -s ../shared/node_modules node_modules",
+        "cp -r ../tpl .",
+        "mv build .",
+        "mv notes.md .claude/",
+    ];
+    let mut stopped = Vec::new();
+    for command in ordinary {
+        let (code, stderr) = host.hook(&host.bash(command));
+        if code != Some(0) {
+            stopped.push(format!("{code:?} {command} :: {stderr}"));
+        }
+    }
+    assert!(stopped.is_empty(), "stopped:\n{}", stopped.join("\n"));
+}
+
+/// A move onto an agent's folder by its bare name stays refused, because
+/// with no folder there it becomes the folder, settings included; the
+/// refusal says so and names the spelling that moves a file into it.
+#[test]
+fn a_move_onto_an_agent_folder_by_its_bare_name_is_refused_and_says_why() {
+    let host = Host::new();
+    for command in [
+        "mv notes.md .claude",
+        "mv x.md .codex",
+        "ln -s ../elsewhere .claude",
+    ] {
+        let (code, stderr) = host.hook(&host.bash(command));
+        assert_eq!(code, Some(2), "{command}: {stderr}");
+        assert!(
+            stderr.contains("end the folder with a slash"),
+            "{command}: {stderr}"
+        );
+    }
+}
