@@ -387,6 +387,27 @@ list, with every limit.
 The verdict is JSON: a recommendation (`allow` / `review` / `deny`), a risk
 score, matched signals, and a short explanation.
 
+### What is already set in the agents' config
+
+`innerwarden status --config`, and `innerwarden setup` after it finds the
+agents, read the config Claude Code, Codex, Gemini CLI and Cursor keep in
+the home directory and say what is already set there. They only read: no
+file is changed.
+
+| Finding | What it means | Files |
+|---|---|---|
+| `[auto-approve]` | tool calls run without the agent asking: an MCP server with `trust` (Gemini), `autoApprove` or `alwaysAllow`; `mcp__<server>` or `mcp__<server>__*` in Claude Code's `permissions.allow`; `permissions.defaultMode = bypassPermissions`; `enableAllProjectMcpServers`; Codex's `approval_policy = "never"`, at the top or in a profile | all |
+| `[unpinned]` | an MCP server started by `npx`, `bunx`, `pnpx`, `pnpm dlx`, `yarn dlx`, `uvx` or `uv tool run` whose package has no exact version (`pkg`, `pkg@latest`, `pkg@^1`, `pkg>=1`); a local path, a URL or a git source is not judged | MCP configs |
+| `[key in file]` | a key or token written in the file: in `env`, `headers`, `http_headers`, `bearer_token`, a URL, or an argument. Said by file, place and kind (GitHub token, AWS access key, ... or "secret" for a value under a name like `*_TOKEN`); the value is never printed. A reference (`${VAR}`, `$VAR`, `${env:VAR}`) is not a finding | all |
+| `[other hook]` | a program other than InnerWarden runs as a hook before tool calls (`PreToolUse`, `BeforeTool`, Cursor's events), named by its program only | settings and hooks files |
+
+Each finding has one line of what to do and, where there is one, the
+InnerWarden command: `innerwarden agents connect <agent>` to put the guard
+in front of an MCP server's calls, `innerwarden mcp list` for the tool
+definitions the proxy holds. A server already behind the proxy is read
+past the wrapper. A file that is there and cannot be parsed is said as
+"could not read", never as having nothing in it.
+
 ### The posture: what an enforcing hook refuses
 
 Operator decision of 2026-11-21: the text rules are triage, not the boundary.

@@ -29,6 +29,8 @@ mod agents_io;
 mod binary_freshness;
 mod command_dir;
 mod concern;
+mod config_check;
+mod config_check_io;
 mod contain;
 mod contain_io;
 mod dashboard;
@@ -4485,22 +4487,52 @@ fn parse_serve_flags(rest: &[String]) -> Result<Option<String>, String> {
     Ok(bind)
 }
 
-/// `status` takes no arguments; anything here is refused by name (#223).
-fn parse_status_flags(rest: &[String]) -> Result<(), String> {
-    match rest.first() {
-        Some(flag) => Err(format!(
-            "unexpected argument `{flag}` for `status`; it takes no arguments"
-        )),
-        None => Ok(()),
+/// What `status` was asked to say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusView {
+    /// The full report.
+    Report,
+    /// `--config`: what is already set in the agents' own config.
+    Config,
+}
+
+/// `status` takes `--config` alone or nothing; anything else is refused by
+/// name (#223).
+fn parse_status_flags(rest: &[String]) -> Result<StatusView, String> {
+    match rest {
+        [] => Ok(StatusView::Report),
+        [flag] if flag == "--config" => Ok(StatusView::Config),
+        [first, more @ ..] => Err(match more.first() {
+            Some(flag) if first == "--config" => {
+                format!("unexpected argument `{flag}` for `status --config`; it takes nothing more")
+            }
+            _ => format!(
+                "unexpected argument `{first}` for `status`; it takes no arguments, or --config"
+            ),
+        }),
     }
 }
 
 fn status_cmd(rest: &[String]) -> std::process::ExitCode {
-    if let Err(msg) = parse_status_flags(rest) {
-        eprintln!("innerwarden status: {msg}");
-        return std::process::ExitCode::from(2);
+    match parse_status_flags(rest) {
+        Err(msg) => {
+            eprintln!("innerwarden status: {msg}");
+            std::process::ExitCode::from(2)
+        }
+        Ok(StatusView::Report) => status_io_cmd(),
+        Ok(StatusView::Config) => match hook::home_dir() {
+            Ok(home) => {
+                for line in config_check_io::lines(&home, "") {
+                    println!("{line}");
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("innerwarden status: {error}");
+                std::process::ExitCode::from(1)
+            }
+        },
     }
-    status_io_cmd()
 }
 
 fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
@@ -6456,6 +6488,21 @@ mod flag_parse_tests {
         let err = parse_serve_flags(&missing).unwrap_err();
         assert!(
             err.contains("needs an address") && err.contains(SERVE_BIND),
+            "{err}"
+        );
+    }
+
+    /// `--config` is the one flag `status` takes, alone.
+    #[test]
+    fn status_takes_config_alone() {
+        let config = vec!["--config".to_string()];
+        assert_eq!(parse_status_flags(&config), Ok(StatusView::Config));
+        let none: Vec<String> = vec![];
+        assert_eq!(parse_status_flags(&none), Ok(StatusView::Report));
+        let more = vec!["--config".to_string(), "--json".to_string()];
+        let err = parse_status_flags(&more).unwrap_err();
+        assert!(
+            err.contains("`--json`") && err.contains("status --config"),
             "{err}"
         );
     }

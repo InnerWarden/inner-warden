@@ -229,11 +229,16 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              \x20           under the config directory, so it goes either way)"
         ),
         "status" => format!(
-            "{p} status\n  \
+            "{p} status [--config]\n  \
              Is it on, and is it screening anything? Reports the mode in force, which\n  \
              agents are wired, how many decisions are on record, and whether the local\n  \
-             dashboard answers. Anything it cannot read says [unknown], never [off].\n  \
-             Takes no arguments."
+             dashboard answers. Anything it cannot read says [unknown], never [off].\n\
+             \n  \
+             --config   instead, say what is already set in the agents' own config\n  \
+             \x20          (Claude Code, Codex, Gemini CLI, Cursor): MCP servers that run\n  \
+             \x20          tools without asking, npx/uvx packages with no version fixed,\n  \
+             \x20          keys written in the file (where and what kind, never the value)\n  \
+             \x20          and hooks of other programs. Reads only; changes nothing."
         ),
         "demo" => format!(
             "{p} demo [--json]\n  \

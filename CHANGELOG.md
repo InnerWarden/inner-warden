@@ -5,6 +5,21 @@ follows semantic versioning.
 
 ## Unreleased
 
+`innerwarden setup` and the new `innerwarden status --config` say what is
+already set in the agents' own config, and change nothing. In
+`~/.claude/settings.json`, `~/.claude.json`, `~/.cursor/mcp.json`,
+`~/.cursor/hooks.json`, `~/.codex/config.toml`, `~/.codex/hooks.json` and
+`~/.gemini/settings.json` they point out: tool calls that run without the
+agent asking (an MCP server with `trust`, `autoApprove` or `alwaysAllow`,
+a whole server in Claude Code's `permissions.allow`, `bypassPermissions`,
+`enableAllProjectMcpServers`, Codex's `approval_policy = "never"`); MCP
+servers started by `npx`, `bunx`, `pnpm dlx`, `uvx` or `uv tool run` with
+no version fixed; keys and tokens written in the file, by place and kind
+and never by value; and hooks of other programs before tool calls. Each
+finding has one line of what to do, with the InnerWarden command where
+there is one (`agents connect`, `mcp list`). A file that is there and
+cannot be parsed is named as not read, never as clean.
+
 A file the line writes, rewrites in place and then runs is read with what the
 edit puts in it: the replacement of a `sed -i` or `perl -pi -e` `s///`, the
 text of a `sed` `a`, `i` or `c`, the command of an `e`, and the strings an
