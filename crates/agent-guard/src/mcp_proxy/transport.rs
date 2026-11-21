@@ -44,7 +44,10 @@
 //!   to exit, then stops it.
 //! * the process is asked to stop (SIGTERM, SIGHUP or SIGINT; Ctrl-C on
 //!   Windows): the proxy stops the server, then exits. A signal that whoever
-//!   started the proxy set to be ignored (`nohup`) stays ignored.
+//!   started the proxy set to be ignored (`nohup`) stays ignored, for the
+//!   proxy. The server is started with SIGTERM at its default action, since
+//!   that is how the proxy asks it to stop; SIGHUP and SIGINT reach it as
+//!   they came.
 //! * an I/O error: the proxy stops the server, then reports the error.
 //!
 //! "Stops the server" is the MCP stdio shutdown: SIGTERM, then SIGKILL 1 s
@@ -1617,6 +1620,23 @@ impl Server {
         // Its own group, so a launcher's children are stopped with it.
         #[cfg(unix)]
         command.process_group(0);
+        // SIGTERM is how the proxy asks the server to stop, so the server
+        // gets it at its default action, whatever the proxy's own is. A
+        // disposition of "ignored" is kept across exec and a shell cannot
+        // trap a signal ignored when it started: a proxy started with SIGTERM
+        // ignored handed that on, its request did nothing, and the server
+        // was killed after the grace without running its own shutdown (seen
+        // on the macOS runner). SIGHUP and SIGINT are left as they came:
+        // ignoring them (`nohup`) is a choice that the tools survive.
+        #[cfg(unix)]
+        // SAFETY: signal(2) is async-signal-safe and touches only the child
+        // between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                Ok(())
+            });
+        }
         let child = command.spawn()?;
         Ok(Self {
             #[cfg(unix)]
@@ -3427,7 +3447,15 @@ mod tests {
             ),
         )
         .await
-        .expect("the proxy hung on an error");
+        .unwrap_or_else(|_| {
+            panic!(
+                "the proxy hung on an error (SIGTERM ignored in this process: {}; \
+                 signals sent: {:?}; trap wrote: {:?})",
+                ignored_from_the_start(libc::SIGTERM),
+                sent.lock().unwrap(),
+                std::fs::read_to_string(&asked).ok()
+            )
+        });
         // Read the moment the error is reported, before anything else runs.
         let at_report = sent.lock().unwrap().clone();
         assert_eq!(
