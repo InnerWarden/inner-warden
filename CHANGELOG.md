@@ -106,17 +106,26 @@ the text of a command; what it does not see is written down, as measured:
   (`innerwarden check`, the release suite), is judged as before.
 - **An order to the assistant in a tool result is read by its shape.** The
   proxy gives each sentence of what a server says the closed classes of words
-  it shows, in English, Portuguese and Spanish: speaking to the assistant (a
-  second person word with an assistant noun or a model name), claiming
-  authority (an important message, the admin, the system, a `Signed` line),
-  putting itself before the task (before you, first, instead, ignore, the
-  task I gave you), ordering a tool action (send, transfer, forward, delete,
-  run, invite, share, pay, book), and framing (a made-up tag pair,
-  `### system`, `[INST]`). Three classes within five sentences, one of them
-  speaking to the assistant or framing, are an order. A call of a class that
-  acts (a payment, a message, a share, a delete, a booking) carrying a value
-  said in such an order is refused (`AG-EFFECT`); the same value said in
-  plain text is forwarded with an alert, as before. What it does not catch:
+  it shows, in English, Portuguese and Spanish, as written and in one
+  spelling (entities, zero-width characters, look-alike letters undone):
+  speaking to the assistant (`you must`, `I need you to`, `você deve`,
+  `te pido que`, or the assistant called at the start, `Assistant, ...`;
+  `ask your assistant` speaks of a third party), claiming authority (the
+  admin, a system message, `I am the user`, a `Signed` line), putting itself
+  before the task (before you answer, instead of, ignore the instructions,
+  do not tell), ordering a tool action (send, transfer, forward, delete,
+  invite, share; a label such as `Email:` or `Order #5512` is none, and a
+  word as often a noun, such as `order` or `agenda`, counts only where the
+  sentence is addressed), and framing (a made-up tag pair, `[INST]`,
+  `<|im_start|>`; a Markdown heading is none). Three classes within five
+  sentences, one of them speaking to the assistant or framing, are an order.
+  A call of a class that acts (a payment, a message, a share, a delete, a
+  booking) carrying a value said in such an order is refused (`AG-EFFECT`);
+  the same value said in plain text is forwarded with an alert, as before. A
+  payment with more values than can be looked for in time is refused, and an
+  order the session can no longer keep gives every acting call an alert.
+  On the benign side, no call of the recorded user sessions is newly
+  refused. What it does not catch:
   an order that neither speaks to the assistant nor is framed, one written as
   code or data, one spread over more than five sentences, another language,
   and a short value (`"34"`, `"Fred"`), which raises nothing.
