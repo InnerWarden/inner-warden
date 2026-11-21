@@ -600,7 +600,7 @@ fn status_reads_a_projects_settings_from_a_subfolder_and_says_what_it_could_not_
     assert!(
         from_deep.contains(&format!(
             "This project's {} sets \"disableAllHooks\"",
-            local.display()
+            std::fs::canonicalize(&local).unwrap().display()
         )),
         "{from_deep}"
     );
@@ -700,7 +700,9 @@ fn status_stops_at_claude_and_at_the_home_and_names_a_denied_file() {
     assert!(
         from_deep.contains(&format!(
             "This project's {} sets \"disableAllHooks\"",
-            app.join(".claude/settings.json").display()
+            std::fs::canonicalize(app.join(".claude/settings.json"))
+                .unwrap()
+                .display()
         )),
         "{from_deep}"
     );
@@ -718,14 +720,18 @@ fn status_stops_at_claude_and_at_the_home_and_names_a_denied_file() {
     assert!(
         from_loose.contains(&format!(
             "{}",
-            home.path().join("loose/.gemini/settings.json").display()
+            std::fs::canonicalize(home.path().join("loose/.gemini/settings.json"))
+                .unwrap()
+                .display()
         )),
         "{from_loose}"
     );
     assert!(
         !from_loose.contains(&format!(
             "This project's {}",
-            home.path().join(".gemini/settings.json").display()
+            std::fs::canonicalize(home.path().join(".gemini/settings.json"))
+                .unwrap()
+                .display()
         )),
         "{from_loose}"
     );
