@@ -17,6 +17,16 @@ fn assert_allowed(cases: &[&str]) {
     }
 }
 
+/// Held for review, not refused: a word of the guard that code only prints
+/// or writes into a project file is a mention (decision of the operator,
+/// 2026-11-21, `tests/guard_word_mention_and_action.rs`).
+fn assert_held(cases: &[&str]) {
+    for command in cases {
+        let (recommendation, why) = verdict(command);
+        assert_eq!(recommendation, "review", "{command:?}: {why}");
+    }
+}
+
 fn assert_denied(cases: &[&str]) {
     let mut passed = Vec::new();
     for command in cases {
@@ -149,9 +159,6 @@ fn guard_words_in_interpreter_code_are_read_as_shell() {
             "const k=Buffer.from('70726f63657373','hex').toString(); global[k].mainModule.require('child_'+'process').execSync('innerwarden allow x')",
         ),
         ("ruby", "Kernel.method(\"sys\" \"tem\").call('innerwarden allow x')"),
-        ("python3", "f = 'sy' 'stem'; print(f, 'innerwarden allow x')"),
-        ("python3", "print('innerwarden allow x')"),
-        ("node", "console.log('innerwarden dry-run')"),
     ];
     let lines: Vec<String> = cases
         .iter()
@@ -159,16 +166,33 @@ fn guard_words_in_interpreter_code_are_read_as_shell() {
         .collect();
     let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
     assert_denied(&lines);
+    // Code that only prints the words, with no way to call what it holds
+    // (no lookup, no run call, no import), names the guard: held for
+    // review since 2026-11-21, refused before.
+    let printed = [
+        (
+            "python3",
+            "f = 'sy' 'stem'; print(f, 'innerwarden allow x')",
+        ),
+        ("python3", "print('innerwarden allow x')"),
+        ("node", "console.log('innerwarden dry-run')"),
+    ];
+    let lines: Vec<String> = printed
+        .iter()
+        .flat_map(|(interpreter, code)| heredoc_and_inline(interpreter, code))
+        .collect();
+    let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+    assert_held(&lines);
 }
 
-/// The false refusal this keeps, pinned: an edit of source that quotes a
-/// guard command, through a here-document or `-c`, is refused. Make that
-/// edit with the agent's file edit tool or a script saved to a file.
+/// An edit of source that quotes a guard command, through a here-document
+/// or `-c`, was refused until 2026-11-21 (the false refusal this pinned);
+/// since the decision of that day it is a mention, held for review.
 #[test]
-fn editing_source_that_quotes_a_guard_command_inline_stays_refused() {
+fn editing_source_that_quotes_a_guard_command_inline_is_held_for_review() {
     let code = "p = 'docs/guard.md'; s = open(p).read(); open(p, 'w').write(s.replace('innerwarden allow x', 'innerwarden allow y'))";
     let lines = heredoc_and_inline("python3", code);
-    assert_denied(&[lines[0].as_str(), lines[1].as_str()]);
+    assert_held(&[lines[0].as_str(), lines[1].as_str()]);
 }
 
 /// Code that edits a file and holds no guard word runs, either way.
@@ -241,6 +265,10 @@ EOF",
 f = '\163ystem'
 print(f, 'innerwarden allow x')
 EOF",
+    ]);
+    // An edit of a project file through `Path`, its text quoting a guard
+    // command: a mention since 2026-11-21, held for review.
+    assert_held(&[
         "python3 - <<'EOF'\nfrom pathlib import Path\np = Path('docs/guard.md')\np.write_text(p.read_text().replace('innerwarden allow x', 'innerwarden allow y'))\nEOF",
     ]);
 }

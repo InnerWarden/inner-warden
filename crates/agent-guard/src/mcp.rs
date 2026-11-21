@@ -3468,6 +3468,7 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "fetch_exec_unanalyzable",
     "fetch_exec_unparsed",
     "guard_self_disable",
+    "guard_word_mention",
     "insecure_permissions",
     "internal_network_target",
     "kubernetes_escalation",
@@ -3883,7 +3884,103 @@ const SUBSTITUTION_HANDS_ON: &str = "in a line a substitution runs";
 /// was allowed). The second reading is the first with every `&>` spaced
 /// apart, quoted ones too: a quoted one is data either way, or a command
 /// string that the same shell family reads.
+/// The signals a word the guard watches earns, named or acted on: a line
+/// denied only for these may be denied for a mention of the name
+/// ([`crate::mention`]).
+const GUARD_WORD_SIGNALS: &[&str] = &[
+    "guard_self_disable",
+    "security_tooling_tamper",
+    "dangerous_command",
+    "persistence_install",
+];
+
+/// What a line held for naming the guard, or what it refuses, as data is
+/// told.
+pub const GUARD_WORD_MENTION: &str =
+    "names the guard, or a line it refuses, only as data (a search \
+     pattern, a message, the text of a here-document, a folder of a repository, a string in code \
+     that acts on nothing of the guard's): held for review, not refused. Acting on the guard's \
+     files, processes or settings, or on an agent's settings, is still refused";
+
 fn analyze_command_at(
+    command: &str,
+    rule_engine: Option<&RuleEngine>,
+    protected_reads: &[String],
+    context: Option<&WorkingContext>,
+    depth: u8,
+) -> CommandAnalysis {
+    let analysis = analyze_command_as_sent(command, rule_engine, protected_reads, context, depth);
+    if depth != 0 || analysis.recommendation != "deny" {
+        return analysis;
+    }
+    mention_only(
+        command,
+        context.map(|c| c.cwd.as_str()),
+        analysis,
+        |masked| analyze_command_as_sent(masked, rule_engine, protected_reads, context, depth),
+    )
+}
+
+/// A line the guard refuses ONLY for the words it watches, where those
+/// words stand as data, is held for review instead (decision of the
+/// operator, 2026-11-21: the guard refuses the action on its files,
+/// processes and settings, not the mention of the name).
+///
+/// The line is written again with every slot that only names something
+/// masked ([`crate::mention::masked`]) and judged again. The refusal is
+/// lowered only when every charged signal of the line is one of the guard's
+/// own families ([`GUARD_WORD_SIGNALS`]) and the masked line is not
+/// refused: a secret read, a download run or any other finding keeps the
+/// refusal whatever slot it stands in.
+fn mention_only(
+    command: &str,
+    cwd: Option<&str>,
+    analysis: CommandAnalysis,
+    judge: impl Fn(&str) -> CommandAnalysis,
+) -> CommandAnalysis {
+    let only_guard_words = analysis
+        .signals
+        .iter()
+        .filter(|signal| signal.score > 0)
+        .all(|signal| GUARD_WORD_SIGNALS.contains(&signal.signal.as_str()));
+    if !only_guard_words {
+        return analysis;
+    }
+    let Some(masked) = crate::mention::masked(command, cwd) else {
+        return analysis;
+    };
+    let mut lowered = judge(&masked);
+    if lowered.recommendation == "deny" {
+        return analysis;
+    }
+    let lift = 20u32.saturating_sub(lowered.risk_score);
+    lowered.signals.push(AnalysisSignal {
+        signal: "guard_word_mention".into(),
+        score: lift,
+        detail: GUARD_WORD_MENTION.into(),
+    });
+    lowered.risk_score += lift;
+    lowered.recommendation = recommendation_for_score(lowered.risk_score).to_string();
+    lowered.severity = if lowered.risk_score >= 30 {
+        "medium"
+    } else {
+        "low"
+    }
+    .to_string();
+    lowered.explanation = lowered
+        .signals
+        .iter()
+        .filter(|signal| signal.score > 0)
+        .map(|signal| signal.detail.as_str())
+        .collect::<Vec<_>>()
+        .join("; ");
+    lowered.command = analysis.command;
+    lowered
+}
+
+/// [`analyze_command_at`] before a refusal is asked whether it came from a
+/// mention of the guard ([`mention_only`]).
+fn analyze_command_as_sent(
     command: &str,
     rule_engine: Option<&RuleEngine>,
     protected_reads: &[String],
@@ -9864,19 +9961,19 @@ mod interpreter_input_and_argv_calls {
     }
 
     /// Editing source code that quotes a command that loosens the guard,
-    /// with an interpreter fed its program in a quoted here-document, is
-    /// refused: the body is read as shell for the guard's words. Reading it
-    /// as the interpreter's language let a run call built at run time
-    /// through. This false refusal is the price; the edit is made with the
-    /// agent's file edit tool or a script saved to a file.
+    /// with an interpreter fed its program in a quoted here-document, was
+    /// refused until 2026-11-21: the body was read as shell for the guard's
+    /// words. Since the decision of that day such code, which runs nothing
+    /// and changes only project files, names the guard: held for review,
+    /// never allowed ([`crate::mention`]).
     #[test]
-    fn a_heredoc_program_quoting_a_guard_loosening_is_refused() {
+    fn a_heredoc_program_quoting_a_guard_loosening_is_held_for_review() {
         for line in [
             "python3 - <<'EOF'\np = 'crates/agent-guard/src/hook.rs'\ns = open(p).read()\ns = s.replace('innerwarden allow x', 'innerwarden allow --list')\nopen(p, 'w').write(s)\nEOF",
             "cd app && python3 - <<'EOF'\np = 'a.rs'\ns = open(p).read().replace('iw dry-run', 'iw status')\nopen(p, 'w').write(s)\nEOF",
             "node - <<'EOF'\nconsole.log('run innerwarden allow x from your own terminal')\nEOF",
         ] {
-            assert!(refused(line), "{line}");
+            assert_eq!(analyze_command(line, None).recommendation, "review", "{line}");
         }
     }
 

@@ -426,6 +426,19 @@ An agent that could turn its guard off would not be guarded. Under an
 enforcing hook (`innerwarden enforce`), the guard refuses an agent the
 following, and says they are the person's to run, from their own terminal.
 
+What it refuses is the action, not the name. A line that stops, kills,
+disarms, removes, moves over or rewrites the guard, its files and settings,
+or an agent's settings is refused. A line that only names them as data is
+held for review instead (a warning under the default posture): a search
+pattern (`grep`, `rg`, `git grep`), a message (`-m`, `--body`,
+`--title`, a commit message read from a here-document or a here-string), a
+folder of a repository or a worktree whose name holds the guard's, and
+Python, Node, Ruby or Perl code whose strings name the guard but which runs
+nothing, signals nothing and changes only files of the project. A slot is
+read as data only when its text is literal and what the command prints goes
+nowhere that runs it; a line whose deny rests on anything else (a secret
+read, a download run) keeps it.
+
 - The guard's own loosening commands: allow, mute, monitor and dry-run, the
   agent decisions (approve, profile, allow, revoke), disconnecting an agent,
   connecting or installing one in monitor, uninstalling, and starting a jail
@@ -703,6 +716,13 @@ Also not seen today, and not promised for any date:
   that returns another user's record, looks like any other call. What is
   left is the proxy's outbound filter, which masks the secrets it knows in
   the answer.
+- A name of the guard built at run time inside inline code (`'inner' +
+  'warden'`, a path joined from pieces, a name read from the environment
+  or from a file) or inside a file the code then reads. Code that runs a
+  program, signals a process, reaches the home or the environment, or
+  writes outside the project is never taken for a mention, but a name it
+  only assembles is not read. The operating system's own permissions and
+  InnerWarden Pro's kernel layer cover that case.
 - Everything the hook decides, from `innerwarden check`. `check` judges one
   line on its own. The hook also knows the agent's session (an argument that
   came out of an earlier tool result) and the place the call reads, so some

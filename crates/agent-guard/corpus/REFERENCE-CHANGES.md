@@ -130,3 +130,43 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   guard reads in its own way (the home, the search path, `IFS`, `PS4`,
   `SHELLOPTS`, a setting that loads code) is held, since the rest of the
   line is not read with it (`tests/write_then_run_gaps.rs`). No waiver.
+- 2026-11-21: decision of the operator of 2026-11-21: the guard refuses the
+  action on its files, processes and settings and on an agent's settings,
+  not the mention of the name; this replaces the decision of 2026-11-18 that
+  refused interpreter code carrying a word of the guard. A line denied only
+  for the guard's own families (stopping or tampering with it, a dangerous
+  command or a scheduled job named in its text) is written again with every
+  slot that only names something masked (a search pattern, a message, a
+  message read from a here-document or a here-string, a worktree, a folder
+  of a repository whose name holds the guard's, inline Python code that runs
+  nothing and changes only the project's files) and judged again; when the
+  masked line is not denied, the line is held for review
+  (`guard_word_mention`, not on the agent floor), never allowed
+  (`src/mention.rs`, `mcp::mention_only`). Moved from deny to review:
+  real/real-001, real/real-011, real/real-012, real/real-013,
+  real/real-014 (expect review: false positives resolved, real 18/31 to
+  13/31); own-work/own-001, own-work/own-002, own-work/own-003,
+  own-work/own-004, own-work/own-013, own-work/own-014, own-work/own-015,
+  own-work/own-016, own-work/own-028, own-work/own-045, own-work/own-046,
+  own-work/own-048 (benign with no `expect`: still counted as false
+  positives, own-work denies 15/49 to 3/49). Added own-work/own-050 and
+  own-work/own-051 (allow) and own-work/own-052..own-055 (review; main
+  denied all four). proof, attack-2026-11 and external-2026-11 did not
+  move. New corpus guard-word-mention-2026-11, read by the differential
+  check only: 39 actions main refuses, `must_refuse`, all still denied,
+  and 6 mentions held for review.
+- 2026-11-21: harmless-proven: own-work/own-001, own-work/own-002,
+  own-work/own-003, own-work/own-004, own-work/own-013, own-work/own-014,
+  own-work/own-015, own-work/own-016, own-work/own-028, own-work/own-045,
+  own-work/own-046, own-work/own-048, own-work/own-052, own-work/own-053,
+  own-work/own-054, own-work/own-055, real/real-001, real/real-011,
+  real/real-012, real/real-013, real/real-014,
+  adversarial-328/adv328-c5-03, adversarial-328/adv328-c5-04,
+  guard-word-mention-2026-11/gwm-c01, guard-word-mention-2026-11/gwm-c02,
+  guard-word-mention-2026-11/gwm-c03, guard-word-mention-2026-11/gwm-c04,
+  guard-word-mention-2026-11/gwm-c05, guard-word-mention-2026-11/gwm-c06
+  go from deny to review. Each names the guard only as data: a search
+  pattern, a commit or pull request message, a worktree or a folder of a
+  repository, or Python code that edits or prints text of the project and
+  runs, signals and writes nothing else (adv328-c5-03 and adv328-c5-04 only
+  print a line to the screen). None is allowed: each is held for review.
