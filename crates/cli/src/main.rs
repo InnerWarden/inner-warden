@@ -444,37 +444,137 @@ fn status_io_cmd_rest(
     std::process::ExitCode::SUCCESS
 }
 
-/// The project settings files in `dir` that switch an agent's hooks off or
-/// add hooks of their own ([`status::project_settings_effect`]). A file that
-/// is missing, too large or not JSON says nothing here: the guard's own
-/// wiring lines are read from the home. Run in the home itself, these files
-/// are the person's own settings, read by the lines above, not a project's.
+/// The project settings files that switch an agent's hooks off or add hooks
+/// of their own ([`status::project_settings_read`]), in `dir` and in each
+/// folder above it up to the project's root ([`project_folders`]). Run in
+/// the home itself, these files are the person's own settings, read by the
+/// lines above, not a project's. A file in a folder above `dir` is named by
+/// its full path.
 fn project_settings_in(
     dir: &std::path::Path,
     home: Option<&std::path::Path>,
 ) -> Vec<status::ProjectSettings> {
-    const MOST: u64 = 1 << 20;
+    let mut found = Vec::new();
+    for folder in project_folders(dir, home) {
+        for (agent, file) in status::PROJECT_SETTINGS_FILES {
+            let Some(effect) = project_settings_effect_at(&folder.join(file), file) else {
+                continue;
+            };
+            found.push(status::ProjectSettings {
+                agent,
+                file: if folder == dir {
+                    (*file).to_string()
+                } else {
+                    folder.join(file).display().to_string()
+                },
+                effect,
+            });
+        }
+    }
+    found
+}
+
+/// The folders a project's settings are read in, from `dir` up: up to and
+/// with the first one that holds `.git` or `.claude` (the project's
+/// root), and never the home or a folder above it. When neither the home nor
+/// such a folder is above `dir` (a folder outside the home with no `.git`
+/// over it), `dir` alone: what lies above it, up to `/`, is no project's.
+/// Empty when `dir` is the home.
+fn project_folders<'a>(
+    dir: &'a std::path::Path,
+    home: Option<&std::path::Path>,
+) -> Vec<&'a std::path::Path> {
     let same = |a: &std::path::Path, b: &std::path::Path| {
         a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
     };
-    if home.is_some_and(|home| same(dir, home)) {
-        return Vec::new();
+    folders_up_to_root(
+        dir,
+        |folder| home.is_some_and(|home| same(folder, home)),
+        |folder| folder.join(".git").exists() || folder.join(".claude").is_dir(),
+    )
+}
+
+/// PURE: [`project_folders`] with what is the home and what is a project's
+/// root handed in.
+fn folders_up_to_root(
+    dir: &std::path::Path,
+    is_home: impl Fn(&std::path::Path) -> bool,
+    is_root: impl Fn(&std::path::Path) -> bool,
+) -> Vec<&std::path::Path> {
+    let mut folders = Vec::new();
+    for folder in dir.ancestors() {
+        if is_home(folder) {
+            return folders;
+        }
+        folders.push(folder);
+        if is_root(folder) {
+            return folders;
+        }
     }
-    status::PROJECT_SETTINGS_FILES
-        .iter()
-        .filter_map(|(agent, file)| {
-            let path = dir.join(file);
-            if std::fs::metadata(&path).ok()?.len() > MOST {
-                return None;
-            }
-            let settings = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-            Some(status::ProjectSettings {
-                agent,
-                file: (*file).to_string(),
-                effect: status::project_settings_effect(file, &settings)?,
-            })
-        })
-        .collect()
+    // No root and no home above it: only the folder itself.
+    folders.truncate(1);
+    folders
+}
+
+/// What the project settings file at `path` does to its agent's hooks. A
+/// missing file says nothing. The file is opened once, without following a
+/// link and without waiting (`O_NOFOLLOW | O_NONBLOCK` on unix), and what is
+/// judged is the file that was opened (`fstat` of it), so nothing can be put
+/// in its place between a check and the open. Only a regular file is read,
+/// and no more of it than the most that is read: a link, a pipe or a device
+/// (a link to `/dev/zero`, a FIFO) is named as not read, never waited on. A
+/// file that is there and cannot be opened (permission denied) is named too,
+/// never passed over.
+fn project_settings_effect_at(path: &std::path::Path, file: &str) -> Option<status::ProjectEffect> {
+    use std::io::Read;
+    const MOST: u64 = 1 << 20;
+    const NOT_REGULAR: &str =
+        "is not a regular file (a link, a pipe or a device), so it was not opened";
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.is_file()) {
+        return Some(status::ProjectEffect::Unread(NOT_REGULAR));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let opened = match options.open(path) {
+        Ok(opened) => opened,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return None;
+        }
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Some(status::ProjectEffect::Unread(NOT_REGULAR));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Some(status::ProjectEffect::Unread(
+                "could not be opened: permission denied",
+            ));
+        }
+        Err(_) => return Some(status::ProjectEffect::Unread("could not be opened")),
+    };
+    match opened.metadata() {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Some(status::ProjectEffect::Unread(NOT_REGULAR)),
+        Err(_) => return Some(status::ProjectEffect::Unread("could not be checked")),
+    }
+    let mut body = Vec::new();
+    if opened.take(MOST + 1).read_to_end(&mut body).is_err() {
+        return Some(status::ProjectEffect::Unread("could not be read"));
+    }
+    if body.len() as u64 > MOST {
+        return Some(status::ProjectEffect::Unread("is larger than 1 MiB"));
+    }
+    status::project_settings_read(file, &body)
 }
 
 /// Does a local InnerWarden dashboard answer on `bind`?
@@ -4267,6 +4367,47 @@ mod status_wiring_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The folders a project's settings are read in stop at the project's
+    /// root (a folder with `.git` or `.claude`, read), at the home (not
+    /// read), and, with neither above, read the folder alone: a folder
+    /// outside the home with no `.git` never climbs to `/`.
+    #[test]
+    fn project_folders_stop_at_git_claude_or_home_and_never_climb_to_the_root() {
+        use std::path::Path;
+        let dir = Path::new("/srv/work/proj/src/module");
+        let never = |_: &Path| false;
+        let at = |stop: &'static str| move |folder: &Path| folder == Path::new(stop);
+        let names = |folders: Vec<&Path>| -> Vec<String> {
+            folders.iter().map(|f| f.display().to_string()).collect()
+        };
+        // A root (`.git` or `.claude`) two folders up: read up to it, it
+        // included.
+        assert_eq!(
+            names(super::folders_up_to_root(dir, never, at("/srv/work/proj"))),
+            [
+                "/srv/work/proj/src/module",
+                "/srv/work/proj/src",
+                "/srv/work/proj"
+            ]
+        );
+        // The home above, no root: up to the home, the home not read.
+        assert_eq!(
+            names(super::folders_up_to_root(dir, at("/srv/work"), never)),
+            [
+                "/srv/work/proj/src/module",
+                "/srv/work/proj/src",
+                "/srv/work/proj"
+            ]
+        );
+        // Outside the home, no root above: the folder alone, never `/`.
+        assert_eq!(
+            names(super::folders_up_to_root(dir, never, never)),
+            ["/srv/work/proj/src/module"]
+        );
+        // The home itself: nothing.
+        assert!(super::folders_up_to_root(dir, at("/srv/work/proj/src/module"), never).is_empty());
+    }
+
     #[test]
     fn check_stdin_hint_explains_terminal_input() {
         let hint = super::check_stdin_hint(true).expect("terminal input needs an explanation");
