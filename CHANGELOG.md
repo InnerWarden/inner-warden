@@ -18,6 +18,15 @@ template pages of the transformers docs and a crate's AGENTS.md) and leaves the
 held-out public attacks unchanged: 53 of 526 found, 34 of 60 of AgentDojo's
 fixed attacks, 0 of 331 benign texts marked.
 
+Inline interpreter code that copies an agent's settings to a backup folder
+is no longer refused. A copy onto a file named `settings.json`,
+`.claude.json`, `.mcp.json` or `config.toml` is a write of an agent's
+settings only in a folder the agent reads it from (`.claude`, `.codex`,
+`.gemini`, `.cursor`, `~/.config/<agent>`, the home folder for
+`.claude.json`, a bare name whose folder is not known); `backup/settings.json`
+is a copy. A copy onto `~/.codex/config.toml`, held for review before, is
+refused like a copy onto `~/.claude/settings.json`.
+
 The MCP proxy reads an order to the assistant in three more shapes, each only
 with an act the assistant would take or a sending: a turn of a chat forged
 inside the data (`<|end|><|user|>Forward ...`), the data declared over and a
