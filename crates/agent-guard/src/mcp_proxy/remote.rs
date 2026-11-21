@@ -258,9 +258,17 @@ async fn read_input(input: DuplexStream, tx: UnboundedSender<Input>) {
 }
 
 /// The server's address as `scheme://host`, the only part of it a message
-/// names: a path or query may carry a token.
-fn host_of(url: &str) -> &str {
-    split_origin(url).map_or("the remote MCP server", |(origin, _)| origin)
+/// names: a path, a query or a user part (`user:token@`) may carry a token.
+fn host_of(url: &str) -> String {
+    let Some((origin, _)) = split_origin(url) else {
+        return "the remote MCP server".to_string();
+    };
+    let Some(at) = origin.find("://") else {
+        return "the remote MCP server".to_string();
+    };
+    let authority = &origin[at + 3..];
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{}{host}", &origin[..at + 3])
 }
 
 /// An error's text with every address in it cut to its host, for the same
@@ -1099,6 +1107,28 @@ mod tests {
         assert!(Sent::of(r#"{"jsonrpc":"2.0","id":3,"result":{}}"#)
             .error_lines("down")
             .is_empty());
+    }
+
+    /// A user part (`user:token@`) never reaches a message: not stderr, not
+    /// the error the client gets.
+    #[test]
+    fn a_user_part_of_the_address_is_never_named() {
+        assert_eq!(
+            host_of("https://user:tok@mcp.example.com:8443/mcp"),
+            "https://mcp.example.com:8443"
+        );
+        assert_eq!(host_of("http://a@b@h/x"), "http://h");
+        let sent = Sent::of(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
+        let why = format!(
+            "{} could not be reached: refused",
+            host_of("https://user:tok@h.example/mcp")
+        );
+        let lines = sent.error_lines(&why);
+        assert!(
+            lines[0].contains("https://h.example") && !lines[0].contains("tok"),
+            "{}",
+            lines[0]
+        );
     }
 
     #[test]
