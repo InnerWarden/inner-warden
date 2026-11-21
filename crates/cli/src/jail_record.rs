@@ -2280,15 +2280,17 @@ mod tests {
             let (_base, record, channel, socket) =
                 channel_with(Limits::default(), Stamp::default());
             let go = std::sync::Arc::new(std::sync::Barrier::new(65));
+            let connected = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let senders: Vec<_> = (0..64)
                 .map(|n| {
-                    let (socket, go) = (socket.clone(), go.clone());
+                    let (socket, go, connected) = (socket.clone(), go.clone(), connected.clone());
                     std::thread::spawn(move || {
                         go.wait();
                         let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&socket)
                         else {
                             return (false, false);
                         };
+                        connected.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                         let mut d = decision();
                         d.command = format!("echo at-close-{n}");
@@ -2302,7 +2304,15 @@ mod tests {
                 })
                 .collect();
             go.wait();
-            std::thread::sleep(std::time::Duration::from_micros(300));
+            // The jail ends once some senders have connected and while the
+            // rest still are: reports wait in the backlog, read in part or
+            // not yet sent. Not after a time: on a loaded runner a time fell
+            // before the first connect or after the last report was written.
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while connected.load(std::sync::atomic::Ordering::SeqCst) < 8 {
+                assert!(std::time::Instant::now() < end, "no sender connected");
+                std::thread::yield_now();
+            }
             drop(channel);
             let results: Vec<(bool, bool)> =
                 senders.into_iter().map(|s| s.join().unwrap()).collect();
