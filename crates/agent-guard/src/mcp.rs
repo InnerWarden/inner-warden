@@ -5600,10 +5600,17 @@ fn analyze_command_as_read(
                     .into(),
             });
             score += 50;
-        } else if crate::threats::destructive_rm_credentials(&lower) || {
-            let normalized = threats::normalize_command(&lower);
-            normalized != lower && crate::threats::destructive_rm_credentials(&normalized)
-        } {
+        } else if crate::threats::destructive_rm_credentials(&lower)
+            || {
+                let normalized = threats::normalize_command(&lower);
+                normalized != lower && crate::threats::destructive_rm_credentials(&normalized)
+            }
+            || crate::threats::destructive_rm_credentials_in_place(
+                command_scan,
+                context.map_or("", |place| place.cwd.as_str()),
+                context.and_then(|place| place.home.as_deref()),
+            )
+        {
             // The keys and credential stores of the account: gone, they lock
             // the person out of every host and service they reach.
             signals.push(AnalysisSignal {

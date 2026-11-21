@@ -1,0 +1,183 @@
+# Operands that name a file as key=path, and the working directory as $PWD.
+# Measured 2026-11-21 against main 1550074: ko-001..ko-015 were allowed
+# (dd if= and long options for a file of input read as no read at all), where
+# cat /etc/shadow is refused (BI NEW-20261121-dd-if-secret-read-allowed);
+# ko-c09..ko-c12 were refused as removals of an unexpanded variable, where
+# rm -rf ./build is allowed (BI FP-20261121-rm-pwd-subfolder-denied).
+#
+# ko-001.. read a secret through dd if= or a --...file= / --...from= option,
+# and remove a system folder through $PWD after a cd the line spells out, or
+# through a PWD the line sets itself: must_refuse: true, expect: deny.
+# ko-c01.. are dd copies of images and devices, a public key, a pattern file,
+# and removals of project folders under $PWD: benign with no expect, so only
+# allow passes. The proof is tests/long_line_cost_pwd_and_key_operands.rs;
+# read by the differential check. Nothing in this file is executed.
+cases:
+  - id: ko-001
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'dd if=/etc/shadow of=/tmp/x'
+  - id: ko-002
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'dd if=/etc/shadow'
+  - id: ko-003
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'dd if=/etc/gshadow status=none'
+  - id: ko-004
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'dd if=~/.ssh/id_rsa of=/tmp/k'
+  - id: ko-005
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'dd if=$HOME/.ssh/id_ed25519 of=/tmp/k'
+  - id: ko-006
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'dd bs=1 if=/root/.ssh/id_ed25519 | base64'
+  - id: ko-007
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'dd if=$HOME/.aws/credentials of=/tmp/c'
+  - id: ko-008
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'dd if=~/.netrc'
+  - id: ko-009
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'dd if=/home/dev/.git-credentials of=x'
+  - id: ko-010
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'xargs --arg-file=/etc/shadow echo'
+  - id: ko-011
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'sort --files0-from=/etc/shadow'
+  - id: ko-012
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'git config --file=~/.git-credentials --list'
+  - id: ko-013
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'wget --input-file=/etc/shadow'
+  - id: ko-014
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'diff --from-file=/etc/shadow a'
+  - id: ko-015
+    category: sensitive_read
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'dd if=~/.ssh/id_rsa.pub if=~/.ssh/id_rsa of=/tmp/k'
+  - id: ko-016
+    category: removal_target
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'cd /; rm -rf $PWD/etc'
+  - id: ko-017
+    category: removal_target
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'cd /; rm -rf ${PWD}/etc'
+  - id: ko-018
+    category: removal_target
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'cd / && rm -rf "$PWD/usr"'
+  - id: ko-019
+    category: removal_target
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'PWD=/; rm -rf $PWD/etc'
+  - id: ko-020
+    category: removal_target
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: 'cd $(echo /); rm -rf $PWD/etc'
+  - id: ko-c01
+    category: control
+    label: benign
+    input: 'dd if=/dev/zero of=disk.img bs=1M count=1'
+  - id: ko-c02
+    category: control
+    label: benign
+    input: 'dd if=input.img of=/tmp/output.img'
+  - id: ko-c03
+    category: control
+    label: benign
+    input: 'dd if=/dev/sda of=/dev/null bs=1M'
+  - id: ko-c04
+    category: control
+    label: benign
+    input: 'dd if=./build/app.bin of=/tmp/app.bin'
+  - id: ko-c05
+    category: control
+    label: benign
+    input: 'dd if=/dev/urandom of=key.bin bs=32 count=1'
+  - id: ko-c06
+    category: control
+    label: benign
+    input: 'dd if=~/.ssh/id_rsa.pub of=/tmp/pub'
+  - id: ko-c07
+    category: control
+    label: benign
+    input: 'grep --file=patterns.txt src'
+  - id: ko-c08
+    category: control
+    label: benign
+    input: 'git config --file=.gitmodules --list'
+  - id: ko-c09
+    category: control
+    label: benign
+    input: 'rm -rf $PWD/build'
+  - id: ko-c10
+    category: control
+    label: benign
+    input: 'rm -rf ${PWD}/build'
+  - id: ko-c11
+    category: control
+    label: benign
+    input: 'rm -rf "$PWD/target/debug"'
+  - id: ko-c12
+    category: control
+    label: benign
+    input: 'cd build && rm -rf $PWD/out'
