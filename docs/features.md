@@ -489,6 +489,19 @@ In the MCP proxy and in a line handed to a shell, the guard also does not see:
   from the names a search finds when it runs.
 - A `-c` variable whose value is set at run time. Such a line is held for
   review, not judged by the value it will hold.
+- A file written in an earlier call and run in this one. Each call is judged
+  as its own line: `echo '...' > a.sh` in one call and `sh a.sh` in the next
+  are two lines, and the second runs a file the guard does not read, as any
+  file already on disk is. Within one line, a file the line writes and then
+  runs (by name, by path, through `$SHELL`, `exec`, `env -S`, `xargs` or
+  `find -exec` handing it over, or on a shell's stdin) is read as the code it
+  holds when the line shows the text; when it does not (a program's output, a
+  copy, `dd`, `sed -i`, `perl -pi`, `gawk -i inplace`, `truncate`, a
+  variable), the line is held for review. A file of assignments only, of
+  values the line writes out or of the environment's own paths (`echo
+  "export PATH=$PATH:$HOME/bin" > env.sh`), is read as those assignments.
+  `find -exec` with a pattern is matched only against the files the line
+  writes by a redirect or `tee`.
 
 The MCP proxy does not fix an MCP server that is itself vulnerable. A flaw in
 the server's own logic happens inside the server, where the proxy does not

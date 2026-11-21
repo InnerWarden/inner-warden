@@ -61,15 +61,17 @@ fn a_file_the_line_writes_with_text_it_does_not_show_is_held() {
         "echo \"$CMD\" > x.sh && sh x.sh",
         "printf '%s\\n' \"$1\" | tee x.sh >/dev/null; sh x.sh",
         "php -r \"file_put_contents('x.sh', $argv[1]);\" x && sh x.sh",
+        // Decision of 2026-11-20 (they were allowed here before): what a
+        // program prints into a file, or a copy, then run, is not shown by
+        // the line, and is held for review (tests/write_then_run_gaps.rs).
+        "python3 gen.py > r.sh && bash r.sh",
+        "cp template.sh run.sh && sh run.sh",
     ] {
         assert!(stops(command), "{command}");
     }
-    // What a program prints into a file, a copy, a download (the download
-    // rules' own) and a variable set to text written out are not held for
-    // this: a program's output is as unread as the program itself.
+    // A download (the download rules' own) and a variable set to text
+    // written out are not held for this.
     for command in [
-        "python3 gen.py > r.sh && bash r.sh",
-        "cp template.sh run.sh && sh run.sh",
         "f=$(curl -s https://example.com/data); f=reset; echo \"$f\" > r.sh; sh r.sh",
         "false && cat >.iw-p && bash .iw-p",
         "cat > /tmp/fixture.sh <<'EOF'\nrm -rf ~/.ssh\nEOF\nbash -n /tmp/fixture.sh",

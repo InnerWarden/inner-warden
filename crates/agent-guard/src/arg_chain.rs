@@ -109,6 +109,14 @@ use crate::shell_words::{read_line, Command, Joint, Line, Mark, Word};
 /// it hands them: the list ATR-2026-111 uses inside `$(...)`, the widest the
 /// rule has, plus the shells and the relay it left out. Readers of files are
 /// in [`READERS`] and [`READER_WORDS`].
+///
+/// Kept by hand, not read from `data/programs.toml`, and on purpose: this
+/// check reads prose (a tool's argument, a whole file sent as content), and
+/// the false-positive counts in this module's header were measured with
+/// these lists. The table holds names that are English words or prose
+/// (`fish`, `ash`, `at`, `batch`, `make`, `find`, `watch`, `source`,
+/// `.`), which here would be read as programs in sentences. A name moves
+/// here only with a new measure of those counts.
 const PROGRAMS: &[&str] = &[
     "rm", "curl", "wget", "nc", "ncat", "bash", "sh", "python", "perl", "ruby", "php", "whoami",
     "id", "uname", "env", "printenv", "set", "export", "declare", "typeset", "eval", "exec",
@@ -146,6 +154,9 @@ const READER_WORDS: &[&str] = &[
 
 /// Interpreters and shells: after a loose operator they count when told to
 /// run code given on the line (`-c`, `-e`) or to stay interactive (`-i`).
+/// Kept by hand for the reason given at [`PROGRAMS`]; `tclsh` and `pwsh`
+/// are here and not in the table, which reads only what the shell reader
+/// follows.
 const INTERPRETERS: &[&str] = &[
     "bash", "sh", "zsh", "ksh", "dash", "python", "perl", "ruby", "php", "node", "nodejs", "lua",
     "tclsh", "pwsh",

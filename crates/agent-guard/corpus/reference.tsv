@@ -88,7 +88,7 @@ proof	dx-080	deny
 proof	dx-081	deny
 proof	dx-082	deny
 proof	dx-083	deny
-proof	dx-084	review
+proof	dx-084	deny
 proof	dx-085	deny
 proof	dx-086	deny
 proof	dx-087	deny
@@ -362,7 +362,7 @@ proof	bn-112	allow
 proof	bn-113	allow
 proof	bn-114	allow
 proof	bn-115	allow
-proof	bn-116	allow
+proof	bn-116	review
 proof	bn-117	allow
 proof	bn-118	allow
 proof	bn-119	allow

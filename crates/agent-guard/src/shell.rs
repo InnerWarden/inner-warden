@@ -9,7 +9,7 @@
 use std::ops::Range;
 
 mod inline_calls;
-mod runners;
+pub(crate) mod runners;
 mod unread_parts;
 
 pub(crate) use inline_calls::InlineReading;
@@ -3250,20 +3250,23 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         let Some(words) = command_words(*command, bytes) else {
             continue;
         };
+        // `env -S 'sh -e' x.sh`: the split string is the command's words.
+        let words = env_split_words(&words).unwrap_or(words);
         let Some(effective) = effective_command_words(&words, 0) else {
             continue;
         };
         if command_is_noexec_shell(effective) {
             continue;
         }
-        for (path, language) in files_a_command_runs(effective) {
-            let Some(writer) = file_writer(*command, &path, bytes) else {
+        for (path, language) in files_a_command_runs(*command, effective, bytes) {
+            let writers = file_writer(*command, &path, bytes);
+            if writers.is_empty() {
                 continue;
-            };
+            }
             let text = file_text_before(*command, &path, bytes)
                 .or_else(|| substituted_writer_text(*command, &path, bytes, &assignments));
-            match (text, writer) {
-                (Some(text), _) => {
+            match text {
+                Some(text) => {
                     let (language, program) = match (language, runners::shebang(&text)) {
                         (None, Some(found)) => (found.0, found.1),
                         (None, None) => (runners::Language::Shell, String::new()),
@@ -3272,9 +3275,27 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                     handed
                         .lines
                         .extend(runners::shell_lines(language, &text, &program));
+                    // Another write the line does not show (`cp`, `mv`, `dd`,
+                    // `sed -i`, `truncate`, a program's output, a download)
+                    // may leave the file holding other text than the shown one.
+                    if writers
+                        .iter()
+                        .any(|writer| matches!(writer, Writer::Program | Writer::Download))
+                    {
+                        handed.file_not_shown = true;
+                    }
                 }
-                (None, Writer::Printer) => handed.file_not_shown = true,
-                (None, Writer::Program | Writer::Download) => {}
+                // A program's output, a copy or a link: the line does not
+                // show what runs.
+                None if writers.contains(&Writer::Program) => handed.file_not_shown = true,
+                None if writers.contains(&Writer::Printer) => {
+                    match assignments_written(*command, &path, bytes, &assignments) {
+                        Some(lines) => handed.lines.extend(lines),
+                        None => handed.file_not_shown = true,
+                    }
+                }
+                // A download alone: the download rules' own.
+                None => {}
             }
         }
     }
@@ -3285,23 +3306,437 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
 /// The files the command `effective` runs, each with how it reads it
 /// ([`runners::file_scripts`]); a program run by its path (`./x.sh`)
 /// is read by its first line, `None` here.
-fn files_a_command_runs(effective: &[String]) -> Vec<(String, Option<runners::Language>)> {
-    let program = shell_literal_word(&effective[0]);
-    if program.contains(['$', '`']) {
+fn files_a_command_runs(
+    command: tree_sitter::Node<'_>,
+    effective: &[String],
+    source: &[u8],
+) -> Vec<(String, Option<runners::Language>)> {
+    let mut found = files_named_by(effective, 0);
+    found.extend(file_on_stdin(command, effective, source));
+    found.extend(files_xargs_runs(command, effective, source));
+    found.extend(files_find_runs(command, effective, source));
+    found
+}
+
+/// The files the words `effective` run by name: a script operand, a
+/// program run by its path (`./x.sh`), a program of the table run by its
+/// path (`/bin/sh x.sh`, `/usr/bin/python3 x.py`), and a shell named at run
+/// time (`$SHELL x.sh`, `"${SHELL}" x.sh`), read as `sh` reads its script.
+fn files_named_by(effective: &[String], depth: u8) -> Vec<(String, Option<runners::Language>)> {
+    let Some(first) = effective.first() else {
         return Vec::new();
-    }
-    if program.contains('/') && !program.ends_with('/') {
-        return vec![(program, None)];
-    }
-    let name = normalized_command_name(&effective[0]);
+    };
+    let program = shell_literal_word(first);
+    let name = normalized_command_name(first);
     let args: Vec<String> = effective[1..]
         .iter()
         .map(|argument| shell_literal_word(argument))
         .collect();
-    runners::file_scripts(runners::versionless(&name), &args)
+    let scripts = |name: &str| {
+        runners::file_scripts(runners::versionless(name), &args)
+            .into_iter()
+            .map(|(path, language)| (path, Some(language)))
+            .collect::<Vec<_>>()
+    };
+    if program.contains(['$', '`']) {
+        return if depth == 0 && names_a_shell_at_run_time(first) {
+            scripts("sh")
+        } else {
+            Vec::new()
+        };
+    }
+    if program.contains('/') && !program.ends_with('/') {
+        let mut found = vec![(program, None)];
+        if runners::program(runners::versionless(&name)).is_some() {
+            found.extend(scripts(&name));
+        }
+        return found;
+    }
+    scripts(&name)
+}
+
+/// The words of a command run through `env -S STRING` (`--split-string`),
+/// with the string split into the words it holds: `env -S 'sh -e' x.sh` runs
+/// `sh -e x.sh`. `None` when no `env` in the words splits a string.
+fn env_split_words(words: &[String]) -> Option<Vec<String>> {
+    let at = words
+        .iter()
+        .position(|word| normalized_command_name(word) == "env")?;
+    let mut index = at + 1;
+    while let Some(word) = words.get(index) {
+        let word = shell_word(word);
+        let (split, next) = if word == "-S" || word == "--split-string" {
+            (shell_literal_word(words.get(index + 1)?), index + 2)
+        } else if let Some(value) = word
+            .strip_prefix("--split-string=")
+            .or_else(|| word.strip_prefix("-S").filter(|value| !value.is_empty()))
+        {
+            (value.to_owned(), index + 1)
+        } else if matches!(
+            word.as_str(),
+            "-u" | "--unset" | "-C" | "--chdir" | "-a" | "--argv0"
+        ) {
+            index += 2;
+            continue;
+        } else if word.starts_with('-') || is_environment_assignment(&word) {
+            index += 1;
+            continue;
+        } else {
+            return None;
+        };
+        let mut built: Vec<String> = words[..=at].to_vec();
+        built.extend(split.split_whitespace().map(str::to_owned));
+        built.extend(words.get(next..).unwrap_or_default().iter().cloned());
+        return Some(built);
+    }
+    None
+}
+
+/// The file a shell or an interpreter reads its code from on stdin by a
+/// redirect (`sh < x.sh`, `python3 < x.py`), with how it reads it.
+fn file_on_stdin(
+    command: tree_sitter::Node<'_>,
+    effective: &[String],
+    source: &[u8],
+) -> Option<(String, Option<runners::Language>)> {
+    let name = normalized_command_name(effective.first()?);
+    let name = runners::versionless(&name);
+    let args: Vec<String> = effective[1..]
+        .iter()
+        .map(|argument| shell_literal_word(argument))
+        .collect();
+    let row = runners::program(name)?;
+    let reads_stdin = if row.shell {
+        shell_code_input(&args) == CodeInput::Stdin
+    } else {
+        row.stdin_code
+            && !row.launcher
+            && runners::file_scripts(name, &args).is_empty()
+            && !args.iter().any(|arg| {
+                row.inline.as_deref().is_some_and(|inline| {
+                    arg == inline
+                        || arg
+                            .strip_prefix('-')
+                            .filter(|flags| !flags.starts_with('-'))
+                            .is_some_and(|flags| {
+                                runners::cluster_takes_code(
+                                    flags,
+                                    inline.trim_start_matches('-'),
+                                    row.language,
+                                )
+                            })
+                })
+            })
+    };
+    if !reads_stdin {
+        return None;
+    }
+    // The grammar hangs a redirect on the command, on the statement around
+    // it, or on a whole list whose last command it is (`a && sh < f`).
+    let mut cursor = command.walk();
+    let mut children: Vec<_> = command.children(&mut cursor).collect();
+    if let Some(statement) = ancestor_of_kind(command, "redirected_statement").filter(|statement| {
+        statement_owner(*statement).is_some_and(|owner| owner.id() == command.id())
+    }) {
+        let mut cursor = statement.walk();
+        children.extend(statement.children(&mut cursor));
+    }
+    let input = children
         .into_iter()
-        .map(|(path, language)| (path, Some(language)))
-        .collect()
+        .filter(|child| child.kind() == "file_redirect")
+        .rfind(|redirect| {
+            let Some(destination) = redirect.child_by_field_name("destination") else {
+                return false;
+            };
+            let text = node_text(*redirect, source);
+            let operator = text
+                .get(
+                    ..destination
+                        .start_byte()
+                        .saturating_sub(redirect.start_byte()),
+                )
+                .unwrap_or_default()
+                .trim();
+            matches!(operator, "<" | "0<")
+        })?;
+    let destination = input.child_by_field_name("destination")?;
+    let path = shell_literal_word(&node_text(destination, source));
+    let language = if row.shell {
+        runners::Language::Shell
+    } else {
+        row.language
+    };
+    Some((path, Some(language)))
+}
+
+/// The files `xargs` hands a shell or an interpreter of the table as its
+/// script, from the words a literal `echo`, `printf`, here-string or
+/// here-document gives it: `echo x.sh | xargs sh` and `xargs sh <<< x.sh` run
+/// `sh x.sh`.
+fn files_xargs_runs(
+    command: tree_sitter::Node<'_>,
+    effective: &[String],
+    source: &[u8],
+) -> Vec<(String, Option<runners::Language>)> {
+    const VALUED: &[&str] = &[
+        "-I",
+        "-n",
+        "-P",
+        "-L",
+        "-l",
+        "-s",
+        "-d",
+        "-E",
+        "--delimiter",
+        "--max-args",
+        "--max-procs",
+        "--max-lines",
+        "--replace",
+        "--eof",
+        "--max-chars",
+    ];
+    if effective
+        .first()
+        .is_none_or(|first| normalized_command_name(first) != "xargs")
+    {
+        return Vec::new();
+    }
+    let mut replace = None;
+    let mut at = 1;
+    while let Some(word) = effective.get(at).map(|word| shell_word(word)) {
+        if word == "-a" || word.starts_with("--arg-file") {
+            return Vec::new();
+        }
+        if word == "-I" || word == "--replace" {
+            replace = effective.get(at + 1).map(|value| shell_word(value));
+        } else if word == "-i" || word.starts_with("--replace=") || word.starts_with("-i") {
+            replace = Some(
+                word.strip_prefix("--replace=")
+                    .or_else(|| word.strip_prefix("-i"))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("{}")
+                    .to_owned(),
+            );
+        }
+        if VALUED.contains(&word.as_str()) {
+            at += 2;
+            continue;
+        }
+        if word == "--" {
+            at += 1;
+            break;
+        }
+        if word.starts_with('-') {
+            at += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(run) = effective.get(at..).filter(|run| !run.is_empty()) else {
+        return Vec::new();
+    };
+    let name = normalized_command_name(&run[0]);
+    if runners::program(runners::versionless(&name)).is_none() {
+        return Vec::new();
+    }
+    let text = match piped_input(command, source) {
+        Some(PipedInput::Text(text)) => text,
+        Some(PipedInput::Unread) => return Vec::new(),
+        None => match stdin_text_of(command, source) {
+            Some(text) => text,
+            None => return Vec::new(),
+        },
+    };
+    let mut found = Vec::new();
+    for item in text.split_whitespace().take(64) {
+        let built: Vec<String> = match &replace {
+            Some(token) => run
+                .iter()
+                .map(|word| shell_word(word).replace(token.as_str(), item))
+                .collect(),
+            None => run
+                .iter()
+                .cloned()
+                .chain(std::iter::once(item.to_owned()))
+                .collect(),
+        };
+        if let Some(inner) = effective_command_words(&built, 0) {
+            found.extend(files_named_by(inner, 1));
+        }
+    }
+    found
+}
+
+/// The files `find` hands a shell or an interpreter of the table through
+/// `-exec`, `-execdir`, `-ok` or `-okdir` with `{}`: each path operand, each
+/// `-name` or `-path` written out, and, for a pattern or no name at all,
+/// each file the line writes before that the pattern matches.
+fn files_find_runs(
+    command: tree_sitter::Node<'_>,
+    effective: &[String],
+    source: &[u8],
+) -> Vec<(String, Option<runners::Language>)> {
+    if effective
+        .first()
+        .is_none_or(|first| normalized_command_name(first) != "find")
+    {
+        return Vec::new();
+    }
+    let words: Vec<String> = effective[1..].iter().map(|word| shell_word(word)).collect();
+    let operands: Vec<String> = words
+        .iter()
+        .take_while(|word| !word.starts_with('-') && !matches!(word.as_str(), "(" | "!" | "\\("))
+        .cloned()
+        .collect();
+    let mut names = Vec::new();
+    let mut runs: Vec<Vec<String>> = Vec::new();
+    let mut at = operands.len();
+    while let Some(word) = words.get(at) {
+        match word.as_str() {
+            "-name" | "-iname" | "-path" | "-ipath" | "-wholename" | "-iwholename" => {
+                if let Some(value) = words.get(at + 1) {
+                    names.push(value.clone());
+                }
+                at += 2;
+            }
+            "-exec" | "-execdir" | "-ok" | "-okdir" => {
+                let group: Vec<String> = words[at + 1..]
+                    .iter()
+                    .take_while(|word| !matches!(word.as_str(), ";" | "\\;" | "+"))
+                    .cloned()
+                    .collect();
+                at += group.len() + 2;
+                if group.iter().any(|word| word.contains("{}")) {
+                    runs.push(group);
+                }
+            }
+            _ => at += 1,
+        }
+    }
+    if runs.is_empty() {
+        return Vec::new();
+    }
+    let is_pattern = |name: &str| name.contains(['*', '?', '[']);
+    let mut candidates: Vec<String> = operands.clone();
+    candidates.extend(names.iter().filter(|name| !is_pattern(name)).cloned());
+    if names.is_empty() || names.iter().any(|name| is_pattern(name)) {
+        for written in paths_written_before(command, source) {
+            let base = written.rsplit('/').next().unwrap_or(&written).to_owned();
+            if names.is_empty()
+                || names
+                    .iter()
+                    .any(|name| glob_matches(name.rsplit('/').next().unwrap_or(name), &base))
+            {
+                candidates.push(written);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for run in &runs {
+        for candidate in candidates.iter().take(64) {
+            let built: Vec<String> = run
+                .iter()
+                .map(|word| word.replace("{}", candidate))
+                .collect();
+            if let Some(inner) = effective_command_words(&built, 0) {
+                found.extend(files_named_by(inner, 1));
+            }
+        }
+    }
+    found
+}
+
+/// The paths the line writes by a redirect or `tee` before `reader`.
+fn paths_written_before(reader: tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
+    let root = root_node(reader);
+    let mut paths = Vec::new();
+    let mut redirects = Vec::new();
+    collect_nodes_of_kind(root, "file_redirect", &mut redirects, 0);
+    for redirect in redirects {
+        if redirect.start_byte() >= reader.start_byte() {
+            continue;
+        }
+        let Some(destination) = redirect.child_by_field_name("destination") else {
+            continue;
+        };
+        let text = node_text(redirect, source);
+        let operator = text
+            .get(
+                ..destination
+                    .start_byte()
+                    .saturating_sub(redirect.start_byte()),
+            )
+            .unwrap_or_default();
+        if operator.contains('>') && !operator.contains(">&") {
+            paths.push(shell_literal_word(&node_text(destination, source)));
+        }
+    }
+    let mut commands = Vec::new();
+    collect_all_commands(root, &mut commands, 0);
+    for command in commands {
+        if command.end_byte() > reader.start_byte() {
+            continue;
+        }
+        let Some(words) = command_words(command, source) else {
+            continue;
+        };
+        if words
+            .first()
+            .is_some_and(|first| normalized_command_name(first) == "tee")
+        {
+            paths.extend(
+                words[1..]
+                    .iter()
+                    .map(|word| shell_literal_word(word))
+                    .filter(|word| !word.starts_with('-')),
+            );
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Whether a `find -name` pattern matches `name`: `*` any text, `?` and a
+/// bracket one character (a bracket is read loosely, as any character).
+fn glob_matches(pattern: &str, name: &str) -> bool {
+    let mut simple = String::new();
+    let mut in_bracket = false;
+    for character in pattern.chars() {
+        match character {
+            '[' if !in_bracket => {
+                in_bracket = true;
+                simple.push('?');
+            }
+            ']' if in_bracket => in_bracket = false,
+            _ if in_bracket => {}
+            _ => simple.push(character),
+        }
+    }
+    let pattern: Vec<char> = simple.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut n) = (0, 0);
+    let (mut star, mut mark) = (None, 0);
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == name[n]) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            mark = n;
+            p += 1;
+        } else if let Some(at) = star {
+            p = at + 1;
+            mark += 1;
+            n = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// `path` as the line may write it: as given, and with or without a
@@ -3322,14 +3757,18 @@ enum Writer {
     Download,
 }
 
-/// Who writes `path` before `reader` runs it on the line, if anyone does:
-/// the strongest [`Writer`] of them.
-fn file_writer(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Option<Writer> {
+/// Who writes `path` before `reader` runs it on the line: every kind of
+/// [`Writer`] that does, none when nothing on the line writes it.
+fn file_writer(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Vec<Writer> {
     let spellings = spellings_of(path);
     let root = root_node(reader);
     let printer_name = |name: &str| matches!(name, "echo" | "printf" | "cat" | "exec" | "print");
-    let mut found: Option<Writer> = None;
-    let mut note = |writer: Writer| found = Some(found.map_or(writer, |before| before.max(writer)));
+    let mut found: Vec<Writer> = Vec::new();
+    let mut note = |writer: Writer| {
+        if !found.contains(&writer) {
+            found.push(writer);
+        }
+    };
     let mut redirects = Vec::new();
     collect_nodes_of_kind(root, "file_redirect", &mut redirects, 0);
     for redirect in redirects {
@@ -3416,6 +3855,16 @@ fn file_writer(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Opti
                 note(Writer::Program);
             }
             "curl" | "wget" if args.iter().any(names) => note(Writer::Download),
+            // An edit in place, or a file cut or filled from stdin: what it
+            // leaves in the file is not shown.
+            "sed" | "gsed" if sed_in_place(&args) && args.iter().any(names) => {
+                note(Writer::Program);
+            }
+            "perl" if perl_in_place(&args) && args.iter().any(names) => note(Writer::Program),
+            "awk" | "gawk" if awk_in_place(&args) && args.iter().any(names) => {
+                note(Writer::Program);
+            }
+            "truncate" | "sponge" if args.iter().any(names) => note(Writer::Program),
             _ if is_code_language(&name)
                 && args.iter().any(|arg| {
                     spellings.iter().any(|spelling| {
@@ -3430,6 +3879,168 @@ fn file_writer(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Opti
         }
     }
     found
+}
+
+/// Whether `sed` edits its files in place: `-i`, `-i.bak`, `--in-place`, or
+/// `i` in a group of short flags before one that takes a value (`-Ei`,
+/// `-ni`; the `i` of `-ei` is the script).
+fn sed_in_place(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        if arg == "--in-place" || arg.starts_with("--in-place=") {
+            return true;
+        }
+        let Some(flags) = arg
+            .strip_prefix('-')
+            .filter(|flags| !flags.starts_with('-'))
+        else {
+            return false;
+        };
+        for flag in flags.chars() {
+            match flag {
+                'i' => return true,
+                'e' | 'f' | 'l' => return false,
+                _ => {}
+            }
+        }
+        false
+    })
+}
+
+/// Whether `perl` edits its files in place: `-i` alone or in a group of
+/// short flags (`-pi`, `-pi.bak`, `-0777pi`) before one that takes a value.
+fn perl_in_place(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|arg| arg.starts_with('-') && arg.as_str() != "--")
+        .any(|arg| {
+            let Some(flags) = arg
+                .strip_prefix('-')
+                .filter(|flags| !flags.starts_with('-'))
+            else {
+                return false;
+            };
+            for flag in flags.chars() {
+                match flag {
+                    'i' => return true,
+                    'e' | 'E' | 'I' | 'M' | 'm' | 'x' | 'C' | 'd' | 'D' => return false,
+                    _ => {}
+                }
+            }
+            false
+        })
+}
+
+/// Whether `gawk` edits its files in place: `-i inplace`, `-iinplace`,
+/// `--include=inplace` or `--include inplace`.
+fn awk_in_place(args: &[String]) -> bool {
+    args.iter().enumerate().any(|(at, arg)| {
+        let value = match arg.as_str() {
+            "-i" | "--include" => args.get(at + 1).map(String::as_str),
+            _ => arg
+                .strip_prefix("--include=")
+                .or_else(|| arg.strip_prefix("-i")),
+        };
+        value.is_some_and(|value| value.starts_with("inplace"))
+    })
+}
+
+/// Variables whose value the environment holds as a path or a name.
+const ENVIRONMENT_VALUES: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "PWD",
+    "SHELL",
+    "LANG",
+    "TMPDIR",
+    "GOPATH",
+    "CARGO_HOME",
+    "PYTHONPATH",
+    "NODE_PATH",
+    "JAVA_HOME",
+    "VIRTUAL_ENV",
+];
+
+/// The lines a file holds when the line writes it with one `echo` of
+/// assignments only (`echo "export PATH=$PATH:$HOME/bin" > env.sh`): each
+/// statement sets a variable (or exports one) to text the line writes out
+/// and the values of [`ENVIRONMENT_VALUES`] the line does not set itself.
+/// Such a file sets variables and runs no program, so it is read as those
+/// assignments, which the rules then judge. `None` for anything else: a
+/// substitution, a backtick, an escape, another variable, more than one
+/// write, a statement that is not an assignment.
+fn assignments_written(
+    reader: tree_sitter::Node<'_>,
+    path: &str,
+    source: &[u8],
+    assignments: &[Assignment],
+) -> Option<Vec<String>> {
+    let spellings = spellings_of(path);
+    let mut redirects = Vec::new();
+    collect_nodes_of_kind(root_node(reader), "file_redirect", &mut redirects, 0);
+    let mut writers = redirects.into_iter().filter(|redirect| {
+        redirect.start_byte() < reader.start_byte()
+            && redirect
+                .child_by_field_name("destination")
+                .is_some_and(|destination| {
+                    spellings.contains(&shell_literal_word(&node_text(destination, source)))
+                })
+    });
+    let redirect = writers.next()?;
+    if writers.next().is_some() {
+        return None;
+    }
+    let writer = ancestor_of_kind(redirect, "redirected_statement").and_then(statement_owner)?;
+    if writer.kind() != "command"
+        || normalized_command_name(&command_name(writer, source)?) != "echo"
+    {
+        return None;
+    }
+    let reference =
+        regex::Regex::new(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))").ok()?;
+    let mut printed = Vec::new();
+    for argument in command_arguments(writer) {
+        let text = node_text(argument, source);
+        if printed.is_empty() && text == "-n" {
+            continue;
+        }
+        if text.contains(['`', '\\', '\'']) || text.contains("$(") || text.contains("<(") {
+            return None;
+        }
+        let text = text
+            .strip_prefix('"')
+            .and_then(|inner| inner.strip_suffix('"'))
+            .unwrap_or(&text);
+        if text.contains('"') {
+            return None;
+        }
+        let mut uses = 0;
+        for found in reference.captures_iter(text) {
+            let name = found.get(1).or_else(|| found.get(2))?.as_str();
+            if !ENVIRONMENT_VALUES.contains(&name)
+                || assignments.iter().any(|assigned| assigned.0 == name)
+            {
+                return None;
+            }
+            uses += 1;
+        }
+        if text.matches('$').count() != uses {
+            return None;
+        }
+        printed.push(text.to_owned());
+    }
+    let statement = regex::Regex::new(
+        r"^(?:export\s+[A-Za-z_][A-Za-z0-9_]*(?:=[^\s;&|<>()]*)?|[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>()]*)$",
+    )
+    .ok()?;
+    let lines: Vec<String> = printed
+        .join(" ")
+        .split(['\n', ';'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!lines.is_empty() && lines.iter().all(|line| statement.is_match(line))).then_some(lines)
 }
 
 /// Whether `node` never runs: it is in a literally unreachable branch
@@ -7488,22 +8099,34 @@ fn substitution_lines(source: &str, only_arguments: bool) -> Vec<String> {
     {
         return Vec::new();
     }
+    // Past the parse budget there is no tree: the substitutions are found
+    // by their text, each read as standing in an argument.
     let Some(tree) = parse_bash(source) else {
-        return Vec::new();
+        return substitutions_by_text(source);
     };
     let root = tree.root_node();
+    // Under a node the grammar could not read, where a substitution stands
+    // is not known: it is read as standing in an argument.
+    let place_unknown = root.has_error();
     let mut ranges = Vec::new();
     collect_executable_substitutions(root, source.as_bytes(), &mut ranges, 0);
     ranges
         .into_iter()
         .filter(|range| {
             !only_arguments
+                || place_unknown
                 || root
                     .descendant_for_byte_range(range.start, range.end)
-                    .is_some_and(stands_in_an_argument)
+                    .is_none_or(|node| {
+                        !matches!(node.kind(), "command_substitution" | "process_substitution")
+                            || stands_in_an_argument(node)
+                    })
         })
-        .filter_map(|range| source.get(range))
-        .filter_map(|written| {
+        // The grammar can start a substitution's range at the blank before
+        // it (`"$(a) $(b)"` gives ` $(b)`): the text is trimmed first, so the
+        // second is read, not dropped.
+        .filter_map(|range| source.get(range).map(str::trim))
+        .map(|written| {
             written
                 .strip_prefix("$(")
                 .or_else(|| written.strip_prefix("<("))
@@ -7514,11 +8137,88 @@ fn substitution_lines(source: &str, only_arguments: bool) -> Vec<String> {
                         .strip_prefix('`')
                         .and_then(|rest| rest.strip_suffix('`'))
                 })
+                // A node past the depth the reading follows
+                // ([`collect_executable_substitutions`]) is judged whole.
+                .unwrap_or(written)
         })
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// Whether a node of `source` stands deeper than
+/// [`collect_executable_substitutions`] descends: a substitution there is
+/// not read where it stands, and the line is refused as one read past its
+/// budget. (A line past the parse budget is read by its text,
+/// [`substitutions_by_text`], and by the reading of lines the grammar
+/// cannot parse.)
+pub(crate) fn substitutions_past_reading(source: &str) -> bool {
+    if !source.contains("$(")
+        && !source.contains('`')
+        && !source.contains("<(")
+        && !source.contains(">(")
+    {
+        return false;
+    }
+    let Some(tree) = parse_bash(source) else {
+        return false;
+    };
+    let mut ranges = Vec::new();
+    collect_executable_substitutions(tree.root_node(), source.as_bytes(), &mut ranges, 0);
+    ranges.into_iter().any(|range| {
+        tree.root_node()
+            .descendant_for_byte_range(range.start, range.end)
+            .is_some_and(|node| {
+                !matches!(node.kind(), "command_substitution" | "process_substitution")
+            })
+    })
+}
+
+/// The lines of the substitutions of `source` found by their text, for a
+/// line the grammar does not read: each outermost `$(...)`, `<(...)`,
+/// `>(...)` (not `$((...))`) and backtick pair. Quotes are not read, so a
+/// substitution in single quotes is found too: this only ever finds more.
+fn substitutions_by_text(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut lines = Vec::new();
+    let mut at = 0;
+    while at + 1 < bytes.len() {
+        let opener = matches!(bytes[at], b'$' | b'<' | b'>') && bytes[at + 1] == b'(';
+        if opener && bytes.get(at + 2) != Some(&b'(') {
+            let start = at + 2;
+            let mut depth = 1usize;
+            let mut end = start;
+            while end < bytes.len() && depth > 0 {
+                match bytes[end] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                end += 1;
+            }
+            let inner_end = if depth == 0 { end - 1 } else { end };
+            if let Some(inner) = source.get(start..inner_end) {
+                if !inner.trim().is_empty() {
+                    lines.push(inner.trim().to_owned());
+                }
+            }
+            at = end;
+            continue;
+        }
+        if bytes[at] == b'`' {
+            if let Some(close) = source[at + 1..].find('`') {
+                let inner = &source[at + 1..at + 1 + close];
+                if !inner.trim().is_empty() {
+                    lines.push(inner.trim().to_owned());
+                }
+                at += close + 2;
+                continue;
+            }
+        }
+        at += 1;
+    }
+    lines
 }
 
 /// Whether `node` stands, through the words around it, in an argument of
@@ -7538,7 +8238,19 @@ fn stands_in_an_argument(node: tree_sitter::Node<'_>) -> bool {
                             | "herestring_redirect"
                     );
             }
-            "string" | "concatenation" | "word" | "arithmetic_expansion" => child = parent,
+            // The words around it: a string, a concatenation, a parameter
+            // expansion's default (`${var:-$(...)}`), arithmetic and its
+            // expressions (`$(( $(...) + 1 ))`).
+            "string"
+            | "concatenation"
+            | "word"
+            | "expansion"
+            | "arithmetic_expansion"
+            | "binary_expression"
+            | "unary_expression"
+            | "parenthesized_expression"
+            | "ternary_expression"
+            | "postfix_expression" => child = parent,
             _ => return false,
         }
     }
@@ -10707,21 +11419,37 @@ fn python_code_input(args: &[String]) -> CodeInput {
         if argument == "-c" {
             return next_code_argument(args, index);
         }
-        if let Some(payload) = argument
-            .strip_prefix("-c")
-            .filter(|payload| !payload.is_empty())
+        // A group of short flags is read flag by flag (`-uc CODE`,
+        // `-Bc CODE`, `-ucCODE`): `-c` takes the rest of the group or the
+        // next word as code, `-m` a module, and `-W` or `-X` the rest of
+        // the group or the next word as their value. Measured 2026-11-20:
+        // `python3 -uc CODE` read `CODE` as the script's path.
+        if let Some(flags) = argument
+            .strip_prefix('-')
+            .filter(|flags| !flags.is_empty() && !flags.starts_with('-'))
         {
-            return CodeInput::Argument(payload.to_owned());
-        }
-        if argument == "-m" || argument.starts_with("-m") {
-            return CodeInput::None;
-        }
-        if matches!(argument.as_str(), "-W" | "-X") {
-            index += 2;
-            continue;
-        }
-        if argument.starts_with("-W") || argument.starts_with("-X") {
-            index += 1;
+            let mut skip = 1;
+            for (position, flag) in flags.char_indices() {
+                let rest = &flags[position + flag.len_utf8()..];
+                match flag {
+                    'c' => {
+                        return if rest.is_empty() {
+                            next_code_argument(args, index)
+                        } else {
+                            CodeInput::Argument(rest.to_owned())
+                        };
+                    }
+                    'm' => return CodeInput::None,
+                    'W' | 'X' => {
+                        if rest.is_empty() {
+                            skip = 2;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            index += skip;
             continue;
         }
         if argument.starts_with('-') {
@@ -10843,9 +11571,17 @@ fn perl_code_input(args: &[String]) -> CodeInput {
                         };
                     }
                     'I' | 'M' | 'm' | 'x' | 'i' | 'C' | 'd' | 'D' => break,
+                    // `-l` takes octal digits, `-0` octal ones or `x` and
+                    // hex ones: the `e` of `-le` is `-e`, not a digit.
                     'l' | '0' => {
+                        if flag == '0' && flag_chars.next_if(|(_, x)| *x == 'x').is_some() {
+                            while flag_chars
+                                .next_if(|(_, digit)| digit.is_ascii_hexdigit())
+                                .is_some()
+                            {}
+                        }
                         while flag_chars
-                            .next_if(|(_, digit)| digit.is_ascii_hexdigit() || *digit == 'x')
+                            .next_if(|(_, digit)| ('0'..='7').contains(digit))
                             .is_some()
                         {}
                     }
@@ -11801,7 +12537,7 @@ fn effective_command_words(words: &[String], depth: u8) -> Option<&[String]> {
         "stdbuf" => unwrap_options_with_values(args, &STDBUF_OPTIONS),
         "time" => unwrap_time(args),
         "chrt" | "ionice" => unwrap_scheduler_wrapper(args),
-        "exec" => unwrap_simple_wrapper(args),
+        "exec" => unwrap_exec(args),
         _ => return Some(words),
     };
     match target {
@@ -12015,7 +12751,10 @@ fn collect_executable_substitutions(
     ranges: &mut Vec<Range<usize>>,
     depth: u8,
 ) {
+    // Past the depth followed, the node is taken whole as one that runs:
+    // what it holds is judged as a line, never dropped unread.
     if depth > 32 {
+        ranges.push(node.byte_range());
         return;
     }
     if matches!(node.kind(), "command_substitution" | "process_substitution") {
@@ -12731,6 +13470,31 @@ fn unwrap_privilege_wrapper(args: &[String]) -> WrapperTarget {
         }
     }
     WrapperTarget::Unknown
+}
+
+/// The command `exec` runs past its own options: `-c` (an empty
+/// environment), `-l` (a login dash) and `-a NAME` (the name it is run
+/// as), alone or grouped (`-cl`, `-la NAME`). Measured 2026-11-20: `exec -a
+/// x sh x.sh` left `sh x.sh` unread.
+fn unwrap_exec(args: &[String]) -> WrapperTarget {
+    let mut index = 0;
+    while let Some(arg) = args.get(index).map(|arg| shell_word(arg)) {
+        match arg.as_str() {
+            "--" => return command_at(args, index + 1),
+            flags
+                if flags.len() > 1
+                    && flags.starts_with('-')
+                    && flags[1..]
+                        .chars()
+                        .all(|flag| matches!(flag, 'c' | 'l' | 'a')) =>
+            {
+                index += if flags.contains('a') { 2 } else { 1 };
+            }
+            value if value.starts_with('-') => return WrapperTarget::Unknown,
+            _ => return command_at(args, index),
+        }
+    }
+    WrapperTarget::DataOnly
 }
 
 fn unwrap_simple_wrapper(args: &[String]) -> WrapperTarget {
