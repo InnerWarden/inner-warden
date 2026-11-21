@@ -672,6 +672,10 @@ pub fn is_dashboard_answer(body: &str) -> bool {
 /// which is deliberately different from `Some(false)`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Facts {
+    /// The posture an enforcing hook line runs in
+    /// ([`innerwarden_agent_guard::posture`]): `None` when the home could
+    /// not be told.
+    pub posture: Option<innerwarden_agent_guard::posture::Posture>,
     /// What the wiring of the connected agents actually DOES, summarised:
     /// "enforce", "monitor" (alias "dry-run"), or "mixed" when it disagrees with
     /// itself. `None` when nothing is wired to have a mode, or when a wiring
@@ -1413,12 +1417,39 @@ pub fn headline(findings: &[Finding]) -> &'static str {
     }
 }
 
+/// The posture in force and what it refuses, where a wired hook enforces:
+/// nothing on a home with no wiring, and nothing when every wiring only
+/// records (monitor refuses nothing, whatever the posture).
+pub fn posture_line(facts: &Facts) -> Option<String> {
+    use innerwarden_agent_guard::posture::{refuses_summary, Posture};
+    let posture = facts.posture?;
+    if facts.wired_agents.is_empty() || matches!(facts.mode.as_deref(), Some("monitor" | "dry-run"))
+    {
+        return None;
+    }
+    let harden = match posture {
+        Posture::Guard => {
+            "\n  Refuse every deny instead (the enforce of earlier versions): \
+             innerwarden agents connect --strict"
+        }
+        Posture::Strict => "",
+    };
+    Some(format!(
+        "  Posture: {} ({}).{harden}",
+        posture.word(),
+        refuses_summary(posture)
+    ))
+}
+
 /// The whole report.
 pub fn render(facts: &Facts) -> String {
     let findings = assess(facts);
     let mut out = format!("\n  {}\n\n", headline(&findings));
     for f in &findings {
         out.push_str(&format!("{f}\n"));
+    }
+    if let Some(line) = posture_line(facts) {
+        out.push_str(&format!("\n{line}\n"));
     }
     // The explanation belongs under an `[unknown]` line. Printed on its own it
     // describes something the reader cannot see.
@@ -1436,6 +1467,33 @@ pub fn render(facts: &Facts) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The posture is said where a wired hook enforces, with what it
+    /// refuses and how to harden it, and not where everything only records.
+    #[test]
+    fn status_says_the_posture_where_a_hook_enforces() {
+        use innerwarden_agent_guard::posture::Posture;
+        let mut facts = Facts {
+            posture: Some(Posture::Guard),
+            mode: Some("enforce".into()),
+            wired_agents: vec!["claude-code".into()],
+            ..Facts::default()
+        };
+        let line = posture_line(&facts).expect("said");
+        assert!(line.contains("Posture: guard"), "{line}");
+        assert!(line.contains("reverse shells"), "{line}");
+        assert!(line.contains("connect --strict"), "{line}");
+        assert!(render(&facts).contains("Posture: guard"));
+        facts.posture = Some(Posture::Strict);
+        let line = posture_line(&facts).expect("said");
+        assert!(line.contains("Posture: strict"), "{line}");
+        assert!(line.contains("refuses every deny"), "{line}");
+        facts.mode = Some("monitor".into());
+        assert_eq!(posture_line(&facts), None);
+        facts.mode = Some("enforce".into());
+        facts.wired_agents.clear();
+        assert_eq!(posture_line(&facts), None);
+    }
+
     /// A fresh box is not a broken one.
     ///
     /// Before this, a machine with InnerWarden installed but never set up
@@ -2380,6 +2438,7 @@ mod tests {
 
     fn healthy() -> Facts {
         Facts {
+            posture: None,
             never_configured: false,
             mode: Some("enforce".into()),
             wired_agents: vec!["claude-code".into()],
@@ -2789,6 +2848,7 @@ mod tests {
     #[test]
     fn unreadable_is_never_reported_as_off() {
         let facts = Facts {
+            posture: None,
             never_configured: false,
             mode: None,
             wired_agents: vec![],

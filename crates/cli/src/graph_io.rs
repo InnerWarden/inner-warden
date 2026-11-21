@@ -1076,7 +1076,54 @@ pub fn record_hook(
     layer: Option<LayerLabel>,
     demo: bool,
 ) {
-    let (mode, outcome) = if monitor {
+    let (mode, outcome) = hook_mode_outcome(monitor, would_block_under_policy);
+    let mut origin = hook_origin(verdict, agent, cwd, identity, layer);
+    origin.demo = demo;
+    record(
+        command,
+        verdict,
+        mode,
+        outcome,
+        source_session,
+        source_event_id,
+        origin,
+    );
+}
+
+/// [`record_hook`] for a call the strict policy refuses and the default
+/// posture let run (`innerwarden_agent_guard::posture`): an enforcing line,
+/// so the mode is `enforce`, and the outcome `would_block`, because it ran.
+#[allow(clippy::too_many_arguments)]
+pub fn record_hook_warned(
+    command: &str,
+    verdict: &Value,
+    source_session: Option<&str>,
+    source_event_id: Option<&str>,
+    agent: Option<&str>,
+    cwd: Option<&str>,
+    identity: Option<&Identity>,
+    layer: Option<LayerLabel>,
+    demo: bool,
+) {
+    let mut origin = hook_origin(verdict, agent, cwd, identity, layer);
+    origin.demo = demo;
+    record(
+        command,
+        verdict,
+        DecisionMode::Enforce,
+        DecisionOutcome::WouldBlock,
+        source_session,
+        source_event_id,
+        origin,
+    );
+}
+
+/// The mode and outcome [`record_hook`] records.
+fn hook_mode_outcome(
+    monitor: bool,
+    would_block_under_policy: bool,
+) -> (DecisionMode, DecisionOutcome) {
+    if monitor {
         (
             DecisionMode::Monitor,
             if would_block_under_policy {
@@ -1094,18 +1141,7 @@ pub fn record_hook(
                 DecisionOutcome::Allowed
             },
         )
-    };
-    let mut origin = hook_origin(verdict, agent, cwd, identity, layer);
-    origin.demo = demo;
-    record(
-        command,
-        verdict,
-        mode,
-        outcome,
-        source_session,
-        source_event_id,
-        origin,
-    );
+    }
 }
 
 /// Record one MCP client→server `tools/call`. Clean calls are included; server

@@ -132,11 +132,17 @@ pub fn cmd(_rest: &[String]) -> ExitCode {
             .unwrap_or(false);
         if guard {
             offer_auto_connect = true;
+            let was_wired = crate::posture_io::already_wired(&home);
             match connect_setup_agents(&home, &agents, &bin) {
                 Ok(results) => {
                     for result in results {
                         configured_in_monitor |= result.configured();
                         println!("{}", result.line);
+                    }
+                    // Dry run refuses nothing; the posture is what `enforce`
+                    // will refuse once the person turns it on.
+                    if let Err(error) = crate::posture_io::settle(&home, None, was_wired) {
+                        eprintln!("  Could not write the posture: {error}");
                     }
                 }
                 Err(error) => {

@@ -5,9 +5,12 @@ list, with every limit.
 
 - Screens shell commands and MCP/tool calls before they run, and returns a
   verdict: `allow`, `review`, or `deny`. `innerwarden check` only reports
-  it; the hook `innerwarden install` writes refuses a `deny` (and a
-  `review` with `--block-review`; nothing with `--monitor`), and the MCP
-  proxy starts in `guard`, which refuses a disallowed call.
+  it; the hook `innerwarden install` writes refuses, in the default
+  posture of a new install, only the high-certainty class (see
+  [The posture](#the-posture-what-an-enforcing-hook-refuses)), every `deny`
+  with `--strict`, every `review` too with `--block-review`, and nothing
+  with `--monitor`; the MCP proxy starts in `guard`, which refuses a
+  disallowed call.
 - Runs an MCP proxy: a man-in-the-middle in front of an MCP server that inspects
   every JSON-RPC message and can refuse a disallowed tool call inline. stdout
   stays pure MCP traffic, alerts go to stderr. It pins each tool's
@@ -294,10 +297,77 @@ list, with every limit.
 The verdict is JSON: a recommendation (`allow` / `review` / `deny`), a risk
 score, matched signals, and a short explanation.
 
+### The posture: what an enforcing hook refuses
+
+Operator decision of 2026-11-21: the text rules are triage, not the boundary.
+An enforcing hook line with no mode flag runs in the posture kept in
+`~/.config/innerwarden/posture`:
+
+- `guard`, the default posture, written by the first `agents connect`,
+  `install` or `setup` on a home with no wiring yet. A shell call is refused
+  only when the strict policy below refuses it AND one of its signals is in
+  the high-certainty class:
+  - a hard-class secret read (`sensitive_credential_read` at the hard
+    score: SSH and GPG keys, `.aws/credentials`, `.netrc`, `.pgpass`, the gh
+    and cargo logins, `/etc/shadow`; a path you declared protected,
+    `protected_secret_read`; a secrets file read from outside the project,
+    `credential_read_outside_project`);
+  - destruction of the system or of a home (`destructive_command`, and the
+    pattern findings "rm -rf of root" and "dd raw-device overwrite");
+  - an act that takes the guard down (`guard_self_disable`,
+    `security_tooling_tamper`, Cursor's hooks file losing the guard);
+  - a reverse shell (`reverse_shell`);
+  - download and run (`download_and_execute`, `download_chmod_execute`,
+    `dynamic_code_execution`, `download_run_in_text_argument`,
+    `fetch_exec_unparsed`, `fetch_exec_unanalyzable`, and the pattern
+    findings "pipe to shell" and the PowerShell download cradles).
+
+  Every other refusal, and every review, runs: the record keeps it as
+  `would_block` on an enforcing line, an alert goes out as for a monitor
+  would-block, and the agent shows one line (`systemMessage` for Claude
+  Code, Codex and Gemini CLI; `permission: "allow"` with the words for
+  Cursor; stderr, exit 0, for Hermes and any other agent).
+- `strict`, or no file, or a file that holds anything else: every `deny`
+  is refused and a `review` is answered as the table below says. This is
+  the enforce of every release before the posture existed, so a home wired
+  before it keeps it after an upgrade, and taking the file away only
+  hardens the guard.
+
+`agents connect --strict` and `install --strict` write `strict`;
+`--guard` writes `guard` and, since it lowers what the hook refuses, is
+refused in an agent's shell and by the guard when an agent runs it. With no
+flag a posture already chosen stays. The file is in the guard's own folder,
+which an agent cannot write (the file rules and the shell rules refuse it).
+
+What the posture does not change: a call the hook cannot read (too long,
+unreadable, past its deadline) is refused in both; a write of a file tool
+to a privileged file is refused in both; a `--block-review` line refuses
+every review and a `--monitor` line refuses nothing, whatever the file
+says; where per-agent profiles are in force the call is held to them as
+strict holds it; the MCP proxy and the OpenClaw plugin keep their own modes.
+
+Measured with the release safety suite on 2026-11-21
+(`cargo test -p innerwarden-agent-guard --test release_eval_posture -- --nocapture`;
+a benign case is refused when the posture stops it):
+
+| corpus | attacks stopped for an agent: strict | default posture | benign refused: strict | default posture |
+|---|---|---|---|---|
+| proof | 244/246 | 217/246 | 13/160 | 13/160 |
+| attack-2026-11 | 320/377 | 179/377 | 0/138 | 0/138 |
+| real | 4/5 | 4/5 | 21/31 | 16/31 |
+| external-2026-11 (MCP, the proxy's) | 15/68 | 15/68 | 19/166 | 19/166 |
+| own-work | 0/0 | 0/0 | 15/49 | 13/49 |
+
+The attacks the default posture lets run with a warning are mostly
+privileged containers and host sockets (108 of attack-2026-11), writes to
+`~/.ssh/config` and shell startup files, credential searches, near-miss
+package names and `eval` of a download; the suite prints each one.
+
 ### What an agent's hook does with each verdict
 
-The hook answers each agent in the words that agent reads. In enforce mode
-(the default of `agents connect`):
+The hook answers each agent in the words that agent reads. In the strict
+posture (the enforce of earlier versions; see above for the default
+posture):
 
 | Agent | `allow` | `review` | `deny` |
 |---|---|---|---|

@@ -799,8 +799,9 @@ fn existing_agent_flag(settings: &Value) -> Option<Option<String>> {
 }
 
 /// For a hook that names no agent, the mode flag `agents connect claude-code`
-/// needs to rewrite it in the mode it already has (` --monitor`, ` --strict`,
-/// or nothing for enforce): run by hand, that adds the agent's name and
+/// needs to rewrite it in the mode it already has (` --monitor`, ` --block-review`,
+/// or nothing for enforce; the Community CLI reads `--strict` as a posture,
+/// not as `--block-review`): run by hand, that adds the agent's name and
 /// changes nothing else. `None` when there is no hook, when it already names
 /// its agent, or when its entries disagree on a mode (a reconnect would pick
 /// one, which is not "nothing else").
@@ -826,7 +827,7 @@ pub fn unnamed_hook_reconnect_flag(settings: &Value) -> Option<&'static str> {
     Some(match first {
         HookProtection::Monitor => " --monitor",
         HookProtection::Enforce => "",
-        HookProtection::BlockReview => " --strict",
+        HookProtection::BlockReview => " --block-review",
     })
 }
 
@@ -3435,7 +3436,7 @@ mod tests {
         );
         assert_eq!(
             unnamed_hook_reconnect_flag(&hook("\"/opt/innerwarden\" hook --block-review")),
-            Some(" --strict")
+            Some(" --block-review")
         );
         assert_eq!(unnamed_hook_reconnect_flag(&json!({})), None);
         let mixed = json!({"hooks": {"PreToolUse": [
