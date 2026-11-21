@@ -1212,8 +1212,72 @@ mod json_head {
 /// that already ran (PostToolUse: a large file read, edited or written, a
 /// command with a long output) has nothing left to refuse: its head is
 /// recorded as a result not read whole, and the agent carries on.
+/// A prompt the person submitted (`UserPromptSubmit`): kept, masked and
+/// bounded, for the session it came in ([`user_prompt`]), and the hook ends
+/// with 0 and says nothing, whatever happened to the record. `None` for any
+/// other payload.
+///
+/// [`user_prompt`]: innerwarden_agent_guard::user_prompt
+fn keep_the_prompt(buf: &str, rest: &[String]) -> Option<std::process::ExitCode> {
+    use innerwarden_agent_guard::user_prompt;
+    let value: serde_json::Value = serde_json::from_str(buf).ok()?;
+    // A payload that names a tool is a tool call, whatever event it names:
+    // it is screened, never kept as a prompt.
+    if ["tool_name", "toolName", "tool"]
+        .iter()
+        .any(|key| value.get(key).is_some())
+    {
+        return None;
+    }
+    let prompt = user_prompt::prompt_of(&value)?;
+    // Claude Code drops the prompt on exit 2 and shows any other end: every
+    // end from here is 0 and silent.
+    hook_net::set_quiet(true);
+    // A debug build can be made to panic here, for the test that the panic
+    // guard ends a prompt run with 0.
+    #[cfg(debug_assertions)]
+    if std::env::var_os(TEST_PROMPT_PANIC_ENV).is_some() {
+        panic!("a panic asked for by {TEST_PROMPT_PANIC_ENV}");
+    }
+    let _ = user_prompt::record(
+        hook_session(buf).as_deref(),
+        agent_flag(rest).as_deref(),
+        &prompt,
+    );
+    Some(std::process::ExitCode::SUCCESS)
+}
+
+/// Whether a payload is the person's prompt: its event is
+/// `UserPromptSubmit` and it names no tool.
+fn is_prompt_naming_no_tool(buf: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(buf) else {
+        return false;
+    };
+    !["tool_name", "toolName", "tool"]
+        .iter()
+        .any(|key| value.get(key).is_some())
+        && innerwarden_agent_guard::user_prompt::prompt_of(&value).is_some()
+}
+
+/// Debug builds only: the prompt hook panics while it keeps the prompt.
+#[cfg(debug_assertions)]
+const TEST_PROMPT_PANIC_ENV: &str = "IW_TEST_PROMPT_HOOK_PANIC";
+
+/// A run on a tool call that came on the prompt line: the ends of the net
+/// and of the panic guard are a tool call's again.
+fn screen_as_a_tool_call() {
+    hook_net::set_quiet(false);
+}
+
 fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::ExitCode {
     let call = TooLongCall::read(head);
+    // A prompt the person submitted never ends with 2, on any line: past
+    // the cap it is not kept, and it goes on.
+    if call.event.as_deref() == Some(innerwarden_agent_guard::user_prompt::PROMPT_EVENT)
+        && call.tool.is_none()
+    {
+        return std::process::ExitCode::SUCCESS;
+    }
     if !call.already_ran() {
         return hook_unreadable("", rest, TOOL_CALL_TOO_LONG, monitor);
     }
@@ -1290,15 +1354,30 @@ fn hook_unreadable(buf: &str, rest: &[String], why: &str, monitor: bool) -> std:
 /// either strategy, so it decides the exit code: 2 in enforce (the call is
 /// refused, as for a call the hook could not read), 1 in monitor (it never
 /// blocks, and says the call went unscreened).
+///
+/// A run on the person's prompt ([`hook_net::set_quiet`]) ends with 0 and
+/// says nothing: Claude Code drops the prompt on 2 and shows any other end.
 fn install_hook_panic_guard(monitor: bool) {
-    let message = if monitor {
+    let message: &'static str = if monitor {
         "InnerWarden hook: an internal error stopped the screening of this tool call; it \
          was NOT screened (monitor mode never blocks).\n"
     } else {
         "InnerWarden hook: an internal error stopped the screening of this tool call; \
          refusing it rather than letting it run unscreened.\n"
     };
-    exit_on_panic(message, unreadable_exit_code(monitor));
+    let code = unreadable_exit_code(monitor);
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if hook_net::is_quiet() {
+            std::process::exit(0);
+        }
+        // The default report first: where it failed is what a bug report needs.
+        report(info);
+        // Never `eprintln!` here: it panics when stderr is gone, and a panic
+        // inside the panic hook aborts, which is the outcome this prevents.
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), message.as_bytes());
+        std::process::exit(i32::from(code));
+    }));
 }
 
 /// The MCP proxy's panic guard. A panic while a call is screened must never
@@ -1889,10 +1968,23 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     // blocks. A dev gets the live dashboard/narrative without the guardrail denying
     // day-to-day commands. Overrides --block-review.
     let monitor = rest.iter().any(|a| a == "--monitor");
+    // The line on the person's prompt: before anything is read, every end
+    // of this run is 0 and silent (a panic, stdin it cannot read, the
+    // deadline, a fault). A tool call that comes on it is screened as usual.
+    // The flag counts as the line's last word only, as the grammar of a line
+    // of ours reads it (`hook::is_iwguard_prompt_hook`), and never for
+    // Cursor, whose wiring has no prompt line.
+    let prompt_line = rest.last().map(String::as_str)
+        == Some(innerwarden_agent_guard::user_prompt::PROMPT_LINE_FLAG)
+        && agent_flag(rest).as_deref() != Some(innerwarden_agent_guard::cursor_hook::AGENT);
+    hook_net::set_quiet(prompt_line);
     install_hook_panic_guard(monitor);
     // Before stdin is read: a caller that never closes it is one of the
     // ends the net is for.
     if let Err(why) = hook_net::arm(monitor) {
+        if prompt_line {
+            return std::process::ExitCode::SUCCESS;
+        }
         return hook_unreadable("", rest, why, monitor);
     }
     // A host upgraded by an older binary still runs that binary's wiring:
@@ -1906,9 +1998,53 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     };
     let buf = match read {
         Ok(ToolCallRead::Whole(buf)) => buf,
-        Ok(ToolCallRead::TooLong(head)) => return hook_too_long(&head, rest, monitor),
+        Ok(ToolCallRead::TooLong(head)) => {
+            if prompt_line {
+                // A prompt past the cap is not kept, and the record of its
+                // session says a prompt went unkept. Anything else in a
+                // head this long is screened as a tool call would be.
+                let call = TooLongCall::read(&head);
+                // On the prompt line a head that names no tool, and whose
+                // event is a prompt or is past the head, is the person's
+                // prompt. A head whose event is read and is not a prompt is
+                // a call, screened as one.
+                let event = call.event.as_deref();
+                if call.tool.is_none()
+                    && (event.is_none()
+                        || event == Some(innerwarden_agent_guard::user_prompt::PROMPT_EVENT))
+                {
+                    let _ =
+                        innerwarden_agent_guard::user_prompt::record_lost(call.session.as_deref());
+                    return std::process::ExitCode::SUCCESS;
+                }
+                screen_as_a_tool_call();
+            }
+            return hook_too_long(&head, rest, monitor);
+        }
+        Err(_) if prompt_line => return std::process::ExitCode::SUCCESS,
         Err(_) => return hook_unreadable("", rest, "stdin could not be read", monitor),
     };
+    // A prompt the person submitted, on a line without the prompt flag: not
+    // kept, and never refused (2 drops what the person typed).
+    if !prompt_line && is_prompt_naming_no_tool(&buf) {
+        return std::process::ExitCode::SUCCESS;
+    }
+    if prompt_line {
+        // The person's prompt: kept for the MCP proxy, never refused, nothing
+        // printed (Claude Code adds a prompt hook's output to the
+        // conversation).
+        if let Some(exit) = keep_the_prompt(&buf, rest) {
+            return exit;
+        }
+        // Text that is not JSON is no call to screen: the prompt run ends as
+        // it began, with 0. Any JSON that is not a prompt goes to the
+        // screening every line gives a call, which reads it as it reads any
+        // other (a tool call of any shape, or a payload it refuses).
+        if serde_json::from_str::<serde_json::Value>(&buf).is_err() {
+            return std::process::ExitCode::SUCCESS;
+        }
+        screen_as_a_tool_call();
+    }
     // Cursor sends each event in its own shape: read as the call every other
     // agent's hook carries, and the event kept for the answer.
     let buf = if agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::cursor_hook::AGENT) {

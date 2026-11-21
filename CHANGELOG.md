@@ -13,6 +13,31 @@ guard, and refused if it lets through a line main stops. The guard still reads
 the text of a command; what it does not see is written down, as measured:
 [Where this ends](docs/features.md#where-this-ends).
 
+`innerwarden install` wires a hook on Claude Code's prompts
+(`UserPromptSubmit`) that keeps what the person submitted (pasted text
+included), up to its first 16,384 characters and 65,536 per session, masked,
+per session, in `~/.config/innerwarden/prompts/` (0600, 24 hours), so the MCP
+proxy can ask whether a value appears, whole, in the person's request. A
+session that lost words to those limits answers "unknown", never "no", for a
+value it does not hold. The answer is information only and never lets a
+refused call through: an agent with a shell on the same account can forge a
+record by running the hook itself, and the session id comes from a variable
+a process in between can change. The guard refuses an agent's reads of the
+folder as it refuses its writes (a `cd` into the folder and a glob in its
+name are not recognised). The prompt line ends with `--prompt` and is in
+order only under `UserPromptSubmit`; every end of its run is 0 and silent (a
+panic, unreadable stdin, the deadline), and any JSON on it that is not a prompt
+naming no tool is screened as a tool call. A guard whose program is gone ends
+the line with 127, shown as an error while the prompt goes on. Two prompts of
+one session written at once do not write over each other (the guard's update
+lock); one that still cannot be written marks the session as having lost a
+prompt. A tool line that ends with `--prompt` is said by `status` as not
+screened: its run still ends with 0 on stdin it cannot read, and writing it
+takes an edit of the agent settings the guard refuses to an agent (measured with `innerwarden check`: `jq` into a temp file and `mv`, `sed -i`, `python3` and `jq | sponge` on the `PreToolUse` of `~/.claude/settings.json` are each `deny`). An expired prompt
+is deleted when its session is written or read. Other agents are not wired:
+their MCP servers get no session id to match. Details and limits:
+[The prompt record](docs/prompt-record.md).
+
 ### Added
 
 - **The MCP proxy reads more shapes of an order to the assistant.** The
