@@ -32,7 +32,7 @@ innerwarden serve --bind 127.0.0.1:8787
 
 # ENFORCE: wrap an MCP server and block a disallowed tools/call inline
 innerwarden proxy --mode guard -- npx -y some-mcp-server --flag
-# --mode: advisory | warn | guard (default) | kill
+# --mode: advisory | warn | guard (default) | kill | strict
 ```
 
 `check` screens the command the way the enforcing hook screens a shell call

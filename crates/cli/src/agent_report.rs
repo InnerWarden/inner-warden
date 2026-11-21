@@ -68,6 +68,17 @@ fn report_name(raw: &str) -> String {
         .collect()
 }
 
+/// The `--mode` word for `mode`, as the person wrote it.
+fn mode_word(mode: ProxyMode) -> &'static str {
+    match mode {
+        ProxyMode::Advisory => "advisory",
+        ProxyMode::Warn => "warn",
+        ProxyMode::Guard => "guard",
+        ProxyMode::Kill => "kill",
+        ProxyMode::Strict => "strict",
+    }
+}
+
 /// PURE. The report for a decision the proxy REFUSED (answered with a denial,
 /// never passed to the server), or `None`. Decided by `apply_mode`, the same
 /// function the proxy's transport acts on.
@@ -115,8 +126,14 @@ pub fn block_report(
         "command": summary,
         "tool": tool,
         "rule_ids": rules,
+        // The refusal class the agent's route takes: `guard` or `kill`, and
+        // an agent refuses any other word (its `proxy_block` contract).
         "mode": if mode == ProxyMode::Kill { "kill" } else { "guard" },
     });
+    // The mode the proxy runs in, where the class does not already say it.
+    if body["mode"] != mode_word(mode) {
+        body["proxy_mode"] = json!(mode_word(mode));
+    }
     // Labels from the proxy's own view, never proof; absent without a record.
     if let Some(identity) = identity {
         let (instance, trust) = identity.report_fields();
@@ -377,6 +394,15 @@ mod tests {
             block_report("l", ProxyMode::Kill, &cred, None).unwrap()["mode"],
             "kill"
         );
+        assert!(body.get("proxy_mode").is_none(), "{body}");
+        let strict = block_report("l", ProxyMode::Strict, &cred, None).expect("refused in strict");
+        assert_eq!(strict["proxy_mode"], "strict");
+        // The agent's route takes only `guard` or `kill` as the class.
+        assert_eq!(strict["mode"], "guard");
+        assert!(block_report("l", ProxyMode::Kill, &cred, None)
+            .unwrap()
+            .get("proxy_mode")
+            .is_none());
         for forwarding in [ProxyMode::Advisory, ProxyMode::Warn] {
             assert_eq!(block_report("l", forwarding, &cred, None), None);
         }

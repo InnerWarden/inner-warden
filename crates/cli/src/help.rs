@@ -143,10 +143,12 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         "proxy" => format!(
             "{p} proxy [--mode M] [--label L] [--error-response] -- <server> [args...]\n  \
              Wrap an MCP server on stdio and screen every tool call as it passes.\n  \
-             This is the ENFORCING guardrail: in guard/kill mode a disallowed call is\n  \
-             blocked inline. stdout stays pure MCP bytes; alerts go to stderr.\n\
+             This is the ENFORCING guardrail: in guard/kill/strict mode a disallowed call\n  \
+             is blocked inline. stdout stays pure MCP bytes; alerts go to stderr.\n\
              \n  \
-             --mode             advisory | warn | guard (default) | kill\n  \
+             --mode             advisory | warn | guard (default) | kill | strict\n  \
+             \x20                  (strict: as guard, but a refusal by the tool's name or its\n  \
+             \x20                  argument names stays a refusal; kill also stops the server)\n  \
              --label            name carried on the alert lines (default: innerwarden)\n  \
              --error-response   return a blocked call as a JSON-RPC error\n\
              \n  \
@@ -197,7 +199,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              none is refused rather than assumed.\n\
              \n  \
              --settings PATH   write to this settings file instead of the default\n  \
-             --strict          refuse every deny (the enforce of earlier versions); a new\n  \
+             --strict          refuse every deny and every review (the strict posture,\n  \
+             \x20                 wired with --block-review); a new\n  \
              \x20                 install otherwise starts in the default posture, which\n  \
              \x20                 refuses only the high-certainty class and warns of the rest\n  \
              --guard           move a strict install to the default posture (your terminal only)\n  \

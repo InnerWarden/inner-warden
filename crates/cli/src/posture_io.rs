@@ -90,7 +90,9 @@ pub(crate) fn settle(
 /// The one line that says the posture in force and what it refuses.
 pub(crate) fn line(posture: Posture) -> String {
     let harden = match posture {
-        Posture::Guard => " Refuse every deny instead: `innerwarden agents connect --strict`.",
+        Posture::Guard => {
+            " Refuse every deny and every review instead: `innerwarden agents connect --strict`."
+        }
         Posture::Strict => "",
     };
     format!(

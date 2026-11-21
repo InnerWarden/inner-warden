@@ -4436,7 +4436,7 @@ fn cmd_serve(rest: &[String]) -> std::process::ExitCode {
 /// off without the operator noticing.
 fn parse_proxy_mode(label: &str) -> Option<ProxyMode> {
     match label {
-        "advisory" | "warn" | "guard" | "kill" => Some(ProxyMode::from_label(label)),
+        "advisory" | "warn" | "guard" | "kill" | "strict" => Some(ProxyMode::from_label(label)),
         _ => None,
     }
 }
@@ -4516,7 +4516,7 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
 
     let Some(mode) = parse_proxy_mode(&mode_label) else {
         eprintln!(
-            "innerwarden proxy: unknown --mode `{mode_label}` (use advisory|warn|guard|kill)"
+            "innerwarden proxy: unknown --mode `{mode_label}` (use advisory|warn|guard|kill|strict)"
         );
         return std::process::ExitCode::from(2);
     };
@@ -4700,7 +4700,7 @@ fn help_text() -> String {
          and exits 1 on `deny`, so a PreToolUse hook can gate:\n  \
            {p} check \"$CMD\" || echo blocked\n\
          \n\
-         proxy --mode: advisory | warn | guard (default) | kill\n\
+         proxy --mode: advisory | warn | guard (default) | kill | strict\n\
          install --block-review refuses every `review` (default: a review asks you on Claude Code and Hermes, runs with a warning on Codex, is refused elsewhere)\n\
          install/hook --monitor records every command but never blocks (observe-only)\n\
          notify: set channels once (Telegram/Slack/...); a deny verdict pings them.\n  \
@@ -5795,6 +5795,22 @@ mod tests {
                 monitor: false,
             }
         );
+        // --strict wires as `agents connect --strict` does: the strict
+        // posture (`posture_io::requested`) and every review refused.
+        let strict: Vec<String> = vec!["claude-code".into(), "--strict".into()];
+        assert_eq!(
+            parse_install_args(&strict),
+            InstallArgs::Run {
+                agent: "claude-code".into(),
+                settings: None,
+                block_review: true,
+                monitor: false,
+            }
+        );
+        assert_eq!(
+            posture_io::requested(&strict),
+            Ok(Some(innerwarden_agent_guard::posture::Posture::Strict))
+        );
         // --monitor parses (records, never blocks).
         assert_eq!(
             parse_install_args(&["--monitor".into()]),
@@ -5823,6 +5839,7 @@ mod tests {
         assert_eq!(parse_proxy_mode("warn"), Some(ProxyMode::Warn));
         assert_eq!(parse_proxy_mode("guard"), Some(ProxyMode::Guard));
         assert_eq!(parse_proxy_mode("kill"), Some(ProxyMode::Kill));
+        assert_eq!(parse_proxy_mode("strict"), Some(ProxyMode::Strict));
         // Unknown does NOT silently downgrade to advisory - it must be rejected
         // so enforcement is never turned off by a typo.
         assert_eq!(parse_proxy_mode("bogus"), None);
