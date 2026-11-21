@@ -912,6 +912,23 @@ fn yaml_unscreened(path: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The remote extensions the proxy does not screen, as the end of a
+/// connect line says them (`; not screened by the proxy: a (sse)`), or
+/// nothing.
+fn yaml_unscreened_line(doc: &mcp_wire_yaml::YamlDoc) -> String {
+    let names: Vec<String> = doc
+        .unscreened()
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind.as_str(), "streamable_http" | "sse"))
+        .map(|(name, kind)| format!("{name} ({kind})"))
+        .collect();
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("; not screened by the proxy: {}", names.join(", "))
+    }
+}
+
 /// The extensions of a YAML MCP config that run code inside the agent
 /// ([`mcp_wire_yaml::YamlDoc::runs_inside`]), as a line says them.
 fn yaml_runs_inside(path: &Path) -> Vec<String> {
@@ -1921,8 +1938,15 @@ fn connect_by_one_mechanism(
                 ),
             );
         }
-        let n = mcp_wire_toml::wrap_toml(&mut doc, guard_bin, monitor, &r.name);
-        let fully_guarded = mcp_wire_toml::is_guarded_toml(&doc);
+        // Automatic setup wraps only local servers; a server reached by URL
+        // goes through the proxy on a connect a person runs.
+        let (n, fully_guarded) = if reject_symlinks {
+            let n = mcp_wire_toml::wrap_toml_local(&mut doc, guard_bin, monitor, &r.name);
+            (n, mcp_wire_toml::local_servers_guarded_toml(&doc))
+        } else {
+            let n = mcp_wire_toml::wrap_toml(&mut doc, guard_bin, monitor, &r.name);
+            (n, mcp_wire_toml::is_guarded_toml(&doc))
+        };
         if !fully_guarded {
             return ConnectResult::new(
                 ConnectEffect::Failed,
@@ -1983,18 +2007,7 @@ fn connect_by_one_mechanism(
         let cfg = doc.view();
         // Each extension the proxy never sees, named on the line, so a
         // remote server is not taken for one behind the guard.
-        let unscreened: String = doc
-            .unscreened()
-            .iter()
-            .filter(|(_, kind)| matches!(kind.as_str(), "streamable_http" | "sse"))
-            .map(|(name, kind)| format!("{name} ({kind})"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let unscreened = if unscreened.is_empty() {
-            String::new()
-        } else {
-            format!("; not screened by the proxy: {unscreened}")
-        };
+        let unscreened = yaml_unscreened_line(&doc);
         // Code that runs inside Goose: the wiring is done, the agent is not
         // guarded, and the line says "partly", never "connected" alone.
         let inside: Vec<String> = doc
@@ -2036,8 +2049,18 @@ fn connect_by_one_mechanism(
                 ),
             );
         }
-        let (wrapped, n) = mcp_wire::wrap(cfg, guard_bin, monitor, &r.name);
-        if !mcp_wire::is_guarded(&wrapped) {
+        // Automatic setup wraps only local servers; a remote extension goes
+        // through the proxy on a connect a person runs.
+        let (wrapped, n, fully_guarded) = if reject_symlinks {
+            let (wrapped, n) = mcp_wire::wrap_local(cfg, guard_bin, monitor, &r.name);
+            let guarded = mcp_wire::local_servers_guarded(&wrapped);
+            (wrapped, n, guarded)
+        } else {
+            let (wrapped, n) = mcp_wire::wrap(cfg, guard_bin, monitor, &r.name);
+            let guarded = mcp_wire::is_guarded(&wrapped);
+            (wrapped, n, guarded)
+        };
+        if !fully_guarded {
             return ConnectResult::new(
                 ConnectEffect::Failed,
                 format!(
@@ -2053,6 +2076,9 @@ fn connect_by_one_mechanism(
                 format!("  {} - failed: {} {error}", r.name, path.display()),
             );
         }
+        // A remote extension this connect carried is screened now: the line
+        // names only those still outside the proxy.
+        let unscreened = yaml_unscreened_line(&doc);
         return match write_yaml(home, &path, &doc, &source, reject_symlinks) {
             Ok(()) if n == 0 => ConnectResult::new(
                 ConnectEffect::Unchanged,
@@ -4120,24 +4146,37 @@ mod tests {
     /// FAILS ON REVERT of `unscreened` on the connect line or the listing.
     #[test]
     fn goose_remote_extensions_are_named_on_connect_and_in_the_listing() {
-        let text = "extensions:\n  filesystem:\n    type: stdio\n    name: filesystem\n    enabled: true\n    cmd: npx\n    args: [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]\n    timeout: 300\n  remote-tools:\n    type: streamable_http\n    name: remote-tools\n    enabled: true\n    uri: \"https://example.com/mcp\"\n  old:\n    type: sse\n    name: old\n    enabled: true\n    uri: \"https://example.com/sse\"\n";
+        // `remote-tools` and `old` are carried by the proxy on this connect
+        // (`mcp_wire_yaml::carried_remote`); `signin`, which Goose signs in
+        // to by itself, is not, and stays named.
+        let text = "extensions:\n  filesystem:\n    type: stdio\n    name: filesystem\n    enabled: true\n    cmd: npx\n    args: [\"-y\", \"@modelcontextprotocol/server-filesystem\", \"/tmp\"]\n    timeout: 300\n  remote-tools:\n    type: streamable_http\n    name: remote-tools\n    enabled: true\n    uri: \"https://example.com/mcp\"\n  old:\n    type: sse\n    name: old\n    enabled: true\n    uri: \"https://example.com/sse\"\n  signin:\n    type: streamable_http\n    name: signin\n    enabled: true\n    uri: \"https://example.com/oauth\"\n    client_id: registered-client.example\n";
         let home = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(home.path().join(".config/goose")).unwrap();
         std::fs::write(home.path().join(".config/goose/config.yaml"), text).unwrap();
         let row = known_row(home.path(), "goose");
+        let before = list_lines_of(home.path(), std::slice::from_ref(&row)).join("\n");
+        assert!(
+            before.contains("not screened by the proxy (the agent reaches them itself): remote-tools (streamable_http), old (sse), signin (streamable_http)"),
+            "{before}"
+        );
         let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
         assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
         assert!(
             result
                 .line
-                .contains("not screened by the proxy: remote-tools (streamable_http), old (sse)"),
+                .contains("3 MCP servers routed through the guard proxy")
+                && result
+                    .line
+                    .contains("not screened by the proxy: signin (streamable_http)"),
             "{}",
             result.line
         );
         let row = known_row(home.path(), "goose");
         let lines = list_lines_of(home.path(), std::slice::from_ref(&row)).join("\n");
         assert!(
-            lines.contains("not screened by the proxy (the agent reaches them itself): remote-tools (streamable_http), old (sse)"),
+            lines.contains(
+                "not screened by the proxy (the agent reaches them itself): signin (streamable_http)"
+            ) && !lines.contains("remote-tools ("),
             "{lines}"
         );
     }

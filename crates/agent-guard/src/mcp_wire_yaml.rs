@@ -14,8 +14,20 @@
 //! parsed again and must equal the original document with only those
 //! servers' `cmd` and `args` changed; any other outcome (a shape this editor
 //! cannot place, a server written inline) is an error and nothing is
-//! written. Built-in and remote extensions have no local command: they are
-//! counted as remote, since the proxy never sees their calls.
+//! written. Built-in extensions have no local command: they are counted as
+//! remote, since the proxy never sees their calls.
+//!
+//! A remote extension (`type: streamable_http` or `sse`, an http(s) `uri`)
+//! goes through the same proxy, which talks HTTP(S) to it
+//! ([`crate::mcp_proxy::remote`]): its `type` line becomes `stdio` and
+//! `cmd` and `args` lines marked as connect's own follow it, while its
+//! `uri` and `headers` lines stay as they were (Goose does not read them
+//! for a stdio extension). The proxy reads those headers there
+//! (`--goose-headers <name>`), `$VAR` filled from the variables Goose hands
+//! its servers, so no header value is copied. Disconnect puts the `type`
+//! back and takes the marked lines out. An extension Goose signs in to by
+//! itself (`client_id`), one reached through a `socket`, or one whose
+//! `uri` Goose fills from a variable is left as it was and counted remote.
 //!
 //! All logic here is pure; the file read/write is the I/O layer's job.
 
@@ -103,6 +115,13 @@ impl YamlDoc {
                         server.insert("args".to_string(), to_json(args));
                     }
                     Value::Object(server)
+                } else if let Some((uri, kind)) = carried_remote(extension) {
+                    // A remote server the proxy carries, as a JSON client's
+                    // `{"url", "type"}`: [`crate::mcp_wire`] wraps it.
+                    let mut server = Map::new();
+                    server.insert("url".to_string(), Value::String(uri));
+                    server.insert("type".to_string(), Value::String(kind));
+                    Value::Object(server)
                 } else {
                     let mut server = Map::new();
                     server.insert(
@@ -178,6 +197,11 @@ impl YamlDoc {
             if before == server {
                 continue;
             }
+            if before.get("url").is_some() || server.get("url").is_some() {
+                text = self.apply_remote(&text, &mut expected, name, before, server)?;
+                changed += 1;
+                continue;
+            }
             let beside = |server: &Value| {
                 server.as_object().map(|object| {
                     object
@@ -242,6 +266,148 @@ impl YamlDoc {
         self.value = reparsed;
         Ok(changed)
     }
+}
+
+impl YamlDoc {
+    /// The edit of one remote extension: wrapped (its `type` becomes
+    /// `stdio`, and `cmd` and `args` lines connect marks as its own come
+    /// after it) or given back (its `type` as it was, those lines out).
+    /// Its `uri` and `headers` lines stay where they were: Goose does not
+    /// read them for a stdio extension, and the proxy reads the headers there
+    /// (`--goose-headers`, [`crate::mcp_proxy::remote`]), filled from the
+    /// variables Goose hands its servers, so no header value is copied
+    /// anywhere.
+    fn apply_remote(
+        &self,
+        text: &str,
+        expected: &mut Yaml,
+        name: &str,
+        before: &Value,
+        server: &Value,
+    ) -> Result<String, String> {
+        let extension = expected
+            .get_mut("extensions")
+            .and_then(|extensions| extensions.get_mut(name))
+            .and_then(Yaml::as_mapping_mut)
+            .ok_or_else(|| format!("extension `{name}` could not be found"))?;
+        let only = |server: &Value, keys: &[&str]| {
+            server
+                .as_object()
+                .is_some_and(|object| object.keys().all(|key| keys.contains(&key.as_str())))
+        };
+        if before.get("url").is_some() {
+            // Connect: `{"url", "type"}` becomes a wrapper.
+            if !only(server, &["command", "args", "type"])
+                || server.get("type").and_then(Value::as_str) != Some("stdio")
+            {
+                return Err(format!(
+                    "the edit would change more of extension `{name}` than its command"
+                ));
+            }
+            let command = server
+                .get("command")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("extension `{name}` would have no command"))?;
+            let mut args: Vec<String> = server
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or(Some(Vec::new()))
+                .ok_or_else(|| format!("extension `{name}` has arguments that are not text"))?;
+            if extension.contains_key("headers") {
+                args.push("--goose-headers".to_string());
+                args.push(name.to_string());
+            }
+            let patched = patch_remote_extension(text, name, Some((command, &args)), "stdio")?;
+            extension.insert(Yaml::from("type"), Yaml::from("stdio"));
+            extension.insert(Yaml::from("cmd"), Yaml::from(command));
+            extension.insert(
+                Yaml::from("args"),
+                Yaml::Sequence(args.iter().map(|arg| Yaml::from(arg.as_str())).collect()),
+            );
+            Ok(patched)
+        } else {
+            // Disconnect: a wrapper goes back to the remote server it was.
+            let url = server.get("url").and_then(Value::as_str);
+            let kind = server.get("type").and_then(Value::as_str);
+            let (Some(url), Some(kind)) = (url, kind) else {
+                return Err(format!("extension `{name}` cannot be given back"));
+            };
+            if !only(server, &["url", "type"])
+                || !REMOTE_KINDS.contains(&kind)
+                || extension.get("uri").and_then(Yaml::as_str) != Some(url)
+            {
+                return Err(format!(
+                    "extension `{name}` cannot be given back: its `uri` is not the address its proxy names"
+                ));
+            }
+            let patched = patch_remote_extension(text, name, None, kind)?;
+            extension.insert(Yaml::from("type"), Yaml::from(kind));
+            extension.remove("cmd");
+            extension.remove("args");
+            Ok(patched)
+        }
+    }
+}
+
+/// The remote extension types the proxy carries.
+const REMOTE_KINDS: &[&str] = &["streamable_http", "sse"];
+
+/// Keys of a remote extension the proxy cannot stand in for: a sign-in
+/// Goose does itself (`client_id`, `client_secret_key`, `scopes`), a
+/// Unix socket the connection goes through (`socket`), and the keys of a
+/// local server (a wrapper would write them twice).
+const NOT_CARRIED_KEYS: &[&str] = &[
+    "client_id",
+    "client_secret_key",
+    "scopes",
+    "socket",
+    "cmd",
+    "args",
+];
+
+/// The address and type of a remote extension the proxy can carry: type
+/// `streamable_http` or `sse`, an http(s) `uri` with no `$` (Goose
+/// fills those from its variables, the proxy would not), `headers` of text
+/// if any, and nothing of [`NOT_CARRIED_KEYS`]. Pure.
+fn carried_remote(extension: &Yaml) -> Option<(String, String)> {
+    let map = extension.as_mapping()?;
+    let kind = extension.get("type")?.as_str()?;
+    if !REMOTE_KINDS.contains(&kind) {
+        return None;
+    }
+    if NOT_CARRIED_KEYS
+        .iter()
+        .any(|key| map.contains_key(Yaml::from(*key)))
+    {
+        return None;
+    }
+    let uri = extension.get("uri")?.as_str()?;
+    if uri.contains('$') || !crate::mcp_proxy::remote::is_remote_url(uri) {
+        return None;
+    }
+    match extension.get("headers") {
+        None | Some(Yaml::Null) => {}
+        Some(Yaml::Mapping(headers)) => {
+            for (key, value) in headers {
+                let (Some(key), Some(value)) = (key.as_str(), value.as_str()) else {
+                    return None;
+                };
+                if !crate::mcp_proxy::remote::is_header_name(key.trim())
+                    || value.contains(['\r', '\n', '\0'])
+                {
+                    return None;
+                }
+            }
+        }
+        Some(_) => return None,
+    }
+    Some((uri.to_string(), kind.to_string()))
 }
 
 /// The view of a configuration's bytes ([`YamlDoc::view`]), `None` when they
@@ -501,6 +667,114 @@ fn patch_extension(
     Ok((out, has_args))
 }
 
+/// Rewrite a remote extension's `type` line to `kind`, and put `cmd`
+/// and `args` lines after it (`wrapper`, each marked as connect's own) or
+/// take them out (`None`). Every other line is kept as it was. An error
+/// for a shape the lines cannot be placed in.
+fn patch_remote_extension(
+    text: &str,
+    name: &str,
+    wrapper: Option<(&str, &[String])>,
+    kind: &str,
+) -> Result<String, String> {
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let cannot = |why: &str| format!("extension `{name}` cannot be edited in place: {why}");
+    let top = lines
+        .iter()
+        .position(|line| {
+            Line::read(line)
+                .is_some_and(|line| line.indent == 0 && line.key() == Some(("extensions", "")))
+        })
+        .ok_or_else(|| cannot("no `extensions:` block at the top level"))?;
+    let block_end = (top + 1..lines.len())
+        .find(|at| Line::read(lines[*at]).is_some_and(|line| line.indent == 0))
+        .unwrap_or(lines.len());
+    let child = (top + 1..block_end)
+        .find_map(|at| Line::read(lines[at]))
+        .map(|line| line.indent)
+        .ok_or_else(|| cannot("the `extensions:` block is empty"))?;
+    let entry = (top + 1..block_end)
+        .find(|at| {
+            Line::read(lines[*at]).is_some_and(|line| {
+                line.indent == child && line.key().is_some_and(|(key, _)| key == name)
+            })
+        })
+        .ok_or_else(|| cannot("its key was not found"))?;
+    if Line::read(lines[entry])
+        .and_then(|line| line.key())
+        .is_some_and(|(_, value)| !value.is_empty())
+    {
+        return Err(cannot("it is written on one line"));
+    }
+    let entry_end = (entry + 1..block_end)
+        .find(|at| Line::read(lines[*at]).is_some_and(|line| line.indent <= child))
+        .unwrap_or(block_end);
+    let field = (entry + 1..entry_end)
+        .find_map(|at| Line::read(lines[at]))
+        .map(|line| line.indent)
+        .filter(|indent| *indent > child)
+        .ok_or_else(|| cannot("it has no fields"))?;
+    let find = |wanted: &str| {
+        (entry + 1..entry_end).find(|at| {
+            Line::read(lines[*at]).is_some_and(|line| {
+                line.indent == field && line.key().is_some_and(|(key, _)| key == wanted)
+            })
+        })
+    };
+    let type_at = find("type").ok_or_else(|| cannot("it has no `type` line"))?;
+    let type_end = field_end(&lines, type_at, entry_end, field);
+    if type_end != type_at + 1 {
+        return Err(cannot("its `type` is not written on one line"));
+    }
+    let pad = " ".repeat(field);
+    let mut drop: Vec<(usize, usize)> = Vec::new();
+    let mut added = String::new();
+    match wrapper {
+        Some((command, args)) => {
+            if find("cmd").is_some() || find("args").is_some() {
+                return Err(cannot("it already has a `cmd` or `args` line"));
+            }
+            added.push_str(&format!(
+                "{pad}cmd: {} {ARGS_ADDED}{newline}",
+                scalar(command)
+            ));
+            added.push_str(&format!("{pad}args: {ARGS_ADDED}{newline}"));
+            for arg in args {
+                added.push_str(&format!("{pad}- {}{newline}", scalar(arg)));
+            }
+        }
+        None => {
+            for key in ["cmd", "args"] {
+                let at =
+                    find(key).ok_or_else(|| cannot("its wrapper has no `cmd` or `args` line"))?;
+                drop.push((at, field_end(&lines, at, entry_end, field)));
+            }
+        }
+    }
+    // The `type` line keeps whatever comment it had after its value.
+    let type_line = lines[type_at];
+    let body = type_line.trim_end_matches(['\n', '\r']);
+    let comment = body.find(" #").map(|at| &body[at..]).unwrap_or_default();
+    let type_text = format!("{pad}type: {}{comment}{newline}", scalar(kind));
+    let mut out = String::with_capacity(text.len() + 512);
+    for (at, line) in lines.iter().enumerate() {
+        if drop.iter().any(|(start, end)| (*start..*end).contains(&at)) {
+            continue;
+        }
+        if at == type_at {
+            out.push_str(&type_text);
+            out.push_str(&added);
+            continue;
+        }
+        out.push_str(line);
+        if !line.ends_with('\n') && at + 1 < lines.len() {
+            out.push_str(newline);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,22 +873,27 @@ GOOSE_MODE: smart_approve
     #[test]
     fn a_real_goose_config_is_wrapped_with_only_its_server_lines_changed() {
         let mut doc = YamlDoc::parse(GOOSE).unwrap();
+        // The built-in extension is Goose's own; the remote one is carried.
         assert_eq!(
             mcp_wire::server_counts(&doc.view()),
             mcp_wire::ServerCounts {
-                stdio: 2,
+                stdio: 3,
                 wrapped: 0,
-                remote: 2
+                remote: 1
             }
         );
-        assert_eq!(wrap(&mut doc, false), 2);
+        assert_eq!(wrap(&mut doc, false), 3);
         let view = doc.view();
         assert!(mcp_wire::is_guarded(&view), "{}", doc.text());
         assert_eq!(
             mcp_wire::guarded_mode(&view),
             Some(mcp_wire::WiringMode::Enforce)
         );
-        assert_eq!(kept_lines(doc.text()), kept_lines(GOOSE));
+        // Besides the cmd and args lines, only the remote one's type changed.
+        assert_eq!(
+            kept_lines(doc.text()),
+            kept_lines(&GOOSE.replace("    type: streamable_http\n", "    type: stdio\n"))
+        );
         assert!(doc.text().contains("# the GitHub server, added by hand\n"));
         assert!(doc.text().contains("GOOSE_MODE: smart_approve\n"));
         let github = &view["mcpServers"]["github"];
@@ -659,13 +938,13 @@ GOOSE_MODE: smart_approve
         assert_eq!(wrap(&mut doc, false), 0);
         assert_eq!(doc.text(), once);
 
-        assert_eq!(wrap(&mut doc, true), 2);
+        assert_eq!(wrap(&mut doc, true), 3);
         assert_eq!(
             mcp_wire::guarded_mode(&doc.view()),
             Some(mcp_wire::WiringMode::Monitor)
         );
 
-        assert_eq!(unwrap(&mut doc), 2);
+        assert_eq!(unwrap(&mut doc), 3);
         let original: Yaml = serde_yaml::from_str(GOOSE).unwrap();
         let restored: Yaml = serde_yaml::from_str(doc.text()).unwrap();
         assert_eq!(restored, original);
@@ -763,19 +1042,25 @@ extensions:
     timeout: 300
 ";
 
-    /// Goose 1.60.2's own sample: its stdio server is wrapped, the built-in
-    /// and platform ones are Goose's, the remote one is named as a server
-    /// the proxy does not see, and a disconnect gives back the same bytes.
+    /// Goose 1.60.2's own sample: its stdio server and its remote one are
+    /// wrapped (the remote one was named as a server the proxy does not see
+    /// until the proxy carried it), the built-in and platform ones are
+    /// Goose's, and a disconnect gives back the same bytes.
     #[test]
-    fn goose_1_60_2_sample_is_wrapped_and_its_remote_server_named() {
+    fn goose_1_60_2_sample_is_wrapped_with_its_remote_server() {
         let mut doc = YamlDoc::parse(GOOSE_1_60_2).unwrap();
         assert_eq!(
             doc.unscreened(),
             vec![("remote-tools".to_string(), "streamable_http".to_string())]
         );
-        assert_eq!(wrap(&mut doc, false), 1);
+        assert_eq!(wrap(&mut doc, false), 2);
         assert!(mcp_wire::is_guarded(&doc.view()), "{}", doc.text());
-        assert_eq!(unwrap(&mut doc), 1);
+        assert!(doc.unscreened().is_empty(), "{}", doc.text());
+        assert_eq!(unwrap(&mut doc), 2);
+        // The remote extension comes back byte for byte (the stdio one's
+        // flow-style args come back in block style, as before).
+        let remote = |text: &str| text[text.find("  remote-tools:").unwrap()..].to_string();
+        assert_eq!(remote(doc.text()), remote(GOOSE_1_60_2));
         let restored: Yaml = serde_yaml::from_str(doc.text()).unwrap();
         let original: Yaml = serde_yaml::from_str(GOOSE_1_60_2).unwrap();
         assert_eq!(restored, original);
@@ -808,7 +1093,8 @@ extensions:
                 "    headers: {}\n    env_keys: *none",
             );
         let doc = YamlDoc::parse(&anchors).unwrap();
-        assert_eq!(mcp_wire::server_counts(&doc.view()).stdio, 1);
+        // The stdio server and the remote one the proxy carries.
+        assert_eq!(mcp_wire::server_counts(&doc.view()).stdio, 2);
     }
 
     /// Review of #369, item 7: a key written twice in an extension (a second
@@ -899,5 +1185,95 @@ extensions:
             assert!(!mcp_wire::is_guardable(&doc.view()), "{text:?}");
         }
         assert!(YamlDoc::parse("- a\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod remote_wiring_tests {
+    use super::*;
+    use crate::mcp_wire;
+
+    const BIN: &str = "/usr/local/bin/innerwarden";
+
+    /// A remote extension the proxy cannot stand in for is left as it is
+    /// and named: a sign-in Goose does itself, a Unix socket, an address
+    /// Goose fills from a variable, a header that is not text.
+    #[test]
+    fn a_remote_extension_the_proxy_cannot_carry_is_left_alone() {
+        for extra in [
+            "    client_id: registered-client.example\n",
+            "    socket: /run/mcp.sock\n",
+            "    headers:\n      A: 1\n",
+        ] {
+            let text = format!(
+                "extensions:\n  r:\n    name: r\n    type: streamable_http\n    uri: https://x.example/mcp\n{extra}"
+            );
+            let doc = YamlDoc::parse(&text).unwrap();
+            assert!(!mcp_wire::is_guardable(&doc.view()), "{text}");
+            assert_eq!(doc.unscreened().len(), 1, "{text}");
+        }
+        let filled = "extensions:\n  r:\n    name: r\n    type: sse\n    uri: https://x.example/mcp?key=$KEY\n";
+        assert!(!mcp_wire::is_guardable(
+            &YamlDoc::parse(filled).unwrap().view()
+        ));
+    }
+
+    /// A remote extension with headers names Goose's extension for the
+    /// proxy (`--goose-headers`), keeps its `uri` and `headers` lines,
+    /// and comes back byte for byte after a mode switch. A wrapper whose
+    /// `uri` line is gone is not given back blind. FAILS ON REVERT of
+    /// `patch_remote_extension`.
+    #[test]
+    fn a_remote_extension_with_headers_is_wired_and_comes_back() {
+        let text = "extensions:\n  remote:\n    enabled: true\n    envs: {}\n    env_keys:\n    - API_TOKEN\n    headers:\n      Authorization: Bearer ${API_TOKEN}\n    name: remote\n    timeout: 300\n    type: sse # the old transport\n    uri: https://example.test/sse\n";
+        let mut doc = YamlDoc::parse(text).unwrap();
+        let (wrapped, n) = mcp_wire::wrap(doc.view(), BIN, false, "goose");
+        assert_eq!(n, 1);
+        assert_eq!(doc.apply(&wrapped).unwrap(), 1);
+        assert!(
+            doc.text().contains("    type: stdio # the old transport\n"),
+            "{}",
+            doc.text()
+        );
+        assert!(doc
+            .text()
+            .contains("      Authorization: Bearer ${API_TOKEN}\n"));
+        let view = doc.view();
+        let args: Vec<&str> = view["mcpServers"]["remote"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert!(
+            args.ends_with(&[
+                "--",
+                "https://example.test/sse",
+                "--type",
+                "sse",
+                "--goose-headers",
+                "remote"
+            ]),
+            "{args:?}"
+        );
+        let (monitor, n) = mcp_wire::wrap(view, BIN, true, "goose");
+        assert_eq!(n, 1);
+        assert_eq!(doc.apply(&monitor).unwrap(), 1);
+        let (restored, n) = mcp_wire::unwrap(doc.view());
+        assert_eq!(n, 1);
+        assert_eq!(doc.apply(&restored).unwrap(), 1);
+        assert_eq!(doc.text(), text);
+
+        let mut doc = YamlDoc::parse(text).unwrap();
+        let (wrapped, _) = mcp_wire::wrap(doc.view(), BIN, false, "goose");
+        doc.apply(&wrapped).unwrap();
+        let moved = doc
+            .text()
+            .replace("    uri: https://example.test/sse\n", "");
+        let mut moved = YamlDoc::parse(&moved).unwrap();
+        let (restored, _) = mcp_wire::unwrap(moved.view());
+        let before = moved.text().to_string();
+        assert!(moved.apply(&restored).is_err());
+        assert_eq!(moved.text(), before);
     }
 }

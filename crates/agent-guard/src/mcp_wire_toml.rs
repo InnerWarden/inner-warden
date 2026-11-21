@@ -6,6 +6,20 @@
 //! enforcement may block dangerous calls. Reversible (`unwrap_toml`) and
 //! idempotent (`wrap_toml` twice = wrapped once).
 //!
+//! A server reached by URL (`url`, its token named by
+//! `bearer_token_env_var`, headers in `http_headers` and
+//! `env_http_headers`) goes through the same proxy, which talks HTTP(S) to
+//! it ([`crate::mcp_proxy::remote`]): its table becomes a wrapper whose
+//! server is the address. Codex refuses those keys on a local server, so
+//! each gives way where it was: `url` to `command`/`args`, the variables
+//! to `env_vars` (Codex then hands them to the proxy; the token is never
+//! written anywhere), `http_headers` to `env`. The words after the address
+//! (`--bearer-env`, `--header-env`, `--headers`, `--env-headers`) say
+//! what the table had, so disconnect writes it back where it was. A table
+//! the proxy cannot carry is left alone and counted remote: a token written
+//! in the file, a sign-in Codex does itself, a header helper program, a
+//! server Codex runs elsewhere.
+//!
 //! Edits are FORMAT-PRESERVING (`toml_edit`): the user's comments, key order, and
 //! unrelated config in `config.toml` are left untouched, only `command`/`args`
 //! of each MCP server change. All logic here is pure/tested (operates on a parsed
@@ -16,6 +30,7 @@
 
 use toml_edit::{value, Array, DocumentMut, Item, Table, Value};
 
+use crate::mcp_proxy::remote::{is_env_name, is_header_name, is_remote_url, HEADER_ENV_PREFIX};
 use crate::mcp_wire::{is_guard_command, is_wrapper_name, naming, proxy_agent, wrapper_blocks};
 
 /// Effective enforcement of MCP servers wired through the local proxy.
@@ -130,7 +145,18 @@ fn words<'a>(values: impl Iterator<Item = &'a Value>) -> Vec<String> {
 
 fn wrap_server(server: &mut Table, guard_bin: &str, monitor: bool, agent: Option<&str>) -> bool {
     if !is_stdio_server(server) {
-        return false;
+        let Some(remote) = remote_entry(server) else {
+            return false;
+        };
+        let mut local = server.clone();
+        remote_as_local(&mut local, &remote);
+        let command = decors(&local, "command");
+        if !wrap_server(&mut local, guard_bin, monitor, agent) {
+            return false;
+        }
+        set_decors(&mut local, "command", command);
+        *server = local;
+        return true;
     }
     let current_command = server
         .get("command")
@@ -196,7 +222,10 @@ fn wrap_server(server: &mut Table, guard_bin: &str, monitor: bool, agent: Option
     if current_command == guard_bin && current_words == words(new_args.iter()) {
         return false;
     }
+    // A comment after the command stays where it was.
+    let command = decors(server, "command");
     server.insert("command", value(guard_bin));
+    set_decors(server, "command", command);
     server.insert("args", value(new_args));
     true
 }
@@ -214,6 +243,16 @@ fn unwrap_server(server: &mut Table) -> bool {
         return false;
     }
     let orig_cmd = args[separator + 1].as_str().unwrap_or_default().to_string();
+    // A remote server goes back to the address and keys it had.
+    if is_remote_url(&orig_cmd) {
+        let command = decors(server, "command");
+        let mut restored = server.clone();
+        set_decors(&mut restored, "command", command);
+        if restore_remote(&mut restored, &orig_cmd, &args[separator + 2..]) {
+            *server = restored;
+            return true;
+        }
+    }
     let mut orig_args = Array::new();
     for a in &args[separator + 2..] {
         orig_args.push_formatted(a.clone());
@@ -223,6 +262,417 @@ fn unwrap_server(server: &mut Table) -> bool {
         server.remove("args");
     } else {
         server.insert("args", value(orig_args));
+    }
+    true
+}
+
+/// A Codex server reached by URL that the proxy can carry, as its table
+/// says it (see [`remote_entry`]).
+struct RemoteEntry {
+    url: String,
+    /// The table's remote keys, in the order it has them.
+    keys: Vec<RemoteKey>,
+}
+
+enum RemoteKey {
+    /// `bearer_token_env_var`: the variable Codex reads the token from.
+    Bearer(String),
+    /// `http_headers`: headers written in the file.
+    Headers(Vec<(String, String)>),
+    /// `env_http_headers`: each header's name and the variable its value
+    /// is read from.
+    EnvHeaders(Vec<(String, String)>),
+}
+
+/// Keys that say the server is reached some other way than the proxy can
+/// carry: a token written in the file (`bearer_token`, which Codex refuses
+/// anyway), a sign-in Codex does itself (`oauth`, `oauth_resource`,
+/// `scopes`, `auth`), a program that makes the headers
+/// (`http_headers_helper`), a server Codex runs elsewhere
+/// (`environment_id`), or the keys of a local server.
+const NOT_CARRIED_KEYS: &[&str] = &[
+    "bearer_token",
+    "oauth",
+    "oauth_resource",
+    "scopes",
+    "auth",
+    "http_headers_helper",
+    "environment_id",
+    "command",
+    "args",
+    "env",
+    "env_vars",
+    "cwd",
+];
+
+/// The text pairs of a header table, inline or not; `None` when one is not
+/// text.
+fn text_pairs(item: &Item) -> Option<Vec<(String, String)>> {
+    match item {
+        Item::Table(table) => table
+            .iter()
+            .map(|(key, value)| Some((key.to_string(), value.as_str()?.to_string())))
+            .collect(),
+        Item::Value(Value::InlineTable(table)) => table
+            .iter()
+            .map(|(key, value)| Some((key.to_string(), value.as_str()?.to_string())))
+            .collect(),
+        _ => None,
+    }
+}
+
+/// The remote server a Codex table names, when the proxy can carry it:
+/// an http(s) `url`, its token named by `bearer_token_env_var`, headers
+/// in `http_headers` and `env_http_headers` (inline), and nothing of
+/// [`NOT_CARRIED_KEYS`]. `None` for every other table, which is left as
+/// it is and counted remote.
+fn remote_entry(server: &Table) -> Option<RemoteEntry> {
+    if NOT_CARRIED_KEYS.iter().any(|key| server.contains_key(key)) {
+        return None;
+    }
+    let url = server.get("url")?.as_str()?;
+    if !is_remote_url(url) {
+        return None;
+    }
+    let mut keys = Vec::new();
+    for (key, item) in server.iter() {
+        match key {
+            "bearer_token_env_var" => {
+                let var = item.as_str()?;
+                if !is_env_name(var) {
+                    return None;
+                }
+                keys.push(RemoteKey::Bearer(var.to_string()));
+            }
+            "http_headers" => {
+                let pairs = text_pairs(item)?;
+                if pairs.iter().any(|(name, value)| {
+                    !is_header_name(name) || value.contains(['\r', '\n', '\0'])
+                }) {
+                    return None;
+                }
+                keys.push(RemoteKey::Headers(pairs));
+            }
+            "env_http_headers" => {
+                if !matches!(item, Item::Value(Value::InlineTable(_))) {
+                    return None;
+                }
+                let pairs = text_pairs(item)?;
+                if pairs
+                    .iter()
+                    .any(|(name, var)| !is_header_name(name) || !is_env_name(var))
+                {
+                    return None;
+                }
+                keys.push(RemoteKey::EnvHeaders(pairs));
+            }
+            _ => {}
+        }
+    }
+    Some(RemoteEntry {
+        url: url.to_string(),
+        keys,
+    })
+}
+
+/// A table that runs a local command, or a remote server the proxy carries.
+fn is_proxyable_server(server: &Table) -> bool {
+    is_stdio_server(server) || remote_entry(server).is_some()
+}
+
+/// The decor of a key and of its value, so a key that takes another's place
+/// keeps its comments and spacing.
+fn decors(server: &Table, key: &str) -> (Option<toml_edit::Decor>, Option<toml_edit::Decor>) {
+    (
+        server.key(key).map(|key| key.leaf_decor().clone()),
+        server
+            .get(key)
+            .and_then(Item::as_value)
+            .map(|value| value.decor().clone()),
+    )
+}
+
+fn set_decors(
+    server: &mut Table,
+    key: &str,
+    decor: (Option<toml_edit::Decor>, Option<toml_edit::Decor>),
+) {
+    if let (Some(decor), Some(mut key)) = (decor.0, server.key_mut(key)) {
+        *key.leaf_decor_mut() = decor;
+    }
+    if let (Some(decor), Some(value)) = (decor.1, server.get_mut(key).and_then(Item::as_value_mut))
+    {
+        *value.decor_mut() = decor;
+    }
+}
+
+/// An item of the kind `like` is (a table of its own, or inline), holding
+/// `pairs`.
+fn table_like(like: &Item, pairs: &[(String, String)]) -> Item {
+    match like {
+        Item::Table(original) => {
+            let mut table = Table::new();
+            table.set_position(original.position());
+            *table.decor_mut() = original.decor().clone();
+            for (name, value) in pairs {
+                table.insert(name, toml_edit::value(value.as_str()));
+            }
+            Item::Table(table)
+        }
+        _ => {
+            let mut table = toml_edit::InlineTable::new();
+            for (name, value) in pairs {
+                table.insert(name, Value::from(value.as_str()));
+            }
+            let mut value = Value::InlineTable(table);
+            if let Some(original) = like.as_value() {
+                *value.decor_mut() = original.decor().clone();
+            }
+            Item::Value(value)
+        }
+    }
+}
+
+/// A remote table rewritten as a local one whose command is its address,
+/// the shape [`wrap_server`] then wraps like any other. Each remote key
+/// gives way where it was: `url` to `command` and `args` (the words
+/// that say what the table had, in its order), `bearer_token_env_var` and
+/// `env_http_headers` to `env_vars` (the variables Codex then hands the
+/// proxy, the token never written), `http_headers` to `env` (each
+/// header as `INNERWARDEN_MCP_HEADER_<n>`, read by the proxy as a JSON
+/// client's are).
+fn remote_as_local(server: &mut Table, remote: &RemoteEntry) {
+    let mut words = Array::new();
+    let mut vars: Vec<String> = Vec::new();
+    let mut headers: Vec<(String, String)> = Vec::new();
+    for key in &remote.keys {
+        match key {
+            RemoteKey::Bearer(var) => {
+                words.push("--bearer-env");
+                words.push(var.as_str());
+                vars.push(var.clone());
+            }
+            RemoteKey::Headers(pairs) => {
+                words.push("--headers");
+                for (n, (name, value)) in pairs.iter().enumerate() {
+                    headers.push((
+                        format!("{HEADER_ENV_PREFIX}{}", n + 1),
+                        format!("{name}: {value}"),
+                    ));
+                }
+            }
+            RemoteKey::EnvHeaders(pairs) => {
+                words.push("--env-headers");
+                for (name, var) in pairs {
+                    words.push("--header-env");
+                    words.push(name.as_str());
+                    words.push(var.as_str());
+                    vars.push(var.clone());
+                }
+            }
+        }
+    }
+    let mut unique = Vec::new();
+    for var in vars {
+        if !unique.contains(&var) {
+            unique.push(var);
+        }
+    }
+    let entries: Vec<(toml_edit::Key, Item)> = server
+        .iter()
+        .filter_map(|(key, item)| Some((server.key(key)?.clone(), item.clone())))
+        .collect();
+    server.clear();
+    let mut vars_placed = false;
+    for (key, item) in entries {
+        match key.get() {
+            "url" => {
+                let mut command = Value::from(remote.url.as_str());
+                if let Some(value) = item.as_value() {
+                    *command.decor_mut() = value.decor().clone();
+                }
+                server.insert_formatted(
+                    &toml_edit::Key::new("command").with_leaf_decor(key.leaf_decor().clone()),
+                    Item::Value(command),
+                );
+                server.insert("args", value(words.clone()));
+            }
+            "bearer_token_env_var" | "env_http_headers" => {
+                if vars_placed || unique.is_empty() {
+                    continue;
+                }
+                vars_placed = true;
+                let mut list = Value::Array(unique.iter().map(String::as_str).collect());
+                if let Some(value) = item.as_value() {
+                    *list.decor_mut() = value.decor().clone();
+                }
+                server.insert_formatted(
+                    &toml_edit::Key::new("env_vars").with_leaf_decor(key.leaf_decor().clone()),
+                    Item::Value(list),
+                );
+            }
+            "http_headers" => {
+                server.insert_formatted(
+                    &toml_edit::Key::new("env").with_leaf_decor(key.leaf_decor().clone()),
+                    table_like(&item, &headers),
+                );
+            }
+            _ => {
+                server.insert_formatted(&key, item);
+            }
+        }
+    }
+}
+
+/// Write a wrapped remote table back as it was: `url` where `command` is,
+/// `bearer_token_env_var` and `env_http_headers` where `env_vars` is, in
+/// the order the words name them, and `http_headers` where `env` is.
+/// `false`, touching nothing, when the words after the address are not the
+/// ones [`remote_as_local`] writes.
+fn restore_remote(server: &mut Table, url: &str, words: &[Value]) -> bool {
+    let mut keys: Vec<RemoteKey> = Vec::new();
+    let mut it = words.iter().map(Value::as_str);
+    while let Some(word) = it.next() {
+        match word {
+            Some("--bearer-env") => match it.next().flatten() {
+                Some(var) if is_env_name(var) => keys.push(RemoteKey::Bearer(var.to_string())),
+                _ => return false,
+            },
+            Some("--headers") => keys.push(RemoteKey::Headers(Vec::new())),
+            Some("--env-headers") => keys.push(RemoteKey::EnvHeaders(Vec::new())),
+            Some("--header-env") => {
+                match (it.next().flatten(), it.next().flatten(), keys.last_mut()) {
+                    (Some(name), Some(var), Some(RemoteKey::EnvHeaders(pairs))) => {
+                        pairs.push((name.to_string(), var.to_string()))
+                    }
+                    _ => return false,
+                }
+            }
+            _ => return false,
+        }
+    }
+    let has_headers = keys.iter().any(|key| matches!(key, RemoteKey::Headers(_)));
+    let has_vars = keys.iter().any(|key| !matches!(key, RemoteKey::Headers(_)));
+    // What connect wrote, and only that: `env` of headers alone, `env_vars`
+    // of the variables the words name.
+    let env_ok = match server.get("env") {
+        None => !has_headers,
+        Some(item) => {
+            has_headers
+                && text_pairs(item).is_some_and(|pairs| {
+                    pairs
+                        .iter()
+                        .all(|(name, _)| name.starts_with(HEADER_ENV_PREFIX))
+                })
+        }
+    };
+    if !env_ok || server.contains_key("env_vars") != has_vars {
+        return false;
+    }
+    let mut headers = Vec::new();
+    if let Some(pairs) = server.get("env").and_then(text_pairs) {
+        let mut n = 1;
+        while let Some((_, line)) = pairs
+            .iter()
+            .find(|(name, _)| *name == format!("{HEADER_ENV_PREFIX}{n}"))
+        {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            headers.push((
+                name.to_string(),
+                value.strip_prefix(' ').unwrap_or(value).to_string(),
+            ));
+            n += 1;
+        }
+    }
+    // Where `env_vars` stands, the variable keys that came before the
+    // headers are written; those after the headers follow `http_headers`
+    // where `env` stands, so the keys come back in their order.
+    let headers_at = keys
+        .iter()
+        .position(|key| matches!(key, RemoteKey::Headers(_)));
+    let first_var = keys
+        .iter()
+        .position(|key| !matches!(key, RemoteKey::Headers(_)));
+    let vars_before_headers = match (headers_at, first_var) {
+        (Some(h), Some(f)) if f < h => h,
+        _ => keys.len(),
+    };
+    let entries: Vec<(toml_edit::Key, Item)> = server
+        .iter()
+        .filter_map(|(key, item)| Some((server.key(key)?.clone(), item.clone())))
+        .collect();
+    server.clear();
+    for (key, item) in entries {
+        let value_decor = item.as_value().map(|value| value.decor().clone());
+        let with_decor = |mut value: Value, first: bool| {
+            if let (true, Some(decor)) = (first, &value_decor) {
+                *value.decor_mut() = decor.clone();
+            }
+            value
+        };
+        match key.get() {
+            "command" => {
+                server.insert_formatted(
+                    &toml_edit::Key::new("url").with_leaf_decor(key.leaf_decor().clone()),
+                    Item::Value(with_decor(Value::from(url), true)),
+                );
+            }
+            "args" => {}
+            "env_vars" => {
+                let mut first = true;
+                for remote in keys.iter().take(vars_before_headers) {
+                    let (name, value) = match remote {
+                        RemoteKey::Bearer(var) => {
+                            ("bearer_token_env_var", Value::from(var.as_str()))
+                        }
+                        RemoteKey::EnvHeaders(pairs) => {
+                            let mut table = toml_edit::InlineTable::new();
+                            for (header, var) in pairs {
+                                table.insert(header, Value::from(var.as_str()));
+                            }
+                            ("env_http_headers", Value::InlineTable(table))
+                        }
+                        RemoteKey::Headers(_) => continue,
+                    };
+                    let key = if first {
+                        toml_edit::Key::new(name).with_leaf_decor(key.leaf_decor().clone())
+                    } else {
+                        toml_edit::Key::new(name)
+                    };
+                    server.insert_formatted(&key, Item::Value(with_decor(value, first)));
+                    first = false;
+                }
+            }
+            "env" => {
+                server.insert_formatted(
+                    &toml_edit::Key::new("http_headers").with_leaf_decor(key.leaf_decor().clone()),
+                    table_like(&item, &headers),
+                );
+                // The variable keys that came after the headers in the table
+                // follow them again.
+                for remote in keys.iter().skip(vars_before_headers) {
+                    let (name, value) = match remote {
+                        RemoteKey::Bearer(var) => {
+                            ("bearer_token_env_var", Value::from(var.as_str()))
+                        }
+                        RemoteKey::EnvHeaders(pairs) => {
+                            let mut table = toml_edit::InlineTable::new();
+                            for (header, var) in pairs {
+                                table.insert(header, Value::from(var.as_str()));
+                            }
+                            ("env_http_headers", Value::InlineTable(table))
+                        }
+                        RemoteKey::Headers(_) => continue,
+                    };
+                    server.insert_formatted(&toml_edit::Key::new(name), Item::Value(value));
+                }
+            }
+            _ => {
+                server.insert_formatted(&key, item);
+            }
+        }
     }
     true
 }
@@ -242,9 +692,10 @@ fn for_each_server(doc: &mut DocumentMut, mut f: impl FnMut(&mut Table) -> bool)
 }
 
 /// The TOML twin of [`crate::mcp_wire::server_counts`]: the servers under
-/// `[mcp_servers]`, counted by how the proxy can reach them. Every server
-/// with no local command is remote, whatever names its address: the proxy
-/// never sees its calls. Pure.
+/// `[mcp_servers]`, counted by how the proxy can reach them. A server
+/// reached by URL that the proxy carries ([`remote_entry`]) counts with the
+/// local ones; every other server with no local command is remote, whatever
+/// names its address: the proxy never sees its calls. Pure.
 pub fn server_counts_toml(doc: &DocumentMut) -> crate::mcp_wire::ServerCounts {
     let (stdio, wrapped) = counts(doc);
     let remote = doc
@@ -254,7 +705,7 @@ pub fn server_counts_toml(doc: &DocumentMut) -> crate::mcp_wire::ServerCounts {
             servers
                 .iter()
                 .filter_map(|(_name, item)| item.as_table())
-                .filter(|t| !is_stdio_server(t))
+                .filter(|t| !is_proxyable_server(t))
                 .count()
         })
         .unwrap_or(0);
@@ -271,7 +722,7 @@ fn counts(doc: &DocumentMut) -> (usize, usize) {
     if let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table) {
         for (_name, item) in servers.iter() {
             if let Some(t) = item.as_table() {
-                if is_stdio_server(t) {
+                if is_proxyable_server(t) {
                     stdio += 1;
                     if is_wrapped_server(t) {
                         wrapped += 1;
@@ -343,6 +794,36 @@ fn wrapper_options(server: &Table) -> Option<Vec<Option<&str>>> {
             .map(Value::as_str)
             .collect(),
     )
+}
+
+/// [`wrap_toml`] for automatic setup: only the servers that run a local
+/// command. A server reached by URL goes through the proxy only on a connect
+/// a person runs (as [`crate::mcp_wire::wrap_local`] says for the JSON
+/// clients): one Codex signs in to with `codex mcp login` names no key
+/// that says so, and through the proxy it would stop working.
+pub fn wrap_toml_local(
+    doc: &mut DocumentMut,
+    guard_bin: &str,
+    monitor: bool,
+    agent: &str,
+) -> usize {
+    for_each_server(doc, |s| {
+        is_stdio_server(s) && wrap_server(s, guard_bin, monitor, Some(agent))
+    })
+}
+
+/// Whether every server that runs a local command goes through the proxy,
+/// and there is one: what [`wrap_toml_local`] guarantees.
+pub fn local_servers_guarded_toml(doc: &DocumentMut) -> bool {
+    let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table) else {
+        return false;
+    };
+    let local: Vec<&Table> = servers
+        .iter()
+        .filter_map(|(_, item)| item.as_table())
+        .filter(|t| is_stdio_server(t))
+        .collect();
+    !local.is_empty() && local.iter().all(|t| is_wrapped_server(t))
 }
 
 /// Undo `wrap_toml`. Returns how many servers were unwrapped.
@@ -441,7 +922,11 @@ pub fn is_automatic_wrap_safe_toml(doc: &DocumentMut) -> bool {
             return false;
         }
     }
-    is_guardable_toml(doc)
+    // Automatic setup wraps only local servers ([`wrap_toml_local`]).
+    servers
+        .iter()
+        .filter_map(|(_, item)| item.as_table())
+        .any(is_stdio_server)
 }
 
 #[cfg(test)]
@@ -480,18 +965,19 @@ httpUrl = "https://example.com/stream"
             "streamed": {"httpUrl": "https://example.com/stream"}
         }});
         let mut doc: DocumentMut = toml_text.parse().expect("toml");
-        // Three local and two remote: a count that took one for the other
-        // reads 3 where 2 is (nightly mutant 2026-10-24: with two of each, a
-        // reader that counted the local servers as remote read the same).
+        // Three local, one `url` server the proxy carries, and one under
+        // `httpUrl`, a key Codex does not read, counted remote: a count that
+        // took one kind for the other reads differently (nightly mutant
+        // 2026-10-24: with two of each, a reader that counted the local
+        // servers as remote read the same).
         let expected = crate::mcp_wire::ServerCounts {
-            stdio: 3,
+            stdio: 4,
             wrapped: 0,
-            remote: 2,
+            remote: 1,
         };
         assert_eq!(server_counts_toml(&doc), expected);
-        // The JSON wiring carries a remote server through the proxy
-        // (`mcp_proxy::remote`); Codex's TOML does not yet, so there the two
-        // remote servers stay counted unscreened.
+        // The JSON wiring carries both remote servers through the proxy
+        // (`mcp_proxy::remote`); Codex's TOML carries its `url` one.
         let json_expected = crate::mcp_wire::ServerCounts {
             stdio: 5,
             wrapped: 0,
@@ -501,7 +987,7 @@ httpUrl = "https://example.com/stream"
         wrap_toml(&mut doc, "/abs/innerwarden", true, "codex");
         let (wrapped_json, _) = crate::mcp_wire::wrap(json_cfg, "/abs/innerwarden", true, "codex");
         let after = crate::mcp_wire::ServerCounts {
-            wrapped: 3,
+            wrapped: 4,
             ..expected
         };
         assert_eq!(server_counts_toml(&doc), after);
@@ -542,12 +1028,35 @@ url = "https://example.com/mcp"
     }
 
     #[test]
-    fn wraps_stdio_servers_preserves_comments_and_leaves_remote_alone() {
+    fn wraps_stdio_and_remote_servers_preserving_comments() {
         let mut d = doc();
         assert!(is_guardable_toml(&d));
         assert!(!is_guarded_toml(&d));
         let n = wrap_toml(&mut d, "innerwarden", false, "codex");
-        assert_eq!(n, 2, "two stdio servers wrapped, remote_only left alone");
+        assert_eq!(n, 3, "two stdio servers and the url server wrapped");
+        // The url server's proxy talks to its address.
+        let remote = d["mcp_servers"]["remote_only"].as_table().unwrap();
+        assert_eq!(remote["command"].as_str(), Some("innerwarden"));
+        assert!(remote.get("url").is_none());
+        assert_eq!(
+            remote["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "proxy",
+                "--label",
+                "codex",
+                "--agent",
+                "codex",
+                "--mode",
+                "guard",
+                "--",
+                "https://example.com/mcp"
+            ]
+        );
         // command rewritten, original preserved inside args
         let icm = d["mcp_servers"]["icm"].as_table().unwrap();
         assert_eq!(icm["command"].as_str(), Some("innerwarden"));
@@ -602,7 +1111,7 @@ url = "https://example.com/mcp"
     #[test]
     fn wrap_is_idempotent() {
         let mut d = doc();
-        assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 2);
+        assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 3);
         assert_eq!(
             wrap_toml(&mut d, "innerwarden", false, "codex"),
             0,
@@ -615,7 +1124,8 @@ url = "https://example.com/mcp"
         let mut d = doc();
         wrap_toml(&mut d, "innerwarden", false, "codex");
         let n = unwrap_toml(&mut d);
-        assert_eq!(n, 2);
+        assert_eq!(n, 3);
+        assert_eq!(d.to_string(), doc().to_string(), "the file as it was");
         let icm = d["mcp_servers"]["icm"].as_table().unwrap();
         assert_eq!(icm["command"].as_str(), Some("npx"));
         let args: Vec<&str> = icm["args"]
@@ -659,7 +1169,7 @@ url = "https://example.com/mcp"
     fn switching_monitor_and_enforce_rewrites_without_nesting() {
         let original = doc();
         let mut d = original.clone();
-        assert_eq!(wrap_toml(&mut d, "innerwarden", true, "codex"), 2);
+        assert_eq!(wrap_toml(&mut d, "innerwarden", true, "codex"), 3);
         assert_eq!(guarded_mode_toml(&d), Some(WiringMode::Monitor));
         let first = d["mcp_servers"]["icm"]["args"]
             .as_array()
@@ -684,9 +1194,9 @@ url = "https://example.com/mcp"
             ]
         );
 
-        assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 2);
+        assert_eq!(wrap_toml(&mut d, "innerwarden", false, "codex"), 3);
         assert_eq!(guarded_mode_toml(&d), Some(WiringMode::Enforce));
-        assert_eq!(unwrap_toml(&mut d), 2);
+        assert_eq!(unwrap_toml(&mut d), 3);
         assert_eq!(d.to_string(), original.to_string());
     }
 
@@ -1040,5 +1550,203 @@ mod agent_naming_tests {
         let mut unnamed = wrapper("npx", "[\"srv\"]");
         wrap_toml_naming(&mut unnamed, BIN, false, None);
         assert_eq!(unnamed_reconnect_flag_toml(&unnamed, BIN, "my.app"), None);
+    }
+}
+
+#[cfg(test)]
+mod remote_wiring_tests {
+    use super::*;
+
+    const BIN: &str = "/abs/innerwarden";
+
+    /// A Codex config as `codex mcp add` writes it and a person edits it:
+    /// a server with its token's variable, one with headers of each kind
+    /// and a comment, one with its headers in a table of their own, one
+    /// Codex signs in to, and a local one.
+    const CODEX: &str = r#"# my Codex settings
+model = "gpt-5"
+
+[mcp_servers.docs]
+url = "https://docs.example/mcp"
+bearer_token_env_var = "DOCS_TOKEN"
+startup_timeout_sec = 20
+
+[mcp_servers.team]
+url = "https://team.example/mcp" # the team server
+http_headers = { X-Team = "blue", X-Env = "prod" }
+env_http_headers = { X-Org = "ORG_ID" }
+enabled = true
+
+[mcp_servers.sub]
+url = "http://127.0.0.1:9000/mcp"
+
+[mcp_servers.sub.http_headers]
+X-A = "1"
+
+[mcp_servers.signin]
+url = "https://x.example/mcp"
+scopes = ["read"]
+
+[mcp_servers.local]
+command = "npx"
+args = ["-y", "srv"]
+"#;
+
+    fn args_of(doc: &DocumentMut, name: &str) -> Vec<String> {
+        doc["mcp_servers"][name]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Every remote server the proxy can carry becomes a wrapper Codex
+    /// accepts as a local server (none of the keys it refuses there), the
+    /// variables go to `env_vars` and never a value, and disconnect gives
+    /// back the file byte for byte, after a mode switch too. FAILS ON REVERT
+    /// of `remote_as_local` (nothing wrapped) or `restore_remote` (the
+    /// table comes back as a command named after its address).
+    #[test]
+    fn codex_remote_servers_are_wired_and_come_back_byte_for_byte() {
+        let mut doc: DocumentMut = CODEX.parse().unwrap();
+        assert_eq!(
+            server_counts_toml(&doc),
+            crate::mcp_wire::ServerCounts {
+                stdio: 4,
+                wrapped: 0,
+                remote: 1
+            }
+        );
+        assert_eq!(wrap_toml(&mut doc, BIN, false, "codex"), 4);
+        assert!(is_guarded_toml(&doc));
+        assert_eq!(server_counts_toml(&doc).remote, 1, "signin stays as it was");
+        for name in ["docs", "team", "sub"] {
+            let server = doc["mcp_servers"][name].as_table().unwrap();
+            for key in [
+                "url",
+                "bearer_token_env_var",
+                "http_headers",
+                "env_http_headers",
+            ] {
+                assert!(server.get(key).is_none(), "{name}.{key}: {doc}");
+            }
+            assert_eq!(server["command"].as_str(), Some(BIN));
+        }
+        let docs = args_of(&doc, "docs");
+        assert_eq!(
+            docs[docs.iter().position(|a| a == "--").unwrap()..],
+            [
+                "--",
+                "https://docs.example/mcp",
+                "--bearer-env",
+                "DOCS_TOKEN"
+            ]
+        );
+        let env_vars: Vec<&str> = doc["mcp_servers"]["docs"]["env_vars"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(env_vars, ["DOCS_TOKEN"]);
+        let team = args_of(&doc, "team");
+        assert_eq!(
+            team[team.iter().position(|a| a == "--").unwrap()..],
+            [
+                "--",
+                "https://team.example/mcp",
+                "--headers",
+                "--env-headers",
+                "--header-env",
+                "X-Org",
+                "ORG_ID"
+            ]
+        );
+        let text = doc.to_string();
+        assert!(text.contains("# the team server"), "{text}");
+        assert!(
+            text.contains("INNERWARDEN_MCP_HEADER_1 = \"X-Team: blue\""),
+            "{text}"
+        );
+        assert!(text.contains("[mcp_servers.sub.env]"), "{text}");
+
+        // What the proxy reads from the team wrapper: the headers in `env`
+        // and the one whose value Codex hands it in `ORG_ID`.
+        let env = doc["mcp_servers"]["team"]["env"]
+            .as_inline_table()
+            .unwrap()
+            .clone();
+        let words = team[team.iter().position(|a| a == "--").unwrap() + 1..].to_vec();
+        let spec = crate::mcp_proxy::remote::RemoteSpec::from_cmd(&words, |name| {
+            if name == "ORG_ID" {
+                return Some("org-7".to_string());
+            }
+            env.get(name).and_then(Value::as_str).map(str::to_string)
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            spec.headers,
+            [
+                ("X-Team".to_string(), "blue".to_string()),
+                ("X-Env".to_string(), "prod".to_string()),
+                ("X-Org".to_string(), "org-7".to_string())
+            ]
+        );
+
+        assert_eq!(wrap_toml(&mut doc, BIN, false, "codex"), 0, "idempotent");
+        assert_eq!(wrap_toml(&mut doc, BIN, true, "codex"), 4);
+        assert_eq!(guarded_mode_toml(&doc), Some(WiringMode::Monitor));
+        assert_eq!(unwrap_toml(&mut doc), 4);
+        assert_eq!(doc.to_string(), CODEX);
+    }
+
+    /// Automatic setup wraps only the local server: a server reached by URL
+    /// may be one Codex signs in to with `codex mcp login`, which no key
+    /// says. FAILS ON REVERT of `wrap_toml_local` taking the remote ones.
+    #[test]
+    fn automatic_setup_wraps_only_local_servers() {
+        let mut doc: DocumentMut = CODEX.parse().unwrap();
+        assert!(is_automatic_wrap_safe_toml(&doc));
+        assert_eq!(wrap_toml_local(&mut doc, BIN, false, "codex"), 1);
+        assert!(local_servers_guarded_toml(&doc));
+        assert!(!is_guarded_toml(&doc), "the remote ones are still direct");
+        assert_eq!(
+            doc["mcp_servers"]["docs"]["url"].as_str(),
+            Some("https://docs.example/mcp")
+        );
+        let remote_only: DocumentMut = "[mcp_servers.docs]\nurl = \"https://docs.example/mcp\"\n"
+            .parse()
+            .unwrap();
+        assert!(is_guardable_toml(&remote_only));
+        assert!(!is_automatic_wrap_safe_toml(&remote_only));
+    }
+
+    /// A table the proxy cannot carry is left exactly as it was and counted
+    /// remote: a token written in the file, a sign-in Codex does itself, a
+    /// header program, a server run elsewhere, an address that is not
+    /// http(s), a header that is not text, `env_http_headers` in a table
+    /// of its own.
+    #[test]
+    fn a_table_the_proxy_cannot_carry_is_left_alone() {
+        for server in [
+            "url = \"https://x.example/mcp\"\nbearer_token = \"abc\"\n",
+            "url = \"https://x.example/mcp\"\noauth_resource = \"https://x.example\"\n",
+            "url = \"https://x.example/mcp\"\nscopes = [\"a\"]\n",
+            "url = \"https://x.example/mcp\"\nhttp_headers_helper = \"/bin/mint\"\n",
+            "url = \"https://x.example/mcp\"\nenvironment_id = \"remote\"\n",
+            "url = \"ftp://x.example/mcp\"\n",
+            "url = \"https://x.example/mcp\"\nhttp_headers = { A = 1 }\n",
+            "url = \"https://x.example/mcp\"\nbearer_token_env_var = \"NOT A NAME\"\n",
+            "url = \"https://x.example/mcp\"\n\n[mcp_servers.x.env_http_headers]\nA = \"B\"\n",
+        ] {
+            let text = format!("[mcp_servers.x]\n{server}");
+            let mut doc: DocumentMut = text.parse().unwrap();
+            assert_eq!(wrap_toml(&mut doc, BIN, false, "codex"), 0, "{text}");
+            assert_eq!(doc.to_string(), text);
+            assert_eq!(server_counts_toml(&doc).remote, 1, "{text}");
+            assert!(!is_guardable_toml(&doc), "{text}");
+        }
     }
 }

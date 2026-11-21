@@ -51,8 +51,30 @@ list, with every limit.
   in for the client, so an entry with `oauth`, `auth` or
   `authProviderType` is left as it was (and counted as not screened), and a
   server that asks for a sign-in the client would have done (HTTP 401) gets an
-  error that says to put its token in the entry's headers; Codex's TOML and
-  Goose's YAML remote servers are not carried yet.
+  error that says to put its token in the entry's headers.
+- From the release after 1.6.15, Codex's and Goose's MCP servers reached by
+  URL go through the same proxy. In Codex's `config.toml` a server with a
+  `url` becomes a wrapper Codex runs as a local server: its token stays in
+  the variable `bearer_token_env_var` names, which Codex hands the proxy
+  (`env_vars`), and the proxy sends it as `Authorization: Bearer`; the
+  variables of `env_http_headers` go the same way, and `http_headers`
+  travel in the wrapper's `env`. No token is written in the file, the
+  wrapper or a log; a token variable that is not set stops the proxy with a
+  message naming the variable. In Goose's `config.yaml` an extension of
+  `type: streamable_http` or `sse` becomes `type: stdio` with `cmd` and
+  `args` lines connect marks as its own; its `uri` and `headers` lines
+  stay where they were, and the proxy reads the headers there, with
+  `$VAR` filled from the variables Goose hands its servers (`envs`,
+  `env_keys`). `agents disconnect` gives back each file as it was. Limits:
+  a server Codex signs in to (`oauth`, `scopes`, `auth`), one with a token
+  written in the file (`bearer_token`), a header program
+  (`http_headers_helper`) or another `environment_id` is left as it was,
+  and so is a Goose extension with `client_id`, a `socket` or a `$` in its
+  `uri`; each is counted as not screened. A Codex server signed in with
+  `codex mcp login` names no key that says so: connect carries it, the proxy
+  cannot sign in for it, and `agents disconnect codex` gives it back.
+  Automatic setup never carries a remote server; only a connect a person
+  runs does.
 - From the release after 1.6.15, a tool call whose tool's name says it
   deletes, moves or writes (`delete_directory`, `move_file`, `write_file`,
   `fs.rmdir`, ...) is refused in `guard`, `strict` and `kill`

@@ -103,6 +103,109 @@ pub struct RemoteSpec {
     pub headers: Vec<(String, String)>,
 }
 
+/// Where Goose keeps its configuration, under `$HOME`: the file
+/// `agents connect` wires (`agents::KNOWN`, `mcp_yaml`), read again by a
+/// Goose remote server's proxy for the headers the extension names
+/// (`--goose-headers`).
+pub const GOOSE_CONFIG: &str = ".config/goose/config.yaml";
+
+/// A header name as HTTP takes it (a token).
+pub(crate) fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_|~".contains(&b))
+}
+
+/// An environment variable name as a configuration may give one.
+pub(crate) fn is_env_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Goose's `$VAR` and `${VAR}` in a header value, filled from `env` the
+/// way Goose fills them (`substitute_env_vars` in its extension config): a
+/// name with no value stays written as it was, and a value put in is not
+/// read again.
+fn fill_goose_vars(value: &str, env: &impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(at) = rest.find('$') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let (name, used) = if let Some(inner) = after.strip_prefix('{') {
+            match inner.find('}') {
+                Some(close)
+                    if !inner[..close].trim().is_empty()
+                        && !inner[..close].trim().contains(char::is_whitespace)
+                        && !inner[..close].contains('{') =>
+                {
+                    (inner[..close].trim(), close + 2)
+                }
+                _ => ("", 0),
+            }
+        } else {
+            let len = after
+                .char_indices()
+                .take_while(|(i, c)| {
+                    c.is_ascii_alphabetic() || *c == '_' || (*i > 0 && c.is_ascii_digit())
+                })
+                .count();
+            (&after[..len], len)
+        };
+        match (name.is_empty(), env(name)) {
+            (false, Some(filled)) => out.push_str(&filled),
+            _ if used > 0 => out.push_str(&rest[at..at + 1 + used]),
+            _ => out.push('$'),
+        }
+        rest = &after[used..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The headers Goose's extension `name` gives its remote server, read from
+/// Goose's configuration text and filled from `env` ([`fill_goose_vars`]).
+/// An extension with no `headers` has none; one Goose would not read is an
+/// error naming the extension, never a value.
+fn goose_headers(
+    config: &str,
+    name: &str,
+    env: &impl Fn(&str) -> Option<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(config)
+        .map_err(|_| "Goose's configuration could not be read".to_string())?;
+    let extension = doc
+        .get("extensions")
+        .and_then(|extensions| extensions.get(name))
+        .ok_or_else(|| format!("Goose's configuration has no extension `{name}`"))?;
+    let Some(headers) = extension.get("headers") else {
+        return Ok(Vec::new());
+    };
+    if headers.is_null() {
+        return Ok(Vec::new());
+    }
+    let map = headers
+        .as_mapping()
+        .ok_or_else(|| format!("the headers of extension `{name}` are not a mapping"))?;
+    let mut out = Vec::new();
+    for (key, value) in map {
+        let (Some(key), Some(value)) = (key.as_str(), value.as_str()) else {
+            return Err(format!(
+                "a header of extension `{name}` is not written as text"
+            ));
+        };
+        if !is_header_name(key.trim()) {
+            return Err(format!(
+                "extension `{name}` names a header HTTP does not take"
+            ));
+        }
+        out.push((key.trim().to_string(), fill_goose_vars(value, env)));
+    }
+    Ok(out)
+}
+
 impl RemoteSpec {
     /// The remote server a wrapper's command names, with its headers read
     /// through `env`. `None` when the command is a program; an error for an
@@ -111,38 +214,95 @@ impl RemoteSpec {
     ///
     /// After the address the wrapper may carry `--key <name>` (the key the
     /// address was under, for disconnect) and `--type <type>` (the entry's
-    /// type; `sse` selects the older transport).
+    /// type; `sse` selects the older transport). A Codex server adds where
+    /// its token and headers come from: `--bearer-env <VAR>` (sent as
+    /// `Authorization: Bearer`, the variable must be set) and
+    /// `--header-env <Name> <VAR>` (sent when the variable is set). A Goose
+    /// server adds `--goose-headers <extension>`: the headers that
+    /// extension has in Goose's configuration, `$VAR` filled from the
+    /// environment Goose gives its servers. A value is only ever read where
+    /// the agent itself would read it; none is written in the wrapper.
     pub fn from_cmd(
         cmd: &[String],
         env: impl Fn(&str) -> Option<String>,
+    ) -> Option<Result<Self, String>> {
+        Self::from_cmd_reading(cmd, env, |path| std::fs::read_to_string(path).ok())
+    }
+
+    /// [`Self::from_cmd`] with the read of Goose's configuration given.
+    pub fn from_cmd_reading(
+        cmd: &[String],
+        env: impl Fn(&str) -> Option<String>,
+        read: impl Fn(&std::path::Path) -> Option<String>,
     ) -> Option<Result<Self, String>> {
         let url = cmd.first()?;
         if !is_remote_url(url) {
             return None;
         }
-        Some(Self::parse(url, &cmd[1..], env))
+        Some(Self::parse(url, &cmd[1..], env, read))
     }
 
     fn parse(
         url: &str,
         rest: &[String],
         env: impl Fn(&str) -> Option<String>,
+        read: impl Fn(&std::path::Path) -> Option<String>,
     ) -> Result<Self, String> {
         let mut legacy_sse = false;
+        let mut headers = Vec::new();
+        let mut from_vars: Vec<(String, String)> = Vec::new();
         let mut words = rest.iter();
+        let value_of = |word: &str, words: &mut std::slice::Iter<'_, String>| {
+            words
+                .next()
+                .cloned()
+                .ok_or_else(|| format!("{word} after the remote server's address needs a value"))
+        };
         while let Some(word) = words.next() {
             match word.as_str() {
                 // What the entry had, for disconnect; nothing to the proxy.
-                "--headers" | "--env" => {}
+                "--headers" | "--env" | "--env-headers" => {}
                 "--key" | "--type" => {
-                    let Some(value) = words.next() else {
-                        return Err(format!(
-                            "{word} after the remote server's address needs a value"
-                        ));
-                    };
+                    let value = value_of(word, &mut words)?;
                     if word == "--type" && value.eq_ignore_ascii_case("sse") {
                         legacy_sse = true;
                     }
+                }
+                "--bearer-env" => {
+                    let var = value_of(word, &mut words)?;
+                    if !is_env_name(&var) {
+                        return Err("--bearer-env does not name a variable".to_string());
+                    }
+                    match env(&var).filter(|token| !token.is_empty()) {
+                        Some(token) => from_vars.push((
+                            "Authorization".to_string(),
+                            format!("Bearer {}", token.trim()),
+                        )),
+                        None => {
+                            return Err(format!(
+                            "the variable {var}, which holds the remote server's token, is not set"
+                        ))
+                        }
+                    }
+                }
+                "--header-env" => {
+                    let name = value_of(word, &mut words)?;
+                    let var = value_of(word, &mut words)?;
+                    if !is_header_name(&name) || !is_env_name(&var) {
+                        return Err("--header-env needs a header name and a variable".to_string());
+                    }
+                    if let Some(value) = env(&var).filter(|value| !value.is_empty()) {
+                        from_vars.push((name, value.trim().to_string()));
+                    }
+                }
+                "--goose-headers" => {
+                    let extension = value_of(word, &mut words)?;
+                    let home = env("HOME").filter(|home| !home.is_empty()).ok_or(
+                        "HOME is not set, so Goose's configuration cannot be found".to_string(),
+                    )?;
+                    let config = read(&std::path::Path::new(&home).join(GOOSE_CONFIG))
+                        .ok_or("Goose's configuration could not be read".to_string())?;
+                    from_vars.extend(goose_headers(&config, &extension, &env)?);
                 }
                 other => {
                     return Err(format!(
@@ -151,7 +311,6 @@ impl RemoteSpec {
                 }
             }
         }
-        let mut headers = Vec::new();
         for n in 1..=MAX_HEADERS {
             let name = format!("{HEADER_ENV_PREFIX}{n}");
             let Some(line) = env(&name) else {
@@ -161,17 +320,23 @@ impl RemoteSpec {
                 return Err(format!("{name} is not written as `Name: value`"));
             };
             let key = key.trim();
-            if key.is_empty()
-                || !key
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_|~".contains(&b))
-            {
+            if !is_header_name(key) {
                 return Err(format!("{name} does not name a header"));
             }
             if value.contains(['\r', '\n', '\0']) {
                 return Err(format!("{name} holds a line break"));
             }
             headers.push((key.to_string(), value.trim().to_string()));
+        }
+        for (key, value) in from_vars {
+            // The name only: the value may be the token.
+            if value.contains(['\r', '\n', '\0']) {
+                return Err(format!("the value for header {key} holds a line break"));
+            }
+            headers.push((key, value));
+        }
+        if headers.len() > MAX_HEADERS {
+            return Err(format!("more than {MAX_HEADERS} headers"));
         }
         Ok(Self {
             url: url.to_string(),
@@ -854,6 +1019,120 @@ fn end_session(shared: &Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Goose's `$VAR` and `${VAR}` are filled as Goose fills them: a name
+    /// with no value stays written, a value is not read again (Goose's own
+    /// cases, `substitute_env_vars`).
+    #[test]
+    fn goose_variables_are_filled_as_goose_fills_them() {
+        let env = |name: &str| match name {
+            "TOKEN" => Some("abc$KEY".to_string()),
+            "KEY" => Some("no".to_string()),
+            _ => None,
+        };
+        for (input, want) in [
+            ("${TOKEN}", "abc$KEY"),
+            ("$TOKEN", "abc$KEY"),
+            ("Bearer ${ TOKEN }!", "Bearer abc$KEY!"),
+            ("$MISSING and ${MISSING}", "$MISSING and ${MISSING}"),
+            ("cost: $5", "cost: $5"),
+            ("$", "$"),
+        ] {
+            assert_eq!(fill_goose_vars(input, &env), want, "{input}");
+        }
+    }
+
+    /// A Codex token's variable that is not set stops the proxy with a
+    /// message naming the variable; a header's variable that is not set
+    /// sends no header. A token value is never in a message. FAILS ON
+    /// REVERT of `--bearer-env` (the word is refused as unexpected).
+    #[test]
+    fn a_codex_token_comes_from_its_variable_and_is_never_named() {
+        let words = |rest: &[&str]| -> Vec<String> {
+            std::iter::once("https://x.example/mcp")
+                .chain(rest.iter().copied())
+                .map(str::to_string)
+                .collect()
+        };
+        let spec = RemoteSpec::from_cmd(
+            &words(&[
+                "--bearer-env",
+                "TOK",
+                "--env-headers",
+                "--header-env",
+                "X-Org",
+                "ORG",
+            ]),
+            |name| (name == "TOK").then(|| "s3cret".to_string()),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            spec.headers,
+            [("Authorization".to_string(), "Bearer s3cret".to_string())]
+        );
+        let error = RemoteSpec::from_cmd(&words(&["--bearer-env", "TOK"]), |_| None)
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.contains("TOK") && error.contains("not set"),
+            "{error}"
+        );
+        let error = RemoteSpec::from_cmd(&words(&["--bearer-env", "TOK"]), |_| {
+            Some("s3cret\nX: y".to_string())
+        })
+        .unwrap()
+        .unwrap_err();
+        assert!(!error.contains("s3cret"), "{error}");
+    }
+
+    /// Goose's headers are read from Goose's configuration under HOME, for
+    /// the extension the wrapper names, filled from the environment.
+    #[test]
+    fn goose_headers_are_read_where_goose_keeps_them() {
+        let config = "extensions:\n  r:\n    type: stdio\n    headers:\n      Authorization: Bearer ${T}\n      X-Team: blue\n  bare:\n    type: stdio\n";
+        let words: Vec<String> = ["https://x.example/mcp", "--goose-headers", "r"]
+            .map(str::to_string)
+            .to_vec();
+        let env = |name: &str| match name {
+            "HOME" => Some("/home/u".to_string()),
+            "T" => Some("tok".to_string()),
+            _ => None,
+        };
+        let read = |path: &std::path::Path| {
+            (path == std::path::Path::new("/home/u/.config/goose/config.yaml"))
+                .then(|| config.to_string())
+        };
+        let spec = RemoteSpec::from_cmd_reading(&words, env, read)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            spec.headers,
+            [
+                ("Authorization".to_string(), "Bearer tok".to_string()),
+                ("X-Team".to_string(), "blue".to_string())
+            ]
+        );
+        let none = ["https://x.example/mcp", "--goose-headers", "bare"].map(str::to_string);
+        let spec = RemoteSpec::from_cmd_reading(&none, env, read)
+            .unwrap()
+            .unwrap();
+        assert!(spec.headers.is_empty());
+        let gone = ["https://x.example/mcp", "--goose-headers", "gone"].map(str::to_string);
+        assert!(RemoteSpec::from_cmd_reading(&gone, env, read)
+            .unwrap()
+            .is_err());
+    }
+
+    /// The path the proxy reads is the one connect wires.
+    #[test]
+    fn the_goose_config_is_the_one_connect_wires() {
+        let goose = crate::agents::KNOWN
+            .iter()
+            .find(|k| k.name == "goose")
+            .unwrap();
+        assert_eq!(goose.mcp_yaml, Some(GOOSE_CONFIG));
+    }
 
     fn cmd(words: &[&str]) -> Vec<String> {
         words.iter().map(|w| w.to_string()).collect()
