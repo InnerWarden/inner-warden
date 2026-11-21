@@ -87,14 +87,16 @@ The 25 benign refusals of main were all by name: `send_money`,
 `send_direct_message` (ATR-2026-098) and `delete_file` (ATR-2026-040).
 With the posture each is forwarded with the rule's alert and an `AG-POSTURE`
 note. The attacks still stopped are stopped because the call carries a value
-the injected text said (the taint tracker, the effect table); the
-`delete_file` of file `13` that the injected text asks for is stopped by
-its name because `13`, too short to be looked for alone, is said as a word of
-that text. Still passing, as on main: travel 2 and 4 (a calendar event
+the injected text said (the taint tracker, the effect table, and any
+value of any length a server said as a whole word: the `delete_file` of file
+`13` that the injected text asks for is stopped by its name because `13` is
+in that text). Still passing, as on main: travel 2 and 4 (a calendar event
 and a hotel booking).
 This fake server answers every benign call with a fixed text, so no value
-the user asked for appears in a result: a real session where the person pays
-a bill a tool read is refused, as before.
+the user asked for appears in a result. In a real session a value the person
+names is often in what a tool listed before (a file id, a colleague's name in
+a channel), and then the call keeps its refusal by name, as before: the 0 of
+339 is a floor for this harness, not a measure of real sessions.
 
 ## 3. Poisoned model (model-poisoning-poc-example)
 

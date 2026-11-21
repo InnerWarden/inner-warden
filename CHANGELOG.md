@@ -12,9 +12,14 @@ tool's name or its argument names: that call is forwarded with a warning and
 a record. On AgentDojo, through `innerwarden proxy --mode guard` in front of
 a server that runs nothing: the calls its users asked for refused went from
 25 of 339 to 0, and the injection tasks stopped stayed 24 of 26 (main before
-this change: 24). A secret read, a privileged write, a tool whose definition
-changed, a shell line judged `deny`, and a call that names the root, a home
-or a key store are refused as before. `--mode kill` keeps every refusal of
+this change: 24). A call stays refused when any value it carries was said
+by a server this session as a whole word, when a value is or is under a
+system folder (`/private` too), the guard's folders, a home or a dot entry
+of a home (after `..` is taken out), or is written like a shell line or a link, and so do a
+secret read, a privileged write, a tool whose definition changed and a shell
+line judged `deny`. The fake server answers with fixed text, so the 0 is a
+floor for this harness: in a real session a value a tool listed keeps the
+refusal. `--mode kill` keeps every refusal of
 before. Details: [What InnerWarden does](docs/features.md).
 
 A here-document is read as the input of the command it is written after, and

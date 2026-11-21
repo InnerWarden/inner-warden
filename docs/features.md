@@ -35,11 +35,15 @@ list, with every limit.
   forwards the call with a warning and a record instead of refusing it. Such a
   rule refused the person's own payment, message or delete as it refused an
   injected one (25 of 339 calls AgentDojo's users asked for). The call stays
-  refused when a value it carries was said by a server this session (the
-  taint tracker, the effect and provenance table, also a short value such as
-  a file id said as a word of text shaped as an order to the assistant), when a value it carries matches
-  the rule too, when it names the root, a top-level system folder, a home or
-  a key store, when the call runs a command line, and when anything else
+  refused when a value it carries, of any length (a file id too), was said
+  by a server this session as a whole word, or the session was not read
+  whole; when a value it carries matches the rule too; when a value is or is
+  under the root, a top-level system folder (`/etc/passwd`), a folder of the
+  guard's, a home itself or a dot entry at the top of a home
+  (`~/.ssh/authorized_keys`), read after `..` is taken out (`/private` is a
+  system folder; a relative path that climbs above where it starts counts); when a value
+  is written like a shell line or a link (`|`, `;`, `&&`, a backquote,
+  `$(`, `${`, a URL); when the call runs a command line; and when anything else
   refuses it (a secret read, a privileged write, a tool held since its
   definition changed, a shell line judged `deny`, the loop breaker). A
   value not said by any server proves nothing about where it came from,
