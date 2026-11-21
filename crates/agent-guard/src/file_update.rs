@@ -903,11 +903,76 @@ fn replace_inner(
     )
 }
 
+/// What a write puts in the file.
+enum Content<'a> {
+    /// This body, when the file holds `expected` (`Some(None)`: no file;
+    /// `None`: whatever it holds).
+    Replace {
+        expected: Option<Option<&'a [u8]>>,
+        body: &'a [u8],
+    },
+    /// The body this makes of what the file holds, read under the update lock
+    /// (`None`: no file). An error writes nothing.
+    Update(&'a mut dyn FnMut(Option<&[u8]>) -> Result<Vec<u8>, String>),
+}
+
+/// Read a store under its update lock, make the new body of what it holds,
+/// and write it, the lock held from the read to the rename: two writers of one
+/// store never read the same bytes, so neither has to read again and retry.
+/// [`replace_owned_store_no_symlinks`] in every other way: the same lock, the
+/// same refusal of links, the same owner and group. A writer that does not take
+/// the lock (an editor, an agent's own process) and writes between the read and
+/// the rename is still caught by the compare made right before the rename, and
+/// the write is given up ([`ReplaceError::Failed`]) for the caller to retry.
+///
+/// A lock held for the whole of `lock_wait` is [`ReplaceError::LockBusy`], and
+/// nothing is written.
+pub fn update_owned_store_no_symlinks(
+    trusted_root: &Path,
+    path: &Path,
+    lock_wait: Duration,
+    change: &mut dyn FnMut(Option<&[u8]>) -> Result<Vec<u8>, String>,
+) -> Result<(), ReplaceError> {
+    write_inner_with(
+        path,
+        Content::Update(change),
+        false,
+        Some(trusted_root),
+        MAX_OWNED_STORE_BYTES,
+        Ownership::SharedRecord,
+        lock_wait,
+        restore_owner,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn replace_inner_with(
     requested_path: &Path,
     expected: Option<Option<&[u8]>>,
     body: &[u8],
+    follow_file_symlink: bool,
+    trusted_root: Option<&Path>,
+    limit: u64,
+    ownership: Ownership,
+    lock_wait: Duration,
+    restore_owner: RestoreOwner,
+) -> Result<(), ReplaceError> {
+    write_inner_with(
+        requested_path,
+        Content::Replace { expected, body },
+        follow_file_symlink,
+        trusted_root,
+        limit,
+        ownership,
+        lock_wait,
+        restore_owner,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_inner_with(
+    requested_path: &Path,
+    content: Content<'_>,
     follow_file_symlink: bool,
     trusted_root: Option<&Path>,
     limit: u64,
@@ -930,24 +995,41 @@ fn replace_inner_with(
     fs::create_dir_all(parent)
         .map_err(|error| format!("creating {}: {error}", parent.display()))?;
     let lock = UpdateLock::acquire(&path, ownership, lock_wait)?;
-    if let Some(expected) = expected {
-        let current = if follow_file_symlink {
-            current_bytes(&path, limit)?
+    let read_current = || {
+        if follow_file_symlink {
+            current_bytes(&path, limit)
         } else {
             current_bytes_no_symlinks(
                 trusted_root.ok_or_else(|| "missing automatic setup root".to_string())?,
                 &path,
                 limit,
-            )?
-        };
-        if current.as_deref() != expected {
-            return Err(format!(
-                "{} changed while InnerWarden was preparing the update; retry",
-                requested_path.display()
             )
-            .into());
         }
-    }
+    };
+    // What the file must still hold right before the rename, and the body.
+    let (expected, body): (Option<Option<Vec<u8>>>, std::borrow::Cow<'_, [u8]>) = match content {
+        Content::Replace { expected, body } => {
+            if let Some(expected) = expected {
+                if read_current()?.as_deref() != expected {
+                    return Err(format!(
+                        "{} changed while InnerWarden was preparing the update; retry",
+                        requested_path.display()
+                    )
+                    .into());
+                }
+            }
+            (
+                expected.map(|expected| expected.map(<[u8]>::to_vec)),
+                std::borrow::Cow::Borrowed(body),
+            )
+        }
+        Content::Update(change) => {
+            let current = read_current()?;
+            let body = change(current.as_deref())?;
+            (Some(current), std::borrow::Cow::Owned(body))
+        }
+    };
+    let body: &[u8] = &body;
     let previous_metadata = match fs::metadata(&path) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -1007,17 +1089,8 @@ fn replace_inner_with(
         // Narrow the compare/replace window by comparing again after the temp is
         // fully written and synced. Editors do not share this advisory lock, so
         // an external write in the final syscall window remains a same-user race.
-        if let Some(expected) = expected {
-            let current = if follow_file_symlink {
-                current_bytes(&path, limit)?
-            } else {
-                current_bytes_no_symlinks(
-                    trusted_root.ok_or_else(|| "missing automatic setup root".to_string())?,
-                    &path,
-                    limit,
-                )?
-            };
-            if current.as_deref() != expected {
+        if let Some(expected) = expected.as_ref() {
+            if read_current()? != *expected {
                 return Err(format!(
                     "{} changed while InnerWarden was preparing the update; retry",
                     requested_path.display()

@@ -229,47 +229,53 @@ fn kept_text_and_cut(prompt: &str) -> (String, bool) {
 /// How long a write waits for the update lock of a record.
 const UPDATE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// How many times a write reads the record again when another writer
-/// changed it between the read and the write, or held the lock for the
-/// whole of [`UPDATE_LOCK_WAIT`]. Inside the hook's own deadline.
+/// How many times a write is tried again when the update lock was held for
+/// the whole of [`UPDATE_LOCK_WAIT`], or a writer that does not take the lock
+/// changed the record between the read and the rename. Inside the hook's own
+/// deadline.
 const UPDATE_ATTEMPTS: usize = 8;
 
-/// Read the record of `session`, change it, and write it back under the
-/// guard's update lock (`crate::file_update::replace_owned_store_no_symlinks`,
-/// the lock and the compare-and-replace the guard's own record uses): the
-/// write lands only if the file still holds what was read, and is tried again
-/// from a fresh read otherwise, so two hook runs of one session never lose a
-/// prompt. A record that cannot be read is started again.
+/// Read the record of `session`, change it, and write it back, the guard's
+/// update lock held from the read to the rename
+/// (`crate::file_update::update_owned_store_no_symlinks`, the lock the guard's
+/// own record uses): two hook runs of one session never read the same record,
+/// so neither loses its prompt and neither has to read again. A record that
+/// cannot be read is started again.
+///
+/// The read was once made before the lock and compared after it: with many
+/// hook runs at once each round had one winner, and under load a run could
+/// lose every one of its attempts (`prompts_written_at_once_are_all_kept`).
 fn update_record_waiting(
     dir: &Path,
     session: &str,
     lock_wait: std::time::Duration,
     change: impl Fn(&mut Record),
 ) -> std::io::Result<PathBuf> {
-    use crate::file_update::{replace_owned_store_no_symlinks, ReplaceError};
+    use crate::file_update::{update_owned_store_no_symlinks, ReplaceError};
     make_dir(dir)?;
     let path = file_for(dir, session);
     let mut last = String::from("the record kept changing under the write");
     for _ in 0..UPDATE_ATTEMPTS {
-        let expected = match fs::symlink_metadata(&path) {
+        match fs::symlink_metadata(&path) {
             Ok(meta) if !meta.is_file() => {
                 return Err(std::io::Error::other("the record is not a plain file"));
             }
-            Ok(_) => Some(fs::read(&path)?),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
+        }
+        let mut changed = |current: Option<&[u8]>| {
+            let mut record = current
+                .and_then(|bytes| serde_json::from_slice::<Record>(bytes).ok())
+                .filter(|record| record.session == session)
+                .unwrap_or_else(|| Record {
+                    session: session.to_string(),
+                    ..Record::default()
+                });
+            change(&mut record);
+            serde_json::to_vec(&record).map_err(|e| e.to_string())
         };
-        let mut record = expected
-            .as_deref()
-            .and_then(|bytes| serde_json::from_slice::<Record>(bytes).ok())
-            .filter(|record| record.session == session)
-            .unwrap_or_else(|| Record {
-                session: session.to_string(),
-                ..Record::default()
-            });
-        change(&mut record);
-        let body = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
-        match replace_owned_store_no_symlinks(dir, &path, expected.as_deref(), &body, lock_wait) {
+        match update_owned_store_no_symlinks(dir, &path, lock_wait, &mut changed) {
             Ok(()) => return Ok(path),
             Err(ReplaceError::LockBusy { .. }) => {
                 last = String::from("the record's update lock was busy");
@@ -882,6 +888,42 @@ mod tests {
                 });
             }
         });
+        for i in 0..RUNS {
+            assert_eq!(
+                ask(&dir, Some(SESSION), &format!("ticket-{i}")),
+                UserAsked::Yes,
+                "prompt {i} was lost"
+            );
+        }
+    }
+
+    /// More hook runs of one session at once than a write has attempts, all
+    /// let go at the same instant: every prompt is kept. Each run reads the
+    /// record under the update lock, so none loses a round to another.
+    ///
+    /// FAILS ON REVERT: read the record before the lock and compare after it,
+    /// and with every run reading at once each round has few winners; runs
+    /// that lose all of their attempts lose their prompt (the write fails).
+    #[test]
+    fn more_prompts_at_once_than_attempts_are_all_kept() {
+        let (_tmp, dir) = dir();
+        const RUNS: usize = 4 * UPDATE_ATTEMPTS;
+        let start = std::sync::Barrier::new(RUNS);
+        let failed = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for i in 0..RUNS {
+                let (dir, start, failed) = (&dir, &start, &failed);
+                scope.spawn(move || {
+                    start.wait();
+                    if record_in(dir, Some(SESSION), None, &format!("open ticket-{i} now"), NOW)
+                        .is_err()
+                    {
+                        failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+        assert_eq!(failed.into_inner(), 0, "a write gave up");
         for i in 0..RUNS {
             assert_eq!(
                 ask(&dir, Some(SESSION), &format!("ticket-{i}")),
