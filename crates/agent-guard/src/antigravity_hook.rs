@@ -63,7 +63,25 @@ pub enum AgyCall {
     Call(Value),
     /// Not readable as a tool call.
     Unreadable(&'static str),
+    /// A tool the guard does not read (its name, as sent): any tool outside
+    /// the ones it translates and [`READ_ONLY_TOOLS`]. Asked of the person in
+    /// enforce mode (`force_ask`), refused with `--block-review`, never let
+    /// through as if it named nothing.
+    Unknown(String),
 }
+
+/// Antigravity's documented tools that only look: they list a folder, ask
+/// the person, show grants, or read the public web (as Claude Code's
+/// `WebFetch` and `WebSearch`, which the guard lets through too). Read
+/// with their own name and arguments; everything else the guard does not
+/// translate is [`AgyCall::Unknown`].
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    "list_dir",
+    "search_web",
+    "read_url_content",
+    "list_permissions",
+    "ask_question",
+];
 
 /// A non-blank string field of `value`.
 fn text<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -99,9 +117,10 @@ fn include_glob(args: &Value) -> Option<String> {
 /// same kind: `run_command` is `Bash` in its `Cwd`, `view_file` is `Read`,
 /// `write_to_file` is `Write`, `replace_file_content` is `Edit`,
 /// `multi_replace_file_content` is `MultiEdit`, `grep_search` is `Grep` and
-/// `find_by_name` is `Glob`. Any other tool keeps its own name and
-/// arguments, and is judged as every agent's unknown tool is. A call with no
-/// folder of its own is judged in the first workspace path.
+/// `find_by_name` is `Glob`. A tool of [`READ_ONLY_TOOLS`] keeps its own
+/// name and arguments; any other is [`AgyCall::Unknown`]. Tool names are
+/// matched without regard to case. A call with no folder of its own is
+/// judged in the first workspace path.
 ///
 /// A screened tool without the argument that names what it acts on is
 /// unreadable, never let through as if it named nothing.
@@ -146,7 +165,7 @@ pub fn read(payload: &str) -> AgyCall {
     };
     let field = |key: &str| text(&args, key);
     let or_empty = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or("");
-    match name {
+    match name.to_ascii_lowercase().as_str() {
         "run_command" => match field("CommandLine") {
             Some(command) => call("Bash", json!({ "command": command })),
             None => AgyCall::Unreadable("an Antigravity run_command with no CommandLine"),
@@ -196,7 +215,8 @@ pub fn read(payload: &str) -> AgyCall {
             ),
             None => AgyCall::Unreadable("an Antigravity find_by_name with no SearchDirectory"),
         },
-        other => call(other, args.clone()),
+        known if READ_ONLY_TOOLS.contains(&known) => call(known, args.clone()),
+        _ => AgyCall::Unknown(name.to_string()),
     }
 }
 
@@ -228,8 +248,11 @@ pub fn deny(message: &str) -> String {
 pub fn screened() -> String {
     "shell commands (`run_command`), changes to privileged files through `write_to_file`, \
      `replace_file_content` and `multi_replace_file_content`, and reads of secrets through \
-     `view_file`, `grep_search` and `find_by_name`. Its other tools reach the guard and are \
-     judged as any agent's unknown tool; its MCP servers are not behind the proxy."
+     `view_file`, `grep_search` and `find_by_name`. Its tools that only look (`list_dir`, \
+     `search_web`, `read_url_content`, `list_permissions`, `ask_question`) run; any other \
+     tool, its MCP tools and tools added after its documentation of 2026-11-21 included, asks \
+     you (`force_ask`), or is refused with --block-review. Its MCP servers are not behind the \
+     proxy."
         .to_string()
 }
 
@@ -458,16 +481,60 @@ mod tests {
         }
     }
 
-    /// A tool the guard does not translate keeps its name and arguments,
-    /// and is judged as any agent's unknown tool.
+    /// A tool that only looks keeps its name and arguments; any other tool
+    /// the guard does not translate is unknown, whatever its arguments are
+    /// called, and a screened tool's name in another case is still that tool.
+    ///
+    /// FAILS ON REVERT: hand every other tool on with its own name and
+    /// arguments, and `manage_task` (which can send input to a running
+    /// command) reads as a call that names no command, which the hook lets
+    /// through.
     #[test]
-    fn another_tool_keeps_its_name_and_arguments() {
-        let call = call(&payload(
+    fn a_tool_the_guard_does_not_read_is_unknown_and_never_a_call() {
+        let web = call(&payload(
             "read_url_content",
             json!({"Url": "https://example.com"}),
         ));
-        assert_eq!(call["tool_name"], "read_url_content");
-        assert_eq!(call["tool_input"], json!({"Url": "https://example.com"}));
+        assert_eq!(web["tool_name"], "read_url_content");
+        assert_eq!(web["tool_input"], json!({"Url": "https://example.com"}));
+        for (name, args) in [
+            (
+                "manage_task",
+                json!({"Action": "send_input", "TaskId": "t1", "Input": "rm -rf ~\n"}),
+            ),
+            (
+                "schedule",
+                json!({"CronExpression": "* * * * *", "Prompt": "run it"}),
+            ),
+            (
+                "invoke_subagent",
+                json!({"Subagents": [{"Prompt": "x", "Role": "y"}]}),
+            ),
+            ("browser_click", json!({"Selector": "#ok"})),
+            ("mcp_github_create_issue", json!({"Input": "x"})),
+            (
+                "a_tool_from_next_month",
+                json!({"AbsolutePath": "/home/dev/.ssh/id_ed25519"}),
+            ),
+            ("generate_image", json!({})),
+        ] {
+            assert_eq!(
+                read(&payload(name, args)),
+                AgyCall::Unknown(name.to_string()),
+                "{name}"
+            );
+        }
+        let bash = call(&payload("Run_Command", json!({"CommandLine": "ls"})));
+        assert_eq!(bash["tool_name"], "Bash");
+        let read_file = call(&payload(
+            "VIEW_FILE",
+            json!({"AbsolutePath": "/etc/passwd"}),
+        ));
+        assert_eq!(read_file["tool_name"], "Read");
+        assert!(matches!(
+            read(&payload("Run_Command", json!({}))),
+            AgyCall::Unreadable(_)
+        ));
     }
 
     /// What cannot be read as a call is unreadable (refused in enforce),

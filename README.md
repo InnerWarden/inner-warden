@@ -303,8 +303,14 @@ Whatever agent you run, there is a mechanism and a command for it:
   documented. Not screened: its MCP servers (where it keeps them is not
   confirmed, so the proxy is not wired). Judged only by the payloads its
   hooks documentation gives (read on 2026-11-21), not on a running
-  Antigravity CLI. Reversible with `agents disconnect antigravity`, which
-  gives back the hooks file it found, to the byte.
+  Antigravity CLI. Its tools that only look (`list_dir`, `search_web`,
+  `read_url_content`, `list_permissions`, `ask_question`) run; any other
+  tool asks you (`force_ask`), or is refused with --block-review. Reversible
+  with `agents disconnect antigravity`: a hooks file that held hooks of yours
+  comes back as it was, to the byte, while the guard's entry is still the
+  text connect wrote (after a reformat it is written whole, in your key
+  order); a file that was missing, blank or only `{}` is removed. A hooks
+  file that is a link is refused, by connect and by disconnect.
   OpenClaw has one more surface, and it observes rather than enforces: its
   message hooks see the inbound prompt and the reply, so
   `innerwarden observe install` records a dangerous ask even when the model,

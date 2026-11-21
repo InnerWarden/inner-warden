@@ -901,11 +901,13 @@ fn vacate_named(mut settings: Value, spec: &HookSpec) -> (Value, usize) {
 /// Only the guard's member changes, so it is taken out and put back as text
 /// ([`crate::antigravity_hook::splice_in`]): every byte of the person's
 /// stays where it was, and a disconnect gives back the file a connect found,
-/// to the byte. A file connect created is removed by the disconnect that
-/// empties it (a file that held only `{}` before reads the same, and goes
-/// too: Antigravity reads no hook from either). Whenever the text is not
-/// what this wrote, or the result does not read as `merged`, the file is
-/// written whole in the person's key order, as for the other agents.
+/// to the byte, while our member is still the text connect wrote. A file
+/// connect created is removed by the disconnect that empties it, and so is
+/// one that was blank or held only `{}` before (they read the same, and
+/// Antigravity reads no hook from any of them): those do not come back.
+/// Whenever the text is not what this wrote (the file was reformatted), or
+/// the result does not read as `merged`, the file is written whole in the
+/// person's key order, as for the other agents: then not to the byte.
 fn antigravity_body(
     before: Option<&[u8]>,
     settings: &Value,
@@ -964,6 +966,27 @@ fn antigravity_body(
     }
 }
 
+/// Antigravity's hooks file must be a file of its own, not a link. Its
+/// connect and disconnect write by text and remove the file a disconnect
+/// empties: through a link that would be another file's bytes, or the file
+/// the link points to removed. The read already refuses a link (it opens
+/// without following one, "too many levels of symbolic links"); this says
+/// so in words, with what to do, before anything is read or written.
+fn refuse_a_link(path: &Path, spec: &HookSpec) -> Result<(), String> {
+    if spec.host != Host::Antigravity {
+        return Ok(());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(format!(
+            "{} is a link; InnerWarden does not write {}'s hooks through one. Put the file it \
+             points to in its place, then run this again",
+            path.display(),
+            spec.product
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Write `body` to `path` (or remove the file, for `None`), refused when
 /// the file changed since it was read as `before`.
 fn commit(path: &Path, before: Option<&[u8]>, body: Option<String>) -> Result<(), String> {
@@ -1012,6 +1035,7 @@ fn install_noting_moved(
     monitor: bool,
 ) -> Result<(bool, Vec<String>), String> {
     let path = spec.path(home);
+    refuse_a_link(&path, spec)?;
     let before = file_update::read_config(&path)?;
     let settings = parse(&path, before.as_deref())?;
     let command = spec.command(guard_bin, block_review, monitor);
@@ -1045,6 +1069,7 @@ pub fn uninstall_noting_moved(
     spec: &HookSpec,
 ) -> Result<(usize, Vec<String>), String> {
     let path = spec.path(home);
+    refuse_a_link(&path, spec)?;
     let before = file_update::read_config(&path)?;
     let settings = parse(&path, before.as_deref())?;
     let ours = found(&settings, spec);
@@ -4430,6 +4455,43 @@ mod antigravity_tests {
         assert!(file(home.path()).is_file());
         assert_eq!(uninstall(home.path(), &ANTIGRAVITY).unwrap(), 1);
         assert!(!file(home.path()).exists());
+    }
+
+    /// A hooks file that is a link is refused by connect and by disconnect,
+    /// in words that say so: nothing is written through it and the file it
+    /// points to stays.
+    ///
+    /// FAILS ON REVERT: drop `refuse_a_link`, and the refusal is the read's
+    /// "too many levels of symbolic links", which does not say what to do.
+    #[cfg(unix)]
+    #[test]
+    fn a_hooks_file_that_is_a_link_is_refused() {
+        let home = tempfile::TempDir::new().unwrap();
+        let elsewhere = home.path().join("dotfiles-hooks.json");
+        std::fs::write(&elsewhere, "{}\n").unwrap();
+        let path = file(home.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        let refused = uninstall(home.path(), &ANTIGRAVITY).expect_err("disconnect through a link");
+        assert!(refused.contains("is a link"), "{refused}");
+        let refused = install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, false)
+            .expect_err("connect through a link");
+        assert!(refused.contains("is a link"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), "{}\n");
+
+        // Our entry already behind the link (a link made after the connect).
+        std::fs::remove_file(&path).unwrap();
+        install(home.path(), &ANTIGRAVITY, Path::new(BIN), false, false).unwrap();
+        std::fs::rename(&path, &elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
+        let held = std::fs::read_to_string(&elsewhere).unwrap();
+        let refused = uninstall(home.path(), &ANTIGRAVITY).expect_err("disconnect through a link");
+        assert!(refused.contains("is a link"), "{refused}");
+        assert_eq!(std::fs::read_to_string(&elsewhere).unwrap(), held);
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     /// A file the person reformatted after the connect is still put right:

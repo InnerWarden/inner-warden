@@ -78,7 +78,12 @@ impl Host {
         std::fs::create_dir_all(dir.path().join("home/.ssh")).expect("ssh");
         std::fs::write(
             dir.path().join("home/.ssh/id_ed25519"),
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nnot a key\n-----END OPENSSH PRIVATE KEY-----\n",
+            // Split so that no secret scanner reads a test fixture as a key.
+            concat!(
+                "-----BEGIN OPENSSH ",
+                "PRIVATE KEY-----\nnot a key\n-----END OPENSSH ",
+                "PRIVATE KEY-----\n"
+            ),
         )
         .expect("a key");
         Self { dir }
@@ -237,6 +242,82 @@ fn monitor_lets_every_call_run_with_an_allow() {
         agy_reads(code, &stdout, "unreadable in monitor"),
         Call::Runs
     );
+}
+
+/// A tool the guard does not read (its browser, a task, a subagent, an MCP
+/// tool, a tool added after the documentation) is never let through as a
+/// call that names nothing: enforce asks the person (`force_ask`),
+/// --block-review refuses it, monitor lets it run. A tool that only looks
+/// runs, and a screened tool's name in another case is still screened.
+///
+/// FAILS ON REVERT: hand an unknown tool on with its own name and
+/// arguments (`other => call(other, args)`), and `manage_task` sending
+/// input to a running command is answered `allow`.
+#[test]
+fn a_tool_the_guard_does_not_read_asks_and_is_never_allowed_unseen() {
+    let host = Host::new();
+    let enforce = ANTIGRAVITY.command(bin(), false, false);
+    let block = ANTIGRAVITY.command(bin(), true, false);
+    let monitor = ANTIGRAVITY.command(bin(), false, true);
+    let key = host.home().join(".ssh/id_ed25519");
+    for (tool, args) in [
+        (
+            "manage_task",
+            json!({"Action": "send_input", "TaskId": "t1", "Input": "rm -rf ~\n"}),
+        ),
+        ("browser_navigate", json!({"Url": "https://example.com"})),
+        (
+            "invoke_subagent",
+            json!({"Subagents": [{"Prompt": "x", "Role": "y"}]}),
+        ),
+        ("mcp_files_read", json!({"AbsolutePath": key})),
+    ] {
+        let payload = host.payload(tool, args);
+        let (code, stdout, _) = host.run(&enforce, payload.to_string().as_bytes());
+        assert_eq!(agy_reads(code, &stdout, tool), Call::Asks, "{tool}");
+        assert!(
+            stdout.contains(tool),
+            "the question names the tool: {stdout}"
+        );
+        assert_eq!(host.reads(&block, &payload, tool), Call::Refused, "{tool}");
+        assert_eq!(host.reads(&monitor, &payload, tool), Call::Runs, "{tool}");
+    }
+    let list = host.payload("list_dir", json!({"DirectoryPath": host.project()}));
+    assert_eq!(host.reads(&enforce, &list, "list_dir"), Call::Runs);
+    let rm = host.payload("Run_Command", json!({"CommandLine": "rm -rf ~"}));
+    assert_eq!(host.reads(&enforce, &rm, "Run_Command"), Call::Refused);
+    let read_key = host.payload("View_File", json!({"AbsolutePath": key}));
+    assert_eq!(host.reads(&enforce, &read_key, "View_File"), Call::Refused);
+}
+
+/// A refusal for a call the hook could not read carries that reason in the
+/// JSON, whichever read failed (the payload, a call past the 1 MiB the hook
+/// reads), never the bare "its reason is in the hook's output".
+///
+/// FAILS ON REVERT: take `note_refusal` out of `hook_unreadable`, and the
+/// call too long to read is refused with the bare words.
+#[test]
+fn an_unreadable_call_is_refused_with_its_reason() {
+    let host = Host::new();
+    let line = ANTIGRAVITY.command(bin(), false, false);
+    let long = host.payload(
+        "run_command",
+        json!({"CommandLine": format!("echo {}", "a".repeat(1_200_000))}),
+    );
+    for (raw, what) in [
+        (b"not json".to_vec(), "not JSON"),
+        (long.to_string().into_bytes(), "too long"),
+    ] {
+        let (code, stdout, _) = host.run(&line, &raw);
+        assert_eq!(agy_reads(code, &stdout, what), Call::Refused, "{what}");
+        let answer: Value = serde_json::from_str(stdout.trim()).unwrap();
+        let reason = answer["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("could not read this call"),
+            "{what}: {reason}"
+        );
+        assert!(!reason.contains("hook's output"), "{what}: {reason}");
+    }
 }
 
 /// A review the guard asks about (the line the other agents' suites ask

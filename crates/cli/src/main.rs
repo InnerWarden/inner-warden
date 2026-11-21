@@ -1610,6 +1610,12 @@ fn unreadable_exit_code(monitor: bool) -> u8 {
 /// as a refusal (`unreadable`), so the operator sees it beside the others.
 /// `buf` is what was read of the call, empty when nothing was.
 fn hook_unreadable(buf: &str, rest: &[String], why: &str, monitor: bool) -> std::process::ExitCode {
+    // An agent that reads the reason in JSON (Cursor, Antigravity) gets this
+    // one, whichever read failed: the payload, stdin, a call too long, a
+    // file tool's.
+    note_refusal(format!(
+        "InnerWarden could not read this call ({why}) and refused it."
+    ));
     let explanation = format!("unreadable: could not read this tool call ({why})");
     let label = format!("(unreadable tool call: {why})");
     let verdict = serde_json::json!({
@@ -2339,6 +2345,71 @@ fn antigravity_answer(exit: std::process::ExitCode, monitor: bool) -> std::proce
     std::process::ExitCode::SUCCESS
 }
 
+/// An Antigravity tool the guard does not read (`AgyCall::Unknown`): never
+/// let through as a call that names nothing. In enforce mode the person is
+/// asked (`force_ask`, which no earlier "Always Allow" skips), or with
+/// `--block-review` it is refused; in monitor mode it runs, unscreened, and
+/// says so. Recorded as a review in every mode.
+fn antigravity_unknown_tool(
+    buf: &str,
+    rest: &[String],
+    tool: &str,
+    monitor: bool,
+    block_review: bool,
+) -> std::process::ExitCode {
+    let explanation = format!(
+        "review: {tool} is an Antigravity tool the guard does not read; it was not screened"
+    );
+    let label = format!("(Antigravity tool the guard does not read: {tool})");
+    let verdict = serde_json::json!({
+        "command": label,
+        "risk_score": 40,
+        "severity": "medium",
+        "signals": [{
+            "signal": "unread_tool",
+            "score": 40,
+            "detail": explanation,
+        }],
+        "recommendation": "review",
+        "explanation": explanation,
+    });
+    record_shell(
+        buf,
+        rest,
+        &label,
+        &verdict,
+        monitor,
+        block_review,
+        None,
+        false,
+    );
+    if monitor {
+        eprintln!(
+            "InnerWarden hook: {tool} is an Antigravity tool the guard does not read; it was NOT \
+             screened (monitor mode never blocks)."
+        );
+        return std::process::ExitCode::SUCCESS;
+    }
+    if block_review {
+        let line = format!(
+            "InnerWarden refused {tool}: an Antigravity tool the guard does not read, and this \
+             hook refuses every review (--block-review)."
+        );
+        eprintln!("{line}");
+        note_refusal(line);
+        return std::process::ExitCode::from(2);
+    }
+    println!(
+        "{}",
+        innerwarden_agent_guard::antigravity_hook::ask(&format!(
+            "InnerWarden does not read the Antigravity tool {tool}, so it did not screen this \
+             call. Allow it only if you expected it."
+        ))
+    );
+    HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+    std::process::ExitCode::SUCCESS
+}
+
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let exit = cmd_hook_screen(rest);
     match agent_flag(rest).as_deref() {
@@ -2458,12 +2529,7 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
                 buf
             }
             CursorCall::Other => return std::process::ExitCode::SUCCESS,
-            CursorCall::Unreadable(why) => {
-                note_refusal(format!(
-                    "InnerWarden could not read this call ({why}) and refused it."
-                ));
-                return hook_unreadable(&buf, rest, why, monitor);
-            }
+            CursorCall::Unreadable(why) => return hook_unreadable(&buf, rest, why, monitor),
         }
     } else if json_answer {
         // The Antigravity CLI sends its own camelCase shape: read as the
@@ -2471,11 +2537,9 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         use innerwarden_agent_guard::antigravity_hook::{self, AgyCall};
         match antigravity_hook::read(&buf) {
             AgyCall::Call(call) => call.to_string(),
-            AgyCall::Unreadable(why) => {
-                note_refusal(format!(
-                    "InnerWarden could not read this call ({why}) and refused it."
-                ));
-                return hook_unreadable(&buf, rest, why, monitor);
+            AgyCall::Unreadable(why) => return hook_unreadable(&buf, rest, why, monitor),
+            AgyCall::Unknown(tool) => {
+                return antigravity_unknown_tool(&buf, rest, &tool, monitor, block_review)
             }
         }
     } else {
