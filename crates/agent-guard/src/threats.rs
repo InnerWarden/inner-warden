@@ -3743,6 +3743,9 @@ fn guard_self_disable_after_patterns(content: &str) -> Option<(&'static str, u32
     if writes_guard_config(content, 0) {
         return Some((GUARD_CONFIG_WRITTEN, 60));
     }
+    if changes_jail_notes_mode(content) {
+        return Some((GUARD_CONFIG_WRITTEN, 60));
+    }
     if writes_jail_record(content) {
         return Some((crate::file_tools::JAIL_RECORD_WRITTEN, 60));
     }
@@ -8902,6 +8905,8 @@ fn home_spelled(target: &str) -> String {
         ("$home", "~"),
         ("${xdg_config_home}", "~/.config"),
         ("$xdg_config_home", "~/.config"),
+        ("${xdg_state_home}", "~/.local/state"),
+        ("$xdg_state_home", "~/.local/state"),
     ] {
         if let Some(rest) = lower.strip_prefix(variable) {
             if rest.is_empty() || rest.starts_with('/') {
@@ -9264,8 +9269,10 @@ fn code_names_and_writes_guard_config(code: &str) -> bool {
     static NAMES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
-        regex::Regex::new(r#"\.config\W{1,8}innerwarden|xdg_config_home\W{1,24}innerwarden"#)
-            .expect("static config path regex")
+        regex::Regex::new(
+            r#"\.config\W{1,8}innerwarden|xdg_config_home\W{1,24}innerwarden|innerwarden\W{1,8}jail-claude"#,
+        )
+        .expect("static config path regex")
     });
     let writes = WRITES.get_or_init(|| {
         regex::Regex::new(
@@ -9274,6 +9281,25 @@ fn code_names_and_writes_guard_config(code: &str) -> bool {
         .expect("static interpreter write regex")
     });
     names.is_match(code) && writes.is_match(code)
+}
+
+/// Whether a line changes the mode, owner or attributes of the jail
+/// launcher's folder of projects (`~/.local/state/innerwarden/jail-claude`)
+/// or anything in it. A mode that keeps the owner's rights is no write
+/// elsewhere ([`mode_keeps_owner`]), but here a note made unreadable is a
+/// note taken away, and one opened to others is one another account can
+/// take away: any `chmod`, `chown`, `chgrp`, `setfacl` or `chattr` that
+/// names the folder is refused.
+fn changes_jail_notes_mode(content: &str) -> bool {
+    if !mentions_any(content, &["jail-claude"]) {
+        return false;
+    }
+    static MODE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| {
+        regex::Regex::new(r"(?i)\b(?:chmod|chown|chgrp|setfacl|chattr)\b[^;&|\n]*jail-claude")
+            .expect("static jail notes mode regex")
+    })
+    .is_match(content)
 }
 
 /// Cheap literal gate in front of a regex family.
@@ -19800,6 +19826,12 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
             Place::Components(".openclaw/hooks"),
             // The Community configuration, its allow rules and its record.
             Place::Components(".config/innerwarden"),
+            // The jail launcher's folder of each project's own Claude Code
+            // folder, and beside each its notes of what a jail made in the
+            // project (`<key>.made`, `<key>.run.<pid>`, `<key>.absent`):
+            // an agent outside the jail that took a note away would let the
+            // next jail start on a file the person never accepted.
+            Place::Components(".local/state/innerwarden/jail-claude"),
             // INNERWARDEN_SELF_PATHS, but for the binary, which is a program.
             Place::Tree("/etc/innerwarden"),
             Place::Tree("/var/lib/innerwarden"),

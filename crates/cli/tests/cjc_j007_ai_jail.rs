@@ -4410,6 +4410,7 @@ fn the_folder_claude_config_dir_names_is_never_written_in_the_jail() {
     // writes; the place of the host's folder takes no write at all.
     assert!(text.contains("MOVED") && text.contains("OWN"), "{text}");
     assert!(!text.contains("WROTE") && !text.contains("MADE"), "{text}");
+}
 
 /// T-109, items 1 and 3: a file the person makes in the project between two
 /// runs (hooks of their own) is theirs, and the next jail starts; one a jail

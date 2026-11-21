@@ -187,7 +187,13 @@ list, with every limit.
   before its jail ended (killed, the machine off) cannot say what its jail
   made, so what it found absent and is there now refuses the next start
   the same way; one that runs in the same project at the same time does
-  too, until it ends.
+  too, until it ends (a pid used again by another program is told apart by
+  when that program started). These notes sit beside the jail's own Claude
+  Code folders in `~/.local/state/innerwarden/jail-claude`, out of every
+  jail's reach; outside the jail, the guard holds that folder as it holds
+  its own configuration (a write, `rm`, `mv`, `ln`, a mode or owner change,
+  interpreter code, the file tools), and a note that cannot be read refuses
+  the start instead of counting as none.
   On macOS a jail writes only its own project's folder of the launcher's,
   never another project's.
   A jail does not start where Claude Code's settings may turn the guard's

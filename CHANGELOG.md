@@ -79,7 +79,12 @@ the text of a command; what it does not see is written down, as measured:
   `innerwarden contain --accept-project-files --project <dir>` from your own
   terminal. One you make between runs is yours and no longer refuses the
   start as if a jail had made it. A launch that stopped before its jail
-  ended leaves what it found absent judged at the next start.
+  ended leaves what it found absent judged at the next start. The
+  launcher's notes in `~/.local/state/innerwarden/jail-claude` are held by
+  the guard like its own configuration (shell writes, removal, moves, links,
+  mode and owner changes, interpreter code, the file tools), a note that
+  cannot be read refuses the start, and the guard refuses an agent's
+  `contain --accept-project-files` under any name or wrapper of the program.
 - **A review asks you instead of passing unseen.** In enforce mode the hook
   used to refuse a `deny` and let a `review` run without a word (`chmod 777`
   on a folder, for one). It now hands a review to the person: Claude Code

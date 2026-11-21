@@ -343,12 +343,18 @@ pub fn cmd(rest: &[String]) -> ExitCode {
                 eprintln!("innerwarden contain: {why}");
             }
             if !made.is_empty() {
+                let succeeded = code == ExitCode::SUCCESS;
+                let status = if succeeded {
+                    format!("exiting {PROJECT_FILES_MADE_EXIT}")
+                } else {
+                    "the command failed, and its exit status is kept".to_string()
+                };
                 eprintln!(
                     "innerwarden contain: the jail made Claude Code files the next start \
-                     refuses on; exiting {PROJECT_FILES_MADE_EXIT}. {}",
+                     refuses on; {status}. {}",
                     accept_hint(&input.args.project)
                 );
-                if code == ExitCode::SUCCESS {
+                if succeeded {
                     return ExitCode::from(PROJECT_FILES_MADE_EXIT);
                 }
             }
@@ -670,28 +676,58 @@ fn made_marker(claude: &crate::contain::ProjectClaude) -> Option<PathBuf> {
 }
 
 /// Every run marker there, this launch's included, and an earlier
-/// launcher's `.absent`: plain files only, a link is never read.
+/// launcher's `.absent`, whatever each is (one that is no plain file is
+/// never followed, and refuses the start when read: [`read_note`]), or why
+/// the folder cannot be read.
 #[cfg(unix)]
-fn run_markers(claude: &crate::contain::ProjectClaude) -> Vec<PathBuf> {
+fn run_markers(claude: &crate::contain::ProjectClaude) -> Result<Vec<PathBuf>, String> {
     let Some((dir, name)) = marker_base(claude) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let run = format!("{name}.run.");
     let legacy = format!("{name}.absent");
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(note_unreadable(&dir, &e.to_string())),
     };
     let mut out: Vec<PathBuf> = entries
         .filter_map(Result::ok)
         .filter(|entry| {
             let file = entry.file_name().to_string_lossy().to_string();
-            (file.starts_with(&run) || file == legacy)
-                && entry.file_type().is_ok_and(|t| t.is_file())
+            file.starts_with(&run) || file == legacy
         })
         .map(|entry| entry.path())
         .collect();
     out.sort();
-    out
+    Ok(out)
+}
+
+/// Why a start does not go on where a launcher's note cannot be read: what
+/// a jail made in the project is then not known.
+#[cfg(unix)]
+fn note_unreadable(note: &Path, why: &str) -> String {
+    format!(
+        "the launcher's note {} cannot be read ({why}), so what a jail made in this project \
+         is not known",
+        crate::contain::printable(note)
+    )
+}
+
+/// The text of a launcher's note, `None` where it is not there, or why it
+/// cannot be read (it is no plain file, or closed to this account): a note
+/// that cannot be read refuses the start, never counts as none.
+#[cfg(unix)]
+fn read_note(note: &Path) -> Result<Option<String>, String> {
+    match std::fs::symlink_metadata(note) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(note_unreadable(note, &e.to_string())),
+        Ok(meta) if !meta.is_file() => return Err(note_unreadable(note, "it is no plain file")),
+        Ok(_) => {}
+    }
+    std::fs::read_to_string(note)
+        .map(Some)
+        .map_err(|e| note_unreadable(note, &e.to_string()))
 }
 
 /// The launch a run marker names is running (its pid answers); an earlier
@@ -709,7 +745,73 @@ fn marker_launch_runs(marker: &Path) -> bool {
     };
     // SAFETY: signal 0 sends nothing; it only asks whether the pid exists.
     let answer = unsafe { libc::kill(pid, 0) };
-    answer == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let exists = answer == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    if !exists {
+        return false;
+    }
+    // A pid used again: the process that has it started after the note was
+    // written, so it is not the launch that wrote it. Where the start time
+    // cannot be read, the launch is taken to run.
+    let written = std::fs::symlink_metadata(marker).and_then(|m| m.modified());
+    match (process_started(pid), written) {
+        (Some(started), Ok(written)) => started <= written + std::time::Duration::from_secs(2),
+        _ => true,
+    }
+}
+
+/// When process `pid` started, where the system says.
+#[cfg(target_os = "linux")]
+fn process_started(pid: i32) -> Option<std::time::SystemTime> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after = &stat[stat.rfind(')')? + 1..];
+    // Field 22 (`starttime`), counted from field 3 after the name.
+    let ticks: u64 = after.split_whitespace().nth(19)?.parse().ok()?;
+    let boot: u64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime ")?.trim().parse().ok())?;
+    // SAFETY: sysconf has no preconditions.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    Some(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(boot)
+            + std::time::Duration::from_millis(ticks.saturating_mul(1000) / hz as u64),
+    )
+}
+
+/// When process `pid` started, where the system says.
+#[cfg(target_os = "macos")]
+fn process_started(pid: i32) -> Option<std::time::SystemTime> {
+    // SAFETY: a zeroed proc_bsdinfo is a valid value of plain integers.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the buffer is `size` bytes of the struct the call fills.
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if filled != size {
+        return None;
+    }
+    Some(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::from_secs(info.pbi_start_tvsec)
+            + std::time::Duration::from_micros(info.pbi_start_tvusec),
+    )
+}
+
+/// When process `pid` started: not read on other systems.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn process_started(_pid: i32) -> Option<std::time::SystemTime> {
+    None
 }
 
 /// The Claude Code files of `project` that the `names` of
@@ -745,30 +847,44 @@ fn made_file_refusal(file: &Path) -> Option<String> {
 /// The files a jail may have made that a start judges: each one `.made`
 /// lists, and each a run marker names (this launch's included, where it
 /// asks before its jail starts: none yet).
+///
+/// Each note that cannot be read is said instead (`Err`): a start refuses
+/// on it ([`read_note`]).
 #[cfg(unix)]
-fn files_jails_made(input: &JailInputs) -> Vec<PathBuf> {
+fn files_jails_made(input: &JailInputs) -> (Vec<PathBuf>, Vec<String>) {
     let Some(claude) = planned_project_claude(input) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let project = &input.args.project;
     let allowed = files_of_names(project, crate::contain::PROJECT_GUARD_NAMES.iter().copied());
-    let mut files: Vec<PathBuf> = made_marker(&claude)
-        .and_then(|marker| std::fs::read_to_string(marker).ok())
-        .map(|text| {
-            text.lines()
-                .map(PathBuf::from)
-                .filter(|file| allowed.contains(file))
-                .collect()
-        })
-        .unwrap_or_default();
-    for marker in run_markers(&claude) {
-        if let Ok(text) = std::fs::read_to_string(&marker) {
-            files.extend(files_of_names(project, text.lines()));
+    let mut unread = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    if let Some(marker) = made_marker(&claude) {
+        match read_note(&marker) {
+            Ok(Some(text)) => files.extend(
+                text.lines()
+                    .map(PathBuf::from)
+                    .filter(|file| allowed.contains(file)),
+            ),
+            Ok(None) => {}
+            Err(why) => unread.push(why),
         }
+    }
+    match run_markers(&claude) {
+        Ok(markers) => {
+            for marker in markers {
+                match read_note(&marker) {
+                    Ok(Some(text)) => files.extend(files_of_names(project, text.lines())),
+                    Ok(None) => {}
+                    Err(why) => unread.push(why),
+                }
+            }
+        }
+        Err(why) => unread.push(why),
     }
     let mut seen = std::collections::HashSet::new();
     files.retain(|file| seen.insert(file.clone()));
-    files
+    (files, unread)
 }
 
 /// Each reason a file of the project's that a jail made keeps the next
@@ -777,10 +893,9 @@ fn files_jails_made(input: &JailInputs) -> Vec<PathBuf> {
 /// what reaches the host.
 #[cfg(unix)]
 fn project_files_made(input: &JailInputs) -> Vec<String> {
-    files_jails_made(input)
-        .iter()
-        .filter_map(|file| made_file_refusal(file))
-        .collect()
+    let (files, mut out) = files_jails_made(input);
+    out.extend(files.iter().filter_map(|file| made_file_refusal(file)));
+    out
 }
 
 /// What to do about a file a jail made that the person wants to keep:
@@ -895,13 +1010,23 @@ fn accept_project_files_for(input: &JailInputs) -> ExitCode {
         );
         return ExitCode::SUCCESS;
     };
-    let files: Vec<PathBuf> = files_jails_made(input)
+    let (files, unread) = files_jails_made(input);
+    let files: Vec<PathBuf> = files
         .into_iter()
         .filter(|file| std::fs::symlink_metadata(file).is_ok())
         .collect();
+    for why in &unread {
+        println!("innerwarden contain: {why}; taken away");
+    }
     let mut failed = false;
     let mut running = Vec::new();
-    let markers = run_markers(&claude);
+    let markers = match run_markers(&claude) {
+        Ok(markers) => markers,
+        Err(why) => {
+            eprintln!("innerwarden contain: {why}");
+            return ExitCode::from(1);
+        }
+    };
     for marker in made_marker(&claude).into_iter().chain(markers) {
         if marker_launch_runs(&marker) {
             running.push(marker);
@@ -970,13 +1095,13 @@ fn keep_absent_names(
     // the files `.made` lists that no longer refuse, were judged now and
     // set nothing. Kept, they would take a file the person makes later
     // for a jail's.
-    for left in run_markers(claude) {
+    for left in run_markers(claude)? {
         if left != marker && !marker_launch_runs(&left) {
             let _ = std::fs::remove_file(&left);
         }
     }
     if let Some(made) = made_marker(claude) {
-        if let Ok(text) = std::fs::read_to_string(&made) {
+        if let Ok(Some(text)) = read_note(&made) {
             let still: Vec<&str> = text
                 .lines()
                 .filter(|line| made_file_refusal(Path::new(line)).is_some())
@@ -6961,7 +7086,9 @@ mod tests {
         // Run 1 makes nothing.
         prepare_project_claude(&input).unwrap();
         assert!(finish_project_files(&input).is_empty());
-        assert!(run_markers(input.project_claude.as_ref().unwrap()).is_empty());
+        assert!(run_markers(input.project_claude.as_ref().unwrap())
+            .unwrap()
+            .is_empty());
         // Between runs the person adds hooks of their own: no refusal.
         std::fs::create_dir_all(project.join(".claude")).unwrap();
         std::fs::write(
@@ -7039,7 +7166,7 @@ mod tests {
         std::fs::remove_dir_all(project.join(".claude")).unwrap();
         assert!(project_files_made(&input).is_empty());
         prepare_project_claude(&input).unwrap();
-        let left = run_markers(input.project_claude.as_ref().unwrap());
+        let left = run_markers(input.project_claude.as_ref().unwrap()).unwrap();
         assert_eq!(
             left,
             vec![run_marker(input.project_claude.as_ref().unwrap()).unwrap()]
@@ -7048,6 +7175,119 @@ mod tests {
         // After the run, the person's own file is theirs.
         std::fs::write(project.join(".mcp.json"), r#"{"mcpServers":{"mine":{}}}"#).unwrap();
         assert!(project_files_made(&input).is_empty());
+    }
+
+    /// Review of #361, item 6: the project's `.claude` and `.mcp.json` that
+    /// are THERE when the jail starts (the end of the run only judges those
+    /// that were not) are found by the real resolve and denied writing in
+    /// the macOS profile, after the project itself is allowed.
+    #[cfg(unix)]
+    #[test]
+    fn present_project_claude_files_are_denied_writing_on_macos() {
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        let project = r.join("proj");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::write(project.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        let mut args = parse_contain_args(&["--".to_string(), "true".to_string()]).unwrap();
+        args.project = project.clone();
+        let mut input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        for name in [".claude", ".mcp.json"] {
+            assert!(
+                input.project_guard_files.contains(&project.join(name)),
+                "{name}: {:?}",
+                input.project_guard_files
+            );
+        }
+        let all = r.join("state/innerwarden/jail-claude");
+        input.project_claude = Some(crate::contain::ProjectClaude {
+            covered: vec![all.clone()],
+            folder: all.join("proj-0123456789abcdef"),
+            source: all.join("proj-0123456789abcdef"),
+        });
+        let profile = build_macos_profile(&input).unwrap().profile;
+        let allowed = profile
+            .find(&format!(
+                "(allow file-write* (subpath \"{}\"))",
+                project.display()
+            ))
+            .unwrap_or_else(|| panic!("{profile}"));
+        for name in [".claude", ".mcp.json"] {
+            let deny = profile
+                .find(&format!(
+                    "(deny file-write* (subpath \"{}\"))",
+                    project.join(name).display()
+                ))
+                .unwrap_or_else(|| panic!("{name}: {profile}"));
+            assert!(allowed < deny, "{profile}");
+        }
+    }
+
+    /// Review of #361, item 2: a note that cannot be read (closed to this
+    /// account, or no plain file) refuses the start; it never counts as no
+    /// note.
+    ///
+    /// FAILS ON REVERT: read a note that cannot be read as empty.
+    #[cfg(unix)]
+    #[test]
+    fn a_note_that_cannot_be_read_refuses_the_start() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        let project = r.join("proj");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let mut args = parse_contain_args(&["--".to_string(), "true".to_string()]).unwrap();
+        args.project = project.clone();
+        let mut input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        let all = r.join("state/innerwarden/jail-claude");
+        let source = all.join("proj-0123456789abcdef");
+        std::fs::create_dir_all(&source).unwrap();
+        input.project_claude = Some(crate::contain::ProjectClaude {
+            covered: vec![all.clone()],
+            folder: source.clone(),
+            source: source.clone(),
+        });
+        // A note made a folder: no plain file.
+        let made = all.join("proj-0123456789abcdef.made");
+        std::fs::create_dir_all(&made).unwrap();
+        let why = project_files_made(&input);
+        assert_eq!(why.len(), 1, "{why:?}");
+        assert!(why[0].contains("cannot be read"), "{why:?}");
+        std::fs::remove_dir(&made).unwrap();
+        // Closed to its owner (root reads it anyway: checked only where not).
+        std::fs::write(
+            &made,
+            project.join(".mcp.json").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_to_string(&made).is_err() {
+            let why = project_files_made(&input);
+            assert!(why.iter().any(|w| w.contains("cannot be read")), "{why:?}");
+        }
+        std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Review of #361, item 3: a run note whose pid now belongs to a process
+    /// that started after the note was written is no running launch.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_pid_used_again_is_no_running_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let own = root.path().join(format!("k.run.{}", std::process::id()));
+        std::fs::write(&own, "").unwrap();
+        // This process started before its note: it runs.
+        assert!(marker_launch_runs(&own));
+        // A note written long before this process started.
+        let old = std::fs::File::options().write(true).open(&own).unwrap();
+        old.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(86_400))
+            .unwrap();
+        assert!(process_started(std::process::id() as i32).is_some());
+        assert!(!marker_launch_runs(&own));
     }
 
     /// T-109 item 3: the request to accept is the flag with `--project` and
