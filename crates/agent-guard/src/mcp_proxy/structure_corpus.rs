@@ -1,7 +1,9 @@
-//! The measure of [`super::structure::injection_structure`] on texts its
-//! authors did not tune it to: the held-out corpus
-//! `corpus/injection-structure-2026-11/texts.yml` (attacks by style and the
-//! benign texts of the same shape), the injected AgentDojo text in
+//! The measure of [`super::structure::injection_structure`] on its
+//! development corpus `corpus/injection-structure-2026-11/texts.yml`
+//! (attacks by style and benign texts of the same shape). The rules were
+//! read from this corpus and adjusted on it, so it is no held-out measure:
+//! it pins what was reached and catches a change that loses it. Beside it,
+//! the injected AgentDojo text in
 //! `corpus/external-2026-11`, and every benign input of every corpus of the
 //! repository, read as a text a server sent.
 //!
@@ -10,15 +12,37 @@
 //! ```
 //!
 //! prints the attacks found per style and every benign text marked. It fails
-//! when a benign text of any of them is marked, when an AgentDojo text is
-//! missed, or when the held-out attacks found fall under the floor below.
+//! when a benign text is marked that is not in [`KNOWN_BENIGN_MARKED`], when
+//! an AgentDojo text is missed, or when the development attacks found fall
+//! under the floor below.
 
 use super::structure::injection_structure;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// Held-out attacks found at the last accepted state; fewer fails.
-const HELD_OUT_FLOOR: usize = 155;
+/// Development attacks found at the last accepted state; fewer fails.
+const DEVELOPMENT_FLOOR: usize = 155;
+
+/// Benign texts of the development corpus the reading marks, known and left
+/// so: articles that quote an injection as an example. The first version
+/// blanked quoted examples before reading, which let an order dressed as an
+/// example through (review of #367); the quote is read again, and these are
+/// left for a later change that never takes a mark away. A benign text not
+/// in this list that gets marked fails.
+const KNOWN_BENIGN_MARKED: &[&str] = &[
+    "is-security_article_quote-g01",
+    "is-security_article_quote-g03",
+    "is-security_article_quote-g07",
+    "is-security_article_quote-g08",
+    "is-security_article_quote-g09",
+    "is-security_article_quote-g10",
+    "is-security_article_quote-g13",
+    "is-security_article_quote-g14",
+    "is-security_article_quote-g15",
+    "is-security_article_quote-g16",
+    "is-security_article_quote-g19",
+    "is-security_article_quote-g20",
+];
 
 fn yaml(path: &Path) -> serde_yaml::Value {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -61,7 +85,7 @@ fn repo_cases() -> Vec<(String, serde_yaml::Value)> {
 }
 
 #[test]
-fn structure_corpus_held_out_and_benign() {
+fn structure_corpus_development_and_benign() {
     let guard = Path::new(env!("CARGO_MANIFEST_DIR"));
     let doc = yaml(&guard.join("corpus/injection-structure-2026-11/texts.yml"));
     let texts = doc["texts"].as_sequence().expect("texts").clone();
@@ -108,7 +132,9 @@ fn structure_corpus_held_out_and_benign() {
             row.3 += 1;
             if found {
                 row.2 += 1;
-                marked.push(format!("held-out/{id}"));
+                if !KNOWN_BENIGN_MARKED.contains(&id) {
+                    marked.push(format!("development/{id}"));
+                }
                 if std::env::var_os("IW_STRUCTURE_EXPLAIN").is_some() {
                     for (s, m) in super::structure::explain(text) {
                         println!("  {id} {m:#06x} {s}");
@@ -128,7 +154,7 @@ fn structure_corpus_held_out_and_benign() {
     }
     println!(
         "{:<20} {af:>3} / {at:<3}       {bm:>3} / {bt}",
-        "held-out total"
+        "development total"
     );
     for (batch, (f, a, m, b)) in &per_batch {
         println!(
@@ -136,7 +162,7 @@ fn structure_corpus_held_out_and_benign() {
             format!("batch {batch}")
         );
     }
-    println!("held-out attacks missed: {}", misses.join(" "));
+    println!("development attacks missed: {}", misses.join(" "));
 
     // AgentDojo's injected text, and every benign input of the repository.
     let (mut dojo_found, mut dojo_total, mut benign_total) = (0, 0, 0);
@@ -172,7 +198,7 @@ fn structure_corpus_held_out_and_benign() {
         "AgentDojo texts missed: {dojo_missed:?}"
     );
     assert!(
-        af >= HELD_OUT_FLOOR,
-        "held-out attacks found {af} < {HELD_OUT_FLOOR}"
+        af >= DEVELOPMENT_FLOOR,
+        "development attacks found {af} < {DEVELOPMENT_FLOOR}"
     );
 }

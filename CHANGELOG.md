@@ -22,15 +22,15 @@ the text of a command; what it does not see is written down, as measured:
   must send"), a block dressed as the system or a tool, the task set aside or
   replaced ("the user now wants you to", instructions ignored), an act kept
   from the user, a role taken into the real world, a softened imperative, and
-  letters spaced out. An order quoted and named an example (a security
-  article), and the steps of a procedure for a person (an install guide, an
-  onboarding checklist), are not read as orders unless they call the
-  assistant. On a private held-out set written independently: 26 of 60
-  attacks (main 9); benign flagged 3 of 60 before the fix for install guides,
-  onboarding checklists and quoted examples (main 0), measured again after
-  it. AgentDojo's 35 texts are all still found. A polite request, a claim of
+  letters spaced out. A quote, a procedure's heading, a data key and a
+  greeting with a name take no mark away. On a private held-out set written
+  independently and run once: 31 of 80 attacks (main 10); benign flagged 3 of
+  80 (main 0). Those numbers were measured before the review that made the
+  reading only add marks; they change with it and were not measured again.
+  AgentDojo's 35 texts are all still found. A polite request, a claim of
   authority or a role with only a sending is still not read as an order:
-  people write those to people in the same words.
+  people write those to people in the same words. A text longer than the
+  1 MiB read for this structure is said to be read in its start only.
 
 - **Cursor is screened through its own hooks.** `innerwarden agents connect
   cursor` now writes an entry under `beforeShellExecution`,
