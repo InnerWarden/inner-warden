@@ -302,13 +302,30 @@ fn kept_text_and_cut(prompt: &str) -> (String, bool) {
     }
 }
 
-/// How long a write waits for the update lock of a record.
-const UPDATE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+/// How long, on the clock, a write waits in all for the update lock of a
+/// record: one wait for the whole write, never a count of tries. Writers at
+/// once each wait their turn inside it, however many there are and however
+/// loaded the machine is; under load a count of short waits ran out
+/// (`a write gave up` in `more_prompts_at_once_than_attempts_are_all_kept`)
+/// while the lock was only ever held by other writers of the same session.
+///
+/// Wide, and still under the hook's own limit on the clock (`WALL_CAP` in the
+/// CLI's `hook_net`, checked there), so a write that waits it out ends with
+/// the lost mark written rather than with the hook killed. A lock held the
+/// whole time is a holder that is not one of these writers (the record's
+/// lock can be opened by the agent's own account): the prompt is then marked
+/// lost, never waited on for ever.
+pub const UPDATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// How many times a write is tried again when the update lock was held for
-/// the whole of [`UPDATE_LOCK_WAIT`], or a writer that does not take the lock
-/// changed the record between the read and the rename. Inside the hook's own
-/// deadline.
+/// How long a trim of an expired record ([`prune`]) waits for its update
+/// lock. A trim is housekeeping: one that finds the lock held leaves the
+/// record to the next write, which trims it.
+const TRIM_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many times a write is tried again when a writer that does not take
+/// the lock (an editor, the agent's own process) changed the record between
+/// the read and the rename. A busy lock is not counted here: it is waited on
+/// until [`UPDATE_DEADLINE`].
 const UPDATE_ATTEMPTS: usize = 8;
 
 /// Read the record of `session`, change it, and write it back, the guard's
@@ -321,17 +338,24 @@ const UPDATE_ATTEMPTS: usize = 8;
 /// The read was once made before the lock and compared after it: with many
 /// hook runs at once each round had one winner, and under load a run could
 /// lose every one of its attempts (`prompts_written_at_once_are_all_kept`).
+/// Then the lock was waited on a second at a time, eight times at most, and
+/// under load a writer still gave up while the others took turns ahead of
+/// it. `deadline` is now the one wait of the whole write.
 fn update_record_waiting(
     dir: &Path,
     session: &str,
-    lock_wait: std::time::Duration,
+    deadline: std::time::Duration,
     change: impl Fn(&mut Record),
 ) -> std::io::Result<PathBuf> {
     use crate::file_update::{update_owned_store_no_symlinks, ReplaceError};
     make_dir(dir)?;
     let path = file_for(dir, session);
+    let started = std::time::Instant::now();
     let mut last = String::from("the record kept changing under the write");
     for _ in 0..UPDATE_ATTEMPTS {
+        let Some(lock_wait) = deadline.checked_sub(started.elapsed()) else {
+            break;
+        };
         match fs::symlink_metadata(&path) {
             Ok(meta) if !meta.is_file() => {
                 return Err(std::io::Error::other("the record is not a plain file"));
@@ -353,8 +377,12 @@ fn update_record_waiting(
         };
         match update_owned_store_no_symlinks(dir, &path, lock_wait, &mut changed) {
             Ok(()) => return Ok(path),
+            // Held for the whole of what was left of the deadline: there is
+            // no time left to try again in.
             Err(ReplaceError::LockBusy { .. }) => {
-                last = String::from("the record's update lock was busy");
+                return Err(std::io::Error::other(
+                    "the record's update lock was held past the write's deadline",
+                ));
             }
             Err(ReplaceError::Failed(why)) => last = why,
         }
@@ -455,11 +483,11 @@ pub fn record_in(
     if prompt.trim().is_empty() {
         return Ok(());
     }
-    record_in_waiting(dir, session, agent, prompt, now_ms, UPDATE_LOCK_WAIT)
+    record_in_waiting(dir, session, agent, prompt, now_ms, UPDATE_DEADLINE)
 }
 
-/// [`record_in`] with the wait for the update lock handed in. A prompt that
-/// could not be written (the lock held through every attempt, a write that
+/// [`record_in`] with the deadline of the write handed in. A prompt that
+/// could not be written (the lock held past the deadline, a write that
 /// failed) leaves the lost mark, so a value it held answers "unknown",
 /// never "no".
 fn record_in_waiting(
@@ -468,10 +496,10 @@ fn record_in_waiting(
     agent: Option<&str>,
     prompt: &str,
     now_ms: i64,
-    lock_wait: std::time::Duration,
+    deadline: std::time::Duration,
 ) -> std::io::Result<()> {
     let (text, cut) = kept_text_and_cut(prompt);
-    let written = update_record_waiting(dir, session, lock_wait, |record| {
+    let written = update_record_waiting(dir, session, deadline, |record| {
         if let Some(agent) = agent {
             record.agent = Some(agent.to_string());
         }
@@ -665,7 +693,7 @@ fn drop_expired(path: &Path, read_from: &[u8], record: &Record, now_ms: i64) {
             path,
             Some(read_from),
             &body,
-            UPDATE_LOCK_WAIT,
+            TRIM_LOCK_WAIT,
         );
     }
 }
@@ -975,7 +1003,10 @@ mod tests {
 
     /// More hook runs of one session at once than a write has attempts, all
     /// let go at the same instant: every prompt is kept. Each run reads the
-    /// record under the update lock, so none loses a round to another.
+    /// record under the update lock, so none loses a round to another, and
+    /// waits for its turn until the write's deadline, not for a count of
+    /// tries: on a loaded machine (other builds and suites beside it,
+    /// 2026-11-21) eight one-second waits gave up and the prompt was lost.
     ///
     /// FAILS ON REVERT: read the record before the lock and compare after it,
     /// and with every run reading at once each round has few winners; runs
