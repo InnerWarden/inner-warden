@@ -158,11 +158,24 @@ their MCP servers get no session id to match. Details and limits:
   on a macOS disk. A move, link or copy onto the folder by its bare name
   (`mv notes.md .claude`) is refused too, since with no folder there it
   becomes the folder, and the refusal says to end the folder with a slash
-  (`mv notes.md .claude/`) to move a file into it. Not read, and so not
-  held: a target the shell builds (a glob, a brace, a substitution), a copy
-  of a whole folder that holds one of these files into a place other than
-  the agent's folder, an archive unpacked over one, a download that takes its
-  name from the URL, a branch switched, pulled or merged that changes one
+  (`mv notes.md .claude/`) to move a file into it. What a folder holds
+  copied into an agent's folder (`rsync -a ../x/ .claude`, `cp -r ../x/.
+  .claude/`, `cp -r ../x/* .claude/`, `cp ../x/*.json .claude/`, with a
+  slash at the end of the folder or without one) and an archive unpacked into
+  one (`tar -xf x.tar -C .claude`, `unzip x.zip -d .claude`, `bsdtar`,
+  `7z x x.7z -o.claude`) are refused as well: the names they write are not
+  on the line, and a `settings.json` written first in `../x` would land in
+  the settings. A single file copied into the folder under a name that is
+  not a settings file (`cp notes.md .claude/notes.md`), and copies and
+  unpacks into other folders (`rsync -a src/ build/`, `tar -xf x.tar -C
+  vendor`), still run. Ruby's `FileUtils` with the settings file named
+  before it (`p=".claude/settings.json"; FileUtils.cp("x.json", p)`) is
+  refused too; Python's `open(path, "w")` and Ruby's `File.new(path, "w")`
+  already were. Not read, and so not held: a target the shell builds (a
+  glob in the destination, a brace, a substitution), a copy of a whole folder that holds one of these
+  files into a place other than the agent's folder, an archive unpacked in a
+  folder above an agent's folder (`tar -xf x.tar` at the project's root), a
+  download that takes its name from the URL, a branch switched, pulled or merged that changes one
   (`git checkout <tree> -- <file>` and `git restore` of one are read), a
   change of owner (`chown`), and a write made by interpreter code other than
   the rewrites listed above.
@@ -170,7 +183,9 @@ their MCP servers get no session id to match. Details and limits:
   subfolder, it reads each folder up to the project's root, the first one
   that holds `.git` or `.claude`, and never the home or above it. Outside
   the home, in a folder with no such root above it, it reads that folder
-  alone and never climbs to `/`. It also reads Codex's project
+  alone and never climbs to `/`. A folder whose `.git` or `.claude` it is
+  denied a look at is named, with the reason, and the folders above it are
+  read too, instead of the climb going on in silence. It also reads Codex's project
   `.codex/config.toml` (`hooks = false` under `[features]`, or
   `codex_hooks = false`, its older name, as read in Codex's source at
   `rust-v0.171.0`) and `.codex/hooks.json`, and says when a file is there
@@ -179,7 +194,10 @@ their MCP servers get no session id to match. Details and limits:
   file is opened once, without following a link and without waiting, and
   judged by what was opened, so a FIFO or a link to `/dev/zero` no longer
   makes `status` wait and nothing can be swapped in between a check and the
-  open.
+  open. On Windows the file is opened with `FILE_FLAG_OPEN_REPARSE_POINT`, so
+  a link is opened as itself and judged by the handle; on a system that is
+  neither unix nor Windows the link is looked for before the open, with a
+  window between the two.
 - **A jail's change to the project's Claude Code files is told apart from
   yours.** A `.claude` settings file or a `.mcp.json` that a jail made
   during its run with hooks, hooks off, a bypass mode or MCP servers now
