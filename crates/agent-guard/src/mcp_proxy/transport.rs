@@ -1442,7 +1442,7 @@ where
         };
     let mut upstream = match remote {
         Some(spec) => Upstream::Remote(super::remote::Remote::start(spec)),
-        None => Upstream::Local(Server::spawn(&cfg.server_cmd)?),
+        None => Upstream::Local(Box::new(Server::spawn(&cfg.server_cmd)?)),
     };
     type Writer = Box<dyn AsyncWrite + Unpin + Send>;
     type Reader = Box<dyn AsyncRead + Unpin + Send>;
@@ -1629,8 +1629,10 @@ where
 }
 
 /// What the proxy forwards to: a server it spawned, or one reached by URL.
+/// The spawned server is boxed: on Windows its handles make it several times
+/// the size of a remote one.
 enum Upstream {
-    Local(Server),
+    Local(Box<Server>),
     Remote(super::remote::Remote),
 }
 
