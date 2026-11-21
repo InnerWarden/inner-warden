@@ -69,6 +69,35 @@ separate attack from use.
 None of AgentDojo's actions is a shell line. 11 of the 35 injection tasks have
 a shell analogue (delete a file, send data out).
 
+### AgentDojo again, with the default posture (2026-11-21)
+
+Same plans, same fake server that runs nothing, `innerwarden proxy --mode
+guard`, an empty home per session, debug builds of `main` at 37af662 and of
+the change that makes a refusal by name alone a warning in `guard`:
+
+| | 1.6.15 (above) | main 37af662 | with the posture |
+|---|---|---|---|
+| injection tasks stopped (of 26 with attack calls) | 19 | 24 | 24 |
+| attack calls refused (of 47) | 22 | 29 | 29 |
+| benign calls refused (of 339) | 25 | 25 | 0 |
+| benign tasks with a refusal (of 97) | 19 | 19 | 0 |
+
+The 25 benign refusals of main were all by name: `send_money`,
+`schedule_transaction`, `update_scheduled_transaction` and
+`send_direct_message` (ATR-2026-098) and `delete_file` (ATR-2026-040).
+With the posture each is forwarded with the rule's alert and an `AG-POSTURE`
+note. The attacks still stopped are stopped because the call carries a value
+the injected text said (the taint tracker, the effect table, and any
+value of any length a server said as a whole word: the `delete_file` of file
+`13` that the injected text asks for is stopped by its name because `13` is
+in that text). Still passing, as on main: travel 2 and 4 (a calendar event
+and a hotel booking).
+This fake server answers every benign call with a fixed text, so no value
+the user asked for appears in a result. In a real session a value the person
+names is often in what a tool listed before (a file id, a colleague's name in
+a channel), and then the call keeps its refusal by name, as before: the 0 of
+339 is a floor for this harness, not a measure of real sessions.
+
 ## 3. Poisoned model (model-poisoning-poc-example)
 
 Qwen2.5-0.5B-Instruct fine-tuned on CPU with the project's own recipe (382

@@ -145,6 +145,37 @@ fn route_client_to_server(
             // decide a refusal by name (`super::effect`).
             let class = t.effect_of(&name, &args);
             super::effect::apply_table(&name, &args, class, &t.seen, &mut verdict);
+            // A call a rule refuses, with no finding yet that a server said
+            // a value of it: any value at all a server said keeps the
+            // refusal by name in the default posture (`super::enforce`).
+            let refused_by_a_rule = verdict
+                .alerts
+                .iter()
+                .any(|alert| alert.block && alert.rule.starts_with("ATR-"));
+            let said_already = verdict.alerts.iter().any(|alert| {
+                matches!(alert.rule.as_str(), "AG-TAINT" | super::effect::EFFECT_RULE)
+            });
+            if refused_by_a_rule && !said_already {
+                if let Some((slot, value)) = super::effect::said_value(&args, &t.seen) {
+                    let shown: String = crate::redact::redact_secrets(&value)
+                        .text
+                        .chars()
+                        .take(64)
+                        .collect();
+                    verdict.alerts.push(VerdictAlert::builtin(
+                        super::effect::EFFECT_RULE,
+                        if slot.is_empty() {
+                            format!("{shown}: a refusal by the tool's name stands")
+                        } else {
+                            format!(
+                                "carries in `{slot}` a value a server said this session \
+                                 (`{shown}`): a refusal by the tool's name stands"
+                            )
+                        },
+                        false,
+                    ));
+                }
+            }
         }
         let safe_name = safe_tool_name(&name);
         return ProxyDecision {
