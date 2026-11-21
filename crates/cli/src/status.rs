@@ -1442,7 +1442,7 @@ pub fn posture_line(facts: &Facts) -> Option<String> {
     }
     let harden = match posture {
         Posture::Guard => {
-            "\n  Refuse every deny instead (the enforce of earlier versions): \
+            "\n  Refuse every deny and every review instead: \
              innerwarden agents connect --strict"
         }
         Posture::Strict => "",

@@ -47,6 +47,12 @@ A `sed` that writes a home's startup file with its `w` command, and inline
 code that writes one, are held for review, as a copy of an unseen file onto
 it is. Measured on every corpus line and its variants (34,954, an empty home
 and a home with keys): no benign line newly refused.
+`innerwarden proxy --mode strict` is accepted and listed in `--help`: like
+`guard`, but a refusal by the tool's name or its argument names stays a
+refusal. It used to be refused as an unknown mode. A refused call reported
+to a local InnerWarden agent from a strict proxy now carries
+`proxy_mode: strict`; `mode` stays `guard`, the refusal class the agent's
+route takes, where before nothing said the proxy ran strict.
 
 Ordinary agent work is refused less. In a set of commands from public
 coding-agent runs with no attack among them, main refused 69 lines; this
@@ -82,7 +88,8 @@ highly certain of: a hard-class secret read, destruction of the system or a
 home, an act that takes the guard down, a reverse shell, and download and run.
 Every other deny and every review runs, is recorded as `would_block`, and the
 agent shows one line about it. `agents connect --strict` and `install
---strict` keep the enforce of earlier versions (every deny refused); an install
+--strict` refuse every deny and every review (the strict posture, wired with
+`--block-review`); an install
 wired before this release keeps it on upgrade, and `--guard`, from the person's
 terminal, moves it to the default posture. `innerwarden status` says the
 posture in force and what it refuses. In the Community CLI `--strict` now

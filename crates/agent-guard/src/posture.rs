@@ -229,10 +229,7 @@ pub fn refuses_summary(posture: Posture) -> &'static str {
              acts that take the guard down, reverse shells and download-and-run; \
              every other deny or review runs with a one-line warning and is recorded"
         }
-        Posture::Strict => {
-            "refuses every deny; a review asks you (Claude Code, Hermes, Cursor), \
-             runs with a warning (Codex) or is refused (other agents)"
-        }
+        Posture::Strict => "refuses every deny and every review",
     }
 }
 
