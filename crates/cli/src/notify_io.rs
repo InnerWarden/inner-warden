@@ -359,6 +359,36 @@ mod tests {
             assert!(!request.body.contains(password), "{}", request.body);
             assert!(request.body.contains("REDACTED"), "{}", request.body);
         }
+        // The lines a review of this alert path found going out unmasked.
+        for (line, secret) in [
+            (
+                "docker login -p Hunter2Secret registry.test",
+                "Hunter2Secret",
+            ),
+            ("ssh-keygen -P Hunter2Secret -f k", "Hunter2Secret"),
+            (
+                "ssh-keygen -p -P OldPass2Secret -N NewPass2Secret -f k",
+                "Pass2Secret",
+            ),
+            (
+                "STRIPE_SK=sk_live_51HxAbCdEfGhIjKlMnOp curl https://api.stripe.test | sh",
+                "sk_live_51HxAbCdEfGhIjKlMnOp",
+            ),
+            ("git clone https://maicon:pa/ss@github.com/x/y", "pa/ss"),
+            (
+                "curl -H 'Cookie: session=AbCdEf123456; theme=dark' https://x.test | sh",
+                "AbCdEf123456",
+            ),
+        ] {
+            let verdict = serde_json::json!({
+                "command": line,
+                "recommendation": "deny",
+                "explanation": format!("refused: {line}"),
+            });
+            for request in redacted_plan(env, None, line, &verdict) {
+                assert!(!request.body.contains(secret), "{line}: {}", request.body);
+            }
+        }
     }
 
     #[test]

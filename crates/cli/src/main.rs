@@ -1798,7 +1798,14 @@ fn warm_up_in_parallel(
             });
         let _ = innerwarden_agent_guard::mcp::analyze_command_in(first, None, context);
         if let Ok(engine) = engine {
-            let _ = engine.join();
+            if engine.join().is_err() {
+                // Said, not swallowed: the rules then load on this thread,
+                // and the verdict is the same.
+                eprintln!(
+                    "InnerWarden hook: loading the rules on a second thread failed; they were \
+                     loaded on this one instead."
+                );
+            }
         }
     });
 }
