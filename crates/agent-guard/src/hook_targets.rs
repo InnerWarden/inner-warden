@@ -162,8 +162,12 @@ pub static TARGETS: &[HookTarget] = &[
         id: "goose",
         display: "Goose",
         aliases: &[],
-        mechanism: Mechanism::NotYetWirable {
-            why: "no pre-execution hook, and its MCP configuration has no lossless editor yet",
+        // Goose's own extensions (the built-in `developer` among them) run
+        // inside Goose, where no proxy sees them; only its stdio MCP servers
+        // are routed through the proxy, and the line says so.
+        mechanism: Mechanism::McpProxy {
+            why: "no pre-execution hook; its stdio MCP servers are screened through the proxy, its built-in extensions are not",
+            connect: "goose",
         },
         markers: &[".config/goose"],
     },
@@ -401,7 +405,7 @@ mod tests {
                     )
                 });
             assert!(
-                known.mcp_json.is_some() || known.mcp_toml.is_some(),
+                known.mcp_json.is_some() || known.mcp_toml.is_some() || known.mcp_yaml.is_some(),
                 "{} is offered the MCP mechanism but `{connect}` has no MCP config to rewrite",
                 target.id
             );
@@ -412,26 +416,27 @@ mod tests {
         }
     }
 
-    /// An agent with no hook AND no lossless config editor cannot be wired at
-    /// all. That is the honest gap, and it must be routed to isolation rather
-    /// than to a connect command that would silently do nothing.
+    /// An agent with no hook and no MCP surface cannot be wired at all. That
+    /// is the honest gap, and it must be routed to isolation rather than to a
+    /// connect command that would silently do nothing.
     #[test]
     fn an_unwirable_agent_is_routed_to_isolation() {
-        // Goose keeps its servers in YAML, which no writer here round-trips.
-        {
-            let id = "goose";
-            let g = guidance(by_id(id).unwrap());
-            assert!(
-                g.contains("innerwarden contain"),
-                "{id} has nothing to wire yet, so it must be isolated: {g}"
-            );
-            assert!(
-                !g.contains("agents connect"),
-                "{id} cannot be connected; offering it would be a false promise: {g}"
-            );
-        }
         let g = guidance(by_id("aider").unwrap());
         assert!(g.contains("innerwarden contain"), "got: {g}");
+        assert!(!g.contains("agents connect"), "got: {g}");
+    }
+
+    /// Goose was routed to isolation while its YAML had no lossless editor.
+    /// It now has one ([`crate::mcp_wire_yaml`]), so it is sent to the
+    /// connect that wires its stdio servers, and told its built-in
+    /// extensions are not screened by it.
+    ///
+    /// FAILS ON REVERT: Goose back to `NotYetWirable`.
+    #[test]
+    fn goose_is_sent_to_the_connect_that_wires_its_yaml() {
+        let g = guidance(by_id("goose").unwrap());
+        assert!(g.contains("innerwarden agents connect goose"), "got: {g}");
+        assert!(g.contains("built-in extensions are not"), "got: {g}");
     }
 
     #[test]

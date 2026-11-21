@@ -61,6 +61,10 @@ pub struct Known {
     /// The `$HOME`-relative TOML config whose `[mcp_servers.*]` tables are wrapped
     /// (Codex uses `~/.codex/config.toml`, not an `mcp.json`).
     pub mcp_toml: Option<&'static str>,
+    /// The `$HOME`-relative YAML config whose stdio `extensions` are wrapped
+    /// (Goose uses `~/.config/goose/config.yaml`), edited line by line
+    /// ([`crate::mcp_wire_yaml`]).
+    pub mcp_yaml: Option<&'static str>,
 }
 
 pub const KNOWN: &[Known] = &[
@@ -74,6 +78,7 @@ pub const KNOWN: &[Known] = &[
         hookable: true,
         mcp_json: None,
         mcp_toml: None,
+        mcp_yaml: None,
     },
     Known {
         name: "cursor",
@@ -85,6 +90,7 @@ pub const KNOWN: &[Known] = &[
         hookable: false,
         mcp_json: Some(".cursor/mcp.json"),
         mcp_toml: None,
+        mcp_yaml: None,
     },
     // Codex stores MCP servers in TOML (`~/.codex/config.toml` -> [mcp_servers.*]),
     // NOT an mcp.json.
@@ -98,6 +104,7 @@ pub const KNOWN: &[Known] = &[
         hookable: false,
         mcp_json: None,
         mcp_toml: Some(".codex/config.toml"),
+        mcp_yaml: None,
     },
     Known {
         name: "gemini",
@@ -110,6 +117,7 @@ pub const KNOWN: &[Known] = &[
         // Gemini CLI stores MCP servers in the top-level `mcpServers` key here.
         mcp_json: Some(".gemini/settings.json"),
         mcp_toml: None,
+        mcp_yaml: None,
     },
     Known {
         name: "goose",
@@ -119,10 +127,12 @@ pub const KNOWN: &[Known] = &[
         config_files: &[(".config/goose/config.yaml", ConfigFormat::YamlMapping)],
         profile_config: None,
         hookable: false,
-        // Goose's supported user config is YAML, which the JSON proxy writer
-        // must never rewrite as though it were an mcp.json file.
+        // Goose keeps its MCP servers under `extensions:` in YAML, which the
+        // JSON proxy writer must never rewrite as though it were an mcp.json
+        // file: its own line editor does, leaving every other line as it was.
         mcp_json: None,
         mcp_toml: None,
+        mcp_yaml: Some(".config/goose/config.yaml"),
     },
     Known {
         name: "aider",
@@ -135,6 +145,7 @@ pub const KNOWN: &[Known] = &[
         // Aider has no reviewed native MCP integration.
         mcp_json: None,
         mcp_toml: None,
+        mcp_yaml: None,
     },
     Known {
         name: "openclaw",
@@ -161,6 +172,7 @@ pub const KNOWN: &[Known] = &[
         // never the safety property; parsing strictly is.
         mcp_json: Some(".openclaw/openclaw.json"),
         mcp_toml: None,
+        mcp_yaml: None,
     },
     Known {
         name: "hermes",
@@ -175,6 +187,7 @@ pub const KNOWN: &[Known] = &[
         // is Claude Code's settings hook) or an MCP config.
         mcp_json: None,
         mcp_toml: None,
+        mcp_yaml: None,
     },
 ];
 
@@ -264,6 +277,8 @@ pub struct AgentStatus {
     pub mcp_json: Option<String>,
     /// The `$HOME`-relative TOML config to wrap (Codex's `config.toml`).
     pub mcp_toml: Option<String>,
+    /// The `$HOME`-relative YAML config to wrap (Goose's `config.yaml`).
+    pub mcp_yaml: Option<String>,
     /// The guardrail is already wired for it.
     pub guarded: bool,
     /// Whether that wiring RECORDS or BLOCKS, when it can be read back.
@@ -301,10 +316,11 @@ impl GuardMode {
 }
 
 impl AgentStatus {
-    /// Can we wire this agent (hook, an mcp.json, or a TOML config)?
+    /// Can we wire this agent (hook, an mcp.json, a TOML or a YAML config)?
     pub fn guardable(&self) -> bool {
         self.hookable
             || self.mcp_json.is_some()
+            || self.mcp_yaml.is_some()
             || self.mcp_toml.is_some()
             || self.name == crate::hermes_hook::AGENT
     }
@@ -374,6 +390,7 @@ pub fn summarize_discovered(
                 hookable: known.hookable,
                 mcp_json: known.mcp_json.map(String::from),
                 mcp_toml: known.mcp_toml.map(String::from),
+                mcp_yaml: known.mcp_yaml.map(String::from),
                 guarded,
                 mode: None,
             };
@@ -410,6 +427,7 @@ pub fn summarize_discovered(
                     hookable: false,
                     mcp_json: None,
                     mcp_toml: None,
+                    mcp_yaml: None,
                     guarded: false,
                     mode: None,
                 });
@@ -518,7 +536,9 @@ mod tests {
 
     #[test]
     fn reviewed_agents_are_guardable_and_unreviewed_formats_stay_manual() {
-        let guardable = |k: &Known| k.hookable || k.mcp_json.is_some() || k.mcp_toml.is_some();
+        let guardable = |k: &Known| {
+            k.hookable || k.mcp_json.is_some() || k.mcp_toml.is_some() || k.mcp_yaml.is_some()
+        };
         let guarded_names: Vec<_> = KNOWN
             .iter()
             .filter(|known| guardable(known))
@@ -527,9 +547,18 @@ mod tests {
         // OpenClaw joined on 2026-08-05: `mcp_wire` learned to locate a NESTED
         // server table (`mcp.servers`), which was the only thing keeping the
         // agent this product's own description names first unguardable.
+        // Goose joined on 2026-11-21: its `extensions:` YAML has a line
+        // editor that changes only the servers' `cmd` and `args` lines.
         assert_eq!(
             guarded_names,
-            vec!["claude-code", "cursor", "codex", "gemini", "openclaw"]
+            vec![
+                "claude-code",
+                "cursor",
+                "codex",
+                "gemini",
+                "goose",
+                "openclaw"
+            ]
         );
         let cc = KNOWN.iter().find(|k| k.name == "claude-code").unwrap();
         assert!(cc.hookable && cc.mcp_json.is_none());
@@ -551,9 +580,16 @@ mod tests {
         );
         let gemini = KNOWN.iter().find(|k| k.name == "gemini").unwrap();
         assert_eq!(gemini.mcp_json, Some(".gemini/settings.json"));
-        // Still manual: Goose keeps its servers in YAML and Aider/Hermes have no
-        // reviewed MCP surface at all, so a JSON writer must not touch either.
-        for name in ["goose", "aider", "hermes"] {
+        let goose = KNOWN.iter().find(|k| k.name == "goose").unwrap();
+        assert!(
+            !goose.hookable
+                && goose.mcp_json.is_none()
+                && goose.mcp_yaml == Some(".config/goose/config.yaml"),
+            "goose must be guarded via its YAML config, never by the JSON writer"
+        );
+        // Still manual: Aider and Hermes have no reviewed MCP surface at all,
+        // so no writer may touch either.
+        for name in ["aider", "hermes"] {
             let known = KNOWN.iter().find(|known| known.name == name).unwrap();
             assert!(!guardable(known), "{name} must remain manual");
         }
@@ -643,6 +679,7 @@ mod tests {
                 hookable: true,
                 mcp_json: None,
                 mcp_toml: None,
+                mcp_yaml: None,
                 guarded: false,
                 mode: None,
             },
@@ -654,6 +691,7 @@ mod tests {
                 hookable: false,
                 mcp_json: Some(".cursor/mcp.json".into()),
                 mcp_toml: None,
+                mcp_yaml: None,
                 guarded: false,
                 mode: None,
             },
@@ -665,6 +703,7 @@ mod tests {
                 hookable: false,
                 mcp_json: None,
                 mcp_toml: None,
+                mcp_yaml: None,
                 guarded: false,
                 mode: None,
             },

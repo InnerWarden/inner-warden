@@ -501,6 +501,7 @@ pub(super) fn agents_payload(rows: &[FixtureAgent], host_mode: &str) -> Value {
             hookable: row.wiring == Wiring::Hook,
             mcp_json: (row.wiring == Wiring::McpJson).then(|| format!(".{}/mcp.json", row.id)),
             mcp_toml: (row.wiring == Wiring::McpToml).then(|| format!(".{}/config.toml", row.id)),
+            mcp_yaml: None,
             guarded: matches!(row.mode, "monitor" | "enforce" | "mixed"),
             mode: None,
         };

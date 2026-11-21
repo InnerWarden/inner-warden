@@ -2308,4 +2308,42 @@ mod tests {
         assert_eq!(d.method.as_deref(), Some("resources/read"));
         assert!(d.verdict.alerts.iter().any(|a| a.rule == "AG-RESP-INJECT"));
     }
+
+    /// Through the proxy, with the rules and a session, a shell tool's call
+    /// that names its program in `argv` runs when the line is harmless and
+    /// is refused when it is not. It was refused by ATR-2026-040 for the
+    /// tool's name, whatever the line.
+    ///
+    /// FAILS ON REVERT of `program_argv` in `mcp::read_tool_call`.
+    #[test]
+    fn a_shell_call_naming_its_program_in_argv_is_judged_by_its_line_in_the_proxy() {
+        use crate::mcp_proxy::taint::TaintTracker;
+        let engine = crate::rules::RuleEngine::load_embedded();
+        let call = |id: u64, args: serde_json::Value| {
+            msg(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {"name": "run_shell", "arguments": args},
+            })
+            .to_string())
+        };
+        let mut session = TaintTracker::new();
+        let harmless = route_message(
+            &call(1, serde_json::json!({"argv": ["ls", "-la"]})),
+            Direction::ClientToServer,
+            None,
+            Some(&engine),
+            Some(&mut session),
+        );
+        assert!(harmless.verdict.allowed, "{:?}", harmless.verdict.alerts);
+        let harmful = route_message(
+            &call(2, serde_json::json!({"argv": ["rm", "-rf", "/"]})),
+            Direction::ClientToServer,
+            None,
+            Some(&engine),
+            Some(&mut session),
+        );
+        assert!(!harmful.verdict.allowed, "{:?}", harmful.verdict.alerts);
+    }
 }
