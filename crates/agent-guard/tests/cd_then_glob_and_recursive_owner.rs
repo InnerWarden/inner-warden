@@ -96,3 +96,101 @@ fn project_folders_and_unresolved_cds_stay_allowed() {
         assert_eq!(verdict(line), "allow", "{line}");
     }
 }
+
+/// `find` handing every file of the root, a system directory or a home to
+/// `chown`, `chgrp` or `chmod` (`-exec`, `-execdir`, `-ok`) is the same change
+/// as `chown -R` (BI NEW-20261121-find-exec-chown-root-allowed). Measured
+/// 2026-11-21 on the branch of #368, each allowed.
+///
+/// FAILS ON REVERT: take the `find` branch out of
+/// `recursive_owner_change_of_system` (threats.rs) and each is allowed.
+#[test]
+fn find_handing_the_whole_system_to_an_owner_change_is_refused() {
+    for line in [
+        "find / -exec chown nobody {} +",
+        "find / -execdir chown nobody {} \\;",
+        "find / -ok chgrp nobody {} \\;",
+        "find ~ -exec chown nobody {} +",
+        "find /etc -type f -exec chown nobody {} \\;",
+        "sudo find /home -exec chgrp staff {} +",
+        "find / -exec sudo chown nobody {} +",
+        "find / -name '*' -exec chown nobody {} +",
+        "find /usr -okdir chown nobody {} \\;",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// A `find` that picks some files out, keeps to its starting point, or
+/// starts in a project folder keeps its verdict.
+#[test]
+fn find_with_a_selection_or_in_a_project_stays_allowed() {
+    for line in [
+        "find build -exec chown me {} +",
+        "find . -exec chmod 644 {} +",
+        "find /tmp/x -exec chown me {} +",
+        "find / -maxdepth 0 -exec chown nobody {} +",
+        "find /srv/app -exec chgrp www-data {} +",
+        "find /etc/nginx -name nginx.conf -exec chmod 644 {} +",
+        "find . -name '*.sh' -exec sh -c 'chmod +x \"$1\"' sh {} \\;",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// Second review of this change (2026-11-21): global options before the
+/// starting point, a starting point the line does not spell out, a test
+/// that is not a literal name or path (an owner, a glob, a regex, a
+/// negation, `-o`, `-prune`), and the program behind its launchers or in
+/// a shell's `-c` line. Measured on the first version of this change,
+/// before the fix: allowed, except the unread starting point (review).
+/// `find / -user olduser -exec chown newuser {} +` was asserted allowed
+/// above in the first version: an owner test leaves every file of that
+/// owner in the whole system to the change.
+#[test]
+fn find_options_tests_and_launchers_do_not_free_a_whole_system_change() {
+    for line in [
+        "find -L / -exec chown nobody {} +",
+        "find -H / -exec chown nobody {} +",
+        "find -P / -exec chown nobody {} +",
+        "find -O3 / -exec chown nobody {} +",
+        "find / -user root -exec chown nobody {} +",
+        "find / -user olduser -exec chown newuser {} +",
+        "find / ! -name x -exec chown nobody {} +",
+        "find / -not -name x -exec chown nobody {} +",
+        "find / -regex '.*' -exec chown nobody {} +",
+        "find / -name '?*' -exec chown nobody {} +",
+        "find / -name zzz -o -exec chown nobody {} +",
+        "find / -path /proc -prune -o -exec chown nobody {} +",
+        "find / -exec nohup chown nobody {} +",
+        "find / -exec timeout 9 chown nobody {} +",
+        "find / -exec sudo -u root chown nobody {} +",
+        "find / -exec sh -c 'chown nobody \"$1\"' sh {} +",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// Final review of this change (2026-11-21): a starting point the line does
+/// not spell out keeps main's verdict (review): build scripts change the
+/// mode of their own output folder this way. One the line resolves to the
+/// root is refused. `-nouser`, `-nogroup` and `-empty` take no argument,
+/// so the action after them is read.
+#[test]
+fn an_unread_starting_point_is_not_refused_but_a_resolved_root_is() {
+    for line in [
+        "find \"$OUT\" -name \"*.html\" -exec chmod 644 {} +",
+        "find \"$BUILD\" -type f -exec chmod +x {} \\;",
+        "find \"$1\" -type f -exec chmod 644 {} +",
+    ] {
+        assert_ne!(verdict(line), "deny", "{line}");
+    }
+    for line in [
+        "X=/; find \"$X\" -exec chown nobody {} +",
+        "X=/; find $X -type f -exec chown nobody {} +",
+        "find / -nouser -exec chown nobody {} +",
+        "find / -empty -exec chmod 777 {} +",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
