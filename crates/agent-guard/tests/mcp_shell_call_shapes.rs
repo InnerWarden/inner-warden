@@ -253,7 +253,7 @@ fn shell_and_interpreter_forms_in_argv_are_judged_by_their_line() {
 /// FAILS ON REVERT of `operands_in_folder` in `read_call_shape`.
 #[test]
 fn relative_operands_are_read_in_the_folder_the_call_names() {
-    let mut dangerous = vec![
+    let dangerous = vec![
         json!({"argv": ["cat", "shadow"], "cwd": "/etc"}),
         json!({"command": "cat", "args": ["shadow"], "cwd": "/etc"}),
         json!({"command": "cat shadow", "cwd": "/etc"}),
@@ -268,12 +268,13 @@ fn relative_operands_are_read_in_the_folder_the_call_names() {
     ];
     // A link to /etc is /etc.
     #[cfg(unix)]
-    let _link_dir = {
+    let (dangerous, _link_dir) = {
+        let mut dangerous = dangerous;
         let dir = tempfile::TempDir::new().unwrap();
         let link = dir.path().join("conf");
         std::os::unix::fs::symlink("/etc", &link).unwrap();
         dangerous.push(json!({"argv": ["cat", "shadow"], "cwd": link.to_string_lossy()}));
-        dir
+        (dangerous, dir)
     };
     for tool in ["run_command", "run_shell", "subprocess"] {
         for args in &dangerous {

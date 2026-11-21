@@ -148,15 +148,11 @@ jobs:
 
       # --all-targets lints the test code too, the Linux-only tests (the jail
       # tests, the sandbox filter's real-kernel child tests) among them, which
-      # a plain clippy never compiles. Windows keeps the plain run: its test
-      # code has not been linted there yet, and the suite there only reports.
+      # a plain clippy never compiles. Windows too: its test code is linted
+      # even though the suite there only reports, so a Unix-only helper left
+      # outside its cfg breaks the build here and not on a later PR.
       - name: Clippy
-        if: runner.os != 'Windows'
         run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Clippy (Windows)
-        if: runner.os == 'Windows'
-        run: cargo clippy --workspace -- -D warnings
 
       # Full suite (unit + integration) on Linux and macOS, the first-class
       # platforms.

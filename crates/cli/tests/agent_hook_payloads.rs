@@ -1325,7 +1325,6 @@ fn a_review_for_an_agent_with_no_way_to_ask_is_refused_with_the_reason() {
 /// stdout that is not JSON of that shape blocks too. Any other end (another
 /// exit, a signal, a timeout) runs the call unless the entry carries
 /// `failClosed: true`.
-#[cfg(unix)]
 fn cursor_reads(answer: &Answer, fail_closed: bool) -> Call {
     match answer.code {
         Some(2) => Call::Refused,
