@@ -173,11 +173,27 @@ list, with every limit.
   turn every project server on or add a server there for you. So what you
   allow with "always allow" inside a jail is not saved in the project's
   `.claude/settings.local.json` and is asked again next run. Where they
-  are not there, `contain` keeps that they were not, and one a jail makes
-  that sets hooks, `disableAllHooks`, permissions in bypass mode,
-  `enableAllProjectMcpServers` or MCP servers (or that does not read as
-  JSON) is said as the jail ends and refuses the next start on the
-  project, naming the file; remove it, or what it sets, to start again.
+  are not there, `contain` keeps that they were not for the run, and one a
+  jail makes during it that sets hooks, `disableAllHooks`, permissions in
+  bypass mode, `enableAllProjectMcpServers` or MCP servers (or that does
+  not read as JSON) is said as the jail ends, `contain` exits 3 (the
+  command's own failure status is kept), and it refuses each next start on
+  the project, naming the file. Remove it, or what it sets, to start again,
+  or, if you read it and want it, accept it from your own terminal with
+  `innerwarden contain --accept-project-files --project <dir>` (refused in
+  an agent's shell, and the guard refuses it to an agent). A file you make
+  in the project between two runs is yours and refuses nothing for being
+  new; the start reads it as it reads your settings. A launch that stopped
+  before its jail ended (killed, the machine off) cannot say what its jail
+  made, so what it found absent and is there now refuses the next start
+  the same way; one that runs in the same project at the same time does
+  too, until it ends (a pid used again by another program is told apart by
+  when that program started). These notes sit beside the jail's own Claude
+  Code folders in `~/.local/state/innerwarden/jail-claude`, out of every
+  jail's reach; outside the jail, the guard holds that folder as it holds
+  its own configuration (a write, `rm`, `mv`, `ln`, a mode or owner change,
+  interpreter code, the file tools), and a note that cannot be read refuses
+  the start instead of counting as none.
   On macOS a jail writes only its own project's folder of the launcher's,
   never another project's.
   A jail does not start where Claude Code's settings may turn the guard's

@@ -70,6 +70,21 @@ the text of a command; what it does not see is written down, as measured:
   `status` says that the agent started there runs without the guard's hook,
   and that you remove the key. A project file that adds hooks of its own is
   named as hooks the guard does not judge.
+- **A jail's change to the project's Claude Code files is told apart from
+  yours.** A `.claude` settings file or a `.mcp.json` that a jail made
+  during its run with hooks, hooks off, a bypass mode or MCP servers now
+  ends the launch with exit status 3 (the command's own failure is kept),
+  besides the line it already printed, so a script running `contain` sees
+  it; the next starts are refused until you remove it or accept it with
+  `innerwarden contain --accept-project-files --project <dir>` from your own
+  terminal. One you make between runs is yours and no longer refuses the
+  start as if a jail had made it. A launch that stopped before its jail
+  ended leaves what it found absent judged at the next start. The
+  launcher's notes in `~/.local/state/innerwarden/jail-claude` are held by
+  the guard like its own configuration (shell writes, removal, moves, links,
+  mode and owner changes, interpreter code, the file tools), a note that
+  cannot be read refuses the start, and the guard refuses an agent's
+  `contain --accept-project-files` under any name or wrapper of the program.
 - **A review asks you instead of passing unseen.** In enforce mode the hook
   used to refuse a `deny` and let a `review` run without a word (`chmod 777`
   on a folder, for one). It now hands a review to the person: Claude Code

@@ -646,23 +646,17 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
         let mode = std::fs::metadata(&records).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
     }
-    // This project's folder, and beside it the launcher's note of which of
-    // the project's Claude Code files were not there (final review of
-    // #352), out of the jail's reach.
+    // This project's folder, and nothing beside it: the launch's note of
+    // which of the project's Claude Code files were not there
+    // (`<folder>.run.<pid>`, beside the folder, out of the jail's reach) is
+    // taken away as the launch ends cleanly, and a jail that made nothing
+    // leaves no `<folder>.made` (T-109; before, a `<folder>.absent` stayed).
     let projects: Vec<_> = std::fs::read_dir(state.join("jail-claude"))
         .expect("this project's folder for Claude Code's settings file")
         .map(|e| e.unwrap().path())
         .collect();
-    assert_eq!(projects.len(), 2, "{projects:?}");
-    let folder = projects.iter().find(|p| p.is_dir()).expect("the folder");
-    let mut note = folder.clone().into_os_string();
-    note.push(".absent");
-    assert!(
-        projects
-            .iter()
-            .any(|p| p.as_os_str() == note && p.is_file()),
-        "{projects:?}"
-    );
+    assert_eq!(projects.len(), 1, "{projects:?}");
+    assert!(projects[0].is_dir(), "{projects:?}");
     let mut entries: Vec<String> = std::fs::read_dir(&state)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -4219,6 +4213,8 @@ fn what_a_jail_writes_in_the_projects_claude_files_never_reaches_the_host() {
         err.contains("settings.local.json appeared while a jail ran"),
         "{err}"
     );
+    // T-109 item 1: the launch does not end in success.
+    assert_eq!(made.status.code(), Some(3), "{err}");
     let next = jail_sh(false, h, a, "echo STARTED");
     let err = String::from_utf8_lossy(&next.stderr);
     assert_eq!(next.status.code(), Some(2), "{err}");
@@ -4416,6 +4412,87 @@ fn the_folder_claude_config_dir_names_is_never_written_in_the_jail() {
     assert!(!text.contains("WROTE") && !text.contains("MADE"), "{text}");
 }
 
+/// T-109, items 1 and 3: a file the person makes in the project between two
+/// runs (hooks of their own) is theirs, and the next jail starts; one a jail
+/// makes during its run (MCP servers) ends that launch with exit status 3,
+/// refuses the next start naming how to accept it, and once the person
+/// accepts it from their terminal the jail starts again.
+///
+/// FAILS ON REVERT: end the launch in success, keep the names absent until
+/// the next good start (the person's file refuses), or accept nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_jails_project_file_fails_the_launch_and_waits_for_the_persons_accept() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    let there = tempfile::TempDir::new().unwrap();
+    let p = there.path();
+    let first = jail_sh(false, h, p, "echo ONE");
+    let err = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "{err}");
+    // Between runs the person adds hooks of their own.
+    std::fs::create_dir_all(p.join(".claude")).unwrap();
+    std::fs::write(
+        p.join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"make lint"}]}]}}"#,
+    )
+    .unwrap();
+    let mine = jail_sh(false, h, p, "echo TWO");
+    let err = String::from_utf8_lossy(&mine.stderr);
+    assert!(mine.status.success(), "{err}");
+    assert!(
+        String::from_utf8_lossy(&mine.stdout).contains("TWO"),
+        "{err}"
+    );
+    // A jail makes MCP servers.
+    let made = jail_sh(
+        false,
+        h,
+        p,
+        "echo '{\"mcpServers\":{\"e\":{\"command\":\"nc\"}}}' > .mcp.json && echo MADE",
+    );
+    let err = String::from_utf8_lossy(&made.stderr);
+    assert!(
+        String::from_utf8_lossy(&made.stdout).contains("MADE"),
+        "{err}"
+    );
+    assert_eq!(made.status.code(), Some(3), "{err}");
+    assert!(err.contains(".mcp.json appeared while a jail ran"), "{err}");
+    let next = jail_sh(false, h, p, "echo STARTED");
+    let err = String::from_utf8_lossy(&next.stderr);
+    assert_eq!(next.status.code(), Some(2), "{err}");
+    assert!(err.contains("--accept-project-files"), "{err}");
+    let accepted = cli()
+        .args([
+            "contain",
+            "--accept-project-files",
+            "--project",
+            p.to_str().unwrap(),
+        ])
+        .env("HOME", h)
+        .output()
+        .expect("accept");
+    let out = String::from_utf8_lossy(&accepted.stdout);
+    assert!(
+        accepted.status.success(),
+        "{out} {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    assert!(
+        out.contains("accepted as yours") && out.contains(".mcp.json"),
+        "{out}"
+    );
+    let again = jail_sh(false, h, p, "echo STARTED");
+    let err = String::from_utf8_lossy(&again.stderr);
+    assert!(again.status.success(), "{err}");
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("STARTED"),
+        "{err}"
+    );
+}
+
 /// Second review of #352, item 3: a start that could not read the person's
 /// Claude Code settings went on as if nothing turned the hook off. Now each
 /// doubt refuses the start (exit 2), names the file, and arms nothing: the
@@ -4503,9 +4580,11 @@ fn every_doubt_in_the_persons_claude_settings_refuses_the_start() {
 fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
-    // The project's folder, and beside it, out of the jail's reach, the
-    // launcher's note of which of the project's Claude Code files were not
-    // there (`<folder>.absent`, final review of #352).
+    // The project's folder, and nothing beside it once the launch ended
+    // cleanly: the launch's note of which of the project's Claude Code files
+    // were not there (`<folder>.run.<pid>`, beside the folder, out of the
+    // jail's reach) is taken away at its end, and a jail that made nothing
+    // leaves no `<folder>.made` (T-109; before, `<folder>.absent` stayed).
     let entries = |h: &std::path::Path| -> Vec<std::path::PathBuf> {
         std::fs::read_dir(h.join(".local/state/innerwarden/jail-claude"))
             .map(|dir| dir.map(|e| e.unwrap().path()).collect())
@@ -4525,10 +4604,7 @@ fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     let made_one = |h: &std::path::Path, when: &str| {
         let made = folders(h);
         assert_eq!(made.len(), 1, "{when}: {made:?}");
-        let mut note = made[0].clone().into_os_string();
-        note.push(".absent");
-        assert_eq!(entries(h).len(), 2, "{when}: {:?}", entries(h));
-        assert!(std::path::Path::new(&note).is_file(), "{when}: {note:?}");
+        assert_eq!(entries(h).len(), 1, "{when}: {:?}", entries(h));
         let meta = std::fs::symlink_metadata(&made[0]).unwrap();
         assert!(meta.is_dir(), "{when}");
         assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{when}");
@@ -6442,6 +6518,7 @@ fn a_mount_of_the_jails_own_never_takes_the_hooks_decisions() {
          s = socket.socket(socket.AF_UNIX)\n\
          s.bind('/run/innerwarden-record/graph.sock')\n\
          s.listen(8)\n\
+         open('/run/innerwarden-record/ready', 'w').close()\n\
          while True:\n    \
              c, _ = s.accept()\n    \
              d = c.recv(1 << 20)\n    \
@@ -6450,12 +6527,14 @@ fn a_mount_of_the_jails_own_never_takes_the_hooks_decisions() {
              c.close()\n",
     )
     .unwrap();
+    // Waits for the program to say it listens, or to be gone, and at most
+    // 400 turns of 0.05 s (20 s, as the test beside it gives its program).
     let inner = format!(
         "mount -t tmpfs none /run/innerwarden-record || exit 3; \
-         python3 '{}' & i=0; \
-         while [ ! -S /run/innerwarden-record/graph.sock ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; \
+         python3 '{}' & F=$!; i=0; \
+         while [ ! -e /run/innerwarden-record/ready ] && kill -0 $F 2>/dev/null && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; \
          mount -o remount,ro /run/innerwarden-record; \
-         {}; if [ -s /tmp/heard ]; then echo HEARD; fi; kill $! 2>/dev/null; true",
+         {}; if [ -s /tmp/heard ]; then echo HEARD; fi; kill $F 2>/dev/null; true",
         fake.display(),
         jail_hook_line("inner"),
     );
