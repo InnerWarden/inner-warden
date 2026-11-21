@@ -70,6 +70,28 @@ the text of a command; what it does not see is written down, as measured:
   `status` says that the agent started there runs without the guard's hook,
   and that you remove the key. A project file that adds hooks of its own is
   named as hooks the guard does not judge.
+- **A project's agent settings are held by path.** Every write an agent makes
+  to them is refused, whatever it changes: a rule added to
+  `permissions.allow` and a project hook of its own (a formatter run after
+  each edit, for one) are refused too, a false positive accepted because a
+  hook the agent writes runs outside the guard. Claude Code's own "always
+  allow" answer is written by Claude Code, not through a tool call, and still
+  works. The shell forms held now include `cp`, `mv`, `tee`, an append,
+  a heredoc, a write from inside `.claude`, `git checkout <tree> -- <file>`
+  and `git restore`, a file written elsewhere and moved in, a link made at
+  the file or put where the folder was (`ln -sfn`), the absolute path, node
+  and ruby code, and the folder spelled in capitals, which is the same folder
+  on a macOS disk. Not held: a branch switched, pulled or merged that changes
+  one of these files.
+- **`status` reads a project's settings from anywhere inside it.** Run in a
+  subfolder, it reads each folder up to the project's root (the one with
+  `.git`), never the home or above. It also reads Codex's project
+  `.codex/config.toml` (`codex_hooks = false` or `hooks = false` under
+  `[features]`) and `.codex/hooks.json`, and says when a file is there and
+  could not be read: JSON with a comment or a trailing comma, a file over
+  1 MiB, or something that is not a regular file. A link, a pipe or a device
+  in the place of one of these files is never opened, so a FIFO or a link to
+  `/dev/zero` no longer makes `status` wait.
 - **A review asks you instead of passing unseen.** In enforce mode the hook
   used to refuse a `deny` and let a `review` run without a word (`chmod 777`
   on a folder, for one). It now hands a review to the person: Claude Code

@@ -760,6 +760,9 @@ pub enum ProjectEffect {
     HooksOff(&'static str),
     /// Hooks of the project's own, which the agent runs beside the guard's.
     OwnHooks,
+    /// The file is there and could not be read; the words say why. The
+    /// agent may still read it, so what it does to the hooks is not known.
+    Unread(&'static str),
 }
 
 /// The project files an agent reads its hooks from, relative to the
@@ -769,7 +772,49 @@ pub const PROJECT_SETTINGS_FILES: &[(&str, &str)] = &[
     ("claude-code", ".claude/settings.local.json"),
     ("gemini", ".gemini/settings.json"),
     ("cursor", ".cursor/hooks.json"),
+    ("codex", ".codex/config.toml"),
+    ("codex", ".codex/hooks.json"),
 ];
+
+/// What a project's settings file does to its agent's hooks, from the bytes
+/// it holds: [`project_settings_effect`] once they are parsed, or
+/// [`ProjectEffect::Unread`] when they are not JSON (or TOML, for Codex's
+/// `config.toml`) this can read: a comment or a trailing comma, for one.
+/// For Codex's `config.toml`, `codex_hooks = false` or `hooks = false`
+/// under `[features]` switches every hook off.
+pub fn project_settings_read(file: &str, body: &[u8]) -> Option<ProjectEffect> {
+    if file.ends_with(".toml") {
+        let Some(config) = std::str::from_utf8(body)
+            .ok()
+            .and_then(|text| text.parse::<toml::Table>().ok())
+        else {
+            return Some(ProjectEffect::Unread("is not TOML that could be read"));
+        };
+        let features = config.get("features").and_then(toml::Value::as_table);
+        for (switch, words) in [
+            (
+                "codex_hooks",
+                "sets \"codex_hooks\" to false under [features]",
+            ),
+            ("hooks", "sets \"hooks\" to false under [features]"),
+        ] {
+            if features
+                .and_then(|features| features.get(switch))
+                .and_then(toml::Value::as_bool)
+                == Some(false)
+            {
+                return Some(ProjectEffect::HooksOff(words));
+            }
+        }
+        return None;
+    }
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(settings) => project_settings_effect(file, &settings),
+        Err(_) => Some(ProjectEffect::Unread(
+            "is not plain JSON (a comment or a trailing comma, for one)",
+        )),
+    }
+}
 
 /// What a project's settings file does to its agent's hooks, read from its
 /// parsed text; `None` when it leaves them as they are.
@@ -843,6 +888,14 @@ pub fn project_settings_finding(project: &ProjectSettings) -> Finding {
                 "remove it from {} yourself (an agent's change to that file is refused), \
                  then start {} again",
                 project.file, project.agent
+            ),
+        },
+        ProjectEffect::Unread(why) => Finding::Unknown {
+            what: format!("Could not read this project's {}: it {why}.", project.file),
+            why: format!(
+                "{} may still read it, and a project's settings can switch the guard's hook \
+                 off in this folder: open it and check before you start {} here.",
+                project.agent, project.agent
             ),
         },
         ProjectEffect::OwnHooks => Finding::Unknown {
@@ -1495,6 +1548,62 @@ mod tests {
         );
         assert!(
             report.contains("NOT fully protecting this machine"),
+            "{report}"
+        );
+    }
+
+    /// Codex's project files are read, and a file this cannot parse is named
+    /// as unread instead of passing in silence.
+    #[test]
+    fn project_settings_read_names_codex_and_what_it_cannot_parse() {
+        for switch in ["codex_hooks", "hooks"] {
+            assert!(matches!(
+                project_settings_read(
+                    ".codex/config.toml",
+                    format!("[features]\n{switch} = false\n").as_bytes()
+                ),
+                Some(ProjectEffect::HooksOff(_))
+            ));
+            assert_eq!(
+                project_settings_read(
+                    ".codex/config.toml",
+                    format!("[features]\n{switch} = true\n").as_bytes()
+                ),
+                None
+            );
+        }
+        assert!(matches!(
+            project_settings_read(".codex/config.toml", b"[features\n"),
+            Some(ProjectEffect::Unread(_))
+        ));
+        assert_eq!(
+            project_settings_read(
+                ".codex/hooks.json",
+                br#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"x"}]}]}}"#
+            ),
+            Some(ProjectEffect::OwnHooks)
+        );
+        for body in [
+            &b"{\"disableAllHooks\": true,}"[..],
+            b"{\n// off\n\"disableAllHooks\": true}",
+        ] {
+            assert!(matches!(
+                project_settings_read(".claude/settings.json", body),
+                Some(ProjectEffect::Unread(_))
+            ));
+        }
+        let report = render(&Facts {
+            project_settings: vec![ProjectSettings {
+                agent: "claude-code",
+                file: ".claude/settings.json".into(),
+                effect: ProjectEffect::Unread("is larger than 1 MiB"),
+            }],
+            ..healthy()
+        });
+        assert!(
+            report.contains(
+                "Could not read this project's .claude/settings.json: it is larger than 1 MiB."
+            ),
             "{report}"
         );
     }

@@ -3636,7 +3636,7 @@ fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)]
             60,
         );
         add(
-            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\().*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|\.codex/hooks\.json|\.cursor/hooks\.json|\.codex/config\.toml)"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\(|\b(?:File|IO)\.(?:bin)?write\(|\bFile\.(?:rename|delete|unlink|symlink)\(|\bFileUtils\.).*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|\.codex/hooks\.json|\.cursor/hooks\.json|\.codex/config\.toml)"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
@@ -7693,9 +7693,11 @@ const GUARD_CARRIER_WRITTEN: &str =
 /// of `cp`, `mv`, a redirection and the other writers [`writes_place`] reads.
 ///
 /// Not read, and so not refused: a target the shell builds (a glob, a brace,
-/// a substitution), a copy of a whole folder that holds one of these files,
-/// an archive unpacked over one, a download that takes its name from the
-/// URL, `git checkout` of one, a change of owner, and a write made by
+/// a substitution), a copy of a whole folder that holds one of these files
+/// into a place other than the agent's folder, an archive unpacked over one,
+/// a download that takes its name from the URL, a branch switched, pulled or
+/// merged that changes one (`git checkout <tree> -- <path>` and `git restore`
+/// of one are read), a change of owner, and a write made by
 /// interpreter code other than the rewrites [`guard_self_disable_in`] names.
 fn writes_guard_carrier(content: &str) -> bool {
     if !may_name_guard_carrier(content) {
@@ -8116,6 +8118,25 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 if command == "mv" {
                     taken.extend(sources.iter().map(|path| path.to_string()));
                 }
+                // A link, a move or a recursive copy onto an agent's folder
+                // puts another folder in its place (`ln -sfn ../elsewhere
+                // .claude`), and the settings files in it with it.
+                let recursive = arguments.iter().any(|argument| {
+                    matches!(argument.as_str(), "--recursive" | "--archive")
+                        || (argument.starts_with('-')
+                            && !argument.starts_with("--")
+                            && argument.contains(['r', 'R', 'a']))
+                });
+                // Named as the folder itself: one source, no `-t`, no `/` at
+                // the end. `mv CLAUDE.md ~/.claude/` puts a file into it.
+                let replaces = !named_directory
+                    && sources.len() == 1
+                    && destination
+                        .as_deref()
+                        .is_some_and(|path| !path.trim_matches(['"', '\'']).ends_with('/'));
+                if replaces && (matches!(command, "ln" | "mv") || (command == "cp" && recursive)) {
+                    taken.extend(destination.clone());
+                }
                 // `rsync --delete` (and `--delete-before`, `--del`, ...)
                 // removes what the destination holds that the source does
                 // not: the destination folder is taken away, not only
@@ -8169,6 +8190,16 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 targets.extend(reading.written);
             }
             "dd" => targets.extend(dd_operand(arguments, "of").map(str::to_string)),
+            // `git checkout <tree> -- <path>` and `git restore` put another
+            // version of each path they name in its place.
+            "git" => {
+                if let Some(at) = positional
+                    .iter()
+                    .position(|word| matches!(word.as_str(), "checkout" | "restore"))
+                {
+                    targets.extend(positional[at + 1..].iter().map(|path| path.to_string()));
+                }
+            }
             "curl" => targets.extend(option_values(arguments, 'o', &["output"])),
             "wget" => targets.extend(option_values(arguments, 'O', &["output-document"])),
             "unzip" => targets.extend(unpacks_into(option_values(arguments, 'd', &[]))),

@@ -7,8 +7,11 @@
 //! the person's own included). An agent works in that project and can write
 //! both files, so a write that switches the guard's hook off, adds a hook,
 //! puts the session in bypass mode or names a key helper is refused, by the
-//! shell and by the file tools alike. A rule added to \`permissions.allow\` is
-//! the ordinary "always allow" and still runs.
+//! shell and by the file tools alike. The hold is by path: every write the
+//! agent makes to those files is refused, a rule it adds to
+//! \`permissions.allow\` and a project hook (a formatter, for one) included.
+//! Claude Code's own "always allow" is written by Claude Code, not through a
+//! tool call, and still works.
 //!
 //! These run the REAL binary the way Claude Code runs it, with HOME and the
 //! record in a scratch directory.
@@ -154,6 +157,76 @@ fn a_project_settings_write_that_lowers_the_guard_is_refused() {
     ];
     let mut let_through = Vec::new();
     for payload in &refused {
+        let (code, stderr) = host.hook(payload);
+        if code != Some(2) {
+            let_through.push(format!("{code:?} {} :: {stderr}", payload["tool_input"]));
+        }
+    }
+    assert!(
+        let_through.is_empty(),
+        "let through:\n{}",
+        let_through.join("\n")
+    );
+}
+
+/// The other shapes a write to a project's settings takes, refused like the
+/// plain redirect: a copy or a move onto the file, `tee`, an append, a
+/// heredoc, a write from inside `.claude`, git putting another version of
+/// the file back, a file written elsewhere and moved in, a link made at the
+/// file's place or put where `.claude` was, the absolute path, node and
+/// ruby, and the folder spelled in capitals, which is the same folder on a
+/// macOS disk. The hold is by path: even a rule added to
+/// `permissions.allow` by the agent is refused.
+#[test]
+fn every_shape_of_a_project_settings_write_is_refused() {
+    let host = Host::new();
+    let abs = host.project().join(".claude/settings.json");
+    let abs = abs.display();
+    let shapes = [
+        host.bash("cp /dev/null .claude/settings.json"),
+        host.bash("cp ../x.json .claude/settings.local.json"),
+        host.bash("mv x.json .claude/settings.json"),
+        host.bash(r#"echo '{"disableAllHooks": true}' | tee .claude/settings.local.json"#),
+        host.bash(r#"echo '{"disableAllHooks": true}' >> .claude/settings.local.json"#),
+        host.bash("cat > .claude/settings.json <<'EOF'\n{\"disableAllHooks\": true}\nEOF"),
+        host.bash("cd .claude && cp ../x.json settings.json"),
+        host.bash(r#"cd .claude && echo '{"disableAllHooks": true}' > settings.local.json"#),
+        host.bash("git checkout other -- .claude/settings.json"),
+        host.bash("git restore --source=other .claude/settings.local.json"),
+        host.bash(
+            r#"echo '{"disableAllHooks": true}' > /tmp/s.json && mv /tmp/s.json .claude/settings.json"#,
+        ),
+        host.bash("ln -sf ../x.json .claude/settings.json"),
+        host.bash("rm -rf .claude && ln -s ../elsewhere .claude"),
+        host.bash("ln -sfn ../elsewhere .claude"),
+        host.bash("mv ../elsewhere .claude"),
+        host.bash("cp -r ../elsewhere .claude"),
+        host.bash(&format!(r#"echo '{{"disableAllHooks": true}}' > {abs}"#)),
+        host.bash(
+            r#"node -e 'require("fs").writeFileSync(".claude/settings.json", JSON.stringify({disableAllHooks: true}))'"#,
+        ),
+        host.bash(r#"ruby -e 'File.write(".claude/settings.local.json", %q({"disableAllHooks": true}))'"#),
+        host.bash(r#"echo '{"disableAllHooks": true}' > .CLAUDE/settings.json"#),
+        host.bash(r#"echo '{"version":1,"hooks":{}}' > .Cursor/hooks.json"#),
+        host.write_tool(".Claude/Settings.Local.json", r#"{"disableAllHooks": true}"#),
+        host.write_tool(".CURSOR/hooks.json", r#"{"version":1,"hooks":{}}"#),
+        // Held by path: a rule added to `permissions.allow` is refused too.
+        host.edit_tool(
+            ".claude/settings.local.json",
+            r#""allow": ["#,
+            r#""allow": ["Bash(npm test)", "#,
+        ),
+        // A project's own hooks, a formatter for one, are refused as well:
+        // an accepted false positive, since a hook the agent writes runs
+        // outside the guard.
+        host.write_tool(
+            ".claude/settings.json",
+            r#"{"hooks":{"PostToolUse":[{"matcher":"Edit","hooks":[{"type":"command","command":"cargo fmt"}]}]}}"#,
+        ),
+        host.write_tool(".codex/hooks.json", r#"{"hooks":{}}"#),
+    ];
+    let mut let_through = Vec::new();
+    for payload in &shapes {
         let (code, stderr) = host.hook(payload);
         if code != Some(2) {
             let_through.push(format!("{code:?} {} :: {stderr}", payload["tool_input"]));

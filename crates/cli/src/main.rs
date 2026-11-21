@@ -444,37 +444,68 @@ fn status_io_cmd_rest(
     std::process::ExitCode::SUCCESS
 }
 
-/// The project settings files in `dir` that switch an agent's hooks off or
-/// add hooks of their own ([`status::project_settings_effect`]). A file that
-/// is missing, too large or not JSON says nothing here: the guard's own
-/// wiring lines are read from the home. Run in the home itself, these files
-/// are the person's own settings, read by the lines above, not a project's.
+/// The project settings files that switch an agent's hooks off or add hooks
+/// of their own ([`status::project_settings_read`]), in `dir` and in each
+/// folder above it up to the project's root: the first one that holds
+/// `.git`, and never the home or above it. Run in the home itself, these
+/// files are the person's own settings, read by the lines above, not a
+/// project's. A file in a folder above `dir` is named by its full path.
 fn project_settings_in(
     dir: &std::path::Path,
     home: Option<&std::path::Path>,
 ) -> Vec<status::ProjectSettings> {
-    const MOST: u64 = 1 << 20;
     let same = |a: &std::path::Path, b: &std::path::Path| {
         a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(a), Ok(b)) if a == b)
     };
-    if home.is_some_and(|home| same(dir, home)) {
-        return Vec::new();
-    }
-    status::PROJECT_SETTINGS_FILES
-        .iter()
-        .filter_map(|(agent, file)| {
-            let path = dir.join(file);
-            if std::fs::metadata(&path).ok()?.len() > MOST {
-                return None;
-            }
-            let settings = serde_json::from_slice(&std::fs::read(&path).ok()?).ok()?;
-            Some(status::ProjectSettings {
+    let mut found = Vec::new();
+    for folder in dir.ancestors() {
+        if home.is_some_and(|home| same(folder, home)) {
+            break;
+        }
+        for (agent, file) in status::PROJECT_SETTINGS_FILES {
+            let Some(effect) = project_settings_effect_at(&folder.join(file), file) else {
+                continue;
+            };
+            found.push(status::ProjectSettings {
                 agent,
-                file: (*file).to_string(),
-                effect: status::project_settings_effect(file, &settings)?,
-            })
-        })
-        .collect()
+                file: if folder == dir {
+                    (*file).to_string()
+                } else {
+                    folder.join(file).display().to_string()
+                },
+                effect,
+            });
+        }
+        if folder.join(".git").exists() {
+            break;
+        }
+    }
+    found
+}
+
+/// What the project settings file at `path` does to its agent's hooks. A
+/// missing file says nothing. Only a regular file is opened, and no more of
+/// it than the most that is read: a link, a pipe or a device (a link to
+/// `/dev/zero`, a FIFO) is named as not read, never waited on.
+fn project_settings_effect_at(path: &std::path::Path, file: &str) -> Option<status::ProjectEffect> {
+    use std::io::Read;
+    const MOST: u64 = 1 << 20;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.is_file() {
+        return Some(status::ProjectEffect::Unread(
+            "is not a regular file (a link, a pipe or a device), so it was not opened",
+        ));
+    }
+    let mut body = Vec::new();
+    let read =
+        std::fs::File::open(path).and_then(|opened| opened.take(MOST + 1).read_to_end(&mut body));
+    if read.is_err() {
+        return Some(status::ProjectEffect::Unread("could not be opened"));
+    }
+    if body.len() as u64 > MOST {
+        return Some(status::ProjectEffect::Unread("is larger than 1 MiB"));
+    }
+    status::project_settings_read(file, &body)
 }
 
 /// Does a local InnerWarden dashboard answer on `bind`?
