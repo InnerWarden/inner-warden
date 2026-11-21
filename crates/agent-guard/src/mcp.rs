@@ -141,14 +141,30 @@ pub(crate) fn inspect_declared_tool_call(
     // carries is judged and the strictest verdict stands, so a command
     // string read as it always was is never lowered by another shape of the
     // same call ([`tool_commands`]).
-    let (commands, read_keys, unreadable) = match tool_call_read(tool_name, args) {
+    let (commands, read_keys, unreadable, in_folder) = match tool_call_read(tool_name, args) {
         Some(read) => {
             let mut commands = read.commands;
-            add_proxy_readings(args, &mut commands);
-            (commands, read.read_keys, read.unreadable)
+            let in_folder = add_proxy_readings(args, &mut commands);
+            (commands, read.read_keys, read.unreadable, in_folder)
         }
-        None => (Vec::new(), Vec::new(), None),
+        None => (Vec::new(), Vec::new(), None, Vec::new()),
     };
+    // A key or secret file a line names once its operands are read in the
+    // folder the call names (`dd if=shadow` in `/etc`): the analyzer judges
+    // what each program does with a path, and lets some readings of one
+    // through (`dd if=/etc/shadow` as a line), so the file named is refused
+    // here, as the same path written in the call's arguments is (AG-FILE).
+    if let Some(path) = in_folder
+        .iter()
+        .filter_map(|line| threats::check_sensitive_path(line))
+        .find(|path| threats::is_hard_sensitive_path(path))
+    {
+        alerts.push(VerdictAlert::builtin(
+            "AG-FILE",
+            format!("sensitive file, read in the folder the call names: {path}"),
+            true,
+        ));
+    }
     // Standard input past what the guard reads as code, handed to a shell,
     // which runs it: what it runs is not known, so it is refused unread.
     let long_stdin = (names_a_shell_tool(tool_name) || names_a_process_tool(tool_name))
@@ -216,11 +232,13 @@ pub(crate) fn inspect_declared_tool_call(
         // arguments (its tool's name among them) still run.
         // `{"command": "ls", "args": [{"x": "; rm -rf /"}]}` was judged as `ls`.
         if unreadable.is_none() && commands.iter().all(|command| command.exclusive) {
-            let refused_unread = alerts
-                .iter()
-                .any(|alert| alert.block && alert.rule == "AG-ARGV-LONG");
+            // A refusal of the call itself (arguments past the cap, a secret
+            // file read in its folder) stands beside the lines' verdict.
+            let refused_call = alerts.iter().any(|alert| {
+                alert.block && matches!(alert.rule.as_str(), "AG-ARGV-LONG" | "AG-FILE")
+            });
             return Verdict {
-                allowed: !blocks && long_stdin.is_none() && !refused_unread,
+                allowed: !blocks && long_stdin.is_none() && !refused_call,
                 alerts,
             };
         }
@@ -766,9 +784,10 @@ fn arguments_past_cap(args: &serde_json::Value) -> Option<(usize, usize)> {
                     walk(word, true, bytes, items);
                 }
             }
+            // An object inside a list is part of it: its strings count.
             serde_json::Value::Object(map) => {
                 for value in map.values() {
-                    walk(value, false, bytes, items);
+                    walk(value, in_list, bytes, items);
                 }
             }
             serde_json::Value::String(text) if in_list => *bytes += text.len(),
@@ -1580,10 +1599,13 @@ fn read_call_shape<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCal
 ///   relative operands are: each is also read joined to it
 ///   ([`folder_readings`], [`operands_in_folder`]). Before,
 ///   `{"argv": ["cat", "shadow"], "cwd": "/etc"}` was judged as `cat shadow`.
-fn add_proxy_readings<'a>(args: &'a serde_json::Value, commands: &mut Vec<ToolCommand<'a>>) {
+fn add_proxy_readings<'a>(
+    args: &'a serde_json::Value,
+    commands: &mut Vec<ToolCommand<'a>>,
+) -> Vec<String> {
     use std::borrow::Cow;
     let Some(original) = args.as_object() else {
-        return;
+        return Vec::new();
     };
     let canonical = canonical_call(original);
     let object = canonical.as_ref().map_or(original, |(object, _)| object);
@@ -1611,24 +1633,29 @@ fn add_proxy_readings<'a>(args: &'a serde_json::Value, commands: &mut Vec<ToolCo
         .flat_map(|folder| folder_readings(&folder))
         .collect();
     if folders.is_empty() {
-        return;
+        return Vec::new();
     }
     let joined: Vec<ToolCommand<'a>> = commands
         .iter()
         .flat_map(|command| {
             folders.iter().filter_map(move |folder| {
-                operands_in_folder(&command.line, folder).map(|line| ToolCommand {
+                crate::mcp::operands_in_folder(&command.line, folder).map(|line| ToolCommand {
                     line: Cow::Owned(line),
                     exclusive: command.exclusive,
                 })
             })
         })
         .collect();
+    let lines: Vec<String> = joined
+        .iter()
+        .map(|command| command.line.to_string())
+        .collect();
     for command in joined {
         if !commands.iter().any(|known| known.line == command.line) {
             commands.push(command);
         }
     }
+    lines
 }
 
 /// Every command line a shell or process tool call carries, as
@@ -2107,15 +2134,37 @@ fn folder_readings(folder: &str) -> Vec<String> {
 /// reads it: split into its commands ([`threats::shell_command_segments`])
 /// and each into the shell's words ([`threats::shell_tokens`]), so a quote
 /// or an escape (`cat 'shadow'`, `cat sh\\adow`) does not hide an operand.
-/// An operand is a word after the program that is not an option, not a path
-/// from `/` or `~`, not a variable or a substitution, not an assignment
-/// and not a link. The commands are given back joined by `;`, each word
-/// quoted: a reading added to the line's own, which stays judged as written.
-/// `None` when no operand was joined.
+/// An operand is a word after the program that is not an option and not a
+/// path from `/` or `~` (`$HOME` among them); the value of one written
+/// `name=value` (`if=shadow`) is one too. A part the line builds when it
+/// runs (`$f`, `$(echo shadow)`) is a name not known: any name in the
+/// folder, read as `*` ([`unknown_values`]). The commands are given back
+/// joined by `;`, each word quoted but its globs ([`quoted_but_globs`]): a
+/// reading added to the line's own, which stays judged as written. `None`
+/// when no operand was joined.
 fn operands_in_folder(line: &str, folder: &str) -> Option<String> {
     let base = folder.trim_end_matches('/');
     let mut changed = false;
     let mut commands: Vec<String> = Vec::new();
+    // `word` joined to the folder, collapsed; `None` for a word that is no
+    // relative operand.
+    let join = |word: &str| -> Option<String> {
+        if word.is_empty()
+            || word.starts_with(['-', '/', '~', '<', '>', '&', '|', ';', '(', ')'])
+            || word.contains("://")
+            || word.starts_with("$HOME")
+            || word.starts_with("${HOME}")
+        {
+            return None;
+        }
+        let word = unknown_values(word);
+        let path = threats::collapse_path(&format!("{base}/{word}"));
+        Some(match (base.starts_with('~'), path.is_empty()) {
+            (_, true) => "/".to_string(),
+            (true, _) if !path.starts_with('~') => format!("/{path}"),
+            _ => path,
+        })
+    };
     for segment in threats::shell_command_segments(line) {
         let words = threats::shell_tokens(segment);
         let Some(program) = words.iter().position(|word| {
@@ -2129,32 +2178,139 @@ fn operands_in_folder(line: &str, folder: &str) -> Option<String> {
             .iter()
             .enumerate()
             .map(|(at, word)| {
-                let relative = at > program
-                    && !word.is_empty()
-                    && !word.starts_with(['-', '/', '~', '$', '<', '>', '&', '|', ';', '(', ')'])
-                    && !word.contains('=')
-                    && !word.contains("://");
-                if !relative {
+                if at <= program {
                     return shell_quoted(word);
                 }
-                changed = true;
-                let path = threats::collapse_path(&format!("{base}/{word}"));
-                let path = match (base.starts_with('~'), path.is_empty()) {
-                    (_, true) => "/".to_string(),
-                    (true, _) if !path.starts_with('~') => format!("/{path}"),
-                    _ => path,
-                };
-                // A glob stays a glob: only the text around it is quoted.
-                if path.contains(['*', '?', '[']) {
-                    path
-                } else {
-                    shell_quoted(&path)
+                // An operand that names its value after `=` (`if=shadow`,
+                // `--input=id_rsa`): after the program it is no assignment,
+                // and its value is read in the folder.
+                if let Some((name, value)) = word.split_once('=') {
+                    return match join(value) {
+                        Some(path) => {
+                            changed = true;
+                            format!("{}={}", shell_quoted(name), quoted_but_globs(&path))
+                        }
+                        None => shell_quoted(word),
+                    };
+                }
+                match join(word) {
+                    Some(path) => {
+                        changed = true;
+                        quoted_but_globs(&path)
+                    }
+                    None => shell_quoted(word),
                 }
             })
             .collect();
         commands.push(joined.join(" "));
     }
     changed.then(|| commands.join(" ; "))
+}
+
+/// `word` with each part the line builds when it runs (`$f`, `${x}`,
+/// `$(...)`, a backtick substitution) as `*`: a name not known, so any name
+/// in the folder (`cat $f` in `/etc` is `cat /etc/*`).
+fn unknown_values(word: &str) -> String {
+    let chars: Vec<char> = word.chars().collect();
+    let mut out = String::new();
+    let mut at = 0;
+    while at < chars.len() {
+        match chars[at] {
+            '$' if chars.get(at + 1) == Some(&'(') => {
+                let mut depth = 0usize;
+                while at < chars.len() {
+                    match chars[at] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    at += 1;
+                }
+                at += 1;
+                out.push('*');
+            }
+            '$' if chars.get(at + 1) == Some(&'{') => {
+                while at < chars.len() && chars[at] != '}' {
+                    at += 1;
+                }
+                at += 1;
+                out.push('*');
+            }
+            '$' if chars.get(at + 1).is_some_and(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '*' | '#' | '?' | '!')
+            }) =>
+            {
+                at += 1;
+                if chars[at].is_ascii_alphabetic() || chars[at] == '_' {
+                    while at < chars.len()
+                        && (chars[at].is_ascii_alphanumeric() || chars[at] == '_')
+                    {
+                        at += 1;
+                    }
+                } else {
+                    at += 1;
+                }
+                out.push('*');
+            }
+            '`' => {
+                at += 1;
+                while at < chars.len() && chars[at] != '`' {
+                    at += 1;
+                }
+                at += 1;
+                out.push('*');
+            }
+            other => {
+                out.push(other);
+                at += 1;
+            }
+        }
+    }
+    out
+}
+
+/// `path` for a shell line, a glob in it kept a glob: each run of the text
+/// that holds no `*`, `?` or `[...]` quoted on its own
+/// (`'/home/u/My Dir'/*`), so a space in the folder does not split it.
+fn quoted_but_globs(path: &str) -> String {
+    if !path.contains(['*', '?', '[']) {
+        return shell_quoted(path);
+    }
+    let mut out = String::new();
+    let mut plain = String::new();
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' | '?' => {
+                if !plain.is_empty() {
+                    out.push_str(&shell_quoted(&std::mem::take(&mut plain)));
+                }
+                out.push(c);
+            }
+            '[' => {
+                if !plain.is_empty() {
+                    out.push_str(&shell_quoted(&std::mem::take(&mut plain)));
+                }
+                out.push('[');
+                for inner in chars.by_ref() {
+                    out.push(inner);
+                    if inner == ']' {
+                        break;
+                    }
+                }
+            }
+            other => plain.push(other),
+        }
+    }
+    if !plain.is_empty() {
+        out.push_str(&shell_quoted(&plain));
+    }
+    out
 }
 
 /// Whether `text` is a folder named as plainly as a path can be: letters,
@@ -9792,5 +9948,31 @@ mod interpreter_input_and_argv_calls {
                 verdict.alerts
             );
         }
+    }
+
+    /// Review 3 of #369, item 4: a joined glob keeps a folder with a space
+    /// one word, only its parts that are no glob quoted; a value the line
+    /// builds is any name there; the value after `=` is read there too.
+    ///
+    /// FAILS ON REVERT of `quoted_but_globs` (the folder is split at its
+    /// space: `/home/u/My Dir/*`).
+    #[test]
+    fn a_joined_operand_keeps_its_folder_one_word() {
+        assert_eq!(
+            crate::mcp::operands_in_folder("cat *", "/home/u/My Dir").as_deref(),
+            Some("cat '/home/u/My Dir/'*")
+        );
+        assert_eq!(
+            crate::mcp::operands_in_folder("cat $f", "/etc").as_deref(),
+            Some("cat /etc/*")
+        );
+        assert_eq!(
+            crate::mcp::operands_in_folder("dd if=shadow of=/tmp/x", "/etc").as_deref(),
+            Some("dd if=/etc/shadow of=/tmp/x")
+        );
+        assert_eq!(
+            crate::mcp::operands_in_folder("cat 'a b'", "/x y").as_deref(),
+            Some("cat '/x y/a b'")
+        );
     }
 }

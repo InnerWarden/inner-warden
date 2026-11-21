@@ -460,3 +460,69 @@ fn any_list_beside_a_command_is_held_to_the_cap() {
         }
     }
 }
+
+/// Review 3 of #369, item 1: the value of an `name=value` operand (`if=`,
+/// `--input=`) is read in the folder too, and a key or secret file the joined
+/// path names is refused even where the analyzer lets the program's own
+/// reading of it through (`dd if=/etc/shadow` is allowed as a line).
+///
+/// FAILS ON REVERT of the `=` value in `operands_in_folder` or of the
+/// sensitive file check on the joined lines.
+#[test]
+fn the_value_of_an_operand_with_an_equals_is_read_in_its_folder() {
+    for tool in ["run_command", "run_shell"] {
+        for args in [
+            json!({"command": "dd if=shadow of=/tmp/x", "cwd": "/etc"}),
+            json!({"argv": ["dd", "if=shadow", "of=/tmp/x"], "cwd": "/etc"}),
+            json!({"command": "tool --input=id_rsa", "cwd": "~/.ssh"}),
+        ] {
+            refused(tool, &args);
+        }
+        allowed(
+            tool,
+            &json!({"command": "make CC=gcc all", "cwd": "/home/u/app"}),
+        );
+        allowed(
+            tool,
+            &json!({"command": "dd if=disk.img of=out.img bs=1M", "cwd": "/home/u/app"}),
+        );
+    }
+}
+
+/// Review 3 of #369, item 2: an operand whose value the line builds (`$f`,
+/// `${x}shadow`, `$(echo shadow)`) is read in its folder as any name there.
+///
+/// FAILS ON REVERT of the unknown value in `operands_in_folder` (the
+/// operand was not joined, so `cat $f` in `/etc` ran).
+#[test]
+fn an_operand_built_at_run_time_is_any_name_in_its_folder() {
+    for tool in ["run_command", "run_shell"] {
+        for args in [
+            json!({"command": "cat $f", "cwd": "/etc"}),
+            json!({"command": "cat ${x}shadow", "cwd": "/etc"}),
+            json!({"command": "cat $(echo shadow)", "cwd": "/etc"}),
+            json!({"command": "cat `echo shadow`", "cwd": "/etc"}),
+            json!({"command": "cat $f", "cwd": "~/.ssh"}),
+        ] {
+            refused(tool, &args);
+        }
+        allowed(tool, &json!({"command": "cat $f", "cwd": "/home/u/app"}));
+    }
+}
+
+/// Review 3 of #369, item 3: an object inside a list counts toward the cap,
+/// its strings too.
+///
+/// FAILS ON REVERT of `in_list` kept through objects in `arguments_past_cap`.
+#[test]
+fn an_object_inside_a_list_counts_toward_the_cap() {
+    let big = "a".repeat(2 * 1024 * 1024);
+    for tool in ["run_command", "run_shell"] {
+        let v = verdict(tool, &json!({"command": "ls", "options": [{"x": big}]}));
+        assert!(
+            !v.allowed && v.alerts.iter().any(|a| a.rule == "AG-ARGV-LONG"),
+            "{tool}: {:?}",
+            rules(&v)
+        );
+    }
+}

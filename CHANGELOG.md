@@ -199,7 +199,11 @@ the text of a command; what it does not see is written down, as measured:
   these as `cat shadow`). The line is read in the shell's words, so a quote
   or an escape does not hide an operand (`cat 'shadow'`, `cat sh\adow`), and
   each joined operand is collapsed (`../../etc//shadow` from `/home/u/app` is
-  `/etc/shadow`). A link is followed on the proxy's own disk, which is the
+  `/etc/shadow`). The value of an operand written `name=value` is read there
+  too (`dd if=shadow` in `/etc`), a part the line builds when it runs (`cat
+  $f`, `$(echo shadow)`) is any name there (`cat /etc/*`), and a key or
+  secret file a joined operand names is refused (AG-FILE) even where the
+  analyzer lets the program's own reading of it through. A link is followed on the proxy's own disk, which is the
   server's only when both run on the same machine; elsewhere the folder is
   read as written. A folder holding shell syntax (`$(...)`, `;`, a
   backtick) is also judged as the line a server would join it into, `cd
@@ -211,8 +215,8 @@ the text of a command; what it does not see is written down, as measured:
   >~/.bashrc`); the flag keeps the call's other checks, its tool's name among
   them. A word that is not text beside a command string no longer lets that
   string be judged alone. The lists a call holds (its arguments, and any
-  other list beside the command) past 256 KiB or 4096 words in all are
-  refused unread (AG-ARGV-LONG).
+  other list beside the command, and the objects inside those lists) past
+  256 KiB or 4096 words in all are refused unread (AG-ARGV-LONG).
 - **Goose's config: a merge key, an unreadable file, remote extensions and
   `args`.** An extension holding a YAML merge key (`<<: *base`), which
   Goose does not apply, was read without it, so a stdio server whose `type`
