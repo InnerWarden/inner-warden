@@ -89,6 +89,7 @@ pub mod threats;
 // What the person asked for, kept per agent session by the prompt hook, and
 // read by the MCP proxy to tell a value the person typed from one the model
 // wrote.
+pub mod prompt_writer;
 pub mod user_prompt;
 
 // ── 3. INTERNAL ──────────────────────────────────────────────────────────────

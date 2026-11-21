@@ -81,6 +81,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::prompt_writer::Writer;
+
 /// The event Claude Code (and Codex, by the same name) runs a hook on when
 /// the person submits a prompt.
 pub const PROMPT_EVENT: &str = "UserPromptSubmit";
@@ -142,6 +144,8 @@ pub mod why {
     pub const OTHER_SESSION: &str = "the record found belongs to another session";
     pub const TOO_SHORT: &str = "the value is too short to tell";
     pub const MASKED: &str = "the value is a secret, which the record keeps masked";
+    pub const NOT_PROVEN: &str = "the prompts that could hold the value were not proven to come \
+         from the hook the agent's runtime ran, so the agent may have written them";
     pub const LOST: &str = "this session lost or cut a prompt (past the length cap, the \
          session cap or its day), so the value may have been in what is gone";
 }
@@ -169,6 +173,11 @@ struct Prompt {
     at_ms: i64,
     /// The prompt, masked and cut to [`MAX_PROMPT_CHARS`].
     text: String,
+    /// The runtime that ran the hook, when the hook could prove it
+    /// ([`crate::prompt_writer::hook_writer`]); none for a prompt fed to the
+    /// hook any other way, or written before the proof existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    writer: Option<Writer>,
 }
 
 /// The folder the prompts are kept in, under `home`.
@@ -465,8 +474,19 @@ pub fn record_lost_in(dir: &Path, session: Option<&str>) -> std::io::Result<()> 
 /// Best effort: an error is returned for the caller to drop, never to
 /// refuse the prompt with.
 pub fn record(session: Option<&str>, agent: Option<&str>, prompt: &str) -> std::io::Result<()> {
+    record_from(session, agent, prompt, None)
+}
+
+/// [`record`] with the runtime that ran the hook, when the hook proved it
+/// ([`crate::prompt_writer::hook_writer`]).
+pub fn record_from(
+    session: Option<&str>,
+    agent: Option<&str>,
+    prompt: &str,
+    writer: Option<Writer>,
+) -> std::io::Result<()> {
     let dir = default_dir().ok_or_else(|| std::io::Error::other(why::NO_HOME))?;
-    record_in(&dir, session, agent, prompt, now_ms())
+    record_in_from(&dir, session, agent, prompt, now_ms(), writer)
 }
 
 /// [`record`] with the folder and the clock handed in.
@@ -477,19 +497,29 @@ pub fn record_in(
     prompt: &str,
     now_ms: i64,
 ) -> std::io::Result<()> {
+    record_in_from(dir, session, agent, prompt, now_ms, None)
+}
+
+/// [`record_from`] with the folder and the clock handed in.
+pub fn record_in_from(
+    dir: &Path,
+    session: Option<&str>,
+    agent: Option<&str>,
+    prompt: &str,
+    now_ms: i64,
+    writer: Option<Writer>,
+) -> std::io::Result<()> {
     let Some(session) = session.and_then(usable_session) else {
         return Ok(());
     };
     if prompt.trim().is_empty() {
         return Ok(());
     }
-    record_in_waiting(dir, session, agent, prompt, now_ms, UPDATE_DEADLINE)
+    record_in_waiting_from(dir, session, agent, prompt, now_ms, UPDATE_DEADLINE, writer)
 }
 
-/// [`record_in`] with the deadline of the write handed in. A prompt that
-/// could not be written (the lock held past the deadline, a write that
-/// failed) leaves the lost mark, so a value it held answers "unknown",
-/// never "no".
+/// [`record_in_waiting_from`] for a prompt with no proven writer.
+#[cfg(all(test, unix))]
 fn record_in_waiting(
     dir: &Path,
     session: &str,
@@ -497,6 +527,22 @@ fn record_in_waiting(
     prompt: &str,
     now_ms: i64,
     deadline: std::time::Duration,
+) -> std::io::Result<()> {
+    record_in_waiting_from(dir, session, agent, prompt, now_ms, deadline, None)
+}
+
+/// [`record_in`] with the deadline of the write handed in. A prompt that
+/// could not be written (the lock held past the deadline, a write that
+/// failed) leaves the lost mark, so a value it held answers "unknown",
+/// never "no".
+fn record_in_waiting_from(
+    dir: &Path,
+    session: &str,
+    agent: Option<&str>,
+    prompt: &str,
+    now_ms: i64,
+    deadline: std::time::Duration,
+    writer: Option<Writer>,
 ) -> std::io::Result<()> {
     let (text, cut) = kept_text_and_cut(prompt);
     let written = update_record_waiting(dir, session, deadline, |record| {
@@ -509,6 +555,7 @@ fn record_in_waiting(
         record.prompts.push(Prompt {
             at_ms: now_ms,
             text: text.clone(),
+            writer,
         });
         let mut total: usize = record.prompts.iter().map(|p| p.text.chars().count()).sum();
         while total > MAX_SESSION_CHARS && record.prompts.len() > 1 {
@@ -671,6 +718,7 @@ fn drop_expired(path: &Path, read_from: &[u8], record: &Record, now_ms: i64) {
         .map(|p| Prompt {
             at_ms: p.at_ms,
             text: p.text.clone(),
+            writer: p.writer,
         })
         .collect();
     if kept.is_empty() {
@@ -790,6 +838,56 @@ pub fn user_asked_for_in_this_session(value: &str) -> UserAsked {
 
 /// [`user_asked_for`] with the folder and the clock handed in.
 pub fn user_asked_for_in(dir: &Path, session: Option<&str>, value: &str, now_ms: i64) -> UserAsked {
+    asked_in(dir, session, value, now_ms, None)
+}
+
+/// Does `value` appear in a prompt of `session` that the hook the agent's
+/// runtime ran wrote, that runtime being this process or one of its
+/// ancestors ([`crate::prompt_writer`])? Read under `$HOME`. A prompt
+/// the hook could not prove, or that a process outside this one's line
+/// wrote (an agent's script, shell or `subprocess` feeding the hook), never
+/// answers "yes"; when such a prompt could hold the value the answer is
+/// "unknown" ([`why::NOT_PROVEN`]), never "no". Information, as every
+/// answer here: it lowers nothing.
+pub fn user_asked_for_proven(session: Option<&str>, value: &str) -> UserAsked {
+    let Some(dir) = default_dir() else {
+        return UserAsked::Unknown(why::NO_HOME);
+    };
+    user_asked_for_proven_in(
+        &dir,
+        session,
+        value,
+        now_ms(),
+        crate::prompt_writer::is_self_or_ancestor,
+    )
+}
+
+/// [`user_asked_for_proven`] for the session the proxy runs in.
+pub fn user_asked_for_proven_in_this_session(value: &str) -> UserAsked {
+    user_asked_for_proven(proxy_session().as_deref(), value)
+}
+
+/// [`user_asked_for_proven`] with the folder, the clock and the test of a
+/// writer handed in.
+pub fn user_asked_for_proven_in(
+    dir: &Path,
+    session: Option<&str>,
+    value: &str,
+    now_ms: i64,
+    proven: fn(&Writer) -> bool,
+) -> UserAsked {
+    asked_in(dir, session, value, now_ms, Some(proven))
+}
+
+/// The answer, from every fresh prompt (`proven` none) or from the prompts
+/// whose writer `proven` accepts.
+fn asked_in(
+    dir: &Path,
+    session: Option<&str>,
+    value: &str,
+    now_ms: i64,
+    proven: Option<fn(&Writer) -> bool>,
+) -> UserAsked {
     let Some(session) = session.and_then(usable_session) else {
         return UserAsked::Unknown(why::NO_SESSION);
     };
@@ -815,11 +913,23 @@ pub fn user_asked_for_in(dir: &Path, session: Option<&str>, value: &str, now_ms:
     // What has expired is not only unread: it goes now.
     drop_expired(&path, &bytes, &record, now_ms);
     let mut any = false;
+    let mut unproven = false;
     for prompt in record.prompts.iter().filter(|p| fresh(p.at_ms, now_ms)) {
+        if let Some(proven) = proven {
+            if !prompt.writer.as_ref().is_some_and(proven) {
+                unproven = true;
+                continue;
+            }
+        }
         any = true;
         if holds_whole(&folded(&prompt.text), &needle) {
             return UserAsked::Yes;
         }
+    }
+    // A prompt not proven may be the person's own: not found among the
+    // proven ones is then unknown, never no.
+    if unproven {
+        return UserAsked::Unknown(why::NOT_PROVEN);
     }
     // Words this session lost (cut, dropped, past their day) may have held
     // the value: not found is then unknown, never no.
@@ -1381,10 +1491,12 @@ mod tests {
                 Prompt {
                     at_ms: NOW - PROMPT_TTL_MS - 1,
                     text: "rotate the db password tonight".into(),
+                    writer: None,
                 },
                 Prompt {
                     at_ms: NOW - 1,
                     text: "and open issue 7781".into(),
+                    writer: None,
                 },
             ],
             lost: false,
@@ -1432,6 +1544,7 @@ mod tests {
                 prompts: vec![Prompt {
                     at_ms: old,
                     text: "hello there".into(),
+                    writer: None,
                 }],
                 lost: false,
             };

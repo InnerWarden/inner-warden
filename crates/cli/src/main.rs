@@ -1545,10 +1545,13 @@ fn keep_the_prompt(buf: &str, rest: &[String]) -> Option<std::process::ExitCode>
     if std::env::var_os(TEST_PROMPT_PANIC_ENV).is_some() {
         panic!("a panic asked for by {TEST_PROMPT_PANIC_ENV}");
     }
-    let _ = user_prompt::record(
+    // The runtime that ran this hook, when the hook can prove it: the one
+    // process that reads its stdout, its parent or the `sh -c` between.
+    let _ = user_prompt::record_from(
         hook_session(buf).as_deref(),
         agent_flag(rest).as_deref(),
         &prompt,
+        innerwarden_agent_guard::prompt_writer::hook_writer(),
     );
     Some(std::process::ExitCode::SUCCESS)
 }

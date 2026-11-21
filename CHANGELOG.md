@@ -5,6 +5,16 @@ follows semantic versioning.
 
 ## Unreleased
 
+A prompt the person submitted is kept with the agent's runtime that ran the
+hook, when the hook can prove it: its stdin and stdout are pipes and the one
+process reading its stdout is its parent or the parent of the `sh -c`
+between. `user_prompt::user_asked_for_proven` reads only the prompts whose
+runtime is the reader or one of its ancestors (the MCP proxy it started); a
+prompt the agent fed to the hook by a shell line, a script, a Python
+`subprocess` or an `exec` into the hook line is kept as before and never
+proven. Linux reads `/proc`, macOS libproc (not measured on a Mac); no root.
+It is information only and lowers no refusal (docs/prompt-record.md).
+
 `innerwarden agents connect antigravity` wires the guard into the
 Antigravity CLI (`agy`), which took Gemini CLI's place for its free and
 individual users: one `PreToolUse` group under the name `innerwarden` in

@@ -23,6 +23,43 @@ So the record is information only: what it can do is say that a value in a
 call is not in what the person asked (an alert). It lowers nothing, and it
 will not until the record has a writer the agent cannot imitate.
 
+## Who wrote a prompt
+
+Each prompt kept also keeps, when the hook can prove it, the process that ran
+the hook: the agent's runtime. The runtime reads what the hook prints, so the
+hook's stdout is a pipe whose reading end the runtime alone holds until the
+hook ends. A command the agent runs is not handed such a pipe: Claude Code
+2.1.329 runs each command of its Bash tool as `/bin/bash -c`, a child of its
+own binary, with stdin `/dev/null` and stdout on a file (measured on Linux).
+The hook keeps the runtime's process id and start time when its stdin and
+stdout are pipes, exactly one other process reads that stdout, and that
+process is its parent or the parent of the `sh -c` between.
+
+`user_asked_for_proven(session, value)` reads only those prompts, and only
+when the process that kept them is the reader itself or one of its
+ancestors: the MCP proxy that the same runtime started. A prompt the agent
+fed to the hook (a shell line, a script file, a Python `subprocess`, an
+`exec` into the hook line) is kept as before and never proven: its writer is
+the agent's own process, or none. Where such a prompt could hold the value,
+the answer is "unknown", never "no".
+
+What it does not prove:
+
+- A process of the same account can open another process's pipe through
+  `/proc/<pid>/fd` (on Linux, `ptrace_scope` 1 guards attaching, not this)
+  and hand it to the hook as its stdout.
+- A runtime that hands its agent's commands a stdout pipe it reads itself
+  gives the agent's own run of the hook the same proof
+  (`limit_a_runtime_that_reads_its_agent_s_commands_through_a_pipe`).
+- The record is a file of the person's account: an agent that writes it
+  directly writes what it likes, proof included. The guard refuses an
+  agent's writes there by the command's text.
+- Linux reads `/proc`; macOS reads libproc, compiled and not measured on a
+  Mac. Elsewhere nothing is proven.
+
+No root is needed. The proven answer, like every answer here, is
+information: it lowers no refusal.
+
 ## Which agents
 
 | Agent | Session id its prompt hook gets | Session id its MCP servers get | Channel | How it was found |
