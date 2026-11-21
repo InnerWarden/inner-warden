@@ -254,3 +254,19 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   `xargs` splits a name with a blank. bench-benign-2026-11/bb-024,
   bench-benign-2026-11/bb-025; `\x00` and `\x27` in source code spell no
   command (see real/real-015 above).
+- 2026-11-21: guard-word-mention-2026-11 gains gwm-049..gwm-054 (actions
+  main refuses, `must_refuse`, all still denied: `cargo run` of the
+  guard's binary, a guard verb after a test, a note to `~/.bashrc`, a note
+  beside a substitution that acts) and gwm-c07..gwm-c11 (mentions main
+  refused, held for review now). harmless-proven:
+  guard-word-mention-2026-11/gwm-c07, guard-word-mention-2026-11/gwm-c08,
+  guard-word-mention-2026-11/gwm-c09, guard-word-mention-2026-11/gwm-c10,
+  guard-word-mention-2026-11/gwm-c11 go from deny to review. gwm-c07 and
+  gwm-c08 name the guard's package and binary in `cargo test`, whose
+  `contain` filters the project's tests and starts no jail (`cargo run`
+  is not read so); gwm-c09 and gwm-c10 write a note that quotes a refused
+  path to a `.md` file under the home or the project, with its time from
+  a `date` that reads no file; gwm-c11 is Node code that prints a line
+  holding `systemctl` and runs nothing. None is allowed: each is held for
+  review. No other line of any corpus moved, from an empty home or a home
+  with keys.

@@ -132,3 +132,85 @@ fn a_fixed_search_pattern_is_not_a_folder_read() {
         );
     }
 }
+
+/// A package or a target of the project named after the guard, in a build,
+/// a check or a test, is a name: `cargo test -p innerwarden --bin innerwarden
+/// contain` filters the tests by `contain` and starts no jail (BI
+/// FP-20261120-repo-name-and-literal-variable). Measured 2026-11-21 against
+/// main fa63f83: refused as "starts a jail", with a pipe to `grep` or the
+/// output in a log. `cargo run` runs what it builds and keeps the name.
+#[test]
+fn a_test_filter_of_the_guards_package_starts_no_jail() {
+    for line in [
+        "cargo test -p innerwarden --bin innerwarden contain",
+        "cd ~/work/wt-1 && cargo test -p innerwarden --bin innerwarden contain 2>&1 | grep -E 'FAILED|test result'",
+        "CARGO_TARGET_DIR=/home/u/work/target cargo test -p innerwarden --bin innerwarden contain > /home/u/work/t.log 2>&1",
+        "cargo test --package=innerwarden contain",
+    ] {
+        let (recommendation, signals, why) = verdict(line);
+        assert_eq!(recommendation, "review", "{line:?}: {why}");
+        assert!(signals.iter().any(|s| s == "guard_word_mention"), "{line:?}: {signals:?}");
+    }
+    for line in [
+        "cargo run --bin innerwarden contain",
+        "cargo run -p innerwarden -- contain",
+        "cargo test -p innerwarden contain && innerwarden contain",
+        "cargo test -p innerwarden contain > run.sh; sh run.sh",
+    ] {
+        let (recommendation, _, why) = verdict(line);
+        assert_eq!(recommendation, "deny", "{line:?}: {why}");
+    }
+}
+
+/// The text of a note (`echo`, `printf`) written to a `.md`, `.txt` or
+/// `.log` file of the home or the project is text, with its time from
+/// `$(date ...)`: a journal line that quoted a refused path was refused
+/// (BI FP-20261120-message-text-quoting-refused-forms; measured 2026-11-21
+/// against main fa63f83). The same text to a file an agent or the shell
+/// reads as orders, or beside a substitution that acts, stays refused.
+#[test]
+fn a_note_that_quotes_a_refused_path_is_text() {
+    for line in [
+        "echo \"x /etc/sudoers.d/a b\" >> ~/journal/T-1.md",
+        "echo \"$(date -u '+%F') x /etc/sudoers.d/a\" >> ~/journal/T-1.md",
+        "echo \"$(date -u '+%Y-%m-%d %H:%M UTC') FEITO: (\"/etc/sudoers.d/a b\\n\") stays refused\" >> ~/journal/T-1.md",
+        "printf '%s\\n' 'see /etc/sudoers.d/90-cloud' >> docs/notes.md",
+    ] {
+        let (recommendation, signals, why) = verdict(line);
+        assert_eq!(recommendation, "review", "{line:?}: {why}");
+        assert!(signals.iter().any(|s| s == "guard_word_mention"), "{line:?}: {signals:?}");
+    }
+    for line in [
+        "echo 'systemctl stop innerwarden-agent' >> ~/.bashrc",
+        "echo 'x /etc/sudoers.d/a' >> ~/.claude/CLAUDE.md",
+        "echo 'x /etc/sudoers.d/a' >> CLAUDE.md",
+        "echo \"ALL ALL=(ALL) NOPASSWD:ALL\" >> /etc/sudoers.d/x",
+        "echo \"$(date -u) $(systemctl stop innerwarden-agent)\" >> notes.md",
+        "echo \"$(date; systemctl stop innerwarden-agent) x\" >> notes.md",
+        "echo \"$(date -f /etc/shadow) x /etc/sudoers.d/a\" >> notes.md",
+        "echo \"$(date -u) x /etc/sudoers.d/a\" >> notes.md && $_",
+    ] {
+        let (recommendation, _, why) = verdict(line);
+        assert_eq!(recommendation, "deny", "{line:?}: {why}");
+    }
+}
+
+/// `systemctl` in a string that Node prints runs nothing; a call of
+/// `system` or a child process does (BI
+/// FP-20261120-guard-words-in-interpreter-code, measured 2026-11-21 against
+/// main fa63f83: `system` was found inside `systemctl`).
+#[test]
+fn node_code_that_prints_a_unit_name_runs_nothing() {
+    let (recommendation, _, why) =
+        verdict("node -e \"console.log('systemctl disable innerwarden-agent')\"");
+    assert_eq!(recommendation, "review", "{why}");
+    for line in [
+        "node -e \"require('child_process').execSync('systemctl stop innerwarden-agent')\"",
+        "ruby -e \"system('systemctl stop innerwarden-agent')\"",
+        "ruby -e \"system 'systemctl stop innerwarden-agent'\"",
+        "perl -e 'system(\"systemctl stop innerwarden-agent\")'",
+    ] {
+        let (recommendation, _, why) = verdict(line);
+        assert_eq!(recommendation, "deny", "{line:?}: {why}");
+    }
+}
