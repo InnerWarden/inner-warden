@@ -3227,6 +3227,9 @@ fn inline_code_pieces(source: &str) -> Vec<(String, String, bool)> {
 pub(crate) struct HandedLines {
     /// The lines handed to a shell to run.
     pub(crate) lines: Vec<String>,
+    /// The lines of them that `at` or `batch` read on their input: a job
+    /// that runs later, outside this session.
+    pub(crate) scheduled: Vec<String>,
     /// A line is handed through more levels of `xargs` or `find` than the
     /// guard reads ([`HANDED_LEVELS_READ`]): what runs there is unread.
     pub(crate) over_budget: bool,
@@ -3241,6 +3244,12 @@ pub(crate) struct HandedLines {
     /// path, a setting that loads code), which it does not carry to the rest
     /// of the line.
     pub(crate) loads_special: bool,
+}
+
+/// Whether the program `name` runs what it reads on its input as a job
+/// later, outside this session: `at` and `batch`.
+fn schedules_a_job(name: &str) -> bool {
+    matches!(runners::versionless(name), "at" | "batch")
 }
 
 /// The most levels of `xargs` and `find -exec` a handed line is read
@@ -3428,11 +3437,11 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             if !(is_shell_name(&name) || names_a_shell_at_run_time(&effective[0])) {
                 // A runner that reads a script on stdin (`at now <<'EOF'`).
                 if let Some(language) = runners::stdin_script(runners::versionless(&name), &args) {
-                    handed.lines.extend(runners::shell_lines(
-                        language,
-                        &stdin_code_text(body, bytes),
-                        "",
-                    ));
+                    let lines = runners::shell_lines(language, &stdin_code_text(body, bytes), "");
+                    if schedules_a_job(&name) {
+                        handed.scheduled.extend(lines.iter().cloned());
+                    }
+                    handed.lines.extend(lines);
                 }
                 continue;
             }
@@ -3466,20 +3475,20 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             // -f -`, an `awk` program that runs its input, `parallel` with no
             // command. Text the line does not show is held for review.
             if let Some(language) = runners::stdin_script(runners::versionless(&name), &args) {
-                match piped_input(*command, bytes) {
-                    Some(PipedInput::Text(text)) => {
-                        handed
-                            .lines
-                            .extend(runners::shell_lines(language, &text, ""));
+                let text = match piped_input(*command, bytes) {
+                    Some(PipedInput::Text(text)) => Some(text),
+                    Some(PipedInput::Unread) => {
+                        handed.not_literal = true;
+                        None
                     }
-                    Some(PipedInput::Unread) => handed.not_literal = true,
-                    None => {
-                        if let Some(text) = stdin_text_of(*command, bytes) {
-                            handed
-                                .lines
-                                .extend(runners::shell_lines(language, &text, ""));
-                        }
+                    None => stdin_text_of(*command, bytes),
+                };
+                if let Some(text) = text {
+                    let lines = runners::shell_lines(language, &text, "");
+                    if schedules_a_job(&name) {
+                        handed.scheduled.extend(lines.iter().cloned());
                     }
+                    handed.lines.extend(lines);
                 }
             }
             continue;

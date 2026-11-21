@@ -5176,6 +5176,35 @@ fn analyze_command_as_read(
             }
         }
     }
+    // A job `at` or `batch` reads on its input runs later, outside this
+    // session: one that downloads code and runs it is refused, by a pipe
+    // (`echo 'curl ... | sh' | at now`) as by a here-string or a
+    // here-document, where the job is scheduled from text the line holds.
+    // `echo hi | at now` runs nothing fetched and stays as it was.
+    if depth < STARTUP_PAYLOAD_DEPTH
+        && !handed_to_shell.scheduled.is_empty()
+        && !signals.iter().any(|s| s.signal == "persistence_install")
+    {
+        let job = analyze_command_at(
+            &handed_to_shell.scheduled.join("\n"),
+            rule_engine,
+            protected_reads,
+            context,
+            depth + 1,
+        );
+        if job.signals.iter().any(|s| {
+            s.score > 0
+                && (FETCH_EXEC_OBSERVATION.contains(&s.signal.as_str())
+                    || s.signal.starts_with("fetch_exec_"))
+        }) {
+            signals.push(AnalysisSignal {
+                signal: "persistence_install".into(),
+                score: 60,
+                detail: "schedules a job that downloads code and runs it, later and outside this session".into(),
+            });
+            score += 60;
+        }
+    }
     // The fetch-and-execute findings of the lines handed on, charged at the
     // end only when the line itself charged none.
     let mut handed_fetch_exec: Vec<AnalysisSignal> = Vec::new();
