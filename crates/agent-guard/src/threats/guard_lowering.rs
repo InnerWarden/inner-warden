@@ -34,6 +34,11 @@ const NESTED_DEPTH: u8 = 4;
 pub(super) struct GuardLine {
     pub(super) text: String,
     shared: Vec<Range<usize>>,
+    /// The guard's own message in the line (what the fail-closed hook
+    /// prints when the guard gives no answer): ordinary words of English,
+    /// whole or in part not a mark of the guard, though a match across
+    /// them is.
+    prose: Vec<Range<usize>>,
     /// Where the folder of the program ends: the bytes before it are its
     /// install path (`/usr/local/bin/`), words many programs share.
     folder_end: usize,
@@ -83,7 +88,12 @@ impl GuardLine {
         {
             return PkillReach::NamesGuard;
         }
+        // A word that starts in the message is the message's (its last one
+        // runs on to the closing quote).
+        let prose =
+            |word: &Range<usize>| self.prose.iter().any(|prose| prose.contains(&word.start));
         let mut start = 0usize;
+        let mut reach = PkillReach::Unread;
         for (at, byte) in bytes
             .iter()
             .enumerate()
@@ -91,17 +101,29 @@ impl GuardLine {
         {
             if matches!(byte, b' ' | b'/') {
                 let word = start..at;
-                if !word.is_empty()
-                    && range.start <= word.start
-                    && word.end <= range.end
-                    && word.clone().all(owned)
-                {
-                    return PkillReach::Broad;
+                if !word.is_empty() && word.clone().all(owned) && !prose(&word) {
+                    if range.start <= word.start && word.end <= range.end {
+                        return PkillReach::Broad;
+                    }
+                    // A piece of [`NAME_PIECE`] bytes or more of one word of
+                    // the program's (`roxy` of `proxy`, `hoo` of `hook`), not
+                    // of a folder in a path: written for this word, the kill
+                    // takes the guard with whatever else holds it.
+                    let spaced = (word.start == 0 || bytes[word.start - 1] == b' ')
+                        && (word.end == bytes.len() || bytes[word.end] == b' ');
+                    if spaced
+                        && word.start >= self.folder_end
+                        && word.start <= range.start
+                        && range.end <= word.end
+                        && range.len() >= NAME_PIECE
+                    {
+                        reach = PkillReach::Broad;
+                    }
                 }
                 start = at + 1;
             }
         }
-        PkillReach::Unread
+        reach
     }
 }
 
@@ -153,6 +175,32 @@ const LEGACY_LINES: &[&str] = &[
     "/usr/bin/innerwarden hook",
     "/home/user/.local/bin/innerwarden hook",
     "innerwarden",
+];
+
+/// The layouts of the MCP wrapper the CLI has written, oldest first, as the
+/// options between `proxy` and its `--`: `{mode}` is `guard` or `advisory`,
+/// `{agent}` the agent's id (another program's part of the line). A wrapper
+/// keeps the options it already had when it is wrapped again, so each
+/// layout runs on machines that installed it.
+///
+/// * 1.0 to 1.5.1: the mode alone (`mcp_wire.rs` of guard-v1.5.1);
+/// * 1.0 to 1.5.1, a wrapper a person labelled, kept on a later wrap
+///   (`--label`, `--error-response`; the same file's tests);
+/// * from 1.5.2: `--label` and `--agent` added before the mode
+///   (`mcp_wire::naming`, d98eabd);
+/// * an `--agent` with no `--label`, as a wrapper written by hand or by the
+///   Pro CLI's label reads before a reconnect adds the label.
+///
+/// The last one is what [`crate::mcp_wire::wrap`] writes today, which a
+/// test holds to.
+const WRAPPER_LAYOUTS: &[&[&str]] = &[
+    &["--mode", "{mode}"],
+    &["--label", "{agent}", "--mode", "{mode}"],
+    &["--label", "{agent}", "--error-response", "--mode", "{mode}"],
+    &["--agent", "{agent}", "--mode", "{mode}"],
+    &[
+        "--label", "{agent}", "--agent", "{agent}", "--mode", "{mode}",
+    ],
 ];
 
 /// MCP servers as agents start them, behind the proxy's `--`: what follows
@@ -219,34 +267,80 @@ fn build_guard_lines() -> Vec<GuardLine> {
                 if let Some(words) = started_program_words(&line) {
                     lines.push(guard_line(&words, None));
                 }
+                // The shell that runs a fail-closed hook is the guard's too:
+                // killed, the agent reads no refusal and runs the call. The
+                // line Claude Code is given is run by its own `sh -c`.
+                let run = if line.starts_with(FAIL_CLOSED_SHELL) {
+                    line.clone()
+                } else {
+                    format!("{FAIL_CLOSED_SHELL} -c {} \"\"", quoted(&line))
+                };
+                if line.contains("s=$?") {
+                    if let Some(shell) = fail_closed_shell_line(&run) {
+                        lines.push(shell);
+                    }
+                }
             }
         }
         // The MCP wrappers the CLI writes, in each mode, and the layout it
         // still reads as its own (`proxy -- <server>`), around each server.
-        for server in SERVER_LINES {
-            for monitor in [false, true] {
-                let config = serde_json::json!({"mcpServers": {"s": {
-                    "command": server[0],
-                    "args": server[1..],
-                }}});
-                let (wrapped, _) = crate::mcp_wire::wrap(config, program, monitor, "claude-code");
-                let entry = &wrapped["mcpServers"]["s"];
-                let mut words: Vec<String> = Vec::new();
-                if let Some(command) = entry["command"].as_str() {
-                    words.push(command.to_owned());
-                }
-                for arg in entry["args"].as_array().into_iter().flatten() {
-                    if let Some(arg) = arg.as_str() {
-                        words.push(arg.to_owned());
+        for (index, server) in SERVER_LINES.iter().enumerate() {
+            // Each agent the CLI wires MCP servers for names its wrappers;
+            // the first server stands for the rest.
+            let mut agents: Vec<&str> = vec!["claude-code"];
+            if index == 0 {
+                for agent in wired_agents() {
+                    if !agents.contains(&agent) {
+                        agents.push(agent);
                     }
                 }
-                lines.push(guard_line(&words, words.iter().position(|w| w == "--")));
+            }
+            for agent in &agents {
+                for monitor in [false, true] {
+                    let config = serde_json::json!({"mcpServers": {"s": {
+                        "command": server[0],
+                        "args": server[1..],
+                    }}});
+                    let (wrapped, _) = crate::mcp_wire::wrap(config, program, monitor, agent);
+                    let entry = &wrapped["mcpServers"]["s"];
+                    let mut words: Vec<String> = Vec::new();
+                    if let Some(command) = entry["command"].as_str() {
+                        words.push(command.to_owned());
+                    }
+                    for arg in entry["args"].as_array().into_iter().flatten() {
+                        if let Some(arg) = arg.as_str() {
+                            words.push(arg.to_owned());
+                        }
+                    }
+                    lines.push(guard_line(&words, words.iter().position(|w| w == "--")));
+                }
             }
             for subcommand in ["proxy", "mcp-proxy"] {
                 let mut legacy: Vec<String> =
                     vec![program.to_owned(), subcommand.into(), "--".into()];
                 legacy.extend(server.iter().map(|word| (*word).to_owned()));
                 lines.push(guard_line(&legacy, Some(2)));
+            }
+            // The layouts older CLIs wrote ([`WRAPPER_LAYOUTS`]), in each mode.
+            for (layout, agent, mode) in WRAPPER_LAYOUTS.iter().flat_map(|layout| {
+                agents.iter().flat_map(move |agent| {
+                    ["guard", "advisory"]
+                        .into_iter()
+                        .map(move |mode| (layout, *agent, mode))
+                })
+            }) {
+                let mut words: Vec<String> = vec![program.to_owned(), "proxy".into()];
+                words.extend(
+                    layout
+                        .iter()
+                        .map(|word| word.replace("{mode}", mode).replace("{agent}", agent)),
+                );
+                let separator = words.len();
+                words.push("--".into());
+                words.extend(server.iter().map(|word| (*word).to_owned()));
+                // `--label` names the agent as `--agent` does (shared by
+                // [`guard_line`]); `--error-response` takes no value.
+                lines.push(guard_line(&words, Some(separator)));
             }
             let mut pro: Vec<String> = [
                 "/usr/local/bin/innerwarden-ctl",
@@ -309,6 +403,48 @@ fn started_program_words(line: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
+/// The agents the CLI wires MCP servers for, by the id their wrappers name
+/// ([`crate::agents::KNOWN`]).
+fn wired_agents() -> Vec<&'static str> {
+    crate::agents::KNOWN
+        .iter()
+        .filter(|known| known.mcp_json.is_some() || known.mcp_toml.is_some())
+        .map(|known| known.name)
+        .collect()
+}
+
+/// The shell that runs a fail-closed hook line.
+const FAIL_CLOSED_SHELL: &str = "/bin/sh";
+
+/// The process a fail-closed hook line (`/bin/sh -c '"$0" hook ...; s=$?;
+/// ...' "/path/innerwarden"`) starts first, as `pkill -f` reads it: the
+/// shell's words joined by a space, the script one of them. The agent's id
+/// after `--agent` is another program's part; the message the script
+/// prints is the guard's prose ([`GuardLine::prose`]).
+fn fail_closed_shell_line(line: &str) -> Option<GuardLine> {
+    let read = read_line(line);
+    let words: Vec<String> = read
+        .commands
+        .first()?
+        .words
+        .iter()
+        .map(|w| w.text.clone())
+        .collect();
+    if words.len() < 4 || !words[0].ends_with("/sh") || words[1] != "-c" {
+        return None;
+    }
+    let text = words.join(" ");
+    let pieces: Vec<String> = text.split(' ').map(str::to_owned).collect();
+    let mut shell = guard_line(&pieces, None);
+    if let Some(open) = shell.text.find("echo \"") {
+        let start = open + "echo \"".len();
+        if let Some(close) = shell.text[start..].find('"') {
+            shell.prose.push(start..start + close);
+        }
+    }
+    Some(shell)
+}
+
 /// A [`GuardLine`] of `words`: the agent id after `--agent` or `--label` is shared,
 /// and so is every word after the one at `separator`.
 fn guard_line(words: &[String], separator: Option<usize>) -> GuardLine {
@@ -340,6 +476,7 @@ fn guard_line(words: &[String], separator: Option<usize>) -> GuardLine {
     GuardLine {
         text,
         shared,
+        prose: Vec::new(),
         folder_end,
     }
 }
@@ -437,9 +574,13 @@ fn names_a_guard_process(name: &str, ignore_case: bool) -> bool {
         }
     };
     if name.contains('/') {
+        // Any folder: a path whose file is one of the guard's programs is
+        // the guard, wherever it was installed (`/opt/iw/bin/innerwarden`).
+        let file = name.rsplit('/').next().unwrap_or(name);
         return guard_lines()
             .iter()
-            .any(|line| same(line.text.split(' ').next().unwrap_or_default(), name));
+            .any(|line| same(line.text.split(' ').next().unwrap_or_default(), name))
+            || guard_process_names().iter().any(|own| same(own, file));
     }
     guard_process_names().iter().any(|own| same(own, name))
 }
@@ -452,6 +593,15 @@ fn names_a_guard_process(name: &str, ignore_case: bool) -> bool {
 /// 'innerwar\den'` matches `innerwarden` on Linux and nothing here.
 fn dialect_readings(pattern: &str) -> Vec<String> {
     let mut readings = vec![pattern.to_owned()];
+    // glibc reads `{,n}` as `{0,n}`; this crate does not compile it.
+    if pattern.contains("{,") {
+        if let Ok(open) = regex::Regex::new(r"\{,(\d+)\}") {
+            let read = open.replace_all(pattern, "{0,$1}").into_owned();
+            if read != pattern {
+                readings.extend(dialect_readings(&read));
+            }
+        }
+    }
     if !pattern.contains('\\') {
         return readings;
     }
@@ -484,8 +634,14 @@ fn dialect_readings(pattern: &str) -> Vec<String> {
 /// What a `pkill` or `pgrep` pattern does to the guard's processes, in the
 /// strongest of its [`dialect_readings`], case ignored: matched against the
 /// command lines with `-f` ([`pattern_reach`]), against the names without
-/// ([`name_reach`]). [`PkillReach::Unread`] when no reading compiles.
+/// ([`name_reach`]). A pattern that names a path whose file is one of the
+/// guard's programs, in any folder ([`names_a_guard_path`]), names the
+/// guard. [`PkillReach::Broad`] when no reading compiles: what the program
+/// makes of it is not known, and a person decides.
 pub(super) fn reach_of_pattern(pattern: &str, full: bool) -> PkillReach {
+    if names_a_guard_path(pattern) {
+        return PkillReach::NamesGuard;
+    }
     let mut reach: Option<PkillReach> = None;
     for reading in dialect_readings(pattern) {
         let Ok(regex) = regex::RegexBuilder::new(&reading)
@@ -502,7 +658,21 @@ pub(super) fn reach_of_pattern(pattern: &str, full: bool) -> PkillReach {
         };
         reach = Some(reach.map_or(this, |before| before.max(this)));
     }
-    reach.unwrap_or(PkillReach::Unread)
+    reach.unwrap_or(PkillReach::Broad)
+}
+
+/// Whether `pattern` spells a path whose file is one of the guard's
+/// programs (`/opt/iw/bin/innerwarden`, `~/bin/innerwarden-agent`), in a
+/// folder the guard's lines do not list: every process of that program is
+/// the guard's.
+fn names_a_guard_path(pattern: &str) -> bool {
+    pattern
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~')))
+        .filter(|token| token.contains('/'))
+        .any(|token| {
+            let file = token.rsplit('/').next().unwrap_or(token);
+            !file.is_empty() && names_a_guard_process(file, true)
+        })
 }
 
 /// Whether `pattern` spells the guard's CLI as a program followed by its
@@ -1101,6 +1271,74 @@ mod tests {
         }
         for pattern in ["innerwarden-docs-server", "cargo build", "vite --port"] {
             assert_eq!(reach(pattern), PkillReach::Misses, "{pattern}");
+        }
+    }
+
+    /// The newest of [`WRAPPER_LAYOUTS`] is what [`crate::mcp_wire::wrap`]
+    /// writes today, for every agent it wires and in each mode: a new
+    /// layout is added to the history, not written over it.
+    #[test]
+    fn the_newest_wrapper_layout_is_the_one_the_cli_writes() {
+        let newest = WRAPPER_LAYOUTS.last().unwrap();
+        for agent in wired_agents() {
+            for (monitor, mode) in [(false, "guard"), (true, "advisory")] {
+                let config = serde_json::json!({"mcpServers": {"s": {
+                    "command": "npx", "args": ["-y", "server"],
+                }}});
+                let (wrapped, _) = crate::mcp_wire::wrap(config, "/x/innerwarden", monitor, agent);
+                let args: Vec<String> = wrapped["mcpServers"]["s"]["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|arg| arg.as_str().unwrap().to_owned())
+                    .collect();
+                let separator = args.iter().position(|arg| arg == "--").unwrap();
+                let expected: Vec<String> = newest
+                    .iter()
+                    .map(|word| word.replace("{mode}", mode).replace("{agent}", agent))
+                    .collect();
+                assert_eq!(args[0], "proxy", "{args:?}");
+                assert_eq!(args[1..separator], expected[..], "{agent}: {args:?}");
+            }
+        }
+    }
+
+    /// A kill pattern across the words of every layout, past the program,
+    /// names the guard; the agent's id alone does not.
+    #[test]
+    fn every_wrapper_layout_is_matched() {
+        for layout in WRAPPER_LAYOUTS {
+            let words: Vec<String> = layout
+                .iter()
+                .map(|word| {
+                    word.replace("{mode}", "advisory")
+                        .replace("{agent}", "codex")
+                })
+                .collect();
+            let pattern = regex::escape(&format!("proxy {} --", words.join(" ")));
+            assert_eq!(reach(&pattern), PkillReach::NamesGuard, "{pattern}");
+        }
+        assert_eq!(reach("codex"), PkillReach::Unread);
+    }
+
+    /// The shell of a fail-closed hook: its words are the guard's, the
+    /// agent's id is the agent's, and the words of its message alone are
+    /// no mark of the guard.
+    #[test]
+    fn the_fail_closed_shell_is_a_line_of_the_guards() {
+        assert!(guard_lines()
+            .iter()
+            .any(|line| line.text.starts_with("/bin/sh -c \"$0\" hook")));
+        for pattern in ["without an answer", "--agent codex; s=", "esac; echo"] {
+            assert_eq!(
+                reach(&regex::escape(pattern)),
+                PkillReach::NamesGuard,
+                "{pattern}"
+            );
+        }
+        for pattern in ["program", "settings", "answer"] {
+            let found = reach(pattern);
+            assert!(found < PkillReach::Broad, "{pattern}: {found:?}");
         }
     }
 

@@ -766,7 +766,9 @@ pub const CHILD_AGENT_OTHER_FOLDER: &str = "starts Claude Code with CLAUDE_CONFI
 /// agent's own folder, Codex's `CODEX_HOME`, Hermes's `HERMES_HOME`,
 /// `HERMES_SAFE_MODE` and `HERMES_IGNORE_USER_CONFIG`, Gemini's
 /// `GEMINI_CLI_HOME`, `GEMINI_CLI_SYSTEM_SETTINGS_PATH` and
-/// `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, and Claude Code's `CLAUDE_CONFIG_DIR`,
+/// `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, Cursor's `CURSOR_CONFIG_DIR` (the
+/// folder the Cursor CLI reads its configuration from, cursor.com/docs/cli,
+/// 2026-11-21), and Claude Code's `CLAUDE_CONFIG_DIR`,
 /// `CLAUDE_CODE_SIMPLE`, `CLAUDE_CODE_SAFE_MODE`, `CLAUDE_CODE_RESTRICTED`,
 /// `CLAUDE_CODE_MANAGED_SETTINGS_PATH`, `CLAUDE_CODE_PERSONAL_HOOKS_OFF`,
 /// `CLAUDE_CODE_RESTRICT_PERSONAL_CONFIG` and
@@ -782,6 +784,7 @@ const AGENT_HOOK_VARIABLES: &[&str] = &[
     "gemini_cli_home",
     "gemini_cli_system_settings_path",
     "gemini_cli_trusted_folders_path",
+    "cursor_config_dir",
     "claude_config_dir",
     "claude_code_simple",
     "claude_code_safe_mode",
@@ -792,8 +795,9 @@ const AGENT_HOOK_VARIABLES: &[&str] = &[
     "claude_code_remote_session_origin",
 ];
 
-/// The agent CLIs whose hook the guard writes, by program name.
-const HOOKED_AGENT_PROGRAMS: &[&str] = &["codex", "gemini", "hermes", "claude"];
+/// The agent CLIs whose hook (or, for the Cursor CLI, whose MCP wiring) the
+/// guard writes, by program name.
+const HOOKED_AGENT_PROGRAMS: &[&str] = &["codex", "gemini", "hermes", "claude", "cursor-agent"];
 
 /// The npm packages of [`HOOKED_AGENT_PROGRAMS`], with the program each one
 /// is: what `npx`, `bunx`, `pnpm dlx` or `npm exec` are told to run, and
@@ -1532,6 +1536,9 @@ fn setter_effect(program: &str, command: &Spoken, at: usize, set: &mut SetBefore
             // starts the value is the home folder.
             found |= match argument.split_once('=') {
                 Some((_, target)) if reference && is_shell_name(target) => unshown(set, target),
+                // A name built at run time (`export CLAUDE_${X:-CONFIG}_DIR=...`):
+                // it may be any of the watched ones.
+                Some((name, _)) if name.contains(['$', '`']) => UNHOOKED,
                 _ => assignment_effect(argument, written(index).map(|word| (word, 0)), true),
             };
         }
