@@ -1,0 +1,162 @@
+# A value the line itself gives a name, read into every look the guard takes
+# at the line (the target of a removal or of dd, the program word, a line
+# handed to a shell, a file the line writes and then loads), allowed on main
+# 003699c (2026-11-21) where the same line typed out with the value is
+# refused: X=/; rm -rf $X, export, declare, local, readonly, typeset, a value
+# set in front of the command, a one-word loop, a value through another
+# name, the program word from a variable. Controls set a project folder.
+# The proof is tests/line_variables_reach_every_look.rs.
+# Nothing in this file is executed.
+cases:
+  - id: lv-01
+    category: removal_target
+    label: malicious
+    input: 'X=/; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-02
+    category: removal_target
+    label: malicious
+    input: 'X=/; rm -rf "$X"'
+    must_refuse: true
+    expect: deny
+  - id: lv-03
+    category: removal_target
+    label: malicious
+    input: 'X=~/.ssh; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-04
+    category: removal_target
+    label: malicious
+    input: 'X=/ rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-05
+    category: removal_target
+    label: malicious
+    input: 'export X=/; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-06
+    category: removal_target
+    label: malicious
+    input: 'declare X=/; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-07
+    category: removal_target
+    label: malicious
+    input: 'local X=/; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-08
+    category: removal_target
+    label: malicious
+    input: 'readonly X=/; rm -rf "${X}"'
+    must_refuse: true
+    expect: deny
+  - id: lv-09
+    category: removal_target
+    label: malicious
+    input: 'typeset X=/etc; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-10
+    category: removal_target
+    label: malicious
+    input: 'for X in /; do rm -rf $X; done'
+    must_refuse: true
+    expect: deny
+  - id: lv-11
+    category: removal_target
+    label: malicious
+    input: 'X=/; Y=$X; rm -rf $Y'
+    must_refuse: true
+    expect: deny
+  - id: lv-12
+    category: removal_target
+    label: malicious
+    input: 'X=$HOME; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-13
+    category: removal_target
+    label: malicious
+    input: 'X=/; sudo rm -rf -- "$X"'
+    must_refuse: true
+    expect: deny
+  - id: lv-14
+    category: removal_target
+    label: malicious
+    input: 'X=/; sh -c "rm -rf $X"'
+    must_refuse: true
+    expect: deny
+  - id: lv-15
+    category: device_target
+    label: malicious
+    input: 'X=/dev/sda; dd if=/dev/zero of=$X'
+    must_refuse: true
+    expect: deny
+  - id: lv-16
+    category: program_word
+    label: malicious
+    input: 'P=rm; $P -rf /'
+    must_refuse: true
+    expect: deny
+  - id: lv-17
+    category: program_word
+    label: malicious
+    input: 'P=/bin/rm; "$P" -rf /'
+    must_refuse: true
+    expect: deny
+  - id: lv-18
+    category: program_word
+    label: malicious
+    input: 'P=rm; F=-rf; T=/; $P $F $T'
+    must_refuse: true
+    expect: deny
+  - id: lv-19
+    category: loaded_file
+    label: malicious
+    input: 'echo ''X=/'' > e.sh; . ./e.sh; rm -rf $X'
+    must_refuse: true
+    expect: deny
+  - id: lv-20
+    category: loaded_file
+    label: malicious
+    input: 'echo ''export X=/'' > e.sh && source ./e.sh && rm -rf "$X"'
+    must_refuse: true
+    expect: deny
+  - id: lv-c01
+    category: control
+    label: benign
+    input: 'X=build; rm -rf $X'
+  - id: lv-c02
+    category: control
+    label: benign
+    input: 'D=/tmp/x; mkdir -p $D'
+  - id: lv-c03
+    category: control
+    label: benign
+    input: 'X=build; rm -rf "$X"'
+  - id: lv-c04
+    category: control
+    label: benign
+    input: 'D=dist; rm -rf "$D" && mkdir -p "$D"'
+  - id: lv-c05
+    category: control
+    label: benign
+    input: 'X=node_modules; rm -rf ./$X'
+  - id: lv-c06
+    category: control
+    label: benign
+    input: 'OUT=target/release; ls $OUT'
+  - id: lv-c07
+    category: control
+    label: benign
+    input: 'X=/; echo "removing $X"'
+  - id: lv-c08
+    category: control
+    label: benign
+    input: 'echo ''read NAME'' > e.sh; . ./e.sh; ls'
