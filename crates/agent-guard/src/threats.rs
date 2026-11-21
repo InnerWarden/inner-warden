@@ -342,6 +342,10 @@ pub const SENSITIVE_PATHS: &[&str] = &[
     // even though a .pem is frequently a PUBLIC certificate. The hard list was
     // keyed on file extension conventions rather than on what the file holds.
     ".aws/credentials",
+    // What the person asked their agent, kept by the prompt hook
+    // (`crate::user_prompt`): the person's own words, refused to the agent
+    // to read as they are refused to it to write.
+    ".config/innerwarden/prompts",
     ".ssh/",
     ".aws/",
     ".gnupg/",
@@ -9140,7 +9144,6 @@ const GUARD_DIR_READERS: &[&str] = &[
 /// applies it ([`crate::profiles`]), and with no profile file nothing calls it.
 pub fn names_guard_llm_key(content: &str) -> bool {
     static KEY_FILE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    static BRACED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let key_file = KEY_FILE.get_or_init(|| {
         regex::Regex::new(r#"(?i)(?:^|[\s/'"=:$({`;|&,\[])llm-key(?:$|[\s'"/;|&)}`,\]])"#)
             .expect("static llm-key regex")
@@ -9148,6 +9151,18 @@ pub fn names_guard_llm_key(content: &str) -> bool {
     if key_file.is_match(content) {
         return true;
     }
+    guard_folder_handed_to_reader(content)
+}
+
+/// Whether a program that reads or copies files ([`GUARD_DIR_READERS`]) is
+/// handed the guard's configuration folder whole (`cp -r ~/.config/innerwarden
+/// x`) or through a glob inside it (`cat ~/.config/innerwarden/*/*`), spelled
+/// any way the guard's own write rule recognises, a variable assigned it
+/// included. The folder holds the LLM key and the person's prompts
+/// ([`crate::user_prompt`]). A glob in the folder's own name is not
+/// recognised, nor a name relative to a `cd` into it.
+pub(crate) fn guard_folder_handed_to_reader(content: &str) -> bool {
+    static BRACED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let braced = BRACED.get_or_init(|| {
         regex::Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").expect("static braced variable regex")
     });
@@ -15152,6 +15167,11 @@ pub(crate) fn check_sensitive_read_as_written(
     content: &str,
     as_written: &str,
 ) -> Option<(&'static str, u32)> {
+    // The guard's folder handed whole to a reader takes the person's
+    // prompts with it.
+    if guard_folder_handed_to_reader(content) {
+        return Some((".config/innerwarden/prompts", 60));
+    }
     sensitive_read_nested(content, as_written, 0)
 }
 
@@ -15829,6 +15849,7 @@ pub fn is_hard_sensitive_path(path: &str) -> bool {
             // SENSITIVE_PATHS. `.git-credentials` was already here for the
             // same reason, a file whose entire purpose is to hold a secret.
             | ".aws/credentials"
+            | ".config/innerwarden/prompts"
             | "/etc/shadow"
             | "/etc/gshadow"
             | "id_rsa"

@@ -206,16 +206,23 @@ pub fn merge_userpromptsubmit_hook(mut settings: Value, hook_command: &str) -> V
 }
 
 /// The prompt hook's line ([`merge_userpromptsubmit_hook`]): the guard with
-/// the mode flags of the tool halves, naming its agent, and never the
-/// fail-closed script, so a guard that is gone ends it with 127 and the
-/// prompt goes on. The hook itself never refuses a prompt, whatever its mode.
+/// the mode flags of the tool halves, naming its agent, then
+/// [`crate::user_prompt::PROMPT_LINE_FLAG`], and never the fail-closed
+/// script. The flag tells the hook, before it reads anything, that every end
+/// of this run is 0 and silent. A guard that is gone ends the line with 127
+/// (the one end the guard cannot answer for): Claude Code shows it as an
+/// error and the prompt goes on.
 pub fn prompt_hook_command(
     iw_guard: &Path,
     block_review: bool,
     monitor: bool,
     agent: Option<&str>,
 ) -> String {
-    hook_command_shaped(iw_guard, block_review, monitor, agent, false)
+    format!(
+        "{} {}",
+        hook_command_shaped(iw_guard, block_review, monitor, agent, false),
+        crate::user_prompt::PROMPT_LINE_FLAG
+    )
 }
 
 /// Whether the settings hold a prompt hook of ours.
@@ -1269,6 +1276,12 @@ fn parse_guard_words(words: &[String], shape: LineShape) -> Option<GuardLine> {
     if !is_innerwarden_executable(executable) || subcommand != "hook" {
         return None;
     }
+    // The prompt line's last word ([`prompt_hook_command`]). A tool call
+    // that arrives on a line carrying it is screened as on any other.
+    let flags = match flags.split_last() {
+        Some((last, before)) if last == crate::user_prompt::PROMPT_LINE_FLAG => before,
+        _ => flags,
+    };
     let (mode_flag, agent_flags) = match flags.first().map(String::as_str) {
         Some("--monitor" | "--block-review") => (flags.first(), &flags[1..]),
         _ => (None, flags),

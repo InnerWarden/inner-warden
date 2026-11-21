@@ -14,12 +14,20 @@ the text of a command; what it does not see is written down, as measured:
 [Where this ends](docs/features.md#where-this-ends).
 
 `innerwarden install` wires a hook on Claude Code's prompts
-(`UserPromptSubmit`) that keeps what the person asked, masked, per session,
-in `~/.config/innerwarden/prompts/` (0600, 24 hours, bounded), so the MCP
-proxy can ask whether a value appears in the person's request. The hook never
-stops a prompt and prints nothing. Other agents are not wired: their MCP
-servers get no session id to match. What is kept, where, for how long and how
-to delete it: [The prompt record](docs/prompt-record.md).
+(`UserPromptSubmit`) that keeps what the person submitted (pasted text
+included), masked, per session, in `~/.config/innerwarden/prompts/` (0600,
+24 hours, bounded), so the MCP proxy can ask whether a value appears, whole,
+in the person's request. The answer is information only and never lets a
+refused call through: an agent with a shell on the same account can forge a
+record by running the hook itself, and the session id comes from a variable
+a process in between can change. The guard refuses an agent's reads of the
+folder as it refuses its writes (a `cd` into the folder and a glob in its
+name are not recognised). Every end of the prompt run is 0 and silent (a
+panic, unreadable stdin, the deadline); a guard whose program is gone ends the
+line with 127, shown as an error while the prompt goes on. An expired prompt
+is deleted when its session is written or read. Other agents are not wired:
+their MCP servers get no session id to match. Details and limits:
+[The prompt record](docs/prompt-record.md).
 
 ### Added
 

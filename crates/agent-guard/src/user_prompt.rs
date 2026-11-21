@@ -12,6 +12,25 @@
 //! the prompt, and [`user_asked_for`] answers the one question the proxy
 //! needs: does this value appear in what the person asked, this session?
 //!
+//! # Information, never a pass
+//!
+//! The answer never lowers a refusal. An agent with a shell on the same
+//! account can write a record of its own: it runs `innerwarden hook` with a
+//! `UserPromptSubmit` payload it made up, and the record then says the person
+//! asked for whatever the agent wrote (a test shows it,
+//! `an_agent_with_a_shell_can_forge_a_record`). The rule that stops an agent
+//! running the guard's own hook reads the command's text, and a copy of the
+//! binary or a variable gets past it. So "yes" is never a reason to let a call
+//! through. What the answer is for is information: an alert that a value in a
+//! call is not in what the person asked. Nothing here may become a pass until
+//! the record has a writer the agent cannot imitate.
+//!
+//! What is kept is what was submitted: text the person pasted into the prompt
+//! counts as theirs, wherever it came from. The session the proxy reads comes
+//! from a variable of its environment, which a process between Claude Code
+//! and the proxy can change: a wrong id reads another session's words or
+//! none, never writes anything.
+//!
 //! # What is kept, where, for how long
 //!
 //! - One file per session under `~/.config/innerwarden/prompts/`, a folder
@@ -24,8 +43,13 @@
 //!   most [`MAX_SESSIONS`] session files (the least recently written go
 //!   first).
 //! - A prompt is kept for [`PROMPT_TTL_MS`] (24 hours). An older one is never
-//!   read, and is dropped the next time its session is written; a session file
-//!   with nothing left is removed.
+//!   read. It is dropped when its session is written or read; a session file
+//!   with nothing left is removed then, or when any session is written, or at
+//!   most once a minute when the proxy reads ([`forget_expired_in`]). With no
+//!   prompt and no read after it, an expired file stays on disk, unread, until
+//!   the next one.
+//! - The guard refuses an agent's reads of the folder (file tools and shell),
+//!   as it refuses its writes there.
 //! - Deleting the folder forgets everything; nothing else reads it.
 //!
 //! # The id both sides know
@@ -85,6 +109,17 @@ pub const MIN_VALUE_CHARS: usize = 4;
 
 /// The longest session id kept; a longer one is not an agent's.
 const MAX_SESSION_ID_CHARS: usize = 256;
+
+/// The word at the end of the prompt hook's line. It tells the hook, before
+/// it reads anything, that it runs on the person's prompt: every way that
+/// run can end (a panic, stdin it cannot read, the deadline, a fault) ends
+/// with 0 and says nothing, so the hook never drops the person's prompt. A
+/// tool call that arrives on such a line is screened as on any other.
+pub const PROMPT_LINE_FLAG: &str = "--prompt";
+
+/// How often, at most, a read under `$HOME` sweeps every session file for
+/// what has expired ([`forget_expired_in`]).
+const SWEEP_EVERY_MS: i64 = 60 * 1000;
 
 /// The answer to "does this value appear in what the person asked?".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,7 +259,7 @@ pub fn record_in(
     }
     let body = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
     write_private(&path, &body)?;
-    prune(dir, now_ms, &path);
+    prune(dir, now_ms, Some(&path));
     Ok(())
 }
 
@@ -279,15 +314,16 @@ fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
 
 /// Drop the session files past [`MAX_SESSIONS`] (least recently written
 /// first) and those whose every prompt is past [`PROMPT_TTL_MS`]. `keep` is
-/// the file just written.
-fn prune(dir: &Path, now_ms: i64, keep: &Path) {
+/// the file just written, when there is one.
+fn prune(dir: &Path, now_ms: i64, keep: Option<&Path>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path == keep || path.extension().and_then(|e| e.to_str()) != Some("json") {
+        if Some(path.as_path()) == keep || path.extension().and_then(|e| e.to_str()) != Some("json")
+        {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
@@ -302,10 +338,11 @@ fn prune(dir: &Path, now_ms: i64, keep: &Path) {
             files.push((modified, path));
         }
     }
-    // The file just written is one of the sessions kept.
-    if files.len() >= MAX_SESSIONS {
+    // The file just written, when there is one, is one of the sessions kept.
+    let kept = files.len() + usize::from(keep.is_some());
+    if kept > MAX_SESSIONS {
         files.sort();
-        let over = files.len() + 1 - MAX_SESSIONS;
+        let over = kept - MAX_SESSIONS;
         for (_, path) in files.into_iter().take(over) {
             let _ = fs::remove_file(path);
         }
@@ -313,6 +350,11 @@ fn prune(dir: &Path, now_ms: i64, keep: &Path) {
 }
 
 fn read_record(path: &Path) -> std::io::Result<Option<Record>> {
+    read_record_bytes(path).map(|read| read.map(|(_, record)| record))
+}
+
+/// [`read_record`], with the bytes it was read from.
+fn read_record_bytes(path: &Path) -> std::io::Result<Option<(Vec<u8>, Record)>> {
     match fs::symlink_metadata(path) {
         Ok(meta) if !meta.is_file() => {
             return Err(std::io::Error::other("the record is not a plain file"));
@@ -322,9 +364,98 @@ fn read_record(path: &Path) -> std::io::Result<Option<Record>> {
         Err(e) => return Err(e),
     }
     let bytes = fs::read(path)?;
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(std::io::Error::other)
+    let record = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    Ok(Some((bytes, record)))
+}
+
+/// Drop the expired prompts of a record that was just read, writing it back
+/// without them, or removing the file when nothing is left. Only when the
+/// file still holds the bytes it was read from: a prompt the hook wrote in
+/// between is never lost to the read.
+fn drop_expired(path: &Path, read_from: &[u8], record: &Record, now_ms: i64) {
+    if record.prompts.iter().all(|p| fresh(p.at_ms, now_ms)) {
+        return;
+    }
+    let kept: Vec<Prompt> = record
+        .prompts
+        .iter()
+        .filter(|p| fresh(p.at_ms, now_ms))
+        .map(|p| Prompt {
+            at_ms: p.at_ms,
+            text: p.text.clone(),
+        })
+        .collect();
+    if fs::read(path).ok().as_deref() != Some(read_from) {
+        return;
+    }
+    if kept.is_empty() {
+        let _ = fs::remove_file(path);
+        return;
+    }
+    let left = Record {
+        session: record.session.clone(),
+        agent: record.agent.clone(),
+        prompts: kept,
+    };
+    if let Ok(body) = serde_json::to_vec(&left) {
+        let _ = write_private(path, &body);
+    }
+}
+
+/// Remove every session file in `dir` whose prompts have all expired, and
+/// those past [`MAX_SESSIONS`]. Called by a write, and by a read under
+/// `$HOME` at most once every [`SWEEP_EVERY_MS`].
+pub fn forget_expired_in(dir: &Path, now_ms: i64) {
+    prune(dir, now_ms, None);
+}
+
+/// A character a value is made of: a run of them is one value
+/// (`ana@example.com.au`, `release-7`, `https://x.example/a?b=c`).
+fn value_char(c: char) -> bool {
+    c.is_alphanumeric() || "@._-+/:%~=#&".contains(c)
+}
+
+/// What may end a sentence right after a value: `ana@example.com.` still
+/// names `ana@example.com`.
+const SENTENCE_END: &str = ".,;:!?";
+
+/// Whether `needle` stands in `hay` as a whole value: no character a value
+/// is made of right before it or right after it, so `ana@example.com` is
+/// not found in `joana@example.com` nor in `ana@example.com.au`, and
+/// `issue 4512` is not found in `issue 45123`. A mark that ends a sentence
+/// after it is not part of it. Both are already folded ([`folded`]).
+fn holds_whole(hay: &str, needle: &str) -> bool {
+    let (Some(first), Some(last)) = (needle.chars().next(), needle.chars().next_back()) else {
+        return false;
+    };
+    let mut from = 0;
+    while let Some(at) = hay[from..].find(needle) {
+        let start = from + at;
+        let end = start + needle.len();
+        let before_ok = !value_char(first)
+            || hay[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !value_char(c));
+        let after_ok = !value_char(last) || ends_a_value(&hay[end..]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + hay[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+/// Whether the text right after a value ends it: nothing, a character no
+/// value is made of, or a mark that ends a sentence followed by either.
+fn ends_a_value(after: &str) -> bool {
+    let mut chars = after.chars();
+    match chars.next() {
+        None => true,
+        Some(c) if !value_char(c) => true,
+        Some(c) if SENTENCE_END.contains(c) => chars.next().is_none_or(|n| !value_char(n)),
+        Some(_) => false,
+    }
 }
 
 /// How a value and a prompt are compared: lowercase, every run of blanks
@@ -339,10 +470,21 @@ fn folded(text: &str) -> String {
 /// Does `value` appear in what the person asked in `session`? Read under
 /// `$HOME`, at the current time.
 pub fn user_asked_for(session: Option<&str>, value: &str) -> UserAsked {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST_SWEEP_MS: AtomicI64 = AtomicI64::new(i64::MIN);
     let Some(dir) = default_dir() else {
         return UserAsked::Unknown(why::NO_HOME);
     };
-    user_asked_for_in(&dir, session, value, now_ms())
+    let now = now_ms();
+    let last = LAST_SWEEP_MS.load(Ordering::SeqCst);
+    if now.saturating_sub(last) >= SWEEP_EVERY_MS
+        && LAST_SWEEP_MS
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        forget_expired_in(&dir, now);
+    }
+    user_asked_for_in(&dir, session, value, now)
 }
 
 /// [`user_asked_for`] for the session the proxy runs in ([`proxy_session`]).
@@ -364,18 +506,21 @@ pub fn user_asked_for_in(dir: &Path, session: Option<&str>, value: &str, now_ms:
     if crate::redact::redact_secrets(value).count > 0 {
         return UserAsked::Unknown(why::MASKED);
     }
-    let record = match read_record(&file_for(dir, session)) {
-        Ok(Some(record)) => record,
+    let path = file_for(dir, session);
+    let (bytes, record) = match read_record_bytes(&path) {
+        Ok(Some(read)) => read,
         Ok(None) => return UserAsked::Unknown(why::NO_RECORD),
         Err(_) => return UserAsked::Unknown(why::UNREADABLE),
     };
     if record.session != session {
         return UserAsked::Unknown(why::OTHER_SESSION);
     }
+    // What has expired is not only unread: it goes now.
+    drop_expired(&path, &bytes, &record, now_ms);
     let mut any = false;
     for prompt in record.prompts.iter().filter(|p| fresh(p.at_ms, now_ms)) {
         any = true;
-        if folded(&prompt.text).contains(&needle) {
+        if holds_whole(&folded(&prompt.text), &needle) {
             return UserAsked::Yes;
         }
     }
@@ -647,6 +792,139 @@ mod tests {
         // A write over it starts the record again.
         record_in(&dir, Some(SESSION), None, "hello there", NOW).unwrap();
         assert_eq!(ask(&dir, Some(SESSION), "hello"), UserAsked::Yes);
+    }
+
+    /// A value is found whole or not at all: a piece of a longer value the
+    /// person typed proves nothing about the value in the call.
+    #[test]
+    fn a_piece_of_a_longer_value_is_not_the_value() {
+        let (_tmp, dir) = dir();
+        record_in(
+            &dir,
+            Some(SESSION),
+            None,
+            "write to ana@example.com.au and joana@example.com about issue 45123",
+            NOW,
+        )
+        .unwrap();
+        for piece in [
+            "ana@example.com",
+            "issue 4512",
+            "example.co",
+            "ana@example",
+            "example.com.au",
+        ] {
+            assert_eq!(ask(&dir, Some(SESSION), piece), UserAsked::No, "{piece}");
+        }
+        for whole in ["ana@example.com.au", "joana@example.com", "issue 45123"] {
+            assert_eq!(ask(&dir, Some(SESSION), whole), UserAsked::Yes, "{whole}");
+        }
+    }
+
+    /// A mark that ends a sentence, or brackets around it, are not part of
+    /// the value.
+    #[test]
+    fn a_value_at_the_end_of_a_sentence_or_in_brackets_is_whole() {
+        let (_tmp, dir) = dir();
+        record_in(
+            &dir,
+            Some(SESSION),
+            None,
+            "Mail it to ana@example.com. Then ping <bob@example.org>, and tag release-7!",
+            NOW,
+        )
+        .unwrap();
+        for value in ["ana@example.com", "bob@example.org", "release-7"] {
+            assert_eq!(ask(&dir, Some(SESSION), value), UserAsked::Yes, "{value}");
+        }
+        assert_eq!(ask(&dir, Some(SESSION), "release-"), UserAsked::No);
+    }
+
+    #[test]
+    fn an_expired_prompt_is_deleted_when_its_session_is_read() {
+        let (_tmp, dir) = dir();
+        record_in(
+            &dir,
+            Some(SESSION),
+            None,
+            "rotate the db password tonight",
+            NOW - PROMPT_TTL_MS - 1,
+        )
+        .unwrap();
+        // A write drops it already: write both back to see the read do it.
+        let path = file_for(&dir, SESSION);
+        let both = Record {
+            session: SESSION.into(),
+            agent: None,
+            prompts: vec![
+                Prompt {
+                    at_ms: NOW - PROMPT_TTL_MS - 1,
+                    text: "rotate the db password tonight".into(),
+                },
+                Prompt {
+                    at_ms: NOW - 1,
+                    text: "and open issue 7781".into(),
+                },
+            ],
+        };
+        write_private(&path, &serde_json::to_vec(&both).unwrap()).unwrap();
+        assert_eq!(ask(&dir, Some(SESSION), "issue 7781"), UserAsked::Yes);
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("rotate"), "{raw}");
+        assert!(raw.contains("issue 7781"), "{raw}");
+    }
+
+    #[test]
+    fn a_session_with_nothing_fresh_is_removed_when_it_is_read() {
+        let (_tmp, dir) = dir();
+        record_in(
+            &dir,
+            Some(SESSION),
+            None,
+            "rotate the db password tonight",
+            NOW - PROMPT_TTL_MS - 1,
+        )
+        .unwrap();
+        let path = file_for(&dir, SESSION);
+        assert!(path.exists());
+        assert_eq!(
+            ask(&dir, Some(SESSION), "rotate the db"),
+            UserAsked::Unknown(why::NO_RECORD)
+        );
+        assert!(!path.exists(), "an expired record outlived its read");
+    }
+
+    #[test]
+    fn the_sweep_removes_every_expired_session_and_keeps_the_fresh() {
+        let (_tmp, dir) = dir();
+        let old = NOW - PROMPT_TTL_MS - 1;
+        record_in(&dir, Some("old-1"), None, "hello there", old).unwrap();
+        record_in(&dir, Some("old-2"), None, "hello there", old).unwrap();
+        record_in(&dir, Some(SESSION), None, "hello there", NOW).unwrap();
+        // Write the old ones back: the last write already swept them.
+        for session in ["old-1", "old-2"] {
+            let record = Record {
+                session: session.into(),
+                agent: None,
+                prompts: vec![Prompt {
+                    at_ms: old,
+                    text: "hello there".into(),
+                }],
+            };
+            write_private(
+                &file_for(&dir, session),
+                &serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3);
+        forget_expired_in(&dir, NOW);
+        let left: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(left, vec![file_for(&dir, SESSION)]);
     }
 
     #[test]
