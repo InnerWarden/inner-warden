@@ -69,6 +69,9 @@ fn unsafe_project_is_rejected_before_the_host_hook_is_mutated() {
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_backend_masks_innerwarden_secrets_and_keeps_project_available() {
+    if !jail_opens_here("linux_backend_masks_innerwarden_secrets_and_keeps_project_available") {
+        return;
+    }
     let backend_available = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
         .iter()
         .any(|path| std::path::Path::new(path).is_file());
@@ -125,6 +128,9 @@ fn linux_backend_masks_innerwarden_secrets_and_keeps_project_available() {
 #[cfg(target_os = "linux")]
 #[test]
 fn exported_credentials_stay_out_of_the_jail_unless_passed_by_name() {
+    if !jail_opens_here("exported_credentials_stay_out_of_the_jail_unless_passed_by_name") {
+        return;
+    }
     let home = tempfile::TempDir::new().unwrap();
     let project = tempfile::TempDir::new().unwrap();
     let output = cli()
@@ -204,6 +210,9 @@ fn exported_credentials_stay_out_of_the_jail_unless_passed_by_name() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_deny_read_link_into_a_home_folder_cannot_be_moved_from_its_name() {
+    if !jail_opens_here("a_deny_read_link_into_a_home_folder_cannot_be_moved_from_its_name") {
+        return;
+    }
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
     let h = home.path();
@@ -260,6 +269,71 @@ fn require_bwrap() {
         backend_available,
         "CJC-090-AT-007 requires a real trusted bubblewrap binary on Linux; install bwrap on the journey runner instead of silently skipping isolation"
     );
+}
+
+/// Whether a jail opens on this host, for a test that starts a real one
+/// (NEW-20261121-jail-tests-fail-on-azure-dev-vm). Ubuntu 24.04 restricts
+/// unprivileged user namespaces through AppArmor
+/// (`kernel.apparmor_restrict_unprivileged_userns = 1`), and a bwrap with no
+/// profile granting one cannot set up its uid map (`bwrap: setting up uid
+/// map: Permission denied`): every jail fails there for a reason that is not
+/// the jail's. Measured, never assumed: a throwaway bwrap fails and the
+/// sysctl says 1. Outside CI the test then says why and the fix, on stderr,
+/// and is skipped; in CI (`CI` set, where the workflow turns the sysctl off
+/// before the suite) it fails, so a runner never passes without measuring.
+/// Any other failure of the probe (one without bwrap's `setting up uid
+/// map`) is left to the test to show. The skip is said past the test
+/// harness's capture ([`said_past_the_capture`]), so it shows in the output
+/// of a test that passed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn jail_opens_here(test: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static WHY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+        let why = WHY.get_or_init(|| {
+            let bwrap = jail_bwrap()?;
+            let probe = Command::new(&bwrap)
+                .args(["--unshare-pid", "--ro-bind", "/", "/", "true"])
+                .stdin(std::process::Stdio::null())
+                .output()
+                .ok()?;
+            let said = String::from_utf8_lossy(&probe.stderr).to_string();
+            // Only the refusal this skip is for: bwrap could not set up its
+            // uid map. Any other failure is left to the test to show.
+            if probe.status.success() || !said.contains("setting up uid map") {
+                return None;
+            }
+            let restricted =
+                std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                    .is_ok_and(|v| v.trim() == "1");
+            restricted.then(|| {
+                format!(
+                    "no jail opens on this host: kernel.apparmor_restrict_unprivileged_userns = 1 \
+                     and {} has no AppArmor profile granting it a user namespace ({}); fix it on \
+                     the host as innerwarden contain says: an AppArmor profile for bwrap with \
+                     userns, or sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+                    bwrap.display(),
+                    said.trim()
+                )
+            })
+        });
+        if let Some(why) = why {
+            assert!(std::env::var_os("CI").is_none(), "{test}: {why}");
+            said_past_the_capture(&format!("SKIPPED {test}: {why}\n"));
+            return false;
+        }
+    }
+    let _ = test;
+    true
+}
+
+/// Write `line` to the process's stderr itself, not through `eprintln!`,
+/// which the test harness captures and shows only for a test that failed:
+/// a skipped test passes, and its reason must still be read.
+#[cfg(target_os = "linux")]
+fn said_past_the_capture(line: &str) {
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(line.as_bytes());
 }
 
 /// A macOS jail test starts a real sandbox. Where `sandbox-exec` cannot start
@@ -440,6 +514,10 @@ fn identified_without_a_scope(command: &mut Command) -> &mut Command {
 #[cfg(target_os = "linux")]
 #[test]
 fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
+    if !jail_opens_here("identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy")
+    {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     let home = state_home();
@@ -595,6 +673,9 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
 #[cfg(target_os = "linux")]
 #[test]
 fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
+    if !jail_opens_here("without_the_identity_flag_no_record_is_written_and_nothing_changes") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let project = tempfile::TempDir::new().unwrap();
@@ -1000,6 +1081,10 @@ const LOOK_AT_THE_LAUNCHER: &str = "readlink /proc/self/ns/mnt; \
 #[cfg(target_os = "linux")]
 #[test]
 fn identity_hides_the_launchers_records_and_names_the_jails_mount_namespace() {
+    if !jail_opens_here("identity_hides_the_launchers_records_and_names_the_jails_mount_namespace")
+    {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let project = tempfile::TempDir::new().unwrap();
@@ -1121,6 +1206,9 @@ fn stderr_to_end(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<S
 #[cfg(target_os = "linux")]
 #[test]
 fn a_jail_the_host_did_not_admit_never_runs_its_command() {
+    if !jail_opens_here("a_jail_the_host_did_not_admit_never_runs_its_command") {
+        return;
+    }
     require_bwrap();
     let home = home_that_starts_only_once_admitted();
     let project = tempfile::TempDir::new().unwrap();
@@ -1218,6 +1306,9 @@ fn a_jail_the_host_did_not_admit_never_runs_its_command() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
+    if !jail_opens_here("a_launcher_that_dies_before_the_host_answers_starts_nothing") {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     let home = home_that_starts_only_once_admitted();
@@ -1345,6 +1436,9 @@ fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_launcher_that_dies_with_its_jail_held_stopped_starts_nothing() {
+    if !jail_opens_here("a_launcher_that_dies_with_its_jail_held_stopped_starts_nothing") {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     let home = home_that_starts_only_once_admitted();
@@ -1538,6 +1632,9 @@ fn pipe_ends(pid: u32, write: bool) -> std::collections::BTreeSet<String> {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_state_home_spelled_through_a_parent_step_never_shows_the_home() {
+    if !jail_opens_here("a_state_home_spelled_through_a_parent_step_never_shows_the_home") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -1655,6 +1752,9 @@ fn identified_in(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_folder_above_a_hidden_home_path_cannot_be_renamed() {
+    if !jail_opens_here("a_folder_above_a_hidden_home_path_cannot_be_renamed") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_folder_above_a_hidden_home_path_cannot_be_renamed") {
         return;
@@ -1782,6 +1882,9 @@ fn on_macos_a_link_down_the_way_to_a_hidden_home_path_stays_in_place() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_hidden_home_path_behind_a_link_hides_what_it_leads_to() {
+    if !jail_opens_here("a_hidden_home_path_behind_a_link_hides_what_it_leads_to") {
+        return;
+    }
     require_bwrap();
     let home = home_that_hides(&["gh-dotfiles", "gh3"]);
     let h = home.path();
@@ -1918,6 +2021,9 @@ fn a_hidden_home_path_behind_a_link_the_jail_can_replace_stops_the_launch() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_hidden_home_path_made_after_the_jail_started_stays_hidden() {
+    if !jail_opens_here("a_hidden_home_path_made_after_the_jail_started_stays_hidden") {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     let home = home_that_hides(&[".cache/git/credential"]);
@@ -1984,6 +2090,9 @@ fn a_hidden_home_path_made_after_the_jail_started_stays_hidden() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_home_folder_linked_outside_the_home_hides_where_it_leads() {
+    if !jail_opens_here("a_home_folder_linked_outside_the_home_hides_where_it_leads") {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     let home = home_that_hides(&[".cache/git/credential", ".cache/gh"]);
@@ -2167,6 +2276,9 @@ echo SAVED
 #[cfg(target_os = "linux")]
 #[test]
 fn claude_codes_settings_file_survives_between_identified_jails() {
+    if !jail_opens_here("claude_codes_settings_file_survives_between_identified_jails") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -2257,6 +2369,9 @@ fn claude_codes_settings_file_survives_between_identified_jails() {
 #[cfg(target_os = "linux")]
 #[test]
 fn two_identified_jails_at_once_keep_separate_session_files() {
+    if !jail_opens_here("two_identified_jails_at_once_keep_separate_session_files") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -2338,6 +2453,9 @@ fn two_identified_jails_at_once_keep_separate_session_files() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_link_in_place_of_the_kept_settings_file_is_left_alone() {
+    if !jail_opens_here("a_link_in_place_of_the_kept_settings_file_is_left_alone") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -2381,6 +2499,9 @@ fn a_link_in_place_of_the_kept_settings_file_is_left_alone() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_kept_settings_file_a_profile_hides_stays_hidden() {
+    if !jail_opens_here("a_kept_settings_file_a_profile_hides_stays_hidden") {
+        return;
+    }
     require_bwrap();
     for there in [true, false] {
         let home = home_that_hides(&[".claude/.claude.json"]);
@@ -2418,6 +2539,9 @@ fn a_kept_settings_file_a_profile_hides_stays_hidden() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_persons_own_settings_file_in_claudes_folder_is_never_the_jails() {
+    if !jail_opens_here("the_persons_own_settings_file_in_claudes_folder_is_never_the_jails") {
+        return;
+    }
     require_bwrap();
     for hard in [false, true] {
         let home = state_home();
@@ -2462,6 +2586,9 @@ fn the_persons_own_settings_file_in_claudes_folder_is_never_the_jails() {
 #[cfg(target_os = "linux")]
 #[test]
 fn claude_codes_folders_are_the_jails_own_through_a_linked_claude_folder() {
+    if !jail_opens_here("claude_codes_folders_are_the_jails_own_through_a_linked_claude_folder") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -2506,6 +2633,9 @@ fn claude_codes_folders_are_the_jails_own_through_a_linked_claude_folder() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_of_a_profile_inside_the_project_is_never_written() {
+    if !jail_opens_here("a_read_only_path_of_a_profile_inside_the_project_is_never_written") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_read_only_path_of_a_profile_inside_the_project_is_never_written") {
         return;
@@ -2588,6 +2718,9 @@ fn a_read_only_path_of_a_profile_inside_the_project_is_never_written() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_running_identified_jail_hands_its_filter_before_any_descriptor_bind() {
+    if !jail_opens_here("a_running_identified_jail_hands_its_filter_before_any_descriptor_bind") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let project = tempfile::TempDir::new().unwrap();
@@ -2705,6 +2838,10 @@ fn not_held(path: &std::path::Path) -> String {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_strict_profile_never_starts_where_bwrap_cannot_keep_its_read_only_path() {
+    if !jail_opens_here("a_strict_profile_never_starts_where_bwrap_cannot_keep_its_read_only_path")
+    {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     let (_home, h) = extra_home();
@@ -2861,6 +2998,9 @@ fn bwrap_binds_fds() -> bool {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_link_planted_at_a_read_only_path_never_shows_where_it_leads() {
+    if !jail_opens_here("a_link_planted_at_a_read_only_path_never_shows_where_it_leads") {
+        return;
+    }
     use std::os::unix::fs::symlink;
     require_bwrap();
     let (_home, h) = extra_home();
@@ -2914,6 +3054,9 @@ fn a_link_planted_at_a_read_only_path_never_shows_where_it_leads() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_link_into_a_hidden_folder_is_left_out_and_the_jail_still_starts() {
+    if !jail_opens_here("a_link_into_a_hidden_folder_is_left_out_and_the_jail_still_starts") {
+        return;
+    }
     use std::os::unix::fs::symlink;
     require_bwrap();
     let (_home, h) = extra_home();
@@ -2956,6 +3099,9 @@ fn a_link_into_a_hidden_folder_is_left_out_and_the_jail_still_starts() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn the_persons_own_link_on_the_way_to_a_read_only_path_is_followed() {
+    if !jail_opens_here("the_persons_own_link_on_the_way_to_a_read_only_path_is_followed") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("the_persons_own_link_on_the_way_to_a_read_only_path_is_followed") {
         return;
@@ -3005,6 +3151,9 @@ fn the_persons_own_link_on_the_way_to_a_read_only_path_is_followed() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_that_is_a_link_stays_read_only_where_it_leads() {
+    if !jail_opens_here("a_read_only_path_that_is_a_link_stays_read_only_where_it_leads") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_read_only_path_that_is_a_link_stays_read_only_where_it_leads") {
         return;
@@ -3139,6 +3288,11 @@ fn on_macos_a_read_only_config_folder_is_never_written() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_under_a_home_folder_kept_as_a_link_is_read_only_where_the_agent_runs_it() {
+    if !jail_opens_here(
+        "a_read_only_path_under_a_home_folder_kept_as_a_link_is_read_only_where_the_agent_runs_it",
+    ) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here(
         "a_read_only_path_under_a_home_folder_kept_as_a_link_is_read_only_where_the_agent_runs_it",
@@ -3198,6 +3352,9 @@ fn a_read_only_path_under_a_home_folder_kept_as_a_link_is_read_only_where_the_ag
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_in_a_project_reached_through_a_link_is_never_written() {
+    if !jail_opens_here("a_read_only_path_in_a_project_reached_through_a_link_is_never_written") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_read_only_path_in_a_project_reached_through_a_link_is_never_written")
     {
@@ -3252,6 +3409,9 @@ fn a_read_only_path_in_a_project_reached_through_a_link_is_never_written() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_read_only_path_where_a_hidden_dotdir_leads_never_shows_the_secret() {
+    if !jail_opens_here("a_read_only_path_where_a_hidden_dotdir_leads_never_shows_the_secret") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_read_only_path_where_a_hidden_dotdir_leads_never_shows_the_secret") {
         return;
@@ -3303,6 +3463,9 @@ fn a_read_only_path_where_a_hidden_dotdir_leads_never_shows_the_secret() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_git_file_that_names_a_folder_of_the_home_never_shows_it_writable() {
+    if !jail_opens_here("a_git_file_that_names_a_folder_of_the_home_never_shows_it_writable") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_git_file_that_names_a_folder_of_the_home_never_shows_it_writable") {
         return;
@@ -3429,6 +3592,9 @@ fn git_dir_by_hand(dir: &std::path::Path) {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_forged_worktree_never_shows_a_folder_of_the_home_writable() {
+    if !jail_opens_here("a_forged_worktree_never_shows_a_folder_of_the_home_writable") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_forged_worktree_never_shows_a_folder_of_the_home_writable") {
         return;
@@ -3543,6 +3709,9 @@ fn a_forged_worktree_never_shows_a_folder_of_the_home_writable() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_real_worktree_still_works_in_the_jail() {
+    if !jail_opens_here("a_real_worktree_still_works_in_the_jail") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_real_worktree_still_works_in_the_jail") {
         return;
@@ -3637,6 +3806,9 @@ fn a_real_worktree_still_works_in_the_jail() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_worktree_of_a_repository_in_a_folder_every_jail_writes_still_works() {
+    if !jail_opens_here("a_worktree_of_a_repository_in_a_folder_every_jail_writes_still_works") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_worktree_of_a_repository_in_a_folder_every_jail_writes_still_works")
     {
@@ -3729,6 +3901,11 @@ fn a_worktree_of_a_repository_in_a_folder_every_jail_writes_still_works() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable() {
+    if !jail_opens_here(
+        "a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable",
+    ) {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here(
         "a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable",
@@ -3881,6 +4058,9 @@ fn on_macos_a_link_at_a_read_only_path_is_denied_as_named_and_where_it_leads() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_profile_that_shows_the_persons_settings_file_read_only_still_starts() {
+    if !jail_opens_here("a_profile_that_shows_the_persons_settings_file_read_only_still_starts") {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     let home = state_home();
@@ -3955,6 +4135,9 @@ fn a_project_that_is_claudes_folder_is_refused() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_link_in_the_hosts_claude_folder_never_leads_the_jails_sessions() {
+    if !jail_opens_here("a_link_in_the_hosts_claude_folder_never_leads_the_jails_sessions") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -4039,6 +4222,9 @@ fn a_project_whose_settings_turn_the_hooks_off_never_starts_a_jail() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_jail_cannot_change_the_settings_that_carry_the_guards_hook() {
+    if !jail_opens_here("a_jail_cannot_change_the_settings_that_carry_the_guards_hook") {
+        return;
+    }
     require_bwrap();
     let script = "s=\"$HOME/.claude/settings.json\"; l=\"$HOME/.claude/settings.local.json\"; \
                   (echo '{\"disableAllHooks\":true}' > \"$s\") 2>/dev/null && echo WROTE; \
@@ -4124,6 +4310,9 @@ fn a_jail_cannot_change_the_settings_that_carry_the_guards_hook() {
 #[cfg(target_os = "linux")]
 #[test]
 fn what_a_jail_writes_where_the_person_has_nothing_never_reaches_the_next() {
+    if !jail_opens_here("what_a_jail_writes_where_the_person_has_nothing_never_reaches_the_next") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -4169,6 +4358,9 @@ fn what_a_jail_writes_where_the_person_has_nothing_never_reaches_the_next() {
 #[cfg(target_os = "linux")]
 #[test]
 fn what_a_jail_writes_in_the_projects_claude_files_never_reaches_the_host() {
+    if !jail_opens_here("what_a_jail_writes_in_the_projects_claude_files_never_reaches_the_host") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -4370,6 +4562,9 @@ fn a_claude_config_dir_that_cannot_be_guarded_refuses_before_anything_is_written
 #[cfg(target_os = "linux")]
 #[test]
 fn the_folder_claude_config_dir_names_is_never_written_in_the_jail() {
+    if !jail_opens_here("the_folder_claude_config_dir_names_is_never_written_in_the_jail") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -4423,6 +4618,9 @@ fn the_folder_claude_config_dir_names_is_never_written_in_the_jail() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_jails_project_file_fails_the_launch_and_waits_for_the_persons_accept() {
+    if !jail_opens_here("a_jails_project_file_fails_the_launch_and_waits_for_the_persons_accept") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -4578,6 +4776,9 @@ fn every_doubt_in_the_persons_claude_settings_refuses_the_start() {
 #[cfg(target_os = "linux")]
 #[test]
 fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
+    if !jail_opens_here("claude_codes_own_folder_is_made_only_by_a_real_launch") {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     // The project's folder, and nothing beside it once the launch ended
@@ -4697,6 +4898,9 @@ fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_first_launch_on_a_home_with_no_claude_folder_shows_the_hook() {
+    if !jail_opens_here("the_first_launch_on_a_home_with_no_claude_folder_shows_the_hook") {
+        return;
+    }
     require_bwrap();
     for identity in [false, true] {
         let home = state_home();
@@ -4745,6 +4949,9 @@ fn the_first_launch_on_a_home_with_no_claude_folder_shows_the_hook() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_secret_folder_shown_through_another_linked_home_folder_stays_hidden() {
+    if !jail_opens_here("a_secret_folder_shown_through_another_linked_home_folder_stays_hidden") {
+        return;
+    }
     require_bwrap();
     for identity in [false, true] {
         let home = tempfile::TempDir::new().unwrap();
@@ -4861,6 +5068,9 @@ fn read_and_plant(places: &[&str]) -> String {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dotdir_linked_into_a_folder_the_jail_shows_stays_hidden() {
+    if !jail_opens_here("a_dotdir_linked_into_a_folder_the_jail_shows_stays_hidden") {
+        return;
+    }
     require_bwrap();
     for identity in [false, true] {
         let home = tempfile::TempDir::new().unwrap();
@@ -5106,6 +5316,9 @@ fn on_macos_a_deny_read_link_out_of_the_home_is_denied_where_it_leads() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_folder_the_jail_shows_that_leads_above_a_dotdir_shows_nothing_of_it() {
+    if !jail_opens_here("a_folder_the_jail_shows_that_leads_above_a_dotdir_shows_nothing_of_it") {
+        return;
+    }
     require_bwrap();
     for (cache, ssh, view) in [
         ("dots", Some("dots/ssh"), ".cache/ssh"),
@@ -5143,6 +5356,9 @@ fn a_folder_the_jail_shows_that_leads_above_a_dotdir_shows_nothing_of_it() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dotdir_behind_a_chain_of_two_links_stays_hidden() {
+    if !jail_opens_here("a_dotdir_behind_a_chain_of_two_links_stays_hidden") {
+        return;
+    }
     require_bwrap();
     for identity in [false, true] {
         let home = tempfile::TempDir::new().unwrap();
@@ -5182,6 +5398,11 @@ fn a_dotdir_behind_a_chain_of_two_links_stays_hidden() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dotdir_that_leads_where_the_jail_shows_nothing_is_not_in_it_and_nothing_is_said() {
+    if !jail_opens_here(
+        "a_dotdir_that_leads_where_the_jail_shows_nothing_is_not_in_it_and_nothing_is_said",
+    ) {
+        return;
+    }
     require_bwrap();
     for identity in [false, true] {
         let home = tempfile::TempDir::new().unwrap();
@@ -5312,6 +5533,9 @@ fn a_dotdir_through_a_link_the_jail_can_change_is_refused_and_the_hosts_link_sta
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dotdir_that_leads_into_the_project_is_hidden_there_and_said() {
+    if !jail_opens_here("a_dotdir_that_leads_into_the_project_is_hidden_there_and_said") {
+        return;
+    }
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
     let h = home.path();
@@ -5360,6 +5584,9 @@ fn a_dotdir_that_leads_into_the_project_is_hidden_there_and_said() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_link_inside_a_dotdir_the_jail_never_shows_is_hidden_where_it_leads() {
+    if !jail_opens_here("a_link_inside_a_dotdir_the_jail_never_shows_is_hidden_where_it_leads") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_link_inside_a_dotdir_the_jail_never_shows_is_hidden_where_it_leads")
     {
@@ -5442,6 +5669,9 @@ const MOVE_THE_FOLDER_BETWEEN: &str = "mv \"$1\" \"$1-old\" 2>/dev/null; echo \"
 #[cfg(target_os = "linux")]
 #[test]
 fn a_cover_below_a_folder_the_jail_writes_stays_where_the_hosts_link_leads() {
+    if !jail_opens_here("a_cover_below_a_folder_the_jail_writes_stays_where_the_hosts_link_leads") {
+        return;
+    }
     require_bwrap();
     for (identity, in_project) in [(false, true), (true, true), (false, false), (true, false)] {
         let home = tempfile::TempDir::new().unwrap();
@@ -5505,6 +5735,11 @@ fn a_cover_below_a_folder_the_jail_writes_stays_where_the_hosts_link_leads() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_cover_in_a_project_inside_a_home_folder_stays_where_the_hosts_link_leads() {
+    if !jail_opens_here(
+        "a_cover_in_a_project_inside_a_home_folder_stays_where_the_hosts_link_leads",
+    ) {
+        return;
+    }
     require_bwrap();
     for identity in [false, true] {
         let home = tempfile::TempDir::new().unwrap();
@@ -5552,6 +5787,9 @@ fn a_cover_in_a_project_inside_a_home_folder_stays_where_the_hosts_link_leads() 
 #[cfg(target_os = "linux")]
 #[test]
 fn an_identified_jail_never_moves_the_records_folder_away() {
+    if !jail_opens_here("an_identified_jail_never_moves_the_records_folder_away") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = std::fs::canonicalize(home.path()).unwrap();
@@ -6002,6 +6240,9 @@ fn on_macos_a_folder_kept_in_place_still_reads_as_writable() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_worktree_named_onto_where_a_hidden_dotdir_leads_is_left_out() {
+    if !jail_opens_here("a_worktree_named_onto_where_a_hidden_dotdir_leads_is_left_out") {
+        return;
+    }
     #[cfg(target_os = "macos")]
     if !sandbox_starts_here("a_worktree_named_onto_where_a_hidden_dotdir_leads_is_left_out") {
         return;
@@ -6078,6 +6319,9 @@ fn a_worktree_named_onto_where_a_hidden_dotdir_leads_is_left_out() {
 #[cfg(target_os = "linux")]
 #[test]
 fn ordinary_dotdirs_are_hidden_as_before_and_nothing_is_added() {
+    if !jail_opens_here("ordinary_dotdirs_are_hidden_as_before_and_nothing_is_added") {
+        return;
+    }
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
@@ -6178,6 +6422,9 @@ fn ordinary_dotdirs_are_hidden_as_before_and_nothing_is_added() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dotdir_link_to_nothing_yet_is_made_and_covered() {
+    if !jail_opens_here("a_dotdir_link_to_nothing_yet_is_made_and_covered") {
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     require_bwrap();
     for identity in [false, true] {
@@ -6296,6 +6543,9 @@ fn innerwardens_folder_that_is_a_link_is_refused_and_the_hosts_link_stays() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_suppression_planted_in_the_jail_never_lifts_the_hooks_verdict() {
+    if !jail_opens_here("a_suppression_planted_in_the_jail_never_lifts_the_hooks_verdict") {
+        return;
+    }
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
     let h = home.path();
@@ -6337,6 +6587,9 @@ fn a_suppression_planted_in_the_jail_never_lifts_the_hooks_verdict() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_jails_record_of_decisions_is_out_of_the_agents_reach() {
+    if !jail_opens_here("the_jails_record_of_decisions_is_out_of_the_agents_reach") {
+        return;
+    }
     require_bwrap();
     for identity in [false, true] {
         let home = state_home();
@@ -6420,6 +6673,9 @@ fn the_jails_record_of_decisions_is_out_of_the_agents_reach() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers() {
+    if !jail_opens_here("a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -6506,6 +6762,9 @@ fn a_record_folder_made_in_the_jail_is_never_taken_for_the_launchers() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_mount_of_the_jails_own_never_takes_the_hooks_decisions() {
+    if !jail_opens_here("a_mount_of_the_jails_own_never_takes_the_hooks_decisions") {
+        return;
+    }
     require_bwrap();
     let home = state_home();
     let h = home.path();
@@ -6630,6 +6889,9 @@ fn record_jail_sh(
 #[cfg(target_os = "linux")]
 #[test]
 fn a_planted_record_entry_is_moved_aside_and_the_record_kept_out_of_reach() {
+    if !jail_opens_here("a_planted_record_entry_is_moved_aside_and_the_record_kept_out_of_reach") {
+        return;
+    }
     require_bwrap();
     for identity in [false, true] {
         let home = state_home();
@@ -6689,6 +6951,9 @@ fn a_planted_record_entry_is_moved_aside_and_the_record_kept_out_of_reach() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_socket_folder_the_jail_can_write_is_refused() {
+    if !jail_opens_here("a_socket_folder_the_jail_can_write_is_refused") {
+        return;
+    }
     require_bwrap();
     for identity in [false, true] {
         let home = state_home();
@@ -6744,6 +7009,11 @@ fn a_socket_folder_the_jail_can_write_is_refused() {
 #[cfg(target_os = "linux")]
 #[test]
 fn the_lines_beside_the_record_reach_it_from_a_jail_whatever_iw_graph_file_says() {
+    if !jail_opens_here(
+        "the_lines_beside_the_record_reach_it_from_a_jail_whatever_iw_graph_file_says",
+    ) {
+        return;
+    }
     require_bwrap();
     for identity in [false, true] {
         let home = state_home();
@@ -6790,6 +7060,9 @@ fn the_lines_beside_the_record_reach_it_from_a_jail_whatever_iw_graph_file_says(
 #[cfg(target_os = "linux")]
 #[test]
 fn an_llm_or_notify_config_planted_in_the_jail_is_never_read() {
+    if !jail_opens_here("an_llm_or_notify_config_planted_in_the_jail_is_never_read") {
+        return;
+    }
     require_bwrap();
     let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let at = endpoint.local_addr().unwrap();
@@ -6927,6 +7200,9 @@ fn an_identified_jail_where_the_records_folder_is_behind_a_link_is_refused() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_deny_read_link_never_empties_the_hook_or_the_system() {
+    if !jail_opens_here("a_deny_read_link_never_empties_the_hook_or_the_system") {
+        return;
+    }
     require_bwrap();
     let home = tempfile::TempDir::new().unwrap();
     let h = std::fs::canonicalize(home.path()).unwrap();
@@ -7377,4 +7653,174 @@ fn on_a_bcachefs_disk_no_jail_makes_a_subvolume_or_snapshot() {
         ],
         newer: &["subvolume_create_v2", "snapshot_create_v2"],
     });
+}
+
+/// A home with OpenClaw set up and the guard's plugin wired, and keys,
+/// cloud credentials and docker's folder beside it.
+#[cfg(target_os = "linux")]
+fn openclaw_home() -> tempfile::TempDir {
+    let home = state_home();
+    let dir = home.path().join(".openclaw");
+    std::fs::create_dir_all(dir.join("extensions/innerwarden-guard")).unwrap();
+    std::fs::write(
+        dir.join("extensions/innerwarden-guard/index.js"),
+        "// guard\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("openclaw.json"),
+        r#"{"plugins":{"entries":{"innerwarden-guard":{"enabled":true,"config":{"mode":"enforce"}}}}}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join(".env"), "PROVIDER_KEY=from-host\n").unwrap();
+    for (file, text) in [
+        (".ssh/id_ed25519", "CJC-OC-SSH"),
+        (".aws/credentials", "CJC-OC-AWS"),
+        (".docker/config.json", "CJC-OC-DOCKER"),
+    ] {
+        let path = home.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    home
+}
+
+/// Review of the jail of OpenClaw, item 6, in a real bwrap: what wires the
+/// guard is read-only over the writable folder (a write, a removal and a
+/// rename of the config, the `.env`, the plugins and the hooks all fail,
+/// while the gateway's own sessions are written); a plugin cannot be
+/// planted in the workspace; keys, cloud credentials, docker's folder and
+/// socket are not there; automatic updates are off; and a nested user
+/// namespace is refused as in Claude Code's jail. On the host, nothing the
+/// jail was refused changed.
+///
+/// FAILS ON REVERT: drop the read-only binds and `MOVED-hooks` or
+/// `WROTE-config` is printed and the host's config changes.
+#[cfg(target_os = "linux")]
+#[test]
+fn openclaws_jail_holds_its_wiring_read_only_in_a_real_bwrap() {
+    if !jail_opens_here("openclaws_jail_holds_its_wiring_read_only_in_a_real_bwrap") {
+        return;
+    }
+    require_bwrap();
+    let home = openclaw_home();
+    let project = tempfile::TempDir::new().unwrap();
+    let script = r#"
+        o="$HOME/.openclaw"
+        if ( echo x >> "$o/openclaw.json" ) 2>/dev/null; then echo WROTE-config; fi
+        if ( echo X=1 >> "$o/.env" ) 2>/dev/null; then echo WROTE-env; fi
+        if mkdir "$o/extensions/evil" 2>/dev/null; then echo PLANTED-extensions; fi
+        if mkdir "$o/hooks/evil" 2>/dev/null; then echo PLANTED-hooks; fi
+        if mkdir "$o/skills/evil" 2>/dev/null; then echo PLANTED-skills; fi
+        for p in openclaw.json .env extensions hooks; do
+            if mv "$o/$p" "$o/$p.moved" 2>/dev/null; then echo "MOVED-$p"; fi
+            if rm -rf "$o/$p" 2>/dev/null && [ ! -e "$o/$p" ]; then echo "REMOVED-$p"; fi
+        done
+        if mkdir -p "$o/workspace/.openclaw/extensions/evil" 2>/dev/null; then echo PLANTED-workspace; fi
+        if mkdir -p "$o/agents/main/sessions" && echo '{}' > "$o/agents/main/sessions/s.json"; then echo WROTE-session; fi
+        for f in .ssh/id_ed25519 .aws/credentials .docker/config.json; do
+            if [ -e "$HOME/$f" ]; then echo "SHOWN-$f"; fi
+        done
+        if [ -e /var/run/docker.sock ] || [ -e /run/docker.sock ]; then echo SHOWN-docker-sock; fi
+        echo "UPDATE=$OPENCLAW_NO_AUTO_UPDATE"
+        if ! command -v unshare >/dev/null; then echo NO-UNSHARE;
+        elif unshare -U true 2>/dev/null; then echo NESTED-USERNS; else echo NESTED-REFUSED; fi
+        echo DONE
+    "#;
+    let output = cli()
+        .args([
+            "contain",
+            "--agent",
+            "openclaw",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+        ])
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .expect("run the jail of OpenClaw");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stdout.contains("DONE"), "{stdout} {stderr}");
+    for refused in [
+        "WROTE-config",
+        "WROTE-env",
+        "PLANTED-extensions",
+        "PLANTED-hooks",
+        "PLANTED-skills",
+        "PLANTED-workspace",
+        "MOVED-",
+        "REMOVED-",
+        "SHOWN-",
+    ] {
+        assert!(!stdout.contains(refused), "{refused}: {stdout}");
+    }
+    assert!(stdout.contains("WROTE-session"), "{stdout}");
+    assert!(stdout.contains("UPDATE=1"), "{stdout}");
+    let dir = home.path().join(".openclaw");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(".env")).unwrap(),
+        "PROVIDER_KEY=from-host\n"
+    );
+    assert!(std::fs::read_to_string(dir.join("openclaw.json"))
+        .unwrap()
+        .ends_with("}}}}}"));
+    assert!(!dir.join("workspace/.openclaw/extensions/evil").exists());
+    assert!(dir.join("extensions/innerwarden-guard/index.js").is_file());
+    assert!(dir.join("agents/main/sessions/s.json").is_file());
+    match filter_here() {
+        FilterHere::Taken => {
+            assert!(!stdout.contains("NESTED-USERNS"), "{stdout}");
+            if !stdout.contains("NO-UNSHARE") {
+                assert!(stdout.contains("NESTED-REFUSED"), "{stdout}");
+            }
+        }
+        FilterHere::NotTaken => {
+            assert!(stderr.contains("no sandbox filter"), "{stderr}");
+        }
+        other => panic!("the jail ran on a host where {other:?}: {stdout}"),
+    }
+}
+
+/// Review of the jail of OpenClaw, items 4 and 6, in a real launch: a part of
+/// the guard's wiring that is a link (here `hooks` into the project) stops
+/// the jail before its command runs, and nothing is made through the link.
+///
+/// FAILS ON REVERT: check only `~/.openclaw` for a link and the command
+/// runs with the project's folder as OpenClaw's hooks.
+#[cfg(target_os = "linux")]
+#[test]
+fn openclaws_jail_does_not_start_through_a_link() {
+    require_bwrap();
+    let home = openclaw_home();
+    let project = tempfile::TempDir::new().unwrap();
+    let target = project.path().join("hooks");
+    std::fs::create_dir_all(&target).unwrap();
+    std::os::unix::fs::symlink(&target, home.path().join(".openclaw/hooks")).unwrap();
+    let output = cli()
+        .args([
+            "contain",
+            "--agent",
+            "openclaw",
+            "--project",
+            project.path().to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo RAN",
+        ])
+        .env("HOME", home.path())
+        .env_remove("XDG_STATE_HOME")
+        .output()
+        .expect("run the jail of OpenClaw");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("is a link"), "{stderr}");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("RAN"));
+    assert!(std::fs::read_dir(&target).unwrap().next().is_none());
 }

@@ -63,6 +63,35 @@ list, with every limit.
   settings `HTTP_PROXY`, `HTTPS_PROXY`, `FTP_PROXY`, `ALL_PROXY` and
   `NO_PROXY`, in capitals or lowercase); `--pass-env NAME` hands in any other, and `contain` names every
   variable it kept out, never a value.
+  `--agent openclaw` (Linux) jails OpenClaw instead of Claude Code: the jail
+  shows `~/.openclaw` writable (sessions, databases, workspace) and, read-only
+  over it, every place OpenClaw 2026.9.7's documentation says it loads code
+  or instructions from at its next start, where the jail shows it writable:
+  its config `openclaw.json`, its `.env`, its plugins (`extensions`), managed
+  hooks (`hooks`), managed skills (`skills`) and old cron store (`cron`); in
+  each workspace (`~/.openclaw/workspace`, `workspace-<id>`, the ones the
+  config names) its plugins (`.openclaw`), hooks (`hooks`) and skills
+  (`skills`, `.agents`); each agent's `agents/<id>/agent/workshop-skills`;
+  and the config's `plugins.load.paths`, `hooks.internal.load.extraDirs` and
+  `skills.load.extraDirs`. Each is a mount point of its own, so a program in
+  the jail can neither change, remove nor rename it, nor turn the guard plugin
+  off or plant a plugin, a hook or a skill for the next start. The launcher
+  makes each one that is not there (empty, owner only), and refuses to start
+  where one is a link or is reached through one, where a load path the config
+  names is not there, where the config uses `$include` (its files sit in the
+  writable folder) or is not plain JSON. A settings change, or a config
+  migration the gateway would write at its start, is refused inside the jail.
+  What OpenClaw keeps in its state database (sessions, scheduled jobs) stays
+  writable: the gateway needs it, so a job the jailed agent schedules through
+  OpenClaw itself still runs at the next start. Automatic updates are off in the jail
+  (`OPENCLAW_NO_AUTO_UPDATE=1`). It starts only with the guard plugin wired
+  (`innerwarden agents connect openclaw`), keeps the plugin's mode
+  (`innerwarden enforce` and `monitor` set it, never a `contain` flag), and
+  refuses `--pass-env` of any `OPENCLAW_*` variable (and the older
+  `CLAWDBOT_*`, `CLAWD_*` and `MOLTBOT_*`) and a command with OpenClaw's
+  `--profile` or `--dev`, which move its state. `~/.ssh`, `~/.aws` and `~/.docker` stay out, as in
+  every jail, and so do docker's and an ssh agent's sockets (no `/var`, an
+  empty `/run` and `/tmp`). Not on macOS in this version.
   The hook inside the jail keeps its record of decisions in the project, in
   `<project>/.innerwarden/graph.json`. On Linux that folder is read-only
   inside the jail: the hook hands each decision, and each line it keeps
@@ -387,6 +416,20 @@ Code's hooks reference, Gemini CLI 0.68.0, Hermes Agent v0.23.1, Codex CLI
 On its own, InnerWarden keeps its record in the home of the account that runs
 it: `~/.config/innerwarden/graph.json`, with the refusals also appended to
 `guard-events.jsonl` beside it. `IW_GRAPH_FILE` moves it anywhere you say.
+A call the MCP proxy refuses is written to the guard's own record too (the
+one `innerwarden status` reads in your own terminal: the shared record where
+InnerWarden Pro names one, else the one in your account's home, found from
+the account database by uid and never from `HOME`),
+graph and `guard-events.jsonl` line, whatever the proxy's environment says:
+whoever starts the proxy can move its record, but not hide a refusal from
+you, and neither can an empty, missing or redirected `HOME`. On Windows, where
+no account database is read, the copy goes only to a shared record. What
+`IW_GRAPH_FILE` still moves is everything else the proxy records
+(every allowed call, and what advisory and warn only record).
+`INNERWARDEN_AGENT_URL=off` turns off only the report of each refusal to an
+InnerWarden Pro agent on the same machine (`POST /api/agent/proxy-block`);
+the refusal is still recorded, and Pro still reads the `guard.blocked` line
+from the shared record where it is installed.
 
 When InnerWarden Pro is installed on the same machine, its installer writes
 `/etc/innerwarden/guard.toml`, which names a shared record in

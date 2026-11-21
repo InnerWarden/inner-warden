@@ -57,6 +57,14 @@ fn cli() -> Command {
     // a developer running the suite on a host with an agent never gets the
     // suite's fake attacks as cases; the one test of the report turns it on.
     command.env("INNERWARDEN_AGENT_URL", "off");
+    // A refusal of the proxy is also written to the guard's own record,
+    // whatever IW_GRAPH_FILE says; a debug build reads where that is from
+    // this file instead of /etc/innerwarden/guard.toml, so the suite never
+    // writes into the shared record of a host with InnerWarden Pro.
+    command.env("IW_TEST_GUARD_CONFIG", scratch_home().join("no-guard.toml"));
+    // And the account's home is the scratch home too (debug builds read it
+    // in place of the account database), never the developer's own.
+    command.env("IW_TEST_ACCOUNT_HOME", scratch_home());
     // The person's shell, even when the suite runs under an AI agent's: a
     // jail and the wiring that lowers a guard are refused inside one. A test
     // about an agent's shell sets its marker again; the later value wins.

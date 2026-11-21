@@ -17,6 +17,10 @@
 //! or absent agent never delays an MCP message, and only to this host's
 //! loopback: `INNERWARDEN_AGENT_URL` may name another loopback address or
 //! port (default `https://127.0.0.1:8787`), and `off` turns reporting off.
+//! `off` turns off only this report: the refusal is still written to the
+//! local record, and to the guard's own record even where `IW_GRAPH_FILE`
+//! moved the proxy's (`graph_io::record_mcp`), so the agent still reads its
+//! `guard.blocked` line where it reads the shared record.
 
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::Duration;
