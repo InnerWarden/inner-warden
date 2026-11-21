@@ -6,8 +6,8 @@
 //! list below was `deny` or `review`, and every neighbour already refused):
 //!
 //! - inline code (`python3 -c "..."`) that edits a file quoting a guard
-//!   command is refused as that command, on purpose: the guard's words in
-//!   interpreter code are read as shell (see the test below);
+//!   command was refused as that command, on purpose; since 2026-11-21 it
+//!   is held for review (see the test below);
 //! - `bash "$(git rev-parse --show-toplevel)/scripts/x.sh"` stays refused,
 //!   as on main: a function or a search path stands in for `git`, so the
 //!   way is `bash scripts/x.sh` from the top of the repository;
@@ -35,13 +35,13 @@ fn assert_verdict(lines: &[&str], expected: &str) {
     assert!(wrong.is_empty(), "expected {expected}: {wrong:#?}");
 }
 
-/// Kept refused on purpose: the guard's words in interpreter code are read
-/// as shell, `-c` and here-document alike, because reading the code as its
-/// own language and passing what "starts no program" had a way around every
-/// list of run calls. Edit such a file with the agent's file edit tool or a
-/// script saved to a file.
+/// Refused on purpose until 2026-11-21: the guard's words in interpreter
+/// code were read as shell, `-c` and here-document alike. Since the
+/// decision of that day, code that runs nothing, signals nothing and
+/// changes only project files names the guard: held for review, never
+/// allowed. Code that may act stays refused (the next test).
 #[test]
-fn inline_code_that_edits_text_quoting_a_guard_command_stays_refused() {
+fn inline_code_that_edits_text_quoting_a_guard_command_is_held_for_review() {
     assert_verdict(
         &[
             "python3 -c \"import re,pathlib; p=pathlib.Path('src/x.rs'); s=p.read_text(); s=s.replace('innerwarden allow x', 'innerwarden allow y'); p.write_text(s)\"",
@@ -50,7 +50,7 @@ fn inline_code_that_edits_text_quoting_a_guard_command_stays_refused() {
             "cd docs && python3 -I -c \"print('innerwarden allow x')\"",
             "node -e \"console.log('innerwarden allow x')\"",
         ],
-        "deny",
+        "review",
     );
     // The same edits without a guard word run.
     assert_verdict(

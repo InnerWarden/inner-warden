@@ -143,9 +143,6 @@ s = 'rm -rf "$d"/b'
 pty.spawn(['sh','-c',s])
 EOF"##,
         r##"python3 -c "import shutil; shutil.rmtree('/home/u')""##,
-        r##"python3 - <<'EOF'
-print('pkill -f innerwarden')
-EOF"##,
         r##"python3 -c "s='rm -rf ~'; import os; os.system(s)""##,
         r##"python3 -c "s='rm -rf ~'; exec(s)""##,
         r##"python3 -c "s='rm -rf ~'; eval(s)""##,
@@ -154,4 +151,9 @@ EOF"##,
     ] {
         assert_eq!(verdict(line), "deny", "{line}");
     }
+    // Code that only prints a stop of the guard names it: refused until
+    // 2026-11-21, held for review since (decision of the operator; the
+    // print piped to a shell stays refused, `tests/guard_word_mention_and_action.rs`).
+    let printed = "python3 - <<'EOF'\nprint('pkill -f innerwarden')\nEOF";
+    assert_eq!(verdict(printed), "review", "{printed}");
 }
