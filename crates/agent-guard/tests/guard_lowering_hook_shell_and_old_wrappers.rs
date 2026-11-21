@@ -64,20 +64,77 @@ fn hook_scripts() -> Vec<String> {
     scripts
 }
 
+/// Where a word of a script stands: in the guard's part (up to the space
+/// after `s=$?;`), in the message it prints, or in the shell after it
+/// (`case $s in`, `exit 2`), which any script holds.
+#[derive(Clone, Copy, PartialEq)]
+enum Part {
+    Guard,
+    Message,
+    Shell,
+}
+
+/// The words of `script`, each with its [`Part`].
+fn script_parts(script: &str) -> Vec<(&str, Part)> {
+    let mark_end = script.find("s=$?;").expect("a fail-closed script") + "s=$?;".len();
+    let message = script.find("echo \"").map(|at| {
+        let start = at + "echo \"".len();
+        let end = start + script[start..].find('"').expect("a closed message");
+        start..end
+    });
+    let mut at = 0;
+    script
+        .split(' ')
+        .map(|word| {
+            let start = at;
+            at += word.len() + 1;
+            let end = start + word.len();
+            let part = if start < mark_end || word.to_ascii_lowercase().contains("innerwarden") {
+                Part::Guard
+            } else if message
+                .as_ref()
+                .is_some_and(|message| start < message.end && message.start < end)
+            {
+                Part::Message
+            } else {
+                Part::Shell
+            };
+            (word, part)
+        })
+        .collect()
+}
+
 /// Every run of three words of each script, as a pattern that matches it
-/// as written (its regular expression characters escaped).
-fn script_fragments() -> Vec<String> {
-    let mut fragments = Vec::new();
+/// as written (its regular expression characters escaped): those that take
+/// a word of the guard's part or two of its message, and those that lie
+/// in the shell after the mark alone.
+fn script_fragments() -> (Vec<String>, Vec<String>) {
+    let mut guards = Vec::new();
+    let mut shells = Vec::new();
     for script in hook_scripts() {
-        let words: Vec<&str> = script.split(' ').collect();
+        let words = script_parts(&script);
         for window in words.windows(3) {
-            let fragment = regex::escape(&window.join(" "));
-            if !fragments.contains(&fragment) {
-                fragments.push(fragment);
+            let fragment = regex::escape(
+                &window
+                    .iter()
+                    .map(|(word, _)| *word)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            let of = |part: Part| window.iter().filter(|(_, p)| *p == part).count();
+            let list = if of(Part::Guard) > 0 || of(Part::Message) >= 2 {
+                &mut guards
+            } else if of(Part::Shell) == 3 {
+                &mut shells
+            } else {
+                continue;
+            };
+            if !list.contains(&fragment) {
+                list.push(fragment);
             }
         }
     }
-    fragments
+    (guards, shells)
 }
 
 /// Shell-quote `text` as one word.
@@ -87,7 +144,7 @@ fn quoted(text: &str) -> String {
 
 #[test]
 fn a_pattern_of_the_fail_closed_hook_shell_is_refused() {
-    let fragments = script_fragments();
+    let (fragments, _) = script_fragments();
     assert!(fragments.len() > 40, "{fragments:?}");
     for fragment in &fragments {
         for line in [
@@ -212,4 +269,75 @@ fn stopping_a_process_of_ours_unrelated_to_the_guard_stays_allowed() {
     ] {
         assert_eq!(verdict(line), "allow", "{line}");
     }
+}
+
+/// Review of #360: the shell that runs a fail-closed hook is the guard's
+/// only where its script is: the mark `s=$?;` and what stands before it,
+/// and the message it prints. `sh -c`, `exit 2` and the shell after the
+/// mark are in every script, and a folder named for the guard is no
+/// program of it.
+#[test]
+fn the_shell_any_script_holds_and_a_folder_named_for_the_guard_stay_allowed() {
+    let (_, shells) = script_fragments();
+    assert!(shells.len() > 5, "{shells:?}");
+    for fragment in &shells {
+        let line = format!("pkill -f {}", quoted(fragment));
+        assert_eq!(verdict(&line), "allow", "{line}");
+    }
+    for line in [
+        "pkill -f 'sh -c'",
+        "pkill -f \"sh -c\"",
+        "pkill -f 'exit 2'",
+        "pkill -f 'exit 1'",
+        "pkill -f 'bash -c'",
+        "pkill -f /var/log/innerwarden",
+        "pkill -f /usr/local/bin/innerwardenx",
+        "pgrep -f vite > /tmp/p; xargs kill < /tmp/p",
+        "systemctl restart nginx",
+        "systemctl restart auditd",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// Review of #360: the mark of each fail-closed script (Codex, Gemini CLI,
+/// Claude Code) is refused alike.
+#[test]
+fn the_mark_of_every_fail_closed_script_is_refused() {
+    for line in [
+        "pkill -f 'hook --agent codex; s=\\$\\?;'",
+        "pkill -f 'hook --agent gemini; s=\\$\\?;'",
+        "pkill -f 'hook --block-review --agent codex; s='",
+        "pkill -f 'hook \\|\\| \\{ s='",
+        "pkill -f 's=\\$\\?; case \\$s in 0\\|2\\)'",
+        "pkill -f 's=\\$\\?; \\[ \\$s -ge 126'",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// Review of #360: the ids of the guard's processes reach a kill through
+/// whatever stands between them; a program of the guard installed under a
+/// longer name is the guard;
+/// the wrapper's options glued with `=` or in another order are its line.
+#[test]
+fn what_the_review_of_360_found() {
+    for line in [
+        "pgrep -f innerwarden-agent | tee /tmp/p | xargs kill",
+        "pgrep -f innerwarden-agent > /tmp/p; xargs kill < /tmp/p",
+        "pidof innerwarden-agent > /tmp/p; kill $(cat /tmp/p)",
+        "P=$(pgrep -f innerwarden-sensor); kill $P",
+        "pkill -f /usr/local/bin/innerwarden-agent-2",
+        "pkill -f /usr/local/bin/innerwarden-helper",
+        "killall /usr/local/bin/innerwarden-helper",
+        "pkill -f 'proxy --mode=advisory'",
+        "pkill -f 'proxy --label=codex --mode=guard'",
+        "pkill -f 'proxy --mode guard --label codex'",
+        "pkill -f 'proxy --mode=guard --agent=claude-code'",
+        "pkill -f -- '--agent codex --label codex --mode guard'",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    // A file loaded before an agent starts is held for a person.
+    assert_eq!(verdict(". /tmp/e.sh; claude"), "review");
 }

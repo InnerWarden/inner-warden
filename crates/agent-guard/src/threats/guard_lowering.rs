@@ -55,11 +55,15 @@ const NAME_PIECE: usize = 3;
 /// Whether `range` of `text` covers [`NAME_PIECE`] bytes or more of one
 /// [`GUARD_NAME`] in it.
 fn touches_name(text: &str, range: &Range<usize>) -> bool {
-    text.match_indices(GUARD_NAME).any(|(at, name)| {
-        let start = range.start.max(at);
-        let end = range.end.min(at + name.len());
-        end >= start + NAME_PIECE
-    })
+    // Patterns are matched with case ignored: `InnerWarden` in the message
+    // is the name too.
+    text.to_ascii_lowercase()
+        .match_indices(GUARD_NAME)
+        .any(|(at, name)| {
+            let start = range.start.max(at);
+            let end = range.end.min(at + name.len());
+            end >= start + NAME_PIECE
+        })
 }
 
 impl GuardLine {
@@ -238,7 +242,8 @@ pub(super) fn guard_lines() -> &'static [GuardLine] {
 
 fn build_guard_lines() -> Vec<GuardLine> {
     let mut lines = Vec::new();
-    for program in &guard_programs() {
+    let programs = guard_programs();
+    for program in &programs {
         let program = program.as_str();
         let bin = Path::new(program);
         // The program alone, and its hook with no option.
@@ -321,7 +326,11 @@ fn build_guard_lines() -> Vec<GuardLine> {
                 legacy.extend(server.iter().map(|word| (*word).to_owned()));
                 lines.push(guard_line(&legacy, Some(2)));
             }
-            // The layouts older CLIs wrote ([`WRAPPER_LAYOUTS`]), in each mode.
+            // The layouts older CLIs wrote ([`WRAPPER_LAYOUTS`]), in each mode,
+            // their options in any order and as `--mode=guard` too (the
+            // proxy reads both): around the first server and after the
+            // first program, which stand for the rest, the options being
+            // the guard's part.
             for (layout, agent, mode) in WRAPPER_LAYOUTS.iter().flat_map(|layout| {
                 agents.iter().flat_map(move |agent| {
                     ["guard", "advisory"]
@@ -329,18 +338,25 @@ fn build_guard_lines() -> Vec<GuardLine> {
                         .map(move |mode| (layout, *agent, mode))
                 })
             }) {
-                let mut words: Vec<String> = vec![program.to_owned(), "proxy".into()];
-                words.extend(
-                    layout
-                        .iter()
-                        .map(|word| word.replace("{mode}", mode).replace("{agent}", agent)),
-                );
-                let separator = words.len();
-                words.push("--".into());
-                words.extend(server.iter().map(|word| (*word).to_owned()));
-                // `--label` names the agent as `--agent` does (shared by
-                // [`guard_line`]); `--error-response` takes no value.
-                lines.push(guard_line(&words, Some(separator)));
+                let options: Vec<String> = layout
+                    .iter()
+                    .map(|word| word.replace("{mode}", mode).replace("{agent}", agent))
+                    .collect();
+                let spellings = if index == 0 && program == programs[0] {
+                    option_spellings(&options)
+                } else {
+                    vec![options]
+                };
+                for options in spellings {
+                    let mut words: Vec<String> = vec![program.to_owned(), "proxy".into()];
+                    words.extend(options);
+                    let separator = words.len();
+                    words.push("--".into());
+                    words.extend(server.iter().map(|word| (*word).to_owned()));
+                    // `--label` names the agent as `--agent` does (shared
+                    // by [`guard_line`]); `--error-response` takes no value.
+                    lines.push(guard_line(&words, Some(separator)));
+                }
             }
             let mut pro: Vec<String> = [
                 "/usr/local/bin/innerwarden-ctl",
@@ -368,6 +384,54 @@ fn build_guard_lines() -> Vec<GuardLine> {
         lines.push(guard_line(&words, separator));
     }
     lines
+}
+
+/// Every way the proxy reads the same options: `words` as option groups
+/// (`--mode guard` is one, `--error-response` another) in every order, each
+/// group with a value written apart or after `=`, all of them one way or
+/// the other.
+fn option_spellings(words: &[String]) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    let mut rest = words.iter().peekable();
+    while let Some(word) = rest.next() {
+        let mut group = vec![word.clone()];
+        if let Some(value) = rest.next_if(|next| !next.starts_with("--")) {
+            group.push(value.clone());
+        }
+        groups.push(group);
+    }
+    let mut orders: Vec<Vec<usize>> = vec![Vec::new()];
+    for _ in 0..groups.len() {
+        orders = orders
+            .into_iter()
+            .flat_map(|order| {
+                (0..groups.len())
+                    .filter(|at| !order.contains(at))
+                    .map(|at| {
+                        let mut next = order.clone();
+                        next.push(at);
+                        next
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+    }
+    let mut spellings = Vec::new();
+    for order in &orders {
+        for glued in [false, true] {
+            let mut spelled = Vec::new();
+            for &at in order {
+                match groups[at].as_slice() {
+                    [option, value] if glued => spelled.push(format!("{option}={value}")),
+                    group => spelled.extend(group.iter().cloned()),
+                }
+            }
+            if !spellings.contains(&spelled) {
+                spellings.push(spelled);
+            }
+        }
+    }
+    spellings
 }
 
 /// The words of the program a hook line starts, as the shell starts it:
@@ -416,11 +480,21 @@ fn wired_agents() -> Vec<&'static str> {
 /// The shell that runs a fail-closed hook line.
 const FAIL_CLOSED_SHELL: &str = "/bin/sh";
 
+/// What only the script of a fail-closed hook line holds: the status of the
+/// guard taken right after it ends, `s=$?`, and what stands before it
+/// (`"$0" hook --agent codex; `, `hook || { `). The rest of the script is
+/// shell any script holds (`exit 2`, `case $s in`, `[ $s -ge 126 ]`), and
+/// so is the shell that runs it (`/bin/sh -c`).
+const FAIL_CLOSED_MARK: &str = "s=$?;";
+
 /// The process a fail-closed hook line (`/bin/sh -c '"$0" hook ...; s=$?;
 /// ...' "/path/innerwarden"`) starts first, as `pkill -f` reads it: the
-/// shell's words joined by a space, the script one of them. The agent's id
-/// after `--agent` is another program's part; the message the script
-/// prints is the guard's prose ([`GuardLine::prose`]).
+/// shell's words joined by a space, the script one of them. The guard's
+/// part is the script up to the space after [`FAIL_CLOSED_MARK`] and the
+/// message the script prints ([`GuardLine::prose`]); the shell's words,
+/// the agent's id after `--agent` and the shell after the mark are another
+/// program's: `pkill -f 'sh -c'` or `pkill -f 'exit 2'` aims at every
+/// script, not at this one.
 fn fail_closed_shell_line(line: &str) -> Option<GuardLine> {
     let read = read_line(line);
     let words: Vec<String> = read
@@ -436,12 +510,29 @@ fn fail_closed_shell_line(line: &str) -> Option<GuardLine> {
     let text = words.join(" ");
     let pieces: Vec<String> = text.split(' ').map(str::to_owned).collect();
     let mut shell = guard_line(&pieces, None);
+    let script_start = words[0].len() + 1 + words[1].len() + 1;
+    let script_end = script_start + words[2].len();
+    let mark_end = shell.text[script_start..script_end]
+        .find(FAIL_CLOSED_MARK)
+        .map(|at| (script_start + at + FAIL_CLOSED_MARK.len() + 1).min(script_end))?;
+    let mut prose = None;
     if let Some(open) = shell.text.find("echo \"") {
         let start = open + "echo \"".len();
         if let Some(close) = shell.text[start..].find('"') {
-            shell.prose.push(start..start + close);
+            prose = Some(start..start + close);
         }
     }
+    // The shell and what follows the mark, but the message, are shared,
+    // with what [`guard_line`] already shares (the agent's id).
+    shell.shared.push(0..script_start);
+    match &prose {
+        Some(message) if message.start >= mark_end => {
+            shell.shared.push(mark_end..message.start);
+            shell.shared.push(message.end..shell.text.len());
+        }
+        _ => shell.shared.push(mark_end..shell.text.len()),
+    }
+    shell.prose.extend(prose);
     Some(shell)
 }
 
@@ -458,6 +549,15 @@ fn guard_line(words: &[String], separator: Option<usize>) -> GuardLine {
         }
         let start = text.len();
         text.push_str(word);
+        // `--agent=codex`: the value after `=` is the agent's id.
+        if let Some(value) = ["--agent=", "--label="]
+            .iter()
+            .find_map(|option| word.strip_prefix(option))
+        {
+            if !value.is_empty() {
+                shared.push(text.len() - value.len()..text.len());
+            }
+        }
         let theirs = names_agent || separator.is_some_and(|at| index > at);
         if theirs {
             // The space in front of a shared word is the guard's only when
@@ -574,13 +674,12 @@ fn names_a_guard_process(name: &str, ignore_case: bool) -> bool {
         }
     };
     if name.contains('/') {
-        // Any folder: a path whose file is one of the guard's programs is
-        // the guard, wherever it was installed (`/opt/iw/bin/innerwarden`).
-        let file = name.rsplit('/').next().unwrap_or(name);
+        // A program of the guard where it is installed, in any folder of
+        // programs (`/opt/iw/bin/innerwarden`, `~/bin/innerwarden-helper`).
         return guard_lines()
             .iter()
             .any(|line| same(line.text.split(' ').next().unwrap_or_default(), name))
-            || guard_process_names().iter().any(|own| same(own, file));
+            || is_guard_install_path(name);
     }
     guard_process_names().iter().any(|own| same(own, name))
 }
@@ -661,18 +760,35 @@ pub(super) fn reach_of_pattern(pattern: &str, full: bool) -> PkillReach {
     reach.unwrap_or(PkillReach::Broad)
 }
 
-/// Whether `pattern` spells a path whose file is one of the guard's
-/// programs (`/opt/iw/bin/innerwarden`, `~/bin/innerwarden-agent`), in a
-/// folder the guard's lines do not list: every process of that program is
-/// the guard's.
+/// Whether `pattern` spells a path where a program of the guard is
+/// installed ([`is_guard_install_path`]), in a folder the guard's lines do
+/// not list: every process of that program is the guard's. A folder named
+/// for the guard (`/var/log/innerwarden`) is no program of it.
 fn names_a_guard_path(pattern: &str) -> bool {
     pattern
         .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~')))
         .filter(|token| token.contains('/'))
-        .any(|token| {
-            let file = token.rsplit('/').next().unwrap_or(token);
-            !file.is_empty() && names_a_guard_process(file, true)
-        })
+        .any(is_guard_install_path)
+}
+
+/// The folders programs are installed in: a `bin` or `sbin` anywhere
+/// (`/usr/local/bin`, `~/.local/bin`, `~/.cargo/bin`, `/opt/iw/bin`).
+const PROGRAM_FOLDERS: &[&str] = &["bin", "sbin"];
+
+/// Whether `path` is a program of the guard where it is installed: a file
+/// in one of [`PROGRAM_FOLDERS`] whose name is the guard's name or starts
+/// with it at a word's edge (`innerwarden`, `innerwarden-agent`,
+/// `innerwarden-agent-2`, `innerwarden-helper`; not `innerwardenx`), case
+/// ignored.
+fn is_guard_install_path(path: &str) -> bool {
+    let mut parts = path.rsplit('/');
+    let file = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let folder = parts.next().unwrap_or_default();
+    if !PROGRAM_FOLDERS.contains(&folder) {
+        return false;
+    }
+    file.strip_prefix(GUARD_NAME)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(['-', '_', '.']))
 }
 
 /// Whether `pattern` spells the guard's CLI as a program followed by its
@@ -766,6 +882,27 @@ pub(super) fn pgrep_feeds_a_kill_of_the_guard(text: &str) -> PkillReach {
 fn feeds_kill(text: &str, depth: u8) -> PkillReach {
     let line = read_line(text);
     let mut reach = PkillReach::Misses;
+    // A list of the guard's processes and a `kill` on the same line: what
+    // stands between them (a file, `tee`, a variable) carries the ids
+    // from one to the other (`pgrep -f innerwarden-agent > p; xargs kill <
+    // p`).
+    if line.commands.iter().any(runs_kill) {
+        let substituted: Vec<_> = line
+            .commands
+            .iter()
+            .flat_map(|command| &command.words)
+            .flat_map(|word| &word.substitutions)
+            .flat_map(|inner| read_line(inner).commands)
+            .collect();
+        if line
+            .commands
+            .iter()
+            .chain(&substituted)
+            .any(|command| listed_reach(command) == PkillReach::NamesGuard)
+        {
+            return PkillReach::NamesGuard;
+        }
+    }
     for (index, command) in line.commands.iter().enumerate() {
         if command.piped && line.commands.get(index + 1).is_some_and(runs_kill) {
             reach = reach.max(listed_reach(command));
@@ -1321,22 +1458,30 @@ mod tests {
         assert_eq!(reach("codex"), PkillReach::Unread);
     }
 
-    /// The shell of a fail-closed hook: its words are the guard's, the
-    /// agent's id is the agent's, and the words of its message alone are
-    /// no mark of the guard.
+    /// The shell of a fail-closed hook: its script up to the mark and its
+    /// message are the guard's, the agent's id is the agent's, and the
+    /// shell's words, the shell after the mark and the words of its
+    /// message alone are no mark of the guard.
     #[test]
     fn the_fail_closed_shell_is_a_line_of_the_guards() {
         assert!(guard_lines()
             .iter()
             .any(|line| line.text.starts_with("/bin/sh -c \"$0\" hook")));
-        for pattern in ["without an answer", "--agent codex; s=", "esac; echo"] {
+        for pattern in ["without an answer", "--agent codex; s=", "s=$?; case"] {
             assert_eq!(
                 reach(&regex::escape(pattern)),
                 PkillReach::NamesGuard,
                 "{pattern}"
             );
         }
-        for pattern in ["program", "settings", "answer"] {
+        for pattern in [
+            "esac; echo",
+            "sh -c",
+            "exit 2",
+            "program",
+            "settings",
+            "answer",
+        ] {
             let found = reach(pattern);
             assert!(found < PkillReach::Broad, "{pattern}: {found:?}");
         }

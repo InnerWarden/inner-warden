@@ -622,14 +622,15 @@ Also not seen today, and not promised for any date:
   the guard does not count those writes.
 - A script that Python, Node or Ruby code writes and the same line then runs.
   The guard does not read what the code put in the file.
-- Some ways of stopping the guard: the process ids of its processes written
-  to a file by one command and read back by another (`pgrep -f hook > p;
-  kill $(cat p)`) are held for review, not refused; a `pkill` pattern that
-  matches the guard's command line only on another program's part (the
-  agent's id, the MCP server) is left to the other checks. A restart of a
-  service of the guard (`systemctl restart`) runs, as ordinary maintenance,
-  while a restart asked of systemd over D-Bus is refused. The Cursor CLI's
-  own flags are not read.
+- Some ways of stopping the guard: a `pkill` pattern that matches the
+  guard's command line only on another program's part (the agent's id, the
+  MCP server) or only on the shell a fail-closed hook script runs after the
+  guard ends (`exit 2`, `case $s in`), which any script holds, is left to
+  the other checks; process ids of the guard handed to a `kill` on a later
+  line, or by a program the line does not show, are not followed. A
+  restart of a service of the guard (`systemctl restart`) runs, as ordinary
+  maintenance, while a restart asked of systemd over D-Bus is refused. The
+  Cursor CLI's own flags are not read.
 - A path that steps back with `..` after a symbolic link. The MCP proxy
   reads a path where a call writes by its text, with `.` and `..` taken
   out, without looking at the disk: the proxy may not run on the server's
