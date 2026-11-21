@@ -350,8 +350,8 @@ pub(crate) fn help_text() -> String {
          reverse shell and download-and-run; every other deny or review runs with a\n  \
          one-line warning and is recorded. An install from an earlier version keeps\n  \
          refusing every deny.\n  \
-         --strict        refuse every deny; a review asks you or is refused, by agent\n  \
-         \x20               (the enforce of earlier versions)\n  \
+         --strict        refuse every deny and every review (the --block-review\n  \
+         \x20               wiring of earlier versions' --strict)\n  \
          --guard         move a strict install to the default posture (your terminal only)\n  \
          --block-review  refuse every review too\n  \
          --monitor       record every call and refuse nothing\n  \

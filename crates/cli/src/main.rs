@@ -2247,13 +2247,10 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         // here was an instruction the agent could follow to lift its own block.
         eprintln!("{}", hook_block_remedy(&verdict));
         std::process::ExitCode::from(2)
-    } else if !monitor
-        && (warned
-            || (is_review(&verdict) && posture == innerwarden_agent_guard::posture::Posture::Guard))
-    {
+    } else if !monitor && runs_with_a_warning(warned, &verdict, posture) {
         // The default posture: a refusal outside the high-certainty class,
-        // or a review, runs. It is in the record, and the agent shows the
-        // person one line. No ask and no exit 2.
+        // or a review outside it, runs. It is in the record, and the agent
+        // shows the person one line. No ask and no exit 2.
         let rec = verdict
             .get("recommendation")
             .and_then(|r| r.as_str())
@@ -2291,6 +2288,24 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     } else {
         std::process::ExitCode::SUCCESS
     }
+}
+
+/// PURE. Whether the default posture lets a screened call run with a
+/// one-line warning: a refusal it does not hold (`warned`), or a review
+/// outside the high-certainty class. A review that carries a signal of the
+/// class (a download run as code, a secrets file outside the project) goes
+/// on to the strict review: the person is asked or it is refused, as the
+/// strict posture does. The class decides a review exactly as it decides a
+/// deny (`posture::refuses`).
+fn runs_with_a_warning(
+    warned: bool,
+    verdict: &serde_json::Value,
+    posture: innerwarden_agent_guard::posture::Posture,
+) -> bool {
+    warned
+        || (is_review(verdict)
+            && posture == innerwarden_agent_guard::posture::Posture::Guard
+            && !innerwarden_agent_guard::posture::verdict_is_high_certainty(verdict))
 }
 
 /// The agents that type into a running command in a call their hook never
@@ -3316,8 +3331,10 @@ fn parse_install_args(rest: &[String]) -> InstallArgs {
             }
             "--block-review" => block_review = true,
             "--monitor" => monitor = true,
-            // The posture (`posture_io`), read by `cmd_install`.
-            "--strict" | "--guard" => {}
+            // The posture (`posture_io`), read by `cmd_install`. `--strict`
+            // is also the wiring of earlier versions' strict, `--block-review`.
+            "--strict" => block_review = true,
+            "--guard" => {}
             other if !other.starts_with('-') => agent = other.to_string(),
             other => return InstallArgs::Err(format!("unexpected argument `{other}`")),
         }
@@ -3429,7 +3446,12 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
                     "deny"
                 }
             );
-            if !report.monitor && !report.block_review {
+            // A `--block-review` line refuses more than either posture, so a
+            // guard posture is not said over it; `--strict` is both.
+            if !report.monitor
+                && (!report.block_review
+                    || posture == innerwarden_agent_guard::posture::Posture::Strict)
+            {
                 println!("{}", posture_io::line(posture));
             }
             println!();
@@ -5350,6 +5372,50 @@ mod tests {
         ] {
             assert!(!review_answer_line(answer, "").unwrap().contains('\n'));
         }
+    }
+
+    /// A review of the high-certainty class is never waved through by the
+    /// default posture: it goes on to the strict review (ask or refuse). Only
+    /// a review outside the class, or a refusal the posture does not hold,
+    /// runs with a warning.
+    ///
+    /// FAILS ON REVERT: drop the `verdict_is_high_certainty` check from
+    /// `runs_with_a_warning` and the class reviews below run.
+    #[test]
+    fn a_review_of_the_class_is_not_run_with_a_warning() {
+        use innerwarden_agent_guard::posture::Posture;
+        let review = |signal: &str, score: u64| {
+            serde_json::json!({
+                "recommendation": "review",
+                "signals": [{"signal": signal, "score": score, "detail": "x"}],
+            })
+        };
+        for (signal, score) in [
+            ("fetch_exec_unparsed", 25),
+            ("credential_read_outside_project", 10),
+            ("download_chmod_execute", 25),
+            ("dynamic_code_execution", 20),
+            ("fetch_exec_unanalyzable", 25),
+        ] {
+            let verdict = review(signal, score);
+            assert!(
+                !runs_with_a_warning(false, &verdict, Posture::Guard),
+                "{signal} ran with a warning under the default posture"
+            );
+            assert!(!runs_with_a_warning(false, &verdict, Posture::Strict));
+        }
+        // Outside the class, a review runs with a warning under guard only.
+        let plain = review("network_exfil_hint", 15);
+        assert!(runs_with_a_warning(false, &plain, Posture::Guard));
+        assert!(!runs_with_a_warning(false, &plain, Posture::Strict));
+        // A subsumed signal of the class does not decide.
+        assert!(runs_with_a_warning(
+            false,
+            &review("download_chmod_execute", 0),
+            Posture::Guard
+        ));
+        // A refusal the posture does not hold runs with a warning either way.
+        assert!(runs_with_a_warning(true, &plain, Posture::Guard));
     }
 
     #[test]

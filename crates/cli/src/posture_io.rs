@@ -27,20 +27,37 @@ pub(crate) fn requested(rest: &[String]) -> Result<Option<Posture>, String> {
     }
 }
 
-/// The command line without the posture flags, for the wiring engine,
-/// which reads `--strict` as `--block-review` for the callers that came
-/// before the posture.
+/// The command line for the wiring engine: `--guard` taken out, and
+/// `--strict` kept, because `--strict` is both the posture and the wiring
+/// it had before the posture existed (`--block-review`, which the engine
+/// reads it as). A strict connect never wires less than it did.
 pub(crate) fn without_posture_flags(rest: &[String]) -> Vec<String> {
     rest.iter()
-        .filter(|a| !matches!(a.as_str(), "--strict" | "--guard"))
+        .filter(|a| a.as_str() != "--guard")
         .cloned()
         .collect()
 }
 
-/// Whether any agent under `home` is wired to the guard already, read
+/// Whether any agent under `home` holds wiring of the guard already, read
 /// before a connect writes anything.
+///
+/// Any line of ours counts, not only one `status` reports as guarded: an
+/// install from before the posture existed whose hook sits under a matcher
+/// that leaves the shell out, or whose MCP wrapping is partial, was still
+/// wired by a person, and reading it as a new install would move it to the
+/// default posture, which refuses less. Claude Code's settings are read
+/// directly as well, so a home whose agent discovery does not list Claude
+/// Code still counts a hook it holds.
 pub(crate) fn already_wired(home: &Path) -> bool {
-    agents_ops::rows(home).iter().any(|agent| agent.guarded)
+    let claude_hook = [".claude/settings.json", ".claude/settings.local.json"]
+        .iter()
+        .filter_map(|rel| std::fs::read_to_string(home.join(rel)).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .any(|settings| innerwarden_agent_guard::hook::has_iwguard_wiring(&settings));
+    claude_hook
+        || agents_ops::rows(home)
+            .iter()
+            .any(|agent| agent.guarded || agents_ops::has_guard_wiring(home, &agent.name))
 }
 
 /// PURE: the posture to write, or `None` to leave the file as it is.
@@ -120,8 +137,13 @@ mod tests {
         assert_eq!(requested(&args(&["connect"])), Ok(None));
         assert!(requested(&args(&["connect", "--guard", "--strict"])).is_err());
         assert_eq!(
-            without_posture_flags(&args(&["connect", "cursor", "--strict", "--block-review"])),
+            without_posture_flags(&args(&["connect", "cursor", "--guard", "--block-review"])),
             args(&["connect", "cursor", "--block-review"])
+        );
+        // `--strict` reaches the engine, which wires it as `--block-review`.
+        assert_eq!(
+            without_posture_flags(&args(&["connect", "cursor", "--strict"])),
+            args(&["connect", "cursor", "--strict"])
         );
     }
 

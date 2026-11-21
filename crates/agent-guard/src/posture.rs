@@ -71,15 +71,24 @@ pub fn posture_in_force(home: &Path) -> Posture {
     read_posture_file(home).unwrap_or(Posture::Strict)
 }
 
-/// Write `posture` to the file under `home` (its folder created).
+/// Write `posture` to the file under `home` (its folder created), through a
+/// temporary file in the same folder renamed over it: a hook reading the
+/// file while it is written sees the old word or the new one, never an
+/// empty or half-written file.
 pub fn write_posture(home: &Path, posture: Posture) -> Result<(), String> {
     let path = posture_path(home);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no folder", path.display()))?;
+    std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+    let temp = parent.join(format!(".posture.{}.tmp", std::process::id()));
+    let written = std::fs::write(&temp, format!("{}\n", posture.word()))
+        .and_then(|()| std::fs::rename(&temp, &path));
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("writing {}: {e}", path.display()));
     }
-    std::fs::write(&path, format!("{}\n", posture.word()))
-        .map_err(|e| format!("writing {}: {e}", path.display()))
+    Ok(())
 }
 
 /// The signals of the high-certainty class, each refused by name alone:
@@ -104,10 +113,11 @@ pub const HIGH_CERTAINTY_SIGNALS: &[&str] = &[
     "credential_read_outside_project",
     // Destruction of the system or of a home.
     "destructive_command",
-    // The guard taken down by an act.
+    // The guard taken down by an act. (A Cursor hooks file that lost the
+    // guard, `hook_wiring_lost`, is refused before any posture is read, by
+    // `cursor_wiring_lost` in the CLI, so it is not listed here.)
     "guard_self_disable",
     "security_tooling_tamper",
-    "hook_wiring_lost",
     // A reverse shell.
     "reverse_shell",
     // Something downloaded and run.
@@ -246,6 +256,22 @@ mod tests {
         assert_eq!(posture_in_force(home.path()), Posture::Guard);
         write_posture(home.path(), Posture::Strict).unwrap();
         assert_eq!(read_posture_file(home.path()), Some(Posture::Strict));
+    }
+
+    /// The write goes through a temporary file renamed over the posture, and
+    /// leaves nothing else in the folder.
+    #[test]
+    fn a_write_leaves_only_the_posture_file() {
+        let home = tempfile::tempdir().unwrap();
+        write_posture(home.path(), Posture::Strict).unwrap();
+        write_posture(home.path(), Posture::Guard).unwrap();
+        let folder = posture_path(home.path()).parent().unwrap().to_path_buf();
+        let names: Vec<_> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(names, vec!["posture".to_string()]);
+        assert_eq!(read_posture_file(home.path()), Some(Posture::Guard));
     }
 
     #[test]
