@@ -22,6 +22,9 @@
 //!   or a link a server said is **refused** (`AG-EFFECT`, blocking): the shape
 //!   of an injected payment. A payment the person asked for from a bill a
 //!   tool read is refused too, as `send_money` already was by name;
+//! * any acting call carrying a value a server said in text shaped as an
+//!   order to the assistant ([`super::structure`]) is **refused**
+//!   (`AG-EFFECT`, blocking), naming the classes the text showed;
 //! * any other acting call carrying a value a server said is **forwarded
 //!   with an alert** (`AG-EFFECT`, which does not block), naming the
 //!   argument and the value.
@@ -424,6 +427,20 @@ pub(crate) struct SeenText {
     squeezed: String,
     /// Everything said this session is in `text`, read whole.
     whole: bool,
+    /// The parts of what servers said that have the structure of an
+    /// injection ([`super::structure`]), each with its classes.
+    injected: Vec<Injected>,
+    /// Bytes kept in `injected`, at most [`SEEN_TEXT_BUDGET`].
+    injected_bytes: usize,
+}
+
+/// A part of what a server said with the structure of an injection,
+/// lower-cased as [`SeenText`] keeps it.
+#[derive(Debug)]
+struct Injected {
+    text: String,
+    squeezed: String,
+    classes: u8,
 }
 
 impl Default for SeenText {
@@ -432,6 +449,8 @@ impl Default for SeenText {
             text: String::new(),
             squeezed: String::new(),
             whole: true,
+            injected: Vec::new(),
+            injected_bytes: 0,
         }
     }
 }
@@ -440,6 +459,9 @@ impl SeenText {
     /// Keep what a server said. Past [`SEEN_TEXT_BUDGET`] nothing more is kept and
     /// the session is no longer whole.
     pub(crate) fn record(&mut self, said: &str) {
+        if let Some(found) = super::structure::injection_structure(said) {
+            self.record_injected(&found);
+        }
         if !self.whole {
             return;
         }
@@ -468,6 +490,46 @@ impl SeenText {
         }
     }
 
+    /// Keep a part with the structure of an injection, as written and in
+    /// one spelling, while [`SEEN_TEXT_BUDGET`] allows. It only raises, so
+    /// what the budget leaves out raises nothing more.
+    fn record_injected(&mut self, found: &super::structure::Found) {
+        let canon = super::canon::canonical(&found.text);
+        let mut forms = vec![found.text.to_lowercase()];
+        if canon != found.text {
+            forms.push(canon.to_lowercase());
+        }
+        let squeezed = forms
+            .iter()
+            .map(|form| super::canon::squeezed(form))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let text = forms.join("\n");
+        let cost = text.len() + squeezed.len();
+        if self.injected_bytes + cost > SEEN_TEXT_BUDGET {
+            return;
+        }
+        self.injected_bytes += cost;
+        self.injected.push(Injected {
+            text,
+            squeezed,
+            classes: found.classes,
+        });
+    }
+
+    /// The classes of the part with the structure of an injection
+    /// ([`super::structure`]) that `value` was said in, compared as
+    /// [`Self::contains_value`] does, or `None`.
+    pub(crate) fn injected_classes(&self, value: &str) -> Option<u8> {
+        let forms = super::canon::value_forms(value);
+        self.injected.iter().find_map(|part| {
+            forms
+                .iter()
+                .any(|form| contains_in(&part.text, &part.squeezed, form))
+                .then_some(part.classes)
+        })
+    }
+
     /// A server said something that was not read whole (an answer cut at the
     /// scan limit): what lies past the cut is not known.
     pub(crate) fn note_unread(&mut self) {
@@ -486,7 +548,8 @@ impl SeenText {
     /// What looking for `value` costs: the bytes kept, once per form.
     pub(crate) fn scan_cost(&self, value: &str) -> usize {
         let forms = super::canon::value_forms(value).len().max(1);
-        (self.text.len() + self.squeezed.len() + value.len()).saturating_mul(forms)
+        (self.text.len() + self.squeezed.len() + self.injected_bytes + value.len())
+            .saturating_mul(forms)
     }
 
     /// Whether `value` appeared in what servers said, in any of its forms
@@ -502,25 +565,29 @@ impl SeenText {
     }
 
     fn contains_form(&self, value: &str) -> bool {
-        let value = value.trim().to_lowercase();
-        if value.is_empty() {
-            return false;
-        }
-        let is_word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
-        let mut from = 0;
-        while let Some(at) = self.text[from..].find(&value) {
-            let start = from + at;
-            let end = start + value.len();
-            if !is_word(self.text[..start].chars().next_back())
-                && !is_word(self.text[end..].chars().next())
-            {
-                return true;
-            }
-            from = start + value.chars().next().map_or(1, char::len_utf8);
-        }
-        let squeezed = super::canon::squeezed(&value);
-        squeezed.chars().count() >= SQUEEZED_MIN_LEN && self.squeezed.contains(&squeezed)
+        contains_in(&self.text, &self.squeezed, value)
     }
+}
+
+/// Whether `value` is in `text` as a whole word, or, for a value of at
+/// least [`SQUEEZED_MIN_LEN`] letters and digits, in `squeezed`.
+fn contains_in(text: &str, squeezed_text: &str, value: &str) -> bool {
+    let value = value.trim().to_lowercase();
+    if value.is_empty() {
+        return false;
+    }
+    let is_word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let mut from = 0;
+    while let Some(at) = text[from..].find(&value) {
+        let start = from + at;
+        let end = start + value.len();
+        if !is_word(text[..start].chars().next_back()) && !is_word(text[end..].chars().next()) {
+            return true;
+        }
+        from = start + value.chars().next().map_or(1, char::len_utf8);
+    }
+    let squeezed = super::canon::squeezed(&value);
+    squeezed.chars().count() >= SQUEEZED_MIN_LEN && squeezed_text.contains(&squeezed)
 }
 
 /// What a call carries: `(top-level argument, value)`, in the order met.
@@ -644,6 +711,7 @@ pub(crate) fn apply_table(
         return;
     }
     let mut said: Vec<(String, String)> = Vec::new();
+    let mut injected: Option<(String, String, u8)> = None;
     let mut looked: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut budget = MAX_EFFECT_SCAN_BYTES;
     for (slot, value) in carried(args) {
@@ -664,9 +732,33 @@ pub(crate) fn apply_table(
             break;
         }
         budget -= cost;
+        if injected.is_none() {
+            if let Some(classes) = seen.injected_classes(&value) {
+                injected = Some((slot.clone(), value.clone(), classes));
+            }
+        }
         if seen.contains_value(&value) {
             said.push((slot, value));
         }
+    }
+    if let Some((slot, value, classes)) = injected {
+        let shown: String = crate::redact::redact_secrets(&value)
+            .text
+            .chars()
+            .take(64)
+            .collect();
+        verdict.alerts.push(VerdictAlert::builtin(
+            EFFECT_RULE,
+            format!(
+                "{} call carries in `{slot}` a value a server said in text shaped as an \
+                 injection ({}): `{shown}`; refused",
+                class.label(),
+                super::structure::class_names(classes),
+            ),
+            true,
+        ));
+        verdict.allowed = false;
+        return;
     }
     let Some(first) = said.first() else {
         return;

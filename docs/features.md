@@ -479,6 +479,13 @@ In the MCP proxy and in a line handed to a shell, the guard also does not see:
   between it and the action it asks for. An override order followed by an
   action is held however it is quoted or fenced; one padded with filler
   before the action can pass.
+- An order in a tool result that neither speaks to the assistant nor is
+  framed as the system, one written as code or data, one spread over more
+  than five sentences, or one in a language other than English, Portuguese
+  and Spanish. Where an order is read by its shape (three classes of words
+  within five sentences, one of them speaking to the assistant or framing),
+  a payment, message, share, delete or booking carrying a value said in it
+  is refused; a short value (`"34"`, `"Fred"`) is not looked for.
 - The input a shell tool call hands a shell past its first 64 KiB. The call
   is held for review and the rest is not read.
 - What `xargs` or `find -exec` acts on, beyond what the line spells out. A

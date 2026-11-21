@@ -104,6 +104,22 @@ the text of a command; what it does not see is written down, as measured:
   text is not proof the person asked for it. Lowering waits for the person's
   request as a source. A call judged on its own, outside a proxy session
   (`innerwarden check`, the release suite), is judged as before.
+- **An order to the assistant in a tool result is read by its shape.** The
+  proxy gives each sentence of what a server says the closed classes of words
+  it shows, in English, Portuguese and Spanish: speaking to the assistant (a
+  second person word with an assistant noun or a model name), claiming
+  authority (an important message, the admin, the system, a `Signed` line),
+  putting itself before the task (before you, first, instead, ignore, the
+  task I gave you), ordering a tool action (send, transfer, forward, delete,
+  run, invite, share, pay, book), and framing (a made-up tag pair,
+  `### system`, `[INST]`). Three classes within five sentences, one of them
+  speaking to the assistant or framing, are an order. A call of a class that
+  acts (a payment, a message, a share, a delete, a booking) carrying a value
+  said in such an order is refused (`AG-EFFECT`); the same value said in
+  plain text is forwarded with an alert, as before. What it does not catch:
+  an order that neither speaks to the assistant nor is framed, one written as
+  code or data, one spread over more than five sentences, another language,
+  and a short value (`"34"`, `"Fred"`), which raises nothing.
 - **A value a server said is found in the spelling a call sends it.** The
   provenance table and the taint tracker compare both sides in one spelling:
   `[at]` and `[.]` put back, percent escapes, HTML entities and base64 runs

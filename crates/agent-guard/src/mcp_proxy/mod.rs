@@ -24,5 +24,6 @@ pub mod enforce;
 pub mod jsonrpc;
 pub mod pins;
 pub mod router;
+pub(crate) mod structure;
 pub mod taint;
 pub mod transport;
