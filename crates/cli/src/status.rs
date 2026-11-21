@@ -1445,10 +1445,13 @@ mod tests {
     fn status_tool_classes_for_matches_the_old_inline_read() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join(".claude")).unwrap();
-        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        // The MCP agent here is Goose, judged through the proxy alone. Cursor
+        // was this row until it got a hook of its own: it now reads as a hook
+        // agent and is filtered out below with Codex and Gemini.
+        std::fs::create_dir_all(home.path().join(".config/goose")).unwrap();
         std::fs::write(
-            home.path().join(".cursor/mcp.json"),
-            r#"{"mcpServers":{"fs":{"command":"npx"}}}"#,
+            home.path().join(".config/goose/config.yaml"),
+            "extensions: {}\n",
         )
         .unwrap();
         let old_inline = |home: &std::path::Path,
@@ -1481,7 +1484,7 @@ mod tests {
             "not json",
         ] {
             std::fs::write(home.path().join(".claude/settings.json"), settings).unwrap();
-            // Codex and Gemini are read by their hook too, which the inline
+            // Codex, Gemini and Cursor are read by their hook too, which the inline
             // block never did. A host with one of them installed lists it
             // here, so those rows are left to their own test.
             let rows: Vec<_> = innerwarden_agent_guard::agents_ops::rows(home.path())
@@ -1491,7 +1494,12 @@ mod tests {
                 })
                 .collect();
             assert!(rows.iter().any(|r| r.hookable), "a hook agent row");
-            assert!(rows.iter().any(|r| !r.hookable), "an MCP agent row");
+            // The row comes from this home, not from an agent running on the
+            // host the test runs on.
+            assert!(
+                rows.iter().any(|r| r.name == "goose" && !r.hookable),
+                "an MCP agent row"
+            );
             let classes = tool_classes_for(home.path(), &rows);
             assert_eq!(classes, old_inline(home.path(), &rows), "{settings}");
             assert_eq!(
