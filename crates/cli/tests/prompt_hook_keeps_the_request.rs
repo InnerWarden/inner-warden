@@ -9,6 +9,10 @@
 //! the conversation, so the hook must end with 0 and print nothing.
 //!
 //! HOME, the record and the session store point into a scratch directory.
+//!
+//! Every test here starts the hook through `sh -c`, so the file is Unix only.
+
+#![cfg(unix)]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
