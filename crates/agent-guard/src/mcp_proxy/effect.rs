@@ -27,7 +27,13 @@
 //!   (`AG-EFFECT`, blocking), naming the classes the text showed;
 //! * any other acting call carrying a value a server said is **forwarded
 //!   with an alert** (`AG-EFFECT`, which does not block), naming the
-//!   argument and the value.
+//!   argument and the value;
+//! * a call a rule refuses that carries a value of any length (`"13"`) a
+//!   server said this session as a whole word, or that comes after what a
+//!   server said was not read whole, gets an alert that does not block
+//!   ([`said_value`], added by the router). Like every `AG-EFFECT` finding,
+//!   it keeps a refusal the rules give by the tool's name in the default
+//!   posture ([`super::enforce::lower_name_refusals`]).
 //!
 //! The search has a budget ([`MAX_EFFECT_SCAN_BYTES`]): a call whose values
 //! cannot all be looked for in time gets the same alert, saying so, and a
@@ -865,6 +871,44 @@ fn names_a_destination(value: &str) -> bool {
         || canon.contains("://")
         || canon.to_ascii_lowercase().starts_with("www.")
         || (squeezed.len() >= 8 && squeezed.bytes().filter(u8::is_ascii_digit).count() >= 6)
+}
+
+/// For a call a rule refuses: the first value it carries, of any length
+/// with a letter or a digit, that a server said this session as a whole word,
+/// as `(argument, value)`; or a reason when that cannot be shown (the session
+/// not read whole, more values than the budget looks for). The router turns
+/// it into an [`EFFECT_RULE`] alert that does not block, and that keeps the
+/// refusal by the tool's name in the default posture
+/// ([`super::enforce::lower_name_refusals`]). Short values count here: a
+/// file id a server listed (`"Created file 13."`) is the shape of a delete
+/// it was told to make.
+pub(crate) fn said_value(args: &Value, seen: &SeenText) -> Option<(String, String)> {
+    if !seen.is_whole() {
+        return Some((
+            String::new(),
+            "what servers said this session was not read whole".to_string(),
+        ));
+    }
+    let mut budget = MAX_EFFECT_SCAN_BYTES;
+    let mut looked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (slot, value) in carried(args) {
+        let value = value.trim().to_string();
+        if !value.chars().any(char::is_alphanumeric) || !looked.insert(value.clone()) {
+            continue;
+        }
+        let cost = seen.scan_cost(&value);
+        if cost > budget {
+            return Some((
+                slot,
+                "more values than can be looked for in time".to_string(),
+            ));
+        }
+        budget -= cost;
+        if seen.contains_value(&value) {
+            return Some((slot, value));
+        }
+    }
+    None
 }
 
 /// Apply the table to the verdict of one `tools/call` (see the module docs).

@@ -516,6 +516,12 @@ fn guard_mode_with_the_shipped_rules_judges_a_code_tool_by_its_call_not_its_name
 ///
 /// FAILS ON REVERT: put `system_` back in ATR-2026-012's privileged-prefix
 /// condition and the health check never reaches the server.
+///
+/// Since the default posture, a refusal by the tool's name alone (52, 53:
+/// ATR-2026-012 on the `admin_` and `debug_` prefixes) is a warning in
+/// `guard` and a refusal in `strict` and `kill`, so the refusals below are
+/// asserted in `strict`, and `guard` is asserted to forward exactly those
+/// two. 54 (an `admin` value) and 55 (a command tool) stay refused in both.
 #[test]
 fn guard_mode_with_the_shipped_rules_forwards_a_system_health_check() {
     let engine = Arc::new(RuleEngine::load_embedded());
@@ -530,7 +536,14 @@ fn guard_mode_with_the_shipped_rules_forwards_a_system_health_check() {
         ),
         fs_call(55, "system_exec", serde_json::json!({"command": "uptime"})),
     ];
-    let seen = run_through_proxy_with(&requests, ProxyMode::Guard, Some(engine));
+    let in_guard = run_through_proxy_with(&requests, ProxyMode::Guard, Some(engine.clone()));
+    let (reached, _) = outcomes(&in_guard);
+    assert_eq!(
+        reached,
+        [51, 52, 53],
+        "guard forwards the health check and the two refused by name only:\n{in_guard}"
+    );
+    let seen = run_through_proxy_with(&requests, ProxyMode::Strict, Some(engine));
     let (reached, refused) = outcomes(&seen);
 
     assert_eq!(reached, [51], "only the health check goes through:\n{seen}");

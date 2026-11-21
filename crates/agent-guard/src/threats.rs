@@ -3643,7 +3643,7 @@ fn guard_self_disable_patterns() -> &'static [(regex::Regex, &'static str, u32)]
         // `os` and `shutil` remove and move, node's `fs` does each of those.
         // A rename, replace or move counts with the settings on either side.
         add(
-            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|\.codex/hooks\.json|\.cursor/hooks\.json|\.codex/config\.toml).*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\(|\bwrite\b|\bwritelines\b|\bdel\b|\bunlink\b|\.truncate\(|\.write_(?:text|bytes)\(|\.rename\(|\.symlink_to\()"#,
+            r#"(?is)(?:(?:python3?|node|ruby|perl|lua(?:jit)?)\b.{0,200}?-[ce]|php\b.{0,200}?-r)\b.*?(?:settings(?:\.local)?\.json|\.claude\.json|mcp\.json|\.codex/hooks\.json|\.cursor/hooks\.json|\.codex/config\.toml).*?(?:["']w["']|\bopen(?:sync)?\s*\((?:[^()]*(?:\([^()]*\)[^()]*)*,)?\s*(?:(?:mode|flags?)\s*[=:]\s*)?["'][bt]?(?:[wax]|r[bt]?\+)[bt+]{0,2}["']\s*[,)}]|createWriteStream\(|\bdump\b|writeFileSync|writeSync\(|\bfile_put_contents\b|\bos\.(?:remove|rename|replace|unlink|truncate)\(|\bshutil\.(?:move|rmtree)\(|\bpath\([^()]*\)\.(?:replace|rename)\(|\b(?:unlink|rm|rename|appendFile|truncate|writeFile)Sync\(|\b(?:fs|promises)\.(?:unlink|rm|rename|appendFile|writeFile|truncate)\(|\brename\(|\bwrite\b|\bwritelines\b|\bdel\b|\bunlink\b|\.truncate\(|\.write_(?:text|bytes)\(|\.rename\(|\.symlink_to\(|\b(?:File|IO)\.(?:bin)?write\(|\bFile\.(?:rename|delete|unlink|symlink)\(|\bFileUtils\.)"#,
             "rewrites an agent's configuration through an interpreter",
             60,
         );
@@ -7734,6 +7734,8 @@ fn names_agent_folder_as_destination(content: &str) -> bool {
         sources.len() == 1
             && !last.trim_matches(['"', '\'']).ends_with('/')
             && names_agent_home(last)
+            // `cp -r ../x/. .claude/` is refused with its `/` too.
+            && !copies_contents(sources[0], true)
     })
 }
 
@@ -7755,9 +7757,18 @@ fn guard_carrier_refusal(content: &str) -> Option<(&'static str, u32)> {
 /// same writes (`crate::file_tools`); this is the shell side saying the same
 /// of `cp`, `mv`, a redirection and the other writers [`writes_place`] reads.
 ///
-/// Not read, and so not refused: a target the shell builds (a glob, a brace,
-/// a substitution), a copy of a whole folder that holds one of these files
-/// into a place other than the agent's folder, an archive unpacked over one,
+/// An archive unpacked into an agent's folder (`tar -xf x.tar -C .claude`,
+/// `unzip x.zip -d .claude`, `bsdtar`, `7z x -o.claude`), and a copy of
+/// what a folder holds into one (`rsync -a ../x/ .claude`, `cp -r ../x/.
+/// .claude/`, `cp -r ../x/* .claude/`, a `/` at the destination's end or
+/// not) are refused: the names they write are not on the line, a
+/// `settings.json` among them. A single file copied into the folder under a
+/// name that is not a settings file (`cp notes.md .claude/notes.md`) runs.
+///
+/// Not read, and so not refused: a target the shell builds (a glob in the
+/// destination, a brace, a substitution), a copy of a whole folder that holds one of these files
+/// into a place other than the agent's folder, an archive unpacked in a
+/// folder above an agent's folder (`tar -xf x.tar` at a project's root),
 /// a download that takes its name from the URL, a branch switched, pulled or
 /// merged that changes one (`git checkout <tree> -- <path>` and `git restore`
 /// of one are read), a change of owner, and a write made by
@@ -7992,7 +8003,10 @@ fn may_name_guard_carrier(content: &str) -> bool {
 /// onto it or into its directory under its name, a move or removal of it, an
 /// in-place `sed`/`perl` edit, `dd of=`, a `chmod` that closes it to its
 /// owner, `patch`, a download saved as it (`curl -o`, `wget -O`), an archive
-/// unpacked into it (`unzip`, `tar -x`) and, with `code`, interpreter code
+/// unpacked into it (`unzip`, `tar -x`, `bsdtar -x`, `7z x`), which takes the
+/// folder it is unpacked into as written, a recursive copy of what a folder
+/// holds (`rsync -a dir/ D`, `cp -r dir/. D`) or of a glob (`cp dir/* D`),
+/// which takes `D` as written, and, with `code`, interpreter code
 /// that names the guard's configuration and writes. The place is recognised
 /// as `~/`, `$HOME/`, `${HOME}/`, `$XDG_CONFIG_HOME/`, an absolute home, a
 /// path relative to any `cd` before it, or a variable assigned it earlier in
@@ -8207,6 +8221,21 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 if replaces && (matches!(command, "ln" | "mv") || (command == "cp" && recursive)) {
                     taken.extend(destination.clone());
                 }
+                // What a folder holds, not the folder, put at the
+                // destination: `rsync -a ../x/ .claude`, `cp -r ../x/.
+                // .claude/`, `cp ../x/* .claude/`. Whatever names the
+                // source's files carry land in the destination, a
+                // `settings.json` written there first included, so the
+                // destination is written as a folder, with or without its
+                // `/`. A source with a `/` at its end copies what it holds
+                // with rsync and with macOS's `cp`.
+                if matches!(command, "cp" | "rsync" | "scp")
+                    && sources
+                        .iter()
+                        .any(|source| copies_contents(source, recursive))
+                {
+                    taken.extend(destination.as_deref().map(folder_spelled));
+                }
                 // `rsync --delete` (and `--delete-before`, `--del`, ...)
                 // removes what the destination holds that the source does
                 // not: the destination folder is taken away, not only
@@ -8272,7 +8301,32 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
             }
             "curl" => targets.extend(option_values(arguments, 'o', &["output"])),
             "wget" => targets.extend(option_values(arguments, 'O', &["output-document"])),
-            "unzip" => targets.extend(unpacks_into(option_values(arguments, 'd', &[]))),
+            // An archive's names are not on the line: one unpacked into an
+            // agent's folder may hold its settings, so the folder is taken
+            // as written ([`names_agent_home`] is asked of it).
+            "unzip" => {
+                let into = unpacks_into(option_values(arguments, 'd', &[]));
+                taken.extend(into.iter().map(|path| folder_spelled(path)));
+                targets.extend(into);
+            }
+            // `7z x x.7z -o.claude` (and `e`): the folder is joined to its
+            // option.
+            "7z" | "7za" | "7zr" | "7zz" => {
+                if positional
+                    .first()
+                    .is_some_and(|verb| matches!(verb.as_str(), "x" | "e"))
+                {
+                    let named: Vec<String> = arguments
+                        .iter()
+                        .filter_map(|argument| argument.strip_prefix("-o"))
+                        .filter(|folder| !folder.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    let into = unpacks_into(named);
+                    taken.extend(into.iter().map(|path| folder_spelled(path)));
+                    targets.extend(into);
+                }
+            }
             "tar" | "gtar" | "bsdtar" => {
                 let extracts = arguments.iter().enumerate().any(|(at, argument)| {
                     matches!(argument.as_str(), "--extract" | "--get")
@@ -8285,7 +8339,9 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                                 .all(|c| c.is_ascii_alphabetic()))
                 });
                 if extracts {
-                    targets.extend(unpacks_into(option_values(arguments, 'C', &["directory"])));
+                    let into = unpacks_into(option_values(arguments, 'C', &["directory"]));
+                    taken.extend(into.iter().map(|path| folder_spelled(path)));
+                    targets.extend(into);
                 }
             }
             "python" | "py" | "node" | "nodejs" | "ruby" | "php"
@@ -8919,6 +8975,43 @@ fn option_values(arguments: &[String], short: char, long: &[&str]) -> Vec<String
     values
 }
 
+/// Whether a copy's source puts what a folder holds at the destination,
+/// rather than the folder under its own name: `dir/` or `dir/.` copied
+/// recursively (rsync, and `cp` on macOS, read a final `/` that way), or a
+/// glob that may match a settings file (`dir/*`, `dir/*.json`; `*.md`
+/// names none).
+fn copies_contents(source: &str, recursive: bool) -> bool {
+    let source = source.trim_matches(['"', '\'']);
+    let folder = source.ends_with('/') || source.ends_with("/.") || source == ".";
+    if recursive && folder {
+        return true;
+    }
+    let last = source.rsplit('/').next().unwrap_or(source);
+    if !last.contains(['*', '?', '[']) {
+        return false;
+    }
+    match last.rsplit_once('.') {
+        Some((_, end)) if !end.contains(['*', '?', '[', ']']) => names_settings_file(last),
+        _ => true,
+    }
+}
+
+/// A folder as a path that names it: without quotes, a final `/` or a
+/// final `/.` (`.claude/.` is `.claude`).
+fn folder_spelled(path: &str) -> String {
+    let mut path = path.trim_matches(['"', '\'']);
+    loop {
+        let shorter = path
+            .strip_suffix("/.")
+            .or_else(|| path.strip_suffix('/').filter(|rest| !rest.is_empty()))
+            .unwrap_or(path);
+        if shorter.len() == path.len() {
+            return path.to_string();
+        }
+        path = shorter;
+    }
+}
+
 /// Whether the destination of a copy reads as a directory: `dir/`, `.`, `~`,
 /// or a last component with no extension (`~/.local/bin`, `~/.claude`). A
 /// copy to `settings.json.bak` is a copy to a file of that name.
@@ -9205,7 +9298,8 @@ const AGENT_HOMES: &[&str] = &[
 /// settings that load the guard with it.
 fn names_agent_home(target: &str) -> bool {
     named_path(&home_spelled(target)).is_some_and(|named| {
-        let path = named.path.trim_end_matches('/');
+        let path = folder_spelled(&named.path);
+        let path = path.as_str();
         AGENT_HOMES.iter().any(|home| {
             path.strip_suffix(home)
                 .is_some_and(|before| before.is_empty() || before.ends_with('/'))
@@ -28718,6 +28812,42 @@ mod round_three_rule_tests {
                 "reading Codex's files is not disabling the guard: {cmd}"
             );
         }
+    }
+
+    /// Which interpreter pattern refuses an open of a project settings file
+    /// to write: Python's `open(path, "w")` and Ruby's `File.new(path, "w")`
+    /// name the file before the write, so the first pattern (file, then the
+    /// write) refuses them and the one that names the write first
+    /// (`FileUtils`, `File.write`) does not see them. Ruby's `FileUtils`
+    /// with the file named first is the case that pattern alone missed.
+    ///
+    /// FAILS ON REVERT: take `FileUtils` out of the first pattern and the
+    /// last line here is matched by none.
+    #[test]
+    fn which_interpreter_pattern_refuses_a_project_settings_open() {
+        let matching = |cmd: &str| -> Vec<usize> {
+            guard_self_disable_patterns()
+                .iter()
+                .filter(|(_, what, _)| *what == SETTINGS_REWRITTEN_BY_INTERPRETER)
+                .enumerate()
+                .filter(|(_, (re, _, _))| re.is_match(cmd))
+                .map(|(at, _)| at)
+                .collect()
+        };
+        for cmd in [
+            r#"python3 -c 'open(".claude/settings.json","w")'"#,
+            r#"ruby -e 'File.new(".claude/settings.json","w")'"#,
+        ] {
+            let found = matching(cmd);
+            assert!(
+                found.contains(&0) && !found.contains(&1),
+                "{cmd}: {found:?}"
+            );
+        }
+        let cmd = r#"ruby -e 'FileUtils.cp("x.json", ".claude/settings.json")'"#;
+        assert!(matching(cmd).contains(&1), "{cmd}");
+        let cmd = r#"ruby -e 'p=".claude/settings.json"; FileUtils.cp("x.json", p)'"#;
+        assert!(matching(cmd).contains(&0), "{cmd}");
     }
 
     /// The pattern for removing or moving aside the settings that carry the
