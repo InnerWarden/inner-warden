@@ -13661,6 +13661,106 @@ pub fn destructive_rm_in_place(hay: &str, cwd: &str, home: Option<&str>) -> bool
             .any(|body| wipes(shell_command_segments(body)))
 }
 
+/// Top-level directories whose owner or mode, changed for the whole tree,
+/// breaks the system or an account: the programs, libraries, settings, logs
+/// and boot files, and the folders of homes.
+const OWNER_MODE_SYSTEM_DIRS: &[&str] = &[
+    "bin", "sbin", "etc", "usr", "boot", "lib", "lib32", "lib64", "libx32", "var", "root", "home",
+];
+
+/// Whether a line changes owner, group or mode for a whole tree (`chown -R`,
+/// `chgrp -R`, `chmod -R`, `--recursive`) at the filesystem root, a system
+/// directory or a home. `sudo` and the other launchers are read through. A
+/// `cd` earlier in the line moves where a relative target is resolved, as
+/// for a removal ([`destructive_rm_in_place`]); `cwd` may be empty when the
+/// caller does not know it. A project folder (`chown -R dev ./build`,
+/// `chmod -R g+w /srv/app`) is not such a place. Measured 2026-11-21:
+/// `chown -R nobody /` was allowed and `chmod -R 777 /` only held for
+/// review.
+pub fn recursive_owner_change_of_system(hay: &str, cwd: &str, home: Option<&str>) -> bool {
+    let changes = |segments: Vec<&str>| {
+        let mut place = CommandPlace::new(cwd, home);
+        segments.into_iter().any(|segment| {
+            let Some(words) = place.step(segment) else {
+                return false;
+            };
+            let Some(index) = effective_command_index(&words) else {
+                return false;
+            };
+            let command = token_basename(&words[index]).to_ascii_lowercase();
+            if !matches!(command.as_str(), "chown" | "chgrp" | "chmod") {
+                return false;
+            }
+            let mut recursive = false;
+            let mut by_reference = false;
+            let mut options_done = false;
+            let mut operands: Vec<&str> = Vec::new();
+            for word in &words[index + 1..] {
+                let bare = word.trim_matches(['\'', '"']);
+                if options_done {
+                    operands.push(bare);
+                    continue;
+                }
+                match bare {
+                    "--" => options_done = true,
+                    "--recursive" => recursive = true,
+                    _ if bare.starts_with("--reference") => by_reference = true,
+                    _ if bare.starts_with("--") => {}
+                    // `chmod -w` and `chmod -x` hand a mode, not an option.
+                    _ if command == "chmod"
+                        && bare.len() > 1
+                        && bare.starts_with('-')
+                        && bare[1..].chars().all(|c| "rwxXstugoa".contains(c)) =>
+                    {
+                        operands.push(bare);
+                    }
+                    _ if bare.starts_with('-') && bare.len() > 1 => {
+                        if bare[1..].contains('R') {
+                            recursive = true;
+                        }
+                    }
+                    _ => operands.push(bare),
+                }
+            }
+            // The first operand is the owner, group or mode, unless a
+            // reference file gives it.
+            recursive
+                && operands
+                    .iter()
+                    .skip(usize::from(!by_reference))
+                    .any(|target| owner_change_target_is_system_or_home(&place, target, home))
+        })
+    };
+    changes(shell_command_segments(hay))
+        || substitution_bodies(hay)
+            .into_iter()
+            .any(|body| changes(shell_command_segments(body)))
+}
+
+/// Whether one operand of a recursive owner or mode change names the root, a
+/// directory of [`OWNER_MODE_SYSTEM_DIRS`] or a home, as a whole or by a glob
+/// of everything in it.
+fn owner_change_target_is_system_or_home(
+    place: &CommandPlace<'_>,
+    target: &str,
+    home: Option<&str>,
+) -> bool {
+    if matches!(rm_target_base(target), "~" | "$HOME" | "$home") {
+        return true;
+    }
+    let Some(path) = place.resolve(target) else {
+        return false;
+    };
+    let base = rm_target_base(&path);
+    base == "/"
+        || base == "/*"
+        || is_home_path(base)
+        || home.is_some_and(|home| base == rm_target_base(home))
+        || base
+            .strip_prefix('/')
+            .is_some_and(|rest| OWNER_MODE_SYSTEM_DIRS.contains(&rest))
+}
+
 /// A resolved absolute path whose removal wipes the root, a system directory,
 /// a home, or everything in one of them.
 fn path_is_wipe_target(path: &str, home: Option<&str>) -> bool {
