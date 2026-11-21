@@ -530,3 +530,96 @@ fn the_agent_is_refused_a_read_of_the_record_through_an_interpreter() {
         );
     }
 }
+
+/// A prompt the person submitted never ends a run with 2, on any line: on a
+/// line without the prompt flag it is not kept, and still goes on.
+#[cfg(unix)]
+#[test]
+fn a_prompt_event_on_a_line_without_the_flag_goes_on() {
+    let host = Host::new();
+    for line in [
+        format!("\"{}\" hook --agent claude-code", bin()),
+        format!("\"{}\" hook --block-review --agent claude-code", bin()),
+    ] {
+        let out = host.run_line(&line, &prompt_payload("rename the branch to release-7"));
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{line}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty(), "{line}");
+    }
+    assert!(matches!(host.asked("release-7"), UserAsked::Unknown(_)));
+}
+
+/// A prompt whose event name comes after the 1 MiB the hook reads: the head
+/// names no tool, and the run ends with 0 on either line.
+#[cfg(unix)]
+#[test]
+fn a_prompt_whose_event_is_past_the_head_goes_on() {
+    let host = Host::new();
+    // Written by hand: `json!` orders its keys, which would put the event
+    // name first. Here it comes after the prompt, past the head.
+    let past_the_head = format!(
+        r#"{{"session_id":"{SESSION}","prompt":"{}","hook_event_name":"UserPromptSubmit"}}"#,
+        "z".repeat(1100 * 1024)
+    )
+    .into_bytes();
+    let out = host.run_line(&the_prompt_line(), &past_the_head);
+    assert_silent_zero(&out, "the event name past the head, on the prompt line");
+    // Not kept, and the session says it lost a prompt.
+    assert_eq!(
+        host.asked("zzzz"),
+        UserAsked::Unknown(user_prompt::why::LOST)
+    );
+    // The event name in the head: 0 on a line without the flag too.
+    let in_the_head = serde_json::to_vec(&json!({
+        "session_id": SESSION,
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "z".repeat(1100 * 1024),
+    }))
+    .unwrap();
+    for line in [
+        the_prompt_line(),
+        format!("\"{}\" hook --agent claude-code", bin()),
+    ] {
+        let out = host.run_line(&line, &in_the_head);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{line}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// On the prompt line, JSON whose event is not a prompt is screened as a
+/// call, and refused as one: a tool event with no tool name is refused as a
+/// call the hook cannot read.
+#[cfg(unix)]
+#[test]
+fn a_tool_event_on_the_prompt_line_is_refused_as_a_call() {
+    let host = Host::new();
+    for payload in [
+        json!({
+            "session_id": SESSION,
+            "hook_event_name": "PreToolUse",
+            "tool_input": {"command": "cat ~/.aws/credentials"},
+        }),
+        json!({
+            "session_id": SESSION,
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat ~/.aws/credentials"},
+        }),
+    ] {
+        let out = host.run_line(&the_prompt_line(), &serde_json::to_vec(&payload).unwrap());
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{payload}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}

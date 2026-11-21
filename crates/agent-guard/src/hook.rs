@@ -1907,22 +1907,42 @@ pub fn unscreened_iwguard_hooks(
             } else {
                 matcher_label(entry)
             };
+            let prompt_event = event == crate::user_prompt::PROMPT_EVENT;
             let verdicts: Vec<HookProgram> = entry
                 .get("hooks")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter(|hook| {
-                    if event == crate::user_prompt::PROMPT_EVENT {
+                .filter_map(|hook| {
+                    let screening = if prompt_event {
                         is_iwguard_prompt_hook(hook)
                     } else {
                         is_screening_iwguard_hook(hook)
+                    };
+                    // The prompt line under a tool event: a line of ours that
+                    // screens no tool call (its run even ends with 0 on stdin
+                    // it cannot read).
+                    let prompt_here = !prompt_event && is_iwguard_prompt_hook(hook);
+                    if !screening && !prompt_here {
+                        return None;
                     }
+                    let program = hook
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .and_then(hook_command_words)
+                        .and_then(|words| words.into_iter().next())?;
+                    Some(if prompt_here {
+                        HookProgram::Broken {
+                            problem: format!(
+                                "its innerwarden line ends with {}, which screens no tool call",
+                                crate::user_prompt::PROMPT_LINE_FLAG
+                            ),
+                            program,
+                        }
+                    } else {
+                        judge_hook_program(&program, fact(&program))
+                    })
                 })
-                .filter_map(|hook| hook.get("command").and_then(Value::as_str))
-                .filter_map(hook_command_words)
-                .filter_map(|words| words.into_iter().next())
-                .map(|program| judge_hook_program(&program, fact(&program)))
                 .collect();
             if verdicts.is_empty() {
                 continue;
@@ -1946,8 +1966,14 @@ pub fn unscreened_iwguard_hooks(
                 continue;
             }
             // The Bash group is judged by `judge_iwguard_hooks`; a broken one
-            // already makes the whole agent off, said elsewhere.
-            if event == "PreToolUse" && label == "Bash" {
+            // already makes the whole agent off, said elsewhere. A Bash group
+            // whose every line of ours is the prompt line has no line there
+            // to judge, so it is said here.
+            let prompt_lines_only = verdicts.iter().all(|v| {
+                matches!(v, HookProgram::Broken { problem, .. }
+                    if problem.contains(crate::user_prompt::PROMPT_LINE_FLAG))
+            });
+            if event == "PreToolUse" && label == "Bash" && !prompt_lines_only {
                 continue;
             }
             let Some(HookProgram::Broken { problem, .. }) = verdicts.into_iter().next() else {
@@ -4170,6 +4196,42 @@ mod tests {
         assert!(
             !is_iwguard_hook(&json!({"type": "command", "command": scripted})),
             "{scripted}"
+        );
+    }
+
+    /// Status says "not screened" for every tool event whose lines of ours
+    /// are all the prompt line, the Bash group too, and not for one that also
+    /// holds a line that screens.
+    #[test]
+    fn a_tool_event_whose_lines_are_all_prompt_lines_is_not_screened() {
+        let bin = Path::new("/opt/innerwarden");
+        let prompt = prompt_hook_command(bin, false, false, Some("claude-code"));
+        let screening = hook_command_for(bin, false, false, Some("claude-code"));
+        let settings = json!({"hooks": {
+            "PreToolUse": [
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": prompt}]},
+                {"matcher": "Write|Edit", "hooks": [
+                    {"type": "command", "command": prompt},
+                    {"type": "command", "command": prompt}
+                ]},
+                {"matcher": "Read", "hooks": [
+                    {"type": "command", "command": prompt},
+                    {"type": "command", "command": screening}
+                ]}
+            ],
+            "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": prompt}]}],
+            "UserPromptSubmit": [{"hooks": [{"type": "command", "command": prompt}]}]
+        }});
+        let found = unscreened_iwguard_hooks(&settings, |_| ProgramFact::Executable);
+        let tools: Vec<&str> = found.iter().map(|g| g.tools.as_str()).collect();
+        assert_eq!(
+            tools,
+            ["Bash", "Write/Edit", "PostToolUse (every tool)"],
+            "{found:?}"
+        );
+        assert!(
+            found.iter().all(|g| g.problem.contains("--prompt")),
+            "{found:?}"
         );
     }
 

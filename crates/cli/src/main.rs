@@ -1147,6 +1147,18 @@ fn keep_the_prompt(buf: &str, rest: &[String]) -> Option<std::process::ExitCode>
     Some(std::process::ExitCode::SUCCESS)
 }
 
+/// Whether a payload is the person's prompt: its event is
+/// `UserPromptSubmit` and it names no tool.
+fn is_prompt_naming_no_tool(buf: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(buf) else {
+        return false;
+    };
+    !["tool_name", "toolName", "tool"]
+        .iter()
+        .any(|key| value.get(key).is_some())
+        && innerwarden_agent_guard::user_prompt::prompt_of(&value).is_some()
+}
+
 /// Debug builds only: the prompt hook panics while it keeps the prompt.
 #[cfg(debug_assertions)]
 const TEST_PROMPT_PANIC_ENV: &str = "IW_TEST_PROMPT_HOOK_PANIC";
@@ -1159,6 +1171,13 @@ fn screen_as_a_tool_call() {
 
 fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::ExitCode {
     let call = TooLongCall::read(head);
+    // A prompt the person submitted never ends with 2, on any line: past
+    // the cap it is not kept, and it goes on.
+    if call.event.as_deref() == Some(innerwarden_agent_guard::user_prompt::PROMPT_EVENT)
+        && call.tool.is_none()
+    {
+        return std::process::ExitCode::SUCCESS;
+    }
     if !call.already_ran() {
         return hook_unreadable("", rest, TOOL_CALL_TOO_LONG, monitor);
     }
@@ -1885,9 +1904,9 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
                 // session says a prompt went unkept. Anything else in a
                 // head this long is screened as a tool call would be.
                 let call = TooLongCall::read(&head);
-                if call.event.as_deref() == Some(innerwarden_agent_guard::user_prompt::PROMPT_EVENT)
-                    && call.tool.is_none()
-                {
+                // On the prompt line a head that names no tool is the
+                // person's prompt, its event name read or not (past the head).
+                if call.tool.is_none() {
                     let _ =
                         innerwarden_agent_guard::user_prompt::record_lost(call.session.as_deref());
                     return std::process::ExitCode::SUCCESS;
@@ -1899,6 +1918,11 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         Err(_) if prompt_line => return std::process::ExitCode::SUCCESS,
         Err(_) => return hook_unreadable("", rest, "stdin could not be read", monitor),
     };
+    // A prompt the person submitted, on a line without the prompt flag: not
+    // kept, and never refused (2 drops what the person typed).
+    if !prompt_line && is_prompt_naming_no_tool(&buf) {
+        return std::process::ExitCode::SUCCESS;
+    }
     if prompt_line {
         // The person's prompt: kept for the MCP proxy, never refused, nothing
         // printed (Claude Code adds a prompt hook's output to the

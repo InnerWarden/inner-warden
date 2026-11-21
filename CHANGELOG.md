@@ -29,7 +29,11 @@ order only under `UserPromptSubmit`; every end of its run is 0 and silent (a
 panic, unreadable stdin, the deadline), and any JSON on it that is not a prompt
 naming no tool is screened as a tool call. A guard whose program is gone ends
 the line with 127, shown as an error while the prompt goes on. Two prompts of
-one session written at once are both kept (the guard's update lock). An expired prompt
+one session written at once do not write over each other (the guard's update
+lock); one that still cannot be written marks the session as having lost a
+prompt. A tool line that ends with `--prompt` is said by `status` as not
+screened: its run still ends with 0 on stdin it cannot read, and writing it
+takes an edit of the agent settings the guard refuses to an agent. An expired prompt
 is deleted when its session is written or read. Other agents are not wired:
 their MCP servers get no session id to match. Details and limits:
 [The prompt record](docs/prompt-record.md).

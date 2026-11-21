@@ -240,9 +240,10 @@ const UPDATE_ATTEMPTS: usize = 8;
 /// write lands only if the file still holds what was read, and is tried again
 /// from a fresh read otherwise, so two hook runs of one session never lose a
 /// prompt. A record that cannot be read is started again.
-fn update_record(
+fn update_record_waiting(
     dir: &Path,
     session: &str,
+    lock_wait: std::time::Duration,
     change: impl Fn(&mut Record),
 ) -> std::io::Result<PathBuf> {
     use crate::file_update::{replace_owned_store_no_symlinks, ReplaceError};
@@ -268,13 +269,7 @@ fn update_record(
             });
         change(&mut record);
         let body = serde_json::to_vec(&record).map_err(std::io::Error::other)?;
-        match replace_owned_store_no_symlinks(
-            dir,
-            &path,
-            expected.as_deref(),
-            &body,
-            UPDATE_LOCK_WAIT,
-        ) {
+        match replace_owned_store_no_symlinks(dir, &path, expected.as_deref(), &body, lock_wait) {
             Ok(()) => return Ok(path),
             Err(ReplaceError::LockBusy { .. }) => {
                 last = String::from("the record's update lock was busy");
@@ -294,10 +289,38 @@ fn lock_for(record: &Path) -> PathBuf {
     record.with_file_name(format!(".{name}.innerwarden.lock"))
 }
 
-/// Remove a record and its update lock.
+/// The mark beside a record that says the session lost a prompt it could
+/// not write ([`mark_lost`]).
+fn lost_mark_for(record: &Path) -> PathBuf {
+    let name = record
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    record.with_file_name(format!(".{name}.lost"))
+}
+
+/// Say that `session` lost a prompt, without the update lock: an empty
+/// file beside the record, created 0600. It is what is left to say when the
+/// record itself could not be written (its lock held, the write failed).
+fn mark_lost(dir: &Path, session: &str) -> std::io::Result<()> {
+    make_dir(dir)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options
+        .open(lost_mark_for(&file_for(dir, session)))
+        .map(|_| ())
+}
+
+/// Remove a record, its update lock and its lost mark.
 fn remove_record(path: &Path) {
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(lock_for(path));
+    let _ = fs::remove_file(lost_mark_for(path));
 }
 
 /// Say, in the record of `session` under `$HOME`, that one of its prompts
@@ -308,12 +331,14 @@ pub fn record_lost(session: Option<&str>) -> std::io::Result<()> {
     record_lost_in(&dir, session)
 }
 
-/// [`record_lost`] with the folder handed in.
+/// [`record_lost`] with the folder handed in. Written as the lost mark,
+/// which needs no lock: the record may be the thing that could not be
+/// written.
 pub fn record_lost_in(dir: &Path, session: Option<&str>) -> std::io::Result<()> {
     let Some(session) = session.and_then(usable_session) else {
         return Ok(());
     };
-    update_record(dir, session, |record| record.lost = true).map(|_| ())
+    mark_lost(dir, session)
 }
 
 /// Keep `prompt`, the person's words, for `session`, under `$HOME`.
@@ -338,8 +363,23 @@ pub fn record_in(
     if prompt.trim().is_empty() {
         return Ok(());
     }
+    record_in_waiting(dir, session, agent, prompt, now_ms, UPDATE_LOCK_WAIT)
+}
+
+/// [`record_in`] with the wait for the update lock handed in. A prompt that
+/// could not be written (the lock held through every attempt, a write that
+/// failed) leaves the lost mark, so a value it held answers "unknown",
+/// never "no".
+fn record_in_waiting(
+    dir: &Path,
+    session: &str,
+    agent: Option<&str>,
+    prompt: &str,
+    now_ms: i64,
+    lock_wait: std::time::Duration,
+) -> std::io::Result<()> {
     let (text, cut) = kept_text_and_cut(prompt);
-    let path = update_record(dir, session, |record| {
+    let written = update_record_waiting(dir, session, lock_wait, |record| {
         if let Some(agent) = agent {
             record.agent = Some(agent.to_string());
         }
@@ -356,7 +396,14 @@ pub fn record_in(
             lost = true;
         }
         record.lost |= lost;
-    })?;
+    });
+    let path = match written {
+        Ok(path) => path,
+        Err(e) => {
+            let _ = mark_lost(dir, session);
+            return Err(e);
+        }
+    };
     prune(dir, now_ms, Some(&path));
     Ok(())
 }
@@ -618,6 +665,7 @@ pub fn user_asked_for_in(dir: &Path, session: Option<&str>, value: &str, now_ms:
     let path = file_for(dir, session);
     let (bytes, record) = match read_record_bytes(&path) {
         Ok(Some(read)) => read,
+        Ok(None) if lost_mark_for(&path).exists() => return UserAsked::Unknown(why::LOST),
         Ok(None) => return UserAsked::Unknown(why::NO_RECORD),
         Err(_) => return UserAsked::Unknown(why::UNREADABLE),
     };
@@ -635,7 +683,9 @@ pub fn user_asked_for_in(dir: &Path, session: Option<&str>, value: &str, now_ms:
     }
     // Words this session lost (cut, dropped, past their day) may have held
     // the value: not found is then unknown, never no.
-    let lost = record.lost || record.prompts.iter().any(|p| !fresh(p.at_ms, now_ms));
+    let lost = record.lost
+        || record.prompts.iter().any(|p| !fresh(p.at_ms, now_ms))
+        || lost_mark_for(&path).exists();
     if lost {
         UserAsked::Unknown(why::LOST)
     } else if any {
@@ -720,6 +770,39 @@ mod tests {
         );
         // What is there is still found.
         assert_eq!(ask(&dir2, Some(SESSION), "ana@example.com"), UserAsked::Yes);
+    }
+
+    /// A prompt that cannot be written (its record's update lock held by
+    /// another process the whole time) leaves the lost mark: the value it
+    /// held answers unknown, never no, while what was written before is
+    /// still found.
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_that_could_not_be_written_makes_its_value_unknown() {
+        use std::os::unix::io::AsRawFd;
+        let (_tmp, dir) = dir();
+        record_in(&dir, Some(SESSION), None, "mail ana@example.com", NOW).unwrap();
+        let lock = fs::File::open(lock_for(&file_for(&dir, SESSION))).expect("the update lock");
+        // SAFETY: a plain flock on a descriptor this test owns.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let written = record_in_waiting(
+            &dir,
+            SESSION,
+            None,
+            "then mail eve@evil.example",
+            NOW + 1,
+            std::time::Duration::from_millis(20),
+        );
+        drop(lock);
+        assert!(written.is_err(), "the write went through a held lock");
+        assert_eq!(
+            ask(&dir, Some(SESSION), "eve@evil.example"),
+            UserAsked::Unknown(why::LOST)
+        );
+        assert_eq!(ask(&dir, Some(SESSION), "ana@example.com"), UserAsked::Yes);
+        // The mark goes with the record.
+        remove_record(&file_for(&dir, SESSION));
+        assert!(fs::read_dir(&dir).unwrap().next().is_none());
     }
 
     /// Two hook runs of one session at once: each prompt is kept, none is

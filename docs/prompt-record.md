@@ -85,10 +85,13 @@ are hashes. A folder that is a symbolic link is never written through.
 | Most sessions kept | 64; the least recently written go first |
 | A prompt longer than 1 MiB as the hook reads it | not kept; its session is marked as having lost words |
 
-Two hook runs of one session at once each keep their prompt: a record is
-read, changed and written back under the update lock the guard uses for its
-own record, and written only if the file still holds what was read (tried
-again otherwise). Each record has its lock file beside it
+Two hook runs of one session at once do not write over each other: a record
+is read, changed and written back under the update lock the guard uses for
+its own record, and written only if the file still holds what was read
+(tried again, up to 8 times, waiting up to 1 s for the lock each time). A
+prompt that still cannot be written is not kept: an empty mark beside the
+record (`.<name>.json.lost`) says the session lost a prompt, and a value not
+found answers "unknown", never "no". Each record has its lock file beside it
 (`.<name>.json.innerwarden.lock`), removed with the record.
 
 A prompt past 24 hours is never read. It is deleted:
@@ -143,11 +146,21 @@ names no tool is kept as a prompt. Any other JSON on that line (a tool call of
 any shape, a prompt event that names a tool) goes to the screening every line
 gives a call, and is refused or allowed as there.
 
+A prompt the person submitted never ends a run with 2, on any line: on a line
+without the flag it is not kept and goes on. One case is left: on a line
+without the flag, a prompt longer than 1 MiB whose event name comes after the
+first 1 MiB cannot be told from a tool call, and is refused as one; Claude
+Code's prompt line carries the flag, where such a head is read as a prompt.
+
 The flag counts only as the line's last word, and the line is in order only
 under `UserPromptSubmit`. The same line under a tool event screens nothing:
 `innerwarden status` does not count it as a hook of ours that screens, and
-`innerwarden install` replaces it. Its run would still end with 0 on stdin it
-cannot read, which is why it is not counted. Cursor's wiring has no prompt
+`innerwarden install` replaces it. Its run still ends with 0 on stdin it
+cannot read, text that is not JSON, the deadline or a panic, which is why
+status says that event is not screened when every line of ours under it is
+the prompt line; any JSON on it that is not a prompt naming no tool is
+screened and refused as on any other line. Writing such a line takes an edit
+of the agent's settings, which the guard refuses to the agent. Cursor's wiring has no prompt
 line, and the flag is ignored on a line that names Cursor.
 
 The one end the guard cannot answer for: if its program is gone, the shell
