@@ -26445,6 +26445,20 @@ mod brq_evaluation_tests {
     ///
     /// FAILS ON REVERT: drop the `disconnect`, `connect --monitor` or
     /// `contain` arm and its forms are `None` again.
+    /// T-109: accepting the project files a jail made is the person's; an
+    /// agent's `innerwarden contain --accept-project-files` is stopped like
+    /// every other `contain` that is not help or a dry run.
+    #[test]
+    fn an_agent_cannot_accept_what_a_jail_made() {
+        for cmd in [
+            "innerwarden contain --accept-project-files",
+            "innerwarden contain --accept-project-files --project /w/app",
+            "innerwarden contain --project . --accept-project-files",
+        ] {
+            assert!(check_guard_self_disable(cmd).is_some(), "{cmd}");
+        }
+    }
+
     #[test]
     fn an_agent_cannot_lower_its_own_guard_by_wiring_or_a_jail() {
         for cmd in [

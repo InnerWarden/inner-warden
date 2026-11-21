@@ -20,6 +20,9 @@ use crate::contain::{
 /// [--project DIR] [--dry-run] [--setup] -- <command...>` - run the command inside
 /// a filesystem/namespace jail with the InnerWarden hook active inside it.
 pub fn cmd(rest: &[String]) -> ExitCode {
+    if let Some(asked) = accept_request(rest) {
+        return cmd_accept(asked);
+    }
     let args = match parse_contain_args(rest) {
         Ok(a) => a,
         Err(e) => {
@@ -248,7 +251,10 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     // were not there when it started.
     #[cfg(unix)]
     if let Some(why) = project_files_made(&input).into_iter().next() {
-        eprintln!("innerwarden contain: refusing to start: {why}");
+        eprintln!(
+            "innerwarden contain: refusing to start: {why}; {}",
+            accept_hint(&input.args.project)
+        );
         return ExitCode::from(2);
     }
 
@@ -327,11 +333,24 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             run_macos(&input)
         };
         // Said as the jail ends: what it made of the project's Claude Code
-        // files that were not there (the next start refuses on it).
+        // files that were not there (the next start refuses on it), and the
+        // launch does not end in success, so whoever runs it unattended
+        // sees it (the command's own failure is kept).
         #[cfg(unix)]
         if !input.args.dry_run {
-            for why in project_files_made(&input) {
+            let made = finish_project_files(&input);
+            for why in &made {
                 eprintln!("innerwarden contain: {why}");
+            }
+            if !made.is_empty() {
+                eprintln!(
+                    "innerwarden contain: the jail made Claude Code files the next start \
+                     refuses on; exiting {PROJECT_FILES_MADE_EXIT}. {}",
+                    accept_hint(&input.args.project)
+                );
+                if code == ExitCode::SUCCESS {
+                    return ExitCode::from(PROJECT_FILES_MADE_EXIT);
+                }
             }
         }
         code
@@ -339,6 +358,99 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         eprintln!(
             "innerwarden contain: containment needs Linux (bubblewrap) or macOS (sandbox-exec); this OS is not supported"
         );
+        ExitCode::from(2)
+    }
+}
+
+/// The exit status of a launch whose jail made Claude Code files in the
+/// project that the next start refuses on, where the command itself
+/// succeeded ([`finish_project_files`]).
+#[cfg(unix)]
+const PROJECT_FILES_MADE_EXIT: u8 = 3;
+
+/// The flag by which the person accepts the files of the project's that
+/// jails made ([`accept_project_files`]).
+const ACCEPT_FLAG: &str = "--accept-project-files";
+
+/// PURE. Where `rest` asks to accept a project's files (the flag among
+/// `contain`'s own arguments): the project (`.` by default), or why the
+/// request is not one: it takes `--project <dir>` and nothing else.
+fn accept_request(rest: &[String]) -> Option<Result<PathBuf, String>> {
+    let mut words = rest.iter();
+    let mut asked = false;
+    let mut project = PathBuf::from(".");
+    let mut other = None;
+    while let Some(word) = words.next() {
+        match word.as_str() {
+            ACCEPT_FLAG => asked = true,
+            "--project" => match words.next() {
+                Some(dir) => project = PathBuf::from(dir),
+                None => other = Some("--project needs a folder".to_string()),
+            },
+            "--" => {
+                other = Some("it runs no command".to_string());
+                break;
+            }
+            flag if flag.starts_with('-') => {
+                other.get_or_insert_with(|| format!("it takes no {flag}"));
+            }
+            _ => {
+                // A bare word starts the agent's command: the flag after it
+                // is the command's.
+                break;
+            }
+        }
+    }
+    if !asked {
+        return None;
+    }
+    Some(match other {
+        Some(why) => Err(format!("{ACCEPT_FLAG} takes only --project <dir>: {why}")),
+        None => Ok(project),
+    })
+}
+
+/// `innerwarden contain --accept-project-files`, as the person runs it
+/// ([`accept_project_files`]).
+fn cmd_accept(asked: Result<PathBuf, String>) -> ExitCode {
+    let project = match asked {
+        Ok(project) => project,
+        Err(why) => {
+            eprintln!("innerwarden contain: {why}");
+            return ExitCode::from(2);
+        }
+    };
+    if crate::suppress_io::in_agent_shell() {
+        eprintln!(
+            "innerwarden contain: refused inside an AI agent's shell. Accepting the files a \
+             jail made is the person's, from their own terminal. Nothing was changed."
+        );
+        return ExitCode::from(1);
+    }
+    let home = match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(h) if !h.as_os_str().is_empty() => h,
+        _ => {
+            eprintln!("innerwarden contain: HOME is not set");
+            return ExitCode::from(2);
+        }
+    };
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
+    let project = resolve_project(&project);
+    if !project.is_dir() {
+        eprintln!(
+            "innerwarden contain: project directory not found: {} (pass --project <dir>)",
+            project.display()
+        );
+        return ExitCode::from(2);
+    }
+    #[cfg(unix)]
+    {
+        accept_project_files(&home, &project)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = home;
+        eprintln!("innerwarden contain: containment needs Linux or macOS; nothing to accept");
         ExitCode::from(2)
     }
 }
@@ -500,16 +612,6 @@ fn project_guard_refused(project: &Path) -> Option<String> {
     }
 }
 
-/// Where the launcher keeps which of the project's
-/// [`crate::contain::PROJECT_GUARD_NAMES`] were not there when a jail
-/// started there: beside the project's own folder, out of every jail's
-/// reach (`<key>.absent`).
-#[cfg(unix)]
-fn absent_marker(claude: &crate::contain::ProjectClaude) -> Option<PathBuf> {
-    let name = claude.source.file_name()?.to_string_lossy().to_string();
-    Some(claude.source.parent()?.join(format!("{name}.absent")))
-}
-
 /// The project's [`crate::contain::ProjectClaude`], planned from the
 /// launcher's records folder whether it is made yet or not.
 #[cfg(unix)]
@@ -530,60 +632,327 @@ fn planned_project_claude(input: &JailInputs) -> Option<crate::contain::ProjectC
     crate::contain::plan_project_claude(&records, &real, &input.args.project)
 }
 
-/// Each reason a file of the project's that was not there when the last
-/// jail started there, and is now, keeps the next one from starting
-/// ([`crate::contain::project_settings_made_refusal`]).
+/// The launcher's markers for the project's Claude Code files, kept beside
+/// the project's own folder, out of every jail's reach:
+///
+/// * `<key>.run.<pid>`: which of [`crate::contain::PROJECT_GUARD_NAMES`]
+///   were not there when this launch's jail started; removed as the launch
+///   ends ([`finish_project_files`]). One another launch left (its jail
+///   runs still, or its launcher stopped before the end) keeps its names
+///   judged at every start;
+/// * `<key>.made`: each file a jail made there that keeps a jail from
+///   starting, as the launcher found it when that jail ended, until the
+///   person accepts it (`innerwarden contain --accept-project-files`);
+/// * `<key>.absent`: the one marker of an earlier launcher, read as a run
+///   marker left behind.
+///
+/// A file the person makes in the project between two runs is in none of
+/// them, so it is the person's: the start check of their settings
+/// ([`claude_settings_refused`]) reads it like any other.
 #[cfg(unix)]
-fn project_files_made(input: &JailInputs) -> Vec<String> {
-    let Some(marker) = planned_project_claude(input).and_then(|c| absent_marker(&c)) else {
+fn marker_base(claude: &crate::contain::ProjectClaude) -> Option<(PathBuf, String)> {
+    let name = claude.source.file_name()?.to_string_lossy().to_string();
+    Some((claude.source.parent()?.to_path_buf(), name))
+}
+
+/// This launch's run marker ([`marker_base`]).
+#[cfg(unix)]
+fn run_marker(claude: &crate::contain::ProjectClaude) -> Option<PathBuf> {
+    let (dir, name) = marker_base(claude)?;
+    Some(dir.join(format!("{name}.run.{}", std::process::id())))
+}
+
+/// The marker of the files jails made ([`marker_base`]).
+#[cfg(unix)]
+fn made_marker(claude: &crate::contain::ProjectClaude) -> Option<PathBuf> {
+    let (dir, name) = marker_base(claude)?;
+    Some(dir.join(format!("{name}.made")))
+}
+
+/// Every run marker there, this launch's included, and an earlier
+/// launcher's `.absent`: plain files only, a link is never read.
+#[cfg(unix)]
+fn run_markers(claude: &crate::contain::ProjectClaude) -> Vec<PathBuf> {
+    let Some((dir, name)) = marker_base(claude) else {
         return Vec::new();
     };
-    let Ok(text) = std::fs::read_to_string(&marker) else {
+    let run = format!("{name}.run.");
+    let legacy = format!("{name}.absent");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let project = &input.args.project;
+    let mut out: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let file = entry.file_name().to_string_lossy().to_string();
+            (file.starts_with(&run) || file == legacy)
+                && entry.file_type().is_ok_and(|t| t.is_file())
+        })
+        .map(|entry| entry.path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// The launch a run marker names is running (its pid answers); an earlier
+/// launcher's `.absent` names none.
+#[cfg(unix)]
+fn marker_launch_runs(marker: &Path) -> bool {
+    let Some(pid) = marker
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.rsplit_once(".run."))
+        .and_then(|(_, pid)| pid.parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+    else {
+        return false;
+    };
+    // SAFETY: signal 0 sends nothing; it only asks whether the pid exists.
+    let answer = unsafe { libc::kill(pid, 0) };
+    answer == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// The Claude Code files of `project` that the `names` of
+/// [`crate::contain::PROJECT_GUARD_NAMES`] stand for.
+#[cfg(unix)]
+fn files_of_names<'a>(project: &Path, names: impl Iterator<Item = &'a str>) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for name in text
-        .lines()
-        .filter(|n| crate::contain::PROJECT_GUARD_NAMES.contains(n))
-    {
-        let files: Vec<PathBuf> = if name == ".claude" {
-            ["settings.json", "settings.local.json"]
-                .iter()
-                .map(|f| project.join(".claude").join(f))
-                .collect()
+    for name in names.filter(|n| crate::contain::PROJECT_GUARD_NAMES.contains(n)) {
+        if name == ".claude" {
+            for file in ["settings.json", "settings.local.json"] {
+                out.push(project.join(".claude").join(file));
+            }
         } else {
-            vec![project.join(name)]
-        };
-        for file in files {
-            if std::fs::symlink_metadata(&file).is_err() {
-                continue;
-            }
-            let value = read_claude_settings(&file)
-                .ok()
-                .flatten()
-                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
-            if let Some(why) = crate::contain::project_settings_made_refusal(
-                &crate::contain::printable(&file),
-                value.as_ref(),
-            ) {
-                out.push(why);
-            }
+            out.push(project.join(name));
         }
     }
     out
 }
 
+/// Why `file`, made while a jail ran, keeps a jail from starting, or
+/// `None` where it is not there or sets nothing that reaches the host
+/// ([`crate::contain::project_settings_made_refusal`]).
+#[cfg(unix)]
+fn made_file_refusal(file: &Path) -> Option<String> {
+    std::fs::symlink_metadata(file).ok()?;
+    let value = read_claude_settings(file)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    crate::contain::project_settings_made_refusal(&crate::contain::printable(file), value.as_ref())
+}
+
+/// The files a jail may have made that a start judges: each one `.made`
+/// lists, and each a run marker names (this launch's included, where it
+/// asks before its jail starts: none yet).
+#[cfg(unix)]
+fn files_jails_made(input: &JailInputs) -> Vec<PathBuf> {
+    let Some(claude) = planned_project_claude(input) else {
+        return Vec::new();
+    };
+    let project = &input.args.project;
+    let allowed = files_of_names(project, crate::contain::PROJECT_GUARD_NAMES.iter().copied());
+    let mut files: Vec<PathBuf> = made_marker(&claude)
+        .and_then(|marker| std::fs::read_to_string(marker).ok())
+        .map(|text| {
+            text.lines()
+                .map(PathBuf::from)
+                .filter(|file| allowed.contains(file))
+                .collect()
+        })
+        .unwrap_or_default();
+    for marker in run_markers(&claude) {
+        if let Ok(text) = std::fs::read_to_string(&marker) {
+            files.extend(files_of_names(project, text.lines()));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    files.retain(|file| seen.insert(file.clone()));
+    files
+}
+
+/// Each reason a file of the project's that a jail made keeps the next
+/// jail from starting: one `.made` lists, or one a run marker another
+/// launch left names that is there now ([`marker_base`]), still setting
+/// what reaches the host.
+#[cfg(unix)]
+fn project_files_made(input: &JailInputs) -> Vec<String> {
+    files_jails_made(input)
+        .iter()
+        .filter_map(|file| made_file_refusal(file))
+        .collect()
+}
+
+/// What to do about a file a jail made that the person wants to keep:
+/// accepted by the person, from outside any jail.
+#[cfg(unix)]
+fn accept_hint(project: &Path) -> String {
+    format!(
+        "if you made it yourself, or read it and want to keep it, accept it from outside \
+         any jail: innerwarden contain --accept-project-files --project {}",
+        crate::contain::printable(project)
+    )
+}
+
+/// The names each launch's jail found absent, kept by this process as
+/// well as in its run marker: the end of the run judges what its own jail
+/// started without even where the marker was taken away meanwhile.
+#[cfg(unix)]
+fn absent_at_start() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<String>>> {
+    static NAMES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Vec<String>>>,
+    > = std::sync::OnceLock::new();
+    NAMES.get_or_init(Default::default)
+}
+
+/// As the jail ends: each file of the project's its jail made (absent when
+/// it started, there now) that keeps the next jail from starting, said
+/// back, and kept in `.made` for the next start; the run marker is taken
+/// away. A dry run, or a jail without the launcher's folder, made nothing.
+#[cfg(unix)]
+fn finish_project_files(input: &JailInputs) -> Vec<String> {
+    let Some(claude) = planned_project_claude(input) else {
+        return Vec::new();
+    };
+    let (Some(marker), Some(made)) = (run_marker(&claude), made_marker(&claude)) else {
+        return Vec::new();
+    };
+    let kept = absent_at_start()
+        .lock()
+        .ok()
+        .and_then(|mut names| names.remove(&marker));
+    let names = kept.unwrap_or_else(|| {
+        std::fs::read_to_string(&marker)
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    });
+    let files = files_of_names(&input.args.project, names.iter().map(String::as_str));
+    let refused: Vec<(PathBuf, String)> = files
+        .into_iter()
+        .filter_map(|file| made_file_refusal(&file).map(|why| (file, why)))
+        .collect();
+    if !refused.is_empty() {
+        let mut listed: Vec<String> = std::fs::read_to_string(&made)
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default();
+        for (file, _) in &refused {
+            let line = file.to_string_lossy().to_string();
+            if !listed.contains(&line) {
+                listed.push(line);
+            }
+        }
+        let dir = made.parent().unwrap_or(Path::new("/"));
+        let temp = launch_temp_name(&made);
+        // SAFETY: getuid has no preconditions.
+        let uid = unsafe { libc::getuid() };
+        if let Err(e) = write_private_file(dir, &made, &temp, listed.join("\n").as_bytes(), uid) {
+            eprintln!(
+                "innerwarden contain: the launcher cannot keep which files the jail made ({e}); \
+                 its run marker stays, so the next start judges them"
+            );
+            return refused.into_iter().map(|(_, why)| why).collect();
+        }
+    }
+    let _ = std::fs::remove_file(&marker);
+    refused.into_iter().map(|(_, why)| why).collect()
+}
+
+/// `innerwarden contain --accept-project-files [--project <dir>]`: the
+/// person takes the files of the project's that jails made as theirs. It
+/// says each, takes away `.made` and the run markers of launches that no
+/// longer run, and starts nothing. A launch still running keeps its marker
+/// (what its jail makes is judged when it ends). Inside a jail the
+/// launcher's folder is out of reach, and the guard refuses the command to
+/// an agent: accepting is the person's.
+#[cfg(unix)]
+fn accept_project_files(home: &Path, project: &Path) -> ExitCode {
+    let mut args = match crate::contain::parse_contain_args(&["--setup".to_string()]) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("innerwarden contain: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    args.project = project.to_path_buf();
+    match resolve_inputs(args, home.to_path_buf(), PathBuf::from("/usr/bin/true")) {
+        Ok(input) => accept_project_files_for(&input),
+        Err(e) => {
+            eprintln!("innerwarden contain: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// [`accept_project_files`] for the project and the launcher's folder
+/// `input` plans.
+#[cfg(unix)]
+fn accept_project_files_for(input: &JailInputs) -> ExitCode {
+    let project = &input.args.project;
+    let Some(claude) = planned_project_claude(input) else {
+        println!(
+            "innerwarden contain: nothing to accept in {}",
+            crate::contain::printable(project)
+        );
+        return ExitCode::SUCCESS;
+    };
+    let files: Vec<PathBuf> = files_jails_made(input)
+        .into_iter()
+        .filter(|file| std::fs::symlink_metadata(file).is_ok())
+        .collect();
+    let mut failed = false;
+    let mut running = Vec::new();
+    let markers = run_markers(&claude);
+    for marker in made_marker(&claude).into_iter().chain(markers) {
+        if marker_launch_runs(&marker) {
+            running.push(marker);
+            continue;
+        }
+        match std::fs::remove_file(&marker) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!(
+                    "innerwarden contain: cannot take away {} ({e})",
+                    crate::contain::printable(&marker)
+                );
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        return ExitCode::from(1);
+    }
+    if files.is_empty() {
+        println!(
+            "innerwarden contain: nothing to accept in {}",
+            crate::contain::printable(project)
+        );
+    }
+    for file in &files {
+        println!(
+            "innerwarden contain: accepted as yours: {}",
+            crate::contain::printable(file)
+        );
+    }
+    if !running.is_empty() {
+        println!(
+            "innerwarden contain: a jail still runs in this project; what it makes is judged \
+             when it ends"
+        );
+    }
+    ExitCode::SUCCESS
+}
+
 /// Before the jail runs: which of the project's
-/// [`crate::contain::PROJECT_GUARD_NAMES`] are not there, kept beside
-/// the project's own folder ([`absent_marker`]).
+/// [`crate::contain::PROJECT_GUARD_NAMES`] are not there, kept in this
+/// launch's run marker ([`marker_base`]) and by this process.
 #[cfg(unix)]
 fn keep_absent_names(
     input: &JailInputs,
     claude: &crate::contain::ProjectClaude,
     uid: u32,
 ) -> Result<(), String> {
-    let Some(marker) = absent_marker(claude) else {
+    let Some(marker) = run_marker(claude) else {
         return Ok(());
     };
     let absent: Vec<&str> = crate::contain::PROJECT_GUARD_NAMES
@@ -591,6 +960,38 @@ fn keep_absent_names(
         .copied()
         .filter(|name| std::fs::symlink_metadata(input.args.project.join(name)).is_err())
         .collect();
+    if let Ok(mut names) = absent_at_start().lock() {
+        names.insert(
+            marker.clone(),
+            absent.iter().map(|n| n.to_string()).collect(),
+        );
+    }
+    // The start check passed: what launches that no longer run left, and
+    // the files `.made` lists that no longer refuse, were judged now and
+    // set nothing. Kept, they would take a file the person makes later
+    // for a jail's.
+    for left in run_markers(claude) {
+        if left != marker && !marker_launch_runs(&left) {
+            let _ = std::fs::remove_file(&left);
+        }
+    }
+    if let Some(made) = made_marker(claude) {
+        if let Ok(text) = std::fs::read_to_string(&made) {
+            let still: Vec<&str> = text
+                .lines()
+                .filter(|line| made_file_refusal(Path::new(line)).is_some())
+                .collect();
+            if still.is_empty() {
+                let _ = std::fs::remove_file(&made);
+            } else if still.len() < text.lines().count() {
+                let temp = launch_temp_name(&made);
+                let dir = made.parent().unwrap_or(Path::new("/"));
+                write_private_file(dir, &made, &temp, still.join("\n").as_bytes(), uid).map_err(
+                    |e| format!("the launcher cannot keep which files jails made ({e})"),
+                )?;
+            }
+        }
+    }
     let dir = marker.parent().unwrap_or(Path::new("/"));
     let temp = launch_temp_name(&marker);
     write_private_file(dir, &marker, &temp, absent.join("\n").as_bytes(), uid)
@@ -6522,6 +6923,217 @@ mod tests {
         // here on (read-only in the jail), and nothing is judged.
         prepare_project_claude(&input).unwrap();
         assert!(project_files_made(&input).is_empty());
+    }
+
+    /// T-109 item 3, as the launcher sees each run: a file the person makes
+    /// in the project between two runs (here, hooks of their own in
+    /// `.claude/settings.json`) is theirs and refuses no start; one a jail
+    /// makes during its run (MCP servers in `.mcp.json`) is said as the run
+    /// ends, kept, and refuses each next start until the person accepts it.
+    ///
+    /// FAILS ON REVERT: keep the names absent at the start until the next
+    /// good start (the person's file refuses), or keep nothing as the run
+    /// ends (the jail's file is forgotten).
+    #[cfg(unix)]
+    #[test]
+    fn a_file_the_person_makes_between_runs_is_theirs_and_a_jails_waits_for_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        let project = r.join("proj");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let mut args = parse_contain_args(&["--".to_string(), "true".to_string()]).unwrap();
+        args.project = project.clone();
+        let mut input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        let all = r.join("state/innerwarden/jail-claude");
+        let source = all.join("proj-0123456789abcdef");
+        std::fs::create_dir_all(&source).unwrap();
+        for dir in [&source, &all] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        input.project_claude = Some(crate::contain::ProjectClaude {
+            covered: vec![all.clone()],
+            folder: source.clone(),
+            source: source.clone(),
+        });
+        // Run 1 makes nothing.
+        prepare_project_claude(&input).unwrap();
+        assert!(finish_project_files(&input).is_empty());
+        assert!(run_markers(input.project_claude.as_ref().unwrap()).is_empty());
+        // Between runs the person adds hooks of their own: no refusal.
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::write(
+            project.join(".claude/settings.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"make lint"}]}]}}"#,
+        )
+        .unwrap();
+        assert!(project_files_made(&input).is_empty(), "the person's file");
+        // Run 2: its jail makes MCP servers.
+        prepare_project_claude(&input).unwrap();
+        std::fs::write(
+            project.join(".mcp.json"),
+            r#"{"mcpServers":{"evil":{"command":"nc"}}}"#,
+        )
+        .unwrap();
+        let said = finish_project_files(&input);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert!(said[0].contains(".mcp.json"), "{said:?}");
+        // Each next start refuses on it, even after a start that skipped
+        // the check would have pruned what no longer refuses.
+        let why = project_files_made(&input);
+        assert_eq!(why.len(), 1, "{why:?}");
+        assert!(why[0].contains(".mcp.json"), "{why:?}");
+        // The person accepts it: nothing refuses any more.
+        assert_eq!(accept_project_files_for(&input), ExitCode::SUCCESS);
+        assert!(project_files_made(&input).is_empty());
+    }
+
+    /// T-109 item 3: a launch that stopped before its end (no clean end, so
+    /// no judgement) leaves its run marker, and what its jail may have made
+    /// refuses the next start; an earlier launcher's `.absent` is read the
+    /// same way. A start that passes the check takes away what launches that
+    /// no longer run left, and a file the person makes after it is theirs.
+    ///
+    /// FAILS ON REVERT: read only this launch's names.
+    #[cfg(unix)]
+    #[test]
+    fn a_launch_stopped_before_its_end_leaves_its_names_judged() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        let project = r.join("proj");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let mut args = parse_contain_args(&["--".to_string(), "true".to_string()]).unwrap();
+        args.project = project.clone();
+        let mut input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        let all = r.join("state/innerwarden/jail-claude");
+        let source = all.join("proj-0123456789abcdef");
+        std::fs::create_dir_all(&source).unwrap();
+        for dir in [&source, &all] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        input.project_claude = Some(crate::contain::ProjectClaude {
+            covered: vec![all.clone()],
+            folder: source.clone(),
+            source: source.clone(),
+        });
+        // A launch whose pid no longer runs, and an earlier launcher's marker.
+        let gone = all.join("proj-0123456789abcdef.run.2147483646");
+        std::fs::write(&gone, ".mcp.json").unwrap();
+        std::fs::write(all.join("proj-0123456789abcdef.absent"), ".claude").unwrap();
+        assert!(!marker_launch_runs(&gone));
+        std::fs::write(project.join(".mcp.json"), r#"{"mcpServers":{"e":{}}}"#).unwrap();
+        std::fs::create_dir_all(project.join(".claude")).unwrap();
+        std::fs::write(
+            project.join(".claude/settings.local.json"),
+            r#"{"disableAllHooks":true}"#,
+        )
+        .unwrap();
+        assert_eq!(project_files_made(&input).len(), 2);
+        // Both taken away by the person: a start passes and prunes them.
+        std::fs::remove_file(project.join(".mcp.json")).unwrap();
+        std::fs::remove_dir_all(project.join(".claude")).unwrap();
+        assert!(project_files_made(&input).is_empty());
+        prepare_project_claude(&input).unwrap();
+        let left = run_markers(input.project_claude.as_ref().unwrap());
+        assert_eq!(
+            left,
+            vec![run_marker(input.project_claude.as_ref().unwrap()).unwrap()]
+        );
+        assert!(finish_project_files(&input).is_empty());
+        // After the run, the person's own file is theirs.
+        std::fs::write(project.join(".mcp.json"), r#"{"mcpServers":{"mine":{}}}"#).unwrap();
+        assert!(project_files_made(&input).is_empty());
+    }
+
+    /// T-109 item 3: the request to accept is the flag with `--project` and
+    /// nothing else; after the agent's command a flag is the command's.
+    #[test]
+    fn accepting_takes_only_a_project() {
+        let s = |a: &[&str]| a.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            accept_request(&s(&["--accept-project-files"])),
+            Some(Ok(PathBuf::from(".")))
+        );
+        assert_eq!(
+            accept_request(&s(&["--project", "/w/app", "--accept-project-files"])),
+            Some(Ok(PathBuf::from("/w/app")))
+        );
+        assert!(matches!(
+            accept_request(&s(&["--accept-project-files", "--enforce"])),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            accept_request(&s(&["--accept-project-files", "--", "claude"])),
+            Some(Err(_))
+        ));
+        assert_eq!(
+            accept_request(&s(&["--", "claude", "--accept-project-files"])),
+            None
+        );
+        assert_eq!(
+            accept_request(&s(&["claude", "--accept-project-files"])),
+            None
+        );
+        assert_eq!(accept_request(&s(&["--enforce", "--", "claude"])), None);
+    }
+
+    /// T-109 item 2: on macOS too, the launcher clears what a jail wrote in
+    /// its own `~/.claude` at a name the person's folder lacks before the
+    /// next run, and links each shared name the person has
+    /// (`CLAUDE_READ_ONLY_SHARED`) that the jail's folder lacks.
+    ///
+    /// FAILS ON REVERT: leave what the jail wrote, or link nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_what_a_jail_left_is_cleared_and_the_persons_shared_names_linked() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        let project = r.join("proj");
+        std::fs::create_dir_all(home.join(".claude/agents")).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            home.join(".claude/settings.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"sh ~/.claude/hooks/x.sh"}]}]}}"#,
+        )
+        .unwrap();
+        let mut args = parse_contain_args(&["--".to_string(), "true".to_string()]).unwrap();
+        args.project = project.clone();
+        let mut input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        let all = r.join("state/innerwarden/jail-claude");
+        let source = all.join("proj-0123456789abcdef");
+        std::fs::create_dir_all(source.join("hooks")).unwrap();
+        std::fs::create_dir_all(source.join("skills/s")).unwrap();
+        for dir in [&source, &all] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        input.project_claude = Some(crate::contain::ProjectClaude {
+            covered: vec![all.clone()],
+            folder: source.clone(),
+            source: source.clone(),
+        });
+        std::fs::write(source.join("CLAUDE.md"), "JAIL-WROTE").unwrap();
+        std::fs::write(source.join("hooks/x.sh"), "JAIL-WROTE").unwrap();
+        std::fs::write(source.join("skills/s/SKILL.md"), "JAIL-WROTE").unwrap();
+        prepare_project_claude(&input).unwrap();
+        for gone in ["CLAUDE.md", "hooks/x.sh", "skills"] {
+            assert!(
+                std::fs::symlink_metadata(source.join(gone)).is_err(),
+                "{gone}"
+            );
+        }
+        let agents = std::fs::symlink_metadata(source.join("agents")).unwrap();
+        assert!(agents.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(source.join("agents")).unwrap(),
+            home.join(".claude/agents")
+        );
     }
 
     /// Final review of #352, item 1: the start reads the project's

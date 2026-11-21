@@ -4219,6 +4219,8 @@ fn what_a_jail_writes_in_the_projects_claude_files_never_reaches_the_host() {
         err.contains("settings.local.json appeared while a jail ran"),
         "{err}"
     );
+    // T-109 item 1: the launch does not end in success.
+    assert_eq!(made.status.code(), Some(3), "{err}");
     let next = jail_sh(false, h, a, "echo STARTED");
     let err = String::from_utf8_lossy(&next.stderr);
     assert_eq!(next.status.code(), Some(2), "{err}");
@@ -4414,6 +4416,86 @@ fn the_folder_claude_config_dir_names_is_never_written_in_the_jail() {
     // writes; the place of the host's folder takes no write at all.
     assert!(text.contains("MOVED") && text.contains("OWN"), "{text}");
     assert!(!text.contains("WROTE") && !text.contains("MADE"), "{text}");
+
+/// T-109, items 1 and 3: a file the person makes in the project between two
+/// runs (hooks of their own) is theirs, and the next jail starts; one a jail
+/// makes during its run (MCP servers) ends that launch with exit status 3,
+/// refuses the next start naming how to accept it, and once the person
+/// accepts it from their terminal the jail starts again.
+///
+/// FAILS ON REVERT: end the launch in success, keep the names absent until
+/// the next good start (the person's file refuses), or accept nothing.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_jails_project_file_fails_the_launch_and_waits_for_the_persons_accept() {
+    require_bwrap();
+    let home = state_home();
+    let h = home.path();
+    std::fs::create_dir_all(h.join(".claude")).unwrap();
+    let there = tempfile::TempDir::new().unwrap();
+    let p = there.path();
+    let first = jail_sh(false, h, p, "echo ONE");
+    let err = String::from_utf8_lossy(&first.stderr);
+    assert!(first.status.success(), "{err}");
+    // Between runs the person adds hooks of their own.
+    std::fs::create_dir_all(p.join(".claude")).unwrap();
+    std::fs::write(
+        p.join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"make lint"}]}]}}"#,
+    )
+    .unwrap();
+    let mine = jail_sh(false, h, p, "echo TWO");
+    let err = String::from_utf8_lossy(&mine.stderr);
+    assert!(mine.status.success(), "{err}");
+    assert!(
+        String::from_utf8_lossy(&mine.stdout).contains("TWO"),
+        "{err}"
+    );
+    // A jail makes MCP servers.
+    let made = jail_sh(
+        false,
+        h,
+        p,
+        "echo '{\"mcpServers\":{\"e\":{\"command\":\"nc\"}}}' > .mcp.json && echo MADE",
+    );
+    let err = String::from_utf8_lossy(&made.stderr);
+    assert!(
+        String::from_utf8_lossy(&made.stdout).contains("MADE"),
+        "{err}"
+    );
+    assert_eq!(made.status.code(), Some(3), "{err}");
+    assert!(err.contains(".mcp.json appeared while a jail ran"), "{err}");
+    let next = jail_sh(false, h, p, "echo STARTED");
+    let err = String::from_utf8_lossy(&next.stderr);
+    assert_eq!(next.status.code(), Some(2), "{err}");
+    assert!(err.contains("--accept-project-files"), "{err}");
+    let accepted = cli()
+        .args([
+            "contain",
+            "--accept-project-files",
+            "--project",
+            p.to_str().unwrap(),
+        ])
+        .env("HOME", h)
+        .output()
+        .expect("accept");
+    let out = String::from_utf8_lossy(&accepted.stdout);
+    assert!(
+        accepted.status.success(),
+        "{out} {}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    assert!(
+        out.contains("accepted as yours") && out.contains(".mcp.json"),
+        "{out}"
+    );
+    let again = jail_sh(false, h, p, "echo STARTED");
+    let err = String::from_utf8_lossy(&again.stderr);
+    assert!(again.status.success(), "{err}");
+    assert!(
+        String::from_utf8_lossy(&again.stdout).contains("STARTED"),
+        "{err}"
+    );
 }
 
 /// Second review of #352, item 3: a start that could not read the person's
@@ -6442,6 +6524,7 @@ fn a_mount_of_the_jails_own_never_takes_the_hooks_decisions() {
          s = socket.socket(socket.AF_UNIX)\n\
          s.bind('/run/innerwarden-record/graph.sock')\n\
          s.listen(8)\n\
+         open('/run/innerwarden-record/ready', 'w').close()\n\
          while True:\n    \
              c, _ = s.accept()\n    \
              d = c.recv(1 << 20)\n    \
@@ -6450,12 +6533,14 @@ fn a_mount_of_the_jails_own_never_takes_the_hooks_decisions() {
              c.close()\n",
     )
     .unwrap();
+    // Waits for the program to say it listens, or to be gone, and at most
+    // 400 turns of 0.05 s (20 s, as the test beside it gives its program).
     let inner = format!(
         "mount -t tmpfs none /run/innerwarden-record || exit 3; \
-         python3 '{}' & i=0; \
-         while [ ! -S /run/innerwarden-record/graph.sock ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done; \
+         python3 '{}' & F=$!; i=0; \
+         while [ ! -e /run/innerwarden-record/ready ] && kill -0 $F 2>/dev/null && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; \
          mount -o remount,ro /run/innerwarden-record; \
-         {}; if [ -s /tmp/heard ]; then echo HEARD; fi; kill $! 2>/dev/null; true",
+         {}; if [ -s /tmp/heard ]; then echo HEARD; fi; kill $F 2>/dev/null; true",
         fake.display(),
         jail_hook_line("inner"),
     );
