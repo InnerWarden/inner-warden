@@ -40,6 +40,19 @@ list, with every limit.
   settings `HTTP_PROXY`, `HTTPS_PROXY`, `FTP_PROXY`, `ALL_PROXY` and
   `NO_PROXY`, in capitals or lowercase); `--pass-env NAME` hands in any other, and `contain` names every
   variable it kept out, never a value.
+  `--agent openclaw` (Linux) jails OpenClaw instead of Claude Code: the jail
+  shows `~/.openclaw` writable (sessions, databases, workspace) and its
+  config `openclaw.json`, its `.env`, its plugins (`extensions`) and its
+  managed hooks (`hooks`) read-only, so a program in the jail cannot turn the
+  guard plugin off or plant a plugin for the next start; a settings change
+  made from inside the jail is refused. Automatic updates are off in the jail
+  (`OPENCLAW_NO_AUTO_UPDATE=1`). It starts only with the guard plugin wired
+  (`innerwarden agents connect openclaw`), keeps the plugin's mode
+  (`innerwarden enforce` and `monitor` set it, never a `contain` flag), and
+  refuses `--pass-env` of `OPENCLAW_HOME`, `OPENCLAW_STATE_DIR` or
+  `OPENCLAW_CONFIG_PATH`. `~/.ssh`, `~/.aws` and `~/.docker` stay out, as in
+  every jail, and so do docker's and an ssh agent's sockets (no `/var`, an
+  empty `/run` and `/tmp`). Not on macOS in this version.
   The hook inside the jail keeps its record of decisions in the project, in
   `<project>/.innerwarden/graph.json`. On Linux that folder is read-only
   inside the jail: the hook hands each decision, and each line it keeps
@@ -364,6 +377,16 @@ Code's hooks reference, Gemini CLI 0.68.0, Hermes Agent v0.23.1, Codex CLI
 On its own, InnerWarden keeps its record in the home of the account that runs
 it: `~/.config/innerwarden/graph.json`, with the refusals also appended to
 `guard-events.jsonl` beside it. `IW_GRAPH_FILE` moves it anywhere you say.
+A call the MCP proxy refuses is written to the guard's own record too (the
+one `innerwarden status` reads, where it would be without `IW_GRAPH_FILE`),
+graph and `guard-events.jsonl` line, whatever the proxy's environment says:
+whoever starts the proxy can move its record, but not hide a refusal from
+you. What `IW_GRAPH_FILE` still moves is everything else the proxy records
+(every allowed call, and what advisory and warn only record).
+`INNERWARDEN_AGENT_URL=off` turns off only the report of each refusal to an
+InnerWarden Pro agent on the same machine (`POST /api/agent/proxy-block`);
+the refusal is still recorded, and Pro still reads the `guard.blocked` line
+from the shared record where it is installed.
 
 When InnerWarden Pro is installed on the same machine, its installer writes
 `/etc/innerwarden/guard.toml`, which names a shared record in

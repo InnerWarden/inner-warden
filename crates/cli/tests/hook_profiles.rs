@@ -348,6 +348,9 @@ impl Host {
             .env("HOME", self.home())
             .env("IW_GRAPH_FILE", self.dir.path().join("graph.json"))
             .env("INNERWARDEN_AGENT_URL", "off")
+            // Never the shared record of a host with InnerWarden Pro: the
+            // refusal's copy goes to the guard's own record.
+            .env("IW_TEST_GUARD_CONFIG", self.home().join("no-guard.toml"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

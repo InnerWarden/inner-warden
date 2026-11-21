@@ -122,7 +122,8 @@ impl std::fmt::Display for ContainError {
         match self {
             ContainError::UnknownAgent(a) => write!(
                 f,
-                "unsupported agent '{a}' (only 'claude-code' is supported today)"
+                "unsupported agent '{a}' (supported: {})",
+                CONTAIN_AGENTS.join(", ")
             ),
             ContainError::NoCommand => write!(
                 f,
@@ -132,6 +133,136 @@ impl std::fmt::Display for ContainError {
             ContainError::UnknownFlag(x) => write!(f, "unknown flag `{x}`"),
         }
     }
+}
+
+/// The agents `contain --agent` jails. `claude-code` (the default): the
+/// guard is its PreToolUse hook. `openclaw`: the guard is OpenClaw's
+/// `innerwarden-guard` plugin, which `agents connect openclaw` installs, and
+/// the jail keeps OpenClaw's own folder ([`OPENCLAW_DIR`]).
+pub const CONTAIN_AGENTS: [&str; 2] = ["claude-code", OPENCLAW_AGENT];
+
+/// The agent type of OpenClaw ([`crate::openclaw_guard::AGENT`]).
+pub const OPENCLAW_AGENT: &str = "openclaw";
+
+/// OpenClaw's folder under the home: its state, config, plugins, hooks,
+/// agents, sessions and workspace (`OPENCLAW_STATE_DIR`, default
+/// `~/.openclaw`, in OpenClaw 2026.9.7's `docs/help/environment.md`). A jail
+/// of `--agent openclaw` shows it writable: the gateway writes its sessions,
+/// its databases and its workspace there.
+pub(crate) const OPENCLAW_DIR: &str = ".openclaw";
+
+/// What of [`OPENCLAW_DIR`] decides which code OpenClaw on the host runs,
+/// and so whether the guard runs: its config (`openclaw.json`, which wires
+/// the plugin and its mode), its global `.env` (read at every start: a
+/// variable written there, `OPENCLAW_CONFIG_PATH` say, moves the config),
+/// its plugins (`extensions`, the guard's among them) and its managed hooks
+/// (`hooks`). A jail shows each read-only over the writable folder, so a
+/// program in it can neither turn the guard off for the next start nor plant
+/// a plugin or a hook there. The gateway keeps working: its start validates
+/// the config without writing it, and a token it makes on loopback is
+/// runtime-only (`docs/gateway/doctor/config-migrations.md`,
+/// `docs/gateway/tailscale.md` of 2026.9.7); a settings change from inside
+/// the jail is refused. The launcher makes the ones that are not there
+/// (an empty `.env`, empty folders) before the jail starts, never
+/// `openclaw.json`: without it the guard is not wired, and the jail does
+/// not start.
+pub(crate) const OPENCLAW_GUARD_PATHS: [&str; 4] = ["openclaw.json", ".env", "extensions", "hooks"];
+
+/// The variables that move OpenClaw's folder or config away from
+/// [`OPENCLAW_DIR`] (`docs/help/environment.md` of 2026.9.7). The launcher
+/// keeps every one out of the jail already ([`env_goes_in`]); handed in with
+/// `--pass-env`, the jail's OpenClaw would read a config the jail does not
+/// hold read-only, so a launch of `--agent openclaw` that hands one in is
+/// refused ([`openclaw_pass_env_refusal`]).
+pub const OPENCLAW_PLACE_ENV: [&str; 3] = [
+    "OPENCLAW_HOME",
+    "OPENCLAW_STATE_DIR",
+    "OPENCLAW_CONFIG_PATH",
+];
+
+/// The variable that turns off OpenClaw's automatic updates, set in every
+/// jail of `--agent openclaw`: "Disable automatic update applies"
+/// (`docs/help/environment.md` of 2026.9.7), the gateway's and a headless
+/// node's (`docs/install/updating/automatic-updates.md`). A jail never
+/// replaces the program the host runs.
+pub const OPENCLAW_NO_AUTO_UPDATE: (&str, &str) = ("OPENCLAW_NO_AUTO_UPDATE", "1");
+
+/// PURE. Why a launch of `agent` that hands `pass_env` in is refused, or
+/// `None`: `--agent openclaw` with a variable of [`OPENCLAW_PLACE_ENV`].
+pub fn openclaw_pass_env_refusal(agent: &str, pass_env: &[String]) -> Option<String> {
+    if agent != OPENCLAW_AGENT {
+        return None;
+    }
+    let name = pass_env
+        .iter()
+        .find(|name| OPENCLAW_PLACE_ENV.contains(&name.as_str()))?;
+    Some(format!(
+        "refusing to start: --pass-env {name} moves OpenClaw's folder or config out of \
+            ~/{OPENCLAW_DIR}, which the jail holds read-only where it wires the guard;          start without it"
+    ))
+}
+
+/// PURE. Why `contain --agent openclaw` does not start on this OS, or
+/// `None`: the jail of OpenClaw is a Linux jail in this version.
+pub fn openclaw_os_refusal(agent: &str, macos: bool) -> Option<String> {
+    (agent == OPENCLAW_AGENT && macos).then(|| {
+        "--agent openclaw runs in a Linux jail in this version; on macOS, start OpenClaw \
+            with the guard plugin (`agents connect openclaw`) and without a jail"
+            .to_string()
+    })
+}
+
+/// PURE. Why the jail of `--agent openclaw` planned from `input` does not
+/// start, or `None`: OpenClaw's folder, or one of what of it wires the
+/// guard ([`OPENCLAW_GUARD_PATHS`]), is not among the places the launcher
+/// found there. Each is bound by name, never with `-try`: one left out would
+/// be one a program in the jail could make for the next start.
+fn openclaw_paths_refusal(input: &JailInputs) -> Option<String> {
+    if input.args.agent != OPENCLAW_AGENT {
+        return None;
+    }
+    let dir = input.home.join(OPENCLAW_DIR);
+    std::iter::once(dir.clone())
+        .chain(OPENCLAW_GUARD_PATHS.iter().map(|name| dir.join(name)))
+        .find(|path| !input.exists(path))
+        .map(|path| {
+            format!(
+                "refusing to start: {} is not there; the jail of OpenClaw shows it read-only \
+                    (`innerwarden agents connect openclaw` wires the guard)",
+                path.display()
+            )
+        })
+}
+
+/// PURE. Why `contain --agent openclaw` does not start with OpenClaw's
+/// folder at `dir` (`~/.openclaw` as named), or `None`. `link`: it is a
+/// link (no mount pins a link, and a program in the jail could replace
+/// what it leads to); `config`: `openclaw.json` is there as a file; `guard`:
+/// the guard plugin is installed and its entry on (`agents connect
+/// openclaw`). The jail holds the guard's wiring read-only; it never makes
+/// it.
+pub fn openclaw_dir_refusal(dir: &Path, link: bool, config: bool, guard: bool) -> Option<String> {
+    let dir = dir.display();
+    if link {
+        return Some(format!(
+            "refusing to start: {dir} is a link; the jail shows OpenClaw's own folder only \
+                where it is"
+        ));
+    }
+    if !config {
+        return Some(format!(
+            "refusing to start: {dir}/openclaw.json is not there; set OpenClaw up first \
+                (`openclaw onboard`), then `innerwarden agents connect openclaw`"
+        ));
+    }
+    if !guard {
+        return Some(
+            "refusing to start: InnerWarden's guard plugin is not wired in OpenClaw (or its \
+                entry is turned off); run `innerwarden agents connect openclaw` first, so the              jail starts with the guard on"
+                .to_string(),
+        );
+    }
+    None
 }
 
 /// The project-relative secret globs denied by default inside the jail.
@@ -209,8 +340,11 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
         }
     }
 
-    if agent != "claude-code" {
+    if !CONTAIN_AGENTS.contains(&agent.as_str()) {
         return Err(ContainError::UnknownAgent(agent));
+    }
+    if let Some(why) = openclaw_pass_env_refusal(&agent, &pass_env) {
+        return Err(ContainError::Unsupported(why));
     }
     if child.is_empty() && !setup_only {
         return Err(ContainError::NoCommand);
@@ -2917,6 +3051,8 @@ pub fn validate_jail_inputs_for(input: &JailInputs, macos: bool) -> Result<(), C
     let protected = protected_host_paths(input);
     let refuse =
         |why: Option<String>| why.map_or(Ok(()), |why| Err(ContainError::Unsupported(why)));
+    refuse(openclaw_os_refusal(&input.args.agent, macos))?;
+    refuse(openclaw_paths_refusal(input))?;
     // `hidden`: a bind the agent can name (a worktree's folders, named by
     // the project's `.git`) or a profile's path, which may not show where a
     // hidden dotdir leads either. The project is not held to that: a
@@ -4012,6 +4148,23 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
         }
     }
 
+    // --- OpenClaw's folder (`--agent openclaw`), writable, with what of it
+    // wires the guard read-only over it ([`OPENCLAW_GUARD_PATHS`]), after
+    // every writable bind, so nothing the jail writes covers them; a
+    // profile's hidden home paths, after it, still hide what they name in it
+    // (`.openclaw/credentials`). The jail shows no `/var` and an empty `/run`
+    // and `/tmp`, so no socket of docker's or of an ssh agent; `SSH_AUTH_SOCK`
+    // and the rest stay out of the environment ([`env_goes_in`]). ---
+    if input.args.agent == OPENCLAW_AGENT {
+        let dir = input.home.join(OPENCLAW_DIR);
+        let at = dir.to_string_lossy().to_string();
+        push(&["--bind", &at, &at]);
+        for name in OPENCLAW_GUARD_PATHS {
+            let path = dir.join(name).to_string_lossy().to_string();
+            push(&["--ro-bind", &path, &path]);
+        }
+    }
+
     // --- the home paths a jail profile hides that exist (`hide_home`),
     // after every writable bind, so none of them brings one back: a folder
     // under an empty tmpfs, a file under /dev/null. Empty unless a profile
@@ -4595,6 +4748,10 @@ pub fn compute_jail_env(input: &JailInputs) -> Vec<(String, String)> {
             input.args.agent.clone(),
         ));
     }
+    if input.args.agent == OPENCLAW_AGENT {
+        let (name, value) = OPENCLAW_NO_AUTO_UPDATE;
+        env.push((name.to_string(), value.to_string()));
+    }
     env
 }
 
@@ -4693,6 +4850,9 @@ pub fn userns_restriction_advice(
             "  This distribution's own profile for bwrap grants it one once it is loaded:".into(),
             format!("    sudo apparmor_parser -r {DISTRO_BWRAP_PROFILE}"),
             "".into(),
+            SYSCTL_ADVICE[0].into(),
+            SYSCTL_ADVICE[1].into(),
+            "".into(),
             RESTRICTION_ADVICE_END.into(),
         ]);
     }
@@ -4716,9 +4876,22 @@ pub fn userns_restriction_advice(
         "    EOF".into(),
         "    sudo apparmor_parser -r /etc/apparmor.d/bwrap".into(),
         "".into(),
+        SYSCTL_ADVICE[0].into(),
+        SYSCTL_ADVICE[1].into(),
+        "".into(),
         RESTRICTION_ADVICE_END.into(),
     ])
 }
+
+/// The other fix [`userns_restriction_advice`] names, after the profile:
+/// lifting the restriction for every program, which is what CI does
+/// (NEW-20261121-jail-tests-fail-on-azure-dev-vm). Weaker than the
+/// profile, so said second; until the next boot unless written to
+/// `/etc/sysctl.d`.
+pub const SYSCTL_ADVICE: [&str; 2] = [
+    "  Or lift the restriction for every program (weaker; until the next boot unless also set in /etc/sysctl.d):",
+    "    sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+];
 
 /// What `contain` says when bwrap could not make a user namespace on a host
 /// with no AppArmor restriction (the case [`userns_restriction_advice`] does
@@ -6973,6 +7146,24 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("Nothing was run"), "{text}");
+        // The other fix, the sysctl, after the profile (NEW-20261121).
+        let sysctl = text
+            .find("sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0")
+            .expect("the sysctl fix");
+        assert!(text.find("apparmor_parser -r").unwrap() < sysctl, "{text}");
+        let distro = UsernsGrant {
+            distro_profile: true,
+            probed: Some(false),
+            ..none
+        };
+        let lines = userns_restriction_advice(Some("1"), distro, bwrap).unwrap();
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("apparmor_restrict_unprivileged_userns=0")));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(RESTRICTION_ADVICE_END)
+        );
         // With the profile on disk the jail builds: say nothing.
         let own = UsernsGrant {
             own_profile: true,
@@ -15941,4 +16132,225 @@ mod tests {
         /bin/sh\n\
         -c\n\
         true";
+
+    /// The identified-or-plain jail of `--agent openclaw` running the gateway
+    /// as OpenClaw's own user unit starts it (`ExecStart=/usr/local/bin/openclaw
+    /// gateway --port 18789`, `docs/gateway/index.md` of 2026.9.7), on a
+    /// home with OpenClaw's folder and the guard's wiring there, and with
+    /// keys, cloud credentials and docker's folder too.
+    fn openclaw_inputs() -> JailInputs {
+        let mut input = inputs(&["/usr/local/bin/openclaw", "gateway", "--port", "18789"]);
+        input.args.agent = OPENCLAW_AGENT.into();
+        let dir = PathBuf::from("/home/dev/.openclaw");
+        input.existing_paths.push(dir.clone());
+        for name in OPENCLAW_GUARD_PATHS {
+            input.existing_paths.push(dir.join(name));
+        }
+        for name in [".aws", ".docker", ".local"] {
+            input
+                .existing_paths
+                .push(PathBuf::from("/home/dev").join(name));
+        }
+        input
+    }
+
+    /// NEW-20261031-contain-agent-openclaw-unsupported: `--agent openclaw`
+    /// is taken, alone with `claude-code`; any other agent is still refused,
+    /// and so is a launch of OpenClaw that hands in a variable that moves its
+    /// folder or config.
+    ///
+    /// FAILS ON REVERT: accept only `claude-code` and the first parse fails.
+    #[test]
+    fn contain_takes_openclaw_and_refuses_what_moves_its_folder() {
+        let a = parse_contain_args(&[
+            "--agent".into(),
+            "openclaw".into(),
+            "--identity".into(),
+            "--".into(),
+            "openclaw".into(),
+            "gateway".into(),
+        ])
+        .unwrap();
+        assert_eq!(a.agent, "openclaw");
+        assert!(a.identity);
+        assert_eq!(a.child, ["openclaw", "gateway"]);
+        let why = parse_contain_args(&["--agent".into(), "cursor".into(), "--".into(), "x".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("claude-code, openclaw"), "{why}");
+        for name in OPENCLAW_PLACE_ENV {
+            let why = parse_contain_args(&[
+                "--agent".into(),
+                "openclaw".into(),
+                "--pass-env".into(),
+                name.into(),
+                "--".into(),
+                "openclaw".into(),
+            ])
+            .unwrap_err()
+            .to_string();
+            assert!(why.contains(name) && why.contains("refusing"), "{why}");
+            // Claude Code's jail is not OpenClaw's: the name passes there.
+            assert!(parse_contain_args(&[
+                "--pass-env".into(),
+                name.into(),
+                "--".into(),
+                "claude".into()
+            ])
+            .is_ok());
+        }
+    }
+
+    /// The profile of OpenClaw is applied: its folder is bound writable,
+    /// and its config, its global `.env`, its plugins and its hooks are
+    /// bound read-only over it, after the project and after every mask laid
+    /// again, so no writable bind covers them; automatic updates are off in
+    /// the jail. A jail of Claude Code has none of it.
+    ///
+    /// FAILS ON REVERT: drop the read-only binds and the plugin's folder is
+    /// writable in the jail; drop the variable and the gateway may replace
+    /// itself.
+    #[test]
+    fn the_openclaw_profile_binds_its_folder_and_holds_the_guard_read_only() {
+        for identity in [false, true] {
+            let mut input = openclaw_inputs();
+            input.args.identity = identity;
+            let plan = build_linux_jail(&input).unwrap();
+            let got = &plan.bwrap_args;
+            let dir = "/home/dev/.openclaw";
+            let bind = got
+                .windows(3)
+                .position(|w| w == ["--bind", dir, dir])
+                .unwrap_or_else(|| panic!("{got:?}"));
+            let project = got
+                .windows(3)
+                .position(|w| w == ["--bind", "/home/dev/proj", "/home/dev/proj"])
+                .unwrap();
+            let masks = got
+                .windows(2)
+                .rposition(|w| w == ["--tmpfs", "/home/dev/.config/innerwarden"])
+                .unwrap();
+            assert!(project < bind && masks < bind, "{got:?}");
+            for name in OPENCLAW_GUARD_PATHS {
+                let path = format!("{dir}/{name}");
+                let at = got
+                    .windows(3)
+                    .position(|w| w == ["--ro-bind", path.as_str(), path.as_str()])
+                    .unwrap_or_else(|| panic!("{path}: {got:?}"));
+                assert!(bind < at, "{path}: {got:?}");
+                // Nothing after it binds over it writable.
+                assert!(
+                    !got[at + 3..]
+                        .windows(3)
+                        .any(|w| w[0] == "--bind" && Path::new(&w[2]).starts_with(dir)),
+                    "{got:?}"
+                );
+            }
+            assert!(
+                plan.env
+                    .contains(&("OPENCLAW_NO_AUTO_UPDATE".to_string(), "1".to_string())),
+                "{:?}",
+                plan.env
+            );
+        }
+        let claude = build_linux_jail(&inputs(&["claude"])).unwrap();
+        assert!(!claude.bwrap_args.iter().any(|a| a.contains(".openclaw")));
+        assert!(!claude
+            .env
+            .iter()
+            .any(|(name, _)| name.starts_with("OPENCLAW")));
+    }
+
+    /// The jail of OpenClaw keeps out what the card names: `~/.ssh`, `~/.aws`
+    /// and docker's folder are never bound though they are there; no `/var`
+    /// is shown (docker's socket is `/var/run/docker.sock`), and `/run` and
+    /// `/tmp` are empty folders of the jail's own (where an ssh agent's socket
+    /// is); the variables naming them stay out of its environment.
+    ///
+    /// FAILS ON REVERT: bind `/var` or the home's `.docker` and the docker
+    /// socket or its credentials are in the jail.
+    #[test]
+    fn the_openclaw_jail_keeps_keys_clouds_and_sockets_out() {
+        let got = build_linux_jail(&openclaw_inputs()).unwrap().bwrap_args;
+        for hidden in ["/home/dev/.ssh", "/home/dev/.aws", "/home/dev/.docker"] {
+            assert!(
+                !got.windows(3)
+                    .any(|w| w[0].contains("bind") && (w[1] == hidden || w[2] == hidden)),
+                "{hidden}: {got:?}"
+            );
+        }
+        assert!(!got
+            .iter()
+            .any(|a| a.starts_with("/var") || a.contains("docker.sock")));
+        assert!(got.windows(2).any(|w| w == ["--tmpfs", "/run"]));
+        assert!(got.windows(2).any(|w| w == ["--tmpfs", "/tmp"]));
+        for name in [
+            "SSH_AUTH_SOCK",
+            "SSH_AGENT_PID",
+            "DOCKER_HOST",
+            "AWS_PROFILE",
+        ] {
+            assert!(!env_goes_in(std::ffi::OsStr::new(name), &[]), "{name}");
+        }
+    }
+
+    /// The gateway starts in the jail: the command of OpenClaw's user unit
+    /// is the jail's command, after `--`, as written; the network is the
+    /// host's (no `--unshare-net`, it listens on 18789 and reaches its
+    /// model); `/usr` (where the unit's `openclaw` is) is shown; its folder
+    /// is writable for its sessions and databases.
+    ///
+    /// FAILS ON REVERT: unshare the network, or leave its folder out, and
+    /// the gateway cannot serve or keep its state.
+    #[test]
+    fn the_gateway_of_openclaw_starts_in_the_jail() {
+        let got = build_linux_jail(&openclaw_inputs()).unwrap().bwrap_args;
+        let end = got.iter().position(|a| a == "--").unwrap();
+        assert_eq!(
+            got[end + 1..],
+            ["/usr/local/bin/openclaw", "gateway", "--port", "18789"]
+        );
+        assert!(!got
+            .iter()
+            .any(|a| a == "--unshare-net" || a == "--unshare-all"));
+        assert!(got.windows(3).any(|w| w == ["--ro-bind", "/usr", "/usr"]));
+        assert!(got
+            .windows(3)
+            .any(|w| w == ["--bind", "/home/dev/.openclaw", "/home/dev/.openclaw"]));
+    }
+
+    /// The jail of OpenClaw does not start where a part of the guard's
+    /// wiring is not there (each is bound by name, so a program in the jail
+    /// could not make one), nor on macOS in this version; OpenClaw's folder
+    /// as a link, with no config, or with the guard not wired, is refused
+    /// before anything is made.
+    ///
+    /// FAILS ON REVERT: bind with `-try` and skip the check, and a jail
+    /// with no `hooks` folder lets a program plant one.
+    #[test]
+    fn the_openclaw_jail_needs_the_guards_wiring_there() {
+        for name in OPENCLAW_GUARD_PATHS {
+            let mut input = openclaw_inputs();
+            let gone = PathBuf::from("/home/dev/.openclaw").join(name);
+            input.existing_paths.retain(|path| *path != gone);
+            let why = build_linux_jail(&input).unwrap_err().to_string();
+            assert!(why.contains(&gone.display().to_string()), "{why}");
+        }
+        let why = validate_jail_inputs_for(&openclaw_inputs(), true)
+            .unwrap_err()
+            .to_string();
+        assert!(why.contains("Linux jail"), "{why}");
+        assert_eq!(openclaw_os_refusal("claude-code", true), None);
+        let dir = Path::new("/home/dev/.openclaw");
+        assert!(openclaw_dir_refusal(dir, true, true, true)
+            .unwrap()
+            .contains("is a link"));
+        assert!(openclaw_dir_refusal(dir, false, false, true)
+            .unwrap()
+            .contains("openclaw.json"));
+        assert!(openclaw_dir_refusal(dir, false, true, false)
+            .unwrap()
+            .contains("agents connect openclaw"));
+        assert_eq!(openclaw_dir_refusal(dir, false, true, true), None);
+    }
 }

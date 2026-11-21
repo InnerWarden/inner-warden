@@ -1133,7 +1133,7 @@ pub fn record_mcp(
     // arguments, already cut at 240 characters by the router
     // (`MAX_TOOL_SUMMARY_CHARS`). The raw arguments never reach this boundary,
     // so nothing past those 240 characters is kept anywhere.
-    record(
+    let decision = prepare(
         summary,
         &verdict,
         mode,
@@ -1142,6 +1142,57 @@ pub fn record_mcp(
         None,
         mcp_origin(decision, agent, identity),
     );
+    if record_prepared(&decision).is_none() {
+        return;
+    }
+    // NEW-20261102-free-mcp-proxy-env-hides-refusals: whoever controls the
+    // proxy's environment chose where its record goes (`IW_GRAPH_FILE`) and
+    // whether the local agent hears of a refusal (`INNERWARDEN_AGENT_URL=off`),
+    // and the refusals, which still held, were out of the operator's sight. A
+    // refusal is also written to the guard's own record, the one
+    // `innerwarden status` reads, whatever those variables say.
+    if outcome == DecisionOutcome::Blocked {
+        let config = refusal_copy_config();
+        if let Some(local) = refusal_copy_path(&config, |key| std::env::var(key).ok()) {
+            persist(&local, &decision);
+        }
+    }
+}
+
+/// The product config that says where the guard's own record is, read for
+/// the copy of a refusal ([`refusal_copy_path`]): [`GUARD_CONFIG_PATH`].
+/// A debug build (this repository's tests) takes another from
+/// `IW_TEST_GUARD_CONFIG`, so the suite, run on a host where InnerWarden Pro
+/// is installed, never writes its made-up refusals into that host's shared
+/// record. A release build has no such variable.
+///
+/// [`GUARD_CONFIG_PATH`]: innerwarden_graph::GUARD_CONFIG_PATH
+fn refusal_copy_config() -> std::path::PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(path) = std::env::var_os("IW_TEST_GUARD_CONFIG") {
+        return path.into();
+    }
+    std::path::PathBuf::from(innerwarden_graph::GUARD_CONFIG_PATH)
+}
+
+/// Where a refusal is written too, besides the record the environment
+/// moved it to, or `None`: the guard's own record (the place without
+/// `IW_GRAPH_FILE`, which `innerwarden status` reads), when `IW_GRAPH_FILE`
+/// moved this process's record away from it. `None` when the record was not
+/// moved, or the override names that same file.
+fn refusal_copy_path(
+    config_path: &std::path::Path,
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<std::path::PathBuf> {
+    let moved = resolve_with(config_path, &get);
+    if moved.source != innerwarden_graph::GraphPathSource::EnvironmentOverride {
+        return None;
+    }
+    let local = resolve_with(config_path, |key: &str| {
+        (key != "IW_GRAPH_FILE").then(|| get(key)).flatten()
+    })
+    .path?;
+    (moved.path.as_deref() != Some(local.as_path())).then_some(local)
 }
 
 fn mcp_context(decision: &ProxyDecision, proxy_mode: ProxyMode) -> (DecisionMode, DecisionOutcome) {
@@ -1246,6 +1297,13 @@ fn record(
         source_event_id,
         origin,
     );
+    record_prepared(&decision);
+}
+
+/// Write one prepared decision where this process keeps its record: to the
+/// launcher inside a jail that keeps it, else into [`graph_path`]. The path
+/// written, `None` inside such a jail or with no record.
+fn record_prepared(decision: &crate::jail_record::Decision) -> Option<std::path::PathBuf> {
     // Inside a jail whose launcher keeps the record, the decision goes to
     // the launcher and nowhere else: the record folder is read-only here,
     // and a path from the environment (`IW_GRAPH_FILE`, which a program in
@@ -1254,14 +1312,15 @@ fn record(
     if crate::jail_record::in_record_jail() {
         let handed = crate::jail_record::socket_here()
             .ok_or("jail_record_unreachable")
-            .and_then(|socket| crate::jail_record::hand_over(&socket, &decision));
+            .and_then(|socket| crate::jail_record::hand_over(&socket, decision));
         if let Err(code) = handed {
             eprintln!("innerwarden: graph record skipped ({code})");
         }
-        return;
+        return None;
     }
-    let Some(path) = graph_path() else { return };
-    persist(&path, &decision);
+    let path = graph_path()?;
+    persist(&path, decision);
+    Some(path)
 }
 
 /// [`record`] into the graph at `path` (and `guard-events.jsonl` beside it).
@@ -4138,6 +4197,38 @@ mod tests {
             })
             .expect("preserved corrupt sibling");
         assert_eq!(std::fs::read(preserved).unwrap(), corrupt);
+    }
+
+    /// NEW-20261102-free-mcp-proxy-env-hides-refusals: where `IW_GRAPH_FILE`
+    /// moved the record, a refusal is written to the guard's own record too
+    /// (the place without the override, which `innerwarden status` reads);
+    /// not moved, or moved onto that same file, nothing more is written.
+    ///
+    /// FAILS ON REVERT: answer `None` always and the refusal stays only
+    /// where the environment sent it.
+    #[test]
+    fn a_refusal_moved_by_the_environment_is_kept_in_the_guards_record_too() {
+        let home = tempfile::TempDir::new().unwrap();
+        let config = home.path().join("no-guard.toml");
+        let own = home.path().join(".config/innerwarden/graph.json");
+        let home_text = home.path().to_string_lossy().to_string();
+        let env = |graph: Option<String>| {
+            let home_text = home_text.clone();
+            move |key: &str| match key {
+                "HOME" => Some(home_text.clone()),
+                "IW_GRAPH_FILE" => graph.clone(),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            refusal_copy_path(&config, env(Some("/elsewhere/graph.json".into()))),
+            Some(own.clone())
+        );
+        assert_eq!(refusal_copy_path(&config, env(None)), None);
+        assert_eq!(
+            refusal_copy_path(&config, env(Some(own.to_string_lossy().to_string()))),
+            None
+        );
     }
 }
 

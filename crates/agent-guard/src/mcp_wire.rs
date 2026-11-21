@@ -407,7 +407,17 @@ fn unwrap_server(server: &mut Value) -> bool {
     let orig_cmd = args[separator + 1].as_str().unwrap_or_default().to_string();
     let orig_args: Vec<Value> = args[separator + 2..].to_vec();
     obj.insert("command".into(), json!(orig_cmd));
-    obj.insert("args".into(), json!(orig_args));
+    // A server that had no arguments goes back without an `args` entry
+    // (NEW-20261121-mcp-json-disconnect-leaves-empty-args): connect wrote
+    // one where there was none, and disconnect left `"args": []` behind.
+    // JSON has no comment to mark the entry connect added (the YAML of
+    // Goose carries one), and an empty list and no list run the same
+    // server, so no arguments left is read as no entry.
+    if orig_args.is_empty() {
+        obj.remove("args");
+    } else {
+        obj.insert("args".into(), json!(orig_args));
+    }
     true
 }
 
@@ -1205,6 +1215,36 @@ mod nested_table_tests {
             !is_automatic_wrap_safe(&cfg),
             "automatic wiring must refuse a config it cannot rewrite safely"
         );
+    }
+
+    /// NEW-20261121-mcp-json-disconnect-leaves-empty-args: connect, then
+    /// disconnect, gives back the entry as it was: a server with no `args`
+    /// comes back without one (it used to come back with `"args": []`), a
+    /// server with arguments comes back with the same list, in every table
+    /// and in both modes; the keys beside them stay.
+    ///
+    /// FAILS ON REVERT: write `args` back always and the first entry
+    /// keeps `"args": []`.
+    #[test]
+    fn a_disconnect_gives_back_each_entry_as_it_was() {
+        let cfg = json!({
+            "mcpServers": {
+                "bare": {"command": "my-server", "env": {"A": "1"}},
+                "full": {"command": "npx", "args": ["-y", "fs-server", "/tmp"]}
+            },
+            "servers": {"vs": {"type": "stdio", "command": "uvx"}},
+            "mcp": {"servers": {"claw": {"command": "node"}}}
+        });
+        for monitor in [false, true] {
+            let (wrapped, n) = wrap(cfg.clone(), "/usr/bin/innerwarden", monitor, "cursor");
+            assert_eq!(n, 4);
+            assert!(is_guarded(&wrapped), "{wrapped}");
+            assert!(wrapped["mcpServers"]["bare"]["args"].is_array());
+            let (restored, n) = unwrap(wrapped);
+            assert_eq!(n, 4);
+            assert_eq!(restored, cfg, "{restored}");
+            assert!(restored["mcpServers"]["bare"].get("args").is_none());
+        }
     }
 }
 

@@ -15,6 +15,18 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Added
 
+- **`innerwarden contain --agent openclaw` (Linux).** OpenClaw runs in the
+  AI Jail with a profile of its own: `~/.openclaw` writable (sessions,
+  databases, workspace), and its config, its `.env`, its plugins and its
+  managed hooks read-only, so a program in the jail cannot turn the guard
+  plugin off or plant a plugin for the next start. Automatic updates are off
+  in the jail (`OPENCLAW_NO_AUTO_UPDATE=1`). `~/.ssh`, `~/.aws`, docker's
+  folder and socket and an ssh agent's socket stay out, as in every jail. It
+  starts only with the guard plugin wired (`agents connect openclaw`), keeps
+  the plugin's own mode, and refuses `--pass-env` of a variable that moves
+  OpenClaw's folder or config. What OpenClaw uses was read from OpenClaw
+  2026.9.7's own documentation and is held by unit tests; the jail was not
+  run with a live gateway here.
 - **Goose's MCP servers are wired through the proxy.** `innerwarden agents
   connect goose` now routes every `type: stdio` extension in
   `~/.config/goose/config.yaml` through `innerwarden proxy`, naming Goose,
@@ -173,6 +185,20 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Fixed
 
+- **A refusal of the MCP proxy always reaches the guard's own record.**
+  Whoever starts the proxy could move its record (`IW_GRAPH_FILE`) and turn
+  off its report to the local agent (`INNERWARDEN_AGENT_URL=off`), and the
+  refusals, which still held, were out of the operator's sight. A refused
+  call is now also written to the record `innerwarden status` reads, graph
+  and `guard.blocked` line. `INNERWARDEN_AGENT_URL=off` turns off only the
+  report.
+- **Disconnect gives a JSON MCP server back as it was.** A server that had
+  no `args` no longer comes back with `"args": []`.
+- **The jail names both fixes for Ubuntu's user namespace restriction.**
+  Where `kernel.apparmor_restrict_unprivileged_userns = 1` keeps bwrap from
+  starting a jail, `contain` now names lifting the sysctl too, after the
+  AppArmor profile, and the jail tests are skipped there with that reason
+  instead of failing (in CI they still fail).
 - **A shell tool's call that names its program in `argv` is judged by its
   line.** `run_shell {"argv": ["ls", "-la"]}` and `{"program": "ls", "args":
   []}` were refused by ATR-2026-040 for the tool's name: `argv` with no

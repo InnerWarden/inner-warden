@@ -1670,6 +1670,8 @@ impl Server {
             unsafe {
                 libc::killpg(group, signo);
             }
+            #[cfg(test)]
+            let _ = TEST_SIGNALS.try_with(|sent| sent.lock().unwrap().push(signo));
         }
     }
 
@@ -1762,6 +1764,15 @@ fn stop_grace() -> Duration {
 #[cfg(test)]
 tokio::task_local! {
     static TEST_STOP_GRACE: Duration;
+}
+
+#[cfg(all(test, unix))]
+tokio::task_local! {
+    /// Each signal a test's proxy sent its server's group, in the order it
+    /// sent them: a test proves the order (asked to stop, then killed, then
+    /// the session's end reported) by this list, not by how soon a server
+    /// on a loaded runner got the CPU to say it was asked.
+    static TEST_SIGNALS: std::sync::Arc<std::sync::Mutex<Vec<i32>>>;
 }
 
 /// Resolves when the process is asked to stop: SIGTERM, SIGHUP or SIGINT.
@@ -3370,12 +3381,18 @@ mod tests {
         // asked to stop with SIGTERM, so it can finish cleanly, and is not left
         // to the SIGKILL of a dropped child.
         //
-        // The proxy waits for a signal here, not for its 1 s grace: for this
-        // proxy only, the grace is a bound of 5 s on the wait for the
-        // server's group to be gone, which ends as soon as the trap exits.
-        // With the 1 s grace, a loaded runner killed a server whose trap had
-        // not yet run, and this failed with nothing wrong in the proxy. A
-        // proxy that kills without asking still leaves the file empty.
+        // Proved by order and count, never by how long a server takes to get
+        // the CPU (NEW-20261118-mcp-transport-test-flaky-macos: with a grace
+        // of 1 s, then 5 s, a loaded macOS runner killed a server whose trap
+        // had not yet run, and this failed with nothing wrong in the proxy).
+        // The proxy records each signal it sends the server's group: when
+        // its error comes back, exactly one SIGTERM was sent, and first; a
+        // SIGKILL, if any, after it. For this proxy only the grace has no
+        // bound a runner can reach, so the wait for the group ends when the
+        // trap has written and exited, whatever the load: the trap's file
+        // then says the server got the request, by order alone. A proxy that
+        // kills without asking leaves no SIGTERM in the list and the file
+        // empty. The outer timeout only catches a hang.
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("server.pid");
         let asked = dir.path().join("asked-to-stop");
@@ -3383,33 +3400,51 @@ mod tests {
         let (_to_proxy, proxy_in) = duplex(16384);
         let (proxy_out, from_proxy) = duplex(16384);
         drop(from_proxy);
+        let sent = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            TEST_STOP_GRACE.scope(
-                std::time::Duration::from_secs(5),
-                run_proxy_with_io(
-                    proxy_in,
-                    proxy_out,
-                    advisory(vec![
-                        "sh".into(),
-                        "-c".into(),
-                        script.into(),
-                        "sh".into(),
-                        pid_file.display().to_string(),
-                        asked.display().to_string(),
-                    ]),
-                    None,
-                    |_d: &ProxyDecision| {},
+            std::time::Duration::from_secs(600),
+            TEST_SIGNALS.scope(
+                sent.clone(),
+                TEST_STOP_GRACE.scope(
+                    std::time::Duration::from_secs(3600),
+                    run_proxy_with_io(
+                        proxy_in,
+                        proxy_out,
+                        advisory(vec![
+                            "sh".into(),
+                            "-c".into(),
+                            script.into(),
+                            "sh".into(),
+                            pid_file.display().to_string(),
+                            asked.display().to_string(),
+                        ]),
+                        None,
+                        |_d: &ProxyDecision| {},
+                    ),
                 ),
             ),
         )
         .await
         .expect("the proxy hung on an error");
+        // Read the moment the error is reported, before anything else runs.
+        let at_report = sent.lock().unwrap().clone();
         assert_eq!(
             result
                 .expect_err("a client that cannot be written is an error")
                 .kind(),
             std::io::ErrorKind::BrokenPipe
+        );
+        assert_eq!(
+            at_report.iter().filter(|s| **s == libc::SIGTERM).count(),
+            1,
+            "asked to stop once, before the error was reported: {at_report:?}"
+        );
+        assert_eq!(at_report.first(), Some(&libc::SIGTERM), "{at_report:?}");
+        assert!(
+            at_report
+                .iter()
+                .all(|s| [libc::SIGTERM, libc::SIGKILL].contains(s)),
+            "{at_report:?}"
         );
         assert_eq!(
             std::fs::read_to_string(&asked).ok().as_deref(),
