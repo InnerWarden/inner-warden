@@ -4578,9 +4578,16 @@ fn analyze_command_as_read(
             .flatten()
     });
     if let Some(flow) = flow {
+        // Text of the project's own files placed into code is a warning;
+        // every other flow is a refusal.
+        let flow_score = if flow == crate::shell::DataFlow::LocalTextIntoCode {
+            20
+        } else {
+            40
+        };
         signals.push(AnalysisSignal {
             signal: "dynamic_code_execution".into(),
-            score: 40,
+            score: flow_score,
             detail: match flow {
                 crate::shell::DataFlow::Fed => {
                     "shell data is structurally fed into a code interpreter".into()
@@ -4588,12 +4595,17 @@ fn analyze_command_as_read(
                 crate::shell::DataFlow::RuntimeProgram => {
                     runtime_program_reason(crate::shell::runtime_program_why(scan_cmd)).into()
                 }
+                crate::shell::DataFlow::LocalTextIntoCode => {
+                    "text local programs read out of the project's files is placed by xargs \
+                     into a shell's code: held for review"
+                        .into()
+                }
                 crate::shell::DataFlow::EvaluatedFetch => {
                     "a value fetched from the network is read as arithmetic or as a variable name, where the shell runs the commands in its array subscripts".into()
                 }
             },
         });
-        score += 40;
+        score += flow_score;
     }
 
     // Reverse shell indicators (score 60).
@@ -5112,8 +5124,34 @@ fn analyze_command_as_read(
     // The name of a call the reader read (`os.system(`, `exec(`) says
     // nothing the line it runs does not: that line is judged below, and
     // one it cannot read is held above.
-    let inline_names_read =
+    let mut inline_names_read =
         threats::inline_call_names_read(scan_cmd, &inline_code.code, &inline_code.residue);
+    // `exec`/`eval` the reader judged (code it reads is judged, code it
+    // cannot read is held above, code downloaded is refused above): the
+    // name adds nothing unless the code hides or fetches what it runs.
+    // Only in a language whose own call it is (`exec` in Python, `eval` in
+    // Python, Node, Ruby, Perl and PHP: `exec('x')` in Lua is no call of it),
+    // and no string it runs as code is a shell line that would be refused
+    // (`s='rm -rf ~'; exec(s)`).
+    if !inline_code.runs_download
+        && depth < STARTUP_PAYLOAD_DEPTH
+        && inline_code.code_run.iter().all(|run| {
+            analyze_command_at(run, rule_engine, protected_reads, context, depth + 1).recommendation
+                != "deny"
+        })
+    {
+        for name in threats::inline_code_call_names_held(scan_cmd, &inline_code.code)
+            .into_iter()
+            .filter(|name| match *name {
+                "exec()" => inline_code.read_python,
+                _ => inline_code.read_eval_language,
+            })
+        {
+            if !inline_names_read.contains(&name) {
+                inline_names_read.push(name);
+            }
+        }
+    }
     // The fetch-and-execute findings of the lines handed on, charged at the
     // end only when the line itself charged none.
     let mut handed_fetch_exec: Vec<AnalysisSignal> = Vec::new();
@@ -5208,12 +5246,22 @@ fn analyze_command_as_read(
         crate::shell::line_with_known_paths(scan_cmd)
             .and_then(|known| threats::check_tmp_execution(&known))
     }) {
-        signals.push(AnalysisSignal {
-            signal: "tmp_execution".into(),
-            score: s,
-            detail: format!("references world-writable directory: {dir}"),
-        });
-        score += s;
+        // Charged once: a line handed on that names the same folder (a test
+        // file the line writes and runs, whose code opens `/tmp/foo.py`) is
+        // the same finding, read in the text the line holds (benchmark of
+        // 2026-11-21: two such checks were refused for the folder twice).
+        let detail = format!("references world-writable directory: {dir}");
+        if !signals
+            .iter()
+            .any(|seen| seen.signal == "tmp_execution" && seen.detail.ends_with(&detail))
+        {
+            signals.push(AnalysisSignal {
+                signal: "tmp_execution".into(),
+                score: s,
+                detail,
+            });
+            score += s;
+        }
     }
 
     // A download piped into a local shell script: the script reads what was
@@ -5319,6 +5367,12 @@ fn analyze_command_as_read(
                     50,
                     "recursive removal by xargs of paths it reads from a file or input the \
                      guard does not see",
+                ),
+                crate::threats::XargsRemoval::FoundUnderNamedFolders => (
+                    20,
+                    "recursive removal by xargs of what a find prints from a folder the line \
+                     names: held for review, since xargs splits a name with a blank into \
+                     other paths (find -print0 | xargs -0 hands each name whole)",
                 ),
             };
             signals.push(AnalysisSignal {

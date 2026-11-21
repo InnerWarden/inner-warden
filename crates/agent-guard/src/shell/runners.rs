@@ -418,7 +418,15 @@ pub(crate) fn versionless(name: &str) -> &str {
 /// What runs in a shell when a program reads `text` as `language`, as lines
 /// the guard reads: a shell script is itself; a makefile's recipe lines; a
 /// crontab's commands; code in another language is the line that would run
-/// it inline (`python3 -c '...'`), so the reader of that language judges it.
+/// it from a quoted here-document (`python3 - <<'IW_CODE'`), so the reader of
+/// that language judges it as it judges such a line typed out. PHP keeps
+/// `php -r '...'`, which reads code without its tags.
+///
+/// Written as `python3 -c '...'` before 2026-11-21, every `'` of the code
+/// became `'\''`, and the reading of the guard's own words took the pieces
+/// between those quotes for words beside a part it could not read: a Python
+/// test file a line wrote and ran was refused where the same code typed in a
+/// here-document was allowed (benchmark of 2026-11-21).
 pub(crate) fn shell_lines(language: Language, text: &str, program: &str) -> Vec<String> {
     match language {
         Language::Shell | Language::Awk => vec![text.to_owned()],
@@ -479,7 +487,17 @@ pub(crate) fn shell_lines(language: Language, text: &str, program: &str) -> Vec<
                     .map(|(_, rest)| rest.to_owned())
                     .unwrap_or_default();
             }
-            vec![format!("{program} {} {}", row.1, single_quoted(&code))]
+            if language == Language::Php {
+                return vec![format!("{program} {} {}", row.1, single_quoted(&code))];
+            }
+            let mut end = String::from("IW_CODE");
+            while code
+                .lines()
+                .any(|line| line.trim_start_matches('\t') == end)
+            {
+                end.push('_');
+            }
+            vec![format!("{program} - <<'{end}'\n{code}\n{end}")]
         }
     }
 }
@@ -723,7 +741,7 @@ mod tests {
         );
         assert_eq!(
             shell_lines(Language::Python, "import os\nos.system('id')", "python3"),
-            vec!["python3 -c 'import os\nos.system('\\''id'\\'')'".to_owned()]
+            vec!["python3 - <<'IW_CODE'\nimport os\nos.system('id')\nIW_CODE".to_owned()]
         );
     }
 

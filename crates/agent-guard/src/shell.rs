@@ -1826,6 +1826,13 @@ pub(crate) enum DataFlow {
     /// A value fetched from the network is read as arithmetic or as a name,
     /// where bash runs the substitutions in the subscripts it holds.
     EvaluatedFetch,
+    /// What local programs read out of files the line names, and nothing
+    /// fetched or expanded, is placed by `xargs` into a shell's code
+    /// (`grep -n x f | awk ... | xargs -I {} sh -c "sed -n '{}p' f"`): the
+    /// text of a file of the project, which the guard does not read, may
+    /// become code, so it is held for review, not refused (benchmark of
+    /// 2026-11-21).
+    LocalTextIntoCode,
 }
 
 /// The yes-or-no reading of [`executable_data_flow`], for the tests that ask
@@ -1854,6 +1861,7 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
     // is refused for that name, and says how to write it.
     let mut unknown_program = false;
     let mut evaluated_fetch = false;
+    let mut local_text = false;
     for pipeline in pipelines {
         if node_is_in_literal_unreachable_branch(pipeline, source.as_bytes())
             || !pipeline_has_stdin_executor(pipeline, source.as_bytes(), false)
@@ -1862,6 +1870,8 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
         }
         if pipeline_feeds_only_programs_named_at_run_time(pipeline, source.as_bytes()) {
             unknown_program = true;
+        } else if local_text_into_xargs_shell(pipeline, source.as_bytes()) {
+            local_text = true;
         } else {
             return Some(DataFlow::Fed);
         }
@@ -1926,6 +1936,7 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
                     Some(DataFlow::Fed) => return true,
                     Some(DataFlow::RuntimeProgram) => unknown_program = true,
                     Some(DataFlow::EvaluatedFetch) => evaluated_fetch = true,
+                    Some(DataFlow::LocalTextIntoCode) => local_text = true,
                     None => {}
                 }
                 false
@@ -1938,8 +1949,9 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
                 // The substitution inside a program word that still ends in
                 // its name picks a folder. It is not input to the program.
                 let program = resolved_program_word(command, &words, effective);
-                let substituted = node_contains_kind_outside(unit, "command_substitution", program)
-                    || node_contains_kind_outside(unit, "process_substitution", program);
+                let substituted =
+                    substitution_feeds_code(command, unit, program, source.as_bytes())
+                        || node_contains_kind_outside(unit, "process_substitution", program);
                 if program_is_named_at_run_time(&effective[0]) {
                     // The program may be an interpreter. The code it is
                     // handed in an argument is read as a shell would run it,
@@ -1966,6 +1978,7 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
                             Some(DataFlow::Fed) => return true,
                             Some(DataFlow::RuntimeProgram) => unknown_program = true,
                             Some(DataFlow::EvaluatedFetch) => evaluated_fetch = true,
+                            Some(DataFlow::LocalTextIntoCode) => local_text = true,
                             None => {}
                         }
                     }
@@ -1997,8 +2010,181 @@ pub(crate) fn executable_data_flow(source: &str) -> Option<DataFlow> {
     if unknown_program {
         return Some(DataFlow::RuntimeProgram);
     }
-    (evaluated_fetch || fetched_value_is_evaluated(tree.root_node(), source.as_bytes()))
-        .then_some(DataFlow::EvaluatedFetch)
+    if evaluated_fetch || fetched_value_is_evaluated(tree.root_node(), source.as_bytes()) {
+        return Some(DataFlow::EvaluatedFetch);
+    }
+    local_text.then_some(DataFlow::LocalTextIntoCode)
+}
+
+/// Programs that only print text they read from the files they are named
+/// (or from their input), for [`local_text_into_xargs_shell`]. `awk` is
+/// one only with a program that runs, pipes and writes nothing.
+const LOCAL_TEXT_READERS: &[&str] = &[
+    "grep", "egrep", "fgrep", "rg", "head", "tail", "cut", "sort", "uniq", "wc", "tr", "cat", "nl",
+    "awk", "gawk", "mawk",
+];
+
+/// Whether a pipeline is local text readers ([`LOCAL_TEXT_READERS`]) on
+/// words the line writes out, ending in an `xargs` that places what they
+/// print into a shell's `-c` code. No variable is expanded anywhere in it,
+/// and a substitution runs only such readers.
+fn local_text_into_xargs_shell(pipeline: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let mut members = Vec::new();
+    collect_all_commands(pipeline, &mut members, 0);
+    members.sort_by_key(|command| command.start_byte());
+    if node_contains_kind(pipeline, "simple_expansion", 0)
+        || node_contains_kind(pipeline, "expansion", 0)
+        || node_contains_kind(pipeline, "process_substitution", 0)
+    {
+        return false;
+    }
+    let mut cursor = pipeline.walk();
+    let direct: Vec<tree_sitter::Node<'_>> = pipeline
+        .named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect();
+    let Some((last, readers)) = direct.split_last() else {
+        return false;
+    };
+    if readers.is_empty() || last.kind() != "command" {
+        return false;
+    }
+    // Every other command of the pipeline, its own and those its
+    // substitutions run, only reads text.
+    let others_read = members
+        .iter()
+        .filter(|command| command.id() != last.id())
+        .all(|command| only_reads_text(*command, source, false));
+    if !others_read || readers.iter().any(|reader| reader.kind() != "command") {
+        return false;
+    }
+    let Some(words) = command_words(*last, source) else {
+        return false;
+    };
+    if normalized_command_name(&words[0]) != "xargs" {
+        return false;
+    }
+    let shell_at = words.iter().position(|word| {
+        matches!(
+            normalized_command_name(word).as_str(),
+            "sh" | "bash" | "dash" | "zsh"
+        )
+    });
+    // The shell's code itself only reads text (`sed -n '{}p' f`): the
+    // words xargs places in it are where text may become code, and only
+    // there. Code that downloads, runs a program named by what it is handed
+    // (`sh -c "{}"`) or writes is refused as before.
+    shell_at.is_some_and(|at| {
+        words.get(at + 1).is_some_and(|flag| flag == "-c")
+            && words
+                .get(at + 2)
+                .is_some_and(|code| code_only_reads_text(&one_quote_level_off(code)))
+    })
+}
+
+/// Whether a command only prints text it reads ([`LOCAL_TEXT_READERS`]),
+/// `awk` with a program that runs, pipes and writes nothing, and, when
+/// `sed_too`, a `sed` that edits no file in place.
+fn only_reads_text(command: tree_sitter::Node<'_>, source: &[u8], sed_too: bool) -> bool {
+    let Some(words) = command_words(command, source) else {
+        return false;
+    };
+    let Some(name) = words.first().map(|word| normalized_command_name(word)) else {
+        return false;
+    };
+    if sed_too && name == "sed" {
+        return !words[1..].iter().any(|word| {
+            word.starts_with("--in-place")
+                || (word.starts_with('-') && !word.starts_with("--") && word.contains('i'))
+                || word.starts_with("--expression")
+                || word.starts_with("--file")
+                || word == "-f"
+        });
+    }
+    if !LOCAL_TEXT_READERS.contains(&name.as_str()) {
+        return false;
+    }
+    !(name.contains("awk")
+        && words[1..].iter().any(|word| {
+            ["system", "|", "getline", ">", "print >"]
+                .iter()
+                .any(|bad| word.contains(bad))
+        }))
+}
+
+/// A word as the shell hands it on when it is one quoted string: the text
+/// of `'...'`, the text of `"..."` with its escapes undone. Any other word
+/// is kept as written.
+fn one_quote_level_off(word: &str) -> String {
+    if word.len() >= 2 && word.starts_with('\'') && word.ends_with('\'') {
+        return word[1..word.len() - 1].to_owned();
+    }
+    if word.len() >= 2 && word.starts_with('"') && word.ends_with('"') {
+        let inner = &word[1..word.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars().peekable();
+        while let Some(c) = chars.next() {
+            // A substitution runs in the shell that reads the word; what it
+            // prints stands in the code as one word.
+            if c == '`' {
+                for skipped in chars.by_ref() {
+                    if skipped == '`' {
+                        break;
+                    }
+                }
+                out.push_str("IW_SUBSTITUTED");
+                continue;
+            }
+            if c == '$' && chars.peek() == Some(&'(') {
+                let mut depth = 0usize;
+                for skipped in chars.by_ref() {
+                    match skipped {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out.push_str("IW_SUBSTITUTED");
+                continue;
+            }
+            if c == '\\' {
+                match chars.next() {
+                    Some(next @ ('"' | '\\' | '$' | '`')) => out.push(next),
+                    Some(next) => {
+                        out.push(c);
+                        out.push(next);
+                    }
+                    None => out.push(c),
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        return out;
+    }
+    word.to_owned()
+}
+
+/// Whether shell code, as a shell's `-c` would run it, holds commands and
+/// each only reads text ([`only_reads_text`], `sed` included).
+fn code_only_reads_text(code: &str) -> bool {
+    let Some(tree) = parse_bash(code) else {
+        return false;
+    };
+    if tree.root_node().has_error() {
+        return false;
+    }
+    let mut commands = Vec::new();
+    collect_all_commands(tree.root_node(), &mut commands, 0);
+    !commands.is_empty()
+        && commands
+            .iter()
+            .all(|command| only_reads_text(*command, code.as_bytes(), true))
 }
 
 /// What the code a program is handed in an argument does when the program
@@ -11921,6 +12107,99 @@ fn normalized_command_name(name: &str) -> String {
 }
 
 /// Whether `unit` holds a node of `kind` that is not part of `skipped`.
+/// Programs that only print a path of this machine, with no input of
+/// their own: a substitution of one in a variable set for the command
+/// (`PYTHONPATH="$(pwd)/lib" python - <<'PY'`) names a folder, it hands the
+/// interpreter no code.
+const PATH_PRINTERS: &[&str] = &["pwd", "dirname", "realpath", "readlink", "basename"];
+
+/// Whether a command substitution in `unit` (outside `program`, the word
+/// that names the program) may hand an interpreter reading its stdin code
+/// to run. One in a value the command sets for itself, whose line is only
+/// a program of [`PATH_PRINTERS`] or `git rev-parse` with literal words,
+/// prints a path and does not (benchmark of 2026-11-21: four Python checks
+/// run with `PYTHONPATH="$(pwd)/lib"` and a quoted here-document were
+/// refused as code fed by the shell).
+fn substitution_feeds_code(
+    command: tree_sitter::Node<'_>,
+    unit: tree_sitter::Node<'_>,
+    program: Option<tree_sitter::Node<'_>>,
+    source: &[u8],
+) -> bool {
+    let mut found = Vec::new();
+    collect_nodes_of_kind(unit, "command_substitution", &mut found, 0);
+    let mut own = Vec::new();
+    if let Some(program) = program {
+        collect_nodes_of_kind(program, "command_substitution", &mut own, 0);
+    }
+    found
+        .iter()
+        .filter(|node| !own.iter().any(|mine| mine.id() == node.id()))
+        .any(|node| !prints_a_path_for_the_command(*node, command, source))
+}
+
+/// Whether a command substitution stands in a variable the command sets for
+/// itself and runs only a program that prints a path
+/// ([`substitution_feeds_code`]).
+fn prints_a_path_for_the_command(
+    substitution: tree_sitter::Node<'_>,
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    let in_own_assignment = {
+        let mut node = substitution.parent();
+        let mut found = false;
+        let mut steps = 0;
+        while let Some(at) = node {
+            steps += 1;
+            if steps > MAX_AST_DEPTH || at.id() == command.id() {
+                break;
+            }
+            if at.kind() == "variable_assignment"
+                && at
+                    .parent()
+                    .is_some_and(|parent| parent.id() == command.id())
+            {
+                found = true;
+                break;
+            }
+            node = at.parent();
+        }
+        found
+    };
+    if !in_own_assignment {
+        return false;
+    }
+    let mut cursor = substitution.walk();
+    let inner: Vec<tree_sitter::Node<'_>> = substitution.named_children(&mut cursor).collect();
+    let [only] = inner.as_slice() else {
+        return false;
+    };
+    if only.kind() != "command" {
+        return false;
+    }
+    let Some(words) = command_words(*only, source) else {
+        return false;
+    };
+    let mut cursor = only.walk();
+    let literal = only.named_children(&mut cursor).all(|part| {
+        !node_contains_kind(part, "command_substitution", 0)
+            && !node_contains_kind(part, "simple_expansion", 0)
+            && !node_contains_kind(part, "expansion", 0)
+            && part.kind() != "variable_assignment"
+            && part.kind() != "file_redirect"
+    });
+    if !literal {
+        return false;
+    }
+    let name = words
+        .first()
+        .map(|word| normalized_command_name(word))
+        .unwrap_or_default();
+    PATH_PRINTERS.contains(&name.as_str())
+        || (name == "git" && words.get(1).is_some_and(|verb| verb == "rev-parse"))
+}
+
 fn node_contains_kind_outside(
     unit: tree_sitter::Node<'_>,
     kind: &str,

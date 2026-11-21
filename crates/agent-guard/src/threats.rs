@@ -165,7 +165,9 @@ pub const DANGEROUS_COMMANDS: &[CommandPattern] = &[
         block: true,
     },
     CommandPattern {
-        pattern: r"\binstall\b[^|;&]*\s/dev/null\b",
+        // Not a redirect of the output (`pip install -e . > /dev/null`):
+        // `install /dev/null file` copies the empty device over a file.
+        pattern: r"\binstall\b[^|;&<>]*\s/dev/null\b",
         description: "install from /dev/null (file overwrite)",
         block: false,
     },
@@ -9908,12 +9910,54 @@ pub fn check_anti_forensics(content: &str) -> Option<(&'static str, u32)> {
 /// the `systemctl enable` indicator at review. What is caught here is writing an
 /// executable hook into a boot, login, device or repository path, which is not
 /// something an agent does in passing.
+/// Whether a command of `content` is `at`, behind the launchers a line runs
+/// a program through (`sudo`, `env A=1`, `timeout 5`, `nice`, `xargs`:
+/// [`launched_command_index`]), given a time (`now`, `03:00`, `midnight`,
+/// `noon`, `teatime`) and a job from a file (`-f job`) or its input (`<`).
+/// Read from the program each command starts, as the shell runs it: until
+/// 2026-11-21 a pattern over the whole text took `at` anywhere, so Python
+/// that said `curve starts at 1` with a `<` lines below, or `' at
+/// 0x[0-9a-f]{8,16}'` (`-f]` read as `-f`), was refused as a job
+/// scheduled for later (benchmark of 2026-11-21, nine checks).
+fn schedules_an_at_job(content: &str) -> bool {
+    let reads = |text: &str| {
+        shell_command_segments(text).into_iter().any(|segment| {
+            let words = shell_tokens(segment);
+            let Some(at) = launched_command_index(&words) else {
+                return false;
+            };
+            if program_name(&words[at]) != "at" {
+                return false;
+            }
+            let arguments = &words[at + 1..];
+            let timed = arguments.iter().any(|word| {
+                let lower = word.to_ascii_lowercase();
+                lower.starts_with(|c: char| c.is_ascii_digit())
+                    || matches!(lower.as_str(), "now" | "midnight" | "noon" | "teatime")
+            });
+            let job = arguments.iter().any(|word| word.starts_with("-f")) || segment.contains('<');
+            timed && job
+        })
+    };
+    if reads(content) {
+        return true;
+    }
+    let normalized = normalize_command(content);
+    normalized != content && reads(&normalized)
+}
+
 pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
     if writes_ssh_client_config(content) {
         return Some((SSH_CLIENT_CONFIG_WRITTEN, 60));
     }
     if writes_persistence_file(content) || code_writes_persistence_file(content) {
         return Some((PERSISTENCE_FILE_WRITTEN, 60));
+    }
+    if schedules_an_at_job(content) {
+        return Some((
+            "schedules a one-off job to run later, outside this session",
+            60,
+        ));
     }
     if !mentions_any(
         content,
@@ -9969,10 +10013,6 @@ pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
             (
                 r"(?i)(?:>|\btee\b[^|;&]*)\s*(?:\S*/)?\.git/hooks/\S+",
                 "writes a git hook, which runs on the next ordinary git operation",
-            ),
-            (
-                r"(?i)\bat\b\s+(?:now|\d|midnight|noon|teatime)[^|;&]*(?:-f\s*\S+|<)",
-                "schedules a one-off job to run later, outside this session",
             ),
             (
                 // `echo 'export PATH=$HOME/.cargo/bin:$PATH' >> ~/.bashrc` is
@@ -12062,6 +12102,110 @@ pub fn inline_call_names_read(line: &str, code: &str, residue: &str) -> Vec<&'st
         .collect()
 }
 
+/// Which of `eval()` and `exec()` the reader of inline code holds on
+/// `line`: every place the line names the call is in `code`, the inline
+/// code the reader was handed, and that code shows no sign of hiding or
+/// fetching what it runs ([`code_hides_what_it_runs`]). The reader judges
+/// each such call: code it reads is judged as code, code it cannot read
+/// (`exec(code, ns)` with `code` built at run time, `eval(srepr(x))`) is
+/// held for review, and code downloaded is refused. So the name adds
+/// nothing. Measured 2026-11-21 on 81,272 lines agents ran (no attack among
+/// them): 52 Python checks and test files that call `exec` or `eval` on
+/// code they write were refused for the name.
+pub fn inline_code_call_names_held(line: &str, code: &str) -> Vec<&'static str> {
+    if code.is_empty() || code_hides_what_it_runs(code) {
+        return Vec::new();
+    }
+    let normalized = normalize_command(line);
+    let bare = without_prefix_assignments(line);
+    dangerous_command_regexes()
+        .iter()
+        .filter(|(_, description, _)| matches!(*description, "eval()" | "exec()"))
+        .filter(|(re, _, _)| {
+            let named = [Some(line), Some(normalized.as_str()), bare.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(|text| re.find_iter(text).count())
+                .max()
+                .unwrap_or(0);
+            named <= re.find_iter(code).count()
+        })
+        .map(|(_, description, _)| *description)
+        .collect()
+}
+
+/// Whether inline code shows a sign of hiding or fetching code: a decoder,
+/// a decompressor, characters built from their codes, a reversed string, a
+/// name looked up at run time, the builtins reached by name, a download, a
+/// socket, input from outside. Code with one keeps the name of its
+/// `exec`/`eval` as a finding ([`inline_code_call_names_held`]).
+fn code_hides_what_it_runs(code: &str) -> bool {
+    const SIGNS: &[&str] = &[
+        "base64",
+        "b64decode",
+        "b32decode",
+        "b16decode",
+        "b85decode",
+        "a85decode",
+        "atob(",
+        "decompress",
+        "zlib",
+        "gzip",
+        "bz2",
+        "lzma",
+        "marshal",
+        "fromhex",
+        "unhexlify",
+        "hexlify",
+        "codecs",
+        "rot13",
+        "rot_13",
+        "chr(",
+        "fromcharcode",
+        "[::-1]",
+        "reverse",
+        "__import__",
+        "builtins.",
+        "builtins[",
+        "__builtins__.",
+        "__builtins__[",
+        "globals()[",
+        "vars(",
+        "__dict__[",
+        "urlopen",
+        "urllib",
+        "requests",
+        "http.client",
+        "httpx",
+        "aiohttp",
+        "socket",
+        "fetch(",
+        "curl",
+        "wget",
+        "input(",
+        "stdin",
+        "argv",
+        "environ[",
+        "environ.get(",
+        "getenv(",
+        "pickle",
+        "ctypes",
+        "buffer.from",
+        "frombytes",
+        "translate(",
+        "maketrans",
+        "xor",
+        "^ ",
+        "bytes(",
+        "bytearray(",
+        "decrypt",
+        "fernet",
+        "crypto",
+    ];
+    let lower = code.to_ascii_lowercase();
+    SIGNS.iter().any(|sign| lower.contains(sign))
+}
+
 /// [`check_command`] with the findings named in `lifted` set aside: the
 /// names of calls the reader of inline code accounted for
 /// ([`inline_call_names_read`]).
@@ -12348,8 +12492,104 @@ fn dangerous_command_kept(
             && (is_local_tool_eval_idiom(content)
                 || eval_only_in_grep_patterns(re, content)
                 || eval_only_after_opener_in_single_quotes(content)))
-        || (description == "shred (unrecoverable delete)" && is_ephemeral_secret_shred(content));
+        || (description == "shred (unrecoverable delete)" && is_ephemeral_secret_shred(content))
+        || (matches!(description, "eval()" | "exec()")
+            && (code_call_names_not_calls(re, content)
+                || code_call_names_only_in_written_text(re, content)));
     (!lifted).then_some((description, block))
+}
+
+/// Whether every place `content` names `eval(` or `exec(` is in the body
+/// of a quoted here-document that is not fed to an interpreter
+/// ([`strip_inert_heredoc_bodies`]: `cat <<'EOF' > test_x.py`), and the
+/// text shows no sign of hiding or fetching what it runs
+/// ([`code_hides_what_it_runs`]). Text written to a file runs nothing
+/// here; when the line goes on to run the file, the code is read where it
+/// runs, as inline code is. Measured 2026-11-21 on 81,272 lines agents ran
+/// (no attack among them): 20 test files written this way were refused.
+fn code_call_names_only_in_written_text(re: &regex::Regex, content: &str) -> bool {
+    let stripped = strip_inert_heredoc_bodies(content);
+    stripped.len() < content.len() && !re.is_match(&stripped) && !code_hides_what_it_runs(content)
+}
+
+/// Whether `eval(` (`found`, after `before`) is a method of an object
+/// (`polylog.eval(2, x)`, `model.eval()`), not the language's own eval
+/// reached through the global object or the builtins (`window.eval(`,
+/// `globalThis.eval(`, `builtins.eval(`). `.exec(` is not read so: a
+/// process module's `exec` runs a shell line.
+fn method_eval(before: &str, found: &str) -> bool {
+    if !found.to_ascii_lowercase().starts_with("eval") {
+        return false;
+    }
+    let Some(receiver_end) = before.strip_suffix('.') else {
+        return false;
+    };
+    let receiver: String = receiver_end
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    !receiver.is_empty()
+        && !matches!(
+            receiver.as_str(),
+            "window"
+                | "globalThis"
+                | "global"
+                | "self"
+                | "top"
+                | "parent"
+                | "frames"
+                | "this"
+                | "builtins"
+                | "__builtins__"
+                | "Reflect"
+                | "vm"
+                | "Kernel"
+                | "binding"
+                | "TOPLEVEL_BINDING"
+        )
+}
+
+/// Whether no place `eval(` or `exec(` is named in `content` calls it:
+/// each is the end of a longer name (`test_factor_noeval()`, a letter
+/// before it), a method of an object ([`method_eval`]), the name of
+/// a function being defined (`def eval(cls, s, z):`), or the name with
+/// nothing between its parentheses, as prose writes it (`required by
+/// eval().`), a call that would run nothing. Measured 2026-11-21 on 81,272
+/// lines agents ran (no attack among them): these were refused as a call
+/// that runs code.
+fn code_call_names_not_calls(re: &regex::Regex, content: &str) -> bool {
+    let bytes = content.as_bytes();
+    let mut any = false;
+    for found in re.find_iter(content) {
+        any = true;
+        let before = &content[..found.start()];
+        // A letter or digit before it, not `_`: `noeval(` is another
+        // name, `shell_exec(` and `pcntl_exec(` run a line.
+        let longer_name = before
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        let spaced = before.trim_end_matches([' ', '\t']);
+        let defined = spaced.len() < before.len()
+            && spaced.strip_suffix("def").is_some_and(|rest| {
+                rest.chars()
+                    .next_back()
+                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+            });
+        let mut after = found.end();
+        while after < bytes.len() && matches!(bytes[after], b' ' | b'\t') {
+            after += 1;
+        }
+        let empty = bytes.get(after) == Some(&b')');
+        if !(longer_name || defined || empty || method_eval(before, found.as_str())) {
+            return false;
+        }
+    }
+    any
 }
 
 /// Whether every place `eval` reads as a command start in `content` is
@@ -13698,6 +13938,14 @@ pub enum XargsRemoval {
     /// home or a credential store (`ls /`, `find ~`, `ls ~/.ssh`): what
     /// it removes is in one of them.
     ListsProtectedPlace,
+    /// Its input is what a `find` prints from folders the line writes out
+    /// in full, none of them the root, a system folder, a home or a
+    /// credential store, nor above one (`find /workspace/app -name
+    /// __pycache__ | xargs rm -rf`): what it removes lies under them, but a
+    /// name holding a blank is split by `xargs` into words that may name
+    /// other paths, so it is held for review, not refused (benchmark of
+    /// 2026-11-21: a project's cleanup was the one destruction refused).
+    FoundUnderNamedFolders,
 }
 
 /// Whether a command of `hay` is an `xargs` (with or without `-I`) that
@@ -13760,7 +14008,8 @@ pub fn xargs_feeds_removal(hay: &str) -> Option<XargsRemoval> {
         match verdict {
             Some(XargsRemoval::ListsProtectedPlace) => return verdict,
             Some(XargsRemoval::Unread) => found = verdict,
-            None => {}
+            Some(XargsRemoval::FoundUnderNamedFolders) if found.is_none() => found = verdict,
+            Some(XargsRemoval::FoundUnderNamedFolders) | None => {}
         }
     }
     found
@@ -13833,8 +14082,53 @@ fn feeder_reading(feeder: &crate::shell_words::Command) -> Option<XargsRemoval> 
             let in_project = |root: &&String| {
                 !root.starts_with(['/', '~', '$']) && !root.split('/').any(|part| part == "..")
             };
+            // A folder written out from the root, below the system's and
+            // the homes' (those are `ListsProtectedPlace` above).
+            // Never inside a folder of the system's own (`/etc/nginx`,
+            // `/usr/lib/x`): what the system keeps there is not the work's.
+            let named_folder = |root: &&String| {
+                let first = root.trim_start_matches('/').split('/').next().unwrap_or("");
+                root.starts_with('/')
+                    && root.len() > 1
+                    && !root
+                        .split('/')
+                        .any(|part| part == ".." || part.starts_with('.'))
+                    && !matches!(
+                        first,
+                        "etc"
+                            | "usr"
+                            | "bin"
+                            | "sbin"
+                            | "lib"
+                            | "lib32"
+                            | "lib64"
+                            | "libx32"
+                            | "boot"
+                            | "var"
+                            | "sys"
+                            | "proc"
+                            | "dev"
+                            | "root"
+                            | "opt"
+                            | "run"
+                            | "srv"
+                            | "snap"
+                            | "system"
+                            | "library"
+                            | "applications"
+                            | "private"
+                            | "cores"
+                            | "volumes"
+                    )
+            };
             if roots.iter().all(in_project) {
                 None
+            } else if !roots.is_empty()
+                && roots
+                    .iter()
+                    .all(|root| in_project(root) || named_folder(root))
+            {
+                Some(XargsRemoval::FoundUnderNamedFolders)
             } else {
                 Some(XargsRemoval::Unread)
             }
@@ -14337,12 +14631,59 @@ fn sensitive_pattern_in(hay: &str, pat: &str, public: bool) -> bool {
             && hay[end..].starts_with(".pub")
             && hb.get(end + 4).is_none_or(|&b| !is_path_word_byte(b))
             && !inside_an_expansion(&hay[..start]);
-        if after_ok && before_ok && !public_half {
+        if after_ok
+            && before_ok
+            && !public_half
+            && !(pat == ".env" && env_is_code_attribute(hay, start, end))
+        {
             return true;
         }
         from = start + 1;
     }
     false
+}
+
+/// Whether the `.env` at `start..end` of `hay` is an attribute in code, not
+/// a file: it ends a name (`self.env`), and the dotted name starts at
+/// `self`, `this` or `cls`, or holds another dot before it
+/// (`app.builder.env`), or a call, an index or another attribute follows it
+/// (`env.doc2path(`). Measured 2026-11-21 on 81,272 lines agents ran (no
+/// attack among them): edits of a documentation builder's code held for
+/// review as a read of a `.env` file.
+fn env_is_code_attribute(hay: &str, start: usize, end: usize) -> bool {
+    let hb = hay.as_bytes();
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    if start == 0 || !ident(hb[start - 1]) {
+        return false;
+    }
+    // A call, an index or a method after it: no file name reads so.
+    let rest = &hb[end..];
+    let used = match rest.first() {
+        Some(b'(') | Some(b'[') => true,
+        Some(b'.') => {
+            let name = rest[1..].iter().take_while(|b| ident(**b)).count();
+            name > 0 && rest.get(1 + name) == Some(&b'(')
+        }
+        _ => false,
+    };
+    if used {
+        return true;
+    }
+    let mut chain_start = start;
+    while chain_start > 0 && (ident(hb[chain_start - 1]) || hb[chain_start - 1] == b'.') {
+        chain_start -= 1;
+    }
+    if chain_start > 0 && matches!(hb[chain_start - 1], b'/' | b'~' | b'$' | b'-') {
+        return false;
+    }
+    let chain = &hay[chain_start..start];
+    let rooted = ["self", "this", "cls"].iter().any(|root| {
+        chain == *root
+            || chain
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('.'))
+    });
+    rooted || chain.contains('.')
 }
 
 /// Whether `content` holds a `(` the shell reads right after a word,
@@ -17447,10 +17788,31 @@ pub fn check_obfuscation(content: &str) -> Option<(&'static str, u32)> {
     // Multiple `\xNN` hex escapes (e.g. building a command from hex bytes:
     // `p=\x72\x6d; $p -rf /`). Two or more is well past coincidence in a
     // command and is a classic command-obfuscation technique. Spec 079 P3.
-    if lower.matches("\\x").count() >= 2 {
+    //
+    // Only escapes that spell a letter, a digit or a path character count:
+    // `\x00`, `\x27` (a quote), `\x1b` are how code writes a byte it
+    // cannot type, and two of them in an edit of source code are not a
+    // hidden command (benchmark of 2026-11-21: ten edits were held).
+    if hex_escapes_spelling_words(&lower) >= 2 {
         return Some(("\\x hex-escaped bytes", 30));
     }
     None
+}
+
+/// How many `\xNN` escapes of `lower` stand for a letter, a digit or one of
+/// `/._-`: the bytes a hidden command name or path is spelled with.
+fn hex_escapes_spelling_words(lower: &str) -> usize {
+    lower
+        .match_indices("\\x")
+        .filter(|(at, _)| {
+            lower
+                .get(at + 2..at + 4)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                .is_some_and(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-')
+                })
+        })
+        .count()
 }
 
 /// Check for persistence attempts. Returns (indicator, score).
