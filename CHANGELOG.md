@@ -15,6 +15,22 @@ the text of a command; what it does not see is written down, as measured:
 
 ### Added
 
+- **The MCP proxy reads more shapes of an order to the assistant.** The
+  reading of a server's text as an order (what raises a call that acts with a
+  value said in it) now finds the assistant called after a data key, a label
+  or a code comment, named with what it does ("the assistant reading this
+  must send"), a block dressed as the system or a tool, the task set aside or
+  replaced ("the user now wants you to", instructions ignored), an act kept
+  from the user, a role taken into the real world, a softened imperative, and
+  letters spaced out. On a corpus written for it, by style, in English,
+  Portuguese and Spanish (`crates/agent-guard/corpus/injection-structure-2026-11`),
+  it finds 158 of 190 attacks where it found 33, and marks none of its 261
+  benign texts of the same shapes, none of the 667 benign inputs of the
+  repository's corpora, and still all 35 AgentDojo texts. A polite request, a
+  claim of authority or a role with only a sending is still not read as an
+  order: people write those to people in the same words. Measured by
+  `cargo test -p innerwarden-agent-guard structure_corpus -- --nocapture`.
+
 - **Cursor is screened through its own hooks.** `innerwarden agents connect
   cursor` now writes an entry under `beforeShellExecution`,
   `beforeMCPExecution` and `beforeReadFile` in `~/.cursor/hooks.json`,
