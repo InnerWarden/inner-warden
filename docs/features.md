@@ -430,10 +430,13 @@ following, and says they are the person's to run, from their own terminal.
   sources that leave out the user's, or with settings that switch hooks off
   or empty the events the guard's hook sits under; Codex CLI with `--disable
   hooks` or a `-c` override of its hooks; Hermes Agent with `--safe-mode` or
-  `--ignore-user-config`; or any of them, Gemini CLI included, with a
-  variable it reads that moves the folder its hook is in or switches its
-  hooks off (`HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `HERMES_HOME`,
-  `GEMINI_CLI_HOME`, `CLAUDE_CODE_SIMPLE` and the others they read). `HOME`
+  `--ignore-user-config`; or any of them, Gemini CLI and the Cursor CLI
+  (`cursor-agent`, whose MCP wiring the guard writes) included, with a
+  variable it reads that moves the folder its hook or wiring is in or
+  switches its hooks off (`HOME`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+  `HERMES_HOME`, `GEMINI_CLI_HOME`, `CURSOR_CONFIG_DIR`,
+  `CLAUDE_CODE_SIMPLE` and the others they read), also when the line builds
+  the variable's name at run time (`export CLAUDE_${X:-CONFIG}_DIR=...`). `HOME`
   set to the home folder the shell itself puts in, and `CLAUDE_CONFIG_DIR` set
   to the folder Claude Code already uses, move nothing and run; another
   folder for Claude Code is refused in words that say how to install the
@@ -646,9 +649,15 @@ Also not seen today, and not promised for any date:
   the guard does not count those writes.
 - A script that Python, Node or Ruby code writes and the same line then runs.
   The guard does not read what the code put in the file.
-- Some ways of stopping the guard: a `pkill` pattern that matches only part
-  of the guard's command line, and a stop or kill of its service sent over
-  D-Bus (`busctl`, `gdbus`, `dbus-send`) instead of through `systemctl`.
+- Some ways of stopping the guard: a `pkill` pattern that matches the
+  guard's command line only on another program's part (the agent's id, the
+  MCP server) or only on the shell a fail-closed hook script runs after the
+  guard ends (`exit 2`, `case $s in`), which any script holds, is left to
+  the other checks; process ids of the guard handed to a `kill` on a later
+  line, or by a program the line does not show, are not followed. A
+  restart of a service of the guard (`systemctl restart`) runs, as ordinary
+  maintenance, while a restart asked of systemd over D-Bus is refused. The
+  Cursor CLI's own flags are not read.
 - A path that steps back with `..` after a symbolic link. The MCP proxy
   reads a path where a call writes by its text, with `.` and `..` taken
   out, without looking at the disk: the proxy may not run on the server's
