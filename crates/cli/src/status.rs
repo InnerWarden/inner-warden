@@ -763,6 +763,10 @@ pub enum ProjectEffect {
     /// The file is there and could not be read; the words say why. The
     /// agent may still read it, so what it does to the hooks is not known.
     Unread(&'static str),
+    /// A `.git` or `.claude` (the file) that could not be looked at, so
+    /// whether the project ends there is not known; the words say why. The
+    /// folders above it were read too.
+    RootUnchecked(&'static str),
 }
 
 /// The project files an agent reads its hooks from, relative to the
@@ -900,6 +904,15 @@ pub fn project_settings_finding(project: &ProjectSettings) -> Finding {
                  off in this folder: open it and check before you start {} here.",
                 project.agent, project.agent
             ),
+        },
+        ProjectEffect::RootUnchecked(why) => Finding::Unknown {
+            what: format!(
+                "Could not tell whether the project ends at {}: {why}.",
+                project.file
+            ),
+            why: "status read the folders above it as well; a folder it could not look into \
+                  may hold settings that switch the guard's hook off, so check it yourself."
+                .into(),
         },
         ProjectEffect::OwnHooks => Finding::Unknown {
             what: format!(

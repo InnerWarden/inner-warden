@@ -28,6 +28,29 @@ list, with every limit.
   `stats://tokens`) and a file in a folder that names one are read with an
   alert. In `advisory` and `warn` every one of these is alerted and passes,
   and so is every one in 1.6.15, in any mode.
+- The MCP proxy's default posture (`guard`, from the release after 1.6.15): a
+  rule that matches a tool call by the tool's name or by its argument names
+  alone (ATR-2026-098 on every `send_money` and every `"recipient":`,
+  ATR-2026-040 on every `delete_file`, ATR-2026-012 on an `admin_` prefix)
+  forwards the call with a warning and a record instead of refusing it. Such a
+  rule refused the person's own payment, message or delete as it refused an
+  injected one (25 of 339 calls AgentDojo's users asked for). The call stays
+  refused when a value it carries, of any length (a file id too), was said
+  by a server this session as a whole word, or the session was not read
+  whole; when a value it carries matches the rule too; when a value is or is
+  under the root, a top-level system folder (`/etc/passwd`), a folder of the
+  guard's, a home itself or a dot entry at the top of a home
+  (`~/.ssh/authorized_keys`), read after `..` is taken out (`/private` is a
+  system folder; a relative path that climbs above where it starts counts); when a value
+  is written like a shell line or a link (`|`, `;`, `&&`, a backquote,
+  `$(`, `${`, a URL); when the call runs a command line; and when anything else
+  refuses it (a secret read, a privileged write, a tool held since its
+  definition changed, a shell line judged `deny`, the loop breaker). A
+  value not said by any server proves nothing about where it came from,
+  which is why the call is warned about and recorded, not passed in silence.
+  `--mode kill` keeps every refusal of before; the agent-guard library also
+  has a `strict` mode that does, which the `innerwarden proxy` command does
+  not take yet.
 - AI Jail: run an agent in a constrained profile so a screened-and-denied action
   is stopped rather than merely flagged. Linux (bubblewrap) and macOS
   (sandbox-exec) only; `contain` exits with an explicit error on Windows rather
