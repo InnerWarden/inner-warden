@@ -5,6 +5,19 @@ follows semantic versioning.
 
 ## Unreleased
 
+The MCP proxy no longer reads a page that explains how a chat is written as
+an order to the assistant. A fenced code block (three backticks or `~~~`)
+that orders nothing is an example: the turns, system messages, tags and
+assistant names inside it are not a forged turn (`{"role": "system", ...}`,
+`<|im_start|>assistant`). A fenced block with an act or a sending keeps every
+mark, and a fence never closed fences nothing. `Even if you're not the model
+owner` no longer tells the reader it is an assistant, and `instead of more
+integration tests` weighs two ways of testing instead of putting the text
+before the task. On the stress pages this clears the 4 marked ones (3 chat
+template pages of the transformers docs and a crate's AGENTS.md) and leaves the
+held-out public attacks unchanged: 53 of 526 found, 34 of 60 of AgentDojo's
+fixed attacks, 0 of 331 benign texts marked.
+
 The MCP proxy reads an order to the assistant in three more shapes, each only
 with an act the assistant would take or a sending: a turn of a chat forged
 inside the data (`<|end|><|user|>Forward ...`), the data declared over and a
