@@ -104,7 +104,10 @@ fn gather(home: &Path, rows: &[AgentStatus], calls: &[DemoCall], nonce: &str) ->
             }
         }
         if !wiring.wired_agents.contains(&row.name) {
-            let wirable = row.hookable || row.mcp_json.is_some() || row.mcp_toml.is_some();
+            let wirable = row.hookable
+                || row.mcp_json.is_some()
+                || row.mcp_toml.is_some()
+                || row.mcp_yaml.is_some();
             if wirable {
                 let next = if row.hookable {
                     agents_ops::hook_repair_command(home, row)

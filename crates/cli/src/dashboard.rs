@@ -279,6 +279,16 @@ fn agent_identity_step(
                     &agent.name,
                 )
             })
+    } else if let Some(rel) = &agent.mcp_yaml {
+        read(rel)
+            .and_then(|body| innerwarden_agent_guard::mcp_wire_yaml::view_of_bytes(&body))
+            .and_then(|config| {
+                innerwarden_agent_guard::mcp_wire::unnamed_reconnect_flag(
+                    &config,
+                    guard_bin,
+                    &agent.name,
+                )
+            })
     } else {
         None
     };
@@ -352,7 +362,11 @@ fn agent_config_rel(agent: &innerwarden_agent_guard::agents::AgentStatus) -> Opt
     if agent.hookable {
         return Some(".claude/settings.json");
     }
-    agent.mcp_json.as_deref().or(agent.mcp_toml.as_deref())
+    agent
+        .mcp_json
+        .as_deref()
+        .or(agent.mcp_toml.as_deref())
+        .or(agent.mcp_yaml.as_deref())
 }
 
 /// When the config `agent_mode` reads last changed, under the same rule:
@@ -421,6 +435,11 @@ fn agent_server_counts(
             .and_then(|body| std::str::from_utf8(&body).ok()?.parse().ok())
             .map(|config| innerwarden_agent_guard::mcp_wire_toml::server_counts_toml(&config));
     }
+    if let Some(rel) = &agent.mcp_yaml {
+        return read(rel)
+            .and_then(|body| innerwarden_agent_guard::mcp_wire_yaml::view_of_bytes(&body))
+            .map(|config| innerwarden_agent_guard::mcp_wire::server_counts(&config));
+    }
     None
 }
 
@@ -438,7 +457,10 @@ fn agent_mode_steps(
     mode: &str,
     setup_support: &str,
 ) -> Option<AgentModeSteps> {
-    let proven = agent.hookable || agent.mcp_json.is_some() || agent.mcp_toml.is_some();
+    let proven = agent.hookable
+        || agent.mcp_json.is_some()
+        || agent.mcp_toml.is_some()
+        || agent.mcp_yaml.is_some();
     if !proven || setup_support == "unsupported" {
         return None;
     }
@@ -501,6 +523,17 @@ fn agent_wired_monitor(
         .and_then(|body| std::str::from_utf8(&body).ok()?.parse().ok())
         .and_then(|config| innerwarden_agent_guard::mcp_wire_toml::guarded_mode_toml(&config))
             == Some(innerwarden_agent_guard::mcp_wire_toml::WiringMode::Monitor);
+    }
+    if let Some(rel) = &agent.mcp_yaml {
+        return innerwarden_agent_guard::file_update::read_config_no_symlinks(
+            home,
+            &home.join(rel),
+        )
+        .ok()
+        .flatten()
+        .and_then(|body| innerwarden_agent_guard::mcp_wire_yaml::view_of_bytes(&body))
+        .and_then(|config| innerwarden_agent_guard::mcp_wire::guarded_mode(&config))
+            == Some(innerwarden_agent_guard::mcp_wire::WiringMode::Monitor);
     }
     false
 }
@@ -613,7 +646,7 @@ fn dashboard_mode(
 fn agent_mechanism(agent: &innerwarden_agent_guard::agents::AgentStatus) -> Option<&'static str> {
     if agent.hookable {
         Some("pretooluse_hook")
-    } else if agent.mcp_json.is_some() || agent.mcp_toml.is_some() {
+    } else if agent.mcp_json.is_some() || agent.mcp_toml.is_some() || agent.mcp_yaml.is_some() {
         Some("mcp_proxy")
     } else {
         None
@@ -1127,6 +1160,26 @@ fn agent_mode(
                     Some(innerwarden_agent_guard::mcp_wire_toml::WiringMode::Monitor) => "monitor",
                     Some(innerwarden_agent_guard::mcp_wire_toml::WiringMode::Enforce) => "enforce",
                     Some(innerwarden_agent_guard::mcp_wire_toml::WiringMode::Mixed) => "mixed",
+                    None => "unknown",
+                }
+            })
+            .unwrap_or("unknown");
+    }
+    if let Some(rel) = &agent.mcp_yaml {
+        let path = home.join(rel);
+        return innerwarden_agent_guard::file_update::read_config_no_symlinks(home, &path)
+            .ok()
+            .flatten()
+            .and_then(|body| innerwarden_agent_guard::mcp_wire_yaml::view_of_bytes(&body))
+            .map(|config| {
+                let mode = innerwarden_agent_guard::mcp_wire::guarded_mode(&config);
+                if !innerwarden_agent_guard::mcp_wire::is_guarded(&config) {
+                    return if mode.is_some() { "partial" } else { "unknown" };
+                }
+                match mode {
+                    Some(innerwarden_agent_guard::mcp_wire::WiringMode::Monitor) => "monitor",
+                    Some(innerwarden_agent_guard::mcp_wire::WiringMode::Enforce) => "enforce",
+                    Some(innerwarden_agent_guard::mcp_wire::WiringMode::Mixed) => "mixed",
                     None => "unknown",
                 }
             })
@@ -2721,6 +2774,7 @@ mod tests {
             hookable: true,
             mcp_json: None,
             mcp_toml: None,
+            mcp_yaml: None,
             guarded: true,
             mode: None,
         };
@@ -2788,6 +2842,7 @@ mod tests {
             hookable: false,
             mcp_json: Some(".cursor/mcp.json".into()),
             mcp_toml: None,
+            mcp_yaml: None,
             guarded: true,
             mode: None,
         };
@@ -2904,6 +2959,7 @@ mod tests {
             hookable: false,
             mcp_json: None,
             mcp_toml: None,
+            mcp_yaml: None,
             guarded: true,
             mode: None,
         };
@@ -3924,6 +3980,7 @@ mod tests {
             hookable: false,
             mcp_json: None,
             mcp_toml: None,
+            mcp_yaml: None,
             guarded: false,
             mode: None,
         }];

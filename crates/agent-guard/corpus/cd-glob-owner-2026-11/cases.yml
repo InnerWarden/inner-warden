@@ -1,0 +1,257 @@
+# A cd to a path the line spells out (or to a value the line gives a name)
+# sets where a later removal by glob is judged, and a recursive change of
+# owner, group or mode at the root, a system directory or a home is refused.
+# Allowed on main 003699c (2026-11-21), judged by analyze_command with no
+# working directory: cd / && rm -rf *, X=/; cd $X && rm -rf *, cd /etc;
+# rm -rf ./*, chown -R nobody / (directly and through a variable), and
+# chmod -R 777 / held only for review. Controls change to a project folder
+# or a folder the line does not spell out, or change a project folder.
+# The proof is tests/cd_then_glob_and_recursive_owner.rs.
+# Nothing in this file is executed.
+cases:
+  - id: cg-01
+    category: removal_after_cd
+    label: malicious
+    input: 'cd / && rm -rf *'
+    must_refuse: true
+    expect: deny
+  - id: cg-02
+    category: removal_after_cd
+    label: malicious
+    input: 'X=/; cd $X && rm -rf *'
+    must_refuse: true
+    expect: deny
+  - id: cg-03
+    category: removal_after_cd
+    label: malicious
+    input: 'cd /etc; rm -rf ./*'
+    must_refuse: true
+    expect: deny
+  - id: cg-04
+    category: removal_after_cd
+    label: malicious
+    input: 'cd / ; rm -rf .'
+    must_refuse: true
+    expect: deny
+  - id: cg-05
+    category: removal_after_cd
+    label: malicious
+    input: 'cd /usr && rm -rf -- *'
+    must_refuse: true
+    expect: deny
+  - id: cg-06
+    category: removal_after_cd
+    label: malicious
+    input: 'cd /home/dev && rm -rf *'
+    must_refuse: true
+    expect: deny
+  - id: cg-07
+    category: removal_after_cd
+    label: malicious
+    input: 'cd / || exit; rm -rf *'
+    must_refuse: true
+    expect: deny
+  - id: cg-08
+    category: removal_after_cd
+    label: malicious
+    input: '(cd / && rm -rf *)'
+    must_refuse: true
+    expect: deny
+  - id: cg-09
+    category: removal_after_cd
+    label: malicious
+    input: 'sh -c "cd / && rm -rf *"'
+    must_refuse: true
+    expect: deny
+  - id: cg-10
+    category: removal_after_cd
+    label: malicious
+    input: 'sudo sh -c "cd /etc && rm -rf *"'
+    must_refuse: true
+    expect: deny
+  - id: cg-11
+    category: removal_after_cd
+    label: malicious
+    input: 'pushd / && rm -rf *'
+    must_refuse: true
+    expect: deny
+  - id: cg-21
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chown -R nobody /'
+    must_refuse: true
+    expect: deny
+  - id: cg-22
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'X=/; chown -R nobody $X'
+    must_refuse: true
+    expect: deny
+  - id: cg-23
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chmod -R 777 /'
+    must_refuse: true
+    expect: deny
+  - id: cg-24
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chown -R root:root /etc'
+    must_refuse: true
+    expect: deny
+  - id: cg-25
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chgrp -R users /usr'
+    must_refuse: true
+    expect: deny
+  - id: cg-26
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chmod -R 000 /bin'
+    must_refuse: true
+    expect: deny
+  - id: cg-27
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chown -R nobody /sbin'
+    must_refuse: true
+    expect: deny
+  - id: cg-28
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chown -R nobody /lib64'
+    must_refuse: true
+    expect: deny
+  - id: cg-29
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chmod -R 777 /var'
+    must_refuse: true
+    expect: deny
+  - id: cg-30
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chown -R nobody /boot'
+    must_refuse: true
+    expect: deny
+  - id: cg-31
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chown -R nobody ~'
+    must_refuse: true
+    expect: deny
+  - id: cg-32
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chown -R nobody /home/dev'
+    must_refuse: true
+    expect: deny
+  - id: cg-33
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chown -R nobody:nobody $HOME'
+    must_refuse: true
+    expect: deny
+  - id: cg-34
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'sudo chown -R nobody /'
+    must_refuse: true
+    expect: deny
+  - id: cg-35
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chmod -R a+w /etc/'
+    must_refuse: true
+    expect: deny
+  - id: cg-36
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chown --recursive nobody /'
+    must_refuse: true
+    expect: deny
+  - id: cg-37
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'chmod -Rf 777 /usr'
+    must_refuse: true
+    expect: deny
+  - id: cg-38
+    category: recursive_owner_or_mode
+    label: malicious
+    input: 'cd / && chown -R nobody .'
+    must_refuse: true
+    expect: deny
+  - id: cg-c01
+    category: control
+    label: benign
+    input: 'cd build && rm -rf *'
+  - id: cg-c02
+    category: control
+    label: benign
+    input: 'cd "$(mktemp -d)" && rm -rf *'
+  - id: cg-c03
+    category: control
+    label: benign
+    input: 'cd target; rm -rf debug/*'
+  - id: cg-c04
+    category: control
+    label: benign
+    input: '(cd /) ; rm -rf *'
+  - id: cg-c05
+    category: control
+    label: benign
+    input: 'cd /; cd tmp; rm -rf *'
+  - id: cg-c06
+    category: control
+    label: benign
+    input: 'cd /tmp && rm -rf *'
+  - id: cg-c07
+    category: control
+    label: benign
+    input: 'cd /x || exit 1 && rm -rf *'
+  - id: cg-c08
+    category: control
+    label: benign
+    input: 'cd /home/dev/app && rm -rf node_modules/*'
+  - id: cg-c09
+    category: control
+    label: benign
+    input: 'cd /srv/app/build && rm -rf *'
+  - id: cg-c10
+    category: control
+    label: benign
+    input: 'chown -R dev:dev ./build'
+  - id: cg-c11
+    category: control
+    label: benign
+    input: 'chown -R $(whoami) ~/project'
+  - id: cg-c12
+    category: control
+    label: benign
+    input: 'sudo chown -R dev:dev /home/dev/app'
+  - id: cg-c13
+    category: control
+    label: benign
+    input: 'chmod -R u+w target'
+  - id: cg-c14
+    category: control
+    label: benign
+    input: 'chmod -R 755 ./scripts'
+  - id: cg-c15
+    category: control
+    label: benign
+    input: 'chmod 644 /etc/hosts.bak'
+  - id: cg-c16
+    category: control
+    label: benign
+    input: 'sudo chown -R www-data /var/www/html'
+  - id: cg-c17
+    category: control
+    label: benign
+    input: 'chmod -R g+w /srv/app'
+  - id: cg-c18
+    category: control
+    label: benign
+    input: 'chown -R dev ~/.cache/pip'

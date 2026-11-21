@@ -31,6 +31,19 @@ the text of a command; what it does not see is written down, as measured:
   authority or a role with only a sending is still not read as an order:
   people write those to people in the same words. A text longer than the
   1 MiB read for this structure is said to be read in its start only.
+- **Goose's MCP servers are wired through the proxy.** `innerwarden agents
+  connect goose` now routes every `type: stdio` extension in
+  `~/.config/goose/config.yaml` through `innerwarden proxy`, naming Goose,
+  in monitor or enforce, and `innerwarden install` names that command instead
+  of sending Goose to `contain`. The YAML is read as the same server table the
+  JSON clients use, and written back line by line: only the `cmd` and `args`
+  lines of the servers that change are replaced, and every other line of the
+  file (comments, key order, other settings) is kept. The edited file is
+  parsed again and must equal the original with only those fields changed, or
+  nothing is written; a server written on one line is refused, not rewritten.
+  Disconnect restores each server's own command. Goose's built-in extensions
+  (`developer` among them) run inside Goose, where no proxy sees them; the
+  connect line says so.
 
 - **Cursor is screened through its own hooks.** `innerwarden agents connect
   cursor` now writes an entry under `beforeShellExecution`,
@@ -175,6 +188,17 @@ the text of a command; what it does not see is written down, as measured:
   a download that code runs is refused for an agent.
 
 ### Fixed
+
+- **A shell tool's call that names its program in `argv` is judged by its
+  line.** `run_shell {"argv": ["ls", "-la"]}` and `{"program": "ls", "args":
+  []}` were refused by ATR-2026-040 for the tool's name: `argv` with no
+  program beside it was read as arguments added to a program the call never
+  named, and an empty argument list was left unread, so no line was read and
+  the name conditions judged the call. An `argv` with no program is now the
+  program's whole vector (its first word the program) and an empty list adds
+  nothing. A harmful line in that shape is refused by the line, on a process
+  tool too: `start_process {"argv": ["rm", "-rf", "/"]}` ran before. The
+  differential check over 33,112 corpus lines and variants moves no verdict.
 
 - **The MCP proxy raises the verdict of a payment, a message, a share or a
   delete that carries a value a server said.** Each listed tool is classed

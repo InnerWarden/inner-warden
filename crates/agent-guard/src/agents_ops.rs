@@ -19,7 +19,7 @@ use crate::agents::{
     GuardMode, KnownDiscovery, ProfileConfig, KNOWN,
 };
 use crate::signatures::SignatureIndex;
-use crate::{detect, hermes_hook, hook, mcp_wire, mcp_wire_toml};
+use crate::{detect, hermes_hook, hook, mcp_wire, mcp_wire_toml, mcp_wire_yaml};
 
 const MAX_GENERIC_MCP_CONFIGS: usize = 256;
 const MAX_GENERIC_DIRECTORY_ENTRIES: usize = 4_096;
@@ -398,9 +398,15 @@ fn mcp_wrapper_programs(
     home: &Path,
     mcp_json: Option<&str>,
     mcp_toml: Option<&str>,
+    mcp_yaml: Option<&str>,
 ) -> Vec<String> {
     if let Some(relative) = mcp_json {
         return read_json(&home.join(relative))
+            .map(|config| mcp_wire::guard_wrapper_commands(&config))
+            .unwrap_or_default();
+    }
+    if let Some(relative) = mcp_yaml {
+        return read_yaml(&home.join(relative))
             .map(|config| mcp_wire::guard_wrapper_commands(&config))
             .unwrap_or_default();
     }
@@ -432,7 +438,12 @@ fn mcp_proxy_program_with(
     path_env: Option<&OsStr>,
     places: &[std::path::PathBuf],
 ) -> Option<hook::HookProgram> {
-    let programs = mcp_wrapper_programs(home, agent.mcp_json.as_deref(), agent.mcp_toml.as_deref());
+    let programs = mcp_wrapper_programs(
+        home,
+        agent.mcp_json.as_deref(),
+        agent.mcp_toml.as_deref(),
+        agent.mcp_yaml.as_deref(),
+    );
     let verdict = judge_proxy_programs(&programs, |program| {
         hook_program_fact(program, path_env, places)
     })?;
@@ -465,7 +476,12 @@ pub fn proxy_repair_command(home: &Path, agent: &AgentStatus) -> String {
         (None, Some(relative)) => read_toml(&home.join(relative))
             .and_then(|document| mcp_wire_toml::guarded_mode_toml(&document))
             .is_some_and(|mode| mode == mcp_wire_toml::WiringMode::Monitor),
-        (None, None) => false,
+        (None, None) => agent
+            .mcp_yaml
+            .as_deref()
+            .and_then(|relative| read_yaml(&home.join(relative)))
+            .and_then(|config| mcp_wire::guarded_mode(&config))
+            .is_some_and(|mode| mode == mcp_wire::WiringMode::Monitor),
     };
     let flag = if monitor { " --monitor" } else { "" };
     format!("innerwarden agents connect {}{flag}", agent.name)
@@ -850,6 +866,50 @@ fn write_json(
     }
 }
 
+/// A YAML MCP config (Goose's) read as a JSON client's server table
+/// ([`mcp_wire_yaml::YamlDoc::view`]), so every decision on it is
+/// [`mcp_wire`]'s.
+fn read_yaml(path: &Path) -> Option<Value> {
+    crate::file_update::read_config(path)
+        .ok()
+        .flatten()
+        .and_then(|bytes| mcp_wire_yaml::view_of_bytes(&bytes))
+}
+
+fn read_yaml_for_update(
+    trusted_root: &Path,
+    path: &Path,
+    reject_symlinks: bool,
+) -> Result<Option<(mcp_wire_yaml::YamlDoc, Vec<u8>)>, String> {
+    let Some(source) = read_config_for_update(trusted_root, path, reject_symlinks)? else {
+        return Ok(None);
+    };
+    let body = std::str::from_utf8(&source)
+        .map_err(|error| format!("{} is not valid UTF-8: {error}", path.display()))?;
+    let document = mcp_wire_yaml::YamlDoc::parse(body)
+        .map_err(|error| format!("{} is {error}", path.display()))?;
+    Ok(Some((document, source)))
+}
+
+fn write_yaml(
+    trusted_root: &Path,
+    path: &Path,
+    doc: &mcp_wire_yaml::YamlDoc,
+    expected: &[u8],
+    reject_symlinks: bool,
+) -> Result<(), String> {
+    if reject_symlinks {
+        crate::file_update::replace_if_unchanged_no_symlinks(
+            trusted_root,
+            path,
+            Some(expected),
+            doc.text().as_bytes(),
+        )
+    } else {
+        crate::file_update::replace_if_unchanged(path, Some(expected), doc.text().as_bytes())
+    }
+}
+
 fn read_toml(path: &Path) -> Option<toml_edit::DocumentMut> {
     crate::file_update::read_config(path)
         .ok()
@@ -990,6 +1050,14 @@ fn is_guarded(home: &Path, agent: &str, path_env: Option<&OsStr>) -> bool {
             })
             .unwrap_or(false);
     }
+    if let Some(rel) = k.mcp_yaml {
+        return read_yaml(&home.join(rel))
+            .map(|v| {
+                mcp_wire::is_guarded(&v)
+                    && !proxy_is_broken(&mcp_wire::guard_wrapper_commands(&v), path_env)
+            })
+            .unwrap_or(false);
+    }
     false
 }
 
@@ -1022,6 +1090,11 @@ pub fn has_guard_wiring(home: &Path, agent: &str) -> bool {
         if let Some(rel) = k.mcp_toml {
             return read_toml(&home.join(rel))
                 .map(|d| mcp_wire_toml::has_guard_wiring_toml(&d))
+                .unwrap_or(false);
+        }
+        if let Some(rel) = k.mcp_yaml {
+            return read_yaml(&home.join(rel))
+                .map(|v| mcp_wire::has_guard_wiring(&v))
                 .unwrap_or(false);
         }
         return false;
@@ -1066,6 +1139,11 @@ pub fn status_has_unguarded_server(home: &Path, agent: &AgentStatus) -> bool {
             .map(|document| mcp_wire_toml::has_unguarded_stdio_server_toml(&document))
             .unwrap_or(false);
     }
+    if let Some(relative) = &agent.mcp_yaml {
+        return read_yaml(&home.join(relative))
+            .map(|value| mcp_wire::has_unguarded_stdio_server(&value))
+            .unwrap_or(false);
+    }
     false
 }
 
@@ -1096,6 +1174,11 @@ fn mcp_has_guard_wiring(home: &Path, agent: &AgentStatus) -> bool {
     if let Some(relative) = &agent.mcp_toml {
         return read_toml(&home.join(relative))
             .map(|document| mcp_wire_toml::has_guard_wiring_toml(&document))
+            .unwrap_or(false);
+    }
+    if let Some(relative) = &agent.mcp_yaml {
+        return read_yaml(&home.join(relative))
+            .map(|value| mcp_wire::has_guard_wiring(&value))
             .unwrap_or(false);
     }
     false
@@ -1189,6 +1272,7 @@ fn rows_from_sources(
             // nested schema visible without granting connect authority.
             mcp_json: (schema == CompatibleMcpSchema::ProxyWrappable).then_some(rel),
             mcp_toml: None,
+            mcp_yaml: None,
             guarded,
             mode: None,
         });
@@ -1232,7 +1316,7 @@ pub fn guard_bin() -> String {
 fn mechanism(r: &AgentStatus) -> &'static str {
     if r.hookable || r.name == hermes_hook::AGENT {
         "hook"
-    } else if r.mcp_json.is_some() || r.mcp_toml.is_some() {
+    } else if r.mcp_json.is_some() || r.mcp_toml.is_some() || r.mcp_yaml.is_some() {
         "MCP proxy"
     } else {
         "manual"
@@ -1771,6 +1855,96 @@ fn connect_by_one_mechanism(
             }
         };
     }
+    if let Some(rel) = &r.mcp_yaml {
+        // Goose: wrap the stdio `extensions` in ~/.config/goose/config.yaml,
+        // read as a JSON client's servers and written back line by line: only
+        // the `cmd` and `args` lines of the servers that change are touched.
+        let path = home.join(rel);
+        let (mut doc, source) = match read_yaml_for_update(home, &path, reject_symlinks) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
+                return ConnectResult::new(
+                    ConnectEffect::Skipped,
+                    format!(
+                        "  {} - {} does not exist yet; nothing to guard until it has extensions",
+                        r.name,
+                        path.display()
+                    ),
+                )
+            }
+            Err(error) => {
+                return ConnectResult::new(
+                    ConnectEffect::Failed,
+                    format!("  {} - failed: {error}", r.name),
+                )
+            }
+        };
+        let cfg = doc.view();
+        if reject_symlinks && mcp_wire::has_guard_wiring(&cfg) {
+            return ConnectResult::new(
+                ConnectEffect::Skipped,
+                format!("  {} - existing MCP wiring left unchanged", r.name),
+            );
+        }
+        if reject_symlinks && !mcp_wire::is_automatic_wrap_safe(&cfg) {
+            return ConnectResult::new(
+                ConnectEffect::Skipped,
+                format!(
+                    "  {} - invalid MCP structure requires an explicit manual connect",
+                    r.name
+                ),
+            );
+        }
+        if !mcp_wire::is_guardable(&cfg) {
+            return ConnectResult::new(
+                ConnectEffect::Skipped,
+                format!(
+                    "  {} - {} has no local MCP servers to guard (built-in or remote only, or none)",
+                    r.name,
+                    path.display()
+                ),
+            );
+        }
+        let (wrapped, n) = mcp_wire::wrap(cfg, guard_bin, monitor, &r.name);
+        if !mcp_wire::is_guarded(&wrapped) {
+            return ConnectResult::new(
+                ConnectEffect::Failed,
+                format!(
+                    "  {} - failed: incomplete InnerWarden MCP wrapper in {}; restore its child command, then reconnect",
+                    r.name,
+                    path.display()
+                ),
+            );
+        }
+        if let Err(error) = doc.apply(&wrapped) {
+            return ConnectResult::new(
+                ConnectEffect::Failed,
+                format!("  {} - failed: {} {error}", r.name, path.display()),
+            );
+        }
+        return match write_yaml(home, &path, &doc, &source, reject_symlinks) {
+            Ok(()) if n == 0 => ConnectResult::new(
+                ConnectEffect::Unchanged,
+                format!(
+                    "  {} - already guarded (MCP proxy, {})",
+                    r.name,
+                    if monitor { "monitor" } else { "enforce" }
+                ),
+            ),
+            Ok(()) => ConnectResult::new(
+                ConnectEffect::Connected,
+                format!(
+                    "  {} - connected ({n} MCP server{} routed through the guard proxy, {}; built-in extensions are not screened by it)",
+                    r.name,
+                    if n == 1 { "" } else { "s" },
+                    if monitor { "monitor" } else { "enforce" }
+                ),
+            ),
+            Err(e) => {
+                ConnectResult::new(ConnectEffect::Failed, format!("  {} - failed: {e}", r.name))
+            }
+        };
+    }
     ConnectResult::new(
         ConnectEffect::Skipped,
         format!(
@@ -1864,6 +2038,27 @@ fn disconnect_by_one_mechanism(home: &Path, r: &AgentStatus) -> String {
             return format!("  {}, was not connected", r.name);
         }
         return match write_toml(home, &path, &doc, &source, false) {
+            Ok(()) => format!("  {}, disconnected", r.name),
+            Err(e) => format!("  {}, failed: {e}", r.name),
+        };
+    }
+    if let Some(rel) = &r.mcp_yaml {
+        // Goose: only the `cmd` and `args` lines of the servers connect
+        // wrapped are rewritten, back to the command each wrapper runs.
+        let path = home.join(rel);
+        let (mut doc, source) = match read_yaml_for_update(home, &path, false) {
+            Ok(Some(pair)) => pair,
+            Ok(None) => return format!("  {} - was not connected", r.name),
+            Err(error) => return format!("  {} - failed: {error}", r.name),
+        };
+        let (restored, n) = mcp_wire::unwrap(doc.view());
+        if n == 0 {
+            return format!("  {}, was not connected", r.name);
+        }
+        if let Err(error) = doc.apply(&restored) {
+            return format!("  {}, failed: {error}", r.name);
+        }
+        return match write_yaml(home, &path, &doc, &source, false) {
             Ok(()) => format!("  {}, disconnected", r.name),
             Err(e) => format!("  {}, failed: {e}", r.name),
         };
@@ -2308,6 +2503,15 @@ fn mcp_guard_mode(home: &Path, row: &AgentStatus) -> Option<GuardMode> {
                 mcp_wire_toml::WiringMode::Monitor => GuardMode::Monitor,
                 mcp_wire_toml::WiringMode::Enforce => GuardMode::Enforce,
                 mcp_wire_toml::WiringMode::Mixed => GuardMode::Mixed,
+            });
+    }
+    if let Some(rel) = &row.mcp_yaml {
+        return read_yaml(&home.join(rel))
+            .and_then(|config| mcp_wire::guarded_mode(&config))
+            .map(|m| match m {
+                mcp_wire::WiringMode::Monitor => GuardMode::Monitor,
+                mcp_wire::WiringMode::Enforce => GuardMode::Enforce,
+                mcp_wire::WiringMode::Mixed => GuardMode::Mixed,
             });
     }
     None
@@ -3551,6 +3755,117 @@ mod tests {
             serde_json::json!({"url": "https://example.com/sse"})
         );
         assert_eq!(config["gateway"], serde_json::json!({"port": 18789}));
+    }
+
+    /// The Goose twin: `agents connect goose` routes every stdio extension of
+    /// a real `~/.config/goose/config.yaml` through the proxy, naming Goose,
+    /// and changes no other line of the person's file; the row then reads
+    /// guarded in that mode; a second connect writes nothing; disconnect
+    /// takes out only what connect put in, and Goose reads back the document
+    /// it had.
+    ///
+    /// FAILS ON REVERT: drop `mcp_yaml` from Goose's row (connect answers
+    /// "no automatic wiring" and writes nothing).
+    #[test]
+    fn connect_goose_wraps_its_yaml_servers_and_disconnect_takes_out_only_ours() {
+        const BIN: &str = "/abs/innerwarden";
+        let original = "# my Goose\nGOOSE_PROVIDER: anthropic\nextensions:\n  developer:\n    enabled: true\n    name: developer\n    type: builtin\n  # added by hand\n  github:\n    args:\n    - -y\n    - '@modelcontextprotocol/server-github'\n    cmd: npx\n    enabled: true\n    envs: {}\n    name: github\n    timeout: 300\n    type: stdio\nGOOSE_MODE: smart_approve\n";
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/goose")).unwrap();
+        let path = home.path().join(".config/goose/config.yaml");
+        std::fs::write(&path, original).unwrap();
+        let row = known_row(home.path(), "goose");
+        assert_eq!(mechanism(&row), "MCP proxy");
+
+        let result = connect_one_result(home.path(), &row, BIN, false, false);
+        assert_eq!(result.effect, ConnectEffect::Connected, "{}", result.line);
+        assert!(result.line.contains("1 MCP server"), "{}", result.line);
+        assert!(
+            result.line.contains("built-in extensions are not screened"),
+            "{}",
+            result.line
+        );
+        let wired = std::fs::read_to_string(&path).unwrap();
+        for kept in [
+            "# my Goose\n",
+            "  # added by hand\n",
+            "  developer:\n    enabled: true\n    name: developer\n    type: builtin\n",
+            "    enabled: true\n    envs: {}\n    name: github\n    timeout: 300\n    type: stdio\nGOOSE_MODE: smart_approve\n",
+        ] {
+            assert!(wired.contains(kept), "{kept:?} in {wired}");
+        }
+        let doc: serde_yaml::Value = serde_yaml::from_str(&wired).unwrap();
+        assert_eq!(doc["extensions"]["github"]["cmd"], BIN);
+        let args: Vec<&str> = doc["extensions"]["github"]["args"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "proxy",
+                "--label",
+                "goose",
+                "--agent",
+                "goose",
+                "--mode",
+                "guard",
+                "--",
+                "npx",
+                "-y",
+                "@modelcontextprotocol/server-github"
+            ]
+        );
+        assert!(has_guard_wiring(home.path(), "goose"));
+        assert!(!status_has_unguarded_server(home.path(), &row));
+        assert_eq!(mcp_guard_mode(home.path(), &row), Some(GuardMode::Enforce));
+
+        let again = connect_one_result(home.path(), &row, BIN, false, false);
+        assert_eq!(again.effect, ConnectEffect::Unchanged, "{}", again.line);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), wired);
+
+        let monitor = connect_one_result(home.path(), &row, BIN, false, true);
+        assert_eq!(monitor.effect, ConnectEffect::Connected, "{}", monitor.line);
+        assert_eq!(mcp_guard_mode(home.path(), &row), Some(GuardMode::Monitor));
+
+        assert_eq!(disconnect_one(home.path(), &row), "  goose, disconnected");
+        let restored = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            serde_yaml::from_str::<serde_yaml::Value>(&restored).unwrap(),
+            serde_yaml::from_str::<serde_yaml::Value>(original).unwrap()
+        );
+        assert!(
+            restored.starts_with("# my Goose\nGOOSE_PROVIDER: anthropic\n"),
+            "{restored}"
+        );
+        assert!(restored.contains("  # added by hand\n"), "{restored}");
+        assert!(!has_guard_wiring(home.path(), "goose"));
+        assert_eq!(
+            disconnect_one(home.path(), &row),
+            "  goose, was not connected"
+        );
+    }
+
+    /// A connect never rewrites a Goose config whose server it cannot edit in
+    /// place: it says so and leaves the file as it was.
+    #[test]
+    fn connect_leaves_a_goose_config_it_cannot_edit_in_place() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".config/goose")).unwrap();
+        let path = home.path().join(".config/goose/config.yaml");
+        let inline = "extensions:\n  github: {cmd: npx, args: [x], type: stdio}\n";
+        std::fs::write(&path, inline).unwrap();
+        let row = known_row(home.path(), "goose");
+        let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert_eq!(result.effect, ConnectEffect::Failed, "{}", result.line);
+        assert!(
+            result.line.contains("cannot be edited in place"),
+            "{}",
+            result.line
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), inline);
     }
 
     /// The Codex twin: its TOML wrappers name it too, in enforce here.
