@@ -186,7 +186,7 @@ pub(crate) fn inspect_declared_tool_call(
             alerts.push(VerdictAlert::builtin(
                 "AG-ARGV-LONG",
                 format!(
-                    "arguments of {bytes} bytes in {items} words are more than the {MAX_ARGUMENT_READ_BYTES} \
+                    "lists of {bytes} bytes in {items} words are more than the {MAX_ARGUMENT_READ_BYTES} \
                      bytes or {MAX_ARGUMENT_WORDS} words the guard reads; refused unread"
                 ),
                 true,
@@ -216,8 +216,11 @@ pub(crate) fn inspect_declared_tool_call(
         // arguments (its tool's name among them) still run.
         // `{"command": "ls", "args": [{"x": "; rm -rf /"}]}` was judged as `ls`.
         if unreadable.is_none() && commands.iter().all(|command| command.exclusive) {
+            let refused_unread = alerts
+                .iter()
+                .any(|alert| alert.block && alert.rule == "AG-ARGV-LONG");
             return Verdict {
-                allowed: !blocks && long_stdin.is_none(),
+                allowed: !blocks && long_stdin.is_none() && !refused_unread,
                 alerts,
             };
         }
@@ -749,29 +752,42 @@ pub(crate) const MAX_ARGUMENT_READ_BYTES: usize = 256 * 1024;
 /// See [`MAX_ARGUMENT_READ_BYTES`].
 pub(crate) const MAX_ARGUMENT_WORDS: usize = 4096;
 
-/// The size (bytes, words) of a call's argument vectors when past
-/// [`MAX_ARGUMENT_READ_BYTES`] or [`MAX_ARGUMENT_WORDS`].
+/// The size (bytes, words) of every list a shell or process tool call
+/// holds, at any depth (`argv`, `args`, a `files` or `paths` list beside the
+/// command, one inside `options`), when past [`MAX_ARGUMENT_READ_BYTES`] or
+/// [`MAX_ARGUMENT_WORDS`]. A server may hand any of them to its program, so
+/// none is left unbounded.
 fn arguments_past_cap(args: &serde_json::Value) -> Option<(usize, usize)> {
-    let object = args.as_object()?;
-    let (mut bytes, mut items) = (0usize, 0usize);
-    for key in ARGUMENT_KEYS {
-        match object.get(*key) {
-            Some(serde_json::Value::Array(words)) => {
-                items += words.len();
-                bytes += words
-                    .iter()
-                    .map(|word| match word {
-                        serde_json::Value::String(text) => text.len(),
-                        other => other.to_string().len(),
-                    })
-                    .sum::<usize>();
+    fn walk(value: &serde_json::Value, in_list: bool, bytes: &mut usize, items: &mut usize) {
+        match value {
+            serde_json::Value::Array(words) => {
+                *items += words.len();
+                for word in words {
+                    walk(word, true, bytes, items);
+                }
             }
-            Some(serde_json::Value::String(text)) => {
-                items += 1;
-                bytes += text.len();
+            serde_json::Value::Object(map) => {
+                for value in map.values() {
+                    walk(value, false, bytes, items);
+                }
             }
+            serde_json::Value::String(text) if in_list => *bytes += text.len(),
+            other if in_list => *bytes += other.to_string().len(),
             _ => {}
         }
+    }
+    let object = args.as_object()?;
+    let (mut bytes, mut items) = (0usize, 0usize);
+    for (key, value) in object {
+        // A lone argument string is a list of one word.
+        if ARGUMENT_KEYS.contains(&key.as_str()) {
+            if let serde_json::Value::String(text) = value {
+                items += 1;
+                bytes += text.len();
+                continue;
+            }
+        }
+        walk(value, false, &mut bytes, &mut items);
     }
     (bytes > MAX_ARGUMENT_READ_BYTES || items > MAX_ARGUMENT_WORDS).then_some((bytes, items))
 }
@@ -1557,9 +1573,9 @@ fn read_call_shape<'a>(shell_tool: bool, args: &'a serde_json::Value) -> ToolCal
 ///   (it says so with `shell: true`, or may do so unasked) runs what a glob,
 ///   a redirection or a variable in a word does there: the words joined as
 ///   written are judged as well. Read so when the call asks for a shell, or
-///   when a word other than the program's holds such a character and no
-///   space, and the program is no shell (a shell's word is already a line,
-///   and code with spaces would be torn apart for nothing).
+///   when a word other than the program's holds such a character and the
+///   program is no shell (a shell's word is already a line). A word with a
+///   space joins too (`-n /home/u/.aws/*`).
 /// * The folder a call names for its command is where the command's
 ///   relative operands are: each is also read joined to it
 ///   ([`folder_readings`], [`operands_in_folder`]). Before,
@@ -1574,10 +1590,10 @@ fn add_proxy_readings<'a>(args: &'a serde_json::Value, commands: &mut Vec<ToolCo
     let shell_asked = asks_for_a_shell(object);
     if let Some(words) = words_handed(object) {
         let meta = !program_is_a_shell(object)
-            && words.iter().skip(1).any(|word| {
-                word.contains(['*', '?', '[', '<', '>', '$', '`'])
-                    && !word.contains(char::is_whitespace)
-            });
+            && words
+                .iter()
+                .skip(1)
+                .any(|word| word.contains(['*', '?', '[', '<', '>', '$', '`']));
         if shell_asked || meta {
             let line = words.join(" ");
             if !commands.iter().any(|known| known.line == line.as_str()) {
@@ -2033,6 +2049,13 @@ fn words_handed(object: &serde_json::Map<String, serde_json::Value>) -> Option<V
 /// it is there and differs (a link to `/etc` is `/etc`). A plain relative
 /// folder (`src`) stays relative to where the server runs, which is not
 /// known: it gives nothing.
+///
+/// Limit: the real path is read on the proxy's disk, which is the server's
+/// only when the server runs on the same machine and sees the same files (a
+/// server in a container or on another host does not). There a link is read
+/// as written only, the lexical reading, which still judges every `..`. The
+/// lookup is one `realpath` per folder a call names, made only for a call
+/// with a folder.
 fn folder_readings(folder: &str) -> Vec<String> {
     let folder = folder.trim();
     if folder.is_empty() {
@@ -2078,52 +2101,60 @@ fn folder_readings(folder: &str) -> Vec<String> {
 }
 
 /// `line` with each operand written relative to where it runs joined to
-/// `folder` (`cat shadow` in `/etc` is `cat /etc/shadow`; `rm -rf .` in
-/// `/` is `rm -rf /`). An operand is a word after the program that is not
-/// an option, not a path from `/` or `~`, not a variable and not an
-/// assignment. `None` for a line with shell syntax beyond words (an
-/// operator, a quote, a substitution), whose words are not read here, or
-/// with no such operand.
+/// `folder` and collapsed (`cat shadow` in `/etc` is `cat /etc/shadow`;
+/// `rm -rf .` in `/` is `rm -rf /`; `cat ../../etc//shadow` in
+/// `/home/u/app` is `cat /etc/shadow`). The line is read as the analyzer
+/// reads it: split into its commands ([`threats::shell_command_segments`])
+/// and each into the shell's words ([`threats::shell_tokens`]), so a quote
+/// or an escape (`cat 'shadow'`, `cat sh\\adow`) does not hide an operand.
+/// An operand is a word after the program that is not an option, not a path
+/// from `/` or `~`, not a variable or a substitution, not an assignment
+/// and not a link. The commands are given back joined by `;`, each word
+/// quoted: a reading added to the line's own, which stays judged as written.
+/// `None` when no operand was joined.
 fn operands_in_folder(line: &str, folder: &str) -> Option<String> {
-    if line.contains([
-        ';', '&', '|', '<', '>', '(', ')', '`', '"', '\'', '\\', '\n', '{', '}',
-    ]) {
-        return None;
-    }
-    let words: Vec<&str> = line.split_whitespace().collect();
-    let program = words.iter().position(|word| {
-        !word
-            .split_once('=')
-            .is_some_and(|(name, _)| threats::is_shell_name(name))
-    })?;
+    let base = folder.trim_end_matches('/');
     let mut changed = false;
-    let joined: Vec<String> = words
-        .iter()
-        .enumerate()
-        .map(|(at, word)| {
-            let relative = at > program
-                && !word.starts_with(['-', '/', '~', '$'])
-                && !word.contains('=')
-                && !word.contains("://");
-            if !relative {
-                return (*word).to_string();
-            }
-            changed = true;
-            let base = folder.trim_end_matches('/');
-            let path = match *word {
-                "." | "./" => {
-                    if base.is_empty() {
-                        "/".to_string()
-                    } else {
-                        base.to_string()
-                    }
+    let mut commands: Vec<String> = Vec::new();
+    for segment in threats::shell_command_segments(line) {
+        let words = threats::shell_tokens(segment);
+        let Some(program) = words.iter().position(|word| {
+            !word
+                .split_once('=')
+                .is_some_and(|(name, _)| threats::is_shell_name(name))
+        }) else {
+            continue;
+        };
+        let joined: Vec<String> = words
+            .iter()
+            .enumerate()
+            .map(|(at, word)| {
+                let relative = at > program
+                    && !word.is_empty()
+                    && !word.starts_with(['-', '/', '~', '$', '<', '>', '&', '|', ';', '(', ')'])
+                    && !word.contains('=')
+                    && !word.contains("://");
+                if !relative {
+                    return shell_quoted(word);
                 }
-                _ => format!("{base}/{}", word.trim_start_matches("./")),
-            };
-            path
-        })
-        .collect();
-    changed.then(|| joined.join(" "))
+                changed = true;
+                let path = threats::collapse_path(&format!("{base}/{word}"));
+                let path = match (base.starts_with('~'), path.is_empty()) {
+                    (_, true) => "/".to_string(),
+                    (true, _) if !path.starts_with('~') => format!("/{path}"),
+                    _ => path,
+                };
+                // A glob stays a glob: only the text around it is quoted.
+                if path.contains(['*', '?', '[']) {
+                    path
+                } else {
+                    shell_quoted(&path)
+                }
+            })
+            .collect();
+        commands.push(joined.join(" "));
+    }
+    changed.then(|| commands.join(" ; "))
 }
 
 /// Whether `text` is a folder named as plainly as a path can be: letters,

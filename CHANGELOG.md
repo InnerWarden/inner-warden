@@ -196,16 +196,23 @@ the text of a command; what it does not see is written down, as measured:
   to where it points: `cat shadow` in `/etc` is `cat /etc/shadow`, `rm -rf
   .` in `/` is `rm -rf /`, `rm -rf *` in the home is a wipe of it, in
   `run_shell` as in `run_command` and for a command string too (main judged
-  these as `cat shadow`). A folder holding shell syntax (`$(...)`, `;`, a
+  these as `cat shadow`). The line is read in the shell's words, so a quote
+  or an escape does not hide an operand (`cat 'shadow'`, `cat sh\adow`), and
+  each joined operand is collapsed (`../../etc//shadow` from `/home/u/app` is
+  `/etc/shadow`). A link is followed on the proxy's own disk, which is the
+  server's only when both run on the same machine; elsewhere the folder is
+  read as written. A folder holding shell syntax (`$(...)`, `;`, a
   backtick) is also judged as the line a server would join it into, `cd
   <folder> && <line>`.
 - **Words a server may join into a shell line are judged joined.** A call
   that asks for a shell (`shell`, `use_shell`: true), or whose words hold a
-  glob, a redirection or a variable, is also judged as its words joined as
-  written (`cat *` in `~/.ssh`, `echo x >~/.bashrc`); the flag keeps the
-  call's other checks, its tool's name among them. A word that is not text
-  beside a command string no longer lets that string be judged alone.
-  Arguments past 256 KiB or 4096 words are refused unread (AG-ARGV-LONG).
+  glob, a redirection or a variable (a space in it too: `-rf /home/u/*`), is
+  also judged as its words joined as written (`cat *` in `~/.ssh`, `echo x
+  >~/.bashrc`); the flag keeps the call's other checks, its tool's name among
+  them. A word that is not text beside a command string no longer lets that
+  string be judged alone. The lists a call holds (its arguments, and any
+  other list beside the command) past 256 KiB or 4096 words in all are
+  refused unread (AG-ARGV-LONG).
 - **Goose's config: a merge key, an unreadable file, remote extensions and
   `args`.** An extension holding a YAML merge key (`<<: *base`), which
   Goose does not apply, was read without it, so a stdio server whose `type`

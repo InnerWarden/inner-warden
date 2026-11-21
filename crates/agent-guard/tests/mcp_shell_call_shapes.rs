@@ -359,3 +359,104 @@ fn arguments_past_the_cap_are_refused_unread() {
         );
     }
 }
+
+/// Review 2 of #369, item 1: a command string with quotes or an escape is
+/// read in its folder too: its words are the shell's (quotes taken off, an
+/// escape read), each relative one joined to the folder.
+///
+/// FAILS ON REVERT of the lexed words in `operands_in_folder` (the line was
+/// skipped for its quote, so `cat 'shadow'` in `/etc` ran).
+#[test]
+fn a_quoted_or_escaped_operand_is_read_in_its_folder() {
+    for tool in ["run_command", "run_shell", "subprocess"] {
+        for args in [
+            json!({"command": "cat 'shadow'", "cwd": "/etc"}),
+            json!({"command": "cat \"shadow\"", "cwd": "/etc"}),
+            json!({"command": "cat sh\\adow", "cwd": "/etc"}),
+            json!({"command": "cat 'sha'dow", "cwd": "/etc"}),
+            json!({"command": "ls && cat 'shadow'", "cwd": "/etc"}),
+            json!({"command": "cd . ; cat \"shadow\" | head", "cwd": "/etc"}),
+            json!({"command": "cat 'id_rsa'", "cwd": "~/.ssh"}),
+            json!({"command": "rm -rf \"*\"", "cwd": "/"}),
+        ] {
+            refused(tool, &args);
+        }
+        allowed(
+            tool,
+            &json!({"command": "cat 'README.md'", "cwd": "/home/u/app"}),
+        );
+        allowed(
+            tool,
+            &json!({"command": "git log --format='%h %s' -n 5", "cwd": "/home/u/app"}),
+        );
+    }
+}
+
+/// Review 2 of #369, item 2: an operand joined to its folder is collapsed
+/// (`..`, `.`, `//`) as the folder is, so `../../etc//shadow` from
+/// `/home/u/app` is `/etc/shadow`.
+///
+/// FAILS ON REVERT of `collapse_path` on the joined operand.
+#[test]
+fn a_joined_operand_is_collapsed() {
+    for tool in ["run_command", "run_shell"] {
+        for args in [
+            json!({"command": "cat ../../etc//shadow", "cwd": "/home/u/app"}),
+            json!({"argv": ["cat", "../../etc/./shadow"], "cwd": "/home/u/app"}),
+            json!({"argv": ["cat", "./../../etc/shadow"], "cwd": "/home/u/app"}),
+            json!({"argv": ["cat", "..//..//.ssh/id_rsa"], "cwd": "/home/u/app/src"}),
+        ] {
+            refused(tool, &args);
+        }
+        allowed(
+            tool,
+            // `../README.md` itself is refused by ATR-2026-012 (a traversal in
+            // the arguments), on main too.
+            &json!({"argv": ["cat", "./README.md"], "cwd": "/home/u/app/src"}),
+        );
+    }
+}
+
+/// Review 2 of #369, item 4: a word with a glob, a redirection or a
+/// variable is joined even when it holds a space: `-n /home/u/.aws/*`.
+#[test]
+fn a_word_with_a_glob_and_a_space_is_joined_too() {
+    for tool in ["run_command", "run_shell"] {
+        // Joined, `cat -n /home/u/.aws/*` is held for review by the
+        // analyzer, as the same line typed into the shell is: not refused.
+        refused(tool, &json!({"argv": ["rm", "-rf /home/u/*"]}));
+        refused(tool, &json!({"command": "rm", "args": ["-rf /*"]}));
+        refused(
+            tool,
+            &json!({"command": "cat", "args": ["-n /home/u/.ssh/id_*"]}),
+        );
+        refused(
+            tool,
+            &json!({"argv": ["cat", "x >/home/u/.ssh/authorized_keys"]}),
+        );
+        allowed(tool, &json!({"argv": ["ls", "-la *.rs"]}));
+    }
+}
+
+/// Review 2 of #369, item 5: any list of words beside a command is held to
+/// the cap the arguments are held to.
+///
+/// FAILS ON REVERT of the cap on every list in `arguments_past_cap`.
+#[test]
+fn any_list_beside_a_command_is_held_to_the_cap() {
+    let many: Vec<String> = (0..5000).map(|n| format!("f{n}")).collect();
+    for tool in ["run_command", "run_shell"] {
+        for args in [
+            json!({"command": "ls", "files": many}),
+            json!({"argv": ["ls"], "paths": many}),
+            json!({"command": "ls", "options": {"extra": many}}),
+        ] {
+            let v = verdict(tool, &args);
+            assert!(
+                !v.allowed && v.alerts.iter().any(|a| a.rule == "AG-ARGV-LONG"),
+                "{tool}: {:?}",
+                rules(&v)
+            );
+        }
+    }
+}
