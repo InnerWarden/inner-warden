@@ -133,9 +133,11 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
 - 2026-11-21: line-variables-2026-11 and cd-glob-owner-2026-11 join the
   release safety suite (review of the pull request that reads a line's
   values where each name is used); nothing already in the reference moved.
-  Added line-variables-2026-11/lv-01..lv-47 (malicious, each deny) with
-  lv-c01..lv-c19 (benign, each allow), and cd-glob-owner-2026-11/cg-01..cg-64
-  (malicious, each deny) with cg-c01..cg-c22 (benign, each allow).
+  Added line-variables-2026-11/lv-01..lv-51 (malicious, each deny) with
+  lv-c01..lv-c20 (benign, each allow), and cd-glob-owner-2026-11/cg-01..cg-66
+  (malicious, each deny) with cg-c01..cg-c22 (benign, each allow) and
+  cg-c23..cg-c25 (benign, `expect: review`, each review: a `find` whose
+  starting point the line does not spell out, as main holds it).
 - 2026-11-21: harmless-proven: line-variables-2026-11/lv-c09,
   line-variables-2026-11/lv-c10 and line-variables-2026-11/lv-c11 go from
   deny to allow; the shell gives the name no value where it is used.

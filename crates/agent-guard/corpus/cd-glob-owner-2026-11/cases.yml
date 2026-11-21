@@ -12,7 +12,7 @@
 # cg-c18 pick some files out, keep to the starting point or start in a
 # project folder.
 # From cg-48 (second review, 2026-11-21): global options before the starting
-# point, a starting point the line does not spell out, a test that is not a
+# point, a starting point the line resolves to the root, a test that is not a
 # literal name or path, the program behind a launcher or in a shell's -c line.
 # The proof is tests/cd_then_glob_and_recursive_owner.rs.
 # Nothing in this file is executed.
@@ -360,7 +360,7 @@ cases:
   - id: cg-52
     category: find_owner_change
     label: malicious
-    input: 'find -L $UNKNOWN -exec chown nobody {} +'
+    input: 'X=/; find "$X" -exec chown nobody {} +'
     must_refuse: true
     expect: deny
   - id: cg-53
@@ -433,5 +433,32 @@ cases:
     category: find_owner_change
     label: malicious
     input: 'find / -exec sh -c ''chown nobody "$1"'' sh {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-c23
+    category: control
+    label: benign
+    input: 'find "$OUT" -name "*.html" -exec chmod 644 {} +'
+    expect: review
+  - id: cg-c24
+    category: control
+    label: benign
+    input: 'find "$BUILD" -type f -exec chmod +x {} \;'
+    expect: review
+  - id: cg-c25
+    category: control
+    label: benign
+    input: 'find "$1" -type f -exec chmod 644 {} +'
+    expect: review
+  - id: cg-65
+    category: find_owner_change
+    label: malicious
+    input: 'find / -nouser -exec chown nobody {} +'
+    must_refuse: true
+    expect: deny
+  - id: cg-66
+    category: find_owner_change
+    label: malicious
+    input: 'find / -empty -exec chmod 777 {} +'
     must_refuse: true
     expect: deny

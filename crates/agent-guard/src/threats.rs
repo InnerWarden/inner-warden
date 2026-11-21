@@ -13873,8 +13873,9 @@ pub fn recursive_owner_change_of_system(hay: &str, cwd: &str, home: Option<&str>
             .any(|body| changes(shell_command_segments(body)))
 }
 
-/// The tests of `find` that pick some files out of the tree: with one of
-/// them the change reaches the files it names, not the whole tree.
+/// The tests of `find` that take an argument, stepped over with it so the
+/// argument is not read as an action. None of them picks files out by
+/// itself: only a literal name or path does ([`find_changes_owner_of_system`]).
 const FIND_SELECTING_TESTS: &[&str] = &[
     "-name",
     "-iname",
@@ -13888,8 +13889,6 @@ const FIND_SELECTING_TESTS: &[&str] = &[
     "-group",
     "-uid",
     "-gid",
-    "-nouser",
-    "-nogroup",
     "-perm",
     "-newer",
     "-anewer",
@@ -13906,7 +13905,6 @@ const FIND_SELECTING_TESTS: &[&str] = &[
     "-links",
     "-lname",
     "-ilname",
-    "-empty",
 ];
 
 /// Whether `find` with `words` after it hands every file of the root, a
@@ -13914,8 +13912,10 @@ const FIND_SELECTING_TESTS: &[&str] = &[
 /// `-execdir`, `-ok`, `-okdir`): the same change of the whole tree as
 /// `chown -R` ([`recursive_owner_change_of_system`]). The global options
 /// before the starting points (`-H`, `-L`, `-P`, `-D`, `-O3`) are
-/// stepped over, and a starting point the line does not spell out (`$X`
-/// with no value) counts as such a place. The program run is read past its
+/// stepped over. A starting point the line does not spell out (`"$OUT"`
+/// with no value) is not such a place here: it keeps the verdict of the
+/// rules that read unread words (review); one the line resolves (`X=/;
+/// find "$X"`) is judged as the place it holds. The program run is read past its
 /// launchers (`sudo -u root`, `nohup`, `timeout 9`) and inside a shell's
 /// `-c` line. Only a test of a literal name or path (`-name app.conf`,
 /// `-path /etc/x`) picks some files out; an owner, a glob, a regex, a
@@ -13992,10 +13992,9 @@ fn find_changes_owner_of_system(
         return false;
     }
     let starts = if starts.is_empty() { vec!["."] } else { starts };
-    starts.iter().any(|start| {
-        owner_change_target_is_system_or_home(place, start, home)
-            || (start.contains(['$', '`']) && place.resolve(start).is_none())
-    })
+    starts
+        .iter()
+        .any(|start| owner_change_target_is_system_or_home(place, start, home))
 }
 
 /// Whether the words of a `find -exec` run `chown`, `chgrp` or `chmod`:

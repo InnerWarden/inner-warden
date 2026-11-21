@@ -285,3 +285,25 @@ fn prose_after_read_in_a_loaded_file_sets_no_name() {
         "allow"
     );
 }
+
+/// Final review of this change (2026-11-21): a use in a loop body reads the
+/// value the same body gives the name later, the next time round (main:
+/// deny 90; the first version of this change: allow). Outside a loop a use
+/// before the assignment stays as `rm -rf $X` alone is.
+#[test]
+fn a_value_a_loop_gives_later_reaches_the_next_time_round() {
+    for line in [
+        "for i in 1 2; do rm -rf $X; X=/; done",
+        "while true; do rm -rf $X; X=/; done",
+        "until false; do rm -rf $X; X=/; done",
+        "X=build; for i in 1 2; do rm -rf $X; X=/; done",
+        "X=/; for i in 1 2; do rm -rf $X; X=build; done",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    assert_eq!(verdict("rm -rf $X; X=/"), "review");
+    assert_eq!(
+        verdict("for i in 1 2; do X=build; rm -rf $X; done"),
+        "allow"
+    );
+}

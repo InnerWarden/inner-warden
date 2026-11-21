@@ -1307,6 +1307,11 @@ line-variables-2026-11	lv-47	deny
 line-variables-2026-11	lv-c17	allow
 line-variables-2026-11	lv-c18	allow
 line-variables-2026-11	lv-c19	allow
+line-variables-2026-11	lv-48	deny
+line-variables-2026-11	lv-49	deny
+line-variables-2026-11	lv-50	deny
+line-variables-2026-11	lv-51	deny
+line-variables-2026-11	lv-c20	allow
 cd-glob-owner-2026-11	cg-01	deny
 cd-glob-owner-2026-11	cg-02	deny
 cd-glob-owner-2026-11	cg-03	deny
@@ -1384,3 +1389,8 @@ cd-glob-owner-2026-11	cg-61	deny
 cd-glob-owner-2026-11	cg-62	deny
 cd-glob-owner-2026-11	cg-63	deny
 cd-glob-owner-2026-11	cg-64	deny
+cd-glob-owner-2026-11	cg-c23	review
+cd-glob-owner-2026-11	cg-c24	review
+cd-glob-owner-2026-11	cg-c25	review
+cd-glob-owner-2026-11	cg-65	deny
+cd-glob-owner-2026-11	cg-66	deny

@@ -491,6 +491,53 @@ fn block_depths(text: &str, layout: &Layout) -> Vec<i32> {
     depths
 }
 
+/// Where the bodies of the loops of the line are written: from past each
+/// `do` to its `done`, read on the words outside single quotes. At most
+/// [`LOOK_BACK`].
+fn loop_bodies(text: &str, layout: &Layout) -> Vec<(usize, usize)> {
+    let b = text.as_bytes();
+    let mut open: Vec<(&str, usize)> = Vec::new();
+    let mut bodies = Vec::new();
+    let mut word_start = None;
+    for at in 0..=b.len() {
+        let ends = at == b.len()
+            || b" \t\n;&|()".contains(&b[at])
+            || layout.single.get(at).copied().unwrap_or(false);
+        if !ends {
+            if word_start.is_none() {
+                word_start = Some(at);
+            }
+            continue;
+        }
+        let Some(from) = word_start.take() else {
+            continue;
+        };
+        match &text[from..at] {
+            "do" => open.push(("do", at)),
+            "if" => open.push(("if", at)),
+            "case" => open.push(("case", at)),
+            "{" => open.push(("{", at)),
+            word @ ("done" | "fi" | "esac" | "}") => {
+                let opener = match word {
+                    "done" => "do",
+                    "fi" => "if",
+                    "esac" => "case",
+                    _ => "{",
+                };
+                if let Some(index) = open.iter().rposition(|(kind, _)| *kind == opener) {
+                    let (_, start) = open[index];
+                    open.truncate(index);
+                    if opener == "do" && bodies.len() < LOOK_BACK {
+                        bodies.push((start, from));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    bodies
+}
+
 /// Where the bodies of the functions the line defines are written
 /// (`f(){ ...; }`, `function f { ...; }`): a name used there takes the value
 /// it has where the function is called, which may be any the line gives.
@@ -744,13 +791,22 @@ struct Values {
     unplain_read: std::cell::Cell<bool>,
     /// The bodies of the functions the line defines ([`function_bodies`]).
     bodies: Vec<(usize, usize)>,
+    /// The bodies of the loops of the line ([`loop_bodies`]).
+    loops: Vec<(usize, usize)>,
+    /// Set for the reading that takes, where a loop gives the name a value
+    /// later in its body, that value first.
+    prefer_late: std::cell::Cell<bool>,
 }
 
 impl Values {
     /// The value of `name` at `at`: the one in effect there or, inside a
     /// function body, any the line gives the name.
     fn lookup(&self, name: &str, at: usize) -> Option<String> {
-        let found = self.lookup_in_order(name, at);
+        let late = self.later_in_loop(name, at);
+        if late.is_some() && self.prefer_late.get() {
+            return late;
+        }
+        let found = self.lookup_in_order(name, at).or(late);
         if found.is_some()
             || !self
                 .bodies
@@ -764,6 +820,32 @@ impl Values {
         let list = self.by_name.get(name)?;
         for &index in list.iter().rev().take(LOOK_BACK) {
             let event = &self.events[index];
+            if let Some(value) = &event.resolved {
+                if !event.plain {
+                    self.unplain_read.set(true);
+                }
+                return Some(value.clone());
+            }
+        }
+        None
+    }
+
+    /// A value a loop around `at` gives `name` later in its body: the next
+    /// time round, the use reads it (`for i in 1 2; do rm -rf $X; X=/;
+    /// done` removes `/` the second time).
+    fn later_in_loop(&self, name: &str, at: usize) -> Option<String> {
+        let close = self
+            .loops
+            .iter()
+            .filter(|(open, close)| *open <= at && at < *close)
+            .map(|(_, close)| *close)
+            .max()?;
+        let list = self.by_name.get(name)?;
+        for &index in list.iter().rev().take(LOOK_BACK) {
+            let event = &self.events[index];
+            if event.from <= at || event.head >= close {
+                continue;
+            }
             if let Some(value) = &event.resolved {
                 if !event.plain {
                     self.unplain_read.set(true);
@@ -982,6 +1064,8 @@ pub(crate) fn readings_in_effect(content: &str) -> Vec<String> {
         limit,
         unplain_read: std::cell::Cell::new(false),
         bodies: function_bodies(content, &layout),
+        loops: loop_bodies(content, &layout),
+        prefer_late: std::cell::Cell::new(false),
     };
     let moves = folder_moves(content);
     // All the values worked out together may hold four times the limit.
@@ -1016,12 +1100,23 @@ pub(crate) fn readings_in_effect(content: &str) -> Vec<String> {
         }
         values.events[index].resolved = resolved;
     }
-    match values.expand(content, &|at: usize| at) {
-        Some((reading, true)) if reading != content && !values.unplain_read.get() => {
-            vec![reading]
+    let mut readings = Vec::new();
+    // Once with the value in effect where each name is used, once more with
+    // a value a loop gives the name later in its body, where there is one:
+    // both may run, and the worse decides.
+    for late in [false, true] {
+        if late && values.loops.is_empty() {
+            break;
         }
-        _ => Vec::new(),
+        values.prefer_late.set(late);
+        values.unplain_read.set(false);
+        if let Some((reading, true)) = values.expand(content, &|at: usize| at) {
+            if reading != content && !values.unplain_read.get() && !readings.contains(&reading) {
+                readings.push(reading);
+            }
+        }
     }
+    readings
 }
 
 #[cfg(test)]

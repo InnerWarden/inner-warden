@@ -154,7 +154,6 @@ fn find_options_tests_and_launchers_do_not_free_a_whole_system_change() {
         "find -H / -exec chown nobody {} +",
         "find -P / -exec chown nobody {} +",
         "find -O3 / -exec chown nobody {} +",
-        "find -L $UNKNOWN -exec chown nobody {} +",
         "find / -user root -exec chown nobody {} +",
         "find / -user olduser -exec chown newuser {} +",
         "find / ! -name x -exec chown nobody {} +",
@@ -167,6 +166,30 @@ fn find_options_tests_and_launchers_do_not_free_a_whole_system_change() {
         "find / -exec timeout 9 chown nobody {} +",
         "find / -exec sudo -u root chown nobody {} +",
         "find / -exec sh -c 'chown nobody \"$1\"' sh {} +",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// Final review of this change (2026-11-21): a starting point the line does
+/// not spell out keeps main's verdict (review): build scripts change the
+/// mode of their own output folder this way. One the line resolves to the
+/// root is refused. `-nouser`, `-nogroup` and `-empty` take no argument,
+/// so the action after them is read.
+#[test]
+fn an_unread_starting_point_is_not_refused_but_a_resolved_root_is() {
+    for line in [
+        "find \"$OUT\" -name \"*.html\" -exec chmod 644 {} +",
+        "find \"$BUILD\" -type f -exec chmod +x {} \\;",
+        "find \"$1\" -type f -exec chmod 644 {} +",
+    ] {
+        assert_ne!(verdict(line), "deny", "{line}");
+    }
+    for line in [
+        "X=/; find \"$X\" -exec chown nobody {} +",
+        "X=/; find $X -type f -exec chown nobody {} +",
+        "find / -nouser -exec chown nobody {} +",
+        "find / -empty -exec chmod 777 {} +",
     ] {
         assert_eq!(verdict(line), "deny", "{line}");
     }
