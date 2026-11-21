@@ -91,7 +91,8 @@ its own record, and written only if the file still holds what was read
 (tried again, up to 8 times, waiting up to 1 s for the lock each time). A
 prompt that still cannot be written is not kept: an empty mark beside the
 record (`.<name>.json.lost`) says the session lost a prompt, and a value not
-found answers "unknown", never "no". Each record has its lock file beside it
+found answers "unknown", never "no". A mark with no record beside it goes after
+24 hours and counts toward the 64 sessions kept. Each record has its lock file beside it
 (`.<name>.json.innerwarden.lock`), removed with the record.
 
 A prompt past 24 hours is never read. It is deleted:
@@ -160,7 +161,7 @@ cannot read, text that is not JSON, the deadline or a panic, which is why
 status says that event is not screened when every line of ours under it is
 the prompt line; any JSON on it that is not a prompt naming no tool is
 screened and refused as on any other line. Writing such a line takes an edit
-of the agent's settings, which the guard refuses to the agent. Cursor's wiring has no prompt
+of the agent's settings, which the guard refuses to the agent (measured with `innerwarden check`: `jq` into a temp file and `mv`, `sed -i`, `python3` and `jq | sponge` on the `PreToolUse` of `~/.claude/settings.json` are each `deny`). Cursor's wiring has no prompt
 line, and the flag is ignored on a line that names Cursor.
 
 The one end the guard cannot answer for: if its program is gone, the shell

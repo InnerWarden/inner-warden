@@ -1898,8 +1898,9 @@ pub fn unscreened_iwguard_hooks(
         let Some(entries) = entries.as_array() else {
             continue;
         };
-        // (label, verdicts) per matcher, in file order.
-        let mut groups: Vec<(String, Vec<HookProgram>)> = Vec::new();
+        // (label, verdicts) per matcher, in file order, each verdict with whether it came
+        // from the prompt line, which screens no tool call.
+        let mut groups: Vec<(String, Vec<(HookProgram, bool)>)> = Vec::new();
         let mut every_tool_runs = false;
         for entry in entries {
             let label = if event == crate::user_prompt::PROMPT_EVENT {
@@ -1908,7 +1909,7 @@ pub fn unscreened_iwguard_hooks(
                 matcher_label(entry)
             };
             let prompt_event = event == crate::user_prompt::PROMPT_EVENT;
-            let verdicts: Vec<HookProgram> = entry
+            let verdicts: Vec<(HookProgram, bool)> = entry
                 .get("hooks")
                 .and_then(Value::as_array)
                 .into_iter()
@@ -1932,22 +1933,26 @@ pub fn unscreened_iwguard_hooks(
                         .and_then(hook_command_words)
                         .and_then(|words| words.into_iter().next())?;
                     Some(if prompt_here {
-                        HookProgram::Broken {
-                            problem: format!(
-                                "its innerwarden line ends with {}, which screens no tool call",
-                                crate::user_prompt::PROMPT_LINE_FLAG
-                            ),
-                            program,
-                        }
+                        (
+                            HookProgram::Broken {
+                                problem: format!(
+                                    "its innerwarden line ends with {}, which screens no tool \
+                                     call",
+                                    crate::user_prompt::PROMPT_LINE_FLAG
+                                ),
+                                program,
+                            },
+                            true,
+                        )
                     } else {
-                        judge_hook_program(&program, fact(&program))
+                        (judge_hook_program(&program, fact(&program)), false)
                     })
                 })
                 .collect();
             if verdicts.is_empty() {
                 continue;
             }
-            if label == "every tool" && verdicts.contains(&HookProgram::Runs) {
+            if label == "every tool" && verdicts.iter().any(|(v, _)| *v == HookProgram::Runs) {
                 every_tool_runs = true;
             }
             match groups.iter_mut().find(|(l, _)| *l == label) {
@@ -1961,7 +1966,7 @@ pub fn unscreened_iwguard_hooks(
         for (label, verdicts) in groups {
             if verdicts
                 .iter()
-                .any(|v| !matches!(v, HookProgram::Broken { .. }))
+                .any(|(v, _)| !matches!(v, HookProgram::Broken { .. }))
             {
                 continue;
             }
@@ -1969,14 +1974,11 @@ pub fn unscreened_iwguard_hooks(
             // already makes the whole agent off, said elsewhere. A Bash group
             // whose every line of ours is the prompt line has no line there
             // to judge, so it is said here.
-            let prompt_lines_only = verdicts.iter().all(|v| {
-                matches!(v, HookProgram::Broken { problem, .. }
-                    if problem.contains(crate::user_prompt::PROMPT_LINE_FLAG))
-            });
+            let prompt_lines_only = verdicts.iter().all(|(_, prompt_line)| *prompt_line);
             if event == "PreToolUse" && label == "Bash" && !prompt_lines_only {
                 continue;
             }
-            let Some(HookProgram::Broken { problem, .. }) = verdicts.into_iter().next() else {
+            let Some((HookProgram::Broken { problem, .. }, _)) = verdicts.into_iter().next() else {
                 continue;
             };
             let tools = if event == "PreToolUse" {

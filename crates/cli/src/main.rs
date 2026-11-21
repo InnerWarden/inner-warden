@@ -1904,9 +1904,15 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
                 // session says a prompt went unkept. Anything else in a
                 // head this long is screened as a tool call would be.
                 let call = TooLongCall::read(&head);
-                // On the prompt line a head that names no tool is the
-                // person's prompt, its event name read or not (past the head).
-                if call.tool.is_none() {
+                // On the prompt line a head that names no tool, and whose
+                // event is a prompt or is past the head, is the person's
+                // prompt. A head whose event is read and is not a prompt is
+                // a call, screened as one.
+                let event = call.event.as_deref();
+                if call.tool.is_none()
+                    && (event.is_none()
+                        || event == Some(innerwarden_agent_guard::user_prompt::PROMPT_EVENT))
+                {
                     let _ =
                         innerwarden_agent_guard::user_prompt::record_lost(call.session.as_deref());
                     return std::process::ExitCode::SUCCESS;

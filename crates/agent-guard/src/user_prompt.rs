@@ -316,6 +316,16 @@ fn mark_lost(dir: &Path, session: &str) -> std::io::Result<()> {
         .map(|_| ())
 }
 
+/// The record a lost mark ([`lost_mark_for`]) stands beside, when `path` is
+/// one.
+fn record_of_lost_mark(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let record = name.strip_prefix('.')?.strip_suffix(".lost")?;
+    record
+        .ends_with(".json")
+        .then(|| path.with_file_name(record))
+}
+
 /// Remove a record, its update lock and its lost mark.
 fn remove_record(path: &Path) {
     let _ = fs::remove_file(path);
@@ -470,6 +480,26 @@ fn prune(dir: &Path, now_ms: i64, keep: Option<&Path>) {
     let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
+        // A lost mark with no record beside it is a session of its own: it
+        // goes after its day, as a prompt does, and counts toward
+        // [`MAX_SESSIONS`]. Beside a record it goes with the record.
+        if let Some(record) = record_of_lost_mark(&path) {
+            if record.exists() || Some(record.as_path()) == keep {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            let at_ms = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if fresh(at_ms, now_ms) {
+                files.push((modified, record));
+            } else {
+                remove_record(&record);
+            }
+            continue;
+        }
         if Some(path.as_path()) == keep || path.extension().and_then(|e| e.to_str()) != Some("json")
         {
             continue;
@@ -803,6 +833,29 @@ mod tests {
         // The mark goes with the record.
         remove_record(&file_for(&dir, SESSION));
         assert!(fs::read_dir(&dir).unwrap().next().is_none());
+    }
+
+    /// A lost mark with no record (a prompt that never got written) goes
+    /// after its day, and counts toward the most sessions kept.
+    #[test]
+    fn a_lost_mark_alone_goes_after_its_day_and_counts_toward_the_cap() {
+        let (_tmp, dir) = dir();
+        let now = super::now_ms();
+        record_lost_in(&dir, Some(SESSION)).unwrap();
+        let mark = lost_mark_for(&file_for(&dir, SESSION));
+        assert!(mark.exists());
+        forget_expired_in(&dir, now);
+        assert!(mark.exists(), "a fresh mark went");
+        forget_expired_in(&dir, now + PROMPT_TTL_MS + 1000);
+        assert!(!mark.exists(), "a mark outlived its day");
+
+        // Marks alone fill the cap like records do.
+        for i in 0..(MAX_SESSIONS + 5) {
+            record_lost_in(&dir, Some(&format!("m{i}"))).unwrap();
+        }
+        forget_expired_in(&dir, now);
+        let marks = fs::read_dir(&dir).unwrap().count();
+        assert!(marks <= MAX_SESSIONS, "{marks}");
     }
 
     /// Two hook runs of one session at once: each prompt is kept, none is

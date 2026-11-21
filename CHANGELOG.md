@@ -33,7 +33,7 @@ one session written at once do not write over each other (the guard's update
 lock); one that still cannot be written marks the session as having lost a
 prompt. A tool line that ends with `--prompt` is said by `status` as not
 screened: its run still ends with 0 on stdin it cannot read, and writing it
-takes an edit of the agent settings the guard refuses to an agent. An expired prompt
+takes an edit of the agent settings the guard refuses to an agent (measured with `innerwarden check`: `jq` into a temp file and `mv`, `sed -i`, `python3` and `jq | sponge` on the `PreToolUse` of `~/.claude/settings.json` are each `deny`). An expired prompt
 is deleted when its session is written or read. Other agents are not wired:
 their MCP servers get no session id to match. Details and limits:
 [The prompt record](docs/prompt-record.md).

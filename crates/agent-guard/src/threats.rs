@@ -658,12 +658,13 @@ fn dangerous_command_regexes() -> &'static [(regex::Regex, &'static str, bool)] 
 /// Found by a customer's red team, 2026-08-30, and it was the finding that
 /// decided their evaluation. The product already refused the LOUD ways to
 /// disable itself (`innerwarden uninstall`, `pkill` the agent, `systemctl stop`
-/// the sensor, all `deny`) and permitted every QUIET one at `risk_score: 0`:
+/// the sensor, all `deny`) and permitted every QUIET one at `risk_score: 0`.
+/// The verdicts then, each a `deny` now:
 ///
-///   innerwarden allow "*"                          -> allow
-///   innerwarden dry-run                            -> allow
-///   mv ~/.claude/settings.json ~/.claude/settings.json.bak   -> allow
-///   jq '.hooks.PreToolUse = []' ~/.claude/settings.json ...  -> allow
+///   innerwarden allow "*"                          -> allow then, deny now
+///   innerwarden dry-run                            -> allow then, deny now
+///   mv ~/.claude/settings.json ~/.claude/settings.json.bak   -> allow then, deny now
+///   jq '.hooks.PreToolUse = []' ~/.claude/settings.json ...  -> allow then, deny now
 ///
 /// An agent that wants out does not uninstall anything. It runs one wildcard
 /// allow and proceeds, and the hook then returns exit 0 for a command it

@@ -623,3 +623,24 @@ fn a_tool_event_on_the_prompt_line_is_refused_as_a_call() {
         );
     }
 }
+
+/// On the prompt line, a head past the cap whose event is read and is not a
+/// prompt is a call, screened as one, even with its tool name past the
+/// head: a credential read there is refused.
+#[cfg(unix)]
+#[test]
+fn a_long_tool_head_on_the_prompt_line_is_screened() {
+    let host = Host::new();
+    let payload = format!(
+        r#"{{"session_id":"{SESSION}","hook_event_name":"PreToolUse","tool_input":{{"command":"cat ~/.aws/credentials","pad":"{}"}},"tool_name":"Bash"}}"#,
+        "z".repeat(1100 * 1024)
+    )
+    .into_bytes();
+    let out = host.run_line(&the_prompt_line(), &payload);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
