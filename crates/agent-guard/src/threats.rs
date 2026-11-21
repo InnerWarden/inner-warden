@@ -8088,7 +8088,13 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 // A link to the place under another name (`ln -s
                 // ~/.config/innerwarden /tmp/c`) is a path that writes into it
                 // without naming it; making one is the write.
-                if command == "ln" && positional.iter().any(|path| counts(path, &dirs, false)) {
+                // A link to an agent's own folder (`ln -s .claude c`) is the
+                // same: a later write to `c/settings.json` names none of it.
+                if command == "ln"
+                    && positional
+                        .iter()
+                        .any(|path| counts(path, &dirs, false) || counts(path, &dirs, true))
+                {
                     return true;
                 }
                 // `rsync -t` keeps times, and `scp` has no such option.

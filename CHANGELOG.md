@@ -79,7 +79,9 @@ the text of a command; what it does not see is written down, as measured:
   works. The shell forms held now include `cp`, `mv`, `tee`, an append,
   a heredoc, a write from inside `.claude`, `git checkout <tree> -- <file>`
   and `git restore`, a file written elsewhere and moved in, a link made at
-  the file or put where the folder was (`ln -sfn`), the absolute path, node
+  the file or put where the folder was (`ln -sfn`), a link made first to the
+  folder or to a settings file and written through later (the line that
+  makes the link is refused: `ln -s .claude c`), the absolute path, node
   and ruby code, and the folder spelled in capitals, which is the same folder
   on a macOS disk. Not held: a branch switched, pulled or merged that changes
   one of these files.

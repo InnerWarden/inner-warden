@@ -173,7 +173,9 @@ fn a_project_settings_write_that_lowers_the_guard_is_refused() {
 /// plain redirect: a copy or a move onto the file, `tee`, an append, a
 /// heredoc, a write from inside `.claude`, git putting another version of
 /// the file back, a file written elsewhere and moved in, a link made at the
-/// file's place or put where `.claude` was, the absolute path, node and
+/// file's place or put where `.claude` was, a link made to `.claude` or to
+/// a settings file (refused when it is made, since the write through it
+/// later names neither), the absolute path, node and
 /// ruby, and the folder spelled in capitals, which is the same folder on a
 /// macOS disk. The hold is by path: even a rule added to
 /// `permissions.allow` by the agent is refused.
@@ -200,6 +202,14 @@ fn every_shape_of_a_project_settings_write_is_refused() {
         host.bash("rm -rf .claude && ln -s ../elsewhere .claude"),
         host.bash("ln -sfn ../elsewhere .claude"),
         host.bash("mv ../elsewhere .claude"),
+        // A link made first, then written through: the line that makes a
+        // link to the folder or to a settings file is refused.
+        host.bash(r#"ln -s .claude c && echo '{"disableAllHooks": true}' > c/settings.json"#),
+        host.bash(r#"ln -s .claude/settings.json s && echo '{"disableAllHooks": true}' > s"#),
+        host.bash("ln -s .claude c"),
+        host.bash("ln -s \"$PWD/.claude\" /tmp/c"),
+        host.bash("ln -s .claude/settings.local.json s"),
+        host.bash("ln .claude/settings.json hard"),
         host.bash("cp -r ../elsewhere .claude"),
         host.bash(&format!(r#"echo '{{"disableAllHooks": true}}' > {abs}"#)),
         host.bash(
