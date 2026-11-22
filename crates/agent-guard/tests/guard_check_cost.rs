@@ -99,7 +99,7 @@ fn nested(open: &str, close: &str, tail: &str, bytes: usize) -> String {
 /// built to five eighths, over one piece at both lengths. Nested
 /// substitutions show no such step and are built to a quarter.
 ///
-/// One is built twice as long. Reading an assignment costs so much by itself
+/// Two, both of assignments, are built twice as long. Reading an assignment costs so much by itself
 /// that a second reading of every assignment at each one shows only from
 /// some 3 500 of them: at 3 277 the long line took 7.8 times the short one
 /// (measured 2026-11-10), under the bound.
@@ -278,6 +278,10 @@ fn shapes(bytes: usize) -> Vec<(&'static str, String)> {
             "the guard given, a value read",
             numbered("", "a#=iw $b ", "", bytes),
         ),
+        (
+            "a value read after each assignment",
+            numbered("", "a#=x; $a# ;", "", twice),
+        ),
     ]
 }
 
@@ -338,10 +342,14 @@ fn check(line: &str) {
 /// ("one word of groups of two") do not end at all without the sum a
 /// command's expansions are held to; the test that fails on that revert
 /// in good time is `the_rewrite_leaves_a_word_too_large_as_written_and_says_so`.
-/// Look a name's values up among every assignment of the line
-/// (`with_values_assigned`) and "a name assigned its own value" took more
-/// than the ceiling in seconds this test had until 2026-11-21; that revert
-/// has not been measured against the ratio. Ask every name the line gave the guard at each word
+/// Look a name's values up by reading every name the line assigned
+/// (`ValuesAssigned::values`, asked by `with_values_assigned`) instead of
+/// the one asked for, and "a value read after each assignment" takes 10.3
+/// times as long at four times the length (2.7 on main), "the guard given,
+/// a value read" 11.5 (4.2 on main), measured in a debug build on the lab
+/// box, 2026-11-21. "a name assigned its own value" does not tell that
+/// revert apart (2.6 both ways): its values all hold a name, and a name
+/// with more values than are read is never looked up again. Ask every name the line gave the guard at each word
 /// (`guard_program`) and "the guard given, a value read" takes twelve times
 /// as long (19 s in a debug build on the lab box, 2026-11-10).
 #[test]

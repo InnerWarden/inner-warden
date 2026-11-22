@@ -4113,6 +4113,11 @@ enum Writer {
 
 /// Who writes `path` before `reader` runs it on the line: every kind of
 /// [`Writer`] that does, none when nothing on the line writes it.
+/// Whether the word after `>&` names a descriptor (`2`, `-`), not a file.
+fn is_descriptor_target(word: &str) -> bool {
+    word == "-" || (!word.is_empty() && word.chars().all(|c| c.is_ascii_digit()))
+}
+
 fn file_writer(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Vec<Writer> {
     let spellings = spellings_of(path);
     let root = root_node(reader);
@@ -4149,9 +4154,12 @@ fn file_writer(reader: tree_sitter::Node<'_>, path: &str, source: &[u8]) -> Vec<
             .unwrap_or_default()
             .trim()
             .to_owned();
+        // `>& a.sh` writes the file as `> a.sh` does; `>&2` and `>&-` hand
+        // on a descriptor (found 2026-11-21: `base64 -d f >& a.sh; sh a.sh`).
+        let target = shell_literal_word(&node_text(destination, source));
         if !operator.contains('>')
-            || operator.contains(">&")
-            || !spellings.contains(&shell_literal_word(&node_text(destination, source)))
+            || (operator.contains(">&") && is_descriptor_target(&target))
+            || !spellings.contains(&target)
         {
             continue;
         }
