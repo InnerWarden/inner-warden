@@ -3474,6 +3474,7 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "dynamic_code_execution",
     "fetch_exec_unanalyzable",
     "fetch_exec_unparsed",
+    "fetch_exec_written_script",
     "guard_self_disable",
     "guard_word_mention",
     "insecure_permissions",
@@ -5252,6 +5253,11 @@ fn analyze_command_as_read(
         handed_to_shell.over_budget |= as_written.over_budget;
         handed_to_shell.not_literal |= as_written.not_literal;
         handed_to_shell.file_not_shown |= as_written.file_not_shown;
+        for script in as_written.written_scripts {
+            if !handed_to_shell.written_scripts.contains(&script) {
+                handed_to_shell.written_scripts.push(script);
+            }
+        }
         handed_to_shell.loads_special |= as_written.loads_special;
         for line in as_written.lines {
             if !handed_to_shell.lines.contains(&line) {
@@ -5435,6 +5441,16 @@ fn analyze_command_as_read(
     // The fetch-and-execute findings of the lines handed on, charged at the
     // end only when the line itself charged none.
     let mut handed_fetch_exec: Vec<AnalysisSignal> = Vec::new();
+    // A file the line writes and then runs whose own text pipes a download
+    // to a shell ([`crate::shell::HandedLines::written_scripts`]).
+    let writes_a_dropper = handed_to_shell.written_scripts.iter().any(|script| {
+        script
+            .lines()
+            .chain(std::iter::once(script.as_str()))
+            .any(|line| {
+                threats::check_download_execute_pipe(&threats::strip_shell_noops(line)).is_some()
+            })
+    });
     // The other findings of the lines the line's substitutions run, charged
     // at the end under each name the line around them did not charge as
     // high: the line as written shows the substitution's text to the outer
@@ -6066,6 +6082,19 @@ fn analyze_command_as_read(
             score += handed.score;
             signals.push(handed);
         }
+    }
+    // A download piped to a shell written into a file the line then runs
+    // (`printf 'curl -s URL | sh\n' > s.sh; bash < s.sh`): a dropper the
+    // line writes and runs, which no installer is. Measured 2026-11-22: once
+    // the file's text was read, the line fell from deny (the text unshown
+    // plus the download) to review (the download alone).
+    if writes_a_dropper {
+        signals.push(AnalysisSignal {
+            signal: "fetch_exec_written_script".into(),
+            score: 20,
+            detail: "writes a download piped to a shell into a file and then runs the file".into(),
+        });
+        score += 20;
     }
     // A download handed to a shell inside a substitution that stands in any
     // argument of any program (`--body`, `-m`, `pytest -k`, but also `ls

@@ -3239,6 +3239,11 @@ pub(crate) struct HandedLines {
     /// A file the line writes and then runs holds text the line prints
     /// without showing it (`echo "$X" > x.sh; sh x.sh`, `exec > x.sh`).
     pub(crate) file_not_shown: bool,
+    /// The text of each file the line writes and then runs, when the line
+    /// shows it (also read into [`HandedLines::lines`]): a download handed
+    /// to a shell there is a dropper the line writes and runs, not an
+    /// installer.
+    pub(crate) written_scripts: Vec<String>,
     /// A file the line writes and then loads in this shell (`. ./env.sh`)
     /// sets a variable the guard reads in its own way (the home, the search
     /// path, a setting that loads code), which it does not carry to the rest
@@ -3603,6 +3608,7 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                 .or_else(|| substituted_writer_text(*command, &path, bytes, &assignments));
             match text {
                 Some(text) => {
+                    handed.written_scripts.push(text.clone());
                     let (language, program) = match (language, runners::shebang(&text)) {
                         (None, Some(found)) => (found.0, found.1),
                         (None, None) => (runners::Language::Shell, String::new()),
@@ -6435,10 +6441,8 @@ fn exec_output_text(
             .is_some_and(|parent| {
                 let mut cursor = parent.walk();
                 let elsewhere = parent.children(&mut cursor).any(|child| {
-                    child.kind() == "file_redirect" && {
-                        let redirect = node_text(child, source);
-                        redirect.contains('>') && !redirect.trim_start().starts_with('2')
-                    }
+                    child.kind() == "file_redirect"
+                        && sends_stdout_elsewhere(&node_text(child, source))
                 });
                 elsewhere
             });
@@ -6448,6 +6452,34 @@ fn exec_output_text(
         text.push_str(&printed_text(command, source, level)?);
     }
     Some(text)
+}
+
+/// Whether a redirect moves the standard output somewhere other than
+/// where it already goes: `>`, `1>`, `>>`, `>|` or `&>` to a file or
+/// a descriptor other than 1 or `/dev/stdout`. `>&1`, `1>/dev/stdout` and
+/// `3>/dev/null` leave it where it was. Measured 2026-11-22 in review: any
+/// redirect not starting with 2 counted as output sent elsewhere.
+fn sends_stdout_elsewhere(redirect: &str) -> bool {
+    let redirect = redirect.trim();
+    let (descriptor, rest) = redirect.split_at(
+        redirect
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(redirect.len()),
+    );
+    let rest = match descriptor {
+        "" => rest.strip_prefix('&').unwrap_or(rest),
+        "1" => rest,
+        _ => return false,
+    };
+    let Some(rest) = rest.strip_prefix('>') else {
+        return false;
+    };
+    let rest = rest.strip_prefix(['>', '|', '&']).unwrap_or(rest);
+    let target = shell_word(rest.trim());
+    !matches!(
+        target.as_str(),
+        "1" | "/dev/stdout" | "/dev/fd/1" | "/proc/self/fd/1"
+    )
 }
 
 /// Whether a word holds only text the line writes out: no expansion,
@@ -14111,6 +14143,7 @@ fn mask_message_herestring(
     // around it.
     let redirected = ancestor_of_kind(redirect, "redirected_statement").unwrap_or(owner);
     if !reads_stdin_as_message(owner, redirected, source)
+        || output_piped_past_data(owner, redirected, source)
         || has_execution_sink_ancestor(owner, source)
         || command_name(owner, source).is_some_and(|name| {
             line_redefines(root_node(redirect), &normalized_command_name(&name), source)
@@ -14122,7 +14155,94 @@ fn mask_message_herestring(
     else {
         return;
     };
-    mask_preserving_substitutions(value, source, masked, executable_inside_mask);
+    // The word stays a word: masked whole, `<<<` is left without one, the
+    // projection no longer parses and the rest of the line goes unread
+    // (`git commit -F - <<< 'x'; sh <(curl -s URL)` fell from deny to
+    // review). Only what lies inside the quotes, or after the first letter
+    // of a bare word, is hidden; a value that cannot keep a word is not
+    // masked at all.
+    let mut hidden = Vec::new();
+    if !message_text_ranges(value, source, &mut hidden) {
+        return;
+    }
+    masked.extend(hidden);
+    collect_executable_substitutions(value, source, executable_inside_mask, 0);
+}
+
+/// Whether what `owner` prints is piped on into a stage that is not
+/// only data handling (`git commit -F - <<< '...' | sh`): a message
+/// handed on to a program that may run it is not only a message. Stages
+/// before the one holding `owner` do not read its output, and a later
+/// stage of data handling (`| tail -3`) runs nothing.
+fn output_piped_past_data(
+    owner: tree_sitter::Node<'_>,
+    redirected: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    let Some(pipeline) = nearest_pipeline(redirected) else {
+        return false;
+    };
+    let mut stage = owner;
+    while let Some(parent) = stage.parent() {
+        if parent.id() == pipeline.id() {
+            break;
+        }
+        stage = parent;
+    }
+    let mut cursor = pipeline.walk();
+    let later: Vec<_> = pipeline
+        .named_children(&mut cursor)
+        .filter(|later| later.start_byte() >= stage.end_byte())
+        .collect();
+    later.into_iter().any(|later| {
+        let mut commands = Vec::new();
+        collect_commands(later, &mut commands, 0);
+        commands.is_empty()
+            || commands.into_iter().any(|command| {
+                classify_pipeline_command(command, source) != PipelineCommand::DataOnly
+            })
+    })
+}
+
+/// The ranges of a here-string's word that hold its text, leaving a word
+/// in place: the quotes of a string, the first letter of a bare word, the
+/// first piece of a concatenation. False when no word can be kept.
+fn message_text_ranges(
+    value: tree_sitter::Node<'_>,
+    source: &[u8],
+    hidden: &mut Vec<Range<usize>>,
+) -> bool {
+    let range = value.byte_range();
+    match value.kind() {
+        "raw_string" | "string" if range.len() >= 2 => {
+            hidden.push(range.start + 1..range.end - 1);
+            true
+        }
+        "ansi_c_string" if range.len() >= 3 => {
+            hidden.push(range.start + 2..range.end - 1);
+            true
+        }
+        "word" => {
+            let keeps_a_letter = source
+                .get(range.start)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric());
+            if keeps_a_letter {
+                hidden.push(range.start + 1..range.end);
+            }
+            keeps_a_letter
+        }
+        "concatenation" => {
+            let Some(first) = value.child(0) else {
+                return false;
+            };
+            if !message_text_ranges(first, source, hidden) {
+                return false;
+            }
+            hidden.push(first.end_byte()..range.end);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn mask_preserving_substitutions(
