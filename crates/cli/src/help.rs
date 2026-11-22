@@ -392,7 +392,9 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              With --identity it also refuses new user namespaces and joining other\n  \
              namespaces, ends a 32-bit program, and drops every capability: turn the\n  \
              agent's own sandbox off inside the jail. The jail shares the host's\n  \
-             network, so an X server's abstract socket stays reachable from it.\n\
+             network; on Linux 6.12 or later (Landlock) its programs cannot connect\n  \
+             to an abstract unix socket made outside it, an X server's among them.\n  \
+             On an older kernel they still can, and the jail says so when it starts.\n\
              \n  \
              Everything after `--` is the jailed command line, including its own\n  \
              `--help`."
@@ -631,7 +633,7 @@ mod tests {
             "A snapshot made before the jail started, in a folder the jail shows, still holds the files it hides: only new ones are refused.",
             "ends a 32-bit program, and drops every capability",
             "With --identity it also refuses new user namespaces and joining other namespaces,",
-            "The jail shares the host's network, so an X server's abstract socket stays reachable",
+            "The jail shares the host's network; on Linux 6.12 or later (Landlock) its programs cannot connect to an abstract unix socket made outside it, an X server's among them. On an older kernel they still can, and the jail says so when it starts.",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
@@ -657,6 +659,8 @@ mod tests {
             "Limits: the filter covers those commands only.",
             "It refuses only new subvolumes and snapshots: a snapshot made before the jail started, in a folder the jail shows, still holds the files the jail hides (`.env`, `secrets/`, each `--deny-read` path), and a program in the jail can read them there.",
             "a desktop's X server among them",
+            "so a program in it cannot connect to an abstract unix socket made outside the jail,",
+            "On an older kernel a program in the jail can still reach any abstract unix socket, and through X type into another window; the jail says so when it starts.",
             "On a kernel older than 4.8",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
@@ -667,6 +671,7 @@ mod tests {
             assert!(!text.contains("gets only the terminal rule,"));
             assert!(!text.contains("joining other namespaces, and new btrfs"));
             assert!(!text.contains("covers those terminal commands only"));
+            assert!(!text.contains("abstract socket stays reachable"));
         }
     }
 

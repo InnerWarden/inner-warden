@@ -4511,7 +4511,7 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
             instance,
             &input.args.child,
         )),
-        None => a.extend(input.args.child.iter().cloned()),
+        None => a.extend(launch::exec_child(&input.iw_binary, &input.args.child)),
     }
 
     Ok(LinuxJailPlan {
@@ -6153,6 +6153,34 @@ pub mod launch {
         argv
     }
 
+    /// The verb the jail's command starts through when no gate waits for an
+    /// admission ([`exec_child`]). The gate does the same before it opens.
+    pub const EXEC_VERB: &str = "contain-exec";
+
+    /// PURE. The jail's command line through the launcher's own binary,
+    /// bound read-only in the jail: it closes the abstract unix sockets made
+    /// outside the jail to the command (Landlock, [`crate::jail_scope`]) and
+    /// replaces itself with it. The jail shares the host's network
+    /// namespace, where those sockets live, an X server's among them.
+    pub fn exec_child(iw_binary: &Path, child: &[String]) -> Vec<String> {
+        let mut argv = vec![
+            iw_binary.to_string_lossy().into_owned(),
+            EXEC_VERB.to_string(),
+            "--".to_string(),
+        ];
+        argv.extend(child.iter().cloned());
+        argv
+    }
+
+    /// PURE. The exec verb's arguments, `-- <command...>`: the command, or
+    /// `None` for anything else.
+    pub fn parse_exec_args(args: &[String]) -> Option<&[String]> {
+        match args {
+            [end, command @ ..] if end == "--" && !command.is_empty() => Some(command),
+            _ => None,
+        }
+    }
+
     /// PURE. The gate's arguments, `--instance <id> -- <command...>`: the
     /// instance and the command, or `None` for anything else.
     pub fn parse_gate_args(args: &[String]) -> Option<(&str, &[String])> {
@@ -7072,8 +7100,18 @@ mod tests {
             .windows(2)
             .any(|w| w[0] == "--chdir" && w[1] == "/home/dev/proj"));
         // child at the end after the terminator
+        // ... through the launcher's own binary, which closes the abstract
+        // unix sockets made outside the jail before it runs the child.
         let term = a.iter().position(|x| x == "--").unwrap();
-        assert_eq!(&a[term + 1..], &["claude".to_string()]);
+        assert_eq!(
+            &a[term + 1..],
+            [
+                "/home/dev/.local/bin/innerwarden",
+                launch::EXEC_VERB,
+                "--",
+                "claude"
+            ]
+        );
     }
 
     #[test]
@@ -8726,7 +8764,9 @@ mod tests {
         assert_eq!(got.matches(CLAUDE_STATE_LINES).count(), 1);
         assert_eq!(got.matches(CLAUDE_FOLDER_LINES).count(), 1);
         assert_eq!(got.matches(RECORDS_PIN_LINES).count(), 1);
+        assert_eq!(got.matches(EXEC_LINES).count(), 1);
         let before = got
+            .replacen(EXEC_LINES, "\n--\n", 1)
             .replacen("--unshare-ipc\n--cap-drop\nALL\n", "--unshare-ipc\n", 1)
             .replacen(CLAUDE_STATE_LINES, "", 1)
             .replacen(CLAUDE_FOLDER_LINES, "", 1)
@@ -8747,8 +8787,9 @@ mod tests {
     }
 
     /// The plain jail's argument vector moved by one pair since the build
-    /// before the filter, the terminal filter, on purpose, and by nothing
-    /// else. Without the filter (a host whose probe failed) it is
+    /// before the filter, the terminal filter, on purpose, and by the
+    /// command started through `contain-exec` ([`EXEC_LINES`]), and by
+    /// nothing else. Without the filter (a host whose probe failed) it is
     /// that build's, to the byte (the hashes are of the goldens at 4ded5fea).
     ///
     /// FAILS ON REVERT: move or add anything else in the plain jail.
@@ -8778,8 +8819,10 @@ mod tests {
             ),
         ] {
             assert_eq!(golden.matches("--seccomp").count(), 1);
+            assert_eq!(golden.matches(EXEC_LINES).count(), 1);
             let without = golden.replacen("\n--seccomp\n13\n", "\n", 1);
-            assert_eq!(sha256_hex(without.as_bytes()), before);
+            let before_scope = without.replacen(EXEC_LINES, "\n--\n", 1);
+            assert_eq!(sha256_hex(before_scope.as_bytes()), before);
             input.seccomp_fd = None;
             assert_eq!(
                 build_linux_jail(&input).unwrap().bwrap_args.join("\n"),
@@ -9231,7 +9274,14 @@ mod tests {
         let mut input = inputs(&["claude", "--print"]);
         input.iw_binary = local.to_path_buf();
         let got = build_linux_jail(&input).unwrap().bwrap_args;
-        assert!(!got.iter().any(|a| a == SYSTEM_CLI_PATHS[0]), "{got:?}");
+        // Not bound on its own: no bwrap option names it. After `--` it
+        // starts the jail's command ([`launch::exec_child`]).
+        let end = got.iter().position(|a| a == "--").unwrap();
+        assert!(
+            !got[..end].iter().any(|a| a == SYSTEM_CLI_PATHS[0]),
+            "{got:?}"
+        );
+        assert_eq!(got[end + 1], SYSTEM_CLI_PATHS[0], "{got:?}");
         assert!(
             got.windows(3).any(|w| w == ["--ro-bind", "/usr", "/usr"]),
             "{got:?}"
@@ -15970,6 +16020,9 @@ mod tests {
         --info-fd\n\
         7\n\
         --\n\
+        /home/dev/.local/bin/innerwarden\n\
+        contain-exec\n\
+        --\n\
         claude\n\
         --print";
 
@@ -16135,8 +16188,53 @@ mod tests {
         --info-fd\n\
         7\n\
         --\n\
+        /home/dev/.local/bin/innerwarden\n\
+        contain-exec\n\
+        --\n\
         claude\n\
         --print";
+
+    /// The one change to every golden since the abstract socket rule: the
+    /// jail's command starts through the launcher's own binary and
+    /// `contain-exec` ([`launch::exec_child`]). Taken out, a golden is
+    /// what it was before, to the byte.
+    const EXEC_LINES: &str = "\n--\n/home/dev/.local/bin/innerwarden\ncontain-exec\n--\n";
+
+    /// The exec verb takes `-- <command>` and nothing else, and the jail's
+    /// command line through it is the launcher's binary, the verb, `--` and
+    /// the command as given.
+    ///
+    /// FAILS ON REVERT: run the jail's command without the verb, or take a
+    /// command line with no `--` or no command.
+    #[test]
+    fn the_jail_command_starts_through_the_exec_verb() {
+        let child = ["claude".to_string(), "--print".to_string()];
+        assert_eq!(
+            launch::exec_child(Path::new("/usr/bin/innerwarden"), &child),
+            [
+                "/usr/bin/innerwarden",
+                "contain-exec",
+                "--",
+                "claude",
+                "--print"
+            ]
+        );
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            launch::parse_exec_args(&s(&["--", "ls", "-l"])),
+            Some(&s(&["ls", "-l"])[..])
+        );
+        assert_eq!(launch::parse_exec_args(&s(&["--"])), None);
+        assert_eq!(launch::parse_exec_args(&s(&["ls"])), None);
+        assert_eq!(launch::parse_exec_args(&s(&[])), None);
+        // A gated jail starts through the gate, which closes the sockets too.
+        let mut gated = inputs(&["claude"]);
+        gated.gate_instance = Some("i-1".to_string());
+        let a = build_linux_jail(&gated).unwrap().bwrap_args;
+        let end = a.iter().position(|x| x == "--").unwrap();
+        assert_eq!(a[end + 2], launch::GATE_VERB);
+        assert!(!a.iter().any(|x| x == launch::EXEC_VERB), "{a:?}");
+    }
 
     const GOLDEN_ARGV_PLAIN: &str = "\
         --ro-bind\n\
@@ -16222,6 +16320,9 @@ mod tests {
         13\n\
         --hostname\n\
         ai-sandbox\n\
+        --\n\
+        /home/dev/.local/bin/innerwarden\n\
+        contain-exec\n\
         --\n\
         claude\n\
         --print";
@@ -16322,6 +16423,9 @@ mod tests {
         --hostname\n\
         ai-sandbox\n\
         --new-session\n\
+        --\n\
+        /home/dev/.local/bin/innerwarden\n\
+        contain-exec\n\
         --\n\
         /bin/sh\n\
         -c\n\
@@ -16512,7 +16616,15 @@ mod tests {
         let end = got.iter().position(|a| a == "--").unwrap();
         assert_eq!(
             got[end + 1..],
-            ["/usr/local/bin/openclaw", "gateway", "--port", "18789"]
+            [
+                "/home/dev/.local/bin/innerwarden",
+                launch::EXEC_VERB,
+                "--",
+                "/usr/local/bin/openclaw",
+                "gateway",
+                "--port",
+                "18789"
+            ]
         );
         assert!(!got
             .iter()

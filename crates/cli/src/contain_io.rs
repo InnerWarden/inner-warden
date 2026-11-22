@@ -518,7 +518,53 @@ pub fn cmd_gate(rest: &[String]) -> ExitCode {
         eprintln!("innerwarden contain: {GATE_REFUSED}");
         return ExitCode::from(2);
     }
+    if let Err(code) = close_abstract_sockets() {
+        return code;
+    }
     run_in_place(command)
+}
+
+/// `innerwarden contain-exec -- <command...>`: run inside a Linux jail as
+/// its command ([`crate::contain::launch::exec_child`]). It closes the
+/// abstract unix sockets made outside the jail ([`crate::jail_scope`]) and
+/// replaces itself with `command`.
+pub fn cmd_exec(rest: &[String]) -> ExitCode {
+    let Some(command) = crate::contain::launch::parse_exec_args(rest) else {
+        eprintln!("innerwarden contain: contain-exec takes -- <command>");
+        return ExitCode::from(2);
+    };
+    if let Err(code) = close_abstract_sockets() {
+        return code;
+    }
+    run_in_place(command)
+}
+
+/// Close the abstract unix sockets made outside the jail to this process
+/// and what it runs. A kernel without Landlock scopes is said once and the
+/// command starts as it did before; one that has them and still refuses
+/// ends the launch (exit 126), so a jail never runs without a rule its
+/// kernel takes.
+#[cfg(target_os = "linux")]
+fn close_abstract_sockets() -> Result<(), ExitCode> {
+    match crate::jail_scope::close_abstract_sockets() {
+        Ok(crate::jail_scope::Kernel::Scopes) => Ok(()),
+        Ok(crate::jail_scope::Kernel::NoScopes) => {
+            eprintln!("{}", crate::jail_scope::NO_SCOPES_SAID);
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "innerwarden contain: cannot close the abstract unix sockets outside the jail \
+                 ({error}); its command does not start"
+            );
+            Err(ExitCode::from(126))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn close_abstract_sockets() -> Result<(), ExitCode> {
+    Ok(())
 }
 
 /// Replace this process with `command`, as the jail's own child would have
