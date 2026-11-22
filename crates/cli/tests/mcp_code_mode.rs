@@ -364,3 +364,48 @@ fn a_shell_script_is_not_read_as_javascript_by_the_proxy() {
     let proxied = host.proxy("strict", code);
     assert!(!proxied.contains("AG-CODE-MODE"), "{proxied}");
 }
+
+/// The second round's cases through the real hook and proxy: a script that
+/// names its method through many names answers in time (it took past the
+/// hook's 10 s), the items of a page's elements and Node's hashes run, and
+/// a shell line handed to `execute` keeps the reading it had before.
+#[test]
+fn round_two_cases_through_the_hook_and_proxy() {
+    let host = Host::new();
+    let v = 100;
+    let named = format!(
+        "{}{}{}{}{}",
+        "method=b;".repeat(v),
+        "b=c;".repeat(v),
+        "c=d;".repeat(v),
+        "d=e;".repeat(v),
+        "f({method});".repeat(v)
+    );
+    let started = std::time::Instant::now();
+    let strict = host.hook(&["--agent", "claude-code", "--block-review"], TOOL, &named);
+    assert_eq!(hook_verdict(&strict), "deny", "{strict:?}");
+    let proxied = host.proxy("strict", &named);
+    assert_eq!(proxy_verdict(&proxied), "refused", "{proxied}");
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(8), "{took:?}");
+    for code in [
+        "document.querySelectorAll(\".ad\").forEach((e) => e.remove())",
+        "for (const el of document.querySelectorAll(\".ad\")) el.remove();",
+        "const { createHash } = require(\"node:crypto\"); return createHash(\"sha256\").update(s).digest(\"hex\");",
+        "const c = require(\"crypto\"); return c.createHash(\"sha256\").update(s).digest(\"hex\");",
+    ] {
+        let strict = host.hook(&["--agent", "claude-code", "--block-review"], TOOL, code);
+        assert_eq!(hook_verdict(&strict), "allow", "{code}: {strict:?}");
+    }
+    let shell = "ls -la build && echo it's there";
+    let enforce = host.hook(&["--agent", "claude-code"], "mcp__sh__execute", shell);
+    assert_eq!(hook_verdict(&enforce), "allow", "{enforce:?}");
+    let strict = host.hook(
+        &["--agent", "claude-code", "--block-review"],
+        "mcp__sh__execute",
+        shell,
+    );
+    assert_eq!(hook_verdict(&strict), "allow", "{strict:?}");
+    let proxied = host.proxy("strict", shell);
+    assert!(!proxied.contains("AG-CODE-MODE"), "{proxied}");
+}

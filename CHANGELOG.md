@@ -30,7 +30,15 @@ decoded before it is read. Methods of the script's own values (`Map`,
 are not the API's and run. A tool that runs more than one language and names
 none (Hermes Agent's `execute_code`, which runs Python) is read only when an
 argument says JavaScript; a script that starts with a `#` comment or a `#!`
-line for another interpreter is not read as JavaScript. The hook's record
+line for another interpreter is not read as JavaScript, nor is one named in
+`language`, `lang`, `runtime`, `interpreter` or `shell` as another
+language. With no language named, a script is read as JavaScript only when
+it splits into JavaScript's tokens; a shell line (`echo it's there`) keeps
+the reading it had before. The items of a page's elements (a callback of
+`forEach` or `map` on them, `for (const el of ...)`) and Node's
+`require("crypto")` are the script's own values too. The HTTP method behind
+a name is followed once per name, at most 32 values; past that, or round a
+loop of names, it counts as chosen at run time. The hook's record
 keeps a long script by its start, size and SHA-256.
 
 Known limits of this first reader: a member named at run time and kept for
@@ -39,6 +47,14 @@ outside its table (`cancel`, `merge`, `addCollaborator`, `addDeployKey`,
 `setSecret`, `unpublish`, `clear`, `stop`, `writeFile`, a batch with
 `deletes`) are not read as changes; `child_process.execSync` and
 `fs.rmSync` are not read by it (the proxy refuses them today by its ATR rules).
+Its tokens can still part from JavaScript's after a `{}` block followed by
+`/`, with `of` used as a name, and at an HTML comment `<!--` (Annex B).
+Not followed either: `.constructor.call` and `.constructor.apply`; a method
+handed in as a parameter or a default value; a built-in value reassigned or
+shadowed by another (`document = api`); a script that starts with a
+`#!` line or names another language in its language key is not read, even
+where the tool runs it as JavaScript; the script in a `command` key; a CTE (`WITH ... DELETE`); a request line
+whose method is replaced later in the script.
 
 `innerwarden setup` and the new `innerwarden status --config` say what is
 already set in the agents' own config, and change nothing. In

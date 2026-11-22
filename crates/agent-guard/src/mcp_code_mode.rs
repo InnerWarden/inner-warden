@@ -81,7 +81,7 @@ const CODE_KEYS: &[&str] = &[
 
 /// Argument names that say the language of the script. A language other
 /// than JavaScript or TypeScript is not read here.
-const LANGUAGE_KEYS: &[&str] = &["language", "lang", "runtime"];
+const LANGUAGE_KEYS: &[&str] = &["language", "lang", "runtime", "interpreter", "shell"];
 
 /// Languages read as JavaScript.
 const SCRIPT_LANGUAGES: &[&str] = &[
@@ -302,6 +302,21 @@ fn another_language(script: &str) -> bool {
         .any(|runtime| line.split(['/', ' ', '\t']).any(|word| word == *runtime))
 }
 
+/// Whether a script splits into JavaScript's tokens (a script past the
+/// size that is read counts as one: it is a review by its size).
+fn splits_as_javascript(script: &str) -> bool {
+    if script.len() > MAX_SCRIPT_BYTES {
+        return true;
+    }
+    let src: Vec<char> = script.chars().collect();
+    let mut scan = Scan {
+        src: &src,
+        i: 0,
+        bodies: Vec::new(),
+    };
+    scan.run(&mut Vec::new(), false, 0).is_ok()
+}
+
 /// The findings of a reading, each once, in the order they were found.
 #[derive(Default)]
 struct Findings {
@@ -357,8 +372,13 @@ pub fn read_code_call(tool_name: &str, args: &Value) -> Option<CodeReading> {
     for value in scripts {
         match value {
             // Written in another language, with none named: not this
-            // reader's (the MCP proxy still reads it as a shell line).
-            Value::String(script) if language.is_none() && another_language(script) => {}
+            // reader's (the MCP proxy still reads it as a shell line). With
+            // no language named, a script is read as JavaScript only when it
+            // splits into JavaScript's tokens: a shell line (`echo it's
+            // there`) does not, and keeps the reading it had before.
+            Value::String(script)
+                if language.is_none()
+                    && (another_language(script) || !splits_as_javascript(script)) => {}
             Value::String(script) => {
                 if shown.is_empty() {
                     shown.clone_from(script);
@@ -1133,10 +1153,19 @@ fn local_receiver(
     chain: &[String],
     root: Option<usize>,
     locals: &std::collections::HashSet<String>,
+    scoped: &[ScopedLocal],
 ) -> bool {
     let Some(first) = chain.first() else {
         return false;
     };
+    if root.is_some_and(|r| {
+        matches!(tokens.get(r), Some(Tok::Ident(name)) if name == first)
+            && scoped
+                .iter()
+                .any(|(name, start, end)| name == first && r > *start && r < *end)
+    }) {
+        return true;
+    }
     let constructed = root.is_some_and(|r| {
         matches!(tokens.get(r), Some(Tok::Ident(name)) if *name == *first)
             && matches!(r.checked_sub(1).and_then(|p| tokens.get(p)), Some(Tok::Ident(w)) if w == "new")
@@ -1270,12 +1299,18 @@ fn destructured_keys(tokens: &[Tok], matches: &[usize]) -> Vec<PatternRole> {
         if !assigned && !declared {
             continue;
         }
+        // `const { createHash } = require("crypto")`: the makers of Node's
+        // hashes and ciphers are taken out, nothing of the API.
+        let from_crypto = assigned && requires_crypto(tokens, close + 2);
         covered_until = close;
         for k in open + 1..close {
             // A key: followed by one of `: , } =` and not itself a value.
             let key_position = matches!(tokens.get(k + 1), Some(Tok::Punct(':' | ',' | '}' | '=')))
                 && !matches!(tokens.get(k - 1), Some(Tok::Punct(':')));
-            if key_position && matches!(tokens[k], Tok::Ident(_) | Tok::Str { .. }) {
+            let crypto_maker = from_crypto
+                && matches!(&tokens[k], Tok::Ident(name) if LOCAL_MAKERS.contains(&name.as_str()));
+            if key_position && !crypto_maker && matches!(tokens[k], Tok::Ident(_) | Tok::Str { .. })
+            {
                 roles[k] = PatternRole::Key;
             }
             if tokens[k] == Tok::Punct('[')
@@ -1311,9 +1346,69 @@ fn assignments(tokens: &[Tok]) -> Vec<(String, usize)> {
     out
 }
 
-/// The names bound to a value that lives in the script ([`local_receiver`]):
-/// `const m = new Map()`, `const h = crypto.createHash("sha256")`,
-/// `const e = document.querySelector("p")`, `const o = Object.create(null)`,
+/// Whether the value at `value` lives in the script ([`local_receiver`]):
+/// `new Map()`, `crypto.createHash("sha256")`, `document.querySelector("p")`,
+/// `Object.create(null)`, `require("crypto")`, or a name in `locals`.
+fn value_is_local(
+    tokens: &[Tok],
+    matches: &[usize],
+    value: usize,
+    locals: &std::collections::HashSet<String>,
+) -> bool {
+    let mut k = value;
+    let constructed = matches!(tokens.get(k), Some(Tok::Ident(w)) if w == "new");
+    if constructed {
+        k += 1;
+    }
+    let Some(Tok::Ident(root)) = tokens.get(k) else {
+        return false;
+    };
+    if constructed {
+        return LOCAL_CONSTRUCTORS.contains(&root.as_str());
+    }
+    let mut chain = vec![root.clone()];
+    let mut at = k + 1;
+    for _ in 0..64 {
+        match tokens.get(at) {
+            Some(Tok::Punct('.') | Tok::OptChain) => match tokens.get(at + 1) {
+                Some(Tok::Ident(member)) => {
+                    chain.push(member.clone());
+                    at += 2;
+                }
+                _ => break,
+            },
+            Some(Tok::Punct('(' | '[')) => match matched(matches, at) {
+                Some(close) => at = close + 1,
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    let made = (locals.contains(root)
+        || MAKER_ROOTS.contains(&root.as_str())
+        || LOCAL_MAKERS.contains(&root.as_str()))
+        && chain.iter().any(|m| LOCAL_MAKERS.contains(&m.as_str()));
+    locals.contains(root)
+        || LOCAL_ROOTS.contains(&root.as_str())
+        || made
+        || (chain.len() == 2 && root == "Object" && chain[1] == "create")
+        || (chain.len() == 1 && requires_crypto(tokens, k))
+}
+
+/// Whether the tokens at `at` are `require("crypto")` or
+/// `require("node:crypto")`: Node's hashes and ciphers, which live in the
+/// script.
+fn requires_crypto(tokens: &[Tok], at: usize) -> bool {
+    matches!(tokens.get(at), Some(Tok::Ident(w)) if w == "require")
+        && matches!(tokens.get(at + 1), Some(Tok::Punct('(')))
+        && matches!(
+            tokens.get(at + 2),
+            Some(Tok::Str { text, plain: true, .. }) if text == "crypto" || text == "node:crypto"
+        )
+        && matches!(tokens.get(at + 3), Some(Tok::Punct(')')))
+}
+
+/// The names bound to a value that lives in the script ([`value_is_local`])
 /// and a name bound to one of those.
 fn local_names(
     tokens: &[Tok],
@@ -1322,51 +1417,197 @@ fn local_names(
 ) -> std::collections::HashSet<String> {
     let mut locals = std::collections::HashSet::new();
     for (name, value) in assigned {
-        let mut k = *value;
-        let constructed = matches!(tokens.get(k), Some(Tok::Ident(w)) if w == "new");
-        if constructed {
-            k += 1;
-        }
-        let Some(Tok::Ident(root)) = tokens.get(k) else {
-            continue;
-        };
-        if constructed {
-            if LOCAL_CONSTRUCTORS.contains(&root.as_str()) {
-                locals.insert(name.clone());
-            }
-            continue;
-        }
-        let mut chain = vec![root.clone()];
-        let mut at = k + 1;
-        for _ in 0..64 {
-            match tokens.get(at) {
-                Some(Tok::Punct('.') | Tok::OptChain) => match tokens.get(at + 1) {
-                    Some(Tok::Ident(member)) => {
-                        chain.push(member.clone());
-                        at += 2;
-                    }
-                    _ => break,
-                },
-                Some(Tok::Punct('(' | '[')) => match matched(matches, at) {
-                    Some(close) => at = close + 1,
-                    None => break,
-                },
-                _ => break,
-            }
-        }
-        let made = (locals.contains(root)
-            || MAKER_ROOTS.contains(&root.as_str())
-            || LOCAL_MAKERS.contains(&root.as_str()))
-            && chain.iter().any(|m| LOCAL_MAKERS.contains(&m.as_str()));
-        if locals.contains(root)
-            || LOCAL_ROOTS.contains(&root.as_str())
-            || made
-            || (chain.len() == 2 && root == "Object" && chain[1] == "create")
-        {
+        if value_is_local(tokens, matches, *value, &locals) {
             locals.insert(name.clone());
         }
     }
     locals
+}
+
+/// Methods that hand each item of what they are called on to a callback.
+const ITEM_METHODS: &[&str] = &[
+    "forEach",
+    "map",
+    "filter",
+    "find",
+    "findLast",
+    "findIndex",
+    "findLastIndex",
+    "some",
+    "every",
+    "flatMap",
+];
+
+/// The most names [`scoped_locals`] gives. Past it a name holds what it
+/// holds: a call on it is read as any other.
+const MAX_SCOPED_LOCALS: usize = 256;
+
+/// The most tokens a statement is followed through for its end.
+const MAX_STATEMENT_TOKENS: usize = 4096;
+
+/// A name that holds an item of a value that lives in the script, and the
+/// tokens it does so in (past the first, before the last).
+type ScopedLocal = (String, usize, usize);
+
+/// The plain names of a parameter list between `open` and `close`.
+fn parameter_names(tokens: &[Tok], open: usize, close: usize) -> Vec<String> {
+    (open + 1..close)
+        .filter_map(|k| match &tokens[k] {
+            Tok::Ident(name)
+                if matches!(tokens.get(k - 1), Some(Tok::Punct('(' | ',')))
+                    && matches!(tokens.get(k + 1), Some(Tok::Punct(',' | ')' | '='))) =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The parameters of the callback that starts at `at` (`e => ...`,
+/// `(e, i) => ...`, `function (e) {...}`, any of them `async`).
+fn callback_parameters(tokens: &[Tok], matches: &[usize], mut at: usize) -> Vec<String> {
+    if matches!(tokens.get(at), Some(Tok::Ident(w)) if w == "async") {
+        at += 1;
+    }
+    match tokens.get(at) {
+        Some(Tok::Ident(w)) if w == "function" => {
+            let open = if matches!(tokens.get(at + 1), Some(Tok::Ident(_))) {
+                at + 2
+            } else {
+                at + 1
+            };
+            match (tokens.get(open), matched(matches, open)) {
+                (Some(Tok::Punct('(')), Some(close)) => parameter_names(tokens, open, close),
+                _ => Vec::new(),
+            }
+        }
+        Some(Tok::Ident(name))
+            if matches!(
+                (tokens.get(at + 1), tokens.get(at + 2)),
+                (Some(Tok::Punct('=')), Some(Tok::Punct('>')))
+            ) =>
+        {
+            vec![name.clone()]
+        }
+        Some(Tok::Punct('(')) => match matched(matches, at) {
+            Some(close)
+                if matches!(
+                    (tokens.get(close + 1), tokens.get(close + 2)),
+                    (Some(Tok::Punct('=')), Some(Tok::Punct('>')))
+                ) =>
+            {
+                parameter_names(tokens, at, close)
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// The end of the statement that starts at `at`: its block's `}`, or the
+/// `;` that ends it (brackets passed over), or the end of the script.
+fn statement_end(tokens: &[Tok], matches: &[usize], at: usize) -> usize {
+    if matches!(tokens.get(at), Some(Tok::Punct('{'))) {
+        return matched(matches, at).unwrap_or(tokens.len());
+    }
+    let mut k = at;
+    let last = tokens.len().min(at.saturating_add(MAX_STATEMENT_TOKENS));
+    while k < last {
+        match tokens[k] {
+            Tok::Punct(';') => return k,
+            Tok::Punct('(' | '[' | '{') => match matched(matches, k) {
+                Some(close) => k = close,
+                None => return tokens.len(),
+            },
+            _ => {}
+        }
+        k += 1;
+    }
+    last
+}
+
+/// The names that hold an item of a value that lives in the script, where
+/// they do: the parameters of a callback handed to [`ITEM_METHODS`] on such a
+/// value (`document.querySelectorAll(".ad").forEach((e) => e.remove())`),
+/// inside the call, and the name of a `for (const x of <local>)`, inside the
+/// loop. A name assigned again where it holds the item does not count.
+fn scoped_locals(
+    tokens: &[Tok],
+    matches: &[usize],
+    locals: &std::collections::HashSet<String>,
+    assigned: &[(String, usize)],
+) -> Vec<ScopedLocal> {
+    let mut values_of: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (name, value) in assigned {
+        values_of.entry(name.as_str()).or_default().push(*value);
+    }
+    let mut scoped: Vec<ScopedLocal> = Vec::new();
+    for (at, tok) in tokens.iter().enumerate() {
+        if scoped.len() >= MAX_SCOPED_LOCALS {
+            break;
+        }
+        let Tok::Ident(word) = tok else { continue };
+        let mut found: Vec<ScopedLocal> = Vec::new();
+        if ITEM_METHODS.contains(&word.as_str())
+            && at > 0
+            && is_dot(tokens.get(at - 1))
+            && matches!(tokens.get(at + 1), Some(Tok::Punct('(')))
+        {
+            let (chain, root) = chain_before(tokens, matches, at - 1);
+            let Some(close) = matched(matches, at + 1) else {
+                continue;
+            };
+            if local_receiver(tokens, &chain, root, locals, &scoped) {
+                for name in callback_parameters(tokens, matches, at + 2) {
+                    found.push((name, at + 1, close));
+                }
+            }
+        }
+        if word == "for" && !at.checked_sub(1).is_some_and(|p| is_dot(tokens.get(p))) {
+            let mut open = at + 1;
+            if matches!(tokens.get(open), Some(Tok::Ident(w)) if w == "await") {
+                open += 1;
+            }
+            let Some(close) = matched(matches, open) else {
+                continue;
+            };
+            let mut k = open + 1;
+            if matches!(tokens.get(k), Some(Tok::Ident(w)) if matches!(w.as_str(), "const" | "let" | "var"))
+            {
+                k += 1;
+            }
+            if let (Some(Tok::Ident(name)), Some(Tok::Ident(of))) =
+                (tokens.get(k), tokens.get(k + 1))
+            {
+                let from = k + 2;
+                let item_of_local = of == "of"
+                    && from < close
+                    && (value_is_local(tokens, matches, from, locals)
+                        || matches!(tokens.get(from), Some(Tok::Ident(r))
+                            if scoped.iter().any(|(n, s, e)| n == r && from > *s && from < *e)));
+                if item_of_local {
+                    found.push((
+                        name.clone(),
+                        close,
+                        statement_end(tokens, matches, close + 1),
+                    ));
+                }
+            }
+        }
+        for (name, start, end) in found {
+            // The values of a name are in the order of the script.
+            let assigned_inside = values_of.get(name.as_str()).is_some_and(|values| {
+                let after = values.partition_point(|value| *value <= start);
+                values.get(after).is_some_and(|value| *value < end)
+            });
+            if !assigned_inside {
+                scoped.push((name, start, end));
+            }
+        }
+    }
+    scoped
 }
 
 /// Whether a string of the script names a credential's path (`/user/tokens`).
@@ -1438,34 +1679,83 @@ fn unreadable_call(tokens: &[Tok], at: usize, name: &str, member: bool) -> Optio
     }
 }
 
-/// The HTTP methods a value of the script can hold: the literal strings it
-/// is, through names bound to them (`const method = "delete"`), and whether
-/// some part of it is chosen at run time. `None` for a TypeScript type
-/// (`method: string`).
-fn method_values(
-    tokens: &[Tok],
-    assigned: &std::collections::HashMap<String, Vec<usize>>,
-    value: usize,
-    depth: usize,
-    out: &mut Vec<String>,
-) -> Option<bool> {
-    match tokens.get(value) {
-        Some(Tok::Str { text, plain, .. }) => {
-            out.push(text.clone());
-            Some(!plain)
-        }
-        Some(Tok::Ident(word)) if word == "string" => None,
-        Some(Tok::Ident(word)) if depth < 4 => {
-            let Some(values) = assigned.get(word) else {
-                return Some(true);
-            };
-            let mut unknown = false;
-            for v in values {
-                unknown |= method_values(tokens, assigned, *v, depth + 1, out).unwrap_or(true);
+/// The most values a name's HTTP method is followed through. Past it the
+/// method counts as chosen at run time.
+const MAX_METHOD_VALUES: usize = 32;
+
+/// What the names of a script can hold as an HTTP method: each name's
+/// values worked out once, so a name used again costs nothing.
+struct MethodValues<'a> {
+    tokens: &'a [Tok],
+    assigned: &'a std::collections::HashMap<String, Vec<usize>>,
+    /// Per name: the literal strings it can hold, and whether some value of
+    /// it is chosen at run time.
+    names: std::collections::HashMap<String, (Vec<String>, bool)>,
+}
+
+impl MethodValues<'_> {
+    /// The HTTP methods the value at `value` can hold: the literal strings it
+    /// is, through names bound to them (`const method = "delete"`), and
+    /// whether some part of it is chosen at run time. `None` for a
+    /// TypeScript type (`method: string`).
+    fn of_value(&mut self, value: usize) -> Option<(Vec<String>, bool)> {
+        match self.tokens.get(value) {
+            Some(Tok::Str { text, plain, .. }) => Some((vec![text.clone()], !plain)),
+            Some(Tok::Ident(word)) if word == "string" => None,
+            Some(Tok::Ident(word)) => {
+                let word = word.clone();
+                Some(self.of_name(&word, &mut std::collections::HashSet::new()))
             }
-            Some(unknown)
+            _ => Some((Vec::new(), true)),
         }
-        _ => Some(true),
+    }
+
+    /// The values of a name, worked out once. A name met again on its own
+    /// way (`a = b; b = a`), a value that is no literal, and more than
+    /// [`MAX_METHOD_VALUES`] values are chosen at run time.
+    fn of_name(
+        &mut self,
+        name: &str,
+        visiting: &mut std::collections::HashSet<String>,
+    ) -> (Vec<String>, bool) {
+        if let Some(known) = self.names.get(name) {
+            return known.clone();
+        }
+        let Some(values) = self.assigned.get(name) else {
+            return (Vec::new(), true);
+        };
+        if !visiting.insert(name.to_string()) {
+            return (Vec::new(), true);
+        }
+        let mut out: Vec<String> = Vec::new();
+        let mut unknown = false;
+        for v in values {
+            let (found, chosen) = match self.tokens.get(*v) {
+                Some(Tok::Str { text, plain, .. }) => (vec![text.clone()], !plain),
+                Some(Tok::Ident(word)) if word == "string" => (Vec::new(), true),
+                Some(Tok::Ident(word)) if visiting.len() < 64 => {
+                    let word = word.clone();
+                    self.of_name(&word, visiting)
+                }
+                _ => (Vec::new(), true),
+            };
+            unknown |= chosen;
+            for value in found {
+                if !out.contains(&value) {
+                    out.push(value);
+                }
+            }
+            if out.len() > MAX_METHOD_VALUES {
+                out.truncate(MAX_METHOD_VALUES);
+                unknown = true;
+                break;
+            }
+        }
+        visiting.remove(name);
+        // A name cut short by a loop on its way is kept too: what the loop
+        // hid makes it chosen at run time, a review either way.
+        self.names.insert(name.to_string(), (out.clone(), unknown));
+        (out, unknown)
     }
 }
 
@@ -1508,6 +1798,7 @@ fn read_tokens(tokens: &[Tok], findings: &mut Findings) {
     let roles = destructured_keys(tokens, &matches);
     let assigned_list = assignments(tokens);
     let locals = local_names(tokens, &matches, &assigned_list);
+    let scoped = scoped_locals(tokens, &matches, &locals, &assigned_list);
     let mut assigned: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
     for (name, value) in &assigned_list {
@@ -1524,9 +1815,13 @@ fn read_tokens(tokens: &[Tok], findings: &mut Findings) {
         }
     };
     // The method a request is sent with, from the value at `value`.
+    let method_values = std::cell::RefCell::new(MethodValues {
+        tokens,
+        assigned: &assigned,
+        names: std::collections::HashMap::new(),
+    });
     let judge_method = |findings: &mut Findings, value: usize| {
-        let mut methods = Vec::new();
-        let Some(unknown) = method_values(tokens, &assigned, value, 0, &mut methods) else {
+        let Some((methods, unknown)) = method_values.borrow_mut().of_value(value) else {
             return;
         };
         for method in methods {
@@ -1607,7 +1902,7 @@ fn read_tokens(tokens: &[Tok], findings: &mut Findings) {
                     } else {
                         (Vec::new(), None)
                     };
-                    if member && local_receiver(tokens, &chain, root, &locals) {
+                    if member && local_receiver(tokens, &chain, root, &locals, &scoped) {
                         continue;
                     }
                     // A maker of a local value, on its own root
@@ -1679,7 +1974,7 @@ fn read_tokens(tokens: &[Tok], findings: &mut Findings) {
                         } else {
                             chain_before(tokens, &matches, at)
                         };
-                        if !computed_key && local_receiver(tokens, &chain, root, &locals) {
+                        if !computed_key && local_receiver(tokens, &chain, root, &locals, &scoped) {
                             continue;
                         }
                         if !plain && (computed_key || called_after(tokens, close)) {
@@ -2222,5 +2517,97 @@ mod tests {
         assert!(command.len() < 2_000, "{}", command.len());
         assert!(command.contains("sha256:"));
         assert_eq!(verdict["command"], command);
+    }
+
+    /// FAILS ON REVERT (each name's values were worked out again at each
+    /// use, through four names: a 3 KB script took over 10 s): a script
+    /// that names its method through names, each written many times, reads
+    /// in a moment, and a method past the most values followed is a review.
+    #[test]
+    fn methods_through_many_names_read_in_a_moment() {
+        let v = 200;
+        let script = format!(
+            "{}{}{}{}{}",
+            "method=b;".repeat(v),
+            "b=c;".repeat(v),
+            "c=d;".repeat(v),
+            "d=e;".repeat(v),
+            "f({method});".repeat(v)
+        );
+        let started = std::time::Instant::now();
+        let found = read_script(&script);
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "{} bytes: {took:?}",
+            script.len()
+        );
+        assert!(
+            found.iter().any(|f| f.kind == CodeKind::Unreadable),
+            "{found:?}"
+        );
+        // A loop of names is chosen at run time.
+        let looped = "a = b; b = a; method = a; await fetch(u, { method })";
+        assert!(kinds(looped).contains(&CodeKind::Unreadable), "{looped}");
+        // Past the most values followed: chosen at run time.
+        let many: String = (0..40).map(|i| format!("m = \"GET{i}\"; ")).collect();
+        let many = format!("{many}await fetch(u, {{ method: m }})");
+        assert!(kinds(&many).contains(&CodeKind::Unreadable), "{many}");
+        // Followed through names, a method is still found.
+        let named = "const a = \"DELETE\"; const b = a; const c = b; const d = c; const e = d; await fetch(u, { method: e })";
+        assert!(kinds(named).contains(&CodeKind::Destructive), "{named}");
+    }
+
+    /// FAILS ON REVERT: the items of a page's elements and Node's hashes
+    /// were read as the API (`e.remove` destroyed, `createHash` created).
+    #[test]
+    fn items_of_local_values_and_node_crypto_are_local() {
+        for script in [
+            "document.querySelectorAll(\".ad\").forEach((e) => e.remove())",
+            "for (const el of document.querySelectorAll(\".ad\")) el.remove();",
+            "const { createHash } = require(\"node:crypto\"); return createHash(\"sha256\").update(s).digest(\"hex\");",
+            "const c = require(\"crypto\"); return c.createHash(\"sha256\").update(s).digest(\"hex\");",
+            "document.querySelectorAll(\"p\").forEach(function (e) { e.remove(); })",
+            "for (const el of document.querySelectorAll(\".ad\")) { el.classList.remove(\"x\"); el.remove(); }",
+        ] {
+            assert_eq!(read_script(script), Vec::new(), "{script}");
+        }
+        // Outside the callback or the loop, or on the API, the name is read.
+        for script in [
+            "document.querySelectorAll(\"p\").forEach(cf => 0); await cf.zones.delete({})",
+            "for (const z of document.querySelectorAll(\"p\")) z.id; await z.delete()",
+            "(await cloudflare.zones.list()).result.forEach((z) => z.delete())",
+            "for (const z of cloudflare.zones.list()) z.delete();",
+            "document.querySelectorAll(\"p\").forEach((e) => { e = cloudflare.zones; e.delete(); })",
+            "const { createHash, update } = require(\"crypto\"); await cloudflare.zones.delete({})",
+        ] {
+            assert!(!read_script(script).is_empty(), "{script}");
+        }
+    }
+
+    /// FAILS ON REVERT: a shell line handed with no language named was
+    /// "a string not closed" (a review); a language named in `interpreter`
+    /// or `shell` was not read as one.
+    #[test]
+    fn a_script_that_is_no_javascript_keeps_its_reading() {
+        let shell = serde_json::json!({"script": "ls -la build && echo it's there"});
+        let reading = read_code_call("mcp__sh__execute", &shell).unwrap();
+        assert!(reading.findings.is_empty(), "{:?}", reading.findings);
+        let python = serde_json::json!({"interpreter": "python3", "code": "client.zones.delete()"});
+        assert!(read_code_call("run_script", &python).is_none());
+        let bash = serde_json::json!({"shell": "bash", "code": "curl -X DELETE https://example.invalid/x"});
+        assert!(read_code_call("execute", &bash).is_none());
+        // Named JavaScript that does not split is still a review.
+        let named = serde_json::json!({"code": "await x(\"unclosed)", "language": "js"});
+        assert_eq!(
+            read_code_call("execute", &named).unwrap().findings[0].kind,
+            CodeKind::Unreadable
+        );
+        // JavaScript with no language named is still read.
+        let js = serde_json::json!({"script": "await cloudflare.zones.delete({})"});
+        assert_eq!(
+            read_code_call("mcp__sh__execute", &js).unwrap().findings[0].kind,
+            CodeKind::Destructive
+        );
     }
 }
