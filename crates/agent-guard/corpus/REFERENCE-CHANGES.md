@@ -298,3 +298,13 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   `cd ~ && rm -rf $PWD/.ssh` (deny), and `rm -rf $PWD` (review, as on
   main). ko-c01..ko-c08 are stopped by neither. No other
   line of any corpus moved, from an empty home or a home with keys.
+- 2026-11-22: harmless-proven: real/real-001 goes from review to allow.
+  It is `git commit -q -F - <<< '...'`, a commit message handed to git as a
+  here-string, whose text quotes shell lines (`rm -rf ~`, `eval`, `trap`).
+  The same message after `-m` or in a here-document was allowed by main; a
+  commit message is now read one way for `-m`, `-am` and `-F -` with a
+  here-string or a here-document, as data to git. Measured on this branch
+  beside it, still refused: a substitution in the message (`git commit -F -
+  <<< "$(...)"`, `git commit -am "$(...)"`), a message file named in place
+  of the input (`-F msg.txt <<< ...`) and the same text handed to a shell
+  (`sh <<< ...`). No other line of any corpus moved, from an empty home.

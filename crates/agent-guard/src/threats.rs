@@ -10112,19 +10112,62 @@ fn schedules_an_at_job(content: &str) -> bool {
 /// reads it and judges it as it judges the same job piped in (`echo '...' |
 /// at now`), a download it runs refused there. Until 2026-11-21 such a job
 /// was refused for its form alone, while the pipe let it through.
+///
+/// A here-document whose delimiter is quoted (`at now <<'EOF'`, `<<"EOF"`,
+/// `<<\EOF`) is not expanded: its body is the job as written, read and
+/// judged as the same job piped in. Until 2026-11-22 it was refused for its
+/// form alone. One whose delimiter is bare expands what the line does not
+/// show, and stays refused.
 fn at_job_on_input(segment: &str) -> bool {
     let mut rest = segment;
     while let Some(at) = rest.find('<') {
-        let Some(body) = rest[at..].strip_prefix("<<<") else {
+        if let Some(body) = rest[at..].strip_prefix("<<<") {
+            let body = body.trim_start_matches([' ', '\t']);
+            let Some(shown) = quoted_text_shown(body) else {
+                return true;
+            };
+            rest = &body[shown..];
+            continue;
+        }
+        let Some(start) = rest[at..].strip_prefix("<<") else {
             return true;
         };
-        let body = body.trim_start_matches([' ', '\t']);
-        let Some(shown) = quoted_text_shown(body) else {
+        let start = start
+            .strip_prefix('-')
+            .unwrap_or(start)
+            .trim_start_matches([' ', '\t']);
+        let Some(delimiter) = quoted_delimiter_length(start) else {
             return true;
         };
-        rest = &body[shown..];
+        rest = &start[delimiter..];
     }
     false
+}
+
+/// The length of the quoted delimiter of a here-document that `text`
+/// starts with (`'EOF'`, `"EOF"`, `\EOF`); `None` for a bare one, whose
+/// body the shell expands.
+fn quoted_delimiter_length(text: &str) -> Option<usize> {
+    let first = text.chars().next()?;
+    let length = match first {
+        '\'' | '"' => text[1..].find(first)? + 2,
+        '\\' => {
+            let name = text[1..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(text.len() - 1);
+            if name == 0 {
+                return None;
+            }
+            name + 1
+        }
+        _ => return None,
+    };
+    let after = &text[length..];
+    after
+        .chars()
+        .next()
+        .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+        .then_some(length)
 }
 
 /// The length of the quoted word `text` starts with, when its text is shown

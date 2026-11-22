@@ -867,6 +867,11 @@ fn normalized_code(lang: Lang, code: &str) -> String {
                         .position(|b| !(b.is_ascii_alphanumeric() || b == b'_'))?;
                     let (name, rest) = name.split_at(end);
                     let rest = rest.trim_start_matches(['\'', '"']).trim_start();
+                    // A name written out ends its argument: `send('sys' +
+                    // 'tem', x)` is built at run time, not a call of `sys`.
+                    if !rest.starts_with([',', ')']) {
+                        return None;
+                    }
                     let rest = rest.strip_prefix(',').unwrap_or(rest);
                     (!name.is_empty()).then(|| (format!("{name}("), rest.len()))
                 });
@@ -886,6 +891,139 @@ fn normalized_code(lang: Lang, code: &str) -> String {
         _ => {}
     }
     text
+}
+
+/// A way code reaches a function by a name it builds at run time, found
+/// where it starts ([`constructed_lookup`]).
+#[derive(Clone, Copy, Debug)]
+struct Lookup {
+    /// How many bytes of the code the name of the lookup takes.
+    name_len: usize,
+    /// The lookup's own brackets come next (`getattr(...)`, `&{...}`):
+    /// a call of what it returns comes after them.
+    own_group: bool,
+    /// Its own brackets are the call, the first argument the name
+    /// (`methodcaller('system', 'id')`, Ruby's `send(n, ...)`).
+    called_with_name: bool,
+    /// The target is built at run time whatever its brackets hold; when
+    /// not (`require('fs')`), only a bracket that is not one plain string
+    /// makes it so.
+    built: bool,
+}
+
+/// The lookup of a function by a name built at run time that starts
+/// `text`, in `lang`: Python's `getattr`, `__import__`,
+/// `importlib.import_module`, `globals()`, `locals()`, `vars()`,
+/// `__builtins__`, `eval` of a name and `operator.methodcaller` (the
+/// plain spellings of the first three are written as the call they make
+/// before this reading, [`normalized_code`]); Node's `require`, `eval`
+/// and the global objects indexed by name; Ruby's `send`, `public_send`,
+/// `__send__` and `method`; Perl's `&{...}` and `&$name`. `call_start`:
+/// nothing that makes it a method of another value stands before it.
+fn constructed_lookup(lang: Lang, text: &str, call_start: bool) -> Option<Lookup> {
+    let lookup = |name: &str, own_group: bool, called_with_name: bool, built: bool| Lookup {
+        name_len: name.len(),
+        own_group,
+        called_with_name,
+        built,
+    };
+    let opens = |name: &str| {
+        text.strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with('('))
+    };
+    match lang {
+        Lang::Python => {
+            for name in [
+                "operator.methodcaller",
+                "importlib.import_module",
+                "methodcaller",
+            ] {
+                if opens(name) && (call_start || !name.starts_with('m')) {
+                    return Some(lookup(name, true, name.ends_with("caller"), true));
+                }
+            }
+            if !call_start {
+                return None;
+            }
+            for name in [
+                "getattr",
+                "__import__",
+                "import_module",
+                "globals",
+                "locals",
+                "vars",
+                "eval",
+            ] {
+                if opens(name) {
+                    return Some(lookup(name, true, false, true));
+                }
+            }
+            text.strip_prefix("__builtins__")
+                .is_some_and(|rest| rest.starts_with('[') || rest.starts_with(".__dict__"))
+                .then(|| lookup("__builtins__", false, false, true))
+        }
+        Lang::Js => {
+            if !call_start {
+                return None;
+            }
+            if opens("require") {
+                return Some(lookup("require", true, false, false));
+            }
+            if opens("eval") {
+                return Some(lookup("eval", true, false, true));
+            }
+            [
+                "globalThis",
+                "global",
+                "window",
+                "self",
+                "this",
+                "process.mainModule",
+            ]
+            .into_iter()
+            .find(|name| {
+                text.strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with('['))
+            })
+            .map(|name| lookup(name, false, false, false))
+        }
+        Lang::Ruby => {
+            for name in ["public_send", "__send__", "send"] {
+                if opens(name) {
+                    return Some(lookup(name, true, true, true));
+                }
+            }
+            opens("method").then(|| lookup("method", true, false, true))
+        }
+        Lang::Perl => {
+            if text.starts_with("&{") {
+                return Some(lookup("&", true, false, true));
+            }
+            let name = text
+                .strip_prefix("&$")?
+                .bytes()
+                .take_while(|b| is_name_byte(*b))
+                .count();
+            (name > 0).then(|| lookup(&text[..2 + name], false, false, true))
+        }
+        Lang::Php | Lang::Lua => None,
+    }
+}
+
+/// The name a Ruby argument writes out: a symbol (`:size`) or one plain
+/// string.
+fn ruby_written_name(argument: &str) -> Option<&str> {
+    let argument = argument.trim();
+    if let Some(symbol) = argument.strip_prefix(':') {
+        return (!symbol.is_empty() && symbol.bytes().all(is_name_byte)).then_some(symbol);
+    }
+    let (name, rest) = simple_quoted(argument)?;
+    (rest.trim().is_empty() && !name.is_empty() && name.bytes().all(is_name_byte)).then_some(name)
+}
+
+/// Whether `inner` is one string in plain quotes and nothing else.
+fn whole_literal(inner: &str) -> bool {
+    simple_quoted(inner.trim()).is_some_and(|(_, rest)| rest.trim().is_empty())
 }
 
 /// A string in single or double quotes at the start of `text`, without
@@ -1321,6 +1459,127 @@ impl Reader<'_> {
         }
         if self.lang == Lang::Js {
             self.scan_js(start, end);
+        }
+        self.scan_constructed(start, end);
+    }
+
+    /// Calls whose target the code builds at run time
+    /// ([`constructed_lookup`]): `getattr(m, 'sys'+'tem')(...)`,
+    /// `__import__(x).system(...)`, `globals()[n](...)`,
+    /// `operator.methodcaller(n, ...)`, `require(x)[y](...)`, Ruby's
+    /// `send(n, ...)` with a name it does not write out, Perl's `&{"..."}(...)`.
+    /// What such a call reaches is not read: it is held as a line built at
+    /// run time is ([`InlineReading::unread`]), and what it is handed is
+    /// read as the line a shell would be handed, so a destructive or
+    /// downloaded argument keeps its refusal. Measured 2026-11-22 on main:
+    /// `python3 -c "getattr(__import__('o'+'s'),'sys'+'tem')('rm -rf ~')"`
+    /// and its Node, Ruby and Perl twins were allowed.
+    fn scan_constructed(&mut self, start: usize, end: usize) {
+        let code = self.code;
+        let bytes = code.as_bytes();
+        let mut at = start;
+        while at < end {
+            if !code.is_char_boundary(at) {
+                at += 1;
+                continue;
+            }
+            if let Some(next) = self.skip_literal(at, end) {
+                at = next.max(at + 1);
+                continue;
+            }
+            let after_name = at
+                .checked_sub(1)
+                .is_none_or(|before| !is_name_byte(bytes[before]));
+            if after_name {
+                if let Some(lookup) =
+                    constructed_lookup(self.lang, &code[at..end], starts_a_call(code, at))
+                {
+                    for (arguments_at, skip) in self.constructed_calls(at, end, lookup) {
+                        self.read_constructed_call(arguments_at, end, skip);
+                    }
+                }
+            }
+            at += 1;
+        }
+    }
+
+    /// Where the calls of a value [`constructed_lookup`] found at `at`
+    /// open their arguments, each with how many leading arguments name the
+    /// target rather than being handed to it.
+    fn constructed_calls(&self, at: usize, end: usize, lookup: Lookup) -> Vec<(usize, usize)> {
+        let code = self.code;
+        let mut calls = Vec::new();
+        let mut cursor = at + lookup.name_len;
+        let mut own = lookup.own_group;
+        let mut built = lookup.built;
+        while cursor < end {
+            let rest = &code[cursor..end];
+            match rest.as_bytes()[0] {
+                open @ (b'(' | b'[' | b'{') => {
+                    let Some(close) = closing(&rest[1..]) else {
+                        break;
+                    };
+                    let inner = &rest[1..1 + close];
+                    if own {
+                        own = false;
+                        built |= !whole_literal(inner);
+                        // Ruby's `send(:size)` names what it calls: only
+                        // a name that runs something is a call to read.
+                        if lookup.called_with_name
+                            && self.lang == Lang::Ruby
+                            && ruby_written_name(split_top(inner, ",")[0])
+                                .is_some_and(|name| sink_of(Lang::Ruby, name).is_none())
+                        {
+                            break;
+                        }
+                        if lookup.called_with_name {
+                            calls.push((cursor + 1, 1));
+                        }
+                    } else if open == b'[' {
+                        built |= !whole_literal(inner);
+                    } else if open == b'(' && built {
+                        calls.push((cursor + 1, 0));
+                    }
+                    cursor += close + 2;
+                }
+                b'.' if !matches!(self.lang, Lang::Perl | Lang::Php) => {
+                    let name = rest[1..].bytes().take_while(|b| is_name_byte(*b)).count();
+                    if name == 0 {
+                        break;
+                    }
+                    cursor += 1 + name;
+                }
+                b'-' if rest.starts_with("->") => {
+                    let name = rest[2..].bytes().take_while(|b| is_name_byte(*b)).count();
+                    cursor += 2 + name;
+                }
+                _ => break,
+            }
+        }
+        calls
+    }
+
+    /// A call whose target is built at run time: not read, and what it is
+    /// handed read as a line ([`Self::scan_constructed`]).
+    fn read_constructed_call(&mut self, arguments_at: usize, end: usize, skip: usize) {
+        let arguments = call_arguments(&self.code[arguments_at..end]);
+        let done = arguments_at + arguments.len();
+        self.out.unread = true;
+        for part in split_top(arguments, ",").into_iter().skip(skip) {
+            let part = part.trim();
+            if part.is_empty() || keyword_argument(self.lang, part).is_some() {
+                continue;
+            }
+            match self.fold(part, FOLD_DEPTH) {
+                Value::Str(text) if !text.contains(UNREAD) && !text.trim().is_empty() => {
+                    self.read_line(done, Value::Str(text));
+                }
+                value => {
+                    if value.has_unread() && self.fetch_before(done) {
+                        self.out.runs_download = true;
+                    }
+                }
+            }
         }
     }
 

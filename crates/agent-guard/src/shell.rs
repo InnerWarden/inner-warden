@@ -3240,6 +3240,11 @@ pub(crate) struct HandedLines {
     /// A file the line writes and then runs holds text the line prints
     /// without showing it (`echo "$X" > x.sh; sh x.sh`, `exec > x.sh`).
     pub(crate) file_not_shown: bool,
+    /// The text of each file the line writes and then runs, when the line
+    /// shows it (also read into [`HandedLines::lines`]): a download handed
+    /// to a shell there is a dropper the line writes and runs, not an
+    /// installer.
+    pub(crate) written_scripts: Vec<String>,
     /// A file the line writes and then loads in this shell (`. ./env.sh`)
     /// sets a variable the guard reads in its own way (the home, the search
     /// path, a setting that loads code), which it does not carry to the rest
@@ -3604,6 +3609,7 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                 .or_else(|| substituted_writer_text(*command, &path, bytes, &assignments));
             match text {
                 Some(text) => {
+                    handed.written_scripts.push(text.clone());
                     let (language, program) = match (language, runners::shebang(&text)) {
                         (None, Some(found)) => (found.0, found.1),
                         (None, None) => (runners::Language::Shell, String::new()),
@@ -6430,7 +6436,12 @@ fn written_file_text(
             continue;
         }
         let writer = ancestor_of_kind(redirect, "redirected_statement").and_then(statement_owner);
-        let printed = writer.and_then(|writer| printed_text(writer, source, level))?;
+        let printed = match writer {
+            Some(writer) if is_bare_exec(writer, source) => {
+                exec_output_text(writer, reader, source, level)?
+            }
+            _ => writer.and_then(|writer| printed_text(writer, source, level))?,
+        };
         text = Some(if operator.ends_with(">>") {
             text.unwrap_or_default() + &printed
         } else {
@@ -6438,6 +6449,89 @@ fn written_file_text(
         });
     }
     text
+}
+
+/// Whether `command` is `exec` with nothing but redirections: it moves
+/// the output of the commands after it.
+fn is_bare_exec(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    command_words(command, source).is_some_and(|words| words.len() == 1 && words[0] == "exec")
+}
+
+/// What the commands after a bare `exec > file` print into the file,
+/// before `reader` and until another bare `exec` moves the output: `exec >
+/// r.sh; echo '...'; exec > /dev/tty; sh r.sh` runs what `echo` printed.
+/// A command whose own output goes elsewhere (`>&2`, `> log`) adds
+/// nothing; one whose output the line does not show leaves the file
+/// unread. Measured 2026-11-22 on main: such a file was held for review
+/// whatever it held, a removal of the home included.
+fn exec_output_text(
+    exec: tree_sitter::Node<'_>,
+    reader: tree_sitter::Node<'_>,
+    source: &[u8],
+    level: u8,
+) -> Option<String> {
+    let statement = ancestor_of_kind(exec, "redirected_statement")?;
+    let mut commands = Vec::new();
+    collect_all_commands(root_node(exec), &mut commands, 0);
+    commands.sort_by_key(|command| command.start_byte());
+    let mut text = String::new();
+    for command in commands {
+        if command.start_byte() < statement.end_byte() || never_runs(command, source) {
+            continue;
+        }
+        if command.start_byte() >= reader.start_byte() || is_bare_exec(command, source) {
+            break;
+        }
+        if ancestor_of_kind(command, "command_substitution").is_some()
+            || ancestor_of_kind(command, "process_substitution").is_some()
+        {
+            return None;
+        }
+        let own_output = command
+            .parent()
+            .filter(|parent| parent.kind() == "redirected_statement")
+            .is_some_and(|parent| {
+                let mut cursor = parent.walk();
+                let elsewhere = parent.children(&mut cursor).any(|child| {
+                    child.kind() == "file_redirect"
+                        && sends_stdout_elsewhere(&node_text(child, source))
+                });
+                elsewhere
+            });
+        if own_output {
+            continue;
+        }
+        text.push_str(&printed_text(command, source, level)?);
+    }
+    Some(text)
+}
+
+/// Whether a redirect moves the standard output somewhere other than
+/// where it already goes: `>`, `1>`, `>>`, `>|` or `&>` to a file or
+/// a descriptor other than 1 or `/dev/stdout`. `>&1`, `1>/dev/stdout` and
+/// `3>/dev/null` leave it where it was. Measured 2026-11-22 in review: any
+/// redirect not starting with 2 counted as output sent elsewhere.
+fn sends_stdout_elsewhere(redirect: &str) -> bool {
+    let redirect = redirect.trim();
+    let (descriptor, rest) = redirect.split_at(
+        redirect
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(redirect.len()),
+    );
+    let rest = match descriptor {
+        "" => rest.strip_prefix('&').unwrap_or(rest),
+        "1" => rest,
+        _ => return false,
+    };
+    let Some(rest) = rest.strip_prefix('>') else {
+        return false;
+    };
+    let rest = rest.strip_prefix(['>', '|', '&']).unwrap_or(rest);
+    let target = shell_word(rest.trim());
+    !matches!(
+        target.as_str(),
+        "1" | "/dev/stdout" | "/dev/fd/1" | "/proc/self/fd/1"
+    )
 }
 
 /// Whether a word holds only text the line writes out: no expansion,
@@ -7942,6 +8036,46 @@ pub(crate) fn download_pipeline_output_targets(source: &str) -> Vec<(usize, Stri
                         .into_iter()
                         .map(|target| (pipeline.end_byte(), target)),
                 );
+            }
+        }
+    }
+    // A downloader in a group or a subshell whose redirect writes a file
+    // (`{ curl -s URL; } > r.sh`): the redirect is the group's, and what the
+    // downloader prints lands in the file. Measured 2026-11-22 on main: the
+    // group form was allowed where `(curl -s URL) > r.sh` and `curl -s URL >
+    // r.sh` were held for review.
+    let mut commands = Vec::new();
+    collect_all_commands(tree.root_node(), &mut commands, 0);
+    for command in commands {
+        let downloads = command_words(command, bytes).is_some_and(|words| {
+            effective_command_words(&words, 0).is_some_and(produces_downloaded_bytes)
+        });
+        if !downloads {
+            continue;
+        }
+        let mut node = command;
+        let mut grouped = false;
+        while let Some(parent) = node.parent() {
+            match parent.kind() {
+                "compound_statement" | "subshell" => {
+                    grouped = true;
+                    node = parent;
+                }
+                "list" => node = parent,
+                "redirected_statement"
+                    if grouped
+                        && parent
+                            .child_by_field_name("body")
+                            .is_some_and(|body| body.id() == node.id()) =>
+                {
+                    outputs.extend(
+                        output_redirect_targets(parent, bytes)
+                            .into_iter()
+                            .map(|target| (parent.end_byte(), target)),
+                    );
+                    break;
+                }
+                _ => break,
             }
         }
     }
@@ -13063,6 +13197,9 @@ fn collect_ranges(
             mask_literal_command_args(node, source, taint, masked, executable_inside_mask);
         }
         "heredoc_body" => mask_data_heredoc(node, source, masked, executable_inside_mask),
+        "herestring_redirect" => {
+            mask_message_herestring(node, source, masked, executable_inside_mask);
+        }
         _ => {}
     }
 
@@ -13189,7 +13326,7 @@ fn mask_literal_command_args(
             // flagged as attempting the very thing they were searching for, which
             // is both wrong and the kind of false positive that gets a guard
             // switched off.
-            for argument in option_data_arguments(
+            let mut data = option_data_arguments(
                 &arguments,
                 source,
                 &[
@@ -13202,7 +13339,18 @@ fn mask_literal_command_args(
                     "-G",
                 ],
                 &["--message=", "--grep=", "--author=", "--committer="],
-            ) {
+            );
+            // `git commit -am '...'`: a cluster of short flags that ends in
+            // `m` takes the message as `-m` does. Measured 2026-11-22: a
+            // message that named the guard was allowed after `-m` and held
+            // for review after `-am`.
+            data.extend(
+                arguments
+                    .windows(2)
+                    .filter(|pair| git_message_cluster(&shell_word(&node_text(pair[0], source))))
+                    .map(|pair| pair[1]),
+            );
+            for argument in data {
                 mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
@@ -13626,6 +13774,22 @@ fn targets_executed_after(
         {
             return true;
         }
+        // A program that runs its input as code, handed the file there
+        // (`sh < x.sh`, `python3 < x.py`): measured 2026-11-22, the text a
+        // `printf` wrote was hidden from the reading of the file it runs.
+        let on_stdin = command_words(candidate, source)
+            .and_then(|words| {
+                effective_command_words(&words, 0)
+                    .and_then(|effective| file_on_stdin(candidate, effective, source))
+            })
+            .map(|(path, _)| path);
+        if on_stdin.is_some_and(|path| {
+            targets.iter().any(|target| {
+                spellings_of(target).contains(&path) || spellings_of(&path).contains(target)
+            })
+        }) {
+            return true;
+        }
     }
     false
 }
@@ -13998,6 +14162,136 @@ fn reads_stdin_as_message(
         "git" => stdin_valued("-F") || stdin_valued("--file"),
         "gh" | "glab" => {
             stdin_valued("--body-file") || stdin_valued("-F") || stdin_valued("--notes-file")
+        }
+        _ => false,
+    }
+}
+
+/// A cluster of git's short flags that ends in `m` (`-am`, `-sam`): the
+/// next word is the message.
+fn git_message_cluster(word: &str) -> bool {
+    word.len() > 2
+        && word.starts_with('-')
+        && !word.starts_with("--")
+        && word.ends_with('m')
+        && word[1..].chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// A here-string a command reads as its message ([`reads_stdin_as_message`]:
+/// `git commit -F - <<< '...'`) is data, as the same text in a
+/// here-document is ([`mask_data_heredoc`]). Measured 2026-11-22: a
+/// message that named the guard was allowed in a here-document and after
+/// `-m`, and held for review in a here-string.
+fn mask_message_herestring(
+    redirect: tree_sitter::Node<'_>,
+    source: &[u8],
+    masked: &mut Vec<Range<usize>>,
+    executable_inside_mask: &mut Vec<Range<usize>>,
+) {
+    let Some(owner) = heredoc_owner(redirect) else {
+        return;
+    };
+    // The grammar hangs a here-string on its command, or on the statement
+    // around it.
+    let redirected = ancestor_of_kind(redirect, "redirected_statement").unwrap_or(owner);
+    if !reads_stdin_as_message(owner, redirected, source)
+        || output_piped_past_data(owner, redirected, source)
+        || has_execution_sink_ancestor(owner, source)
+        || command_name(owner, source).is_some_and(|name| {
+            line_redefines(root_node(redirect), &normalized_command_name(&name), source)
+        })
+    {
+        return;
+    }
+    let Some(value) = redirect.named_child((redirect.named_child_count() as u32).saturating_sub(1))
+    else {
+        return;
+    };
+    // The word stays a word: masked whole, `<<<` is left without one, the
+    // projection no longer parses and the rest of the line goes unread
+    // (`git commit -F - <<< 'x'; sh <(curl -s URL)` fell from deny to
+    // review). Only what lies inside the quotes, or after the first letter
+    // of a bare word, is hidden; a value that cannot keep a word is not
+    // masked at all.
+    let mut hidden = Vec::new();
+    if !message_text_ranges(value, source, &mut hidden) {
+        return;
+    }
+    masked.extend(hidden);
+    collect_executable_substitutions(value, source, executable_inside_mask, 0);
+}
+
+/// Whether what `owner` prints is piped on into a stage that is not
+/// only data handling (`git commit -F - <<< '...' | sh`): a message
+/// handed on to a program that may run it is not only a message. Stages
+/// before the one holding `owner` do not read its output, and a later
+/// stage of data handling (`| tail -3`) runs nothing.
+fn output_piped_past_data(
+    owner: tree_sitter::Node<'_>,
+    redirected: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> bool {
+    let Some(pipeline) = nearest_pipeline(redirected) else {
+        return false;
+    };
+    let mut stage = owner;
+    while let Some(parent) = stage.parent() {
+        if parent.id() == pipeline.id() {
+            break;
+        }
+        stage = parent;
+    }
+    let mut cursor = pipeline.walk();
+    let later: Vec<_> = pipeline
+        .named_children(&mut cursor)
+        .filter(|later| later.start_byte() >= stage.end_byte())
+        .collect();
+    later.into_iter().any(|later| {
+        let mut commands = Vec::new();
+        collect_commands(later, &mut commands, 0);
+        commands.is_empty()
+            || commands.into_iter().any(|command| {
+                classify_pipeline_command(command, source) != PipelineCommand::DataOnly
+            })
+    })
+}
+
+/// The ranges of a here-string's word that hold its text, leaving a word
+/// in place: the quotes of a string, the first letter of a bare word, the
+/// first piece of a concatenation. False when no word can be kept.
+fn message_text_ranges(
+    value: tree_sitter::Node<'_>,
+    source: &[u8],
+    hidden: &mut Vec<Range<usize>>,
+) -> bool {
+    let range = value.byte_range();
+    match value.kind() {
+        "raw_string" | "string" if range.len() >= 2 => {
+            hidden.push(range.start + 1..range.end - 1);
+            true
+        }
+        "ansi_c_string" if range.len() >= 3 => {
+            hidden.push(range.start + 2..range.end - 1);
+            true
+        }
+        "word" => {
+            let keeps_a_letter = source
+                .get(range.start)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric());
+            if keeps_a_letter {
+                hidden.push(range.start + 1..range.end);
+            }
+            keeps_a_letter
+        }
+        "concatenation" => {
+            let Some(first) = value.child(0) else {
+                return false;
+            };
+            if !message_text_ranges(first, source, hidden) {
+                return false;
+            }
+            hidden.push(first.end_byte()..range.end);
+            true
         }
         _ => false,
     }
