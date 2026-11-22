@@ -35,6 +35,7 @@
 // product that pins this crate by revision, so treat these as published API.
 pub mod detect;
 pub mod mcp;
+pub mod mcp_code_mode;
 pub mod mcp_proxy;
 pub mod mcp_targets;
 pub mod registry;

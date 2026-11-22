@@ -793,3 +793,70 @@ fn the_warning_is_the_stronger_of_the_two_readings() {
         "{graph}"
     );
 }
+
+/// An `execute` call of a code-mode server is read twice in the hook:
+/// by the proxy's rules for a server the proxy does not carry
+/// (`screen_mcp_call`), then, for a call those let run, by the reader of
+/// its script. Neither reading skips the other: a script that destroys is a
+/// warning that names it in the default posture and a refusal in strict,
+/// whatever server it goes to, and a script the proxy's rules also flag
+/// carries both findings.
+#[test]
+fn a_code_mode_script_is_read_by_both_readings() {
+    let host = Host::with_posture(Some("default"));
+    let destroy = "await cloudflare.zones.delete({ zone_id: \"z\" })";
+    let metadata = format!(
+        "await fetch(\"http://169.254.169.254/latest/meta-data/iam/security-credentials/\"); {destroy}"
+    );
+    let own_document = "const document = { querySelectorAll: () => [cloudflare.zones] }; \
+         document.querySelectorAll(\"p\").forEach((e) => e.delete({ zone_id: \"z\" }))";
+    for code in [
+        destroy.to_string(),
+        metadata.clone(),
+        own_document.to_string(),
+    ] {
+        // `local` and `linear` are judged by the proxy's rules here,
+        // `docs` is behind the proxy and left to it; the script is read
+        // for all three.
+        for server in ["local", "linear", "docs", "cloudflare"] {
+            let tool = format!("mcp__{server}__execute");
+            let (exit, text) = host.hook(&[], &tool, json!({ "code": code }));
+            assert_eq!(exit, Some(0), "{tool} {code}: {text}");
+            assert!(
+                text.contains("InnerWarden warning (review, ran under the default posture)")
+                    && text.contains("deletes, purges or takes away"),
+                "{tool} {code}: {text}"
+            );
+            let (exit, text) = host.hook(&["--block-review"], &tool, json!({ "code": code }));
+            assert_eq!(exit, Some(2), "{tool} {code}: {text}");
+            assert!(
+                text.contains("deletes, purges or takes away"),
+                "{tool} {code}: {text}"
+            );
+        }
+        let payload = host.codex_payload("mcp__cloudflare__execute", json!({ "code": code }));
+        let (exit, text) = host.run("claude-code", &["--block-review"], payload);
+        assert_eq!(exit, Some(2), "claude-code {code}: {text}");
+    }
+    // In strict the proxy's rules and the script's reader both speak.
+    let (exit, text) = host.hook(
+        &["--block-review"],
+        "mcp__local__execute",
+        json!({ "code": metadata }),
+    );
+    assert_eq!(exit, Some(2), "{text}");
+    assert!(
+        text.contains("ATR-2026-013") && text.contains("AG-CODE-MODE"),
+        "{text}"
+    );
+    // A script that only reads runs, silent.
+    for server in ["local", "linear", "docs"] {
+        let tool = format!("mcp__{server}__execute");
+        let (exit, text) = host.hook(
+            &["--block-review"],
+            &tool,
+            json!({ "code": "await cloudflare.zones.list()" }),
+        );
+        assert_eq!((exit, text.trim()), (Some(0), ""), "{tool}");
+    }
+}

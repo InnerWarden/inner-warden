@@ -66,6 +66,25 @@ pub const DEADLINE_ENV: &str = "INNERWARDEN_HOOK_DEADLINE_MS";
 #[cfg(debug_assertions)]
 pub const TEST_DEADLINE_ENV: &str = "IW_TEST_HOOK_DEADLINE_MS";
 
+/// Holds the screening of a tool result (PostToolUse) back, in
+/// milliseconds, in a DEBUG build only: the slow read of a large result on a
+/// busy machine, for the tests that prove the deadline does not take a
+/// result that already ran from the agent. A release build does not read it.
+#[cfg(debug_assertions)]
+pub const TEST_RESULT_DELAY_ENV: &str = "IW_TEST_HOOK_RESULT_DELAY_MS";
+
+/// Debug builds: wait as long as [`TEST_RESULT_DELAY_ENV`] says, while the
+/// result of a call that already ran is screened. Not in a release build.
+#[cfg(debug_assertions)]
+pub fn test_result_delay() {
+    if let Some(ms) = std::env::var(TEST_RESULT_DELAY_ENV)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
 /// Names a file, in a DEBUG build only, that each phase of the hook appends
 /// one line to ([`mark`]): where the time of a hook run goes, measured by
 /// the test suite. A release build does not read it.
@@ -77,6 +96,14 @@ pub const TEST_PHASES_ENV: &str = "IW_TEST_HOOK_PHASES";
 static ARMED: std::sync::OnceLock<(Instant, RunQueue)> = std::sync::OnceLock::new();
 
 static MONITOR: AtomicBool = AtomicBool::new(false);
+
+/// Set once the hook knows the call it reads already ran (a PostToolUse
+/// with its result): [`already_ran`].
+static ALREADY_RAN: AtomicBool = AtomicBool::new(false);
+
+/// Whether the agent reads [`RESULT_UNREAD_JSON`] on stdout once
+/// [`already_ran`] is set (Claude Code).
+static RESULT_UNREAD_TO_AGENT: AtomicBool = AtomicBool::new(false);
 
 /// No answer yet: [`ANSWER`] holds this until [`answered`].
 const NO_ANSWER: u16 = u16::MAX;
@@ -140,6 +167,16 @@ const OUT_OF_TIME_ENFORCE: &str =
 const OUT_OF_TIME_MONITOR: &str =
     "InnerWarden hook: the screening of this tool call did not finish in time; it was NOT \
      screened (monitor mode never blocks).\n";
+/// The end of the deadline for a call that already ran: nothing is left to
+/// refuse, so the result goes on to the agent, said not to have been read.
+const OUT_OF_TIME_RESULT: &str =
+    "InnerWarden hook: the screening of this tool result did not finish in time; the tool \
+     already ran, so the result was not refused, and the guard did NOT read it.\n";
+/// The same, for the agent, in Claude Code's shape for a PostToolUse hook:
+/// added to what the agent reads beside the result.
+const RESULT_UNREAD_JSON: &str = "{\"hookSpecificOutput\":{\"hookEventName\":\"PostToolUse\",\
+\"additionalContext\":\"InnerWarden did not finish reading this tool result in time: the guard \
+did NOT read it.\"}}\n";
 #[cfg(unix)]
 const FAULT_ENFORCE: &str =
     "InnerWarden hook: a fault stopped the screening of this tool call; refusing it rather \
@@ -352,6 +389,19 @@ pub fn mark(phase: &str) {
     let _ = phase;
 }
 
+/// The call being read already ran (a PostToolUse that carries its
+/// result), and every way through the screening from here answers it with
+/// 0: from here on the deadline answers it with 0 too, says the result was
+/// not read, and, where `to_agent` (Claude Code), tells the agent so on
+/// stdout. A refusal at the deadline would only take the result from the
+/// agent: the tool already ran. Only a PostToolUse is marked: a call about
+/// to run is never marked, even one that carries a `tool_response`, and
+/// keeps its refusal at the deadline; a fault keeps its own end.
+pub fn already_ran(to_agent: bool) {
+    RESULT_UNREAD_TO_AGENT.store(to_agent, Ordering::SeqCst);
+    ALREADY_RAN.store(true, Ordering::SeqCst);
+}
+
 /// From here on every end of the net (the deadline, a fault) is 0 and
 /// silent, and so is the panic guard's: for a run on the person's prompt,
 /// where any other end shows an error, and 2 drops what the person typed.
@@ -560,6 +610,14 @@ fn watch(armed: Instant, queue: &RunQueue) -> ! {
                     // next hook or the status to say the record was cut and
                     // to remove this writer's temporaries.
                     end(AFTER_ANSWER_LATE, code)
+                } else if ALREADY_RAN.load(Ordering::SeqCst) {
+                    if json_answer().is_some() {
+                        end_answering(OUT_OF_TIME_RESULT, JSON_ALLOW)
+                    } else if RESULT_UNREAD_TO_AGENT.load(Ordering::SeqCst) {
+                        end_answering(OUT_OF_TIME_RESULT, RESULT_UNREAD_JSON)
+                    } else {
+                        end(OUT_OF_TIME_RESULT, 0)
+                    }
                 } else if let Some(answer) = json_answer() {
                     let said = if MONITOR.load(Ordering::SeqCst) {
                         OUT_OF_TIME_MONITOR
@@ -799,6 +857,28 @@ mod tests {
             }
             "json-stall" => {
                 set_json_answer(true, monitor);
+                arm_with(monitor, Duration::from_millis(200)).expect("arm");
+                loop {
+                    std::hint::black_box(0u8);
+                }
+            }
+            "ran-stall" => {
+                already_ran(true);
+                arm_with(monitor, Duration::from_millis(200)).expect("arm");
+                loop {
+                    std::hint::black_box(0u8);
+                }
+            }
+            "ran-quiet-stall" => {
+                already_ran(false);
+                arm_with(monitor, Duration::from_millis(200)).expect("arm");
+                loop {
+                    std::hint::black_box(0u8);
+                }
+            }
+            "ran-json-stall" => {
+                set_json_answer(true, monitor);
+                already_ran(false);
                 arm_with(monitor, Duration::from_millis(200)).expect("arm");
                 loop {
                     std::hint::black_box(0u8);
@@ -1106,6 +1186,51 @@ mod tests {
             assert_eq!(code, Some(expected), "{mode}: {said}");
             assert!(said.contains("did not finish in time"), "{mode}: {said}");
             assert!(said.contains(says), "{mode}: {said}");
+        }
+    }
+
+    /// A call that already ran (PostToolUse) still busy at the deadline is
+    /// not refused: it ends with 0 in enforce and in monitor, says the
+    /// result was not read, and tells the agent so on stdout where the agent
+    /// reads it there (Claude Code's `additionalContext`, Antigravity's
+    /// JSON answer). The same stall on a call about to run is refused, as
+    /// `a_screening_past_its_deadline_refuses_the_call` shows.
+    ///
+    /// FAILS ON REVERT: the watchdog refuses every unanswered call (2), and
+    /// says it is NOT screened in monitor (1).
+    #[test]
+    fn a_result_past_its_deadline_is_not_refused_and_says_it_was_not_read() {
+        const TEST: &str = "a_result_past_its_deadline_is_not_refused_and_says_it_was_not_read";
+        act_as_child(TEST);
+        for mode in ["enforce", "monitor"] {
+            for (end, stdout_has) in [
+                ("ran-stall", "\"additionalContext\""),
+                ("ran-quiet-stall", ""),
+                ("ran-json-stall", "{\"decision\":\"allow\"}"),
+            ] {
+                let (code, out, said) = child_with_stdout(TEST, &format!("{mode}:{end}"));
+                assert_eq!(code, Some(0), "{mode}:{end}: {said}");
+                assert!(said.contains("tool already ran"), "{mode}:{end}: {said}");
+                assert!(said.contains("did NOT read it"), "{mode}:{end}: {said}");
+                assert!(!said.contains("refusing it"), "{mode}:{end}: {said}");
+                if stdout_has.is_empty() {
+                    // Only the test binary's own lines: no answer.
+                    assert!(!out.contains('{'), "{mode}:{end}: {out}");
+                } else {
+                    assert!(out.contains(stdout_has), "{mode}:{end}: {out}");
+                    assert!(!out.contains("deny"), "{mode}:{end}: {out}");
+                }
+                if end == "ran-stall" {
+                    // The child is a test binary: its own lines come first.
+                    let line = out
+                        .find("{\"hookSpecificOutput\"")
+                        .and_then(|at| out[at..].lines().next())
+                        .expect("the answer on stdout");
+                    let answer: serde_json::Value =
+                        serde_json::from_str(line).expect("JSON on stdout");
+                    assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+                }
+            }
         }
     }
 
