@@ -729,13 +729,27 @@ pub fn server_entries(root: &Value) -> Vec<crate::mcp_unproxied::ServerEntry> {
         .filter_map(|path| table_at(root, path))
         .flat_map(|map| map.iter())
         .filter(|(_, server)| server.is_object())
-        .map(|(name, server)| crate::mcp_unproxied::ServerEntry {
-            name: name.clone(),
-            behind_proxy: is_wrapped_server(server),
-            remote: !server
-                .as_object()
-                .is_some_and(|obj| obj.contains_key("command"))
-                && REMOTE_URL_KEYS.iter().any(|key| server.get(*key).is_some()),
+        .map(|(name, server)| {
+            let command = server.get("command").and_then(Value::as_str);
+            let args: Vec<&str> = server
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| args.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            crate::mcp_unproxied::ServerEntry {
+                name: name.clone(),
+                wrapper: server_mode(server).and_then(|mode| {
+                    Some(crate::mcp_unproxied::Wrapper {
+                        command: command?.to_string(),
+                        blocks: mode == WiringMode::Enforce,
+                    })
+                }),
+                remote: (!server
+                    .as_object()
+                    .is_some_and(|obj| obj.contains_key("command"))
+                    && REMOTE_URL_KEYS.iter().any(|key| server.get(*key).is_some()))
+                    || command.is_some_and(|c| crate::mcp_unproxied::runs_mcp_remote(c, &args)),
+            }
         })
         .collect()
 }

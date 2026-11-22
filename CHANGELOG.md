@@ -19,14 +19,26 @@ arguments, and the guard never reads, holds or writes the token.
 A server is told by the name Codex gives it in the hook (`linear-app` is
 `linear_app`, `notion.so` is `notion_so`) and by the address Cursor sends
 for one it reaches by URL. A call whose server cannot be told (a name Codex
-hashed or cut, a configuration missing, unreadable or not a regular file)
-is judged too. The strict posture refuses what the proxy refuses. The
-default posture refuses only a hard finding (a revoked agent, a profile's
-refusal, the guard's LLM key, and for a local server a privileged or
-secret path); the rest runs with a one-line warning and is recorded, and a
-path handed to a remote server, which names a file there, is never refused
-by it. The configuration is read only for a call with a finding, and
-`CODEX_HOME` is followed. Claude Code and Gemini CLI MCP calls go to the
+hashed or cut, a Cursor call with no server name, a configuration missing,
+unreadable or not a regular file) is judged too. A call is left to the
+proxy only when its wrapper runs this very binary (the same file, not a
+file of the same name), in a mode that refuses when the hook does, in a
+configuration that has not changed since the agent started, when every
+server the call's name fits is such a wrapper, and, for Cursor, when the
+command the call carries is the guard's proxy too. The strict posture
+refuses what the proxy refuses. The default posture refuses only a hard
+finding (a revoked agent, a profile's refusal, the guard's LLM key, and for
+a local server a path in a path's key that names a place on this host:
+absolute, `~`, `file:` or climbing with `..`); the rest runs with a
+one-line warning and is recorded. A search, a comment or a repository's
+relative path only mentions a file, and a path handed to a remote server
+(`mcp-remote` in front of a URL included) names a file there: neither is
+refused by it. An install with no posture file, connected before the
+posture existed, is judged by the default posture's rule, so the upgrade
+does not make it refuse what it ran. The configuration is read only for a
+call with a finding, and `CODEX_HOME` is followed. The rules are parsed
+and compiled on every core at once for such a call: a clean call took
+36 ms in the hook before this and 14 ms after (median of 40, one machine). Claude Code and Gemini CLI MCP calls go to the
 shell rules as before. What the proxy does with the server's answers
 (pinned tool definitions, secrets in answers) still needs the proxy.
 

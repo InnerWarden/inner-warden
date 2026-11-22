@@ -31,16 +31,38 @@ const TOKEN: &str = "iwoauth-7f3c9ad1e05b48c2a6f1d9e3b7c04a58";
 /// Codex's config: `linear`, a server Codex signs in to (`oauth_resource`);
 /// `linear-app` and `notion.so`, the same with names Codex cleans;
 /// `inline`, one written as an inline table; `local`, a local server the
-/// proxy does not carry; and `docs`, one behind the proxy.
-const CODEX_CONFIG: &str = "[mcp_servers]\n\
-     inline = { url = \"https://i.example/mcp\", oauth_resource = \"https://i.example/mcp\" }\n\
-     local = { command = \"fs-server\" }\n\n\
+/// proxy does not carry; `atlassian`, `mcp-remote` in front of a remote
+/// server; and `docs`, one behind the proxy (this very binary in `guard`).
+fn codex_config() -> String {
+    format!(
+        "[mcp_servers]\n\
+     inline = {{ url = \"https://i.example/mcp\", oauth_resource = \"https://i.example/mcp\" }}\n\
+     local = {{ command = \"fs-server\" }}\n\
+     atlassian = {{ command = \"npx\", args = [\"-y\", \"mcp-remote\", \"https://mcp.atlassian.example/v1/sse\"] }}\n\n\
      [mcp_servers.linear]\nurl = \"https://mcp.linear.example/mcp\"\n\
      oauth_resource = \"https://mcp.linear.example/mcp\"\n\n\
      [mcp_servers.linear-app]\nurl = \"https://mcp.linear.example/mcp\"\nscopes = [\"read\"]\n\n\
      [mcp_servers.\"notion.so\"]\nurl = \"https://mcp.notion.example/mcp\"\nscopes = [\"read\"]\n\n\
-     [mcp_servers.docs]\ncommand = \"/abs/innerwarden\"\n\
-     args = [\"proxy\", \"--mode\", \"guard\", \"--agent\", \"codex\", \"--\", \"docs-server\"]\n";
+     [mcp_servers.docs]\ncommand = \"{guard}\"\n\
+     args = [\"proxy\", \"--mode\", \"guard\", \"--agent\", \"codex\", \"--\", \"docs-server\"]\n",
+        guard = env!("CARGO_BIN_EXE_innerwarden")
+    )
+}
+
+/// Write an agent's configuration as one it read when it started: changed
+/// long before the hook's parent (this test) started. A configuration
+/// changed after the agent started proves nothing of the server it talks
+/// to, and every call is judged.
+fn write_config(path: &Path, text: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, text).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
+        .unwrap();
+}
 
 /// The servers a call names as Codex names them, each one the proxy does
 /// not stand in front of.
@@ -51,9 +73,15 @@ struct Host {
 }
 
 impl Host {
-    /// A home with [`CODEX_CONFIG`] and Codex's sign-in to `linear` on file,
-    /// in the strict posture (no posture file) unless `posture` names one.
+    /// A home with [`codex_config`] and Codex's sign-in to `linear` on
+    /// file, in the strict posture by its file.
     fn new() -> Self {
+        Self::with_posture(Some("strict"))
+    }
+
+    /// The same with no posture file: an install connected before the
+    /// posture existed.
+    fn without_posture() -> Self {
         Self::with_posture(None)
     }
 
@@ -62,7 +90,7 @@ impl Host {
         let home = dir.path().join("home");
         std::fs::create_dir_all(home.join(".codex")).unwrap();
         std::fs::create_dir_all(home.join("proj")).unwrap();
-        std::fs::write(home.join(".codex/config.toml"), CODEX_CONFIG).unwrap();
+        write_config(&home.join(".codex/config.toml"), &codex_config());
         if let Some(posture) = posture {
             std::fs::create_dir_all(home.join(".config/innerwarden")).unwrap();
             std::fs::write(home.join(".config/innerwarden/posture"), posture).unwrap();
@@ -119,6 +147,19 @@ impl Host {
         input: Value,
         url: Option<&str>,
     ) -> (Option<i32>, String) {
+        self.cursor_with(extra, tool, input, url, json!({}))
+    }
+
+    /// [`Host::cursor`] with more fields of the payload (`mcp_server_name`,
+    /// `command`).
+    fn cursor_with(
+        &self,
+        extra: &[&str],
+        tool: &str,
+        input: Value,
+        url: Option<&str>,
+        fields: Value,
+    ) -> (Option<i32>, String) {
         let mut payload = json!({
             "conversation_id": "c0nv-185",
             "generation_id": "g-1",
@@ -132,6 +173,9 @@ impl Host {
         });
         if let Some(url) = url {
             payload["url"] = json!(url);
+        }
+        for (key, value) in fields.as_object().into_iter().flatten() {
+            payload[key] = value.clone();
         }
         self.run("cursor", extra, payload)
     }
@@ -267,6 +311,23 @@ fn mentions() -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// What the review measured refused in the default posture from a local
+/// server (`mcp-remote`, the GitHub server in a container): a search for a
+/// key's name, a repository's template and example file.
+fn local_mentions() -> Vec<(&'static str, Value)> {
+    vec![
+        ("search", json!({"query": "id_rsa rotated"})),
+        (
+            "get_file_contents",
+            json!({"owner": "o", "repo": "r", "path": "roles/users/templates/etc/shadow.j2"}),
+        ),
+        (
+            "get_file_contents",
+            json!({"owner": "o", "repo": "r", "path": ".aws/credentials.example"}),
+        ),
+    ]
+}
+
 /// Reads an issue tracker answers all day.
 fn reads() -> Vec<(&'static str, Value)> {
     vec![
@@ -368,6 +429,22 @@ fn the_default_posture_refuses_only_a_hard_finding() {
     }
     let (code, text) = host.hook(&[], "mcp__local__get_file", json!({"path": "/etc/shadow"}));
     assert_eq!(code, Some(2), "{text}");
+    // To a local server too, a mention is no path on this host: a search
+    // for a key's name, a repository's template and example file run.
+    // FAILS ON REVERT of `host_path_args`: the three exit 2.
+    for (tool, input) in local_mentions() {
+        let (code, text) = host.hook(&[], &format!("mcp__local__{tool}"), input.clone());
+        assert_eq!(code, Some(0), "local {tool} {input}: {text}");
+    }
+    // `mcp-remote` in front of a URL is a remote server: a path handed to
+    // it names a file there.
+    let (code, text) = host.hook(
+        &[],
+        "mcp__atlassian__get_file",
+        json!({"path": "/etc/shadow"}),
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("ran under the default posture"), "{text}");
     let graph = host.graph();
     assert!(graph.contains("would_block"), "{graph}");
     // The strict posture keeps the proxy's whole refusal.
@@ -493,4 +570,121 @@ fn the_token_never_reaches_the_record() {
     for token in typed {
         assert!(!written.contains(token), "{token} in {written}");
     }
+}
+
+/// A wrapper's shape is not the guard: a file named `innerwarden` the agent
+/// could write, the real binary in a mode that only records, a server whose
+/// name another one shares, and a configuration changed after the agent
+/// started each leave the call judged. Read in the default posture, the
+/// read of `/etc/shadow` each is refused.
+///
+/// FAILS ON REVERT of `ProxyTrust` to the shape alone (each exits 0).
+#[test]
+fn a_wrapper_that_is_not_the_guard_running_leaves_the_call_judged() {
+    let host = Host::with_posture(Some("default"));
+    let fake = host.dir.path().join("bin/innerwarden");
+    std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+    std::fs::write(&fake, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    let guard = env!("CARGO_BIN_EXE_innerwarden");
+    let wrapper = |command: &str, mode: &str| {
+        format!("{{ command = \"{command}\", args = [\"proxy\", \"--mode\", \"{mode}\", \"--\", \"npx\", \"fs\"] }}")
+    };
+    let config = format!(
+        "[mcp_servers]\n\
+         docs = {}\n\
+         planted = {}\n\
+         soft = {}\n\
+         unknown = {}\n\
+         fs__read = {}\n\
+         fs = {{ command = \"fs-server\" }}\n",
+        wrapper(guard, "guard"),
+        wrapper(&fake.display().to_string(), "guard"),
+        wrapper(guard, "advisory"),
+        wrapper(guard, "guard"),
+        wrapper(guard, "guard"),
+    );
+    let path = host.home().join(".codex/config.toml");
+    write_config(&path, &config);
+    let shadow = || json!({"path": "/etc/shadow"});
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+    assert_eq!(code, Some(0), "the guard's own proxy judges it: {text}");
+    for tool in [
+        "mcp__planted__get_file",
+        "mcp__soft__get_file",
+        "mcp__fs__read__file",
+    ] {
+        let (code, text) = host.hook(&[], tool, shadow());
+        assert_eq!(code, Some(2), "{tool}: {text}");
+    }
+    // The same configuration written now, after the agent started.
+    std::fs::write(&path, &config).unwrap();
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+    assert_eq!(code, Some(2), "a configuration changed mid-session: {text}");
+}
+
+/// Cursor: a call with no server name never matches an entry, not even one
+/// called `unknown` behind the proxy, and a call whose own command line is
+/// not the guard's proxy is judged though an entry of its name is.
+///
+/// FAILS ON REVERT of the no-name flag in `cursor_hook::read` (the call is
+/// left to `unknown`'s proxy) and of the command check (`docs` is).
+#[test]
+fn a_cursor_call_is_left_to_the_proxy_only_by_its_own_command() {
+    let host = Host::with_posture(Some("default"));
+    let guard = env!("CARGO_BIN_EXE_innerwarden");
+    let entry = format!(
+        "{{\"command\": \"{guard}\", \"args\": [\"proxy\", \"--mode\", \"guard\", \"--\", \"npx\", \"docs-server\"]}}"
+    );
+    write_config(
+        &host.home().join(".cursor/mcp.json"),
+        &format!("{{\"mcpServers\": {{\"unknown\": {entry}, \"docs\": {entry}}}}}"),
+    );
+    let shadow = || json!({"path": "/etc/shadow"});
+    let (code, text) = host.cursor(&[], "get_file", shadow(), None);
+    assert_eq!(code, Some(2), "no name: {text}");
+    let proxied = format!("{guard} proxy --mode guard -- npx docs-server");
+    let (code, text) = host.cursor_with(
+        &[],
+        "get_file",
+        shadow(),
+        None,
+        json!({"mcp_server_name": "docs", "command": proxied}),
+    );
+    assert_eq!(code, Some(0), "the guard's proxy: {text}");
+    let (code, text) = host.cursor_with(
+        &[],
+        "get_file",
+        shadow(),
+        None,
+        json!({"mcp_server_name": "docs", "command": "npx docs-server"}),
+    );
+    assert_eq!(code, Some(2), "not the guard's proxy: {text}");
+}
+
+/// An install with no posture file (connected before the posture existed)
+/// keeps running what it ran: the mentions to a remote and a local server
+/// run, through Codex and Cursor, and only a hard finding is refused.
+///
+/// FAILS ON REVERT of `mcp_strict` (no file read as strict: every mention
+/// exits 2).
+#[test]
+fn an_install_with_no_posture_file_refuses_only_a_hard_finding() {
+    let host = Host::without_posture();
+    for (tool, input) in mentions() {
+        let (code, text) = host.hook(&[], &format!("mcp__linear__{tool}"), input.clone());
+        assert_eq!(code, Some(0), "linear {tool} {input}: {text}");
+        let (code, text) = host.cursor(
+            &[],
+            tool,
+            input.clone(),
+            Some("https://mcp.linear.example/mcp"),
+        );
+        assert_eq!(code, Some(0), "cursor {tool} {input}: {text}");
+    }
+    for (tool, input) in local_mentions() {
+        let (code, text) = host.hook(&[], &format!("mcp__local__{tool}"), input.clone());
+        assert_eq!(code, Some(0), "local {tool} {input}: {text}");
+    }
+    let (code, text) = host.hook(&[], "mcp__local__get_file", json!({"path": "/etc/shadow"}));
+    assert_eq!(code, Some(2), "{text}");
 }

@@ -3438,7 +3438,7 @@ fn screen_mcp_call(
     use innerwarden_agent_guard::cursor_hook;
     use innerwarden_agent_guard::mcp_proxy::enforce::ProxyAction;
     use innerwarden_agent_guard::mcp_unproxied::{self, Reach};
-    use innerwarden_agent_guard::posture::{warning_line, Posture};
+    use innerwarden_agent_guard::posture::warning_line;
     let payload = serde_json::from_str::<serde_json::Value>(buf).ok()?;
     let tool_name = payload
         .get("tool_name")
@@ -3451,51 +3451,110 @@ fn screen_mcp_call(
     if !mcp_unproxied::AGENTS.contains(&agent.as_str()) {
         return None;
     }
-    let server_url = if agent == cursor_hook::AGENT {
-        payload
-            .get(cursor_hook::MCP_SERVER_URL_KEY)
-            .and_then(|u| u.as_str())
-    } else {
-        None
+    let from_cursor = |key: &str| {
+        (agent == cursor_hook::AGENT)
+            .then(|| payload.get(key))
+            .flatten()
     };
+    let call_server = mcp_unproxied::CallServer {
+        url: from_cursor(cursor_hook::MCP_SERVER_URL_KEY).and_then(|u| u.as_str()),
+        unnamed: from_cursor(cursor_hook::MCP_SERVER_UNNAMED_KEY)
+            .and_then(|u| u.as_bool())
+            .unwrap_or(false),
+    };
+    let call_command = from_cursor(cursor_hook::MCP_SERVER_COMMAND_KEY)
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
     let args = payload
         .get("tool_input")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    let engine = RuleEngine::load_embedded();
-    let payload_session = hook_session(buf);
-    let identity = hook_identity::current(Some(&agent), payload_session.as_deref());
-    let profile =
-        agent_profiles::proxy_profile(&agent_profiles_io::load(), Some(&agent), identity.as_ref());
-    let strict = hook_posture(monitor, block_review) == Posture::Strict;
-    let mode = mcp_unproxied::mode_for_hook(monitor, strict);
-    let judge =
-        |tool: &str| mcp_unproxied::judge(tool, &args, Some(&engine), profile.as_ref(), mode);
     let first_tool = mcp_unproxied::tool_of(tool_name)?;
-    let (mut decision, mut action) = judge(first_tool);
+    // The rule engine is most of a call's time: its rules parsed, then the
+    // regexes a tool call selects compiled on every core at once, beside the
+    // identity and profile, not after them.
+    let (engine, payload_session, profile) = std::thread::scope(|scope| {
+        let engine = scope.spawn(|| {
+            let engine = RuleEngine::load_embedded_on_cores();
+            engine.warm(innerwarden_agent_guard::rules::AtrSource::ToolCall);
+            engine
+        });
+        let payload_session = hook_session(buf);
+        let identity = hook_identity::current(Some(&agent), payload_session.as_deref());
+        let profile = agent_profiles::proxy_profile(
+            &agent_profiles_io::load(),
+            Some(&agent),
+            identity.as_ref(),
+        );
+        let engine = engine
+            .join()
+            .unwrap_or_else(|_| RuleEngine::load_embedded());
+        (engine, payload_session, profile)
+    });
+    // Strict only by its own file or `--block-review`: an install with no
+    // posture file (connected before the posture existed) is judged by the
+    // default posture's rule, so an upgrade does not change what it refuses.
+    let strict = mcp_unproxied::mcp_strict(
+        monitor,
+        block_review,
+        hook::home_dir()
+            .ok()
+            .and_then(|home| innerwarden_agent_guard::posture::read_posture_file(&home)),
+    );
+    let mode = mcp_unproxied::mode_for_hook(monitor, strict);
+    let judge = |tool: &str, args: &serde_json::Value| {
+        mcp_unproxied::judge(tool, args, Some(&engine), profile.as_ref(), mode)
+    };
+    let (decision, _) = judge(first_tool, &args);
     if decision.verdict.alerts.is_empty() {
         return None;
     }
     // Only a call with a finding pays for reading the configuration.
-    let entries = hook::home_dir()
+    let config = hook::home_dir()
         .ok()
         .and_then(|home| mcp_unproxied::config_path_here(&agent, &home))
-        .and_then(|path| mcp_unproxied::read_entries(&path));
-    let (reach, tool) = mcp_unproxied::reach(&agent, tool_name, server_url, entries.as_deref())?;
+        .and_then(|path| mcp_unproxied::read_config(&path));
+    let settled = config.as_ref().is_some_and(|(_, modified)| {
+        mcp_unproxied::config_settled(*modified, mcp_unproxied::agent_started_at())
+    });
+    let trust = mcp_unproxied::ProxyTrust::here(!monitor, settled, call_command);
+    let entries = config.map(|(entries, _)| entries);
+    let (reach, tools) =
+        mcp_unproxied::reach(&agent, tool_name, call_server, entries.as_deref(), &trust)?;
     if reach == Reach::BehindProxy {
         return None;
     }
-    if tool != first_tool {
-        (decision, action) = judge(tool);
-        if decision.verdict.alerts.is_empty() {
-            return None;
-        }
-    }
-    let proxy_refuses = !decision.verdict.allowed
-        && (monitor || matches!(action, ProxyAction::Block { .. } | ProxyAction::Kill { .. }));
-    let refused = proxy_refuses
-        && !monitor
-        && (strict || mcp_unproxied::default_posture_refuses(&decision, reach));
+    // Every tool the call may name on a server it may go to is judged; the
+    // one the posture refuses, or else the proxy refuses, or else the first
+    // with a finding, decides.
+    let refuses_here = |decision: &innerwarden_agent_guard::mcp_proxy::router::ProxyDecision,
+                        tool: &str| {
+        strict
+            || mcp_unproxied::default_posture_refuses(decision, reach, &args, &|paths| {
+                judge(tool, paths).0
+            })
+    };
+    let mut judged: Vec<(&str, _, ProxyAction)> = tools
+        .iter()
+        .map(|tool| {
+            let (decision, action) = judge(tool, &args);
+            (*tool, decision, action)
+        })
+        .filter(|(_, decision, _)| !decision.verdict.alerts.is_empty())
+        .collect();
+    let blocks = |decision: &innerwarden_agent_guard::mcp_proxy::router::ProxyDecision,
+                  action: &ProxyAction| {
+        !decision.verdict.allowed
+            && (monitor || matches!(action, ProxyAction::Block { .. } | ProxyAction::Kill { .. }))
+    };
+    judged.sort_by_cached_key(|(tool, decision, action)| {
+        let proxy = blocks(decision, action);
+        let here = proxy && !monitor && refuses_here(decision, tool);
+        (!here, !proxy)
+    });
+    let (tool, decision, action) = judged.into_iter().next()?;
+    let proxy_refuses = blocks(&decision, &action);
+    let refused = proxy_refuses && !monitor && refuses_here(&decision, tool);
     let warned = proxy_refuses && !monitor && !refused;
     let explanation = decision
         .verdict

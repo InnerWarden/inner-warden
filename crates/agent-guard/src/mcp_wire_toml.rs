@@ -458,10 +458,24 @@ pub fn unscreened_remote_toml(doc: &DocumentMut) -> Vec<String> {
 pub fn server_entries_toml(doc: &DocumentMut) -> Vec<crate::mcp_unproxied::ServerEntry> {
     server_tables(doc)
         .into_iter()
-        .map(|(name, table)| crate::mcp_unproxied::ServerEntry {
-            behind_proxy: is_wrapped_server(&table),
-            remote: !is_stdio_server(&table) && table.contains_key("url"),
-            name,
+        .map(|(name, table)| {
+            let command = table.get("command").and_then(Item::as_str);
+            let args: Vec<&str> = table
+                .get("args")
+                .and_then(Item::as_array)
+                .map(|args| args.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            crate::mcp_unproxied::ServerEntry {
+                wrapper: server_mode(&table).and_then(|mode| {
+                    Some(crate::mcp_unproxied::Wrapper {
+                        command: command?.to_string(),
+                        blocks: mode == WiringMode::Enforce,
+                    })
+                }),
+                remote: (!is_stdio_server(&table) && table.contains_key("url"))
+                    || command.is_some_and(|c| crate::mcp_unproxied::runs_mcp_remote(c, &args)),
+                name,
+            }
         })
         .collect()
 }
@@ -1044,7 +1058,7 @@ mod tests {
             assert_eq!(guarded_mode_toml(&doc), Some(WiringMode::Enforce));
             assert_eq!(wrap_toml(&mut doc, "/abs/innerwarden", false, "codex"), 0);
             let entries = server_entries_toml(&doc);
-            assert!(entries[0].behind_proxy, "{entries:?}");
+            assert!(entries[0].wrapper.is_some(), "{entries:?}");
             assert_eq!(unwrap_toml(&mut doc), 1);
             let back: DocumentMut = doc.to_string().parse().unwrap();
             assert!(!is_guarded_toml(&back), "{back}");
