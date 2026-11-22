@@ -2762,10 +2762,14 @@ fn node_program_name(name: &str) -> &str {
 /// The language an interpreter's name stands for: `python3`, `lua5.4` and
 /// `php8.2` are the interpreter under its version, `nodejs` is Node.
 fn interpreter_language(interpreter: &str) -> &str {
-    node_program_name(
+    match node_program_name(
         interpreter
             .trim_end_matches(|character: char| character.is_ascii_digit() || character == '.'),
-    )
+    ) {
+        // LuaJIT runs Lua code with the same `-e`.
+        "luajit" => "lua",
+        name => name,
+    }
 }
 
 fn embedded_system_payload_executes_download(interpreter: &str, payload: &str) -> bool {
@@ -3025,7 +3029,16 @@ fn process_lines_in_order(source: &str) -> Vec<String> {
 /// runs what it downloads.
 pub(crate) fn inline_code_reading(source: &str) -> InlineReading {
     let mut reading = InlineReading::default();
-    for (language, code, double_quoted) in inline_code_pieces(source) {
+    let pieces = inline_code_pieces(source);
+    // The line's own commands, without the code it hands interpreters: a
+    // name in the code (`file_put_contents("x.sh", ...)`) is no command.
+    let mut commands = source.to_owned();
+    for (_, code, _) in &pieces {
+        if !code.trim().is_empty() {
+            commands = commands.replace(code.as_str(), " ");
+        }
+    }
+    for (language, code, double_quoted) in pieces {
         reading.merge(InlineReading {
             lines: process_lines_in_order(&code),
             ..InlineReading::default()
@@ -3044,7 +3057,7 @@ pub(crate) fn inline_code_reading(source: &str) -> InlineReading {
             // the code wrote is what runs (`php -r 'file_put_contents("x.sh",
             // ...)' && sh x.sh`).
             for (path, text) in piece.written.clone() {
-                if let Some(runner) = inline_calls::runner_of_file(source, &path) {
+                if let Some(runner) = inline_calls::runner_of_file(&commands, &path) {
                     piece.merge(inline_calls::written_reading(
                         runner,
                         &text,
@@ -12231,11 +12244,7 @@ fn command_code_input(words: &[String]) -> CodeInput {
     let name = if normalized == "." {
         normalized
     } else {
-        node_program_name(
-            normalized
-                .trim_end_matches(|character: char| character.is_ascii_digit() || character == '.'),
-        )
-        .to_owned()
+        interpreter_language(&normalized).to_owned()
     };
     if matches!(name.as_str(), "$shell" | "${shell}") || name.starts_with("$(") {
         return CodeInput::Stdin;

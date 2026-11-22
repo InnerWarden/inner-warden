@@ -167,3 +167,229 @@ fn everyday_perl_php_and_lua_stay_allowed() {
         assert_eq!(verdict(line), "allow", "{line}");
     }
 }
+
+/// The longest one line may take in a test of cost: 1 s where asked for
+/// (the nightly perf job), none in a mutation sweep, a minute otherwise.
+fn line_ceiling() -> std::time::Duration {
+    if std::env::var_os("IW_NO_WALL_CLOCK_CEILINGS").is_some() {
+        std::time::Duration::MAX
+    } else if std::env::var_os("IW_WALL_CLOCK_CEILINGS").is_some_and(|v| v == "1") {
+        std::time::Duration::from_secs(1)
+    } else {
+        std::time::Duration::from_secs(60)
+    }
+}
+
+/// The verdict on a line, or a failure naming it when it takes longer
+/// than [`line_ceiling`] (judged on its own thread, so a line that never
+/// ends fails the test instead of hanging it).
+fn verdict_within_ceiling(line: String) -> String {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let shown: String = line.chars().take(80).collect();
+    std::thread::spawn(move || {
+        let _ = sender.send(verdict(&line));
+    });
+    let ceiling = line_ceiling();
+    let wait = if ceiling == std::time::Duration::MAX {
+        std::time::Duration::from_secs(u64::from(u32::MAX))
+    } else {
+        ceiling
+    };
+    receiver
+        .recv_timeout(wait)
+        .unwrap_or_else(|_| panic!("slower than {ceiling:?}: {shown}"))
+}
+
+/// Text nested `depth` times in `open` and `close` around `inner`.
+fn nested(open: &str, close: &str, depth: usize, inner: &str) -> String {
+    format!("{}{inner}{}", open.repeat(depth), close.repeat(depth))
+}
+
+/// FAILS ON REVERT (main fe9342e: allow): a name set to a closure and then
+/// to a function's name calls that function; the latest value wins.
+#[test]
+fn a_name_given_again_after_a_closure_is_read_again() {
+    for line in [
+        r#"php -r '$f = function($x) { return $x; }; $f = "system"; $f("rm -rf ~/.ssh");'"#,
+        r#"php -r '$f = fn($x) => $x; $f = "system"; $f("rm -rf ~/.ssh");'"#,
+        r#"php -r '$f = static function($x) { return $x; }; $f = "system"; $f("rm -rf ~/.ssh");'"#,
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    // main fe9342e: allow.
+    let line = r#"php -r '$f = fn() => 1; $f = $argv[1]; $f("rm -rf ~/.ssh");' system"#;
+    assert_eq!(verdict(line), "review", "{line}");
+}
+
+/// FAILS ON REVERT (main fe9342e: each of these takes longer than a minute,
+/// the reading of nested code in strings grew twice with each level): code
+/// inside strings nested 40 deep is read within the ceiling, for each
+/// opener, and what the innermost one runs is not allowed.
+#[test]
+fn code_nested_in_strings_is_read_within_the_ceiling() {
+    for line in [
+        format!(r#"perl -e 'print "{}";'"#, nested("@{[", "]}", 40, "1")),
+        format!(
+            r#"perl -e 'print "{}";'"#,
+            nested(r#"@{[ ""#, r#"" ]}"#, 40, "1")
+        ),
+        format!(r#"perl -e 'print "{}";'"#, nested(r"${\ ", " }", 40, "1")),
+        format!(r#"php -r 'echo "{}";'"#, nested("{${", "}}", 40, "1")),
+    ] {
+        let verdict = verdict_within_ceiling(line.clone());
+        assert_ne!(verdict, "deny", "{line}");
+    }
+    let line = format!(
+        r#"perl -e 'print "{}";'"#,
+        nested("@{[", "]}", 40, "system(q{rm -rf ~/.ssh})")
+    );
+    assert_ne!(verdict_within_ceiling(line.clone()), "allow", "{line}");
+}
+
+/// FAILS ON REVERT under the nightly ceiling of a second (main fe9342e:
+/// 1.1 s for 32 KiB, measured 2026-11-22 in a release build): a line of
+/// tens of thousands of openers of a call through a value is not read once
+/// for each of them.
+#[test]
+fn a_long_run_of_call_heads_costs_little() {
+    for line in [
+        format!("php -r '{}'", "(".repeat(60 * 1024)),
+        format!("php -r '{}'", r#"("x")"#.repeat(10_000)),
+    ] {
+        verdict_within_ceiling(line);
+    }
+}
+
+/// FAILS ON REVERT (main fe9342e: review, the file names in the code were
+/// read as commands of the line): PHP reading a file, changing it and
+/// writing it back is everyday work.
+#[test]
+fn php_read_modify_write_of_a_file_stays_allowed() {
+    for line in [
+        r#"php -r '$s = file_get_contents("README.md"); file_put_contents("README.md", str_replace("v1.0", "v1.1", $s));'"#,
+        r#"php -r 'file_put_contents("out.txt", strtoupper(file_get_contents("out.txt")));'"#,
+        r#"php -r '$s = file_get_contents("composer.json"); $j = json_decode($s, true); $j["version"] = "2.0.0"; file_put_contents("composer.json", json_encode($j, JSON_PRETTY_PRINT));'"#,
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+    // main fe9342e: deny. Main before the reader's tables (53de788): review,
+    // for reading a credential file; it keeps that verdict.
+    let line = r#"php -r 'file_put_contents(".env", str_replace("DEBUG=true", "DEBUG=false", file_get_contents(".env")));'"#;
+    assert_eq!(verdict(line), "review", "{line}");
+}
+
+/// FAILS ON REVERT (main fe9342e: review): a PHP cast before brackets and
+/// a Lua table indexed by a key built at run time with nothing called are
+/// everyday code.
+#[test]
+fn casts_and_reads_of_global_tables_stay_allowed() {
+    for line in [
+        r"php -r '$n = (int)($argv[1] ?? 10); echo $n * 2, PHP_EOL;' 7",
+        r"php -r '$s = (string)(42); echo $s;'",
+        r"php -r '$a = (array)($obj ?? []); print_r($a);'",
+        r#"php -r '$v = (float)($argv[1]); printf("%.2f\n", $v);' 3.5"#,
+        r"php -r '$n = (int) ($argv[1]); echo $n;' 5",
+        r#"lua -e 'local k = "string"; print(type(_G[k]))'"#,
+        r#"lua -e 'for _, k in ipairs({"string", "table"}) do print(k, type(_G[k])) end'"#,
+        r"lua -e 'local v = os[arg[1]]; print(v)' time",
+        r"lua -e 'print(_G[arg[1]])' string",
+        r#"lua -e 'local name = "print"; _G[name]("hi")'"#,
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+    // main fe9342e: review. What a call in brackets returns, called.
+    let line = r#"php -r '(get_fn())("rm -rf ~/.ssh");'"#;
+    assert_eq!(verdict(line), "review", "{line}");
+    // main fe9342e: allow. A call through a name given an index not read.
+    let line = r#"lua -e 'local f = os[arg[1]] f("rm -rf ~/.ssh")' execute"#;
+    assert_eq!(verdict(line), "review", "{line}");
+}
+
+/// FAILS ON REVERT (main fe9342e: allow): the shell line a call written
+/// without brackets, a string called as a function, a name in any case, or
+/// an alias with no separator after it runs is read and judged.
+#[test]
+fn more_ways_to_run_a_shell_line_are_read_and_judged() {
+    for line in [
+        r#"perl -e 'open my $p, "-|", "rm -rf ~/.ssh"; print <$p>'"#,
+        r#"perl -e 'open my $p, "|-", "rm -rf ~/.ssh"'"#,
+        r#"perl -e 'open P, "rm -rf ~/.ssh |"; print <P>'"#,
+        r#"perl -e 'print readpipe "rm -rf ~/.ssh"'"#,
+        r#"perl -e 'my $c="rm -rf ~/.ssh"; print readpipe $c'"#,
+        r#"lua -e 'local e=os.execute e"rm -rf ~/.ssh"'"#,
+        r#"lua -e 'local e = os.execute e("rm -rf ~/.ssh")'"#,
+        r#"lua -e 'local o = os o.execute("rm -rf ~/.ssh")'"#,
+        r#"lua -e 'local p = io.popen p("rm -rf ~/.ssh")'"#,
+        r#"lua -e 'local o = rawget(_G, "os") o.execute("rm -rf ~/.ssh")'"#,
+        r#"php -r 'file_put_contents("x.php", "<?php system(\"rm -rf ~/.ssh\");"); include __DIR__ . "/x.php";'"#,
+        r#"php -r 'file_put_contents("x.php", "<?php system(\"rm -rf ~/.ssh\");"); include getcwd() . "/x.php";'"#,
+        r#"php -r 'file_put_contents(__DIR__ . "/x.php", "<?php system(\"rm -rf ~/.ssh\");"); require __DIR__ . "/x.php";'"#,
+        r#"php -r '$p = __DIR__."/x.php"; file_put_contents($p, "<?php system(\"rm -rf ~/.ssh\");"); include $p;'"#,
+        r#"php -r 'file_put_contents("x.php", "<?php sys"); file_put_contents("x.php", "tem(\"rm -rf ~/.ssh\");", FILE_APPEND); include "x.php";'"#,
+        r#"php -r '"system"("rm -rf ~/.ssh");'"#,
+        r#"php -r "'system'('rm -rf ~/.ssh');""#,
+        r#"php -r '"sys"."tem"("rm -rf ~/.ssh");'"#,
+        r#"php -r '$f = "system"; call_user_func($f, "rm -rf ~/.ssh");'"#,
+        r#"php -r 'call_user_func_array("system", ["rm -rf ~/.ssh"]);'"#,
+        r#"php -r 'call_user_func("sys"."tem", "rm -rf ~/.ssh");'"#,
+        r#"php -r 'array_map("SYSTEM", ["rm -rf ~/.ssh"]);'"#,
+        r#"php -r 'array_map("\\system", ["rm -rf ~/.ssh"]);'"#,
+        r#"php -r 'ARRAY_MAP("system", ["rm -rf ~/.ssh"]);'"#,
+        r#"php -r '$f = "System"; $f("rm -rf ~/.ssh");'"#,
+        r#"php -r '("SYS"."TEM")("rm -rf ~/.ssh");'"#,
+        r#"php -r 'SYSTEM("rm -rf ~/.ssh");'"#,
+        r#"luajit -e 'os.execute("rm -rf ~/.ssh")'"#,
+        r#"lua -e 'os.execute("\114\109 -rf ~/.ssh")'"#,
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+}
+
+/// FAILS ON REVERT (main fe9342e: allow): code loaded from the process's
+/// own input, a callback named at run time, a shell fed on a pipe, or code
+/// in a string opened with a space is held for review.
+#[test]
+fn more_calls_the_reader_cannot_read_are_reviewed() {
+    for line in [
+        r#"perl -e 'open P, "| sh"; print P "rm -rf ~/.ssh"'"#,
+        r#"perl -e 'print "@{ [ system(q{rm -rf ~/.ssh}) ] }"'"#,
+        r#"perl -e 'print "${ \ system(q{rm -rf ~/.ssh}) }"'"#,
+        "perl -e 'print \"@{\n[ system(q{rm -rf ~/.ssh}) ] }\"'",
+        r#"php -r 'call_user_func($argv[1], "x");' a"#,
+        r#"php -r 'include "/dev/stdin";'"#,
+        r#"php -r 'include "/dev/fd/0";'"#,
+        r#"php -r 'include "/proc/self/fd/0";'"#,
+        r#"perl -e 'do "/dev/stdin"'"#,
+        r#"lua -e 'dofile("/dev/stdin")'"#,
+        r#"php -r 'function apply($f,$x){return $f($x);} echo apply("system","rm -rf ~/.ssh");'"#,
+        r#"php -r 'function apply($f,$x){return $f($x);} echo apply($argv[1],"x");' a"#,
+    ] {
+        assert_eq!(verdict(line), "review", "{line}");
+    }
+}
+
+/// FAILS ON REVERT (main fe9342e: review): a function handed a function
+/// that starts no process, a static arrow function, files a glob written
+/// out names, and a load inside a block are everyday code.
+#[test]
+fn callbacks_globs_and_blocks_of_everyday_code_stay_allowed() {
+    for line in [
+        r#"php -r 'function apply($f,$x){return $f($x);} echo apply("strtoupper","a");'"#,
+        r"php -r '$f = static fn ($x) => $x*2; echo $f(3);'",
+        r#"php -r 'foreach (glob("migrations/*.php") as $f) { require $f; }'"#,
+        r#"php -r 'if (1) { require "vendor/autoload.php"; }'"#,
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+    // Allowed on main as well: they stay so with the readings above.
+    for line in [
+        r"luajit -e 'print(1)'",
+        r#"lua -e 'print("\104\105")'"#,
+        r#"lua -e 'local x = a and b print(x)'"#,
+        r#"php -r 'echo "a" . "b";'"#,
+        r#"perl -e 'open my $f, "<", "a.txt" or die; print <$f>'"#,
+        r#"perl -e 'open F, "a.txt"; print <F>'"#,
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}

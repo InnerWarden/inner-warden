@@ -316,3 +316,14 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   main 7f125ba with the differential judge (37127 lines, an empty home and
   a home with keys): dx-126 and its ten wrapper and body variants move from
   review to deny; no other line of any corpus moved.
+- 2026-11-22: the inline reader's follow-up for Perl, PHP and Lua moves no
+  line of any corpus. Measured against main 0f6ec89 with the differential
+  judge (37127 lines, an empty home and a home with keys): no verdict
+  changed. The forms it reads now are held in
+  `tests/inline_reader_perl_php_lua.rs`: a closure name given a function's
+  name again, `open` and `readpipe` without brackets, Perl's `"@{ [ ... ] }"`
+  with spaces, Lua aliases with no separator, PHP strings called as
+  functions, names in any case, `call_user_func`, files written then
+  included by a built path or in appends, and loads of `/dev/stdin`. A
+  PHP read, edit and write of a file, a cast and a Lua read of `_G[k]` go
+  back to allow.

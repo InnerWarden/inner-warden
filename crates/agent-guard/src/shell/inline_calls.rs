@@ -248,6 +248,15 @@ enum Sink {
 
 fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
     use Sink::*;
+    // PHP's function names ignore case and may name the global namespace
+    // (`SYSTEM(...)`, `\system(...)`).
+    let php_name;
+    let callee = if lang == Lang::Php {
+        php_name = php_function_name(callee);
+        php_name.as_str()
+    } else {
+        callee
+    };
     Some(match lang {
         Lang::Python => match callee {
             "os.system"
@@ -307,6 +316,8 @@ fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
             "eval" | "assert" | "create_function" => Code,
             "include" | "include_once" | "require" | "require_once" => Load,
             "array_map"
+            | "call_user_func"
+            | "call_user_func_array"
             | "register_shutdown_function"
             | "register_tick_function"
             | "forward_static_call"
@@ -346,12 +357,31 @@ fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
 
 /// Where code inside a string runs where it stands, by language: Perl's
 /// `"@{[ system(...) ]}"` and `"${\ system(...) }"`, PHP's
-/// `"{${ system(...) }}"`. What stands inside is read as code in its place.
-const CODE_IN_STRINGS: &[(Lang, &str)] = &[
-    (Lang::Perl, "@{["),
-    (Lang::Perl, "${\\"),
-    (Lang::Php, "{${"),
+/// `"{${ system(...) }}"`. Each opener, then any space, then one of the
+/// marks when there are any (Perl's `"@{ [ ... ] }"` runs as well): what
+/// stands inside is read as code in its place.
+const CODE_IN_STRINGS: &[(Lang, &str, &[char])] = &[
+    (Lang::Perl, "@{", &['[', '\\']),
+    (Lang::Perl, "${", &['[', '\\']),
+    (Lang::Php, "{${", &[]),
 ];
+
+/// How deep code inside a string inside code inside a string is read;
+/// deeper, it is held as not read.
+const MAX_STRING_CODE_DEPTH: u8 = 16;
+
+/// How far the brackets of a call through a value (`("sys"."tem")(...)`,
+/// `&{...}`, `_G[...]`) are looked for at first, in bytes: a line of
+/// thousands of openers would otherwise be read once for each.
+const HEAD_WINDOW: usize = 256;
+
+/// How many heads in one piece of code are looked for past
+/// [`HEAD_WINDOW`]; past that, the code is held as not read.
+const MAX_LONG_HEADS: u8 = 64;
+
+/// How many strings joined with `.` are read as the name a PHP call of a
+/// string builds.
+const MAX_JOINED_STRINGS: usize = 32;
 
 /// How a call reaches its function through a value rather than a name.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -670,6 +700,14 @@ struct Reader<'a> {
     /// function ...`, Perl's `$f = sub ...`): a call through one runs
     /// that body, which is read where it stands.
     closures: Vec<String>,
+    /// How deep the code being read stands inside strings that run code
+    /// ([`Self::scan_code_in_strings`]).
+    string_code_depth: u8,
+    /// How many heads of calls through a value had their brackets looked
+    /// for past [`HEAD_WINDOW`] ([`Self::head_closing`]).
+    long_heads: std::cell::Cell<u8>,
+    /// Whether a head was left unread because [`MAX_LONG_HEADS`] ran out.
+    heads_unread: std::cell::Cell<bool>,
     depth: u8,
     out: InlineReading,
 }
@@ -692,10 +730,16 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
         read_names: Vec::new(),
         call_list: None,
         closures: Vec::new(),
+        string_code_depth: 0,
+        long_heads: std::cell::Cell::new(0),
+        heads_unread: std::cell::Cell::new(false),
         depth,
         out: InlineReading::default(),
     };
     reader.run();
+    if reader.heads_unread.get() {
+        reader.out.unread = true;
+    }
     let mut read = vec![false; normalized.len()];
     for (start, end) in &reader.read_names {
         for byte in read.iter_mut().take(*end).skip(*start) {
@@ -993,16 +1037,6 @@ fn normalized_code(lang: Lang, code: &str) -> String {
                 });
             }
             text = lua_literal_indexes(&text);
-        }
-        Lang::Php => {
-            for opener in ["call_user_func(", "call_user_func_array("] {
-                text = replace_call_heads(&text, opener, |arguments| {
-                    let (name, rest) = simple_quoted(arguments.trim_start())?;
-                    let rest = rest.trim_start();
-                    let rest = rest.strip_prefix(',').unwrap_or(rest);
-                    (!name.is_empty() && is_chain(name)).then(|| (format!("{name}("), rest.len()))
-                });
-            }
         }
         _ => {}
     }
@@ -1369,7 +1403,20 @@ impl Reader<'_> {
         }
         self.fetches = self.fetch_positions();
         self.functions = defined_functions(self.lang, code);
-        for (start, end) in statements(code) {
+        for (mut start, end) in statements(code) {
+            // Lua needs nothing between two statements: `local e = os.execute
+            // e("...")` is an assignment, then a call through the name.
+            while self.lang == Lang::Lua {
+                let Some(split) = lua_assignment_end(&code[start..end]) else {
+                    break;
+                };
+                self.scan(start, start + split);
+                self.assign(&code[start..start + split]);
+                start += split;
+            }
+            if self.lang == Lang::Php {
+                self.bind_glob_loop(&code[start..end]);
+            }
             self.scan(start, end);
             self.assign(&code[start..end]);
         }
@@ -1377,6 +1424,41 @@ impl Reader<'_> {
         self.out
             .lines
             .retain(|line| !line.trim().is_empty() && seen.insert(line.clone()));
+    }
+
+    /// PHP's `foreach (glob("migrations/*.php") as $f)`: the name stands
+    /// for the files the pattern written out matches, files of the project
+    /// rather than a value not read.
+    fn bind_glob_loop(&mut self, statement: &str) {
+        let Some(rest) = statement.trim_start().strip_prefix("foreach") else {
+            return;
+        };
+        let Some(inner) = rest.trim_start().strip_prefix('(') else {
+            return;
+        };
+        let Some(close) = closing(inner) else {
+            return;
+        };
+        let Some(arguments) = inner[..close].trim_start().strip_prefix("glob(") else {
+            return;
+        };
+        let Some(glob_close) = closing(arguments) else {
+            return;
+        };
+        let Some((pattern, after)) = simple_quoted(arguments[..glob_close].trim()) else {
+            return;
+        };
+        if !after.trim().is_empty() {
+            return;
+        }
+        let Some(bound) = arguments[glob_close + 1..].trim_start().strip_prefix("as") else {
+            return;
+        };
+        let variable = bound.rsplit("=>").next().unwrap_or(bound).trim();
+        if is_variable(variable) {
+            self.vars
+                .insert(variable.to_owned(), Value::Str(pattern.to_owned()));
+        }
     }
 
     fn fetch_before(&self, at: usize) -> bool {
@@ -1485,6 +1567,11 @@ impl Reader<'_> {
         let mut sites = Vec::new();
         let mut at = start;
         while at < end {
+            if self.lang == Lang::Php && matches!(bytes[at], b'"' | b'\'') {
+                if let Some((name, arguments_at)) = self.php_called_string(at, end) {
+                    sites.push((name, at, arguments_at));
+                }
+            }
             if let Some(skip) = self.skip_literal(at, end) {
                 at = skip.max(at + 1);
                 continue;
@@ -1535,9 +1622,20 @@ impl Reader<'_> {
                 chain,
                 "system" | "exec" | "spawn" | "eval" | "load" | "require"
             ),
-            Lang::Perl => matches!(chain, "system" | "exec" | "eval" | "do" | "require"),
-            Lang::Php => matches!(
+            Lang::Perl => matches!(
                 chain,
+                "system"
+                    | "exec"
+                    | "eval"
+                    | "do"
+                    | "require"
+                    | "open"
+                    | "CORE::open"
+                    | "readpipe"
+                    | "CORE::readpipe"
+            ),
+            Lang::Php => matches!(
+                php_function_name(chain).as_str(),
                 "include" | "include_once" | "require" | "require_once" | "eval"
             ),
             _ => false,
@@ -1618,7 +1716,7 @@ impl Reader<'_> {
         self.scan_code_in_strings(start, end);
         for (chain, at, arguments_at) in self.call_sites(start, end) {
             let callee = if self.lang == Lang::Php && is_variable(&chain) {
-                self.called_variable(&chain)
+                self.called_php_variable(&chain)
             } else {
                 self.callee(&chain)
             };
@@ -1643,7 +1741,11 @@ impl Reader<'_> {
             } else if self.lang == Lang::Lua {
                 &code[arguments_at..self.lua_single_argument_end(arguments_at, end)]
             } else {
-                trailing_modifier_cut(&code[arguments_at..end])
+                // A call without brackets ends with its statement, which
+                // may stand inside a block: `{ require $f; }`.
+                let own = &code[arguments_at..end];
+                let own = &own[..closing(own).unwrap_or(own.len())];
+                trailing_modifier_cut(split_top(own, ";").first().copied().unwrap_or(own))
             };
             let done = arguments_at + arguments.len();
             self.with_parameters(arguments, |reader| reader.read_sink(sink, done, arguments));
@@ -1775,24 +1877,36 @@ impl Reader<'_> {
     }
 
     /// Code that runs inside a string where it stands ([`CODE_IN_STRINGS`]),
-    /// read in its place.
+    /// read in its place. Only the outermost openers are read here: the
+    /// scan of what one holds reads the openers inside it, so each piece is
+    /// read once whatever the depth.
     fn scan_code_in_strings(&mut self, start: usize, end: usize) {
         let code = self.code;
-        for &(lang, opener) in CODE_IN_STRINGS {
-            if lang != self.lang {
+        let mut at = start;
+        while at < end {
+            let Some(offset) = code[at..end].find(['@', '$', '{']) else {
+                break;
+            };
+            let opener = at + offset;
+            let Some(inner) = code_in_string(self.lang, &code[opener..end]) else {
+                at = opener + 1;
                 continue;
-            }
-            let found: Vec<usize> = code[start..end]
-                .match_indices(opener)
-                .map(|(offset, _)| start + offset + opener.len())
-                .collect();
-            for inner in found {
-                if let Some(close) = closing(&code[inner..end]) {
-                    if close > 0 {
-                        self.scan(inner, inner + close);
-                    }
+            };
+            let inner = opener + inner;
+            let Some(close) = closing(&code[inner..end]) else {
+                at = inner;
+                continue;
+            };
+            if close > 0 {
+                if self.string_code_depth >= MAX_STRING_CODE_DEPTH {
+                    self.out.unread = true;
+                    return;
                 }
+                self.string_code_depth += 1;
+                self.scan(inner, inner + close);
+                self.string_code_depth -= 1;
             }
+            at = inner + close;
         }
     }
 
@@ -1817,7 +1931,7 @@ impl Reader<'_> {
                     if before.is_some_and(|b| is_name_byte(b) || matches!(b, b'&' | b'\\')) {
                         continue;
                     }
-                    let close = open + closing(&code[open..])?;
+                    let close = open + self.head_closing(&code[open..])?;
                     // `&{...}` with no brackets calls with the caller's own
                     // arguments: what it runs is not read either.
                     let arguments_at = arguments_after(close + 1).unwrap_or(close + 1);
@@ -1853,13 +1967,18 @@ impl Reader<'_> {
                     }) {
                         continue;
                     }
-                    let close = open + closing(&code[open..])?;
+                    let close = open + self.head_closing(&code[open..])?;
                     let inner = code[open..close].trim();
                     // A function written in place is read where it stands.
                     if inner.starts_with("function")
                         || inner.starts_with("fn")
                         || inner.starts_with("static")
                     {
+                        continue;
+                    }
+                    // A cast (`(int)($x)`) or a constant: a name alone
+                    // in brackets names no function PHP calls.
+                    if !inner.contains(['$', '.']) && is_function_name(inner) {
                         continue;
                     }
                     let Some(arguments_at) = arguments_after(close + 1) else {
@@ -1872,14 +1991,121 @@ impl Reader<'_> {
                         continue;
                     }
                     // A key written out was read as the name it is
-                    // ([`normalized_code`]); this one is built at run time.
-                    return Some((UNREAD.to_string(), open));
+                    // ([`normalized_code`]); a key a name holds is folded,
+                    // one built at run time is not read. Only a call of
+                    // what the index reaches is held: `type(_G[k])` calls
+                    // nothing.
+                    let (mut name, length) = self.lua_indexed(rest)?;
+                    let mut after = code[at + length..].trim_start();
+                    if let Some(method) = after.strip_prefix(['.', ':']) {
+                        let method_end = method
+                            .bytes()
+                            .position(|b| !is_name_byte(b))
+                            .unwrap_or(method.len());
+                        if method_end == 0 {
+                            return None;
+                        }
+                        if !name.contains(UNREAD) {
+                            name = self.callee(&format!("{name}.{}", &method[..method_end]));
+                        }
+                        after = method[method_end..].trim_start();
+                    }
+                    let arguments_at = end - after.len();
+                    return if after.starts_with('(') {
+                        Some((name, arguments_at + 1))
+                    } else if after.starts_with(['"', '\'', '{'])
+                        || lua_long_bracket(after).is_some()
+                    {
+                        Some((name, arguments_at))
+                    } else {
+                        None
+                    };
                 }
             }
         }
         None
     }
 
+    /// Where the brackets a head of a call through a value opens close
+    /// ([`closing`]), looked for within [`HEAD_WINDOW`] first, and past it
+    /// only [`MAX_LONG_HEADS`] times.
+    fn head_closing(&self, text: &str) -> Option<usize> {
+        let mut window = text.len().min(HEAD_WINDOW);
+        while !text.is_char_boundary(window) {
+            window -= 1;
+        }
+        if let Some(close) = closing(&text[..window]) {
+            return Some(close);
+        }
+        if window == text.len() {
+            return None;
+        }
+        if self.long_heads.get() >= MAX_LONG_HEADS {
+            self.heads_unread.set(true);
+            return None;
+        }
+        self.long_heads.set(self.long_heads.get() + 1);
+        closing(text)
+    }
+
+    /// Lua's `os[k]` or `_G[k]` at the start of `text`: the name it reaches
+    /// (`os.execute`, or [`UNREAD`] for a key not read) and how many bytes
+    /// the index takes.
+    fn lua_indexed(&self, text: &str) -> Option<(String, usize)> {
+        let opener = CALL_THROUGH_VALUE
+            .iter()
+            .filter(|(lang, _, head)| *lang == Lang::Lua && *head == Head::Indexed)
+            .map(|(_, opener, _)| *opener)
+            .find(|opener| text.starts_with(opener))?;
+        let open = opener.len();
+        let close = open + self.head_closing(&text[open..])?;
+        let table = &opener[..open - 1];
+        let name = match self.fold(text[open..close].trim(), FOLD_DEPTH).literal() {
+            Some(key) if is_chain(key.trim()) && !key.contains('.') => {
+                self.callee(&format!("{table}.{}", key.trim()))
+            }
+            _ => UNREAD.to_string(),
+        };
+        Some((name, close + 1))
+    }
+
+    /// What a Lua name is given when its whole value is an index of a table
+    /// of functions (`local f = os[k]`): a function that starts a process,
+    /// a table of them, or [`UNREAD`] for a key not read. A call through
+    /// the name reaches it.
+    fn lua_index_name(&self, expression: &str) -> Option<String> {
+        let (name, length) = self.lua_indexed(expression)?;
+        if !expression[length..].trim().is_empty() {
+            return None;
+        }
+        let holder = SINK_HOLDERS
+            .iter()
+            .any(|&(lang, held)| lang == Lang::Lua && held == name);
+        (name.contains(UNREAD) || holder || sink_of(Lang::Lua, &name).is_some()).then_some(name)
+    }
+
+    /// PHP calls a string as the function it names: `"system"(...)`,
+    /// `"sys"."tem"(...)`. At a string that starts at `at`: the name the
+    /// strings joined up to the call build, and where its arguments start.
+    fn php_called_string(&self, at: usize, end: usize) -> Option<(String, usize)> {
+        let mut rest = &self.code[at..end];
+        let mut name = String::new();
+        for _ in 0..MAX_JOINED_STRINGS {
+            let (value, after) = self.string_at(rest, None)?;
+            name.push_str(value.literal()?);
+            rest = after.trim_start();
+            match rest.strip_prefix('.') {
+                Some(next) if !next.starts_with(['.', '=']) => rest = next.trim_start(),
+                _ => {
+                    let arguments = rest.strip_prefix('(')?;
+                    let name = name.trim();
+                    return is_function_name(name)
+                        .then(|| (name.to_owned(), end - arguments.len()));
+                }
+            }
+        }
+        None
+    }
     /// The function an expression names, when the reader can fold it to a
     /// name; [`UNREAD`] otherwise.
     fn called_name(&self, expression: &str) -> String {
@@ -1902,6 +2128,68 @@ impl Reader<'_> {
     /// The function a variable holds: a name it was set to, a function
     /// written in place (read where it stands, so it is no sink here), or
     /// [`UNREAD`].
+    /// Where each call of a function the code defines hands it its
+    /// arguments, and where the statement ends: the first 65.
+    fn calls_of(&mut self, function: &str) -> Vec<(usize, usize)> {
+        let code = self.code;
+        if self.call_list.is_none() {
+            let mut list = Vec::new();
+            for (start, end) in statements(code) {
+                for (chain, at, arguments_at) in self.call_sites(start, end) {
+                    let defining = code[..at].trim_end().ends_with("def")
+                        || code[..at].trim_end().ends_with("function");
+                    if !defining {
+                        list.push((chain, arguments_at, end));
+                    }
+                }
+            }
+            self.call_list = Some(list);
+        }
+        self.call_list
+            .iter()
+            .flatten()
+            .filter(|(chain, _, _)| *chain == function)
+            .map(|(_, arguments_at, end)| (*arguments_at, *end))
+            .take(65)
+            .collect()
+    }
+
+    /// The function a PHP variable holds ([`Self::called_variable`]). A
+    /// parameter of a function the code defines holds what the calls of
+    /// that function hand it: when each hands a function written in place
+    /// or the name of one that starts no process (`apply("strtoupper",
+    /// $x)`), the call through it is no sink; anything else is not read.
+    fn called_php_variable(&mut self, variable: &str) -> String {
+        let called = self.called_variable(variable);
+        if !called.contains(UNREAD) || self.vars.contains_key(variable) {
+            return called;
+        }
+        let Some((function, index)) = self.functions.iter().find_map(|(name, parameters)| {
+            parameters
+                .iter()
+                .position(|parameter| parameter == variable)
+                .map(|index| (name.clone(), index))
+        }) else {
+            return called;
+        };
+        for (arguments_at, end) in self.calls_of(&function) {
+            let handed = split_top(call_arguments(&self.code[arguments_at..end]), ",");
+            let Some(argument) = handed.get(index).map(|argument| argument.trim()) else {
+                return called;
+            };
+            if written_in_place(argument) {
+                continue;
+            }
+            match self.fold(argument, FOLD_DEPTH).literal() {
+                Some(name)
+                    if is_function_name(name.trim())
+                        && sink_of(self.lang, &self.callee(name.trim())).is_none() => {}
+                _ => return called,
+            }
+        }
+        variable.to_owned()
+    }
+
     fn called_variable(&self, variable: &str) -> String {
         if self.closures.iter().any(|closure| closure == variable) {
             return variable.to_owned();
@@ -2078,27 +2366,7 @@ impl Reader<'_> {
             return;
         };
         let code = self.code;
-        if self.call_list.is_none() {
-            let mut list = Vec::new();
-            for (start, end) in statements(code) {
-                for (chain, at, arguments_at) in self.call_sites(start, end) {
-                    let defining = code[..at].trim_end().ends_with("def")
-                        || code[..at].trim_end().ends_with("function");
-                    if !defining {
-                        list.push((chain, arguments_at, end));
-                    }
-                }
-            }
-            self.call_list = Some(list);
-        }
-        let calls: Vec<(usize, usize)> = self
-            .call_list
-            .iter()
-            .flatten()
-            .filter(|(chain, _, _)| *chain == function)
-            .map(|(_, arguments_at, end)| (*arguments_at, *end))
-            .take(65)
-            .collect();
+        let calls = self.calls_of(&function);
         let mut bindings = Vec::new();
         {
             for (arguments_at, end) in calls {
@@ -2447,23 +2715,15 @@ impl Reader<'_> {
             }
             Sink::OpenPipe => self.read_open(done, &positional),
             Sink::Callback(index) => self.read_callback(done, &positional, usize::from(index)),
-            Sink::WriteFile => {
-                if let Some(path) = self.positional_value(&positional, 0).literal() {
-                    let text = self
-                        .positional_value(&positional, 1)
-                        .text()
-                        .replace(UNREAD, UNREAD_WORD);
-                    let written = (path.trim().to_owned(), text);
-                    if !self.out.written.contains(&written) {
-                        self.out.written.push(written);
-                    }
-                }
-            }
+            Sink::WriteFile => self.note_written(&positional),
         }
     }
 
     /// Code loaded from a path or a URL.
     fn read_load(&mut self, value: Value) {
+        if self.load_written(&value.text()) {
+            return;
+        }
         let Some(path) = value.literal() else {
             // A path built at run time whose end is not read may be any
             // file: Perl, PHP and Lua load it as code the guard has not
@@ -2490,19 +2750,9 @@ impl Reader<'_> {
             }
             return;
         }
-        // A file the code itself wrote: what it wrote is the code loaded.
-        if let Some((_, text)) = self
-            .out
-            .written
-            .iter()
-            .find(|(written, _)| same_path(written, path))
-        {
-            if text.contains(UNREAD_WORD) {
-                self.out.code_unread = true;
-            } else {
-                let inner = read_code(self.lang, &text.clone(), self.depth - 1);
-                self.out.merge(inner.nested());
-            }
+        // The process's own input: code sent on stdin, not read here.
+        if matches!(self.lang, Lang::Perl | Lang::Php | Lang::Lua) && names_stdin(path) {
+            self.out.code_unread = true;
             return;
         }
         if lower.starts_with("data:") {
@@ -2516,6 +2766,59 @@ impl Reader<'_> {
             || self.downloaded.iter().any(|saved| same_path(saved, path))
         {
             self.out.runs_download = true;
+        }
+    }
+
+    /// A file the code itself wrote, loaded as code: what it wrote is the
+    /// code loaded, read here ([`written_file`]). Whether `path` is one.
+    fn load_written(&mut self, path: &str) -> bool {
+        let Some(text) = self
+            .out
+            .written
+            .iter()
+            .find(|(written, _)| written_file(written, path))
+            .map(|(_, text)| text.clone())
+        else {
+            return false;
+        };
+        if text.contains(UNREAD_WORD) {
+            self.out.code_unread = true;
+        } else {
+            let inner = read_code(self.lang, &text, self.depth - 1);
+            self.out.merge(inner.nested());
+        }
+        true
+    }
+
+    /// What `file_put_contents` writes: a path built at run time is kept
+    /// when it ends in a name written out (`__DIR__ . "/x.php"`), and a
+    /// write with `FILE_APPEND`, or with flags not read, adds to what an
+    /// earlier write of the same file left there.
+    fn note_written(&mut self, positional: &[&str]) {
+        let path = self.positional_value(positional, 0).text();
+        if path.trim().is_empty() || path.trim_end().ends_with(UNREAD) {
+            return;
+        }
+        let path = path.trim().to_owned();
+        let text = self
+            .positional_value(positional, 1)
+            .text()
+            .replace(UNREAD, UNREAD_WORD);
+        let append = positional.get(2).is_some_and(|flags| {
+            let known = flags
+                .split('|')
+                .all(|flag| matches!(flag.trim(), "0" | "LOCK_EX" | "FILE_USE_INCLUDE_PATH"));
+            flags.contains("FILE_APPEND") || !known
+        });
+        match self
+            .out
+            .written
+            .iter_mut()
+            .find(|(written, _)| written_file(written, &path))
+        {
+            Some((_, before)) if append => before.push_str(&text),
+            Some((_, before)) => *before = text,
+            None => self.out.written.push((path, text)),
         }
     }
 
@@ -2736,6 +3039,20 @@ impl Reader<'_> {
                 return;
             };
         let expression = expression.trim();
+        // The latest value a name is given is the one a call through it
+        // reaches: a closure set before is gone.
+        if !append && matches!(self.lang, Lang::Php | Lang::Perl | Lang::Lua) {
+            self.closures.retain(|closure| closure != name);
+            self.aliases.remove(name);
+        }
+        // Lua's `os[k]` with a key built at run time: a call through the
+        // name reaches what the key names.
+        if self.lang == Lang::Lua && !append {
+            if let Some(held) = self.lua_index_name(expression) {
+                self.aliases.insert(name.to_owned(), held);
+                return;
+            }
+        }
         // A name given a function or a module: `s = os.system`, Lua's
         // `local e = os.execute` and `local o = os`.
         if matches!(self.lang, Lang::Python | Lang::Lua) && !append && is_chain(expression) {
@@ -2752,10 +3069,7 @@ impl Reader<'_> {
         if matches!(self.lang, Lang::Php | Lang::Perl | Lang::Lua) && !append {
             // A function written in place: a call through the name runs its
             // body, read where it stands.
-            if ["function", "fn", "sub", "static function"]
-                .iter()
-                .any(|word| expression.starts_with(word))
-            {
+            if written_in_place(expression) {
                 self.closures.push(name.to_owned());
             }
             // Perl's `$f = \&CORE::system`: the function by its name.
@@ -3426,6 +3740,8 @@ impl Reader<'_> {
             template || (quote == b'"' && matches!(self.lang, Lang::Ruby | Lang::Perl | Lang::Php));
         let value = if !escapes {
             inner.replace("\\'", "'").replace("\\\\", "\\")
+        } else if self.lang == Lang::Lua {
+            lua_unescaped(inner)
         } else {
             match (interpolating, depth) {
                 (true, Some(depth)) => match self.lang {
@@ -3604,6 +3920,48 @@ fn quoted_end(text: &str, quote: char, escapes: bool) -> Option<usize> {
         }
     }
     None
+}
+
+/// A Lua string body with its escapes read: Lua writes a byte by its
+/// decimal value (`\114` is `r`), and `\z` skips the space after it.
+fn lua_unescaped(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            plain.push(character);
+            continue;
+        }
+        match characters.peek() {
+            Some(digit) if digit.is_ascii_digit() => {
+                let mut value = 0u32;
+                for _ in 0..3 {
+                    match characters.next_if(char::is_ascii_digit) {
+                        Some(digit) => value = value * 10 + digit.to_digit(10).unwrap_or(0),
+                        None => break,
+                    }
+                }
+                match char::from_u32(value) {
+                    // Read again as a backslash written out.
+                    Some('\\') => plain.push_str("\\\\"),
+                    Some(decoded) if value < 0x80 => plain.push(decoded),
+                    _ => plain.push(UNREAD),
+                }
+            }
+            Some('z') => {
+                characters.next();
+                while characters.next_if(|c| c.is_whitespace()).is_some() {}
+            }
+            Some(_) => {
+                plain.push('\\');
+                if let Some(escaped) = characters.next() {
+                    plain.push(escaped);
+                }
+            }
+            None => plain.push('\\'),
+        }
+    }
+    unescaped(&plain)
 }
 
 /// A string body with its backslash escapes read.
@@ -3825,6 +4183,123 @@ fn is_function_name(text: &str) -> bool {
             .all(|b| is_name_byte(b) || matches!(b, b':' | b'.'))
 }
 
+/// A PHP function's name as PHP looks it up: without case, and without the
+/// backslash that names the global namespace.
+fn php_function_name(name: &str) -> String {
+    name.strip_prefix('\\').unwrap_or(name).to_ascii_lowercase()
+}
+
+/// Whether a path names the process's own input (`/dev/stdin`,
+/// `/dev/fd/0`, `/proc/self/fd/0`): code loaded from it is what is sent on
+/// stdin, which the guard does not read.
+fn names_stdin(path: &str) -> bool {
+    path == "/dev/stdin"
+        || ["/dev/fd/", "/proc/self/fd/"].iter().any(|prefix| {
+            path.strip_prefix(prefix).is_some_and(|fd| {
+                !fd.is_empty()
+                    && fd
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || b"*?[]".contains(&b))
+            })
+        })
+}
+
+/// Where a Lua assignment that starts `statement` and gives a name a
+/// function, a module or what a call returns (`local e = os.execute`,
+/// `local o = rawget(_G, "os")`) ends, when another statement follows it
+/// with nothing between them but a space: a name after the value with no
+/// operator starts the next one.
+fn lua_assignment_end(statement: &str) -> Option<usize> {
+    let bytes = statement.as_bytes();
+    let skip_space = |mut at: usize| {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    };
+    let name_end = |mut at: usize| {
+        while at < bytes.len() && is_name_byte(bytes[at]) {
+            at += 1;
+        }
+        at
+    };
+    let mut at = skip_space(0);
+    if statement[at..].starts_with("local")
+        && bytes.get(at + 5).is_some_and(u8::is_ascii_whitespace)
+    {
+        at = skip_space(at + 5);
+    }
+    let name = name_end(at);
+    if name == at {
+        return None;
+    }
+    at = skip_space(name);
+    if bytes.get(at) != Some(&b'=') || bytes.get(at + 1) == Some(&b'=') {
+        return None;
+    }
+    at = skip_space(at + 1);
+    let value = at;
+    at = name_end(at);
+    if at == value || bytes[value].is_ascii_digit() {
+        return None;
+    }
+    loop {
+        match bytes.get(at) {
+            Some(b'.' | b':')
+                if bytes
+                    .get(at + 1)
+                    .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') =>
+            {
+                at = name_end(at + 1);
+            }
+            Some(b'(' | b'[') => at += 2 + closing(&statement[at + 1..])?,
+            _ => break,
+        }
+    }
+    let next = skip_space(at);
+    if next == at
+        || next >= bytes.len()
+        || !(bytes[next].is_ascii_alphabetic() || bytes[next] == b'_')
+    {
+        return None;
+    }
+    let word = &statement[next..name_end(next)];
+    (!matches!(word, "and" | "or")).then_some(next)
+}
+
+/// Code inside a string that runs where it stands, opening at the start of
+/// `text` ([`CODE_IN_STRINGS`]): where the code starts.
+fn code_in_string(lang: Lang, text: &str) -> Option<usize> {
+    CODE_IN_STRINGS
+        .iter()
+        .filter(|(of, _, _)| *of == lang)
+        .find_map(|(_, opener, marks)| {
+            let rest = text.strip_prefix(opener)?;
+            if marks.is_empty() {
+                return Some(opener.len());
+            }
+            let spaced = rest.trim_start();
+            let mark = spaced.chars().next().filter(|mark| marks.contains(mark))?;
+            Some(text.len() - spaced.len() + mark.len_utf8())
+        })
+}
+
+/// Whether an expression is a function written in place: PHP's
+/// `function (...) {...}`, `fn (...) => ...` and their `static` forms,
+/// Perl's `sub {...}`, Lua's `function (...) ... end`.
+fn written_in_place(expression: &str) -> bool {
+    let expression = expression.trim_start();
+    let expression = expression
+        .strip_prefix("static")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map_or(expression, str::trim_start);
+    ["function", "fn", "sub"].iter().any(|word| {
+        expression
+            .strip_prefix(word)
+            .is_some_and(|rest| rest.trim_start().starts_with(['(', '{', '&']))
+    })
+}
+
 /// Whether a callee is a variable alone (PHP's `$f`).
 fn is_variable(chain: &str) -> bool {
     chain
@@ -3905,7 +4380,11 @@ pub(crate) fn runner_of_file(line: &str, path: &str) -> Option<Runner> {
 /// The language an interpreter's program name runs (`python3.11`, `lua5.4`).
 fn interpreter_lang(name: &str) -> Option<Lang> {
     let name = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    Lang::of(if name == "nodejs" { "node" } else { name })
+    Lang::of(match name {
+        "nodejs" => "node",
+        "luajit" => "lua",
+        other => other,
+    })
 }
 
 /// What a file the code wrote holds, read as `runner` runs it: a line for
@@ -3951,6 +4430,31 @@ pub(crate) fn written_reading(runner: Runner, text: &str, depth: u8) -> InlineRe
         _ => out.code_unread = true,
     }
     out
+}
+
+/// Whether a file the code wrote at `written` is the one it loads at
+/// `loaded`: the same path, or, where either is built at run time from a
+/// piece not read (`__DIR__`, `getcwd()`), the same name after it.
+fn written_file(written: &str, loaded: &str) -> bool {
+    if same_path(written, loaded) {
+        return true;
+    }
+    if !written.contains(UNREAD) && !loaded.contains(UNREAD) {
+        return false;
+    }
+    let tail = |path: &str| {
+        let tail = path.rsplit(UNREAD).next().unwrap_or(path).trim();
+        tail.trim_start_matches("./").to_owned()
+    };
+    let (first, second) = (tail(written), tail(loaded));
+    let (long, short) = if first.len() >= second.len() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let short = short.trim_start_matches('/');
+    !short.is_empty()
+        && (long.trim_start_matches('/') == short || long.ends_with(&format!("/{short}")))
 }
 
 fn same_path(first: &str, second: &str) -> bool {
