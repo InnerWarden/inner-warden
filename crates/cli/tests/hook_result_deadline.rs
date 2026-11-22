@@ -24,6 +24,11 @@ const GIVE_UP: Duration = Duration::from_secs(30);
 const DEADLINE_MS: &str = "300";
 const HELD_MS: u64 = 5_000;
 
+/// The deadline of a run whose rule must answer: far past [`GIVE_UP`], so
+/// on a loaded runner the rule answers before it by construction, and only
+/// a hook that hangs fails. Debug builds only (`IW_TEST_HOOK_DEADLINE_MS`).
+const RULE_DEADLINE_MS: &str = "120000";
+
 struct Host {
     dir: tempfile::TempDir,
 }
@@ -48,6 +53,19 @@ impl Host {
 
     /// The hook with the deadline lowered and a tool result held past it.
     fn hook(&self, flags: &[&str]) -> Command {
+        let mut command = self.hook_raised(flags);
+        command
+            .env_remove("IW_TEST_HOOK_DEADLINE_MS")
+            .env("INNERWARDEN_HOOK_DEADLINE_MS", DEADLINE_MS);
+        command
+    }
+
+    /// The hook with a tool result held past [`DEADLINE_MS`], and a deadline
+    /// ([`RULE_DEADLINE_MS`]) that a rule answers before on any runner: for
+    /// a run that must end by its rule, not by the clock. A payload read as
+    /// a result that already ran still ends with 0 (after the held read),
+    /// so what the run tells apart does not need the lowered deadline.
+    fn hook_raised(&self, flags: &[&str]) -> Command {
         let home = self.home();
         let mut command = Command::new(env!("CARGO_BIN_EXE_innerwarden"));
         command
@@ -59,8 +77,8 @@ impl Host {
             .env("IW_SESSION_FILE", self.dir.path().join("sessions.json"))
             .env("INNERWARDEN_AGENT_URL", "off")
             .env_remove("IW_GUARD_SESSION")
-            .env_remove("IW_TEST_HOOK_DEADLINE_MS")
-            .env("INNERWARDEN_HOOK_DEADLINE_MS", DEADLINE_MS)
+            .env_remove("INNERWARDEN_HOOK_DEADLINE_MS")
+            .env("IW_TEST_HOOK_DEADLINE_MS", RULE_DEADLINE_MS)
             .env("IW_TEST_HOOK_RESULT_DELAY_MS", HELD_MS.to_string())
             .current_dir(home.join("proj"))
             .stdin(Stdio::piped())
@@ -71,8 +89,18 @@ impl Host {
 
     /// Run the hook on `payload`, stdin closed once it is written.
     fn run(&self, flags: &[&str], payload: String) -> Run {
+        self.run_command(self.hook(flags), payload)
+    }
+
+    /// [`Host::run`] with the deadline a rule answers before
+    /// ([`Host::hook_raised`]).
+    fn run_raised(&self, flags: &[&str], payload: String) -> Run {
+        self.run_command(self.hook_raised(flags), payload)
+    }
+
+    fn run_command(&self, mut command: Command, payload: String) -> Run {
         let started = Instant::now();
-        let mut child = self.hook(flags).spawn().expect("run innerwarden hook");
+        let mut child = command.spawn().expect("run innerwarden hook");
         let mut stdin = child.stdin.take().expect("stdin");
         // Its own thread: a hook that ends early leaves this write with
         // nowhere to go, and it then fails, which is fine.
@@ -197,12 +225,20 @@ fn a_tool_result_past_the_deadline_reaches_the_agent_marked_unread() {
 }
 
 /// Only the deadline of a call that already ran changes. With the same
-/// lowered deadline and the same held read:
+/// held read:
 /// - a call refused by its content is refused as before (2, by its rule);
 /// - so is one that names PostToolUse but carries no result, and one whose
 ///   command only carries the words of a result;
 /// - a call about to run that the hook cannot finish reading in time is
 ///   still refused by the deadline (2).
+///
+/// The refusals by content run with a deadline the rule answers before on
+/// any runner ([`Host::hook_raised`]): with the lowered one, a loaded CI
+/// runner took longer than 300 ms to screen and the deadline answered
+/// first, so the message was the clock's. Read as a result that already
+/// ran, any of them still ends with 0 after the held read. Only the call
+/// whose stdin never closes keeps the lowered deadline: the deadline is
+/// what it tests.
 ///
 /// Passes before and after the change: it guards that the change stays on
 /// the deadline of a result.
@@ -218,7 +254,7 @@ fn calls_refused_today_are_still_refused() {
         ),
     ] {
         let host = Host::new();
-        let run = host.run(&[], payload.clone());
+        let run = host.run_raised(&[], payload.clone());
         assert_eq!(run.code, Some(2), "{payload}: {}", run.said);
         assert!(
             run.said.contains("InnerWarden blocked this command"),
