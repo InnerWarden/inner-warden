@@ -19,6 +19,27 @@ refuses under `--block-review`; the proxy forwards it with the alert in
 gets runs as before. Before, `execute(script)` ran in every mode whatever the
 script did.
 
+What counts as a change: an HTTP `DELETE` (destroys), `PUT`, `PATCH` or
+`POST` (changes), whether the method is written in `method:`, by shorthand
+from a name, or as the start of a request line (`"DELETE /repos/..."`, in a
+template too); a `POST` that only reads (a GraphQL query) is also asked
+about. SQL that drops, truncates, deletes, inserts, alters, grants or
+updates, among other statements or however spaced. Escapes in a string are
+decoded before it is read. Methods of the script's own values (`Map`,
+`Set`, `Headers`, `URLSearchParams`, `FormData`, a hash, a page element)
+are not the API's and run. A tool that runs more than one language and names
+none (Hermes Agent's `execute_code`, which runs Python) is read only when an
+argument says JavaScript; a script that starts with a `#` comment or a `#!`
+line for another interpreter is not read as JavaScript. The hook's record
+keeps a long script by its start, size and SHA-256.
+
+Known limits of this first reader: a member named at run time and kept for
+later (`const f = zones["del" + "ete"]; f.call(...)`) is not followed; verbs
+outside its table (`cancel`, `merge`, `addCollaborator`, `addDeployKey`,
+`setSecret`, `unpublish`, `clear`, `stop`, `writeFile`, a batch with
+`deletes`) are not read as changes; `child_process.execSync` and
+`fs.rmSync` are not read by it (the proxy refuses them today by its ATR rules).
+
 `innerwarden setup` and the new `innerwarden status --config` say what is
 already set in the agents' own config, and change nothing. In
 `~/.claude/settings.json`, `~/.claude.json`, `~/.cursor/mcp.json`,

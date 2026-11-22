@@ -294,3 +294,73 @@ fn code_mode_reads_still_run() {
     }
     assert!(!host.record().contains("AG-CODE-MODE"));
 }
+
+/// Hermes Agent's `execute_code` runs Python, and its hook judges it as a
+/// `python3 -c` line. Three ordinary scripts: allowed by the hook, under
+/// `--block-review` too, as on main (the round before read them as
+/// JavaScript: unreadable, a reset, a change).
+#[test]
+fn hermes_python_is_not_read_as_javascript() {
+    let host = Host::new();
+    for code in [
+        "import json\n# list what's there\nprint(json.dumps(sorted(os.listdir('.'))))",
+        "import pandas as pd\ndf = pd.DataFrame({'a': [1, 2]}).reset_index()\nprint(df.head())",
+        "d = {}\nd.update(a=1)\nprint(d)",
+    ] {
+        for flags in [
+            &["--agent", "hermes"][..],
+            &["--agent", "hermes", "--block-review"][..],
+        ] {
+            let answer = host.hook(flags, "execute_code", code);
+            assert_eq!(answer.code, Some(0), "{flags:?} {code}: {answer:?}");
+            assert!(
+                !answer.stdout.contains("block") && !answer.stdout.contains("approve"),
+                "{flags:?} {code}: {answer:?}"
+            );
+        }
+    }
+}
+
+/// The round's cases through the real hook: a request method in lower case
+/// or by shorthand, a template with substitutions, an escape, code built at
+/// run time and a call hidden behind a `/` are each a review (a refusal
+/// under `--block-review`); methods of the script's own values run.
+#[test]
+fn round_one_cases_through_the_hook() {
+    let host = Host::new();
+    for code in [
+        "const method = \"delete\"; await fetch(u, { method })",
+        "await fetch(u, { \"method\": \"delete\" })",
+        "await octokit.request(`DELETE /repos/${o}/${r}`)",
+        "await octokit.request(\"\\x44ELETE /repos/o/r\")",
+        "(0, eval)(s)",
+        "Reflect.get(cloudflare.zones, \"delete\").call(cloudflare.zones, {})",
+        "await env.DB.exec(\"SELECT 1; DROP TABLE users\")",
+        "let a = 0; a++ /cloudflare.zones.delete({ zone_id: 'z' })/ 1",
+        "{} /\"/; await cloudflare.zones.delete({ zone_id: 'z' }); //\"",
+        "// x\rawait cloudflare.zones.delete({ zone_id: 'z' })",
+    ] {
+        let enforce = host.hook(&["--agent", "claude-code"], TOOL, code);
+        assert_eq!(hook_verdict(&enforce), "review", "{code}: {enforce:?}");
+        let strict = host.hook(&["--agent", "claude-code", "--block-review"], TOOL, code);
+        assert_eq!(hook_verdict(&strict), "deny", "{code}: {strict:?}");
+    }
+    for code in [
+        "const m = new Map(); m.set(\"a\", 1); m.delete(\"a\"); return m.size;",
+        "const q = new URLSearchParams(s); q.delete(\"a\"); return q.toString();",
+        "return crypto.createHash(\"sha256\").update(body).digest(\"hex\");",
+    ] {
+        let strict = host.hook(&["--agent", "claude-code", "--block-review"], TOOL, code);
+        assert_eq!(hook_verdict(&strict), "allow", "{code}: {strict:?}");
+    }
+}
+
+/// A shell script handed to `execute` with no language named is not read as
+/// JavaScript: the proxy's strict mode finds no `AG-CODE-MODE` in it.
+#[test]
+fn a_shell_script_is_not_read_as_javascript_by_the_proxy() {
+    let host = Host::new();
+    let code = "# show the build\nls -la build && echo it's there";
+    let proxied = host.proxy("strict", code);
+    assert!(!proxied.contains("AG-CODE-MODE"), "{proxied}");
+}

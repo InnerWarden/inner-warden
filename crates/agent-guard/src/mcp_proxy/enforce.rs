@@ -248,6 +248,11 @@ pub fn lower_code_mode_refusals(d: &mut ProxyDecision) {
         return;
     }
     d.verdict.allowed = !d.verdict.alerts.iter().any(|alert| alert.block);
+    // Another rule still refuses the call: it is not forwarded, so no note
+    // says it is.
+    if !d.verdict.allowed {
+        return;
+    }
     d.verdict.alerts.push(crate::mcp::VerdictAlert::builtin(
         POSTURE_RULE,
         format!(
@@ -1808,5 +1813,33 @@ mod tests {
         ] {
             assert!(!is_protected_path(path), "{path}");
         }
+    }
+
+    /// The note that a code-mode refusal was forwarded with a warning is
+    /// written only when the call is forwarded: with another rule still
+    /// refusing it, no note says so.
+    #[test]
+    fn code_mode_note_only_on_a_call_that_is_forwarded() {
+        let (mut alone, _) = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute","arguments":{"code":"await cloudflare.zones.delete({})"}}}"#,
+        );
+        lower_code_mode_refusals(&mut alone);
+        assert!(alone.verdict.allowed);
+        assert!(alone.verdict.alerts.iter().any(|a| a.rule == POSTURE_RULE));
+        let (mut with_key, _) = call(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute","arguments":{"code":"await cloudflare.zones.delete({})","token":"sk-ant-aaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+        );
+        assert!(with_key
+            .verdict
+            .alerts
+            .iter()
+            .any(|a| a.rule == crate::mcp_code_mode::CODE_MODE_RULE));
+        lower_code_mode_refusals(&mut with_key);
+        assert!(!with_key.verdict.allowed);
+        assert!(with_key
+            .verdict
+            .alerts
+            .iter()
+            .all(|a| a.rule != POSTURE_RULE));
     }
 }
