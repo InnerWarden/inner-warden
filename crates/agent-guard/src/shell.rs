@@ -3306,6 +3306,13 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             command_words(*command, bytes)
                 .is_some_and(|words| sets_a_trap_between_commands(&words, 0, &anywhere))
         });
+    // The assignments of each name, in text order, for the commands that
+    // spell it.
+    let mut assignments_of: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (index, (name, _, _, _, _)) in assignments.iter().enumerate() {
+        assignments_of.entry(name.as_str()).or_default().push(index);
+    }
     for command in &commands {
         if node_is_in_literal_unreachable_branch(*command, bytes) {
             continue;
@@ -3315,19 +3322,60 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         };
         let at_command = command.start_byte();
         let inside = |body: &std::ops::Range<usize>| body.contains(&at_command);
+        // The command reads a variable only by a name its words spell
+        // (`$C`, `${C}`), or through a reference to it: the values of the
+        // other names are not carried to it. Carrying all of them made a
+        // line of many commands and assignments cost the square of its
+        // length (measured 2026-11-21).
+        let read_here: Vec<&Assignment> = if namerefs.is_empty() {
+            let spelled: std::collections::HashSet<&str> = words
+                .iter()
+                .flat_map(|word| word.split(|c: char| c != '_' && !c.is_ascii_alphanumeric()))
+                .filter(|name| !name.is_empty())
+                .collect();
+            let mut indexes: Vec<usize> = spelled
+                .iter()
+                .filter_map(|name| assignments_of.get(name))
+                .flatten()
+                .copied()
+                .collect();
+            indexes.sort_unstable();
+            indexes
+                .into_iter()
+                .map(|index| &assignments[index])
+                .collect()
+        } else {
+            assignments.iter().collect()
+        };
         // In text order: the assignments outside any function, and those in
         // the body the command itself is in.
-        let in_order: Vec<&Assignment> = assignments
+        let in_text_order = |(_, _, at, body, _): &Assignment| {
+            *at <= at_command && body.as_ref().is_none_or(inside)
+        };
+        let in_order: Vec<&Assignment> = read_here
             .iter()
-            .filter(|(_, _, at, body, _)| *at <= at_command && body.as_ref().is_none_or(inside))
+            .copied()
+            .filter(|a| in_text_order(a))
             .collect();
         // One that may not have run (`A || C=ok`), or ran in a child shell
         // (`(C=ok)`), does not replace the value before it: both are judged.
         let sure = |scopes: &Vec<std::ops::Range<usize>>| scopes.iter().all(&inside);
+        // Of the values a name is surely set to, the last one is the value it
+        // holds ([`LineVars::values`]); the ones before it are not carried.
+        let mut last_set: Vec<&Assignment> = Vec::new();
+        let mut set_at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for assignment in in_order.iter().filter(|(_, _, _, _, scopes)| sure(scopes)) {
+            match set_at.get(assignment.0.as_str()) {
+                Some(&slot) => last_set[slot] = assignment,
+                None => {
+                    set_at.insert(assignment.0.as_str(), last_set.len());
+                    last_set.push(assignment);
+                }
+            }
+        }
         let mut vars = LineVars {
-            set: in_order
+            set: last_set
                 .iter()
-                .filter(|(_, _, _, _, scopes)| sure(scopes))
                 .map(|(name, value, _, _, _)| (name.clone(), value.clone()))
                 .collect(),
             maybe: in_order
@@ -3371,8 +3419,9 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                         .is_none_or(|definition| inside(&definition.byte_range()))
             })
         };
-        for (name, value, at, body, _) in &assignments {
-            if in_order.iter().any(|(_, _, other, _, _)| other == at) {
+        for &assignment in &read_here {
+            let (name, value, _, body, _) = assignment;
+            if in_text_order(assignment) {
                 continue;
             }
             // Every other value the name may hold here is judged too: the
@@ -3403,7 +3452,7 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
         if own_body.is_some() {
             // A name the body does not set first may hold anything its
             // caller left.
-            for (name, _, _, _, _) in &assignments {
+            for (name, _, _, _, _) in read_here.iter().copied() {
                 if !set_in_own_body(name) {
                     vars.maybe.push((name.clone(), None));
                 }
@@ -8267,27 +8316,139 @@ fn parse_read_budget(len: usize) -> usize {
 /// reads it the conservative way.
 pub(crate) fn parse_bash(source: &str) -> Option<tree_sitter::Tree> {
     if source.len() < PARSE_CACHE_FROM {
-        return parse_bash_uncached(source);
+        return parse_bash_uncached(source).inspect(remember_kinds_of);
     }
     // The same long line is parsed by many checks in one analysis: 19
     // times for a 64 KiB `python3 -c` line, 5 to 8 ms each in release, most
     // of its 240 to 280 ms (measured 2026-11-19). A tree depends on the text
     // alone, and a copy of one is cheap (a reference count).
-    PARSE_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(at) = cache.iter().position(|(text, _)| text == source) {
-            let entry = cache.remove(at);
-            let tree = entry.1.clone();
-            cache.push(entry);
-            return tree;
+    PARSE_CACHE
+        .with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(at) = cache.iter().position(|(text, _)| text == source) {
+                let entry = cache.remove(at);
+                let tree = entry.1.clone();
+                cache.push(entry);
+                return tree;
+            }
+            let tree = parse_bash_uncached(source);
+            if cache.len() >= PARSE_CACHE_SIZE {
+                cache.remove(0);
+            }
+            cache.push((source.to_owned(), tree.clone()));
+            tree
+        })
+        .inspect(remember_kinds_of)
+}
+
+/// The shortest text whose tree [`parse_bash`] indexes by the kinds of
+/// node it holds ([`tree_lacks_kind`]).
+const KIND_INDEX_FROM: usize = 1024;
+/// How many trees are indexed on a thread, the latest parsed last.
+const KIND_INDEX_SIZE: usize = 8;
+
+/// A kept copy of a tree, the key of its root ([`kind_index_key`]), and the
+/// kinds of node it holds, found on the first question.
+struct KindIndex {
+    tree: tree_sitter::Tree,
+    root: usize,
+    kinds: std::cell::OnceCell<std::collections::HashSet<String>>,
+}
+
+thread_local! {
+    static KIND_INDEX: std::cell::RefCell<Vec<KindIndex>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The key a root is indexed by: the id of its first child.
+///
+/// The id of a root is where the caller's copy of the tree keeps it, and
+/// another tree may be made there once that copy is dropped. The id of a
+/// child is a place in the parsed text's own memory, which every copy of
+/// the tree shares and the kept copy keeps alive: while an entry is kept,
+/// only a copy of its tree has a root with that key. No node but a root has
+/// the same first child.
+fn kind_index_key(node: tree_sitter::Node<'_>) -> Option<usize> {
+    node.child(0).map(|child| child.id())
+}
+
+/// Keeps a long line's tree for [`tree_lacks_kind`].
+fn remember_kinds_of(tree: &tree_sitter::Tree) {
+    let root = tree.root_node();
+    if root.end_byte() < KIND_INDEX_FROM {
+        return;
+    }
+    let Some(key) = kind_index_key(root) else {
+        return;
+    };
+    KIND_INDEX.with(|index| {
+        let mut index = index.borrow_mut();
+        if let Some(at) = index.iter().position(|entry| entry.root == key) {
+            let entry = index.remove(at);
+            index.push(entry);
+            return;
         }
-        let tree = parse_bash_uncached(source);
-        if cache.len() >= PARSE_CACHE_SIZE {
-            cache.remove(0);
+        if index.len() >= KIND_INDEX_SIZE {
+            index.remove(0);
         }
-        cache.push((source.to_owned(), tree.clone()));
-        tree
+        index.push(KindIndex {
+            tree: tree.clone(),
+            root: key,
+            kinds: std::cell::OnceCell::new(),
+        });
+    });
+}
+
+/// Whether `node` is the root of an indexed tree that holds no node of
+/// `kind`. A walk of the whole tree for that kind then finds nothing, and is
+/// skipped.
+///
+/// Checks that walk the whole line once for every command of it made the
+/// time of a line grow with the square of its length (measured 2026-11-21
+/// in a debug build: 352 ms for 2 KB of `(X=#); echo $X;`, 3418 ms for 8
+/// KB), and the hook refuses a call that takes too long. The index only
+/// ever says a kind is absent: any other answer, a tree that is not indexed
+/// or a node that is not a root, leaves the walk to run.
+fn tree_lacks_kind(node: tree_sitter::Node<'_>, kind: &str) -> bool {
+    let Some(key) = kind_index_key(node) else {
+        return false;
+    };
+    KIND_INDEX.with(|index| {
+        let index = index.borrow();
+        index
+            .iter()
+            .find(|entry| entry.root == key && node.parent().is_none())
+            .is_some_and(|entry| {
+                !entry
+                    .kinds
+                    .get_or_init(|| kinds_in(entry.tree.root_node()))
+                    .contains(kind)
+            })
     })
+}
+
+/// Every kind of node under `root`, itself included, at any depth.
+fn kinds_in(root: tree_sitter::Node<'_>) -> std::collections::HashSet<String> {
+    let mut kinds = std::collections::HashSet::new();
+    let mut cursor = root.walk();
+    'walk: loop {
+        let kind = cursor.node().kind();
+        if !kinds.contains(kind) {
+            kinds.insert(kind.to_owned());
+        }
+        if cursor.goto_first_child() || cursor.goto_next_sibling() {
+            continue;
+        }
+        loop {
+            if !cursor.goto_parent() {
+                break 'walk;
+            }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
+    kinds
 }
 
 /// The shortest text whose parse [`parse_bash`] keeps: below it a parse
@@ -12756,7 +12917,7 @@ fn node_contains_kind_outside(
 }
 
 fn node_contains_kind(node: tree_sitter::Node<'_>, kind: &str, depth: u8) -> bool {
-    if depth > MAX_AST_DEPTH as u8 {
+    if depth > MAX_AST_DEPTH as u8 || (depth == 0 && tree_lacks_kind(node, kind)) {
         return false;
     }
     let mut cursor = node.walk();
@@ -12780,7 +12941,7 @@ fn collect_nodes_of_kind<'tree>(
     nodes: &mut Vec<tree_sitter::Node<'tree>>,
     depth: u8,
 ) {
-    if depth > MAX_AST_DEPTH as u8 {
+    if depth > MAX_AST_DEPTH as u8 || (depth == 0 && tree_lacks_kind(node, kind)) {
         return;
     }
     if node.kind() == kind {

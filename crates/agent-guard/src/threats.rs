@@ -9859,6 +9859,7 @@ pub fn check_local_credential_and_kernel_tamper(content: &str) -> Option<(&'stat
 /// [`destructive_rm_home`]. See [`with_home_named`] for when it is not.
 pub fn check_data_destruction(content: &str) -> Option<(&'static str, u32)> {
     let content = with_home_named(content);
+    let content = crate::line_values::with_working_directory_named(content.as_ref());
     let content = content.as_ref();
     if !mentions_any(
         content,
@@ -14392,6 +14393,47 @@ pub fn destructive_rm_in_place(hay: &str, cwd: &str, home: Option<&str>) -> bool
             .any(|body| wipes(shell_command_segments(body)))
 }
 
+/// Whether a line removes the account's keys or a credential store by a
+/// path read against where it runs ([`destructive_rm_credentials`] for a
+/// path the line spells out from the home or `/`): `rm -rf ./.ssh` and
+/// `rm -rf .aws` run from the home, `cd ~ && rm -rf .gnupg`. `cwd` may be
+/// empty when the caller does not know it; a `cd` the line spells out still
+/// says where it runs. Measured 2026-11-21: `rm -rf ./.ssh` from the home
+/// was allowed where `rm -rf ~/.ssh` is refused.
+pub fn destructive_rm_credentials_in_place(hay: &str, cwd: &str, home: Option<&str>) -> bool {
+    let removes = |segments: Vec<&str>| {
+        let mut place = CommandPlace::new(cwd, home);
+        segments.into_iter().any(|segment| {
+            if place.step(segment).is_none() {
+                return false;
+            }
+            let Some(rm) = segment_rm_invocation(segment) else {
+                return false;
+            };
+            rm.targets.iter().any(|target| {
+                place
+                    .resolve(target)
+                    .is_some_and(|path| path_is_credential_store(&path, home))
+            })
+        })
+    };
+    removes(shell_command_segments(hay))
+        || substitution_bodies(hay)
+            .into_iter()
+            .any(|body| removes(shell_command_segments(body)))
+}
+
+/// Whether an absolute path is a credential store or a private key of a
+/// home ([`rm_target_is_credential_store`]): under `/home`, `/Users` or
+/// `/root`, or under the home the caller names wherever it is.
+fn path_is_credential_store(path: &str, home: Option<&str>) -> bool {
+    rm_target_is_credential_store(path)
+        || home
+            .and_then(|home| path.strip_prefix(home.trim_end_matches('/')))
+            .filter(|rest| rest.starts_with('/'))
+            .is_some_and(|rest| rm_target_is_credential_store(&format!("~{rest}")))
+}
+
 /// Top-level directories whose owner or mode, changed for the whole tree,
 /// breaks the system or an account: the programs, libraries, settings, logs
 /// and boot files, and the folders of homes.
@@ -15264,7 +15306,18 @@ fn without_public_ssh_files(content: &str) -> std::borrow::Cow<'_, str> {
                 .ends_with('>')
         })
     };
-    let excused = |word: &str| is_public_ssh_file(word) && !written_to(word);
+    // A `key=path` operand (`dd if=`, `--file=`) names its path.
+    let named = |word: &str| {
+        is_public_ssh_file(word)
+            || word.split_once('=').is_some_and(|(key, path)| {
+                !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c == '-' || c == '_' || c.is_ascii_alphanumeric())
+                    && is_public_ssh_file(path)
+            })
+    };
+    let excused = |word: &str| named(word) && !written_to(word);
     if !words.iter().any(|word| excused(word)) {
         return std::borrow::Cow::Borrowed(content);
     }
@@ -17024,12 +17077,21 @@ pub fn strongest_sensitive_path(text: &str) -> Option<&'static str> {
 
 /// A program that hands a file's content on: prints, searches, copies,
 /// archives or sends it.
+///
+/// An operand that names the file a program reads as `key=path` reads it
+/// too: `dd if=`, and a long option for a file of input or of names
+/// (`--file=`, `--files-from=`, `--arg-file=`, `--input-file=`,
+/// `--from-file=`), or `-f=`. Measured 2026-11-21: `dd if=/etc/shadow
+/// of=/tmp/x` and `xargs --arg-file=/etc/shadow echo` were allowed where
+/// `cat /etc/shadow` is refused.
 fn content_reader() -> &'static regex::Regex {
     static READER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     READER.get_or_init(|| {
-        regex::Regex::new(
+        regex::Regex::new(concat!(
             r"(?i)\b(?:cat|head|tail|less|more|grep|egrep|fgrep|rg|ag|ack|awk|sed|cut|strings|base64|tar|zip|cp|scp|rsync)\b|\bopen\s*\(|\b(?:readFileSync|readFile|createReadStream|readTextFile|readTextFileSync|file_get_contents)\s*\(|\bcurl\b[^|;&]*@",
-        )
+            r"|\bdd\b[^|;&]*(?:^|\s)['\x22]?if=",
+            r"|(?:^|\s)['\x22]?(?:--[a-z0-9-]*(?:file|from)[a-z0-9-]*|-f)=",
+        ))
         .expect("static sensitive-reader regex")
     })
 }

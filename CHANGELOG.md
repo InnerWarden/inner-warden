@@ -122,6 +122,22 @@ that puts another file in an instruction file's place is a review
 When the same line wrote the file it copies, its text is read as written
 into the instruction file, and an order in it is refused.
 
+A long line of many commands is judged in time that grows with its length,
+not with its square: in a debug build 8 KB of `(X=#); echo $X; ` took 3964
+ms against 504 ms for 2 KB, and now about 610 ms against 330 ms. Checks that
+ran once per command each walked the whole line again, and every value the
+line sets was carried to every command; the hook refuses a call that takes
+too long, so an ordinary long line could be refused for its time alone.
+`rm -rf $PWD/build` removes `./build` and is judged as that, no longer as a
+removal of an unexpanded variable; after a `cd` the line spells out, `$PWD`
+is that folder (`cd /; rm -rf $PWD/etc` is still refused), and a `PWD` the
+line sets is read as written. A credential store removed by a path relative
+to where the line runs (`rm -rf ./.ssh` from the home) is refused, as
+`rm -rf ~/.ssh` was. A secret read through an operand that names it as
+`key=path` is a read: `dd if=/etc/shadow of=/tmp/x`, `xargs
+--arg-file=/etc/shadow`, `git config --file=~/.git-credentials --list` were
+allowed where `cat /etc/shadow` is refused.
+
 The MCP proxy no longer reads a page that explains how a chat is written as
 an order to the assistant. A fenced code block (three backticks or `~~~`)
 that orders nothing is an example: the turns, system messages, tags and

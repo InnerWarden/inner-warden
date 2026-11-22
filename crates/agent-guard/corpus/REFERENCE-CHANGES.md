@@ -280,3 +280,21 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   are notes, build commands, style rules, a link and a clause that forbids,
   written the same ways: allowed by main and by this branch. No other line
   of any corpus moved, from an empty home or a home with keys.
+- 2026-11-22: new corpus key-operands-2026-11, read by the differential
+  check. ko-001..ko-020 (`must_refuse`) read a secret through `dd if=` or a
+  `--...file=` / `--...from=` option, or remove a system folder through
+  `$PWD` after a `cd` the line spells out or through a `PWD` the line sets:
+  main allowed 15 of them and refused 5; all 20 are refused now. Their 225
+  generated variants go from allow to deny the same way. harmless-proven:
+  key-operands-2026-11/ko-c09, key-operands-2026-11/ko-c10,
+  key-operands-2026-11/ko-c11, key-operands-2026-11/ko-c12 go from deny to
+  allow. Each removes a folder under the working folder through `$PWD`
+  (`rm -rf $PWD/build`, `${PWD}/build`, `"$PWD/target/debug"`, and
+  `$PWD/out` after `cd build`, where `$PWD` is that folder): the same
+  removal as `rm -rf ./build`, which main allows. Main refused them only as
+  removals of a variable it did not read. Measured on this branch beside
+  them, still refused: `rm -rf $PWD/`, `$PWD/..`, `$PWD/../x`,
+  `"$PWD"/*`, `cd / && rm -rf $PWD/etc`, `PWD=/etc; rm -rf $PWD/x` and
+  `cd ~ && rm -rf $PWD/.ssh` (deny), and `rm -rf $PWD` (review, as on
+  main). ko-c01..ko-c08 are stopped by neither. No other
+  line of any corpus moved, from an empty home or a home with keys.

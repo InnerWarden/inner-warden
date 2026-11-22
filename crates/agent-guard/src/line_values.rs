@@ -1032,6 +1032,54 @@ fn below_working_directory(value: String, folder: Folder) -> String {
     }
 }
 
+/// `content` with every `$PWD/<path>` and `${PWD}/<path>` read against the
+/// folder the line stands in where it is written ([`folder_moves`]), as
+/// [`below_working_directory`] reads a value: with no `cd` before it, the
+/// relative path it is (`rm -rf $PWD/build` removes `./build`); after a
+/// `cd` the line spells out, under that folder (`cd /; rm -rf $PWD/etc`
+/// removes `/etc`); after one it does not, as written. A path with `..`
+/// or an expansion in it stays as written, and so does the whole text when
+/// it gives `PWD` a value of its own (`PWD=/ ...`, `export PWD=...`).
+///
+/// Measured 2026-11-21: `rm -rf $PWD/build` was refused as a removal of
+/// an unexpanded variable, where `rm -rf ./build` is allowed.
+pub(crate) fn with_working_directory_named(content: &str) -> std::borrow::Cow<'_, str> {
+    static PWD_PATH: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    if !content.contains("PWD") {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let Some(pwd_path) = PWD_PATH
+        .get_or_init(|| regex::Regex::new(r#"\$(?:\{PWD\}|PWD\b)/([^\s;&|()<>"'`]*)"#).ok())
+        .as_ref()
+    else {
+        return std::borrow::Cow::Borrowed(content);
+    };
+    let moves = folder_moves(content);
+    let mut out = String::with_capacity(content.len());
+    let mut offset = 0;
+    for found in pwd_path.captures_iter(content) {
+        let (Some(whole), Some(rest)) = (found.get(0), found.get(1)) else {
+            continue;
+        };
+        let read = below_working_directory(
+            format!("$PWD/{}", rest.as_str()),
+            folder_at(&moves, whole.start()),
+        );
+        if read.starts_with('$') {
+            continue;
+        }
+        out.push_str(&content[offset..whole.start()]);
+        out.push_str(&read);
+        offset = whole.end();
+    }
+    out.push_str(&content[offset..]);
+    // A value the line gives `PWD` itself is not the folder it stands in.
+    if offset == 0 || out.contains("PWD") {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// The line with every `$NAME` of a name it sets replaced by the value in
 /// effect where it is used, when that changes it: at most one reading.
 /// Empty when nothing is read in, or the values grow past eight times the
