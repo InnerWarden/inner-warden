@@ -94,8 +94,14 @@ pub(crate) struct Overwrite {
 /// a `$(...)` or a backquote runs it, and is kept; so is any other
 /// here-document ([`message_heredoc`]), and a body whose delimiter never
 /// closes on a line of its own.
+///
+/// A body is left out only when its `<<` is the only one of the whole
+/// content: a message here-document inside another here-document (`sh
+/// <<'X'`, `cat <<'X' | sh`) is that one's body, and its own body holds
+/// lines the outer shell runs after the outer delimiter. Nor when the line
+/// before it ends in `\` (the git line goes on another command).
 pub(crate) fn without_message_bodies(content: &str) -> std::borrow::Cow<'_, str> {
-    if !content.contains("<<") {
+    if content.matches("<<").count() != 1 {
         return std::borrow::Cow::Borrowed(content);
     }
     let all: Vec<&str> = content.lines().collect();
@@ -105,7 +111,11 @@ pub(crate) fn without_message_bodies(content: &str) -> std::borrow::Cow<'_, str>
     while let Some(line) = all.get(index) {
         index += 1;
         kept.push(line);
-        let Some(heredoc) = message_heredoc(line) else {
+        let continued = index
+            .checked_sub(2)
+            .and_then(|before| all.get(before))
+            .is_some_and(|before| before.trim_end().ends_with('\\'));
+        let Some(heredoc) = message_heredoc(line).filter(|_| !continued) else {
             continue;
         };
         // The shell ends the body at the first line that is the delimiter
@@ -902,6 +912,9 @@ mod tests {
             "git -c core.editor=sh commit -F - <<'EOF'\nmsg\nEOF",
             "git log -F - <<'EOF'\nmsg\nEOF",
             "gh api -F - <<'EOF'\nmsg\nEOF",
+            "sh <<'X'\ngit commit -F - <<'EOF'\nX\nmsg\nEOF",
+            "cat <<'X' | sh\ngit commit -F - <<'EOF'\nX\nmsg\nEOF",
+            "echo \\\ngit commit -F - <<'EOF'\nmsg\nEOF",
         ] {
             assert_eq!(without_message_bodies(line), line, "{line}");
         }
