@@ -302,19 +302,44 @@ fn another_language(script: &str) -> bool {
         .any(|runtime| line.split(['/', ' ', '\t']).any(|word| word == *runtime))
 }
 
-/// Whether a script splits into JavaScript's tokens (a script past the
-/// size that is read counts as one: it is a review by its size).
-fn splits_as_javascript(script: &str) -> bool {
+/// A script handed with no language named, read ([`read_script`]); `None`
+/// for a shell line. A script that does not split into JavaScript's tokens
+/// is a shell line only when it fails the way one does ([`SHELL_SHAPED`]:
+/// `echo it's there`) and, read again with what was left open as plain
+/// punctuation, makes no call this reader judges. A failure a shell line
+/// never makes stays a review, and so does JavaScript this reader does not
+/// split the way the language does (`{} /'/; api.delete()`, an HTML-like
+/// comment) when a call in it is found.
+fn read_unnamed(script: &str) -> Option<Vec<CodeFinding>> {
     if script.len() > MAX_SCRIPT_BYTES {
-        return true;
+        return Some(read_script(script));
     }
     let src: Vec<char> = script.chars().collect();
-    let mut scan = Scan {
-        src: &src,
-        i: 0,
-        bodies: Vec::new(),
+    let why = match Scan::new(&src, false).run(&mut Vec::new(), false, 0) {
+        Err(Unsplit(why)) if SHELL_SHAPED.contains(&why) => why,
+        _ => return Some(read_script(script)),
     };
-    scan.run(&mut Vec::new(), false, 0).is_ok()
+    let mut scan = Scan::new(&src, true);
+    let mut tokens = Vec::new();
+    let mut findings = Findings::default();
+    if let Err(Unsplit(other)) = scan.run(&mut tokens, false, 0) {
+        findings.add(
+            CodeKind::Unreadable,
+            format!("the script cannot be read: {other}"),
+        );
+        return Some(findings.list);
+    }
+    read_tokens(&tokens, &mut findings);
+    hidden_calls(&src, &scan.bodies, &mut findings);
+    if findings.list.is_empty() {
+        return None;
+    }
+    let mut out = vec![CodeFinding {
+        kind: CodeKind::Unreadable,
+        what: format!("the script cannot be read: {why}"),
+    }];
+    out.extend(findings.list);
+    Some(out)
 }
 
 /// The findings of a reading, each once, in the order they were found.
@@ -372,18 +397,21 @@ pub fn read_code_call(tool_name: &str, args: &Value) -> Option<CodeReading> {
     for value in scripts {
         match value {
             // Written in another language, with none named: not this
-            // reader's (the MCP proxy still reads it as a shell line). With
-            // no language named, a script is read as JavaScript only when it
-            // splits into JavaScript's tokens: a shell line (`echo it's
-            // there`) does not, and keeps the reading it had before.
-            Value::String(script)
-                if language.is_none()
-                    && (another_language(script) || !splits_as_javascript(script)) => {}
+            // reader's (the MCP proxy still reads it as a shell line).
+            Value::String(script) if language.is_none() && another_language(script) => {}
             Value::String(script) => {
+                // With no language named, a shell line (`echo it's there`)
+                // keeps the reading it had before ([`read_unnamed`]).
+                let found = if language.is_none() {
+                    read_unnamed(script)
+                } else {
+                    Some(read_script(script))
+                };
+                let Some(found) = found else { continue };
                 if shown.is_empty() {
                     shown.clone_from(script);
                 }
-                for finding in read_script(script) {
+                for finding in found {
                     findings.add(finding.kind, finding.what);
                 }
             }
@@ -516,6 +544,22 @@ enum Tok {
 /// Why a script could not be split into tokens.
 struct Unsplit(&'static str);
 
+/// A string left open.
+const STRING_OPEN: &str = "a string is not closed";
+/// A regular expression left open.
+const REGEX_OPEN: &str = "a regular expression is not closed";
+/// A `/*` comment left open.
+const COMMENT_OPEN: &str = "a comment is not closed";
+/// A template left open.
+const TEMPLATE_OPEN: &str = "a template is not closed";
+
+/// The ways a shell line fails to split into JavaScript's tokens: an
+/// apostrophe (`echo it's there`), a `/` or a `/*` of a path
+/// (`grep /x`, `rm build/*`), a backtick left open. A shell line never
+/// writes an escape in a name, an escape that is not one, or templates
+/// nested past the most read.
+const SHELL_SHAPED: &[&str] = &[STRING_OPEN, REGEX_OPEN, COMMENT_OPEN, TEMPLATE_OPEN];
+
 /// Keywords after which a `/` starts a regular expression.
 const REGEX_AFTER_WORDS: &[&str] = &[
     "return",
@@ -591,7 +635,7 @@ fn hex_digits(src: &[char], i: &mut usize, count: usize) -> Result<u32, Unsplit>
 /// The escape after a backslash in a string or template, at `*i`.
 fn escaped(src: &[char], i: &mut usize) -> Result<Escape, Unsplit> {
     let Some(&e) = src.get(*i) else {
-        return Err(Unsplit("a string is not closed"));
+        return Err(Unsplit(STRING_OPEN));
     };
     *i += 1;
     let hidden = |value: u32| char::from_u32(value).map_or(Escape::Unknown, Escape::Hidden);
@@ -656,9 +700,20 @@ struct Scan<'a> {
     src: &'a [char],
     i: usize,
     bodies: Vec<(usize, usize)>,
+    /// Read what is left open as plain punctuation ([`Scan::recover`]).
+    lenient: bool,
 }
 
-impl Scan<'_> {
+impl<'a> Scan<'a> {
+    fn new(src: &'a [char], lenient: bool) -> Self {
+        Self {
+            src,
+            i: 0,
+            bodies: Vec::new(),
+            lenient,
+        }
+    }
+
     /// Split from `self.i` into `tokens`. In a substitution of a template
     /// (`in_substitution`), stop after the `}` that closes it.
     fn run(
@@ -700,132 +755,24 @@ impl Scan<'_> {
             }
             if c == '/' && next == Some('*') {
                 self.i += 2;
-                let start = self.i;
-                loop {
-                    if self.i + 1 >= src.len() {
-                        return Err(Unsplit("a comment is not closed"));
-                    }
-                    if src[self.i] == '*' && src[self.i + 1] == '/' {
-                        self.bodies.push((start, self.i));
-                        self.i += 2;
-                        break;
-                    }
-                    self.i += 1;
-                }
+                self.recover(tokens, "/*", Self::block_comment)?;
                 continue;
             }
             if c == '/' && regex_may_start(tokens, control_closed == Some(tokens.len())) {
                 self.i += 1;
-                let start = self.i;
-                let mut class = false;
-                loop {
-                    let Some(&r) = src.get(self.i) else {
-                        return Err(Unsplit("a regular expression is not closed"));
-                    };
-                    self.i += 1;
-                    match r {
-                        '\\' => {
-                            if src.get(self.i).is_none_or(|e| line_end(*e)) {
-                                return Err(Unsplit("a regular expression is not closed"));
-                            }
-                            self.i += 1;
-                        }
-                        '[' => class = true,
-                        ']' => class = false,
-                        '/' if !class => break,
-                        r if line_end(r) => {
-                            return Err(Unsplit("a regular expression is not closed"))
-                        }
-                        _ => {}
-                    }
-                }
-                self.bodies.push((start, self.i - 1));
-                while src.get(self.i).is_some_and(|f| f.is_ascii_alphabetic()) {
-                    self.i += 1;
-                }
-                tokens.push(Tok::Str {
-                    text: String::new(),
-                    plain: true,
-                    template: false,
-                });
+                self.recover(tokens, "/", Self::regex)?;
                 continue;
             }
             if c == '"' || c == '\'' {
                 self.i += 1;
-                let start = self.i;
-                let mut text = String::new();
-                let mut plain = true;
-                loop {
-                    let Some(&s) = src.get(self.i) else {
-                        return Err(Unsplit("a string is not closed"));
-                    };
-                    self.i += 1;
-                    if s == c {
-                        break;
-                    }
-                    match s {
-                        '\\' => match escaped(src, &mut self.i)? {
-                            Escape::Char(ch) => text.push(ch),
-                            Escape::Hidden(ch) => {
-                                text.push(ch);
-                                plain = false;
-                            }
-                            Escape::Unknown => plain = false,
-                            Escape::Continuation => {}
-                        },
-                        '\n' | '\r' => return Err(Unsplit("a string is not closed")),
-                        other => text.push(other),
-                    }
-                }
-                self.bodies.push((start, self.i - 1));
-                tokens.push(Tok::Str {
-                    text,
-                    plain,
-                    template: false,
-                });
+                self.recover(tokens, if c == '"' { "\"" } else { "'" }, |scan| {
+                    scan.string(c)
+                })?;
                 continue;
             }
             if c == '`' {
                 self.i += 1;
-                let mut part = self.i;
-                let mut text = String::new();
-                let mut plain = true;
-                let mut substituted = Vec::new();
-                loop {
-                    let Some(&s) = src.get(self.i) else {
-                        return Err(Unsplit("a template is not closed"));
-                    };
-                    self.i += 1;
-                    match s {
-                        '`' => break,
-                        '\\' => match escaped(src, &mut self.i)? {
-                            Escape::Char(ch) => text.push(ch),
-                            Escape::Hidden(ch) => {
-                                text.push(ch);
-                                plain = false;
-                            }
-                            Escape::Unknown => plain = false,
-                            Escape::Continuation => {}
-                        },
-                        '$' if src.get(self.i) == Some(&'{') => {
-                            self.bodies.push((part, self.i - 1));
-                            self.i += 1;
-                            plain = false;
-                            substituted.push(Tok::Punct('('));
-                            self.run(&mut substituted, true, depth + 1)?;
-                            substituted.push(Tok::Punct(')'));
-                            part = self.i;
-                        }
-                        other => text.push(other),
-                    }
-                }
-                self.bodies.push((part, self.i - 1));
-                tokens.extend(substituted);
-                tokens.push(Tok::Str {
-                    text,
-                    plain,
-                    template: true,
-                });
+                self.recover(tokens, "`", |scan| scan.template(depth))?;
                 continue;
             }
             if c == '\\' {
@@ -891,9 +838,168 @@ impl Scan<'_> {
             }
         }
         if in_substitution {
-            return Err(Unsplit("a template is not closed"));
+            return Err(Unsplit(TEMPLATE_OPEN));
         }
         Ok(())
+    }
+
+    /// Read with `read` from `self.i`, just past `opener`. In a lenient
+    /// scan, a quote, a regular expression, a comment or a template left open
+    /// ([`SHELL_SHAPED`]) is read again as plain punctuation, and the scan
+    /// goes on just past it.
+    fn recover(
+        &mut self,
+        tokens: &mut Vec<Tok>,
+        opener: &str,
+        read: impl FnOnce(&mut Self) -> Result<Vec<Tok>, Unsplit>,
+    ) -> Result<(), Unsplit> {
+        let (at, bodies) = (self.i, self.bodies.len());
+        match read(self) {
+            Ok(read) => {
+                tokens.extend(read);
+                Ok(())
+            }
+            Err(Unsplit(why)) if self.lenient && SHELL_SHAPED.contains(&why) => {
+                self.i = at;
+                self.bodies.truncate(bodies);
+                tokens.extend(opener.chars().map(Tok::Punct));
+                Ok(())
+            }
+            Err(unsplit) => Err(unsplit),
+        }
+    }
+
+    /// A `/* ... */` comment, from just past its `/*`.
+    fn block_comment(&mut self) -> Result<Vec<Tok>, Unsplit> {
+        let src = self.src;
+        let start = self.i;
+        loop {
+            if self.i + 1 >= src.len() {
+                return Err(Unsplit(COMMENT_OPEN));
+            }
+            if src[self.i] == '*' && src[self.i + 1] == '/' {
+                self.bodies.push((start, self.i));
+                self.i += 2;
+                return Ok(Vec::new());
+            }
+            self.i += 1;
+        }
+    }
+
+    /// A regular expression, from just past its `/`.
+    fn regex(&mut self) -> Result<Vec<Tok>, Unsplit> {
+        let src = self.src;
+        let start = self.i;
+        let mut class = false;
+        loop {
+            let Some(&r) = src.get(self.i) else {
+                return Err(Unsplit(REGEX_OPEN));
+            };
+            self.i += 1;
+            match r {
+                '\\' => {
+                    if src.get(self.i).is_none_or(|e| line_end(*e)) {
+                        return Err(Unsplit(REGEX_OPEN));
+                    }
+                    self.i += 1;
+                }
+                '[' => class = true,
+                ']' => class = false,
+                '/' if !class => break,
+                r if line_end(r) => return Err(Unsplit(REGEX_OPEN)),
+                _ => {}
+            }
+        }
+        self.bodies.push((start, self.i - 1));
+        while src.get(self.i).is_some_and(|f| f.is_ascii_alphabetic()) {
+            self.i += 1;
+        }
+        Ok(vec![Tok::Str {
+            text: String::new(),
+            plain: true,
+            template: false,
+        }])
+    }
+
+    /// A string, from just past its `quote`.
+    fn string(&mut self, quote: char) -> Result<Vec<Tok>, Unsplit> {
+        let src = self.src;
+        let start = self.i;
+        let mut text = String::new();
+        let mut plain = true;
+        loop {
+            let Some(&s) = src.get(self.i) else {
+                return Err(Unsplit(STRING_OPEN));
+            };
+            self.i += 1;
+            if s == quote {
+                break;
+            }
+            match s {
+                '\\' => match escaped(src, &mut self.i)? {
+                    Escape::Char(ch) => text.push(ch),
+                    Escape::Hidden(ch) => {
+                        text.push(ch);
+                        plain = false;
+                    }
+                    Escape::Unknown => plain = false,
+                    Escape::Continuation => {}
+                },
+                '\n' | '\r' => return Err(Unsplit(STRING_OPEN)),
+                other => text.push(other),
+            }
+        }
+        self.bodies.push((start, self.i - 1));
+        Ok(vec![Tok::Str {
+            text,
+            plain,
+            template: false,
+        }])
+    }
+
+    /// A template, from just past its backtick: the tokens of its
+    /// substitutions, each in parentheses, then the template.
+    fn template(&mut self, depth: usize) -> Result<Vec<Tok>, Unsplit> {
+        let src = self.src;
+        let mut part = self.i;
+        let mut text = String::new();
+        let mut plain = true;
+        let mut substituted = Vec::new();
+        loop {
+            let Some(&s) = src.get(self.i) else {
+                return Err(Unsplit(TEMPLATE_OPEN));
+            };
+            self.i += 1;
+            match s {
+                '`' => break,
+                '\\' => match escaped(src, &mut self.i)? {
+                    Escape::Char(ch) => text.push(ch),
+                    Escape::Hidden(ch) => {
+                        text.push(ch);
+                        plain = false;
+                    }
+                    Escape::Unknown => plain = false,
+                    Escape::Continuation => {}
+                },
+                '$' if src.get(self.i) == Some(&'{') => {
+                    self.bodies.push((part, self.i - 1));
+                    self.i += 1;
+                    plain = false;
+                    substituted.push(Tok::Punct('('));
+                    self.run(&mut substituted, true, depth + 1)?;
+                    substituted.push(Tok::Punct(')'));
+                    part = self.i;
+                }
+                other => text.push(other),
+            }
+        }
+        self.bodies.push((part, self.i - 1));
+        substituted.push(Tok::Str {
+            text,
+            plain,
+            template: true,
+        });
+        Ok(substituted)
     }
 }
 
@@ -1348,12 +1454,29 @@ fn assignments(tokens: &[Tok]) -> Vec<(String, usize)> {
 
 /// Whether the value at `value` lives in the script ([`local_receiver`]):
 /// `new Map()`, `crypto.createHash("sha256")`, `document.querySelector("p")`,
-/// `Object.create(null)`, `require("crypto")`, or a name in `locals`.
+/// `Object.create(null)`, `require("crypto")`, or a name in `locals`. A
+/// value joined to another (`a || b`, `a ?? b`, `a && b`) lives in the
+/// script only when both do; one that picks (`c ? a : b`) or computes with
+/// another (`a | b`) does not.
 fn value_is_local(
     tokens: &[Tok],
     matches: &[usize],
     value: usize,
     locals: &std::collections::HashSet<String>,
+) -> bool {
+    value_is_local_at(tokens, matches, value, locals, 0)
+}
+
+/// The most values joined by `||`, `??` or `&&` [`value_is_local`] goes
+/// through.
+const MAX_JOINED_VALUES: usize = 16;
+
+fn value_is_local_at(
+    tokens: &[Tok],
+    matches: &[usize],
+    value: usize,
+    locals: &std::collections::HashSet<String>,
+    joined: usize,
 ) -> bool {
     let mut k = value;
     let constructed = matches!(tokens.get(k), Some(Tok::Ident(w)) if w == "new");
@@ -1363,9 +1486,6 @@ fn value_is_local(
     let Some(Tok::Ident(root)) = tokens.get(k) else {
         return false;
     };
-    if constructed {
-        return LOCAL_CONSTRUCTORS.contains(&root.as_str());
-    }
     let mut chain = vec![root.clone()];
     let mut at = k + 1;
     for _ in 0..64 {
@@ -1384,15 +1504,32 @@ fn value_is_local(
             _ => break,
         }
     }
-    let made = (locals.contains(root)
-        || MAKER_ROOTS.contains(&root.as_str())
-        || LOCAL_MAKERS.contains(&root.as_str()))
-        && chain.iter().any(|m| LOCAL_MAKERS.contains(&m.as_str()));
-    locals.contains(root)
-        || LOCAL_ROOTS.contains(&root.as_str())
-        || made
-        || (chain.len() == 2 && root == "Object" && chain[1] == "create")
-        || (chain.len() == 1 && requires_crypto(tokens, k))
+    let local = if constructed {
+        LOCAL_CONSTRUCTORS.contains(&root.as_str())
+    } else {
+        let made = (locals.contains(root)
+            || MAKER_ROOTS.contains(&root.as_str())
+            || LOCAL_MAKERS.contains(&root.as_str()))
+            && chain.iter().any(|m| LOCAL_MAKERS.contains(&m.as_str()));
+        locals.contains(root)
+            || LOCAL_ROOTS.contains(&root.as_str())
+            || made
+            || (chain.len() == 2 && root == "Object" && chain[1] == "create")
+            || (chain.len() == 1 && requires_crypto(tokens, k))
+    };
+    if !local {
+        return false;
+    }
+    match (tokens.get(at), tokens.get(at + 1)) {
+        (Some(Tok::Punct('|')), Some(Tok::Punct('|')))
+        | (Some(Tok::Punct('?')), Some(Tok::Punct('?')))
+        | (Some(Tok::Punct('&')), Some(Tok::Punct('&'))) => {
+            joined < MAX_JOINED_VALUES
+                && value_is_local_at(tokens, matches, at + 2, locals, joined + 1)
+        }
+        (Some(Tok::Punct('?' | '|' | '&' | ':')), _) => false,
+        _ => true,
+    }
 }
 
 /// Whether the tokens at `at` are `require("crypto")` or
@@ -1465,8 +1602,9 @@ fn parameter_names(tokens: &[Tok], open: usize, close: usize) -> Vec<String> {
 }
 
 /// The parameters of the callback that starts at `at` (`e => ...`,
-/// `(e, i) => ...`, `function (e) {...}`, any of them `async`).
-fn callback_parameters(tokens: &[Tok], matches: &[usize], mut at: usize) -> Vec<String> {
+/// `(e, i) => ...`, `function (e) {...}`, any of them `async`), and the
+/// index of the first token of its body.
+fn callback_parameters(tokens: &[Tok], matches: &[usize], mut at: usize) -> (Vec<String>, usize) {
     if matches!(tokens.get(at), Some(Tok::Ident(w)) if w == "async") {
         at += 1;
     }
@@ -1478,8 +1616,10 @@ fn callback_parameters(tokens: &[Tok], matches: &[usize], mut at: usize) -> Vec<
                 at + 1
             };
             match (tokens.get(open), matched(matches, open)) {
-                (Some(Tok::Punct('(')), Some(close)) => parameter_names(tokens, open, close),
-                _ => Vec::new(),
+                (Some(Tok::Punct('(')), Some(close)) => {
+                    (parameter_names(tokens, open, close), close + 1)
+                }
+                _ => (Vec::new(), at),
             }
         }
         Some(Tok::Ident(name))
@@ -1488,7 +1628,7 @@ fn callback_parameters(tokens: &[Tok], matches: &[usize], mut at: usize) -> Vec<
                 (Some(Tok::Punct('=')), Some(Tok::Punct('>')))
             ) =>
         {
-            vec![name.clone()]
+            (vec![name.clone()], at + 3)
         }
         Some(Tok::Punct('(')) => match matched(matches, at) {
             Some(close)
@@ -1497,12 +1637,200 @@ fn callback_parameters(tokens: &[Tok], matches: &[usize], mut at: usize) -> Vec<
                     (Some(Tok::Punct('=')), Some(Tok::Punct('>')))
                 ) =>
             {
-                parameter_names(tokens, at, close)
+                (parameter_names(tokens, at, close), close + 3)
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), at),
         },
-        _ => Vec::new(),
+        _ => (Vec::new(), at),
     }
+}
+
+/// Every place a name is bound, in order: a `const`, `let` or `var` (each
+/// name of a pattern after one), a `function` or `class` name, every name
+/// in the parameters of an arrow, a `function`, a method or a `catch`, and
+/// the name of a `for (x of ...)` or `for (x in ...)`. A name in a default
+/// value counts too: a binding found where there is none only ends a
+/// scoped name early ([`scoped_locals`]).
+fn bindings(tokens: &[Tok], matches: &[usize]) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    // A group inside one already gone through is not gone through again.
+    let mut covered_until = 0usize;
+    let mut names_in = |out: &mut Vec<(String, usize)>, open: usize, close: usize| {
+        if open < covered_until {
+            return;
+        }
+        covered_until = close;
+        for (k, tok) in tokens.iter().enumerate().take(close).skip(open + 1) {
+            if let Tok::Ident(name) = tok {
+                out.push((name.clone(), k));
+            }
+        }
+    };
+    for (k, tok) in tokens.iter().enumerate() {
+        let after_dot = is_dot(k.checked_sub(1).and_then(|p| tokens.get(p)));
+        match tok {
+            Tok::Ident(word) if !after_dot && matches!(word.as_str(), "const" | "let" | "var") => {
+                match tokens.get(k + 1) {
+                    Some(Tok::Ident(name)) => out.push((name.clone(), k + 1)),
+                    Some(Tok::Punct('{' | '[')) => {
+                        if let Some(close) = matched(matches, k + 1) {
+                            names_in(&mut out, k + 1, close);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Tok::Ident(word) if !after_dot && matches!(word.as_str(), "function" | "class") => {
+                if let Some(Tok::Ident(name)) = tokens.get(k + 1) {
+                    out.push((name.clone(), k + 1));
+                }
+            }
+            Tok::Ident(name)
+                if matches!(
+                    (tokens.get(k + 1), tokens.get(k + 2)),
+                    (Some(Tok::Punct('=')), Some(Tok::Punct('>')))
+                ) =>
+            {
+                out.push((name.clone(), k));
+            }
+            Tok::Ident(name)
+                if matches!(
+                    k.checked_sub(1).and_then(|p| tokens.get(p)),
+                    Some(Tok::Punct('('))
+                ) && matches!(tokens.get(k + 1), Some(Tok::Ident(w)) if w == "of" || w == "in") =>
+            {
+                out.push((name.clone(), k));
+            }
+            Tok::Punct('(') => {
+                let Some(close) = matched(matches, k) else {
+                    continue;
+                };
+                let arrow = matches!(
+                    (tokens.get(close + 1), tokens.get(close + 2)),
+                    (Some(Tok::Punct('=')), Some(Tok::Punct('>')))
+                );
+                // `function (e)`, `function f(e)`, `catch (e)`, a method
+                // `f(e) { ... }` (not a statement's head: `if (e) {`).
+                let before = k.checked_sub(1).and_then(|p| tokens.get(p));
+                let two_before = k.checked_sub(2).and_then(|p| tokens.get(p));
+                let headed = match before {
+                    Some(Tok::Ident(w)) if w == "function" || w == "catch" => true,
+                    Some(Tok::Ident(_)) if matches!(two_before, Some(Tok::Ident(w)) if w == "function") => {
+                        true
+                    }
+                    Some(Tok::Ident(w)) => {
+                        !CONTROL_WORDS.contains(&w.as_str())
+                            && w != "switch"
+                            && matches!(tokens.get(close + 1), Some(Tok::Punct('{')))
+                    }
+                    _ => false,
+                };
+                if arrow || headed {
+                    names_in(&mut out, k, close);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Makers of the page's elements: what they return, and each item of it,
+/// is an element of the page.
+const DOM_MAKERS: &[&str] = &[
+    "querySelector",
+    "querySelectorAll",
+    "getElementById",
+    "getElementsByClassName",
+    "getElementsByTagName",
+    "getElementsByName",
+    "closest",
+];
+
+/// Where a value made of the page's elements that starts at `at` ends: a
+/// [`DOM_MAKERS`] call on `document`, on a name in `dom_names`, or on a
+/// name that holds an element where it is (`scoped`), or such a name
+/// alone, read up to `stop` at most. `None` for any other value.
+fn dom_value_end(
+    tokens: &[Tok],
+    matches: &[usize],
+    at: usize,
+    dom_names: &std::collections::HashSet<String>,
+    scoped: &[ScopedLocal],
+    stop: Option<usize>,
+) -> Option<usize> {
+    let Some(Tok::Ident(root)) = tokens.get(at) else {
+        return None;
+    };
+    let named = dom_names.contains(root)
+        || scoped
+            .iter()
+            .any(|(name, start, end)| name == root && at > *start && at < *end);
+    if root != "document" && !named {
+        return None;
+    }
+    let mut k = at + 1;
+    let mut made = false;
+    let mut members = 0;
+    for _ in 0..64 {
+        if stop == Some(k) {
+            break;
+        }
+        match tokens.get(k) {
+            Some(Tok::Punct('.') | Tok::OptChain) => match tokens.get(k + 1) {
+                Some(Tok::Ident(member)) => {
+                    made |= DOM_MAKERS.contains(&member.as_str());
+                    members += 1;
+                    k += 2;
+                }
+                _ => return None,
+            },
+            Some(Tok::Punct('(' | '[')) => k = matched(matches, k)? + 1,
+            _ => break,
+        }
+    }
+    (made || (named && members == 0 && k == at + 1)).then_some(k)
+}
+
+/// The names bound once, and nowhere else bound, to a value made of the
+/// page's elements, whole (`const ads = document.querySelectorAll(".ad");`).
+fn dom_names(
+    tokens: &[Tok],
+    matches: &[usize],
+    assigned: &[(String, usize)],
+    bound_at: &std::collections::HashMap<&str, Vec<usize>>,
+) -> std::collections::HashSet<String> {
+    let mut times: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (name, _) in assigned {
+        *times.entry(name.as_str()).or_default() += 1;
+    }
+    let mut names = std::collections::HashSet::new();
+    for (name, value) in assigned {
+        if times.get(name.as_str()) != Some(&1) {
+            continue;
+        }
+        let awaited = matches!(
+            value.checked_sub(1).and_then(|p| tokens.get(p)),
+            Some(Tok::Ident(w)) if w == "await"
+        );
+        let at_name = value.saturating_sub(if awaited { 3 } else { 2 });
+        if bound_at
+            .get(name.as_str())
+            .is_some_and(|places| places.iter().any(|k| *k != at_name))
+        {
+            continue;
+        }
+        let whole = dom_value_end(tokens, matches, *value, &names, &[], None).is_some_and(|end| {
+            matches!(
+                tokens.get(end),
+                None | Some(Tok::Punct(';' | ',' | ')' | '}')) | Some(Tok::Ident(_))
+            )
+        });
+        if whole {
+            names.insert(name.clone());
+        }
+    }
+    names
 }
 
 /// The end of the statement that starts at `at`: its block's `}`, or the
@@ -1527,41 +1855,57 @@ fn statement_end(tokens: &[Tok], matches: &[usize], at: usize) -> usize {
     last
 }
 
-/// The names that hold an item of a value that lives in the script, where
-/// they do: the parameters of a callback handed to [`ITEM_METHODS`] on such a
-/// value (`document.querySelectorAll(".ad").forEach((e) => e.remove())`),
-/// inside the call, and the name of a `for (const x of <local>)`, inside the
-/// loop. A name assigned again where it holds the item does not count.
+/// The names that hold an element of the page, where they do: the
+/// parameters of a callback handed to [`ITEM_METHODS`] on a value made of
+/// the page's elements ([`dom_value_end`]:
+/// `document.querySelectorAll(".ad").forEach((e) => e.remove())`), inside
+/// the callback, and the name of a `for (const x of <such a value>)`,
+/// inside the loop. The items of a `Map`, a `Set`, an array or an object
+/// are not: the script can put anything in one. A name assigned again
+/// where it holds the item does not count, and its scope ends where a
+/// name of its own is bound again inside it ([`bindings`]).
 fn scoped_locals(
     tokens: &[Tok],
     matches: &[usize],
-    locals: &std::collections::HashSet<String>,
     assigned: &[(String, usize)],
 ) -> Vec<ScopedLocal> {
+    let bound = bindings(tokens, matches);
     let mut values_of: std::collections::HashMap<&str, Vec<usize>> =
         std::collections::HashMap::new();
     for (name, value) in assigned {
         values_of.entry(name.as_str()).or_default().push(*value);
     }
+    let mut bound_at: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (name, at) in &bound {
+        bound_at.entry(name.as_str()).or_default().push(*at);
+    }
+    let dom = dom_names(tokens, matches, assigned, &bound_at);
     let mut scoped: Vec<ScopedLocal> = Vec::new();
     for (at, tok) in tokens.iter().enumerate() {
         if scoped.len() >= MAX_SCOPED_LOCALS {
             break;
         }
         let Tok::Ident(word) = tok else { continue };
-        let mut found: Vec<ScopedLocal> = Vec::new();
+        // Each: the name, where its scope starts, where its body starts, and
+        // where its scope ends.
+        let mut found: Vec<(String, usize, usize, usize)> = Vec::new();
         if ITEM_METHODS.contains(&word.as_str())
             && at > 0
             && is_dot(tokens.get(at - 1))
             && matches!(tokens.get(at + 1), Some(Tok::Punct('(')))
         {
-            let (chain, root) = chain_before(tokens, matches, at - 1);
+            let (_, root) = chain_before(tokens, matches, at - 1);
             let Some(close) = matched(matches, at + 1) else {
                 continue;
             };
-            if local_receiver(tokens, &chain, root, locals, &scoped) {
-                for name in callback_parameters(tokens, matches, at + 2) {
-                    found.push((name, at + 1, close));
+            let receiver = root.is_some_and(|r| {
+                dom_value_end(tokens, matches, r, &dom, &scoped, Some(at - 1)) == Some(at - 1)
+            });
+            if receiver {
+                let (names, body) = callback_parameters(tokens, matches, at + 2);
+                for name in names {
+                    found.push((name, at + 1, body, close));
                 }
             }
         }
@@ -1582,29 +1926,35 @@ fn scoped_locals(
                 (tokens.get(k), tokens.get(k + 1))
             {
                 let from = k + 2;
-                let item_of_local = of == "of"
-                    && from < close
-                    && (value_is_local(tokens, matches, from, locals)
-                        || matches!(tokens.get(from), Some(Tok::Ident(r))
-                            if scoped.iter().any(|(n, s, e)| n == r && from > *s && from < *e)));
-                if item_of_local {
+                if of == "of"
+                    && dom_value_end(tokens, matches, from, &dom, &scoped, Some(close))
+                        == Some(close)
+                {
                     found.push((
                         name.clone(),
+                        close,
                         close,
                         statement_end(tokens, matches, close + 1),
                     ));
                 }
             }
         }
-        for (name, start, end) in found {
+        for (name, start, body, end) in found {
             // The values of a name are in the order of the script.
             let assigned_inside = values_of.get(name.as_str()).is_some_and(|values| {
                 let after = values.partition_point(|value| *value <= start);
                 values.get(after).is_some_and(|value| *value < end)
             });
-            if !assigned_inside {
-                scoped.push((name, start, end));
+            if assigned_inside {
+                continue;
             }
+            // A name of its own bound again inside (a parameter, a `catch`,
+            // a `const`): the scope ends there.
+            let end = bound_at
+                .get(name.as_str())
+                .and_then(|places| places.iter().find(|k| **k >= body && **k < end).copied())
+                .unwrap_or(end);
+            scoped.push((name, start, end));
         }
     }
     scoped
@@ -1774,11 +2124,7 @@ pub fn read_script(script: &str) -> Vec<CodeFinding> {
         return findings.list;
     }
     let src: Vec<char> = script.chars().collect();
-    let mut scan = Scan {
-        src: &src,
-        i: 0,
-        bodies: Vec::new(),
-    };
+    let mut scan = Scan::new(&src, false);
     let mut tokens = Vec::new();
     if let Err(Unsplit(why)) = scan.run(&mut tokens, false, 0) {
         findings.add(
@@ -1798,7 +2144,7 @@ fn read_tokens(tokens: &[Tok], findings: &mut Findings) {
     let roles = destructured_keys(tokens, &matches);
     let assigned_list = assignments(tokens);
     let locals = local_names(tokens, &matches, &assigned_list);
-    let scoped = scoped_locals(tokens, &matches, &locals, &assigned_list);
+    let scoped = scoped_locals(tokens, &matches, &assigned_list);
     let mut assigned: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
     for (name, value) in &assigned_list {
@@ -2609,5 +2955,115 @@ mod tests {
             read_code_call("mcp__sh__execute", &js).unwrap().findings[0].kind,
             CodeKind::Destructive
         );
+    }
+
+    /// FAILS ON REVERT: with no language named, any script this reader did
+    /// not split was taken for a shell line and allowed, JavaScript it does
+    /// not split the way the language does among them.
+    #[test]
+    fn javascript_the_reader_does_not_split_is_still_a_review() {
+        let nested = format!(
+            "{}x{}; await cloudflare.zones.delete({{}})",
+            "`${".repeat(34),
+            "}`".repeat(34)
+        );
+        let scripts = [
+            "await cloudflare.zones.delete({ zone_id: \"z\" });".to_string(),
+            "{} /'/; await cloudflare.zones.delete({})".to_string(),
+            "String.raw`\\u{zz}`; await cloudflare.zones.delete({})".to_string(),
+            nested,
+            "x <!-- '\nawait cloudflare.zones.delete({})".to_string(),
+            "const z = cloudflare.zones; await z.delete({ zone_id: \"z\" })".to_string(),
+            "x <!-- '\r\nawait cloudflare.zones.delete({})".to_string(),
+            "/* it's */ x = 1 /'; await cloudflare.zones.delete({})".to_string(),
+            "await api.delete(\"\\xq\")".to_string(),
+            "a\\u0062; await cloudflare.zones.delete({})".to_string(),
+        ];
+        for script in &scripts {
+            for tool in [
+                "execute",
+                "codemode",
+                "run_code",
+                "mcp__cloudflare__execute",
+            ] {
+                let reading = read_code_call(tool, &serde_json::json!({ "code": script }))
+                    .unwrap_or_else(|| panic!("{tool}: {script}"));
+                assert!(!reading.findings.is_empty(), "{tool}: {script}");
+                let payload =
+                    serde_json::json!({"tool_name": tool, "tool_input": {"code": script}});
+                let (_, verdict) = hook_verdict(&payload).unwrap_or_else(|| panic!("{script}"));
+                assert_eq!(verdict["recommendation"], "review", "{script}");
+            }
+        }
+        // A shell line still keeps its reading.
+        for line in [
+            "ls -la build && echo it's there",
+            "rm -rf build/*",
+            "cat log | grep /var/x",
+            "echo don't; git status",
+            "find . -name '*.log",
+            "docker rm $(docker ps -aq) && echo it's gone",
+            "echo `date",
+        ] {
+            let reading =
+                read_code_call("execute", &serde_json::json!({ "script": line })).unwrap();
+            assert!(
+                reading.findings.is_empty(),
+                "{line}: {:?}",
+                reading.findings
+            );
+        }
+    }
+
+    /// FAILS ON REVERT: the items of a `Map`, a `Set` or an array were
+    /// local, a scoped name went on past a binding of its own inside it, and
+    /// a local value joined to the API by `||` was local.
+    #[test]
+    fn only_the_page_elements_are_local_items() {
+        for script in [
+            "new Set([cloudflare.zones]).forEach(z => z.delete({}))",
+            "for (const z of new Set([api])) { await z.delete({}) }",
+            "new Map([[\"a\", api]]).forEach(v => v.delete({}))",
+            "new Array(api).forEach(z => z.delete({}))",
+            "const s = new Set(); s.add(api); s.forEach(z => z.delete({}))",
+            "const a = []; a.push(api); for (const z of a) { await z.delete({}) }",
+            "document.querySelectorAll(\"p\").forEach((e) => { [api].forEach((e) => e.delete({})); })",
+            "document.querySelectorAll(\"p\").forEach((e) => { for (const e of [api]) { e.delete({}) } })",
+            "document.querySelectorAll(\"p\").forEach((e) => { const g = (e) => e.delete({}); g(api); })",
+            "document.querySelectorAll(\"p\").forEach((e) => { try { x() } catch (e) { e.delete({}) } })",
+            "document.querySelectorAll(\"p\").forEach((el) => { ((el) => el.delete({}))(api); })",
+            "document.querySelectorAll(\"p\").forEach((e) => { function f(e) { return e.delete({}) } f(api); })",
+            "document.querySelectorAll(\"p\").forEach((e) => { const h = ({ e }) => e.delete({}); h({ e: api }); })",
+            "const c = require(\"crypto\") || cloudflare.zones; c.delete({})",
+            "const s = new Set(); s.add(api); for (const z of s) { await z.delete({}) }",
+            "const a = new Array(); a.push(api); a.forEach(z => z.delete({}))",
+            "Object.values({ a: api }).forEach(z => z.delete({}))",
+            "const o = new Object(); o.a = api; Object.values(o).forEach(z => z.delete({}))",
+            "const c = require(\"crypto\") ?? cloudflare.zones; c.delete({})",
+            "const c = new Map() && cloudflare.zones; c.delete({})",
+            "const c = x ? new Map() : cloudflare.zones; c.delete({})",
+            "const els = document.querySelectorAll(\"p\"); function f(els) { els.forEach(e => e.delete({})) } f([api])",
+            "let els = document.querySelectorAll(\"p\"); els = [api]; els.forEach(e => e.delete({}))",
+            "(api || document.querySelectorAll(\"p\")).forEach(e => e.delete({}))",
+            "for (const e of document.querySelectorAll(\"p\") || [api]) { e.delete({}) }",
+        ] {
+            assert!(
+                read_script(script).iter().any(|f| f.kind == CodeKind::Destructive),
+                "{script}: {:?}",
+                read_script(script)
+            );
+        }
+        // The page's elements are still local.
+        for script in [
+            "document.querySelectorAll(\".ad\").forEach((e) => e.remove())",
+            "const ads = document.querySelectorAll(\".ad\"); ads.forEach((e) => e.remove());",
+            "for (const el of document.getElementsByClassName(\"ad\")) { el.classList.remove(\"x\"); el.remove(); }",
+            "document.querySelectorAll(\"ul\").forEach((ul) => ul.querySelectorAll(\"li\").forEach((li) => li.remove()))",
+            "document.querySelectorAll(\"p\").forEach((e) => { console.log(e); e.remove(); })",
+            "const s = new Set([1]); s.delete(1); const m = new Map(); m.delete(\"a\");",
+            "const h = require(\"crypto\") || require(\"node:crypto\"); h.createHash(\"sha256\");",
+        ] {
+            assert_eq!(read_script(script), Vec::new(), "{script}");
+        }
     }
 }

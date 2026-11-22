@@ -32,11 +32,18 @@ none (Hermes Agent's `execute_code`, which runs Python) is read only when an
 argument says JavaScript; a script that starts with a `#` comment or a `#!`
 line for another interpreter is not read as JavaScript, nor is one named in
 `language`, `lang`, `runtime`, `interpreter` or `shell` as another
-language. With no language named, a script is read as JavaScript only when
-it splits into JavaScript's tokens; a shell line (`echo it's there`) keeps
-the reading it had before. The items of a page's elements (a callback of
-`forEach` or `map` on them, `for (const el of ...)`) and Node's
-`require("crypto")` are the script's own values too. The HTTP method behind
+language. With no language named, a script that does not split into
+JavaScript's tokens is taken for a shell line (`echo it's there`, which
+keeps the reading it had before) only when it fails the way a shell line
+does (a quote, a regular expression, a comment or a template left open) and,
+read again with what was left open as plain punctuation, makes no call the
+reader judges; any other failure (an escape in a name, an escape that is not
+one, templates nested too deep) is a review. The items of a page's elements
+(a callback of `forEach` or `map` on `document.querySelectorAll(...)` and
+the like, `for (const el of ...)`), until a name of their own is bound again
+inside, and Node's `require("crypto")` are the script's own values too; the
+items of a `Map`, a `Set`, an array or an object are not, nor is a value
+joined to another by `||`, `??` or `&&` unless both are local. The HTTP method behind
 a name is followed once per name, at most 32 values; past that, or round a
 loop of names, it counts as chosen at run time. The hook's record
 keeps a long script by its start, size and SHA-256.

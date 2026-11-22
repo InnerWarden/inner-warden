@@ -409,3 +409,61 @@ fn round_two_cases_through_the_hook_and_proxy() {
     let proxied = host.proxy("strict", shell);
     assert!(!proxied.contains("AG-CODE-MODE"), "{proxied}");
 }
+
+/// The third round's cases through the real hook and proxy: JavaScript this
+/// reader does not split is still a review with no language named (a
+/// refusal under `--block-review` and in the proxy's strict mode), and the
+/// items of a `Set`, a `Map` or an array, a name bound again inside, and a
+/// value joined to the API by `||` are read as the API.
+///
+/// FAILS ON REVERT: each of them ran, under `--block-review` too.
+#[test]
+fn round_three_cases_through_the_hook_and_proxy() {
+    let host = Host::new();
+    let nested = format!(
+        "{}x{}; await cloudflare.zones.delete({{}})",
+        "`${".repeat(34),
+        "}`".repeat(34)
+    );
+    let unsplit = [
+        "{} /'/; await cloudflare.zones.delete({ zone_id: \"z\" });".to_string(),
+        "String.raw`\\u{zz}`; await cloudflare.zones.delete({ zone_id: \"z\" });".to_string(),
+        nested,
+        "x <!-- '\nawait cloudflare.zones.delete({ zone_id: \"z\" });".to_string(),
+    ];
+    for code in &unsplit {
+        for tool in [TOOL, "mcp__x__codemode", "mcp__x__run_code"] {
+            let strict = host.hook(&["--agent", "claude-code", "--block-review"], tool, code);
+            assert_eq!(hook_verdict(&strict), "deny", "{tool} {code}: {strict:?}");
+        }
+        let proxied = host.proxy("strict", code);
+        assert_eq!(proxy_verdict(&proxied), "refused", "{code}: {proxied}");
+    }
+    for code in [
+        "new Set([cloudflare.zones]).forEach(z => z.delete({ zone_id: \"z\" }))",
+        "new Map([[\"a\", cloudflare.zones]]).forEach(v => v.delete({ zone_id: \"z\" }))",
+        "const a = []; a.push(cloudflare.zones); a.forEach(z => z.delete({ zone_id: \"z\" }))",
+        "document.querySelectorAll(\"p\").forEach((e) => { [cloudflare.zones].forEach((e) => e.delete({ zone_id: \"z\" })); })",
+        "document.querySelectorAll(\"p\").forEach((e) => { try { x() } catch (e) { e.delete({ zone_id: \"z\" }) } })",
+        "const c = require(\"crypto\") || cloudflare.zones; c.delete({ zone_id: \"z\" })",
+    ] {
+        let strict = host.hook(&["--agent", "claude-code", "--block-review"], TOOL, code);
+        assert_eq!(hook_verdict(&strict), "deny", "{code}: {strict:?}");
+    }
+    // The page's elements and a shell line still run.
+    for code in [
+        "document.querySelectorAll(\".ad\").forEach((e) => e.remove())",
+        "const ads = document.querySelectorAll(\".ad\"); ads.forEach((e) => e.remove());",
+    ] {
+        let strict = host.hook(&["--agent", "claude-code", "--block-review"], TOOL, code);
+        assert_eq!(hook_verdict(&strict), "allow", "{code}: {strict:?}");
+    }
+    for shell in ["ls -la build && echo it's there", "rm -rf build/*"] {
+        let strict = host.hook(
+            &["--agent", "claude-code", "--block-review"],
+            "mcp__sh__execute",
+            shell,
+        );
+        assert_eq!(hook_verdict(&strict), "allow", "{shell}: {strict:?}");
+    }
+}
