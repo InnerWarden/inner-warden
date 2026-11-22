@@ -2433,7 +2433,7 @@ fn flag_value<'a>(
 
 /// Whether `arguments` start agent `program` with no hooks, or without the
 /// user's own settings: Codex with `--disable hooks`, or a `-c` / `--config`
-/// override of `hooks` or `features.hooks`; Hermes with `--safe-mode` or
+/// override of `hooks`, `features.hooks` or `mcp_servers`; Hermes with `--safe-mode` or
 /// `--ignore-user-config`; Claude Code with `--bare`, `--safe-mode` or
 /// `--restricted`, a `--setting-sources` that leaves out `user`, or settings
 /// (`--settings`, `--managed-settings`) that drop the user's hooks
@@ -2470,6 +2470,10 @@ fn agent_flags_drop_its_hook(
                             || key.starts_with("hooks.")
                             || key == "features.hooks"
                             || key.starts_with("features.hooks.")
+                            // A server set on the line runs outside the
+                            // proxy the user's file puts in front of it, and
+                            // the hook takes the file's entry for it.
+                            || crate::mcp_unproxied::codex_setting_names_servers(setting)
                     })
                 })
         }

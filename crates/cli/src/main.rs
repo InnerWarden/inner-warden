@@ -3606,29 +3606,69 @@ fn screen_mcp_call(
         .ok()
         .and_then(|home| mcp_unproxied::config_path_here(&agent, &home));
     let config = config_path.as_deref().and_then(mcp_unproxied::read_config);
+    let agent_process = mcp_unproxied::agent_process(&agent);
+    let agent_started = agent_process.as_ref().and_then(|process| process.started);
     let settled = config.as_ref().is_some_and(|(_, modified)| {
-        mcp_unproxied::config_settled(*modified, mcp_unproxied::agent_started_at())
+        mcp_unproxied::config_settled(*modified, agent_started)
     });
     let mut trust = mcp_unproxied::ProxyTrust::here(!monitor, settled, call_command);
     // Codex reads the `.codex/config.toml` of a trusted project over the
-    // user's file: a server one of those layers names is not trusted from
-    // the user's entry. The folder the call runs in, as Codex says it and as
-    // this process has it.
+    // user's file, and settings on its own command line over both: a server
+    // they may set is not trusted from the user's entry. The folder the call
+    // runs in, as Codex says it and as this process has it.
     if agent == "codex" {
         if let Some(user) = &config_path {
-            let mut layers: Vec<std::path::PathBuf> = payload
+            let cwds: Vec<std::path::PathBuf> = payload
                 .get("cwd")
                 .and_then(|cwd| cwd.as_str())
                 .map(std::path::PathBuf::from)
                 .into_iter()
                 .chain(std::env::current_dir().ok())
                 .filter(|cwd| cwd.is_absolute())
-                .flat_map(|cwd| mcp_unproxied::codex_project_layers(&cwd, user))
+                .collect();
+            let mut layers: Vec<std::path::PathBuf> = cwds
+                .iter()
+                .flat_map(|cwd| mcp_unproxied::codex_project_layers(cwd, user))
                 .collect();
             layers.sort();
             layers.dedup();
             trust.project_layers = mcp_unproxied::project_layer_servers(&layers);
+            let trusted = std::fs::read_to_string(user)
+                .map(|text| mcp_unproxied::codex_trusted_projects(&text))
+                .unwrap_or_default();
+            let moved = cwds
+                .iter()
+                .any(|cwd| mcp_unproxied::codex_layers_may_have_moved(cwd, &trusted, agent_started));
+            let argv_sets_servers = agent_process
+                .as_ref()
+                .and_then(|process| mcp_unproxied::process_argv(process.pid))
+                .is_none_or(|argv| mcp_unproxied::codex_argv_sets_servers(&argv));
+            if moved || argv_sets_servers {
+                trust.project_layers = mcp_unproxied::ProjectLayers::Unreadable;
+            }
         }
+    }
+    // Cursor reads a workspace's `.cursor/mcp.json` over the user's file: a
+    // server one of them names may run with an `env`, an `envFile`, a
+    // `cwd` or a mode the user's entry does not have.
+    if agent == cursor_hook::AGENT {
+        let mut layers: Vec<std::path::PathBuf> = payload
+            .get(cursor_hook::MCP_WORKSPACE_ROOTS_KEY)
+            .and_then(|roots| roots.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|root| root.as_str())
+            .map(std::path::PathBuf::from)
+            .filter(|root| root.is_absolute())
+            .map(|root| root.join(".cursor/mcp.json"))
+            .filter(|layer| {
+                std::fs::symlink_metadata(layer).is_ok()
+                    && config_path.as_deref() != Some(layer.as_path())
+            })
+            .collect();
+        layers.sort();
+        layers.dedup();
+        trust.project_layers = mcp_unproxied::project_layer_servers(&layers);
     }
     let entries = config.map(|(entries, _)| entries);
     let (reach, tools) =

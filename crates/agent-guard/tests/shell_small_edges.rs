@@ -150,6 +150,30 @@ fn a_worktree_removed_with_git_c_is_read_as_without_it() {
     );
 }
 
+/// A Codex started with an MCP server on its own command line runs that
+/// server outside the proxy the user's file puts in front of it, and the
+/// hook would take the file's entry for it: read as the override of its
+/// hooks is.
+///
+/// FAILS ON REVERT of `codex_setting_names_servers` in
+/// `agent_flags_drop_its_hook`: the two lines are allowed.
+#[test]
+fn a_codex_started_with_a_server_of_its_own_is_refused() {
+    for line in [
+        "codex -c mcp_servers.docs.command=\"npx\" exec \"fix it\"",
+        "codex --config mcp_servers.docs.args=[] exec go",
+    ] {
+        assert_eq!(
+            verdict(line),
+            verdict("codex -c hooks.PreToolUse=[] exec \"fix it\""),
+            "{line}"
+        );
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    assert_eq!(verdict("codex -c model=\"o3\" exec go"), "allow");
+    assert_eq!(verdict("codex exec \"fix the mcp_servers parser\""), "allow");
+}
+
 /// git finds a worktree by the end of its path: a worktree registered at the
 /// guard's folder is removed by its last name alone, from any repository
 /// that holds it. Such a word is never read as a work folder, with or

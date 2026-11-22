@@ -899,3 +899,95 @@ fn a_server_on_this_host_keeps_the_path_rules() {
     let (code, text) = host.cursor(&[], "get_file", shadow(), Some("https://mcp.example/mcp"));
     assert_eq!(code, Some(0), "{text}");
 }
+
+/// A project layer that names a server spelled another way than the
+/// user's entry (`docs__x` read as a tool of `docs`, `my-docs` for
+/// `my_docs`) or that sits above a `.git` made later still takes the
+/// call away from the user's entry: any server a layer names leaves every
+/// call judged.
+///
+/// FAILS ON REVERT of the name check in `ProxyTrust::trusts` (exact name
+/// only) and of the walk past `.git` in `codex_project_layers`: each
+/// exits 0.
+#[test]
+fn a_project_layer_judges_every_call_whatever_it_names() {
+    let host = Host::with_posture(Some("default"));
+    let shadow = || json!({"path": "/etc/shadow"});
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+    assert_eq!(code, Some(0), "behind the proxy by the user's file: {text}");
+    let proj = host.home().join("proj");
+    for layer in [
+        "[mcp_servers.docs__x]\ncommand = \"npx\"\nargs = [\"docs-server\"]\n",
+        "[mcp_servers.\"do.cs\"]\ncommand = \"npx\"\n",
+    ] {
+        write_config(&proj.join(".codex/config.toml"), layer);
+        let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+        assert_eq!(code, Some(2), "{layer}: {text}");
+    }
+    std::fs::remove_file(proj.join(".codex/config.toml")).unwrap();
+    // A layer in the folder above a project's `.git` (`sub` holds the
+    // project `sub/inner`), not the user's own file.
+    let sub = host.home().join("sub");
+    std::fs::create_dir_all(sub.join("inner/.git")).unwrap();
+    write_config(
+        &sub.join(".codex/config.toml"),
+        "[mcp_servers.docs]\ncommand = \"npx\"\nargs = [\"docs-server\"]\n",
+    );
+    let payload = {
+        let mut payload = host.codex_payload("mcp__docs__get_file", shadow());
+        payload["cwd"] = json!(sub.join("inner"));
+        payload
+    };
+    let (code, text) = host.run("codex", &[], payload);
+    assert_eq!(code, Some(2), "a layer above .git: {text}");
+}
+
+/// Cursor: a call whose own command line is the guard's proxy in a mode
+/// that only records, or that comes from a workspace whose
+/// `.cursor/mcp.json` names servers, is judged though the user's entry is
+/// the guard's proxy.
+///
+/// FAILS ON REVERT of the mode check in `call_command_is_guard_proxy` and
+/// of the workspace layers in the hook: each exits 0.
+#[test]
+fn a_cursor_call_from_a_project_entry_is_judged() {
+    let host = Host::with_posture(Some("default"));
+    let guard = env!("CARGO_BIN_EXE_innerwarden");
+    let entry = format!(
+        "{{\"command\": \"{guard}\", \"args\": [\"proxy\", \"--mode\", \"guard\", \"--\", \"npx\", \"docs-server\"]}}"
+    );
+    write_config(
+        &host.home().join(".cursor/mcp.json"),
+        &format!("{{\"mcpServers\": {{\"docs\": {entry}}}}}"),
+    );
+    let shadow = || json!({"path": "/etc/shadow"});
+    let call = |command: String| json!({"mcp_server_name": "docs", "command": command});
+    let (code, text) = host.cursor_with(
+        &[],
+        "get_file",
+        shadow(),
+        None,
+        call(format!("{guard} proxy --mode guard -- npx docs-server")),
+    );
+    assert_eq!(code, Some(0), "the guard's proxy: {text}");
+    let (code, text) = host.cursor_with(
+        &[],
+        "get_file",
+        shadow(),
+        None,
+        call(format!("{guard} proxy --mode advisory -- npx docs-server")),
+    );
+    assert_eq!(code, Some(2), "advisory: {text}");
+    write_config(
+        &host.home().join("proj/.cursor/mcp.json"),
+        &format!("{{\"mcpServers\": {{\"docs\": {entry}}}}}"),
+    );
+    let (code, text) = host.cursor_with(
+        &[],
+        "get_file",
+        shadow(),
+        None,
+        call(format!("{guard} proxy --mode guard -- npx docs-server")),
+    );
+    assert_eq!(code, Some(2), "a workspace layer: {text}");
+}

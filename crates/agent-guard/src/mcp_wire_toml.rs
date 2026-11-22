@@ -470,13 +470,13 @@ pub fn server_entries_toml(doc: &DocumentMut) -> Vec<crate::mcp_unproxied::Serve
                     Some(crate::mcp_unproxied::Wrapper {
                         command: command?.to_string(),
                         blocks: mode == WiringMode::Enforce,
-                        sets_loader_env: match table.get("env") {
+                        sets_loader_env: (match table.get("env") {
                             None => false,
                             Some(env) => env.as_table_like().is_none_or(|env| {
                                 env.iter()
                                     .any(|(name, _)| crate::mcp_unproxied::is_loader_variable(name))
                             }),
-                        },
+                        }) || env_vars_pass_loader(table.get("env_vars")),
                         has_cwd: table.contains_key("cwd"),
                     })
                 }),
@@ -489,6 +489,29 @@ pub fn server_entries_toml(doc: &DocumentMut) -> Vec<crate::mcp_unproxied::Serve
             }
         })
         .collect()
+}
+
+/// Whether Codex's `env_vars` (the variables a server is handed from the
+/// agent's own environment) passes one that decides which program starts
+/// or what it loads ([`crate::mcp_unproxied::is_loader_variable`]): the
+/// agent's `PATH` or `LD_PRELOAD` reaches the wrapper as if the entry set
+/// it. A list that cannot be read counts.
+fn env_vars_pass_loader(item: Option<&Item>) -> bool {
+    let Some(item) = item else {
+        return false;
+    };
+    let Some(list) = item.as_array() else {
+        return true;
+    };
+    list.iter().any(|value| {
+        let name = value.as_str().or_else(|| {
+            value
+                .as_inline_table()
+                .and_then(|table| table.get("name"))
+                .and_then(|name| name.as_str())
+        });
+        name.is_none_or(crate::mcp_unproxied::is_loader_variable)
+    })
 }
 
 /// A table that runs a local command, or a remote server the proxy carries.
