@@ -80,20 +80,90 @@ pub enum Layout {
     GeminiSettings,
 }
 
-/// The files the check reads, `$HOME`-relative, with their agent.
-pub const FILES: &[(&str, &str, Layout)] = &[
+/// The folder a file is in: the home, or the folder a variable moves an
+/// agent's config to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dir {
+    Home,
+    /// `CLAUDE_CONFIG_DIR`: Claude Code reads `settings.json` and
+    /// `.claude.json` there instead of `~/.claude/` and `~/.claude.json`.
+    Claude,
+    /// `CODEX_HOME`: Codex reads its files there instead of `~/.codex/`.
+    Codex,
+}
+
+/// The variable that moves Claude Code's config folder.
+pub const CLAUDE_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
+/// The variable that moves Codex's config folder.
+pub const CODEX_DIR_ENV: &str = "CODEX_HOME";
+
+/// The files the check reads, with their agent: the folder a variable can
+/// move it to, its name there, and its `$HOME`-relative place otherwise.
+pub const FILES: &[(&str, Dir, &str, &str, Layout)] = &[
     (
         "claude-code",
+        Dir::Claude,
+        "settings.json",
         ".claude/settings.json",
         Layout::ClaudeSettings,
     ),
-    ("claude-code", ".claude.json", Layout::ClaudeState),
-    ("cursor", ".cursor/mcp.json", Layout::CursorMcp),
-    ("cursor", ".cursor/hooks.json", Layout::CursorHooks),
-    ("codex", ".codex/config.toml", Layout::CodexConfig),
-    ("codex", ".codex/hooks.json", Layout::CodexHooks),
-    ("gemini", ".gemini/settings.json", Layout::GeminiSettings),
+    (
+        "claude-code",
+        Dir::Claude,
+        ".claude.json",
+        ".claude.json",
+        Layout::ClaudeState,
+    ),
+    (
+        "cursor",
+        Dir::Home,
+        "",
+        ".cursor/mcp.json",
+        Layout::CursorMcp,
+    ),
+    (
+        "cursor",
+        Dir::Home,
+        "",
+        ".cursor/hooks.json",
+        Layout::CursorHooks,
+    ),
+    (
+        "codex",
+        Dir::Codex,
+        "config.toml",
+        ".codex/config.toml",
+        Layout::CodexConfig,
+    ),
+    (
+        "codex",
+        Dir::Codex,
+        "hooks.json",
+        ".codex/hooks.json",
+        Layout::CodexHooks,
+    ),
+    (
+        "gemini",
+        Dir::Home,
+        "",
+        ".gemini/settings.json",
+        Layout::GeminiSettings,
+    ),
 ];
+
+/// PURE. The folder a variable names, when it is set to an absolute path
+/// with no `.` or `..` step; anything else falls back to the home.
+pub fn moved_dir(value: Option<&str>) -> Option<std::path::PathBuf> {
+    let path = std::path::Path::new(value?);
+    let plain = path.is_absolute()
+        && path.components().all(|c| {
+            !matches!(
+                c,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        });
+    plain.then(|| path.to_path_buf())
+}
 
 /// What to do about a key written in the file, in the agent's own way of
 /// naming a variable instead.
@@ -267,7 +337,7 @@ fn servers(
             None => format!("MCP server {}", name(server_name)),
         };
         let (command, args, wrapped) = launch(server);
-        if let Some(why) = auto_approved(server) {
+        if let Some(why) = auto_approved(agent, server) {
             let next = match agent {
                 "cursor" | "gemini" | "codex" if !wrapped => format!(
                     "Remove it so the agent asks before each call; `innerwarden agents connect {agent}` puts the guard in front of this server's calls."
@@ -284,7 +354,7 @@ fn servers(
             };
             push(
                 Kind::Unpinned,
-                format!("{label}: {} with no version fixed, so each new release runs as soon as it is published", found.said),
+                format!("{label}: {} with no version fixed, so the version is whatever the registry serves when it is next fetched", found.said),
                 format!("Fix the version ({}){pins}", found.fix),
             );
         }
@@ -343,8 +413,14 @@ fn is_innerwarden(program: &str) -> bool {
     stem(program) == "innerwarden"
 }
 
-/// Why a server's calls run without asking, or `None`.
-fn auto_approved(server: &Value) -> Option<String> {
+/// Why a server's calls run without asking, or `None`. Cursor documents no
+/// per-server approval field in `mcp.json` (its approval follows the Run
+/// Mode set in the app, https://cursor.com/docs/context/mcp), so an
+/// `autoApprove` or `alwaysAllow` there changes nothing and is not said.
+fn auto_approved(agent: &str, server: &Value) -> Option<String> {
+    if agent == "cursor" {
+        return None;
+    }
     // Gemini CLI: `trust: true` skips every confirmation for the server.
     if server.get("trust").and_then(Value::as_bool) == Some(true) {
         return Some("`trust` is on, so every tool call runs without asking".to_string());
@@ -410,15 +486,55 @@ pub fn unpinned(command: &str, args: &[String]) -> Option<Unpinned> {
                 "--index",
                 "--index-url",
                 "--extra-index-url",
+                "--default-index",
+                "--find-links",
+                "-f",
+                "--python-preference",
+                "--index-strategy",
+                "--keyring-provider",
+                "--resolution",
+                "--prerelease",
+                "--env-file",
+                "--prefix",
+                "--constraints",
+                "-c",
+                "--overrides",
+                "--build-constraints",
+                "-b",
+                "--cache-dir",
+                "--config-file",
+                "--directory",
+                "--project",
+                "--exclude-newer",
+                "--link-mode",
+                "--refresh-package",
+                "--reinstall-package",
+                "--upgrade-package",
+                "--color",
             ],
+            &[],
         )?
     } else {
+        // `-c` / `--call` run a shell string, not a package: nothing to
+        // judge, and the string may carry a token.
         package_arg(
             rest,
             &["--package", "-p"],
-            &["--registry", "--cache", "--userconfig", "--node-options"],
+            &[
+                "--registry",
+                "--cache",
+                "--userconfig",
+                "--node-options",
+                "--prefix",
+            ],
+            &["-c", "--call"],
         )?
     };
+    // A registry package has no space in its name: a word with one is a
+    // command line, and saying it back could say a token in it.
+    if package.contains(char::is_whitespace) {
+        return None;
+    }
     if is_not_registry(&package) {
         return None;
     }
@@ -444,13 +560,22 @@ pub fn unpinned(command: &str, args: &[String]) -> Option<Unpinned> {
 
 /// The package a runner starts: the value of one of `package_flags`, or else
 /// the first word that is not a flag (a flag in `value_flags` takes the next
-/// word with it).
-fn package_arg(args: &[String], package_flags: &[&str], value_flags: &[&str]) -> Option<String> {
+/// word with it). `None` when a flag in `no_package` is there.
+fn package_arg(
+    args: &[String],
+    package_flags: &[&str],
+    value_flags: &[&str],
+    no_package: &[&str],
+) -> Option<String> {
     let mut words = args.iter();
     let mut first = None;
     while let Some(word) = words.next() {
         if word == "--" {
             break;
+        }
+        let flag = word.split_once('=').map_or(word.as_str(), |(flag, _)| flag);
+        if no_package.contains(&flag) {
+            return None;
         }
         if let Some((flag, value)) = word.split_once('=') {
             if package_flags.contains(&flag) {
@@ -514,13 +639,15 @@ fn python_pinned(package: &str) -> (String, bool) {
     (bare, false)
 }
 
-/// A version with nothing left open: it starts with a digit and has no
-/// range or wildcard in it.
+/// A version with nothing left open: it starts with a digit, has no range
+/// in it, and no part between dots is a wildcard (`x`, `X`, `*`), so
+/// `2.0.0-next.3` is fixed and `1.x` is not.
 fn exact_version(version: &str) -> bool {
     version.starts_with(|c: char| c.is_ascii_digit())
         && !version
             .chars()
-            .any(|c| matches!(c, '^' | '~' | '*' | '>' | '<' | '|' | ' ' | ',' | 'x' | 'X'))
+            .any(|c| matches!(c, '^' | '~' | '*' | '>' | '<' | '|' | ' ' | ','))
+        && !version.split('.').any(|part| matches!(part, "x" | "X"))
 }
 
 /// Where a server's entry holds a secret written out, said without its value.
@@ -580,7 +707,7 @@ fn secrets_in_server(server: &Value, args: &[String]) -> Vec<String> {
             }
             continue;
         }
-        if let Some(kind) = known_prefix(word) {
+        if let Some(kind) = word.split_whitespace().find_map(known_prefix) {
             places.push(format!(
                 "argument {} holds a value written in the file ({kind})",
                 i + 1
@@ -623,12 +750,35 @@ pub fn secret_kind(key: &str, value: &str) -> Option<&'static str> {
     if let Some(kind) = known_prefix(value) {
         return Some(kind);
     }
+    // A path names where a secret is kept, not the secret.
+    if is_path(value) {
+        return None;
+    }
+    // A URL is a secret only for what it carries: a password, or a secret
+    // in its query.
+    if value.contains("://") {
+        return url_secret(value).map(|_| "secret");
+    }
     let plain = matches!(
         value.to_ascii_lowercase().as_str(),
         "true" | "false" | "null" | "none" | "yes" | "no"
     ) || value.chars().all(|c| c.is_ascii_digit() || c == '.');
     (secret_name(key) && value.len() >= 8 && !plain && !value.contains(char::is_whitespace))
         .then_some("secret")
+}
+
+/// A file path: `/`, `~`, `./`, `../` or a drive letter (`C:\` or `C:/`).
+fn is_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    value.starts_with(['/', '~'])
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with(".\\")
+        || value.starts_with("..\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
 }
 
 fn refers_elsewhere(value: &str) -> bool {
@@ -677,24 +827,27 @@ fn known_prefix(value: &str) -> Option<&'static str> {
         .map(|(_, kind)| *kind)
 }
 
-/// A setting whose name says it holds a secret.
+/// A setting whose name says it holds a secret. `auth` counts only as a
+/// whole word between `_` (`AUTH_HEADER`), not inside one (`AUTHOR`,
+/// `OAUTH`).
 fn secret_name(key: &str) -> bool {
     let key = key.to_ascii_lowercase().replace('-', "_");
-    [
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "api_key",
-        "apikey",
-        "access_key",
-        "private_key",
-        "authorization",
-        "credential",
-        "auth",
-    ]
-    .iter()
-    .any(|word| key.contains(word))
+    let auth = key.split('_').any(|word| word == "auth");
+    (auth
+        || [
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "api_key",
+            "apikey",
+            "access_key",
+            "private_key",
+            "authorization",
+            "credential",
+        ]
+        .iter()
+        .any(|word| key.contains(word)))
         && !["_url", "_file", "_path", "_env", "_var", "_vars", "_helper"]
             .iter()
             .any(|tail| key.ends_with(tail))
@@ -732,11 +885,40 @@ fn other_hook(event: &str, command: &str, push: &mut impl FnMut(Kind, String, St
     if words.iter().any(|word| is_innerwarden(word)) {
         return;
     }
-    let Some(program) = words
-        .iter()
-        .find(|w| !w.contains('=') && !matches!(**w, "env" | "exec" | "sudo"))
-        .map(|w| stem(w))
-    else {
+    // Past `env`, `exec` and `sudo`, their flags (and the value of the ones
+    // that take one, as in `sudo -u bob`) and variable settings.
+    const VALUE_FLAGS: &[&str] = &[
+        "-u",
+        "-g",
+        "-C",
+        "-D",
+        "-p",
+        "-r",
+        "-t",
+        "-U",
+        "-T",
+        "-S",
+        "-a",
+        "--user",
+        "--group",
+        "--chdir",
+        "--unset",
+        "--split-string",
+    ];
+    let mut rest = words.iter();
+    let mut program = None;
+    while let Some(word) = rest.next() {
+        if VALUE_FLAGS.contains(word) {
+            rest.next();
+            continue;
+        }
+        if word.starts_with('-') || word.contains('=') || matches!(*word, "env" | "exec" | "sudo") {
+            continue;
+        }
+        program = Some(stem(word));
+        break;
+    }
+    let Some(program) = program else {
         return;
     };
     push(

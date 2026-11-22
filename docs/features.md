@@ -391,14 +391,15 @@ score, matched signals, and a short explanation.
 
 `innerwarden status --config`, and `innerwarden setup` after it finds the
 agents, read the config Claude Code, Codex, Gemini CLI and Cursor keep in
-the home directory and say what is already set there. They only read: no
+the home directory (or in the folder `CLAUDE_CONFIG_DIR` or `CODEX_HOME`
+names, when set to an absolute path) and say what is already set there. They only read: no
 file is changed.
 
 | Finding | What it means | Files |
 |---|---|---|
-| `[auto-approve]` | tool calls run without the agent asking: an MCP server with `trust` (Gemini), `autoApprove` or `alwaysAllow`; `mcp__<server>` or `mcp__<server>__*` in Claude Code's `permissions.allow`; `permissions.defaultMode = bypassPermissions`; `enableAllProjectMcpServers`; Codex's `approval_policy = "never"`, at the top or in a profile | all |
-| `[unpinned]` | an MCP server started by `npx`, `bunx`, `pnpx`, `pnpm dlx`, `yarn dlx`, `uvx` or `uv tool run` whose package has no exact version (`pkg`, `pkg@latest`, `pkg@^1`, `pkg>=1`); a local path, a URL or a git source is not judged | MCP configs |
-| `[key in file]` | a key or token written in the file: in `env`, `headers`, `http_headers`, `bearer_token`, a URL, or an argument. Said by file, place and kind (GitHub token, AWS access key, ... or "secret" for a value under a name like `*_TOKEN`); the value is never printed. A reference (`${VAR}`, `$VAR`, `${env:VAR}`) is not a finding | all |
+| `[auto-approve]` | tool calls run without the agent asking: an MCP server with `trust` (Gemini), `autoApprove` or `alwaysAllow` (not in Cursor's `mcp.json`: Cursor documents no such field there, its approval follows the Run Mode set in the app); `mcp__<server>` or `mcp__<server>__*` in Claude Code's `permissions.allow`; `permissions.defaultMode = bypassPermissions`; `enableAllProjectMcpServers`; Codex's `approval_policy = "never"`, at the top or in a profile | all |
+| `[unpinned]` | an MCP server started by `npx`, `bunx`, `pnpx`, `pnpm dlx`, `yarn dlx`, `uvx` or `uv tool run` whose package has no exact version (`pkg`, `pkg@latest`, `pkg@^1`, `pkg>=1`), so the version is whatever the registry serves when it is next fetched; a local path, a URL, a git source or a shell string (`npx -c`) is not judged | MCP configs |
+| `[key in file]` | a key or token written in the file: in `env`, `headers`, `http_headers`, `bearer_token`, a URL, or an argument. Said by file, place and kind (GitHub token, AWS access key, ... or "secret" for a value under a name like `*_TOKEN`); the value is never printed. A reference (`${VAR}`, `$VAR`, `${env:VAR}`), a file path or a URL with no password is not a finding | all |
 | `[other hook]` | a program other than InnerWarden runs as a hook before tool calls (`PreToolUse`, `BeforeTool`, Cursor's events), named by its program only | settings and hooks files |
 
 Each finding has one line of what to do and, where there is one, the

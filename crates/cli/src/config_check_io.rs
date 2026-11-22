@@ -2,22 +2,54 @@
 //! hand it to the pure `config_check`, and print what it says. Reads only;
 //! never writes, and never prints the value of a secret it found.
 
-use std::path::Path;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
-use crate::config_check::{self, Layout, Report, Unread};
+use crate::config_check::{self, Dir, Layout, Report, Unread};
 
 /// A file bigger than this is not read (`~/.claude.json` grows with the
 /// projects Claude Code has opened, but stays far below it).
 const MAX_BYTES: u64 = 32 * 1024 * 1024;
 
-/// Read every file the check knows under `home` and say what is set there.
+/// Read every file the check knows, under `home` or the folders
+/// `CLAUDE_CONFIG_DIR` and `CODEX_HOME` name, and say what is set there.
+pub fn check(home: &Path) -> Report {
+    let var = |name: &str| std::env::var(name).ok();
+    check_in(
+        home,
+        config_check::moved_dir(var(config_check::CLAUDE_DIR_ENV).as_deref()),
+        config_check::moved_dir(var(config_check::CODEX_DIR_ENV).as_deref()),
+    )
+}
+
+/// The file as the person knows it: `~/...` under the home, else the path.
+fn shown(home: &Path, path: &Path) -> String {
+    match path.strip_prefix(home) {
+        Ok(rel) => format!("~/{}", rel.display()),
+        Err(_) => path.display().to_string(),
+    }
+    .chars()
+    .filter(|c| !c.is_control())
+    .collect()
+}
+
+/// Read every file the check knows, Claude Code's in `claude_dir` and
+/// Codex's in `codex_dir` when they are given, else under `home`.
 /// A file that is not there is skipped; one that is there and cannot be
 /// read or parsed is named, never taken for "nothing found".
-pub fn check(home: &Path) -> Report {
+pub fn check_in(home: &Path, claude_dir: Option<PathBuf>, codex_dir: Option<PathBuf>) -> Report {
     let mut report = Report::default();
-    for (agent, rel, layout) in config_check::FILES {
-        let path = home.join(rel);
-        let shown = format!("~/{rel}");
+    for (agent, dir, in_dir, rel, layout) in config_check::FILES {
+        let moved = match dir {
+            Dir::Home => None,
+            Dir::Claude => claude_dir.as_deref(),
+            Dir::Codex => codex_dir.as_deref(),
+        };
+        let path = match moved {
+            Some(folder) => folder.join(in_dir),
+            None => home.join(rel),
+        };
+        let shown = shown(home, &path);
         let meta = match std::fs::metadata(&path) {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -32,15 +64,22 @@ pub fn check(home: &Path) -> Report {
         if !meta.is_file() {
             continue;
         }
+        let too_big = || Unread {
+            file: shown.clone(),
+            why: format!("larger than {} MiB", MAX_BYTES / (1024 * 1024)),
+        };
         if meta.len() > MAX_BYTES {
-            report.unread.push(Unread {
-                file: shown,
-                why: format!("larger than {} MiB", MAX_BYTES / (1024 * 1024)),
-            });
+            report.unread.push(too_big());
             continue;
         }
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
+        // The size is held while reading too: the file can grow after the
+        // metadata was taken.
+        let text = match read_at_most(&path, MAX_BYTES) {
+            Ok(Some(text)) => text,
+            Ok(None) => {
+                report.unread.push(too_big());
+                continue;
+            }
             Err(error) => {
                 report.unread.push(Unread {
                     file: shown,
@@ -60,6 +99,15 @@ pub fn check(home: &Path) -> Report {
         }
     }
     report
+}
+
+/// The file's text, or `None` when it holds more than `max` bytes.
+fn read_at_most(path: &Path, max: u64) -> std::io::Result<Option<String>> {
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take(max + 1)
+        .read_to_string(&mut text)?;
+    Ok((text.len() as u64 <= max).then_some(text))
 }
 
 /// The file's content as JSON values. The reason given on a parse error
@@ -100,7 +148,9 @@ mod tests {
 
     /// A fake token of each shape the check names, and one under a name that
     /// says it is a secret. None of them is real.
-    const FAKE_GITHUB: &str = "ghp_FAKEfake0123456789FAKEfake0123456789";
+    /// Put together from pieces so that no token shape sits whole in the
+    /// source for a secret scanner to match.
+    const FAKE_GITHUB: &str = concat!("gh", "p_", "FAKEfake0123456789FAKEfake0123456789");
     const FAKE_ANTHROPIC: &str = "sk-ant-FAKEfake0123456789FAKEfake";
     const FAKE_PLAIN: &str = "hunter2-FAKE-not-a-real-password";
     const FAKE_AWS: &str = "AKIAFAKEFAKEFAKE1234";
@@ -213,7 +263,7 @@ env = {{ AWS_ACCESS_KEY_ID = "{FAKE_AWS}" }}
         );
         assert_eq!(
             kinds(&report, "~/.cursor/mcp.json"),
-            vec![AutoApprove, Unpinned, Secret, Unpinned],
+            vec![Unpinned, Secret, Unpinned],
             "{:#?}",
             report.findings
         );
@@ -398,5 +448,235 @@ env = {{ AWS_ACCESS_KEY_ID = "{FAKE_AWS}" }}
         );
         assert_eq!(secret_kind("LOG_LEVEL", FAKE_PLAIN), None);
         assert_eq!(secret_kind("MODEL", "sk-short"), None);
+    }
+
+    fn findings_of(agent: &'static str, layout: Layout, body: &str) -> Vec<config_check::Finding> {
+        let root: serde_json::Value = serde_json::from_str(body).unwrap();
+        config_check::check_file(agent, "~/f", layout, &root)
+    }
+
+    /// `npx -c` / `--call` run a shell string: it is not a package, so it is
+    /// not said back, and a token in it is named but never printed.
+    ///
+    /// FAILS ON REVERT: without the `no_package` flags the whole string is
+    /// taken for the package and said twice, token included.
+    #[test]
+    fn a_shell_string_given_to_npx_is_never_said_back() {
+        let shell = format!("mcp-server --token {FAKE_GITHUB}");
+        for args in [
+            vec!["-c".to_string(), shell.clone()],
+            vec!["--call".to_string(), shell.clone()],
+            vec![format!("--call={shell}")],
+            vec!["-y".to_string(), shell.clone()],
+            // A one-word shell string is still not a package.
+            vec!["-c".to_string(), "mcp-tool".to_string()],
+            vec!["--call=mcp-tool".to_string()],
+        ] {
+            assert_eq!(config_check::unpinned("npx", &args), None, "{args:?}");
+        }
+        let body =
+            serde_json::json!({"mcpServers": {"x": {"command": "npx", "args": ["-c", shell]}}})
+                .to_string();
+        for agent in ["claude-code", "cursor", "gemini"] {
+            let found = findings_of(agent, Layout::CursorMcp, &body);
+            let said = format!("{found:?}");
+            assert!(!said.contains(FAKE_GITHUB), "{said}");
+            assert!(!said.contains(&FAKE_GITHUB[4..16]), "{said}");
+            assert_eq!(
+                found.iter().map(|f| f.kind).collect::<Vec<_>>(),
+                vec![Kind::Secret],
+                "{said}"
+            );
+        }
+    }
+
+    /// A path, a URL with no password, or a name with `auth` inside a word
+    /// is not a secret; `auth` as a whole word and a URL with a password are.
+    ///
+    /// FAILS ON REVERT: the old name match took `AUTHOR` and `OAUTH` for
+    /// `auth`, and any long value under `CREDENTIALS` for a secret.
+    #[test]
+    fn a_path_an_address_or_an_author_is_not_a_secret() {
+        use config_check::secret_kind;
+        for (key, value) in [
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "/home/u/.config/gcloud/key.json",
+            ),
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "~/keys/service-account.json",
+            ),
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "./keys/service-account.json",
+            ),
+            ("GOOGLE_APPLICATION_CREDENTIALS", "C:\\Users\\u\\key.json"),
+            ("GOOGLE_APPLICATION_CREDENTIALS", "D:/keys/key.json"),
+            ("GIT_AUTHOR_EMAIL", "me@example.com"),
+            ("GIT_AUTHOR_NAME", "Someone Else"),
+            ("OAUTH_REDIRECT_URI", "http://localhost:3000/cb"),
+            ("AUTH_SERVER", "https://login.example.com/oauth2"),
+        ] {
+            assert_eq!(secret_kind(key, value), None, "{key}={value}");
+        }
+        assert_eq!(secret_kind("AUTH_HEADER", FAKE_PLAIN), Some("secret"));
+        assert_eq!(secret_kind("X_AUTH", FAKE_PLAIN), Some("secret"));
+        assert_eq!(
+            secret_kind(
+                "DATABASE_PASSWORD",
+                "postgres://u:hunter2-FAKE@db.example.com/app"
+            ),
+            Some("secret")
+        );
+        assert_eq!(
+            secret_kind(
+                "WEBHOOK_TOKEN",
+                &format!("https://h.example.com/x?api_key={FAKE_PLAIN}")
+            ),
+            Some("secret")
+        );
+    }
+
+    /// A pre-release such as `2.0.0-next.3` is fixed: `x` is a wildcard
+    /// only as a whole part between dots.
+    ///
+    /// FAILS ON REVERT: the old check saw the `x` in `next` and called the
+    /// version open.
+    #[test]
+    fn a_prerelease_is_a_fixed_version() {
+        let run = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            config_check::unpinned("npx", &args).is_some()
+        };
+        assert!(!run(&["-y", "@scope/tool@2.0.0-next.3"]));
+        assert!(!run(&["tool@1.0.0-rc.x1"]));
+        assert!(!run(&["tool@3.1.4-beta.1+exp.sha.5114f85"]));
+        assert!(run(&["tool@1.x"]));
+        assert!(run(&["tool@1.2.X"]));
+        assert!(run(&["tool@1.*"]));
+    }
+
+    /// uvx flags that take a value do not have that value read as the
+    /// package.
+    ///
+    /// FAILS ON REVERT: without them `only-managed` (and the rest) is said
+    /// to be the package, unpinned.
+    #[test]
+    fn a_uvx_flag_value_is_not_the_package() {
+        let run = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            config_check::unpinned("uvx", &args)
+        };
+        for flag in [
+            "--python-preference",
+            "--index-strategy",
+            "--env-file",
+            "--prefix",
+        ] {
+            assert_eq!(run(&[flag, "some-value", "mcp-x==1.0"]), None, "{flag}");
+            let found = run(&[flag, "some-value", "mcp-x"]).expect(flag);
+            assert_eq!(found.said, "`uvx` runs `mcp-x`", "{flag}");
+        }
+    }
+
+    /// A hook behind `sudo -u bob` or `env -u VAR` is named by its program.
+    ///
+    /// FAILS ON REVERT: the old pick took `-u` for the program.
+    #[test]
+    fn a_hook_is_named_by_its_program_past_sudo_and_its_flags() {
+        for (command, program) in [
+            ("sudo -u bob /opt/g", "`g`"),
+            ("sudo -n -u bob -- /opt/g --check", "`g`"),
+            ("env -u HOME A=1 /usr/bin/other-guard", "`other-guard`"),
+            ("exec -a name /opt/h", "`h`"),
+        ] {
+            let body =
+                serde_json::json!({"hooks": {"beforeShellExecution": [{"command": command}]}})
+                    .to_string();
+            let found = findings_of("cursor", Layout::CursorHooks, &body);
+            assert_eq!(found.len(), 1, "{command}: {found:?}");
+            assert!(
+                found[0]
+                    .what
+                    .contains(&format!("another program, {program},")),
+                "{command}: {}",
+                found[0].what
+            );
+        }
+    }
+
+    /// `CLAUDE_CONFIG_DIR` and `CODEX_HOME` move where the files are read;
+    /// unset, or not an absolute path, the home is read.
+    ///
+    /// FAILS ON REVERT: the old check read only `~/.claude` and `~/.codex`
+    /// and said nothing about the folder the agent really uses.
+    #[test]
+    fn the_folders_the_variables_name_are_read() {
+        let home = home_with(&[(".claude/settings.json", "{}"), (".codex/config.toml", "")]);
+        let moved = home_with(&[
+            (
+                "claude/settings.json",
+                r#"{"permissions": {"defaultMode": "bypassPermissions"}}"#,
+            ),
+            (
+                "claude/.claude.json",
+                r#"{"mcpServers": {"s": {"command": "npx", "args": ["s"]}}}"#,
+            ),
+            ("codex/config.toml", "approval_policy = \"never\"\n"),
+        ]);
+        let claude_dir = moved.path().join("claude");
+        let codex_dir = moved.path().join("codex");
+        let report = check_in(
+            home.path(),
+            Some(claude_dir.clone()),
+            Some(codex_dir.clone()),
+        );
+        let files: Vec<&str> = report.findings.iter().map(|f| f.file.as_str()).collect();
+        let settings = claude_dir.join("settings.json").display().to_string();
+        let state = claude_dir.join(".claude.json").display().to_string();
+        let codex = codex_dir.join("config.toml").display().to_string();
+        assert_eq!(
+            files,
+            vec![settings.as_str(), state.as_str(), codex.as_str()],
+            "{report:#?}"
+        );
+        assert!(
+            !report
+                .read
+                .iter()
+                .any(|f| f.starts_with("~/.claude") || f.starts_with("~/.codex")),
+            "{:?}",
+            report.read
+        );
+
+        let at_home = check_in(home.path(), None, None);
+        assert_eq!(
+            at_home.read,
+            vec!["~/.claude/settings.json", "~/.codex/config.toml"]
+        );
+        assert!(at_home.findings.is_empty());
+
+        use config_check::moved_dir;
+        assert_eq!(moved_dir(None), None);
+        assert_eq!(moved_dir(Some("relative/dir")), None);
+        assert_eq!(moved_dir(Some("/a/../b")), None);
+        assert_eq!(
+            moved_dir(Some("/opt/claude")),
+            Some(PathBuf::from("/opt/claude"))
+        );
+    }
+
+    /// A file that grows past the limit while it is read is not taken whole.
+    #[test]
+    fn a_file_past_the_limit_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, "0123456789").unwrap();
+        assert_eq!(
+            read_at_most(&path, 10).unwrap().as_deref(),
+            Some("0123456789")
+        );
+        assert_eq!(read_at_most(&path, 9).unwrap(), None);
     }
 }
