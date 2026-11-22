@@ -8,7 +8,7 @@
 //! config-dir stat, the file read/write)
 //! and returns the lines to print, so each CLI is a thin `println` wrapper.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 use serde_json::Value;
@@ -1069,18 +1069,21 @@ pub fn hook_state(home: &Path, agent: &AgentStatus) -> Option<(&'static HookSpec
 /// or holds no stdio server: the proxy has nothing to say either way.
 fn mcp_guarded(
     home: &Path,
+    agent: &str,
     mcp_json: Option<&str>,
     mcp_toml: Option<&str>,
     path_env: Option<&OsStr>,
 ) -> Option<bool> {
+    // A server the agent signs in to by itself is left out of the proxy by
+    // a connect, and counts as one the proxy does not carry.
     if let Some(rel) = mcp_json {
-        let v = read_json(&home.join(rel))?;
+        let v = mcp_wire::as_agent_signs_in(&read_json(&home.join(rel))?, agent);
         return mcp_wire::is_guardable(&v).then(|| {
             mcp_wire::is_guarded(&v)
                 && !proxy_is_broken(&mcp_wire::guard_wrapper_commands(&v), path_env)
         });
     }
-    let d = read_toml(&home.join(mcp_toml?))?;
+    let d = mcp_wire_toml::as_codex_signs_in(&read_toml(&home.join(mcp_toml?))?);
     mcp_wire_toml::is_guardable_toml(&d).then(|| {
         mcp_wire_toml::is_guarded_toml(&d)
             && !proxy_is_broken(&mcp_wire_toml::guard_wrapper_commands_toml(&d), path_env)
@@ -1105,7 +1108,7 @@ fn is_guarded(home: &Path, agent: &str, path_env: Option<&OsStr>) -> bool {
             .unwrap_or(false);
     }
     if let Some(spec) = hook_spec(k.name, k.mcp_json, k.mcp_toml) {
-        return mcp_guarded(home, k.mcp_json, k.mcp_toml, path_env)
+        return mcp_guarded(home, k.name, k.mcp_json, k.mcp_toml, path_env)
             .unwrap_or_else(|| agent_hooks::state(home, spec, path_env).is_on());
     }
     if let Some(rel) = k.mcp_json {
@@ -1213,12 +1216,21 @@ pub fn status_has_unguarded_server(home: &Path, agent: &AgentStatus) -> bool {
     }
     if let Some(relative) = &agent.mcp_json {
         return read_json(&home.join(relative))
-            .map(|value| mcp_wire::has_unguarded_stdio_server(&value))
+            .map(|value| {
+                mcp_wire::has_unguarded_stdio_server(&mcp_wire::as_agent_signs_in(
+                    &value,
+                    &agent.name,
+                ))
+            })
             .unwrap_or(false);
     }
     if let Some(relative) = &agent.mcp_toml {
         return read_toml(&home.join(relative))
-            .map(|document| mcp_wire_toml::has_unguarded_stdio_server_toml(&document))
+            .map(|document| {
+                mcp_wire_toml::has_unguarded_stdio_server_toml(&mcp_wire_toml::as_codex_signs_in(
+                    &document,
+                ))
+            })
             .unwrap_or(false);
     }
     if let Some(relative) = &agent.mcp_yaml {
@@ -1605,6 +1617,94 @@ fn connect_hermes(
     ConnectResult::new(effect, lines.join("\n"))
 }
 
+/// The words a connect says when an agent has no server the proxy carries.
+const NO_LOCAL_SERVERS: &str = "no local MCP servers to route through the guard proxy";
+
+/// How long `codex mcp list --json` is given: it asks each server reached
+/// by URL whether it wants a sign-in.
+const CODEX_LIST_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Which servers Codex signs in to by itself, asked of the Codex that serves
+/// `home` ([`agent_hooks::codex_to_ask`]) with `codex mcp list --json`.
+/// Its listing names each server's sign-in, never a token. Not asked, or no
+/// readable answer in time: [`mcp_wire_toml::CodexSignIn::NotAsked`].
+fn codex_sign_in(home: &Path) -> mcp_wire_toml::CodexSignIn {
+    agent_hooks::codex_to_ask(home)
+        .and_then(|codex| run_for_output(&codex, &["mcp", "list", "--json"], CODEX_LIST_WAIT))
+        .and_then(|out| mcp_wire_toml::codex_sign_in_servers(&out))
+        .map_or(
+            mcp_wire_toml::CodexSignIn::NotAsked,
+            mcp_wire_toml::CodexSignIn::Servers,
+        )
+}
+
+/// What `program` (and the words before `args`) prints, when it ends with
+/// 0 within `wait`. The process is ended on every other path.
+fn run_for_output(
+    program: &[OsString],
+    args: &[&str],
+    wait: std::time::Duration,
+) -> Option<String> {
+    use std::io::Read as _;
+    let (first, leading) = program.split_first()?;
+    let mut child = std::process::Command::new(first)
+        .args(leading)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.by_ref().take(4 * 1024 * 1024).read_to_end(&mut out);
+        out
+    });
+    let deadline = std::time::Instant::now() + wait;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => break None,
+        }
+    };
+    if !status.is_some_and(|s| s.success()) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    }
+    String::from_utf8(reader.join().ok()?).ok()
+}
+
+/// The words for servers of a JSON client a connect left as they are
+/// because the client signs in to them by itself.
+fn client_signed_in_note(agent: &str, names: &[String]) -> String {
+    format!(
+        "left as they are, {agent} signs in to them itself: {}; its hook, when it is on, judges \
+         calls to them with the proxy's rules",
+        names.join(", ")
+    )
+}
+
+/// The words for servers a connect left as they are because Codex signs in
+/// to them.
+fn signed_in_note(names: &[String], sign_in: &mcp_wire_toml::CodexSignIn) -> String {
+    let why = match sign_in {
+        mcp_wire_toml::CodexSignIn::NotAsked => {
+            "reached by URL alone, so Codex may sign in to them (Codex could not be asked)"
+        }
+        mcp_wire_toml::CodexSignIn::Servers(_) => "Codex signs in to them itself",
+    };
+    format!(
+        "left as they are, {why}: {}; the Codex hook, when it is on, judges calls to them with \
+         the proxy's rules",
+        names.join(", ")
+    )
+}
+
 /// Wire the blocking hook and the MCP proxy of Codex or Gemini in one go.
 ///
 /// The hook goes first and the proxy second, in series: Gemini keeps both in
@@ -1697,11 +1797,11 @@ fn connect_hook_and_proxy(
     // only: the agent has no stdio server to wrap. Its own words for that end
     // in "nothing to guard", which is not true beside a hook.
     lines.push(
-        if proxy.effect == ConnectEffect::Skipped && spec.has_mcp_config() {
-            format!(
-                "  {} - no local MCP servers to route through the guard proxy",
-                r.name
-            )
+        if proxy.effect == ConnectEffect::Skipped
+            && spec.has_mcp_config()
+            && !proxy.line.contains(NO_LOCAL_SERVERS)
+        {
+            format!("  {} - {NO_LOCAL_SERVERS}", r.name)
         } else {
             proxy.line
         },
@@ -1848,14 +1948,34 @@ fn connect_by_one_mechanism(
         // it never adds a name to an existing hook.
         // Automatic setup wraps only local servers; a remote server goes
         // through the proxy on a connect a person runs (`mcp_wire::wrap_local`).
-        let (wrapped, n, fully_guarded) = if reject_symlinks {
+        // A server the client signs in to by itself (Cursor, by URL alone)
+        // is left as it is on a connect a person runs too
+        // (`mcp_wire::wrap_signed_in`), and its calls are judged by the hook.
+        let (wrapped, n, fully_guarded, signed_in) = if reject_symlinks {
             let (wrapped, n) = mcp_wire::wrap_local(cfg, guard_bin, monitor, &r.name);
             let guarded = mcp_wire::local_servers_guarded(&wrapped);
-            (wrapped, n, guarded)
+            (wrapped, n, guarded, Vec::new())
         } else {
-            let (wrapped, n) = mcp_wire::wrap(cfg, guard_bin, monitor, &r.name);
-            let guarded = mcp_wire::is_guarded(&wrapped);
-            (wrapped, n, guarded)
+            let (wrapped, n) = mcp_wire::wrap_signed_in(cfg, guard_bin, monitor, &r.name);
+            let signed_in = mcp_wire::signed_in_servers(&wrapped, &r.name);
+            match mcp_wire::is_guarded_signed_in(&wrapped, &r.name) {
+                Some(guarded) => (wrapped, n, guarded, signed_in),
+                None => {
+                    return ConnectResult::new(
+                        ConnectEffect::Skipped,
+                        format!(
+                            "  {} - {NO_LOCAL_SERVERS}; {}",
+                            r.name,
+                            client_signed_in_note(&r.name, &signed_in)
+                        ),
+                    )
+                }
+            }
+        };
+        let signed_in = if signed_in.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", client_signed_in_note(&r.name, &signed_in))
         };
         if !fully_guarded {
             return ConnectResult::new(
@@ -1871,7 +1991,7 @@ fn connect_by_one_mechanism(
             Ok(()) if n == 0 => ConnectResult::new(
                 ConnectEffect::Unchanged,
                 format!(
-                    "  {} - already guarded (MCP proxy, {})",
+                    "  {} - already guarded (MCP proxy, {}){signed_in}",
                     r.name,
                     if monitor { "monitor" } else { "enforce" }
                 ),
@@ -1879,7 +1999,7 @@ fn connect_by_one_mechanism(
             Ok(()) => ConnectResult::new(
                 ConnectEffect::Connected,
                 format!(
-                    "  {} - connected ({n} MCP server{} routed through the guard proxy, {})",
+                    "  {} - connected ({n} MCP server{} routed through the guard proxy, {}){signed_in}",
                     r.name,
                     if n == 1 { "" } else { "s" },
                     if monitor { "monitor" } else { "enforce" }
@@ -1939,13 +2059,40 @@ fn connect_by_one_mechanism(
             );
         }
         // Automatic setup wraps only local servers; a server reached by URL
-        // goes through the proxy on a connect a person runs.
-        let (n, fully_guarded) = if reject_symlinks {
+        // goes through the proxy on a connect a person runs, except one Codex
+        // signs in to by itself (`codex mcp login`): through the proxy Codex
+        // stops signing in and the server answers 401. Codex is asked which
+        // those are; their calls are judged by Codex's hook.
+        let (n, fully_guarded, signed_in) = if reject_symlinks {
             let n = mcp_wire_toml::wrap_toml_local(&mut doc, guard_bin, monitor, &r.name);
-            (n, mcp_wire_toml::local_servers_guarded_toml(&doc))
+            (
+                n,
+                mcp_wire_toml::local_servers_guarded_toml(&doc),
+                String::new(),
+            )
         } else {
-            let n = mcp_wire_toml::wrap_toml(&mut doc, guard_bin, monitor, &r.name);
-            (n, mcp_wire_toml::is_guarded_toml(&doc))
+            let sign_in = codex_sign_in(home);
+            let n =
+                mcp_wire_toml::wrap_toml_signed_in(&mut doc, guard_bin, monitor, &r.name, &sign_in);
+            let left = mcp_wire_toml::signed_in_servers_toml(&doc, &sign_in);
+            let signed_in = if left.is_empty() {
+                String::new()
+            } else {
+                format!("; {}", signed_in_note(&left, &sign_in))
+            };
+            match mcp_wire_toml::is_guarded_toml_signed_in(&doc, &sign_in) {
+                Some(guarded) => (n, guarded, signed_in),
+                None => {
+                    return ConnectResult::new(
+                        ConnectEffect::Skipped,
+                        format!(
+                            "  {} - {NO_LOCAL_SERVERS}; {}",
+                            r.name,
+                            signed_in_note(&left, &sign_in)
+                        ),
+                    )
+                }
+            }
         };
         if !fully_guarded {
             return ConnectResult::new(
@@ -1972,6 +2119,7 @@ fn connect_by_one_mechanism(
         } else {
             "; the Codex hook, when it is on, judges calls to those servers with the proxy's rules"
         };
+        let judged_by_hook = format!("{judged_by_hook}{signed_in}");
         return match write_toml(home, &path, &doc, &source, reject_symlinks) {
             Ok(()) if n == 0 => ConnectResult::new(
                 ConnectEffect::Unchanged,

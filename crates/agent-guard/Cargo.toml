@@ -30,6 +30,11 @@ regex = "1"
 # src/rules.rs). Already in the tree through `regex`; same version.
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "perf", "unicode", "hybrid", "nfa-pikevm", "meta"] }
 fancy-regex = "0.20"
+# Read a pattern's syntax to find the literals every match of it contains
+# (`atr_corpus::required_literals`), so a rule whose literals are not in a
+# text is never compiled for it. Already in the tree through `regex`; same
+# version.
+regex-syntax = "0.8"
 fs4 = { version = "1.1", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
@@ -50,6 +55,14 @@ xattr = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+# build.rs reads the embedded ATR corpus once into a table the binary carries
+# (`src/atr_corpus.rs`), so a one-shot hook parses no YAML. The same crates
+# and versions as the library's.
+[build-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+regex-syntax = "0.8"
 
 [dev-dependencies]
 tempfile = "3"

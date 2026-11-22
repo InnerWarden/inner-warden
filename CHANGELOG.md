@@ -5,6 +5,39 @@ follows semantic versioning.
 
 ## Unreleased
 
+`agents connect` leaves a server the agent signs in to by itself as it is,
+instead of wrapping it in the proxy, where the sign-in was lost (every call
+came back 401). For Codex it asks `codex mcp list --json`, which names each
+server's sign-in and never a token: a server Codex signed in to with
+`codex mcp login`, or one that asks for a sign-in, is left; one whose token
+comes from a variable is carried as before. When Codex cannot be asked, a
+server reached by URL alone is left. For Cursor, a server reached by URL
+alone is left (Cursor signs in to it by itself). The connect line names
+those servers; the agent's hook judges their calls with the proxy's rules.
+
+An ordinary MCP call costs the hook about half what it did: the ATR rules
+are read from the YAML once, when the binary is built, and a rule is
+compiled for a call only when the call holds one of the literals every
+match of its patterns contains (median of 41 clean Codex calls on one
+machine, release build: 13.8 ms before, 7.2 ms after). What a rule matches
+is unchanged.
+
+A call is left to the proxy only when its wrapper's command is an absolute
+path, its entry sets no `PATH`, `LD_*` or `DYLD_*` (nor a file of
+variables) and no working folder, no layer of the project Codex runs in
+(`.codex/config.toml` from the working folder up to the project's root)
+names the server, and the configuration's last change, content or status,
+is older than the agent. `touch -d` on a configuration rewritten after the
+agent started no longer passes for an old one.
+
+`git -C <folder> worktree remove <path>` (and `--git-dir`, `--work-tree`,
+`-c`, `--namespace` before the verb) is read as the same line without the
+option: the option's value is not git's verb.
+
+When an MCP call and the command it carries both run with a warning in the
+default posture, the warning said and recorded is the stronger of the two,
+with both findings.
+
 An MCP call of Codex or Cursor is now judged with the MCP proxy's rules
 where the agent shows it, the hook it runs before every tool call, unless
 its server is one the proxy already stands in front of. This reaches a

@@ -667,11 +667,16 @@ fn table_at_mut<'a>(
 /// Apply `f` to every server object under either schema key. Returns how many
 /// times `f` returned true.
 fn for_each_server(root: &mut Value, mut f: impl FnMut(&mut Value) -> bool) -> usize {
+    for_each_named_server(root, |_, server| f(server))
+}
+
+/// [`for_each_server`], with each server's name.
+fn for_each_named_server(root: &mut Value, mut f: impl FnMut(&str, &mut Value) -> bool) -> usize {
     let mut n = 0;
     for path in SERVER_TABLE_PATHS {
         if let Some(map) = table_at_mut(root, path) {
-            for (_name, server) in map.iter_mut() {
-                if f(server) {
+            for (name, server) in map.iter_mut() {
+                if f(name, server) {
                     n += 1;
                 }
             }
@@ -742,6 +747,15 @@ pub fn server_entries(root: &Value) -> Vec<crate::mcp_unproxied::ServerEntry> {
                     Some(crate::mcp_unproxied::Wrapper {
                         command: command?.to_string(),
                         blocks: mode == WiringMode::Enforce,
+                        sets_loader_env: server.get("envFile").is_some()
+                            || match server.get("env") {
+                                None => false,
+                                Some(Value::Object(env)) => env
+                                    .keys()
+                                    .any(|name| crate::mcp_unproxied::is_loader_variable(name)),
+                                Some(_) => true,
+                            },
+                        has_cwd: server.get("cwd").is_some(),
                     })
                 }),
                 remote: (!server
@@ -793,6 +807,73 @@ pub fn wrap_local(mut root: Value, guard_bin: &str, monitor: bool, agent: &str) 
         is_stdio_server(s) && wrap_server(s, guard_bin, monitor, Some(agent))
     });
     (root, n)
+}
+
+/// Whether `agent` signs in to `server` by itself, so a connect leaves it
+/// as it is: a Cursor server reached by URL alone (no headers). Cursor runs
+/// the OAuth sign-in for such a server on its own and keeps the token; as the
+/// proxy's stdio wrapper it would no longer sign in, and every call would come
+/// back 401. Its calls are judged by Cursor's hook ([`crate::mcp_unproxied`]).
+fn left_for_sign_in(agent: &str, server: &Value) -> bool {
+    agent == crate::cursor_hook::AGENT
+        && !is_stdio_server(server)
+        && remote_entry(server).is_some_and(|remote| remote.headers.is_empty())
+}
+
+/// The configuration as the proxy can carry it for `agent`: each server
+/// `agent` signs in to by itself ([`left_for_sign_in`]) read as one with a
+/// sign-in key, so it counts with the servers the proxy does not carry and a
+/// status never asks for a connect that leaves it as it is. Pure.
+pub fn as_agent_signs_in(root: &Value, agent: &str) -> Value {
+    let mut view = root.clone();
+    for_each_server(&mut view, |server| {
+        if !left_for_sign_in(agent, server) {
+            return false;
+        }
+        if let Some(obj) = server.as_object_mut() {
+            obj.insert("auth".to_string(), json!({"by": agent}));
+        }
+        true
+    });
+    view
+}
+
+/// [`wrap`] on a connect a person ran, leaving the servers `agent` signs in
+/// to by itself as they are ([`left_for_sign_in`]). Pure.
+pub fn wrap_signed_in(
+    mut root: Value,
+    guard_bin: &str,
+    monitor: bool,
+    agent: &str,
+) -> (Value, usize) {
+    let n = for_each_named_server(&mut root, |_, server| {
+        !left_for_sign_in(agent, server) && wrap_server(server, guard_bin, monitor, Some(agent))
+    });
+    (root, n)
+}
+
+/// The servers [`wrap_signed_in`] leaves as they are, in file order. Pure.
+pub fn signed_in_servers(root: &Value, agent: &str) -> Vec<String> {
+    SERVER_TABLE_PATHS
+        .iter()
+        .filter_map(|path| table_at(root, path))
+        .flat_map(|map| map.iter())
+        .filter(|(_, server)| left_for_sign_in(agent, server))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// [`is_guarded`] but for the servers `agent` signs in to by itself:
+/// every other server the proxy can carry goes through it. `None` when no
+/// other server is there to carry. Pure.
+pub fn is_guarded_signed_in(root: &Value, agent: &str) -> Option<bool> {
+    let carried: Vec<&Value> = SERVER_TABLE_PATHS
+        .iter()
+        .filter_map(|path| table_at(root, path))
+        .flat_map(|map| map.values())
+        .filter(|server| is_proxyable_server(server) && !left_for_sign_in(agent, server))
+        .collect();
+    (!carried.is_empty()).then(|| carried.iter().all(|server| is_wrapped_server(server)))
 }
 
 /// Whether every server of this config that runs a local command goes

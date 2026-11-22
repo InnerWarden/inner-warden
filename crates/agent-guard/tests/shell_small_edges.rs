@@ -113,3 +113,39 @@ fn the_default_posture_flag_is_refused_to_an_agent_as_the_guard_flag_is() {
     assert_eq!(verdict("innerwarden install claude-code --strict"), "allow");
     assert_eq!(verdict("innerwarden install claude-code"), "allow");
 }
+
+/// `git -C <folder>` before the verb: the folder is the value of `-C`,
+/// not git's verb, so a worktree's removal is read as it is without `-C`
+/// (seen three times on 2026-11-22: a deny for "flags between verb and
+/// target" with `-C`, a review without). The same for git's other
+/// options that take a value.
+///
+/// FAILS ON REVERT of `git_verb_positions` in mention.rs (the `-C` lines
+/// are a deny).
+#[test]
+fn a_worktree_removed_with_git_c_is_read_as_without_it() {
+    for plain in [
+        "git worktree remove ~/innerwarden-wt2",
+        "git worktree remove --force ~/innerwarden-wt2",
+        "git worktree remove ~/innerwarden/wt-197-base",
+    ] {
+        let without = verdict(plain);
+        assert_ne!(without, "deny", "{plain}");
+        let rest = plain.trim_start_matches("git ");
+        for options in [
+            "-C ~/innerwarden",
+            "-C /home/u/innerwarden",
+            "--git-dir ~/innerwarden/.git",
+            "-c core.quotepath=off",
+            "-C ~/innerwarden -c color.ui=never",
+        ] {
+            let with = format!("git {options} {rest}");
+            assert_eq!(verdict(&with), without, "{with}");
+        }
+    }
+    // The removal of the guard's own folder stays what it was.
+    assert_eq!(
+        verdict("git -C /tmp worktree remove --force ~/.config/innerwarden"),
+        verdict("git worktree remove --force ~/.config/innerwarden"),
+    );
+}

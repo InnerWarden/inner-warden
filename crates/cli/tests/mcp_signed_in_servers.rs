@@ -49,19 +49,49 @@ fn codex_config() -> String {
     )
 }
 
-/// Write an agent's configuration as one it read when it started: changed
-/// long before the hook's parent (this test) started. A configuration
-/// changed after the agent started proves nothing of the server it talks
-/// to, and every call is judged.
+/// When each configuration [`write_config`] wrote was written.
+static WRITTEN: std::sync::Mutex<Vec<(PathBuf, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How long after a configuration was written the agent that reads it
+/// starts: past the hook's two-second margin, and past the second the
+/// system's boot time is read to (an agent's start is counted from it).
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(3_200);
+
+/// Write an agent's configuration as one it read when it started: the
+/// agent ([`agent_stand_in`]) starts [`SETTLE`] after the file last
+/// changed. Dating the content back (`touch -d`) proves nothing: the hook
+/// reads the status change too. A configuration changed after the agent
+/// started proves nothing of the server it talks to, and every call is
+/// judged.
 fn write_config(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(path)
+    WRITTEN
+        .lock()
         .unwrap()
-        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
-        .unwrap();
+        .push((path.to_path_buf(), std::time::Instant::now()));
+}
+
+/// What tells this test binary, run again, to stand in for the agent.
+const STAND_IN_VAR: &str = "IW_TEST_AGENT_STAND_IN";
+
+/// The agent the hook runs under: this test binary run again
+/// (`agent_stand_in`), so the agent starts after its configuration was
+/// written, as an agent that read it does. It runs the hook with the words
+/// in [`STAND_IN_VAR`], hands it its own input and output, and exits with
+/// the hook's code. In an ordinary run it does nothing.
+#[test]
+fn agent_stand_in() {
+    let Some(words) = std::env::var_os(STAND_IN_VAR) else {
+        return;
+    };
+    let words: Vec<String> = serde_json::from_str(&words.to_string_lossy()).unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_innerwarden"))
+        .args(&words)
+        .status()
+        .expect("run the hook");
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// The servers a call names as Codex names them, each one the proxy does
@@ -181,10 +211,25 @@ impl Host {
     }
 
     fn run(&self, agent: &str, extra: &[&str], payload: Value) -> (Option<i32>, String) {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_innerwarden"));
+        let home = self.home();
+        let last_written = WRITTEN
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.starts_with(&home))
+            .map(|(_, at)| *at)
+            .max();
+        if let Some(wait) = last_written
+            .and_then(|at| (at + SETTLE).checked_duration_since(std::time::Instant::now()))
+        {
+            std::thread::sleep(wait);
+        }
+        let mut words = vec!["hook".to_string(), "--agent".to_string(), agent.to_string()];
+        words.extend(extra.iter().map(|word| word.to_string()));
+        let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["hook", "--agent", agent])
-            .args(extra)
+            .args(["--exact", "agent_stand_in", "--test-threads=1", "--quiet"])
+            .env(STAND_IN_VAR, serde_json::to_string(&words).unwrap())
             .env("HOME", self.home())
             .env("USERPROFILE", self.home())
             .env("IW_GRAPH_FILE", self.dir.path().join("graph.json"))
@@ -209,9 +254,15 @@ impl Host {
             .write_all(payload.to_string().as_bytes())
             .unwrap();
         let out = child.wait_with_output().unwrap();
+        // What the test harness says before the stand-in runs is not the hook's.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stdout = stdout
+            .trim_start()
+            .strip_prefix("running 1 test")
+            .unwrap_or(&stdout);
         let text = format!(
             "{}{}",
-            String::from_utf8_lossy(&out.stdout),
+            stdout.trim_start(),
             String::from_utf8_lossy(&out.stderr)
         );
         (out.status.code(), text)
@@ -687,4 +738,58 @@ fn an_install_with_no_posture_file_refuses_only_a_hard_finding() {
     }
     let (code, text) = host.hook(&[], "mcp__local__get_file", json!({"path": "/etc/shadow"}));
     assert_eq!(code, Some(2), "{text}");
+}
+
+/// A server a layer of the project Codex runs in names (its
+/// `.codex/config.toml`, read over the user's file in a trusted project)
+/// may not be the wrapper the user's file has: a call to it is judged.
+///
+/// FAILS ON REVERT of the project layers in `screen_mcp_call`: the call is
+/// left to the proxy the user's file names and exits 0.
+#[test]
+fn a_server_the_project_layer_names_is_judged() {
+    let host = Host::with_posture(Some("default"));
+    let shadow = || json!({"path": "/etc/shadow"});
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+    assert_eq!(code, Some(0), "behind the proxy by the user's file: {text}");
+    let project = host.home().join("proj");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    write_config(
+        &project.join(".codex/config.toml"),
+        "[mcp_servers.docs]\ncommand = \"npx\"\nargs = [\"docs-server\"]\n",
+    );
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+    assert_eq!(code, Some(2), "named again by the project: {text}");
+    write_config(&project.join(".codex/config.toml"), "not = [toml");
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+    assert_eq!(code, Some(2), "a layer that cannot be read: {text}");
+}
+
+/// A call both readings find something in (the proxy's rules in the MCP
+/// call, the shell rules in the command it carries), each run with a
+/// warning in the default posture: the warning said and recorded is the
+/// stronger, the proxy's refusal, with both findings; not the shell
+/// reading's review alone.
+///
+/// FAILS ON REVERT of `raised_to_mcp_warning` in `screen_shell`: the
+/// warning says `review` and only the shell reading's words.
+#[test]
+fn the_warning_is_the_stronger_of_the_two_readings() {
+    let host = Host::with_posture(Some("default"));
+    let input = json!({"command": "chmod 777 /tmp/x", "note": "build step"});
+    let (code, text) = host.hook(&[], "mcp__linear__run", input);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("InnerWarden warning (deny, ran under the default posture)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("world-writable permissions; MCP call: ATR-2026-040"),
+        "{text}"
+    );
+    let graph = host.graph();
+    assert!(
+        graph.contains("world-writable permissions; MCP call: ATR-2026-040"),
+        "{graph}"
+    );
 }

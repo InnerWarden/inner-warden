@@ -3112,6 +3112,28 @@ pub(crate) fn screen_shell(
     let refused =
         innerwarden_agent_guard::posture::refuses(posture, would_block_under_policy, &verdict);
     let warned = !monitor && would_block_under_policy && !refused;
+    // An MCP call the proxy's rules refuse and the default posture let run
+    // (`screen_mcp_call`) may also be read here (a script it carries): when
+    // this reading runs with a warning too, the warning said and recorded is
+    // the stronger of the two, never the weaker. Only the words and the
+    // record change: what refuses is decided above.
+    let (verdict, warned) =
+        if !monitor && !refused && runs_with_a_warning(warned, &verdict, posture) {
+            let stronger = MCP_PENDING.lock().ok().and_then(|mut slot| {
+                let Some(McpPending::Warning { explanation, .. }) = slot.as_ref() else {
+                    return None;
+                };
+                let raised = raised_to_mcp_warning(&verdict, explanation)?;
+                slot.take();
+                Some(raised)
+            });
+            match stronger {
+                Some(raised) => (raised, true),
+                None => (verdict, warned),
+            }
+        } else {
+            (verdict, warned)
+        };
 
     // Record EVERY screened command into the narrative graph (allow AND deny).
     // Persist recommendation and real outcome separately: monitor records a deny
@@ -3384,8 +3406,47 @@ pub(crate) fn stricter_with_host(
 /// rules then answer for (a refusal, an ask, their own warning) is never
 /// answered twice.
 enum McpPending {
-    Warning(String),
+    /// The warning line, and the proxy's explanation it says.
+    Warning {
+        line: String,
+        explanation: String,
+    },
     DemoReport(String),
+}
+
+/// PURE. The shell reading's verdict raised to the MCP judgment's warned
+/// refusal, when that is the stronger: `deny` over the shell reading's
+/// `review` or `allow`, both explanations kept. `None` when the shell
+/// reading is as strong.
+fn raised_to_mcp_warning(
+    verdict: &serde_json::Value,
+    explanation: &str,
+) -> Option<serde_json::Value> {
+    let own = verdict
+        .get("recommendation")
+        .and_then(|r| r.as_str())
+        .unwrap_or("allow");
+    if own == "deny" {
+        return None;
+    }
+    let mut raised = verdict.clone();
+    let obj = raised.as_object_mut()?;
+    obj.insert("recommendation".into(), "deny".into());
+    let previous = obj
+        .get("explanation")
+        .and_then(|e| e.as_str())
+        .unwrap_or("")
+        .to_string();
+    let reason = format!("MCP call: {explanation}");
+    let joined = if previous.is_empty() {
+        reason
+    } else {
+        format!("{previous}; {reason}")
+    };
+    obj.insert("explanation".into(), joined.into());
+    let score = obj.get("risk_score").and_then(|s| s.as_u64()).unwrap_or(0);
+    obj.insert("risk_score".into(), score.max(80).into());
+    Some(raised)
 }
 
 static MCP_PENDING: std::sync::Mutex<Option<McpPending>> = std::sync::Mutex::new(None);
@@ -3398,7 +3459,9 @@ fn say_mcp_pending(agent: Option<&str>, exit: std::process::ExitCode) {
     };
     let answered = HOOK_ANSWERED.load(std::sync::atomic::Ordering::SeqCst);
     match pending {
-        McpPending::Warning(line) if exit == std::process::ExitCode::SUCCESS && !answered => {
+        McpPending::Warning { line, .. }
+            if exit == std::process::ExitCode::SUCCESS && !answered =>
+        {
             if warn_agent(agent, &line) {
                 HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -3407,7 +3470,7 @@ fn say_mcp_pending(agent: Option<&str>, exit: std::process::ExitCode) {
             println!("{report}");
             HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
         }
-        McpPending::Warning(line) => eprintln!("{line}"),
+        McpPending::Warning { line, .. } => eprintln!("{line}"),
         McpPending::DemoReport(_) => {}
     }
 }
@@ -3470,27 +3533,14 @@ fn screen_mcp_call(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let first_tool = mcp_unproxied::tool_of(tool_name)?;
-    // The rule engine is most of a call's time: its rules parsed, then the
-    // regexes a tool call selects compiled on every core at once, beside the
-    // identity and profile, not after them.
-    let (engine, payload_session, profile) = std::thread::scope(|scope| {
-        let engine = scope.spawn(|| {
-            let engine = RuleEngine::load_embedded_on_cores();
-            engine.warm(innerwarden_agent_guard::rules::AtrSource::ToolCall);
-            engine
-        });
-        let payload_session = hook_session(buf);
-        let identity = hook_identity::current(Some(&agent), payload_session.as_deref());
-        let profile = agent_profiles::proxy_profile(
-            &agent_profiles_io::load(),
-            Some(&agent),
-            identity.as_ref(),
-        );
-        let engine = engine
-            .join()
-            .unwrap_or_else(|_| RuleEngine::load_embedded());
-        (engine, payload_session, profile)
-    });
+    // The rules come from the table the build wrote (no YAML is parsed),
+    // and a rule is compiled only for a call whose text holds one of its
+    // literals: an ordinary call compiles almost none.
+    let engine = RuleEngine::load_embedded();
+    let payload_session = hook_session(buf);
+    let identity = hook_identity::current(Some(&agent), payload_session.as_deref());
+    let profile =
+        agent_profiles::proxy_profile(&agent_profiles_io::load(), Some(&agent), identity.as_ref());
     // Strict only by its own file or `--block-review`: an install with no
     // posture file (connected before the posture existed) is judged by the
     // default posture's rule, so an upgrade does not change what it refuses.
@@ -3510,14 +3560,34 @@ fn screen_mcp_call(
         return None;
     }
     // Only a call with a finding pays for reading the configuration.
-    let config = hook::home_dir()
+    let config_path = hook::home_dir()
         .ok()
-        .and_then(|home| mcp_unproxied::config_path_here(&agent, &home))
-        .and_then(|path| mcp_unproxied::read_config(&path));
+        .and_then(|home| mcp_unproxied::config_path_here(&agent, &home));
+    let config = config_path.as_deref().and_then(mcp_unproxied::read_config);
     let settled = config.as_ref().is_some_and(|(_, modified)| {
         mcp_unproxied::config_settled(*modified, mcp_unproxied::agent_started_at())
     });
-    let trust = mcp_unproxied::ProxyTrust::here(!monitor, settled, call_command);
+    let mut trust = mcp_unproxied::ProxyTrust::here(!monitor, settled, call_command);
+    // Codex reads the `.codex/config.toml` of a trusted project over the
+    // user's file: a server one of those layers names is not trusted from
+    // the user's entry. The folder the call runs in, as Codex says it and as
+    // this process has it.
+    if agent == "codex" {
+        if let Some(user) = &config_path {
+            let mut layers: Vec<std::path::PathBuf> = payload
+                .get("cwd")
+                .and_then(|cwd| cwd.as_str())
+                .map(std::path::PathBuf::from)
+                .into_iter()
+                .chain(std::env::current_dir().ok())
+                .filter(|cwd| cwd.is_absolute())
+                .flat_map(|cwd| mcp_unproxied::codex_project_layers(&cwd, user))
+                .collect();
+            layers.sort();
+            layers.dedup();
+            trust.project_layers = mcp_unproxied::project_layer_servers(&layers);
+        }
+    }
     let entries = config.map(|(entries, _)| entries);
     let (reach, tools) =
         mcp_unproxied::reach(&agent, tool_name, call_server, entries.as_deref(), &trust)?;
@@ -3598,7 +3668,10 @@ fn screen_mcp_call(
             McpPending::DemoReport(demo::hook_report(Some("deny"), false, Some(&explanation)))
         })
     } else if warned {
-        Some(McpPending::Warning(warning_line("deny", &explanation)))
+        Some(McpPending::Warning {
+            line: warning_line("deny", &explanation),
+            explanation: explanation.clone(),
+        })
     } else {
         None
     };

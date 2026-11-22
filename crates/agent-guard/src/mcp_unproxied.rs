@@ -110,12 +110,26 @@ pub struct ServerEntry {
 
 /// A wrapper's command and whether its mode refuses (`guard`, `kill`,
 /// `strict`) rather than only records (`advisory`, `warn`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Wrapper {
     /// The command as the configuration writes it.
     pub command: String,
     /// Its proxy refuses what it denies.
     pub blocks: bool,
+    /// The entry sets what decides which program its command starts or what
+    /// that program loads: `PATH`, a `LD_*` or `DYLD_*` variable in its
+    /// `env`, or a file of variables (Cursor's `envFile`) or an `env`
+    /// that cannot be read.
+    pub sets_loader_env: bool,
+    /// The entry names a working folder (`cwd`) its command starts in.
+    pub has_cwd: bool,
+}
+
+/// Whether a variable an entry sets decides which program a command starts
+/// or what it loads: `PATH` (any case: Windows reads it so), `LD_*`,
+/// `DYLD_*`.
+pub fn is_loader_variable(name: &str) -> bool {
+    name.eq_ignore_ascii_case("PATH") || name.starts_with("LD_") || name.starts_with("DYLD_")
 }
 
 /// What a client tells the hook of a call's server besides the tool name.
@@ -236,6 +250,61 @@ pub struct ProxyTrust {
     /// Cursor's `command` line of the server the call goes to, when it
     /// sent one: it must be the guard's proxy as well.
     pub call_command: Option<String>,
+    /// The servers Codex's project layers name ([`codex_project_layers`]):
+    /// one of them may replace the entry read from the user's file.
+    pub project_layers: ProjectLayers,
+}
+
+/// What the configuration layers of a project (Codex's `.codex/config.toml`
+/// in the folders from the working folder up to the project's root) say of
+/// the servers. Codex reads the layers of a trusted project over the user's
+/// file, so a server one of them names may not be the entry the hook read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectLayers {
+    /// The servers the layers name (none: no layer, or layers with no
+    /// server).
+    Servers(Vec<String>),
+    /// A layer is there but cannot be read: any server may be in it.
+    Unreadable,
+}
+
+impl Default for ProjectLayers {
+    fn default() -> Self {
+        Self::Servers(Vec::new())
+    }
+}
+
+/// The configuration layers Codex may read for a session in `cwd`: each
+/// `.codex/config.toml` in `cwd` and its parents up to the first folder
+/// that holds `.git` (the project's root, inclusive), or up to the root of
+/// the file system when none does. `user_config` (the user's own file,
+/// read already) is left out.
+pub fn codex_project_layers(cwd: &Path, user_config: &Path) -> Vec<PathBuf> {
+    let user = file_id(user_config);
+    let mut layers = Vec::new();
+    for dir in cwd.ancestors() {
+        let layer = dir.join(".codex").join("config.toml");
+        let is_user = layer == user_config || (user.is_some() && file_id(&layer) == user);
+        if !is_user && std::fs::symlink_metadata(&layer).is_ok() {
+            layers.push(layer);
+        }
+        if dir.join(".git").exists() {
+            break;
+        }
+    }
+    layers
+}
+
+/// The servers `layers` name, read as the user's file is ([`read_entries`]).
+pub fn project_layer_servers(layers: &[PathBuf]) -> ProjectLayers {
+    let mut names = Vec::new();
+    for layer in layers {
+        match read_entries(layer) {
+            Some(entries) => names.extend(entries.into_iter().map(|entry| entry.name)),
+            None => return ProjectLayers::Unreadable,
+        }
+    }
+    ProjectLayers::Servers(names)
 }
 
 impl ProxyTrust {
@@ -248,6 +317,7 @@ impl ProxyTrust {
             path_var: std::env::var_os("PATH"),
             cwd: std::env::current_dir().ok(),
             call_command,
+            project_layers: ProjectLayers::default(),
         }
     }
 
@@ -273,16 +343,37 @@ impl ProxyTrust {
         if !self.config_settled || (self.hook_enforces && !wrapper.blocks) {
             return false;
         }
-        if !self.is_guard(&wrapper.command) {
+        // What the entry sets beside its command could start another program
+        // under the guard's name (`PATH`, a relative command from `cwd`) or
+        // load other code into it (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`).
+        if wrapper.sets_loader_env || wrapper.has_cwd {
+            return false;
+        }
+        match &self.project_layers {
+            ProjectLayers::Unreadable => return false,
+            ProjectLayers::Servers(names) if names.iter().any(|n| n == &entry.name) => {
+                return false
+            }
+            ProjectLayers::Servers(_) => {}
+        }
+        if !self.is_guard_absolute(&wrapper.command) {
             return false;
         }
         match &self.call_command {
             None => true,
             Some(line) => {
                 let mut words = line.split_whitespace();
-                words.next().is_some_and(|c| self.is_guard(c)) && words.next() == Some("proxy")
+                words.next().is_some_and(|c| self.is_guard_absolute(c))
+                    && words.next() == Some("proxy")
             }
         }
+    }
+
+    /// [`Self::is_guard`] for a command written as an absolute path only:
+    /// a bare name is looked up in a `PATH` the agent may not share with
+    /// this hook, and a relative one is read from a folder it may not share.
+    fn is_guard_absolute(&self, command: &str) -> bool {
+        Path::new(command.trim()).is_absolute() && self.is_guard(command)
     }
 }
 
@@ -423,6 +514,29 @@ pub fn config_path_here(agent: &str, home: &Path) -> Option<PathBuf> {
     config_path(agent, home, std::env::var_os(CODEX_HOME_VAR).as_deref())
 }
 
+/// When a file last changed: the later of its content's time (`mtime`,
+/// which anyone who can write the file can set back with `touch -d`) and
+/// its status change (`ctime`, which the system sets on every write and
+/// on that `touch` too). `None` when neither can be read.
+pub fn last_change(meta: &std::fs::Metadata) -> Option<SystemTime> {
+    let modified = meta.modified().ok();
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        u64::try_from(meta.ctime()).ok().map(|secs| {
+            std::time::UNIX_EPOCH
+                + Duration::from_secs(secs)
+                + Duration::from_nanos(u64::try_from(meta.ctime_nsec()).unwrap_or(0))
+        })
+    };
+    #[cfg(not(unix))]
+    let changed: Option<SystemTime> = None;
+    match (modified, changed) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// The servers the configuration at `path` names. `None` when it is not a
 /// regular file (a FIFO is never opened: it would hold the hook until its
 /// deadline), is larger than [`MAX_CONFIG_BYTES`], cannot be read, or does
@@ -439,7 +553,7 @@ pub fn read_config(path: &Path) -> Option<(Vec<ServerEntry>, Option<SystemTime>)
         return None;
     }
     let file = std::fs::File::open(path).ok()?;
-    let modified = file.metadata().and_then(|m| m.modified()).ok();
+    let modified = file.metadata().ok().and_then(|meta| last_change(&meta));
     let mut text = String::new();
     file.take(MAX_CONFIG_BYTES + 1)
         .read_to_string(&mut text)
@@ -758,6 +872,7 @@ mod tests {
             wrapper: behind_proxy.then(|| Wrapper {
                 command: GUARD.to_string(),
                 blocks: true,
+                ..Wrapper::default()
             }),
             remote,
         }
@@ -773,6 +888,7 @@ mod tests {
             path_var: guard.parent().map(|dir| dir.as_os_str().to_owned()),
             cwd: None,
             call_command: None,
+            project_layers: ProjectLayers::default(),
         }
     }
 
@@ -996,13 +1112,15 @@ mod tests {
             wrapper: Some(Wrapper {
                 command: command.to_string(),
                 blocks,
+                ..Wrapper::default()
             }),
             remote: false,
         };
         let real = guard.path.display().to_string();
         assert!(trust.trusts(&wrapped(&real, true)));
-        // The bare name, found in PATH as a shell finds it.
-        assert!(trust.trusts(&wrapped("innerwarden", true)));
+        // The bare name, even found in PATH as a shell finds it: the agent's
+        // PATH may not be this hook's.
+        assert!(!trust.trusts(&wrapped("innerwarden", true)));
         // A file of the same name somewhere else is not the guard.
         let other = tempfile::TempDir::new().unwrap();
         let fake = other.path().join("innerwarden");
@@ -1405,5 +1523,220 @@ mod tests {
                 decision.verdict.alerts
             );
         }
+    }
+
+    /// Remains of the check on the wrapper: only an absolute command is the
+    /// guard (a relative one is read from a folder the agent may not
+    /// share), and an entry that sets `PATH`, `LD_*` or `DYLD_*`, a file
+    /// of variables or a `cwd` may start another program under the guard's
+    /// name or load other code into it: none is trusted.
+    ///
+    /// FAILS ON REVERT of the check of `sets_loader_env` and `has_cwd` in
+    /// [`ProxyTrust::trusts`], or of `is_guard_absolute`.
+    #[test]
+    fn a_wrapper_that_sets_the_loader_or_a_folder_is_not_trusted() {
+        let guard = Guard::new();
+        let trust = ProxyTrust {
+            cwd: guard.path.parent().map(Path::to_path_buf),
+            ..guard.trust()
+        };
+        let real = guard.path.display().to_string();
+        let entry = |wrapper: Wrapper| ServerEntry {
+            name: "s".to_string(),
+            wrapper: Some(wrapper),
+            remote: false,
+        };
+        let plain = Wrapper {
+            command: real.clone(),
+            blocks: true,
+            ..Wrapper::default()
+        };
+        assert!(trust.trusts(&entry(plain.clone())));
+        // Relative, found from the folder: not trusted.
+        assert!(!trust.trusts(&entry(Wrapper {
+            command: "./innerwarden".to_string(),
+            ..plain.clone()
+        })));
+        assert!(!trust.trusts(&entry(Wrapper {
+            sets_loader_env: true,
+            ..plain.clone()
+        })));
+        assert!(!trust.trusts(&entry(Wrapper {
+            has_cwd: true,
+            ..plain.clone()
+        })));
+        for (name, loader) in [
+            ("PATH", true),
+            ("Path", true),
+            ("LD_PRELOAD", true),
+            ("LD_LIBRARY_PATH", true),
+            ("DYLD_INSERT_LIBRARIES", true),
+            ("NODE_OPTIONS", false),
+            ("HOME", false),
+        ] {
+            assert_eq!(is_loader_variable(name), loader, "{name}");
+        }
+    }
+
+    /// The entries of a Codex and a Cursor config say what they set beside
+    /// their command.
+    #[test]
+    fn entries_say_what_they_set_beside_the_command() {
+        let toml_doc: toml_edit::DocumentMut = "[mcp_servers.a]\ncommand = \"/bin/iw\"\n\
+             args = [\"proxy\", \"--mode\", \"guard\", \"--\", \"srv\"]\nenv = { LD_PRELOAD = \"/tmp/x.so\" }\n\n\
+             [mcp_servers.b]\ncommand = \"/bin/iw\"\n\
+             args = [\"proxy\", \"--mode\", \"guard\", \"--\", \"srv\"]\ncwd = \"/tmp\"\n\n\
+             [mcp_servers.c]\ncommand = \"/bin/iw\"\n\
+             args = [\"proxy\", \"--mode\", \"guard\", \"--\", \"srv\"]\nenv = { TOKEN = \"x\" }\n"
+            .parse()
+            .unwrap();
+        let flags: Vec<(bool, bool)> = crate::mcp_wire_toml::server_entries_toml(&toml_doc)
+            .into_iter()
+            .map(|e| {
+                let w = e.wrapper.expect("a wrapper");
+                (w.sets_loader_env, w.has_cwd)
+            })
+            .collect();
+        assert_eq!(flags, vec![(true, false), (false, true), (false, false)]);
+
+        let wrapper = |extra: Value| {
+            let mut server = json!({"command": "/bin/iw",
+                "args": ["proxy", "--mode", "guard", "--", "srv"]});
+            for (k, v) in extra.as_object().unwrap() {
+                server[k] = v.clone();
+            }
+            server
+        };
+        let root = json!({"mcpServers": {
+            "a": wrapper(json!({"env": {"PATH": "/tmp/bin"}})),
+            "b": wrapper(json!({"envFile": ".env"})),
+            "c": wrapper(json!({"cwd": "/tmp"})),
+            "d": wrapper(json!({"env": {"TOKEN": "x"}})),
+        }});
+        let flags: Vec<(String, bool, bool)> = crate::mcp_wire::server_entries(&root)
+            .into_iter()
+            .map(|e| {
+                let w = e.wrapper.expect("a wrapper");
+                (e.name, w.sets_loader_env, w.has_cwd)
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("a".to_string(), true, false),
+                ("b".to_string(), true, false),
+                ("c".to_string(), false, true),
+                ("d".to_string(), false, false),
+            ]
+        );
+    }
+
+    /// A server a project layer of Codex names may be another entry than the
+    /// user's: not trusted. A layer that cannot be read may name any. The
+    /// layers run from the working folder up to the folder with `.git`.
+    ///
+    /// FAILS ON REVERT of the check of `project_layers` in
+    /// [`ProxyTrust::trusts`].
+    #[test]
+    fn a_server_a_project_layer_names_is_not_trusted() {
+        let guard = Guard::new();
+        let real = guard.path.display().to_string();
+        let entry = ServerEntry {
+            name: "docs".to_string(),
+            wrapper: Some(Wrapper {
+                command: real,
+                blocks: true,
+                ..Wrapper::default()
+            }),
+            remote: false,
+        };
+        assert!(guard.trust().trusts(&entry));
+        let named = ProxyTrust {
+            project_layers: ProjectLayers::Servers(vec!["docs".to_string()]),
+            ..guard.trust()
+        };
+        assert!(!named.trusts(&entry));
+        let other = ProxyTrust {
+            project_layers: ProjectLayers::Servers(vec!["other".to_string()]),
+            ..guard.trust()
+        };
+        assert!(other.trusts(&entry));
+        let unreadable = ProxyTrust {
+            project_layers: ProjectLayers::Unreadable,
+            ..guard.trust()
+        };
+        assert!(!unreadable.trusts(&entry));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let repo = home.join("repo");
+        let sub = repo.join("crates/a");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let user = home.join(".codex/config.toml");
+        for layer in [
+            &user,
+            &repo.join(".codex/config.toml"),
+            &sub.join(".codex/config.toml"),
+        ] {
+            std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&user, "[mcp_servers.user]\ncommand = \"u\"\n").unwrap();
+        std::fs::write(
+            repo.join(".codex/config.toml"),
+            "[mcp_servers.docs]\ncommand = \"evil\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sub.join(".codex/config.toml"),
+            "[mcp_servers.fs]\ncommand = \"x\"\n",
+        )
+        .unwrap();
+        let layers = codex_project_layers(&sub, &user);
+        assert_eq!(
+            layers,
+            vec![
+                sub.join(".codex/config.toml"),
+                repo.join(".codex/config.toml")
+            ]
+        );
+        assert_eq!(
+            project_layer_servers(&layers),
+            ProjectLayers::Servers(vec!["fs".to_string(), "docs".to_string()])
+        );
+        // No `.git` above: every folder up to the root, the user's file left out.
+        std::fs::remove_dir(repo.join(".git")).unwrap();
+        assert!(!codex_project_layers(&sub, &user).contains(&user));
+        std::fs::write(sub.join(".codex/config.toml"), "not = [toml").unwrap();
+        assert_eq!(
+            project_layer_servers(&codex_project_layers(&sub, &user)),
+            ProjectLayers::Unreadable
+        );
+    }
+
+    /// A configuration rewritten today and dated back with `touch -d` keeps
+    /// today's status change: it is not taken as the one the agent read.
+    ///
+    /// FAILS ON REVERT of `last_change` to the content's time alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_dated_back_is_still_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[mcp_servers]\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_577_836_800))
+            .unwrap();
+        let (_, changed) = read_config(&path).expect("reads");
+        let started = SystemTime::now() - Duration::from_secs(60);
+        assert!(!config_settled(changed, Some(started)));
+        let mtime = std::fs::metadata(&path).unwrap().modified().ok();
+        assert!(
+            config_settled(mtime, Some(started)),
+            "the content's time alone was fooled"
+        );
     }
 }

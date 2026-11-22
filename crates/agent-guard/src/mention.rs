@@ -1284,18 +1284,14 @@ fn command_edits(
                 }
             }
             if program == "git" {
-                let verbs: Vec<&str> = words
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|w| !w.starts_with('-'))
-                    .take(2)
-                    .collect();
+                let at = git_verb_positions(&words);
+                let verbs: Vec<&str> = at.iter().map(|i| words[*i].as_str()).collect();
                 if verbs.first() == Some(&"grep") {
-                    let from = words.iter().position(|w| w == "grep").unwrap_or(0) + 1;
+                    let from = at[0] + 1;
                     search_pattern_edits(&words[from..], from, &literal_at, &mut mask);
                 }
                 if verbs.first() == Some(&"worktree") && verbs.get(1) == Some(&"remove") {
-                    let from = words.iter().position(|w| w == verbs[1]).unwrap_or(0) + 1;
+                    let from = at[1] + 1;
                     for (at, word) in words.iter().enumerate().skip(from) {
                         if !word.starts_with('-') && literal_at(at) && work_folder(word) {
                             mask(at, "wt");
@@ -1338,6 +1334,33 @@ fn command_edits(
             }
         }
     }
+}
+
+/// git's options before its verb whose value is the next word: the folder
+/// it runs in (`-C`), its repository and work tree, a setting, a
+/// namespace. Their value is no verb.
+const GIT_VALUE_OPTIONS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c", "--namespace"];
+
+/// Where git's verb and the word after it are among `words` (a git
+/// line's arguments): the first two words that are not options, the value
+/// of an option before the verb ([`GIT_VALUE_OPTIONS`]) skipped. `git -C
+/// ~/repo worktree remove ../wt` is `worktree remove`, not `~/repo
+/// worktree` (BI FP-20261122-git-C-innerwarden-path-worktree-remove).
+fn git_verb_positions(words: &[String]) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < words.len() && found.len() < 2 {
+        let word = words[at].as_str();
+        if found.is_empty() && GIT_VALUE_OPTIONS.contains(&word) {
+            at += 2;
+            continue;
+        }
+        if !word.starts_with('-') {
+            found.push(at);
+        }
+        at += 1;
+    }
+    found
 }
 
 /// Subcommands of `cargo` that build, check or test what the project holds

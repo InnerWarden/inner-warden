@@ -917,6 +917,7 @@ dependencies = [
  "libc",
  "regex",
  "regex-automata",
+ "regex-syntax",
  "serde",
  "serde_json",
  "serde_yaml",
