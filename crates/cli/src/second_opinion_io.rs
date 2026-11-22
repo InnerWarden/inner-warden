@@ -7,7 +7,8 @@
 use serde_json::Value;
 
 use crate::second_opinion::{
-    apply_second_opinion, build_body, needs_second_opinion, parse_reply, LlmConfig,
+    apply_second_opinion, ask_at_once_or_again, build_body, needs_second_opinion, parse_reply,
+    retry_after, Asked, LlmConfig,
 };
 
 // ---- I/O boundary (config read + HTTP POST). Excluded from the coverage floor
@@ -299,25 +300,13 @@ pub fn has_key() -> bool {
 /// agent is given for the hook has to be longer than the two together.
 pub(crate) const LLM_ANSWER_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// POST the classification request to the user's endpoint. Best-effort: any error
-/// (no key, network, bad status) returns `None` so the caller keeps the `review`.
-fn call_llm(cfg: &LlmConfig, source: &Source, command: &str) -> Option<Value> {
-    // The command LEAVES THE HOST here (off-box to the user's LLM endpoint). Redact
-    // secrets first so a screened command that embeds a credential never reaches the
-    // model; the redacted form keeps the dangerous SHAPE, so the verdict is unaffected.
-    let command = innerwarden_agent_guard::redact::redact_secrets(command).text;
-    let body = build_body(&cfg.model, &command);
-    // The hook's deadline does not count a wait this call bounds itself, up
-    // to one model's answer a run, counted by the time really waited. With
-    // nothing left the call keeps its review rather than be refused by the
-    // deadline while it waits; with less than the bound left, that is the
-    // timeout.
-    let timeout = crate::hook_net::grant_wait(LLM_ANSWER_BOUND)?;
-    // Key precedence: the named env var (zero key-at-rest) first, then the 0600
-    // key file the wizard / `llm set-key` wrote, read through the folder the
-    // config was. A key named and not read is said in one line: the request
-    // still goes, without it, and a 401 alone said nothing of why.
-    let key = match key_for(cfg, source) {
+/// The second opinion's API key: the named env var (zero key-at-rest) first,
+/// then the 0600 key file the wizard / `llm set-key` wrote, read through the
+/// folder the config was ([`key_for`]). A key named and not read is said in
+/// one line: the request still goes, without it, and a 401 alone said nothing
+/// of why.
+fn read_key(cfg: &LlmConfig, source: &Source) -> Option<String> {
+    match key_for(cfg, source) {
         Ok(key) => key,
         Err(why) => {
             let _ = std::io::Write::write_all(
@@ -326,24 +315,56 @@ fn call_llm(cfg: &LlmConfig, source: &Source, command: &str) -> Option<Value> {
             );
             None
         }
-    };
-    let started = std::time::Instant::now();
-    let reply = (|| {
-        let mut req = crate::http_io::agent_with_timeout(timeout)
+    }
+}
+
+/// POST the classification request to the user's endpoint, with `timeout`
+/// ([`consider_all`] gave it) and the `key` [`read_key`] read. Best-effort:
+/// any error (network, bad status) is `Answered(None)` so the caller keeps the
+/// `review`, but a busy endpoint (429) is told apart, with the wait it asked
+/// for, so the line can be asked again while time is left.
+fn call_llm(
+    cfg: &LlmConfig,
+    key: Option<&str>,
+    command: &str,
+    timeout: std::time::Duration,
+) -> Asked {
+    // The command LEAVES THE HOST here (off-box to the user's LLM endpoint). Redact
+    // secrets first so a screened command that embeds a credential never reaches the
+    // model; the redacted form keeps the dangerous SHAPE, so the verdict is unaffected.
+    let command = innerwarden_agent_guard::redact::redact_secrets(command).text;
+    let body = build_body(&cfg.model, &command);
+    (|| {
+        // The status is read here, not turned into an error, so a 429 keeps
+        // its Retry-After headers.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut req = agent
             .post(&cfg.url)
             .header("Content-Type", "application/json");
-        if let Some(key) = &key {
+        if let Some(key) = key {
             req = if cfg.is_azure() {
                 req.header("api-key", key)
             } else {
                 req.header("Authorization", &format!("Bearer {key}"))
             };
         }
-        let resp = req.send_json(body).ok()?;
-        resp.into_body().read_json::<Value>().ok()
-    })();
-    crate::hook_net::waited(timeout, started.elapsed());
-    reply
+        let Ok(resp) = req.send_json(body) else {
+            return Asked::Answered(None);
+        };
+        let status = resp.status().as_u16();
+        if status == 429 {
+            let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok());
+            return Asked::Busy(retry_after(header("retry-after-ms"), header("retry-after")));
+        }
+        if !(200..300).contains(&status) {
+            return Asked::Answered(None);
+        }
+        Asked::Answered(resp.into_body().read_json::<Value>().ok())
+    })()
 }
 
 /// The default key-file path the wizard / `set-key` writes: a 0600 file beside the
@@ -447,20 +468,44 @@ pub fn verify_endpoint(cfg: &LlmConfig) -> Result<(), String> {
     }
 }
 
-/// The full second-opinion flow: only for `review`, only when the user configured
-/// an endpoint. Returns an overriding verdict (`decided_by = llm`) or `None` to
-/// keep the rules verdict (which then escalates to a human via notify).
-pub fn consider(command: &str, rules_verdict: &Value) -> Option<Value> {
+/// The full second-opinion flow, for every line of a call, in their order:
+/// only a `review`, only when the user configured an endpoint. Each answer
+/// is an overriding verdict (`decided_by = llm`) or `None` to keep the
+/// rules verdict (which then escalates to a human via notify). The lines
+/// that need one are asked at once, under one model answer's wait
+/// ([`ask_at_once_or_again`]).
+pub fn consider_all(lines: &[(&str, &Value)]) -> Vec<Option<Value>> {
     // No configured endpoint = never escalate (the common case; zero cost, fast).
-    let Loaded { cfg, source } = load()?;
-    // Escalate only when it is worth the spend: an ambiguous command with real
-    // harm potential (review + risk >= the configured floor).
-    if !needs_second_opinion(rules_verdict, cfg.effective_min_risk()) {
-        return None;
-    }
-    let resp = call_llm(&cfg, &source, command)?;
-    let (verdict, why) = parse_reply(&resp)?;
-    Some(apply_second_opinion(rules_verdict, &verdict, &why))
+    let Some(Loaded { cfg, source }) = load() else {
+        return vec![None; lines.len()];
+    };
+    let min_risk = cfg.effective_min_risk();
+    // The key is read once, when the first line is asked, so a run that asks
+    // nothing reads no key and a key not read is said in one line.
+    let key = std::sync::OnceLock::new();
+    ask_at_once_or_again(
+        lines,
+        // Escalate only when it is worth the spend: an ambiguous command
+        // with real harm potential (review + risk >= the configured floor).
+        |rules| needs_second_opinion(rules, min_risk),
+        // The hook's deadline does not count a wait the call bounds itself,
+        // up to one model's answer a run, counted by the time really
+        // waited. With nothing left the call keeps its review rather than
+        // be refused by the deadline while it waits; with less than the
+        // bound left, that is the timeout.
+        || crate::hook_net::grant_wait(LLM_ANSWER_BOUND),
+        |command, rules, timeout| {
+            let key = key.get_or_init(|| read_key(&cfg, &source));
+            match call_llm(&cfg, key.as_deref(), command, timeout) {
+                Asked::Answered(resp) => Asked::Answered(resp.and_then(|resp| {
+                    let (verdict, why) = parse_reply(&resp)?;
+                    Some(apply_second_opinion(rules, &verdict, &why))
+                })),
+                busy => busy,
+            }
+        },
+        crate::hook_net::waited,
+    )
 }
 
 /// Persist the llm config to `config_path()`. Shared by `set`, `set-key`, and the

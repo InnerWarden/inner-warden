@@ -67,6 +67,17 @@ fn cost(line: &str) -> Duration {
 /// 2 KB (3964 / 504 ms and 3009 / 320 ms in a debug build). A line four
 /// times as long is held to six times the cost, five and a margin; nothing
 /// is measured in absolute time.
+///
+/// Skipped under coverage only: instrumented, with the other tests of the
+/// binary running beside it, the ratio crossed six on the runner on lines
+/// whose cost had not changed (2026-11-22, the coverage job of several PRs),
+/// while the build job, which runs it as shipped, kept it. The square it
+/// guards against is ten times in a debug build, so the build job alone still
+/// catches a revert.
+#[cfg_attr(
+    tarpaulin,
+    ignore = "a perf ratio under instrumentation measures the instrumentation"
+)]
 #[test]
 fn a_line_four_times_as_long_costs_about_four_times_as_much() {
     // Compiles the rules once, outside what is measured.
