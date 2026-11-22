@@ -4642,27 +4642,52 @@ const GUARD_PROGRAM_DIRS: &[&str] = &[
 
 /// The values a line may set in front of `innerwarden check` and still have
 /// its line read as data ([`guard_check_without_its_line`]): the home it
-/// reads its own files from, and its colours.
+/// reads its own files from (its config, and the `llm.toml` and
+/// `notify.toml` a check may consult for a second opinion or an alert),
+/// and its colours.
 const CHECK_HARMLESS_VALUES: &[&str] = &["HOME", "NO_COLOR"];
 
-/// Whether `path` is, from the root, a file named `innerwarden` that is
-/// the very file of the program judging the line: the hook or the proxy
-/// that runs this code, reached by another path (a build folder, a link, a
-/// home written out). A file of the same name anywhere else may be
-/// anything and is not the guard. The file is compared as the system
-/// resolves both paths, links followed.
+/// Whether `path` is, from the root, a file named `innerwarden` written as
+/// the very path of the program judging the line: the hook or the proxy
+/// that runs this code, in a build folder for one. A file of the same name
+/// anywhere else may be anything and is not the guard.
+///
+/// The text is compared, never the file system: the path is the agent's
+/// and is resolved by the shell that runs the line, later and in its own
+/// working folder, so a link the agent can change or a `/proc/self/cwd/`
+/// resolved in the guard's process says nothing about what runs (measured
+/// 2026-11-22: a link swapped in a loop let the shell run another file
+/// with the refused line). Only `current_exe()` or its canonical form,
+/// written out, with no `.` or `..` part, no `//`, and nothing under
+/// `/proc` or `/dev`.
 fn is_the_running_guard(path: &str) -> bool {
-    static RUNNING: std::sync::LazyLock<Option<std::path::PathBuf>> =
-        std::sync::LazyLock::new(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|exe| std::fs::canonicalize(exe).ok())
-        });
+    running_guard_path_matches(path, &RUNNING_GUARD_PATHS)
+}
+
+/// The paths of the running guard [`is_the_running_guard`] accepts:
+/// `current_exe()` as the system gives it and its canonical form, read
+/// once, the guard's own file.
+static RUNNING_GUARD_PATHS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    let canonical = std::fs::canonicalize(&exe).ok();
+    std::iter::once(exe)
+        .chain(canonical)
+        .filter_map(|path| path.to_str().map(str::to_owned))
+        .collect()
+});
+
+/// [`is_the_running_guard`] against the paths `running`.
+fn running_guard_path_matches(path: &str, running: &[String]) -> bool {
     path.starts_with('/')
         && path.ends_with("/innerwarden")
-        && RUNNING.as_ref().is_some_and(|running| {
-            std::fs::canonicalize(path).is_ok_and(|resolved| &resolved == running)
-        })
+        && !path.contains("//")
+        && !path.split('/').any(|part| matches!(part, "." | ".."))
+        && !["/proc/", "/dev/"]
+            .iter()
+            .any(|under| path.starts_with(under))
+        && running.iter().any(|exe| exe == path)
 }
 
 /// `innerwarden check [options] '<line>'` (or `iw check`): the guard asked
@@ -4709,8 +4734,9 @@ fn guard_check_without_its_line(command: &str) -> Option<String> {
         return None;
     }
     // Values set in front of it, only the ones that change no program the
-    // line runs and nothing `check` does but where it reads its own files
-    // from (`HOME=/x`) or its colours.
+    // line runs: where it reads its own files from (`HOME=/x`: its config,
+    // and the `llm.toml` and `notify.toml` a check may consult) or its
+    // colours.
     let set_before = only
         .words
         .iter()
@@ -6461,6 +6487,65 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The running guard's own path is read by its text, never resolved
+    /// in the guard's process: a path the shell resolves in its own
+    /// working folder (`/proc/self/cwd/`, `/dev/fd/../cwd/`) or through a
+    /// `.` or `..` part is not it, even when it leads there from here.
+    ///
+    /// FAILS ON REVERT of `running_guard_path_matches` to the file
+    /// system comparison: the `/proc` and `..` paths that lead to the
+    /// running program are accepted.
+    #[test]
+    fn the_running_guard_is_its_path_as_written() {
+        let running = vec![
+            "/home/u/src/inner-warden/target/release/innerwarden".to_string(),
+            "/opt/iw/bin/innerwarden".to_string(),
+        ];
+        for path in [
+            "/home/u/src/inner-warden/target/release/innerwarden",
+            "/opt/iw/bin/innerwarden",
+        ] {
+            assert!(running_guard_path_matches(path, &running), "{path}");
+        }
+        for path in [
+            "/proc/self/cwd/innerwarden",
+            "/proc/self/cwd/../release/innerwarden",
+            "/proc/thread-self/cwd/innerwarden",
+            "/dev/fd/../cwd/innerwarden",
+            "/proc/self/exe",
+            "/home/u/src/inner-warden/target/release/./innerwarden",
+            "/home/u/src/inner-warden/target/debug/../release/innerwarden",
+            "/home/u/src/inner-warden/target/release//innerwarden",
+            "//home/u/src/inner-warden/target/release/innerwarden",
+            "/tmp/x/innerwarden",
+            "target/release/innerwarden",
+        ] {
+            assert!(!running_guard_path_matches(path, &running), "{path}");
+        }
+        // The forms that walk the file system are refused before any
+        // comparison, whatever the running paths hold.
+        for path in [
+            "/proc/self/cwd/innerwarden",
+            "/dev/fd/../cwd/innerwarden",
+            "/a/../innerwarden",
+        ] {
+            assert!(
+                !running_guard_path_matches(path, &[path.to_string()]),
+                "{path}"
+            );
+        }
+        // With the guard's own program in the working folder, the paths
+        // through `/proc/self/cwd` still read the line as a command.
+        for path in [
+            "/proc/self/cwd/innerwarden",
+            "/proc/thread-self/cwd/innerwarden",
+            "/dev/fd/../cwd/innerwarden",
+        ] {
+            let line = format!("{path} check 'systemctl stop innerwarden-agent'");
+            assert_eq!(guard_check_without_its_line(&line), None, "{line}");
+        }
+    }
 
     /// A refusing ATR rule whose pattern cannot finish on the input (the
     /// fancy-regex backtrack limit) refuses the MCP message on each path

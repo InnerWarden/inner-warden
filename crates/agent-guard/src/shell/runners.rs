@@ -108,9 +108,23 @@ pub(crate) fn reads_code_when_given_none(name: &str) -> bool {
 /// quote, an escape or an expansion in it is left as written. `None` when
 /// nothing changes.
 pub(crate) fn launchers_read_through(line: &str) -> Option<String> {
+    // Redirections in front of a launcher (`2>/dev/null env sh`), the
+    // launchers, then the redirections a cut launcher left in front
+    // (`env 2>/dev/null sh` is `2>/dev/null sh`).
+    let moved = leading_redirections_moved(line);
+    let first = moved.as_deref().unwrap_or(line);
+    let cut = launchers_cut(first);
+    let second = cut.as_deref().unwrap_or(first);
+    let read = leading_redirections_moved(second).unwrap_or_else(|| second.to_owned());
+    (read != line).then_some(read)
+}
+
+/// [`launchers_read_through`] without the redirections moved.
+fn launchers_cut(line: &str) -> Option<String> {
     let base = line.as_ptr() as usize;
     let mut cuts: Vec<(usize, usize, String)> = Vec::new();
     for segment in crate::threats::shell_command_segments(line) {
+        let segment = without_group_head(segment);
         let Some(offset) = (segment.as_ptr() as usize).checked_sub(base) else {
             continue;
         };
@@ -120,12 +134,7 @@ pub(crate) fn launchers_read_through(line: &str) -> Option<String> {
         let tokens = crate::threats::shell_tokens(segment);
         let keywords = tokens
             .iter()
-            .take_while(|word| {
-                matches!(
-                    word.as_str(),
-                    "if" | "then" | "elif" | "else" | "do" | "while" | "until" | "!"
-                )
-            })
+            .take_while(|word| opens_a_command(word))
             .count();
         let Some(first) = tokens.get(keywords) else {
             continue;
@@ -146,21 +155,23 @@ pub(crate) fn launchers_read_through(line: &str) -> Option<String> {
         {
             continue;
         }
-        let Some(command) = crate::threats::effective_command_index(&tokens) else {
+        let Some(command) = crate::threats::effective_command_index(&tokens[keywords..])
+            .map(|command| command + keywords)
+        else {
             continue;
         };
         if command <= keywords {
             continue;
         }
-        // A launcher followed by a redirection runs no command: `exec >
+        // A launcher followed only by redirections runs no command: `exec >
         // r.sh` moves the output of the commands after it, and the same
         // words without `exec` (`> r.sh`) only empty the file. Measured
         // 2026-11-22: `exec > r.sh; echo hi > log; exec > /dev/tty; sh
-        // r.sh` was held for review through that reading.
-        if tokens
-            .get(command)
-            .is_some_and(|word| is_redirection_word(word))
-        {
+        // r.sh` was held for review through that reading. A word after the
+        // redirections is the command it runs (`env 2>/dev/null sh`), so
+        // the launcher is cut as before and the redirections left in front
+        // are moved after it ([`leading_redirections_moved`]).
+        if past_redirections(&tokens, command) >= tokens.len() {
             continue;
         }
         // Walk the words as written up to the command the launchers run.
@@ -211,18 +222,119 @@ pub(crate) fn launchers_read_through(line: &str) -> Option<String> {
     (read != line).then_some(read)
 }
 
-/// Where word `index` of `segment` starts, the words split at blanks as
-/// written. `None` when a word before it holds a quote or an escape, so
-/// the blanks do not tell where the words are.
 /// Whether a word of a command is a redirection, not the program a launcher
 /// runs: `>`, `>>`, `<`, `&>`, a descriptor before one (`2>`, `1>&2`),
 /// or the same glued to its target (`>r.sh`).
 fn is_redirection_word(word: &str) -> bool {
-    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
-    let rest = rest.strip_prefix('&').unwrap_or(rest);
-    rest.starts_with(['>', '<'])
+    crate::threats::is_redirection_word(word)
 }
 
+/// Whether a word in front of a command only opens it: a keyword, so the
+/// command the launchers run starts after it.
+fn opens_a_command(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then" | "elif" | "else" | "do" | "while" | "until" | "!"
+    )
+}
+
+/// The segment of a line without the head of a group or a function that
+/// opens it (`{ `, `( `, `x() { `, `function x { `): [`crate::threats::shell_tokens`]
+/// drops those words, so the words it gives and the words as written line
+/// up only after them.
+fn without_group_head(segment: &str) -> &str {
+    static HEAD: LazyLock<Option<regex::Regex>> = LazyLock::new(|| {
+        regex::Regex::new(
+            r"^[ \t]*(?:(?:function[ \t]+)?[A-Za-z_][A-Za-z0-9_.:-]*[ \t]*\([ \t]*\)[ \t]*|function[ \t]+[A-Za-z_][A-Za-z0-9_.:-]*[ \t]+)?(?:[{(][ \t]+)*",
+        )
+        .ok()
+    });
+    let head = HEAD
+        .as_ref()
+        .and_then(|head| head.find(segment))
+        .map_or(0, |found| found.end());
+    &segment[head..]
+}
+
+/// The index of the first word from `at` on that is not a redirection
+/// nor the target of one written apart (`2> /dev/null`).
+fn past_redirections(tokens: &[String], at: usize) -> usize {
+    crate::threats::past_redirection_words(tokens, at)
+}
+
+/// The line with the redirections written in front of the name of each
+/// command moved after it: `2>/dev/null rm -rf X` runs `rm -rf X` as
+/// `rm -rf X 2>/dev/null` does, so every rule that reads a command by its
+/// first word sees it. Measured 2026-11-22: `2>/dev/null rm -rf
+/// ~/.innerwarden` and `f | 2>/dev/null tee -a ~/.bashrc` were allowed,
+/// the same lines without the redirection refused. A redirection word with
+/// a quote, an escape, an expansion or a here-document is left as written.
+/// `None` when nothing changes.
+pub(crate) fn leading_redirections_moved(line: &str) -> Option<String> {
+    if !line.contains(['>', '<']) {
+        return None;
+    }
+    let base = line.as_ptr() as usize;
+    let mut cuts: Vec<(usize, usize, String)> = Vec::new();
+    for segment in crate::threats::shell_command_segments(line) {
+        let segment = without_group_head(segment);
+        let Some(offset) = (segment.as_ptr() as usize).checked_sub(base) else {
+            continue;
+        };
+        if line.get(offset..offset + segment.len()) != Some(segment) {
+            continue;
+        }
+        let tokens = crate::threats::shell_tokens(segment);
+        let keywords = tokens
+            .iter()
+            .take_while(|word| opens_a_command(word))
+            .count();
+        if !tokens
+            .get(keywords)
+            .is_some_and(|word| is_redirection_word(word))
+        {
+            continue;
+        }
+        let command = past_redirections(&tokens, keywords);
+        if command >= tokens.len() || tokens[keywords..command].iter().any(|w| w.contains("<<")) {
+            continue;
+        }
+        let (Some(from), Some(to)) = (word_start(segment, keywords), word_start(segment, command))
+        else {
+            continue;
+        };
+        // The words as written line up with the words read.
+        if !segment[to..].starts_with(tokens[command].as_str()) {
+            continue;
+        }
+        let moved = segment[from..to].trim_end();
+        if moved.contains(['\'', '"', '\\', '$', '`']) {
+            continue;
+        }
+        // After the command's words on its own line, before a here-document
+        // body and before the parentheses that close a group around it.
+        let rest = segment[to..].trim_end();
+        let rest = rest.split('\n').next().unwrap_or(rest);
+        let rest = rest.trim_end_matches([' ', '\t', ')']);
+        cuts.push((
+            offset + from,
+            offset + to + rest.len(),
+            format!("{rest} {moved}"),
+        ));
+    }
+    if cuts.is_empty() {
+        return None;
+    }
+    let mut read = line.to_owned();
+    for (from, to, with) in cuts.into_iter().rev() {
+        read.replace_range(from..to, &with);
+    }
+    (read != line).then_some(read)
+}
+
+/// Where word `index` of `segment` starts, the words split at blanks as
+/// written. `None` when a word before it holds a quote or an escape, so
+/// the blanks do not tell where the words are.
 fn word_start(segment: &str, index: usize) -> Option<usize> {
     let bytes = segment.as_bytes();
     let mut at = 0;

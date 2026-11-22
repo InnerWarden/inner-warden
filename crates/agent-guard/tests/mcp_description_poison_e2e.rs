@@ -105,13 +105,17 @@ fn list_tools_through_proxy(mode: ProxyMode) -> (String, Vec<ProxyDecision>) {
         // A bound for a proxy that never answers, not the wait itself: the
         // client's input stays open until the answers are in
         // ([`ClientInput`]).
-        let _ = tokio::time::timeout(
+        let finished = tokio::time::timeout(
             std::time::Duration::from_secs(120),
             run_proxy_with_io(client_in, writer, cfg, None, move |d| {
                 seen.lock().expect("lock").push(d.clone());
             }),
         )
         .await;
+        assert!(
+            finished.is_ok(),
+            "the proxy did not finish within 120 s after its client's answers"
+        );
     });
 
     let bytes = out.lock().expect("lock").clone();
@@ -239,13 +243,17 @@ fn through_proxy(mode: ProxyMode, answers: serde_json::Value) -> (String, Vec<Pr
         // A bound for a proxy that never answers, not the wait itself: the
         // client's input stays open until the answers are in
         // ([`ClientInput`]).
-        let _ = tokio::time::timeout(
+        let finished = tokio::time::timeout(
             std::time::Duration::from_secs(120),
             run_proxy_with_io(client_in, writer, cfg, None, move |d| {
                 seen.lock().expect("lock").push(d.clone());
             }),
         )
         .await;
+        assert!(
+            finished.is_ok(),
+            "the proxy did not finish within 120 s after its client's answers"
+        );
     });
     let bytes = out.lock().expect("lock").clone();
     let events = events.lock().expect("lock").clone();

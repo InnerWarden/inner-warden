@@ -74,6 +74,7 @@ fn a_command_that_sends_its_own_output_elsewhere_adds_nothing_to_an_exec_file() 
 }
 
 /// A folder of the test's own, under the build's temporary folder.
+#[cfg(unix)]
 fn folder(name: &str) -> std::path::PathBuf {
     let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("check-by-path")
@@ -83,14 +84,18 @@ fn folder(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// FAILS ON REVERT of `is_the_running_guard` and `CHECK_HARMLESS_VALUES`
-/// in `guard_check_without_its_line`: the first lines are denied as
-/// clearing the shell history.
+/// FAILS ON REVERT of `CHECK_HARMLESS_VALUES` in
+/// `guard_check_without_its_line`: the lines with `HOME` or `NO_COLOR` in
+/// front are denied as clearing the shell history. The running guard's
+/// own path is read by its text (`running_guard_path_matches`, unit tests
+/// in `mcp.rs`): this test's program is not named `innerwarden`.
 #[cfg(unix)]
 #[test]
 fn check_by_the_running_guards_own_file_reads_its_line_as_data() {
-    // This test's program stands for the guard judging the line: a link
-    // named `innerwarden` to it is the same file, reached by another path.
+    // A link named `innerwarden` to the program judging the line is
+    // judged with its words: the shell resolves it later, and the agent
+    // may have changed it by then (review round 1 of the change: 61 of 200
+    // tries with a link swapped in a loop were allowed).
     let running = std::env::current_exe().expect("current exe");
     let linked = folder("linked").join("innerwarden");
     std::os::unix::fs::symlink(&running, &linked).expect("link");
@@ -99,7 +104,12 @@ fn check_by_the_running_guards_own_file_reads_its_line_as_data() {
         format!("'{linked}' check --json 'history -c'"),
         format!("HOME=/x '{linked}' check --json 'history -c'"),
         format!("NO_COLOR=1 {linked} check 'history -c'"),
+    ] {
+        assert_eq!(verdict(&line), "deny", "{line}");
+    }
+    for line in [
         "HOME=/x /usr/local/bin/innerwarden check --json 'history -c'".to_string(),
+        "NO_COLOR=1 /usr/local/bin/innerwarden check 'history -c'".to_string(),
         "innerwarden check --json 'history -c'".to_string(),
     ] {
         assert_eq!(verdict(&line), "allow", "{line}");

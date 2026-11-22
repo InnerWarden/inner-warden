@@ -336,3 +336,24 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   lines (`>&1`, `1>&1`, `>/dev/stdout` keep the output in the file).
   No other line of any corpus moved, from an empty home or a home with
   keys.
+- 2026-11-22: review round 1 of the same change; reference.tsv unchanged.
+  Measured with the differential judge against main 0f6ec89 (39097 lines,
+  an empty home and a home with keys, the same in both): no line main
+  stops goes unstopped, and only these move. New must_refuse lines that
+  main allows and this branch refuses: cursor-exec-2026-11/ce-23, cursor-exec-2026-11/ce-24, cursor-exec-2026-11/ce-25, cursor-exec-2026-11/ce-27, cursor-exec-2026-11/ce-28, cursor-exec-2026-11/ce-29, cursor-exec-2026-11/ce-30
+  (a redirection in front of the name of a command, and the Cursor
+  install folder written with `//`, `/./`, a glob or reached by `cd`);
+  review on main, deny now: cursor-exec-2026-11/ce-26, cursor-exec-2026-11/ce-31, cursor-exec-2026-11/ce-32, cursor-exec-2026-11/ce-33
+  (`crontab - 2>/dev/null`, and a table from a file the line does not
+  show behind a launcher and a redirection, refused as `cat /tmp/x |
+  crontab -` is). cursor-exec-2026-11/ce-06, cursor-exec-2026-11/ce-07, cursor-exec-2026-11/ce-08, cursor-exec-2026-11/ce-09, cursor-exec-2026-11/ce-10, cursor-exec-2026-11/ce-11, cursor-exec-2026-11/ce-12, cursor-exec-2026-11/ce-13, cursor-exec-2026-11/ce-14, cursor-exec-2026-11/ce-15, cursor-exec-2026-11/ce-16, cursor-exec-2026-11/ce-17, cursor-exec-2026-11/ce-18, cursor-exec-2026-11/ce-19, cursor-exec-2026-11/ce-20, cursor-exec-2026-11/ce-21, cursor-exec-2026-11/ce-22
+  (a redirection after a launcher) are deny on main and here; the first
+  version of this change allowed them. Their generated variants move the
+  same way. New metamorphic technique env_redirect (`env 2>/dev/null
+  <word>`, one per env_prefix variant): metamorphic/adv328-c1-14-m-envr,
+  metamorphic/adv328-c2-11-m-envr, metamorphic/adv328-c2-12-m-envr go from
+  review to deny and metamorphic/adv328-c2-18-m-envr from allow to deny;
+  every other envr variant keeps main's verdict. Controls
+  cursor-exec-2026-11/ce-c07, cursor-exec-2026-11/ce-c08, cursor-exec-2026-11/ce-c09, cursor-exec-2026-11/ce-c10, cursor-exec-2026-11/ce-c11, cursor-exec-2026-11/ce-c12, cursor-exec-2026-11/ce-c13, cursor-exec-2026-11/ce-c14
+  are allowed on main and here; ce-c04, ce-c05 and ce-c06 move as recorded
+  above. No other line of any corpus moved.

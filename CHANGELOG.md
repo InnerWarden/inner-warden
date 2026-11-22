@@ -53,14 +53,25 @@ and any opaque run of 32 or more letters and digits.
 The Cursor CLI started by the entry file its launcher hands its own `node`
 (`~/.local/share/cursor-agent/versions/<version>/node .../index.js`) with
 `HOME` moved, so its user hooks are not read, is refused as `cursor-agent`
-started that way already was. A command between `exec > file` and the run
-of that file that sends its own output elsewhere (`echo hi &> log`) no
-longer leaves the file held for review as unread. `innerwarden check` run
-by a path to the very file of the running guard (a build folder, a link),
-or from an installed folder with `HOME` or `NO_COLOR` set in front, reads
-its line as data; a file of the same name anywhere else is still judged
-with its words. A test of the MCP proxy that failed on a loaded machine
-now waits for the server's answers instead of a clock.
+started that way already was. The folder is read as whole parts of the
+path (`cursor-agent/versions/<version>/index.js`), also written with `//`,
+`/./` or a glob, and after a `cd` into it (`./node index.js`); a folder
+that only ends with that name (`my-cursor-agent/versions/`) or another
+file in it (`node_modules/.bin/tsc`) is not the agent. A command between
+`exec > file` and the run of that file that sends its own output
+elsewhere (`echo hi &> log`) no longer leaves the file held for review as
+unread; a launcher followed by a redirection and a command (`env
+2>/dev/null sh`) still runs that command. A redirection written in front
+of the name of a command (`2>/dev/null rm -rf ~/.innerwarden`, `f | 2>/dev/null
+tee -a ~/.bashrc`) no longer hides the command, and `crontab - 2>/dev/null`
+is read as a table from its input. `innerwarden check` run by the path of
+the running guard's own file written out (a build folder), or from an
+installed folder with `HOME` or `NO_COLOR` set in front, reads its line
+as data. The path is compared as text: a link, a `.` or `..` part, `//`
+or a path under `/proc` or `/dev` is judged with its words, since the
+shell resolves it later and in its own folder. A test of the MCP proxy that
+failed on a loaded machine now waits for the server's answers instead of a
+clock, and says so when the proxy does not finish.
 
 `innerwarden setup` and the new `innerwarden status --config` say what is
 already set in the agents' own config, and change nothing. In
