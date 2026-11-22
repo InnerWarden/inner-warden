@@ -1601,6 +1601,7 @@ fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::E
     if !call.already_ran() {
         return hook_unreadable("", rest, TOOL_CALL_TOO_LONG, monitor);
     }
+    hook_net::already_ran(result_unread_to_agent(rest));
     let tool = call.tool.as_deref().unwrap_or("a tool");
     let on = call
         .path
@@ -1616,6 +1617,13 @@ fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::E
          read whole)."
     );
     std::process::ExitCode::SUCCESS
+}
+
+/// Whether the agent of this hook line reads a PostToolUse hook's
+/// `additionalContext` on stdout: Claude Code, the agent of a line that
+/// names none.
+fn result_unread_to_agent(rest: &[String]) -> bool {
+    matches!(agent_flag(rest).as_deref(), None | Some("claude-code"))
 }
 
 fn unreadable_exit_code(monitor: bool) -> u8 {
@@ -2611,6 +2619,9 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     // `tool_input` that produced it, and screening that again would record the
     // same command twice.
     if let Some((tool, result)) = hook_tool_result(&buf) {
+        // Every way through here ends with 0: so does the deadline now.
+        hook_net::already_ran(result_unread_to_agent(rest));
+        hook_net::test_result_delay();
         let payload_session = hook_session(&buf);
         let identity =
             hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
