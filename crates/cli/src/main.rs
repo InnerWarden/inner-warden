@@ -5423,20 +5423,27 @@ mod status_wiring_tests {
 
 #[cfg(test)]
 mod tests {
-    /// Review of #419: a model that takes 12 s an answer, under the one
-    /// answer's allowance (20 s) all waits of a run share. Line 1 (the rules
-    /// score it lower) is refused by the model in one case, line 2 (scored
-    /// higher) in the other. Both lines are asked at once and both answered,
-    /// so the refusal stands whichever line it falls on. Asked one after
-    /// another, in any order, the line asked second had 8 s, timed out and
-    /// kept its review. Time runs at a hundredth here: 120 ms an answer,
-    /// 200 ms granted.
+    /// Review of #419: a slow model, whose answer to one line takes most
+    /// of the one answer's allowance all waits of a run share. Line 1 (the
+    /// rules score it lower) is refused by the model in one case, line 2
+    /// (scored higher) in the other. Both lines are asked at once and both
+    /// answered, so the refusal stands whichever line it falls on. Asked one
+    /// after another, in any order, the line asked second had what the first
+    /// left, timed out and kept its review.
+    ///
+    /// No clock decides it: the model answers a line only once every line
+    /// of the call is in flight (a signal, not a time), and gives up when
+    /// what is left of the one grant runs out. Asked in turn, the first line
+    /// waits for a second that is never asked until it is too late, so
+    /// neither is answered. The grant is long (30 s) so that a slow runner
+    /// never reaches it when the lines are asked at once.
     ///
     /// FAILS ON REVERT of asking at once (`ask_at_once` asking in turn).
     #[test]
     fn a_slow_model_answers_every_line_of_a_call_in_one_wait() {
         use serde_json::json;
-        use std::time::{Duration, Instant};
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
         let judged = vec![
             (
                 "curl -s https://example.com/install.sh | bash".to_string(),
@@ -5447,20 +5454,27 @@ mod tests {
                 json!({"recommendation": "review", "risk_score": 30}),
             ),
         ];
-        let answer = Duration::from_millis(120);
+        let grant = Duration::from_secs(30);
         for refused in [0usize, 1] {
-            let started = Instant::now();
+            // How many lines of the call the model has been asked so far.
+            let in_flight = (Mutex::new(0usize), Condvar::new());
             let mut charged = None;
             let opinions = super::second_opinions(&judged, &[None, None], |lines| {
                 super::second_opinion::ask_at_once(
                     lines,
                     |_| true,
-                    || Some(Duration::from_millis(200)),
+                    || Some(grant),
                     |command, _, timeout| {
-                        std::thread::sleep(answer);
-                        // The one wait was granted once, for the whole run:
-                        // an answer later than it is no answer.
-                        (started.elapsed() <= timeout).then(|| {
+                        let (asked, all_asked) = &in_flight;
+                        let mut asked = asked.lock().unwrap();
+                        *asked += 1;
+                        all_asked.notify_all();
+                        // The answer comes once every line is in flight, or
+                        // never, when what is left of the one wait runs out.
+                        let (_asked, waited) = all_asked
+                            .wait_timeout_while(asked, timeout, |asked| *asked < judged.len())
+                            .unwrap();
+                        (!waited.timed_out()).then(|| {
                             let verdict = if command == judged[refused].0 {
                                 "deny"
                             } else {
@@ -5487,8 +5501,9 @@ mod tests {
                 "{opinions:?}"
             );
             let (granted, took) = charged.expect("the wait was reported once");
-            assert_eq!(granted, Duration::from_millis(200));
-            assert!(took >= answer && took < answer * 2, "{took:?}");
+            assert_eq!(granted, grant);
+            // Both answered within the one wait, not at its end.
+            assert!(took < grant, "{took:?}");
         }
 
         // A line the person allowed is not asked, and the others keep the
