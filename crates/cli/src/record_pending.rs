@@ -50,13 +50,62 @@ fn now_unix() -> u64 {
 /// Leave the mark before the work after the answer. Nothing where the
 /// record's folder is not there or cannot be written (a jail whose launcher
 /// keeps the record, say): the mark is a best effort, as the record is.
+///
+/// The mark appears whole: written to `.hook-pending.<pid>.tmp` and renamed
+/// to its name, so a sweep never reads it empty (a mark created and then
+/// written was read empty in between, taken for stale with its hook alive,
+/// alerted on and removed, and that hook's record lost). The folder is
+/// shared with the agent's account and the names are predictable, so the
+/// temporary is created only where nothing stands (a link planted there is
+/// never followed), and takes the mode and group the folder implies, as
+/// every file this product creates there. A rename replaces a link at the
+/// mark's name, never writes through it.
 pub fn begin(graph: &Path) -> Option<PathBuf> {
     let mark = mark_path(graph)?;
-    if !graph.parent().is_some_and(Path::is_dir) {
+    let dir = graph.parent()?;
+    if !dir.is_dir() {
         return None;
     }
-    std::fs::write(&mark, now_unix().to_string()).ok()?;
+    let temp = dir.join(format!("{MARK_PREFIX}{}{TEMP_SUFFIX}", std::process::id()));
+    let file = match create_new(&temp) {
+        Ok(file) => file,
+        // Left by an earlier process of the same pid, or planted: removing a
+        // name never follows it.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::remove_file(&temp).ok()?;
+            create_new(&temp).ok()?
+        }
+        Err(_) => return None,
+    };
+    let written = write_mark(file, dir);
+    if !written || std::fs::rename(&temp, &mark).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return None;
+    }
     Some(mark)
+}
+
+/// The suffix of a mark's temporary, before it is renamed to its name.
+const TEMP_SUFFIX: &str = ".tmp";
+
+/// Create `path` where nothing stands, without following a link.
+fn create_new(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    innerwarden_safe_io::harden(&mut options);
+    options.open(path)
+}
+
+/// Give the new mark the folder's mode and group, and the second it was made.
+fn write_mark(mut file: std::fs::File, dir: &Path) -> bool {
+    use std::io::Write;
+    // Best effort, as for the health record: a mark the next writer cannot
+    // read is still a mark this one can remove.
+    #[cfg(unix)]
+    let _ = innerwarden_agent_guard::file_update::apply_new_file_ownership(&file, dir);
+    #[cfg(not(unix))]
+    let _ = dir;
+    file.write_all(now_unix().to_string().as_bytes()).is_ok()
 }
 
 /// Take the mark away once the work is done.
@@ -87,14 +136,6 @@ fn temporaries_of(graph: &Path, pid: u32) -> Vec<PathBuf> {
         .unwrap_or_default()
 }
 
-/// Remove the temporaries this process's graph writer left beside
-/// `graph`: the end at the limit on the clock, which leaves the mark.
-pub fn clean_own_temporaries(graph: &Path) {
-    for temp in temporaries_of(graph, std::process::id()) {
-        let _ = std::fs::remove_file(temp);
-    }
-}
-
 /// Whether process `pid` is still running. Where that cannot be asked, it
 /// is taken as running, and only the age of the mark makes it stale.
 fn alive(pid: u32) -> bool {
@@ -115,10 +156,45 @@ fn alive(pid: u32) -> bool {
     }
 }
 
-/// PURE: whether a mark made at `made_unix` by a process that is (or is
-/// not) `alive` is stale at `now_unix`.
-fn is_stale(made_unix: Option<u64>, alive: bool, now_unix: u64, stale_after: Duration) -> bool {
-    !alive || made_unix.is_none_or(|made| now_unix.saturating_sub(made) > stale_after.as_secs())
+/// PURE: whether a mark is stale at `now_unix`: its process is not
+/// `alive`, or it is older than any hook may live, by the second written in
+/// it (`made_unix`) or, when that cannot be read, by the file's own time
+/// (`modified_unix`). A mark that cannot be read is never stale for that
+/// alone while its process runs: that was a mark being written.
+fn is_stale(
+    made_unix: Option<u64>,
+    modified_unix: Option<u64>,
+    alive: bool,
+    now_unix: u64,
+    stale_after: Duration,
+) -> bool {
+    let too_old = |at: u64| now_unix.saturating_sub(at) > stale_after.as_secs();
+    !alive || made_unix.or(modified_unix).is_some_and(too_old)
+}
+
+/// What a mark holds, read without following a link: the second it was
+/// made, if it says one, and the file's own time. `None` for what is not
+/// a regular file (a link or a folder planted at the name), which is no
+/// mark of a hook's.
+fn read_mark(path: &Path) -> Option<(Option<u64>, Option<u64>)> {
+    use std::io::Read;
+    let file = innerwarden_safe_io::open_no_follow(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !innerwarden_safe_io::is_regular_file(&metadata) {
+        return None;
+    }
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let mut text = String::new();
+    let made = file
+        .take(32)
+        .read_to_string(&mut text)
+        .ok()
+        .and_then(|_| text.trim().parse::<u64>().ok());
+    Some((made, modified))
 }
 
 /// The marks beside `graph` that are stale, each with its pid. This
@@ -143,10 +219,9 @@ fn stale_marks(graph: &Path, now: u64) -> Vec<(PathBuf, u32)> {
             (pid != own).then(|| (entry.path(), pid))
         })
         .filter(|(path, pid)| {
-            let made = std::fs::read_to_string(path)
-                .ok()
-                .and_then(|text| text.trim().parse::<u64>().ok());
-            is_stale(made, alive(*pid), now, stale_after())
+            read_mark(path).is_some_and(|(made, modified)| {
+                is_stale(made, modified, alive(*pid), now, stale_after())
+            })
         })
         .collect()
 }
@@ -168,16 +243,31 @@ fn sweep_with(graph: &Path, alert: impl FnOnce(&str)) -> u64 {
         for temp in temporaries_of(graph, *pid) {
             let _ = std::fs::remove_file(temp);
         }
+        if let Some(dir) = graph.parent() {
+            let _ = std::fs::remove_file(dir.join(format!("{MARK_PREFIX}{pid}{TEMP_SUFFIX}")));
+        }
         // Removed first: two sweeps at once count a mark once, by whoever
         // took it away.
         if std::fs::remove_file(mark).is_ok() {
             lost += 1;
         }
     }
-    if lost > 0 {
-        let outage = crate::record_health::note_failures_at(graph, CUT_CODE, lost);
-        if crate::record_health::is_first_of_episode_at(graph) {
-            alert(&outage.summary());
+    if lost == 0 {
+        return 0;
+    }
+    // An outage of another fault in progress (a lock that timed out on a
+    // busy disk, say) takes the cut records into its count, without a new
+    // alert: a fresh episode under this code reset its start and its count
+    // and alerted again, and the two codes took turns on a busy disk.
+    match crate::record_health::report_at(graph) {
+        Some(going) if going.code != CUT_CODE => {
+            crate::record_health::note_failures_at(graph, &going.code, lost);
+        }
+        _ => {
+            let outage = crate::record_health::note_failures_at(graph, CUT_CODE, lost);
+            if crate::record_health::is_first_of_episode_at(graph) {
+                alert(&outage.summary());
+            }
         }
     }
     lost
@@ -190,10 +280,110 @@ mod tests {
     #[test]
     fn a_mark_is_stale_when_its_hook_is_gone_or_too_old() {
         let limit = Duration::from_secs(100);
-        assert!(is_stale(Some(1_000), false, 1_001, limit));
-        assert!(!is_stale(Some(1_000), true, 1_050, limit));
-        assert!(is_stale(Some(1_000), true, 1_101, limit));
-        assert!(is_stale(None, true, 1_000, limit), "an unreadable mark");
+        assert!(is_stale(Some(1_000), Some(1_000), false, 1_001, limit));
+        assert!(!is_stale(Some(1_000), Some(1_000), true, 1_050, limit));
+        assert!(is_stale(Some(1_000), Some(1_000), true, 1_101, limit));
+    }
+
+    /// Review of #414, item 3: a mark that says no second (being written,
+    /// or unreadable) is stale by the file's own time or a process that is
+    /// gone, never with its process running and the file young.
+    ///
+    /// FAILS ON REVERT of `is_stale` taking an unreadable mark for stale.
+    #[test]
+    fn an_unreadable_mark_of_a_running_hook_is_stale_only_by_age() {
+        let limit = Duration::from_secs(100);
+        assert!(!is_stale(None, Some(1_000), true, 1_050, limit));
+        assert!(!is_stale(None, None, true, 1_050, limit));
+        assert!(is_stale(None, Some(1_000), true, 1_101, limit));
+        assert!(is_stale(None, None, false, 1_050, limit));
+    }
+
+    /// Review of #414, item 4: the mark's names are predictable in a folder
+    /// the agent's account writes. A link planted at the temporary's name or
+    /// at the mark's own name is never written through: the files they point
+    /// at keep what they held, and the mark is a regular file of its own.
+    ///
+    /// FAILS ON REVERT of `begin` to `fs::write` at the mark's name.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_at_a_mark_is_never_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.json");
+        let outside = tempfile::tempdir().unwrap();
+        let at_mark = outside.path().join("victim-a");
+        let at_temp = outside.path().join("victim-b");
+        std::fs::write(&at_mark, "kept a").unwrap();
+        std::fs::write(&at_temp, "kept b").unwrap();
+        let pid = std::process::id();
+        let mark_name = dir.path().join(format!("{MARK_PREFIX}{pid}"));
+        let temp_name = dir.path().join(format!("{MARK_PREFIX}{pid}{TEMP_SUFFIX}"));
+        std::os::unix::fs::symlink(&at_mark, &mark_name).unwrap();
+        std::os::unix::fs::symlink(&at_temp, &temp_name).unwrap();
+
+        let mark = begin(&graph).expect("a mark of its own");
+        assert_eq!(std::fs::read_to_string(&at_mark).unwrap(), "kept a");
+        assert_eq!(std::fs::read_to_string(&at_temp).unwrap(), "kept b");
+        let meta = std::fs::symlink_metadata(&mark).unwrap();
+        assert!(meta.file_type().is_file(), "{meta:?}");
+        assert!(!temp_name.exists() && std::fs::symlink_metadata(&temp_name).is_err());
+        finish(&mark);
+    }
+
+    /// Review of #414, item 4: a new mark takes the mode the folder implies,
+    /// as the record and the health file do, whatever the umask.
+    #[cfg(unix)]
+    #[test]
+    fn a_mark_takes_the_mode_its_folder_implies() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.json");
+        let mark = begin(&graph).unwrap();
+        let wanted = innerwarden_agent_guard::file_update::new_file_ownership(dir.path()).mode;
+        let mode = std::fs::metadata(&mark).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, wanted);
+        finish(&mark);
+    }
+
+    /// Review of #414, item 4: the sweep reads a mark without following a
+    /// link. A link at a mark's name, to a file holding an old second, is no
+    /// hook's mark: nothing is counted and nothing alerted.
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_does_not_follow_a_link_at_a_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.json");
+        let old = dir.path().join("old-second");
+        std::fs::write(&old, "1").unwrap();
+        let gone = 4_194_304u32 + 23;
+        std::os::unix::fs::symlink(&old, dir.path().join(format!("{MARK_PREFIX}{gone}"))).unwrap();
+        assert_eq!(sweep_with(&graph, |_| panic!("no alert")), 0);
+        assert!(crate::record_health::report_at(&graph).is_none());
+    }
+
+    /// Review of #414, item 5: with an outage of another fault in progress,
+    /// a cut record is counted in it, under its code, with its start kept
+    /// and no new alert. A fresh episode reset both and alerted again.
+    ///
+    /// FAILS ON REVERT of the `report_at` branch in `sweep_with`.
+    #[cfg(unix)]
+    #[test]
+    fn a_cut_during_another_outage_is_counted_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.json");
+        std::fs::write(&graph, "{}").unwrap();
+        let first = crate::record_health::note_failure_at(&graph, "lock_timed_out");
+        let gone = 4_194_304u32 + 29;
+        std::fs::write(
+            dir.path().join(format!("{MARK_PREFIX}{gone}")),
+            now_unix().to_string(),
+        )
+        .unwrap();
+        assert_eq!(sweep_with(&graph, |_| panic!("no new alert")), 1);
+        let outage = crate::record_health::report_at(&graph).unwrap();
+        assert_eq!(outage.code, "lock_timed_out");
+        assert_eq!(outage.lost, 2);
+        assert_eq!(outage.since_unix, first.since_unix);
     }
 
     /// FAILS ON REVERT of the sweep: a mark left by a hook that is gone (a
