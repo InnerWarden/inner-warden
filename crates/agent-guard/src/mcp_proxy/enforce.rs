@@ -217,12 +217,51 @@ pub fn apply_layers(
     as_protocol_error: bool,
 ) -> ProxyAction {
     if !mode.keeps_name_refusals() {
+        lower_code_mode_refusals(d);
         lower_name_refusals(d, env, engine);
     }
     if let Some(profile) = profile {
         apply_profile(d, env, profile, engine);
     }
     apply_mode(d, mode, as_protocol_error)
+}
+
+/// Make a warning of the refusal [`crate::mcp_code_mode`] gives a client
+/// `tools/call` whose script changes, destroys or cannot be read: a review,
+/// so the default modes forward it with the alert and a [`POSTURE_RULE`]
+/// note, and `kill` and `strict` refuse it. Any other refusal of the call
+/// stands.
+pub fn lower_code_mode_refusals(d: &mut ProxyDecision) {
+    if d.direction != super::router::Direction::ClientToServer.label()
+        || d.method.as_deref() != Some("tools/call")
+    {
+        return;
+    }
+    let mut lowered = false;
+    for alert in d.verdict.alerts.iter_mut() {
+        if alert.block && alert.rule == crate::mcp_code_mode::CODE_MODE_RULE {
+            alert.block = false;
+            lowered = true;
+        }
+    }
+    if !lowered {
+        return;
+    }
+    d.verdict.allowed = !d.verdict.alerts.iter().any(|alert| alert.block);
+    // Another rule still refuses the call: it is not forwarded, so no note
+    // says it is.
+    if !d.verdict.allowed {
+        return;
+    }
+    d.verdict.alerts.push(crate::mcp::VerdictAlert::builtin(
+        POSTURE_RULE,
+        format!(
+            "forwarded with a warning: {} is a review (a script that changes, destroys or \
+             cannot be read); refused in the kill and strict modes",
+            crate::mcp_code_mode::CODE_MODE_RULE
+        ),
+        false,
+    ));
 }
 
 /// The rule the note on a refusal by name made a warning is reported under.
@@ -1774,5 +1813,33 @@ mod tests {
         ] {
             assert!(!is_protected_path(path), "{path}");
         }
+    }
+
+    /// The note that a code-mode refusal was forwarded with a warning is
+    /// written only when the call is forwarded: with another rule still
+    /// refusing it, no note says so.
+    #[test]
+    fn code_mode_note_only_on_a_call_that_is_forwarded() {
+        let (mut alone, _) = call(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"execute","arguments":{"code":"await cloudflare.zones.delete({})"}}}"#,
+        );
+        lower_code_mode_refusals(&mut alone);
+        assert!(alone.verdict.allowed);
+        assert!(alone.verdict.alerts.iter().any(|a| a.rule == POSTURE_RULE));
+        let (mut with_key, _) = call(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"execute","arguments":{"code":"await cloudflare.zones.delete({})","token":"sk-ant-aaaaaaaaaaaaaaaaaaaaaaaa"}}}"#,
+        );
+        assert!(with_key
+            .verdict
+            .alerts
+            .iter()
+            .any(|a| a.rule == crate::mcp_code_mode::CODE_MODE_RULE));
+        lower_code_mode_refusals(&mut with_key);
+        assert!(!with_key.verdict.allowed);
+        assert!(with_key
+            .verdict
+            .alerts
+            .iter()
+            .all(|a| a.rule != POSTURE_RULE));
     }
 }

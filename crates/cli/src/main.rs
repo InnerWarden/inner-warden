@@ -2956,11 +2956,24 @@ pub(crate) fn screen_shell(
         host,
         posture,
     } = *options;
-    let (lines, file_read) = match classify_hook_input(buf) {
-        HookInput::Command(command) => (vec![command], false),
-        HookInput::Commands(lines) => (lines, false),
-        HookInput::FileRead(command) => (vec![command], true),
-        HookInput::NotAShellCall => return ShellScreen::Nothing,
+    let (lines, file_read, script) = match classify_hook_input(buf) {
+        HookInput::Command(command) => (vec![command], false, None),
+        HookInput::Commands(lines) => (lines, false, None),
+        HookInput::FileRead(command) => (vec![command], true, None),
+        // A tool that runs the script it is handed (an MCP server in code
+        // mode: `execute`, `run_code`, `eval`) is judged by the API calls
+        // in the script, as the MCP proxy judges it: one that changes,
+        // destroys or cannot be read is a review, which goes through every
+        // layer below as a line's review does. A script that only reads
+        // runs, as before. Only a call no other reading took: Hermes's
+        // `execute_code` is Python, judged above as a `python3 -c` line.
+        HookInput::NotAShellCall => match serde_json::from_str::<serde_json::Value>(buf)
+            .ok()
+            .and_then(|payload| innerwarden_agent_guard::mcp_code_mode::hook_verdict(&payload))
+        {
+            Some(script) => (Vec::new(), false, Some(script)),
+            None => return ShellScreen::Nothing,
+        },
         HookInput::Unreadable(why) => return ShellScreen::Unreadable(why),
     };
     // The rules' verdict on every line the call carries. Each line then goes
@@ -2973,6 +2986,7 @@ pub(crate) fn screen_shell(
     let judged: Vec<(String, serde_json::Value)> = lines
         .iter()
         .filter_map(|line| hook_verdict_for(line, context.as_ref()))
+        .chain(script)
         .collect();
     hook_net::mark("rules");
     if judged.is_empty() {

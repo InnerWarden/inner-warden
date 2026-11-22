@@ -112,7 +112,29 @@ pub fn inspect_tool_call(
 }
 
 /// [`inspect_tool_call`], knowing what the tool's server declared about it.
+///
+/// A tool that runs the script it is handed (code mode: `execute`,
+/// `run_code`, `eval`) is also judged by the API calls in its script
+/// ([`crate::mcp_code_mode`]): one that changes, destroys or cannot be read
+/// adds a refusal (`AG-CODE-MODE`) beside the verdict on the call's
+/// arguments, which the proxy's default modes forward with a warning
+/// ([`crate::mcp_proxy::enforce::lower_code_mode_refusals`]).
 pub(crate) fn inspect_declared_tool_call(
+    tool_name: &str,
+    args: &serde_json::Value,
+    declared: ToolDeclaration,
+    rule_engine: Option<&RuleEngine>,
+) -> Verdict {
+    let mut verdict = inspect_call_arguments(tool_name, args, declared, rule_engine);
+    if let Some(alert) = crate::mcp_code_mode::code_mode_alert(tool_name, args) {
+        verdict.allowed = false;
+        verdict.alerts.push(alert);
+    }
+    verdict
+}
+
+/// [`inspect_declared_tool_call`] but for the script a code-mode tool runs.
+fn inspect_call_arguments(
     tool_name: &str,
     args: &serde_json::Value,
     declared: ToolDeclaration,
