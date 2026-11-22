@@ -219,22 +219,25 @@ fn a_jail_cannot_reach_an_abstract_socket_made_outside_it() {
     std::fs::create_dir_all(home.path().join(".local/state")).unwrap();
     let project = tempfile::TempDir::new().unwrap();
     let graph = tempfile::TempDir::new().unwrap();
-    let script = "import os, socket\n\
-def go(fam, addr):\n\
-    s = socket.socket(fam)\n\
-    try:\n\
-        s.connect(addr)\n\
-        return 'ok'\n\
-    except OSError as e:\n\
-        return 'errno%d' % e.errno\n\
-own = socket.socket(socket.AF_UNIX)\n\
-own.bind('\\0' + os.environ['IW_OUT'] + '-own')\n\
-own.listen(1)\n\
-host, port = os.environ['IW_TCP'].rsplit(':', 1)\n\
-print('PROBE outside=%s own=%s tcp=%s' % (\n\
-    go(socket.AF_UNIX, '\\0' + os.environ['IW_OUT']),\n\
-    go(socket.AF_UNIX, '\\0' + os.environ['IW_OUT'] + '-own'),\n\
-    go(socket.AF_INET, (host, int(port)))))\n";
+    // A raw string: a `\` line continuation in a Rust string eats the next
+    // line's leading spaces, and Python then finds no indented block.
+    let script = r#"import os, socket
+def go(fam, addr):
+    s = socket.socket(fam)
+    try:
+        s.connect(addr)
+        return 'ok'
+    except OSError as e:
+        return 'errno%d' % e.errno
+own = socket.socket(socket.AF_UNIX)
+own.bind('\0' + os.environ['IW_OUT'] + '-own')
+own.listen(1)
+host, port = os.environ['IW_TCP'].rsplit(':', 1)
+print('PROBE outside=%s own=%s tcp=%s' % (
+    go(socket.AF_UNIX, '\0' + os.environ['IW_OUT']),
+    go(socket.AF_UNIX, '\0' + os.environ['IW_OUT'] + '-own'),
+    go(socket.AF_INET, (host, int(port)))))
+"#;
     let mut command = Command::new(bin());
     command
         .args(["contain", "--project", project.path().to_str().unwrap()])

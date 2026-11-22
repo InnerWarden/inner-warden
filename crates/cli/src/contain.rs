@@ -2399,6 +2399,15 @@ pub struct JailInputs {
     /// works in a home that holds it. Empty unless the launch asked for an
     /// identity record.
     pub records_dirs: Vec<PathBuf>,
+    /// Linux: the home folders the person's session runs from on its own
+    /// ([`AUTOSTART_PLACES`]), each that is there, as named, as resolved
+    /// and at every other place the jail shows it: read-only in the jail,
+    /// so a program in it cannot leave a unit, a `.desktop` file or an
+    /// environment that runs at the next login, outside the jail. The real
+    /// run makes each one that is not there first ([`crate::contain_io`]).
+    /// Empty on macOS, in a dry run where none is there, and in the tests'
+    /// common inputs.
+    pub autostart_dirs: Vec<PathBuf>,
     /// Variables the launcher keeps out of the programs it runs to start the
     /// jail, handed to the jail's command as they were ([`launch_env`]).
     /// Empty unless the launch asked for an identity record.
@@ -2531,6 +2540,22 @@ pub fn jail_graph_dir(project: &Path) -> PathBuf {
 /// `.config` is included but IMMEDIATELY shadowed on the innerwarden subdir.
 /// Never `.claude`: the jail has one of its own ([`ProjectClaude`]).
 const DOTDIR_RW: &[&str] = &[".config", ".cache", ".cargo", ".rustup", ".npm", ".local"];
+/// The home folders, under the dotdirs a Linux jail writes ([`DOTDIR_RW`]),
+/// that the person's session runs from on its own at the next login, as
+/// the person and outside any jail: desktop autostart entries, systemd
+/// user units and their manager's settings (`user.conf`), the login
+/// environment, upstart's session jobs, the user units of `~/.local` and
+/// D-Bus services started on demand. Read-only in the jail
+/// ([`JailInputs::autostart_dirs`]); the jail's own folders beside them
+/// (`~/.config/<agent>`) stay writable.
+pub const AUTOSTART_PLACES: &[&str] = &[
+    ".config/autostart",
+    ".config/systemd",
+    ".config/environment.d",
+    ".config/upstart",
+    ".local/share/systemd/user",
+    ".local/share/dbus-1/services",
+];
 /// Claude Code's folder in the home. The host's is never shown writable in
 /// a jail: each jail has one of its own ([`ProjectClaude`]).
 pub(crate) const CLAUDE_DIR: &str = ".claude";
@@ -3728,6 +3753,10 @@ pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
     // read-only in a plain one; and where a plain jail keeps Claude Code's
     // settings file of each project, covered.
     places.extend(input.records_dirs.iter().map(PathBuf::as_path));
+    // The folders the session runs from on its own, read-only: a rename of
+    // `~/.config/systemd` or `~/.local/share` took that bind away with
+    // it, and the jail made a folder of its own at the name.
+    places.extend(input.autostart_dirs.iter().map(PathBuf::as_path));
     if let Some(claude) = &input.project_claude {
         places.extend(claude.covered.iter().map(PathBuf::as_path));
     }
@@ -4280,6 +4309,17 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
             let dest = dir.to_string_lossy().to_string();
             push(&["--ro-bind-try", &dest, &dest]);
         }
+    }
+    // --- the home folders the person's session runs from on its own at
+    // the next login ([`AUTOSTART_PLACES`]), read-only, after every
+    // writable bind of the home and the project, so none of them brings
+    // one back: an autostart entry, a systemd user unit or a login
+    // environment written there ran as the person, outside the jail. Never
+    // `-try`: the launcher made each one, and bwrap stops on one gone
+    // since. Each folder above one is pinned ([`linux_pins`]). ---
+    for dir in &input.autostart_dirs {
+        let dest = dir.to_string_lossy().to_string();
+        push(&["--ro-bind", &dest, &dest]);
     }
     // --- Claude Code's `~/.claude` in the jail: never the host's, which
     // carries the settings that wire the guard's hook (and was covered with
@@ -6897,6 +6937,7 @@ mod tests {
             key_fd: None,
             profiles_marker_fd: None,
             records_dirs: vec![],
+            autostart_dirs: vec![],
             child_env: vec![],
             close_userns: false,
             // A plain jail on a host that takes the terminal filter.
@@ -16234,6 +16275,80 @@ mod tests {
         let end = a.iter().position(|x| x == "--").unwrap();
         assert_eq!(a[end + 2], launch::GATE_VERB);
         assert!(!a.iter().any(|x| x == launch::EXEC_VERB), "{a:?}");
+    }
+
+    /// The home folders the person's session runs from on its own at the
+    /// next login are read-only in the jail, after the writable `.config`,
+    /// `.local` and project binds, by name and never with `-try`; each
+    /// folder between a writable bind and one of them (`~/.local/share`,
+    /// `~/.local/share/systemd`) is pinned before it, so a rename cannot
+    /// take the bind away. The jail's own folders in `.config` stay as
+    /// they were, and a jail with none of them is the jail it was.
+    ///
+    /// FAILS ON REVERT: drop the read-only binds, or the pins above them.
+    #[test]
+    fn the_sessions_autostart_folders_are_read_only_in_the_jail() {
+        let mut input = inputs(&["claude"]);
+        let before = build_linux_jail(&input).unwrap().bwrap_args;
+        input.existing_paths.push(PathBuf::from("/home/dev/.local"));
+        let without = build_linux_jail(&input).unwrap().bwrap_args;
+        input.autostart_dirs = [
+            "/home/dev/.config/autostart",
+            "/home/dev/.config/systemd",
+            "/home/dev/.local/share/systemd/user",
+        ]
+        .map(PathBuf::from)
+        .to_vec();
+        let a = build_linux_jail(&input).unwrap().bwrap_args;
+        let at = |w: [&str; 3]| a.windows(3).position(|x| x == w);
+        let config = at(["--bind", "/home/dev/.config", "/home/dev/.config"]).unwrap();
+        let local = at(["--bind", "/home/dev/.local", "/home/dev/.local"]).unwrap();
+        let project = at(["--bind", "/home/dev/proj", "/home/dev/proj"]).unwrap();
+        let share = at(["--bind", "/home/dev/.local/share", "/home/dev/.local/share"]).unwrap();
+        let systemd = at([
+            "--bind",
+            "/home/dev/.local/share/systemd",
+            "/home/dev/.local/share/systemd",
+        ])
+        .unwrap();
+        assert!(local < share && share < systemd, "{a:?}");
+        for dir in &input.autostart_dirs {
+            let d = dir.to_str().unwrap();
+            let ro = at(["--ro-bind", d, d]).unwrap_or_else(|| panic!("{d}: {a:?}"));
+            assert!(
+                ro > config && ro > local && ro > project && ro > systemd,
+                "{a:?}"
+            );
+            assert!(!a.windows(3).any(|x| x == ["--ro-bind-try", d, d]), "{a:?}");
+        }
+        // `.config/systemd` is a bind of its own under the `.config` bind:
+        // no pin is needed above it.
+        assert!(
+            !a.iter().any(|x| x == "/home/dev/.config/systemd/user"),
+            "{a:?}"
+        );
+        // Nothing else moved: taken out, the plan is the one without them.
+        let mut rest = a.clone();
+        for dir in &input.autostart_dirs {
+            let d = dir.to_str().unwrap();
+            let i = rest
+                .windows(3)
+                .position(|x| x == ["--ro-bind", d, d])
+                .unwrap();
+            rest.drain(i..i + 3);
+        }
+        for pin in ["/home/dev/.local/share", "/home/dev/.local/share/systemd"] {
+            let i = rest
+                .windows(3)
+                .position(|x| x == ["--bind", pin, pin])
+                .unwrap();
+            rest.drain(i..i + 3);
+        }
+        assert_eq!(rest, without);
+        assert!(
+            !before.iter().any(|x| x.contains("autostart")),
+            "{before:?}"
+        );
     }
 
     const GOLDEN_ARGV_PLAIN: &str = "\

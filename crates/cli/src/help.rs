@@ -394,7 +394,14 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              agent's own sandbox off inside the jail. The jail shares the host's\n  \
              network; on Linux 6.12 or later (Landlock) its programs cannot connect\n  \
              to an abstract unix socket made outside it, an X server's among them.\n  \
-             On an older kernel they still can, and the jail says so when it starts.\n\
+             On an older kernel they still can, and the jail says so when it starts.\n  \
+             The jail does not isolate the display: a program in it that binds a\n  \
+             display's abstract name before that X server starts receives its\n  \
+             clients, and an X server listening on TCP stays reachable.\n  \
+             On Linux the folders your session runs from at the next login\n  \
+             (~/.config/autostart, ~/.config/systemd, ~/.config/environment.d,\n  \
+             ~/.config/upstart, ~/.local/share/systemd/user,\n  \
+             ~/.local/share/dbus-1/services) are read-only in every jail.\n\
              \n  \
              Everything after `--` is the jailed command line, including its own\n  \
              `--help`."
@@ -634,6 +641,8 @@ mod tests {
             "ends a 32-bit program, and drops every capability",
             "With --identity it also refuses new user namespaces and joining other namespaces,",
             "The jail shares the host's network; on Linux 6.12 or later (Landlock) its programs cannot connect to an abstract unix socket made outside it, an X server's among them. On an older kernel they still can, and the jail says so when it starts.",
+            "The jail does not isolate the display: a program in it that binds a display's abstract name before that X server starts receives its clients, and an X server listening on TCP stays reachable.",
+            "On Linux the folders your session runs from at the next login (~/.config/autostart, ~/.config/systemd, ~/.config/environment.d, ~/.config/upstart, ~/.local/share/systemd/user, ~/.local/share/dbus-1/services) are read-only in every jail.",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
@@ -661,6 +670,10 @@ mod tests {
             "a desktop's X server among them",
             "so a program in it cannot connect to an abstract unix socket made outside the jail,",
             "On an older kernel a program in the jail can still reach any abstract unix socket, and through X type into another window; the jail says so when it starts.",
+            "so the jail does not isolate the display.",
+            "receives the X clients of the host that connect to that display, and an X server that listens on TCP (`Xvfb -listen tcp`, `DISPLAY=127.0.0.1:7`) is reachable like any other TCP port.",
+            "It does not isolate your display: a program in it that binds a display's abstract name before that X server starts receives its clients, and an X server listening on TCP stays reachable",
+            "On Linux the folders the person's session runs from on its own at the next login are read-only in every jail:",
             "On a kernel older than 4.8",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");
