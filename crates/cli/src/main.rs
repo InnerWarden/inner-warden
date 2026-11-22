@@ -1683,6 +1683,17 @@ fn install_hook_panic_guard(monitor: bool) {
         if hook_net::is_quiet() {
             std::process::exit(0);
         }
+        // Past the answer (writing the record): the answer, already given
+        // on stdout and stderr, keeps its code.
+        if let Some(code) = hook_net::answer() {
+            report(info);
+            let _ = std::io::Write::write_all(
+                &mut std::io::stderr(),
+                b"InnerWarden hook: this call was answered, but an internal error stopped writing \
+                  its record; the answer stands.\n",
+            );
+            std::process::exit(i32::from(code));
+        }
         // The default report first: where it failed is what a bug report needs.
         report(info);
         // Never `eprintln!` here: it panics when stderr is gone, and a panic
@@ -2419,13 +2430,27 @@ fn antigravity_unknown_tool(
 
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let exit = cmd_hook_screen(rest);
-    match agent_flag(rest).as_deref() {
+    let exit = match agent_flag(rest).as_deref() {
         Some(innerwarden_agent_guard::cursor_hook::AGENT) => cursor_answer(exit),
         Some(innerwarden_agent_guard::antigravity_hook::AGENT) => {
             antigravity_answer(exit, rest.iter().any(|a| a == "--monitor"))
         }
         _ => exit,
-    }
+    };
+    // The answer is out (stdout, stderr) and only its exit code is left:
+    // the record and the alert, kept for now, run outside the deadline.
+    hook_net::mark("answered");
+    hook_net::answered(exit_code_number(exit));
+    hook_net::mark("recorded");
+    exit
+}
+
+/// The number of an exit code the hook builds (`ExitCode::from` or
+/// `SUCCESS`); 2, a refusal, for one it cannot name.
+fn exit_code_number(exit: std::process::ExitCode) -> u8 {
+    (0..=u8::MAX)
+        .find(|&n| exit == std::process::ExitCode::from(n))
+        .unwrap_or(2)
 }
 
 fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
@@ -2459,9 +2484,11 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         }
         return hook_unreadable("", rest, why, monitor);
     }
+    hook_net::mark("armed");
     // A host upgraded by an older binary still runs that binary's wiring:
-    // the first hook of this version brings it up to this one's.
-    agents_io::rewire_once_per_version();
+    // the first hook of this version brings it up to this one's. It decides
+    // nothing about this call, so it runs after the answer.
+    hook_net::after_answer(agents_io::rewire_once_per_version);
 
     let read = if agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::cursor_hook::AGENT) {
         read_cursor_call_or_head(std::io::stdin())
@@ -2496,6 +2523,7 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         Err(_) if prompt_line => return std::process::ExitCode::SUCCESS,
         Err(_) => return hook_unreadable("", rest, "stdin could not be read", monitor),
     };
+    hook_net::mark("read");
     // A prompt the person submitted, on a line without the prompt flag: not
     // kept, and never refused (2 drops what the person typed).
     if !prompt_line && is_prompt_naming_no_tool(&buf) {
@@ -2895,6 +2923,7 @@ pub(crate) fn screen_shell(
         .iter()
         .filter_map(|line| hook_verdict_for(line, context.as_ref()))
         .collect();
+    hook_net::mark("rules");
     if judged.is_empty() {
         return ShellScreen::Nothing;
     }
@@ -2925,6 +2954,7 @@ pub(crate) fn screen_shell(
         let commands: Vec<&str> = judged.iter().map(|(command, _)| command.as_str()).collect();
         session_store::record_call_and_taint(window_key.as_deref(), &commands)
     };
+    hook_net::mark("session");
 
     // Per-agent profiles, only where a profiles file exists. With none the
     // state is `Off` and the decision is the hook's own, as it always was.
@@ -3071,6 +3101,7 @@ pub(crate) fn screen_shell(
     // file change is recorded only when it is refused: an agent reads files
     // all day, and a record of each would bury the decisions that matter.
     let said_something = verdict.get("recommendation").and_then(|r| r.as_str()) != Some("allow");
+    hook_net::mark("decided");
     if record && (!file_read || said_something) {
         if warned {
             record_shell_warned(buf, rest, &command, &verdict, deciding_layer.clone(), demo);
@@ -3106,6 +3137,10 @@ pub(crate) fn screen_shell(
 /// `would_block`, in enforce `blocked` (`would_block` says the policy refuses
 /// it). The payload's event id makes a delivery idempotent. A `demo` call is
 /// recorded with `demo: true` and never alerted on.
+///
+/// In a hook run this is done after the answer (`hook_net::after_answer`):
+/// the record decides nothing, and a busy disk must not cost the call its
+/// answer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_shell(
     buf: &str,
@@ -3117,6 +3152,38 @@ pub(crate) fn record_shell(
     layer: Option<graph_io::LayerLabel>,
     demo: bool,
 ) {
+    let (buf, rest, command, verdict) = (
+        buf.to_string(),
+        rest.to_vec(),
+        command.to_string(),
+        verdict.clone(),
+    );
+    hook_net::after_answer(move || {
+        record_shell_now(
+            &buf,
+            &rest,
+            &command,
+            &verdict,
+            monitor,
+            would_block,
+            layer,
+            demo,
+        )
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_shell_now(
+    buf: &str,
+    rest: &[String],
+    command: &str,
+    verdict: &serde_json::Value,
+    monitor: bool,
+    would_block: bool,
+    layer: Option<graph_io::LayerLabel>,
+    demo: bool,
+) {
+    hook_net::test_record_delay();
     let source_session = hook_session(buf);
     let identity = hook_identity::current(agent_flag(rest).as_deref(), source_session.as_deref());
     graph_io::record_hook(
@@ -3132,6 +3199,7 @@ pub(crate) fn record_shell(
         layer,
         demo,
     );
+    hook_net::mark("graph");
     if would_block && !demo {
         // In monitor mode this is a would-block alert; in enforce it accompanies
         // the real block. Alerting must not change the hook outcome.
@@ -3141,8 +3209,28 @@ pub(crate) fn record_shell(
 
 /// [`record_shell`] for a call the strict policy refuses and the default
 /// posture let run: recorded as `would_block` on an enforcing line, and
-/// alerted on as a would-block is, since it ran.
+/// alerted on as a would-block is, since it ran. After the answer in a
+/// hook run, as [`record_shell`].
 pub(crate) fn record_shell_warned(
+    buf: &str,
+    rest: &[String],
+    command: &str,
+    verdict: &serde_json::Value,
+    layer: Option<graph_io::LayerLabel>,
+    demo: bool,
+) {
+    let (buf, rest, command, verdict) = (
+        buf.to_string(),
+        rest.to_vec(),
+        command.to_string(),
+        verdict.clone(),
+    );
+    hook_net::after_answer(move || {
+        record_shell_warned_now(&buf, &rest, &command, &verdict, layer, demo)
+    });
+}
+
+fn record_shell_warned_now(
     buf: &str,
     rest: &[String],
     command: &str,
@@ -3425,30 +3513,36 @@ pub(crate) fn screen_file_writes(
     };
     let verdict = file_tools::refusal_verdict(tool, path, what);
     let command = format!("{tool} {}", path.trim());
-    let payload_session = hook_session(buf);
-    let identity = hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
     // A change to a privileged file is a hard rule: no profile has a word
     // about it. Where profiles are in force the record says which layer.
     let deciding_layer = match agent_profiles_io::load() {
         agent_profiles::ProfilesState::Off => None,
         _ => Some(innerwarden_agent_guard::identity::RuleLayer::Hard.into()),
     };
-    graph_io::record_hook(
-        &command,
-        &verdict,
-        monitor,
-        true,
-        payload_session.as_deref(),
-        hook_event_id(buf).as_deref(),
-        agent_flag(rest).as_deref(),
-        hook_cwd(buf).as_deref(),
-        identity.as_ref(),
-        deciding_layer,
-        demo,
-    );
-    if !demo {
-        notify_io::fire(&command, &verdict);
-    }
+    // Recorded and alerted on after the answer, as `record_shell` is.
+    let (owned_buf, owned_rest) = (buf.to_string(), rest.to_vec());
+    hook_net::after_answer(move || {
+        let (buf, rest) = (owned_buf.as_str(), owned_rest.as_slice());
+        let payload_session = hook_session(buf);
+        let identity =
+            hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
+        graph_io::record_hook(
+            &command,
+            &verdict,
+            monitor,
+            true,
+            payload_session.as_deref(),
+            hook_event_id(buf).as_deref(),
+            agent_flag(rest).as_deref(),
+            hook_cwd(buf).as_deref(),
+            identity.as_ref(),
+            deciding_layer,
+            demo,
+        );
+        if !demo {
+            notify_io::fire(&command, &verdict);
+        }
+    });
     FileScreen::Refused {
         explanation: file_tools::refusal_explanation(tool, path, what),
     }
@@ -3557,22 +3651,25 @@ fn file_tool_revoked(
         "explanation": revoked.sentence(),
         "signals": [],
     });
-    graph_io::record_hook(
-        &command,
-        &verdict,
-        monitor,
-        true,
-        payload_session.as_deref(),
-        hook_event_id(buf).as_deref(),
-        hook_agent.as_deref(),
-        hook_cwd(buf).as_deref(),
-        identity.as_ref(),
-        Some(innerwarden_agent_guard::identity::RuleLayer::Hard.into()),
-        demo,
-    );
-    FileScreen::Refused {
-        explanation: revoked.sentence().to_string(),
-    }
+    let explanation = revoked.sentence().to_string();
+    // Recorded after the answer, as `record_shell` is.
+    let (event_id, cwd) = (hook_event_id(buf), hook_cwd(buf));
+    hook_net::after_answer(move || {
+        graph_io::record_hook(
+            &command,
+            &verdict,
+            monitor,
+            true,
+            payload_session.as_deref(),
+            event_id.as_deref(),
+            hook_agent.as_deref(),
+            cwd.as_deref(),
+            identity.as_ref(),
+            Some(innerwarden_agent_guard::identity::RuleLayer::Hard.into()),
+            demo,
+        );
+    });
+    FileScreen::Refused { explanation }
 }
 
 /// A profiles file that cannot be used, in enforce: the call is refused, as a

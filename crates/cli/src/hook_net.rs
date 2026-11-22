@@ -65,7 +65,29 @@ pub const DEADLINE_ENV: &str = "INNERWARDEN_HOOK_DEADLINE_MS";
 #[cfg(debug_assertions)]
 pub const TEST_DEADLINE_ENV: &str = "IW_TEST_HOOK_DEADLINE_MS";
 
+/// Names a file, in a DEBUG build only, that each phase of the hook appends
+/// one line to ([`mark`]): where the time of a hook run goes, measured by
+/// the test suite. A release build does not read it.
+#[cfg(debug_assertions)]
+pub const TEST_PHASES_ENV: &str = "IW_TEST_HOOK_PHASES";
+
+/// When the net was armed, and the run queue of the thread that screens:
+/// what the watchdog and [`mark`] measure from.
+static ARMED: std::sync::OnceLock<(Instant, RunQueue)> = std::sync::OnceLock::new();
+
 static MONITOR: AtomicBool = AtomicBool::new(false);
+
+/// No answer yet: [`ANSWER`] holds this until [`answered`].
+const NO_ANSWER: u16 = u16::MAX;
+
+/// The exit code the hook answered with, once it has ([`answered`]), and
+/// [`NO_ANSWER`] before.
+static ANSWER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(NO_ANSWER);
+
+/// Work that decides nothing (writing the record, alerting, bringing the
+/// wiring up to date), kept for after the answer by [`after_answer`].
+type Deferred = Box<dyn FnOnce() + Send>;
+static AFTER_ANSWER: std::sync::Mutex<Vec<Deferred>> = std::sync::Mutex::new(Vec::new());
 
 /// Set for a run on the person's prompt: every end is 0 and silent.
 static QUIET: AtomicBool = AtomicBool::new(false);
@@ -171,15 +193,109 @@ fn arm_with_cap(monitor: bool, deadline: Duration, cap: Duration) -> Result<(), 
     #[cfg(unix)]
     fault::install()?;
     // Opened here, on the thread that screens: the file is that thread's.
-    let queue = RunQueue::of_this_thread();
-    let armed = Instant::now();
+    let (armed, queue) = ARMED.get_or_init(|| (Instant::now(), RunQueue::of_this_thread()));
     DEADLINE_MS.store(millis(deadline).max(1), Ordering::SeqCst);
     WALL_MS.store(millis(cap).max(1), Ordering::SeqCst);
     std::thread::Builder::new()
         .name("hook-deadline".into())
-        .spawn(move || watch(armed, &queue))
+        .spawn(move || watch(*armed, queue))
         .map(|_| ())
         .map_err(|_| "no screening deadline could be set")
+}
+
+/// Run `work` after the hook has answered, outside the deadline, when the
+/// net is armed (a hook run); at once otherwise (`innerwarden check`, the
+/// OpenClaw guard). For work whose outcome no answer waits on: the record,
+/// the alert. Written to the record late or not at all, a call keeps the
+/// answer it was given; refused by the deadline, it would lose an answer it
+/// already had because a busy disk held the record (2026-11-20, four
+/// calls of a lab machine refused during a build).
+pub fn after_answer(work: impl FnOnce() + Send + 'static) {
+    if ARMED.get().is_none() || answer().is_some() {
+        return work();
+    }
+    match AFTER_ANSWER.lock() {
+        Ok(mut queue) => queue.push(Box::new(work)),
+        Err(_) => work(),
+    }
+}
+
+/// The hook has its answer, `code`, and has written whatever it says on
+/// stdout and stderr: from here on the deadline is behind it. Then the work
+/// [`after_answer`] kept runs, still under [`WALL_CAP`]; past it, and on a
+/// fault or a panic, the hook ends with `code` and not with a refusal.
+pub fn answered(code: u8) {
+    ANSWER.store(u16::from(code), Ordering::SeqCst);
+    let kept = AFTER_ANSWER
+        .lock()
+        .map(|mut queue| std::mem::take(&mut *queue))
+        .unwrap_or_default();
+    for work in kept {
+        work();
+    }
+}
+
+/// The exit code the hook answered with, `None` before [`answered`].
+pub fn answer() -> Option<u8> {
+    u8::try_from(ANSWER.load(Ordering::SeqCst)).ok()
+}
+
+/// What an end of the net that comes after the answer says.
+const AFTER_ANSWER_LATE: &str =
+    "InnerWarden hook: this call was answered, but its record was not written in time; the \
+     answer stands.\n";
+#[cfg(unix)]
+const AFTER_ANSWER_FAULT: &str =
+    "InnerWarden hook: this call was answered, but a fault stopped writing its record; the \
+     answer stands.\n";
+
+/// Holds the record back, in milliseconds, in a DEBUG build only: a disk
+/// that a build keeps busy, for the tests that prove a slow record does not
+/// cost a call its answer. A release build does not read it.
+#[cfg(debug_assertions)]
+pub const TEST_RECORD_DELAY_ENV: &str = "IW_TEST_HOOK_RECORD_DELAY_MS";
+
+/// Debug builds: wait as long as [`TEST_RECORD_DELAY_ENV`] says, before the
+/// record is written. Nothing in a release build.
+pub fn test_record_delay() {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(TEST_RECORD_DELAY_ENV)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
+
+/// Debug builds, with [`TEST_PHASES_ENV`] set, append one line for `phase`:
+/// the time since [`arm`] on the clock, the part of it the screening
+/// thread waited for a CPU, and the rest, which is what the deadline counts.
+/// Nothing anywhere else, nor before the net is armed.
+pub fn mark(phase: &str) {
+    #[cfg(debug_assertions)]
+    {
+        let Some(path) = std::env::var_os(TEST_PHASES_ENV) else {
+            return;
+        };
+        let Some((armed, queue)) = ARMED.get() else {
+            return;
+        };
+        let wall = armed.elapsed();
+        let queued = queue.since_armed();
+        let line = format!(
+            "{phase} wall_ms={} queued_ms={} screening_ms={}\n",
+            millis(wall),
+            millis(queued),
+            millis(wall.saturating_sub(queued))
+        );
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| std::io::Write::write_all(&mut file, line.as_bytes()));
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = phase;
 }
 
 /// From here on every end of the net (the deadline, a fault) is 0 and
@@ -286,15 +402,22 @@ impl RunQueue {
 
 /// PURE: what is left before the hook is out of time, or `None` once it
 /// is: the screening is `wall` less what it spent `queued` for a CPU, held
-/// to `deadline`; the clock is held to `cap` whatever was queued.
+/// to `deadline`; the clock is held to `cap` whatever was queued. Once the
+/// hook has `answered`, the screening is over and only the clock counts.
 fn time_left(
     wall: Duration,
     queued: Duration,
     deadline: Duration,
     cap: Duration,
+    answered: bool,
 ) -> Option<Duration> {
-    let screening = wall.saturating_sub(queued);
-    let left = deadline.checked_sub(screening)?.min(cap.checked_sub(wall)?);
+    let on_the_clock = cap.checked_sub(wall)?;
+    let left = if answered {
+        on_the_clock
+    } else {
+        let screening = wall.saturating_sub(queued);
+        deadline.checked_sub(screening)?.min(on_the_clock)
+    };
     (!left.is_zero()).then_some(left)
 }
 
@@ -304,11 +427,22 @@ fn watch(armed: Instant, queue: &RunQueue) -> ! {
     loop {
         let deadline = Duration::from_millis(DEADLINE_MS.load(Ordering::SeqCst));
         let cap = Duration::from_millis(WALL_MS.load(Ordering::SeqCst));
-        match time_left(armed.elapsed(), queue.since_armed(), deadline, cap) {
+        let answer = answer();
+        match time_left(
+            armed.elapsed(),
+            queue.since_armed(),
+            deadline,
+            cap,
+            answer.is_some(),
+        ) {
             Some(left) => std::thread::sleep(left.max(Duration::from_millis(1))),
             None => {
                 if QUIET.load(Ordering::SeqCst) {
                     end("", 0)
+                } else if let Some(code) = answer {
+                    // Answered already, on stdout too in JSON mode: only the
+                    // exit is left, with the answer's own code.
+                    end(AFTER_ANSWER_LATE, code)
                 } else if let Some(answer) = json_answer() {
                     let said = if MONITOR.load(Ordering::SeqCst) {
                         OUT_OF_TIME_MONITOR
@@ -397,6 +531,8 @@ mod fault {
         // Only what a signal handler may do: read an atomic, `write`, `_exit`.
         if super::QUIET.load(Ordering::SeqCst) {
             super::end("", 0)
+        } else if let Some(code) = super::answer() {
+            super::end(super::AFTER_ANSWER_FAULT, code)
         } else if let Some(answer) = super::json_answer() {
             let said = if super::MONITOR.load(Ordering::SeqCst) {
                 super::FAULT_MONITOR
@@ -803,13 +939,28 @@ mod tests {
     fn the_deadline_is_the_screenings_and_the_clock_has_its_own_limit() {
         let ms = Duration::from_millis;
         let (deadline, cap) = (ms(1000), ms(5000));
-        assert_eq!(time_left(ms(400), ms(0), deadline, cap), Some(ms(600)));
+        assert_eq!(
+            time_left(ms(400), ms(0), deadline, cap, false),
+            Some(ms(600))
+        );
         // 3 s on the clock, 2.5 s of it queued: 500 ms of screening.
-        assert_eq!(time_left(ms(3000), ms(2500), deadline, cap), Some(ms(500)));
-        assert_eq!(time_left(ms(1000), ms(0), deadline, cap), None);
+        assert_eq!(
+            time_left(ms(3000), ms(2500), deadline, cap, false),
+            Some(ms(500))
+        );
+        assert_eq!(time_left(ms(1000), ms(0), deadline, cap, false), None);
         // Queued or not, the clock's limit holds.
-        assert_eq!(time_left(ms(5000), ms(4900), deadline, cap), None);
-        assert_eq!(time_left(ms(4800), ms(4500), deadline, cap), Some(ms(200)));
+        assert_eq!(time_left(ms(5000), ms(4900), deadline, cap, false), None);
+        assert_eq!(
+            time_left(ms(4800), ms(4500), deadline, cap, false),
+            Some(ms(200))
+        );
+        // Once answered, the screening is over: only the clock's limit holds.
+        assert_eq!(
+            time_left(ms(3000), ms(0), deadline, cap, true),
+            Some(ms(2000))
+        );
+        assert_eq!(time_left(ms(5000), ms(0), deadline, cap, true), None);
         // A lowered deadline is also the clock's limit.
         assert_eq!(wall_cap_for(ms(300)), ms(300));
         assert_eq!(wall_cap_for(DEADLINE), WALL_CAP);
