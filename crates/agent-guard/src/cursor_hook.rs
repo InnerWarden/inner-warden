@@ -48,6 +48,10 @@ pub const SHELL_EVENT: &str = "beforeShellExecution";
 /// The event before the agent calls a tool of an MCP server.
 pub const MCP_EVENT: &str = "beforeMCPExecution";
 
+/// The key of the call [`read`] builds that keeps the `url` of the server a
+/// Cursor MCP call goes to, when Cursor reaches it by URL.
+pub const MCP_SERVER_URL_KEY: &str = "mcp_server_url";
+
 /// The event before the agent reads a file.
 pub const READ_EVENT: &str = "beforeReadFile";
 
@@ -167,7 +171,14 @@ pub fn read(payload: &str) -> CursorCall {
                 }
             };
             let server = text(&value, "mcp_server_name").unwrap_or("unknown");
-            CursorCall::Call(Event::Mcp, call(format!("mcp__{server}__{tool}"), input))
+            let mut call = call(format!("mcp__{server}__{tool}"), input);
+            // The address of a server Cursor reaches by URL, never one the
+            // proxy carries (a wrapper is a local command): the hook judges
+            // such a call as one to a remote server (`crate::mcp_unproxied`).
+            if let Some(url) = text(&value, "url") {
+                call[MCP_SERVER_URL_KEY] = json!(url);
+            }
+            CursorCall::Call(Event::Mcp, call)
         }
         _ if value.get("tool_name").and_then(Value::as_str).is_some() => CursorCall::Canonical,
         Some(_) => CursorCall::Other,
@@ -650,6 +661,26 @@ mod tests {
         };
         assert_eq!(call["tool_name"], "mcp__shell__run_command");
         assert_eq!(call["tool_input"]["command"], "ls -la");
+        assert!(call.get(MCP_SERVER_URL_KEY).is_none(), "{call}");
+    }
+
+    /// A call to a server Cursor reaches by URL keeps the address, so the
+    /// hook knows the server is remote, with or without its name.
+    #[test]
+    fn an_mcp_call_to_a_server_reached_by_url_keeps_the_address() {
+        let payload = with(
+            MCP_EVENT,
+            json!({
+                "tool_name": "get_file",
+                "tool_input": "{\"path\":\"a.txt\"}",
+                "url": "https://mcp.example/mcp",
+            }),
+        );
+        let CursorCall::Call(Event::Mcp, call) = read(&payload) else {
+            panic!("{:?}", read(&payload));
+        };
+        assert_eq!(call["tool_name"], "mcp__unknown__get_file");
+        assert_eq!(call[MCP_SERVER_URL_KEY], "https://mcp.example/mcp");
     }
 
     #[test]

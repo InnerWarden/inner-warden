@@ -719,24 +719,24 @@ pub fn server_counts(root: &Value) -> ServerCounts {
     }
 }
 
-/// The names of the servers reached by URL that the proxy does not carry
-/// (one whose client signs in to it by itself, `auth` or `oauth`, and
-/// every other entry [`remote_entry`] leaves alone), across every table
-/// [`wrap`] reads. Their calls are judged where the client shows them, its
-/// hook ([`crate::mcp_unproxied`]). Names only, never a value. Pure.
-pub fn unproxied_remote_names(root: &Value) -> Vec<String> {
+/// Every server of a JSON client's configuration as the hook reads it
+/// ([`crate::mcp_unproxied`]), across every table [`wrap`] reads: its name,
+/// whether the proxy stands in front of it (a wrapper), and whether it is
+/// reached by URL. Names only, never a value. Pure.
+pub fn server_entries(root: &Value) -> Vec<crate::mcp_unproxied::ServerEntry> {
     SERVER_TABLE_PATHS
         .iter()
         .filter_map(|path| table_at(root, path))
         .flat_map(|map| map.iter())
-        .filter(|(_, server)| {
-            is_remote_server(server)
-                && !server
-                    .as_object()
-                    .is_some_and(|obj| obj.contains_key("command"))
-                && REMOTE_URL_KEYS.iter().any(|key| server.get(*key).is_some())
+        .filter(|(_, server)| server.is_object())
+        .map(|(name, server)| crate::mcp_unproxied::ServerEntry {
+            name: name.clone(),
+            behind_proxy: is_wrapped_server(server),
+            remote: !server
+                .as_object()
+                .is_some_and(|obj| obj.contains_key("command"))
+                && REMOTE_URL_KEYS.iter().any(|key| server.get(*key).is_some()),
         })
-        .map(|(name, _)| name.clone())
         .collect()
 }
 

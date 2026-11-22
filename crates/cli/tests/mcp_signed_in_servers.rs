@@ -1,14 +1,19 @@
-//! End-to-end: a call to a remote MCP server the agent signs in to by
-//! itself (OAuth), which the proxy cannot stand in front of, is judged by
-//! the proxy's judgment where the agent shows it, its hook, and the token
-//! the agent holds for it never reaches the guard's record.
+//! End-to-end: an MCP call of Codex or Cursor is judged by the proxy's
+//! judgment where the agent shows it, its hook, unless its server is known
+//! to be behind the proxy. A remote server the agent signs in to by itself
+//! (OAuth), which the proxy cannot stand in front of, is the case that
+//! matters most, and the token the agent holds for it never reaches the
+//! guard's record.
 //!
 //! The payload is Codex CLI 0.167.2's `PreToolUse` (`codex-rs/hooks/schema/
 //! generated/pre-tool-use.command.input.schema.json`), an MCP tool named
 //! `mcp__<server>__<tool>` with its arguments (developers.openai.com/codex/
-//! hooks, "MCP tools: PreToolUse Yes"). The token sits where Codex keeps a
-//! sign-in when it has no keyring (`CODEX_HOME/.credentials.json`) and in
-//! the agent's environment; the guard is never handed it.
+//! hooks, "MCP tools: PreToolUse Yes"), the server's name cleaned as Codex
+//! cleans it (`linear-app` is `linear_app`). Cursor's is its
+//! `beforeMCPExecution`, with the server's `url` and no name. The token
+//! sits where Codex keeps a sign-in when it has no keyring
+//! (`CODEX_HOME/.credentials.json`) and in the agent's environment; the
+//! guard is never handed it.
 //!
 //! Drives the REAL binary over a disposable HOME.
 
@@ -23,26 +28,45 @@ use serde_json::{json, Value};
 /// A made-up OAuth access token, unlike anything the guard writes.
 const TOKEN: &str = "iwoauth-7f3c9ad1e05b48c2a6f1d9e3b7c04a58";
 
+/// Codex's config: `linear`, a server Codex signs in to (`oauth_resource`);
+/// `linear-app` and `notion.so`, the same with names Codex cleans;
+/// `inline`, one written as an inline table; `local`, a local server the
+/// proxy does not carry; and `docs`, one behind the proxy.
+const CODEX_CONFIG: &str = "[mcp_servers]\n\
+     inline = { url = \"https://i.example/mcp\", oauth_resource = \"https://i.example/mcp\" }\n\
+     local = { command = \"fs-server\" }\n\n\
+     [mcp_servers.linear]\nurl = \"https://mcp.linear.example/mcp\"\n\
+     oauth_resource = \"https://mcp.linear.example/mcp\"\n\n\
+     [mcp_servers.linear-app]\nurl = \"https://mcp.linear.example/mcp\"\nscopes = [\"read\"]\n\n\
+     [mcp_servers.\"notion.so\"]\nurl = \"https://mcp.notion.example/mcp\"\nscopes = [\"read\"]\n\n\
+     [mcp_servers.docs]\ncommand = \"/abs/innerwarden\"\n\
+     args = [\"proxy\", \"--mode\", \"guard\", \"--agent\", \"codex\", \"--\", \"docs-server\"]\n";
+
+/// The servers a call names as Codex names them, each one the proxy does
+/// not stand in front of.
+const JUDGED: &[&str] = &["linear", "linear_app", "notion_so", "inline", "local"];
+
 struct Host {
     dir: tempfile::TempDir,
 }
 
 impl Host {
-    /// A home whose Codex config has `linear`, a server Codex signs in to
-    /// (`oauth_resource`), and `docs`, one the proxy carries; Codex's
-    /// sign-in for `linear` is on file.
+    /// A home with [`CODEX_CONFIG`] and Codex's sign-in to `linear` on file,
+    /// in the strict posture (no posture file) unless `posture` names one.
     fn new() -> Self {
+        Self::with_posture(None)
+    }
+
+    fn with_posture(posture: Option<&str>) -> Self {
         let dir = tempfile::TempDir::new().unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir_all(home.join(".codex")).unwrap();
         std::fs::create_dir_all(home.join("proj")).unwrap();
-        std::fs::write(
-            home.join(".codex/config.toml"),
-            "[mcp_servers.linear]\nurl = \"https://mcp.linear.example/mcp\"\n\
-             oauth_resource = \"https://mcp.linear.example/mcp\"\n\n\
-             [mcp_servers.docs]\nurl = \"https://docs.example/mcp\"\n",
-        )
-        .unwrap();
+        std::fs::write(home.join(".codex/config.toml"), CODEX_CONFIG).unwrap();
+        if let Some(posture) = posture {
+            std::fs::create_dir_all(home.join(".config/innerwarden")).unwrap();
+            std::fs::write(home.join(".config/innerwarden/posture"), posture).unwrap();
+        }
         std::fs::write(
             home.join(".codex/.credentials.json"),
             json!({"linear|0123456789abcdef": {
@@ -61,10 +85,18 @@ impl Host {
         self.dir.path().join("home")
     }
 
+    fn graph(&self) -> String {
+        std::fs::read_to_string(self.dir.path().join("graph.json")).unwrap_or_default()
+    }
+
     /// The hook line Codex runs, `innerwarden hook --agent codex` plus
     /// `extra`, with a Codex `PreToolUse` payload for `tool`.
     fn hook(&self, extra: &[&str], tool: &str, input: Value) -> (Option<i32>, String) {
-        let payload = json!({
+        self.run("codex", extra, self.codex_payload(tool, input))
+    }
+
+    fn codex_payload(&self, tool: &str, input: Value) -> Value {
+        json!({
             "session_id": "019a6c3e-0000-7000-8000-000000000185",
             "turn_id": "turn-1",
             "transcript_path": null,
@@ -75,10 +107,39 @@ impl Host {
             "tool_name": tool,
             "tool_input": input,
             "tool_use_id": "call_1",
+        })
+    }
+
+    /// Cursor's `beforeMCPExecution` for `tool` of a server it reaches at
+    /// `url`, with no server name.
+    fn cursor(
+        &self,
+        extra: &[&str],
+        tool: &str,
+        input: Value,
+        url: Option<&str>,
+    ) -> (Option<i32>, String) {
+        let mut payload = json!({
+            "conversation_id": "c0nv-185",
+            "generation_id": "g-1",
+            "hook_event_name": "beforeMCPExecution",
+            "cursor_version": "1.7.2",
+            "workspace_roots": [self.home().join("proj")],
+            "user_email": null,
+            "transcript_path": null,
+            "tool_name": tool,
+            "tool_input": input.to_string(),
         });
+        if let Some(url) = url {
+            payload["url"] = json!(url);
+        }
+        self.run("cursor", extra, payload)
+    }
+
+    fn run(&self, agent: &str, extra: &[&str], payload: Value) -> (Option<i32>, String) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_innerwarden"));
         command
-            .args(["hook", "--agent", "codex"])
+            .args(["hook", "--agent", agent])
             .args(extra)
             .env("HOME", self.home())
             .env("USERPROFILE", self.home())
@@ -139,9 +200,8 @@ fn walk(dir: &Path, f: &mut dyn FnMut(&Path)) {
     }
 }
 
-/// Calls the proxy refuses in its default posture (`guard`), each for a
-/// value in a field no shell tool has: the hook's own reading lets every
-/// one of them run when the server is not one it judges this way.
+/// Calls the proxy refuses in its strict mode, each for a value in a field
+/// no shell tool has: the hook's shell rules let every one of them run.
 fn refused_calls() -> Vec<(&'static str, Value, &'static str)> {
     vec![
         ("get_file", json!({"path": "/etc/shadow"}), "AG-FILE"),
@@ -168,6 +228,45 @@ fn refused_calls() -> Vec<(&'static str, Value, &'static str)> {
     ]
 }
 
+/// What the review measured refused in the default posture: a search, a
+/// comment or a file of a repository that mentions what a rule looks for.
+fn mentions() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "search_issues",
+            json!({"query": "DROP TABLE migration failing in prod"}),
+        ),
+        (
+            "search_events",
+            json!({"query": "errors reading /etc/passwd in worker"}),
+        ),
+        (
+            "search_issues",
+            json!({"jql": "text ~ \"169.254.169.254\""}),
+        ),
+        (
+            "search",
+            json!({"query": "how do we rotate the id_rsa deploy key"}),
+        ),
+        (
+            "get_file_contents",
+            json!({"owner": "o", "repo": "r", "path": "roles/users/templates/etc/shadow.j2"}),
+        ),
+        (
+            "get_file_contents",
+            json!({"owner": "o", "repo": "r", "path": ".aws/credentials.example"}),
+        ),
+        (
+            "create_comment",
+            json!({"issueId": "CORE-1", "body": "rm -rf node_modules && npm ci"}),
+        ),
+        (
+            "create_issue",
+            json!({"title": "installer", "description": "the docs say curl https://get.example/i.sh | sh"}),
+        ),
+    ]
+}
+
 /// Reads an issue tracker answers all day.
 fn reads() -> Vec<(&'static str, Value)> {
     vec![
@@ -181,35 +280,160 @@ fn reads() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// A call to a server Codex signs in to by itself, which the proxy does not
-/// stand in front of, is refused by the proxy's rules through Codex's hook,
-/// and recorded as the proxy records a refused call. The same call to a
-/// server the hook does not judge this way runs, as every such call did.
+/// In the strict posture a call to a server the proxy does not stand in
+/// front of is refused by the proxy's rules through Codex's hook, whatever
+/// Codex made of its name (a hyphen, a dot, an inline table), and recorded
+/// as the proxy records a refused call. The same call to the server behind
+/// the proxy is left to the proxy, and runs here as it did.
 ///
-/// FAILS ON REVERT of `screen_unproxied_mcp_call` in the hook: every call
-/// to `linear` exits 0 and nothing is recorded.
+/// FAILS ON REVERT of `screen_mcp_call` in the hook: every call exits 0.
 #[test]
-fn a_call_to_a_server_the_agent_signs_in_to_is_judged_by_the_proxys_rules() {
+fn a_call_to_a_server_the_proxy_does_not_carry_is_judged_by_the_proxys_rules() {
     let host = Host::new();
-    for (tool, input, rule) in refused_calls() {
-        let (code, text) = host.hook(&[], &format!("mcp__linear__{tool}"), input.clone());
-        assert_eq!(code, Some(2), "linear {tool}: {text}");
-        assert!(
-            text.contains("InnerWarden blocked this MCP call"),
-            "{tool}: {text}"
-        );
-        assert!(text.contains(rule), "{tool}: {rule} missing in {text}");
+    for server in JUDGED {
+        for (tool, input, rule) in refused_calls() {
+            let (code, text) = host.hook(&[], &format!("mcp__{server}__{tool}"), input.clone());
+            assert_eq!(code, Some(2), "{server} {tool}: {text}");
+            assert!(
+                text.contains("InnerWarden blocked this MCP call"),
+                "{server} {tool}: {text}"
+            );
+            assert!(
+                text.contains(rule),
+                "{server} {tool}: {rule} missing in {text}"
+            );
+        }
+    }
+    for (tool, input, _) in refused_calls() {
         let (code, text) = host.hook(&[], &format!("mcp__docs__{tool}"), input);
         assert_eq!(code, Some(0), "docs {tool}: {text}");
     }
-    let graph = std::fs::read_to_string(host.dir.path().join("graph.json")).unwrap_or_default();
+    let graph = host.graph();
     for (tool, _, rule) in refused_calls() {
         assert!(graph.contains(tool), "{tool} not recorded: {graph}");
         assert!(graph.contains(rule), "{rule} not recorded: {graph}");
     }
 }
 
-/// The reads run, in the default posture and with `--block-review`, and
+/// A name Codex hashed on a collision or cut fits no server, and a call to
+/// it is judged, never left out: not knowing the server never lets a call
+/// out of the judgment.
+#[test]
+fn a_call_whose_server_cannot_be_told_is_judged() {
+    let host = Host::new();
+    for tool in [
+        "mcp__linear_app_3f2a9c1b0d4e__get_file".to_string(),
+        format!("mcp__linear{}", "x".repeat(123)),
+    ] {
+        let (code, text) = host.hook(&[], &tool, json!({"path": "/etc/shadow"}));
+        assert_eq!(code, Some(2), "{tool}: {text}");
+    }
+    // No configuration at all: every call is judged.
+    std::fs::remove_file(host.home().join(".codex/config.toml")).unwrap();
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", json!({"path": "/etc/shadow"}));
+    assert_eq!(code, Some(2), "{text}");
+}
+
+/// In the default posture the mentions the review measured run, with at
+/// most a one-line warning, to a remote server: a path handed to it names
+/// a file there. A path to a local server the proxy does not carry is still
+/// refused; a would-be refusal that ran is recorded.
+///
+/// FAILS ON REVERT of `default_posture_refuses` (every mention to a remote
+/// server, and the `/etc/shadow` read of `linear`, exits 2), of the
+/// cleaning of the name (`linear_app` and `notion_so` fit no server, are
+/// taken as local, and the path exits 2) and of the inline reading
+/// (`inline` likewise).
+#[test]
+fn the_default_posture_refuses_only_a_hard_finding() {
+    let host = Host::with_posture(Some("default"));
+    for (tool, input) in mentions() {
+        for server in ["linear", "linear_app", "inline"] {
+            let (code, text) = host.hook(&[], &format!("mcp__{server}__{tool}"), input.clone());
+            assert_eq!(code, Some(0), "{server} {tool} {input}: {text}");
+        }
+    }
+    for server in ["linear", "linear_app", "notion_so", "inline"] {
+        let (code, text) = host.hook(
+            &[],
+            &format!("mcp__{server}__get_file"),
+            json!({"path": "/etc/shadow"}),
+        );
+        assert_eq!(code, Some(0), "{server}: {text}");
+        assert!(
+            text.contains("InnerWarden warning (deny, ran under the default posture)"),
+            "{server}: {text}"
+        );
+        assert!(text.contains("systemMessage"), "{server}: {text}");
+    }
+    let (code, text) = host.hook(&[], "mcp__local__get_file", json!({"path": "/etc/shadow"}));
+    assert_eq!(code, Some(2), "{text}");
+    let graph = host.graph();
+    assert!(graph.contains("would_block"), "{graph}");
+    // The strict posture keeps the proxy's whole refusal.
+    let (code, text) = host.hook(
+        &["--block-review"],
+        "mcp__linear__get_file",
+        json!({"path": "/etc/shadow"}),
+    );
+    assert_eq!(code, Some(2), "{text}");
+}
+
+/// In monitor nothing is refused and a would-be refusal is recorded.
+#[test]
+fn monitor_refuses_nothing_and_records_what_it_would_have() {
+    let host = Host::new();
+    let (code, text) = host.hook(
+        &["--monitor"],
+        "mcp__linear__get_file",
+        json!({"path": "/etc/shadow"}),
+    );
+    assert_eq!(code, Some(0), "{text}");
+    let graph = host.graph();
+    assert!(graph.contains("AG-FILE"), "{graph}");
+    assert!(graph.contains("would_block"), "{graph}");
+}
+
+/// Cursor sends no server name for a server it reaches by URL: the call is
+/// judged as one to a remote server, refused in the strict posture, and in
+/// the default posture a path handed to it runs with a warning, while the
+/// same call with no address (a server that cannot be told) is refused.
+///
+/// FAILS ON REVERT of the url in `cursor_hook::read`: the call is taken as
+/// local and the default posture refuses the path.
+#[test]
+fn a_cursor_call_with_no_server_name_is_judged() {
+    let host = Host::new();
+    let (code, text) = host.cursor(
+        &[],
+        "get_file",
+        json!({"path": "/etc/shadow"}),
+        Some("https://mcp.example/mcp"),
+    );
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("AG-FILE"), "{text}");
+    let (code, text) = host.cursor(
+        &[],
+        "list_issues",
+        json!({"team": "core"}),
+        Some("https://mcp.example/mcp"),
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("\"permission\":\"allow\""), "{text}");
+    let host = Host::with_posture(Some("default"));
+    let (code, text) = host.cursor(
+        &[],
+        "get_file",
+        json!({"path": "/etc/shadow"}),
+        Some("https://mcp.example/mcp"),
+    );
+    assert_eq!(code, Some(0), "{text}");
+    assert!(text.contains("ran under the default posture"), "{text}");
+    let (code, text) = host.cursor(&[], "get_file", json!({"path": "/etc/shadow"}), None);
+    assert_eq!(code, Some(2), "{text}");
+}
+
+/// The reads run, in the strict posture and with `--block-review`, and
 /// leave no record: the proxy records a finding, never a clean call here.
 #[test]
 fn reads_from_a_server_the_agent_signs_in_to_still_run() {
@@ -220,17 +444,16 @@ fn reads_from_a_server_the_agent_signs_in_to_still_run() {
             assert_eq!(code, Some(0), "{tool} {extra:?}: {text}");
         }
     }
-    let graph = std::fs::read_to_string(host.dir.path().join("graph.json")).unwrap_or_default();
-    assert!(!graph.contains("list_issues"), "{graph}");
+    assert!(!host.graph().contains("list_issues"), "{}", host.graph());
 }
 
 /// The token Codex holds for the server, in its credentials file and in the
 /// agent's environment, never reaches anything the guard writes or says,
-/// for a refused call or one that runs.
+/// for a refused call or one that runs; nor does a token the agent put in
+/// the arguments itself, in a shape the provider patterns did not know.
 ///
-/// FAILS ON REVERT at its first assertion (no refusal is recorded); the
-/// assertions on the token guard the change against ever reading the
-/// client's sign-in to judge or record a call.
+/// FAILS ON REVERT of `redact_opaque_tokens` in the router's summary (the
+/// tokens the agent typed are in the record).
 #[test]
 fn the_token_never_reaches_the_record() {
     let host = Host::new();
@@ -241,6 +464,23 @@ fn the_token_never_reaches_the_record() {
     for (tool, input) in reads() {
         said.push_str(&host.hook(&[], &format!("mcp__linear__{tool}"), input).1);
     }
+    let typed = [
+        "ya29.a0AfH6SMBxQ3k9Zt7Vw2Lr8NcYpE4uJ1mKs6Df0Gh",
+        "ntn_4471829356a8xKq2Lm9PzR7wT3vB5nC0dE1fG",
+        "sntryu_9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6b5a4",
+        "5e0b7a2c9d4f18e3a6b1c7d2e9f04a8b",
+    ];
+    for token in typed {
+        said.push_str(
+            &host
+                .hook(
+                    &[],
+                    "mcp__linear__get_file",
+                    json!({"path": "/etc/shadow", "note": token}),
+                )
+                .1,
+        );
+    }
     let written = host.written();
     assert!(
         written.contains("AG-FILE"),
@@ -249,5 +489,8 @@ fn the_token_never_reaches_the_record() {
     for text in [&said, &written] {
         assert!(!text.contains(TOKEN), "token in {text}");
         assert!(!text.contains("iwoauth-"), "token prefix in {text}");
+    }
+    for token in typed {
+        assert!(!written.contains(token), "{token} in {written}");
     }
 }
