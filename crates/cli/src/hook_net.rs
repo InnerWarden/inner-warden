@@ -20,7 +20,8 @@
 //! screening's: on Linux it is read from the kernel (`run_delay` in the
 //! thread's `schedstat`) and left out of [`DEADLINE`], never out of
 //! [`WALL_CAP`]. A wait the hook makes on purpose and bounds itself (the
-//! second opinion of a model) moves both by its bound with [`allow_wait`].
+//! second opinion of a model) moves both by the time it waited, with
+//! [`grant_wait`] before it and [`waited`] after.
 //!
 //! Both end as a call the hook could not read does: 2 in enforce (the call
 //! is refused), 1 in monitor (it never blocks, and says the call went
@@ -88,6 +89,23 @@ static ANSWER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(
 /// wiring up to date), kept for after the answer by [`after_answer`].
 type Deferred = Box<dyn FnOnce() + Send>;
 static AFTER_ANSWER: std::sync::Mutex<Vec<Deferred>> = std::sync::Mutex::new(Vec::new());
+
+/// Work kept by [`after_answer_last`]: run after all of [`AFTER_ANSWER`].
+static AFTER_ANSWER_LAST: std::sync::Mutex<Vec<Deferred>> = std::sync::Mutex::new(Vec::new());
+
+/// The most [`grant_wait`] adds in one run, all waits together: one answer
+/// of a model ([`crate::second_opinion_io::LLM_ANSWER_BOUND`]). Each line of
+/// a call asked its own and added 20 s, so with two lines the limit on the
+/// clock (65 s) passed the 50 s Claude Code waits for its hook.
+pub const MAX_ALLOWED_WAIT: Duration = crate::second_opinion_io::LLM_ANSWER_BOUND;
+const _: () = assert!(
+    WALL_CAP.as_millis() + MAX_ALLOWED_WAIT.as_millis()
+        <= (innerwarden_agent_guard::hook::HOOK_LONGEST_SECS as u128) * 1000
+);
+
+/// Milliseconds [`grant_wait`] has added in this run, less what [`waited`]
+/// gave back.
+static ALLOWED_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Set for a run on the person's prompt: every end is 0 and silent.
 static QUIET: AtomicBool = AtomicBool::new(false);
@@ -199,7 +217,9 @@ fn arm_with_cap(monitor: bool, deadline: Duration, cap: Duration) -> Result<(), 
     std::thread::Builder::new()
         .name("hook-deadline".into())
         .spawn(move || watch(*armed, queue))
-        .map(|_| ())
+        .map(|handle| {
+            let _ = WATCHDOG.set(handle.thread().clone());
+        })
         .map_err(|_| "no screening deadline could be set")
 }
 
@@ -226,12 +246,46 @@ pub fn after_answer(work: impl FnOnce() + Send + 'static) {
 /// fault or a panic, the hook ends with `code` and not with a refusal.
 pub fn answered(code: u8) {
     ANSWER.store(u16::from(code), Ordering::SeqCst);
-    let kept = AFTER_ANSWER
-        .lock()
-        .map(|mut queue| std::mem::take(&mut *queue))
-        .unwrap_or_default();
+    let take = |queue: &std::sync::Mutex<Vec<Deferred>>| {
+        queue
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default()
+    };
+    let kept: Vec<Deferred> = take(&AFTER_ANSWER)
+        .into_iter()
+        .chain(take(&AFTER_ANSWER_LAST))
+        .collect();
+    if kept.is_empty() {
+        return;
+    }
+    // A mark beside the record while the work runs (`record_pending`): an
+    // end at the limit on the clock leaves it, and the next hook or the
+    // status says the record was cut. Marks an earlier hook left are swept
+    // first.
+    let graph = crate::graph_io::graph_path();
+    if let Some(graph) = &graph {
+        crate::record_pending::sweep(graph);
+    }
+    let mark = graph.as_deref().and_then(crate::record_pending::begin);
     for work in kept {
         work();
+    }
+    if let Some(mark) = mark {
+        crate::record_pending::finish(&mark);
+    }
+}
+
+/// [`after_answer`] for work that must come after every other kept work:
+/// bringing the wiring up to date, which decides nothing about this call
+/// and must not hold back its record and alert.
+pub fn after_answer_last(work: impl FnOnce() + Send + 'static) {
+    if ARMED.get().is_none() || answer().is_some() {
+        return work();
+    }
+    match AFTER_ANSWER_LAST.lock() {
+        Ok(mut queue) => queue.push(Box::new(work)),
+        Err(_) => work(),
     }
 }
 
@@ -334,16 +388,74 @@ pub fn json_answer() -> Option<&'static str> {
     })
 }
 
-/// The hook is about to make a wait it bounds itself by `bound`: move the
-/// deadline and the limit on the clock by as much. Nothing to move when no
-/// deadline is armed (the same code runs under `innerwarden check`).
-pub fn allow_wait(bound: Duration) {
+/// The hook is about to make a wait it bounds itself by `bound`: the
+/// timeout it may give that wait, with the deadline and the limit on the
+/// clock moved by as much, or `None` when nothing is left for it. With no
+/// deadline armed (the same code runs under `innerwarden check`) the wait
+/// keeps its bound and there is nothing to move.
+///
+/// All waits of a run together move the limits by at most
+/// [`MAX_ALLOWED_WAIT`], counted by the time they really waited: once the
+/// wait is over the caller says so with [`waited`], and what it did not use
+/// goes back. A wait is given what is left when that is less than its bound,
+/// so a model that answers the first line of a call in 100 ms leaves nearly
+/// all of it to the next line; charged at its bound, the first wait took it
+/// all and a line put in front switched the model off for the line behind.
+pub fn grant_wait(bound: Duration) -> Option<Duration> {
+    if DEADLINE_MS.load(Ordering::SeqCst) == 0 {
+        return Some(bound);
+    }
+    let mut take = 0;
+    ALLOWED_MS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |added| {
+            take = millis(bound).min(millis(MAX_ALLOWED_WAIT).saturating_sub(added));
+            (take > 0).then(|| added.saturating_add(take))
+        })
+        .ok()?;
     for limit in [&DEADLINE_MS, &WALL_MS] {
         let _ = limit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
-            (armed != 0).then(|| armed.saturating_add(millis(bound)))
+            (armed != 0).then(|| armed.saturating_add(take))
         });
     }
+    Some(Duration::from_millis(take))
 }
+
+/// A wait [`grant_wait`] gave `granted` is over after `took`: what it did
+/// not use goes back, to the run's allowance and off the deadline and the
+/// limit on the clock, and the watchdog reads the limits again (it may be
+/// asleep until the later one).
+pub fn waited(granted: Duration, took: Duration) {
+    if DEADLINE_MS.load(Ordering::SeqCst) == 0 {
+        return;
+    }
+    let unused = millis(granted.saturating_sub(took));
+    if unused == 0 {
+        return;
+    }
+    // Each was moved up by at least `granted` when the wait was given, so
+    // taking `unused` off leaves an armed limit armed.
+    let _ = ALLOWED_MS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |added| {
+        Some(added.saturating_sub(unused))
+    });
+    for limit in [&DEADLINE_MS, &WALL_MS] {
+        let _ = limit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
+            (armed != 0).then(|| armed.saturating_sub(unused).max(1))
+        });
+    }
+    if let Some(watchdog) = WATCHDOG.get() {
+        watchdog.unpark();
+    }
+}
+
+/// [`grant_wait`] for a wait never said to be over: whether it was given
+/// anything.
+#[cfg(test)]
+fn allow_wait(bound: Duration) -> bool {
+    grant_wait(bound).is_some()
+}
+
+/// The watchdog's thread, woken by [`waited`] when the limits come back.
+static WATCHDOG: std::sync::OnceLock<std::thread::Thread> = std::sync::OnceLock::new();
 
 /// How long the screening thread has waited, ready to run, for a CPU since
 /// the net was armed: `run_delay`, the second field of the thread's
@@ -435,13 +547,18 @@ fn watch(armed: Instant, queue: &RunQueue) -> ! {
             cap,
             answer.is_some(),
         ) {
-            Some(left) => std::thread::sleep(left.max(Duration::from_millis(1))),
+            // Woken early by `waited`, which puts the limits back.
+            Some(left) => std::thread::park_timeout(left.max(Duration::from_millis(1))),
             None => {
                 if QUIET.load(Ordering::SeqCst) {
                     end("", 0)
                 } else if let Some(code) = answer {
                     // Answered already, on stdout too in JSON mode: only the
-                    // exit is left, with the answer's own code.
+                    // exit is left, with the answer's own code, and nothing
+                    // that touches a folder (one on a stuck disk would hold
+                    // the exit past the agent's wait). The mark stays, for the
+                    // next hook or the status to say the record was cut and
+                    // to remove this writer's temporaries.
                     end(AFTER_ANSWER_LATE, code)
                 } else if let Some(answer) = json_answer() {
                     let said = if MONITOR.load(Ordering::SeqCst) {
@@ -699,6 +816,68 @@ mod tests {
                     std::hint::black_box(0u8);
                 }
             }
+            "order" => {
+                // The record of this child goes where its parent said
+                // (`child_in`), a folder of its own.
+                let dir = crate::graph_io::graph_path()
+                    .and_then(|graph| graph.parent().map(std::path::Path::to_path_buf))
+                    .expect("a record folder");
+                arm_with(monitor, DEADLINE).expect("arm");
+                after_answer_last(|| eprintln!("ran=rewire"));
+                after_answer(|| eprintln!("ran=record"));
+                after_answer(|| eprintln!("ran=alert"));
+                answered(0);
+                let marks = std::fs::read_dir(&dir)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter(|e| {
+                                e.file_name()
+                                    .to_string_lossy()
+                                    .starts_with(".hook-pending.")
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                eprintln!("marks_left={marks}");
+                std::process::exit(0)
+            }
+            "two-waits" => {
+                arm_with(monitor, Duration::from_millis(200)).expect("arm");
+                let first = allow_wait(crate::second_opinion_io::LLM_ANSWER_BOUND);
+                let second = allow_wait(crate::second_opinion_io::LLM_ANSWER_BOUND);
+                let small = allow_wait(Duration::from_millis(1));
+                eprintln!(
+                    "granted={first},{second},{small} wall_ms={}",
+                    WALL_MS.load(Ordering::SeqCst)
+                );
+                std::process::exit(0)
+            }
+            "given-back" => {
+                arm_with(monitor, Duration::from_millis(200)).expect("arm");
+                let bound = crate::second_opinion_io::LLM_ANSWER_BOUND;
+                let first = grant_wait(bound).expect("the first wait");
+                waited(first, Duration::from_millis(100));
+                let second = grant_wait(bound).expect("what is left");
+                eprintln!(
+                    "granted_ms={},{} wall_ms={}",
+                    millis(first),
+                    millis(second),
+                    WALL_MS.load(Ordering::SeqCst)
+                );
+                std::process::exit(0)
+            }
+            "given-back-stall" => {
+                arm_with(monitor, Duration::from_millis(200)).expect("arm");
+                let granted = grant_wait(Duration::from_secs(3)).expect("granted");
+                // Past the first deadline: the watchdog has woken, read the
+                // moved one and gone back to sleep until it.
+                std::thread::sleep(Duration::from_millis(400));
+                waited(granted, Duration::from_millis(400));
+                loop {
+                    std::hint::black_box(0u8);
+                }
+            }
             other => panic!("{test}: unknown end {other}"),
         }
     }
@@ -750,8 +929,29 @@ mod tests {
     /// Run this test again as a child told to end one way; its exit code,
     /// what it said, and how long it took.
     fn child(test: &str, asked: &str) -> (Option<i32>, String, Duration) {
+        child_with(test, asked, None)
+    }
+
+    /// [`child`] with its record at `graph`.
+    fn child_in(
+        test: &str,
+        asked: &str,
+        graph: &std::path::Path,
+    ) -> (Option<i32>, String, Duration) {
+        child_with(test, asked, Some(graph))
+    }
+
+    fn child_with(
+        test: &str,
+        asked: &str,
+        graph: Option<&std::path::Path>,
+    ) -> (Option<i32>, String, Duration) {
         let started = Instant::now();
-        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+        let mut command = Command::new(std::env::current_exe().expect("test binary"));
+        if let Some(graph) = graph {
+            command.env("IW_GRAPH_FILE", graph);
+        }
+        let mut child = command
             .args([
                 "--exact",
                 &format!("hook_net::tests::{test}"),
@@ -979,6 +1179,86 @@ mod tests {
     ///
     /// FAILS ON REVERT: with `allow_wait` doing nothing the child ends at
     /// its 200 ms and not after the 3 s it was allowed.
+    /// Review of the hook deadline change, item d: the work kept for after
+    /// the answer runs the record and the alert first, in the order they
+    /// were kept, and bringing the wiring up to date last, though it was
+    /// kept first; the mark beside the record is gone once all of it ran.
+    ///
+    /// FAILS ON REVERT of `after_answer_last` (the rewire kept in the same
+    /// queue, first) and of taking the mark away (`record_pending::finish`).
+    #[test]
+    fn the_rewire_runs_after_the_record_and_the_alert() {
+        const TEST: &str = "the_rewire_runs_after_the_record_and_the_alert";
+        act_as_child(TEST);
+        let dir = tempfile::tempdir().expect("folder");
+        let (code, said, _) = child_in(TEST, "enforce:order", &dir.path().join("graph.json"));
+        assert_eq!(code, Some(0), "{said}");
+        let ran: Vec<&str> = said
+            .lines()
+            .filter_map(|line| line.strip_prefix("ran="))
+            .collect();
+        assert_eq!(ran, ["record", "alert", "rewire"], "{said}");
+        assert!(said.contains("marks_left=0"), "{said}");
+    }
+
+    /// Review of the hook deadline change, item h: the waits of one run
+    /// move the limits by one model's answer in all. A second line asking
+    /// for another is refused (and keeps its review), so the limit on the
+    /// clock stays under the 50 s Claude Code waits.
+    ///
+    /// FAILS ON REVERT of `MAX_ALLOWED_WAIT` in `allow_wait`: the second wait
+    /// is granted and the limit on the clock is 40 s past the deadline.
+    #[test]
+    fn the_waits_of_one_run_move_the_limits_by_one_answer_in_all() {
+        const TEST: &str = "the_waits_of_one_run_move_the_limits_by_one_answer_in_all";
+        act_as_child(TEST);
+        let (code, said, _) = child(TEST, "enforce:two-waits");
+        assert_eq!(code, Some(0), "{said}");
+        let expected = 200 + millis(crate::second_opinion_io::LLM_ANSWER_BOUND);
+        assert!(
+            said.contains(&format!("granted=true,false,false wall_ms={expected}")),
+            "{said}"
+        );
+    }
+
+    /// Review of #414, item 1: a wait is charged what it really waited. A
+    /// model that answers the first line in 100 ms leaves the rest of the
+    /// allowance to the next line, and the limits move by what was used.
+    ///
+    /// FAILS ON REVERT of `waited` (the second wait gets nothing, as when
+    /// each wait was charged its whole bound).
+    #[test]
+    fn a_wait_is_charged_what_it_waited() {
+        const TEST: &str = "a_wait_is_charged_what_it_waited";
+        act_as_child(TEST);
+        let (code, said, _) = child(TEST, "enforce:given-back");
+        assert_eq!(code, Some(0), "{said}");
+        let bound = millis(crate::second_opinion_io::LLM_ANSWER_BOUND);
+        let left = bound - 100;
+        let wall = 200 + 100 + left;
+        assert!(
+            said.contains(&format!("granted_ms={bound},{left} wall_ms={wall}")),
+            "{said}"
+        );
+    }
+
+    /// Review of #414, item 1: what a wait gives back comes off the
+    /// deadline at once, though the watchdog was asleep until the moved
+    /// one: a call that stalls after a quick answer is still refused at its
+    /// own time, not at the end of the whole bound.
+    ///
+    /// FAILS ON REVERT of the `unpark` in `waited` (the child ends after
+    /// the 3 s it was given) and of giving the time back.
+    #[test]
+    fn time_a_wait_gives_back_comes_off_the_deadline() {
+        const TEST: &str = "time_a_wait_gives_back_comes_off_the_deadline";
+        act_as_child(TEST);
+        let (code, said, took) = child(TEST, "enforce:given-back-stall");
+        assert_eq!(code, Some(2), "{said}");
+        assert!(said.contains("did not finish in time"), "{said}");
+        assert!(took < Duration::from_secs(2), "ended after {took:?}");
+    }
+
     #[test]
     fn a_wait_the_hook_bounds_moves_the_deadline_by_its_bound() {
         const TEST: &str = "a_wait_the_hook_bounds_moves_the_deadline_by_its_bound";

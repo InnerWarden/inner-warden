@@ -81,22 +81,31 @@ fn call_llm(cfg: &LlmConfig, command: &str) -> Option<Value> {
     // model; the redacted form keeps the dangerous SHAPE, so the verdict is unaffected.
     let command = innerwarden_agent_guard::redact::redact_secrets(command).text;
     let body = build_body(&cfg.model, &command);
-    // The hook's deadline does not count a wait this call bounds itself.
-    crate::hook_net::allow_wait(LLM_ANSWER_BOUND);
-    let mut req = crate::http_io::agent_with_timeout(LLM_ANSWER_BOUND)
-        .post(&cfg.url)
-        .header("Content-Type", "application/json");
-    // Key precedence: the named env var (zero key-at-rest) first, then the 0600
-    // key file the wizard / `llm set-key` wrote. Resolved off-thread of the config.
-    if let Some(key) = cfg.resolve_key(|k| std::env::var(k).ok(), read_key_file) {
-        req = if cfg.is_azure() {
-            req.header("api-key", &key)
-        } else {
-            req.header("Authorization", &format!("Bearer {key}"))
-        };
-    }
-    let resp = req.send_json(body).ok()?;
-    resp.into_body().read_json::<Value>().ok()
+    // The hook's deadline does not count a wait this call bounds itself, up
+    // to one model's answer a run, counted by the time really waited. With
+    // nothing left the call keeps its review rather than be refused by the
+    // deadline while it waits; with less than the bound left, that is the
+    // timeout.
+    let timeout = crate::hook_net::grant_wait(LLM_ANSWER_BOUND)?;
+    let started = std::time::Instant::now();
+    let reply = (|| {
+        let mut req = crate::http_io::agent_with_timeout(timeout)
+            .post(&cfg.url)
+            .header("Content-Type", "application/json");
+        // Key precedence: the named env var (zero key-at-rest) first, then the 0600
+        // key file the wizard / `llm set-key` wrote. Resolved off-thread of the config.
+        if let Some(key) = cfg.resolve_key(|k| std::env::var(k).ok(), read_key_file) {
+            req = if cfg.is_azure() {
+                req.header("api-key", &key)
+            } else {
+                req.header("Authorization", &format!("Bearer {key}"))
+            };
+        }
+        let resp = req.send_json(body).ok()?;
+        resp.into_body().read_json::<Value>().ok()
+    })();
+    crate::hook_net::waited(timeout, started.elapsed());
+    reply
 }
 
 /// Expand a leading `~/` to `$HOME`, then read the file (trimmed by the caller).

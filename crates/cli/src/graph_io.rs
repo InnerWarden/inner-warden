@@ -1494,6 +1494,31 @@ pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Dec
         event_hash,
     } = decision;
     let (mode, outcome) = (*mode, *outcome);
+    // A block or a would-block is told on the compact, append-only line
+    // (`guard.blocked` in `guard-events.jsonl`) BEFORE the graph is
+    // rewritten: the rewrite reads and writes the whole record, seconds on a
+    // busy disk, and an end at the hook's limit on the clock while it runs
+    // must not take the line with it. Only where the record folder is there
+    // already: this line makes no folder of its own (see below).
+    let blocks = !origin.demo
+        && matches!(
+            outcome,
+            DecisionOutcome::Blocked | DecisionOutcome::WouldBlock
+        );
+    let told_first = blocks && path.parent().is_some_and(std::path::Path::is_dir);
+    if told_first {
+        emit_guard_event(
+            path,
+            command,
+            verdict,
+            DecisionContextParts { mode, outcome },
+            session,
+            origin,
+        );
+    }
+    // A disk a build keeps busy, held back here in the tests (a debug build
+    // only): after the line above and before the rewrite it stands for.
+    crate::hook_net::test_record_delay();
     let written = if let Err(error) = record_at_with_origin(
         path,
         session,
@@ -1532,20 +1557,15 @@ pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Dec
     // small. Uses the already-redacted command + verdict (no raw secrets), and a
     // failure here never affects the verdict or the graph record.
     //
-    // After the graph's writer, never before: the writer is what makes the
-    // record folder, and a line appended first into a folder not made yet
-    // was lost with `entity not found` on stderr. This line makes no folder
-    // of its own, so a shared directory that is not there stays the writer's
-    // to report.
+    // Where the record folder was not there, after the graph's writer: the
+    // writer is what makes the record folder, and a line appended first into
+    // a folder not made yet was lost with `entity not found` on stderr. This
+    // line makes no folder of its own, so a shared directory that is not
+    // there stays the writer's to report.
     //
     // A demo call is recorded, but it is no event for the host to act on:
     // the demo sent it, and nothing an agent did is behind it.
-    if !origin.demo
-        && matches!(
-            outcome,
-            DecisionOutcome::Blocked | DecisionOutcome::WouldBlock
-        )
-    {
+    if blocks && !told_first {
         emit_guard_event(
             path,
             command,
@@ -2213,6 +2233,11 @@ impl Drop for GraphLock {
 /// the raw graph JSON, a one-line summary, or reset it.
 /// The recording outage in progress, for the CLI and the dashboard.
 pub fn current_outage() -> Option<crate::record_health::Outage> {
+    // A hook cut at its limit while it wrote leaves a mark
+    // (`record_pending`): read here as the lost record it is.
+    if let Some(graph) = graph_path() {
+        crate::record_pending::sweep(&graph);
+    }
     crate::record_health::current()
 }
 

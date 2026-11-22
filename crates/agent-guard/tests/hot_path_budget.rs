@@ -238,6 +238,15 @@ fn listing_under_one_root(n: usize) -> String {
 /// ceilings are about 5x and 20x the new figures.
 ///
 /// FAILS ON REVERT: with the start-chain store the listings take about 9 s.
+///
+/// Since 2026-11-21 each listing is also read for the structure of an
+/// injection (`mcp_proxy::structure`), about 17 ms per listing in a release
+/// build and 280 ms unoptimised: the 60 listings took 12 s in a plain debug
+/// build, a cost no user sees. The workspace builds this crate at
+/// `opt-level = 2` in debug (`[profile.dev.package.innerwarden-agent-guard]`
+/// in the root `Cargo.toml`), so this ceiling measures the code as it ships
+/// within about 1.6x; level 1 inlines too little and stays near 9 s. Measured
+/// 2026-11-22 on an x86_64 runner with 8 cores: 1.2 s for the six tests here.
 #[cfg_attr(
     tarpaulin,
     ignore = "a perf ceiling under instrumentation measures the instrumentation"
@@ -271,6 +280,48 @@ fn a_listing_heavy_mcp_session_stays_within_its_budget() {
     assert!(
         !ceilings_are_asserted() || searched.as_millis() <= 1_000,
         "searching a 240 KB argument full of paths under the root took {searched:?}"
+    );
+}
+
+/// What one more listing costs does not grow with what the session already
+/// holds. Recorded in one session: 24 listings of 64 KiB (1.5 MiB, under the
+/// 2 MiB a session keeps of what servers said, `SEEN_TEXT_BUDGET`, so every
+/// listing is still read for the structure of an injection and kept), and the
+/// last six are timed against the first six. A store that rereads or rewrites
+/// what it holds at each listing makes the last six cost several times the
+/// first; a constant cost keeps the ratio near 1.
+///
+/// A ratio in one run, not a wall clock: a busy runner slows both halves.
+/// The 60 listings above go past the budget, after which nothing more is
+/// read, so comparing 60 with 240 listings would not see such a store.
+///
+/// FAILS ON REVERT of a constant cost per listing: re-reading the session's
+/// kept text for structure at each listing (tried as a mutant) takes the last
+/// six to 4.6x the first.
+#[cfg_attr(
+    tarpaulin,
+    ignore = "a perf ratio under instrumentation measures the instrumentation"
+)]
+#[test]
+fn a_listing_costs_the_same_late_in_a_session_as_early() {
+    use innerwarden_agent_guard::mcp_proxy::taint::{Provenance, TaintTracker};
+
+    let listings: Vec<String> = (0..24).map(listing_under_one_root).collect();
+    let mut taint = TaintTracker::new();
+    let mut timed = |range: std::ops::Range<usize>| {
+        let start = Instant::now();
+        for listing in &listings[range] {
+            taint.record_result(listing, Provenance::Listing);
+        }
+        start.elapsed()
+    };
+    let first = timed(0..6);
+    let _ = timed(6..18);
+    let last = timed(18..24);
+    let ratio = last.as_secs_f64() / first.as_secs_f64().max(1e-6);
+    assert!(
+        std::env::var_os(NO_CEILINGS_ENV).is_some() || ratio <= 3.0,
+        "the last 6 of 24 listings took {last:?}, the first 6 {first:?}: {ratio:.1}x"
     );
 }
 

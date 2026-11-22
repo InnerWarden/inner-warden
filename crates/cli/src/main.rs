@@ -55,6 +55,7 @@ mod openclaw_guard;
 mod openclaw_guard_io;
 mod posture_io;
 mod record_health;
+mod record_pending;
 mod release_verify;
 mod safer_alternative;
 mod second_opinion;
@@ -2500,8 +2501,9 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     hook_net::mark("armed");
     // A host upgraded by an older binary still runs that binary's wiring:
     // the first hook of this version brings it up to this one's. It decides
-    // nothing about this call, so it runs after the answer.
-    hook_net::after_answer(agents_io::rewire_once_per_version);
+    // nothing about this call, so it runs after the answer, and after this
+    // call's record and alert: those are what a cut at the limit would lose.
+    hook_net::after_answer_last(agents_io::rewire_once_per_version);
 
     let read = if agent_flag(rest).as_deref() == Some(innerwarden_agent_guard::cursor_hook::AGENT) {
         read_cursor_call_or_head(std::io::stdin())
@@ -3196,7 +3198,14 @@ fn record_shell_now(
     layer: Option<graph_io::LayerLabel>,
     demo: bool,
 ) {
-    hook_net::test_record_delay();
+    // The alert first: rewriting the whole record can take seconds on a
+    // busy disk, and an end at the limit on the clock while it runs must not
+    // take the alert with it. In monitor mode this is a would-block alert;
+    // in enforce it accompanies the real block. Alerting must not change the
+    // hook outcome.
+    if would_block && !demo {
+        notify_io::fire(command, verdict);
+    }
     let source_session = hook_session(buf);
     let identity = hook_identity::current(agent_flag(rest).as_deref(), source_session.as_deref());
     graph_io::record_hook(
@@ -3213,11 +3222,6 @@ fn record_shell_now(
         demo,
     );
     hook_net::mark("graph");
-    if would_block && !demo {
-        // In monitor mode this is a would-block alert; in enforce it accompanies
-        // the real block. Alerting must not change the hook outcome.
-        notify_io::fire(command, verdict);
-    }
 }
 
 /// [`record_shell`] for a call the strict policy refuses and the default
@@ -3251,6 +3255,10 @@ fn record_shell_warned_now(
     layer: Option<graph_io::LayerLabel>,
     demo: bool,
 ) {
+    // The alert before the record, as in `record_shell_now`.
+    if !demo {
+        notify_io::fire(command, verdict);
+    }
     let source_session = hook_session(buf);
     let identity = hook_identity::current(agent_flag(rest).as_deref(), source_session.as_deref());
     graph_io::record_hook_warned(
@@ -3264,9 +3272,6 @@ fn record_shell_warned_now(
         layer,
         demo,
     );
-    if !demo {
-        notify_io::fire(command, verdict);
-    }
 }
 
 /// The posture an enforcing hook line runs in: the file's
@@ -3536,6 +3541,10 @@ pub(crate) fn screen_file_writes(
     let (owned_buf, owned_rest) = (buf.to_string(), rest.to_vec());
     hook_net::after_answer(move || {
         let (buf, rest) = (owned_buf.as_str(), owned_rest.as_slice());
+        // The alert before the record, as in `record_shell_now`.
+        if !demo {
+            notify_io::fire(&command, &verdict);
+        }
         let payload_session = hook_session(buf);
         let identity =
             hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
@@ -3552,9 +3561,6 @@ pub(crate) fn screen_file_writes(
             deciding_layer,
             demo,
         );
-        if !demo {
-            notify_io::fire(&command, &verdict);
-        }
     });
     FileScreen::Refused {
         explanation: file_tools::refusal_explanation(tool, path, what),
