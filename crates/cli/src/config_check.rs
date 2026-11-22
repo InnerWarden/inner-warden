@@ -221,6 +221,9 @@ pub fn check_file(agent: &'static str, file: &str, layout: Layout, root: &Value)
             nested_hooks(root, "BeforeTool", &mut push);
         }
         Layout::CodexConfig => {
+            // `approval_policy` "controls when Codex pauses for approval";
+            // `never` does not pause,
+            // https://developers.openai.com/codex/config-reference
             if root.get("approval_policy").and_then(Value::as_str) == Some("never") {
                 push(
                     Kind::AutoApprove,
@@ -266,7 +269,15 @@ fn name(raw: &str) -> String {
 }
 
 /// Claude Code's permissions: bypass mode, a whole MCP server allowed, and
-/// every project server started.
+/// every project server started. From the docs:
+///
+/// * `permissions.defaultMode = "bypassPermissions"` skips permission
+///   prompts, https://code.claude.com/docs/en/permissions
+/// * `mcp__<server>` and `mcp__<server>__*` in `permissions.allow` match
+///   every tool of the server, https://code.claude.com/docs/en/permissions
+/// * `enableAllProjectMcpServers` approves every server in project
+///   `.mcp.json` files without a prompt,
+///   https://code.claude.com/docs/en/settings
 fn claude_permissions(root: &Value, push: &mut impl FnMut(Kind, String, String)) {
     let permissions = root.get("permissions");
     if permissions
@@ -413,39 +424,26 @@ fn is_innerwarden(program: &str) -> bool {
     stem(program) == "innerwarden"
 }
 
-/// Why a server's calls run without asking, or `None`. Cursor documents no
-/// per-server approval field in `mcp.json` (its approval follows the Run
-/// Mode set in the app, https://cursor.com/docs/context/mcp), so an
-/// `autoApprove` or `alwaysAllow` there changes nothing and is not said.
+/// Why a server's calls run without asking, or `None`. Only a field the
+/// agent's own docs say skips its confirmation is counted:
+///
+/// * Gemini CLI: `trust: true` "bypasses all tool call confirmations for
+///   this server",
+///   https://github.com/google-gemini/gemini-cli/blob/main/docs/tools/mcp-server.md
+///
+/// `autoApprove` / `alwaysAllow` / `auto_approve` belong to other clients
+/// and are read by none of these four, so they are not said:
+///
+/// * Cursor documents no approval field in `mcp.json`; its approval follows
+///   the Run Mode set in the app, https://cursor.com/docs/context/mcp
+/// * Claude Code's `~/.claude.json` server entries have none; the
+///   equivalent is `mcp__<server>` in `permissions.allow`, read in
+///   `claude_permissions`, https://code.claude.com/docs/en/permissions
+/// * Codex documents no `auto_approve` for `[mcp_servers.<name>]`,
+///   https://developers.openai.com/codex/config-reference
 fn auto_approved(agent: &str, server: &Value) -> Option<String> {
-    if agent == "cursor" {
-        return None;
-    }
-    // Gemini CLI: `trust: true` skips every confirmation for the server.
-    if server.get("trust").and_then(Value::as_bool) == Some(true) {
+    if agent == "gemini" && server.get("trust").and_then(Value::as_bool) == Some(true) {
         return Some("`trust` is on, so every tool call runs without asking".to_string());
-    }
-    // `autoApprove` / `alwaysAllow`: a list of tools, or `true` for all.
-    for key in ["autoApprove", "alwaysAllow", "auto_approve"] {
-        match server.get(key) {
-            Some(Value::Bool(true)) => {
-                return Some(format!(
-                    "`{key}` is on, so every tool call runs without asking"
-                ))
-            }
-            Some(Value::Array(tools)) if !tools.is_empty() => {
-                return Some(if tools.iter().any(|t| t.as_str() == Some("*")) {
-                    format!("`{key}` lists `*`, so every tool call runs without asking")
-                } else {
-                    format!(
-                        "`{key}` lists {} tool{} that run without asking",
-                        tools.len(),
-                        if tools.len() == 1 { "" } else { "s" }
-                    )
-                });
-            }
-            _ => {}
-        }
     }
     None
 }

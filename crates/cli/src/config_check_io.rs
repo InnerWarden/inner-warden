@@ -455,6 +455,42 @@ env = {{ AWS_ACCESS_KEY_ID = "{FAKE_AWS}" }}
         config_check::check_file(agent, "~/f", layout, &root)
     }
 
+    /// Only an approval field the agent's own docs name is counted: Gemini's
+    /// `trust`. `autoApprove`, `alwaysAllow` and `auto_approve` are read by
+    /// none of the four agents, so they are not said, wherever they are.
+    ///
+    /// FAILS ON REVERT: count those keys again and the other agents' files
+    /// say "runs without asking" about a field the agent never reads.
+    #[test]
+    fn only_an_approval_field_the_agent_documents_is_counted() {
+        let foreign = r#"{"mcpServers": {"s": {"command": "node", "args": ["s.js"],
+            "autoApprove": ["*"], "alwaysAllow": true, "auto_approve": true}}}"#;
+        for (agent, layout) in [
+            ("claude-code", Layout::ClaudeState),
+            ("cursor", Layout::CursorMcp),
+            ("gemini", Layout::GeminiSettings),
+        ] {
+            let found = findings_of(agent, layout, foreign);
+            assert!(found.is_empty(), "{agent}: {found:?}");
+        }
+        let codex: serde_json::Value = serde_json::to_value(
+            toml::from_str::<toml::Value>(
+                "[mcp_servers.s]\ncommand = \"node\"\nauto_approve = true\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(config_check::check_file("codex", "~/f", Layout::CodexConfig, &codex).is_empty());
+
+        let trusted = r#"{"mcpServers": {"s": {"command": "node", "trust": true}}}"#;
+        let found = findings_of("gemini", Layout::GeminiSettings, trusted);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].kind, Kind::AutoApprove);
+        assert!(found[0].what.contains("`trust` is on"), "{}", found[0].what);
+        // `trust` is Gemini's: another agent's file with it says nothing.
+        assert!(findings_of("cursor", Layout::CursorMcp, trusted).is_empty());
+    }
+
     /// `npx -c` / `--call` run a shell string: it is not a package, so it is
     /// not said back, and a token in it is named but never printed.
     ///
