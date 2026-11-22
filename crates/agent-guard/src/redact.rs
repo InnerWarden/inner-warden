@@ -212,16 +212,28 @@ pub fn redact_secrets(input: &str) -> Redaction {
                     .map(|m| (m.start(), m.end()))
                 })
                 .collect();
-        for (start, end) in spans.into_iter().rev() {
+        if spans.is_empty() {
+            continue;
+        }
+        // The text built anew by appending, left to right: replacing each
+        // span in place moved the whole rest of the text every time, so a
+        // megabyte of `token=x` cost seconds.
+        let mut out = String::with_capacity(text.len());
+        let mut kept = 0;
+        for (start, end) in spans {
             // An earlier pattern already masked this span (a header caught as
             // Authorization and again as Bearer, say): nothing left to hide.
             // An empty quoted value has nothing to hide either.
             if start == end || &text[start..end] == MASK {
                 continue;
             }
-            text.replace_range(start..end, MASK);
+            out.push_str(&text[kept..start]);
+            out.push_str(MASK);
+            kept = end;
             count += 1;
         }
+        out.push_str(&text[kept..]);
+        text = out;
     }
     Redaction { text, count }
 }
@@ -241,6 +253,36 @@ mod tests {
         assert!(!r.text.contains("123-45-6789"));
         // The key= prefix stays so the shape is still readable.
         assert!(r.text.contains("password=[REDACTED]"));
+    }
+
+    /// Review of the hook deadline change, item c: masking is linear in the
+    /// text. Every span was replaced in place, which moved the rest of the
+    /// text each time: a megabyte of `token=x` took 7.3 s. Timed as a ratio
+    /// in one run, so a busy machine slows both sides: 16 times the text
+    /// costs about 16 times as much (16x measured), and in place 70x
+    /// (measured on 2026-11-22, x86_64, opt-level 2 in debug).
+    ///
+    /// FAILS ON REVERT of building the text by appending.
+    #[test]
+    fn masking_many_secrets_is_linear_in_the_text() {
+        let text = |n: usize| "token=x ".repeat(n);
+        let (small, large) = (text(16 * 1024), text(256 * 1024));
+        let timed = |t: &str| {
+            let start = std::time::Instant::now();
+            let r = redact_secrets(t);
+            (start.elapsed(), r)
+        };
+        let _ = timed(&small);
+        let (t_small, r_small) = timed(&small);
+        let (t_large, r_large) = timed(&large);
+        assert_eq!(r_small.count, 16 * 1024);
+        assert_eq!(r_large.count, 256 * 1024);
+        assert!(!r_large.text.contains("token=x "));
+        let ratio = t_large.as_secs_f64() / t_small.as_secs_f64().max(1e-6);
+        assert!(
+            ratio <= 32.0,
+            "16x the text took {ratio:.0}x the time ({t_small:?} and {t_large:?})"
+        );
     }
 
     #[test]
