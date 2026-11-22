@@ -480,7 +480,10 @@ pub fn server_entries_toml(doc: &DocumentMut) -> Vec<crate::mcp_unproxied::Serve
                         has_cwd: table.contains_key("cwd"),
                     })
                 }),
-                remote: (!is_stdio_server(&table) && table.contains_key("url"))
+                remote: (!is_stdio_server(&table)
+                    && table
+                        .get("url")
+                        .is_some_and(|url| url.as_str().is_none_or(|url| !crate::mcp_proxy::remote::is_local_url(url))))
                     || command.is_some_and(|c| crate::mcp_unproxied::runs_mcp_remote(c, &args)),
                 name,
             }
@@ -995,20 +998,41 @@ pub fn codex_sign_in_servers(list_json: &str) -> Option<Vec<String>> {
 }
 
 /// Whether a connect leaves the server `name` with `table` as it is
-/// because Codex signs in to it (see [`CodexSignIn`]): a server reached
-/// by URL that the proxy could otherwise carry, which Codex named, or, when
-/// Codex could not be asked, one with nothing but its address.
+/// because Codex signs in to it (see [`CodexSignIn`]): a server
+/// [`may_be_left`] that Codex named, or, when Codex could not be asked,
+/// any such server.
 fn left_for_sign_in(name: &str, table: &Table, sign_in: &CodexSignIn) -> bool {
-    if is_stdio_server(table) {
-        return false;
-    }
-    let Some(remote) = remote_entry(table) else {
-        return false;
-    };
-    match sign_in {
-        CodexSignIn::Servers(names) => names.iter().any(|n| n == name),
-        CodexSignIn::NotAsked => remote.keys.is_empty(),
-    }
+    may_be_left(table)
+        && match sign_in {
+            CodexSignIn::Servers(names) => names.iter().any(|n| n == name),
+            CodexSignIn::NotAsked => true,
+        }
+}
+
+/// Whether a connect may leave `table` for Codex to sign in to: a server
+/// reached by URL that the proxy could otherwise carry, with nothing but its
+/// address. One with a credential the proxy sends (`bearer_token_env_var`,
+/// `http_headers`, `env_http_headers`) is carried whatever a listing
+/// says of it, and one on this host (a loopback address,
+/// [`crate::mcp_proxy::remote::is_local_url`]) too: a path its calls carry
+/// names a file here, and the proxy's path rules are what refuse it.
+///
+/// What a connect leaves is a subset of these, so a status that reads
+/// every such server as left ([`as_codex_signs_in`]) never calls a server
+/// a connect left unguarded.
+fn may_be_left(table: &Table) -> bool {
+    !is_stdio_server(table)
+        && remote_entry(table).is_some_and(|remote| {
+            remote.keys.is_empty() && !crate::mcp_proxy::remote::is_local_url(&remote.url)
+        })
+}
+
+/// Whether any server of `doc` [`may_be_left`]: without one, a connect has
+/// nothing to ask Codex about.
+pub fn has_server_codex_may_sign_in_to(doc: &DocumentMut) -> bool {
+    server_tables(doc)
+        .iter()
+        .any(|(_, table)| may_be_left(table))
 }
 
 /// The configuration as the proxy can carry it without asking Codex: each
@@ -2121,11 +2145,13 @@ args = ["-y", "srv"]
                     [mcp_servers.docs]\nurl = \"https://d.example/mcp\"\nbearer_token_env_var = \"T\"\n";
         let named = CodexSignIn::Servers(vec!["linear".to_string(), "docs".to_string()]);
         let mut doc: DocumentMut = text.parse().unwrap();
+        // `docs` sends a token the proxy can send: carried, whatever the
+        // listing says of it.
         assert_eq!(
             wrap_toml_signed_in(&mut doc, "/bin/iw", false, "codex", &named),
-            1
+            2
         );
-        assert_eq!(signed_in_servers_toml(&doc, &named), vec!["linear", "docs"]);
+        assert_eq!(signed_in_servers_toml(&doc, &named), vec!["linear"]);
         assert_eq!(is_guarded_toml_signed_in(&doc, &named), Some(true));
         assert!(!doc.to_string().contains("l.example/mcp\", \"--"), "{doc}");
 
@@ -2143,5 +2169,50 @@ args = ["-y", "srv"]
             .parse()
             .unwrap();
         assert_eq!(is_guarded_toml_signed_in(&only, &named), None);
+    }
+
+    /// A connect never leaves a server on this host, nor one with a
+    /// credential the proxy sends, whatever a listing (a `codex` found on
+    /// the PATH) says of it; and what it leaves, a status reads as left, so
+    /// it never calls the result unguarded.
+    ///
+    /// FAILS ON REVERT of `may_be_left` (loopback and keys): `local`,
+    /// `hdr` and `tok` are left.
+    #[test]
+    fn a_server_here_or_with_a_credential_is_always_carried() {
+        let text = "[mcp_servers.local]\nurl = \"http://127.0.0.1:8931/mcp\"\n\n\
+                    [mcp_servers.named]\nurl = \"http://localhost:3000/mcp\"\n\n\
+                    [mcp_servers.v6]\nurl = \"http://[::1]/mcp\"\n\n\
+                    [mcp_servers.hdr]\nurl = \"https://h.example/mcp\"\nhttp_headers = { \"X-Team\" = \"a\" }\n\n\
+                    [mcp_servers.tok]\nurl = \"https://t.example/mcp\"\nbearer_token_env_var = \"T\"\n\n\
+                    [mcp_servers.far]\nurl = \"https://f.example/mcp\"\n";
+        let all = ["local", "named", "v6", "hdr", "tok", "far"];
+        let listed = CodexSignIn::Servers(all.iter().map(|s| s.to_string()).collect());
+        for sign_in in [listed, CodexSignIn::NotAsked] {
+            let mut doc: DocumentMut = text.parse().unwrap();
+            assert_eq!(
+                wrap_toml_signed_in(&mut doc, "/bin/iw", false, "codex", &sign_in),
+                5,
+                "{sign_in:?}"
+            );
+            assert_eq!(signed_in_servers_toml(&doc, &sign_in), vec!["far"]);
+            let status = as_codex_signs_in(&doc);
+            assert!(is_guarded_toml(&status), "{sign_in:?}: {status}");
+        }
+        let doc: DocumentMut = text.parse().unwrap();
+        assert!(has_server_codex_may_sign_in_to(&doc));
+        let none: DocumentMut = "[mcp_servers.local]\nurl = \"http://127.0.0.1:1/mcp\"\n"
+            .parse()
+            .unwrap();
+        assert!(!has_server_codex_may_sign_in_to(&none));
+        // The hook reads a server on this host as local, keeping the path
+        // rules.
+        let entries = server_entries_toml(&doc);
+        let remote: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.remote)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(remote, vec!["hdr", "tok", "far"]);
     }
 }

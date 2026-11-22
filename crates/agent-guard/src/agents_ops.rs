@@ -1682,6 +1682,10 @@ fn run_for_output(
 /// The words for servers of a JSON client a connect left as they are
 /// because the client signs in to them by itself.
 fn client_signed_in_note(agent: &str, names: &[String]) -> String {
+    let agent = match agent {
+        a if a == crate::cursor_hook::AGENT => "Cursor",
+        other => other,
+    };
     format!(
         "left as they are, {agent} signs in to them itself: {}; its hook, when it is on, judges \
          calls to them with the proxy's rules",
@@ -2071,7 +2075,13 @@ fn connect_by_one_mechanism(
                 String::new(),
             )
         } else {
-            let sign_in = codex_sign_in(home);
+            // No server a connect may leave: nothing to ask, and the
+            // listing can take its whole wait asking each server.
+            let sign_in = if mcp_wire_toml::has_server_codex_may_sign_in_to(&doc) {
+                codex_sign_in(home)
+            } else {
+                mcp_wire_toml::CodexSignIn::Servers(Vec::new())
+            };
             let n =
                 mcp_wire_toml::wrap_toml_signed_in(&mut doc, guard_bin, monitor, &r.name, &sign_in);
             let left = mcp_wire_toml::signed_in_servers_toml(&doc, &sign_in);

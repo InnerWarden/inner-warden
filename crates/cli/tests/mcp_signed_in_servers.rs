@@ -822,9 +822,17 @@ fn a_code_mode_script_is_read_by_both_readings() {
             let tool = format!("mcp__{server}__execute");
             let (exit, text) = host.hook(&[], &tool, json!({ "code": code }));
             assert_eq!(exit, Some(0), "{tool} {code}: {text}");
+            // Where the proxy's rules also refuse the call (the metadata
+            // address, on a server the proxy does not carry), the warning
+            // is the stronger of the two readings, with both findings
+            // (`the_warning_is_the_stronger_of_the_two_readings`).
+            let warning = if code == metadata && server != "docs" {
+                "InnerWarden warning (deny, ran under the default posture)"
+            } else {
+                "InnerWarden warning (review, ran under the default posture)"
+            };
             assert!(
-                text.contains("InnerWarden warning (review, ran under the default posture)")
-                    && text.contains("deletes, purges or takes away"),
+                text.contains(warning) && text.contains("deletes, purges or takes away"),
                 "{tool} {code}: {text}"
             );
             let (exit, text) = host.hook(&["--block-review"], &tool, json!({ "code": code }));
@@ -859,4 +867,35 @@ fn a_code_mode_script_is_read_by_both_readings() {
         );
         assert_eq!((exit, text.trim()), (Some(0), ""), "{tool}");
     }
+}
+
+/// A server on this host (a loopback address) is a local server: a path
+/// handed to it names a file here, so in the default posture the path
+/// rules still refuse `/etc/shadow`, for Codex by its configuration and
+/// for Cursor by the address its call carries.
+///
+/// FAILS ON REVERT of `is_local_url` in `mcp_wire_toml::server_entries_toml`
+/// and in `mcp_unproxied::reach`: both calls are remote, run with a
+/// warning and exit 0.
+#[test]
+fn a_server_on_this_host_keeps_the_path_rules() {
+    let host = Host::with_posture(Some("default"));
+    write_config(
+        &host.home().join(".codex/config.toml"),
+        &format!(
+            "{}\n[mcp_servers.pw]\nurl = \"http://127.0.0.1:8931/mcp\"\n",
+            codex_config()
+        ),
+    );
+    let shadow = || json!({"path": "/etc/shadow"});
+    let (code, text) = host.hook(&[], "mcp__pw__get_file", shadow());
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("AG-FILE"), "{text}");
+    for url in ["http://127.0.0.1:8931/mcp", "http://localhost:8931/mcp"] {
+        let (code, text) = host.cursor(&[], "get_file", shadow(), Some(url));
+        assert_eq!(code, Some(2), "{url}: {text}");
+    }
+    // A server elsewhere is remote as before: a warning in this posture.
+    let (code, text) = host.cursor(&[], "get_file", shadow(), Some("https://mcp.example/mcp"));
+    assert_eq!(code, Some(0), "{text}");
 }

@@ -761,7 +761,12 @@ pub fn server_entries(root: &Value) -> Vec<crate::mcp_unproxied::ServerEntry> {
                 remote: (!server
                     .as_object()
                     .is_some_and(|obj| obj.contains_key("command"))
-                    && REMOTE_URL_KEYS.iter().any(|key| server.get(*key).is_some()))
+                    && REMOTE_URL_KEYS.iter().any(|key| {
+                        server.get(*key).is_some_and(|url| {
+                            url.as_str()
+                                .is_none_or(|url| !crate::mcp_proxy::remote::is_local_url(url))
+                        })
+                    }))
                     || command.is_some_and(|c| crate::mcp_unproxied::runs_mcp_remote(c, &args)),
             }
         })
@@ -814,10 +819,17 @@ pub fn wrap_local(mut root: Value, guard_bin: &str, monitor: bool, agent: &str) 
 /// the OAuth sign-in for such a server on its own and keeps the token; as the
 /// proxy's stdio wrapper it would no longer sign in, and every call would come
 /// back 401. Its calls are judged by Cursor's hook ([`crate::mcp_unproxied`]).
+///
+/// A server on this host (a loopback address,
+/// [`crate::mcp_proxy::remote::is_local_url`]) is never left: a path its
+/// calls carry names a file here, and the proxy's path rules are what
+/// refuse it.
 fn left_for_sign_in(agent: &str, server: &Value) -> bool {
     agent == crate::cursor_hook::AGENT
         && !is_stdio_server(server)
-        && remote_entry(server).is_some_and(|remote| remote.headers.is_empty())
+        && remote_entry(server).is_some_and(|remote| {
+            remote.headers.is_empty() && !crate::mcp_proxy::remote::is_local_url(&remote.url)
+        })
 }
 
 /// The configuration as the proxy can carry it for `agent`: each server
@@ -2300,6 +2312,31 @@ mod remote_wiring_tests {
             spec.headers,
             vec![("Authorization".to_string(), "Bearer x".to_string())]
         );
+    }
+
+    /// A Cursor server on this host is carried through the proxy like any
+    /// local server: its calls carry paths that name files here. Only one
+    /// elsewhere, with no header, is left for Cursor to sign in to.
+    ///
+    /// FAILS ON REVERT of the loopback check in `left_for_sign_in`: the
+    /// loopback servers are left.
+    #[test]
+    fn a_cursor_server_on_this_host_is_carried() {
+        let cfg = json!({"mcpServers": {
+            "local": {"url": "http://127.0.0.1:8931/mcp"},
+            "named": {"url": "http://localhost:3000/sse"},
+            "far": {"url": "https://f.example/mcp"},
+        }});
+        let (out, n) = wrap_signed_in(cfg.clone(), "/abs/innerwarden", false, "cursor");
+        assert_eq!(n, 2, "{out}");
+        assert_eq!(signed_in_servers(&out, "cursor"), vec!["far"]);
+        assert_eq!(is_guarded_signed_in(&out, "cursor"), Some(true));
+        let remote: Vec<String> = server_entries(&cfg)
+            .into_iter()
+            .filter(|e| e.remote)
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(remote, vec!["far"]);
     }
 
     /// Entries the proxy cannot carry are left as they are and counted

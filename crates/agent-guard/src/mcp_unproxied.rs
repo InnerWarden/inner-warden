@@ -163,9 +163,13 @@ pub fn runs_mcp_remote(command: &str, args: &[&str]) -> bool {
         let word = word.trim();
         word == "mcp-remote" || word.starts_with("mcp-remote@")
     };
+    // An address on this host (`mcp-remote http://127.0.0.1:...`) is a
+    // local server: a path handed to it names a file here.
     let has_url = |rest: &[&str]| {
-        rest.iter()
-            .any(|a| a.starts_with("https://") || a.starts_with("http://"))
+        rest.iter().any(|a| {
+            (a.starts_with("https://") || a.starts_with("http://"))
+                && !crate::mcp_proxy::remote::is_local_url(a)
+        })
     };
     let runner = program(command);
     if runner == "mcp-remote" {
@@ -602,8 +606,10 @@ pub fn tool_of(tool_name: &str) -> Option<&str> {
 /// Where a call of `agent` to `tool_name` goes, and the server's own tools
 /// it may name.
 ///
-/// For Cursor, a call that carries the server's `url` goes to a remote
-/// server the proxy does not carry: a wrapper is a local command. A Cursor
+/// For Cursor, a call that carries the server's `url` goes to a server
+/// the proxy does not carry (a wrapper is a local command): remote, or
+/// [`Reach::Local`] for an address on this host
+/// ([`crate::mcp_proxy::remote::is_local_url`]). A Cursor
 /// call with no server name matches no entry and is [`Reach::Local`].
 /// Otherwise the tool name is matched against the servers of `entries`
 /// (Codex's names cleaned as Codex cleans them, [`codex_name`]). The call
@@ -624,8 +630,17 @@ pub fn reach<'a>(
 ) -> Option<(Reach, Vec<&'a str>)> {
     let rest = tool_name.strip_prefix(MCP_TOOL_PREFIX)?;
     let unknown = tool_of(tool_name)?;
-    if agent == crate::cursor_hook::AGENT && call.url.is_some_and(|url| !url.trim().is_empty()) {
-        return Some((Reach::Remote, vec![unknown]));
+    if agent == crate::cursor_hook::AGENT {
+        if let Some(url) = call.url.map(str::trim).filter(|url| !url.is_empty()) {
+            // A server on this host keeps the path rules, as one run as a
+            // local command does.
+            let reach = if crate::mcp_proxy::remote::is_local_url(url) {
+                Reach::Local
+            } else {
+                Reach::Remote
+            };
+            return Some((reach, vec![unknown]));
+        }
     }
     if call.unnamed {
         return Some((Reach::Local, vec![unknown]));
@@ -1032,6 +1047,36 @@ mod tests {
             reach("codex", "mcp__docs__read", none, None, &trust),
             Some((Reach::Local, vec!["read"]))
         );
+    }
+
+    /// Cursor: a call that carries the address of a server on this host is
+    /// local, so the path rules still refuse a file of this host in it.
+    ///
+    /// FAILS ON REVERT of the loopback check in `reach`: the call is
+    /// remote and the default posture lets `/etc/shadow` through.
+    #[test]
+    fn a_cursor_call_to_a_server_here_is_local() {
+        let guard = Guard::new();
+        let trust = guard.trust();
+        let entries = guard.wire(vec![entry("shell", true, false)]);
+        for url in [
+            "http://127.0.0.1:8931/mcp",
+            "http://localhost:3000/mcp",
+            "http://[::1]/mcp",
+        ] {
+            let call = CallServer {
+                url: Some(url),
+                unnamed: false,
+            };
+            assert_eq!(
+                reach("cursor", "mcp__pw__get_file", call, Some(&entries), &trust),
+                Some((Reach::Local, vec!["get_file"])),
+                "{url}"
+            );
+        }
+        // An `mcp-remote` in front of an address here is a local server too.
+        assert!(!runs_mcp_remote("npx", &["mcp-remote", "http://127.0.0.1:9/mcp"]));
+        assert!(runs_mcp_remote("npx", &["mcp-remote", "https://x.example/mcp"]));
     }
 
     /// Cursor: a call that carries the server's url goes to a remote server

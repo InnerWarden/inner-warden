@@ -39,7 +39,6 @@ fs4 = { version = "1.1", features = ["sync"] }
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
 serde_yaml = "0.9"
-include_dir = "0.7"
 base64 = "0.23"
 unicode-normalization = "0.1"
 tree-sitter = "0.27"
@@ -65,6 +64,8 @@ serde_yaml = "0.9"
 regex-syntax = "0.8"
 
 [dev-dependencies]
+# The corpus's YAML, for the tests that hold the build's table to it.
+include_dir = "0.7"
 tempfile = "3"
 serde_json = "1"
 

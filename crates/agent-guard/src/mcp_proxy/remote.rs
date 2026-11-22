@@ -92,6 +92,112 @@ pub fn is_remote_url(word: &str) -> bool {
         && !word.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+/// Whether `url` names a server on this host: no `scheme://host` (a
+/// file, a word that is no address), a unix socket, or one whose host is this host's loopback or
+/// unspecified address (`localhost`, a name under `.localhost`,
+/// `127.0.0.0/8` in any of the forms a URL parser reads, `0.0.0.0`,
+/// `::1`, `::` and their IPv4-mapped forms). A path handed to such a
+/// server names a file here, so its calls keep the path rules, and a
+/// connect carries it through the proxy whatever signs in to it. A name
+/// that only resolves to the loopback (a DNS record) is not seen.
+pub fn is_local_url(url: &str) -> bool {
+    let url = url.trim();
+    let Some(at) = url.find("://") else {
+        return true;
+    };
+    if url[..at].to_ascii_lowercase().contains("unix") {
+        return true;
+    }
+    let after = &url[at + 3..];
+    let authority = &after[..after.find(['/', '?', '#', '\\']).unwrap_or(after.len())];
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = percent_decoded(host).to_ascii_lowercase();
+    if let Some(inside) = host.strip_prefix('[') {
+        let inside = inside.split(']').next().unwrap_or(inside);
+        let inside = inside.split('%').next().unwrap_or(inside);
+        return inside.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+        });
+    }
+    let host = host.rsplit_once(':').map_or(host.as_str(), |(name, _)| name);
+    let host = host.trim_end_matches('.');
+    if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    url_ipv4(host).is_some_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
+/// `text` with each `%XX` read as its byte (a URL's host may be written so).
+fn percent_decoded(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let Some(byte) = text
+                .get(i + 1..i + 3)
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+            {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// An IPv4 host as a URL parser reads it (the WHATWG rules): one to four
+/// numbers split by `.`, each decimal, `0x` hex or `0` octal, the last
+/// filling the bytes left (`127.1`, `2130706433`, `0x7f.0.0.1`).
+fn url_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 4 {
+        return None;
+    }
+    let mut numbers = Vec::with_capacity(parts.len());
+    for part in &parts {
+        let (digits, radix) = if let Some(hex) = part
+            .strip_prefix("0x")
+            .or_else(|| part.strip_prefix("0X"))
+        {
+            (hex, 16)
+        } else if part.len() > 1 && part.starts_with('0') {
+            (&part[1..], 8)
+        } else if part.is_empty() {
+            return None;
+        } else {
+            (*part, 10)
+        };
+        let number = if digits.is_empty() {
+            0
+        } else {
+            u64::from_str_radix(digits, radix).ok()?
+        };
+        numbers.push(number);
+    }
+    let last = numbers.pop()?;
+    let mut address: u64 = 0;
+    for (i, number) in numbers.iter().enumerate() {
+        if *number > 255 {
+            return None;
+        }
+        address |= number << (8 * (3 - i));
+    }
+    if last >= 1u64 << (8 * (4 - numbers.len())) {
+        return None;
+    }
+    address |= last;
+    u32::try_from(address).ok().map(std::net::Ipv4Addr::from)
+}
+
 /// One remote server, as its wrapper names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteSpec {
@@ -1032,6 +1138,47 @@ fn end_session(shared: &Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server on this host is told by its address in every form a URL
+    /// parser reads as the loopback; another host is not.
+    #[test]
+    fn a_loopback_address_is_local_in_every_form() {
+        for url in [
+            "http://127.0.0.1:8931/mcp",
+            "http://LOCALHOST/mcp",
+            "https://api.localhost./mcp",
+            "http://127.1/mcp",
+            "http://2130706433/mcp",
+            "http://0x7f.0.0.1/mcp",
+            "http://0177.0.0.1/mcp",
+            "http://127.200.3.4:80",
+            "http://0.0.0.0:9000/",
+            "http://0/",
+            "http://[::1]:8080/mcp",
+            "http://[::]/mcp",
+            "http://[::ffff:127.0.0.1]/mcp",
+            "http://user:pw@127.0.0.1/mcp",
+            "http://%31%32%37.0.0.1/mcp",
+            "unix:///run/mcp.sock",
+            "http+unix://%2Frun%2Fmcp.sock/mcp",
+            "ws://127.0.0.1:9/",
+            "file:///tmp/x",
+        ] {
+            assert!(is_local_url(url), "{url}");
+        }
+        for url in [
+            "https://mcp.linear.app/mcp",
+            "https://128.0.0.1/mcp",
+            "http://10.0.0.5:8080/mcp",
+            "https://localhost.example.com/mcp",
+            "http://[2001:db8::1]/mcp",
+            "https://127.0.0.1.nip.io.example/mcp",
+            "https://example.com/?next=http://127.0.0.1/",
+            "wss://x.example/mcp",
+        ] {
+            assert!(!is_local_url(url), "{url}");
+        }
+    }
 
     /// Goose's `$VAR` and `${VAR}` are filled as Goose fills them: a name
     /// with no value stays written, a value is not read again (Goose's own

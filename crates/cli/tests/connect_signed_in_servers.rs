@@ -69,7 +69,9 @@ impl Host {
         use std::os::unix::fs::PermissionsExt;
         let script = self.dir.path().join("bin/codex");
         std::fs::write(&script, "").unwrap();
-        std::fs::write(self.dir.path().join("list.json"), CODEX_LIST).unwrap();
+        if !self.dir.path().join("list.json").exists() {
+            std::fs::write(self.dir.path().join("list.json"), CODEX_LIST).unwrap();
+        }
         std::fs::write(
             &script,
             format!(
@@ -82,11 +84,20 @@ impl Host {
     }
 
     fn connect(&self, agent: &str) -> String {
+        self.run(&["agents", "connect", agent])
+    }
+
+    /// A listing for [`Host::with_codex`] to print in place of [`CODEX_LIST`].
+    fn list_says(&self, listing: &str) {
+        std::fs::write(self.dir.path().join("list.json"), listing).unwrap();
+    }
+
+    fn run(&self, args: &[&str]) -> String {
         let mut path = vec![self.dir.path().join("bin")];
         path.extend(std::env::split_paths(&path_without_codex()));
         let mut command = Command::new(env!("CARGO_BIN_EXE_innerwarden"));
         command
-            .args(["agents", "connect", agent])
+            .args(args)
             .env("HOME", self.home())
             .env("USERPROFILE", self.home())
             .env("IW_GRAPH_FILE", self.dir.path().join("graph.json"))
@@ -218,7 +229,81 @@ fn a_cursor_server_reached_by_url_alone_is_left_as_it_is() {
         );
     }
     assert!(
-        out.contains("cursor signs in to them itself: linear"),
+        out.contains("Cursor signs in to them itself: linear"),
         "{out}"
     );
+}
+
+/// A server on this host is carried through the proxy whatever signs in to
+/// it, with Codex to ask (a `codex` on the PATH that names every server as
+/// one it signs in to) and without: a path its calls carry names a file
+/// here, and the proxy's path rules are what refuse it. A server with a
+/// credential the proxy sends is carried whatever the listing says.
+///
+/// FAILS ON REVERT of `mcp_wire_toml::may_be_left` (loopback and keys):
+/// `local`, `hdr` and `docs` are left as they are.
+#[test]
+fn a_server_on_this_host_or_with_a_credential_is_carried() {
+    let config = "[mcp_servers.local]\nurl = \"http://127.0.0.1:8931/mcp\"\n\n\
+[mcp_servers.hdr]\nurl = \"https://hdr.example/mcp\"\nhttp_headers = { \"X-Team\" = \"core\" }\n\n\
+[mcp_servers.docs]\nurl = \"https://docs.example/mcp\"\nbearer_token_env_var = \"DOCS_TOKEN\"\n\n\
+[mcp_servers.linear]\nurl = \"https://mcp.linear.example/mcp\"\n";
+    let every_one_o_auth = r#"[{"name":"local","auth_status":"o_auth"},{"name":"hdr","auth_status":"o_auth"},{"name":"docs","auth_status":"o_auth"},{"name":"linear","auth_status":"o_auth"}]"#;
+    for with_codex in [true, false] {
+        let host = Host::new();
+        host.write(".codex/config.toml", config);
+        if with_codex {
+            host.list_says(every_one_o_auth);
+            host.with_codex();
+        }
+        let out = host.connect("codex");
+        let after = host.read(".codex/config.toml");
+        for carried in ["local", "hdr", "docs"] {
+            assert!(
+                wrapped(&after, carried),
+                "codex={with_codex} {carried} not wrapped:\n{out}\n{after}"
+            );
+        }
+        assert_eq!(table(&after, "linear"), table(config, "linear"), "{out}");
+        assert!(out.contains(": linear;"), "{out}");
+        // What the connect did, the status and the list read as guarded:
+        // they never ask for a connect that would change nothing.
+        let status = host.run(&["status"]);
+        let list = host.run(&["agents", "list"]);
+        // What the connect did, the status and the list read as guarded
+        // by the proxy: they never call it unguarded and ask for a connect
+        // that would change nothing.
+        let codex_row = list
+            .lines()
+            .find(|line| line.trim_start().starts_with("codex "))
+            .unwrap_or_default();
+        assert!(
+            codex_row.contains("guarded (MCP proxy, enforce)"),
+            "codex={with_codex}:\n{list}"
+        );
+        assert!(
+            status.contains("Wired into 1: codex."),
+            "codex={with_codex}:\n{status}"
+        );
+        assert!(out.contains("Codex: Quit Codex and start it again."), "{out}");
+    }
+}
+
+/// A Cursor server on this host is carried too: Cursor's hook would read
+/// it as remote and skip the path rules.
+#[test]
+fn a_cursor_server_on_this_host_is_carried() {
+    let host = Host::new();
+    let config = serde_json::json!({"mcpServers": {
+        "pw": {"url": "http://127.0.0.1:8931/mcp"},
+        "linear": {"url": "https://mcp.linear.example/mcp"}
+    }});
+    host.write(".cursor/mcp.json", &config.to_string());
+    let out = host.connect("cursor");
+    let after: serde_json::Value = serde_json::from_str(&host.read(".cursor/mcp.json")).unwrap();
+    assert!(
+        after["mcpServers"]["pw"].to_string().contains("proxy"),
+        "{out}\n{after}"
+    );
+    assert_eq!(after["mcpServers"]["linear"], config["mcpServers"]["linear"]);
 }
