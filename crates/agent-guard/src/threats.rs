@@ -8180,8 +8180,13 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
         if reads.get() > RELATIVE_READS {
             return refuses_unfollowed();
         }
-        dirs.iter()
-            .any(|dir| names(&format!("{dir}/{target}"), taken))
+        dirs.iter().any(|dir| {
+            let path = match target.trim_start_matches("./") {
+                "" | "." => dir.clone(),
+                rest => format!("{dir}/{rest}"),
+            };
+            names(&path, taken)
+        })
     };
 
     let (redirects, read_whole) = shell_output_redirect_targets(content);
@@ -8423,7 +8428,10 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
             }
             "dd" => targets.extend(dd_operand(arguments, "of").map(str::to_string)),
             // `git checkout <tree> -- <path>` and `git restore` put another
-            // version of each path they name in its place.
+            // version of each path they name in its place; `rm`, `clean` and
+            // `worktree remove` take what they name away, and `init` writes
+            // a repository (or the file that points at one) into its folder.
+            // A relative path is read in the folder `-C` names.
             "git" => {
                 if let Some(at) = positional
                     .iter()
@@ -8431,6 +8439,9 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 {
                     targets.extend(positional[at + 1..].iter().map(|path| path.to_string()));
                 }
+                let reading = git_writes(arguments);
+                targets.extend(reading.written);
+                taken.extend(reading.taken);
             }
             "curl" => targets.extend(option_values(arguments, 'o', &["output"])),
             "wget" => targets.extend(option_values(arguments, 'O', &["output-document"])),
@@ -8626,6 +8637,127 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
         }
     }
     pattern[p..].iter().all(|c| *c == '*')
+}
+
+/// What a `git` line writes and takes away, as paths read in the folder
+/// its `-C` options name (each one relative to the one before, as git
+/// reads them).
+#[derive(Default)]
+struct GitWrites {
+    written: Vec<String>,
+    taken: Vec<String>,
+}
+
+/// git's options before its verb whose value is the next word.
+const GIT_GLOBAL_VALUE_OPTIONS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+    "--exec-path",
+    "--super-prefix",
+];
+
+fn git_writes(arguments: &[String]) -> GitWrites {
+    let mut reading = GitWrites::default();
+    let mut folder: Option<String> = None;
+    let mut at = 0usize;
+    while let Some(word) = arguments.get(at) {
+        let word = word.trim_matches(['"', '\'']);
+        if word == "-C" {
+            if let Some(value) = arguments.get(at + 1) {
+                folder = Some(git_path_in(folder.as_deref(), value.trim_matches(['"', '\''])));
+            }
+            at += 2;
+            continue;
+        }
+        if GIT_GLOBAL_VALUE_OPTIONS.contains(&word) {
+            at += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            at += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(verb) = arguments.get(at).map(|verb| verb.trim_matches(['"', '\''])) else {
+        return reading;
+    };
+    let rest = &arguments[at + 1..];
+    let in_folder = |path: &str| git_path_in(folder.as_deref(), path.trim_matches(['"', '\'']));
+    let words = |from: &[String]| -> Vec<String> {
+        let mut after_dashes = false;
+        let mut out = Vec::new();
+        for word in from {
+            if word == "--" && !after_dashes {
+                after_dashes = true;
+                continue;
+            }
+            if after_dashes || !word.starts_with('-') {
+                out.push(in_folder(word));
+            }
+        }
+        out
+    };
+    match verb {
+        "checkout" | "restore" if folder.is_some() => reading.written.extend(words(rest)),
+        "rm" => reading.taken.extend(words(rest)),
+        // What is not tracked under the folder goes, and with `-x` what is
+        // ignored too: the folder is taken as emptied.
+        "clean" => reading.taken.push(in_folder(".")),
+        "worktree" => {
+            if rest.first().is_some_and(|word| word == "remove") {
+                reading.taken.extend(words(&rest[1..]));
+            }
+        }
+        "init" => {
+            let mut index = 0usize;
+            let mut named = false;
+            while let Some(word) = rest.get(index) {
+                if word == "--separate-git-dir" {
+                    if let Some(value) = rest.get(index + 1) {
+                        reading.written.push(in_folder(value));
+                    }
+                    index += 2;
+                    continue;
+                }
+                if let Some(value) = word.strip_prefix("--separate-git-dir=") {
+                    reading.written.push(in_folder(value));
+                } else if matches!(word.as_str(), "--template" | "-b" | "--initial-branch" | "--object-format" | "--ref-format" | "--shared") {
+                    index += 2;
+                    continue;
+                } else if !word.starts_with('-') {
+                    named = true;
+                    reading.written.push(in_folder(word));
+                }
+                index += 1;
+            }
+            if !named {
+                reading.written.push(in_folder("."));
+            }
+        }
+        _ => {}
+    }
+    reading
+}
+
+/// `path` read in `folder` (git's `-C`): itself when it starts at the
+/// root, the home or a variable, or when no folder is named.
+fn git_path_in(folder: Option<&str>, path: &str) -> String {
+    let Some(folder) = folder else {
+        return path.to_string();
+    };
+    if path.starts_with(['/', '~', '$']) {
+        return path.to_string();
+    }
+    let folder = folder.trim_end_matches('/');
+    match path.trim_start_matches("./") {
+        "" | "." => folder.to_string(),
+        rest => format!("{folder}/{rest}"),
+    }
 }
 
 fn find_takes_and_writes(arguments: &[String]) -> FindReading {

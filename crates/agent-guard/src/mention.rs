@@ -1292,8 +1292,20 @@ fn command_edits(
                 }
                 if verbs.first() == Some(&"worktree") && verbs.get(1) == Some(&"remove") {
                     let from = at[1] + 1;
+                    // A relative worktree is read in the folder `-C` names.
+                    let folder = git_folder(&words[..at[0]]);
                     for (at, word) in words.iter().enumerate().skip(from) {
-                        if !word.starts_with('-') && literal_at(at) && work_folder(word) {
+                        let path = match &folder {
+                            Some(folder) if !word.starts_with(['/', '~', '$']) => {
+                                format!("{}/{word}", folder.trim_end_matches('/'))
+                            }
+                            _ => word.clone(),
+                        };
+                        if !word.starts_with('-')
+                            && literal_at(at)
+                            && work_folder(&path)
+                            && !names_guard_folder_by_name(word)
+                        {
                             mask(at, "wt");
                         }
                     }
@@ -1340,6 +1352,46 @@ fn command_edits(
 /// it runs in (`-C`), its repository and work tree, a setting, a
 /// namespace. Their value is no verb.
 const GIT_VALUE_OPTIONS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c", "--namespace"];
+
+/// The folder git's `-C` options before its verb name, each relative to
+/// the one before; `None` without one, or when one is not a literal word.
+fn git_folder(options: &[String]) -> Option<String> {
+    let mut folder: Option<String> = None;
+    let mut at = 0;
+    while at < options.len() {
+        if options[at] == "-C" {
+            let value = options.get(at + 1)?;
+            folder = Some(match folder {
+                Some(before) if !value.starts_with(['/', '~', '$']) => {
+                    format!("{}/{value}", before.trim_end_matches('/'))
+                }
+                _ => value.clone(),
+            });
+            at += 2;
+            continue;
+        }
+        at += if GIT_VALUE_OPTIONS.contains(&options[at].as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    folder
+}
+
+/// Whether a worktree named by `word` may be one of the guard's folders:
+/// git finds a worktree by the end of its path as well as by its path
+/// (`git worktree remove innerwarden` removes a worktree at
+/// `~/.config/innerwarden`), so a word whose last part is the guard's name
+/// is never read as a work folder.
+fn names_guard_folder_by_name(word: &str) -> bool {
+    let lower = word
+        .trim_matches(['"', '\''])
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    let last = lower.rsplit('/').next().unwrap_or(&lower);
+    GUARD_PROGRAMS.contains(&last)
+}
 
 /// Where git's verb and the word after it are among `words` (a git
 /// line's arguments): the first two words that are not options, the value
