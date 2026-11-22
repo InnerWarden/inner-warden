@@ -441,7 +441,12 @@ impl PendingCondition {
 /// rule with one that can never match.
 struct RuleConditions {
     pending: Vec<PendingCondition>,
-    compiled: OnceLock<Vec<CompiledCondition>>,
+    /// Each condition compiled, the first time it is asked for (`None`
+    /// inside: a pattern neither engine accepts). One at a time: a call
+    /// compiles only the conditions it may match, and a rule with a
+    /// condition that must run on every text (no literals) does not
+    /// compile its others for it.
+    compiled: Vec<OnceLock<Option<CompiledCondition>>>,
     /// Check each pattern with `Regex::new` before building its
     /// [`ForwardRegex`]: true for rules read from disk, false for the embedded
     /// corpus (see [`compile_conditions`]).
@@ -449,16 +454,41 @@ struct RuleConditions {
 }
 
 impl RuleConditions {
-    /// The compiled conditions, compiling them on the first call.
-    fn get(&self, rule_id: &str) -> &[CompiledCondition] {
-        self.compiled
-            .get_or_init(|| compile_conditions(rule_id, &self.pending, self.regex_first))
+    fn new(pending: Vec<PendingCondition>, regex_first: bool) -> Self {
+        Self {
+            compiled: pending.iter().map(|_| OnceLock::new()).collect(),
+            pending,
+            regex_first,
+        }
     }
 
-    /// Whether this rule's regexes have been compiled yet.
+    /// The condition at `at`, compiled on the first call; `None` for a
+    /// pattern neither engine accepts.
+    fn one(&self, rule_id: &str, at: usize) -> Option<&CompiledCondition> {
+        self.compiled[at]
+            .get_or_init(|| {
+                compile_conditions(
+                    rule_id,
+                    std::slice::from_ref(&self.pending[at]),
+                    self.regex_first,
+                )
+                .into_iter()
+                .next()
+            })
+            .as_ref()
+    }
+
+    /// Every compiled condition, in order, compiling those not compiled yet.
+    fn get(&self, rule_id: &str) -> Vec<&CompiledCondition> {
+        (0..self.pending.len())
+            .filter_map(|at| self.one(rule_id, at))
+            .collect()
+    }
+
+    /// Whether any of this rule's regexes has been compiled yet.
     #[cfg(test)]
     fn is_compiled(&self) -> bool {
-        self.compiled.get().is_some()
+        self.compiled.iter().any(|one| one.get().is_some())
     }
 }
 
@@ -1178,13 +1208,25 @@ fn eval_rule_context(
     context: AtrContext<'_>,
     folded: &Folded<'_>,
 ) -> Option<AtrMatch> {
-    // A rule not compiled yet is compiled only for a text it may match: a
-    // one-shot process (the hook) then compiles almost nothing for an
-    // ordinary call. A compiled rule asks its regexes directly.
-    if rule.conditions.compiled.get().is_none() && !rule.conditions.may_match(rule.logic, folded) {
+    // A condition is compiled only for a text it may match: a one-shot
+    // process (the hook) then compiles almost nothing for an ordinary call.
+    // With `any`, a condition whose literals the text lacks cannot match,
+    // and is neither compiled nor asked; with `all`, such a condition makes
+    // the rule not match, whatever the others say.
+    if !rule.conditions.may_match(rule.logic, folded) {
         return None;
     }
-    let conditions = rule.conditions.get(&rule.id);
+    let conditions: Vec<&CompiledCondition> = match rule.logic {
+        ConditionLogic::Any => rule
+            .conditions
+            .pending
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| folded.get(pending.field).is_some_and(|f| pending.may_match(f)))
+            .filter_map(|(at, _)| rule.conditions.one(&rule.id, at))
+            .collect(),
+        ConditionLogic::All => rule.conditions.get(&rule.id),
+    };
     match rule.logic {
         ConditionLogic::Any => {
             let mut undecided = None;
@@ -1323,17 +1365,16 @@ fn load_rule_str_reporting(
         })
         .collect();
 
-    let conditions = RuleConditions {
-        pending,
-        compiled: OnceLock::new(),
-        regex_first: true,
-    };
+    let conditions = RuleConditions::new(pending, true);
     let before = failed.len();
     let compiled = compile_conditions_reporting(&rule.id, &conditions.pending, true, failed);
     if failed.len() > before || compiled.is_empty() {
         return Ok(None);
     }
-    let _ = conditions.compiled.set(compiled);
+    // None failed: one compiled condition per written one, in order.
+    for (slot, condition) in conditions.compiled.iter().zip(compiled) {
+        let _ = slot.set(Some(condition));
+    }
 
     let [owasp_llm, owasp_agentic, mitre_atlas, mitre_attack] = rule.references;
     Ok(Some(CompiledRule {
@@ -1478,9 +1519,8 @@ fn embedded_rules(only_for: Option<AtrSource>) -> Vec<CompiledRule> {
             severity: rule.severity.to_string(),
             category: rule.category.to_string(),
             source_type: rule.source_type.to_string(),
-            conditions: RuleConditions {
-                pending: rule
-                    .conditions
+            conditions: RuleConditions::new(
+                rule.conditions
                     .iter()
                     .map(|cond| PendingCondition {
                         field: parse_field(cond.field),
@@ -1489,9 +1529,8 @@ fn embedded_rules(only_for: Option<AtrSource>) -> Vec<CompiledRule> {
                         literals: cond.literals,
                     })
                     .collect(),
-                compiled: OnceLock::new(),
-                regex_first: false,
-            },
+                false,
+            ),
             logic: if rule.all {
                 ConditionLogic::All
             } else {

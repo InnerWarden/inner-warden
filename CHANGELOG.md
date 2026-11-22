@@ -7,32 +7,72 @@ follows semantic versioning.
 
 `agents connect` leaves a server the agent signs in to by itself as it is,
 instead of wrapping it in the proxy, where the sign-in was lost (every call
-came back 401). For Codex it asks `codex mcp list --json`, which names each
-server's sign-in and never a token: a server Codex signed in to with
-`codex mcp login`, or one that asks for a sign-in, is left; one whose token
-comes from a variable is carried as before. When Codex cannot be asked, a
-server reached by URL alone is left. For Cursor, a server reached by URL
-alone is left (Cursor signs in to it by itself). The connect line names
-those servers; the agent's hook judges their calls with the proxy's rules.
+came back 401). Only a server reached by URL, on another host, with nothing
+the proxy would send for it (no `bearer_token_env_var`, `http_headers` or
+`env_http_headers` for Codex, no `headers` for Cursor) can be left. For
+Codex, such a server is left when `codex mcp list --json` (which names
+each server's sign-in and never a token) says Codex signs in to it, or when
+Codex cannot be asked; Codex is not asked when no server could be left. For
+Cursor, every such server is left (Cursor signs in to it by itself). The
+connect line names those servers; the agent's hook judges their calls with
+the proxy's rules. `agents list`, `status` and the dashboard count the same
+servers as left, so they never call the result unguarded.
 
-An ordinary MCP call costs the hook about half what it did: the ATR rules
-are read from the YAML once, when the binary is built, and a rule is
-compiled for a call only when the call holds one of the literals every
-match of its patterns contains (median of 41 clean Codex calls on one
-machine, release build: 13.8 ms before, 7.2 ms after). What a rule matches
-is unchanged.
+What this leaves out of the proxy that the proxy carried before: a Codex
+server reached by URL alone, on another host, that Codex signs in to (or
+any such server when Codex cannot be asked, as when it is not on the
+`PATH`), and a Cursor server reached by URL alone, on another host. Their
+calls are judged by the agent's hook, with the proxy's rules, only while
+the hook is on. A server on this host (`localhost`, a name under
+`.localhost`, `127.0.0.0/8` in any form a URL parser reads, `0.0.0.0`,
+`::1`) or behind a unix socket is always carried, and the hook reads it
+as a local server: a path its calls carry names a file here, and the path
+rules still refuse `/etc/shadow` in the default posture. A name that only
+resolves to the loopback (a DNS record) is read as another host.
 
-A call is left to the proxy only when its wrapper's command is an absolute
-path, its entry sets no `PATH`, `LD_*` or `DYLD_*` (nor a file of
-variables) and no working folder, no layer of the project Codex runs in
-(`.codex/config.toml` from the working folder up to the project's root)
-names the server, and the configuration's last change, content or status,
-is older than the agent. `touch -d` on a configuration rewritten after the
-agent started no longer passes for an old one.
+An ordinary MCP call costs the hook less: the ATR rules are read from the
+YAML once, when the binary is built, and a rule is compiled for a call only
+when the call holds one of the literals every match of its patterns
+contains, one condition at a time (median of 41 clean Codex calls on one
+machine, release build, three runs each: 13.4 ms on main, 7.3 ms on this
+build; a call that holds a rule's literals pays for that rule as before). A
+pattern only `fancy-regex` reads (look-around, a back-reference) has no
+literals and is compiled for every call: it can be undecided on a long text,
+which holds the call for review, and skipping it let a long call through in
+a hook that had not compiled it. What a rule matches is unchanged.
+
+A call is left to the proxy only when its wrapper's command is written as
+the path the guard runs as (read as text: no link, no `/proc` or `/dev`,
+no `.` or `..` part), its entry sets no `PATH`, `LD_*` or `DYLD_*`
+(nor passes one with Codex's `env_vars`, nor a file of variables) and no
+working folder, and the configuration's last change, content or status, is
+older than the agent. For Codex, also: no layer of the project
+(`.codex/config.toml` in the working folder or any folder above it, past a
+`.git`) names any server; in a project the user's file trusts, no folder
+from the working folder up to the project's, nor a `.codex` in one,
+changed after the agent started (a layer moved away); and the Codex the
+hook runs under was not started with `-c`/`--config mcp_servers...` or a
+profile (read from its command line). For Cursor, also: the call's own
+command line is the guard's proxy in a mode that refuses, and no
+`.cursor/mcp.json` of a workspace root names a server. The agent is the
+nearest ancestor of the hook named for it, else the first that is not a
+shell or a known launcher. `touch -d` on a configuration rewritten after
+the agent started no longer passes for an old one; on a file system that
+keeps no status change apart from the content's time (FAT, exFAT) it still
+can, and such a configuration is read as settled.
 
 `git -C <folder> worktree remove <path>` (and `--git-dir`, `--work-tree`,
 `-c`, `--namespace` before the verb) is read as the same line without the
-option: the option's value is not git's verb.
+option: the option's value is not git's verb. A worktree word whose last
+part is the guard's name (`git worktree remove --force innerwarden`) is
+refused in every form, after a `cd` too: git finds a worktree by the end of
+its path, and one registered at the guard's folder goes. `git rm`, `git
+clean`, `git worktree remove` and `git init` (with `--separate-git-dir`)
+are read at the path the `-C` options reach: `git -C ~/.config/innerwarden
+clean -fdx`, `git -C ~/.local/bin rm -f innerwarden` and `git init` into
+the guard's folder are refused as `rm` of the same path is. They were
+allowed before, on main too. `codex -c mcp_servers...` is refused as the
+override of Codex's hooks is: the server it sets runs outside the proxy.
 
 When an MCP call and the command it carries both run with a warning in the
 default posture, the warning said and recorded is the stronger of the two,
