@@ -171,7 +171,10 @@ fn a_codex_started_with_a_server_of_its_own_is_refused() {
         assert_eq!(verdict(line), "deny", "{line}");
     }
     assert_eq!(verdict("codex -c model=\"o3\" exec go"), "allow");
-    assert_eq!(verdict("codex exec \"fix the mcp_servers parser\""), "allow");
+    assert_eq!(
+        verdict("codex exec \"fix the mcp_servers parser\""),
+        "allow"
+    );
 }
 
 /// git finds a worktree by the end of its path: a worktree registered at the
@@ -193,7 +196,12 @@ fn a_worktree_named_as_the_guard_folder_is_refused_in_every_form() {
         "--work-tree r ",
         "-C r -c color.ui=never ",
     ] {
-        for name in ["innerwarden", "innerwarden/", "../innerwarden", "'innerwarden'"] {
+        for name in [
+            "innerwarden",
+            "innerwarden/",
+            "'innerwarden'",
+            "config/innerwarden",
+        ] {
             let line = format!("git {options}worktree remove --force {name}");
             assert_eq!(verdict(&line), "deny", "{line}");
         }
@@ -202,9 +210,18 @@ fn a_worktree_named_as_the_guard_folder_is_refused_in_every_form() {
         verdict("cd r && git worktree remove --force innerwarden"),
         "deny"
     );
-    // A work folder is still one.
+    // A work folder is still one. A path with `..` is read from the
+    // working folder, as git reads it: what main says of it.
     assert_ne!(verdict("git -C r worktree remove ../wt"), "deny");
-    assert_ne!(verdict("git -C ~/src/innerwarden worktree remove wt-5"), "deny");
+    assert_eq!(verdict("git worktree remove ../innerwarden"), "review");
+    assert_eq!(
+        verdict("git -C ~/.config/r worktree remove ../innerwarden"),
+        "deny"
+    );
+    assert_ne!(
+        verdict("git -C ~/src/innerwarden worktree remove wt-5"),
+        "deny"
+    );
 }
 
 /// What git takes away or writes through `-C` is the path read in that

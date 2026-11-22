@@ -343,7 +343,9 @@ pub fn codex_layers_may_have_moved(
     let Some(root) = trusted
         .iter()
         .filter(|root| root.is_absolute())
-        .find(|root| cwd.starts_with(root) || real.as_ref().is_some_and(|real| real.starts_with(root)))
+        .find(|root| {
+            cwd.starts_with(root) || real.as_ref().is_some_and(|real| real.starts_with(root))
+        })
     else {
         return false;
     };
@@ -402,7 +404,10 @@ pub fn codex_argv_sets_servers(argv: &[String]) -> bool {
             words.next().map(String::as_str)
         } else if let Some(value) = word.strip_prefix("--config=") {
             Some(value)
-        } else if let Some(value) = word.strip_prefix("-c").filter(|v| !v.is_empty() && !word.starts_with("--")) {
+        } else if let Some(value) = word
+            .strip_prefix("-c")
+            .filter(|v| !v.is_empty() && !word.starts_with("--"))
+        {
             Some(value)
         } else if word.starts_with("-p") && !word.starts_with("--") && word.len() > 2 {
             return true;
@@ -441,7 +446,9 @@ impl ProxyTrust {
             project_layers: ProjectLayers::default(),
             guard_paths: {
                 let exe = std::env::current_exe().ok();
-                let resolved = exe.as_deref().and_then(|exe| std::fs::canonicalize(exe).ok());
+                let resolved = exe
+                    .as_deref()
+                    .and_then(|exe| std::fs::canonicalize(exe).ok());
                 [exe, resolved].into_iter().flatten().collect()
             },
         }
@@ -550,7 +557,10 @@ fn plain_absolute_path(path: &str) -> bool {
         return false;
     }
     let parts: Vec<&str> = rest.split(separators).collect();
-    if parts.iter().any(|part| part.is_empty() || *part == "." || *part == "..") {
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
         return false;
     }
     !matches!(parts.first(), Some(&"proc") | Some(&"dev"))
@@ -1379,8 +1389,14 @@ mod tests {
             );
         }
         // An `mcp-remote` in front of an address here is a local server too.
-        assert!(!runs_mcp_remote("npx", &["mcp-remote", "http://127.0.0.1:9/mcp"]));
-        assert!(runs_mcp_remote("npx", &["mcp-remote", "https://x.example/mcp"]));
+        assert!(!runs_mcp_remote(
+            "npx",
+            &["mcp-remote", "http://127.0.0.1:9/mcp"]
+        ));
+        assert!(runs_mcp_remote(
+            "npx",
+            &["mcp-remote", "https://x.example/mcp"]
+        ));
     }
 
     /// Cursor: a call that carries the server's url goes to a remote server
@@ -2134,9 +2150,17 @@ mod tests {
         let hour = Duration::from_secs(3600);
         let now = SystemTime::now();
         // Started an hour after every folder last changed: nothing moved.
-        assert!(!codex_layers_may_have_moved(&sub, &trusted, Some(now + hour)));
+        assert!(!codex_layers_may_have_moved(
+            &sub,
+            &trusted,
+            Some(now + hour)
+        ));
         // Started an hour ago: the folders, made now, changed since.
-        assert!(codex_layers_may_have_moved(&sub, &trusted, Some(now - hour)));
+        assert!(codex_layers_may_have_moved(
+            &sub,
+            &trusted,
+            Some(now - hour)
+        ));
         assert!(codex_layers_may_have_moved(&sub, &trusted, None));
         // A project the file does not trust has no layer Codex reads.
         assert!(!codex_layers_may_have_moved(&sub, &[], Some(now - hour)));
@@ -2157,7 +2181,13 @@ mod tests {
         let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
         for words in [
             &["codex", "-c", "mcp_servers.docs.command=\"npx\""][..],
-            &["codex", "exec", "--config", "mcp_servers.docs.args=[]", "go"],
+            &[
+                "codex",
+                "exec",
+                "--config",
+                "mcp_servers.docs.args=[]",
+                "go",
+            ],
             &["codex", "--config=mcp_servers={}"],
             &["codex", "-cmcp_servers.docs.command=x"],
             &["codex", "-c", "\"mcp_servers\".docs.command=x"],
@@ -2206,7 +2236,11 @@ mod tests {
         // The same file, named another way, and listed as a guard path.
         for other in [
             format!("{}/./innerwarden", parent.display()),
-            format!("{}/../{}/innerwarden", parent.display(), parent.file_name().unwrap().to_string_lossy()),
+            format!(
+                "{}/../{}/innerwarden",
+                parent.display(),
+                parent.file_name().unwrap().to_string_lossy()
+            ),
             format!("/{}", real),
             format!("/proc/self/root{real}"),
         ] {
@@ -2218,7 +2252,13 @@ mod tests {
             assert!(!trust.trusts(&wrapped(other.clone())), "{other}");
         }
         assert!(plain_absolute_path("/usr/local/bin/innerwarden"));
-        for path in ["/dev/fd/3", "/proc/self/cwd/bin/innerwarden", "/usr//bin/x", "/usr/bin/", "/"] {
+        for path in [
+            "/dev/fd/3",
+            "/proc/self/cwd/bin/innerwarden",
+            "/usr//bin/x",
+            "/usr/bin/",
+            "/",
+        ] {
             assert!(!plain_absolute_path(path), "{path}");
         }
     }

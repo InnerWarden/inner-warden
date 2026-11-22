@@ -194,7 +194,10 @@ pub fn read(payload: &str) -> CursorCall {
             if let Some(command) = text(&value, "command") {
                 call[MCP_SERVER_COMMAND_KEY] = json!(command);
             }
-            if let Some(roots) = value.get("workspace_roots").filter(|roots| roots.is_array()) {
+            if let Some(roots) = value
+                .get("workspace_roots")
+                .filter(|roots| roots.is_array())
+            {
                 call[MCP_WORKSPACE_ROOTS_KEY] = roots.clone();
             }
             // The address of a server Cursor reaches by URL, never one the

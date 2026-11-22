@@ -8672,7 +8672,10 @@ fn git_writes(arguments: &[String]) -> GitWrites {
         let word = word.trim_matches(['"', '\'']);
         if word == "-C" {
             if let Some(value) = arguments.get(at + 1) {
-                folder = Some(git_path_in(folder.as_deref(), value.trim_matches(['"', '\''])));
+                folder = Some(git_path_in(
+                    folder.as_deref(),
+                    value.trim_matches(['"', '\'']),
+                ));
             }
             at += 2;
             continue;
@@ -8730,7 +8733,15 @@ fn git_writes(arguments: &[String]) -> GitWrites {
                 }
                 if let Some(value) = word.strip_prefix("--separate-git-dir=") {
                     reading.written.push(in_folder(value));
-                } else if matches!(word.as_str(), "--template" | "-b" | "--initial-branch" | "--object-format" | "--ref-format" | "--shared") {
+                } else if matches!(
+                    word.as_str(),
+                    "--template"
+                        | "-b"
+                        | "--initial-branch"
+                        | "--object-format"
+                        | "--ref-format"
+                        | "--shared"
+                ) {
                     index += 2;
                     continue;
                 } else if !word.starts_with('-') {

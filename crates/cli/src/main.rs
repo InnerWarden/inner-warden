@@ -3608,9 +3608,9 @@ fn screen_mcp_call(
     let config = config_path.as_deref().and_then(mcp_unproxied::read_config);
     let agent_process = mcp_unproxied::agent_process(&agent);
     let agent_started = agent_process.as_ref().and_then(|process| process.started);
-    let settled = config.as_ref().is_some_and(|(_, modified)| {
-        mcp_unproxied::config_settled(*modified, agent_started)
-    });
+    let settled = config
+        .as_ref()
+        .is_some_and(|(_, modified)| mcp_unproxied::config_settled(*modified, agent_started));
     let mut trust = mcp_unproxied::ProxyTrust::here(!monitor, settled, call_command);
     // Codex reads the `.codex/config.toml` of a trusted project over the
     // user's file, and settings on its own command line over both: a server
@@ -3636,9 +3636,9 @@ fn screen_mcp_call(
             let trusted = std::fs::read_to_string(user)
                 .map(|text| mcp_unproxied::codex_trusted_projects(&text))
                 .unwrap_or_default();
-            let moved = cwds
-                .iter()
-                .any(|cwd| mcp_unproxied::codex_layers_may_have_moved(cwd, &trusted, agent_started));
+            let moved = cwds.iter().any(|cwd| {
+                mcp_unproxied::codex_layers_may_have_moved(cwd, &trusted, agent_started)
+            });
             let argv_sets_servers = agent_process
                 .as_ref()
                 .and_then(|process| mcp_unproxied::process_argv(process.pid))

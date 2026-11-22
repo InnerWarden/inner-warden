@@ -481,9 +481,10 @@ pub fn server_entries_toml(doc: &DocumentMut) -> Vec<crate::mcp_unproxied::Serve
                     })
                 }),
                 remote: (!is_stdio_server(&table)
-                    && table
-                        .get("url")
-                        .is_some_and(|url| url.as_str().is_none_or(|url| !crate::mcp_proxy::remote::is_local_url(url))))
+                    && table.get("url").is_some_and(|url| {
+                        url.as_str()
+                            .is_none_or(|url| !crate::mcp_proxy::remote::is_local_url(url))
+                    }))
                     || command.is_some_and(|c| crate::mcp_unproxied::runs_mcp_remote(c, &args)),
                 name,
             }

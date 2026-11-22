@@ -1382,13 +1382,20 @@ fn git_folder(options: &[String]) -> Option<String> {
 /// Whether a worktree named by `word` may be one of the guard's folders:
 /// git finds a worktree by the end of its path as well as by its path
 /// (`git worktree remove innerwarden` removes a worktree at
-/// `~/.config/innerwarden`), so a word whose last part is the guard's name
-/// is never read as a work folder.
+/// `~/.config/innerwarden`, and so does `config/innerwarden`), so a word
+/// whose last part is the guard's name is never read as a work folder.
+///
+/// A word with a `.` or `..` part (`../innerwarden`) is never the end of
+/// a worktree's path, which git keeps whole: git reads it from the working
+/// folder, and [`work_folder`] decides.
 fn names_guard_folder_by_name(word: &str) -> bool {
     let lower = word
         .trim_matches(['"', '\''])
         .trim_end_matches('/')
         .to_ascii_lowercase();
+    if lower.split('/').any(|part| part == "." || part == "..") {
+        return false;
+    }
     let last = lower.rsplit('/').next().unwrap_or(&lower);
     GUARD_PROGRAMS.contains(&last)
 }

@@ -285,7 +285,10 @@ fn a_server_on_this_host_or_with_a_credential_is_carried() {
             status.contains("Wired into 1: codex."),
             "codex={with_codex}:\n{status}"
         );
-        assert!(out.contains("Codex: Quit Codex and start it again."), "{out}");
+        assert!(
+            out.contains("Codex: Quit Codex and start it again."),
+            "{out}"
+        );
     }
 }
 
@@ -305,5 +308,8 @@ fn a_cursor_server_on_this_host_is_carried() {
         after["mcpServers"]["pw"].to_string().contains("proxy"),
         "{out}\n{after}"
     );
-    assert_eq!(after["mcpServers"]["linear"], config["mcpServers"]["linear"]);
+    assert_eq!(
+        after["mcpServers"]["linear"],
+        config["mcpServers"]["linear"]
+    );
 }

@@ -123,7 +123,9 @@ pub fn is_local_url(url: &str) -> bool {
                     .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
         });
     }
-    let host = host.rsplit_once(':').map_or(host.as_str(), |(name, _)| name);
+    let host = host
+        .rsplit_once(':')
+        .map_or(host.as_str(), |(name, _)| name);
     let host = host.trim_end_matches('.');
     if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
         return true;
@@ -164,18 +166,16 @@ fn url_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
     }
     let mut numbers = Vec::with_capacity(parts.len());
     for part in &parts {
-        let (digits, radix) = if let Some(hex) = part
-            .strip_prefix("0x")
-            .or_else(|| part.strip_prefix("0X"))
-        {
-            (hex, 16)
-        } else if part.len() > 1 && part.starts_with('0') {
-            (&part[1..], 8)
-        } else if part.is_empty() {
-            return None;
-        } else {
-            (*part, 10)
-        };
+        let (digits, radix) =
+            if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+                (hex, 16)
+            } else if part.len() > 1 && part.starts_with('0') {
+                (&part[1..], 8)
+            } else if part.is_empty() {
+                return None;
+            } else {
+                (*part, 10)
+            };
         let number = if digits.is_empty() {
             0
         } else {
