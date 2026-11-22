@@ -17096,9 +17096,31 @@ fn content_reader() -> &'static regex::Regex {
     })
 }
 
-/// Whether `segment` runs a [`content_reader`].
+/// Whether `segment` runs a [`content_reader`] or a [`PLAIN_READERS`]
+/// program.
 fn reads_content(segment: &str) -> bool {
     content_reader().is_match(&normalize_command(segment).to_ascii_lowercase())
+        || runs_a_plain_reader(segment)
+}
+
+/// Programs that print the files named on their line, whole or reshaped:
+/// as hex or octal (`od`, `xxd`, `hexdump`, `hd`), encoded (`base32`,
+/// `basenc`), numbered, reversed, folded, pasted or looked up (`nl`,
+/// `tac`, `rev`, `fold`, `paste`, `look`). Measured 2026-11-21 on main
+/// d6e444f: `od -c /etc/shadow` and `xxd /etc/shadow` were allowed where
+/// `cat /etc/shadow` was refused. Asked of the program a segment runs, not
+/// of any word of it: `rev` is also a word of `git rev-parse`.
+const PLAIN_READERS: &[&str] = &[
+    "od", "xxd", "hexdump", "hd", "base32", "basenc", "nl", "tac", "rev", "fold", "paste", "look",
+];
+
+/// Whether the program `segment` runs, past its launchers, is one of
+/// [`PLAIN_READERS`].
+fn runs_a_plain_reader(segment: &str) -> bool {
+    let words = shell_tokens_with_braces(segment);
+    effective_command_index(&words).is_some_and(|at| {
+        PLAIN_READERS.contains(&token_basename(&words[at]).to_ascii_lowercase().as_str())
+    })
 }
 
 /// A tool's stored login in the home, named by where it is: a file called
@@ -17801,7 +17823,7 @@ fn sensitive_read_in(content: &str, as_written: &str, depth: u8) -> Option<(&'st
             continue;
         }
         let lower = normalize_command(segment).to_ascii_lowercase();
-        if !reader.is_match(&lower) {
+        if !reader.is_match(&lower) && !runs_a_plain_reader(segment) {
             continue;
         }
         let hard = is_hard_sensitive_path(path);
@@ -20734,7 +20756,7 @@ fn lexical_sensitive_output_redirect(content: &str) -> bool {
 /// The destination of every unquoted output redirection in `content`, read
 /// from the text with no structure: `>`, `>>`, `>|`, `&>` and `>&` when what
 /// follows is a file and not a descriptor.
-fn lexical_output_redirect_targets(content: &str) -> Vec<String> {
+pub(crate) fn lexical_output_redirect_targets(content: &str) -> Vec<String> {
     let mut targets = Vec::new();
     let bytes = content.as_bytes();
     let mut index = 0usize;
@@ -20816,7 +20838,7 @@ fn lexical_output_redirect_targets(content: &str) -> Vec<String> {
 
 /// The files `tee` writes. `tee copy < FILE` reads FILE: an input redirection
 /// and its file are not among them.
-fn tee_write_targets(words: &[String]) -> Vec<String> {
+pub(crate) fn tee_write_targets(words: &[String]) -> Vec<String> {
     tee_files(words, false)
 }
 

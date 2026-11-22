@@ -27,6 +27,26 @@ does. A test now runs the lines reported as judged apart, and ordinary work,
 through `check` and through the hook of each agent in a home with an SSH key
 and Claude Code connected, and requires the same outcome and exit code.
 
+A file a command writes through an option of its own is judged as a
+redirection to it: `sort -o /etc/passwd x`, `sort --output=/etc/passwd x`,
+`tcpdump -w`, `rsync --log-file=`, `git diff --output=` and the output
+options of `curl`, `wget`, `tshark` and `ssh -E` were allowed onto the
+account database, a key, an agent's settings or the guard's own
+configuration, where `> /etc/passwd` is refused. An output into the work's
+own folder keeps its verdict. GNU abbreviations of these options
+(`sort --out=`, `wget --output-doc=`) are read as the option, and the
+second operand of `xxd` (`xxd -r hex.txt /etc/passwd`) as the file it
+writes. `od`, `xxd`, `hexdump`, `hd`, `base32`,
+`basenc`, `nl`, `tac`, `rev`, `fold`, `paste` and `look` read a secret
+as `cat` does: `od -c /etc/shadow` and `xxd ~/.ssh/id_rsa` were allowed. A
+write into the input or another open file of another process (`>
+/proc/1234/fd/0`, also written `/proc/self/../1/fd/0`) is refused; into
+its output or error (`> /proc/1/fd/1 2>/proc/1/fd/2`, how a job in a
+container logs) it is held for review; the shell's own
+(`/proc/self/fd/1`, `/proc/$$/fd/2`) is neither. A line of many functions defined and called is
+read in time that grows with its length: `f() { true; }; f;` repeated to
+16 KB took over eleven seconds.
+
 A file the line writes, rewrites in place and then runs is read with what the
 edit puts in it: the replacement of a `sed -i` or `perl -pi -e` `s///`, the
 text of a `sed` `a`, `i` or `c`, the command of an `e`, and the strings an
@@ -1826,7 +1846,6 @@ shorten it.
 `sandbox-exec` with the account's environment. 1.6.5 is 1.6.4 with that check
 under the launcher's own environment (root's two folders as `PATH`, no loader
 variable), as every program a launch starts.
-
 
 ### Added
 
