@@ -221,6 +221,32 @@ pub(crate) fn account_home() -> Option<std::path::PathBuf> {
     None
 }
 
+/// The home InnerWarden's own config lives under: the effective account's
+/// ([`account_home`]) on Unix, never `HOME`. A hook and `check` run with
+/// the AI agent's environment, and a home the agent names would choose the
+/// `llm.toml` whose key goes to the url it names, and the `notify.toml`
+/// whose webhooks fire. Off Unix, where no account database is read, `HOME`
+/// as before.
+pub(crate) fn config_home() -> Option<std::path::PathBuf> {
+    #[cfg(unix)]
+    {
+        account_home()
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::var("HOME")
+            .ok()
+            .filter(|home| !home.trim().is_empty())
+            .map(std::path::PathBuf::from)
+    }
+}
+
+/// InnerWarden's own config folder, `<home>/.config/innerwarden`, under
+/// [`config_home`].
+pub(crate) fn account_config_dir() -> Option<std::path::PathBuf> {
+    config_home().map(|home| home.join(".config/innerwarden"))
+}
+
 /// Whether `dir` is this process's own record directory: a directory and not
 /// a link, owned by the effective uid, with no write bit for anyone else.
 /// The paid installer makes it `<name>:innerwarden 2750`.

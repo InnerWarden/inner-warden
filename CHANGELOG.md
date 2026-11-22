@@ -5,6 +5,18 @@ follows semantic versioning.
 
 ## Unreleased
 
+The LLM second opinion and the notifications read their config only from
+the account's own home, as the account database gives it, never from the
+`HOME` the caller hands down. `HOME=<dir> innerwarden check ...` read the
+`llm.toml` in `<dir>` and sent the file its `api_key_file` named as the
+bearer key to the url it named, and fired the webhooks of the
+`notify.toml` there. The key file is read only from inside the config's
+folder, as a regular file with no other name (not a symbolic or a hard
+link): `innerwarden llm set-key` stores it there, and `llm set --key-file`
+refuses a file elsewhere. `api_key_env` is honoured only in the account's
+own `llm.toml`, never in one `IW_LLM_CONFIG` names. On Windows, where no
+account database is read, the home is still `HOME`.
+
 An MCP call of Codex or Cursor is now judged with the MCP proxy's rules
 where the agent shows it, the hook it runs before every tool call, unless
 its server is one the proxy already stands in front of. This reaches a

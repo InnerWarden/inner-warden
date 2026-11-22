@@ -13,18 +13,56 @@ use crate::second_opinion::{
 // ---- I/O boundary (config read + HTTP POST). Excluded from the coverage floor
 // like the other thin adapters; the decision logic above is what is unit-tested.
 
-/// The optional LLM config path: env `IW_LLM_CONFIG`, else
-/// `~/.config/innerwarden/llm.toml` (beside the notify + graph config).
-fn config_path() -> Option<std::path::PathBuf> {
+/// Where the LLM config is read from, and whether it is the account's own.
+struct ConfigAt {
+    path: std::path::PathBuf,
+    /// The account's own `llm.toml` (under the home the account database
+    /// gives, [`crate::graph_io::config_home`]), not one the override names.
+    /// Only the account's own may name an environment variable to send as the
+    /// key: an override is chosen by whoever starts the process, an AI agent
+    /// included, and one naming `AWS_SECRET_ACCESS_KEY` sent it to its url.
+    account: bool,
+}
+
+/// The optional LLM config: env `IW_LLM_CONFIG` (the tests, and the jail,
+/// which points it at `/dev/null`), else `.config/innerwarden/llm.toml` in
+/// the account's own home. Never `HOME`: `HOME=<dir> innerwarden check ...`
+/// read the `llm.toml` in `<dir>` and sent the key file it named to the url
+/// it named.
+fn config_at() -> Option<ConfigAt> {
     if let Ok(p) = std::env::var("IW_LLM_CONFIG") {
         if !p.trim().is_empty() {
-            return Some(std::path::PathBuf::from(p));
+            return Some(ConfigAt {
+                path: std::path::PathBuf::from(p),
+                account: false,
+            });
         }
     }
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.trim().is_empty())
-        .map(|h| std::path::PathBuf::from(h).join(".config/innerwarden/llm.toml"))
+    crate::graph_io::account_config_dir().map(|dir| ConfigAt {
+        path: dir.join("llm.toml"),
+        account: true,
+    })
+}
+
+fn config_path() -> Option<std::path::PathBuf> {
+    config_at().map(|at| at.path)
+}
+
+/// The key for `cfg`, read as the config's place allows: the environment
+/// variable it names only when it is the account's own config, the key file
+/// only from inside the config's folder ([`read_key_file`]).
+fn resolve_key(cfg: &LlmConfig) -> Option<String> {
+    let at = config_at()?;
+    cfg.resolve_key(
+        |name| {
+            if at.account {
+                std::env::var(name).ok()
+            } else {
+                None
+            }
+        },
+        |path| read_key_file(path, &at.path).ok(),
+    )
 }
 
 fn load_config() -> Option<LlmConfig> {
@@ -61,10 +99,7 @@ pub(crate) fn provider() -> Option<String> {
 /// the key on a re-run instead of silently reporting "already set".
 pub fn has_key() -> bool {
     load_config()
-        .map(|c| {
-            c.resolve_key(|k| std::env::var(k).ok(), read_key_file)
-                .is_some()
-        })
+        .map(|c| resolve_key(&c).is_some())
         .unwrap_or(false)
 }
 
@@ -94,7 +129,7 @@ fn call_llm(cfg: &LlmConfig, command: &str) -> Option<Value> {
             .header("Content-Type", "application/json");
         // Key precedence: the named env var (zero key-at-rest) first, then the 0600
         // key file the wizard / `llm set-key` wrote. Resolved off-thread of the config.
-        if let Some(key) = cfg.resolve_key(|k| std::env::var(k).ok(), read_key_file) {
+        if let Some(key) = resolve_key(cfg) {
             req = if cfg.is_azure() {
                 req.header("api-key", &key)
             } else {
@@ -108,23 +143,70 @@ fn call_llm(cfg: &LlmConfig, command: &str) -> Option<Value> {
     reply
 }
 
-/// Expand a leading `~/` to `$HOME`, then read the file (trimmed by the caller).
-/// Used to resolve `api_key_file`. Returns `None` on any error (missing/unreadable).
-fn read_key_file(path: &str) -> Option<String> {
-    let expanded = if let Some(rest) = path.strip_prefix("~/") {
-        match std::env::var("HOME") {
-            Ok(home) => format!("{home}/{rest}"),
-            Err(_) => path.to_string(),
-        }
-    } else {
-        path.to_string()
+/// Read `api_key_file` (trimmed by the caller), or say why not. A leading
+/// `~/` is the account's own home ([`crate::graph_io::config_home`]), never
+/// `HOME`; a relative path is from the config's folder.
+///
+/// Only a key the person stored beside the config is read: a regular file
+/// inside the folder of `config`, not a symbolic link and, on Unix, with no
+/// other name (a hard link to a private key elsewhere is that key). Anything
+/// else is refused: a config naming `~/.ssh/id_ed25519` sent that file as
+/// `Authorization: Bearer` to the url it named.
+fn read_key_file(path: &str, config: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+    let folder = match config.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
     };
-    std::fs::read_to_string(expanded).ok()
+    let named = match path.strip_prefix("~/") {
+        Some(rest) => crate::graph_io::config_home()
+            .ok_or("this account has no home to expand ~/ in")?
+            .join(rest),
+        None => std::path::PathBuf::from(path),
+    };
+    let named = if named.is_relative() {
+        folder.join(named)
+    } else {
+        named
+    };
+    let real_folder =
+        std::fs::canonicalize(&folder).map_err(|_| "the config's folder is missing".to_string())?;
+    let real = std::fs::canonicalize(&named).map_err(|_| "missing".to_string())?;
+    if !real.starts_with(&real_folder) {
+        return Err(format!(
+            "outside the config's folder {}",
+            real_folder.display()
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&named)
+        .map_err(|_| "unreadable, or a symbolic link".to_string())?;
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("not a regular file".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            return Err("a hard link: the file has another name".into());
+        }
+    }
+    let mut key = String::new();
+    file.read_to_string(&mut key).map_err(|e| e.to_string())?;
+    Ok(key)
 }
 
 /// The default key-file path the wizard / `set-key` writes: a 0600 file beside the
 /// llm config (`~/.config/innerwarden/llm-key`). The config stores this PATH, never
-/// the key. Returns `None` when no HOME (and no `IW_LLM_CONFIG` dir) is resolvable.
+/// the key. Returns `None` when the account has no home (and no `IW_LLM_CONFIG`).
 pub fn default_key_path() -> Option<std::path::PathBuf> {
     config_path().and_then(|c| c.parent().map(|d| d.join("llm-key")))
 }
@@ -144,7 +226,7 @@ pub fn store_key(key: &str) -> std::io::Result<std::path::PathBuf> {
     let path = default_key_path().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "cannot resolve a key-file path (set IW_LLM_CONFIG or HOME)",
+            "cannot resolve a key-file path (this account has no home; set IW_LLM_CONFIG)",
         )
     })?;
     if let Some(dir) = path.parent() {
@@ -197,7 +279,7 @@ pub fn verify_endpoint(cfg: &LlmConfig) -> Result<(), String> {
     let mut req = crate::http_io::agent_with_timeout(std::time::Duration::from_secs(12))
         .post(&cfg.url)
         .header("Content-Type", "application/json");
-    if let Some(key) = cfg.resolve_key(|k| std::env::var(k).ok(), read_key_file) {
+    if let Some(key) = resolve_key(cfg) {
         req = if cfg.is_azure() {
             req.header("api-key", &key)
         } else {
@@ -242,8 +324,9 @@ pub fn consider(command: &str, rules_verdict: &Value) -> Option<Value> {
 /// Persist the llm config to `config_path()`. Shared by `set`, `set-key`, and the
 /// setup wizard so there is one writer. Returns the path or an error string.
 pub fn write_config(cfg: &LlmConfig) -> Result<std::path::PathBuf, String> {
-    let path = config_path()
-        .ok_or_else(|| "cannot resolve a config path (set IW_LLM_CONFIG or HOME)".to_string())?;
+    let path = config_path().ok_or_else(|| {
+        "cannot resolve a config path (this account has no home; set IW_LLM_CONFIG)".to_string()
+    })?;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -255,19 +338,39 @@ pub fn write_config(cfg: &LlmConfig) -> Result<std::path::PathBuf, String> {
 /// A one-line, secret-free description of where the API key comes from, honouring
 /// the env-first precedence. Never prints the key itself.
 fn key_status(c: &LlmConfig) -> String {
+    let at = config_at();
+    let account = at.as_ref().is_some_and(|at| at.account);
+    let mut said = Vec::new();
     if let Some(e) = &c.api_key_env {
-        let ok = std::env::var(e)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
-        return format!("env var {e} ({})", if ok { "set" } else { "MISSING" });
+        if !account {
+            said.push(format!(
+                "env var {e} (not read: only the llm.toml in your account's home may name one)"
+            ));
+        } else {
+            let ok = std::env::var(e)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            if ok {
+                return format!("env var {e} (set)");
+            }
+            said.push(format!("env var {e} (MISSING)"));
+        }
     }
     if let Some(f) = &c.api_key_file {
-        let ok = read_key_file(f)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false);
-        return format!("file {f} ({})", if ok { "present" } else { "MISSING" });
+        let read = match &at {
+            Some(at) => read_key_file(f, &at.path),
+            None => Err("no config path".into()),
+        };
+        said.push(match read {
+            Ok(v) if !v.trim().is_empty() => format!("file {f} (present)"),
+            Ok(_) => format!("file {f} (MISSING: empty)"),
+            Err(why) => format!("file {f} (not read: {why})"),
+        });
     }
-    "none (local endpoint, or run `innerwarden llm set-key`)".to_string()
+    if said.is_empty() {
+        return "none (local endpoint, or run `innerwarden llm set-key`)".to_string();
+    }
+    said.join("; ")
 }
 
 /// Read the API key for `set-key`: from stdin when piped or `--stdin`, else a
@@ -310,6 +413,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     match rest.first().map(String::as_str) {
         Some("set") => {
             let mut cfg = load_config().unwrap_or_default();
+            let mut key_file_given = false;
             let mut it = rest[1..].iter();
             while let Some(a) = it.next() {
                 match a.as_str() {
@@ -317,7 +421,10 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     "--model" => cfg.model = it.next().cloned().unwrap_or_default(),
                     "--provider" => cfg.provider = it.next().cloned().unwrap_or_default(),
                     "--key-env" => cfg.api_key_env = it.next().cloned(),
-                    "--key-file" => cfg.api_key_file = it.next().cloned(),
+                    "--key-file" => {
+                        cfg.api_key_file = it.next().cloned();
+                        key_file_given = true;
+                    }
                     "--min-risk" => cfg.min_risk = it.next().and_then(|v| v.parse().ok()),
                     other => {
                         eprintln!("innerwarden llm set: unknown flag `{other}`");
@@ -328,6 +435,14 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             if cfg.url.trim().is_empty() || cfg.model.trim().is_empty() {
                 eprintln!("innerwarden llm set: --url and --model are required");
                 return std::process::ExitCode::from(2);
+            }
+            if let (true, Some(file), Some(config)) =
+                (key_file_given, cfg.api_key_file.as_deref(), config_path())
+            {
+                if let Err(why) = read_key_file(file, &config) {
+                    eprintln!("innerwarden llm set: --key-file {file} is not read: {why}. Only a key stored beside the config is sent; run `innerwarden llm set-key` to store it there.");
+                    return std::process::ExitCode::from(2);
+                }
             }
             match write_config(&cfg) {
                 Ok(_) => {

@@ -15,10 +15,20 @@ use std::time::{Duration, Instant};
 use innerwarden_notify::cli::{compute, plan, Action};
 
 /// The shared notify config path (env `IW_NOTIFY_CONFIG`, else
-/// `~/.config/innerwarden/notify.toml`) - resolved by the shared crate so the
-/// Active Defence host agent reads the exact SAME file.
+/// `.config/innerwarden/notify.toml` in the account's own home) - resolved by
+/// the shared crate so the Active Defence host agent reads the exact SAME file.
+/// The home is the account database's ([`crate::graph_io::config_home`]),
+/// never the `HOME` the caller hands down: `HOME=<dir> innerwarden check`
+/// fired the webhooks of the `notify.toml` in `<dir>`.
 fn config_path() -> Option<PathBuf> {
-    innerwarden_notify::config_path(|k| std::env::var(k).ok())
+    let home = crate::graph_io::config_home();
+    innerwarden_notify::config_path(|k| {
+        if k == "HOME" {
+            home.as_deref().and_then(Path::to_str).map(str::to_string)
+        } else {
+            std::env::var(k).ok()
+        }
+    })
 }
 
 /// Read the shared notify config file's contents, or `None` if unset/unreadable.
@@ -166,7 +176,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 "  config: {}",
                 config_path()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "(no HOME)".into())
+                    .unwrap_or_else(|| "(this account has no home)".into())
             );
             std::process::ExitCode::SUCCESS
         }
@@ -177,7 +187,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
         Action::Apply { write, tests } => {
             if let Some(content) = write {
                 let Some(path) = config_path() else {
-                    eprintln!("innerwarden notify: cannot resolve a config path (set IW_NOTIFY_CONFIG or HOME)");
+                    eprintln!("innerwarden notify: cannot resolve a config path (this account has no home; set IW_NOTIFY_CONFIG)");
                     return std::process::ExitCode::from(2);
                 };
                 if let Err(e) = write_config_file(&path, &content) {
