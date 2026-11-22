@@ -329,6 +329,38 @@ pub fn apply_second_opinion(rules_verdict: &Value, llm_verdict: &str, why: &str)
 /// The most second opinions [`ask_at_once`] has open at the same time.
 const AT_ONCE: usize = 4;
 
+/// The first pause before a line the endpoint turned away as busy (429)
+/// without saying how long to wait is asked again; it doubles each time
+/// the same line is turned away.
+const BUSY_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// What became of one line put to the model.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Asked {
+    /// The model's opinion, or `None` when the request failed in any way
+    /// but a busy endpoint (the line is not asked again).
+    Answered(Option<Value>),
+    /// The endpoint turned the request away as busy (429), with the wait it
+    /// asked for (`Retry-After`), if any.
+    Busy(Option<std::time::Duration>),
+}
+
+/// The wait a busy endpoint (429) asked for: `retry-after-ms` (Azure
+/// OpenAI) first, then `retry-after` in seconds. A date or anything else
+/// unreadable is no wait (`None`).
+pub(crate) fn retry_after(
+    millis: Option<&str>,
+    seconds: Option<&str>,
+) -> Option<std::time::Duration> {
+    let read = |value: Option<&str>, scale: f64| {
+        let n: f64 = value?.trim().parse().ok()?;
+        (n.is_finite() && n >= 0.0)
+            .then(|| std::time::Duration::try_from_secs_f64(n / scale).ok())
+            .flatten()
+    };
+    read(millis, 1000.0).or_else(|| read(seconds, 1.0))
+}
+
 /// The second opinion of each of `lines` (`None` where none was given),
 /// in their order. Only a line `needs` is asked, up to [`AT_ONCE`] at a
 /// time from one queue, under ONE wait: `grant` gives the timeout once
@@ -336,12 +368,22 @@ const AT_ONCE: usize = 4;
 /// model with what is left of it, and `waited` hears the timeout and
 /// how long the asking took. Up to [`AT_ONCE`] lines are answered within
 /// the time of one answer, so a fast model answers a call of many lines
-/// without the call sending them all to the endpoint together. Asked one after another, the lines shared one answer's
-/// allowance, so a slow model answered only the first line asked, and no
-/// order of asking kept the verdict of a line behind it: the main branch's
-/// order lost the riskier line put second, the riskiest first lost a line
-/// the rules scored lower that the model would have refused.
-pub(crate) fn ask_at_once<A>(
+/// without the call sending them all to the endpoint together.
+///
+/// Asked one after another, the lines shared one answer's allowance, so a
+/// slow model answered only the first line asked, and no order of asking
+/// kept the verdict of a line behind it: the main branch's order lost the
+/// riskier line put second, the riskiest first lost a line the rules
+/// scored lower that the model would have refused.
+///
+/// An endpoint that answers one request at a time turns the others away
+/// as busy (429). Such a line goes back to the front of the queue after
+/// the wait the endpoint asked for (or [`BUSY_PAUSE`], doubled at each
+/// turn), when that wait leaves time to ask; and from the first busy answer
+/// on, the call asks one line at a time, as the main branch did. Dropped
+/// at the first 429, the line kept its review where the main branch,
+/// asking in turn, had the model's deny.
+pub(crate) fn ask_at_once_or_again<A>(
     lines: &[(&str, &Value)],
     needs: impl Fn(&Value) -> bool,
     grant: impl FnOnce() -> Option<std::time::Duration>,
@@ -349,8 +391,10 @@ pub(crate) fn ask_at_once<A>(
     waited: impl FnOnce(std::time::Duration, std::time::Duration),
 ) -> Vec<Option<Value>>
 where
-    A: Fn(&str, &Value, std::time::Duration) -> Option<Value> + Sync,
+    A: Fn(&str, &Value, std::time::Duration) -> Asked + Sync,
 {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, PoisonError};
     let mut opinions = vec![None; lines.len()];
     let asked: Vec<usize> = (0..lines.len()).filter(|&at| needs(lines[at].1)).collect();
     if asked.is_empty() {
@@ -363,21 +407,53 @@ where
     // At most AT_ONCE requests are open: the workers pull the next line
     // from one queue, and a line pulled later is given what is left of
     // the one grant, or nothing when none is left (it keeps the rules'
-    // verdict). A line whose request fails is not asked again.
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    // verdict). A line whose request fails is not asked again, unless the
+    // endpoint was only busy; the worker that puts such a line back always
+    // pulls again, so no line is left in the queue unasked.
+    let queue = Mutex::new(
+        asked
+            .iter()
+            .map(|&line| (line, 0u32))
+            .collect::<std::collections::VecDeque<_>>(),
+    );
+    let busy = AtomicBool::new(false);
+    let one_at_a_time = Mutex::new(());
     let work = || {
         let mut answered = Vec::new();
         loop {
-            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let Some(&line) = asked.get(at) else {
+            let pulled = queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front();
+            let Some((line, turned_away)) = pulled else {
                 return answered;
             };
+            // Once the endpoint said it is busy, one request at a time.
+            let _turn = busy
+                .load(Ordering::SeqCst)
+                .then(|| one_at_a_time.lock().unwrap_or_else(PoisonError::into_inner));
             let left = granted.saturating_sub(started.elapsed());
             if left.is_zero() {
                 continue;
             }
             let (command, rules) = lines[line];
-            answered.push((line, ask(command, rules, left)));
+            match ask(command, rules, left) {
+                Asked::Answered(opinion) => answered.push((line, opinion)),
+                Asked::Busy(asked_for) => {
+                    busy.store(true, Ordering::SeqCst);
+                    let pause = asked_for
+                        .unwrap_or_else(|| BUSY_PAUSE.saturating_mul(1 << turned_away.min(16)));
+                    // A wait that leaves no time to ask is not waited: the
+                    // line keeps the rules' verdict.
+                    if pause < granted.saturating_sub(started.elapsed()) {
+                        std::thread::sleep(pause);
+                        queue
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push_front((line, turned_away.saturating_add(1)));
+                    }
+                }
+            }
         }
     };
     let answers: Vec<(usize, Option<Value>)> = std::thread::scope(|scope| {
@@ -404,6 +480,28 @@ where
     opinions
 }
 
+/// [`ask_at_once_or_again`] with an `ask` that only answers or fails (a
+/// failed line is never asked again).
+#[cfg(test)]
+pub(crate) fn ask_at_once<A>(
+    lines: &[(&str, &Value)],
+    needs: impl Fn(&Value) -> bool,
+    grant: impl FnOnce() -> Option<std::time::Duration>,
+    ask: A,
+    waited: impl FnOnce(std::time::Duration, std::time::Duration),
+) -> Vec<Option<Value>>
+where
+    A: Fn(&str, &Value, std::time::Duration) -> Option<Value> + Sync,
+{
+    ask_at_once_or_again(
+        lines,
+        needs,
+        grant,
+        |command, rules, left| Asked::Answered(ask(command, rules, left)),
+        waited,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,7 +519,7 @@ mod tests {
         use std::sync::Mutex;
         use std::time::Duration;
         let commands: Vec<String> = (0..12).map(|n| format!("chmod -R 777 ./d{n}")).collect();
-        let rules = json!({"recommendation": "review", "risk_score": 30});
+        let rules = json!({"recommendation": "review", "risk_score": 20});
         let lines: Vec<(&str, &Value)> = commands.iter().map(|c| (c.as_str(), &rules)).collect();
         let granted = Duration::from_secs(5);
         let open = AtomicUsize::new(0);
@@ -467,7 +565,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
         let commands: Vec<String> = (0..8).map(|n| format!("chmod -R 777 ./d{n}")).collect();
-        let rules = json!({"recommendation": "review", "risk_score": 30});
+        let rules = json!({"recommendation": "review", "risk_score": 20});
         let lines: Vec<(&str, &Value)> = commands.iter().map(|c| (c.as_str(), &rules)).collect();
         let asked = AtomicUsize::new(0);
         // The first AT_ONCE requests use up the grant and fail (a 429): the
@@ -485,6 +583,119 @@ mod tests {
         );
         assert_eq!(opinions, vec![None; 8]);
         assert_eq!(asked.load(Ordering::SeqCst), 4);
+    }
+
+    /// Review of #419 (third round): an endpoint that answers one request
+    /// at a time turns the others away as busy (429). Every line is still
+    /// answered: a line turned away goes back to the queue, and from the
+    /// first 429 on, one request is open at a time.
+    ///
+    /// FAILS ON REVERT of asking a busy line again (a 429 dropped the line,
+    /// which kept the rules' review).
+    #[test]
+    fn a_line_turned_away_as_busy_is_asked_again_one_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use std::time::Duration;
+        let commands: Vec<String> = (0..6).map(|n| format!("chmod -R 777 ./d{n}")).collect();
+        let rules = json!({"recommendation": "review", "risk_score": 20});
+        let lines: Vec<(&str, &Value)> = commands.iter().map(|c| (c.as_str(), &rules)).collect();
+        let open = AtomicUsize::new(0);
+        let busy_seen = AtomicUsize::new(0);
+        // Open requests at the moment of each request answered after the
+        // first 429.
+        let open_after_busy = Mutex::new(Vec::new());
+        let opinions = ask_at_once_or_again(
+            &lines,
+            |_| true,
+            || Some(Duration::from_secs(10)),
+            |command, _, _| {
+                let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+                std::thread::sleep(Duration::from_millis(30));
+                let answer = if now > 1 {
+                    busy_seen.fetch_add(1, Ordering::SeqCst);
+                    Asked::Busy(Some(Duration::from_millis(10)))
+                } else {
+                    if busy_seen.load(Ordering::SeqCst) > 0 {
+                        open_after_busy.lock().unwrap().push(now);
+                    }
+                    Asked::Answered(Some(json!({"asked": command})))
+                };
+                open.fetch_sub(1, Ordering::SeqCst);
+                answer
+            },
+            |_, _| {},
+        );
+        for (at, opinion) in opinions.iter().enumerate() {
+            assert_eq!(
+                opinion.as_ref().map(|o| o["asked"].clone()),
+                Some(json!(commands[at])),
+                "line {at}: {opinions:?}"
+            );
+        }
+        assert!(
+            busy_seen.load(Ordering::SeqCst) > 0,
+            "the endpoint was busy"
+        );
+        assert!(!open_after_busy.lock().unwrap().is_empty());
+    }
+
+    /// An endpoint that is always busy is asked again only while time is
+    /// left, and a wait it asks for that would leave no time is not
+    /// waited: the lines keep the rules' verdict, within the grant.
+    #[test]
+    fn an_endpoint_always_busy_keeps_the_rules_verdict_within_the_grant() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let commands: Vec<String> = (0..3).map(|n| format!("chmod -R 777 ./d{n}")).collect();
+        let rules = json!({"recommendation": "review", "risk_score": 20});
+        let lines: Vec<(&str, &Value)> = commands.iter().map(|c| (c.as_str(), &rules)).collect();
+        for asked_for in [None, Some(Duration::from_secs(60))] {
+            let asked = AtomicUsize::new(0);
+            let started = Instant::now();
+            let opinions = ask_at_once_or_again(
+                &lines,
+                |_| true,
+                || Some(Duration::from_millis(600)),
+                |_, _, _| {
+                    asked.fetch_add(1, Ordering::SeqCst);
+                    Asked::Busy(asked_for)
+                },
+                |_, _| {},
+            );
+            assert_eq!(opinions, vec![None; 3], "{asked_for:?}");
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(2), "{asked_for:?}: {took:?}");
+            let asked = asked.load(Ordering::SeqCst);
+            if asked_for.is_some() {
+                // A wait past the grant: each line asked once, none waited.
+                assert_eq!(asked, 3);
+                assert!(took < Duration::from_millis(300), "{took:?}");
+            } else {
+                // 200, 400 ms ... doubling: a few requests, not a flood.
+                assert!((3..=12).contains(&asked), "{asked}");
+            }
+        }
+    }
+
+    #[test]
+    fn retry_after_reads_millis_first_then_seconds() {
+        use std::time::Duration;
+        assert_eq!(
+            retry_after(Some("1500"), Some("9")),
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(retry_after(None, Some("2")), Some(Duration::from_secs(2)));
+        assert_eq!(
+            retry_after(Some("x"), Some("0.5")),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            retry_after(None, Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(retry_after(Some("-1"), None), None);
+        assert_eq!(retry_after(None, None), None);
     }
 
     #[test]

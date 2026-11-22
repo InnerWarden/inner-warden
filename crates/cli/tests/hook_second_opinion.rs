@@ -36,6 +36,8 @@ fn whole_request(seen: &[u8]) -> bool {
 struct Model {
     port: u16,
     asked: Arc<AtomicUsize>,
+    /// Requests answered 429 (by a model that answers one at a time).
+    turned_away: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
 }
 
@@ -45,12 +47,31 @@ impl Model {
     }
 
     fn slow(deny_for: &'static str, unless: &'static str, delay: Duration) -> Self {
+        Self::serve(deny_for, unless, delay, false)
+    }
+
+    /// A model that answers one request at a time: a request that arrives
+    /// while another is open is answered 429 at once, without Retry-After,
+    /// the way a small deployment limits a burst.
+    fn one_at_a_time(deny_for: &'static str, unless: &'static str, delay: Duration) -> Self {
+        Self::serve(deny_for, unless, delay, true)
+    }
+
+    fn serve(
+        deny_for: &'static str,
+        unless: &'static str,
+        delay: Duration,
+        one_at_a_time: bool,
+    ) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let asked = Arc::new(AtomicUsize::new(0));
+        let turned_away = Arc::new(AtomicUsize::new(0));
+        let open = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (count, stopped) = (asked.clone(), stop.clone());
+        let busy_count = turned_away.clone();
         std::thread::spawn(move || {
             while !stopped.load(Ordering::SeqCst) {
                 let Ok((mut stream, _)) = listener.accept() else {
@@ -58,6 +79,7 @@ impl Model {
                     continue;
                 };
                 let count = count.clone();
+                let (open, busy_count) = (open.clone(), busy_count.clone());
                 std::thread::spawn(move || {
                     stream.set_nonblocking(false).unwrap();
                     stream
@@ -72,6 +94,16 @@ impl Model {
                         }
                     }
                     count.fetch_add(1, Ordering::SeqCst);
+                    let others = open.fetch_add(1, Ordering::SeqCst);
+                    if one_at_a_time && others > 0 {
+                        busy_count.fetch_add(1, Ordering::SeqCst);
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                        );
+                        open.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    }
                     std::thread::sleep(delay);
                     let request = String::from_utf8_lossy(&seen);
                     let verdict = if request.contains(deny_for) && !request.contains(unless) {
@@ -89,10 +121,16 @@ impl Model {
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
+                    open.fetch_sub(1, Ordering::SeqCst);
                 });
             }
         });
-        Self { port, asked, stop }
+        Self {
+            port,
+            asked,
+            turned_away,
+            stop,
+        }
     }
 }
 
@@ -280,5 +318,35 @@ fn a_slow_model_refuses_whichever_line_it_refuses() {
         // Refused by the model's answer, not by the deadline (which exits 2
         // too).
         assert!(said.contains("second opinion: deny"), "{deny_for}: {said}");
+    }
+}
+
+/// Review of #419 (third round): an endpoint that answers one request at a
+/// time, as a small Azure deployment does, answers 429 to a request that
+/// arrives while another is open. The model refuses `./logs`. A line
+/// turned away goes back to the queue, and the call goes on one line at a
+/// time, so `./logs` gets the model's deny and the call is refused (exit
+/// 2), as on the main branch, which asked in turn. Dropped at its 429, the
+/// line kept its review and the call ran (exit 0).
+///
+/// FAILS ON REVERT of asking a busy line again (`Asked::Busy` in
+/// `ask_at_once_or_again`).
+#[test]
+fn an_endpoint_that_answers_one_at_a_time_still_refuses() {
+    let lines = ["chmod 777 ./data", "chmod 777 ./logs"];
+    for run in 0..3 {
+        let model = Model::one_at_a_time("./logs", "./data", Duration::from_millis(300));
+        let (code, said) = hook_on(model.port, &lines);
+        let turned_away = model.turned_away.load(Ordering::SeqCst);
+        assert!(
+            turned_away > 0,
+            "run {run}: the endpoint was never busy: {said}"
+        );
+        assert_eq!(
+            code,
+            Some(2),
+            "run {run}, {turned_away} turned away: {said}"
+        );
+        assert!(said.contains("second opinion: deny"), "run {run}: {said}");
     }
 }
