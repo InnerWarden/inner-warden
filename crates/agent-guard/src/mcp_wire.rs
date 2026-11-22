@@ -719,6 +719,27 @@ pub fn server_counts(root: &Value) -> ServerCounts {
     }
 }
 
+/// The names of the servers reached by URL that the proxy does not carry
+/// (one whose client signs in to it by itself, `auth` or `oauth`, and
+/// every other entry [`remote_entry`] leaves alone), across every table
+/// [`wrap`] reads. Their calls are judged where the client shows them, its
+/// hook ([`crate::mcp_unproxied`]). Names only, never a value. Pure.
+pub fn unproxied_remote_names(root: &Value) -> Vec<String> {
+    SERVER_TABLE_PATHS
+        .iter()
+        .filter_map(|path| table_at(root, path))
+        .flat_map(|map| map.iter())
+        .filter(|(_, server)| {
+            is_remote_server(server)
+                && !server
+                    .as_object()
+                    .is_some_and(|obj| obj.contains_key("command"))
+                && REMOTE_URL_KEYS.iter().any(|key| server.get(*key).is_some())
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 /// Count (stdio servers, of those already wrapped) across both schema keys.
 fn counts(root: &Value) -> (usize, usize) {
     let mut stdio = 0;

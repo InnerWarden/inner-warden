@@ -5,6 +5,21 @@ follows semantic versioning.
 
 ## Unreleased
 
+A call to a remote MCP server the agent signs in to by itself (OAuth: a
+Codex server after `codex mcp login` with `oauth_resource` or `scopes`, a
+Cursor server with `auth`), which the proxy does not stand in front of, is
+now judged with the proxy's rules where the agent shows it: the hook it runs
+before every tool call, which hands the guard the tool and its arguments and
+never the token. A call the proxy would refuse is refused (recorded in
+monitor), and recorded as the proxy records one; reads run as before. The
+agent keeps its sign-in and renews it; the guard never reads, holds or
+writes the token. The proxy cannot sit in front of such a server: as the
+stdio wrapper the client no longer signs in, and as a local address Codex
+and the MCP TypeScript SDK refuse the server's resource metadata, which
+names the real address. What the proxy does with the server's answers
+(pinned tool definitions, secrets in answers) still needs the proxy. The
+Codex line of `agents connect` says which servers are judged this way.
+
 `innerwarden setup` and the new `innerwarden status --config` say what is
 already set in the agents' own config, and change nothing. In
 `~/.claude/settings.json`, `~/.claude.json`, `~/.cursor/mcp.json`,

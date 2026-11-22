@@ -2634,6 +2634,12 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     if let Some(exit) = refuse_a_waiting_interpreter(&buf, rest, monitor, demo) {
         return exit;
     }
+    // A call to a remote MCP server the proxy does not stand in front of
+    // (one the agent signs in to by itself) is judged as the proxy judges
+    // it; one it lets through goes on to the shell rules below.
+    if let Some(exit) = screen_unproxied_mcp_call(&buf, rest, monitor, block_review, demo) {
+        return exit;
+    }
 
     let options = ShellScreenOptions {
         monitor,
@@ -3367,6 +3373,94 @@ pub(crate) fn stricter_with_host(
         obj.insert("risk_score".into(), score.max(floor).into());
     }
     verdict
+}
+
+/// Screen a call to a remote MCP server of the hook's agent that the proxy
+/// does not carry, a server the agent signs in to by itself (OAuth), with
+/// the proxy's own judgment (`innerwarden_agent_guard::mcp_unproxied`).
+/// The agent keeps its sign-in and renews it; the hook is shown the tool and
+/// its arguments, never the token, and nothing here reads one.
+///
+/// The decision is recorded as the proxy records a call, with the router's
+/// redacted summary, whenever it carries a finding. `Some` only for a call
+/// the proxy would refuse: exit 2 in enforce, 0 in monitor (recorded as
+/// what it would have refused). `None` for every other call, which goes on
+/// to the shell rules as before.
+fn screen_unproxied_mcp_call(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    block_review: bool,
+    demo: bool,
+) -> Option<std::process::ExitCode> {
+    use innerwarden_agent_guard::mcp_proxy::enforce::ProxyAction;
+    use innerwarden_agent_guard::mcp_unproxied;
+    use innerwarden_agent_guard::posture::Posture;
+    let payload = serde_json::from_str::<serde_json::Value>(buf).ok()?;
+    let tool_name = payload
+        .get("tool_name")
+        .or_else(|| payload.get("tool"))
+        .and_then(|t| t.as_str())?;
+    if !tool_name.starts_with("mcp__") {
+        return None;
+    }
+    let agent = agent_flag(rest)?;
+    let home = hook::home_dir().ok()?;
+    let servers = mcp_unproxied::unproxied_remote_servers(&agent, &home);
+    let (_server, tool) = mcp_unproxied::server_called(tool_name, &servers)?;
+    let args = payload
+        .get("tool_input")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let engine = RuleEngine::load_embedded();
+    let payload_session = hook_session(buf);
+    let identity = hook_identity::current(Some(&agent), payload_session.as_deref());
+    let profile =
+        agent_profiles::proxy_profile(&agent_profiles_io::load(), Some(&agent), identity.as_ref());
+    let strict = hook_posture(monitor, block_review) == Posture::Strict;
+    let mode = mcp_unproxied::mode_for_hook(monitor, strict);
+    let (decision, action) =
+        mcp_unproxied::judge(tool, &args, Some(&engine), profile.as_ref(), mode);
+    let refused = !decision.verdict.allowed
+        && (monitor || matches!(action, ProxyAction::Block { .. } | ProxyAction::Kill { .. }));
+    let explanation = decision
+        .verdict
+        .alerts
+        .iter()
+        .filter(|alert| alert.block || !refused)
+        .map(|alert| format!("{}: {}", alert.rule, alert.detail))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !decision.verdict.alerts.is_empty() {
+        let (decision, agent) = (decision.clone(), agent.clone());
+        hook_net::after_answer(move || {
+            let identity = hook_identity::current(Some(&agent), payload_session.as_deref());
+            graph_io::record_mcp(
+                &decision,
+                mode,
+                payload_session.as_deref(),
+                Some(&agent),
+                identity.as_ref(),
+            );
+        });
+    }
+    if !refused {
+        return None;
+    }
+    if demo {
+        println!(
+            "{}",
+            demo::hook_report(Some("deny"), true, Some(&explanation))
+        );
+    }
+    if monitor {
+        return Some(std::process::ExitCode::SUCCESS);
+    }
+    eprintln!("InnerWarden blocked this MCP call (recommendation=deny): {explanation}");
+    note_refusal(format!(
+        "InnerWarden blocked this call (deny): {explanation}"
+    ));
+    Some(std::process::ExitCode::from(2))
 }
 
 /// Screen a `Write`, `Edit`, `MultiEdit` or `NotebookEdit` call (see

@@ -437,6 +437,22 @@ pub fn unscreened_remote_toml(doc: &DocumentMut) -> Vec<String> {
         .collect()
 }
 
+/// The names of the servers of a Codex config reached by URL that the
+/// proxy does not carry, the servers [`unscreened_remote_toml`] names: a
+/// server Codex signs in to by itself among them. Their calls are judged
+/// where Codex shows them, its hook ([`crate::mcp_unproxied`]). Pure.
+pub fn unproxied_remote_names_toml(doc: &DocumentMut) -> Vec<String> {
+    let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table) else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .filter_map(|(name, item)| Some((name, item.as_table()?)))
+        .filter(|(_, table)| table.contains_key("url") && !is_proxyable_server(table))
+        .map(|(name, _)| name.to_string())
+        .collect()
+}
+
 /// A table that runs a local command, or a remote server the proxy carries.
 fn is_proxyable_server(server: &Table) -> bool {
     is_stdio_server(server) || remote_entry(server).is_some()
