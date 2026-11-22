@@ -6378,7 +6378,12 @@ fn written_file_text(
             continue;
         }
         let writer = ancestor_of_kind(redirect, "redirected_statement").and_then(statement_owner);
-        let printed = writer.and_then(|writer| printed_text(writer, source, level))?;
+        let printed = match writer {
+            Some(writer) if is_bare_exec(writer, source) => {
+                exec_output_text(writer, reader, source, level)?
+            }
+            _ => writer.and_then(|writer| printed_text(writer, source, level))?,
+        };
         text = Some(if operator.ends_with(">>") {
             text.unwrap_or_default() + &printed
         } else {
@@ -6386,6 +6391,63 @@ fn written_file_text(
         });
     }
     text
+}
+
+/// Whether `command` is `exec` with nothing but redirections: it moves
+/// the output of the commands after it.
+fn is_bare_exec(command: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    command_words(command, source).is_some_and(|words| words.len() == 1 && words[0] == "exec")
+}
+
+/// What the commands after a bare `exec > file` print into the file,
+/// before `reader` and until another bare `exec` moves the output: `exec >
+/// r.sh; echo '...'; exec > /dev/tty; sh r.sh` runs what `echo` printed.
+/// A command whose own output goes elsewhere (`>&2`, `> log`) adds
+/// nothing; one whose output the line does not show leaves the file
+/// unread. Measured 2026-11-22 on main: such a file was held for review
+/// whatever it held, a removal of the home included.
+fn exec_output_text(
+    exec: tree_sitter::Node<'_>,
+    reader: tree_sitter::Node<'_>,
+    source: &[u8],
+    level: u8,
+) -> Option<String> {
+    let statement = ancestor_of_kind(exec, "redirected_statement")?;
+    let mut commands = Vec::new();
+    collect_all_commands(root_node(exec), &mut commands, 0);
+    commands.sort_by_key(|command| command.start_byte());
+    let mut text = String::new();
+    for command in commands {
+        if command.start_byte() < statement.end_byte() || never_runs(command, source) {
+            continue;
+        }
+        if command.start_byte() >= reader.start_byte() || is_bare_exec(command, source) {
+            break;
+        }
+        if ancestor_of_kind(command, "command_substitution").is_some()
+            || ancestor_of_kind(command, "process_substitution").is_some()
+        {
+            return None;
+        }
+        let own_output = command
+            .parent()
+            .filter(|parent| parent.kind() == "redirected_statement")
+            .is_some_and(|parent| {
+                let mut cursor = parent.walk();
+                let elsewhere = parent.children(&mut cursor).any(|child| {
+                    child.kind() == "file_redirect" && {
+                        let redirect = node_text(child, source);
+                        redirect.contains('>') && !redirect.trim_start().starts_with('2')
+                    }
+                });
+                elsewhere
+            });
+        if own_output {
+            continue;
+        }
+        text.push_str(&printed_text(command, source, level)?);
+    }
+    Some(text)
 }
 
 /// Whether a word holds only text the line writes out: no expansion,
@@ -7890,6 +7952,46 @@ pub(crate) fn download_pipeline_output_targets(source: &str) -> Vec<(usize, Stri
                         .into_iter()
                         .map(|target| (pipeline.end_byte(), target)),
                 );
+            }
+        }
+    }
+    // A downloader in a group or a subshell whose redirect writes a file
+    // (`{ curl -s URL; } > r.sh`): the redirect is the group's, and what the
+    // downloader prints lands in the file. Measured 2026-11-22 on main: the
+    // group form was allowed where `(curl -s URL) > r.sh` and `curl -s URL >
+    // r.sh` were held for review.
+    let mut commands = Vec::new();
+    collect_all_commands(tree.root_node(), &mut commands, 0);
+    for command in commands {
+        let downloads = command_words(command, bytes).is_some_and(|words| {
+            effective_command_words(&words, 0).is_some_and(produces_downloaded_bytes)
+        });
+        if !downloads {
+            continue;
+        }
+        let mut node = command;
+        let mut grouped = false;
+        while let Some(parent) = node.parent() {
+            match parent.kind() {
+                "compound_statement" | "subshell" => {
+                    grouped = true;
+                    node = parent;
+                }
+                "list" => node = parent,
+                "redirected_statement"
+                    if grouped
+                        && parent
+                            .child_by_field_name("body")
+                            .is_some_and(|body| body.id() == node.id()) =>
+                {
+                    outputs.extend(
+                        output_redirect_targets(parent, bytes)
+                            .into_iter()
+                            .map(|target| (parent.end_byte(), target)),
+                    );
+                    break;
+                }
+                _ => break,
             }
         }
     }
@@ -13011,6 +13113,9 @@ fn collect_ranges(
             mask_literal_command_args(node, source, taint, masked, executable_inside_mask);
         }
         "heredoc_body" => mask_data_heredoc(node, source, masked, executable_inside_mask),
+        "herestring_redirect" => {
+            mask_message_herestring(node, source, masked, executable_inside_mask);
+        }
         _ => {}
     }
 
@@ -13137,7 +13242,7 @@ fn mask_literal_command_args(
             // flagged as attempting the very thing they were searching for, which
             // is both wrong and the kind of false positive that gets a guard
             // switched off.
-            for argument in option_data_arguments(
+            let mut data = option_data_arguments(
                 &arguments,
                 source,
                 &[
@@ -13150,7 +13255,18 @@ fn mask_literal_command_args(
                     "-G",
                 ],
                 &["--message=", "--grep=", "--author=", "--committer="],
-            ) {
+            );
+            // `git commit -am '...'`: a cluster of short flags that ends in
+            // `m` takes the message as `-m` does. Measured 2026-11-22: a
+            // message that named the guard was allowed after `-m` and held
+            // for review after `-am`.
+            data.extend(
+                arguments
+                    .windows(2)
+                    .filter(|pair| git_message_cluster(&shell_word(&node_text(pair[0], source))))
+                    .map(|pair| pair[1]),
+            );
+            for argument in data {
                 mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
@@ -13574,6 +13690,22 @@ fn targets_executed_after(
         {
             return true;
         }
+        // A program that runs its input as code, handed the file there
+        // (`sh < x.sh`, `python3 < x.py`): measured 2026-11-22, the text a
+        // `printf` wrote was hidden from the reading of the file it runs.
+        let on_stdin = command_words(candidate, source)
+            .and_then(|words| {
+                effective_command_words(&words, 0)
+                    .and_then(|effective| file_on_stdin(candidate, effective, source))
+            })
+            .map(|(path, _)| path);
+        if on_stdin.is_some_and(|path| {
+            targets.iter().any(|target| {
+                spellings_of(target).contains(&path) || spellings_of(&path).contains(target)
+            })
+        }) {
+            return true;
+        }
     }
     false
 }
@@ -13949,6 +14081,48 @@ fn reads_stdin_as_message(
         }
         _ => false,
     }
+}
+
+/// A cluster of git's short flags that ends in `m` (`-am`, `-sam`): the
+/// next word is the message.
+fn git_message_cluster(word: &str) -> bool {
+    word.len() > 2
+        && word.starts_with('-')
+        && !word.starts_with("--")
+        && word.ends_with('m')
+        && word[1..].chars().all(|c| c.is_ascii_alphabetic())
+}
+
+/// A here-string a command reads as its message ([`reads_stdin_as_message`]:
+/// `git commit -F - <<< '...'`) is data, as the same text in a
+/// here-document is ([`mask_data_heredoc`]). Measured 2026-11-22: a
+/// message that named the guard was allowed in a here-document and after
+/// `-m`, and held for review in a here-string.
+fn mask_message_herestring(
+    redirect: tree_sitter::Node<'_>,
+    source: &[u8],
+    masked: &mut Vec<Range<usize>>,
+    executable_inside_mask: &mut Vec<Range<usize>>,
+) {
+    let Some(owner) = heredoc_owner(redirect) else {
+        return;
+    };
+    // The grammar hangs a here-string on its command, or on the statement
+    // around it.
+    let redirected = ancestor_of_kind(redirect, "redirected_statement").unwrap_or(owner);
+    if !reads_stdin_as_message(owner, redirected, source)
+        || has_execution_sink_ancestor(owner, source)
+        || command_name(owner, source).is_some_and(|name| {
+            line_redefines(root_node(redirect), &normalized_command_name(&name), source)
+        })
+    {
+        return;
+    }
+    let Some(value) = redirect.named_child((redirect.named_child_count() as u32).saturating_sub(1))
+    else {
+        return;
+    };
+    mask_preserving_substitutions(value, source, masked, executable_inside_mask);
 }
 
 fn mask_preserving_substitutions(
