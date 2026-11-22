@@ -105,11 +105,11 @@ fn a_plain_reader_of_a_secret_is_judged_as_cat_is() {
         "sed -n p",
         "awk '{print}'",
     ] {
-        for secret in ["/etc/shadow", "~/.ssh/id_rsa", "~/.aws/credentials"] {
-            let command = format!("{reader} {secret}");
+        for path in ["/etc/shadow", "~/.ssh/id_rsa", "~/.aws/credentials"] {
+            let command = format!("{reader} {path}");
             assert_eq!(
                 verdict(&command),
-                verdict(&format!("cat {secret}")),
+                verdict(&format!("cat {path}")),
                 "{command}"
             );
             assert_eq!(verdict(&command), "deny", "{command}");
