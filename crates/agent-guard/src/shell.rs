@@ -3040,6 +3040,18 @@ pub(crate) fn inline_code_reading(source: &str) -> InlineReading {
                 as_written.clone()
             };
             let mut piece = inline_calls::read_code(lang, &code, inline_calls::CODE_DEPTH);
+            // A file the code writes that a command of the line runs: what
+            // the code wrote is what runs (`php -r 'file_put_contents("x.sh",
+            // ...)' && sh x.sh`).
+            for (path, text) in piece.written.clone() {
+                if let Some(runner) = inline_calls::runner_of_file(source, &path) {
+                    piece.merge(inline_calls::written_reading(
+                        runner,
+                        &text,
+                        inline_calls::CODE_DEPTH,
+                    ));
+                }
+            }
             // Its strings are blanked in the line only where the line holds
             // the code as the program reads it.
             if code == as_written {
