@@ -31,6 +31,28 @@ impl Host {
         Self { dir }
     }
 
+    /// A home that holds an SSH key and has Claude Code connected
+    /// (`install claude-code`), as the hooks the card measured ran in.
+    fn lived_in() -> Self {
+        let host = Self::new();
+        std::fs::create_dir_all(host.home().join(".ssh")).expect("ssh folder");
+        std::fs::write(host.home().join(".ssh/id_ed25519"), "not a real key\n").expect("a key");
+        std::fs::create_dir_all(host.home().join(".claude")).expect("claude folder");
+        let out = host
+            .command()
+            .args(["install", "claude-code"])
+            .output()
+            .expect("run install");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "install claude-code: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        host
+    }
+
     fn home(&self) -> PathBuf {
         self.dir.path().join("home")
     }
@@ -207,4 +229,84 @@ fn check_says_why_the_hook_differs() {
         Some(2),
         "an agent id that is not one is refused"
     );
+}
+
+/// The lines of NEW-20261120-check-disagrees-with-hook, measured on 1.6.15:
+/// `check` answered allow to the first two and review to the third, while
+/// the hook of the same host refused them (the third because it sees the
+/// key under `~/.ssh` in the folder the search walks).
+const REPORTED: &[&str] = &[
+    "innerwarden disconnect claude-code",
+    "flock /tmp/l innerwarden disconnect claude-code",
+    "grep -r -e password ~",
+];
+
+/// Ordinary work, which neither may hold up.
+const LEGITIMATE: &[&str] = &[
+    "git status",
+    "git log --oneline -5",
+    "ls -la src",
+    "cat notes.txt",
+    "grep -rn TODO src",
+    "grep -r -e password .",
+    "rg -n fn src",
+    "find . -name '*.rs'",
+    "cargo test --workspace",
+    "innerwarden status",
+];
+
+/// In a home with a key and a connected agent, every reported line and every
+/// ordinary one gets from `check` the outcome, and the exit code, the hook
+/// of each agent gives it.
+#[test]
+fn check_and_the_hook_agree_on_the_reported_lines() {
+    let host = Host::lived_in();
+    for agent in AGENTS {
+        for line in REPORTED.iter().chain(LEGITIMATE) {
+            let hook = host.hook(agent, line);
+            let (outcome, recommendation, code) = host.check(agent, line);
+            assert_eq!(
+                outcome, hook,
+                "{agent} | {line}: check said {outcome} ({recommendation}), the hook {hook}"
+            );
+            assert_eq!(
+                code,
+                Some(if hook == "refuse" { 1 } else { 0 }),
+                "{agent} | {line}: check exits 1 exactly when the hook refuses"
+            );
+            if LEGITIMATE.contains(line) {
+                assert_eq!(hook, "allow", "{agent} | {line}: ordinary work is held up");
+            }
+        }
+    }
+    // The search of the home is the one 1.6.15's check called a review:
+    // with the key there, both refuse it, for every agent.
+    for agent in AGENTS {
+        let (outcome, recommendation, _) = host.check(agent, "grep -r -e password ~");
+        assert_eq!(
+            (outcome.as_str(), recommendation.as_str()),
+            ("refuse", "deny"),
+            "{agent}"
+        );
+    }
+}
+
+/// What the hook checks and `check` cannot (the session) is said in one
+/// line beside a verdict it could make stricter, and not beside a refusal.
+#[test]
+fn check_names_the_check_it_skips() {
+    let host = Host::new();
+    let human = |line: &str| {
+        let out = host
+            .command()
+            .args(["check", "--human", line])
+            .output()
+            .expect("run check");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let skipped = "Not checked here, the hook only: the session";
+    let allowed = human("git status");
+    assert_eq!(allowed.matches(skipped).count(), 1, "{allowed}");
+    let refused = human("rm -rf ~");
+    assert!(!refused.contains(skipped), "{refused}");
 }

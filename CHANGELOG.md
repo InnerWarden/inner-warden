@@ -20,6 +20,13 @@ finding has one line of what to do, with the InnerWarden command where
 there is one (`agents connect`, `mcp list`). A file that is there and
 cannot be parsed is named as not read, never as clean.
 
+`innerwarden check`, read on a terminal, names in one line the check only the
+hook makes (the session: a value from an earlier tool result, or a burst of
+calls, can make the hook stricter), whenever that could change what the hook
+does. A test now runs the lines reported as judged apart, and ordinary work,
+through `check` and through the hook of each agent in a home with an SSH key
+and Claude Code connected, and requires the same outcome and exit code.
+
 A file the line writes, rewrites in place and then runs is read with what the
 edit puts in it: the replacement of a `sed -i` or `perl -pi -e` `s///`, the
 text of a `sed` `a`, `i` or `c`, the command of an `e`, and the strings an

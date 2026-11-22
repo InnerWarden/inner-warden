@@ -901,6 +901,9 @@ fn cmd_check(rest: &[String]) -> std::process::ExitCode {
         if let Some(line) = checked.differs_line(agent.as_deref()) {
             println!("{line}");
         }
+        if let Some(line) = checked.skipped_line() {
+            println!("{line}");
+        }
     }
 
     if checked.outcome == HookOutcome::Refuse {
@@ -958,6 +961,14 @@ impl CheckedAsHook {
             hook["why"] = why.clone().into();
         }
         hook
+    }
+
+    /// The one line that names the check the hook makes and `check` skips
+    /// (the session), when it could change what the hook does: never beside
+    /// a refusal, which nothing in a session can make stricter.
+    fn skipped_line(&self) -> Option<String> {
+        (self.outcome != HookOutcome::Refuse)
+            .then(|| format!("   Not checked here, the hook only: the session ({CHECK_UNSEEN})."))
     }
 
     /// The line a person reads when the hook would not simply do what the
