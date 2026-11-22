@@ -154,6 +154,14 @@ pub fn cmd(_rest: &[String]) -> ExitCode {
         }
     }
 
+    // What is already set in the agents' own config: read, never changed.
+    if !detected.is_empty() {
+        println!();
+        for line in crate::config_check_io::lines(&home, "  ") {
+            println!("{line}");
+        }
+    }
+
     let mut auto_connect_enabled = false;
     if offer_auto_connect {
         let automatic = Confirm::with_theme(&theme)

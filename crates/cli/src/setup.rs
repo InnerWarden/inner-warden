@@ -135,7 +135,8 @@ pub fn noninteractive_summary(prog: &str) -> String {
          See your AI agents (including Claude Code, Cursor, Codex, Gemini, Goose, Aider, OpenClaw and Hermes Agent):\n  \
            {prog} agents                 see what's detected on this machine\n  \
            {prog} agents connect --all --monitor   guard every eligible integration in dry run\n  \
-           {prog} agents auto-connect --monitor   opt in to new-agent discovery while the dashboard runs\n\n\
+           {prog} agents auto-connect --monitor   opt in to new-agent discovery while the dashboard runs\n  \
+           {prog} status --config        what is already set in their config (read only)\n\n\
          Agents without a reviewed adapter are detection-only here; connect them manually and InnerWarden will not rewrite an unsupported format.\n\n\
          Optional extras (all off by default):\n"
     ));
@@ -258,6 +259,7 @@ mod tests {
         assert!(s.contains("detection-only") && s.contains("manually"));
         assert!(s.contains("innerwarden agents connect --all"));
         assert!(s.contains("innerwarden agents auto-connect --monitor"));
+        assert!(s.contains("innerwarden status --config"));
         for o in EXTRAS {
             assert!(s.contains(o.label), "summary missing {}", o.label);
         }

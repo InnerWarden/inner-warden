@@ -118,6 +118,7 @@ Check the guard's status and screen a command without running it:
 
 ```sh
 innerwarden status
+innerwarden status --config   # what is already set in your agents' config
 innerwarden check "git status"
 ```
 
