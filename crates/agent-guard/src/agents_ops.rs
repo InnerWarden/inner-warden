@@ -1965,11 +1965,18 @@ fn connect_by_one_mechanism(
         } else {
             format!("; not screened by the proxy: {}", unscreened.join(", "))
         };
+        // Their calls still reach the guard through Codex's hook, which
+        // judges them with the proxy's rules (`crate::mcp_unproxied`).
+        let judged_by_hook = if unscreened.is_empty() {
+            ""
+        } else {
+            "; the Codex hook, when it is on, judges calls to those servers with the proxy's rules"
+        };
         return match write_toml(home, &path, &doc, &source, reject_symlinks) {
             Ok(()) if n == 0 => ConnectResult::new(
                 ConnectEffect::Unchanged,
                 format!(
-                    "  {} - already guarded (MCP proxy, {}{unscreened})",
+                    "  {} - already guarded (MCP proxy, {}{unscreened}){judged_by_hook}",
                     r.name,
                     if monitor { "monitor" } else { "enforce" }
                 ),
@@ -1977,7 +1984,7 @@ fn connect_by_one_mechanism(
             Ok(()) => ConnectResult::new(
                 ConnectEffect::Connected,
                 format!(
-                    "  {} - connected ({n} MCP server{} routed through the guard proxy, {}{unscreened})",
+                    "  {} - connected ({n} MCP server{} routed through the guard proxy, {}{unscreened}){judged_by_hook}",
                     r.name,
                     if n == 1 { "" } else { "s" },
                     if monitor { "monitor" } else { "enforce" }
@@ -4774,6 +4781,41 @@ mod tests {
             result.line
         );
         assert!(!result.line.contains("sk-not-a-token"), "{}", result.line);
+    }
+
+    /// The Codex connect line says that calls to the servers the proxy
+    /// leaves out are judged by the hook with the proxy's rules, and says
+    /// nothing of it when there is no such server.
+    ///
+    /// FAILS ON REVERT: print the line without `judged_by_hook`.
+    #[test]
+    fn connect_codex_says_the_hook_judges_the_servers_the_proxy_leaves_out() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "[mcp_servers.icm]\ncommand = \"icm\"\n\n[mcp_servers.linear]\nurl = \"https://l.example/mcp\"\noauth_resource = \"https://l.example/mcp\"\n",
+        )
+        .unwrap();
+        let row = known_row(home.path(), "codex");
+        let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert!(
+            result.line.contains(
+                "not screened by the proxy: linear (oauth_resource)); the Codex hook, when it is on, judges calls to those servers with the proxy's rules"
+            ),
+            "{}",
+            result.line
+        );
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".codex")).unwrap();
+        std::fs::write(
+            home.path().join(".codex/config.toml"),
+            "[mcp_servers.icm]\ncommand = \"icm\"\n",
+        )
+        .unwrap();
+        let row = known_row(home.path(), "codex");
+        let result = connect_one_result(home.path(), &row, "/abs/innerwarden", false, false);
+        assert!(!result.line.contains("judges calls"), "{}", result.line);
     }
 
     /// Codex runs a hook only once it trusts it. With nobody to ask and no

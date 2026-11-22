@@ -126,9 +126,27 @@ fn is_stdio_server(server: &Table) -> bool {
         .unwrap_or(false)
 }
 
-/// The `[mcp_servers]` table, mutable, if present.
-fn servers_mut(doc: &mut DocumentMut) -> Option<&mut Table> {
-    doc.get_mut("mcp_servers").and_then(Item::as_table_mut)
+/// Every server under `mcp_servers` with its table, in file order. A server
+/// written as an inline table (`[mcp_servers]` then `linear = { url = ... }`,
+/// or `mcp_servers = { linear = { ... } }` whole) is read as the table it
+/// stands for, as Codex reads it. Copies, for reading only.
+fn server_tables(doc: &DocumentMut) -> Vec<(String, Table)> {
+    let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table_like) else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .filter_map(|(name, item)| Some((name.to_string(), as_server_table(item)?)))
+        .collect()
+}
+
+/// A server's entry as a table: a table, or an inline one read as a table.
+fn as_server_table(item: &Item) -> Option<Table> {
+    match item {
+        Item::Table(table) => Some(table.clone()),
+        Item::Value(Value::InlineTable(inline)) => Some(inline.clone().into_table()),
+        _ => None,
+    }
 }
 
 /// An args array as its words, formatting aside. An array read from a file
@@ -426,14 +444,39 @@ fn not_carried_because(server: &Table) -> String {
 /// ([`not_carried_because`]). For the line `agents connect` prints, as Goose's
 /// names its own. Pure.
 pub fn unscreened_remote_toml(doc: &DocumentMut) -> Vec<String> {
-    let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table) else {
-        return Vec::new();
-    };
-    servers
-        .iter()
-        .filter_map(|(name, item)| Some((name, item.as_table()?)))
+    server_tables(doc)
+        .into_iter()
         .filter(|(_, table)| table.contains_key("url") && !is_proxyable_server(table))
-        .map(|(name, table)| format!("{name} ({})", not_carried_because(table)))
+        .map(|(name, table)| format!("{name} ({})", not_carried_because(&table)))
+        .collect()
+}
+
+/// Every server of a Codex config as the hook reads it
+/// ([`crate::mcp_unproxied`]): its name, whether the proxy stands in front
+/// of it (a wrapper), and whether it is reached by URL. An inline table
+/// counts as the table it stands for. Names only, never a value. Pure.
+pub fn server_entries_toml(doc: &DocumentMut) -> Vec<crate::mcp_unproxied::ServerEntry> {
+    server_tables(doc)
+        .into_iter()
+        .map(|(name, table)| {
+            let command = table.get("command").and_then(Item::as_str);
+            let args: Vec<&str> = table
+                .get("args")
+                .and_then(Item::as_array)
+                .map(|args| args.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            crate::mcp_unproxied::ServerEntry {
+                wrapper: server_mode(&table).and_then(|mode| {
+                    Some(crate::mcp_unproxied::Wrapper {
+                        command: command?.to_string(),
+                        blocks: mode == WiringMode::Enforce,
+                    })
+                }),
+                remote: (!is_stdio_server(&table) && table.contains_key("url"))
+                    || command.is_some_and(|c| crate::mcp_unproxied::runs_mcp_remote(c, &args)),
+                name,
+            }
+        })
         .collect()
 }
 
@@ -744,16 +787,41 @@ fn restore_remote(server: &mut Table, url: &str, words: &[Value]) -> bool {
 
 fn for_each_server(doc: &mut DocumentMut, mut f: impl FnMut(&mut Table) -> bool) -> usize {
     let mut n = 0;
-    if let Some(servers) = servers_mut(doc) {
-        for (_name, item) in servers.iter_mut() {
-            if let Some(t) = item.as_table_mut() {
-                if f(t) {
-                    n += 1;
+    match doc.get_mut("mcp_servers") {
+        Some(Item::Table(servers)) => {
+            for (_name, item) in servers.iter_mut() {
+                match item {
+                    Item::Table(t) => n += usize::from(f(t)),
+                    Item::Value(value) => n += usize::from(change_inline(value, &mut f)),
+                    _ => {}
                 }
             }
         }
+        Some(Item::Value(Value::InlineTable(servers))) => {
+            for (_name, value) in servers.iter_mut() {
+                n += usize::from(change_inline(value, &mut f));
+            }
+        }
+        _ => {}
     }
     n
+}
+
+/// Apply `f` to a server written as an inline table, read as the table it
+/// stands for, and write it back inline (its spacing kept) when `f`
+/// changed it. Anything else is left alone.
+fn change_inline(value: &mut Value, f: &mut impl FnMut(&mut Table) -> bool) -> bool {
+    let Value::InlineTable(inline) = value else {
+        return false;
+    };
+    let mut table = inline.clone().into_table();
+    if !f(&mut table) {
+        return false;
+    }
+    let mut changed = table.into_inline_table();
+    *changed.decor_mut() = inline.decor().clone();
+    *inline = changed;
+    true
 }
 
 /// The TOML twin of [`crate::mcp_wire::server_counts`]: the servers under
@@ -763,17 +831,10 @@ fn for_each_server(doc: &mut DocumentMut, mut f: impl FnMut(&mut Table) -> bool)
 /// names its address: the proxy never sees its calls. Pure.
 pub fn server_counts_toml(doc: &DocumentMut) -> crate::mcp_wire::ServerCounts {
     let (stdio, wrapped) = counts(doc);
-    let remote = doc
-        .get("mcp_servers")
-        .and_then(Item::as_table)
-        .map(|servers| {
-            servers
-                .iter()
-                .filter_map(|(_name, item)| item.as_table())
-                .filter(|t| !is_proxyable_server(t))
-                .count()
-        })
-        .unwrap_or(0);
+    let remote = server_tables(doc)
+        .iter()
+        .filter(|(_, t)| !is_proxyable_server(t))
+        .count();
     crate::mcp_wire::ServerCounts {
         stdio,
         wrapped,
@@ -784,15 +845,11 @@ pub fn server_counts_toml(doc: &DocumentMut) -> crate::mcp_wire::ServerCounts {
 fn counts(doc: &DocumentMut) -> (usize, usize) {
     let mut stdio = 0;
     let mut wrapped = 0;
-    if let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table) {
-        for (_name, item) in servers.iter() {
-            if let Some(t) = item.as_table() {
-                if is_proxyable_server(t) {
-                    stdio += 1;
-                    if is_wrapped_server(t) {
-                        wrapped += 1;
-                    }
-                }
+    for (_name, t) in server_tables(doc) {
+        if is_proxyable_server(&t) {
+            stdio += 1;
+            if is_wrapped_server(&t) {
+                wrapped += 1;
             }
         }
     }
@@ -835,13 +892,9 @@ pub fn unnamed_reconnect_flag_toml(
         WiringMode::Enforce => false,
         WiringMode::Mixed => return None,
     };
-    let unnamed = doc
-        .get("mcp_servers")
-        .and_then(Item::as_table)
-        .into_iter()
-        .flat_map(Table::iter)
-        .filter_map(|(_, item)| item.as_table())
-        .filter_map(wrapper_options)
+    let unnamed = server_tables(doc)
+        .iter()
+        .filter_map(|(_, table)| wrapper_options(table))
         .any(|options| proxy_agent(&options) != Some(agent));
     let beyond_the_name = wrap_toml_naming(&mut doc.clone(), guard_bin, monitor, None);
     (unnamed && beyond_the_name == 0).then_some(if monitor { " --monitor" } else { "" })
@@ -880,12 +933,10 @@ pub fn wrap_toml_local(
 /// Whether every server that runs a local command goes through the proxy,
 /// and there is one: what [`wrap_toml_local`] guarantees.
 pub fn local_servers_guarded_toml(doc: &DocumentMut) -> bool {
-    let Some(servers) = doc.get("mcp_servers").and_then(Item::as_table) else {
-        return false;
-    };
+    let servers = server_tables(doc);
     let local: Vec<&Table> = servers
         .iter()
-        .filter_map(|(_, item)| item.as_table())
+        .map(|(_, t)| t)
         .filter(|t| is_stdio_server(t))
         .collect();
     !local.is_empty() && local.iter().all(|t| is_wrapped_server(t))
@@ -913,45 +964,31 @@ pub fn is_guarded_toml(doc: &DocumentMut) -> bool {
 /// Whether at least one server still points at an InnerWarden proxy wrapper,
 /// including legacy or malformed wiring that a reconnect can repair.
 pub fn has_guard_wiring_toml(doc: &DocumentMut) -> bool {
-    doc.get("mcp_servers")
-        .and_then(Item::as_table)
-        .is_some_and(|servers| {
-            servers
-                .iter()
-                .any(|(_, item)| item.as_table().is_some_and(has_proxy_prefix))
-        })
+    server_tables(doc)
+        .iter()
+        .any(|(_, table)| has_proxy_prefix(table))
 }
 
 /// The program each InnerWarden proxy wrapper in this config runs, as
 /// written, in file order (see `mcp_wire::guard_wrapper_commands`).
 pub fn guard_wrapper_commands_toml(doc: &DocumentMut) -> Vec<String> {
-    doc.get("mcp_servers")
-        .and_then(Item::as_table)
-        .map(|servers| {
-            servers
-                .iter()
-                .filter_map(|(_, item)| item.as_table())
-                .filter(|server| has_proxy_prefix(server))
-                .filter_map(|server| server.get("command").and_then(Item::as_str))
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
+    server_tables(doc)
+        .iter()
+        .filter(|(_, server)| has_proxy_prefix(server))
+        .filter_map(|(_, server)| server.get("command").and_then(Item::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Effective mode across every guarded stdio server. `None` means there is no
 /// fully guarded local server; differing modes are reported as `Mixed`.
 pub fn guarded_mode_toml(doc: &DocumentMut) -> Option<WiringMode> {
     let mut found: Option<WiringMode> = None;
-    let servers = doc.get("mcp_servers").and_then(Item::as_table)?;
-    for (_name, item) in servers.iter() {
-        let Some(server) = item
-            .as_table()
-            .filter(|server| wrapper_separator(server).is_some())
-        else {
+    for (_name, server) in server_tables(doc) {
+        if wrapper_separator(&server).is_none() {
             continue;
-        };
-        let mode = server_mode(server)?;
+        }
+        let mode = server_mode(&server)?;
         found = Some(match found {
             None => mode,
             Some(existing) if existing == mode => existing,
@@ -997,6 +1034,37 @@ pub fn is_automatic_wrap_safe_toml(doc: &DocumentMut) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server written as an inline table, under `[mcp_servers]` or in an
+    /// inline `mcp_servers`, is wrapped as a table is, stays inline, counts
+    /// as guarded, and unwraps back. FAILS ON REVERT of the inline reading
+    /// in `for_each_server` and `server_tables`: nothing is wrapped.
+    #[test]
+    fn an_inline_server_is_wrapped_and_counted() {
+        for text in [
+            "[mcp_servers]\nicm = { command = \"icm\", args = [\"serve\"] }\n",
+            "mcp_servers = { icm = { command = \"icm\", args = [\"serve\"] } }\n",
+        ] {
+            let mut doc: DocumentMut = text.parse().unwrap();
+            assert_eq!(
+                wrap_toml(&mut doc, "/abs/innerwarden", false, "codex"),
+                1,
+                "{text}"
+            );
+            let wrapped = doc.to_string();
+            assert!(wrapped.contains("icm = {"), "stays inline: {wrapped}");
+            assert!(wrapped.contains("\"proxy\""), "{wrapped}");
+            assert!(is_guarded_toml(&doc), "{wrapped}");
+            assert_eq!(guarded_mode_toml(&doc), Some(WiringMode::Enforce));
+            assert_eq!(wrap_toml(&mut doc, "/abs/innerwarden", false, "codex"), 0);
+            let entries = server_entries_toml(&doc);
+            assert!(entries[0].wrapper.is_some(), "{entries:?}");
+            assert_eq!(unwrap_toml(&mut doc), 1);
+            let back: DocumentMut = doc.to_string().parse().unwrap();
+            assert!(!is_guarded_toml(&back), "{back}");
+            assert!(back.to_string().contains("command = \"icm\""), "{back}");
+        }
+    }
 
     /// The same servers, written as Codex's TOML and as a JSON client's
     /// `mcpServers`, count the same before and after a wrap. FAILS ON REVERT
