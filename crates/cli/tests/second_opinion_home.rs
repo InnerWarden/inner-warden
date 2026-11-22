@@ -389,7 +389,8 @@ fn an_override_never_sends_the_accounts_key_or_another_secret_in_its_home() {
 /// to a file elsewhere is not the key the person stored there, and a key
 /// named in another folder is not read: none is sent.
 ///
-/// FAILS ON REVERT of refusing a linked key file.
+/// FAILS ON REVERT of refusing a linked key file: of `O_NOFOLLOW` alone,
+/// and of the one-name check alone.
 #[test]
 fn a_key_file_linked_into_the_folder_is_never_sent() {
     let listener = Listener::start();
@@ -397,6 +398,10 @@ fn a_key_file_linked_into_the_folder_is_never_sent() {
     let account = scratch.path().join("account");
     let secret = scratch.path().join("private.key");
     write_secret(&secret, KEY_IN_FILE);
+    // The symbolic link names a file of one name, so its refusal is its own
+    // and not the hard link's (a target with two names is refused anyway).
+    let linked = scratch.path().join("linked.key");
+    write_secret(&linked, KEY_IN_FILE);
     let absent_notify = scratch.path().join("absent-notify.toml");
 
     let other = scratch.path().join("other");
@@ -415,7 +420,7 @@ fn a_key_file_linked_into_the_folder_is_never_sent() {
         );
         if !folder.join("hard-key").exists() {
             std::fs::hard_link(&secret, folder.join("hard-key")).unwrap();
-            std::os::unix::fs::symlink(&secret, folder.join("soft-key")).unwrap();
+            std::os::unix::fs::symlink(&linked, folder.join("soft-key")).unwrap();
         }
         check(
             scratch.path(),
