@@ -316,3 +316,23 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   main 7f125ba with the differential judge (37127 lines, an empty home and
   a home with keys): dx-126 and its ten wrapper and body variants move from
   review to deny; no other line of any corpus moved.
+- 2026-11-22: new corpus cursor-exec-2026-11, read by the differential
+  check; reference.tsv unchanged. cursor-exec-2026-11/ce-01,
+  cursor-exec-2026-11/ce-02 and cursor-exec-2026-11/ce-03 (`must_refuse`)
+  start the Cursor CLI by the entry file its launcher hands its own `node`
+  with `HOME` moved: allow on main, deny now, and their 33 generated
+  variants the same. cursor-exec-2026-11/ce-04 and
+  cursor-exec-2026-11/ce-05 (`must_refuse`) run a download a command
+  printed into an `exec` file: deny on main and now. harmless-proven:
+  cursor-exec-2026-11/ce-c04, cursor-exec-2026-11/ce-c05,
+  cursor-exec-2026-11/ce-c06 go from review to allow. Each runs a file
+  `exec > r.sh` sent the output of one `echo hello` into, while that
+  `echo` sent its own output to `log.txt` (`&>`, `>`, `>> ... 2>&1`):
+  the file holds nothing. Main held them because the reading that steps
+  over launchers took `exec > r.sh` for `exec` in front of a command and
+  read `> r.sh` as a write it cannot see. Measured on this branch beside
+  them, still refused: ce-04, ce-05 and the existing
+  `only_a_redirect_of_the_standard_output_moves_it_out_of_an_exec_file`
+  lines (`>&1`, `1>&1`, `>/dev/stdout` keep the output in the file).
+  No other line of any corpus moved, from an empty home or a home with
+  keys.

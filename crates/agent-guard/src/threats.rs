@@ -820,6 +820,25 @@ const HOOKED_AGENT_PACKAGES: &[(&str, &str)] = &[
     ("@anthropic-ai/claude-code", "claude"),
 ];
 
+/// The folders an agent CLI of [`HOOKED_AGENT_PROGRAMS`] installs its own
+/// runtime into, with the program each one is: an entry file under one of
+/// them, run by `node` (or `bun`, `deno`), is that agent started. The
+/// Cursor CLI's launcher (`~/.local/share/cursor-agent/versions/<version>/
+/// cursor-agent`, a bash script) runs the `node` in its own folder on the
+/// `index.js` beside it (read in the package of version 2026.11.22-e9042b2
+/// on 2026-11-22), so `HOME=/tmp/h <folder>/node <folder>/index.js` starts
+/// it with its user hooks (`homedir()/.cursor/hooks.json`) moved away.
+const HOOKED_AGENT_INSTALL_FOLDERS: &[(&str, &str)] = &[("cursor-agent/versions/", "cursor-agent")];
+
+/// The agent of [`HOOKED_AGENT_INSTALL_FOLDERS`] whose folder holds the
+/// file `lower` (lowercase) names, as `node` is handed it.
+fn agent_install_folder(lower: &str) -> Option<&'static str> {
+    let lower = lower.replace('\\', "/");
+    HOOKED_AGENT_INSTALL_FOLDERS
+        .iter()
+        .find_map(|(folder, agent)| lower.contains(folder).then_some(*agent))
+}
+
 /// The events of the user's Claude Code hooks the guard's own hook sits
 /// under: the screening before a tool runs, and the record after it.
 const GUARD_HOOK_EVENTS: &[&str] = &["PreToolUse", "PostToolUse"];
@@ -2301,7 +2320,8 @@ fn runuser_command_start(arguments: &[String]) -> Option<usize> {
 /// own arguments begin: the program by name ([`program_name`]), Claude
 /// Code's versioned file (`.../claude/versions/2.1.323`), one of
 /// [`HOOKED_AGENT_PACKAGES`] as `npx` and its kin name it, and `node` (or
-/// `bun`, `deno`) handed that package's entry file.
+/// `bun`, `deno`) handed that package's entry file or an entry file in one
+/// of [`HOOKED_AGENT_INSTALL_FOLDERS`].
 fn hooked_agent_at(words: &[String], at: usize) -> Option<(&'static str, usize)> {
     let word = &words[at];
     let name = program_name(word);
@@ -2335,12 +2355,14 @@ fn hooked_agent_at(words: &[String], at: usize) -> Option<(&'static str, usize)>
         let file = words[script].to_ascii_lowercase();
         // `deno run npm:@anthropic-ai/claude-code`: the package by name.
         let file = file.strip_prefix("npm:").unwrap_or(&file);
-        let agent = agent_package(file).or_else(|| {
-            HOOKED_AGENT_PACKAGES.iter().find_map(|(package, agent)| {
-                let inside = file.contains(&format!("{package}/")) || file.ends_with(package);
-                inside.then_some(*agent)
+        let agent = agent_package(file)
+            .or_else(|| {
+                HOOKED_AGENT_PACKAGES.iter().find_map(|(package, agent)| {
+                    let inside = file.contains(&format!("{package}/")) || file.ends_with(package);
+                    inside.then_some(*agent)
+                })
             })
-        })?;
+            .or_else(|| agent_install_folder(file))?;
         return Some((agent, script + 1));
     }
     None
@@ -2371,6 +2393,7 @@ fn node_script_index(words: &[String], at: usize) -> Option<usize> {
             || HOOKED_AGENT_PACKAGES
                 .iter()
                 .any(|(package, _)| lower.contains(&format!("{package}/")))
+            || agent_install_folder(lower).is_some()
     };
     let mut first = None;
     let mut after_option = false;

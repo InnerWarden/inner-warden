@@ -4640,6 +4640,31 @@ const GUARD_PROGRAM_DIRS: &[&str] = &[
     "~/.cargo/bin/",
 ];
 
+/// The values a line may set in front of `innerwarden check` and still have
+/// its line read as data ([`guard_check_without_its_line`]): the home it
+/// reads its own files from, and its colours.
+const CHECK_HARMLESS_VALUES: &[&str] = &["HOME", "NO_COLOR"];
+
+/// Whether `path` is, from the root, a file named `innerwarden` that is
+/// the very file of the program judging the line: the hook or the proxy
+/// that runs this code, reached by another path (a build folder, a link, a
+/// home written out). A file of the same name anywhere else may be
+/// anything and is not the guard. The file is compared as the system
+/// resolves both paths, links followed.
+fn is_the_running_guard(path: &str) -> bool {
+    static RUNNING: std::sync::LazyLock<Option<std::path::PathBuf>> =
+        std::sync::LazyLock::new(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| std::fs::canonicalize(exe).ok())
+        });
+    path.starts_with('/')
+        && path.ends_with("/innerwarden")
+        && RUNNING.as_ref().is_some_and(|running| {
+            std::fs::canonicalize(path).is_ok_and(|resolved| &resolved == running)
+        })
+}
+
 /// `innerwarden check [options] '<line>'` (or `iw check`): the guard asked
 /// for its verdict on a line, which it reads and never runs. The line is
 /// data, so a dangerous one (`systemctl stop innerwarden-agent`) is not
@@ -4650,8 +4675,11 @@ const GUARD_PROGRAM_DIRS: &[&str] = &[
 /// pipe, no redirection to a file, no input from the line or a file, no
 /// substitution anywhere, every word handed over as written (quoted or
 /// not, nothing the shell expands), the program the guard's by its bare
-/// name or its path in a folder it is installed in, and the first word
-/// after it `check`. A program merely named `innerwarden` somewhere else
+/// name, its path in a folder it is installed in, or a path from the root
+/// to the very file of the program judging the line
+/// ([`is_the_running_guard`]), at most `HOME` or `NO_COLOR` set in front
+/// of it ([`CHECK_HARMLESS_VALUES`], then only by a path from the root),
+/// and the first word after it `check`. A program merely named `innerwarden` somewhere else
 /// (`./innerwarden`, `/tmp/x/innerwarden`) may be anything and is judged
 /// with its words; the guard's other commands run for real and are judged
 /// as they were.
@@ -4673,9 +4701,6 @@ fn guard_check_without_its_line(command: &str) -> Option<String> {
     {
         return None;
     }
-    let [program, subcommand, rest @ ..] = only.words.as_slice() else {
-        return None;
-    };
     if !only
         .words
         .iter()
@@ -4683,12 +4708,42 @@ fn guard_check_without_its_line(command: &str) -> Option<String> {
     {
         return None;
     }
+    // Values set in front of it, only the ones that change no program the
+    // line runs and nothing `check` does but where it reads its own files
+    // from (`HOME=/x`) or its colours.
+    let set_before = only
+        .words
+        .iter()
+        .take_while(|word| {
+            word.text
+                .split_once('=')
+                .is_some_and(|(name, _)| crate::threats::is_shell_name(name))
+        })
+        .count();
+    if !only.words[..set_before].iter().all(|word| {
+        word.text
+            .split_once('=')
+            .is_some_and(|(name, _)| CHECK_HARMLESS_VALUES.contains(&name))
+    }) {
+        return None;
+    }
+    let [program, subcommand, rest @ ..] = &only.words[set_before..] else {
+        return None;
+    };
     let path = program.text.as_str();
-    let guard = matches!(path, "innerwarden" | "iw")
-        || path.strip_suffix("innerwarden").is_some_and(|dir| {
-            GUARD_PROGRAM_DIRS.contains(&dir)
-                && (!dir.starts_with('~') || program.open_tildes == [0])
-        });
+    // With a value set in front, only a path the shell does not look up or
+    // expand with it: one from the root.
+    let installed = if set_before == 0 {
+        matches!(path, "innerwarden" | "iw")
+            || path.strip_suffix("innerwarden").is_some_and(|dir| {
+                GUARD_PROGRAM_DIRS.contains(&dir)
+                    && (!dir.starts_with('~') || program.open_tildes == [0])
+            })
+    } else {
+        path.strip_suffix("innerwarden")
+            .is_some_and(|dir| dir.starts_with('/') && GUARD_PROGRAM_DIRS.contains(&dir))
+    };
+    let guard = installed || is_the_running_guard(path);
     if !guard || subcommand.text != "check" {
         return None;
     }
@@ -4703,7 +4758,10 @@ fn guard_check_without_its_line(command: &str) -> Option<String> {
         return None;
     }
     Some(
-        std::iter::once(path)
+        only.words[..set_before]
+            .iter()
+            .map(|word| word.text.as_str())
+            .chain(std::iter::once(path))
             .chain(std::iter::once("check"))
             .chain(options)
             .collect::<Vec<_>>()

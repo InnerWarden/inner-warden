@@ -88,8 +88,9 @@ fn list_tools_through_proxy(mode: ProxyMode) -> (String, Vec<ProxyDecision>) {
     let collected = Arc::clone(&out);
     let seen = Arc::clone(&events);
     rt.block_on(async move {
-        let client_in = std::io::Cursor::new(input.into_bytes());
-        let writer = TestWriter(Arc::clone(&collected));
+        let woken = Arc::new(Mutex::new(None));
+        let client_in = ClientInput::new(input.into_bytes(), Arc::clone(&collected), &woken, 1);
+        let writer = TestWriter(Arc::clone(&collected), woken);
         let cfg = ProxyConfig {
             server_cmd: vec![
                 "python3".to_string(),
@@ -101,8 +102,11 @@ fn list_tools_through_proxy(mode: ProxyMode) -> (String, Vec<ProxyDecision>) {
             mode,
             as_protocol_error: false,
         };
+        // A bound for a proxy that never answers, not the wait itself: the
+        // client's input stays open until the answers are in
+        // ([`ClientInput`]).
         let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(120),
             run_proxy_with_io(client_in, writer, cfg, None, move |d| {
                 seen.lock().expect("lock").push(d.clone());
             }),
@@ -218,8 +222,9 @@ fn through_proxy(mode: ProxyMode, answers: serde_json::Value) -> (String, Vec<Pr
     let collected = Arc::clone(&out);
     let seen = Arc::clone(&events);
     rt.block_on(async move {
-        let client_in = std::io::Cursor::new(input.into_bytes());
-        let writer = TestWriter(Arc::clone(&collected));
+        let woken = Arc::new(Mutex::new(None));
+        let client_in = ClientInput::new(input.into_bytes(), Arc::clone(&collected), &woken, 2);
+        let writer = TestWriter(Arc::clone(&collected), woken);
         let cfg = ProxyConfig {
             server_cmd: vec![
                 "python3".to_string(),
@@ -231,8 +236,11 @@ fn through_proxy(mode: ProxyMode, answers: serde_json::Value) -> (String, Vec<Pr
             mode,
             as_protocol_error: false,
         };
+        // A bound for a proxy that never answers, not the wait itself: the
+        // client's input stays open until the answers are in
+        // ([`ClientInput`]).
         let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(20),
+            std::time::Duration::from_secs(120),
             run_proxy_with_io(client_in, writer, cfg, None, move |d| {
                 seen.lock().expect("lock").push(d.clone());
             }),
@@ -353,8 +361,79 @@ fn an_order_outside_a_description_key_or_split_in_two_is_withheld() {
     assert!(raised(&events, RULE), "{events:?}");
 }
 
-/// Minimal `AsyncWrite` that accumulates into a shared buffer.
-struct TestWriter(Arc<Mutex<Vec<u8>>>);
+/// Who waits for the client's next answer: the reader of [`ClientInput`].
+type Woken = Arc<Mutex<Option<std::task::Waker>>>;
+
+/// The client's end of the session: the requests, then an input that stays
+/// open until the proxy has written `answers` lines back, then its end.
+///
+/// The proxy relays the server's last output for a fixed window after the
+/// client closes its input (`DRAIN_AFTER_CLIENT_LEFT`, 3 s). A client that
+/// closed at once, as an in-memory cursor does, left the Python server that
+/// window to start and answer: on a loaded machine it did not, and the
+/// client received nothing (found 2026-11-22 with a build running beside
+/// the tests). Closing after the answers makes the test wait for the work,
+/// however long it takes, and never for a clock.
+struct ClientInput {
+    requests: Vec<u8>,
+    sent: usize,
+    received: Arc<Mutex<Vec<u8>>>,
+    woken: Woken,
+    answers: usize,
+}
+
+impl ClientInput {
+    fn new(
+        requests: Vec<u8>,
+        received: Arc<Mutex<Vec<u8>>>,
+        woken: &Woken,
+        answers: usize,
+    ) -> Self {
+        ClientInput {
+            requests,
+            sent: 0,
+            received,
+            woken: Arc::clone(woken),
+            answers,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for ClientInput {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.sent < self.requests.len() {
+            let take = buf.remaining().min(self.requests.len() - self.sent);
+            let from = self.sent;
+            buf.put_slice(&self.requests[from..from + take]);
+            self.sent += take;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        // Registered before the count, so an answer written in between
+        // wakes this read.
+        *self.woken.lock().expect("lock") = Some(cx.waker().clone());
+        let lines = self
+            .received
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|byte| **byte == b'\n')
+            .count();
+        if lines >= self.answers {
+            // Nothing put in `buf`: the end of the client's input.
+            std::task::Poll::Ready(Ok(()))
+        } else {
+            std::task::Poll::Pending
+        }
+    }
+}
+
+/// Minimal `AsyncWrite` that accumulates into a shared buffer and wakes
+/// the client's input, which waits for the answers ([`ClientInput`]).
+struct TestWriter(Arc<Mutex<Vec<u8>>>, Woken);
 
 impl tokio::io::AsyncWrite for TestWriter {
     fn poll_write(
@@ -363,6 +442,9 @@ impl tokio::io::AsyncWrite for TestWriter {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         self.0.lock().expect("lock").extend_from_slice(buf);
+        if let Some(waker) = self.1.lock().expect("lock").take() {
+            waker.wake();
+        }
         std::task::Poll::Ready(Ok(buf.len()))
     }
     fn poll_flush(

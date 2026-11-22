@@ -50,6 +50,18 @@ The summary of an MCP call's arguments the record keeps now masks Google
 OAuth (`ya29.`), Notion (`ntn_`) and Sentry (`sntryu_`, `sntrys_`) tokens
 and any opaque run of 32 or more letters and digits.
 
+The Cursor CLI started by the entry file its launcher hands its own `node`
+(`~/.local/share/cursor-agent/versions/<version>/node .../index.js`) with
+`HOME` moved, so its user hooks are not read, is refused as `cursor-agent`
+started that way already was. A command between `exec > file` and the run
+of that file that sends its own output elsewhere (`echo hi &> log`) no
+longer leaves the file held for review as unread. `innerwarden check` run
+by a path to the very file of the running guard (a build folder, a link),
+or from an installed folder with `HOME` or `NO_COLOR` set in front, reads
+its line as data; a file of the same name anywhere else is still judged
+with its words. A test of the MCP proxy that failed on a loaded machine
+now waits for the server's answers instead of a clock.
+
 `innerwarden setup` and the new `innerwarden status --config` say what is
 already set in the agents' own config, and change nothing. In
 `~/.claude/settings.json`, `~/.claude.json`, `~/.cursor/mcp.json`,

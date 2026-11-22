@@ -152,6 +152,17 @@ pub(crate) fn launchers_read_through(line: &str) -> Option<String> {
         if command <= keywords {
             continue;
         }
+        // A launcher followed by a redirection runs no command: `exec >
+        // r.sh` moves the output of the commands after it, and the same
+        // words without `exec` (`> r.sh`) only empty the file. Measured
+        // 2026-11-22: `exec > r.sh; echo hi > log; exec > /dev/tty; sh
+        // r.sh` was held for review through that reading.
+        if tokens
+            .get(command)
+            .is_some_and(|word| is_redirection_word(word))
+        {
+            continue;
+        }
         // Walk the words as written up to the command the launchers run.
         let bytes = segment.as_bytes();
         let mut at = 0;
@@ -203,6 +214,15 @@ pub(crate) fn launchers_read_through(line: &str) -> Option<String> {
 /// Where word `index` of `segment` starts, the words split at blanks as
 /// written. `None` when a word before it holds a quote or an escape, so
 /// the blanks do not tell where the words are.
+/// Whether a word of a command is a redirection, not the program a launcher
+/// runs: `>`, `>>`, `<`, `&>`, a descriptor before one (`2>`, `1>&2`),
+/// or the same glued to its target (`>r.sh`).
+fn is_redirection_word(word: &str) -> bool {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.strip_prefix('&').unwrap_or(rest);
+    rest.starts_with(['>', '<'])
+}
+
 fn word_start(segment: &str, index: usize) -> Option<usize> {
     let bytes = segment.as_bytes();
     let mut at = 0;
