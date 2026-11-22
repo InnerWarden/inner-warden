@@ -89,6 +89,22 @@ static ANSWER: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(
 type Deferred = Box<dyn FnOnce() + Send>;
 static AFTER_ANSWER: std::sync::Mutex<Vec<Deferred>> = std::sync::Mutex::new(Vec::new());
 
+/// Work kept by [`after_answer_last`]: run after all of [`AFTER_ANSWER`].
+static AFTER_ANSWER_LAST: std::sync::Mutex<Vec<Deferred>> = std::sync::Mutex::new(Vec::new());
+
+/// The most [`allow_wait`] adds in one run, all waits together: one answer
+/// of a model ([`crate::second_opinion_io::LLM_ANSWER_BOUND`]). Each line of
+/// a call asked its own and added 20 s, so with two lines the limit on the
+/// clock (65 s) passed the 50 s Claude Code waits for its hook.
+pub const MAX_ALLOWED_WAIT: Duration = crate::second_opinion_io::LLM_ANSWER_BOUND;
+const _: () = assert!(
+    WALL_CAP.as_millis() + MAX_ALLOWED_WAIT.as_millis()
+        <= (innerwarden_agent_guard::hook::HOOK_LONGEST_SECS as u128) * 1000
+);
+
+/// Milliseconds [`allow_wait`] has added in this run.
+static ALLOWED_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Set for a run on the person's prompt: every end is 0 and silent.
 static QUIET: AtomicBool = AtomicBool::new(false);
 
@@ -226,12 +242,51 @@ pub fn after_answer(work: impl FnOnce() + Send + 'static) {
 /// fault or a panic, the hook ends with `code` and not with a refusal.
 pub fn answered(code: u8) {
     ANSWER.store(u16::from(code), Ordering::SeqCst);
-    let kept = AFTER_ANSWER
-        .lock()
-        .map(|mut queue| std::mem::take(&mut *queue))
-        .unwrap_or_default();
+    let take = |queue: &std::sync::Mutex<Vec<Deferred>>| {
+        queue
+            .lock()
+            .map(|mut queue| std::mem::take(&mut *queue))
+            .unwrap_or_default()
+    };
+    let kept: Vec<Deferred> = take(&AFTER_ANSWER)
+        .into_iter()
+        .chain(take(&AFTER_ANSWER_LAST))
+        .collect();
+    if kept.is_empty() {
+        return;
+    }
+    // A mark beside the record while the work runs (`record_pending`): an
+    // end at the limit on the clock leaves it, and the next hook or the
+    // status says the record was cut. Marks an earlier hook left are swept
+    // first.
+    let graph = crate::graph_io::graph_path();
+    if let Some(graph) = &graph {
+        crate::record_pending::sweep(graph);
+        let _ = PENDING_GRAPH.set(graph.clone());
+    }
+    let mark = graph.as_deref().and_then(crate::record_pending::begin);
     for work in kept {
         work();
+    }
+    if let Some(mark) = mark {
+        crate::record_pending::finish(&mark);
+    }
+}
+
+/// The record the work after the answer writes: what an end at the limit
+/// on the clock cleans the temporaries of ([`watch`]).
+static PENDING_GRAPH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// [`after_answer`] for work that must come after every other kept work:
+/// bringing the wiring up to date, which decides nothing about this call
+/// and must not hold back its record and alert.
+pub fn after_answer_last(work: impl FnOnce() + Send + 'static) {
+    if ARMED.get().is_none() || answer().is_some() {
+        return work();
+    }
+    match AFTER_ANSWER_LAST.lock() {
+        Ok(mut queue) => queue.push(Box::new(work)),
+        Err(_) => work(),
     }
 }
 
@@ -337,12 +392,30 @@ pub fn json_answer() -> Option<&'static str> {
 /// The hook is about to make a wait it bounds itself by `bound`: move the
 /// deadline and the limit on the clock by as much. Nothing to move when no
 /// deadline is armed (the same code runs under `innerwarden check`).
-pub fn allow_wait(bound: Duration) {
+///
+/// All waits of a run together move them by at most [`MAX_ALLOWED_WAIT`].
+/// `false` when this wait would go past it: the caller then does not make
+/// the wait (a second opinion keeps its review), since the deadline would
+/// refuse the call while it waited.
+pub fn allow_wait(bound: Duration) -> bool {
+    if DEADLINE_MS.load(Ordering::SeqCst) == 0 {
+        return true;
+    }
+    let granted = ALLOWED_MS
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |added| {
+            let after = added.saturating_add(millis(bound));
+            (after <= millis(MAX_ALLOWED_WAIT)).then_some(after)
+        })
+        .is_ok();
+    if !granted {
+        return false;
+    }
     for limit in [&DEADLINE_MS, &WALL_MS] {
         let _ = limit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |armed| {
             (armed != 0).then(|| armed.saturating_add(millis(bound)))
         });
     }
+    true
 }
 
 /// How long the screening thread has waited, ready to run, for a CPU since
@@ -441,7 +514,12 @@ fn watch(armed: Instant, queue: &RunQueue) -> ! {
                     end("", 0)
                 } else if let Some(code) = answer {
                     // Answered already, on stdout too in JSON mode: only the
-                    // exit is left, with the answer's own code.
+                    // exit is left, with the answer's own code. The writer's
+                    // temporaries go; the mark stays, for the next hook or
+                    // the status to say the record was cut.
+                    if let Some(graph) = PENDING_GRAPH.get() {
+                        crate::record_pending::clean_own_temporaries(graph);
+                    }
                     end(AFTER_ANSWER_LATE, code)
                 } else if let Some(answer) = json_answer() {
                     let said = if MONITOR.load(Ordering::SeqCst) {
@@ -699,6 +777,43 @@ mod tests {
                     std::hint::black_box(0u8);
                 }
             }
+            "order" => {
+                // The record of this child goes where its parent said
+                // (`child_in`), a folder of its own.
+                let dir = crate::graph_io::graph_path()
+                    .and_then(|graph| graph.parent().map(std::path::Path::to_path_buf))
+                    .expect("a record folder");
+                arm_with(monitor, DEADLINE).expect("arm");
+                after_answer_last(|| eprintln!("ran=rewire"));
+                after_answer(|| eprintln!("ran=record"));
+                after_answer(|| eprintln!("ran=alert"));
+                answered(0);
+                let marks = std::fs::read_dir(&dir)
+                    .map(|entries| {
+                        entries
+                            .flatten()
+                            .filter(|e| {
+                                e.file_name()
+                                    .to_string_lossy()
+                                    .starts_with(".hook-pending.")
+                            })
+                            .count()
+                    })
+                    .unwrap_or(0);
+                eprintln!("marks_left={marks}");
+                std::process::exit(0)
+            }
+            "two-waits" => {
+                arm_with(monitor, Duration::from_millis(200)).expect("arm");
+                let first = allow_wait(crate::second_opinion_io::LLM_ANSWER_BOUND);
+                let second = allow_wait(crate::second_opinion_io::LLM_ANSWER_BOUND);
+                let small = allow_wait(Duration::from_millis(1));
+                eprintln!(
+                    "granted={first},{second},{small} wall_ms={}",
+                    WALL_MS.load(Ordering::SeqCst)
+                );
+                std::process::exit(0)
+            }
             other => panic!("{test}: unknown end {other}"),
         }
     }
@@ -750,8 +865,29 @@ mod tests {
     /// Run this test again as a child told to end one way; its exit code,
     /// what it said, and how long it took.
     fn child(test: &str, asked: &str) -> (Option<i32>, String, Duration) {
+        child_with(test, asked, None)
+    }
+
+    /// [`child`] with its record at `graph`.
+    fn child_in(
+        test: &str,
+        asked: &str,
+        graph: &std::path::Path,
+    ) -> (Option<i32>, String, Duration) {
+        child_with(test, asked, Some(graph))
+    }
+
+    fn child_with(
+        test: &str,
+        asked: &str,
+        graph: Option<&std::path::Path>,
+    ) -> (Option<i32>, String, Duration) {
         let started = Instant::now();
-        let mut child = Command::new(std::env::current_exe().expect("test binary"))
+        let mut command = Command::new(std::env::current_exe().expect("test binary"));
+        if let Some(graph) = graph {
+            command.env("IW_GRAPH_FILE", graph);
+        }
+        let mut child = command
             .args([
                 "--exact",
                 &format!("hook_net::tests::{test}"),
@@ -979,6 +1115,48 @@ mod tests {
     ///
     /// FAILS ON REVERT: with `allow_wait` doing nothing the child ends at
     /// its 200 ms and not after the 3 s it was allowed.
+    /// Review of the hook deadline change, item d: the work kept for after
+    /// the answer runs the record and the alert first, in the order they
+    /// were kept, and bringing the wiring up to date last, though it was
+    /// kept first; the mark beside the record is gone once all of it ran.
+    ///
+    /// FAILS ON REVERT of `after_answer_last` (the rewire kept in the same
+    /// queue, first) and of taking the mark away (`record_pending::finish`).
+    #[test]
+    fn the_rewire_runs_after_the_record_and_the_alert() {
+        const TEST: &str = "the_rewire_runs_after_the_record_and_the_alert";
+        act_as_child(TEST);
+        let dir = tempfile::tempdir().expect("folder");
+        let (code, said, _) = child_in(TEST, "enforce:order", &dir.path().join("graph.json"));
+        assert_eq!(code, Some(0), "{said}");
+        let ran: Vec<&str> = said
+            .lines()
+            .filter_map(|line| line.strip_prefix("ran="))
+            .collect();
+        assert_eq!(ran, ["record", "alert", "rewire"], "{said}");
+        assert!(said.contains("marks_left=0"), "{said}");
+    }
+
+    /// Review of the hook deadline change, item h: the waits of one run
+    /// move the limits by one model's answer in all. A second line asking
+    /// for another is refused (and keeps its review), so the limit on the
+    /// clock stays under the 50 s Claude Code waits.
+    ///
+    /// FAILS ON REVERT of `MAX_ALLOWED_WAIT` in `allow_wait`: the second wait
+    /// is granted and the limit on the clock is 40 s past the deadline.
+    #[test]
+    fn the_waits_of_one_run_move_the_limits_by_one_answer_in_all() {
+        const TEST: &str = "the_waits_of_one_run_move_the_limits_by_one_answer_in_all";
+        act_as_child(TEST);
+        let (code, said, _) = child(TEST, "enforce:two-waits");
+        assert_eq!(code, Some(0), "{said}");
+        let expected = 200 + millis(crate::second_opinion_io::LLM_ANSWER_BOUND);
+        assert!(
+            said.contains(&format!("granted=true,false,false wall_ms={expected}")),
+            "{said}"
+        );
+    }
+
     #[test]
     fn a_wait_the_hook_bounds_moves_the_deadline_by_its_bound() {
         const TEST: &str = "a_wait_the_hook_bounds_moves_the_deadline_by_its_bound";

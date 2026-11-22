@@ -81,8 +81,12 @@ fn call_llm(cfg: &LlmConfig, command: &str) -> Option<Value> {
     // model; the redacted form keeps the dangerous SHAPE, so the verdict is unaffected.
     let command = innerwarden_agent_guard::redact::redact_secrets(command).text;
     let body = build_body(&cfg.model, &command);
-    // The hook's deadline does not count a wait this call bounds itself.
-    crate::hook_net::allow_wait(LLM_ANSWER_BOUND);
+    // The hook's deadline does not count a wait this call bounds itself, up
+    // to one such wait a run: past it the call keeps its review rather than
+    // be refused by the deadline while it waits.
+    if !crate::hook_net::allow_wait(LLM_ANSWER_BOUND) {
+        return None;
+    }
     let mut req = crate::http_io::agent_with_timeout(LLM_ANSWER_BOUND)
         .post(&cfg.url)
         .header("Content-Type", "application/json");
