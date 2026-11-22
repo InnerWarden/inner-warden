@@ -26,7 +26,7 @@ const MARK_PREFIX: &str = ".hook-pending.";
 
 /// A mark older than this is stale whatever its process: a hook ends at
 /// [`crate::hook_net::WALL_CAP`], plus the waits it may add
-/// ([`crate::hook_net::allow_wait`], at most
+/// ([`crate::hook_net::grant_wait`], at most
 /// [`crate::hook_net::MAX_ALLOWED_WAIT`]), and a pid can be reused.
 pub fn stale_after() -> Duration {
     crate::hook_net::WALL_CAP + crate::hook_net::MAX_ALLOWED_WAIT + Duration::from_secs(30)
@@ -175,19 +175,32 @@ fn is_stale(
 /// What a mark holds, read without following a link: the second it was
 /// made, if it says one, and the file's own time. `None` for what is not
 /// a regular file (a link or a folder planted at the name), which is no
-/// mark of a hook's.
+/// mark of a hook's. A mark this account cannot open (another account's,
+/// mode 0600, in a shared records folder) says no second, and its time is
+/// read off its entry: it still turns stale by age or a hook that is gone,
+/// where it was never stale before.
 fn read_mark(path: &Path) -> Option<(Option<u64>, Option<u64>)> {
     use std::io::Read;
-    let file = innerwarden_safe_io::open_no_follow(path).ok()?;
+    let unix = |at: std::time::SystemTime| {
+        at.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs())
+    };
+    let file = match innerwarden_safe_io::open_no_follow(path) {
+        Ok(file) => file,
+        Err(_) => {
+            let entry = std::fs::symlink_metadata(path).ok()?;
+            if !entry.file_type().is_file() {
+                return None;
+            }
+            return Some((None, entry.modified().ok().and_then(unix)));
+        }
+    };
     let metadata = file.metadata().ok()?;
     if !innerwarden_safe_io::is_regular_file(&metadata) {
         return None;
     }
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_secs());
+    let modified = metadata.modified().ok().and_then(unix);
     let mut text = String::new();
     let made = file
         .take(32)
@@ -237,19 +250,34 @@ pub fn sweep(graph: &Path) -> u64 {
 /// [`sweep`] with the alert given: the tests hear it instead of the
 /// channels of whoever runs them.
 fn sweep_with(graph: &Path, alert: impl FnOnce(&str)) -> u64 {
+    sweep_removing(graph, alert, |mark| std::fs::remove_file(mark).is_ok())
+}
+
+/// [`sweep_with`] with the removal of a mark given: the tests hear a mark
+/// that cannot be removed (another account's, in a sticky folder) without
+/// a second account.
+fn sweep_removing(
+    graph: &Path,
+    alert: impl FnOnce(&str),
+    remove_mark: impl Fn(&Path) -> bool,
+) -> u64 {
     let stale = stale_marks(graph, now_unix());
     let mut lost = 0u64;
     for (mark, pid) in &stale {
+        // The mark first: two sweeps at once count it once, by whoever took
+        // it away, and its writer's temporaries go only with it. A mark this
+        // account can never remove stays stale, and removing the
+        // temporaries anyway took, at every sweep, those of a live process
+        // that came to have the same pid.
+        if !remove_mark(mark) {
+            continue;
+        }
+        lost += 1;
         for temp in temporaries_of(graph, *pid) {
             let _ = std::fs::remove_file(temp);
         }
         if let Some(dir) = graph.parent() {
             let _ = std::fs::remove_file(dir.join(format!("{MARK_PREFIX}{pid}{TEMP_SUFFIX}")));
-        }
-        // Removed first: two sweeps at once count a mark once, by whoever
-        // took it away.
-        if std::fs::remove_file(mark).is_ok() {
-            lost += 1;
         }
     }
     if lost == 0 {
@@ -276,6 +304,37 @@ fn sweep_with(graph: &Path, alert: impl FnOnce(&str)) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of #414, item 7b: a mark this account cannot open (EACCES)
+    /// is read off its entry, so with its hook gone it is stale and swept.
+    ///
+    /// FAILS ON REVERT: `read_mark` answering `None` when the open fails
+    /// (the mark is never stale, its hook's lost record never said).
+    #[cfg(unix)]
+    #[test]
+    fn a_mark_this_account_cannot_open_still_turns_stale() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.json");
+        // No pid this high runs (Linux caps pids at 2^22).
+        let mark = dir.path().join(format!("{MARK_PREFIX}4194999"));
+        std::fs::write(&mark, "1").unwrap();
+        std::fs::set_permissions(&mark, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&mark).is_ok() {
+            // Root opens it anyway: nothing to see here.
+            return;
+        }
+        let (made, modified) = read_mark(&mark).expect("an unopenable mark is still a mark");
+        assert_eq!(made, None);
+        assert!(modified.is_some());
+        let stale = stale_marks(&graph, now_unix());
+        assert_eq!(stale, vec![(mark.clone(), 4_194_999)]);
+
+        // A link planted at a name it cannot follow is still no mark.
+        let link = dir.path().join(format!("{MARK_PREFIX}4194998"));
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
+        assert_eq!(read_mark(&link), None);
+    }
 
     #[test]
     fn a_mark_is_stale_when_its_hook_is_gone_or_too_old() {
@@ -420,6 +479,36 @@ mod tests {
         std::fs::write(&again, now_unix().to_string()).unwrap();
         assert_eq!(sweep_with(&graph, |_| panic!("one alert per episode")), 1);
         assert_eq!(crate::record_health::report_at(&graph).unwrap().lost, 2);
+    }
+
+    /// Review of #419, minor item: a stale mark that cannot be removed
+    /// (another account's, in a sticky folder) leaves its pid's temporaries
+    /// alone, at every sweep; once it can be removed, they go with it.
+    ///
+    /// FAILS ON REVERT of removing the temporaries only after the mark.
+    #[cfg(unix)]
+    #[test]
+    fn the_temporaries_stay_while_their_mark_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.json");
+        std::fs::write(&graph, "{}").unwrap();
+        let gone = 4_194_304u32 + 31;
+        let mark = dir.path().join(format!("{MARK_PREFIX}{gone}"));
+        std::fs::write(&mark, now_unix().to_string()).unwrap();
+        let temp = dir.path().join(format!(".graph.json.{gone}.0.tmp"));
+        std::fs::write(&temp, "being written").unwrap();
+        let own_temp = dir.path().join(format!("{MARK_PREFIX}{gone}{TEMP_SUFFIX}"));
+        std::fs::write(&own_temp, "").unwrap();
+
+        for _ in 0..2 {
+            let swept = sweep_removing(&graph, |_| panic!("no alert"), |_| false);
+            assert_eq!(swept, 0);
+            assert!(mark.exists() && temp.exists() && own_temp.exists());
+        }
+        assert!(crate::record_health::report_at(&graph).is_none());
+
+        assert_eq!(sweep_with(&graph, |_| {}), 1);
+        assert!(!mark.exists() && !temp.exists() && !own_temp.exists());
     }
 
     /// A mark of this process (its work is running) and a young mark of a
