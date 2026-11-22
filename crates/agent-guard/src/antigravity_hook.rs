@@ -111,12 +111,66 @@ fn include_glob(args: &Value) -> Option<String> {
         .map(|glob| glob.to_string())
 }
 
+/// The edits of a `multi_replace_file_content`, as `MultiEdit`'s `edits`:
+/// each of its `ReplacementChunks` an `old_string` and a `new_string`, so
+/// the text it writes is read as an edit's new text is (an order written
+/// into `AGENTS.md` is refused as the same text in a `replace_file_content`
+/// is). The documentation names the array but not a chunk's fields: a chunk
+/// is read with `replace_file_content`'s `TargetContent` as the old text,
+/// and every string it holds anywhere else, at any depth
+/// (`ReplacementContent` as a string, an array or an object, and any other
+/// field), as its new text; a chunk that is a string or an array is all new
+/// text. No text a chunk carries goes unread.
+fn replacement_edits(args: &Value) -> Vec<Value> {
+    let Some(chunks) = args.get("ReplacementChunks").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    chunks
+        .iter()
+        .filter_map(|chunk| {
+            let mut texts = Vec::new();
+            let old = match chunk {
+                Value::Object(fields) => {
+                    for (key, value) in fields {
+                        if key != "TargetContent" {
+                            string_leaves(value, &mut texts);
+                        }
+                    }
+                    fields
+                        .get("TargetContent")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string()
+                }
+                Value::String(_) | Value::Array(_) => {
+                    string_leaves(chunk, &mut texts);
+                    String::new()
+                }
+                _ => return None,
+            };
+            let new = texts.join("\n");
+            Some(json!({ "old_string": old, "new_string": new }))
+        })
+        .collect()
+}
+
+/// Every string `value` holds, at any depth, in order.
+fn string_leaves<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => out.push(text),
+        Value::Array(items) => items.iter().for_each(|item| string_leaves(item, out)),
+        Value::Object(fields) => fields.values().for_each(|item| string_leaves(item, out)),
+        _ => {}
+    }
+}
+
 /// PURE: read an Antigravity hook payload as the call the guard judges.
 ///
 /// Each documented tool the guard screens becomes Claude Code's call of the
 /// same kind: `run_command` is `Bash` in its `Cwd`, `view_file` is `Read`,
 /// `write_to_file` is `Write`, `replace_file_content` is `Edit`,
-/// `multi_replace_file_content` is `MultiEdit`, `grep_search` is `Grep` and
+/// `multi_replace_file_content` is `MultiEdit` with each chunk an edit
+/// ([`replacement_edits`]), `grep_search` is `Grep` and
 /// `find_by_name` is `Glob`. A tool of [`READ_ONLY_TOOLS`] keeps its own
 /// name and arguments; any other is [`AgyCall::Unknown`]. Tool names are
 /// matched without regard to case. A call with no folder of its own is
@@ -193,7 +247,14 @@ pub fn read(payload: &str) -> AgyCall {
             None => AgyCall::Unreadable("an Antigravity replace_file_content with no TargetFile"),
         },
         "multi_replace_file_content" => match field("TargetFile") {
-            Some(path) => call("MultiEdit", json!({ "file_path": path })),
+            Some(path) => {
+                let mut input = json!({ "file_path": path });
+                let edits = replacement_edits(&args);
+                if !edits.is_empty() {
+                    input["edits"] = Value::Array(edits);
+                }
+                call("MultiEdit", input)
+            }
             None => {
                 AgyCall::Unreadable("an Antigravity multi_replace_file_content with no TargetFile")
             }
@@ -489,6 +550,80 @@ mod tests {
     /// arguments, and `manage_task` (which can send input to a running
     /// command) reads as a call that names no command, which the hook lets
     /// through.
+    /// Each chunk of a `multi_replace_file_content` is an edit of the
+    /// `MultiEdit`, so its new text is read as an edit's is.
+    ///
+    /// FAILS ON REVERT: the chunks were dropped and `MultiEdit` carried only
+    /// the file.
+    #[test]
+    fn each_replacement_chunk_is_an_edit_with_its_new_text() {
+        let input = call(&payload(
+            "multi_replace_file_content",
+            json!({
+                "TargetFile": "/work/app/AGENTS.md",
+                "ReplacementChunks": [
+                    {"TargetContent": "a", "ReplacementContent": "b", "StartLine": 1, "EndLine": 1},
+                    {"TargetContent": "c", "Text": "d"},
+                    "e",
+                    7
+                ]
+            }),
+        ))["tool_input"]
+            .clone();
+        assert_eq!(
+            input,
+            json!({
+                "file_path": "/work/app/AGENTS.md",
+                "edits": [
+                    {"old_string": "a", "new_string": "b"},
+                    {"old_string": "c", "new_string": "d"},
+                    {"old_string": "", "new_string": "e"}
+                ]
+            })
+        );
+    }
+
+    /// A `ReplacementContent` that is an array or an object, and any other
+    /// field, at any depth, is new text; only `TargetContent` is the old.
+    ///
+    /// FAILS ON REVERT: a chunk with a `ReplacementContent` that is not a
+    /// string gave an empty new text, and one with a string dropped the
+    /// strings of every other field.
+    #[test]
+    fn every_string_a_chunk_holds_but_its_target_is_new_text() {
+        let input = call(&payload(
+            "multi_replace_file_content",
+            json!({
+                "TargetFile": "/work/app/AGENTS.md",
+                "ReplacementChunks": [
+                    {"TargetContent": "a", "ReplacementContent": ["b", {"x": "c"}]},
+                    {"TargetContent": "d", "ReplacementContent": {"Text": "e", "More": ["f"]}},
+                    {"TargetContent": "g", "ReplacementContent": "h", "Note": "i"},
+                    ["j", {"k": "l"}]
+                ]
+            }),
+        ))["tool_input"]
+            .clone();
+        // The order of an object's fields is serde's, not the payload's.
+        let edits = input["edits"].as_array().expect("edits");
+        assert_eq!(edits.len(), 4);
+        for (edit, old, new) in [
+            (&edits[0], "a", ["b", "c"]),
+            (&edits[1], "d", ["e", "f"]),
+            (&edits[2], "g", ["h", "i"]),
+            (&edits[3], "", ["j", "l"]),
+        ] {
+            assert_eq!(edit["old_string"], old, "{edit}");
+            let mut lines: Vec<&str> = edit["new_string"]
+                .as_str()
+                .expect("new_string")
+                .lines()
+                .collect();
+            lines.sort_unstable();
+            assert_eq!(lines, new, "{edit}");
+        }
+    }
+
     #[test]
     fn a_tool_the_guard_does_not_read_is_unknown_and_never_a_call() {
         let web = call(&payload(
