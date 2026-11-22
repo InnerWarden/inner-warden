@@ -7200,7 +7200,9 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
                         // (live gate of Active Defence 0.17.4, G1).
                         || sub == "disconnect"
                         || (sub == "connect"
-                            && (rest.contains(&"--monitor") || rest.contains(&"--guard")))
+                            && (rest.contains(&"--monitor")
+                                || rest.contains(&"--guard")
+                                || rest.contains(&"--default")))
                 })
         }
         // `innerwarden contain` rewires the agent's hook (`--setup` too): a
@@ -7218,9 +7220,15 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         // `innerwarden install <agent> --monitor` rewires the agent's hook to
         // record only, as `agents connect --monitor` does (review of 1.6.6,
         // H1). `--guard` moves a strict install to the default posture,
-        // which refuses less (`crate::posture`). Installing in enforce, or
-        // asking for help, lowers nothing.
-        "install" => !asks_for_help && (rest.contains(&"--monitor") || rest.contains(&"--guard")),
+        // which refuses less (`crate::posture`), and `--default`, the name
+        // that posture goes by, is read as `--guard` is. Installing in
+        // enforce, or asking for help, lowers nothing.
+        "install" => {
+            !asks_for_help
+                && (rest.contains(&"--monitor")
+                    || rest.contains(&"--guard")
+                    || rest.contains(&"--default"))
+        }
         // `innerwarden-ctl agent disconnect` and `agent install-hook
         // --remove` take the guard off an agent, and `install-hook
         // --monitor` rewires it to record only (`innerwarden agent ...`
@@ -10085,7 +10093,8 @@ fn schedules_an_at_job(content: &str) -> bool {
                 lower.starts_with(|c: char| c.is_ascii_digit())
                     || matches!(lower.as_str(), "now" | "midnight" | "noon" | "teatime")
             });
-            let job = arguments.iter().any(|word| word.starts_with("-f")) || segment.contains('<');
+            let job =
+                arguments.iter().any(|word| word.starts_with("-f")) || at_job_on_input(segment);
             timed && job
         })
     };
@@ -10094,6 +10103,45 @@ fn schedules_an_at_job(content: &str) -> bool {
     }
     let normalized = normalize_command(content);
     normalized != content && reads(&normalized)
+}
+
+/// Whether `segment` hands `at` a job on its input (`<`, `<<`) that the
+/// line does not show. A here-string written out in quotes (`at now <<<
+/// 'tar czf /tmp/b.tgz ~/work'`) shows its job: the reading of handed lines
+/// reads it and judges it as it judges the same job piped in (`echo '...' |
+/// at now`), a download it runs refused there. Until 2026-11-21 such a job
+/// was refused for its form alone, while the pipe let it through.
+fn at_job_on_input(segment: &str) -> bool {
+    let mut rest = segment;
+    while let Some(at) = rest.find('<') {
+        let Some(body) = rest[at..].strip_prefix("<<<") else {
+            return true;
+        };
+        let body = body.trim_start_matches([' ', '\t']);
+        let Some(shown) = quoted_text_shown(body) else {
+            return true;
+        };
+        rest = &body[shown..];
+    }
+    false
+}
+
+/// The length of the quoted word `text` starts with, when its text is shown
+/// as written: in single quotes, or in double quotes with no `$`, backquote
+/// or backslash. A word with more after its closing quote is not one.
+fn quoted_text_shown(text: &str) -> Option<usize> {
+    let quote = text.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+    let close = text[1..].find(quote)? + 1;
+    let inner = &text[1..close];
+    if quote == '"' && inner.contains(['$', '`', '\\']) {
+        return None;
+    }
+    let after = &text[close + 1..];
+    after
+        .chars()
+        .next()
+        .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|'))
+        .then_some(close + 1)
 }
 
 pub fn check_persistence_install(content: &str) -> Option<(&'static str, u32)> {
@@ -18811,6 +18859,10 @@ fn decoded_file_is_run(lower: &str) -> bool {
             (0..own).any(|index| {
                 let target = match words[index].as_str() {
                     ">" => words.get(index + 1).map(String::as_str),
+                    ">&" => words
+                        .get(index + 1)
+                        .map(String::as_str)
+                        .filter(|next| !is_descriptor_word(next)),
                     "tee" => words[index + 1..own]
                         .iter()
                         .map(String::as_str)
@@ -18837,7 +18889,8 @@ fn decoded_file_is_run(lower: &str) -> bool {
 
 /// The words of `text` as the checks above read them: quotes taken off,
 /// `;`, `&&`, `||`, a background `&` and a new line as `;`, a pipe as
-/// `|`, `&>` as `>`, and a
+/// `|`, `&>` as `>`, `>&` to a file as `>` (`>&2` and `>&-` hand on a
+/// descriptor and are kept as written), and a
 /// redirection split from its file (`>a.sh` is `>` and `a.sh`; `<` too;
 /// `2>` sends no decoded output and is kept as written).
 fn decode_tokens(text: &str) -> Vec<String> {
@@ -18854,6 +18907,17 @@ fn decode_tokens(text: &str) -> Vec<String> {
             (Some(">"), rest)
         } else if word.starts_with("2>") {
             (None, word)
+        } else if let Some(rest) = word.strip_prefix(">&") {
+            // `>& a.sh` writes the file `>a.sh` does: read as `>&` and
+            // its target the `&` was taken for a file (found 2026-11-21:
+            // `base64 -d f >& a.sh; sh a.sh` was allowed).
+            if rest.is_empty() {
+                (Some(">&"), rest)
+            } else if is_descriptor_word(rest) {
+                (None, word)
+            } else {
+                (Some(">"), rest)
+            }
         } else if word.starts_with('>') {
             (Some(">"), word.trim_start_matches('>'))
         } else if word.starts_with('<') && !word.starts_with("<(") {
@@ -18870,6 +18934,12 @@ fn decode_tokens(text: &str) -> Vec<String> {
         }
     }
     words
+}
+
+/// Whether a word after `>&` names a descriptor (`2`, `-`) rather than a
+/// file.
+fn is_descriptor_word(word: &str) -> bool {
+    word == "-" || (!word.is_empty() && word.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// `text` with each `&` that sends a command to the background, as

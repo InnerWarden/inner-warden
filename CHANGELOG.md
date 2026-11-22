@@ -16,6 +16,19 @@ version or a flag keeps its verdict. The Antigravity CLI's
 protects: a command that edits, empties or removes it is refused, as for
 `~/.claude/settings.json`.
 
+`base64 -d f >& a.sh; sh a.sh` was allowed: the guard read the `&` after
+`>` as the file written, so it saw neither the decoded bytes reaching a
+shell nor the file the line writes and runs. `>& file` is now read as
+`> file` (a descriptor after it, `>&2`, still writes nothing) and the
+line is refused as `> a.sh` is. A job `at` reads from a here-string
+written out in quotes (`at now <<< 'tar czf /tmp/b.tgz ~/work'`) is judged
+as the same job piped in: refused when it downloads and runs code, removes
+the home or does what the guard refuses anywhere, and no longer refused
+for its form alone; a job the line does not show, from a file or a
+here-document is refused as before. `--default`, the name of the posture
+`--guard` moves an install to, is refused to an agent on `install` and
+`agents connect` as `--guard` is.
+
 `innerwarden agents connect antigravity` wires the guard into the
 Antigravity CLI (`agy`), which took Gemini CLI's place for its free and
 individual users: one `PreToolUse` group under the name `innerwarden` in
