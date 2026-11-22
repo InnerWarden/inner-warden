@@ -1400,7 +1400,7 @@ impl TooLongCall {
     /// A tool call that already ran: its result is what is past the cap,
     /// and there is nothing left to permit or refuse.
     pub(crate) fn already_ran(&self) -> bool {
-        self.event.as_deref() == Some("PostToolUse")
+        self.event.as_deref() == Some(RESULT_EVENT)
     }
 }
 
@@ -2075,6 +2075,11 @@ fn apply_behaviour(
     verdict
 }
 
+/// The event of a hook run on a call that already ran, with its result:
+/// Claude Code's `PostToolUse`, the only result event a hook line of ours is
+/// wired to. Every other event is a call about to run.
+const RESULT_EVENT: &str = "PostToolUse";
+
 /// A PostToolUse payload: the tool already ran and its RESULT is attached.
 ///
 /// The two-step attack lives entirely in this half. A PreToolUse hook sees the
@@ -2084,6 +2089,17 @@ fn apply_behaviour(
 /// its arguments came from.
 fn hook_tool_result(payload: &str) -> Option<(String, String)> {
     let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    // Only the event of a call that already ran carries a result. A call
+    // about to run (PreToolUse, BeforeTool, an event of no name) that also
+    // carries a `tool_response` is still a call: screened as one, never
+    // let through as a result.
+    let event = v
+        .get("hook_event_name")
+        .or_else(|| v.get("hookEventName"))
+        .and_then(|e| e.as_str());
+    if event != Some(RESULT_EVENT) {
+        return None;
+    }
     let response = v.get("tool_response").or_else(|| v.get("toolResponse"))?;
     let text = match response {
         serde_json::Value::String(s) => s.clone(),
@@ -2621,6 +2637,7 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     if let Some((tool, result)) = hook_tool_result(&buf) {
         // Every way through here ends with 0: so does the deadline now.
         hook_net::already_ran(result_unread_to_agent(rest));
+        #[cfg(debug_assertions)]
         hook_net::test_result_delay();
         let payload_session = hook_session(&buf);
         let identity =

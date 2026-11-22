@@ -74,9 +74,9 @@ pub const TEST_DEADLINE_ENV: &str = "IW_TEST_HOOK_DEADLINE_MS";
 pub const TEST_RESULT_DELAY_ENV: &str = "IW_TEST_HOOK_RESULT_DELAY_MS";
 
 /// Debug builds: wait as long as [`TEST_RESULT_DELAY_ENV`] says, while the
-/// result of a call that already ran is screened. Nothing in a release build.
+/// result of a call that already ran is screened. Not in a release build.
+#[cfg(debug_assertions)]
 pub fn test_result_delay() {
-    #[cfg(debug_assertions)]
     if let Some(ms) = std::env::var(TEST_RESULT_DELAY_ENV)
         .ok()
         .and_then(|text| text.trim().parse::<u64>().ok())
@@ -394,7 +394,8 @@ pub fn mark(phase: &str) {
 /// 0: from here on the deadline answers it with 0 too, says the result was
 /// not read, and, where `to_agent` (Claude Code), tells the agent so on
 /// stdout. A refusal at the deadline would only take the result from the
-/// agent: the tool already ran. A call about to run is never marked, and
+/// agent: the tool already ran. Only a PostToolUse is marked: a call about
+/// to run is never marked, even one that carries a `tool_response`, and
 /// keeps its refusal at the deadline; a fault keeps its own end.
 pub fn already_ran(to_agent: bool) {
     RESULT_UNREAD_TO_AGENT.store(to_agent, Ordering::SeqCst);
