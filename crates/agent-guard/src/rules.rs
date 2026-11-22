@@ -1222,7 +1222,11 @@ fn eval_rule_context(
             .pending
             .iter()
             .enumerate()
-            .filter(|(_, pending)| folded.get(pending.field).is_some_and(|f| pending.may_match(f)))
+            .filter(|(_, pending)| {
+                folded
+                    .get(pending.field)
+                    .is_some_and(|f| pending.may_match(f))
+            })
             .filter_map(|(at, _)| rule.conditions.one(&rule.id, at))
             .collect(),
         ConditionLogic::All => rule.conditions.get(&rule.id),
