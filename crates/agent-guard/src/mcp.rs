@@ -5058,7 +5058,9 @@ fn analyze_command_as_read(
     }
 
     // Download-and-execute via staged chmod (score 25 = review; see below).
-    if let Some(s) = threats::check_download_execute_staged(scan_cmd) {
+    // Asked once: the aggravators below ask it of the same line.
+    let staged = threats::check_download_execute_staged(scan_cmd);
+    if let Some(s) = staged {
         signals.push(AnalysisSignal {
             signal: "download_chmod_execute".into(),
             score: s,
@@ -5080,7 +5082,7 @@ fn analyze_command_as_read(
     // as one (the aggravators below add their own weight).
     if threats::check_clone_and_run(scan_cmd) {
         let bare_ip = threats::clone_from_bare_ip(scan_cmd);
-        if bare_ip || !threats::fetch_exec_aggravators(scan_cmd).is_empty() {
+        if bare_ip || !threats::fetch_exec_aggravators(scan_cmd, staged).is_empty() {
             if !signals.iter().any(|s| s.signal == "download_chmod_execute") {
                 signals.push(AnalysisSignal {
                     signal: "download_chmod_execute".into(),
@@ -5107,7 +5109,7 @@ fn analyze_command_as_read(
         }
     }
 
-    for (label, detail, s) in threats::fetch_exec_aggravators(scan_cmd) {
+    for (label, detail, s) in threats::fetch_exec_aggravators(scan_cmd, staged) {
         push_unique_signal(
             &mut signals,
             AnalysisSignal {
