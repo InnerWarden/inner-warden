@@ -228,6 +228,11 @@ pub(crate) fn account_home() -> Option<std::path::PathBuf> {
 /// whose webhooks fire. Off Unix, where no account database is read, `HOME`
 /// as before.
 pub(crate) fn config_home() -> Option<std::path::PathBuf> {
+    #[cfg(debug_assertions)]
+    if let Some(home) = test_account_home_from(std::env::var(TEST_ACCOUNT_HOME_ENV).ok().as_deref())
+    {
+        return Some(home);
+    }
     #[cfg(unix)]
     {
         account_home()
@@ -239,6 +244,22 @@ pub(crate) fn config_home() -> Option<std::path::PathBuf> {
             .filter(|home| !home.trim().is_empty())
             .map(std::path::PathBuf::from)
     }
+}
+
+/// Debug builds only: the account's home for a test, so a test can store a
+/// key in an account home of its own. A release build never reads it: the
+/// hook runs with the agent's environment.
+#[cfg(debug_assertions)]
+pub(crate) const TEST_ACCOUNT_HOME_ENV: &str = "IW_TEST_ACCOUNT_HOME";
+
+/// The home [`TEST_ACCOUNT_HOME_ENV`] names, debug builds only: an absolute
+/// path, `None` for anything else.
+#[cfg(debug_assertions)]
+fn test_account_home_from(named: Option<&str>) -> Option<std::path::PathBuf> {
+    named
+        .map(str::trim)
+        .map(std::path::PathBuf::from)
+        .filter(|home| home.is_absolute())
 }
 
 /// InnerWarden's own config folder, `<home>/.config/innerwarden`, under
@@ -4938,6 +4959,18 @@ mod shared_record_denied_tests {
 #[cfg(all(test, unix))]
 mod account_record_tests {
     use super::*;
+
+    /// The test home is honoured only as an absolute path, in debug builds.
+    #[test]
+    fn the_test_account_home_takes_only_an_absolute_path() {
+        assert_eq!(
+            test_account_home_from(Some("/tmp/acct")),
+            Some(std::path::PathBuf::from("/tmp/acct"))
+        );
+        for ignored in [None, Some(""), Some("relative/home"), Some("  ")] {
+            assert_eq!(test_account_home_from(ignored), None, "{ignored:?}");
+        }
+    }
     use innerwarden_graph::GraphPathSource;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
