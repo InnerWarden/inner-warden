@@ -326,13 +326,17 @@ pub fn apply_second_opinion(rules_verdict: &Value, llm_verdict: &str, why: &str)
     out
 }
 
+/// The most second opinions [`ask_at_once`] has open at the same time.
+const AT_ONCE: usize = 4;
+
 /// The second opinion of each of `lines` (`None` where none was given),
-/// in their order. Only a line `needs` is asked, and all of them AT ONCE,
-/// each in its own thread, under ONE wait: `grant` gives the timeout once
+/// in their order. Only a line `needs` is asked, up to [`AT_ONCE`] at a
+/// time from one queue, under ONE wait: `grant` gives the timeout once
 /// (`None`: nothing left, nobody is asked), `ask` puts one line to the
-/// model with that timeout, and `waited` hears the timeout and how long the
-/// longest answer took. Every line is answered within the time of one
-/// answer. Asked one after another, the lines shared one answer's
+/// model with what is left of it, and `waited` hears the timeout and
+/// how long the asking took. Up to [`AT_ONCE`] lines are answered within
+/// the time of one answer, so a fast model answers a call of many lines
+/// without the call sending them all to the endpoint together. Asked one after another, the lines shared one answer's
 /// allowance, so a slow model answered only the first line asked, and no
 /// order of asking kept the verdict of a line behind it: the main branch's
 /// order lost the riskier line put second, the riskiest first lost a line
@@ -356,29 +360,45 @@ where
         return opinions;
     };
     let started = std::time::Instant::now();
-    let answers: Vec<Option<Value>> = std::thread::scope(|scope| {
-        let ask = &ask;
-        let running: Vec<_> = asked
-            .iter()
-            .map(|&at| {
-                let (command, rules) = lines[at];
-                // A thread the system refuses asks here instead: later than
-                // the others, but asked.
-                std::thread::Builder::new()
-                    .spawn_scoped(scope, move || ask(command, rules, granted))
-                    .map_err(|_| (command, rules))
-            })
+    // At most AT_ONCE requests are open: the workers pull the next line
+    // from one queue, and a line pulled later is given what is left of
+    // the one grant, or nothing when none is left (it keeps the rules'
+    // verdict). A line whose request fails is not asked again.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        let mut answered = Vec::new();
+        loop {
+            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let Some(&line) = asked.get(at) else {
+                return answered;
+            };
+            let left = granted.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                continue;
+            }
+            let (command, rules) = lines[line];
+            answered.push((line, ask(command, rules, left)));
+        }
+    };
+    let answers: Vec<(usize, Option<Value>)> = std::thread::scope(|scope| {
+        let work = &work;
+        let running: Vec<_> = (0..asked.len().min(AT_ONCE))
+            .filter_map(|_| std::thread::Builder::new().spawn_scoped(scope, work).ok())
             .collect();
-        running
-            .into_iter()
-            .map(|thread| match thread {
-                Ok(handle) => handle.join().ok().flatten(),
-                Err((command, rules)) => ask(command, rules, granted),
-            })
-            .collect()
+        // With no thread the system allows, the lines are asked here, in
+        // turn, under the same grant.
+        let mut answers = if running.is_empty() {
+            work()
+        } else {
+            Vec::new()
+        };
+        for handle in running {
+            answers.extend(handle.join().unwrap_or_default());
+        }
+        answers
     });
     waited(granted, started.elapsed());
-    for (at, answer) in asked.into_iter().zip(answers) {
+    for (at, answer) in answers {
         opinions[at] = answer;
     }
     opinions
@@ -387,6 +407,85 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review of #419: twelve lines in review and a fast model. Every line
+    /// is answered, never more than [`AT_ONCE`] requests are open at the
+    /// same time, and a line asked later is given what is left of the one
+    /// grant, never more.
+    ///
+    /// FAILS ON REVERT of the cap (a thread and a request a line: twelve
+    /// open at once).
+    #[test]
+    fn many_lines_are_asked_at_most_at_once_under_one_grant() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use std::time::Duration;
+        let commands: Vec<String> = (0..12).map(|n| format!("chmod -R 777 ./d{n}")).collect();
+        let rules = json!({"recommendation": "review", "risk_score": 30});
+        let lines: Vec<(&str, &Value)> = commands.iter().map(|c| (c.as_str(), &rules)).collect();
+        let granted = Duration::from_secs(5);
+        let open = AtomicUsize::new(0);
+        let most = AtomicUsize::new(0);
+        let timeouts = Mutex::new(Vec::new());
+        let mut charged = 0;
+        let opinions = ask_at_once(
+            &lines,
+            |_| true,
+            || Some(granted),
+            |command, _, timeout| {
+                let now = open.fetch_add(1, Ordering::SeqCst) + 1;
+                most.fetch_max(now, Ordering::SeqCst);
+                timeouts.lock().unwrap().push(timeout);
+                std::thread::sleep(Duration::from_millis(20));
+                open.fetch_sub(1, Ordering::SeqCst);
+                Some(json!({"recommendation": "review", "asked": command}))
+            },
+            |_, _| charged += 1,
+        );
+        assert_eq!(charged, 1, "one wait for the whole call");
+        for (at, opinion) in opinions.iter().enumerate() {
+            assert_eq!(
+                opinion.as_ref().map(|o| o["asked"].clone()),
+                Some(json!(commands[at])),
+                "line {at}: {opinions:?}"
+            );
+        }
+        let most = most.load(Ordering::SeqCst);
+        // Four, written out: the cap the review asked for.
+        assert!(most <= 4, "{most} requests open at once");
+        assert!(most > 1, "the lines are still asked together: {most}");
+        let timeouts = timeouts.into_inner().unwrap();
+        assert_eq!(timeouts.len(), 12);
+        assert!(timeouts.iter().all(|t| *t <= granted), "{timeouts:?}");
+        assert!(timeouts.iter().any(|t| *t < granted), "{timeouts:?}");
+    }
+
+    /// A line pulled when nothing is left of the grant is not asked, and
+    /// keeps the rules' verdict (`None`); a failed request is not repeated.
+    #[test]
+    fn a_line_left_without_time_or_with_a_failed_request_is_not_asked_again() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        let commands: Vec<String> = (0..8).map(|n| format!("chmod -R 777 ./d{n}")).collect();
+        let rules = json!({"recommendation": "review", "risk_score": 30});
+        let lines: Vec<(&str, &Value)> = commands.iter().map(|c| (c.as_str(), &rules)).collect();
+        let asked = AtomicUsize::new(0);
+        // The first AT_ONCE requests use up the grant and fail (a 429): the
+        // rest find nothing left.
+        let opinions = ask_at_once(
+            &lines,
+            |_| true,
+            || Some(Duration::from_millis(50)),
+            |_, _, _| {
+                asked.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(80));
+                None
+            },
+            |_, _| {},
+        );
+        assert_eq!(opinions, vec![None; 8]);
+        assert_eq!(asked.load(Ordering::SeqCst), 4);
+    }
 
     #[test]
     fn escalates_only_review_with_real_harm_potential() {
