@@ -7,7 +7,7 @@
 use serde_json::Value;
 
 use crate::second_opinion::{
-    apply_second_opinion, build_body, needs_second_opinion, parse_reply, LlmConfig,
+    apply_second_opinion, ask_at_once, build_body, needs_second_opinion, parse_reply, LlmConfig,
 };
 
 // ---- I/O boundary (config read + HTTP POST). Excluded from the coverage floor
@@ -73,22 +73,16 @@ pub fn has_key() -> bool {
 /// agent is given for the hook has to be longer than the two together.
 pub(crate) const LLM_ANSWER_BOUND: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// POST the classification request to the user's endpoint. Best-effort: any error
-/// (no key, network, bad status) returns `None` so the caller keeps the `review`.
-fn call_llm(cfg: &LlmConfig, command: &str) -> Option<Value> {
+/// POST the classification request to the user's endpoint, with `timeout`
+/// ([`consider_all`] gave it). Best-effort: any error (no key, network, bad
+/// status) returns `None` so the caller keeps the `review`.
+fn call_llm(cfg: &LlmConfig, command: &str, timeout: std::time::Duration) -> Option<Value> {
     // The command LEAVES THE HOST here (off-box to the user's LLM endpoint). Redact
     // secrets first so a screened command that embeds a credential never reaches the
     // model; the redacted form keeps the dangerous SHAPE, so the verdict is unaffected.
     let command = innerwarden_agent_guard::redact::redact_secrets(command).text;
     let body = build_body(&cfg.model, &command);
-    // The hook's deadline does not count a wait this call bounds itself, up
-    // to one model's answer a run, counted by the time really waited. With
-    // nothing left the call keeps its review rather than be refused by the
-    // deadline while it waits; with less than the bound left, that is the
-    // timeout.
-    let timeout = crate::hook_net::grant_wait(LLM_ANSWER_BOUND)?;
-    let started = std::time::Instant::now();
-    let reply = (|| {
+    (|| {
         let mut req = crate::http_io::agent_with_timeout(timeout)
             .post(&cfg.url)
             .header("Content-Type", "application/json");
@@ -103,9 +97,7 @@ fn call_llm(cfg: &LlmConfig, command: &str) -> Option<Value> {
         }
         let resp = req.send_json(body).ok()?;
         resp.into_body().read_json::<Value>().ok()
-    })();
-    crate::hook_net::waited(timeout, started.elapsed());
-    reply
+    })()
 }
 
 /// Expand a leading `~/` to `$HOME`, then read the file (trimmed by the caller).
@@ -223,20 +215,36 @@ pub fn verify_endpoint(cfg: &LlmConfig) -> Result<(), String> {
     }
 }
 
-/// The full second-opinion flow: only for `review`, only when the user configured
-/// an endpoint. Returns an overriding verdict (`decided_by = llm`) or `None` to
-/// keep the rules verdict (which then escalates to a human via notify).
-pub fn consider(command: &str, rules_verdict: &Value) -> Option<Value> {
+/// The full second-opinion flow, for every line of a call, in their order:
+/// only a `review`, only when the user configured an endpoint. Each answer
+/// is an overriding verdict (`decided_by = llm`) or `None` to keep the
+/// rules verdict (which then escalates to a human via notify). The lines
+/// that need one are asked at once, under one model answer's wait
+/// ([`ask_at_once`]).
+pub fn consider_all(lines: &[(&str, &Value)]) -> Vec<Option<Value>> {
     // No configured endpoint = never escalate (the common case; zero cost, fast).
-    let cfg = load_config()?;
-    // Escalate only when it is worth the spend: an ambiguous command with real
-    // harm potential (review + risk >= the configured floor).
-    if !needs_second_opinion(rules_verdict, cfg.effective_min_risk()) {
-        return None;
-    }
-    let resp = call_llm(&cfg, command)?;
-    let (verdict, why) = parse_reply(&resp)?;
-    Some(apply_second_opinion(rules_verdict, &verdict, &why))
+    let Some(cfg) = load_config() else {
+        return vec![None; lines.len()];
+    };
+    let min_risk = cfg.effective_min_risk();
+    ask_at_once(
+        lines,
+        // Escalate only when it is worth the spend: an ambiguous command
+        // with real harm potential (review + risk >= the configured floor).
+        |rules| needs_second_opinion(rules, min_risk),
+        // The hook's deadline does not count a wait the call bounds itself,
+        // up to one model's answer a run, counted by the time really
+        // waited. With nothing left the call keeps its review rather than
+        // be refused by the deadline while it waits; with less than the
+        // bound left, that is the timeout.
+        || crate::hook_net::grant_wait(LLM_ANSWER_BOUND),
+        |command, rules, timeout| {
+            let resp = call_llm(&cfg, command, timeout)?;
+            let (verdict, why) = parse_reply(&resp)?;
+            Some(apply_second_opinion(rules, &verdict, &why))
+        },
+        crate::hook_net::waited,
+    )
 }
 
 /// Persist the llm config to `config_path()`. Shared by `set`, `set-key`, and the

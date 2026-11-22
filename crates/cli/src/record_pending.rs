@@ -250,19 +250,34 @@ pub fn sweep(graph: &Path) -> u64 {
 /// [`sweep`] with the alert given: the tests hear it instead of the
 /// channels of whoever runs them.
 fn sweep_with(graph: &Path, alert: impl FnOnce(&str)) -> u64 {
+    sweep_removing(graph, alert, |mark| std::fs::remove_file(mark).is_ok())
+}
+
+/// [`sweep_with`] with the removal of a mark given: the tests hear a mark
+/// that cannot be removed (another account's, in a sticky folder) without
+/// a second account.
+fn sweep_removing(
+    graph: &Path,
+    alert: impl FnOnce(&str),
+    remove_mark: impl Fn(&Path) -> bool,
+) -> u64 {
     let stale = stale_marks(graph, now_unix());
     let mut lost = 0u64;
     for (mark, pid) in &stale {
+        // The mark first: two sweeps at once count it once, by whoever took
+        // it away, and its writer's temporaries go only with it. A mark this
+        // account can never remove stays stale, and removing the
+        // temporaries anyway took, at every sweep, those of a live process
+        // that came to have the same pid.
+        if !remove_mark(mark) {
+            continue;
+        }
+        lost += 1;
         for temp in temporaries_of(graph, *pid) {
             let _ = std::fs::remove_file(temp);
         }
         if let Some(dir) = graph.parent() {
             let _ = std::fs::remove_file(dir.join(format!("{MARK_PREFIX}{pid}{TEMP_SUFFIX}")));
-        }
-        // Removed first: two sweeps at once count a mark once, by whoever
-        // took it away.
-        if std::fs::remove_file(mark).is_ok() {
-            lost += 1;
         }
     }
     if lost == 0 {
@@ -464,6 +479,36 @@ mod tests {
         std::fs::write(&again, now_unix().to_string()).unwrap();
         assert_eq!(sweep_with(&graph, |_| panic!("one alert per episode")), 1);
         assert_eq!(crate::record_health::report_at(&graph).unwrap().lost, 2);
+    }
+
+    /// Review of #419, minor item: a stale mark that cannot be removed
+    /// (another account's, in a sticky folder) leaves its pid's temporaries
+    /// alone, at every sweep; once it can be removed, they go with it.
+    ///
+    /// FAILS ON REVERT of removing the temporaries only after the mark.
+    #[cfg(unix)]
+    #[test]
+    fn the_temporaries_stay_while_their_mark_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.json");
+        std::fs::write(&graph, "{}").unwrap();
+        let gone = 4_194_304u32 + 31;
+        let mark = dir.path().join(format!("{MARK_PREFIX}{gone}"));
+        std::fs::write(&mark, now_unix().to_string()).unwrap();
+        let temp = dir.path().join(format!(".graph.json.{gone}.0.tmp"));
+        std::fs::write(&temp, "being written").unwrap();
+        let own_temp = dir.path().join(format!("{MARK_PREFIX}{gone}{TEMP_SUFFIX}"));
+        std::fs::write(&own_temp, "").unwrap();
+
+        for _ in 0..2 {
+            let swept = sweep_removing(&graph, |_| panic!("no alert"), |_| false);
+            assert_eq!(swept, 0);
+            assert!(mark.exists() && temp.exists() && own_temp.exists());
+        }
+        assert!(crate::record_health::report_at(&graph).is_none());
+
+        assert_eq!(sweep_with(&graph, |_| {}), 1);
+        assert!(!mark.exists() && !temp.exists() && !own_temp.exists());
     }
 
     /// A mark of this process (its work is running) and a young mark of a

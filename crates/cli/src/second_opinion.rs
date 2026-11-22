@@ -326,6 +326,64 @@ pub fn apply_second_opinion(rules_verdict: &Value, llm_verdict: &str, why: &str)
     out
 }
 
+/// The second opinion of each of `lines` (`None` where none was given),
+/// in their order. Only a line `needs` is asked, and all of them AT ONCE,
+/// each in its own thread, under ONE wait: `grant` gives the timeout once
+/// (`None`: nothing left, nobody is asked), `ask` puts one line to the
+/// model with that timeout, and `waited` hears the timeout and how long the
+/// longest answer took. Every line is answered within the time of one
+/// answer. Asked one after another, the lines shared one answer's
+/// allowance, so a slow model answered only the first line asked, and no
+/// order of asking kept the verdict of a line behind it: the main branch's
+/// order lost the riskier line put second, the riskiest first lost a line
+/// the rules scored lower that the model would have refused.
+pub(crate) fn ask_at_once<A>(
+    lines: &[(&str, &Value)],
+    needs: impl Fn(&Value) -> bool,
+    grant: impl FnOnce() -> Option<std::time::Duration>,
+    ask: A,
+    waited: impl FnOnce(std::time::Duration, std::time::Duration),
+) -> Vec<Option<Value>>
+where
+    A: Fn(&str, &Value, std::time::Duration) -> Option<Value> + Sync,
+{
+    let mut opinions = vec![None; lines.len()];
+    let asked: Vec<usize> = (0..lines.len()).filter(|&at| needs(lines[at].1)).collect();
+    if asked.is_empty() {
+        return opinions;
+    }
+    let Some(granted) = grant() else {
+        return opinions;
+    };
+    let started = std::time::Instant::now();
+    let answers: Vec<Option<Value>> = std::thread::scope(|scope| {
+        let ask = &ask;
+        let running: Vec<_> = asked
+            .iter()
+            .map(|&at| {
+                let (command, rules) = lines[at];
+                // A thread the system refuses asks here instead: later than
+                // the others, but asked.
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, move || ask(command, rules, granted))
+                    .map_err(|_| (command, rules))
+            })
+            .collect();
+        running
+            .into_iter()
+            .map(|thread| match thread {
+                Ok(handle) => handle.join().ok().flatten(),
+                Err((command, rules)) => ask(command, rules, granted),
+            })
+            .collect()
+    });
+    waited(granted, started.elapsed());
+    for (at, answer) in asked.into_iter().zip(answers) {
+        opinions[at] = answer;
+    }
+    opinions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
