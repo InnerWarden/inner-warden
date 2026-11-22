@@ -44,6 +44,12 @@ pub struct LlmConfig {
     /// escalate more. Keeps the spend on commands with real harm potential.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_risk: Option<i64>,
+    /// The proxy the request goes through (`http://host:port`), when the
+    /// machine reaches out only through one. Read only from this file: a
+    /// proxy named in the environment of whoever starts the hook (the AI
+    /// agent) is never used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 impl LlmConfig {
@@ -761,6 +767,7 @@ mod tests {
             api_key_env: None,
             api_key_file: None,
             min_risk: None,
+            proxy: None,
         };
         assert!(by_provider.is_azure());
         let by_url = LlmConfig {
@@ -770,6 +777,7 @@ mod tests {
             api_key_env: None,
             api_key_file: None,
             min_risk: None,
+            proxy: None,
         };
         assert!(by_url.is_azure());
         let openai = LlmConfig {
@@ -779,6 +787,7 @@ mod tests {
             api_key_env: Some("OPENAI_API_KEY".into()),
             api_key_file: None,
             min_risk: None,
+            proxy: None,
         };
         assert!(!openai.is_azure());
     }

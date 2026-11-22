@@ -14,8 +14,48 @@ bearer key to the url it named, and fired the webhooks of the
 folder, as a regular file with no other name (not a symbolic or a hard
 link): `innerwarden llm set-key` stores it there, and `llm set --key-file`
 refuses a file elsewhere. `api_key_env` is honoured only in the account's
-own `llm.toml`, never in one `IW_LLM_CONFIG` names. On Windows, where no
-account database is read, the home is still `HOME`.
+own `llm.toml`, never in one `IW_LLM_CONFIG` names. On Windows the home is
+the profile folder of the account's token (`GetUserProfileDirectoryW`),
+never `HOME` or `USERPROFILE`.
+
+Nothing in the environment of the process that starts `innerwarden` chooses
+where what the guard read goes, in a release build. A hook and `check` run
+with the AI agent's environment, and the alert channels it named
+(`IW_WEBHOOK_URL`, `IW_SLACK_WEBHOOK`, `IW_DISCORD_WEBHOOK`,
+`IW_TELEGRAM_TOKEN` and `IW_TELEGRAM_CHAT`, `IW_NOTIFY_REVIEW`) received
+every command the guard refused, and an `llm.toml` or a `notify.toml` it
+named with `IW_LLM_CONFIG` or `IW_NOTIFY_CONFIG` received the commands sent
+for a second opinion (secrets redacted, no key). Alerts are wired only in
+`notify.toml` in the account's home now, and the second opinion only in its
+`llm.toml`; `innerwarden notify` says which of those variables it did not
+read. `IW_LLM_CONFIG`, `IW_NOTIFY_CONFIG` and `IW_SUPPRESS_CONFIG` are
+honoured only as `/dev/null`, which turns the feature off and is what the
+AI Jail hands its hook: an override can take a destination away, never add
+one. A debug build (the tests) still honours any path and the channel
+variables; `IW_TEST_RELEASE_OVERRIDES=1` has it read them as a release build
+does. Whoever wired alerts with those variables, or pointed `IW_LLM_CONFIG`
+at a config of their own, now writes them in `notify.toml` or `llm.toml` in
+the account's home (`innerwarden notify --webhook-url ...`, `innerwarden llm
+set ...`); a service account without a home gets neither.
+
+The second opinion and the alerts never go through a proxy the environment
+names (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`): with an `http://` url, a
+proxy the caller set received `authorization: Bearer <the account's key>`
+inside the CONNECT tunnel. They go straight to their address, or through
+the `proxy = "http://host:port"` that `llm.toml` and `notify.toml` name. A
+proxy there that is not a proxy url sends nothing, rather than going around
+it.
+
+`llm.toml` itself cannot be a link (the folder may be one, as stow makes
+it): one that is was "not configured" in `llm status` with no word of why;
+the reason is said now in `llm status` and on stderr where a second opinion
+would have been asked. `llm set` refuses a url with a backslash or a space
+(`http://A\@B/` is host A to one parser and B to another), and the key's
+origin check ends the host at a backslash. `llm status` and `llm set`
+print the url without a user part or a query (`http://user:password@host`,
+`?key=`): agents run them too. Under `IW_LLM_CONFIG`, `llm set --key-file`
+outside the folder says to unset it and store the key with `llm set-key` in
+the account's own config, where a key is sent from.
 
 A config `IW_LLM_CONFIG` names carries no API key at all: an override
 naming `~/.config/innerwarden/llm-key` (or another file under the home)

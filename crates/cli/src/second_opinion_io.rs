@@ -14,13 +14,14 @@ use crate::second_opinion::{
 // ---- I/O boundary (config read + HTTP POST). Excluded from the coverage floor
 // like the other thin adapters; the decision logic above is what is unit-tested.
 
-/// The override `IW_LLM_CONFIG` names (the tests, and the jail, which points
-/// it at `/dev/null`), if set.
+/// The override `IW_LLM_CONFIG` names, when it is honoured: `/dev/null`
+/// (no second opinion, what the jail hands its hook) in every build, any
+/// path in a debug build (the tests). A release build reads no other: the
+/// hook runs with the AI agent's environment, and an `llm.toml` it named
+/// sent every command the hook reviews to the url it named
+/// ([`crate::graph_io::override_from_env`]).
 fn override_path() -> Option<std::path::PathBuf> {
-    std::env::var("IW_LLM_CONFIG")
-        .ok()
-        .filter(|p| !p.trim().is_empty())
-        .map(std::path::PathBuf::from)
+    crate::graph_io::override_from_env("IW_LLM_CONFIG")
 }
 
 /// The optional LLM config: the override `IW_LLM_CONFIG`, else
@@ -175,16 +176,49 @@ fn read_override(path: &std::path::Path) -> Option<String> {
 /// The config, and where it came from. The account's `llm.toml` is read
 /// through the folder handle its key is read through later.
 fn load() -> Option<Loaded> {
+    load_or_why().ok()
+}
+
+/// [`load`], with why the account's `llm.toml` is not read when it is
+/// there: `Err(None)` when there is none (or the override names an empty
+/// one, as the jail's `/dev/null` is), `Err(Some(why))` when it is there
+/// and not read. An `llm.toml` that is itself a symbolic link (dotfiles
+/// stowed file by file) was "not configured" in `llm status`, with no word
+/// of why.
+fn load_or_why() -> Result<Loaded, Option<String>> {
     if let Some(path) = override_path() {
-        let cfg = LlmConfig::from_toml(&read_override(&path)?)?;
-        return Some(Loaded {
+        let cfg = read_override(&path)
+            .and_then(|text| LlmConfig::from_toml(&text))
+            .ok_or(None)?;
+        return Ok(Loaded {
             cfg,
             source: Source::Override,
         });
     }
-    let source = open_account()?;
-    let cfg = LlmConfig::from_toml(&read_in(&source, "llm.toml", false).ok()?)?;
-    Some(Loaded { cfg, source })
+    let source = open_account().ok_or(None)?;
+    let named = || {
+        crate::graph_io::account_config_dir()
+            .map(|dir| dir.join("llm.toml").display().to_string())
+            .unwrap_or_else(|| "llm.toml".to_string())
+    };
+    let text = match read_in(&source, "llm.toml", false) {
+        Ok(text) => text,
+        Err(why) if why == "missing" => return Err(None),
+        Err(why) if why == "a symbolic link" => {
+            return Err(Some(format!(
+                "{} is not read: it is a symbolic link, and the file itself is never followed (the folder may be one); keep a plain file there",
+                named()
+            )))
+        }
+        Err(why) => return Err(Some(format!("{} is not read: {why}", named()))),
+    };
+    let cfg = LlmConfig::from_toml(&text).ok_or_else(|| {
+        Some(format!(
+            "{} is not read: it is not a config with a url and a model",
+            named()
+        ))
+    })?;
+    Ok(Loaded { cfg, source })
 }
 
 fn load_config() -> Option<LlmConfig> {
@@ -320,9 +354,10 @@ fn read_key(cfg: &LlmConfig, source: &Source) -> Option<String> {
 
 /// POST the classification request to the user's endpoint, with `timeout`
 /// ([`consider_all`] gave it) and the `key` [`read_key`] read. Best-effort:
-/// any error (network, bad status) is `Answered(None)` so the caller keeps the
-/// `review`, but a busy endpoint (429) is told apart, with the wait it asked
-/// for, so the line can be asked again while time is left.
+/// any error (network, bad status, a proxy in llm.toml that is not a url) is
+/// `Answered(None)` so the caller keeps the `review`, but a busy endpoint
+/// (429) is told apart, with the wait it asked for, so the line can be asked
+/// again while time is left.
 fn call_llm(
     cfg: &LlmConfig,
     key: Option<&str>,
@@ -335,13 +370,21 @@ fn call_llm(
     let command = innerwarden_agent_guard::redact::redact_secrets(command).text;
     let body = build_body(&cfg.model, &command);
     (|| {
-        // The status is read here, not turned into an error, so a 429 keeps
-        // its Retry-After headers.
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(timeout))
-            .http_status_as_error(false)
-            .build()
-            .into();
+        // Never the caller's HTTP_PROXY: only the proxy llm.toml names. The
+        // status is read here, not turned into an error, so a 429 keeps its
+        // Retry-After headers.
+        let agent =
+            match crate::http_io::account_agent_reading_status(timeout, cfg.proxy.as_deref()) {
+                Ok(agent) => agent,
+                Err(why) => {
+                    let _ = std::io::Write::write_all(
+                        &mut std::io::stderr(),
+                        format!("innerwarden: the second opinion was not asked: {why}.\n")
+                            .as_bytes(),
+                    );
+                    return Asked::Answered(None);
+                }
+            };
         let mut req = agent
             .post(&cfg.url)
             .header("Content-Type", "application/json");
@@ -389,7 +432,7 @@ pub fn store_key(key: &str) -> std::io::Result<std::path::PathBuf> {
     let path = default_key_path().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "cannot resolve a key-file path (this account has no home; set IW_LLM_CONFIG)",
+            "cannot resolve a key-file path (this account has no home)",
         )
     })?;
     if let Some(dir) = path.parent() {
@@ -439,7 +482,9 @@ pub fn store_key(key: &str) -> std::io::Result<std::path::PathBuf> {
 /// unreachable). Best-effort: a slow endpoint just times out into an Err.
 pub fn verify_endpoint(cfg: &LlmConfig) -> Result<(), String> {
     let body = build_body(&cfg.model, "echo hello");
-    let mut req = crate::http_io::agent_with_timeout(std::time::Duration::from_secs(12))
+    let agent =
+        crate::http_io::account_agent(std::time::Duration::from_secs(12), cfg.proxy.as_deref())?;
+    let mut req = agent
         .post(&cfg.url)
         .header("Content-Type", "application/json");
     if let Some(key) = open_source().and_then(|source| key_for(cfg, &source).ok().flatten()) {
@@ -463,7 +508,7 @@ pub fn verify_endpoint(cfg: &LlmConfig) -> Result<(), String> {
                 cfg.model
             )),
             Some(code) => Err(format!("endpoint returned HTTP {code}")),
-            None => Err(format!("could not reach {} ({e})", cfg.url)),
+            None => Err(format!("could not reach {} ({e})", shown_url(&cfg.url))),
         },
     }
 }
@@ -476,8 +521,27 @@ pub fn verify_endpoint(cfg: &LlmConfig) -> Result<(), String> {
 /// ([`ask_at_once_or_again`]).
 pub fn consider_all(lines: &[(&str, &Value)]) -> Vec<Option<Value>> {
     // No configured endpoint = never escalate (the common case; zero cost, fast).
-    let Some(Loaded { cfg, source }) = load() else {
-        return vec![None; lines.len()];
+    let Loaded { cfg, source } = match load_or_why() {
+        Ok(loaded) => loaded,
+        Err(None) => return vec![None; lines.len()],
+        Err(Some(why)) => {
+            // Said only where it would have been asked: a review with the
+            // risk the default floor escalates. One line for the whole call.
+            let floor = crate::second_opinion::DEFAULT_MIN_RISK;
+            if lines
+                .iter()
+                .any(|(_, rules)| needs_second_opinion(rules, floor))
+            {
+                let _ = std::io::Write::write_all(
+                    &mut std::io::stderr(),
+                    format!(
+                        "innerwarden: no second opinion: {why}. See `innerwarden llm status`.\n"
+                    )
+                    .as_bytes(),
+                );
+            }
+            return vec![None; lines.len()];
+        }
     };
     let min_risk = cfg.effective_min_risk();
     // The key is read once, when the first line is asked, so a run that asks
@@ -511,9 +575,8 @@ pub fn consider_all(lines: &[(&str, &Value)]) -> Vec<Option<Value>> {
 /// Persist the llm config to `config_path()`. Shared by `set`, `set-key`, and the
 /// setup wizard so there is one writer. Returns the path or an error string.
 pub fn write_config(cfg: &LlmConfig) -> Result<std::path::PathBuf, String> {
-    let path = config_path().ok_or_else(|| {
-        "cannot resolve a config path (this account has no home; set IW_LLM_CONFIG)".to_string()
-    })?;
+    let path = config_path()
+        .ok_or_else(|| "cannot resolve a config path (this account has no home)".to_string())?;
     if let Some(note) = missing_home_note() {
         return Err(note);
     }
@@ -556,12 +619,54 @@ fn key_status(loaded: &Loaded) -> String {
     }
 }
 
+/// `url` as it is printed: scheme, host and path, without a user part
+/// (`http://user:password@host`) and without the query (`?key=...`), said
+/// as `?...`. `llm status` is run by agents too, and what it prints lands
+/// in the agent's context.
+fn shown_url(url: &str) -> String {
+    let url = url.trim();
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, url),
+    };
+    let end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (path, cut) = match tail.find(['?', '#']) {
+        Some(at) => (&tail[..at], "?..."),
+        None => (tail, ""),
+    };
+    match scheme {
+        Some(scheme) => format!("{scheme}://{host}{path}{cut}"),
+        None => format!("{host}{path}{cut}"),
+    }
+}
+
+/// Why `url` is not taken as the endpoint, if it is not: a backslash or a
+/// space in it. Read one way here and another by a client
+/// (`http://A\\@B/` is origin B to a split on `@`, and host A to a
+/// browser), it could keep a key for an address it was not given for.
+fn url_refused(url: &str) -> Option<&'static str> {
+    let url = url.trim();
+    if url.contains('\\') {
+        return Some("a url with a backslash is refused (clients read it two ways)");
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Some("a url with a space or a control character is refused");
+    }
+    None
+}
+
 /// The scheme and host (with port) of `url`, lowercased, without any user
-/// part: the place a key goes to.
+/// part: the place a key goes to. A backslash ends the host as a slash
+/// does, as a WHATWG parser reads an `http` url: `http://A\\@B/` is A, not
+/// B, so a move to it from B drops the key.
 fn origin(url: &str) -> String {
     let url = url.trim();
     let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
     let host = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
@@ -581,7 +686,7 @@ fn missing_home_note() -> Option<String> {
     let home = crate::graph_io::config_home()?;
     (!home.is_dir()).then(|| {
         format!(
-            "this account's home {} does not exist (a service account?). Point IW_LLM_CONFIG at a config file instead; a config it names carries no API key, so only an endpoint without one works that way",
+            "this account's home {} does not exist (a service account?), and the second opinion reads its config only from there (IW_LLM_CONFIG is honoured only as /dev/null, which turns it off)",
             home.display()
         )
     })
@@ -655,6 +760,10 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 eprintln!("innerwarden llm set: --url and --model are required");
                 return std::process::ExitCode::from(2);
             }
+            if let Some(why) = url_refused(&cfg.url) {
+                eprintln!("innerwarden llm set: --url {}: {why}", shown_url(&cfg.url));
+                return std::process::ExitCode::from(2);
+            }
             if let (true, Some(file)) = (key_file_given, cfg.api_key_file.as_deref()) {
                 let read = match open_source() {
                     Some(source) => {
@@ -663,7 +772,11 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     None => Err("the config's folder is missing".to_string()),
                 };
                 if let Err(why) = read {
-                    eprintln!("innerwarden llm set: --key-file {file} is not read: {why}. Only a key stored beside the config is sent; run `innerwarden llm set-key` to store it there.");
+                    if override_path().is_some() {
+                        eprintln!("innerwarden llm set: --key-file {file} is not read: {why}. A key is sent only from the llm.toml in your account's home: unset IW_LLM_CONFIG, then run `innerwarden llm set-key` there.");
+                    } else {
+                        eprintln!("innerwarden llm set: --key-file {file} is not read: {why}. Only a key stored beside the config is sent; run `innerwarden llm set-key` to store it there.");
+                    }
                     return std::process::ExitCode::from(2);
                 }
             }
@@ -684,7 +797,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             }
             match write_config(&cfg) {
                 Ok(_) => {
-                    println!("innerwarden llm - saved. A second opinion from {} ({}) is used ONLY for an ambiguous command with risk >= {} (deny/allow are never escalated).", cfg.model, cfg.url, cfg.effective_min_risk());
+                    println!("innerwarden llm - saved. A second opinion from {} ({}) is used ONLY for an ambiguous command with risk >= {} (deny/allow are never escalated).", cfg.model, shown_url(&cfg.url), cfg.effective_min_risk());
                     if key_dropped {
                         println!("  note: the url moved to another address, so the API key setting was removed: a key is never sent to a new address on its own. Run `innerwarden llm set-key` to give one for it.");
                     } else if cfg.api_key_env.is_none() && cfg.api_key_file.is_none() {
@@ -742,12 +855,17 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             match load() {
                 Some(loaded) => {
                     let c = &loaded.cfg;
-                    println!("innerwarden llm - configured: {} via {}\n  api key: {}\n  escalates only: review + risk >= {} (deny/allow never escalate)", c.model, c.url, key_status(&loaded), c.effective_min_risk());
+                    println!("innerwarden llm - configured: {} via {}\n  api key: {}\n  escalates only: review + risk >= {} (deny/allow never escalate)", c.model, shown_url(&c.url), key_status(&loaded), c.effective_min_risk());
                 }
                 None if missing_home_note().is_some() => println!(
                     "innerwarden llm - not configured: {}.",
                     missing_home_note().unwrap_or_default()
                 ),
+                None if matches!(load_or_why(), Err(Some(_))) => {
+                    let why = load_or_why().err().flatten().unwrap_or_default();
+                    println!("innerwarden llm - not configured: {why}.");
+                    eprintln!("innerwarden llm: {why}");
+                }
                 None => println!(
                     "innerwarden llm - not configured. Ambiguous commands escalate to a human.\n  set one: innerwarden llm set --url <chat-completions-URL> --model <name> [--provider azure], then innerwarden llm set-key"
                 ),
@@ -771,6 +889,35 @@ mod flag_parse_tests {
             "http://x".to_string(),
         ];
         assert!(parse_llm_flags(&set).is_ok());
+    }
+
+    /// A url is printed without its user part or its query.
+    #[test]
+    fn a_url_is_shown_without_a_password_or_a_query() {
+        assert_eq!(
+            shown_url("http://u:p@host:8080/v1/chat"),
+            "http://host:8080/v1/chat"
+        );
+        assert_eq!(
+            shown_url("https://x.example/v1beta/m?key=SECRET"),
+            "https://x.example/v1beta/m?..."
+        );
+        assert_eq!(
+            shown_url("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert!(!shown_url("http://a:SECRET@h/").contains("SECRET"));
+    }
+
+    /// A backslash ends the host, as a WHATWG parser reads it, and a url
+    /// with one is refused by `llm set`.
+    #[test]
+    fn a_backslash_ends_the_host_and_is_refused() {
+        assert_eq!(origin("http://A\\@B/"), "http://a");
+        assert_ne!(origin("http://A\\@B/"), origin("http://B/"));
+        assert!(url_refused("http://A\\@B/").is_some());
+        assert!(url_refused("http://a b/").is_some());
+        assert!(url_refused("https://api.openai.com/v1/chat/completions").is_none());
     }
 
     /// The place a key goes to: scheme and host with port, never the path or
