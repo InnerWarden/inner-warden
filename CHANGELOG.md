@@ -5,6 +5,20 @@ follows semantic versioning.
 
 ## Unreleased
 
+An MCP server in code mode (one tool that runs a script against its API,
+such as Cloudflare's `search` and `execute`) is judged by the API calls in
+the script, in the hook and in the MCP proxy alike. A call to a tool named
+`execute`, `run_code`, `eval` or the like, with its script in `code`,
+`script` or the like, is read as JavaScript or TypeScript: a method that
+deletes, purges or makes or changes a credential (`zones.delete`,
+`cache.purge`, `tokens.create`, `workers.scripts.update`, an HTTP `DELETE`,
+a `DROP TABLE`) is a review, and so is what cannot be read (an `eval` of a
+string, a dynamic `import`, a method named at run time). The hook asks, or
+refuses under `--block-review`; the proxy forwards it with the alert in
+`guard` and refuses it in `strict` and `kill`. A script that only lists and
+gets runs as before. Before, `execute(script)` ran in every mode whatever the
+script did.
+
 `innerwarden setup` and the new `innerwarden status --config` say what is
 already set in the agents' own config, and change nothing. In
 `~/.claude/settings.json`, `~/.claude.json`, `~/.cursor/mcp.json`,

@@ -2918,10 +2918,19 @@ pub(crate) fn screen_shell(
         host,
         posture,
     } = *options;
+    // A tool that runs the script it is handed (an MCP server in code mode:
+    // `execute`, `run_code`, `eval`) is judged by the API calls in the
+    // script, as the MCP proxy judges it: one that changes, destroys or
+    // cannot be read is a review, which goes through every layer below as
+    // a line's review does. A script that only reads runs, as before.
+    let script = serde_json::from_str::<serde_json::Value>(buf)
+        .ok()
+        .and_then(|payload| innerwarden_agent_guard::mcp_code_mode::hook_verdict(&payload));
     let (lines, file_read) = match classify_hook_input(buf) {
         HookInput::Command(command) => (vec![command], false),
         HookInput::Commands(lines) => (lines, false),
         HookInput::FileRead(command) => (vec![command], true),
+        HookInput::NotAShellCall if script.is_some() => (Vec::new(), false),
         HookInput::NotAShellCall => return ShellScreen::Nothing,
         HookInput::Unreadable(why) => return ShellScreen::Unreadable(why),
     };
@@ -2935,6 +2944,7 @@ pub(crate) fn screen_shell(
     let judged: Vec<(String, serde_json::Value)> = lines
         .iter()
         .filter_map(|line| hook_verdict_for(line, context.as_ref()))
+        .chain(script)
         .collect();
     hook_net::mark("rules");
     if judged.is_empty() {
