@@ -945,6 +945,39 @@ their MCP servers get no session id to match. Details and limits:
 
 ### AI Jail
 
+- **A Linux jail's programs do not connect to abstract unix sockets made
+  outside it.** The jail shares the host's network, where an X server's
+  `@/tmp/.X11-unix/X0` lives, so a program in it could type into your other
+  windows. Every Linux jail now starts its command through
+  `innerwarden contain-exec -- <command>` (it shows in the jail's command
+  line and in `--dry-run`), which puts it under Landlock's abstract socket
+  scope and replaces itself with the command. TCP, unix sockets reached by a
+  path and abstract sockets the jail's own programs make work as before. A
+  session bus or agent socket your session offers only as
+  `unix:abstract=` (in `DBUS_SESSION_BUS_ADDRESS`) is now out of the jail's
+  reach. Before Linux 6.12 (no Landlock ABI 6) the jail does NOT have this
+  protection: it says so in one line when it starts, and runs as before.
+  The scope limits connecting out, not binding nor connections in, so the
+  display is not isolated: a program in the jail that binds a display's
+  abstract name before that X server starts receives its clients, and an X
+  server listening on TCP stays reachable. Only a network namespace of the
+  jail's own would close that.
+- **A command the jail cannot run exits 127 or 126.** A jailed command that
+  is not there exits 127, and one that cannot be run (no permission) 126,
+  with `innerwarden contain: cannot run ...`. Before, bubblewrap said
+  `bwrap: execvp ...` and the jail exited 1.
+- **A Linux jail cannot leave what your session runs at the next login.**
+  Every jail showed `~/.config` and `~/.local` writable, so a program in it
+  could write `~/.config/autostart/*.desktop`, a systemd user unit and the
+  link that enables it, or `~/.config/environment.d`, and the session ran
+  it as you, outside the jail, at the next login. Now `~/.config/autostart`,
+  `~/.config/systemd`, `~/.config/environment.d`, `~/.config/upstart`,
+  `~/.local/share/systemd/user` and `~/.local/share/dbus-1/services` are
+  read-only in every jail, made empty first where they are not there, and
+  the folders above them cannot be renamed away. The agent's own folders in
+  `~/.config` stay writable. One of them reached through a link in
+  `~/.config` or `~/.local` refuses the launch. With `XDG_CONFIG_HOME`
+  set elsewhere they are not covered.
 - **No jail shows your `~/.claude` writable any more.** That folder carries
   the settings that wire the guard's hook, and a program in a jail could
   take the hook out, turn hooks off with a `settings.local.json` of its

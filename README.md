@@ -186,7 +186,13 @@ guard` and the rest) are its own and are not the hook posture.
   scheduled jobs, stored credentials).
 - **AI Jail**: `innerwarden contain -- <command>` runs an agent in a
   constrained profile (bubblewrap on Linux, sandbox-exec on macOS), so a
-  denied action is stopped, not only flagged.
+  denied action is stopped, not only flagged. On Linux a program in it
+  cannot leave an autostart entry or a systemd user unit for your next
+  login, and on Linux 6.12 or later it does not connect to an abstract unix
+  socket made outside the jail. It does not isolate your display: a program
+  in it that binds a display's abstract name before that X server starts
+  receives its clients, and an X server listening on TCP stays reachable
+  ([limits](docs/agent-identity.md)).
 - **Agent discovery**: finds the AI agents and agent tooling on the machine.
 - **Local dashboard** on `http://127.0.0.1:8788` (`innerwarden dashboard`),
   read-only, never leaves the machine.

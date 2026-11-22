@@ -334,11 +334,20 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         let records_made = make_plain_records(&input);
         #[cfg(not(target_os = "linux"))]
         let records_made = false;
+        // And the folders the session runs from on its own, read-only in
+        // the jail, so a program in it never makes one.
+        #[cfg(target_os = "linux")]
+        let autostart_made = make_autostart_dirs(&input);
+        #[cfg(not(target_os = "linux"))]
+        let autostart_made = false;
         // On an account where Claude Code never ran, arming the hook made
         // `~/.claude` after the jail was planned without it: the jail would
         // show no `~/.claude`, so no settings file and no hook. The jail is
         // planned again, and checked again, on what is there now.
-        if records_made || existing_home_paths(&input.home) != input.existing_paths {
+        if records_made
+            || autostart_made
+            || existing_home_paths(&input.home) != input.existing_paths
+        {
             input = match resolve_screened(
                 input.args.clone(),
                 input.home.clone(),
@@ -518,7 +527,53 @@ pub fn cmd_gate(rest: &[String]) -> ExitCode {
         eprintln!("innerwarden contain: {GATE_REFUSED}");
         return ExitCode::from(2);
     }
+    if let Err(code) = close_abstract_sockets() {
+        return code;
+    }
     run_in_place(command)
+}
+
+/// `innerwarden contain-exec -- <command...>`: run inside a Linux jail as
+/// its command ([`crate::contain::launch::exec_child`]). It closes the
+/// abstract unix sockets made outside the jail ([`crate::jail_scope`]) and
+/// replaces itself with `command`.
+pub fn cmd_exec(rest: &[String]) -> ExitCode {
+    let Some(command) = crate::contain::launch::parse_exec_args(rest) else {
+        eprintln!("innerwarden contain: contain-exec takes -- <command>");
+        return ExitCode::from(2);
+    };
+    if let Err(code) = close_abstract_sockets() {
+        return code;
+    }
+    run_in_place(command)
+}
+
+/// Close the abstract unix sockets made outside the jail to this process
+/// and what it runs. A kernel without Landlock scopes is said once and the
+/// command starts as it did before; one that has them and still refuses
+/// ends the launch (exit 126), so a jail never runs without a rule its
+/// kernel takes.
+#[cfg(target_os = "linux")]
+fn close_abstract_sockets() -> Result<(), ExitCode> {
+    match crate::jail_scope::close_abstract_sockets() {
+        Ok(crate::jail_scope::Kernel::Scopes) => Ok(()),
+        Ok(crate::jail_scope::Kernel::NoScopes) => {
+            eprintln!("{}", crate::jail_scope::NO_SCOPES_SAID);
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "innerwarden contain: cannot close the abstract unix sockets outside the jail \
+                 ({error}); its command does not start"
+            );
+            Err(ExitCode::from(126))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn close_abstract_sockets() -> Result<(), ExitCode> {
+    Ok(())
 }
 
 /// Replace this process with `command`, as the jail's own child would have
@@ -1701,6 +1756,39 @@ fn resolve_planned(
             .collect()
     };
 
+    // Linux: the home folders the person's session runs from on its own,
+    // read-only in the jail, each that is there (the real run makes the
+    // others first, [`make_autostart_dirs`]). Never through a link in a
+    // folder the jail writes (`~/.config/systemd` a link): no mount pins a
+    // link, so a program in the jail could replace it with a folder of its
+    // own and the session would run what it put there.
+    let autostart_dirs = if cfg!(target_os = "linux") && !facts.macos {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for place in crate::contain::AUTOSTART_PLACES
+            .iter()
+            .map(|name| home.join(name))
+        {
+            let (_, links) = trace_links(&place);
+            if let Some(link) = crate::contain::steering_link(&links, None, &facts.writable) {
+                return Err(crate::contain::steered_link_refused(&place, link));
+            }
+            if !std::fs::symlink_metadata(&place).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            let real = leads_to(&place).unwrap_or_else(|| place.clone());
+            let named = [place.clone(), real.clone()];
+            let others = crate::contain::other_jail_views(&real, &named, &shown);
+            for dir in named.into_iter().chain(others) {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        dirs
+    } else {
+        Vec::new()
+    };
+
     // The project's Claude Code folder and MCP servers file, where each is
     // there and no link: read-only in the jail.
     let project_guard_files = crate::contain::PROJECT_GUARD_NAMES
@@ -1733,6 +1821,7 @@ fn resolve_planned(
         key_fd: None,
         profiles_marker_fd: None,
         records_dirs,
+        autostart_dirs,
         child_env,
         close_userns: false,
         seccomp_fd: None,
@@ -3581,6 +3670,37 @@ fn copy_claude_login(claude: &Path, source: &Path, uid: u32) -> Result<(), Strin
     write_private_file(source, &to, &temp, &bytes, uid)
         .map(|_| ())
         .map_err(|e| format!("Claude Code's login cannot be copied for the jail ({e})"))
+}
+
+/// Linux, the real run, once the jail was planned with every check passed:
+/// each home folder the person's session runs from on its own
+/// ([`crate::contain::AUTOSTART_PLACES`]) made, empty, where it is not
+/// there and the dotdir it is in (`~/.config`, `~/.local`) is, so the jail
+/// is planned again and shows it read-only, and never makes one of its
+/// own. Whether one was made now. One that cannot be made is said: the
+/// jail could then make it.
+#[cfg(target_os = "linux")]
+fn make_autostart_dirs(input: &JailInputs) -> bool {
+    let mut made = false;
+    for name in crate::contain::AUTOSTART_PLACES {
+        let place = input.home.join(name);
+        let Some(top) = Path::new(name).components().next() else {
+            continue;
+        };
+        let dotdir_bound = std::fs::metadata(input.home.join(top)).is_ok_and(|m| m.is_dir());
+        if !dotdir_bound || std::fs::symlink_metadata(&place).is_ok() {
+            continue;
+        }
+        match std::fs::create_dir_all(&place) {
+            Ok(()) => made = true,
+            Err(e) => eprintln!(
+                "innerwarden contain: {} cannot be made ({e}); a program in the jail could make \
+                 it and leave there what the session runs at the next login",
+                crate::contain::printable(&place)
+            ),
+        }
+    }
+    made
 }
 
 /// Linux, the real run of a plain jail, once the jail was planned with
@@ -7028,6 +7148,71 @@ mod tests {
         assert!(open_held(&home.join("shared/ro"), &wide, &[home.join(".cache")]).is_err());
     }
 
+    /// The home folders the person's session runs from on its own: the
+    /// plan lists each one that is there, as named; the real run makes the
+    /// others where the dotdir they are in is there (none under a `~/.local`
+    /// that is not), and the plan made again lists them all. One reached
+    /// through a link in a folder the jail writes (`~/.config/systemd` a
+    /// link) refuses the launch.
+    ///
+    /// FAILS ON REVERT: list none, make none, or plan through the link.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sessions_autostart_folders_are_made_and_listed_for_the_jail() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(home.join(".config/autostart")).unwrap();
+        std::fs::create_dir_all(home.join(".config/myagent")).unwrap();
+        let project = r.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let rest: Vec<String> = ["--project", project.to_str().unwrap(), "--", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let args = parse_contain_args(&rest).unwrap();
+        let resolve = || resolve_inputs(args.clone(), home.clone(), PathBuf::from("/usr/bin/true"));
+        let first = resolve().unwrap();
+        assert_eq!(first.autostart_dirs, [home.join(".config/autostart")]);
+        assert!(make_autostart_dirs(&first));
+        for name in [
+            ".config/systemd",
+            ".config/environment.d",
+            ".config/upstart",
+        ] {
+            assert!(home.join(name).is_dir(), "{name}");
+        }
+        assert!(
+            !home.join(".local").exists(),
+            "no ~/.local, nothing made in it"
+        );
+        let again = resolve().unwrap();
+        let want: Vec<PathBuf> = crate::contain::AUTOSTART_PLACES
+            .iter()
+            .filter(|name| name.starts_with(".config/"))
+            .map(|name| home.join(name))
+            .collect();
+        assert_eq!(again.autostart_dirs, want);
+        assert!(!make_autostart_dirs(&again), "all there: nothing made");
+        // With a `~/.local`, its places are made and listed too.
+        std::fs::create_dir_all(home.join(".local")).unwrap();
+        assert!(make_autostart_dirs(&resolve().unwrap()));
+        assert_eq!(
+            resolve().unwrap().autostart_dirs.len(),
+            crate::contain::AUTOSTART_PLACES.len()
+        );
+        // A link in `~/.config`, which the jail writes: refused.
+        std::fs::remove_dir(home.join(".config/systemd")).unwrap();
+        std::fs::create_dir_all(r.join("dots/systemd")).unwrap();
+        symlink(r.join("dots/systemd"), home.join(".config/systemd")).unwrap();
+        let refused = resolve().unwrap_err().to_string();
+        assert!(
+            refused.contains("a link in a folder a program in the jail can write"),
+            "{refused}"
+        );
+    }
+
     /// A plain jail's real run makes the launcher's records folder and this
     /// project's folder for Claude Code's settings file (0700, this
     /// account's) before the jail is planned again, and the plan then shows
@@ -8707,6 +8892,35 @@ mod tests {
         assert!(none.is_empty() && same.bind_fds.is_empty());
     }
 
+    /// The `innerwarden` binary cargo built beside this test binary
+    /// (`target/<profile>/innerwarden`, next to `deps/`), for a test that
+    /// runs a jail's plan with the host's bwrap: the plan starts the jail's
+    /// command through it ([`crate::contain::launch::exec_child`]). A
+    /// `cargo test` that builds the package's integration tests builds it
+    /// too. Missing: a failure in CI, said and skipped elsewhere.
+    #[cfg(target_os = "linux")]
+    fn built_launcher(test: &str) -> Option<PathBuf> {
+        let built = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent()?.parent().map(|dir| dir.join("innerwarden")))
+            .filter(|path| path.is_file());
+        if built.is_none() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "{test}: no innerwarden binary beside the test binary"
+            );
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(
+                format!(
+                    "SKIPPED {test}: no innerwarden binary beside the test binary \
+                     (run the package's tests, which build it)\n"
+                )
+                .as_bytes(),
+            );
+        }
+        built
+    }
+
     /// CWWT-SEC-1, live (Linux, the host's own bwrap): a program in a jail
     /// of the project `app` lays it out as its own repository (`HEAD`,
     /// `objects`, `refs`, `worktrees/x` naming its `.git` back), puts `L`, a
@@ -8777,7 +8991,15 @@ mod tests {
         .collect();
         let mut args = parse_contain_args(&rest).unwrap();
         args.extra_ro = vec![vendor.clone()];
-        let input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        // The launcher the jail's command starts through
+        // (`<launcher> contain-exec -- /bin/sh ...`): the real one, or the
+        // script never runs. `/usr/bin/true` here exited 0 for it.
+        let Some(launcher) = built_launcher(
+            "a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable",
+        ) else {
+            return;
+        };
+        let input = resolve_inputs(args, home.clone(), launcher).unwrap();
         assert_eq!(input.worktree, None);
         assert!(
             input.left.contains(&crate::contain::worktree_left_out(

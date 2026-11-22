@@ -328,12 +328,34 @@ subvolumes and snapshots: a snapshot made before the jail started, in a folder
 the jail shows, still holds the files the jail hides (`.env`, `secrets/`, each
 `--deny-read` path), and a program in the jail can read them there. Keep such
 snapshots out of the project and out of the folders the jail shows. The jail
-shares the host's network, so a program in it can still reach any abstract unix socket,
-a desktop's X server among them, and through X type into another window. On
+shares the host's network, where abstract unix sockets live. On Linux 6.12 or later
+with landlock in the LSM list, the jail's command starts under Landlock's abstract
+socket scope, so a program in it cannot connect to an abstract unix socket made outside the jail,
+a desktop's X server among them; TCP, unix sockets reached by a path and abstract
+sockets the jail's own programs make work as before. A session bus or an agent
+socket the person's session offers only as an abstract socket (`unix:abstract=` in
+`DBUS_SESSION_BUS_ADDRESS`) is then out of the jail's reach. The scope limits what a
+program in the jail connects or sends to, not what it binds nor who connects to it,
+so the jail does not isolate the display. Two ways stay open: a program in the jail
+that binds a display's name first (`@/tmp/.X11-unix/X5` before that X server starts)
+receives the X clients of the host that connect to that display, and an X server
+that listens on TCP (`Xvfb -listen tcp`, `DISPLAY=127.0.0.1:7`) is reachable like any
+other TCP port. Only a network namespace of the jail's own would close both. On an older kernel a program in the jail can still reach any abstract unix socket, and through X type into another window; the jail says so when it starts. On
 a kernel older than 4.8, a program in the jail that traces another can change
 a call after the filter has seen it: there an identified jail does not close
 user namespaces, and `contain` says the filter is weaker. This is not
 yet proven on RHEL 9 or Rocky 9.
+
+On Linux the folders the person's session runs from on its own at the next login are
+read-only in every jail: `~/.config/autostart`, `~/.config/systemd` (user units, the
+links that enable them and `user.conf`), `~/.config/environment.d`,
+`~/.config/upstart`, `~/.local/share/systemd/user` and `~/.local/share/dbus-1/services`.
+`contain` makes each empty where it is not there and the folder above it is, so a
+program in the jail cannot make one either; the agent's own folders in `~/.config`
+stay writable. One of them reached through a link in `~/.config` or `~/.local`
+(`~/.config/systemd` a link to a dotfiles folder) refuses the launch: a program in
+the jail could replace that link. With `XDG_CONFIG_HOME` set to another folder the
+session reads those places there, and the jail does not cover them.
 
 A tool that reads the command line of a running jail's bubblewrap (from
 `/proc`) finds an identified jail's filter first: that command line starts

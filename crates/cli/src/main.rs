@@ -47,6 +47,7 @@ mod host_decide;
 mod host_decide_io;
 mod http_io;
 mod jail_record;
+mod jail_scope;
 mod mcp_pins_io;
 mod notify_io;
 mod observe;
@@ -711,6 +712,8 @@ fn main() -> std::process::ExitCode {
         Some("contain") => contain_io::cmd(&args[1..]),
         // Run by `contain` inside a jail that starts only once admitted.
         Some(crate::contain::launch::GATE_VERB) => contain_io::cmd_gate(&args[1..]),
+        // Run by `contain` as every other Linux jail's command.
+        Some(crate::contain::launch::EXEC_VERB) => contain_io::cmd_exec(&args[1..]),
         Some("enforce") => cmd_mode(&args[1..], false),
         Some("dry-run") | Some("monitor") => cmd_mode(&args[1..], true),
         Some("allow") => suppress_io::cmd_allow(&args[1..]),
