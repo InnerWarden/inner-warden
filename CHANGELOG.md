@@ -33,12 +33,17 @@ redirection to it: `sort -o /etc/passwd x`, `sort --output=/etc/passwd x`,
 options of `curl`, `wget`, `tshark` and `ssh -E` were allowed onto the
 account database, a key, an agent's settings or the guard's own
 configuration, where `> /etc/passwd` is refused. An output into the work's
-own folder keeps its verdict. `od`, `xxd`, `hexdump`, `hd`, `base32`,
+own folder keeps its verdict. GNU abbreviations of these options
+(`sort --out=`, `wget --output-doc=`) are read as the option, and the
+second operand of `xxd` (`xxd -r hex.txt /etc/passwd`) as the file it
+writes. `od`, `xxd`, `hexdump`, `hd`, `base32`,
 `basenc`, `nl`, `tac`, `rev`, `fold`, `paste` and `look` read a secret
 as `cat` does: `od -c /etc/shadow` and `xxd ~/.ssh/id_rsa` were allowed. A
-write into an open file of another process (`> /proc/1234/fd/0`, `tee
-/proc/77/fd/2`) is refused; the shell's own (`/proc/self/fd/1`,
-`/proc/$$/fd/2`) is not. A line of many functions defined and called is
+write into the input or another open file of another process (`>
+/proc/1234/fd/0`, also written `/proc/self/../1/fd/0`) is refused; into
+its output or error (`> /proc/1/fd/1 2>/proc/1/fd/2`, how a job in a
+container logs) it is held for review; the shell's own
+(`/proc/self/fd/1`, `/proc/$$/fd/2`) is neither. A line of many functions defined and called is
 read in time that grows with its length: `f() { true; }; f;` repeated to
 16 KB took over eleven seconds.
 

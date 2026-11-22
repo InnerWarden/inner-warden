@@ -29,6 +29,60 @@ const LONG_OUTPUTS: &[&str] = &[
     "--append-output",
 ];
 
+/// Whether `--{name}` is one of [`LONG_OUTPUTS`] or, as GNU getopt reads
+/// it, an abbreviation of one: `--out=F` and `--o F` are `--output`. An
+/// abbreviation of three characters or more, dashes counted, is read as the
+/// entry it begins, whether or not another option of the program begins the
+/// same way.
+fn long_output(name: &str) -> bool {
+    let option = format!("--{name}");
+    option.len() >= 3 && LONG_OUTPUTS.iter().any(|entry| entry.starts_with(&option))
+}
+
+/// The file xxd writes: its second operand, the bytes back from a dump
+/// with `-r` (`xxd -r hex.txt out`) or the dump without it.
+/// Options come before the operands, as xxd reads them; `-c`, `-g`,
+/// `-l`, `-n`, `-o`, `-s` and `-R` (and their long forms) take a value,
+/// in the same word or the next. An operand `-` is the standard stream.
+fn xxd_output(words: &[String], at: usize) -> Option<String> {
+    const VALUED: &[&str] = &[
+        "-c",
+        "-cols",
+        "-g",
+        "-groupsize",
+        "-l",
+        "-len",
+        "-n",
+        "-name",
+        "-o",
+        "-offset",
+        "-s",
+        "-seek",
+        "-R",
+    ];
+    let mut index = at + 1;
+    while let Some(word) = words.get(index) {
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        if word == "-" || !word.starts_with('-') {
+            break;
+        }
+        index += 1;
+        // xxd reads `--name` as `-name`.
+        let option = word
+            .strip_prefix('-')
+            .filter(|rest| rest.starts_with('-'))
+            .unwrap_or(word);
+        if VALUED.contains(&option) {
+            index += 1;
+        }
+    }
+    let output = words.get(index + 1)?;
+    (output != "-").then(|| output.clone())
+}
+
 /// A program whose short options name the file it writes: the letters that
 /// do, and the other letters that take a value (so a cluster ends there).
 struct ShortOutputs {
@@ -86,6 +140,9 @@ fn option_outputs(words: &[String], at: usize) -> Vec<String> {
     let program = crate::threats::token_basename(&words[at]).to_ascii_lowercase();
     let short = SHORT_OUTPUTS.iter().find(|row| row.program == program);
     let mut found = Vec::new();
+    if program == "xxd" {
+        found.extend(xxd_output(words, at));
+    }
     let mut index = at + 1;
     while let Some(word) = words.get(index) {
         index += 1;
@@ -97,7 +154,7 @@ fn option_outputs(words: &[String], at: usize) -> Vec<String> {
                 Some((name, value)) => (name, Some(value.to_owned())),
                 None => (long, None),
             };
-            if LONG_OUTPUTS.contains(&format!("--{name}").as_str()) {
+            if long_output(name) {
                 match value {
                     Some(value) => found.push(value),
                     None => {
@@ -205,12 +262,14 @@ pub(crate) fn outputs_as_redirections(line: &str) -> Option<String> {
     Some(read)
 }
 
-/// The first file of `/proc/<pid>/fd/` (or `/proc/<pid>/task/<tid>/fd/`) the
+/// The file of `/proc/<pid>/fd/` (or `/proc/<pid>/task/<tid>/fd/`) the
 /// line writes into, through a redirection or `tee`, for a process that is
 /// not the shell's own: `self`, `thread-self`, `$$` and `$BASHPID` are the
 /// line's own; any other number or name is another process, whose stream
-/// the line does not show.
-pub(crate) fn writes_into_another_process(line: &str) -> Option<String> {
+/// the line does not show. Of the files the line writes into, one that is
+/// not the standard output or error of that process (`fd/0`, its input)
+/// is named before one that is; [`ProcessStream::injects`] says which.
+pub(crate) fn writes_into_another_process(line: &str) -> Option<ProcessStream> {
     let mut targets = crate::threats::lexical_output_redirect_targets(line);
     for segment in crate::threats::shell_command_segments(line) {
         targets.extend(crate::threats::tee_write_targets(
@@ -219,30 +278,66 @@ pub(crate) fn writes_into_another_process(line: &str) -> Option<String> {
     }
     targets
         .into_iter()
-        .find(|target| another_process_stream(target))
+        .filter_map(|target| {
+            another_process_stream(&target).map(|injects| ProcessStream { target, injects })
+        })
+        .max_by_key(|stream| stream.injects)
+}
+
+/// A file of another process the line writes into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProcessStream {
+    /// The target as the line wrote it.
+    pub(crate) target: String,
+    /// True when it is not that process's standard output or error
+    /// (`fd/1`, `fd/2`): its input, `fd/0`, or any other open file. A
+    /// write into `/proc/1/fd/1` is how a job in a container logs to it.
+    pub(crate) injects: bool,
+}
+
+/// The components of an absolute path with `.` and `..` resolved as
+/// written (`/proc/self/../1/fd/0` is `/proc/1/fd/0`); `None` for a path
+/// that is not absolute.
+fn lexical_components(path: &str) -> Option<Vec<&str>> {
+    let rest = path.strip_prefix('/')?;
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    Some(parts)
 }
 
 /// Whether `target` names an open file of a process that is not the
-/// line's own.
-fn another_process_stream(target: &str) -> bool {
+/// line's own: `Some(false)` for its standard output or error, `Some(true)`
+/// for any other of its files.
+fn another_process_stream(target: &str) -> Option<bool> {
     let target = target.trim_matches(|c| c == '"' || c == '\'');
-    let Some(rest) = target.strip_prefix("/proc/") else {
-        return false;
-    };
-    let mut parts = rest.split('/').filter(|part| !part.is_empty());
-    let Some(process) = parts.next() else {
-        return false;
-    };
+    let parts = lexical_components(target)?;
+    let mut parts = parts.into_iter();
+    if parts.next() != Some("proc") {
+        return None;
+    }
+    let process = parts.next()?;
     let mut next = parts.next();
     if next == Some("task") {
         parts.next();
         next = parts.next();
     }
-    next == Some("fd")
-        && !matches!(
+    if next != Some("fd")
+        || matches!(
             process,
             "self" | "thread-self" | "$$" | "${$}" | "$BASHPID" | "${BASHPID}"
         )
+    {
+        return None;
+    }
+    Some(!matches!(parts.next(), Some("1" | "2")))
 }
 
 #[cfg(test)]
@@ -279,6 +374,46 @@ mod tests {
         assert_eq!(outputs_as_redirections("sort -o 'a b' x"), None);
     }
 
+    /// FAILS ON REVERT of `long_output`: GNU getopt reads an abbreviation
+    /// as the option it begins.
+    #[test]
+    fn an_abbreviated_output_option_is_read_as_the_option() {
+        assert_eq!(
+            outputs_as_redirections("sort --out=/etc/passwd x").as_deref(),
+            Some("sort --out=/etc/passwd x > /etc/passwd")
+        );
+        assert_eq!(
+            outputs_as_redirections("sort --o /etc/passwd x").as_deref(),
+            Some("sort --o /etc/passwd x > /etc/passwd")
+        );
+        assert_eq!(
+            outputs_as_redirections("wget --output-doc=f https://x").as_deref(),
+            Some("wget --output-doc=f https://x > f")
+        );
+        assert_eq!(outputs_as_redirections("git diff --stat"), None);
+        assert_eq!(outputs_as_redirections("sort --outputs=f x"), None);
+    }
+
+    /// FAILS ON REVERT of `xxd_output`: the second operand is written.
+    #[test]
+    fn the_second_operand_of_xxd_is_read_as_its_output() {
+        assert_eq!(
+            outputs_as_redirections("xxd -r hex.txt /etc/passwd").as_deref(),
+            Some("xxd -r hex.txt /etc/passwd > /etc/passwd")
+        );
+        assert_eq!(
+            outputs_as_redirections("xxd -c 16 -r -p hex out").as_deref(),
+            Some("xxd -c 16 -r -p hex out > out")
+        );
+        assert_eq!(
+            outputs_as_redirections("xxd --revert -- hex out").as_deref(),
+            Some("xxd --revert -- hex out > out")
+        );
+        assert_eq!(outputs_as_redirections("xxd -r hex.txt"), None);
+        assert_eq!(outputs_as_redirections("xxd -r hex.txt -"), None);
+        assert_eq!(outputs_as_redirections("xxd -l 16 app.bin"), None);
+    }
+
     #[test]
     fn only_another_process_stream_is_found() {
         for line in [
@@ -299,6 +434,46 @@ mod tests {
             "echo '> /proc/1/fd/1'",
         ] {
             assert!(writes_into_another_process(line).is_none(), "{line}");
+        }
+    }
+
+    /// FAILS ON REVERT of `lexical_components`: `.` and `..` resolved
+    /// before the process is read.
+    #[test]
+    fn dots_in_the_path_are_resolved_before_the_process_is_read() {
+        for line in [
+            "echo hi > /proc/self/../1/fd/0",
+            "echo hi > /proc/self/fd/../../1/fd/0",
+            "echo hi > /proc/1/./fd/0",
+            "echo hi > //proc//1/fd/0",
+            "echo hi > /proc/../proc/1/fd/0",
+        ] {
+            let stream = writes_into_another_process(line);
+            assert!(stream.is_some_and(|s| s.injects), "{line}");
+        }
+        assert!(writes_into_another_process("echo hi > /proc/self/../self/fd/1").is_none());
+    }
+
+    /// FAILS ON REVERT of `ProcessStream::injects`: only the standard
+    /// output and error of the other process are its output.
+    #[test]
+    fn the_output_of_another_process_is_told_from_its_input() {
+        for line in [
+            "/app/job.sh > /proc/1/fd/1 2>/proc/1/fd/2",
+            "echo hi >> /proc/$PPID/fd/1",
+            "echo hi | tee /proc/77/fd/2",
+        ] {
+            let stream = writes_into_another_process(line);
+            assert!(stream.is_some_and(|s| !s.injects), "{line}");
+        }
+        for line in [
+            "echo hi > /proc/1234/fd/0",
+            "echo hi > /proc/1/fd/3",
+            "echo hi > /proc/1/fd/1 2>/proc/1/fd/0",
+            "echo hi > /proc/1/fd/$N",
+        ] {
+            let stream = writes_into_another_process(line);
+            assert!(stream.is_some_and(|s| s.injects), "{line}");
         }
     }
 }

@@ -5836,17 +5836,28 @@ fn analyze_command_as_read(
     }
 
     // A write into an open file of another process (`> /proc/1234/fd/0`)
-    // puts text in a stream the line does not show: refused. The shell's
-    // own (`/proc/self/fd/1`, `/proc/$$/fd/2`) is its own output.
-    if let Some(target) = crate::shell::output_options::writes_into_another_process(scan_cmd) {
+    // puts text in a stream the line does not show: refused. Its standard
+    // output or error (`> /proc/1/fd/1 2>/proc/1/fd/2`, how a job in a
+    // container logs to it) is held for review. The shell's own
+    // (`/proc/self/fd/1`, `/proc/$$/fd/2`) is its own output.
+    if let Some(stream) = crate::shell::output_options::writes_into_another_process(scan_cmd) {
+        let (s, what) = if stream.injects {
+            (
+                40,
+                "an open file of another process, a stream the line does not show",
+            )
+        } else {
+            (
+                25,
+                "the output of another process, where the line's text shows as its own",
+            )
+        };
         signals.push(AnalysisSignal {
             signal: "write_into_another_process".into(),
-            score: 40,
-            detail: format!(
-                "writes into an open file of another process: `{target}`, a stream the line does not show"
-            ),
+            score: s,
+            detail: format!("writes into {what}: `{}`", stream.target),
         });
-        score += 40;
+        score += s;
     }
 
     // Built-in credential stores are guarded only when the command consumes
