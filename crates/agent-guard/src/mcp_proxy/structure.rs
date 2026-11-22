@@ -1350,6 +1350,7 @@ fn claims_authority(words: &[&str], clauses: &[(&str, Option<char>)]) -> bool {
     // Who gives the order its weight: `Authorized by the CEO`, `por ordem da
     // diretoria`, `Compliance officer here`, `speaking with full authority`.
     let spaced = format!(" {} ", words.join(" "));
+    let pieces: Vec<&str> = spaced.split(' ').collect();
     let on_behalf = [
         "authorized by",
         "authorised by",
@@ -1373,7 +1374,7 @@ fn claims_authority(words: &[&str], clauses: &[(&str, Option<char>)]) -> bool {
         "con plena autoridad",
     ]
     .iter()
-    .any(|p| spaced.contains(&format!(" {p} ")));
+    .any(|p| may_stand(&pieces, p) && stands_spaced(&spaced, p));
     let here = clauses.first().is_some_and(|(clause, _)| {
         let first = words_of(clause);
         first.len() <= 3
@@ -1385,6 +1386,7 @@ fn claims_authority(words: &[&str], clauses: &[(&str, Option<char>)]) -> bool {
 
 /// Whether the words put the text before the task.
 fn claims_precedence(words: &[&str], spaced: &str) -> bool {
+    let pieces: Vec<&str> = spaced.split(' ').collect();
     let before_task = (0..words.len()).any(|i| {
         matches!(words[i], "before" | "antes")
             && words[i + 1..]
@@ -1407,6 +1409,9 @@ fn claims_precedence(words: &[&str], spaced: &str) -> bool {
     before_task
         || sets_aside
         || PRECEDENCE_PHRASES.iter().any(|p| {
+            if !may_stand(&pieces, p) {
+                return false;
+            }
             let at = format!(" {p} ");
             spaced.match_indices(&at).any(|(i, _)| {
                 // `instead of more integration tests` weighs two ways of
@@ -2287,6 +2292,18 @@ fn run_at(words: &[&str], i: usize, run: &[&str]) -> bool {
     words.get(i..).is_some_and(|rest| rest.starts_with(run))
 }
 
+/// [`run_at`] for a phrase whose words are joined by one space, read
+/// without collecting them first.
+fn run_words_at(words: &[&str], i: usize, phrase: &str) -> bool {
+    let Some(rest) = words.get(i..) else {
+        return false;
+    };
+    phrase
+        .split(' ')
+        .enumerate()
+        .all(|(at, part)| rest.get(at) == Some(&part))
+}
+
 /// An assistant noun as the subject of an obligation to act (`the model
 /// must email`, `any AI agent reading this is required to upload`, `o
 /// agente deve publicar`) or the one a verb hands an order to (`requires
@@ -2410,7 +2427,41 @@ fn message_to_assistant(words: &[&str]) -> bool {
 /// Whether a phrase of `cues` stands in `spaced` (words joined by one
 /// space, with a space at each end).
 fn has_cue(spaced: &str, cues: &[&str]) -> bool {
-    cues.iter().any(|c| spaced.contains(&format!(" {c} ")))
+    let words: Vec<&str> = spaced.split(' ').collect();
+    cues.iter()
+        .any(|c| may_stand(&words, c) && stands_spaced(spaced, c))
+}
+
+/// Whether `phrase` can stand between two spaces in the text whose pieces
+/// between spaces are `words`: its first word must be one of them. A
+/// check of a few words in place of a substring search per cue, and exact:
+/// where `phrase` stands, the bytes up to its first space (or its end) lie
+/// between two spaces of the text, so they are one of its pieces.
+fn may_stand(words: &[&str], phrase: &str) -> bool {
+    let first = phrase.split(' ').next().unwrap_or(phrase);
+    words.contains(&first)
+}
+
+/// Whether `phrase` stands in `spaced` between two spaces: the same as
+/// `spaced.contains(&format!(" {phrase} "))`, without building that string.
+/// The cue lists are read for every sentence of every text a server says, so
+/// a string built per cue per sentence was most of what reading a listing
+/// cost.
+fn stands_spaced(spaced: &str, phrase: &str) -> bool {
+    let bytes = spaced.as_bytes();
+    // Every start, overlapping ones too, as `contains` would find them.
+    let mut from = 0;
+    while let Some(found) = spaced.get(from..).and_then(|rest| rest.find(phrase)) {
+        let i = from + found;
+        if i > 0 && bytes[i - 1] == b' ' && bytes.get(i + phrase.len()) == Some(&b' ') {
+            return true;
+        }
+        let Some(step) = spaced[i..].chars().next() else {
+            return false;
+        };
+        from = i + step.len_utf8();
+    }
+    false
 }
 
 /// A softened order, a role or a game given, or the user's wish told: the
@@ -2421,7 +2472,15 @@ fn soft_address(words: &[&str], spaced: &str) -> bool {
 
 /// A role or a game given to the reader (`pretend you are`, `act as`).
 fn role_given(words: &[&str]) -> bool {
+    if words.is_empty() {
+        return false;
+    }
     ROLE_CUES.iter().any(|cue| {
+        // Only a sentence with the cue's first word can hold it.
+        let first = cue.split(' ').next().unwrap_or(cue);
+        if !words.contains(&first) {
+            return false;
+        }
         let cue_words: Vec<&str> = cue.split(' ').collect();
         (0..words.len()).any(|i| {
             run_at(words, i, &cue_words)
@@ -2545,7 +2604,7 @@ fn strong_precedence(words: &[&str], spaced: &str, parts: &[(&str, Option<char>)
             "en vez de",
         ]
         .iter()
-        .any(|p| run_at(words, i, &p.split(' ').collect::<Vec<_>>()))
+        .any(|p| run_words_at(words, i, p))
             && words[i + 2..].iter().take(3).any(|w| task_word(w))
     });
     // `ignore all previous instructions`, not `the previous instructions in
@@ -2587,6 +2646,10 @@ fn strong_precedence(words: &[&str], spaced: &str, parts: &[(&str, Option<char>)
         })
     }) || has_cue(spaced, SET_ASIDE_PHRASES);
     let hidden = HIDE_FROM_USER.iter().any(|p| {
+        // Only a sentence with the phrase's first word can hold it.
+        if !words.contains(&p.split(' ').next().unwrap_or(p)) {
+            return false;
+        }
         let run: Vec<&str> = p.split(' ').collect();
         (0..words.len()).any(|i| {
             run_at(words, i, &run)
@@ -3228,6 +3291,52 @@ mod tests {
             "USER_QUERY is the environment variable that holds the search text. Set it before you run the script.",
         ] {
             assert!(injection_structure(text).is_none(), "marked: {text}");
+        }
+    }
+
+    /// A cue is found where it was found when a string was built for it:
+    /// every cue list against texts made of the cues' own words, an
+    /// overlapping start (` xa a a ` holds ` a a ` only at its second
+    /// `a`), and a cue at either end.
+    ///
+    /// FAILS ON REVERT of the overlapping starts in `stands_spaced`.
+    #[test]
+    fn a_cue_is_found_where_a_built_string_finds_it() {
+        let built =
+            |spaced: &str, cues: &[&str]| cues.iter().any(|c| spaced.contains(&format!(" {c} ")));
+        assert!(stands_spaced(" xa a a ", "a a"));
+        assert!(has_cue(" xa a a ", &["a a"]));
+        assert!(!stands_spaced(" xa a ", "a a"));
+        let lists: &[&[&str]] = &[
+            POLITE_CUES,
+            TASK_CUES,
+            SET_ASIDE_PHRASES,
+            REALITY_CUES,
+            ROLE_CUES,
+            PRECEDENCE_PHRASES,
+        ];
+        let mut words: Vec<&str> = lists
+            .iter()
+            .flat_map(|l| l.iter())
+            .flat_map(|c| c.split(' '))
+            .collect();
+        words.sort_unstable();
+        words.dedup();
+        for list in lists {
+            for cue in list.iter() {
+                for w in words.iter().step_by(7) {
+                    for spaced in [
+                        format!(" {cue} "),
+                        format!(" {w} {cue} "),
+                        format!(" {cue} {w} "),
+                        format!(" {w}{cue} "),
+                        format!(" {cue}{w} "),
+                        format!(" {w} {cue} {w} "),
+                    ] {
+                        assert_eq!(has_cue(&spaced, list), built(&spaced, list), "{spaced:?}");
+                    }
+                }
+            }
         }
     }
 
