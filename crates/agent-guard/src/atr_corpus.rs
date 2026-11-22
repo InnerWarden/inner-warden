@@ -208,9 +208,17 @@ pub fn fold(text: &str) -> String {
 
 /// Literals at least one of which every match of `pattern` contains, read
 /// as [`fold`] reads a text (so the text must be folded too). `None` when no such set is known:
-/// the pattern does not parse as the `regex` crate parses it, even with
-/// its look-around taken out ([`without_look_around`]), or a match can be made of anything (an optional
-/// part, a class), or more than [`MAX_LITERALS`] are needed.
+/// the pattern does not parse as the `regex` crate parses it, or a match
+/// can be made of anything (an optional part, a class), or more than
+/// [`MAX_LITERALS`] are needed.
+///
+/// A pattern only `fancy-regex` reads (look-around, a back-reference) gets
+/// no literals even when every match holds some: it is run with a backtrack
+/// limit, and a text it cannot finish (a long one) is held for review
+/// ([`crate::rules`]'s `Reading::Undecided`). Skipping it for a text
+/// without its literals would let that text through where compiling the
+/// rule holds it, and the verdict would hang on whether another text had
+/// compiled the rule first.
 ///
 /// Sound by construction, never complete: a class counts as one character
 /// only when every character in it folds to the same one, literal text is
@@ -218,12 +226,7 @@ pub fn fold(text: &str) -> String {
 /// match adds nothing. A text without
 /// any of the literals cannot match.
 pub fn required_literals(pattern: &str) -> Option<Vec<String>> {
-    let hir = match regex_syntax::Parser::new().parse(pattern) {
-        Ok(hir) => hir,
-        Err(_) => regex_syntax::Parser::new()
-            .parse(&without_look_around(pattern)?)
-            .ok()?,
-    };
+    let hir = regex_syntax::Parser::new().parse(pattern).ok()?;
     let found = required(&hir)?;
     let usable = !found.is_empty() && found.len() <= MAX_LITERALS;
     if !usable {
@@ -241,93 +244,6 @@ pub fn required_literals(pattern: &str) -> Option<Vec<String>> {
 /// The most characters a class may hold and still be read as one folded
 /// character (`(?i)k` is three: `K`, `k` and the Kelvin sign).
 const MAX_CLASS_CHARS: usize = 4;
-
-/// `pattern` with its look-around groups (`(?=`, `(?!`, `(?<=`, `(?<!`)
-/// taken out, for a `fancy-regex` pattern the `regex` crate does not
-/// parse. A look-around matches no text, so every text the pattern matches
-/// is matched by what is left, and a literal every match of what is left
-/// holds, every match of the pattern holds too. `None` when the groups
-/// cannot be told apart (an unbalanced parenthesis).
-fn without_look_around(pattern: &str) -> Option<String> {
-    const OPENERS: &[&str] = &["(?<!", "(?<=", "(?!", "(?="];
-    let mut out = String::with_capacity(pattern.len());
-    let mut rest = pattern;
-    let mut in_class = false;
-    while let Some(c) = rest.chars().next() {
-        if c == '\\' {
-            let escaped: String = rest.chars().take(2).collect();
-            out.push_str(&escaped);
-            rest = &rest[escaped.len()..];
-            continue;
-        }
-        if in_class {
-            in_class = c != ']';
-            out.push(c);
-            rest = &rest[c.len_utf8()..];
-            continue;
-        }
-        if c == '[' {
-            in_class = true;
-            out.push(c);
-            rest = &rest[1..];
-            // A `]` right after `[` or `[^` is a member, not the end.
-            for lead in ["^]", "]"] {
-                if let Some(after) = rest.strip_prefix(lead) {
-                    out.push_str(lead);
-                    rest = after;
-                    break;
-                }
-            }
-            continue;
-        }
-        if let Some(opener) = OPENERS.iter().find(|o| rest.starts_with(**o)) {
-            rest = &rest[group_end(&rest[opener.len()..])? + opener.len()..];
-            continue;
-        }
-        out.push(c);
-        rest = &rest[c.len_utf8()..];
-    }
-    Some(out)
-}
-
-/// Where the group whose inside starts `inside` ends: the byte just after
-/// its closing parenthesis, counted from `inside`.
-fn group_end(inside: &str) -> Option<usize> {
-    let mut depth = 1usize;
-    let mut in_class = false;
-    let mut chars = inside.char_indices();
-    while let Some((i, c)) = chars.next() {
-        match c {
-            '\\' => {
-                chars.next();
-            }
-            '[' if !in_class => {
-                in_class = true;
-                let rest = &inside[i + 1..];
-                let skip = if rest.starts_with("^]") {
-                    2
-                } else if rest.starts_with(']') {
-                    1
-                } else {
-                    0
-                };
-                for _ in 0..skip {
-                    chars.next();
-                }
-            }
-            ']' if in_class => in_class = false,
-            '(' if !in_class => depth += 1,
-            ')' if !in_class => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i + 1);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
 
 /// The text one HIR node matches, folded ([`fold`]), when it can match
 /// only one: a literal, or a class whose every character folds to the same

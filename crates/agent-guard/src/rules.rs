@@ -2772,17 +2772,27 @@ detection:
                 let Some(literals) = cond.literals else {
                     continue;
                 };
-                let Ok(regex) = Regex::new(cond.pattern) else {
-                    continue;
-                };
                 let pending = PendingCondition {
                     field: AtrField::Content,
                     pattern: cond.pattern.to_string(),
                     description: String::new(),
                     literals: Some(literals),
                 };
+                // Compiled as the engine compiles it: a condition with
+                // literals is never one fancy-regex runs, which can be
+                // undecided where the literals say "cannot match".
+                let compiled = compile_conditions(rule.id, std::slice::from_ref(&pending), false);
+                let [condition] = compiled.as_slice() else {
+                    panic!("{}: {:?} does not compile", rule.id, cond.pattern);
+                };
+                assert!(
+                    !matches!(condition.regex, CompiledRegex::Fancy(_)),
+                    "{}: {:?} has literals yet runs in fancy-regex",
+                    rule.id,
+                    cond.pattern
+                );
                 for text in &texts {
-                    if regex.is_match(text) {
+                    if condition.regex.read(text) != Reading::NotMatched {
                         checked += 1;
                         assert!(
                             pending.may_match(&crate::atr_corpus::fold(text)),
@@ -2822,14 +2832,49 @@ detection:
         assert_eq!(lits("AKIA[0-9A-Z]{16}"), owned(&["akia"]));
         // A non-ASCII literal is kept as it is.
         assert_eq!(lits("café latte"), owned(&["café latte"]));
-        // Look-around matches no text: what is left decides. A
-        // back-reference is not this parser's.
-        assert_eq!(
-            lits("(?<!get_)(?:pay|refund)(?!\\[|\\))"),
-            owned(&["pay", "refund"])
-        );
-        assert_eq!(lits(r"[(?=]x(?!y)zz"), owned(&["xzz"]));
+        // A pattern only fancy-regex reads (look-around, a
+        // back-reference) gets none: it can be undecided on a long text,
+        // and that is held whatever literals the text lacks.
+        assert_eq!(lits("(?<!get_)(?:pay|refund)(?!\\[|\\))"), None);
+        assert_eq!(lits(r"[(?=]x(?!y)zz"), None);
         assert_eq!(lits(r"(a+)\1bcd"), None);
+        // A class holding `(?=` is not look-around.
+        assert_eq!(lits(r"[(?=]xzz"), owned(&["xzz"]));
+    }
+
+    /// A long call with none of a rule's literals is judged as when every
+    /// rule is compiled: a pattern only fancy-regex reads cannot finish on
+    /// it and holds it for review, in a process that compiled nothing before
+    /// (the hook) as in one whose earlier traffic compiled the rule (the
+    /// proxy).
+    ///
+    /// FAILS ON REVERT of the parse-only literals in
+    /// `atr_corpus::required_literals` (look-around taken out for
+    /// literals): the cold engine skips those rules and lets the call
+    /// through while the warm one holds it.
+    #[test]
+    fn a_long_call_without_literals_is_held_cold_as_warm() {
+        let sentence = "The meeting notes cover the roadmap, the budget and who owns each item. ";
+        let body = sentence.repeat(400_000 / sentence.len());
+        let args = serde_json::json!({ "title": "notes", "body": body }).to_string();
+        let context = AtrContext::tool_call("save_note", &args);
+        let ids = |matches: Vec<AtrMatch>| {
+            let mut ids: Vec<(String, bool)> = matches
+                .into_iter()
+                .map(|m| (m.rule_id, m.undecided_refusal))
+                .collect();
+            ids.sort();
+            ids
+        };
+        let cold = ids(RuleEngine::load_embedded().check_context(context));
+        let warm_engine = RuleEngine::load_embedded();
+        warm_engine.warm(AtrSource::ToolCall);
+        let warm = ids(warm_engine.check_context(context));
+        assert!(
+            warm.iter().any(|(_, undecided)| *undecided),
+            "no rule is undecided on this text any more; pick another: {warm:?}"
+        );
+        assert_eq!(cold, warm);
     }
 
     /// The cost of an ordinary MCP call in the hook was the regexes of every
@@ -2863,11 +2908,26 @@ detection:
             .iter()
             .filter(|rule| source_matches(&rule.source_type, AtrSource::ToolCall))
             .count();
-        let compiled = engine.compiled_rules().len();
+        // A rule with a condition that has no literals (a pattern only
+        // fancy-regex reads) compiles for every call: it must run on every
+        // text (`a_long_call_without_literals_is_held_cold_as_warm`). Of
+        // the rules literals can skip, an ordinary call compiles at most a
+        // third.
+        let skippable: Vec<&str> = EMBEDDED_RULES
+            .iter()
+            .filter(|rule| source_matches(rule.source_type, AtrSource::ToolCall))
+            .filter(|rule| rule.conditions.iter().all(|c| c.literals.is_some()))
+            .map(|rule| rule.id)
+            .collect();
+        let compiled = engine.compiled_rules();
+        let skippable_compiled = compiled
+            .iter()
+            .filter(|(id, _)| skippable.contains(id))
+            .count();
         assert!(
-            compiled * 3 <= tool_call_rules,
-            "{compiled} of {tool_call_rules} tool-call rules compiled for ordinary calls: {:?}",
-            engine.compiled_rules()
+            !skippable.is_empty() && skippable_compiled * 3 <= skippable.len(),
+            "{skippable_compiled} of {} skippable tool-call rules ({tool_call_rules} in all) compiled for ordinary calls: {compiled:?}",
+            skippable.len()
         );
     }
 }
