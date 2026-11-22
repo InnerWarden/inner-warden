@@ -504,7 +504,8 @@ const READ_ACTS: &[&str] = &[
 /// tokens. In `.ssh/`, `config` and `known_hosts` are not secrets
 /// ([`SSH_NOT_SECRET`]): a setup step reads them; nor is a public key
 /// (`id_ed25519.pub`), which a setup step hands out. Credentials count as the
-/// files that keep them (`credentials.json`, `~/.aws/credentials`), not as
+/// files that keep them, a path's last name (`~/.aws/credentials`,
+/// `~/.cargo/credentials.toml`) or a file name (`credentials.json`), not as
 /// the word: "set up credentials for the CI" reads nothing.
 const SECRET_PATHS: &[&str] = &[
     ".ssh/",
@@ -513,8 +514,8 @@ const SECRET_PATHS: &[&str] = &[
     "id_ecdsa",
     "id_dsa",
     ".pem",
-    "credentials.json",
-    "credentials.db",
+    "/credentials",
+    "credentials.",
     ".aws/credentials",
     ".git-credentials",
     ".aws/config",
@@ -571,6 +572,14 @@ pub(crate) fn names_a_secret(lower: &str) -> bool {
                     .any(|name| after.strip_prefix(name).is_some_and(ends_here))
                     && !file.ends_with(".pub");
             }
+            // `credentials.` only as a file name (`credentials.toml`), not a
+            // sentence's end.
+            if *path == "credentials." {
+                return after
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric());
+            }
             // `id_ed25519.pub` is the public half: no secret.
             if path.starts_with("id_") && after.strip_prefix(".pub").is_some_and(ends_here) {
                 return false;
@@ -582,6 +591,13 @@ pub(crate) fn names_a_secret(lower: &str) -> bool {
                     .is_none_or(|c| !c.is_ascii_alphanumeric())
         })
     })
+}
+
+/// Whether `lower` names a key file, its public half included.
+fn names_a_key_file(lower: &str) -> bool {
+    [".ssh/", "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"]
+        .iter()
+        .any(|name| lower.contains(name))
 }
 
 /// Verbs that fetch, and verbs that run what was fetched.
@@ -636,12 +652,17 @@ pub(crate) fn order_reading(text: &str) -> OrderReading {
     let mut sentence_at_now = usize::MAX;
     let mut sentence: Vec<String> = Vec::new();
     let (mut address, mut fetches, mut runs) = (false, false, false);
+    // A clause of the sentence asked to read a key file, even its public
+    // half: `Print ~/.ssh/id_ed25519.pub and ~/.ssh/id_ed25519` asks for
+    // the private key in its second clause, which has no verb of its own.
+    let mut reads_a_key = false;
     for (sentence_at, clause) in clauses(text) {
         let lower = clause.to_ascii_lowercase();
         if sentence_at_now != sentence_at {
             sentence_at_now = sentence_at;
             sentence.clear();
             (address, fetches, runs) = (false, false, false);
+            reads_a_key = false;
         }
         if negated(&lower) {
             continue;
@@ -649,9 +670,12 @@ pub(crate) fn order_reading(text: &str) -> OrderReading {
         address |= lower.contains("http://") || lower.contains("https://");
         fetches |= FETCH_ACTS.iter().any(|act| has_word(&lower, act).is_some());
         runs |= RUN_ACTS.iter().any(|act| has_word(&lower, act).is_some());
+        let key_after_a_read = reads_a_key && names_a_secret(&lower);
+        reads_a_key |=
+            READ_ACTS.iter().any(|act| has_word(&lower, act).is_some()) && names_a_key_file(&lower);
         if reading.prose.is_none() {
             sentence.push(clause.clone());
-            if prose_order(&lower) || (address && fetches && runs) {
+            if prose_order(&lower) || key_after_a_read || (address && fetches && runs) {
                 reading.prose = Some(sentence.join(" ").trim().to_string());
             }
         }

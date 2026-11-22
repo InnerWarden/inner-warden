@@ -92,52 +92,48 @@ pub(crate) struct Overwrite {
 /// quotes the line it fixes (an order written into `CLAUDE.md`) writes
 /// nothing into `CLAUDE.md`. A body under an unquoted delimiter that holds
 /// a `$(...)` or a backquote runs it, and is kept; so is any other
-/// here-document.
+/// here-document ([`message_heredoc`]), and a body whose delimiter never
+/// closes on a line of its own.
 pub(crate) fn without_message_bodies(content: &str) -> std::borrow::Cow<'_, str> {
-    static HEREDOC: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let heredoc = HEREDOC.get_or_init(|| {
-        regex::Regex::new(r#"<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?"#)
-            .expect("static heredoc regex")
-    });
     if !content.contains("<<") {
         return std::borrow::Cow::Borrowed(content);
     }
+    let all: Vec<&str> = content.lines().collect();
     let mut kept: Vec<&str> = Vec::new();
     let mut dropped = false;
-    let mut lines = content.lines();
-    while let Some(line) = lines.next() {
+    let mut index = 0;
+    while let Some(line) = all.get(index) {
+        index += 1;
         kept.push(line);
-        let Some(captures) = heredoc.captures(line).filter(|_| !line.contains("<<<")) else {
+        let Some(heredoc) = message_heredoc(line) else {
             continue;
         };
-        let head = line.split("<<").next().unwrap_or_default();
-        if !reads_message_from_stdin(head) {
+        // The shell ends the body at the first line that is the delimiter
+        // itself (past leading tabs under `<<-`); a body that never ends
+        // is not known to be the message, and is kept.
+        let Some(close) = all[index..].iter().position(|candidate| {
+            let candidate = if heredoc.strips_tabs {
+                candidate.trim_start_matches('\t')
+            } else {
+                candidate
+            };
+            candidate == heredoc.tag
+        }) else {
             continue;
-        }
-        let tag = captures.get(1).map(|m| m.as_str()).unwrap_or_default();
+        };
+        let body = &all[index..index + close];
         // An unquoted delimiter expands the body: a `$(...)` or a backquote
         // in it runs. Such a body is kept to be read.
-        let quoted = captures
-            .get(0)
-            .is_some_and(|m| m.as_str().contains(['\'', '"']));
-        let mut body = Vec::new();
-        let mut closed = None;
-        for candidate in lines.by_ref() {
-            if candidate.trim() == tag {
-                closed = Some(candidate);
-                break;
-            }
-            body.push(candidate);
-        }
         let runs_something = body
             .iter()
             .any(|line| line.contains("$(") || line.contains('\x60'));
-        if quoted || !runs_something {
+        if heredoc.quoted || !runs_something {
             dropped |= !body.is_empty();
         } else {
             kept.extend(body);
         }
-        kept.extend(closed);
+        kept.push(all[index + close]);
+        index += close + 1;
     }
     if dropped {
         std::borrow::Cow::Owned(kept.join("\n"))
@@ -146,35 +142,104 @@ pub(crate) fn without_message_bodies(content: &str) -> std::borrow::Cow<'_, str>
     }
 }
 
-/// Whether the last command of `head` is `git`, `gh` or `glab` reading its
-/// message from stdin: `-F -`, `--file=-`, `--body-file -`,
-/// `--notes-file -`.
+/// A here-document whose body is a message reader's message.
+#[derive(Debug, PartialEq, Eq)]
+struct MessageHeredoc {
+    /// The delimiter, without its quotes.
+    tag: String,
+    /// Whether the delimiter was quoted (the body is not expanded).
+    quoted: bool,
+    /// `<<-`: the closing line may start with tabs.
+    strips_tabs: bool,
+}
+
+/// The here-document a line hands a message reader, when nothing else on
+/// the line can make its body run or land in a file: one `<<` on the
+/// line; a delimiter that is a bare name, whole or in one pair of quotes,
+/// with nothing after it (`<<E'OF'`, `<<'E'OF` and `<<EOF.` end at
+/// another line than the name read here, and are kept); no `>` nor `|`
+/// anywhere on the line (`git commit -F - <<'EOF' > CLAUDE.md` writes
+/// git's output there); and a command of [`reads_message_from_stdin`].
+fn message_heredoc(line: &str) -> Option<MessageHeredoc> {
+    if line.matches("<<").count() != 1 || line.contains("<<<") || line.contains(['>', '|']) {
+        return None;
+    }
+    let (head, tail) = line.split_once("<<")?;
+    let (strips_tabs, tail) = match tail.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, tail),
+    };
+    let tail = tail.trim_start_matches([' ', '\t']);
+    let word = tail.split_whitespace().next()?;
+    if !tail[word.len()..].trim().is_empty() {
+        return None;
+    }
+    let (tag, quoted) = match word.as_bytes() {
+        [open @ (b'\'' | b'"'), .., close] if open == close && word.len() > 2 => {
+            (&word[1..word.len() - 1], true)
+        }
+        _ => (word, false),
+    };
+    let is_name = tag
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !is_name || !reads_message_from_stdin(head) {
+        return None;
+    }
+    Some(MessageHeredoc {
+        tag: tag.to_string(),
+        quoted,
+        strips_tabs,
+    })
+}
+
+/// Whether `head`, the command a here-document feeds, is a fixed message
+/// reader taking its message from stdin and running nothing it is handed:
+/// `git commit`, `git tag`, `git notes add|append` with `-F -` or
+/// `--file=-`, or `gh pr|issue create|edit` with `--body-file -`. Git's own
+/// options before the subcommand (`-c core.editor=sh`, an alias), an
+/// assignment or a wrapper before the program (`GIT_EDITOR=sh git`), and an
+/// option that opens an editor (`-e`, `--edit`, `-c`, `--editor`) all
+/// make the body something a shell may run, and the body is kept.
 fn reads_message_from_stdin(head: &str) -> bool {
     let Some(segment) = shell_command_segments(head).into_iter().last() else {
         return false;
     };
     let words = shell_tokens(segment);
-    let Some(at) = effective_command_index(&words) else {
+    if effective_command_index(&words) != Some(0) {
         return false;
+    }
+    let rest = &words[1..];
+    let word = |at: usize| rest.get(at).map(String::as_str);
+    let fixed = match token_basename(&words[0]).to_ascii_lowercase().as_str() {
+        "git" => {
+            matches!(word(0), Some("commit" | "tag"))
+                || word(0) == Some("notes") && matches!(word(1), Some("add" | "append"))
+        }
+        "gh" => {
+            matches!(word(0), Some("pr" | "issue")) && matches!(word(1), Some("create" | "edit"))
+        }
+        _ => false,
     };
-    if !matches!(
-        token_basename(&words[at]).to_ascii_lowercase().as_str(),
-        "git" | "gh" | "glab"
-    ) {
+    let opens_editor = |arg: &String| {
+        let long = arg.split('=').next().unwrap_or(arg);
+        matches!(long, "--edit" | "--editor" | "--reedit-message")
+            || (arg.len() > 1
+                && arg.starts_with('-')
+                && !arg.starts_with("--")
+                && arg[1..].contains(['e', 'c']))
+    };
+    if !fixed || rest.iter().any(opens_editor) {
         return false;
     }
     let flags = ["-F", "--file", "--body-file", "--notes-file"];
-    words
-        .windows(2)
+    rest.windows(2)
         .any(|pair| flags.contains(&pair[0].as_str()) && pair[1] == "-")
-        || words.last().is_some_and(|word| word == "-")
-            && words
-                .len()
-                .checked_sub(2)
-                .is_some_and(|before| flags.contains(&words[before].as_str()))
-        || words
+        || rest
             .iter()
-            .any(|word| flags.iter().any(|flag| *word == format!("{flag}=-")))
+            .any(|arg| flags.iter().any(|flag| *arg == format!("{flag}=-")))
 }
 
 /// Whether a line mentions an instruction file at all: the cheap test
@@ -234,7 +299,7 @@ fn overwrites_at(content: &str, depth: u8) -> Vec<Overwrite> {
             _ => None,
         };
         let previous = index.checked_sub(1).map(|before| segments[before]);
-        let found = found.or_else(|| redirected_blind(&name, segment, args, previous));
+        let found = found.or_else(|| redirected_blind(content, &name, segment, args, previous));
         out.extend(found);
     }
     out
@@ -375,6 +440,19 @@ fn place(target: String, sources: Vec<String>, is_folder: Option<bool>) -> Optio
             file: target,
             sources,
         });
+    }
+    // `cp CLAUDE.md backup`, `mv CLAUDE.md docs`, `cp -r CLAUDE.md AGENTS.md
+    // /tmp/bk`: the working folder's own instruction files, copied anywhere,
+    // carry no text that was not already there. A folder only guessed at is
+    // not read for them; one written as a folder or given by `-t` is.
+    let own_files = !sources.is_empty()
+        && sources.iter().all(|source| {
+            let source = source.trim_matches(|c: char| c == '"' || c == '\'');
+            let source = source.strip_prefix("./").unwrap_or(source);
+            !source.contains(['/', '\\']) && is_instruction_file(source)
+        });
+    if is_folder.is_none() && !written_as_folder && own_files {
+        return None;
     }
     let folder_like = is_folder.unwrap_or_else(|| {
         written_as_folder || sources.len() > 1 || !last_name(&target).contains('.')
@@ -616,8 +694,9 @@ fn web_request_output(args: &[String]) -> Option<Overwrite> {
 
 /// The instruction file a `git checkout <ref> -- <file>` or `git restore
 /// --source <ref> <file>` puts back from another commit: its text is that
-/// commit's, not on the line. A restore from the index (no ref) puts back
-/// what the work tree last staged, and is not read here.
+/// commit's, not on the line. A restore from the index (no ref) or from the
+/// commit checked out (`HEAD`, `@`) puts back the project's own text, and
+/// is not read here.
 fn git_restored(args: &[String]) -> Option<Overwrite> {
     // Past git's own options to its subcommand.
     let mut at = 0;
@@ -665,6 +744,9 @@ fn git_restored(args: &[String]) -> Option<Overwrite> {
         }
         _ => return None,
     };
+    if matches!(reference.as_str(), "HEAD" | "@") {
+        return None;
+    }
     let file = paths.into_iter().find(|path| is_instruction_file(path))?;
     Some(Overwrite {
         sources: vec![format!("{reference}:{file}")],
@@ -682,26 +764,36 @@ const TEXT_ON_THE_LINE: &[&str] = &["echo", "printf", "print", ":", "true", "fal
 /// `curl -s URL | tee AGENTS.md`. What it writes is not on the line. Text
 /// on the line (`echo`, a here-document, a here-string) is read instead.
 fn redirected_blind(
+    content: &str,
     name: &str,
     segment: &str,
     args: &[String],
     previous: Option<&str>,
 ) -> Option<Overwrite> {
-    if TEXT_ON_THE_LINE.contains(&name) || segment.contains("<<") {
+    // A here-document is text on the line when `cat` or `tee` hands it on;
+    // what another program makes of it (`git commit -F - <<'EOF' >
+    // CLAUDE.md` writes git's output) is not.
+    if TEXT_ON_THE_LINE.contains(&name) || (segment.contains("<<") && matches!(name, "cat" | "tee"))
+    {
         return None;
     }
     let walked = walk(args, "", &[]);
     if name == "tee" {
         // `echo X | tee -a GEMINI.md`: the text is on the line, and is read
-        // as written. A tee with neither a command before it nor a file on
-        // its stdin writes nothing a line gave it.
-        let fed_text = previous.is_some_and(|previous| {
-            let words = shell_tokens(previous);
-            effective_command_index(&words).is_some_and(|at| {
-                TEXT_ON_THE_LINE.contains(&token_basename(&words[at]).to_ascii_lowercase().as_str())
-            })
-        });
-        if fed_text || (previous.is_none() && walked.inputs.is_empty()) {
+        // as written. A tee with neither a pipe into it nor a file on its
+        // stdin writes nothing a line gave it. A command before it that is
+        // not piped (`echo X > /tmp/x; tee -a AGENTS.md < /tmp/x`) feeds it
+        // nothing.
+        let piped = previous.filter(|previous| piped(content, previous, segment));
+        let fed_text = walked.inputs.is_empty()
+            && piped.is_some_and(|previous| {
+                let words = shell_tokens(previous);
+                effective_command_index(&words).is_some_and(|at| {
+                    TEXT_ON_THE_LINE
+                        .contains(&token_basename(&words[at]).to_ascii_lowercase().as_str())
+                })
+            });
+        if fed_text || (piped.is_none() && walked.inputs.is_empty()) {
             return None;
         }
     }
@@ -751,6 +843,19 @@ fn redirected_blind(
     })
 }
 
+/// Whether `right` reads the output of `left` through a pipe: both are
+/// segments of `content`, and only `|` or `|&` stands between them.
+fn piped(content: &str, left: &str, right: &str) -> bool {
+    let base = content.as_ptr() as usize;
+    let (left_at, right_at) = (left.as_ptr() as usize, right.as_ptr() as usize);
+    if left_at < base || right_at < left_at + left.len() {
+        return false;
+    }
+    content
+        .get(left_at - base + left.len()..right_at - base)
+        .is_some_and(|between| matches!(between.trim(), "|" | "|&"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,6 +879,40 @@ mod tests {
             ("gcp -- -odd.md AGENTS.md", "AGENTS.md"),
         ] {
             assert_eq!(files(line), vec![file.to_string()], "{line}");
+        }
+    }
+
+    /// FAILS ON REVERT of the bare-name delimiter, the closing line read as
+    /// the shell reads it, and the fixed message readers.
+    #[test]
+    fn only_a_message_body_that_nothing_can_run_is_left_out() {
+        let body = "git commit -F - <<'EOF'\nmsg\nEOF";
+        assert_eq!(without_message_bodies(body), "git commit -F - <<'EOF'\nEOF");
+        for line in [
+            "git commit -F - <<E'OF'\nmsg\nEOF",
+            "git commit -F - <<EOF.\nmsg\nEOF",
+            "git commit -F - <<'E'OF\nmsg\nEOF",
+            "git commit -F - <<'EOF'\nmsg\n EOF",
+            "git commit -F - <<'EOF'\nmsg",
+            "git commit -F - <<'EOF' > CLAUDE.md\nmsg\nEOF",
+            "git commit -F - <<'EOF' | tee CLAUDE.md\nmsg\nEOF",
+            "git commit -e -F - <<'EOF'\nmsg\nEOF",
+            "git commit -c HEAD -F - <<'EOF'\nmsg\nEOF",
+            "GIT_EDITOR=sh git commit -F - <<'EOF'\nmsg\nEOF",
+            "git -c core.editor=sh commit -F - <<'EOF'\nmsg\nEOF",
+            "git log -F - <<'EOF'\nmsg\nEOF",
+            "gh api -F - <<'EOF'\nmsg\nEOF",
+        ] {
+            assert_eq!(without_message_bodies(line), line, "{line}");
+        }
+        for line in [
+            "git tag -a v1 -F - <<'EOF'\nmsg\nEOF",
+            "git notes add -F - <<'EOF'\nmsg\nEOF",
+            "gh pr create --title x --body-file - <<\"EOF\"\nmsg\nEOF",
+            "gh issue edit 3 --body-file=- <<EOF\nmsg\nEOF",
+            "git commit -F - <<-'EOF'\nmsg\n\tEOF",
+        ] {
+            assert_ne!(without_message_bodies(line), line, "{line}");
         }
     }
 

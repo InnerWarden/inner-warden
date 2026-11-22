@@ -116,10 +116,11 @@ fn include_glob(args: &Value) -> Option<String> {
 /// the text it writes is read as an edit's new text is (an order written
 /// into `AGENTS.md` is refused as the same text in a `replace_file_content`
 /// is). The documentation names the array but not a chunk's fields: a chunk
-/// is read with `replace_file_content`'s (`TargetContent`,
-/// `ReplacementContent`); one without `ReplacementContent` gives every other
-/// string it holds as its new text, and a chunk that is a string is its new
-/// text, so no text it carries goes unread.
+/// is read with `replace_file_content`'s `TargetContent` as the old text,
+/// and every string it holds anywhere else, at any depth
+/// (`ReplacementContent` as a string, an array or an object, and any other
+/// field), as its new text; a chunk that is a string or an array is all new
+/// text. No text a chunk carries goes unread.
 fn replacement_edits(args: &Value) -> Vec<Value> {
     let Some(chunks) = args.get("ReplacementChunks").and_then(Value::as_array) else {
         return Vec::new();
@@ -127,30 +128,40 @@ fn replacement_edits(args: &Value) -> Vec<Value> {
     chunks
         .iter()
         .filter_map(|chunk| {
-            let (old, new) = match chunk {
-                Value::String(text) => (String::new(), text.clone()),
+            let mut texts = Vec::new();
+            let old = match chunk {
                 Value::Object(fields) => {
-                    let old = fields
+                    for (key, value) in fields {
+                        if key != "TargetContent" {
+                            string_leaves(value, &mut texts);
+                        }
+                    }
+                    fields
                         .get("TargetContent")
                         .and_then(Value::as_str)
                         .unwrap_or("")
-                        .to_string();
-                    let new = match fields.get("ReplacementContent").and_then(Value::as_str) {
-                        Some(new) => new.to_string(),
-                        None => fields
-                            .iter()
-                            .filter(|(key, _)| key.as_str() != "TargetContent")
-                            .filter_map(|(_, value)| value.as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    };
-                    (old, new)
+                        .to_string()
+                }
+                Value::String(_) | Value::Array(_) => {
+                    string_leaves(chunk, &mut texts);
+                    String::new()
                 }
                 _ => return None,
             };
+            let new = texts.join("\n");
             Some(json!({ "old_string": old, "new_string": new }))
         })
         .collect()
+}
+
+/// Every string `value` holds, at any depth, in order.
+fn string_leaves<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
+    match value {
+        Value::String(text) => out.push(text),
+        Value::Array(items) => items.iter().for_each(|item| string_leaves(item, out)),
+        Value::Object(fields) => fields.values().for_each(|item| string_leaves(item, out)),
+        _ => {}
+    }
 }
 
 /// PURE: read an Antigravity hook payload as the call the guard judges.
@@ -570,6 +581,47 @@ mod tests {
                 ]
             })
         );
+    }
+
+    /// A `ReplacementContent` that is an array or an object, and any other
+    /// field, at any depth, is new text; only `TargetContent` is the old.
+    ///
+    /// FAILS ON REVERT: a chunk with a `ReplacementContent` that is not a
+    /// string gave an empty new text, and one with a string dropped the
+    /// strings of every other field.
+    #[test]
+    fn every_string_a_chunk_holds_but_its_target_is_new_text() {
+        let input = call(&payload(
+            "multi_replace_file_content",
+            json!({
+                "TargetFile": "/work/app/AGENTS.md",
+                "ReplacementChunks": [
+                    {"TargetContent": "a", "ReplacementContent": ["b", {"x": "c"}]},
+                    {"TargetContent": "d", "ReplacementContent": {"Text": "e", "More": ["f"]}},
+                    {"TargetContent": "g", "ReplacementContent": "h", "Note": "i"},
+                    ["j", {"k": "l"}]
+                ]
+            }),
+        ))["tool_input"]
+            .clone();
+        // The order of an object's fields is serde's, not the payload's.
+        let edits = input["edits"].as_array().expect("edits");
+        assert_eq!(edits.len(), 4);
+        for (edit, old, new) in [
+            (&edits[0], "a", ["b", "c"]),
+            (&edits[1], "d", ["e", "f"]),
+            (&edits[2], "g", ["h", "i"]),
+            (&edits[3], "", ["j", "l"]),
+        ] {
+            assert_eq!(edit["old_string"], old, "{edit}");
+            let mut lines: Vec<&str> = edit["new_string"]
+                .as_str()
+                .expect("new_string")
+                .lines()
+                .collect();
+            lines.sort_unstable();
+            assert_eq!(lines, new, "{edit}");
+        }
     }
 
     #[test]
