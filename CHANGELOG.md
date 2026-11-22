@@ -5,6 +5,51 @@ follows semantic versioning.
 
 ## Unreleased
 
+An MCP call of Codex or Cursor is now judged with the MCP proxy's rules
+where the agent shows it, the hook it runs before every tool call, unless
+its server is one the proxy already stands in front of. This reaches a
+remote server the agent signs in to by itself (OAuth: a Codex server after
+`codex mcp login` with `oauth_resource` or `scopes`, a Cursor server with
+`auth`), which the proxy cannot carry: as the stdio wrapper the client no
+longer signs in, and as a local address Codex and the MCP TypeScript SDK
+refuse the server's resource metadata, which names the real address. The
+agent keeps its sign-in and renews it; the hook is handed the tool and its
+arguments, and the guard never reads, holds or writes the token.
+
+A server is told by the name Codex gives it in the hook (`linear-app` is
+`linear_app`, `notion.so` is `notion_so`) and by the address Cursor sends
+for one it reaches by URL. A call whose server cannot be told (a name Codex
+hashed or cut, a Cursor call with no server name, a configuration missing,
+unreadable or not a regular file) is judged too. A call is left to the
+proxy only when its wrapper runs this very binary (the same file, not a
+file of the same name), in a mode that refuses when the hook does, in a
+configuration that has not changed since the agent started, when every
+server the call's name fits is such a wrapper, and, for Cursor, when the
+command the call carries is the guard's proxy too. The strict posture
+refuses what the proxy refuses. The default posture refuses only a hard
+finding (a revoked agent, a profile's refusal, the guard's LLM key, and for
+a local server a path in a path's key that names a place on this host:
+absolute, `~`, `file:` or climbing with `..`); the rest runs with a
+one-line warning and is recorded. A search, a comment or a repository's
+relative path only mentions a file, and a path handed to a remote server
+(`mcp-remote` in front of a URL included) names a file there: neither is
+refused by it. An install with no posture file, connected before the
+posture existed, is judged by the default posture's rule, so the upgrade
+does not make it refuse what it ran. The configuration is read only for a
+call with a finding, and `CODEX_HOME` is followed. The rules are parsed
+and compiled on every core at once for such a call: a clean call took
+36 ms in the hook before this and 14 ms after (median of 40, one machine). Claude Code and Gemini CLI MCP calls go to the
+shell rules as before. What the proxy does with the server's answers
+(pinned tool definitions, secrets in answers) still needs the proxy.
+
+A Codex MCP server written as an inline table (`linear = { url = ... }`
+under `[mcp_servers]`, or `mcp_servers = { ... }` whole) is now read,
+counted and wrapped by `agents connect` as a table is, and stays inline.
+
+The summary of an MCP call's arguments the record keeps now masks Google
+OAuth (`ya29.`), Notion (`ntn_`) and Sentry (`sntryu_`, `sntrys_`) tokens
+and any opaque run of 32 or more letters and digits.
+
 `innerwarden setup` and the new `innerwarden status --config` say what is
 already set in the agents' own config, and change nothing. In
 `~/.claude/settings.json`, `~/.claude.json`, `~/.cursor/mcp.json`,

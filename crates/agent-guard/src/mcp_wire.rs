@@ -719,6 +719,41 @@ pub fn server_counts(root: &Value) -> ServerCounts {
     }
 }
 
+/// Every server of a JSON client's configuration as the hook reads it
+/// ([`crate::mcp_unproxied`]), across every table [`wrap`] reads: its name,
+/// whether the proxy stands in front of it (a wrapper), and whether it is
+/// reached by URL. Names only, never a value. Pure.
+pub fn server_entries(root: &Value) -> Vec<crate::mcp_unproxied::ServerEntry> {
+    SERVER_TABLE_PATHS
+        .iter()
+        .filter_map(|path| table_at(root, path))
+        .flat_map(|map| map.iter())
+        .filter(|(_, server)| server.is_object())
+        .map(|(name, server)| {
+            let command = server.get("command").and_then(Value::as_str);
+            let args: Vec<&str> = server
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|args| args.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            crate::mcp_unproxied::ServerEntry {
+                name: name.clone(),
+                wrapper: server_mode(server).and_then(|mode| {
+                    Some(crate::mcp_unproxied::Wrapper {
+                        command: command?.to_string(),
+                        blocks: mode == WiringMode::Enforce,
+                    })
+                }),
+                remote: (!server
+                    .as_object()
+                    .is_some_and(|obj| obj.contains_key("command"))
+                    && REMOTE_URL_KEYS.iter().any(|key| server.get(*key).is_some()))
+                    || command.is_some_and(|c| crate::mcp_unproxied::runs_mcp_remote(c, &args)),
+            }
+        })
+        .collect()
+}
+
 /// Count (stdio servers, of those already wrapped) across both schema keys.
 fn counts(root: &Value) -> (usize, usize) {
     let mut stdio = 0;

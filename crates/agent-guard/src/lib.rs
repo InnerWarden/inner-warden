@@ -68,6 +68,7 @@ pub mod json_order;
 // Contract types and pure decisions for agent identity.
 pub mod identity;
 pub mod interactive;
+pub mod mcp_unproxied;
 pub mod mcp_wire;
 pub mod mcp_wire_toml;
 pub mod mcp_wire_yaml;

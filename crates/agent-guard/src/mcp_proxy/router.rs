@@ -505,7 +505,7 @@ fn tool_call_summary(name: &str, args: &Value) -> String {
     let safe_args = crate::redact::redact_json_secrets(args);
     let args = serde_json::to_string(&safe_args).unwrap_or_else(|_| "null".into());
     let raw = format!("MCP · {name} · {args}");
-    let redacted = crate::redact::redact_secrets(&raw).text;
+    let redacted = crate::redact::redact_opaque_tokens(&raw).text;
     let compact = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= MAX_TOOL_SUMMARY_CHARS {
         compact

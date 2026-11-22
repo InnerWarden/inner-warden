@@ -2444,6 +2444,7 @@ fn antigravity_unknown_tool(
 
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
     let exit = cmd_hook_screen(rest);
+    say_mcp_pending(agent_flag(rest).as_deref(), exit);
     let exit = match agent_flag(rest).as_deref() {
         Some(innerwarden_agent_guard::cursor_hook::AGENT) => cursor_answer(exit),
         Some(innerwarden_agent_guard::antigravity_hook::AGENT) => {
@@ -2632,6 +2633,13 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         return exit;
     }
     if let Some(exit) = refuse_a_waiting_interpreter(&buf, rest, monitor, demo) {
+        return exit;
+    }
+    // An MCP call of Codex or Cursor to a server the proxy is not known to
+    // stand in front of (one the agent signs in to by itself among them) is
+    // judged as the proxy judges it; one it does not refuse goes on to the
+    // shell rules below.
+    if let Some(exit) = screen_mcp_call(&buf, rest, monitor, block_review, demo) {
         return exit;
     }
 
@@ -3367,6 +3375,237 @@ pub(crate) fn stricter_with_host(
         obj.insert("risk_score".into(), score.max(floor).into());
     }
     verdict
+}
+
+/// What the hook still has to say once its screening ends with exit 0 and
+/// nothing on stdout: the default posture's warning for an MCP call the
+/// proxy's rules refuse and the posture let run ([`screen_mcp_call`]), or
+/// the report of a demo call. Said by [`cmd_hook`], so a call the shell
+/// rules then answer for (a refusal, an ask, their own warning) is never
+/// answered twice.
+enum McpPending {
+    Warning(String),
+    DemoReport(String),
+}
+
+static MCP_PENDING: std::sync::Mutex<Option<McpPending>> = std::sync::Mutex::new(None);
+
+/// Say what [`MCP_PENDING`] holds, when the screening ended with exit 0 and
+/// wrote nothing on stdout; to stderr when an answer is already out.
+fn say_mcp_pending(agent: Option<&str>, exit: std::process::ExitCode) {
+    let Some(pending) = MCP_PENDING.lock().ok().and_then(|mut slot| slot.take()) else {
+        return;
+    };
+    let answered = HOOK_ANSWERED.load(std::sync::atomic::Ordering::SeqCst);
+    match pending {
+        McpPending::Warning(line) if exit == std::process::ExitCode::SUCCESS && !answered => {
+            if warn_agent(agent, &line) {
+                HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        McpPending::DemoReport(report) if exit == std::process::ExitCode::SUCCESS && !answered => {
+            println!("{report}");
+            HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        McpPending::Warning(line) => eprintln!("{line}"),
+        McpPending::DemoReport(_) => {}
+    }
+}
+
+/// Screen an MCP call of Codex or Cursor with the proxy's own judgment
+/// (`innerwarden_agent_guard::mcp_unproxied`), unless its server is known
+/// to be behind the proxy, which judges it itself. A server the hook cannot
+/// tell is judged. The agent keeps its sign-in to a server and renews it;
+/// the hook is shown the tool and its arguments, never a token, and nothing
+/// here reads one.
+///
+/// The call is judged first, and the agent's configuration is read only
+/// for a call with a finding. A finding is recorded as the proxy records a
+/// call, with the router's redacted summary. `Some` only for a call
+/// refused here (exit 2): in the strict posture whatever the proxy refuses,
+/// in the default posture only a hard finding
+/// (`mcp_unproxied::default_posture_refuses`). Any other refusal of the
+/// proxy runs: a one-line warning in the default posture, a would-block in
+/// monitor. `None` goes on to the shell rules, which record and count the
+/// call as before.
+fn screen_mcp_call(
+    buf: &str,
+    rest: &[String],
+    monitor: bool,
+    block_review: bool,
+    demo: bool,
+) -> Option<std::process::ExitCode> {
+    use innerwarden_agent_guard::cursor_hook;
+    use innerwarden_agent_guard::mcp_proxy::enforce::ProxyAction;
+    use innerwarden_agent_guard::mcp_unproxied::{self, Reach};
+    use innerwarden_agent_guard::posture::warning_line;
+    let payload = serde_json::from_str::<serde_json::Value>(buf).ok()?;
+    let tool_name = payload
+        .get("tool_name")
+        .or_else(|| payload.get("tool"))
+        .and_then(|t| t.as_str())?;
+    if !tool_name.starts_with("mcp__") {
+        return None;
+    }
+    let agent = agent_flag(rest)?;
+    if !mcp_unproxied::AGENTS.contains(&agent.as_str()) {
+        return None;
+    }
+    let from_cursor = |key: &str| {
+        (agent == cursor_hook::AGENT)
+            .then(|| payload.get(key))
+            .flatten()
+    };
+    let call_server = mcp_unproxied::CallServer {
+        url: from_cursor(cursor_hook::MCP_SERVER_URL_KEY).and_then(|u| u.as_str()),
+        unnamed: from_cursor(cursor_hook::MCP_SERVER_UNNAMED_KEY)
+            .and_then(|u| u.as_bool())
+            .unwrap_or(false),
+    };
+    let call_command = from_cursor(cursor_hook::MCP_SERVER_COMMAND_KEY)
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    let args = payload
+        .get("tool_input")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let first_tool = mcp_unproxied::tool_of(tool_name)?;
+    // The rule engine is most of a call's time: its rules parsed, then the
+    // regexes a tool call selects compiled on every core at once, beside the
+    // identity and profile, not after them.
+    let (engine, payload_session, profile) = std::thread::scope(|scope| {
+        let engine = scope.spawn(|| {
+            let engine = RuleEngine::load_embedded_on_cores();
+            engine.warm(innerwarden_agent_guard::rules::AtrSource::ToolCall);
+            engine
+        });
+        let payload_session = hook_session(buf);
+        let identity = hook_identity::current(Some(&agent), payload_session.as_deref());
+        let profile = agent_profiles::proxy_profile(
+            &agent_profiles_io::load(),
+            Some(&agent),
+            identity.as_ref(),
+        );
+        let engine = engine
+            .join()
+            .unwrap_or_else(|_| RuleEngine::load_embedded());
+        (engine, payload_session, profile)
+    });
+    // Strict only by its own file or `--block-review`: an install with no
+    // posture file (connected before the posture existed) is judged by the
+    // default posture's rule, so an upgrade does not change what it refuses.
+    let strict = mcp_unproxied::mcp_strict(
+        monitor,
+        block_review,
+        hook::home_dir()
+            .ok()
+            .and_then(|home| innerwarden_agent_guard::posture::read_posture_file(&home)),
+    );
+    let mode = mcp_unproxied::mode_for_hook(monitor, strict);
+    let judge = |tool: &str, args: &serde_json::Value| {
+        mcp_unproxied::judge(tool, args, Some(&engine), profile.as_ref(), mode)
+    };
+    let (decision, _) = judge(first_tool, &args);
+    if decision.verdict.alerts.is_empty() {
+        return None;
+    }
+    // Only a call with a finding pays for reading the configuration.
+    let config = hook::home_dir()
+        .ok()
+        .and_then(|home| mcp_unproxied::config_path_here(&agent, &home))
+        .and_then(|path| mcp_unproxied::read_config(&path));
+    let settled = config.as_ref().is_some_and(|(_, modified)| {
+        mcp_unproxied::config_settled(*modified, mcp_unproxied::agent_started_at())
+    });
+    let trust = mcp_unproxied::ProxyTrust::here(!monitor, settled, call_command);
+    let entries = config.map(|(entries, _)| entries);
+    let (reach, tools) =
+        mcp_unproxied::reach(&agent, tool_name, call_server, entries.as_deref(), &trust)?;
+    if reach == Reach::BehindProxy {
+        return None;
+    }
+    // Every tool the call may name on a server it may go to is judged; the
+    // one the posture refuses, or else the proxy refuses, or else the first
+    // with a finding, decides.
+    let refuses_here = |decision: &innerwarden_agent_guard::mcp_proxy::router::ProxyDecision,
+                        tool: &str| {
+        strict
+            || mcp_unproxied::default_posture_refuses(decision, reach, &args, &|paths| {
+                judge(tool, paths).0
+            })
+    };
+    let mut judged: Vec<(&str, _, ProxyAction)> = tools
+        .iter()
+        .map(|tool| {
+            let (decision, action) = judge(tool, &args);
+            (*tool, decision, action)
+        })
+        .filter(|(_, decision, _)| !decision.verdict.alerts.is_empty())
+        .collect();
+    let blocks = |decision: &innerwarden_agent_guard::mcp_proxy::router::ProxyDecision,
+                  action: &ProxyAction| {
+        !decision.verdict.allowed
+            && (monitor || matches!(action, ProxyAction::Block { .. } | ProxyAction::Kill { .. }))
+    };
+    judged.sort_by_cached_key(|(tool, decision, action)| {
+        let proxy = blocks(decision, action);
+        let here = proxy && !monitor && refuses_here(decision, tool);
+        (!here, !proxy)
+    });
+    let (tool, decision, action) = judged.into_iter().next()?;
+    let proxy_refuses = blocks(&decision, &action);
+    let refused = proxy_refuses && !monitor && refuses_here(&decision, tool);
+    let warned = proxy_refuses && !monitor && !refused;
+    let explanation = decision
+        .verdict
+        .alerts
+        .iter()
+        .filter(|alert| alert.block || !proxy_refuses)
+        .map(|alert| format!("{}: {}", alert.rule, alert.detail))
+        .collect::<Vec<_>>()
+        .join("; ");
+    {
+        let (decision, agent) = (decision.clone(), agent.clone());
+        let payload_session = payload_session.clone();
+        hook_net::after_answer(move || {
+            let identity = hook_identity::current(Some(&agent), payload_session.as_deref());
+            graph_io::record_mcp_as(
+                &decision,
+                mode,
+                graph_io::McpHookRun { warned, demo },
+                payload_session.as_deref(),
+                Some(&agent),
+                identity.as_ref(),
+            );
+        });
+    }
+    if refused {
+        if demo {
+            println!(
+                "{}",
+                demo::hook_report(Some("deny"), true, Some(&explanation))
+            );
+            HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        eprintln!("InnerWarden blocked this MCP call (recommendation=deny): {explanation}");
+        note_refusal(format!(
+            "InnerWarden blocked this call (deny): {explanation}"
+        ));
+        return Some(std::process::ExitCode::from(2));
+    }
+    let pending = if demo {
+        proxy_refuses.then(|| {
+            McpPending::DemoReport(demo::hook_report(Some("deny"), false, Some(&explanation)))
+        })
+    } else if warned {
+        Some(McpPending::Warning(warning_line("deny", &explanation)))
+    } else {
+        None
+    };
+    if let (Some(pending), Ok(mut slot)) = (pending, MCP_PENDING.lock()) {
+        *slot = Some(pending);
+    }
+    None
 }
 
 /// Screen a `Write`, `Edit`, `MultiEdit` or `NotebookEdit` call (see

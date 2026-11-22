@@ -127,6 +127,9 @@ fn patterns() -> &'static [Pattern] {
             mk(r"github_pat_[A-Za-z0-9_]{20,}", &[]), // GitHub fine-grained PAT
             mk(r"xox[baprs]-[A-Za-z0-9\-]{10,}", &[]), // Slack
             mk(r"AIza[0-9A-Za-z_\-]{35}", &[]), // Google API key
+            mk(r"\bya29\.[A-Za-z0-9_\-]{20,}", &[]), // Google OAuth access token
+            mk(r"\bntn_[A-Za-z0-9]{20,}", &[]), // Notion integration token
+            mk(r"\bsntr(?:yu|ys)_[A-Za-z0-9+/=_\-]{20,}", &[]), // Sentry user / org token
             // JWT (three base64url segments).
             mk(r"eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}", &[]),
             // US SSN.
@@ -192,6 +195,38 @@ pub fn redact_json_secrets(value: &Value) -> Value {
     }
 }
 
+/// A run of 32 or more letters and digits with both in it: a token whose
+/// shape the patterns of [`redact_secrets`] do not know (an opaque hex or
+/// base62 value). Masked only where a call's arguments are summarised for
+/// the record ([`redact_opaque_tokens`]), never in text an agent reads:
+/// a commit hash is one too.
+fn opaque_token() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"[A-Za-z0-9]{32,}").expect("static opaque token regex"))
+}
+
+/// [`redact_secrets`], then every opaque token ([`opaque_token`]): for the
+/// summary of an MCP call's arguments kept in the record, where an agent
+/// may have put a token the patterns do not know.
+pub fn redact_opaque_tokens(input: &str) -> Redaction {
+    let first = redact_secrets(input);
+    let mut count = first.count;
+    let text = opaque_token()
+        .replace_all(&first.text, |caps: &regex::Captures<'_>| {
+            let word = &caps[0];
+            let mixed = word.bytes().any(|b| b.is_ascii_digit())
+                && word.bytes().any(|b| b.is_ascii_alphabetic());
+            if mixed {
+                count += 1;
+                MASK.to_string()
+            } else {
+                word.to_string()
+            }
+        })
+        .into_owned();
+    Redaction { text, count }
+}
+
 /// Scrub obvious secrets and PII from `input`, returning the redacted text and
 /// the number of spans masked. Deterministic and allocation-light on the common
 /// (nothing-to-redact) path.
@@ -241,6 +276,28 @@ pub fn redact_secrets(input: &str) -> Redaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tokens an agent may put in an MCP call's arguments by hand, in shapes
+    /// the provider patterns did not know: masked in the summary the record
+    /// keeps. A word of letters only, or a short id, stays.
+    #[test]
+    fn tokens_of_unknown_shape_are_masked_in_a_call_summary() {
+        let tokens = [
+            "ya29.a0AfH6SMBxQ3k9Zt7Vw2Lr8NcYpE4uJ1mKs6Df0Gh",
+            "ntn_4471829356a8xKq2Lm9PzR7wT3vB5nC0dE1fG",
+            "sntryu_9f8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6b5a4",
+            "7f3c9ad1e05b48c2a6f1d9e3b7c04a58",
+            "Q2x9Lm4Rt7Vw1Zp8Kc3Nd6Bf0Hg5Js2YtE",
+        ];
+        for token in tokens {
+            let text = format!("MCP · search · {{\"q\":\"{token}\"}}");
+            let r = redact_opaque_tokens(&text);
+            assert!(!r.text.contains(token), "{token}: {}", r.text);
+            assert!(r.count >= 1, "{token}");
+        }
+        let plain = "MCP · get_issue · {\"id\":\"CORE-1432\",\"q\":\"averyveryverylongwordwithoutanydigitsinit\"}";
+        assert_eq!(redact_opaque_tokens(plain).text, plain);
+    }
 
     #[test]
     fn scrubs_common_secrets_and_pii() {

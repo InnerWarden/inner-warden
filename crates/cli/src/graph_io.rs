@@ -1193,6 +1193,36 @@ pub fn record_mcp(
     agent: Option<&str>,
     identity: Option<&Identity>,
 ) {
+    record_mcp_as(
+        decision,
+        proxy_mode,
+        McpHookRun::default(),
+        source_session,
+        agent,
+        identity,
+    );
+}
+
+/// How a call the hook judged as the proxy does ran: `warned` when the
+/// proxy refused it and the default posture let it run with a warning (an
+/// enforcing line, so `enforce` and `would_block`), and `demo` for a call
+/// `innerwarden demo` sent.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct McpHookRun {
+    pub warned: bool,
+    pub demo: bool,
+}
+
+/// [`record_mcp`] for a call the hook judged with the proxy's rules
+/// (`innerwarden_agent_guard::mcp_unproxied`), with how it ran.
+pub fn record_mcp_as(
+    decision: &ProxyDecision,
+    proxy_mode: ProxyMode,
+    run: McpHookRun,
+    source_session: Option<&str>,
+    agent: Option<&str>,
+    identity: Option<&Identity>,
+) {
     if decision.direction != "client->server" || decision.method.as_deref() != Some("tools/call") {
         return;
     }
@@ -1201,7 +1231,13 @@ pub fn record_mcp(
     };
 
     let verdict = mcp_graph_verdict(decision);
-    let (mode, outcome) = mcp_context(decision, proxy_mode);
+    let (mode, outcome) = if run.warned {
+        (DecisionMode::Enforce, DecisionOutcome::WouldBlock)
+    } else {
+        mcp_context(decision, proxy_mode)
+    };
+    let mut origin = mcp_origin(decision, agent, identity);
+    origin.demo = run.demo;
     // For an MCP call the "whole command" the graph keeps (`command_full` on a
     // deny or review) is this summary: the tool name and its redacted
     // arguments, already cut at 240 characters by the router
@@ -1214,7 +1250,7 @@ pub fn record_mcp(
         outcome,
         source_session,
         None,
-        mcp_origin(decision, agent, identity),
+        origin,
     );
     if record_prepared(&decision).is_none() {
         return;
