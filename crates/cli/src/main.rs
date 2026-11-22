@@ -1400,7 +1400,7 @@ impl TooLongCall {
     /// A tool call that already ran: its result is what is past the cap,
     /// and there is nothing left to permit or refuse.
     pub(crate) fn already_ran(&self) -> bool {
-        self.event.as_deref() == Some("PostToolUse")
+        self.event.as_deref() == Some(RESULT_EVENT)
     }
 }
 
@@ -1601,6 +1601,7 @@ fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::E
     if !call.already_ran() {
         return hook_unreadable("", rest, TOOL_CALL_TOO_LONG, monitor);
     }
+    hook_net::already_ran(result_unread_to_agent(rest));
     let tool = call.tool.as_deref().unwrap_or("a tool");
     let on = call
         .path
@@ -1616,6 +1617,13 @@ fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::E
          read whole)."
     );
     std::process::ExitCode::SUCCESS
+}
+
+/// Whether the agent of this hook line reads a PostToolUse hook's
+/// `additionalContext` on stdout: Claude Code, the agent of a line that
+/// names none.
+fn result_unread_to_agent(rest: &[String]) -> bool {
+    matches!(agent_flag(rest).as_deref(), None | Some("claude-code"))
 }
 
 fn unreadable_exit_code(monitor: bool) -> u8 {
@@ -2067,6 +2075,11 @@ fn apply_behaviour(
     verdict
 }
 
+/// The event of a hook run on a call that already ran, with its result:
+/// Claude Code's `PostToolUse`, the only result event a hook line of ours is
+/// wired to. Every other event is a call about to run.
+const RESULT_EVENT: &str = "PostToolUse";
+
 /// A PostToolUse payload: the tool already ran and its RESULT is attached.
 ///
 /// The two-step attack lives entirely in this half. A PreToolUse hook sees the
@@ -2076,6 +2089,17 @@ fn apply_behaviour(
 /// its arguments came from.
 fn hook_tool_result(payload: &str) -> Option<(String, String)> {
     let v: serde_json::Value = serde_json::from_str(payload).ok()?;
+    // Only the event of a call that already ran carries a result. A call
+    // about to run (PreToolUse, BeforeTool, an event of no name) that also
+    // carries a `tool_response` is still a call: screened as one, never
+    // let through as a result.
+    let event = v
+        .get("hook_event_name")
+        .or_else(|| v.get("hookEventName"))
+        .and_then(|e| e.as_str());
+    if event != Some(RESULT_EVENT) {
+        return None;
+    }
     let response = v.get("tool_response").or_else(|| v.get("toolResponse"))?;
     let text = match response {
         serde_json::Value::String(s) => s.clone(),
@@ -2612,6 +2636,10 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
     // `tool_input` that produced it, and screening that again would record the
     // same command twice.
     if let Some((tool, result)) = hook_tool_result(&buf) {
+        // Every way through here ends with 0: so does the deadline now.
+        hook_net::already_ran(result_unread_to_agent(rest));
+        #[cfg(debug_assertions)]
+        hook_net::test_result_delay();
         let payload_session = hook_session(&buf);
         let identity =
             hook_identity::current(agent_flag(rest).as_deref(), payload_session.as_deref());
@@ -2928,11 +2956,24 @@ pub(crate) fn screen_shell(
         host,
         posture,
     } = *options;
-    let (lines, file_read) = match classify_hook_input(buf) {
-        HookInput::Command(command) => (vec![command], false),
-        HookInput::Commands(lines) => (lines, false),
-        HookInput::FileRead(command) => (vec![command], true),
-        HookInput::NotAShellCall => return ShellScreen::Nothing,
+    let (lines, file_read, script) = match classify_hook_input(buf) {
+        HookInput::Command(command) => (vec![command], false, None),
+        HookInput::Commands(lines) => (lines, false, None),
+        HookInput::FileRead(command) => (vec![command], true, None),
+        // A tool that runs the script it is handed (an MCP server in code
+        // mode: `execute`, `run_code`, `eval`) is judged by the API calls
+        // in the script, as the MCP proxy judges it: one that changes,
+        // destroys or cannot be read is a review, which goes through every
+        // layer below as a line's review does. A script that only reads
+        // runs, as before. Only a call no other reading took: Hermes's
+        // `execute_code` is Python, judged above as a `python3 -c` line.
+        HookInput::NotAShellCall => match serde_json::from_str::<serde_json::Value>(buf)
+            .ok()
+            .and_then(|payload| innerwarden_agent_guard::mcp_code_mode::hook_verdict(&payload))
+        {
+            Some(script) => (Vec::new(), false, Some(script)),
+            None => return ShellScreen::Nothing,
+        },
         HookInput::Unreadable(why) => return ShellScreen::Unreadable(why),
     };
     // The rules' verdict on every line the call carries. Each line then goes
@@ -2945,6 +2986,7 @@ pub(crate) fn screen_shell(
     let judged: Vec<(String, serde_json::Value)> = lines
         .iter()
         .filter_map(|line| hook_verdict_for(line, context.as_ref()))
+        .chain(script)
         .collect();
     hook_net::mark("rules");
     if judged.is_empty() {

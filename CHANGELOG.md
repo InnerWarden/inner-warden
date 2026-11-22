@@ -34,6 +34,72 @@ A key named and not read is said on stderr. The suppressions
 what the jail hands its hook). Under `sudo -E`, `llm set`, `allow` and
 `mute` now write root's config, not the invoking user's.
 
+An MCP server in code mode (one tool that runs a script against its API,
+such as Cloudflare's `search` and `execute`) is judged by the API calls in
+the script, in the hook and in the MCP proxy alike. A call to a tool named
+`execute`, `run_code`, `eval` or the like, with its script in `code`,
+`script` or the like, is read as JavaScript or TypeScript: a method that
+deletes, purges or makes or changes a credential (`zones.delete`,
+`cache.purge`, `tokens.create`, `workers.scripts.update`, an HTTP `DELETE`,
+a `DROP TABLE`) is a review, and so is what cannot be read (an `eval` of a
+string, a dynamic `import`, a method named at run time). The hook asks, or
+refuses under `--block-review`; the proxy forwards it with the alert in
+`guard` and refuses it in `strict` and `kill`. A script that only lists and
+gets runs as before. Before, `execute(script)` ran in every mode whatever the
+script did.
+
+What counts as a change: an HTTP `DELETE` (destroys), `PUT`, `PATCH` or
+`POST` (changes), whether the method is written in `method:`, by shorthand
+from a name, or as the start of a request line (`"DELETE /repos/..."`, in a
+template too); a `POST` that only reads (a GraphQL query) is also asked
+about. SQL that drops, truncates, deletes, inserts, alters, grants or
+updates, among other statements or however spaced. Escapes in a string are
+decoded before it is read. Methods of the script's own values (`Map`,
+`Set`, `Headers`, `URLSearchParams`, `FormData`, a hash, a page element)
+are not the API's and run. A tool that runs more than one language and names
+none (Hermes Agent's `execute_code`, which runs Python) is read only when an
+argument says JavaScript; a script that starts with a `#` comment or a `#!`
+line for another interpreter is not read as JavaScript, nor is one named in
+`language`, `lang`, `runtime`, `interpreter` or `shell` as another
+language. With no language named, a script that does not split into
+JavaScript's tokens is taken for a shell line (`echo it's there`, which
+keeps the reading it had before) only when it fails the way a shell line
+does (a quote, a regular expression, a comment or a template left open) and,
+read again with what was left open as plain punctuation, makes no call the
+reader judges; any other failure (an escape in a name, an escape that is not
+one, templates nested too deep) is a review. The items of a page's elements
+(a callback of `forEach` or `map` on `document.querySelectorAll(...)` and
+the like, `for (const el of ...)`), until a name of their own is bound again
+inside, and Node's `require("crypto")` are the script's own values too; the
+items of a `Map`, a `Set`, an array or an object are not, nor is a value
+joined to another by `||`, `??` or `&&` unless both are local. The HTTP method behind
+a name is followed once per name, at most 32 values; past that, or round a
+loop of names, it counts as chosen at run time. The hook's record
+keeps a long script by its start, size and SHA-256.
+
+A global the reader takes for the page's or the language's own (`document`,
+`console`, `crypto`, `Map`, `Object` and the like) is that only while the
+script never binds or assigns its name: a `const document = ...`, a
+parameter or `catch` named `document`, `globalThis.document = ...`,
+`document.querySelectorAll = ...` or a destructuring that names it makes it
+the script's own value, read as any other. A script that hands the global
+object on (`Object.assign(globalThis, ...)`) or opens a `with` loses them all.
+
+Known limits of this first reader: a member named at run time and kept for
+later (`const f = zones["del" + "ete"]; f.call(...)`) is not followed; verbs
+outside its table (`cancel`, `merge`, `addCollaborator`, `addDeployKey`,
+`setSecret`, `unpublish`, `clear`, `stop`, `writeFile`, a batch with
+`deletes`) are not read as changes; `child_process.execSync` and
+`fs.rmSync` are not read by it (the proxy refuses them today by its ATR rules).
+Its tokens can still part from JavaScript's after a `{}` block followed by
+`/`, with `of` used as a name, and at an HTML comment `<!--` (Annex B).
+Not followed either: `.constructor.call` and `.constructor.apply`; a method
+handed in as a parameter or a default value; a `require` the script defines
+itself; a script that starts with a
+`#!` line or names another language in its language key is not read, even
+where the tool runs it as JavaScript; the script in a `command` key; a CTE (`WITH ... DELETE`); a request line
+whose method is replaced later in the script.
+
 An MCP call of Codex or Cursor is now judged with the MCP proxy's rules
 where the agent shows it, the hook it runs before every tool call, unless
 its server is one the proxy already stands in front of. This reaches a
