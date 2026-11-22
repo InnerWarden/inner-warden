@@ -174,6 +174,12 @@ mod tests {
             .collect()
     }
 
+    /// What the check says about this home alone: never the folders the
+    /// variables of whoever runs the tests name.
+    fn said_at(home: &Path) -> Vec<String> {
+        config_check::render(&check_in(home, None, None), "")
+    }
+
     fn sample_home() -> tempfile::TempDir {
         let claude_settings = format!(
             r#"{{
@@ -237,7 +243,7 @@ env = {{ AWS_ACCESS_KEY_ID = "{FAKE_AWS}" }}
     #[test]
     fn each_agent_file_says_what_is_set_in_it() {
         let home = sample_home();
-        let report = check(home.path());
+        let report = check_in(home.path(), None, None);
         assert!(report.unread.is_empty(), "{:?}", report.unread);
         assert_eq!(report.read.len(), 6, "{:?}", report.read);
 
@@ -329,7 +335,7 @@ env = {{ AWS_ACCESS_KEY_ID = "{FAKE_AWS}" }}
     #[test]
     fn the_value_of_a_secret_is_never_said() {
         let home = sample_home();
-        let report = check(home.path());
+        let report = check_in(home.path(), None, None);
         let said = format!(
             "{}\n{:?}",
             config_check::render(&report, "  ").join("\n"),
@@ -362,7 +368,7 @@ env = {{ AWS_ACCESS_KEY_ID = "{FAKE_AWS}" }}
             (".cursor/mcp.json", &broken),
             (".codex/config.toml", "x = = 1"),
         ]);
-        let report = check(home.path());
+        let report = check_in(home.path(), None, None);
         assert!(report.findings.is_empty() && report.read.is_empty());
         assert_eq!(report.unread.len(), 2, "{:?}", report.unread);
         let said = config_check::render(&report, "").join("\n");
@@ -379,7 +385,7 @@ env = {{ AWS_ACCESS_KEY_ID = "{FAKE_AWS}" }}
 
         let empty = tempfile::tempdir().unwrap();
         assert_eq!(
-            lines(empty.path(), ""),
+            said_at(empty.path()),
             vec!["No config of Claude Code, Codex, Gemini CLI or Cursor here to check."]
         );
         let clean = home_with(&[(
@@ -387,7 +393,7 @@ env = {{ AWS_ACCESS_KEY_ID = "{FAKE_AWS}" }}
             r#"{"mcpServers": {"fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem@2025.8.21"], "env": {"TOKEN": "${env:TOKEN}"}}}}"#,
         )]);
         assert_eq!(
-            lines(clean.path(), ""),
+            said_at(clean.path()),
             vec!["Nothing to point out in ~/.cursor/mcp.json (auto-approve, unpinned packages, keys in the file, other hooks)."]
         );
     }
@@ -701,6 +707,132 @@ env = {{ AWS_ACCESS_KEY_ID = "{FAKE_AWS}" }}
             moved_dir(Some("/opt/claude")),
             Some(PathBuf::from("/opt/claude"))
         );
+    }
+
+    /// The tests read only the home they make. Run again with
+    /// `CLAUDE_CONFIG_DIR` and `CODEX_HOME` naming folders that hold
+    /// findings, as on the machine of someone who has set them, they still
+    /// pass.
+    ///
+    /// FAILS ON REVERT: call `check()` (which reads the variables) in those
+    /// tests and the run with the variables set fails.
+    #[test]
+    fn the_tests_read_only_the_home_they_make() {
+        const CHILD: &str = "IW_CONFIG_CHECK_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            return;
+        }
+        let other = home_with(&[
+            (
+                "claude/settings.json",
+                r#"{"permissions": {"defaultMode": "bypassPermissions"}}"#,
+            ),
+            ("codex/config.toml", "approval_policy = \"never\"\n"),
+        ]);
+        let exe = std::env::current_exe().unwrap();
+        for test in [
+            "each_agent_file_says_what_is_set_in_it",
+            "the_value_of_a_secret_is_never_said",
+            "a_file_that_cannot_be_read_is_never_called_clean",
+        ] {
+            let name = format!("config_check_io::tests::{test}");
+            let out = std::process::Command::new(&exe)
+                .args([name.as_str(), "--exact", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env(config_check::CLAUDE_DIR_ENV, other.path().join("claude"))
+                .env(config_check::CODEX_DIR_ENV, other.path().join("codex"))
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && said.contains("1 passed"),
+                "{test} with the variables set:\n{said}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    fn found(report: &Report) -> Vec<String> {
+        report.findings.iter().map(|f| f.what.clone()).collect()
+    }
+
+    /// Claude Code's `permissions.allow`: an empty server name is no
+    /// finding, `mcp__*` is said as a possibility, a server whose tools are
+    /// denied in `permissions.deny` names them, a server denied whole is
+    /// no finding.
+    ///
+    /// FAILS ON REVERT: the old loop said "every tool of that MCP server
+    /// runs without asking" for `mcp__`, `mcp____*`, `mcp__*` and the
+    /// denied server, and never named a denied tool.
+    #[test]
+    fn claude_allow_rules_say_only_what_they_allow() {
+        let home = home_with(&[(
+            ".claude/settings.json",
+            r#"{"permissions": {
+  "allow": ["mcp__", "mcp____*", "mcp__*", "mcp__gh", "mcp__fs__*", "mcp__db", "mcp__one__read"],
+  "deny": ["mcp__fs__write_file", "mcp__fs__delete", "mcp__db__*", "mcp__", "Bash(rm:*)"]
+}}"#,
+        )]);
+        let report = check_in(home.path(), None, None);
+        assert_eq!(
+            found(&report),
+            vec![
+                "`permissions.allow` has `mcp__*`: it may allow every MCP server's tools without asking (the permissions docs name only `mcp__<server>` and `mcp__<server>__*`)",
+                "`permissions.allow` has `mcp__gh`: every tool of that MCP server runs without asking",
+                "`permissions.allow` has `mcp__fs__*`: every tool of that MCP server runs without asking except `write_file`, `delete`, denied in `permissions.deny`",
+            ],
+            "{report:#?}"
+        );
+        assert!(report.findings.iter().all(|f| f.kind == Kind::AutoApprove));
+    }
+
+    /// Codex's `approval_mode = "approve"` runs a tool without asking, for
+    /// the whole server (`default_tools_approval_mode`, a tool's own mode
+    /// left out) or for one tool; `auto`, the default, is not said.
+    ///
+    /// FAILS ON REVERT: `auto_approved` read nothing in Codex's servers.
+    #[test]
+    fn codex_approve_mode_is_said() {
+        let home = home_with(&[(
+            ".codex/config.toml",
+            r#"[mcp_servers.a]
+command = "a-server"
+default_tools_approval_mode = "approve"
+
+[mcp_servers.a.tools.danger]
+approval_mode = "prompt"
+
+[mcp_servers.a.tools.also]
+approval_mode = "approve"
+
+[mcp_servers.b]
+command = "b-server"
+
+[mcp_servers.b.tools.read]
+approval_mode = "approve"
+
+[mcp_servers.b.tools.write]
+approval_mode = "auto"
+
+[mcp_servers.c]
+command = "c-server"
+default_tools_approval_mode = "auto"
+"#,
+        )]);
+        let report = check_in(home.path(), None, None);
+        assert_eq!(
+            found(&report),
+            vec![
+                "MCP server `a`: `default_tools_approval_mode = \"approve\"`: every tool of that server runs without asking except `danger`, which set their own `approval_mode`",
+                "MCP server `b`: tool `read` has `approval_mode = \"approve\"`: it runs without asking",
+            ],
+            "{report:#?}"
+        );
+        assert!(report
+            .findings
+            .iter()
+            .all(|f| f.kind == Kind::AutoApprove
+                && f.next.contains("innerwarden agents connect codex")));
     }
 
     /// A file that grows past the limit while it is read is not taken whole.
