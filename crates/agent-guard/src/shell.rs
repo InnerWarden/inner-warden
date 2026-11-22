@@ -9,6 +9,7 @@
 use std::ops::Range;
 
 mod inline_calls;
+pub(crate) mod output_options;
 pub(crate) mod runners;
 mod unread_parts;
 
@@ -5118,20 +5119,71 @@ fn through_line_function(
     }
 }
 
+/// The function definitions of the last line and tree
+/// [`line_function_body`] read: the tree's root (its kind and its bytes),
+/// the line, and each definition's name and bytes, in text order. A tree
+/// whose root and line are the same holds its definitions where these say.
+struct LineDefinitions {
+    key: (u16, std::ops::Range<usize>),
+    source: Vec<u8>,
+    definitions: Vec<(Option<String>, std::ops::Range<usize>)>,
+}
+
+thread_local! {
+    static LINE_DEFINITIONS: std::cell::RefCell<Option<LineDefinitions>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// The commands of the body of the last function named `name` the line
 /// defines.
+///
+/// Asked once for every command of a line, so the definitions of a line
+/// are found once per line and tree ([`LineDefinitions`]): found again for
+/// each command, a line of many definitions and calls took time in the
+/// square of its length (measured 2026-11-21: `f() { true; }; f;` repeated
+/// to 8 KB took 2.8 s).
 fn line_function_body<'tree>(
     root: tree_sitter::Node<'tree>,
     name: &str,
     source: &[u8],
 ) -> Option<Vec<tree_sitter::Node<'tree>>> {
-    let mut definitions = Vec::new();
-    collect_nodes_of_kind(root, "function_definition", &mut definitions, 0);
-    let definition = definitions.into_iter().rev().find(|definition| {
-        definition
-            .child_by_field_name("name")
-            .is_some_and(|found| node_text(found, source) == name)
+    let range = LINE_DEFINITIONS.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        let key = (root.kind_id(), root.byte_range());
+        let fresh = cached
+            .as_ref()
+            .is_some_and(|line| line.key == key && line.source.as_slice() == source);
+        if !fresh {
+            let mut definitions = Vec::new();
+            collect_nodes_of_kind(root, "function_definition", &mut definitions, 0);
+            *cached = Some(LineDefinitions {
+                key,
+                source: source.to_vec(),
+                definitions: definitions
+                    .iter()
+                    .map(|definition| {
+                        let name = definition
+                            .child_by_field_name("name")
+                            .map(|found| node_text(found, source));
+                        (name, definition.byte_range())
+                    })
+                    .collect(),
+            });
+        }
+        cached.as_ref().and_then(|line| {
+            line.definitions
+                .iter()
+                .rev()
+                .find(|(found, _)| found.as_deref() == Some(name))
+                .map(|(_, range)| range.clone())
+        })
     })?;
+    let mut definition = root.descendant_for_byte_range(range.start, range.end)?;
+    while definition.kind() != "function_definition" {
+        definition = definition
+            .parent()
+            .filter(|parent| parent.byte_range() == range)?;
+    }
     let body = definition.child_by_field_name("body")?;
     let mut commands = Vec::new();
     collect_all_commands(body, &mut commands, 0);

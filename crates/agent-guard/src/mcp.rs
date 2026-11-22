@@ -3495,6 +3495,7 @@ pub const SIGNAL_NAMES: &[&str] = &[
     "tls_verification_disabled",
     "tmp_execution",
     "untrusted_software_source",
+    "write_into_another_process",
 ];
 
 /// The aggravating factors of a fetch-and-execute
@@ -4247,6 +4248,8 @@ fn analyze_command_unwrapped_once(
         analyze_command_with_its_values(command, rule_engine, protected_reads, context, depth);
     let whole =
         with_launchers_read_through(command, whole, rule_engine, protected_reads, context, depth);
+    let whole =
+        with_outputs_as_redirections(command, whole, rule_engine, protected_reads, context, depth);
     match literal {
         Some(analysis) if analysis.risk_score >= whole.risk_score => analysis,
         _ => whole,
@@ -4289,6 +4292,59 @@ fn with_launchers_read_through(
         }
     } else {
         as_written
+    }
+}
+
+/// The line judged once more with the files its commands write through an
+/// option read as redirections of their output
+/// ([`crate::shell::output_options::outputs_as_redirections`]): `sort -o F
+/// x` writes F as `sort x > F` does, so every rule that reads where a line
+/// writes (a system file, the guard's or an agent's own, a key) reads it.
+/// The higher of the two verdicts stands. Measured 2026-11-21: `sort -o
+/// /etc/passwd x` and `tcpdump -w /etc/passwd` were allowed.
+fn with_outputs_as_redirections(
+    command: &str,
+    as_written: CommandAnalysis,
+    rule_engine: Option<&RuleEngine>,
+    protected_reads: &[String],
+    context: Option<&WorkingContext>,
+    depth: u8,
+) -> CommandAnalysis {
+    if READING_OUTPUTS.with(std::cell::Cell::get) {
+        return as_written;
+    }
+    let Some(read) = crate::shell::output_options::outputs_as_redirections(command) else {
+        return as_written;
+    };
+    READING_OUTPUTS.with(|reading| reading.set(true));
+    let _clear = OutputsRead;
+    let through =
+        analyze_command_with_its_values(&read, rule_engine, protected_reads, context, depth);
+    if through.risk_score > as_written.risk_score {
+        CommandAnalysis {
+            command: as_written.command,
+            explanation: format!(
+                "with the files its options write read as redirections: {}",
+                through.explanation
+            ),
+            ..through
+        }
+    } else {
+        as_written
+    }
+}
+
+thread_local! {
+    /// Set while [`with_outputs_as_redirections`] judges its reading.
+    static READING_OUTPUTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Clears [`READING_OUTPUTS`] when the reading ends, unwinding too.
+struct OutputsRead;
+
+impl Drop for OutputsRead {
+    fn drop(&mut self) {
+        READING_OUTPUTS.with(|reading| reading.set(false));
     }
 }
 
@@ -5777,6 +5833,20 @@ fn analyze_command_as_read(
             detail: format!("disabling or tampering with security monitoring: `{indicator}`"),
         });
         score += s;
+    }
+
+    // A write into an open file of another process (`> /proc/1234/fd/0`)
+    // puts text in a stream the line does not show: refused. The shell's
+    // own (`/proc/self/fd/1`, `/proc/$$/fd/2`) is its own output.
+    if let Some(target) = crate::shell::output_options::writes_into_another_process(scan_cmd) {
+        signals.push(AnalysisSignal {
+            signal: "write_into_another_process".into(),
+            score: 40,
+            detail: format!(
+                "writes into an open file of another process: `{target}`, a stream the line does not show"
+            ),
+        });
+        score += 40;
     }
 
     // Built-in credential stores are guarded only when the command consumes
