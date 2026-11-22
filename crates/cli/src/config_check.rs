@@ -291,29 +291,69 @@ fn claude_permissions(root: &Value, push: &mut impl FnMut(Kind, String, String))
             "Remove it (or set `default`) so Claude Code asks again; `innerwarden status` says what its hook still judges.".to_string(),
         );
     }
-    for rule in permissions
-        .and_then(|p| p.get("allow"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-    {
+    let rules = |list: &str| -> Vec<&str> {
+        permissions
+            .and_then(|p| p.get(list))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    };
+    let deny = rules("deny");
+    for rule in rules("allow") {
         let Some(rest) = rule.strip_prefix("mcp__") else {
             continue;
         };
         // `mcp__server` and `mcp__server__*` allow every tool of the server;
         // `mcp__server__tool` allows one, chosen by name.
-        let whole = match rest.split_once("__") {
-            None => true,
-            Some((_, tool)) => tool == "*",
+        let (server, tool) = match rest.split_once("__") {
+            None => (rest, None),
+            Some((server, tool)) => (server, Some(tool)),
         };
-        if whole {
+        if server.is_empty() || tool.is_some_and(|tool| tool != "*") {
+            continue;
+        }
+        if server == "*" {
+            // Not a form the docs name, so what Claude Code makes of it is
+            // not known: said as a possibility, never as a fact.
             push(
                 Kind::AutoApprove,
-                format!("`permissions.allow` has {}: every tool of that MCP server runs without asking", name(rule)),
-                "Allow only the tools you need by name (`mcp__<server>__<tool>`), so Claude Code asks before the rest.".to_string(),
+                format!("`permissions.allow` has {}: it may allow every MCP server's tools without asking (the permissions docs name only `mcp__<server>` and `mcp__<server>__*`)", name(rule)),
+                "Allow the servers or tools you need by name (`mcp__<server>` or `mcp__<server>__<tool>`), so Claude Code asks before the rest.".to_string(),
             );
+            continue;
         }
+        // A deny rule wins over an allow rule: the whole server denied leaves
+        // nothing that runs without asking, a tool denied is left out.
+        let whole_rule = format!("mcp__{server}");
+        let all_tools_rule = format!("mcp__{server}__*");
+        if deny
+            .iter()
+            .any(|d| *d == whole_rule || *d == all_tools_rule)
+        {
+            continue;
+        }
+        let tool_prefix = format!("mcp__{server}__");
+        let left_out: Vec<String> = deny
+            .iter()
+            .filter_map(|d| d.strip_prefix(tool_prefix.as_str()))
+            .filter(|tool| !tool.is_empty())
+            .map(name)
+            .collect();
+        let said = if left_out.is_empty() {
+            "every tool of that MCP server runs without asking".to_string()
+        } else {
+            format!(
+                "every tool of that MCP server runs without asking except {}, denied in `permissions.deny`",
+                said_list(&left_out)
+            )
+        };
+        push(
+            Kind::AutoApprove,
+            format!("`permissions.allow` has {}: {said}", name(rule)),
+            "Allow only the tools you need by name (`mcp__<server>__<tool>`), so Claude Code asks before the rest.".to_string(),
+        );
     }
     if root
         .get("enableAllProjectMcpServers")
@@ -348,7 +388,7 @@ fn servers(
             None => format!("MCP server {}", name(server_name)),
         };
         let (command, args, wrapped) = launch(server);
-        if let Some(why) = auto_approved(agent, server) {
+        for why in auto_approved(agent, server) {
             let next = match agent {
                 "cursor" | "gemini" | "codex" if !wrapped => format!(
                     "Remove it so the agent asks before each call; `innerwarden agents connect {agent}` puts the guard in front of this server's calls."
@@ -441,11 +481,93 @@ fn is_innerwarden(program: &str) -> bool {
 ///   `claude_permissions`, https://code.claude.com/docs/en/permissions
 /// * Codex documents no `auto_approve` for `[mcp_servers.<name>]`,
 ///   https://developers.openai.com/codex/config-reference
-fn auto_approved(agent: &str, server: &Value) -> Option<String> {
-    if agent == "gemini" && server.get("trust").and_then(Value::as_bool) == Some(true) {
-        return Some("`trust` is on, so every tool call runs without asking".to_string());
+///
+/// Codex's own field is `approval_mode`, per server as
+/// `default_tools_approval_mode` and per tool under
+/// `[mcp_servers.<name>.tools.<tool>]`, the tool's value first
+/// (openai/codex cf3ff15, codex-rs/core/src/mcp_tool_call.rs:1456-1460).
+/// Read in the source, not in the docs:
+///
+/// * `approve` asks for nothing: `mcp_permission_prompt_is_auto_approved`
+///   returns true for it before anything else
+///   (codex-rs/codex-mcp/src/mcp/mod.rs:102), and
+///   `requires_mcp_tool_approval_for_mode` gives false
+///   (codex-rs/core/src/mcp_tool_call.rs:2878). Counted.
+/// * `auto` is the default: a tool runs without asking only when it calls
+///   itself read-only (`readOnlyHint`), else Codex asks
+///   (codex-rs/core/src/mcp_tool_call.rs:2853-2866, 2873). It is what every
+///   server gets when nothing is set, so it is not counted.
+fn auto_approved(agent: &str, server: &Value) -> Vec<String> {
+    match agent {
+        "gemini" if server.get("trust").and_then(Value::as_bool) == Some(true) => {
+            vec!["`trust` is on, so every tool call runs without asking".to_string()]
+        }
+        "codex" => codex_approved(server),
+        _ => Vec::new(),
     }
-    None
+}
+
+/// Codex's `approval_mode = "approve"`, for the whole server or per tool.
+fn codex_approved(server: &Value) -> Vec<String> {
+    const APPROVE: &str = "approve";
+    let mode = |value: &Value| {
+        value
+            .get("approval_mode")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let tools: Vec<(&String, Option<String>)> = server
+        .get("tools")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(tool, settings)| (tool, mode(settings)))
+        .collect();
+    if server
+        .get("default_tools_approval_mode")
+        .and_then(Value::as_str)
+        == Some(APPROVE)
+    {
+        // A tool's own mode wins over the server's default.
+        let left_out: Vec<String> = tools
+            .iter()
+            .filter(|(_, mode)| mode.as_deref().is_some_and(|m| m != APPROVE))
+            .map(|(tool, _)| name(tool))
+            .collect();
+        let said = "`default_tools_approval_mode = \"approve\"`: every tool of that server runs without asking";
+        return vec![if left_out.is_empty() {
+            said.to_string()
+        } else {
+            format!(
+                "{said} except {}, which set their own `approval_mode`",
+                said_list(&left_out)
+            )
+        }];
+    }
+    tools
+        .iter()
+        .filter(|(_, mode)| mode.as_deref() == Some(APPROVE))
+        .map(|(tool, _)| {
+            format!(
+                "tool {} has `approval_mode = \"approve\"`: it runs without asking",
+                name(tool)
+            )
+        })
+        .collect()
+}
+
+/// Names said in a line: the first few, then how many more.
+fn said_list(names: &[String]) -> String {
+    const SHOWN: usize = 5;
+    if names.len() <= SHOWN {
+        names.join(", ")
+    } else {
+        format!(
+            "{} and {} more",
+            names[..SHOWN].join(", "),
+            names.len() - SHOWN
+        )
+    }
 }
 
 /// A package runner with no version fixed: what to say and how to fix it.

@@ -133,6 +133,7 @@ jobs:
           export "CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_RUNNER=$GITHUB_WORKSPACE/scripts/mutants-test-runner.sh"
           export MUTANTS_TEST_RUNNER_LOG="$RUNNER_TEMP/mutants-test-runner.log"
           export IW_NO_WALL_CLOCK_CEILINGS=1 # see WALL-CLOCK CEILINGS on the full sweep
+          export TMPDIR="${{ runner.temp }}" # see TEMPORARY FOLDER on the full sweep
           set +e
           timeout 75m cargo mutants --package innerwarden-agent-guard \
             --in-diff day.diff --timeout-multiplier 3 -j 2
@@ -250,11 +251,20 @@ jobs:
         # priority: a test that kills one deletes its line in the same commit.
         # A timeout counts as a survivor. The nightly diff job does not read
         # the list: code changed today must have no survivor at all.
+        #
+        # TEMPORARY FOLDER. cargo-mutants copies the tree into the temporary
+        # folder and builds and tests it there, so a test that reads where it
+        # runs sees that folder. With the default `/tmp`, every shard and the
+        # diff job stopped at "Unmutated baseline FAILED" from 2026-11-20 (run
+        # 44988814720): a test of searches from above `/tmp` found its own
+        # home inside it. The copy goes to the runner's temporary folder,
+        # which is no place a test searches.
         run: |
           triple=$(rustc -vV | sed -n 's/^host: //p')
           export "CARGO_TARGET_$(printf '%s' "$triple" | tr 'a-z-' 'A-Z_')_RUNNER=$GITHUB_WORKSPACE/scripts/mutants-test-runner.sh"
           export MUTANTS_TEST_RUNNER_LOG="$RUNNER_TEMP/mutants-test-runner.log"
           export IW_NO_WALL_CLOCK_CEILINGS=1
+          export TMPDIR="${{ runner.temp }}"
           set +e
           timeout 180m cargo mutants --package innerwarden-agent-guard \
             --file 'crates/agent-guard/src/threats.rs' \

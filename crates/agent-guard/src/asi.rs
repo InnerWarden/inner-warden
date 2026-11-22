@@ -140,6 +140,7 @@ pub fn signal_to_asi(signal: &str) -> Option<&'static str> {
         | "fetch_exec_shortened_source"
         | "fetch_exec_decoder"
         | "fetch_exec_unparsed"
+        | "fetch_exec_written_script"
         | "shell_reading_over_budget"
         | "shell_line_not_literal"
         | "reverse_shell" => "ASI05",

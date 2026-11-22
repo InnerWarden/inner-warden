@@ -17,6 +17,16 @@ repository = "https://github.com/InnerWarden/inner-warden"
 homepage = "https://www.innerwarden.com"
 readme = "README.md"
 
+# The screening engine is built with optimisation in debug too. Its readers run
+# for every tool call and every text an MCP server says, and unoptimised they
+# cost about ten times what the release binary does (level 1 inlines too
+# little to change that; level 2 is within 1.6x of release): a debug build then judged
+# a session slower than any user sees it, and the wall-clock ceilings in
+# crates/agent-guard/tests/hot_path_budget.rs measured that artefact. Debug
+# assertions and overflow checks stay on.
+[profile.dev.package.innerwarden-agent-guard]
+opt-level = 2
+
 [profile.release]
 lto = true
 codegen-units = 1

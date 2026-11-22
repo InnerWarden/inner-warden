@@ -23,13 +23,17 @@ fn verdict(command: &str) -> String {
 fn find_from_above_the_guards_places_is_their_removal_when_its_filter_may_match() {
     // A home outside every root searched here: with the account's home in
     // `/tmp` (a disposable one), `find /tmp` was a search from above it.
-    // The target folder holds none of those roots on any runner.
-    let home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("a home");
-    std::fs::create_dir_all(home.path().join("proj")).expect("a project");
+    // It is made of no folder of the build either: the mutation sweep copies
+    // the tree into `/tmp`, and a home made in the build's own temporary
+    // folder sat inside `/tmp` there (from 2026-11-20 every shard stopped at
+    // "Unmutated baseline FAILED" on the assertion below). No line here needs
+    // the home to exist, so it is a path that is not there.
+    let home = std::path::PathBuf::from(format!("/innerwarden-test-home-{}/u", std::process::id()));
+    assert!(!home.exists(), "{}", home.display());
     for root in ["/tmp", "/etc", "/var"] {
-        assert!(!home.path().starts_with(root), "{root}");
+        assert!(!home.starts_with(root), "{root}");
     }
-    std::env::set_var("HOME", home.path());
+    std::env::set_var("HOME", &home);
 
     for line in [
         "find ~ -path '*innerwarden*' -delete",

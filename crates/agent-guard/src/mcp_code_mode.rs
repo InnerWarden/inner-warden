@@ -2138,9 +2138,193 @@ pub fn read_script(script: &str) -> Vec<CodeFinding> {
     findings.list
 }
 
+/// Whether `name` is a global the reader takes for the page's or the
+/// language's own: [`LOCAL_ROOTS`], [`MAKER_ROOTS`], [`LANGUAGE_OBJECTS`]
+/// and [`LOCAL_CONSTRUCTORS`]. Not `require`: a call of it the reader
+/// cannot follow is a finding of its own ([`unreadable_call`]), and stays
+/// one.
+fn trusted_global(name: &str) -> bool {
+    name != "require"
+        && (LOCAL_ROOTS.contains(&name)
+            || MAKER_ROOTS.contains(&name)
+            || LANGUAGE_OBJECTS.contains(&name)
+            || LOCAL_CONSTRUCTORS.contains(&name))
+}
+
+/// Names of the global object itself.
+const GLOBAL_OBJECTS: &[&str] = &[
+    "globalThis",
+    "window",
+    "self",
+    "global",
+    "frames",
+    "parent",
+    "top",
+];
+
+/// Whether an assignment (`=`, `+=`, `||=`, `>>>=`, never `==` or `=>`)
+/// starts at `at`.
+fn assignment_at(tokens: &[Tok], at: usize) -> bool {
+    const OPERATORS: &[&str] = &[
+        "", "+", "-", "*", "/", "%", "&", "|", "^", "**", "<<", ">>", "&&", "||", "??", ">>>",
+    ];
+    OPERATORS.iter().any(|op| {
+        let n = op.len();
+        op.chars()
+            .enumerate()
+            .all(|(i, c)| matches!(tokens.get(at + i), Some(Tok::Punct(p)) if *p == c))
+            && matches!(tokens.get(at + n), Some(Tok::Punct('=')))
+            && !matches!(tokens.get(at + n + 1), Some(Tok::Punct('=' | '>')))
+    })
+}
+
+/// Whether the members reached from the name at `at` (`.x`, `[k]`, no
+/// call) are assigned: `document.querySelectorAll = ...`.
+fn members_assigned(tokens: &[Tok], matches: &[usize], at: usize) -> bool {
+    let mut k = at + 1;
+    let mut members = 0;
+    for _ in 0..64 {
+        match tokens.get(k) {
+            Some(Tok::Punct('.') | Tok::OptChain)
+                if matches!(tokens.get(k + 1), Some(Tok::Ident(_))) =>
+            {
+                k += 2;
+                members += 1;
+            }
+            Some(Tok::Punct('[')) => match matched(matches, k) {
+                Some(close) => {
+                    k = close + 1;
+                    members += 1;
+                }
+                None => return false,
+            },
+            _ => break,
+        }
+    }
+    members > 0 && assignment_at(tokens, k)
+}
+
+/// The tokens with every trusted global ([`trusted_global`]) the script
+/// binds or assigns itself renamed to a name no global has, so the reader
+/// takes it for any other value: `const document = { querySelectorAll:
+/// () => [api] }`, a parameter or a `catch` named `document`,
+/// `globalThis.document = ...`, `document.querySelectorAll = ...`, a
+/// destructuring or an `import` that names it. A script that hands the
+/// global object on (`Object.assign(globalThis, ...)`), writes a member of
+/// it the reader cannot name, or opens a `with` loses every trusted global.
+/// `None` when the script owns none.
+fn own_globals(tokens: &[Tok], matches: &[usize]) -> Option<Vec<Tok>> {
+    if !tokens
+        .iter()
+        .any(|tok| matches!(tok, Tok::Ident(name) if trusted_global(name)))
+    {
+        return None;
+    }
+    let mut owned: std::collections::HashSet<String> = bindings(tokens, matches)
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| trusted_global(name))
+        .collect();
+    let mut all = false;
+    for (k, tok) in tokens.iter().enumerate() {
+        let before = k.checked_sub(1).and_then(|p| tokens.get(p));
+        let after_dot = is_dot(before);
+        match tok {
+            Tok::Ident(name) if trusted_global(name) => {
+                let updated = matches!(tokens.get(k + 1), Some(Tok::Update(true)))
+                    || matches!(before, Some(Tok::Update(false)));
+                if assignment_at(tokens, k + 1)
+                    || updated
+                    || (!after_dot && members_assigned(tokens, matches, k))
+                {
+                    owned.insert(name.clone());
+                }
+            }
+            Tok::Ident(name) if !after_dot && GLOBAL_OBJECTS.contains(&name.as_str()) => {
+                if matches!(before, Some(Tok::Punct('(' | ','))) {
+                    all = true;
+                }
+                if matches!(tokens.get(k + 1), Some(Tok::Punct('['))) {
+                    if let Some(close) = matched(matches, k + 1) {
+                        if assignment_at(tokens, close + 1) {
+                            match tokens.get(k + 2) {
+                                Some(Tok::Str { text, .. }) if close == k + 3 => {
+                                    owned.insert(text.clone());
+                                }
+                                _ => all = true,
+                            }
+                        }
+                    }
+                }
+            }
+            Tok::Ident(word)
+                if !after_dot
+                    && word == "with"
+                    && matches!(tokens.get(k + 1), Some(Tok::Punct('('))) =>
+            {
+                all = true;
+            }
+            Tok::Ident(word)
+                if !after_dot
+                    && word == "import"
+                    && !matches!(tokens.get(k + 1), Some(Tok::Punct('(' | '.'))) =>
+            {
+                for tok in tokens.iter().skip(k + 1).take(64) {
+                    match tok {
+                        Tok::Ident(w) if w == "from" => break,
+                        Tok::Punct(';') => break,
+                        Tok::Ident(w) if trusted_global(w) => {
+                            owned.insert(w.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // `({ document } = x)`, `[document] = x`.
+            Tok::Punct('{' | '[') => {
+                if let Some(close) = matched(matches, k) {
+                    if assignment_at(tokens, close + 1) {
+                        for tok in &tokens[k + 1..close] {
+                            if let Tok::Ident(w) = tok {
+                                if trusted_global(w) {
+                                    owned.insert(w.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if owned.is_empty() && !all {
+        return None;
+    }
+    Some(
+        tokens
+            .iter()
+            .enumerate()
+            .map(|(k, tok)| match tok {
+                Tok::Ident(name)
+                    if !is_dot(k.checked_sub(1).and_then(|p| tokens.get(p)))
+                        && trusted_global(name)
+                        && (all || owned.contains(name)) =>
+                {
+                    Tok::Ident(format!("{name}:own"))
+                }
+                other => other.clone(),
+            })
+            .collect(),
+    )
+}
+
 /// [`read_script`] on the tokens of a script.
 fn read_tokens(tokens: &[Tok], findings: &mut Findings) {
     let matches = match_brackets(tokens);
+    // A global the script makes its own is no longer the page's or the
+    // language's: renamed, it is read as any other value.
+    let renamed = own_globals(tokens, &matches);
+    let tokens: &[Tok] = renamed.as_deref().unwrap_or(tokens);
     let roles = destructured_keys(tokens, &matches);
     let assigned_list = assignments(tokens);
     let locals = local_names(tokens, &matches, &assigned_list);
@@ -3062,6 +3246,58 @@ mod tests {
             "document.querySelectorAll(\"p\").forEach((e) => { console.log(e); e.remove(); })",
             "const s = new Set([1]); s.delete(1); const m = new Map(); m.delete(\"a\");",
             "const h = require(\"crypto\") || require(\"node:crypto\"); h.createHash(\"sha256\");",
+        ] {
+            assert_eq!(read_script(script), Vec::new(), "{script}");
+        }
+    }
+
+    #[test]
+    fn a_global_the_script_makes_its_own_is_not_the_page() {
+        let fake = "{ querySelectorAll: () => [cloudflare.zones] }";
+        let used = "document.querySelectorAll(\"p\").forEach((e) => e.delete({ zone_id: \"z\" }))";
+        for script in [
+            format!("const document = {fake}; {used}"),
+            format!("let document = {fake}; {used}"),
+            format!("var document = {fake}; {used}"),
+            format!("globalThis.document = {fake}; {used}"),
+            format!("window.document = {fake}; {used}"),
+            format!("globalThis[\"document\"] = {fake}; {used}"),
+            format!("globalThis[k] = {fake}; {used}"),
+            format!("Object.assign(globalThis, {{ document: {fake} }}); {used}"),
+            format!("Object.defineProperty(globalThis, \"document\", {{ value: {fake} }}); {used}"),
+            format!("((document) => {used})({fake})"),
+            format!("(function (document) {{ {used} }})({fake})"),
+            format!("[{fake}].forEach(document => {used})"),
+            format!("try {{ throw {fake} }} catch (document) {{ {used} }}"),
+            format!("for (const document of [{fake}]) {{ {used} }}"),
+            format!("function document() {{}} {used}"),
+            format!("({{ document }} = {{ document: {fake} }}); {used}"),
+            format!("[document] = [{fake}]; {used}"),
+            format!("document = {fake}; {used}"),
+            format!("document.querySelectorAll = () => [cloudflare.zones]; {used}"),
+            format!("document[\"querySelectorAll\"] = () => [cloudflare.zones]; {used}"),
+            format!("with ({{ document: {fake} }}) {{ {used} }}"),
+            format!("const {{ document }} = {{ document: {fake} }}; {used}"),
+            "const document = { createElement: () => cloudflare.zones }; document.createElement(\"p\").delete({})".to_string(),
+            "const console = cloudflare.zones; console.delete({})".to_string(),
+            "const localStorage = cloudflare.zones; localStorage.clear(); localStorage.delete({})".to_string(),
+            "const Map = function () { return cloudflare.zones }; new Map().delete({})".to_string(),
+            "const crypto = { createHash: () => cloudflare.zones }; crypto.createHash(\"x\").delete({})".to_string(),
+            "let Object = cloudflare.zones; Object.delete({})".to_string(),
+        ] {
+            assert!(
+                read_script(&script).iter().any(|f| f.kind == CodeKind::Destructive),
+                "{script}: {:?}",
+                read_script(&script)
+            );
+        }
+        // The page's own `document`, and a name of it only as a member or a
+        // key elsewhere, still are the page.
+        for script in [
+            "document.querySelectorAll(\".ad\").forEach((e) => e.remove())",
+            "const page = { document: 1 }; document.querySelectorAll(\".ad\").forEach((e) => e.remove())",
+            "if (x.document === document) { document.querySelectorAll(\".ad\").forEach((e) => e.remove()) }",
+            "const s = new Set([1]); s.delete(1); const doc = window.document;",
         ] {
             assert_eq!(read_script(script), Vec::new(), "{script}");
         }

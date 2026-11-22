@@ -130,7 +130,7 @@ proof	dx-122	review
 proof	dx-123	review
 proof	dx-124	review
 proof	dx-125	review
-proof	dx-126	review
+proof	dx-126	deny
 proof	dx-127	deny
 proof	dx-128	deny
 proof	dx-129	deny
@@ -922,7 +922,7 @@ attack-2026-11	a11-512	allow
 attack-2026-11	a11-513	allow
 attack-2026-11	a11-514	allow
 attack-2026-11	a11-515	allow
-real	real-001	review
+real	real-001	allow
 real	real-002	deny
 real	real-003	deny
 real	real-004	allow

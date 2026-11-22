@@ -64,8 +64,11 @@ pub fn concern_for(rules: &[String]) -> Concern {
 
 /// A few words for a rule, for the one line under a list row.
 const SHORT_WORDS: &[(&str, &str)] = &[
+    ("agent_instruction_order", "order in agent instructions"),
+    ("agent_instruction_overwrite", "agent instructions replaced"),
     ("anti_forensics", "erasing records"),
     ("bare_ip_fetch", "fetch from a bare IP address"),
+    ("clone_and_run", "runs code it just cloned"),
     ("cloud_control_plane", "cloud control plane"),
     ("container_escape", "container escape"),
     ("credential_exposure", "a secret in the command"),
@@ -79,6 +82,11 @@ const SHORT_WORDS: &[(&str, &str)] = &[
     ("destructive_command", "destructive command"),
     ("download_and_execute", "download run by a shell"),
     ("download_chmod_execute", "download made executable"),
+    ("download_fed_to_script", "download fed to a script"),
+    (
+        "download_run_in_text_argument",
+        "download run inside an argument",
+    ),
     ("dynamic_code_execution", "data fed to an interpreter"),
     ("fetch_exec_decoder", "decoded download run"),
     ("fetch_exec_ephemeral_host", "download from a paste site"),
@@ -86,7 +94,9 @@ const SHORT_WORDS: &[(&str, &str)] = &[
     ("fetch_exec_shortened_source", "download from a short link"),
     ("fetch_exec_unanalyzable", "download run, not analysable"),
     ("fetch_exec_unparsed", "fetch and run, not parsed"),
+    ("fetch_exec_written_script", "download scripted and run"),
     ("guard_self_disable", "turning the guard off"),
+    ("guard_word_mention", "names the guard as data"),
     ("insecure_permissions", "world-writable permissions"),
     ("internal_network_target", "internal address"),
     ("kubernetes_escalation", "cluster escalation"),
@@ -104,9 +114,15 @@ const SHORT_WORDS: &[(&str, &str)] = &[
     ("security_tooling_tamper", "security tool tampering"),
     ("sensitive_credential_read", "credential path"),
     ("sensitive_file_overwrite", "overwrites a sensitive file"),
+    ("shell_line_not_literal", "runs text the line hides"),
+    (
+        "shell_reading_over_budget",
+        "too deep for the guard to read",
+    ),
     ("tls_verification_disabled", "TLS checks off"),
     ("tmp_execution", "world-writable folder"),
     ("untrusted_software_source", "untrusted software source"),
+    ("write_into_another_process", "writes into another process"),
 ];
 
 pub fn short_words(rule: &str) -> Option<&'static str> {
@@ -329,6 +345,24 @@ mod tests {
         for id in CREDENTIAL_READ.iter().chain(DOMAIN_FETCH) {
             assert!(short_words(id).is_some(), "{id} has no short words");
         }
+    }
+
+    /// Every signal the guard can put on a verdict has a few words of its
+    /// own, so no list row falls back to cutting the guard's long reason.
+    ///
+    /// FAILS ON REVERT: drop a row of `SHORT_WORDS` (before this change
+    /// `write_into_another_process` and `shell_reading_over_budget` had none)
+    /// and the name is listed here.
+    #[test]
+    fn every_signal_the_guard_emits_has_short_words() {
+        use innerwarden_agent_guard::mcp::{AGGRAVATING_SIGNAL_NAMES, SIGNAL_NAMES};
+        let missing: Vec<&str> = SIGNAL_NAMES
+            .iter()
+            .chain(AGGRAVATING_SIGNAL_NAMES)
+            .copied()
+            .filter(|id| short_words(id).is_none())
+            .collect();
+        assert!(missing.is_empty(), "no short words for {missing:?}");
     }
 
     #[test]

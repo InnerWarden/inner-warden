@@ -145,13 +145,18 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     }
     let (block_review, monitor) = args.mode.hook_flags();
     if args.setup_only {
-        match hook::install_hook(
-            &home,
-            &args.agent,
-            settings_named,
-            &hook_cli,
-            block_review,
-            monitor,
+        match arm_with_retry(
+            || {
+                hook::install_hook(
+                    &home,
+                    &args.agent,
+                    settings_named,
+                    &hook_cli,
+                    block_review,
+                    monitor,
+                )
+            },
+            arm_wait,
         ) {
             Ok(_) => {}
             Err(e) => eprintln!(
@@ -295,13 +300,18 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         );
     }
     if !input.args.dry_run && !openclaw {
-        match hook::install_hook(
-            &input.home,
-            &input.args.agent,
-            settings_named,
-            &hook_cli,
-            block_review,
-            monitor,
+        match arm_with_retry(
+            || {
+                hook::install_hook(
+                    &input.home,
+                    &input.args.agent,
+                    settings_named,
+                    &hook_cli,
+                    block_review,
+                    monitor,
+                )
+            },
+            arm_wait,
         ) {
             // Said every time, so a change of mode is never silent.
             Ok(_) => eprintln!(
@@ -5610,6 +5620,33 @@ fn print_plan_env(env: &[(String, String)]) {
     }
 }
 
+/// How many times arming the in-jail hook is tried in all.
+const ARM_TRIES: u32 = 5;
+
+/// Arm the in-jail hook. Two jails that start at the same moment write the
+/// same settings file; the update refuses the one whose read came before the
+/// other's write and says "retry" (`file_update`). That one is tried again,
+/// on what the file holds now, up to `ARM_TRIES` times in all, so it does
+/// not run with walls only. Any other error is returned at once.
+fn arm_with_retry<T>(
+    mut arm: impl FnMut() -> Result<T, String>,
+    mut wait: impl FnMut(u32),
+) -> Result<T, String> {
+    let mut tried = 0;
+    loop {
+        tried += 1;
+        match arm() {
+            Err(error) if tried < ARM_TRIES && error.contains("; retry") => wait(tried),
+            done => return done,
+        }
+    }
+}
+
+/// The wait before another try: short, and longer each time.
+fn arm_wait(tried: u32) {
+    std::thread::sleep(std::time::Duration::from_millis(25 * u64::from(tried)));
+}
+
 #[cfg(test)]
 mod tests {
     /// Every program this file starts outside the launch paths runs under
@@ -9158,5 +9195,54 @@ mod tests {
             why.contains("mine.js") && why.contains("not there"),
             "{why}"
         );
+    }
+
+    /// A write that lost the race to another jail's write of the same
+    /// settings file is tried again, up to `ARM_TRIES` times in all; any
+    /// other error is said at once.
+    ///
+    /// FAILS ON REVERT: call `hook::install_hook` once and the second of
+    /// two jails starting together runs with walls only.
+    #[test]
+    fn arming_the_hook_is_tried_again_after_a_lost_race() {
+        let lost =
+            "/h/.claude/settings.json changed while InnerWarden was preparing the update; retry";
+        let mut calls = 0;
+        let mut waits = Vec::new();
+        let armed = super::arm_with_retry(
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err(lost.to_string())
+                } else {
+                    Ok(calls)
+                }
+            },
+            |tried| waits.push(tried),
+        );
+        assert_eq!(armed, Ok(3));
+        assert_eq!(waits, vec![1, 2]);
+
+        let mut calls = 0;
+        let armed: Result<(), String> = super::arm_with_retry(
+            || {
+                calls += 1;
+                Err(lost.to_string())
+            },
+            |_| {},
+        );
+        assert_eq!(armed, Err(lost.to_string()));
+        assert_eq!(calls, super::ARM_TRIES);
+
+        let mut calls = 0;
+        let armed: Result<(), String> = super::arm_with_retry(
+            || {
+                calls += 1;
+                Err("settings.json is not valid JSON".to_string())
+            },
+            |_| {},
+        );
+        assert!(armed.is_err());
+        assert_eq!(calls, 1);
     }
 }

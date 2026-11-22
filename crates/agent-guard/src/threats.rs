@@ -10112,19 +10112,62 @@ fn schedules_an_at_job(content: &str) -> bool {
 /// reads it and judges it as it judges the same job piped in (`echo '...' |
 /// at now`), a download it runs refused there. Until 2026-11-21 such a job
 /// was refused for its form alone, while the pipe let it through.
+///
+/// A here-document whose delimiter is quoted (`at now <<'EOF'`, `<<"EOF"`,
+/// `<<\EOF`) is not expanded: its body is the job as written, read and
+/// judged as the same job piped in. Until 2026-11-22 it was refused for its
+/// form alone. One whose delimiter is bare expands what the line does not
+/// show, and stays refused.
 fn at_job_on_input(segment: &str) -> bool {
     let mut rest = segment;
     while let Some(at) = rest.find('<') {
-        let Some(body) = rest[at..].strip_prefix("<<<") else {
+        if let Some(body) = rest[at..].strip_prefix("<<<") {
+            let body = body.trim_start_matches([' ', '\t']);
+            let Some(shown) = quoted_text_shown(body) else {
+                return true;
+            };
+            rest = &body[shown..];
+            continue;
+        }
+        let Some(start) = rest[at..].strip_prefix("<<") else {
             return true;
         };
-        let body = body.trim_start_matches([' ', '\t']);
-        let Some(shown) = quoted_text_shown(body) else {
+        let start = start
+            .strip_prefix('-')
+            .unwrap_or(start)
+            .trim_start_matches([' ', '\t']);
+        let Some(delimiter) = quoted_delimiter_length(start) else {
             return true;
         };
-        rest = &body[shown..];
+        rest = &start[delimiter..];
     }
     false
+}
+
+/// The length of the quoted delimiter of a here-document that `text`
+/// starts with (`'EOF'`, `"EOF"`, `\EOF`); `None` for a bare one, whose
+/// body the shell expands.
+fn quoted_delimiter_length(text: &str) -> Option<usize> {
+    let first = text.chars().next()?;
+    let length = match first {
+        '\'' | '"' => text[1..].find(first)? + 2,
+        '\\' => {
+            let name = text[1..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(text.len() - 1);
+            if name == 0 {
+                return None;
+            }
+            name + 1
+        }
+        _ => return None,
+    };
+    let after = &text[length..];
+    after
+        .chars()
+        .next()
+        .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+        .then_some(length)
 }
 
 /// The length of the quoted word `text` starts with, when its text is shown
@@ -13253,6 +13296,7 @@ fn rm_target_is_root_or_system(target: &str) -> bool {
 /// nothing and takes the same tree `rm -rf` does. A short-option group with
 /// `r` or `R` is recursive whatever other letters it holds (`-rm`, `-Rz`):
 /// the guard does not stake a verdict on which letters one `rm` rejects.
+#[derive(Clone)]
 struct RmInvocation {
     recursive: bool,
     no_preserve: bool,
@@ -13307,7 +13351,43 @@ fn without_case_arm_head(segment: &str) -> &str {
 
 /// Read the `rm` a segment runs, or `None` when the segment runs something
 /// else (`echo rm -rf /`). See [`fold_braced_names`] for `${HOME}`.
+///
+/// The root wipe, the home wipe and the three removals of credentials and of
+/// places each read every segment of a line for its `rm`, so a segment was
+/// read five times or more: 6% of the time of a line of a loop and two
+/// commands (measured 2026-11-22 in a debug build). The reading depends on
+/// the text alone, so the last ones read on a thread are kept.
 fn segment_rm_invocation(segment: &str) -> Option<RmInvocation> {
+    if let Some(kept) = RM_READINGS.with(|read| {
+        read.borrow()
+            .iter()
+            .find(|(text, _)| text == segment)
+            .map(|(_, invocation)| invocation.clone())
+    }) {
+        return kept;
+    }
+    let invocation = segment_rm_invocation_read(segment);
+    RM_READINGS.with(|read| {
+        let mut read = read.borrow_mut();
+        if read.len() >= RM_READINGS_KEPT {
+            read.remove(0);
+        }
+        read.push((segment.to_owned(), invocation.clone()));
+    });
+    invocation
+}
+
+/// How many readings of [`segment_rm_invocation`] a thread keeps.
+const RM_READINGS_KEPT: usize = 16;
+
+thread_local! {
+    /// The readings [`segment_rm_invocation`] keeps, the latest read last.
+    static RM_READINGS: std::cell::RefCell<Vec<(String, Option<RmInvocation>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`segment_rm_invocation`], read from the text.
+fn segment_rm_invocation_read(segment: &str) -> Option<RmInvocation> {
     // A substitution before the command word expands away; see
     // `strip_leading_substitutions` for why only the leading ones go.
     let unnamed = without_coproc_name(without_case_arm_head(segment));
@@ -20214,9 +20294,17 @@ pub(crate) fn clone_from_bare_ip(content: &str) -> bool {
 /// entire purpose is serving anonymous ephemeral content, and whether the payload
 /// is decoded before it reaches the interpreter. A vendor allowlist would invert
 /// the trust model and would need maintaining; these do not.
-pub fn fetch_exec_aggravators(content: &str) -> Vec<(&'static str, &'static str, u32)> {
+///
+/// `staged` is what [`check_download_execute_staged`] says of `content`. The
+/// caller asks it once and hands it here: asked again here, it ran two or
+/// three times per line, 12.8% of the time of a line of a loop and two
+/// commands (measured 2026-11-22 in a debug build).
+pub fn fetch_exec_aggravators(
+    content: &str,
+    staged: Option<u32>,
+) -> Vec<(&'static str, &'static str, u32)> {
     if !crate::shell::has_download_execution_pipeline(content)
-        && check_download_execute_staged(content).is_none()
+        && staged.is_none()
         && !powershell_fetch_exec(content)
         && !check_clone_and_run(content)
     {
@@ -33815,3 +33903,55 @@ mod mutant_kills_t9;
 #[cfg(test)]
 #[path = "mutant_kills/threats_t11.rs"]
 mod mutant_kills_t11;
+
+#[cfg(test)]
+mod rm_readings_kept {
+    use super::*;
+
+    fn reading(read: Option<RmInvocation>) -> Option<(bool, bool, Vec<String>)> {
+        read.map(|rm| (rm.recursive, rm.no_preserve, rm.targets))
+    }
+
+    /// A kept reading is the one of its own segment, asked in any order.
+    ///
+    /// FAILS ON REVERT of the text compared when a kept reading is looked up:
+    /// the reading of another segment (`echo rm -rf /` runs no `rm`) would
+    /// stand for `rm -rf /`.
+    #[test]
+    fn a_kept_reading_is_the_one_of_its_own_segment() {
+        RM_READINGS.with(|read| read.borrow_mut().clear());
+        let segments = ["rm -rf /", "echo rm -rf /", "sudo rm -r ~/x", "ls -la"];
+        for _ in 0..2 {
+            for segment in segments {
+                assert_eq!(
+                    reading(segment_rm_invocation(segment)),
+                    reading(segment_rm_invocation_read(segment)),
+                    "{segment}"
+                );
+            }
+        }
+        assert!(reading(segment_rm_invocation("rm -rf /")).is_some());
+        assert!(reading(segment_rm_invocation("echo rm -rf /")).is_none());
+    }
+
+    /// A thread keeps the last [`RM_READINGS_KEPT`] readings and no more.
+    ///
+    /// FAILS ON REVERT of the bound: one more kept on every reading, the
+    /// readings of a long line would all stay.
+    #[test]
+    fn a_thread_keeps_the_last_readings_only() {
+        RM_READINGS.with(|read| read.borrow_mut().clear());
+        for n in 0..=RM_READINGS_KEPT {
+            let _ = segment_rm_invocation(&format!("rm -rf /srv/{n}"));
+        }
+        RM_READINGS.with(|read| {
+            let read = read.borrow();
+            assert_eq!(read.len(), RM_READINGS_KEPT);
+            assert_eq!(read[0].0, "rm -rf /srv/1");
+            assert_eq!(
+                read[RM_READINGS_KEPT - 1].0,
+                format!("rm -rf /srv/{RM_READINGS_KEPT}")
+            );
+        });
+    }
+}

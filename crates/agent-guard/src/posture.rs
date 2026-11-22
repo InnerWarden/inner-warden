@@ -133,6 +133,7 @@ pub const HIGH_CERTAINTY_SIGNALS: &[&str] = &[
     "download_run_in_text_argument",
     "fetch_exec_unparsed",
     "fetch_exec_unanalyzable",
+    "fetch_exec_written_script",
 ];
 
 /// The built-in secret read: in the high-certainty class at the score the
