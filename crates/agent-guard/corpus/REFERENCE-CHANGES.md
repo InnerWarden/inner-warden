@@ -327,3 +327,18 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   included by a built path or in appends, and loads of `/dev/stdin`. A
   PHP read, edit and write of a file, a cast and a Lua read of `_G[k]` go
   back to allow.
+- 2026-11-22: the inline reader's last round for Perl, PHP and Lua moves no
+  line of any corpus. Measured against main c2e216b with the differential
+  judge (37127 lines, an empty home and a home with keys): no verdict
+  changed. A name that a PHP `foreach` sets from a glob with a wildcard is no
+  longer read as the pattern's text: a process run on it is reviewed, and
+  code loaded from it is judged as on main (review, deny when the input
+  comes from `curl |`). A glob with no wildcard is still read as its one
+  path. A name that `foreach`, `list()`, `[...] =`, `extract` or
+  `$GLOBALS` sets again loses the function it held. Also read now, and
+  held in `tests/inline_reader_perl_php_lua.rs`: a Lua alias after a
+  statement with no `;` whose value is a number, a string, a table or an
+  expression; Perl's `open` and `readpipe` with their arguments on the next
+  lines; stdin as `//dev/stdin`, `/dev/./stdin`, `/dev/../dev/stdin`,
+  `/proc/thread-self/fd/0`, `/proc/1/fd/0` and `file:///dev/stdin`; a PHP
+  function called in another case, from a string or as a method.
