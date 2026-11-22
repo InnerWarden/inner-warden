@@ -9,7 +9,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use innerwarden_agent_guard::hook;
+use innerwarden_agent_guard::{file_update, hook};
 
 use crate::contain::{
     build_linux_jail, build_macos_profile, parse_contain_args, validate_jail_inputs_for,
@@ -130,23 +130,18 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     let settings_named = (claude_dir != home.join(crate::contain::CLAUDE_DIR))
         .then_some(claude_settings_arg.as_str());
     if !mode_given && !openclaw {
-        if let Some((block_review, monitor)) = std::fs::read_to_string(&claude_settings)
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .as_ref()
-            .and_then(hook::kept_hook_flags)
-        {
-            args.mode = match (block_review, monitor) {
-                (true, _) => crate::contain::Mode::BlockReview,
-                (false, true) => crate::contain::Mode::Monitor,
-                (false, false) => crate::contain::Mode::Enforce,
-            };
+        if let Some(mode) = kept_mode(&claude_settings) {
+            args.mode = mode;
         }
     }
-    let (block_review, monitor) = args.mode.hook_flags();
     if args.setup_only {
-        match arm_with_retry(
-            || {
+        // `--setup` only arms the hook: one it could not arm is a failure,
+        // never "armed".
+        match arm_hook(
+            &claude_settings,
+            mode_given,
+            args.mode.clone(),
+            |block_review, monitor| {
                 hook::install_hook(
                     &home,
                     &args.agent,
@@ -158,13 +153,12 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             },
             arm_wait,
         ) {
-            Ok(_) => {}
-            Err(e) => eprintln!(
-                "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
-            ),
+            Ok(mode) => args.mode = mode,
+            Err(e) => {
+                eprintln!("innerwarden contain: could not arm the in-jail hook: {e}");
+                return ExitCode::FAILURE;
+            }
         }
-    }
-    if args.setup_only {
         println!(
             "innerwarden contain - hook armed for {} (mode: {}).",
             args.agent,
@@ -300,8 +294,11 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         );
     }
     if !input.args.dry_run && !openclaw {
-        match arm_with_retry(
-            || {
+        match arm_hook(
+            &claude_settings,
+            mode_given,
+            input.args.mode.clone(),
+            |block_review, monitor| {
                 hook::install_hook(
                     &input.home,
                     &input.args.agent,
@@ -314,16 +311,19 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             arm_wait,
         ) {
             // Said every time, so a change of mode is never silent.
-            Ok(_) => eprintln!(
-                "innerwarden contain: the guard hook for {} is in {}{}.",
-                input.args.agent,
-                match input.args.mode {
-                    crate::contain::Mode::Monitor => "monitor (records, never blocks)",
-                    crate::contain::Mode::Enforce => "enforce (blocks dangerous commands)",
-                    crate::contain::Mode::BlockReview => "enforce with review",
-                },
-                if mode_given { "" } else { ", as it was" }
-            ),
+            Ok(mode) => {
+                input.args.mode = mode;
+                eprintln!(
+                    "innerwarden contain: the guard hook for {} is in {}{}.",
+                    input.args.agent,
+                    match input.args.mode {
+                        crate::contain::Mode::Monitor => "monitor (records, never blocks)",
+                        crate::contain::Mode::Enforce => "enforce (blocks dangerous commands)",
+                        crate::contain::Mode::BlockReview => "enforce with review",
+                    },
+                    if mode_given { "" } else { ", as it was" }
+                )
+            }
             Err(e) => eprintln!(
                 "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
             ),
@@ -5620,12 +5620,55 @@ fn print_plan_env(env: &[(String, String)]) {
     }
 }
 
+/// The mode InnerWarden's hook has in the Claude Code settings at `settings`
+/// (its strongest, where it is wired more than once), or `None` where the
+/// file is not there, does not read, or wires no hook of InnerWarden's.
+fn kept_mode(settings: &Path) -> Option<crate::contain::Mode> {
+    let text = std::fs::read_to_string(settings).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    Some(match hook::kept_hook_flags(&value)? {
+        (true, _) => crate::contain::Mode::BlockReview,
+        (false, true) => crate::contain::Mode::Monitor,
+        (false, false) => crate::contain::Mode::Enforce,
+    })
+}
+
+/// Arm the in-jail hook through `install` (given the hook flags), with the
+/// retry of [`arm_with_retry`], and answer the mode it was armed in. A mode
+/// asked for on the command line is armed at every try. With none, each try
+/// first reads again the mode the hook has in `settings`: a try that lost
+/// the race to another jail's write arms the mode that jail left (its
+/// `--enforce`), never the one read before the race. Both places that arm
+/// the hook come through here.
+fn arm_hook<T>(
+    settings: &Path,
+    mode_given: bool,
+    mode: crate::contain::Mode,
+    mut install: impl FnMut(bool, bool) -> Result<T, String>,
+    wait: impl FnMut(u32),
+) -> Result<crate::contain::Mode, String> {
+    let mut armed = mode;
+    arm_with_retry(
+        || {
+            if !mode_given {
+                if let Some(kept) = kept_mode(settings) {
+                    armed = kept;
+                }
+            }
+            let (block_review, monitor) = armed.hook_flags();
+            install(block_review, monitor)
+        },
+        wait,
+    )?;
+    Ok(armed)
+}
+
 /// How many times arming the in-jail hook is tried in all.
 const ARM_TRIES: u32 = 5;
 
 /// Arm the in-jail hook. Two jails that start at the same moment write the
 /// same settings file; the update refuses the one whose read came before the
-/// other's write and says "retry" (`file_update`). That one is tried again,
+/// other's write and says so ([`file_update::lost_race`]). That one is tried again,
 /// on what the file holds now, up to `ARM_TRIES` times in all, so it does
 /// not run with walls only. Any other error is returned at once.
 fn arm_with_retry<T>(
@@ -5636,7 +5679,7 @@ fn arm_with_retry<T>(
     loop {
         tried += 1;
         match arm() {
-            Err(error) if tried < ARM_TRIES && error.contains("; retry") => wait(tried),
+            Err(error) if tried < ARM_TRIES && file_update::lost_race(&error) => wait(tried),
             done => return done,
         }
     }
@@ -9201,8 +9244,10 @@ mod tests {
     /// settings file is tried again, up to `ARM_TRIES` times in all; any
     /// other error is said at once.
     ///
-    /// FAILS ON REVERT: call `hook::install_hook` once and the second of
-    /// two jails starting together runs with walls only.
+    /// FAILS ON REVERT of the loop in `arm_with_retry` (one try only). It
+    /// calls the function alone: that both places that arm the hook come
+    /// through it is held by
+    /// `both_places_that_arm_the_hook_come_through_arm_hook`.
     #[test]
     fn arming_the_hook_is_tried_again_after_a_lost_race() {
         let lost =
@@ -9244,5 +9289,155 @@ mod tests {
         );
         assert!(armed.is_err());
         assert_eq!(calls, 1);
+    }
+
+    /// A Claude Code home under `dir` whose settings wire InnerWarden's hook
+    /// in the mode given by the flags, written by the real installer.
+    fn hook_home(dir: &std::path::Path, block_review: bool, monitor: bool) -> std::path::PathBuf {
+        super::hook::install_hook(
+            dir,
+            "claude-code",
+            None,
+            std::path::Path::new("/usr/local/bin/innerwarden"),
+            block_review,
+            monitor,
+        )
+        .expect("the installer writes a scratch home");
+        dir.join(".claude").join("settings.json")
+    }
+
+    /// The error a write that lost the race returns, as `file_update` words
+    /// it: the file holds other bytes than the ones the write read.
+    fn real_lost_race(dir: &std::path::Path) -> String {
+        let path = dir.join("raced.json");
+        std::fs::write(&path, b"theirs").unwrap();
+        super::file_update::replace_if_unchanged(&path, Some(b"mine"), b"new")
+            .expect_err("a write over bytes it did not read is refused")
+    }
+
+    /// The retry matches the words `file_update` really returns for a lost
+    /// race (the shared mark, not a copy of the text here), and only those.
+    ///
+    /// FAILS ON REVERT: `file_update` reworded with no change here (the
+    /// retry never fires), or the retry matching its own copy of the words.
+    #[test]
+    fn the_retry_reads_the_lost_race_file_update_returns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lost = real_lost_race(dir.path());
+        assert!(super::file_update::lost_race(&lost), "{lost}");
+        let mut calls = 0;
+        let armed = super::arm_with_retry(
+            || {
+                calls += 1;
+                if calls < 2 {
+                    Err(lost.clone())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(armed, Ok(()));
+        assert_eq!(calls, 2);
+    }
+
+    /// With no mode asked for, a try that lost the race to another jail's
+    /// `--enforce` arms enforce: the mode is read again for every try.
+    ///
+    /// FAILS ON REVERT: arm every try with the mode read before the race
+    /// (monitor goes back over the other jail's enforce).
+    #[test]
+    fn a_retry_with_no_mode_given_arms_the_mode_the_other_jail_left() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = hook_home(dir.path(), false, true);
+        assert_eq!(
+            super::kept_mode(&settings),
+            Some(crate::contain::Mode::Monitor)
+        );
+        let lost = real_lost_race(dir.path());
+        let mut tries = Vec::new();
+        let armed = super::arm_hook(
+            &settings,
+            false,
+            crate::contain::Mode::Monitor,
+            |block_review, monitor| {
+                tries.push((block_review, monitor));
+                if tries.len() == 1 {
+                    // The other jail's `--enforce` lands between this one's
+                    // read and its write.
+                    hook_home(dir.path(), false, false);
+                    return Err(lost.clone());
+                }
+                super::hook::install_hook(
+                    dir.path(),
+                    "claude-code",
+                    None,
+                    std::path::Path::new("/usr/local/bin/innerwarden"),
+                    block_review,
+                    monitor,
+                )
+                .map(|_| ())
+            },
+            |_| {},
+        );
+        assert_eq!(armed, Ok(crate::contain::Mode::Enforce));
+        assert_eq!(tries, vec![(false, true), (false, false)]);
+        assert_eq!(
+            super::kept_mode(&settings),
+            Some(crate::contain::Mode::Enforce)
+        );
+    }
+
+    /// A mode asked for on the command line is armed at every try, whatever
+    /// the file holds.
+    ///
+    /// FAILS ON REVERT: read the mode again with a mode given.
+    #[test]
+    fn a_retry_with_a_mode_given_arms_that_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = hook_home(dir.path(), false, false);
+        let lost = real_lost_race(dir.path());
+        let mut tries = Vec::new();
+        let armed = super::arm_hook(
+            &settings,
+            true,
+            crate::contain::Mode::Monitor,
+            |block_review, monitor| {
+                tries.push((block_review, monitor));
+                if tries.len() == 1 {
+                    Err(lost.clone())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(armed, Ok(crate::contain::Mode::Monitor));
+        assert_eq!(tries, vec![(false, true), (false, true)]);
+    }
+
+    /// Both places that arm the in-jail hook (`--setup` and a launch) arm
+    /// it through `arm_hook`, so both get its retry and its mode read again.
+    ///
+    /// FAILS ON REVERT: either place calling `hook::install_hook` straight
+    /// (the tests of `arm_hook` and `arm_with_retry` stay green then).
+    #[test]
+    fn both_places_that_arm_the_hook_come_through_arm_hook() {
+        let text = include_str!("contain_io.rs");
+        let shipped = &text[..text.find("#[cfg(test)]\nmod tests {").unwrap_or(text.len())];
+        let calls: Vec<usize> = shipped
+            .match_indices("hook::install_hook(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(calls.len(), 2, "the places that arm the hook changed");
+        for at in calls {
+            let before = &shipped[..at];
+            let opened = before.rfind("arm_hook(").expect("an arm_hook call before");
+            assert!(
+                !before[opened..].contains(';'),
+                "hook::install_hook called outside arm_hook: {}",
+                &shipped[opened..at]
+            );
+        }
     }
 }

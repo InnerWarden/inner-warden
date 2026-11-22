@@ -212,7 +212,11 @@ pub fn needs_second_opinion(verdict: &Value, min_risk: i64) -> bool {
 }
 
 /// The OpenAI-compatible chat request body. No `max_tokens`/`temperature` so it
-/// works across old and new (o-series / GPT-5) models that differ on those params.
+/// works across old and new (o-series / GPT-5) models that differ on those params:
+/// those refuse `max_tokens` (they take `max_completion_tokens`, which their
+/// reasoning also spends), so a small cap here would turn every answer of theirs
+/// into an error. What a slow model costs a call is bounded instead by asking the
+/// riskiest line first (`second_opinions` in the hook).
 pub fn build_body(model: &str, command: &str) -> Value {
     json!({
         "model": model,

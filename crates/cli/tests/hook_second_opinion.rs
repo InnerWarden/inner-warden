@@ -168,4 +168,9 @@ fn every_line_gets_the_model_when_it_answers_quickly() {
     // shell call are read apart and as one): every one is asked.
     assert!(model.asked.load(Ordering::SeqCst) >= 2, "{said}");
     assert_eq!(out.status.code(), Some(2), "{said}");
+    // Refused by the model's answer, not by the deadline (which exits 2 too).
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("second opinion: deny"),
+        "{said}"
+    );
 }

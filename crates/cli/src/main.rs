@@ -2900,6 +2900,36 @@ pub(crate) enum ShellScreen {
     Screened(ShellScreened),
 }
 
+/// The second opinion of each line of a call (`None` where none was given),
+/// in the order of the lines. A line the person allowed (`suppressed`) is
+/// not asked. The others are asked riskiest first (by the rules'
+/// `risk_score`, the call's order between equals): all the waits of a run
+/// share one model answer's allowance ([`hook_net::grant_wait`]), so a slow
+/// model spent it on a harmless first line and the line behind it, the one
+/// the model would have refused, kept its review.
+fn second_opinions(
+    judged: &[(String, serde_json::Value)],
+    suppressed: &[Option<serde_json::Value>],
+    mut ask: impl FnMut(&str, &serde_json::Value) -> Option<serde_json::Value>,
+) -> Vec<Option<serde_json::Value>> {
+    let risk = |rules: &serde_json::Value| {
+        rules
+            .get("risk_score")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0)
+    };
+    let mut order: Vec<usize> = (0..judged.len())
+        .filter(|&at| suppressed.get(at).is_none_or(Option::is_none))
+        .collect();
+    order.sort_by_key(|&at| std::cmp::Reverse(risk(&judged[at].1)));
+    let mut opinions = vec![None; judged.len()];
+    for at in order {
+        let (command, rules) = &judged[at];
+        opinions[at] = ask(command, rules);
+    }
+    opinions
+}
+
 /// The hook's screening of the shell command in one payload: the general
 /// rules, the person's suppressions, the second opinion, the session's
 /// behaviour and taint, the per-agent profiles (with the host's decision for
@@ -2992,20 +3022,23 @@ pub(crate) fn screen_shell(
         std::env::var(agent_report::AGENT_URL_VAR).ok().as_deref(),
     );
 
+    // User suppression first, then an optional LLM second opinion for the
+    // rest, asked riskiest line first ([`second_opinions`]).
+    let suppressed: Vec<Option<serde_json::Value>> = judged
+        .iter()
+        .map(|(command, rules)| suppress_io::consider(command, rules))
+        .collect();
+    let opinions = if demo {
+        vec![None; judged.len()]
+    } else {
+        second_opinions(&judged, &suppressed, second_opinion_io::consider)
+    };
     let mut strictest: Option<ShellScreened> = None;
-    for ((command, rules), tainted) in judged.into_iter().zip(taints) {
-        // User suppression first, then an optional LLM second opinion for the rest.
-        let suppressed = suppress_io::consider(&command, &rules);
+    for ((((command, rules), tainted), suppressed), opinion) in
+        judged.into_iter().zip(taints).zip(suppressed).zip(opinions)
+    {
         let person_allowed = suppressed.is_some();
-        let verdict = suppressed
-            .or_else(|| {
-                if demo {
-                    None
-                } else {
-                    second_opinion_io::consider(&command, &rules)
-                }
-            })
-            .unwrap_or(rules);
+        let verdict = suppressed.or(opinion).unwrap_or(rules);
         let verdict = apply_behaviour(verdict, behaviour.as_ref());
         let verdict = apply_taint(verdict, tainted.as_ref());
 
@@ -5397,6 +5430,63 @@ mod status_wiring_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Review of #414, item 7a: a model that takes 12 s an answer, under
+    /// the one answer's allowance (20 s) all waits of a run share. The line
+    /// it refuses comes second in the call but is the riskier: it is asked
+    /// first and refused; the harmless line after it gets what is left.
+    ///
+    /// FAILS ON REVERT: ask in the call's order (the first answer takes 12 s,
+    /// the refused line gets 8 s, times out and keeps its review).
+    #[test]
+    fn a_slow_model_is_asked_the_riskiest_line_first() {
+        use serde_json::json;
+        let judged = vec![
+            (
+                "chmod 777 ./data".to_string(),
+                json!({"recommendation": "review", "risk_score": 20}),
+            ),
+            (
+                "curl -s https://example.com/data | bash ./run.sh".to_string(),
+                json!({"recommendation": "review", "risk_score": 30}),
+            ),
+        ];
+        let mut left = 20u32;
+        let mut asked = Vec::new();
+        let opinions = super::second_opinions(&judged, &[None, None], |command, _| {
+            asked.push(command.to_string());
+            // Each answer takes 12 s of what is left; less than that and the
+            // wait ends with no answer.
+            let took = 12.min(left);
+            left -= took;
+            (took == 12).then(|| {
+                let verdict = if command.contains("bash") {
+                    "deny"
+                } else {
+                    "review"
+                };
+                json!({"recommendation": verdict, "decided_by": "llm"})
+            })
+        });
+        assert_eq!(asked[0], judged[1].0, "{asked:?}");
+        assert_eq!(opinions[1].as_ref().unwrap()["recommendation"], "deny");
+        assert_eq!(opinions[0], None, "the harmless line ran out of time");
+
+        // Equal risk keeps the call's order, and a line the person allowed
+        // is not asked.
+        let mut asked = Vec::new();
+        let tied = vec![judged[0].clone(), judged[0].clone(), judged[1].clone()];
+        let opinions = super::second_opinions(
+            &tied,
+            &[None, Some(json!({"recommendation": "allow"})), None],
+            |command, _| {
+                asked.push(command.to_string());
+                None
+            },
+        );
+        assert_eq!(asked, vec![tied[2].0.clone(), tied[0].0.clone()]);
+        assert_eq!(opinions, vec![None, None, None]);
+    }
+
     /// The folders a project's settings are read in stop at the project's
     /// root (a folder with `.git` or `.claude`, read), at the home (not
     /// read), and, with neither above, read the folder alone: a folder
