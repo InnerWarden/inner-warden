@@ -7,18 +7,31 @@ use serde_json::Value;
 use crate::suppress::{apply, is_universal_pattern, SuppressConfig};
 use innerwarden_agent_guard::threats::GUARD_OPERATOR_FLAG;
 
-/// The suppression config path: env `IW_SUPPRESS_CONFIG`, else
-/// `~/.config/innerwarden/suppress.toml`.
+/// What `IW_SUPPRESS_CONFIG` may name, in every build: no file at all. The
+/// jail hands its hook this, so a `suppress.toml` written in the jail lifts
+/// nothing. It only takes suppressions away.
+const NO_SUPPRESSION: &str = "/dev/null";
+
+/// The suppression config path: `.config/innerwarden/suppress.toml` in the
+/// account's own home ([`crate::graph_io::account_config_dir`]), never the
+/// `HOME` the caller hands down. A hook runs with the AI agent's environment,
+/// and a `suppress.toml` in a home it names, or in a file it names with
+/// `IW_SUPPRESS_CONFIG`, lowered the verdict on the very command it lists.
+/// `IW_SUPPRESS_CONFIG` is honoured as [`NO_SUPPRESSION`] only, and as any
+/// other path in a debug build (the tests).
 fn config_path() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("IW_SUPPRESS_CONFIG") {
-        if !p.trim().is_empty() {
-            return Some(std::path::PathBuf::from(p));
-        }
+    let named = std::env::var("IW_SUPPRESS_CONFIG").ok();
+    if let Some(path) = honoured_override(named.as_deref(), cfg!(debug_assertions)) {
+        return Some(path);
     }
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.trim().is_empty())
-        .map(|h| std::path::PathBuf::from(h).join(".config/innerwarden/suppress.toml"))
+    crate::graph_io::account_config_dir().map(|dir| dir.join("suppress.toml"))
+}
+
+/// The path `IW_SUPPRESS_CONFIG` names when it is honoured: [`NO_SUPPRESSION`]
+/// always, any other with `any` (debug builds).
+fn honoured_override(named: Option<&str>, any: bool) -> Option<std::path::PathBuf> {
+    let named = named.map(str::trim).filter(|named| !named.is_empty())?;
+    (any || named == NO_SUPPRESSION).then(|| std::path::PathBuf::from(named))
 }
 
 fn load() -> SuppressConfig {
@@ -53,8 +66,7 @@ fn load_reporting(warn: bool) -> SuppressConfig {
 /// function, so every mutation is recorded. Turning a guard off is a security
 /// event; it was previously the only thing the guard did silently.
 fn save(cfg: &SuppressConfig) -> Result<(), String> {
-    let path =
-        config_path().ok_or("cannot resolve a config path (set IW_SUPPRESS_CONFIG or HOME)")?;
+    let path = config_path().ok_or("cannot resolve a config path (this account has no home)")?;
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
@@ -383,6 +395,26 @@ mod tests {
     fn an_unchanged_config_reports_nothing() {
         let same = cfg(&["a"], &["ATR-001"], &["x"]);
         assert!(suppression_delta(&same, &same).is_empty());
+    }
+
+    /// A file the caller names is never where suppressions come from in a
+    /// release build: only "no suppression" is. A debug build (the tests)
+    /// takes any path.
+    #[test]
+    fn a_suppression_file_the_caller_names_is_read_only_in_a_debug_build() {
+        for planted in ["/home/agent/plant.toml", "./suppress.toml"] {
+            assert_eq!(honoured_override(Some(planted), false), None, "{planted}");
+            assert_eq!(
+                honoured_override(Some(planted), true),
+                Some(std::path::PathBuf::from(planted))
+            );
+        }
+        assert_eq!(
+            honoured_override(Some(NO_SUPPRESSION), false),
+            Some(std::path::PathBuf::from(NO_SUPPRESSION))
+        );
+        assert_eq!(honoured_override(Some("  "), true), None);
+        assert_eq!(honoured_override(None, true), None);
     }
 
     #[test]
