@@ -478,11 +478,8 @@ fn is_community_serve(
 /// whatever answered, `None` when nothing did. Short timeout: a failed probe
 /// must never turn a successful upgrade into a scary ending.
 fn probe(method: &str, url: &str, body: Option<&str>) -> Option<(u16, String)> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_millis(400)))
-        .http_status_as_error(false)
-        .build()
-        .into();
+    // Straight to the address, never through a proxy the environment names.
+    let agent = crate::http_io::loopback_agent(std::time::Duration::from_millis(400), false, false);
     let response = match (method, body) {
         ("POST", Some(b)) => agent
             .post(url)

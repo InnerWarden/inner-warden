@@ -195,19 +195,10 @@ pub fn agent_route(var: Option<&str>, path: &str) -> Option<String> {
 
 /// POST one report; `Err` says why it was not taken.
 pub fn send_report(url: &str, body: &Value) -> Result<(), String> {
-    let mut config = ureq::Agent::config_builder()
-        .timeout_global(Some(REPORT_TIMEOUT))
-        .http_status_as_error(false);
-    if is_loopback_url(url) {
-        // The agent's dashboard on loopback answers with a self-signed
-        // certificate. Only ever relaxed for loopback.
-        config = config.tls_config(
-            ureq::tls::TlsConfig::builder()
-                .disable_verification(true)
-                .build(),
-        );
-    }
-    let agent: ureq::Agent = config.build().into();
+    // The agent's dashboard on loopback answers with a self-signed
+    // certificate: only ever relaxed for loopback. Never through a proxy the
+    // environment names (`crate::http_io::loopback_agent`).
+    let agent = crate::http_io::loopback_agent(REPORT_TIMEOUT, false, is_loopback_url(url));
     let response = agent
         .post(url)
         .send_json(body)

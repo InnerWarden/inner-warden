@@ -316,6 +316,32 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   main 7f125ba with the differential judge (37127 lines, an empty home and
   a home with keys): dx-126 and its ten wrapper and body variants move from
   review to deny; no other line of any corpus moved.
+- 2026-11-22: the inline reader's follow-up for Perl, PHP and Lua moves no
+  line of any corpus. Measured against main 0f6ec89 with the differential
+  judge (37127 lines, an empty home and a home with keys): no verdict
+  changed. The forms it reads now are held in
+  `tests/inline_reader_perl_php_lua.rs`: a closure name given a function's
+  name again, `open` and `readpipe` without brackets, Perl's `"@{ [ ... ] }"`
+  with spaces, Lua aliases with no separator, PHP strings called as
+  functions, names in any case, `call_user_func`, files written then
+  included by a built path or in appends, and loads of `/dev/stdin`. A
+  PHP read, edit and write of a file, a cast and a Lua read of `_G[k]` go
+  back to allow.
+- 2026-11-22: the inline reader's last round for Perl, PHP and Lua moves no
+  line of any corpus. Measured against main c2e216b with the differential
+  judge (37127 lines, an empty home and a home with keys): no verdict
+  changed. A name that a PHP `foreach` sets from a glob with a wildcard is no
+  longer read as the pattern's text: a process run on it is reviewed, and
+  code loaded from it is judged as on main (review, deny when the input
+  comes from `curl |`). A glob with no wildcard is still read as its one
+  path. A name that `foreach`, `list()`, `[...] =`, `extract` or
+  `$GLOBALS` sets again loses the function it held. Also read now, and
+  held in `tests/inline_reader_perl_php_lua.rs`: a Lua alias after a
+  statement with no `;` whose value is a number, a string, a table or an
+  expression; Perl's `open` and `readpipe` with their arguments on the next
+  lines; stdin as `//dev/stdin`, `/dev/./stdin`, `/dev/../dev/stdin`,
+  `/proc/thread-self/fd/0`, `/proc/1/fd/0` and `file:///dev/stdin`; a PHP
+  function called in another case, from a string or as a method.
 - 2026-11-22: new corpus cursor-exec-2026-11, read by the differential
   check; reference.tsv unchanged. cursor-exec-2026-11/ce-01,
   cursor-exec-2026-11/ce-02 and cursor-exec-2026-11/ce-03 (`must_refuse`)
@@ -378,6 +404,17 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   recorded above. Controls cursor-exec-2026-11/ce-c15, cursor-exec-2026-11/ce-c16, cursor-exec-2026-11/ce-c17, cursor-exec-2026-11/ce-c18, cursor-exec-2026-11/ce-c19, cursor-exec-2026-11/ce-c20, cursor-exec-2026-11/ce-c21, cursor-exec-2026-11/ce-c22 are allowed on main and here;
   ce-c04, ce-c05 and ce-c06 move as recorded above. No other line of any
   corpus moved.
+- 2026-11-23: a PHP `foreach` head read in any case and with any space or
+  comment around `as` moves no line of any corpus. Measured against main
+  80b8b55 with the differential judge (39669 lines, an empty home and a home
+  with keys): no verdict changed. Every name after `as`, inside `list()`
+  and `[...]` too, loses what it held, and a statement whose `foreach` head
+  cannot be read loses what the reader knew of every name. A file name a
+  glob with a wildcard or a directory read (`scandir`, `readdir`) found,
+  written into a line a process runs (`"sh " . $f`, `"./$f"`), is reviewed.
+  Held in `tests/inline_reader_perl_php_lua.rs`. This pull request as a
+  whole also makes benign code nested 20 levels deep or more a review (pre
+  and main: allow); up to 16 levels stays allow.
 - 2026-11-23: review round 1 of the change to the guard's configuration
   commands and the folders above its configuration; reference.tsv unchanged
   (the new corpus is read by the differential check, not by the release

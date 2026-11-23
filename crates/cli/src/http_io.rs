@@ -28,6 +28,52 @@ pub fn agent_with_timeout(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
+/// An agent for a listener on this host (InnerWarden Pro's agent, the
+/// dashboard, `serve`), bounded by `timeout`, that never goes through a
+/// proxy. ureq takes `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` from the
+/// environment by default, and the MCP proxy, the OpenClaw guard and
+/// `contain` run with the AI agent's: a proxy it named received every
+/// refusal report and every command sent to Pro, and could drop or change
+/// Pro's answer. A request to this host has no reason to leave it.
+/// `status_as_error` as ureq reads it; `own_certificate` relaxes TLS
+/// verification for a loopback listener that answers with a certificate of
+/// its own (Pro's agent): a caller sets it only for a loopback url.
+pub fn loopback_agent(
+    timeout: Duration,
+    status_as_error: bool,
+    own_certificate: bool,
+) -> ureq::Agent {
+    loopback_agent_from(
+        ureq::Agent::config_builder(),
+        timeout,
+        status_as_error,
+        own_certificate,
+    )
+}
+
+/// [`loopback_agent`] over `base`: the builder ureq hands out, which already
+/// holds the environment's proxy when one is set. Apart so a test can start
+/// from a builder that carries one, as a run under `HTTPS_PROXY` does.
+fn loopback_agent_from(
+    base: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+    timeout: Duration,
+    status_as_error: bool,
+    own_certificate: bool,
+) -> ureq::Agent {
+    let mut config = base
+        .timeout_global(Some(timeout))
+        .http_status_as_error(status_as_error)
+        .proxy(None);
+    if own_certificate {
+        config = config.tls_config(
+            ureq::tls::TlsConfig::builder()
+                .disable_verification(true)
+                .build(),
+        );
+    }
+    config.build().into()
+}
+
 /// An agent for a request that carries what the guard read off this
 /// machine (the second opinion, an alert), bounded by `timeout`, that goes
 /// through `proxy` (from the account's own config) or straight to the
@@ -147,6 +193,35 @@ mod tests {
             account_agent_reading_status(Duration::from_millis(400), Some("::not a url::"))
                 .is_err()
         );
+    }
+
+    /// The agent for this host's own listeners takes no proxy at all, even
+    /// when the builder ureq hands out already holds one (what it reads from
+    /// `HTTPS_PROXY` and the others), and relaxes TLS only when asked to.
+    #[test]
+    fn the_loopback_agent_takes_no_proxy() {
+        for (status_as_error, own_certificate) in
+            [(true, false), (false, false), (false, true), (true, true)]
+        {
+            let from_env = ureq::Proxy::new("http://127.0.0.1:9").expect("a proxy url");
+            let base = ureq::Agent::config_builder().proxy(Some(from_env));
+            let agent = loopback_agent_from(
+                base,
+                Duration::from_millis(700),
+                status_as_error,
+                own_certificate,
+            );
+            assert!(agent.config().proxy().is_none());
+            assert_eq!(agent.config().http_status_as_error(), status_as_error);
+            assert_eq!(
+                agent.config().timeouts().global,
+                Some(Duration::from_millis(700))
+            );
+            assert_eq!(
+                agent.config().tls_config().disable_verification(),
+                own_certificate
+            );
+        }
     }
 
     /// The agent is the only thing carrying the bound now, so a builder that

@@ -63,6 +63,27 @@ const CHANNEL_VARS: [&str; 6] = [
     "IW_NOTIFY_REVIEW",
 ];
 
+/// The channel variables set in this environment that [`caller_env`] does
+/// not read (a release build), to say so instead of saying nothing.
+fn ignored_channel_vars() -> Vec<&'static str> {
+    if crate::graph_io::caller_overrides_honoured() {
+        return Vec::new();
+    }
+    CHANNEL_VARS
+        .iter()
+        .copied()
+        .filter(|name| std::env::var(name).is_ok_and(|v| !v.trim().is_empty()))
+        .collect()
+}
+
+/// The line that names [`ignored_channel_vars`] and says why.
+fn not_read_line(ignored: &[&str]) -> String {
+    format!(
+        "  not read: {} (a channel comes only from the config file: the hook runs with the AI agent's environment)",
+        ignored.join(", ")
+    )
+}
+
 /// The proxy `notify.toml` names for every alert, if any. Never one from the
 /// environment ([`crate::http_io::account_agent`]).
 fn config_proxy(file: Option<&str>) -> Option<String> {
@@ -214,17 +235,9 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "(this account has no home)".into())
             );
-            let ignored: Vec<&str> = CHANNEL_VARS
-                .iter()
-                .copied()
-                .filter(|name| std::env::var(name).is_ok_and(|v| !v.trim().is_empty()))
-                .filter(|_| !crate::graph_io::caller_overrides_honoured())
-                .collect();
+            let ignored = ignored_channel_vars();
             if !ignored.is_empty() {
-                println!(
-                    "  not read: {} (a channel comes only from the config file above: the hook runs with the AI agent's environment)",
-                    ignored.join(", ")
-                );
+                println!("{}", not_read_line(&ignored));
             }
             std::process::ExitCode::SUCCESS
         }
@@ -248,6 +261,26 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 println!("innerwarden notify - saved to {}", path.display());
             }
             let attempted = tests.len();
+            // `--test` as the parser read it: in `--telegram-chat --test` it is
+            // the chat id, and no test was asked for.
+            let test_asked =
+                innerwarden_notify::cli::parse_set_args(rest).is_ok_and(|(_, test)| test);
+            if attempted == 0 && test_asked {
+                // `--test` with no channel used to print nothing, which
+                // reads as a test that passed. The exit code stays 0, as when
+                // every delivery fails below.
+                eprintln!(
+                    "innerwarden notify - --test sent nothing: no channel is configured in {}.",
+                    config_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "the account's config (this account has no home)".into())
+                );
+                let ignored = ignored_channel_vars();
+                if !ignored.is_empty() {
+                    eprintln!("{}", not_read_line(&ignored));
+                }
+                eprintln!("  set one: innerwarden notify --telegram-token <T> --telegram-chat <C> [--slack-webhook <URL>] --test");
+            }
             let delivered = tests
                 .iter()
                 .filter(|request| send_via(request, proxy.as_deref()) == DeliveryStatus::Delivered)
