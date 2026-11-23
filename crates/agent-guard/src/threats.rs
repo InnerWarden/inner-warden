@@ -1,5 +1,6 @@
 //! Threat detection patterns for AI agent security.
 
+mod git_tree;
 mod glob_names;
 mod guard_doubt;
 mod guard_lowering;
@@ -3327,6 +3328,12 @@ fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
         // zsh runs it before the hook line Codex starts.
         ".zshenv",
     ];
+    // A git verb that empties, resets or repoints a work tree, read where
+    // git reads it: the line need not name the guard's folder
+    // (`git clean -fdx` in a home made a repository).
+    if git_tree::git_takes_guard_place(content) {
+        return Some((git_tree::GIT_TREE_TAKES_GUARD, 60));
+    }
     if !mentions_any(content, NEEDLES)
         && !names_guard_alias(content)
         && !names_a_removing_find(content)

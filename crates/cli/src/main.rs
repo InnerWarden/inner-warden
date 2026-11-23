@@ -3665,9 +3665,20 @@ fn screen_mcp_call(
             let trusted = std::fs::read_to_string(user)
                 .map(|text| mcp_unproxied::codex_trusted_projects(&text))
                 .unwrap_or_default();
+            let payload_cwd = payload
+                .get("cwd")
+                .and_then(|cwd| cwd.as_str())
+                .map(std::path::Path::new);
+            let process_cwd = std::env::current_dir().ok();
             let moved = cwds.iter().any(|cwd| {
-                mcp_unproxied::codex_layers_may_have_moved(cwd, &trusted, agent_started)
-            });
+                mcp_unproxied::codex_layers_may_have_moved_beside(
+                    cwd,
+                    &trusted,
+                    agent_started,
+                    Some(user),
+                )
+            }) || (!trusted.is_empty()
+                && mcp_unproxied::codex_cwds_disagree(payload_cwd, process_cwd.as_deref()));
             let argv_sets_servers = agent_process
                 .as_ref()
                 .and_then(|process| mcp_unproxied::process_argv(process.pid))

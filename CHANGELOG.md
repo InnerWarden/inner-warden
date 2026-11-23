@@ -5,6 +5,34 @@ follows semantic versioning.
 
 ## Unreleased
 
+git verbs that empty or reset a work tree are read on the work tree git
+itself uses: the one the line names (`--work-tree`, `GIT_WORK_TREE`,
+`-c core.worktree=`, `--config-env`, `GIT_CONFIG_KEY_<n>` with
+`GIT_CONFIG_VALUE_<n>`), else the `core.worktree` in the repository's
+config, else the folder that holds its `.git`, found from the folder the
+command runs in. `clean` (without `-n`) and `stash -u`/`-a` are refused
+when what they reach holds one of the guard's places (its folders, the agent
+settings that load it, its program), so `git clean -fdx` in a home made a
+repository is refused; `stash`, `read-tree -u`, `checkout`, `switch`,
+`restore` and `reset --hard` are refused when the work tree, or a path they
+are handed, is one of those places or inside one; `git config core.worktree`
+pointing into the guard's folder is refused. A dotfiles repository with the
+home as its work tree keeps working: `checkout -- .bashrc`, `status` and
+`reset --hard` there are not refused, `clean` and `stash -u` are. Not
+read: a folder or value behind a variable the line does not assign, other
+than the home, and an `include` in a repository's config.
+
+Codex: the hook no longer trusts the proxy for a call when a project layer
+above the trusted folder (in a parent up to the root of the file system,
+past the repository's root) changed after Codex started, when the folder
+the call runs in is not there any more, or, with a trusted project in the
+user's file, when the folder Codex names for the call is not the folder the
+hook runs in. Such calls are judged by the hook. Above the trusted folder
+the `.codex` and its `config.toml` are read, not the folder itself (a
+parent such as the home changes all the time), and the user's own
+`~/.codex` is left out: a whole `.codex` renamed out of a parent above
+the trusted folder is not seen.
+
 `agents connect` leaves a server the agent signs in to by itself as it is,
 instead of wrapping it in the proxy, where the sign-in was lost (every call
 came back 401). Only a server reached by URL, on another host, with nothing

@@ -330,19 +330,42 @@ pub fn codex_trusted_projects(user_config_text: &str) -> Vec<PathBuf> {
 
 /// Whether a layer Codex may have read when the agent started can have
 /// moved since: `cwd` is in a project the user's file trusts
-/// (`trusted`), and one of the folders from `cwd` up to that project's
-/// folder, the `.codex` in one of them or its `config.toml` changed
-/// after the agent started (or either time is unknown). A layer moved
+/// (`trusted`), and, in the folders [`codex_project_layers`] reads
+/// (from `cwd` up to the root of the file system, past the trusted
+/// folder and past a `.git`), a folder up to the trusted one, the
+/// `.codex` in any of them or its `config.toml` changed after the agent
+/// started (or either time is unknown), or one of those folders is not
+/// there (the working folder
+/// renamed away: what the agent read is not where it was). A layer moved
 /// away leaves its folder changed, and one emptied or rewritten in place
 /// leaves the file changed: what the hook finds then is not what the
 /// agent read. A `.codex` or a `config.toml` that is a link is read on
 /// both sides: the link, and what it points at (a link that points at
 /// nothing counts as changed).
+///
+/// Above the trusted folder the `.codex` and its `config.toml` are read,
+/// not the folder itself: a parent such as the home or `/tmp` changes all
+/// the time, and a layer rewritten, emptied or replaced there still leaves
+/// its `.codex` or its file changed. A whole `.codex` renamed out of a
+/// parent above the trusted folder is not seen.
 pub fn codex_layers_may_have_moved(
     cwd: &Path,
     trusted: &[PathBuf],
     agent_started: Option<SystemTime>,
 ) -> bool {
+    codex_layers_may_have_moved_beside(cwd, trusted, agent_started, None)
+}
+
+/// [`codex_layers_may_have_moved`] with the user's own file
+/// (`user_config`) left out: Codex writes beside it all the time, and the
+/// hook reads it already.
+pub fn codex_layers_may_have_moved_beside(
+    cwd: &Path,
+    trusted: &[PathBuf],
+    agent_started: Option<SystemTime>,
+    user_config: Option<&Path>,
+) -> bool {
+    let user = user_config.and_then(file_id);
     let real = std::fs::canonicalize(cwd).ok();
     let Some(root) = trusted
         .iter()
@@ -358,15 +381,49 @@ pub fn codex_layers_may_have_moved(
     } else {
         real.unwrap_or_else(|| cwd.to_path_buf())
     };
+    // Every folder the layers are read from: a layer above the trusted
+    // folder (`~/a/.codex` over a trusted `~/a/proj`) is read by Codex as
+    // well. A folder on the way that is not there leaves what was read
+    // unknown.
+    let mut above = false;
     for dir in base.ancestors() {
-        if layer_may_have_moved(dir, ".codex", "config.toml", agent_started) {
+        if std::fs::symlink_metadata(dir).is_err() {
+            return true;
+        }
+        let layer = dir.join(".codex").join("config.toml");
+        let is_user =
+            user_config == Some(layer.as_path()) || (user.is_some() && file_id(&layer) == user);
+        if !is_user
+            && layer_places_may_have_moved(dir, ".codex", "config.toml", agent_started, !above)
+        {
             return true;
         }
         if dir == root.as_path() {
-            break;
+            above = true;
         }
     }
     false
+}
+
+/// Whether the folder Codex says a call runs in (`payload`, its hook's
+/// `cwd`) is not the folder this process runs in (`process`), as each
+/// resolves now: one that is not there, or the two not the same folder
+/// (the project renamed after the agent started), leaves the layers the
+/// agent read unknown. Only asked when the user's file trusts a project.
+pub fn codex_cwds_disagree(payload: Option<&Path>, process: Option<&Path>) -> bool {
+    let Some(payload) = payload else {
+        return false;
+    };
+    let Some(process) = process else {
+        return true;
+    };
+    match (
+        std::fs::canonicalize(payload),
+        std::fs::canonicalize(process),
+    ) {
+        (Ok(payload), Ok(process)) => payload != process,
+        _ => true,
+    }
 }
 
 /// Whether the layer `<dir>/<folder>/<file>` may have changed since the
@@ -380,9 +437,22 @@ pub fn layer_may_have_moved(
     file: &str,
     agent_started: Option<SystemTime>,
 ) -> bool {
+    layer_places_may_have_moved(dir, folder, file, agent_started, true)
+}
+
+/// [`layer_may_have_moved`], with `dir` itself read only when
+/// `with_dir`.
+fn layer_places_may_have_moved(
+    dir: &Path,
+    folder: &str,
+    file: &str,
+    agent_started: Option<SystemTime>,
+    with_dir: bool,
+) -> bool {
     let holder = dir.join(folder);
     let layer = holder.join(file);
-    for place in [dir.to_path_buf(), holder, layer] {
+    let places = [dir.to_path_buf(), holder, layer];
+    for place in places.into_iter().skip(usize::from(!with_dir)) {
         match std::fs::symlink_metadata(&place) {
             Ok(meta) => {
                 if !config_settled(last_change(&meta), agent_started) {
@@ -2309,6 +2379,54 @@ mod tests {
             Some(now - hour)
         ));
         assert!(codex_trusted_projects("not = [toml").is_empty());
+    }
+
+    /// A layer above the trusted folder (`~/a/.codex` over a trusted
+    /// `~/a/proj`, the repository's root at `~/a`) is one Codex reads:
+    /// rewritten after the agent started, it is uncertain. A trusted
+    /// working folder that is not there any more (renamed away) is too.
+    ///
+    /// FAILS ON REVERT of the walk past the trusted folder, or of the
+    /// missing folder counting, in `codex_layers_may_have_moved`.
+    #[test]
+    fn a_layer_above_the_trusted_folder_or_a_gone_folder_is_uncertain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let a = dir.path().join("a");
+        let proj = a.join("proj");
+        std::fs::create_dir_all(a.join(".git")).unwrap();
+        std::fs::create_dir_all(a.join(".codex")).unwrap();
+        std::fs::create_dir_all(&proj).unwrap();
+        let layer = a.join(".codex/config.toml");
+        std::fs::write(&layer, "[mcp_servers.docs]\ncommand = \"docs-evil\"\n").unwrap();
+        let trusted = vec![proj.clone()];
+        std::thread::sleep(SETTLE_MARGIN + Duration::from_millis(300));
+        let started = SystemTime::now();
+        std::thread::sleep(Duration::from_millis(1100));
+        // Emptied in place after the start.
+        std::fs::write(&layer, "").unwrap();
+        assert!(codex_layers_may_have_moved(&proj, &trusted, Some(started)));
+        // The trusted folder renamed away: the folder Codex names is gone.
+        let gone = dir.path().join("gone");
+        assert!(codex_layers_may_have_moved(
+            &gone,
+            std::slice::from_ref(&gone),
+            Some(started)
+        ));
+    }
+
+    /// FAILS ON REVERT of `codex_cwds_disagree` to `false`.
+    #[test]
+    fn codex_cwd_and_process_cwd_must_be_one_folder() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let x = dir.path().join("proj-x");
+        std::fs::create_dir_all(&x).unwrap();
+        let gone = dir.path().join("proj");
+        assert!(codex_cwds_disagree(Some(&gone), Some(&x)));
+        assert!(codex_cwds_disagree(Some(dir.path()), Some(&x)));
+        assert!(!codex_cwds_disagree(Some(&x), Some(&x)));
+        assert!(!codex_cwds_disagree(Some(&x.join(".")), Some(&x)));
+        assert!(!codex_cwds_disagree(None, Some(&x)));
+        assert!(codex_cwds_disagree(Some(&x), None));
     }
 
     /// A Codex started with a server of its own on its command line, or a
