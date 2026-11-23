@@ -22,7 +22,7 @@
 //! `fetch(u).then(eval)`, a file the code downloads then loads) is
 //! [`InlineReading::runs_download`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{js_option, node_called_sinks, shell_quoted, NodeCall};
 
@@ -714,6 +714,12 @@ struct Reader<'a> {
     heads_unread: std::cell::Cell<bool>,
     depth: u8,
     out: InlineReading,
+    /// PHP: whether a form in the code may set any name
+    /// ([`php_unreadable_names`]).
+    php_any_name_set: bool,
+    /// PHP: the names set somewhere other than by the statements the
+    /// reader follows ([`php_unreadable_names`]).
+    php_unreadable: HashSet<String>,
 }
 
 /// Reads a piece of inline code in `lang` for the process lines it builds.
@@ -739,6 +745,8 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
         heads_unread: std::cell::Cell::new(false),
         depth,
         out: InlineReading::default(),
+        php_any_name_set: false,
+        php_unreadable: HashSet::new(),
     };
     reader.run();
     if reader.heads_unread.get() {
@@ -1461,6 +1469,9 @@ impl Reader<'_> {
         }
         self.fetches = self.fetch_positions();
         self.functions = defined_functions(self.lang, code);
+        if self.lang == Lang::Php {
+            (self.php_any_name_set, self.php_unreadable) = php_unreadable_names(code);
+        }
         for (mut start, end) in statements_of(self.lang, code) {
             // Lua needs nothing between two statements: `local e = os.execute
             // e("...")` is an assignment, then a call through the name.
@@ -1475,9 +1486,13 @@ impl Reader<'_> {
             if self.lang == Lang::Php {
                 self.bind_foreach(&code[start..end]);
                 self.php_other_assignments(&code[start..end]);
+                self.drop_php_unreadable();
             }
             self.scan(start, end);
             self.assign(&code[start..end]);
+            if self.lang == Lang::Php {
+                self.drop_php_unreadable();
+            }
         }
         let mut seen = std::collections::HashSet::new();
         self.out
@@ -1573,6 +1588,33 @@ impl Reader<'_> {
                     .get(name)
                     .is_some_and(|value| value.text().contains(LISTED))
             })
+    }
+
+    /// PHP: the names [`php_unreadable_names`] found set where the reader
+    /// does not follow lose what the reader knew of them, as on main. A
+    /// file name a listing found stays one: it is no more read.
+    fn drop_php_unreadable(&mut self) {
+        let names: Vec<String> = if self.php_any_name_set {
+            self.closures.clear();
+            self.aliases.clear();
+            self.vars.keys().cloned().collect()
+        } else {
+            self.php_unreadable.iter().cloned().collect()
+        };
+        for name in names {
+            // A name not set yet stays unset: a parameter is bound to what
+            // each call hands it ([`Self::with_parameters`]).
+            let Some(held) = self.vars.get(&name) else {
+                self.closures.retain(|closure| closure != &name);
+                self.aliases.remove(&name);
+                continue;
+            };
+            let listing = held.text().contains(LISTED);
+            self.forget(&name);
+            if listing {
+                self.vars.insert(name, listed());
+            }
+        }
     }
 
     /// Everything the reader knew of names is gone.
@@ -4695,6 +4737,302 @@ fn written_in_place(expression: &str) -> bool {
 /// A value that is a file name a listing found ([`LISTED`]).
 fn listed() -> Value {
     Value::Str(format!("{UNREAD}{LISTED}{UNREAD}"))
+}
+
+/// PHP functions that set a name handed to them as an argument (by
+/// reference): `sscanf("...", "%s", $f)`, `preg_match($p, $s, $f)`.
+const PHP_BY_REFERENCE: &[&str] = &[
+    "sscanf",
+    "fscanf",
+    "preg_match",
+    "preg_match_all",
+    "preg_replace",
+    "preg_replace_callback",
+    "preg_replace_callback_array",
+    "str_replace",
+    "str_ireplace",
+    "settype",
+    "unset",
+    "exec",
+    "system",
+    "passthru",
+    "proc_open",
+    "array_shift",
+    "array_pop",
+    "array_push",
+    "array_unshift",
+    "array_splice",
+    "array_walk",
+    "array_walk_recursive",
+    "array_multisort",
+    "sort",
+    "rsort",
+    "usort",
+    "uasort",
+    "uksort",
+    "asort",
+    "arsort",
+    "ksort",
+    "krsort",
+    "natsort",
+    "natcasesort",
+    "shuffle",
+    "end",
+    "reset",
+    "next",
+    "prev",
+    "each",
+    "catch",
+    "fsockopen",
+    "pfsockopen",
+    "stream_socket_client",
+    "stream_socket_server",
+    "stream_select",
+    "socket_select",
+    "socket_recv",
+    "socket_recvfrom",
+    "stream_socket_recvfrom",
+    "getmxrr",
+    "dns_get_record",
+    "getimagesize",
+    "similar_text",
+    "headers_sent",
+    "is_callable",
+    "mb_convert_variables",
+    "openssl_sign",
+    "openssl_seal",
+    "openssl_open",
+    "openssl_encrypt",
+    "openssl_private_decrypt",
+    "openssl_public_encrypt",
+    "openssl_private_encrypt",
+    "openssl_public_decrypt",
+    "openssl_pkey_export",
+    "openssl_csr_export",
+    "openssl_x509_export",
+    "xml_parse_into_struct",
+    "flock",
+    "pcntl_wait",
+    "pcntl_waitpid",
+    "msg_receive",
+];
+
+/// PHP: whether a form in `code` may set any name, and the names set
+/// somewhere other than where the reader follows them. The reader follows
+/// `$f = ...` (and `.=`, `+=`) standing at the start of a top-level
+/// statement, in order, and the head of a `foreach` it reads; the value
+/// it holds for a name counts only when every place the code sets that
+/// name is one of those, and a `foreach` head is the only one or there is
+/// none. Any other form (an assignment inside a block, a loop head or an
+/// expression, an indexed or compound one, `++`, a parameter or a `use`,
+/// `list()`/`[...] =`, a function that sets its argument) makes the name
+/// not read; `$$`, `${`, `$GLOBALS`, a reference (`&$`), `extract`,
+/// `compact`, `parse_str`, `eval`, `global`, `static $`, `goto` or a
+/// comment make every name not read, as on main.
+fn php_unreadable_names(code: &str) -> (bool, HashSet<String>) {
+    let mut unreadable = HashSet::new();
+    if without_comments(code) != code {
+        return (true, unreadable);
+    }
+    let bytes = code.as_bytes();
+    let lower = code.to_ascii_lowercase();
+    let is_word_at = |at: usize, length: usize| {
+        !lower[..at]
+            .bytes()
+            .next_back()
+            .is_some_and(|b| is_name_byte(b) || b == b'>' || b == b':' || b == b'\\')
+            && !lower[at + length..]
+                .bytes()
+                .next()
+                .is_some_and(is_name_byte)
+    };
+    let words_followed_by = |word: &str, next: &[char]| -> Vec<usize> {
+        lower
+            .match_indices(word)
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                is_word_at(at, word.len())
+                    && lower[at + word.len()..].trim_start().starts_with(next)
+            })
+            .collect()
+    };
+    for word in [
+        "extract",
+        "compact",
+        "parse_str",
+        "mb_parse_str",
+        "get_defined_vars",
+        "eval",
+        "assert",
+    ] {
+        if !words_followed_by(word, &['(']).is_empty() {
+            return (true, unreadable);
+        }
+    }
+    for word in ["global", "static"] {
+        if !words_followed_by(word, &['$']).is_empty() {
+            return (true, unreadable);
+        }
+    }
+    if lower.match_indices("goto").any(|(at, _)| is_word_at(at, 4)) {
+        return (true, unreadable);
+    }
+    for (at, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'$' => {
+                let next = bytes.get(at + 1).copied().unwrap_or(b' ');
+                if next == b'$' || next == b'{' || next >= 0x80 {
+                    return (true, unreadable);
+                }
+                if code[at + 1..].starts_with("GLOBALS") {
+                    return (true, unreadable);
+                }
+            }
+            b'&' if (at == 0 || bytes[at - 1] != b'&')
+                && code[at + 1..].trim_start().starts_with('$') =>
+            {
+                return (true, unreadable);
+            }
+            _ => {}
+        }
+    }
+    let starts: HashSet<usize> = statements(code)
+        .into_iter()
+        .map(|(start, end)| start + (code[start..end].len() - code[start..end].trim_start().len()))
+        .collect();
+    let mut followed: HashSet<String> = HashSet::new();
+    // Every `$name` that is set where it stands.
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'$' {
+            at += 1;
+            continue;
+        }
+        let end = bytes[at + 1..]
+            .iter()
+            .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+            .map_or(bytes.len(), |length| at + 1 + length);
+        if end == at + 1 {
+            at += 1;
+            continue;
+        }
+        let name = code[at..end].to_owned();
+        let before = code[..at].trim_end();
+        let mut rest = code[end..].trim_start();
+        let mut indexed = false;
+        while let Some(open) = rest.strip_prefix(['[', '{']) {
+            indexed = true;
+            rest = closing(open).map_or("", |close| open[close + 1..].trim_start());
+        }
+        let compound = [
+            "**=", "??=", "<<=", ">>=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "++", "--",
+        ]
+        .iter()
+        .any(|op| rest.starts_with(op))
+            || before.ends_with("++")
+            || before.ends_with("--");
+        let followed_op = [".=", "+="].iter().any(|op| rest.starts_with(op))
+            || (rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>"));
+        if compound || (followed_op && (indexed || !starts.contains(&at))) {
+            unreadable.insert(name);
+        } else if followed_op {
+            followed.insert(name);
+        }
+        at = end;
+    }
+    // Parameters and `use` lists of functions written in place or named.
+    for word in ["function", "fn"] {
+        for (found, _) in lower.match_indices(word) {
+            if !is_word_at(found, word.len()) {
+                continue;
+            }
+            let mut rest = code[found + word.len()..].trim_start();
+            rest = rest.trim_start_matches('&').trim_start();
+            rest = rest
+                .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                .trim_start();
+            let Some(open) = rest.strip_prefix('(') else {
+                continue;
+            };
+            let Some(close) = closing(open) else {
+                return (true, unreadable);
+            };
+            for name in variables_in(&open[..close]) {
+                unreadable.insert(name);
+            }
+            let after = open[close + 1..].trim_start();
+            let after_lower = after.to_ascii_lowercase();
+            if after_lower.starts_with("use") {
+                if let Some(open) = after[3..].trim_start().strip_prefix('(') {
+                    let close = closing(open).unwrap_or(open.len());
+                    for name in variables_in(&open[..close]) {
+                        unreadable.insert(name);
+                    }
+                }
+            }
+        }
+    }
+    // `list(...) =` and `[...] =`.
+    let mut opens: Vec<usize> = lower
+        .match_indices("list")
+        .filter(|&(found, _)| {
+            is_word_at(found, 4) && lower[found + 4..].trim_start().starts_with('(')
+        })
+        .filter_map(|(found, _)| code[found..].find('(').map(|open| found + open + 1))
+        .collect();
+    opens.extend(code.match_indices('[').map(|(found, _)| found + 1));
+    for open in opens {
+        let inside = &code[open..];
+        let Some(close) = closing(inside) else {
+            continue;
+        };
+        let after = inside[close + 1..].trim_start();
+        if after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>") {
+            for name in variables_in(&inside[..close]) {
+                unreadable.insert(name);
+            }
+        }
+    }
+    // Functions that set a name handed to them.
+    for &function in PHP_BY_REFERENCE {
+        for found in words_followed_by(function, &['(']) {
+            let Some(open) = code[found..].find('(').map(|open| found + open + 1) else {
+                continue;
+            };
+            let inside = &code[open..];
+            let close = closing(inside).unwrap_or(inside.len());
+            for name in variables_in(&inside[..close]) {
+                unreadable.insert(name);
+            }
+        }
+    }
+    // A `foreach` head sets its names; with a statement that sets one too,
+    // the name is set twice in ways the reader does not order.
+    let mut heads: HashMap<String, usize> = HashMap::new();
+    for (found, _) in lower.match_indices("foreach") {
+        if !is_word_at(found, 7) {
+            continue;
+        }
+        let rest = code[found + 7..].trim_start();
+        let head = rest
+            .strip_prefix('(')
+            .and_then(|inner| closing(inner).map(|close| &inner[..close]));
+        let Some(head) = head else {
+            return (true, unreadable);
+        };
+        let Some((_, as_end)) = last_as_keyword(head) else {
+            return (true, unreadable);
+        };
+        for name in variables_in(&head[as_end..]) {
+            *heads.entry(name).or_default() += 1;
+        }
+    }
+    for (name, count) in heads {
+        if count > 1 || followed.contains(&name) {
+            unreadable.insert(name);
+        }
+    }
+    (false, unreadable)
 }
 
 /// `text` with PHP's comments (`/* */`, `//`, `#`) as spaces, strings
