@@ -30,6 +30,10 @@ use super::{js_option, node_called_sinks, shell_quoted, NodeCall};
 const UNREAD: char = '\u{1}';
 /// What a piece that is not read stands as in a line: an expansion.
 const UNREAD_WORD: &str = "$IW_UNREAD";
+/// Beside [`UNREAD`]: a piece that is the name of a file a listing
+/// (a glob with a wildcard, a directory read) found, which the guard has not
+/// seen and the code may have written.
+const LISTED: char = '\u{2}';
 /// The deepest expression folded.
 const FOLD_DEPTH: u8 = 12;
 /// How many times code handed to `exec` or `eval` as a written-out string
@@ -1488,31 +1492,36 @@ impl Reader<'_> {
     /// holds it; a pattern with one (`glob("./*.sh")`, `glob("/dev/std*")`)
     /// matches files the guard has not seen, maybe ones the code wrote.
     fn bind_foreach(&mut self, statement: &str) {
-        let starts: Vec<usize> = statement
+        let lower = statement.to_ascii_lowercase();
+        let starts: Vec<usize> = lower
             .match_indices("foreach")
             .map(|(at, _)| at)
             .filter(|&at| {
-                !statement[..at]
-                    .bytes()
-                    .next_back()
-                    .is_some_and(is_name_byte)
+                !lower[..at].bytes().next_back().is_some_and(is_name_byte)
+                    && !lower[at + 7..].bytes().next().is_some_and(is_name_byte)
             })
             .collect();
         for at in starts {
-            self.bind_foreach_at(&statement[at + 7..]);
+            if !self.bind_foreach_at(&statement[at + 7..]) {
+                // A loop whose head is not read may set any name.
+                self.forget_all();
+                return;
+            }
         }
     }
 
-    fn bind_foreach_at(&mut self, rest: &str) {
+    /// Reads one `foreach` head; false when it cannot be read.
+    fn bind_foreach_at(&mut self, rest: &str) -> bool {
+        let rest = without_comments(rest);
         let Some(inner) = rest.trim_start().strip_prefix('(') else {
-            return;
+            return false;
         };
         let Some(close) = closing(inner) else {
-            return;
+            return false;
         };
         let head = &inner[..close];
-        let Some(as_at) = head.rfind(" as ") else {
-            return;
+        let Some((as_at, as_end)) = last_as_keyword(head) else {
+            return false;
         };
         let walked = head[..as_at].trim();
         let fixed_path = walked
@@ -1523,19 +1532,57 @@ impl Reader<'_> {
                 after.trim().is_empty() && !pattern.contains(['*', '?', '[', '{', '\\'])
             })
             .map(|(pattern, _)| pattern.to_owned());
-        let bound: Vec<&str> = head[as_at + 4..].split("=>").map(str::trim).collect();
-        for (index, name) in bound.iter().enumerate() {
-            let name = name.trim_start_matches('&');
-            if !is_variable(name) {
-                continue;
-            }
-            self.forget(name);
-            let value = match &fixed_path {
-                Some(path) if index + 1 == bound.len() => Value::Str(path.clone()),
-                _ => Value::Unknown,
+        let listing = fixed_path.is_none() && self.walks_listing(walked);
+        let bound_text = &head[as_end..];
+        let single = bound_text
+            .rsplit("=>")
+            .next()
+            .map(|last| last.trim().trim_start_matches('&').trim())
+            .filter(|last| is_variable(last));
+        for name in variables_in(bound_text) {
+            self.forget(&name);
+            let value = if listing {
+                listed()
+            } else {
+                match (&fixed_path, single) {
+                    (Some(path), Some(last)) if last == name => Value::Str(path.clone()),
+                    _ => Value::Unknown,
+                }
             };
-            self.vars.insert(name.to_owned(), value);
+            self.vars.insert(name, value);
         }
+        true
+    }
+
+    /// Whether what a PHP `foreach` walks is names of files the guard has
+    /// not seen: a glob, a directory read, or a name holding one.
+    fn walks_listing(&self, walked: &str) -> bool {
+        let lower = walked.to_ascii_lowercase();
+        [
+            "glob",
+            "scandir",
+            "readdir",
+            "opendir",
+            "directoryiterator",
+            "filesystemiterator",
+        ]
+        .iter()
+        .any(|word| lower.contains(word))
+            || variables_in(walked).iter().any(|name| {
+                self.vars
+                    .get(name)
+                    .is_some_and(|value| value.text().contains(LISTED))
+            })
+    }
+
+    /// Everything the reader knew of names is gone.
+    fn forget_all(&mut self) {
+        let names: Vec<String> = self.vars.keys().cloned().collect();
+        for name in names {
+            self.forget(&name);
+        }
+        self.closures.clear();
+        self.aliases.clear();
     }
 
     /// A name given a value the reader does not follow: what it held
@@ -1601,6 +1648,34 @@ impl Reader<'_> {
             }
         }
         let lower = text.to_ascii_lowercase();
+        // `$f = readdir($d)` anywhere, as in a `while` head: a file name
+        // a directory read found.
+        for word in ["readdir", "scandir", "glob"] {
+            for (found, _) in lower.match_indices(word) {
+                if lower[..found].bytes().next_back().is_some_and(is_name_byte)
+                    || !lower[found + word.len()..].trim_start().starts_with('(')
+                {
+                    continue;
+                }
+                let before = text[..found].trim_end();
+                let Some(before) = before.strip_suffix('=') else {
+                    continue;
+                };
+                if before.ends_with(['=', '!', '<', '>']) {
+                    continue;
+                }
+                let before = before.trim_end();
+                let start = before
+                    .bytes()
+                    .rposition(|b| !is_name_byte(b))
+                    .map_or(0, |at| at + 1);
+                let name = &before[start..];
+                if is_variable(name) && word != "glob" {
+                    self.forget(name);
+                    self.vars.insert(name.to_owned(), listed());
+                }
+            }
+        }
         if lower.match_indices("extract").any(|(found, _)| {
             !lower[..found]
                 .bytes()
@@ -1608,12 +1683,7 @@ impl Reader<'_> {
                 .is_some_and(|b| is_name_byte(b) || b == b'$')
                 && lower[found + 7..].trim_start().starts_with('(')
         }) {
-            let names: Vec<String> = self.vars.keys().cloned().collect();
-            for name in names {
-                self.forget(&name);
-            }
-            self.closures.clear();
-            self.aliases.clear();
+            self.forget_all();
         }
     }
 
@@ -3032,6 +3102,12 @@ impl Reader<'_> {
             }
             Value::Unknown => UNREAD.to_string(),
         };
+        // A file name a listing found, run or handed to what runs: the
+        // file is not read, whatever is written around it.
+        if text.contains(LISTED) {
+            self.out.unread = true;
+        }
+        let text = text.replace(LISTED, "");
         if text.trim_start().starts_with(UNREAD) || text.trim().is_empty() {
             self.out.unread = true;
         }
@@ -3078,6 +3154,16 @@ impl Reader<'_> {
                 other => flat.push(other),
             }
         }
+        if flat.iter().any(|word| word.text().contains(LISTED)) {
+            self.out.unread = true;
+        }
+        let flat: Vec<Value> = flat
+            .into_iter()
+            .map(|word| match word {
+                Value::Str(text) => Value::Str(text.replace(LISTED, "")),
+                other => other,
+            })
+            .collect();
         let Some(program) = flat.first() else {
             return;
         };
@@ -3632,6 +3718,12 @@ impl Reader<'_> {
             | "CGI.unescape" => first()
                 .literal()
                 .map_or(Value::Unknown, |text| capped(percent_decoded(text))),
+            "glob" | "scandir" | "readdir" if self.lang == Lang::Php => match first().literal() {
+                Some(path) if callee == "glob" && !path.contains(['*', '?', '[', '{', '\\']) => {
+                    Value::Str(path.to_owned())
+                }
+                _ => listed(),
+            },
             "strrev" => first().literal().map_or(Value::Unknown, |text| {
                 Value::Str(text.chars().rev().collect())
             }),
@@ -4598,6 +4690,118 @@ fn written_in_place(expression: &str) -> bool {
             .strip_prefix(word)
             .is_some_and(|rest| rest.trim_start().starts_with(['(', '{', '&']))
     })
+}
+
+/// A value that is a file name a listing found ([`LISTED`]).
+fn listed() -> Value {
+    Value::Str(format!("{UNREAD}{LISTED}{UNREAD}"))
+}
+
+/// `text` with PHP's comments (`/* */`, `//`, `#`) as spaces, strings
+/// kept.
+fn without_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            quote @ (b'\'' | b'"' | b'\x60') => {
+                let start = at;
+                at += 1;
+                while at < bytes.len() && bytes[at] != quote {
+                    if bytes[at] == b'\\' {
+                        at += 1;
+                    }
+                    at += 1;
+                }
+                at = (at + 1).min(bytes.len());
+                out.push_str(&text[start..at]);
+                continue;
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                at = text[at + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |end| at + 2 + end + 2);
+                out.push(' ');
+                continue;
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'/') => {
+                at = text[at..].find('\n').map_or(bytes.len(), |end| at + end);
+                out.push(' ');
+                continue;
+            }
+            b'#' if bytes.get(at + 1) != Some(&b'[') => {
+                at = text[at..].find('\n').map_or(bytes.len(), |end| at + end);
+                out.push(' ');
+                continue;
+            }
+            _ => {}
+        }
+        let next = text[at..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&text[at..at + next]);
+        at += next;
+    }
+    out
+}
+
+/// Where the last `as` of a PHP `foreach` head stands, in any case,
+/// outside strings and brackets, with no name byte touching it.
+fn last_as_keyword(head: &str) -> Option<(usize, usize)> {
+    let bytes = head.as_bytes();
+    let mut found = None;
+    let mut depth = 0usize;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            quote @ (b'\'' | b'"' | b'\x60') => {
+                at += 1;
+                while at < bytes.len() && bytes[at] != quote {
+                    if bytes[at] == b'\\' {
+                        at += 1;
+                    }
+                    at += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'a' | b'A'
+                if depth == 0
+                    && matches!(bytes.get(at + 1), Some(b's' | b'S'))
+                    && !(at > 0 && is_name_byte(bytes[at - 1]))
+                    && !bytes
+                        .get(at + 2)
+                        .is_some_and(|b| is_name_byte(*b) && *b != b'$') =>
+            {
+                found = Some((at, at + 2));
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    found
+}
+
+/// Each PHP variable named in `text` (`$f`, inside `list()`, `[...]`, after
+/// `=>` or `&`).
+fn variables_in(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'$' {
+            let end = bytes[at + 1..]
+                .iter()
+                .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+                .map_or(bytes.len(), |length| at + 1 + length);
+            if end > at + 1 && !names.iter().any(|name: &String| name == &text[at..end]) {
+                names.push(text[at..end].to_owned());
+            }
+            at = end.max(at + 1);
+        } else {
+            at += 1;
+        }
+    }
+    names
 }
 
 /// Whether a callee is a variable alone (PHP's `$f`).
