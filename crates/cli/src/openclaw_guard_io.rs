@@ -444,18 +444,11 @@ fn record_dir() -> Option<PathBuf> {
 
 /// An HTTP client for this host's loopback only: Pro answers there with a
 /// certificate of its own, so verification is relaxed for loopback and for
-/// nothing else (`agent_report::agent_route` refuses any other host).
+/// nothing else (`agent_report::agent_route` refuses any other host), and
+/// never through a proxy the environment names
+/// (`crate::http_io::loopback_agent`).
 fn loopback_agent(timeout: Duration) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .tls_config(
-            ureq::tls::TlsConfig::builder()
-                .disable_verification(true)
-                .build(),
-        )
-        .build()
-        .into()
+    crate::http_io::loopback_agent(timeout, false, true)
 }
 
 fn pro_url(path: &str) -> Option<String> {
