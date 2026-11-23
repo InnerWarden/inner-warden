@@ -17,6 +17,12 @@
 //! pattern inside it (`rm -rf ~/.config/*`), the removers `tar
 //! --remove-files`, `zip -m`, `rsync --remove-source-files`, `gio trash` and
 //! `trash-put`, and a home outside `/home` were allowed too.
+//!
+//! Review round 2 (2026-11-23), measured on the branch at a7babb0 and on
+//! main 14509ae: `${HOME:?}` and the home's other operators, a pattern that
+//! reaches into the guard's own folder (`~/.config/inner*/guard.toml`),
+//! braces inside the name (`~/.conf{ig,}`) and `git clone` into the folder
+//! were allowed.
 
 use innerwarden_agent_guard::mcp::{analyze_command, analyze_command_in, WorkingContext};
 
@@ -103,7 +109,7 @@ fn a_folder_above_the_guards_config_is_not_moved_or_removed() {
 }
 
 /// FAILS ON REVERT of the normalising in `above_guard_config` (braces
-/// folded, `//` squeezed, patterns matched) and of `rename` in
+/// folded, patterns matched) and of `rename` in
 /// `ancestor_acts`: each line was allowed at f92cd3a.
 #[test]
 fn the_folder_is_read_as_the_shell_reads_its_path() {
@@ -293,6 +299,85 @@ fn work_inside_config_and_into_a_home_stays_free() {
         "rm -f ~/*.log",
         "mv ~/.config.bak.txt /tmp/",
         "rm -rf $(mktemp -d)",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// Review round 2 (2026-11-23), measured on the branch at a7babb0 and on
+/// main 14509ae: each line below was allowed.
+///
+/// FAILS ON REVERT of `fold_home_expansions` in `above_guard_config` and
+/// in `ancestor_segment_read`: `${HOME:?}` (what shellcheck SC2115 asks
+/// for beside `rm -rf`), `${HOME:-x}` and `${HOME%/}` are the home.
+#[test]
+fn a_home_with_an_operator_is_the_home() {
+    for line in [
+        "rm -rf \"${HOME:?}/.config\"",
+        "rm -rf ${HOME:?}/.config",
+        "mv \"${HOME:?}\"/.config x",
+        "mv ${HOME:-/root}/.config x",
+        "mv ${HOME%/}/.config x",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    for line in ["echo ${HOME:?}", "rm -rf \"${HOME:?}/tmp/build\""] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// FAILS ON REVERT of the path inside the guard's folder through a pattern
+/// in `above_guard_config` (`fits_start`): main refuses every form of
+/// these with the folder written out, none with a pattern.
+#[test]
+fn a_pattern_reaching_into_the_guards_folder_is_refused() {
+    for line in [
+        "rm -f ~/.config/inner*/guard-events.jsonl",
+        "rm -rf ~/.config/inner*/*",
+        "mv ~/.config/[i]nnerwarden/guard.toml /tmp/",
+        "rm -f ~/.config/innerwarde?/agents.lock",
+        "cd ~/.config/inner* && rm -f *",
+        "rm -rf ~/.config/*/*",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    for line in [
+        "rm -f ~/.config/*.log",
+        "rm -rf ~/.config/nvim/*",
+        "mv ~/.config/nvim* /tmp/",
+        "ls ~/.config/inner*",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// FAILS ON REVERT of `expand_braces` in `ancestor_segment_read`: a brace
+/// group inside the name makes `~/.config` as the shell runs it.
+#[test]
+fn braces_inside_the_name_are_expanded() {
+    for line in ["mv ~/.conf{ig,}", "rm -rf ~/.c{o,}nfig"] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    for line in ["cp -r ~/.conf{ig,ig.bak}", "rm -rf ~/.cache/{a,b}"] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// FAILS ON REVERT of `clone` in `git_writes`: a clone writes the
+/// guard's folder by the rule that refuses every other writer of it.
+#[test]
+fn a_clone_into_the_guards_folder_is_refused() {
+    for line in [
+        "git clone https://x.example/r.git ~/.config/innerwarden",
+        "git -C ~/.config clone --depth 1 https://x.example/r.git innerwarden",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    for line in [
+        "cd ~/.config && git clone https://x.example/nvim.git nvim",
+        "cd ~/.config && git clone https://x.example/nvim.git",
+        "git clone https://x.example/r.git ~/src/r",
+        "git clone https://x.example/r.git",
     ] {
         assert_eq!(verdict(line), "allow", "{line}");
     }

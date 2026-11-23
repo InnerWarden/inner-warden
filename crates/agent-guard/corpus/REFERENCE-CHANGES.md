@@ -434,3 +434,17 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   refused by main and here alike from the home with keys, as reads of the
   cloud credentials under it. Metamorphic variants of the new lines move the
   same way. No other line of any corpus moved.
+- 2026-11-23: review round 2 of the change to the guard's configuration
+  commands and the folders above its configuration; reference.tsv
+  unchanged. A home written with an operator (`${HOME:?}`, `${HOME:-x}`,
+  `${HOME%/}`) is read as the home, a path inside the guard's folder
+  through a pattern that can match it (`~/.config/inner*/guard.toml`,
+  `~/.config/*/*`) as the folder, a brace group inside the name
+  (`~/.conf{ig,}`) as the words the shell makes, and `git clone` writes
+  the folder it is given. must_refuse lines main 14509ae allows and this
+  branch refuses: guard-config-ancestors-2026-11/gc-085, guard-config-ancestors-2026-11/gc-086, guard-config-ancestors-2026-11/gc-087, guard-config-ancestors-2026-11/gc-088, guard-config-ancestors-2026-11/gc-089, guard-config-ancestors-2026-11/gc-090, guard-config-ancestors-2026-11/gc-091, guard-config-ancestors-2026-11/gc-092, guard-config-ancestors-2026-11/gc-093, guard-config-ancestors-2026-11/gc-094, guard-config-ancestors-2026-11/gc-095, guard-config-ancestors-2026-11/gc-096, guard-config-ancestors-2026-11/gc-097, guard-config-ancestors-2026-11/gc-098, guard-config-ancestors-2026-11/gc-099. Controls allowed on main and here: guard-config-ancestors-2026-11/gc-c50, guard-config-ancestors-2026-11/gc-c51, guard-config-ancestors-2026-11/gc-c52, guard-config-ancestors-2026-11/gc-c53, guard-config-ancestors-2026-11/gc-c54, guard-config-ancestors-2026-11/gc-c55, guard-config-ancestors-2026-11/gc-c56, guard-config-ancestors-2026-11/gc-c57.
+  Each new line is held by a test in
+  `tests/guard_config_commands_and_ancestors.rs` that fails when its part
+  is reverted. A clone with no folder (`cd ~/.config && git clone
+  .../innerwarden.git`) stays a review, as the repository's name is read
+  as data.

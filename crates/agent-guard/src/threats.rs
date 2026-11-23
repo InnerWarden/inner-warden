@@ -7500,7 +7500,8 @@ enum AboveGuardConfig {
     Home,
     /// The `.config` folder of a home.
     Config,
-    /// The guard's own folder, named through a pattern (`~/.config/*`).
+    /// The guard's own folder, or a path inside it, named through a pattern
+    /// that can match it (`~/.config/*`, `~/.config/inner*/guard.toml`).
     Guard,
 }
 
@@ -7603,22 +7604,17 @@ fn glob_bracket(class: &[u8], byte: Option<u8>) -> Option<(bool, &[u8])> {
 /// none of these. The root itself is left to the rules on removing
 /// everything.
 fn above_guard_config(target: &str, homes: &[String]) -> Option<AboveGuardConfig> {
-    let spelled = home_spelled(&fold_braced_names(target));
-    let mut squeezed = String::with_capacity(spelled.len());
-    for c in spelled.chars() {
-        if !(c == '/' && squeezed.ends_with('/')) {
-            squeezed.push(c);
-        }
-    }
-    let named = named_path(&squeezed)?;
+    let spelled = home_spelled(&fold_braced_names(&fold_home_expansions(target)));
+    let named = named_path(&spelled)?;
     let components: Vec<&str> = named
         .path
         .split('/')
         .filter(|component| !component.is_empty())
         .collect();
     let globbed = components.iter().any(|component| holds_glob(component));
-    let fits = |template: &[&str]| {
-        template.len() == components.len()
+    // Whether the path's first components can be the template's.
+    let fits_start = |template: &[&str]| {
+        template.len() <= components.len()
             && template
                 .iter()
                 .zip(&components)
@@ -7628,6 +7624,7 @@ fn above_guard_config(target: &str, homes: &[String]) -> Option<AboveGuardConfig
                     wanted => glob_component_matches(written, wanted),
                 })
     };
+    let fits = |template: &[&str]| template.len() == components.len() && fits_start(template);
     let under = |base: &[&str]| {
         let mut template = base.to_vec();
         if fits(&template) {
@@ -7638,7 +7635,19 @@ fn above_guard_config(target: &str, homes: &[String]) -> Option<AboveGuardConfig
             return Some(AboveGuardConfig::Config);
         }
         template.push("innerwarden");
-        (globbed && fits(&template)).then_some(AboveGuardConfig::Guard)
+        if globbed && fits(&template) {
+            return Some(AboveGuardConfig::Guard);
+        }
+        // Inside the guard's folder through a pattern that can match it or a
+        // folder above it (`~/.config/inner*/guard.toml`, `~/.config/*/*`):
+        // the folder written out with a pattern only below it is
+        // [`writes_guard_config`]'s.
+        (components.len() > template.len()
+            && components[..template.len()]
+                .iter()
+                .any(|component| holds_glob(component))
+            && fits_start(&template))
+        .then_some(AboveGuardConfig::Guard)
     };
     if !named.rooted {
         return components
@@ -8104,7 +8113,8 @@ fn may_take_guard_config_ancestor(content: &str) -> bool {
 /// guard's configuration ([`above_guard_config`]), read from its text alone:
 /// `mv ~/.config x`, `mv ~ /tmp/h`, `rm -r ${HOME}/.config`, `mv ~//.config
 /// x`, `mv ~/.conf* x`, `rename .config old ~/.config`, `rm -rf ~/.config/*`,
-/// `ln -s ~/.config c`, a move or link that puts another folder in the
+/// `rm -rf "${HOME:?}/.config"`, `mv ~/.conf{ig,}`, `rm -f
+/// ~/.config/inner*/guard.toml`, `ln -s ~/.config c`, a move or link that puts another folder in the
 /// place of one (`mv ~/w ~/.config`), and a tree merged into `.config`
 /// (`cp -rT ~/w ~/.config`, `cp -r ~/w/. ~/.config/`, `rsync -a ~/w/
 /// ~/.config/`, `tar -xf x.tar -C ~/.config`). With the folder moved aside
@@ -8125,10 +8135,11 @@ fn guard_config_ancestor_taken(content: &str, depth: u8) -> Option<AncestorTaken
         return None;
     }
     let values = ancestor_literal_values(content);
+    let made = ReadingBudget::for_braces();
     let mut dirs: Vec<String> = Vec::new();
     let mut found = None;
     for segment in shell_command_segments(content) {
-        let words = shell_tokens(&fold_braced_names(&substitutions_named(segment)));
+        let words = shell_tokens(&ancestor_segment_read(&substitutions_named(segment), &made));
         let Some(index) = effective_command_index(&words) else {
             continue;
         };
@@ -8169,6 +8180,15 @@ fn guard_config_ancestor_taken(content: &str, depth: u8) -> Option<AncestorTaken
     found
 }
 
+/// A segment as [`guard_config_ancestor_taken`] reads its words: a home
+/// with an operator (`${HOME:?}`, `${HOME:-/root}`, `${HOME%/}`) as the
+/// home, `${HOME}` as `$HOME`, and each brace expansion made as the shell
+/// makes it (`~/.conf{ig,}` is `~/.config ~/.conf`, `~/.c{o,}nfig` is
+/// `~/.config ~/.cnfig`), from `made`.
+fn ancestor_segment_read(segment: &str, made: &ReadingBudget) -> String {
+    expand_braces(&fold_braced_names(&fold_home_expansions(segment)), made)
+}
+
 /// [`guard_config_ancestor_taken`] where the line runs: each path resolved
 /// against the working directory the hook was given and the `cd`s of the
 /// line (`mv ../.config x` from `~/proj`, `cd .. && mv .config x`,
@@ -8204,8 +8224,9 @@ fn ancestor_in_place(
         return false;
     }
     let mut place = CommandPlace::new(cwd, home);
+    let made = ReadingBudget::for_braces();
     for segment in shell_command_segments(content) {
-        let Some(words) = place.step(segment) else {
+        let Some(words) = place.step(&ancestor_segment_read(segment, &made)) else {
             continue;
         };
         let Some(index) = effective_command_index(&words) else {
@@ -9748,6 +9769,59 @@ fn git_writes(arguments: &[String], env_tree: Option<&str>) -> GitWrites {
             }
         }
         "rm" => reading.taken.extend(words(rest, &[])),
+        // `git clone <repository> <directory>` writes the folder it is
+        // given, and the one `--separate-git-dir` names. One cloned without
+        // a folder is named by the repository, whose name the line holds
+        // only as data.
+        "clone" => {
+            const VALUED: &[&str] = &[
+                "-b",
+                "--branch",
+                "-o",
+                "--origin",
+                "-u",
+                "--upload-pack",
+                "--reference",
+                "--reference-if-able",
+                "--separate-git-dir",
+                "--depth",
+                "--shallow-since",
+                "--shallow-exclude",
+                "-c",
+                "--config",
+                "--template",
+                "-j",
+                "--jobs",
+                "--filter",
+                "--bundle-uri",
+                "--server-option",
+                "--ref-format",
+            ];
+            let mut given: Vec<&str> = Vec::new();
+            let mut after_dashes = false;
+            let mut index = 0usize;
+            while let Some(word) = rest.get(index) {
+                let word = word.as_str();
+                index += 1;
+                if after_dashes || !word.starts_with('-') {
+                    given.push(word);
+                } else if word == "--" {
+                    after_dashes = true;
+                } else if word == "--separate-git-dir" {
+                    if let Some(value) = rest.get(index) {
+                        reading.written.extend(in_folder(value));
+                    }
+                    index += 1;
+                } else if let Some(value) = word.strip_prefix("--separate-git-dir=") {
+                    reading.written.extend(in_folder(value));
+                } else if VALUED.contains(&word) {
+                    index += 1;
+                }
+            }
+            if let [_, directory, ..] = given.as_slice() {
+                reading.written.extend(in_folder(directory));
+            }
+        }
         // What is not tracked under the folder goes, and with `-x` what is
         // ignored too: the folder is taken as emptied, and each path the
         // line hands it.
