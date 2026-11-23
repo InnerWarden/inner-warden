@@ -2650,6 +2650,76 @@ pub const AUTOSTART_FILES: &[&str] = &[
     ".config/code-flags.conf",
 ];
 
+/// The files in `~/.cargo` that make what the person runs next run a
+/// command of their choosing: rustup's environment scripts (the shell
+/// startup files rustup edits source `~/.cargo/env` at every login) and
+/// cargo's own config (`build.rustc-wrapper`, a `runner`, an alias), in
+/// both names cargo reads. Read-only in every Linux jail like
+/// [`AUTOSTART_FILES`], made first where they are not there: `config`
+/// and `config.toml` as one file ([`cargo_config_partner`]), so cargo
+/// sees no second config and says nothing.
+pub const CARGO_FILES: &[&str] = &[
+    ".cargo/env",
+    ".cargo/env.fish",
+    ".cargo/env.nu",
+    ".cargo/config.toml",
+    ".cargo/config",
+];
+
+/// PURE. The other name cargo reads its config by, beside `file`
+/// (`~/.cargo/config` for `~/.cargo/config.toml` and back): where cargo
+/// finds both as one file (a hard link) it reads it once and warns of
+/// nothing, while two files make it warn on every run. `None` for any
+/// other file.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn cargo_config_partner(file: &Path) -> Option<PathBuf> {
+    let parent = file.parent()?;
+    if parent.file_name()? != ".cargo" {
+        return None;
+    }
+    match file.file_name()?.to_str()? {
+        "config" => Some(parent.join("config.toml")),
+        "config.toml" => Some(parent.join("config")),
+        _ => None,
+    }
+}
+
+/// PURE. `place` is one of `writable`, holds one or lies in one: a
+/// folder of programs there is the jail's to write anyway (the project, a
+/// `--rw` path), so keeping it read-only gains nothing and takes the
+/// project's writes away (a `.venv/bin` in `PATH`, the project in
+/// `PATH` itself).
+pub fn overlaps_any(place: &Path, writable: &[PathBuf]) -> bool {
+    writable
+        .iter()
+        .any(|folder| place.starts_with(folder) || folder.starts_with(place))
+}
+
+/// PURE. The version of a Python whose library folder is named `name`
+/// (`python3.12` gives `3.12`), `None` for any other name.
+pub fn python_version_of(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("python3.")?;
+    (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())).then(|| format!("3.{rest}"))
+}
+
+/// PURE. Python's user site folders in the home for each of `versions`
+/// (`~/.local/lib/python3.12/site-packages`): every Python the person
+/// runs of that version reads each `.pth` file there at start, and
+/// imports `usercustomize` from it, as the person. Each once.
+pub fn python_user_sites(home: &Path, versions: &[String]) -> Vec<PathBuf> {
+    let mut sites: Vec<PathBuf> = Vec::new();
+    for version in versions {
+        let site = home
+            .join(".local/lib")
+            .join(format!("python{version}"))
+            .join("site-packages");
+        if !sites.contains(&site) {
+            sites.push(site);
+        }
+    }
+    sites
+}
+
 /// The flag that keeps the home's folders of programs writable in a Linux
 /// jail ([`ContainArgs::writable_user_bin`]).
 pub const WRITABLE_USER_BIN_FLAG: &str = "--writable-user-bin";
@@ -2859,12 +2929,23 @@ pub fn run_place_link_refused(place: &Path, link: &Path, leads_to: Option<&Path>
 /// but a program in the jail could replace the link itself, and no mount
 /// holds a link in place.
 pub fn run_place_link_kept(place: &Path, link: &Path, leads_to: &Path) -> String {
+    let way = if link == place {
+        format!(
+            "{} goes through {}: it is a link in a folder a program in the jail can write",
+            printable(place),
+            printable(leads_to)
+        )
+    } else {
+        format!(
+            "{} goes through {}, a link in a folder a program in the jail can write, to {}",
+            printable(place),
+            printable(link),
+            printable(leads_to)
+        )
+    };
     format!(
-        "{} goes through {}, a link in a folder a program in the jail can write: the jail \
-         keeps {}, where it leads, out of its reach, but that program could replace the link; \
-         to close that too, replace the link with the folder it leads to",
-        printable(place),
-        printable(link),
+        "{way}: the jail keeps {}, where it leads, out of its reach, but that program could \
+         replace the link; to close that too, replace the link with the folder it leads to",
         printable(leads_to)
     )
 }
@@ -16604,6 +16685,69 @@ mod tests {
         let end = a.iter().position(|x| x == "--").unwrap();
         assert_eq!(a[end + 2], launch::GATE_VERB);
         assert!(!a.iter().any(|x| x == launch::EXEC_VERB), "{a:?}");
+    }
+
+    /// The pieces that keep a folder of programs the project's, and name
+    /// what Python and cargo read as the person: a place that is, holds or
+    /// lies in a folder the jail writes overlaps it (a sibling does not);
+    /// cargo's two config names pair up only in a `.cargo` folder; a
+    /// Python library folder gives its version and the user site of each.
+    /// The link line names where the link leads.
+    ///
+    /// FAILS ON REVERT: compare only one way (a `.venv/bin` in the project,
+    /// or the project in `PATH`, stays read-only), pair any `config`.
+    #[test]
+    fn program_folders_in_the_project_and_what_python_and_cargo_read() {
+        let project = vec![PathBuf::from("/home/dev/proj")];
+        assert!(overlaps_any(
+            Path::new("/home/dev/proj/.venv/bin"),
+            &project
+        ));
+        assert!(overlaps_any(Path::new("/home/dev/proj"), &project));
+        assert!(overlaps_any(Path::new("/home/dev"), &project));
+        assert!(!overlaps_any(Path::new("/home/dev/proj2/bin"), &project));
+        assert!(!overlaps_any(Path::new("/home/dev/.local/bin"), &project));
+        assert_eq!(
+            cargo_config_partner(Path::new("/home/dev/.cargo/config")),
+            Some(PathBuf::from("/home/dev/.cargo/config.toml"))
+        );
+        assert_eq!(
+            cargo_config_partner(Path::new("/home/dev/.cargo/config.toml")),
+            Some(PathBuf::from("/home/dev/.cargo/config"))
+        );
+        assert_eq!(
+            cargo_config_partner(Path::new("/home/dev/.cargo/env")),
+            None
+        );
+        assert_eq!(
+            cargo_config_partner(Path::new("/home/dev/.git/config")),
+            None
+        );
+        assert_eq!(python_version_of("python3.12").as_deref(), Some("3.12"));
+        assert_eq!(python_version_of("python3"), None);
+        assert_eq!(python_version_of("python3.12d"), None);
+        assert_eq!(
+            python_user_sites(
+                Path::new("/home/dev"),
+                &["3.12".to_string(), "3.12".to_string()]
+            ),
+            vec![PathBuf::from(
+                "/home/dev/.local/lib/python3.12/site-packages"
+            )]
+        );
+        let itself = run_place_link_kept(
+            Path::new("/home/dev/.config/git"),
+            Path::new("/home/dev/.config/git"),
+            Path::new("/home/dev/dotfiles/git"),
+        );
+        assert!(
+            itself.starts_with("/home/dev/.config/git goes through /home/dev/dotfiles/git"),
+            "{itself}"
+        );
+        assert!(
+            !itself.contains(".config/git goes through /home/dev/.config/git"),
+            "{itself}"
+        );
     }
 
     /// The home's folders of programs: the common ones always, and each

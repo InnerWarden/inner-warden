@@ -293,6 +293,16 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             state.mode.map_or("monitor", |mode| mode.as_str())
         );
     }
+    // What the launcher makes on the host for the jail, and the home's lock
+    // it makes it under: taken away again when this function returns, the
+    // jail ended ([`MadeGuard`]).
+    #[cfg(target_os = "linux")]
+    let mut made_guard = MadeGuard::default();
+    #[cfg(target_os = "linux")]
+    let MadeGuard {
+        lock: ref mut made_lock,
+        made: ref mut made_entries,
+    } = made_guard;
     if !input.args.dry_run && !openclaw {
         match arm_hook(
             &claude_settings,
@@ -335,10 +345,24 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         #[cfg(not(target_os = "linux"))]
         let records_made = false;
         // And the folders the session runs from on its own, read-only in
-        // the jail, so a program in it never makes one.
+        // the jail, so a program in it never makes one. Made under the
+        // home's lock, held until the jail ends, so no other launch takes
+        // one away while this jail shows it; each taken away again then
+        // where it still holds nothing ([`clean_made`]).
         #[cfg(target_os = "linux")]
-        let autostart_made = match make_autostart_dirs(&input) {
-            Ok(made) => made,
+        {
+            *made_lock = take_made_lock(&input);
+        }
+        #[cfg(target_os = "linux")]
+        let autostart_made = match make_autostart_entries(&input) {
+            Ok(made) => {
+                let any = !made.is_empty();
+                note_made(made_lock.as_ref(), &made);
+                made_entries.extend(made);
+                // One planned as there that another launch took away
+                // before this one had the lock is made again below.
+                any || planned_gone(&input)
+            }
             Err(error) => {
                 eprintln!("innerwarden contain: {error}");
                 return ExitCode::from(2);
@@ -350,10 +374,13 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         // `~/.claude` after the jail was planned without it: the jail would
         // show no `~/.claude`, so no settings file and no hook. The jail is
         // planned again, and checked again, on what is there now.
-        if records_made
+        let mut again = records_made
             || autostart_made
-            || existing_home_paths(&input.home) != input.existing_paths
-        {
+            || existing_home_paths(&input.home) != input.existing_paths;
+        let mut rounds = 0;
+        while again {
+            again = false;
+            rounds += 1;
             input = match resolve_screened(
                 input.args.clone(),
                 input.home.clone(),
@@ -371,6 +398,27 @@ pub fn cmd(rest: &[String]) -> ExitCode {
                 eprintln!("innerwarden contain: {error}");
                 return ExitCode::from(2);
             }
+            // A place another launch took away before this one had the
+            // lock is not there in the new plan: made now, and planned
+            // once more. Under the lock nothing takes one away again.
+            #[cfg(target_os = "linux")]
+            if rounds == 1
+                && !(input.autostart_missing.is_empty() && input.autostart_missing_files.is_empty())
+            {
+                match make_autostart_entries(&input) {
+                    Ok(made) => {
+                        again = !made.is_empty();
+                        note_made(made_lock.as_ref(), &made);
+                        made_entries.extend(made);
+                    }
+                    Err(error) => {
+                        eprintln!("innerwarden contain: {error}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            let _ = rounds;
         }
     }
 
@@ -1782,16 +1830,56 @@ fn resolve_planned(
         let (dirs, missing, said) = run_as_person_dirs(&places, &shown, &facts.writable, true)?;
         autostart_missing = missing;
         left.extend(said);
-        let files = crate::contain::run_as_person_files(
+        let mut files = crate::contain::run_as_person_files(
             &home,
             std::env::var("XDG_CONFIG_HOME").ok().as_deref(),
         );
+        files.extend(
+            crate::contain::CARGO_FILES
+                .iter()
+                .map(|name| home.join(name)),
+        );
+        // rustup's settings (the default toolchain, each override), where
+        // it is there: never made, rustup writes it itself.
+        let rustup_settings = home.join(".rustup/settings.toml");
+        if std::fs::metadata(&rustup_settings).is_ok_and(|m| m.is_file()) {
+            files.push(rustup_settings);
+        }
         let (files, missing_files, said) =
             run_as_person_dirs(&files, &shown, &facts.writable, false)?;
         autostart_files = files;
         autostart_missing_files = missing_files;
         left.extend(said);
-        let bins = crate::contain::user_bin_places(&home, std::env::var("PATH").ok().as_deref());
+        // The folders of programs the jail writes anyway are left as they
+        // are: one that is the project, holds it or lies in it (a venv's
+        // `.venv/bin`, `node_modules/.bin`, the project itself in `PATH`),
+        // or a `--rw` path, as named and as it leads. None is made there.
+        let skip: Vec<PathBuf> = std::iter::once(&args.project)
+            .chain(&args.extra_rw)
+            .flat_map(|path| [path.clone(), leads_to(path).unwrap_or_else(|| path.clone())])
+            .collect();
+        let outside = |place: &PathBuf| {
+            let real = leads_to(place).unwrap_or_else(|| place.clone());
+            !crate::contain::overlaps_any(place, &skip)
+                && !crate::contain::overlaps_any(&real, &skip)
+        };
+        let mut bins: Vec<PathBuf> =
+            crate::contain::user_bin_places(&home, std::env::var("PATH").ok().as_deref())
+                .into_iter()
+                .filter(|bin| outside(bin))
+                .collect();
+        // Python's user site folders (`.pth`, `usercustomize`) for each
+        // Python on the host, and each toolchain rustup installed (its
+        // `cargo` and `rustc`, and the libraries `rustc` loads): what
+        // runs as the person next, like a folder of programs.
+        for place in crate::contain::python_user_sites(&home, &python_versions(&home))
+            .into_iter()
+            .chain(rustup_toolchains(&home))
+        {
+            if outside(&place) && !bins.contains(&place) {
+                bins.push(place);
+            }
+        }
         if args.writable_user_bin {
             // Left writable, as asked: each the jail shows, named once.
             let named: Vec<PathBuf> = bins
@@ -1805,11 +1893,34 @@ fn resolve_planned(
                 left.push(crate::contain::writable_user_bin_said(&named));
             }
         } else {
+            // An entry of `PATH` that is there and not a folder (one left
+            // from an old install) is no folder of programs: a file is held
+            // in place, read-only, so nothing makes the folder there; any
+            // other kind of entry is left out.
+            let (dir_bins, file_bins): (Vec<PathBuf>, Vec<PathBuf>) = bins
+                .into_iter()
+                .partition(|bin| std::fs::metadata(bin).map_or(true, |m| m.is_dir()));
+            let file_bins: Vec<PathBuf> = file_bins
+                .into_iter()
+                .filter(|bin| std::fs::metadata(bin).is_ok_and(|m| m.is_file()))
+                .collect();
             let (bins, missing_bins, said) =
-                run_as_person_dirs(&bins, &shown, &facts.writable, true)?;
-            user_bin_dirs = bins;
-            autostart_missing.extend(missing_bins);
+                run_as_person_dirs(&dir_bins, &shown, &facts.writable, true)?;
             left.extend(said);
+            let (held, _, said) = run_as_person_dirs(&file_bins, &shown, &facts.writable, false)?;
+            left.extend(said);
+            // What the links in those folders lead to, where the jail
+            // writes it (Claude Code's own versions, pipx's and uv's
+            // venvs): read-only too, or a program in the jail could change
+            // the program the link runs.
+            let targets = bin_link_targets(&bins, &shown, &skip);
+            user_bin_dirs = bins;
+            for place in held.into_iter().chain(targets) {
+                if !user_bin_dirs.contains(&place) {
+                    user_bin_dirs.push(place);
+                }
+            }
+            autostart_missing.extend(missing_bins);
         }
         dirs
     } else {
@@ -3703,6 +3814,90 @@ fn copy_claude_login(claude: &Path, source: &Path, uid: u32) -> Result<(), Strin
         .map_err(|e| format!("Claude Code's login cannot be copied for the jail ({e})"))
 }
 
+/// The versions of Python on the host (`3.12`), from the names of their
+/// library folders in `/usr/lib`, `/usr/local/lib` and the home's
+/// `~/.local/lib` ([`crate::contain::python_version_of`]). Sorted, each
+/// once.
+fn python_versions(home: &Path) -> Vec<String> {
+    let mut versions: Vec<String> = [
+        PathBuf::from("/usr/lib"),
+        PathBuf::from("/usr/local/lib"),
+        home.join(".local/lib"),
+    ]
+    .iter()
+    .filter_map(|dir| std::fs::read_dir(dir).ok())
+    .flat_map(|entries| entries.flatten())
+    .filter_map(|entry| crate::contain::python_version_of(&entry.file_name().to_string_lossy()))
+    .collect();
+    versions.sort();
+    versions.dedup();
+    versions
+}
+
+/// Each toolchain folder rustup keeps in the home
+/// (`~/.rustup/toolchains/<name>`) that is a folder, as named: its
+/// `cargo` and `rustc` run behind the proxies of `~/.cargo/bin`, and
+/// `rustc` loads the libraries beside them. Sorted.
+fn rustup_toolchains(home: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(home.join(".rustup/toolchains")) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| std::fs::metadata(path).is_ok_and(|m| m.is_dir()))
+        .collect();
+    found.sort();
+    found
+}
+
+/// Linux: what the links in the folders of programs `dirs` lead to, where
+/// the jail shows it (each place it shows it, [`crate::contain::other_jail_views`]),
+/// to lay read-only: the file itself, or the whole venv where it is a
+/// venv's program (pipx's, uv's tools: the program runs that venv's
+/// Python and packages). Left out: a link that leads to nothing, one into
+/// a place the jail writes anyway (`skip`, [`crate::contain::overlaps_any`])
+/// and one into those folders themselves. Each once.
+fn bin_link_targets(
+    dirs: &[PathBuf],
+    shown: &[(PathBuf, PathBuf)],
+    skip: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|kind| kind.is_symlink()) {
+                continue;
+            }
+            let Some(real) = leads_to(&entry.path()) else {
+                continue;
+            };
+            let Ok(meta) = std::fs::metadata(&real) else {
+                continue;
+            };
+            let venv = real
+                .parent()
+                .and_then(Path::parent)
+                .filter(|root| meta.is_file() && root.join("pyvenv.cfg").is_file())
+                .map(Path::to_path_buf);
+            let unit = venv.unwrap_or(real);
+            if crate::contain::overlaps_any(&unit, skip) || dirs.iter().any(|d| unit.starts_with(d))
+            {
+                continue;
+            }
+            for view in crate::contain::other_jail_views(&unit, &[], shown) {
+                if !out.contains(&view) {
+                    out.push(view);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Linux: where the jail lays each place that runs as the person
 /// (`places`, [`crate::contain::run_as_person_places`]), from what is on
 /// the host now: the folders to show read-only (each as named, as it
@@ -3793,34 +3988,282 @@ fn run_as_person_dirs(
 /// makes one of its own. Whether one was made now. One that cannot be made
 /// refuses the launch ([`crate::contain::run_place_not_made`]): the jail
 /// could then make it.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn make_autostart_dirs(input: &JailInputs) -> Result<bool, crate::contain::ContainError> {
-    let mut made = false;
-    for place in &input.autostart_missing {
-        if std::fs::symlink_metadata(place).is_ok() {
-            continue;
+    make_autostart_entries(input).map(|made| !made.is_empty())
+}
+
+/// An entry the launcher made on the host for a jail
+/// ([`make_autostart_entries`]), as it made it, so it can take it away
+/// again when the jail ends ([`clean_made`]) only if it is still that
+/// entry and still holds nothing.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MadeEntry {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    /// A folder (else a file).
+    dir: bool,
+    /// A file made as a second name of cargo's other config file
+    /// ([`crate::contain::cargo_config_partner`]).
+    linked: bool,
+}
+
+/// [`make_autostart_dirs`], with each entry made: every folder on the way
+/// that was not there, top first, then each file; cargo's `config` and
+/// `config.toml` as one file (a hard link to the other where that one is
+/// there). On a failure what was made is taken away again.
+#[cfg(target_os = "linux")]
+fn make_autostart_entries(
+    input: &JailInputs,
+) -> Result<Vec<MadeEntry>, crate::contain::ContainError> {
+    use std::os::unix::fs::MetadataExt;
+    let mut made: Vec<MadeEntry> = Vec::new();
+    let record = |made: &mut Vec<MadeEntry>, path: &Path, dir: bool, linked: bool| {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            made.push(MadeEntry {
+                path: path.to_path_buf(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                dir,
+                linked,
+            });
         }
-        match std::fs::create_dir_all(place) {
-            Ok(()) => made = true,
-            Err(e) => {
-                return Err(crate::contain::run_place_not_made(place, &e.to_string()));
+    };
+    for place in &input.autostart_missing {
+        let mut levels: Vec<PathBuf> = Vec::new();
+        let mut at = Some(place.as_path());
+        while let Some(level) = at.filter(|level| std::fs::symlink_metadata(level).is_err()) {
+            levels.push(level.to_path_buf());
+            at = level.parent();
+        }
+        for level in levels.iter().rev() {
+            match std::fs::create_dir(level) {
+                Ok(()) => record(&mut made, level, true, false),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => {
+                    clean_entries(&made);
+                    return Err(crate::contain::run_place_not_made(place, &e.to_string()));
+                }
             }
         }
     }
     for place in &input.autostart_missing_files {
-        let made_now = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(place);
+        let partner = crate::contain::cargo_config_partner(place)
+            .filter(|other| std::fs::symlink_metadata(other).is_ok_and(|m| m.is_file()));
+        let made_now = match &partner {
+            Some(other) => std::fs::hard_link(other, place),
+            None => std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(place)
+                .map(|_| ()),
+        };
         match made_now {
-            Ok(_) => made = true,
+            Ok(()) => record(&mut made, place, false, partner.is_some()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => {
+                clean_entries(&made);
                 return Err(crate::contain::run_place_not_made(place, &e.to_string()));
             }
         }
     }
     Ok(made)
+}
+
+/// Each of `made` taken away, the last made first, where it is still the
+/// entry the launcher made (same device and inode) and holds nothing: a
+/// folder still empty, a file still empty, a second name of cargo's
+/// config still beside the file it names. What the person put there since
+/// stays, and so does the entry.
+#[cfg(target_os = "linux")]
+fn clean_entries(made: &[MadeEntry]) {
+    use std::os::unix::fs::MetadataExt;
+    for entry in made.iter().rev() {
+        let Ok(meta) = std::fs::symlink_metadata(&entry.path) else {
+            continue;
+        };
+        if meta.dev() != entry.dev || meta.ino() != entry.ino {
+            continue;
+        }
+        if entry.dir {
+            let _ = std::fs::remove_dir(&entry.path);
+        } else if entry.linked {
+            let partner_same = crate::contain::cargo_config_partner(&entry.path)
+                .and_then(|other| std::fs::symlink_metadata(other).ok())
+                .is_some_and(|other| other.dev() == entry.dev && other.ino() == entry.ino);
+            if partner_same {
+                let _ = std::fs::remove_file(&entry.path);
+            }
+        } else if meta.is_file() && meta.len() == 0 {
+            let _ = std::fs::remove_file(&entry.path);
+        }
+    }
+}
+
+/// The lock the launches of one home share while their jails run
+/// ([`take_made_lock`]): each holds it shared, and only one that can take
+/// it alone when its jail ends takes away what it made ([`clean_made`]),
+/// for an entry another jail still shows read-only must stay: taking it
+/// away on the host would undo that jail's mount of it.
+#[cfg(target_os = "linux")]
+fn take_made_lock(input: &JailInputs) -> Option<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::unix::io::AsRawFd;
+    // Where no jail sees it (a program in one could hold the lock and keep
+    // the next launch waiting, or drop it): the account's runtime folder,
+    // else the launcher's temporary folder, never one the jail writes.
+    let base = record_base(input).ok()?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in input.home.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let path = base.join(format!(
+        "innerwarden-contain-{}-{hash:016x}.lock",
+        own_uid()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.uid() != own_uid() {
+        return None;
+    }
+    // A launch that is taking away what it made holds it alone for a
+    // moment: wait for it. Only launchers hold it, and none for long.
+    // SAFETY: flock on a descriptor this function owns.
+    (unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH) } == 0).then_some(file)
+}
+
+/// What a launch made on the host for its jail and the home's lock it holds
+/// ([`take_made_lock`]): when it goes, the jail has ended, on every way
+/// out of the launch, and what was made is taken away ([`clean_made`]).
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct MadeGuard {
+    lock: Option<std::fs::File>,
+    made: Vec<MadeEntry>,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MadeGuard {
+    fn drop(&mut self) {
+        clean_made(self.lock.take(), &self.made);
+    }
+}
+
+/// A place the plan shows read-only ([`JailInputs::autostart_dirs`], the
+/// folders of programs, the files) is no longer there: bwrap would stop on
+/// it, so the jail is planned again.
+#[cfg(target_os = "linux")]
+fn planned_gone(input: &JailInputs) -> bool {
+    input
+        .autostart_dirs
+        .iter()
+        .chain(&input.user_bin_dirs)
+        .chain(&input.autostart_files)
+        .any(|place| std::fs::symlink_metadata(place).is_err())
+}
+
+/// Each of `made` written down in the home's lock file, one line each,
+/// so the launch that ends alone takes it away even when this one ends
+/// while another jail runs ([`clean_made`]).
+#[cfg(target_os = "linux")]
+fn note_made(lock: Option<&std::fs::File>, made: &[MadeEntry]) {
+    use std::io::Write;
+    let Some(mut file) = lock else {
+        return;
+    };
+    for entry in made {
+        let kind = match (entry.dir, entry.linked) {
+            (true, _) => 'd',
+            (false, true) => 'l',
+            (false, false) => 'f',
+        };
+        let path: String = entry
+            .path
+            .as_os_str()
+            .as_encoded_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        // One write per line, on a file opened to append: whole lines.
+        let _ = file.write_all(format!("{} {} {kind} {path}\n", entry.dev, entry.ino).as_bytes());
+    }
+}
+
+/// PURE. The entries written down in a lock file ([`note_made`]), in the
+/// order they were made; a line that does not read is skipped.
+#[cfg(target_os = "linux")]
+fn read_made(text: &str) -> Vec<MadeEntry> {
+    use std::os::unix::ffi::OsStringExt;
+    text.lines()
+        .filter_map(|line| {
+            let mut words = line.split(' ');
+            let dev = words.next()?.parse().ok()?;
+            let ino = words.next()?.parse().ok()?;
+            let kind = words.next()?;
+            let hex = words.next()?;
+            if words.next().is_some() || hex.len() % 2 != 0 || hex.is_empty() {
+                return None;
+            }
+            let bytes: Option<Vec<u8>> = (0..hex.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok())
+                .collect();
+            let path = PathBuf::from(std::ffi::OsString::from_vec(bytes?));
+            let (dir, linked) = match kind {
+                "d" => (true, false),
+                "l" => (false, true),
+                "f" => (false, false),
+                _ => return None,
+            };
+            path.is_absolute().then_some(MadeEntry {
+                path,
+                dev,
+                ino,
+                dir,
+                linked,
+            })
+        })
+        .collect()
+}
+
+/// When the jail ends: what the launchers of this home made for their
+/// jails ([`MadeEntry`], written down in the lock file by [`note_made`])
+/// taken away, where no other jail of the home runs (the lock is had
+/// alone), so the host keeps no empty folder or file of a jail's. Where
+/// another jail runs it all stays, and the last launch to end alone takes
+/// it away. Where the lock was never had, nothing is taken away.
+#[cfg(target_os = "linux")]
+fn clean_made(lock: Option<std::fs::File>, made: &[MadeEntry]) {
+    use std::io::{Read, Seek};
+    use std::os::unix::io::AsRawFd;
+    let Some(mut file) = lock else {
+        return;
+    };
+    // SAFETY: flock on a descriptor this function owns.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return;
+    }
+    let mut text = String::new();
+    let _ = file.rewind();
+    let _ = file.read_to_string(&mut text);
+    let mut all = read_made(&text);
+    for entry in made {
+        if !all.contains(entry) {
+            all.push(entry.clone());
+        }
+    }
+    clean_entries(&all);
+    let _ = file.set_len(0);
 }
 
 /// Linux, the real run of a plain jail, once the jail was planned with
@@ -9896,5 +10339,50 @@ mod tests {
                 &shipped[opened..at]
             );
         }
+    }
+
+    /// What a launch made is written down in the home's lock file and read
+    /// back as it was made, a path with a line break or a space in it too;
+    /// a line that does not read is skipped.
+    ///
+    /// FAILS ON REVERT: write the path as text (the line break splits the
+    /// line), or drop the kind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn what_a_launch_made_is_written_down_and_read_back() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("lock");
+        let made = vec![
+            MadeEntry {
+                path: PathBuf::from("/home/dev/.config/fi sh\nx"),
+                dev: 2049,
+                ino: 77,
+                dir: true,
+                linked: false,
+            },
+            MadeEntry {
+                path: PathBuf::from("/home/dev/.cargo/config"),
+                dev: 2049,
+                ino: 78,
+                dir: false,
+                linked: true,
+            },
+            MadeEntry {
+                path: PathBuf::from("/home/dev/.cargo/config.toml"),
+                dev: 2049,
+                ino: 78,
+                dir: false,
+                linked: false,
+            },
+        ];
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .unwrap();
+        note_made(Some(&file), &made);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("junk line\n1 2 d zz\n");
+        assert_eq!(read_made(&text), made);
     }
 }

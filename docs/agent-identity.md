@@ -392,7 +392,39 @@ it. A program left there ran as the person, outside the jail, the next time they
 typed its name; an agent updating itself there from inside the jail is the same way
 out. Update the agent, `pip install --user` and `cargo install` outside the jail;
 inside it use a venv or the project. `contain --writable-user-bin` leaves those
-folders writable, and the jail says so in one line when it starts.
+folders writable, and the jail says so in one line when it starts. A folder of
+`PATH` that is the project, holds it or lies in it (`.venv/bin`,
+`node_modules/.bin`, the project itself), or a `--rw` path, stays writable, and
+none is made there. An entry of `PATH` that is a file is held read-only as a
+file.
+
+Under the same flag, read-only too: Python's user site
+(`~/.local/lib/python3.*/site-packages`, for each Python on the host: a `.pth`
+file or `usercustomize.py` runs in every Python the person starts), each folder
+of `~/.rustup/toolchains`, and what each link in a folder of programs leads to
+where the jail writes it: the file itself, or the whole venv of a pipx or uv tool.
+In every jail, flag or not: `~/.cargo/env`, `env.fish` and `env.nu`,
+`~/.cargo/config.toml` and `~/.cargo/config` (made as one file, a hard link,
+where neither is there, so cargo warns of nothing), and `~/.rustup/settings.toml`
+where it is there.
+
+What the launcher makes on the host for a jail (the folders and files above that
+were not there, and the folders above them) it takes away again when the jail
+ends, where each is still the entry it made (same device and inode) and holds
+nothing. The launches of one home share a lock, in the account's runtime folder
+(else the temporary folder), that no jail sees: each holds it shared while its
+jail runs, and only a launch that can take it alone when its jail ends takes
+anything away, since taking a folder away on the host would undo another jail's
+mount of it. Each launch writes down there what it made, so the one that ends
+alone takes away what the others made too.
+
+Limits: not covered, and writable in a jail: `~/.local/share/bash-completion`,
+`~/.local/share/nvim/site` (plugins neovim loads), editors' settings in
+`~/.config` (VS Code's `Code/User/settings.json`), direnv's allow list,
+Jupyter's kernels (`~/.local/share/jupyter/kernels`), a new folder in
+`~/.rustup/toolchains`, cargo's and rustup's files under a `CARGO_HOME` or
+`RUSTUP_HOME` elsewhere, and the project's `.git/hooks` (the jail writes the
+project). While a jail runs, the empty folders made for it are on the host.
 
 A tool that reads the command line of a running jail's bubblewrap (from
 `/proc`) finds an identified jail's filter first: that command line starts

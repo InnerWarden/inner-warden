@@ -132,21 +132,21 @@ fn a_jail_cannot_leave_what_the_session_runs_at_the_next_login() {
         std::fs::read_to_string(h.join(".config/myagent/state")).unwrap(),
         "kept\n"
     );
+    // `~/.config/systemd` was there before and is still there, empty; the
+    // folders the launcher made are gone again with the jail.
+    let left: Vec<_> = std::fs::read_dir(h.join(".config/systemd"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), ".config/systemd: {left:?}");
     for dir in [
         ".config/autostart",
-        ".config/systemd",
         ".config/environment.d",
         ".config/upstart",
         ".local/share/systemd/user",
         ".local/share/dbus-1/services",
     ] {
-        let place = h.join(dir);
-        assert!(place.is_dir(), "{dir} made by the launcher");
-        let left: Vec<_> = std::fs::read_dir(&place)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert!(left.is_empty(), "{dir}: {left:?}");
+        assert!(!h.join(dir).exists(), "{dir} left on the host");
     }
     assert!(!h.join(".config/systemd-old").exists());
     assert!(!h.join(".local/share-old").exists());
@@ -268,25 +268,20 @@ fn a_jail_cannot_leave_what_your_programs_run_next_as_you() {
         stdout.lines().any(|l| l == "agent ok"),
         "{stdout}\n{stderr}"
     );
+    // Nothing of the jail's on the host: the folders the launcher made are
+    // gone again with it, and so is every folder above one it made.
     for dir in [
         ".config/git",
         ".config/fish",
         ".config/nvim",
         ".config/zsh",
         ".config/tmux",
-        ".local/share/applications",
-        ".local/share/flatpak/exports/share/dbus-1/services",
+        ".local/share",
         ".local/cfg/git",
         ".local/cfg/systemd",
-        ".local/xdata/dbus-1/services",
+        ".local/xdata/dbus-1",
     ] {
-        let place = h.join(dir);
-        assert!(place.is_dir(), "{dir} made by the launcher");
-        let left: Vec<_> = std::fs::read_dir(&place)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert!(left.is_empty(), "{dir}: {left:?}");
+        assert!(!h.join(dir).exists(), "{dir} left on the host");
     }
 }
 
@@ -458,10 +453,8 @@ echo DONE
             "{stdout}\n{stderr}"
         );
         assert_eq!(h.join(".local/bin/git").exists(), writable);
-        assert_eq!(
-            std::fs::read_to_string(h.join(".config/starship.toml")).unwrap(),
-            ""
-        );
+        // Made empty for the jail, and gone again with it.
+        assert!(!h.join(".config/starship.toml").exists());
         assert_eq!(
             stderr.contains("--writable-user-bin:")
                 && stderr.contains("runs as you, outside the jail"),
@@ -469,4 +462,392 @@ echo DONE
             "{stderr}"
         );
     }
+}
+
+/// Runs `script` in a real jail of `project`, in the home `h`, with
+/// `PATH` set to `path` on the launcher and every agent's marker taken
+/// out.
+fn run_jail_in(h: &Path, project: &Path, path: &str, script: &str) -> std::process::Output {
+    let graph = tempfile::TempDir::new().unwrap();
+    let mut command = Command::new(bin());
+    command
+        .args(["contain", "--project", project.to_str().unwrap()])
+        .args(["--", "/bin/sh", "-c", script])
+        .current_dir(project)
+        .env("HOME", h)
+        .env("PATH", path)
+        .env("IW_GRAPH_FILE", graph.path().join("graph.json"))
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_DATA_DIRS");
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+        "GEMINI_CLI",
+        "OPENCLAW_SHELL",
+    ] {
+        command.env_remove(marker);
+    }
+    command.output().expect("run the jail")
+}
+
+const TRY: &str = r##"try() { what=$1; shift; if "$@" 2>/dev/null; then echo "$what ok"; else echo "$what refused"; fi; }
+"##;
+
+/// Each `<what> <want>` line is in the jail's output, and it ran to its end.
+fn assert_lines(out: &std::process::Output, want: &[(&str, &str)]) {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("DONE"),
+        "{stdout}\n{stderr}"
+    );
+    for (what, result) in want {
+        assert!(
+            stdout.lines().any(|l| l == format!("{what} {result}")),
+            "{what} {result}: {stdout}\n{stderr}"
+        );
+    }
+}
+
+/// A folder of programs in `PATH` inside the project stays the project's
+/// to write: an activated venv (`.venv/bin` there, or not made yet),
+/// direnv's `node_modules/.bin`, the project itself in `PATH`, and a
+/// project that is `~/bin`. The launcher makes no `.venv/bin` on the
+/// host for a venv not there yet. Folders of programs outside the project
+/// stay read-only.
+///
+/// FAILS ON REVERT: keep every folder of `PATH` in the home read-only
+/// (the venv's `pytest`, the npm link and the project's own files are
+/// refused, and an empty `.venv/bin` is left on the host).
+#[test]
+fn a_program_folder_in_the_project_stays_the_projects() {
+    let test = "a_program_folder_in_the_project_stays_the_projects";
+    if !jail_opens_here(test) {
+        return;
+    }
+    let system = "/usr/local/bin:/usr/bin:/bin";
+    // An activated venv that is there, and `node_modules/.bin`.
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let p = h.join("work/proj");
+    for dir in [
+        ".local/bin",
+        ".local/state",
+        "work/proj/.venv/bin",
+        "work/proj/node_modules/.bin",
+    ] {
+        std::fs::create_dir_all(h.join(dir)).unwrap();
+    }
+    let path = format!(
+        "{}:{}:{}:{system}",
+        p.join(".venv/bin").display(),
+        p.join("node_modules/.bin").display(),
+        h.join(".local/bin").display()
+    );
+    let script = format!(
+        r##"{TRY}try pytest sh -c 'printf "#!/bin/sh\n" > "$PWD/.venv/bin/pytest"'
+try npmlink ln -s ../pkg/cli.js "$PWD/node_modules/.bin/cli"
+try userbin sh -c 'printf "#!/bin/sh\n" > "$HOME/.local/bin/git"'
+echo DONE
+"##
+    );
+    let out = run_jail_in(&h, &p, &path, &script);
+    assert_lines(
+        &out,
+        &[("pytest", "ok"), ("npmlink", "ok"), ("userbin", "refused")],
+    );
+    assert!(p.join(".venv/bin/pytest").is_file());
+    assert!(!h.join(".local/bin/git").exists());
+
+    // A venv not made yet: nothing made on the host, and the jail makes it
+    // whole.
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let p = h.join("proj");
+    for dir in [".local/state", "proj"] {
+        std::fs::create_dir_all(h.join(dir)).unwrap();
+    }
+    let path = format!("{}:{system}", p.join(".venv/bin").display());
+    let script = format!(
+        r##"{TRY}try novenv test ! -e "$PWD/.venv"
+try venv sh -c 'mkdir -p "$PWD/.venv/bin" && printf "#!/bin/sh\n" > "$PWD/.venv/bin/python"'
+echo DONE
+"##
+    );
+    let out = run_jail_in(&h, &p, &path, &script);
+    assert_lines(&out, &[("novenv", "ok"), ("venv", "ok")]);
+    assert!(p.join(".venv/bin/python").is_file());
+
+    // The project in `PATH`, and a project that is `~/bin`.
+    for named in ["proj", "bin"] {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        let p = h.join(named);
+        for dir in [".local/state", named] {
+            std::fs::create_dir_all(h.join(dir)).unwrap();
+        }
+        let path = format!("{}:{system}", p.display());
+        let script = format!(
+            r##"{TRY}try own sh -c 'echo x > "$PWD/notes.txt" && mkdir -p "$PWD/.git/objects"'
+echo DONE
+"##
+        );
+        let out = run_jail_in(&h, &p, &path, &script);
+        assert_lines(&out, &[("own", "ok")]);
+        assert!(p.join("notes.txt").is_file(), "{named}");
+    }
+}
+
+/// What runs as you next from Python's user site, cargo's and rustup's
+/// files, and what the links in your program folders lead to is read-only
+/// in a real jail: a `.pth` or `usercustomize.py`, `~/.cargo/env`,
+/// `~/.cargo/config.toml` and `~/.cargo/config` (made as one file for the
+/// jail), a toolchain's `cargo` and its libraries, Claude Code's version a
+/// `~/.local/bin` link runs and a pipx venv. Gone from the host after:
+/// the cargo config files the launcher made.
+///
+/// FAILS ON REVERT: leave any of those places writable (the write lands on
+/// the host), or leave the files made for the jail on the host.
+#[test]
+fn what_python_cargo_rustup_and_your_links_run_next_is_read_only() {
+    use std::os::unix::fs::symlink;
+    let test = "what_python_cargo_rustup_and_your_links_run_next_is_read_only";
+    if !jail_opens_here(test) {
+        return;
+    }
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    for dir in [
+        ".config",
+        ".local/bin",
+        ".local/state",
+        ".local/lib/python3.99/site-packages",
+        ".local/share/claude/versions",
+        ".local/share/pipx/venvs/black/bin",
+        ".local/share/pipx/venvs/black/lib",
+        ".cargo/bin",
+        ".rustup/toolchains/stable-x/bin",
+        ".rustup/toolchains/stable-x/lib",
+    ] {
+        std::fs::create_dir_all(h.join(dir)).unwrap();
+    }
+    std::fs::write(h.join(".cargo/env"), "export PATH=x\n").unwrap();
+    std::fs::write(h.join(".rustup/toolchains/stable-x/bin/cargo"), "real\n").unwrap();
+    std::fs::write(h.join(".local/share/claude/versions/9.9.9"), "real\n").unwrap();
+    symlink(
+        h.join(".local/share/claude/versions/9.9.9"),
+        h.join(".local/bin/claude"),
+    )
+    .unwrap();
+    std::fs::write(
+        h.join(".local/share/pipx/venvs/black/pyvenv.cfg"),
+        "home = /usr\n",
+    )
+    .unwrap();
+    std::fs::write(h.join(".local/share/pipx/venvs/black/bin/black"), "real\n").unwrap();
+    symlink(
+        h.join(".local/share/pipx/venvs/black/bin/black"),
+        h.join(".local/bin/black"),
+    )
+    .unwrap();
+    let script = format!(
+        r##"{TRY}try pth sh -c 'echo "import os" > "$HOME/.local/lib/python3.99/site-packages/x.pth"'
+try usercustomize sh -c 'echo "import os" > "$HOME/.local/lib/python3.99/site-packages/usercustomize.py"'
+try cargoenv sh -c 'echo "curl x | sh" >> "$HOME/.cargo/env"'
+try cargoconfig sh -c 'printf "[build]\nrustc-wrapper = \"/tmp/w\"\n" > "$HOME/.cargo/config.toml"'
+try cargolegacy sh -c 'printf "[build]\nrustc-wrapper = \"/tmp/w\"\n" > "$HOME/.cargo/config"'
+try toolchain sh -c 'echo fake > "$HOME/.rustup/toolchains/stable-x/bin/cargo"'
+try toolchainlib sh -c 'echo fake > "$HOME/.rustup/toolchains/stable-x/lib/librustc_driver.so"'
+try claude sh -c 'echo fake > "$HOME/.local/share/claude/versions/9.9.9"'
+try pipx sh -c 'echo fake > "$HOME/.local/share/pipx/venvs/black/lib/x.py"'
+try agent sh -c 'echo kept > "$HOME/.local/share/other"'
+echo DONE
+"##
+    );
+    let path = format!("{}:/usr/bin:/bin", h.join(".local/bin").display());
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let out = run_jail_in(&h, &p, &path, &script);
+    assert_lines(
+        &out,
+        &[
+            ("pth", "refused"),
+            ("usercustomize", "refused"),
+            ("cargoenv", "refused"),
+            ("cargoconfig", "refused"),
+            ("cargolegacy", "refused"),
+            ("toolchain", "refused"),
+            ("toolchainlib", "refused"),
+            ("claude", "refused"),
+            ("pipx", "refused"),
+            ("agent", "ok"),
+        ],
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.join(".cargo/env")).unwrap(),
+        "export PATH=x\n"
+    );
+    assert!(!h.join(".cargo/config.toml").exists());
+    assert!(!h.join(".cargo/config").exists());
+    assert_eq!(
+        std::fs::read_to_string(h.join(".rustup/toolchains/stable-x/bin/cargo")).unwrap(),
+        "real\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(h.join(".local/share/claude/versions/9.9.9")).unwrap(),
+        "real\n"
+    );
+    assert!(!h.join(".local/lib/python3.99/site-packages/x.pth").exists());
+}
+
+/// Every name in `dir`, below it, as paths from it. Sorted.
+fn tree(dir: &Path) -> Vec<String> {
+    fn walk(base: &Path, at: &Path, out: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(at) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            out.push(path.strip_prefix(base).unwrap().display().to_string());
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                walk(base, &path, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out);
+    out.sort();
+    out
+}
+
+/// The host keeps no empty folder or file the launcher made for a jail:
+/// `~/.config`, `~/.local` and `~/.cargo` hold after the jail what they
+/// held before (the launcher's records folder and InnerWarden's own folder,
+/// where arming the hook keeps its settings, aside), so a
+/// `ln -s ~/dotfiles/nvim ~/.config/nvim` after it makes the link. A stale
+/// entry of `PATH` that is a file opens the jail. While a second jail of
+/// the same home runs, the first, ending, takes nothing away from it: the
+/// second still refuses a write to a place the first made, and the second,
+/// ending alone, takes away what the first made.
+///
+/// FAILS ON REVERT: leave what was made on the host (the trees differ),
+/// refuse a file in `PATH`, take what was made away while another jail of
+/// the home runs (the late write lands), or take away only a launch's own
+/// (what the first made stays).
+#[test]
+fn the_host_keeps_no_empty_entry_a_jail_was_given() {
+    let test = "the_host_keeps_no_empty_entry_a_jail_was_given";
+    if !jail_opens_here(test) {
+        return;
+    }
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    for dir in [".config/gh", ".local/state", ".cargo/registry"] {
+        std::fs::create_dir_all(h.join(dir)).unwrap();
+    }
+    std::fs::write(h.join(".local/oldbin"), "a file").unwrap();
+    let before: Vec<Vec<String>> = [".config", ".local", ".cargo"]
+        .iter()
+        .map(|dir| tree(&h.join(dir)))
+        .collect();
+    let path = format!("{}:/usr/bin:/bin", h.join(".local/oldbin").display());
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+
+    // Two jails of the home at once: the first ends while the second
+    // runs, and the second ends last.
+    let spawn = |script: String| {
+        let graph = tempfile::TempDir::new().unwrap();
+        let mut command = Command::new(bin());
+        command
+            .args(["contain", "--project", p.to_str().unwrap()])
+            .args(["--", "/bin/sh", "-c", &script])
+            .current_dir(&p)
+            .env("HOME", &h)
+            .env("PATH", &path)
+            .env("IW_GRAPH_FILE", graph.path().join("graph.json"))
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_DATA_DIRS")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        for marker in [
+            "CLAUDECODE",
+            "CLAUDE_CODE_ENTRYPOINT",
+            "CODEX_SANDBOX",
+            "CODEX_SANDBOX_NETWORK_DISABLED",
+            "GEMINI_CLI",
+            "OPENCLAW_SHELL",
+        ] {
+            command.env_remove(marker);
+        }
+        (command.spawn().expect("run a jail"), graph)
+    };
+    let wait_for = |file: &Path| {
+        let start = std::time::Instant::now();
+        while !file.exists() {
+            assert!(
+                start.elapsed().as_secs() < 120,
+                "{} never came",
+                file.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    let first = spawn(format!(
+        r##"{TRY}touch "$PWD/first-runs"
+while [ ! -e "$PWD/go-first" ]; do sleep 0.1; done
+echo DONE
+"##
+    ));
+    wait_for(&p.join("first-runs"));
+    assert!(h.join(".config/fish").is_dir(), "made for the first jail");
+    let second = spawn(format!(
+        r##"{TRY}touch "$PWD/second-runs"
+while [ ! -e "$PWD/go-second" ]; do sleep 0.1; done
+try late sh -c 'echo "echo hi" > "$HOME/.config/fish/config.fish"'
+echo DONE
+"##
+    ));
+    wait_for(&p.join("second-runs"));
+    std::fs::write(p.join("go-first"), "").unwrap();
+    let out = first.0.wait_with_output().unwrap();
+    assert_lines(&out, &[]);
+    // The first ended while the second runs: nothing taken away.
+    assert!(
+        h.join(".config/fish").is_dir(),
+        "taken away while a jail runs"
+    );
+    std::fs::write(p.join("go-second"), "").unwrap();
+    let out = second.0.wait_with_output().unwrap();
+    assert_lines(&out, &[("late", "refused")]);
+    assert!(!h.join(".config/fish/config.fish").exists());
+    // And a short jail alone, with the file in `PATH`.
+    let short = run_jail_in(&h, &p, &path, &format!("{TRY}echo DONE\n"));
+    assert_lines(&short, &[]);
+
+    // Both ended: the home is as it was.
+    let after: Vec<Vec<String>> = [".config", ".local", ".cargo"]
+        .iter()
+        .map(|dir| tree(&h.join(dir)))
+        .collect();
+    let records = |names: &Vec<String>| -> Vec<String> {
+        names
+            .iter()
+            .filter(|name| !name.starts_with("state/") && !name.starts_with("innerwarden"))
+            .cloned()
+            .collect()
+    };
+    for (i, dir) in [".config", ".local", ".cargo"].iter().enumerate() {
+        assert_eq!(records(&before[i]), records(&after[i]), "{dir}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(h.join(".local/oldbin")).unwrap(),
+        "a file"
+    );
 }
