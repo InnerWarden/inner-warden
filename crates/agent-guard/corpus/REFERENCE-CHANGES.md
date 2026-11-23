@@ -406,7 +406,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   corpus moved.
 - 2026-11-23: a PHP `foreach` head read in any case and with any space or
   comment around `as` moves no line of any corpus. Measured against main
-  9f10ffe with the differential judge (37127 lines, an empty home and a home
+  80b8b55 with the differential judge (39669 lines, an empty home and a home
   with keys): no verdict changed. Every name after `as`, inside `list()`
   and `[...]` too, loses what it held, and a statement whose `foreach` head
   cannot be read loses what the reader knew of every name. A file name a
