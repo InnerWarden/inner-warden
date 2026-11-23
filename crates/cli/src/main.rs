@@ -650,9 +650,10 @@ fn project_settings_effect_at(path: &std::path::Path, file: &str) -> Option<stat
 /// Thin I/O over [`status::is_dashboard_answer`], which holds the rule about
 /// what counts as an answer, so the rule is testable without a socket. A short
 /// timeout because this runs inside the one command a beginner reaches for when
-/// something already feels wrong.
+/// something already feels wrong. Straight to the address, never through a
+/// proxy the environment names (`crate::http_io::loopback_agent`).
 fn dashboard_answers(bind: &str) -> bool {
-    crate::http_io::agent_with_timeout(std::time::Duration::from_millis(400))
+    crate::http_io::loopback_agent(std::time::Duration::from_millis(400), true, false)
         .get(&format!("http://{bind}/api/meta"))
         .call()
         .ok()
