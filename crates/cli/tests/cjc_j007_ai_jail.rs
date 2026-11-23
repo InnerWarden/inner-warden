@@ -3848,16 +3848,16 @@ fn a_worktree_of_a_repository_in_a_folder_every_jail_writes_still_works() {
             .output()
             .is_ok_and(|out| out.status.success())
     };
-    if !git(&h.join(".config"), &["init", "-q", "nvim"]) {
+    if !git(&h.join(".config"), &["init", "-q", "home-manager"]) {
         eprintln!("no git on this host: skipped");
         return;
     }
-    let repo = h.join(".config/nvim");
+    let repo = h.join(".config/home-manager");
     assert!(git(
         &repo,
         &["commit", "-q", "--allow-empty", "-m", "first"]
     ));
-    let wt = h.join("code/nvim-wt");
+    let wt = h.join("code/hm-wt");
     assert!(git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]));
     let script = format!(
         "cd '{}' && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m in-jail \
@@ -3886,6 +3886,81 @@ fn a_worktree_of_a_repository_in_a_folder_every_jail_writes_still_works() {
         "{plan}"
     );
     assert!(!plan.contains(&git_folder), "{git_folder}: {plan}");
+}
+
+/// CWWT-BRK-1's worktree again, of a repository kept where a program the
+/// person runs reads its configuration as the person (`~/.config/nvim`,
+/// which every Linux jail now keeps read-only): the jail starts, and git in
+/// it can neither commit there nor leave a hook in the repository's git
+/// folder, which would run at the person's next commit outside the jail.
+/// Before, CWWT-BRK-1 committed through `~/.config/nvim`; its repository
+/// is now kept in `~/.config/home-manager`, a folder no jail covers.
+///
+/// FAILS ON REVERT: leave `~/.config/nvim` writable and the commit and
+/// the hook land on the host.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_worktree_of_a_repository_in_a_folder_that_runs_as_you_is_read_only() {
+    let test = "a_worktree_of_a_repository_in_a_folder_that_runs_as_you_is_read_only";
+    if !jail_opens_here(test) {
+        return;
+    }
+    require_bwrap();
+    let home = tempfile::TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    std::fs::create_dir_all(h.join(".local/state")).unwrap();
+    std::fs::create_dir_all(h.join(".config")).unwrap();
+    std::fs::create_dir_all(h.join("code")).unwrap();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", &h)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|out| out.status.success())
+    };
+    if !git(&h.join(".config"), &["init", "-q", "nvim"]) {
+        eprintln!("no git on this host: skipped");
+        return;
+    }
+    let repo = h.join(".config/nvim");
+    assert!(git(
+        &repo,
+        &["commit", "-q", "--allow-empty", "-m", "first"]
+    ));
+    let wt = h.join("code/nvim-wt");
+    assert!(git(&repo, &["worktree", "add", "-q", wt.to_str().unwrap()]));
+    let hook = repo.join(".git/hooks/post-commit");
+    let script = format!(
+        "cd '{}'; if git -c user.name=t -c user.email=t@t commit -q --allow-empty -m in-jail \
+         2>/dev/null; then echo COMMIT ok; else echo COMMIT refused; fi; \
+         if echo true > '{}' 2>/dev/null; then echo HOOK ok; else echo HOOK refused; fi; echo DONE",
+        wt.display(),
+        hook.display()
+    );
+    let (code_out, out, err) = plain_jail(&h, &wt, false, &script);
+    assert_eq!(code_out, Some(0), "{out} {err}");
+    assert!(out.contains("DONE"), "{out} {err}");
+    assert!(out.contains("COMMIT refused"), "{out} {err}");
+    assert!(out.contains("HOOK refused"), "{out} {err}");
+    assert!(!hook.exists());
+    let log = Command::new("git")
+        .args(["log", "--format=%s", "-1"])
+        .current_dir(&wt)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "first");
 }
 
 /// CWWT-SEC-1, live: a program in a jail of the project lays it out as its
