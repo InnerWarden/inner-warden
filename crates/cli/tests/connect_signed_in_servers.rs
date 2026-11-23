@@ -277,8 +277,24 @@ fn a_server_on_this_host_or_with_a_credential_is_carried() {
             .lines()
             .find(|line| line.trim_start().starts_with("codex "))
             .unwrap_or_default();
+        // The whole status, not a part of it. The fake `codex` cannot
+        // trust the hook (only Codex's app-server can), so the row is
+        // "partly guarded (MCP proxy, enforce)" and the only reason it gives
+        // is that hook: every server is behind the proxy.
+        let status_column = codex_row
+            .split_whitespace()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let hook_untrusted = list.lines().any(|line| {
+            line.trim_start().starts_with(
+                "PreToolUse hook: installed, but Codex skips it: it is not trusted yet.",
+            )
+        });
         assert!(
-            codex_row.contains("guarded (MCP proxy, enforce)"),
+            status_column.starts_with("✓ guarded (MCP proxy, enforce) ")
+                || (hook_untrusted
+                    && status_column.starts_with("partly guarded (MCP proxy, enforce) ")),
             "codex={with_codex}:\n{list}"
         );
         assert!(
@@ -290,6 +306,75 @@ fn a_server_on_this_host_or_with_a_credential_is_carried() {
             "{out}"
         );
     }
+}
+
+/// A server reached by this host's own name, its network address or
+/// `ip6-localhost` is on this host as much as one at `127.0.0.1`: a
+/// connect carries it, with Codex to ask (a `codex` that names it as one
+/// it signs in to) and without, and for Cursor.
+///
+/// FAILS ON REVERT of `this_host` in `is_local_url`: each is left as
+/// it is.
+#[test]
+fn a_server_named_as_this_host_is_carried() {
+    for url in this_host_urls() {
+        let config = format!(
+            "[mcp_servers.here]\nurl = \"{url}\"\n\n\
+[mcp_servers.linear]\nurl = \"https://mcp.linear.example/mcp\"\n"
+        );
+        let every_one_o_auth =
+            r#"[{"name":"here","auth_status":"o_auth"},{"name":"linear","auth_status":"o_auth"}]"#;
+        for with_codex in [true, false] {
+            let host = Host::new();
+            host.write(".codex/config.toml", &config);
+            if with_codex {
+                host.list_says(every_one_o_auth);
+                host.with_codex();
+            }
+            let out = host.connect("codex");
+            let after = host.read(".codex/config.toml");
+            assert!(
+                wrapped(&after, "here"),
+                "{url} codex={with_codex}:\n{out}\n{after}"
+            );
+            assert_eq!(table(&after, "linear"), table(&config, "linear"), "{out}");
+        }
+        let host = Host::new();
+        let cursor = serde_json::json!({"mcpServers": {"pw": {"url": url}}});
+        host.write(".cursor/mcp.json", &cursor.to_string());
+        let out = host.connect("cursor");
+        let after = host.read(".cursor/mcp.json");
+        assert!(after.contains("proxy"), "{url}:\n{out}\n{after}");
+    }
+}
+
+/// URLs that name this host without its loopback: `ip6-localhost`, its
+/// own name, and the address it reaches the network from (a UDP socket
+/// connected to a documentation address sends nothing). The last two only
+/// where the system says them.
+fn this_host_urls() -> Vec<String> {
+    let mut urls = vec!["http://ip6-localhost:8931/mcp".to_string()];
+    if let Some(name) = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+    {
+        urls.push(format!("http://{name}:8931/mcp"));
+    }
+    if let Some(ip) = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("192.0.2.1:9")?;
+            socket.local_addr()
+        })
+        .ok()
+        .map(|address| address.ip())
+        .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+    {
+        urls.push(format!("http://{ip}:8931/mcp"));
+    }
+    urls
 }
 
 /// A Cursor server on this host is carried too: Cursor's hook would read

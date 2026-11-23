@@ -283,3 +283,66 @@ fn git_through_c_is_read_at_the_path_it_reaches() {
         assert_eq!(verdict(line), "allow", "{line}");
     }
 }
+
+/// FAILS ON REVERT of the work tree, pathspec or alias reading in
+/// `git_writes` (each line allowed), or of the `.` part dropped in
+/// `names_guard_folder_by_name` (the worktree line a review).
+#[test]
+fn git_is_read_in_the_work_tree_it_is_given_and_through_its_aliases() {
+    for (line, same_as) in [
+        (
+            "git init -q . && git clean -fdx .config/innerwarden",
+            "rm -rf .config/innerwarden",
+        ),
+        (
+            "git --git-dir=r/.git --work-tree=$HOME/.config/innerwarden clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git --work-tree ~/.config/innerwarden clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "GIT_DIR=r/.git GIT_WORK_TREE=$HOME/.config/innerwarden git clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "export GIT_WORK_TREE=$HOME/.config/innerwarden; git clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -c core.worktree=$HOME/.config/innerwarden clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -c alias.nuke=clean -C ~/.config/innerwarden nuke -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -c alias.nuke='!git clean -fdx' -C ~/.config/innerwarden nuke",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git --work-tree=$HOME/.config/innerwarden reset --hard",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -C r worktree remove --force innerwarden/.",
+            "git -C r worktree remove --force innerwarden",
+        ),
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+        assert_eq!(verdict(line), verdict(same_as), "{line}");
+    }
+    for line in [
+        "git --work-tree=$HOME/src/app clean -fdx",
+        "GIT_WORK_TREE=$HOME/src/app git checkout -f",
+        "git -c alias.st=status st",
+        "git -c alias.nuke=clean -C ~/src/app nuke -fdx",
+        "git reset --hard HEAD~1",
+        "git clean -fdx build",
+        "git -C ~/src/app clean -fdx -e .env",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}

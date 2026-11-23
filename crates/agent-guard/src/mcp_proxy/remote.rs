@@ -98,8 +98,13 @@ pub fn is_remote_url(word: &str) -> bool {
 /// `127.0.0.0/8` in any of the forms a URL parser reads, `0.0.0.0`,
 /// `::1`, `::` and their IPv4-mapped forms). A path handed to such a
 /// server names a file here, so its calls keep the path rules, and a
-/// connect carries it through the proxy whatever signs in to it. A name
-/// that only resolves to the loopback (a DNS record) is not seen.
+/// connect carries it through the proxy whatever signs in to it.
+///
+/// A host that names this host without being written as its loopback is
+/// local too ([`this_host`]): an address of one of its interfaces (the
+/// LAN address), its own name (and `<name>.local`), and a name the hosts
+/// file gives this host or the loopback (`ip6-localhost`). No DNS is
+/// asked: a name only a DNS record points here is not seen.
 pub fn is_local_url(url: &str) -> bool {
     let url = url.trim();
     let Some(at) = url.find("://") else {
@@ -121,6 +126,7 @@ pub fn is_local_url(url: &str) -> bool {
                 || ip
                     .to_ipv4_mapped()
                     .is_some_and(|v4| v4.is_loopback() || v4.is_unspecified())
+                || this_host().is_here(std::net::IpAddr::V6(ip))
         });
     }
     let host = host
@@ -130,7 +136,158 @@ pub fn is_local_url(url: &str) -> bool {
     if host.is_empty() || host == "localhost" || host.ends_with(".localhost") {
         return true;
     }
-    url_ipv4(host).is_some_and(|ip| ip.is_loopback() || ip.is_unspecified())
+    if let Some(ip) = url_ipv4(host) {
+        return ip.is_loopback()
+            || ip.is_unspecified()
+            || this_host().is_here(std::net::IpAddr::V4(ip));
+    }
+    this_host().names.iter().any(|name| name == host)
+}
+
+/// What names this host besides its loopback: the addresses of its
+/// interfaces, and the names it goes by (lowercase, no final dot). Read
+/// once, from the system and the hosts file, never from DNS.
+#[derive(Debug, Default)]
+pub struct ThisHost {
+    /// The addresses of this host's interfaces.
+    pub addresses: Vec<std::net::IpAddr>,
+    /// Its own name, `<name>.local`, and each name the hosts file gives
+    /// one of its addresses or the loopback.
+    pub names: Vec<String>,
+}
+
+impl ThisHost {
+    /// Whether `ip` is an address of this host.
+    pub fn is_here(&self, ip: std::net::IpAddr) -> bool {
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, std::net::IpAddr::V4),
+            v4 => v4,
+        };
+        ip.is_loopback() || ip.is_unspecified() || self.addresses.contains(&ip)
+    }
+}
+
+/// This host, read the first time a URL's host is not plainly the loopback.
+pub fn this_host() -> &'static ThisHost {
+    static HOST: std::sync::OnceLock<ThisHost> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        let mut host = ThisHost {
+            addresses: interface_addresses(),
+            names: vec!["ip6-localhost".to_string(), "ip6-loopback".to_string()],
+        };
+        if let Some(name) = host_name() {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            if !name.is_empty() {
+                host.names.push(format!("{name}.local"));
+                host.names.push(name);
+            }
+        }
+        if let Ok(text) = std::fs::read_to_string(hosts_file()) {
+            let named = hosts_file_names(&text, |ip| host.is_here(ip));
+            host.names.extend(named);
+        }
+        host.names.sort();
+        host.names.dedup();
+        host
+    })
+}
+
+/// The names a hosts file (`/etc/hosts`) gives an address `is_here`
+/// takes, lowercase and with no final dot.
+pub fn hosts_file_names(text: &str, is_here: impl Fn(std::net::IpAddr) -> bool) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        let mut words = line.split_whitespace();
+        let Some(address) = words.next() else {
+            continue;
+        };
+        let address = address.split('%').next().unwrap_or(address);
+        let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        if is_here(ip) {
+            names.extend(words.map(|name| name.trim_end_matches('.').to_ascii_lowercase()));
+        }
+    }
+    names
+}
+
+/// Where the system keeps its hosts file.
+fn hosts_file() -> std::path::PathBuf {
+    if cfg!(windows) {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        std::path::Path::new(&root).join("System32\\drivers\\etc\\hosts")
+    } else {
+        std::path::PathBuf::from("/etc/hosts")
+    }
+}
+
+/// This host's own name.
+#[cfg(unix)]
+fn host_name() -> Option<String> {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the buffer is writable for its whole length, and the length
+    // given leaves its last byte as the terminator.
+    let status =
+        unsafe { libc::gethostname(buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len() - 1) };
+    if status != 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
+    String::from_utf8(buffer[..end].to_vec()).ok()
+}
+
+/// This host's own name.
+#[cfg(not(unix))]
+fn host_name() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
+}
+
+/// The addresses of this host's interfaces (`getifaddrs`).
+#[cfg(unix)]
+fn interface_addresses() -> Vec<std::net::IpAddr> {
+    let mut out = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `list` with a list it allocates, freed
+    // below with `freeifaddrs`; each node and address is read only while
+    // the list is alive, by the family it says it is.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return out;
+        }
+        let mut node = list;
+        while !node.is_null() {
+            let address = (*node).ifa_addr;
+            if !address.is_null() {
+                match i32::from((*address).sa_family) {
+                    libc::AF_INET => {
+                        let v4 = &*address.cast::<libc::sockaddr_in>();
+                        out.push(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+                            u32::from_be(v4.sin_addr.s_addr),
+                        )));
+                    }
+                    libc::AF_INET6 => {
+                        let v6 = &*address.cast::<libc::sockaddr_in6>();
+                        out.push(std::net::IpAddr::V6(std::net::Ipv6Addr::from(
+                            v6.sin6_addr.s6_addr,
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            node = (*node).ifa_next;
+        }
+        libc::freeifaddrs(list);
+    }
+    out
+}
+
+/// The addresses of this host's interfaces: not read here (Windows); its
+/// name and the hosts file still are.
+#[cfg(not(unix))]
+fn interface_addresses() -> Vec<std::net::IpAddr> {
+    Vec::new()
 }
 
 /// `text` with each `%XX` read as its byte (a URL's host may be written so).
@@ -1178,6 +1335,53 @@ mod tests {
         ] {
             assert!(!is_local_url(url), "{url}");
         }
+    }
+
+    /// This host named without its loopback is this host: its own name,
+    /// an address of one of its interfaces, `ip6-localhost`, a name the
+    /// hosts file gives it.
+    ///
+    /// FAILS ON REVERT of `this_host` in `is_local_url`: each URL below
+    /// reads as remote.
+    #[test]
+    fn this_host_named_another_way_is_local() {
+        let host = this_host();
+        let mut urls = vec![
+            "http://ip6-localhost:8080/mcp".to_string(),
+            "http://IP6-LOOPBACK/mcp".to_string(),
+        ];
+        if let Some(name) = host_name().filter(|name| !name.is_empty()) {
+            urls.push(format!("http://{name}:9000/mcp"));
+            urls.push(format!("https://{}./mcp", name.to_ascii_uppercase()));
+        }
+        for address in &host.addresses {
+            urls.push(match address {
+                std::net::IpAddr::V4(v4) => format!("http://{v4}:9000/mcp"),
+                std::net::IpAddr::V6(v6) => format!("http://[{v6}]:9000/mcp"),
+            });
+        }
+        for url in &urls {
+            assert!(is_local_url(url), "{url}");
+        }
+        let here = |ip: std::net::IpAddr| {
+            ip.is_loopback() || ip == "192.168.1.20".parse::<std::net::IpAddr>().unwrap()
+        };
+        assert_eq!(
+            hosts_file_names(
+                "127.0.0.1 localhost\n::1 ip6-localhost ip6-loopback # x\n\
+                 192.168.1.20 box.lan Box\n10.9.9.9 other.lan\n# 127.0.0.1 off\n\
+                 fe80::1%eth0 linklocal\n",
+                here
+            ),
+            vec![
+                "localhost",
+                "ip6-localhost",
+                "ip6-loopback",
+                "box.lan",
+                "box"
+            ]
+        );
+        assert!(!host.names.iter().any(|name| name == "mcp.linear.app"));
     }
 
     /// Goose's `$VAR` and `${VAR}` are filled as Goose fills them: a name

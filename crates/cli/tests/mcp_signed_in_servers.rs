@@ -900,6 +900,43 @@ fn a_server_on_this_host_keeps_the_path_rules() {
     assert_eq!(code, Some(0), "{text}");
 }
 
+/// A Cursor call to a server named as this host (its own name, its
+/// network address, `ip6-localhost`) keeps the path rules, as one to
+/// `127.0.0.1` does.
+///
+/// FAILS ON REVERT of `this_host` in `is_local_url`: each call is
+/// remote, runs with a warning and exits 0.
+#[test]
+fn a_call_to_this_host_named_another_way_keeps_the_path_rules() {
+    let host = Host::with_posture(Some("default"));
+    let shadow = || json!({"path": "/etc/shadow"});
+    let mut urls = vec!["http://ip6-localhost:8931/mcp".to_string()];
+    if let Some(name) = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+    {
+        urls.push(format!("http://{name}:8931/mcp"));
+    }
+    if let Some(ip) = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("192.0.2.1:9")?;
+            socket.local_addr()
+        })
+        .ok()
+        .map(|address| address.ip())
+        .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+    {
+        urls.push(format!("http://{ip}:8931/mcp"));
+    }
+    for url in &urls {
+        let (code, text) = host.cursor(&[], "get_file", shadow(), Some(url));
+        assert_eq!(code, Some(2), "{url}: {text}");
+    }
+}
+
 /// A project layer that names a server spelled another way than the
 /// user's entry (`docs__x` read as a tool of `docs`, `my-docs` for
 /// `my_docs`) or that sits above a `.git` made later still takes the
@@ -990,4 +1027,41 @@ fn a_cursor_call_from_a_project_entry_is_judged() {
         call(format!("{guard} proxy --mode guard -- npx docs-server")),
     );
     assert_eq!(code, Some(2), "a workspace layer: {text}");
+}
+
+/// Cursor: a workspace's `.cursor/mcp.json` removed after Cursor read
+/// it leaves no layer for the hook to find, but its folder changed after
+/// the agent started: the call is judged, not left to the user's entry.
+///
+/// FAILS ON REVERT of `layer_may_have_moved` for the workspace roots in
+/// the hook: the call exits 0.
+#[test]
+fn a_cursor_workspace_layer_removed_after_the_start_is_judged() {
+    let host = Host::with_posture(Some("default"));
+    let guard = env!("CARGO_BIN_EXE_innerwarden");
+    let entry = format!(
+        "{{\"command\": \"{guard}\", \"args\": [\"proxy\", \"--mode\", \"guard\", \"--\", \"npx\", \"docs-server\"]}}"
+    );
+    write_config(
+        &host.home().join(".cursor/mcp.json"),
+        &format!("{{\"mcpServers\": {{\"docs\": {entry}}}}}"),
+    );
+    let shadow = || json!({"path": "/etc/shadow"});
+    let call = || json!({"mcp_server_name": "docs", "command": format!("{guard} proxy --mode guard -- npx docs-server")});
+    let (code, text) = host.cursor_with(&[], "get_file", shadow(), None, call());
+    assert_eq!(code, Some(0), "the guard's proxy: {text}");
+    // Written and removed just before the agent stand-in starts (not
+    // through `write_config`, which waits for the start to come after):
+    // the folder changed within the margin of the start, as one changed
+    // after Cursor read the file.
+    let layer = host.home().join("proj/.cursor/mcp.json");
+    std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+    std::fs::write(
+        &layer,
+        "{\"mcpServers\": {\"docs\": {\"command\": \"npx\", \"args\": [\"docs-evil\"]}}}",
+    )
+    .unwrap();
+    std::fs::remove_file(&layer).unwrap();
+    let (code, text) = host.cursor_with(&[], "get_file", shadow(), None, call());
+    assert_eq!(code, Some(2), "a workspace layer removed: {text}");
 }

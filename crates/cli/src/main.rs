@@ -3681,7 +3681,7 @@ fn screen_mcp_call(
     // server one of them names may run with an `env`, an `envFile`, a
     // `cwd` or a mode the user's entry does not have.
     if agent == cursor_hook::AGENT {
-        let mut layers: Vec<std::path::PathBuf> = payload
+        let roots: Vec<std::path::PathBuf> = payload
             .get(cursor_hook::MCP_WORKSPACE_ROOTS_KEY)
             .and_then(|roots| roots.as_array())
             .into_iter()
@@ -3689,6 +3689,9 @@ fn screen_mcp_call(
             .filter_map(|root| root.as_str())
             .map(std::path::PathBuf::from)
             .filter(|root| root.is_absolute())
+            .collect();
+        let mut layers: Vec<std::path::PathBuf> = roots
+            .iter()
             .map(|root| root.join(".cursor/mcp.json"))
             .filter(|layer| {
                 std::fs::symlink_metadata(layer).is_ok()
@@ -3698,6 +3701,15 @@ fn screen_mcp_call(
         layers.sort();
         layers.dedup();
         trust.project_layers = mcp_unproxied::project_layer_servers(&layers);
+        // A workspace's file removed or changed after Cursor read it: what
+        // the hook finds is not what Cursor runs.
+        let user_layer = config_path.as_deref();
+        if roots.iter().any(|root| {
+            user_layer != Some(root.join(".cursor/mcp.json").as_path())
+                && mcp_unproxied::layer_may_have_moved(root, ".cursor", "mcp.json", agent_started)
+        }) {
+            trust.project_layers = mcp_unproxied::ProjectLayers::Unreadable;
+        }
     }
     let entries = config.map(|(entries, _)| entries);
     let (reach, tools) =

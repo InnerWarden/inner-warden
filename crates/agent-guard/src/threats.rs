@@ -8218,8 +8218,18 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
     let mut dirs: Vec<String> = Vec::new();
     // The line named more directories than are followed.
     let mut crowded = false;
+    // The work tree a `GIT_WORK_TREE=` before a command, or set by an
+    // earlier one, gives git.
+    let mut git_env_tree: Option<String> = None;
     for segment in shell_command_segments(content) {
         let words = shell_tokens(&braced.replace_all(segment, "$$$1"));
+        if let Some(tree) = words
+            .iter()
+            .rev()
+            .find_map(|word| word.strip_prefix("GIT_WORK_TREE="))
+        {
+            git_env_tree = Some(tree.to_string());
+        }
         let mut targets = output_redirect_targets(&words);
         // What the command takes away.
         let mut taken: Vec<String> = Vec::new();
@@ -8443,7 +8453,7 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 {
                     targets.extend(positional[at + 1..].iter().map(|path| path.to_string()));
                 }
-                let reading = git_writes(arguments);
+                let reading = git_writes(arguments, git_env_tree.as_deref());
                 targets.extend(reading.written);
                 taken.extend(reading.taken);
             }
@@ -8664,9 +8674,27 @@ const GIT_GLOBAL_VALUE_OPTIONS: &[&str] = &[
     "--super-prefix",
 ];
 
-fn git_writes(arguments: &[String]) -> GitWrites {
+fn git_writes(arguments: &[String], env_tree: Option<&str>) -> GitWrites {
     let mut reading = GitWrites::default();
     let mut folder: Option<String> = None;
+    // The work tree, when the line names one: `GIT_WORK_TREE`,
+    // `--work-tree`, `-c core.worktree=`. What a verb writes "here" is
+    // written there.
+    let mut tree: Option<String> = env_tree.map(|tree| tree.trim_matches(['"', '\'']).to_string());
+    // `-c alias.<name>=<value>`: the verb `<name>` runs `<value>`.
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut setting = |value: &str, tree: &mut Option<String>| {
+        let value = value.trim_matches(['"', '\'']);
+        let Some((key, value)) = value.split_once('=') else {
+            return;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if key == "core.worktree" {
+            *tree = Some(value.to_string());
+        } else if let Some(name) = key.strip_prefix("alias.") {
+            aliases.push((name.to_string(), value.to_string()));
+        }
+    };
     let mut at = 0usize;
     while let Some(word) = arguments.get(at) {
         let word = word.trim_matches(['"', '\'']);
@@ -8676,6 +8704,25 @@ fn git_writes(arguments: &[String]) -> GitWrites {
                     folder.as_deref(),
                     value.trim_matches(['"', '\'']),
                 ));
+            }
+            at += 2;
+            continue;
+        }
+        if word == "--work-tree" {
+            if let Some(value) = arguments.get(at + 1) {
+                tree = Some(value.trim_matches(['"', '\'']).to_string());
+            }
+            at += 2;
+            continue;
+        }
+        if let Some(value) = word.strip_prefix("--work-tree=") {
+            tree = Some(value.to_string());
+            at += 1;
+            continue;
+        }
+        if word == "-c" {
+            if let Some(value) = arguments.get(at + 1) {
+                setting(value, &mut tree);
             }
             at += 2;
             continue;
@@ -8693,31 +8740,91 @@ fn git_writes(arguments: &[String]) -> GitWrites {
     let Some(verb) = arguments.get(at).map(|verb| verb.trim_matches(['"', '\''])) else {
         return reading;
     };
-    let rest = &arguments[at + 1..];
-    let in_folder = |path: &str| git_path_in(folder.as_deref(), path.trim_matches(['"', '\'']));
-    let words = |from: &[String]| -> Vec<String> {
+    let mut verb = verb.to_string();
+    let mut rest: Vec<String> = arguments[at + 1..].to_vec();
+    // The work tree, read in the folder `-C` names, as git reads it.
+    let tree = tree.map(|tree| git_path_in(folder.as_deref(), &tree));
+    // Where "here" is: the folder (`.` without one) and the work tree.
+    let here: Vec<String> = std::iter::once(git_path_in(folder.as_deref(), "."))
+        .chain(tree.clone())
+        .collect();
+    // An alias is read as the verb it runs (an alias of an alias too); one
+    // that runs a shell (`!...`) may do anything to the work tree.
+    for _ in 0..8 {
+        let lower = verb.to_ascii_lowercase();
+        let Some((_, value)) = aliases.iter().rev().find(|(name, _)| *name == lower) else {
+            break;
+        };
+        if value.trim_start().starts_with('!') {
+            reading.taken.extend(here.iter().cloned());
+            return reading;
+        }
+        let mut words = value.split_whitespace().map(str::to_string);
+        let Some(first) = words.next() else {
+            break;
+        };
+        verb = first;
+        rest = words.chain(rest).collect();
+    }
+    let in_folder = |path: &str| -> Vec<String> {
+        let path = path.trim_matches(['"', '\'']);
+        std::iter::once(git_path_in(folder.as_deref(), path))
+            .chain(tree.as_deref().map(|tree| git_path_in(Some(tree), path)))
+            .collect()
+    };
+    // The paths a verb is handed: every word that is no option (each one
+    // after `--`), the value of an option in `valued` skipped.
+    let words = |from: &[String], valued: &[&str]| -> Vec<String> {
         let mut after_dashes = false;
+        let mut skip = false;
         let mut out = Vec::new();
         for word in from {
+            if skip {
+                skip = false;
+                continue;
+            }
             if word == "--" && !after_dashes {
                 after_dashes = true;
                 continue;
             }
+            if !after_dashes && valued.contains(&word.as_str()) {
+                skip = true;
+                continue;
+            }
             if after_dashes || !word.starts_with('-') {
-                out.push(in_folder(word));
+                out.extend(in_folder(word));
             }
         }
         out
     };
-    match verb {
-        "checkout" | "restore" if folder.is_some() => reading.written.extend(words(rest)),
-        "rm" => reading.taken.extend(words(rest)),
+    let rest = rest.as_slice();
+    match verb.as_str() {
+        "checkout" | "restore" if folder.is_some() || tree.is_some() => {
+            reading.written.extend(words(rest, &[]));
+            if tree.is_some() {
+                reading.written.extend(here.iter().cloned());
+            }
+        }
+        "rm" => reading.taken.extend(words(rest, &[])),
         // What is not tracked under the folder goes, and with `-x` what is
-        // ignored too: the folder is taken as emptied.
-        "clean" => reading.taken.push(in_folder(".")),
+        // ignored too: the folder is taken as emptied, and each path the
+        // line hands it.
+        "clean" => {
+            reading.taken.extend(here.iter().cloned());
+            reading.taken.extend(words(rest, &["-e", "--exclude"]));
+        }
+        // `--hard` (and `--merge`, `--keep`) puts the commit's version
+        // of every tracked file in the work tree in its place.
+        "reset"
+            if rest
+                .iter()
+                .any(|word| matches!(word.as_str(), "--hard" | "--merge" | "--keep")) =>
+        {
+            reading.taken.extend(here.iter().cloned());
+        }
         "worktree" => {
             if rest.first().is_some_and(|word| word == "remove") {
-                reading.taken.extend(words(&rest[1..]));
+                reading.taken.extend(words(&rest[1..], &[]));
             }
         }
         "init" => {
@@ -8726,13 +8833,13 @@ fn git_writes(arguments: &[String]) -> GitWrites {
             while let Some(word) = rest.get(index) {
                 if word == "--separate-git-dir" {
                     if let Some(value) = rest.get(index + 1) {
-                        reading.written.push(in_folder(value));
+                        reading.written.extend(in_folder(value));
                     }
                     index += 2;
                     continue;
                 }
                 if let Some(value) = word.strip_prefix("--separate-git-dir=") {
-                    reading.written.push(in_folder(value));
+                    reading.written.extend(in_folder(value));
                 } else if matches!(
                     word.as_str(),
                     "--template"
@@ -8746,12 +8853,12 @@ fn git_writes(arguments: &[String]) -> GitWrites {
                     continue;
                 } else if !word.starts_with('-') {
                     named = true;
-                    reading.written.push(in_folder(word));
+                    reading.written.extend(in_folder(word));
                 }
                 index += 1;
             }
             if !named {
-                reading.written.push(in_folder("."));
+                reading.written.extend(in_folder("."));
             }
         }
         _ => {}

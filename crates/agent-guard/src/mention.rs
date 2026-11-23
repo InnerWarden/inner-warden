@@ -1389,11 +1389,17 @@ fn git_folder(options: &[String]) -> Option<String> {
 /// a worktree's path, which git keeps whole: git reads it from the working
 /// folder, and [`work_folder`] decides.
 fn names_guard_folder_by_name(word: &str) -> bool {
-    let lower = word
-        .trim_matches(['"', '\''])
-        .trim_end_matches('/')
-        .to_ascii_lowercase();
-    if lower.split('/').any(|part| part == "." || part == "..") {
+    // `innerwarden/.`, `./innerwarden` and `innerwarden/./` name the
+    // same path as `innerwarden`: a `.` part is dropped first.
+    let lower = word.trim_matches(['"', '\'']).to_ascii_lowercase();
+    let absolute = lower.starts_with('/');
+    let lower = lower
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    let lower = if absolute { format!("/{lower}") } else { lower };
+    if lower.split('/').any(|part| part == "..") {
         return false;
     }
     let last = lower.rsplit('/').next().unwrap_or(&lower);

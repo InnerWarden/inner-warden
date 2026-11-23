@@ -27,8 +27,13 @@ the hook is on. A server on this host (`localhost`, a name under
 `.localhost`, `127.0.0.0/8` in any form a URL parser reads, `0.0.0.0`,
 `::1`) or behind a unix socket is always carried, and the hook reads it
 as a local server: a path its calls carry names a file here, and the path
-rules still refuse `/etc/shadow` in the default posture. A name that only
-resolves to the loopback (a DNS record) is read as another host.
+rules still refuse `/etc/shadow` in the default posture. So is one that
+names this host another way: an address of one of its interfaces (its LAN
+address), its own name and `<name>.local`, and a name the hosts file gives
+this host or the loopback (`ip6-localhost`), read once and never from DNS.
+A name that only a DNS record points here (`localtest.me`) is read as
+another host. On Windows the interfaces' addresses are not read; its name
+and the hosts file are.
 
 An ordinary MCP call costs the hook less: the ATR rules are read from the
 YAML once, when the binary is built, and a rule is compiled for a call only
@@ -49,12 +54,18 @@ working folder, and the configuration's last change, content or status, is
 older than the agent. For Codex, also: no layer of the project
 (`.codex/config.toml` in the working folder or any folder above it, past a
 `.git`) names any server; in a project the user's file trusts, no folder
-from the working folder up to the project's, nor a `.codex` in one,
-changed after the agent started (a layer moved away); and the Codex the
-hook runs under was not started with `-c`/`--config mcp_servers...` or a
-profile (read from its command line). For Cursor, also: the call's own
-command line is the guard's proxy in a mode that refuses, and no
-`.cursor/mcp.json` of a workspace root names a server. The agent is the
+from the working folder up to the project's, nor a `.codex` in one, nor its
+`config.toml` (a layer emptied or rewritten in place), changed after the
+agent started, read through a link to what it points at too; and the Codex
+the hook runs under was not started with `-c`/`--config mcp_servers...`,
+`projects...` (a project trusted on the command line), `profile` or
+`profiles...`, or a profile (read from its command line). For Cursor,
+also: the call's own command line is the guard's proxy in a mode that
+refuses, split as a shell splits it (a quote left open, or `--mode` named
+twice, is not the guard's: how Cursor writes a word with a space in it was
+not measured with Cursor itself), and no `.cursor/mcp.json` of a
+workspace root names a server or changed, with its folders, after the
+agent started (a file removed after Cursor read it). The agent is the
 nearest ancestor of the hook named for it, else the first that is not a
 shell or a known launcher. `touch -d` on a configuration rewritten after
 the agent started no longer passes for an old one; on a file system that
@@ -71,7 +82,15 @@ clean`, `git worktree remove` and `git init` (with `--separate-git-dir`)
 are read at the path the `-C` options reach: `git -C ~/.config/innerwarden
 clean -fdx`, `git -C ~/.local/bin rm -f innerwarden` and `git init` into
 the guard's folder are refused as `rm` of the same path is. They were
-allowed before, on main too. `codex -c mcp_servers...` is refused as the
+allowed before, on main too. git is read in the work tree it is given
+(`--work-tree`, `GIT_WORK_TREE` before the command or exported earlier,
+`-c core.worktree=`): `clean`, `rm`, `checkout`, `restore` and `reset
+--hard` (`--merge`, `--keep`) into the guard's folder are refused as `rm`
+of it is. The paths handed to `git clean` are read too (`git clean -fdx
+.config/innerwarden` after a `git init` in the home), and an alias set with
+`-c alias.<name>=` is read as the verb it runs (one that runs a shell, `!`,
+as taking the work tree). `worktree remove innerwarden/.` is read as
+`innerwarden`. `codex -c mcp_servers...` is refused as the
 override of Codex's hooks is: the server it sets runs outside the proxy.
 
 When an MCP call and the command it carries both run with a warning in the

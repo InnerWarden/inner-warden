@@ -331,9 +331,13 @@ pub fn codex_trusted_projects(user_config_text: &str) -> Vec<PathBuf> {
 /// Whether a layer Codex may have read when the agent started can have
 /// moved since: `cwd` is in a project the user's file trusts
 /// (`trusted`), and one of the folders from `cwd` up to that project's
-/// folder, or the `.codex` in one of them, changed after the agent
-/// started (or either time is unknown). A layer moved away leaves its
-/// folder changed: what the hook finds then is not what the agent read.
+/// folder, the `.codex` in one of them or its `config.toml` changed
+/// after the agent started (or either time is unknown). A layer moved
+/// away leaves its folder changed, and one emptied or rewritten in place
+/// leaves the file changed: what the hook finds then is not what the
+/// agent read. A `.codex` or a `config.toml` that is a link is read on
+/// both sides: the link, and what it points at (a link that points at
+/// nothing counts as changed).
 pub fn codex_layers_may_have_moved(
     cwd: &Path,
     trusted: &[PathBuf],
@@ -355,19 +359,54 @@ pub fn codex_layers_may_have_moved(
         real.unwrap_or_else(|| cwd.to_path_buf())
     };
     for dir in base.ancestors() {
-        for place in [dir.to_path_buf(), dir.join(".codex")] {
-            match std::fs::symlink_metadata(&place) {
-                Ok(meta) => {
-                    if !config_settled(last_change(&meta), agent_started) {
-                        return true;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return true,
-            }
+        if layer_may_have_moved(dir, ".codex", "config.toml", agent_started) {
+            return true;
         }
         if dir == root.as_path() {
             break;
+        }
+    }
+    false
+}
+
+/// Whether the layer `<dir>/<folder>/<file>` may have changed since the
+/// agent started: `dir`, `folder` in it or the layer file changed after
+/// the start (or either time is unknown). A `folder` or a `file` that is
+/// a link is read on both sides: the link, and what it points at with the
+/// folder that holds it (a link that points at nothing counts as changed).
+pub fn layer_may_have_moved(
+    dir: &Path,
+    folder: &str,
+    file: &str,
+    agent_started: Option<SystemTime>,
+) -> bool {
+    let holder = dir.join(folder);
+    let layer = holder.join(file);
+    for place in [dir.to_path_buf(), holder, layer] {
+        match std::fs::symlink_metadata(&place) {
+            Ok(meta) => {
+                if !config_settled(last_change(&meta), agent_started) {
+                    return true;
+                }
+                if place != dir && meta.file_type().is_symlink() {
+                    // What the link points at, and the folder that holds
+                    // it: a file moved out of it leaves it changed.
+                    let Ok(target) = std::fs::canonicalize(&place) else {
+                        return true;
+                    };
+                    for followed in [Some(target.as_path()), target.parent()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        match std::fs::metadata(followed) {
+                            Ok(meta) if config_settled(last_change(&meta), agent_started) => {}
+                            _ => return true,
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
         }
     }
     false
@@ -389,8 +428,9 @@ pub fn codex_setting_names_servers(setting: &str) -> bool {
 
 /// Whether the command line Codex was started with may run a server other
 /// than the one the user's file names: a `-c` / `--config` setting of
-/// `mcp_servers` ([`codex_setting_names_servers`]), or a profile
-/// (`-p`, `--profile`), whose settings are read over the file's.
+/// `mcp_servers` ([`codex_setting_names_servers`]), of the projects or
+/// the profile ([`codex_setting_reads_layers`]), or a profile (`-p`,
+/// `--profile`), whose settings are read over the file's.
 pub fn codex_argv_sets_servers(argv: &[String]) -> bool {
     let mut words = argv.iter().skip(1).peekable();
     while let Some(word) = words.next() {
@@ -414,11 +454,34 @@ pub fn codex_argv_sets_servers(argv: &[String]) -> bool {
         } else {
             None
         };
-        if setting.is_some_and(codex_setting_names_servers) {
+        if setting.is_some_and(|setting| {
+            codex_setting_names_servers(setting) || codex_setting_reads_layers(setting)
+        }) {
             return true;
         }
     }
     false
+}
+
+/// Whether a Codex `-c` / `--config` setting changes which layers Codex
+/// reads: one under `projects` (a folder marked trusted on the command
+/// line, whose layers the user's file does not say are read), or the
+/// profile (`profile`, `profiles.*`), whose settings are read over the
+/// file's.
+pub fn codex_setting_reads_layers(setting: &str) -> bool {
+    let key: String = setting
+        .split('=')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | ' ' | '\t'))
+        .collect();
+    let key = key.to_ascii_lowercase();
+    key == "projects"
+        || key.starts_with("projects.")
+        || key == "profile"
+        || key == "profiles"
+        || key.starts_with("profiles.")
 }
 
 /// The servers `layers` name, read as the user's file is ([`read_entries`]).
@@ -505,9 +568,34 @@ impl ProxyTrust {
     /// (no `--mode` is the proxy's default, `guard`). The entry the line
     /// came from may be another than the one the user's file has (a
     /// project's `.cursor/mcp.json`), so its mode is read here.
+    ///
+    /// Words are split as a shell splits them (quotes and `\\` kept
+    /// together); a line whose quotes do not close is not read. How Cursor
+    /// writes a word with a space in it is not measured: a line that names
+    /// `--mode` more than once in its plain words, or that splits two ways
+    /// into different modes, is not taken as the guard's.
     fn call_command_is_guard_proxy(&self, line: &str) -> bool {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let [program, verb, rest @ ..] = words.as_slice() else {
+        let Some(split) = command_line_words(line) else {
+            return false;
+        };
+        let plain: Vec<&str> = line.split_whitespace().collect();
+        let modes = plain
+            .iter()
+            .filter(|word| {
+                let word = word.trim_matches(['"', '\'']);
+                word == "--mode" || word.starts_with("--mode=")
+            })
+            .count();
+        if modes > 1 {
+            return false;
+        }
+        let words: Vec<&str> = split.iter().map(String::as_str).collect();
+        self.proxy_words_refuse(&words) && self.proxy_words_refuse(&plain)
+    }
+
+    /// [`Self::call_command_is_guard_proxy`] for a line already split.
+    fn proxy_words_refuse(&self, words: &[&str]) -> bool {
+        let [program, verb, rest @ ..] = words else {
             return false;
         };
         if !self.is_guard_absolute(program) || *verb != "proxy" {
@@ -546,6 +634,57 @@ impl ProxyTrust {
             .any(|path| path.as_os_str() == std::ffi::OsStr::new(command));
         named && self.is_guard(command)
     }
+}
+
+/// `line` split into words as a shell splits it: `'...'` and `"..."`
+/// hold a word together, `\\` takes the next character as it is. `None`
+/// when a quote is left open.
+fn command_line_words(line: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        other => word.push(other),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => word.push(chars.next()?),
+                        other => word.push(other),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                word.push(chars.next()?);
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            other => {
+                in_word = true;
+                word.push(other);
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    Some(words)
 }
 
 /// Whether `path` is written with no `.`, `..` or empty part and does not
@@ -2303,6 +2442,60 @@ mod tests {
         }
     }
 
+    /// Cursor's command line is split as the proxy's words are: a quoted
+    /// word that holds `--mode guard` is one word, and a line that names
+    /// a mode twice or leaves a quote open is not the guard refusing.
+    ///
+    /// FAILS ON REVERT of `command_line_words` (plain split on spaces) or
+    /// of the `--mode` count in `call_command_is_guard_proxy`: an
+    /// advisory line is trusted.
+    #[test]
+    fn a_cursor_command_line_is_split_as_a_shell_splits_it() {
+        let guard = Guard::new();
+        let real = guard.path.display().to_string();
+        let entry = ServerEntry {
+            name: "docs".to_string(),
+            wrapper: Some(Wrapper {
+                command: real.clone(),
+                blocks: true,
+                ..Wrapper::default()
+            }),
+            remote: false,
+        };
+        let with = |line: String| ProxyTrust {
+            call_command: Some(line),
+            ..guard.trust()
+        };
+        for line in [
+            format!("{real} proxy --mode advisory --label \"x --mode guard\" -- npx docs"),
+            format!("{real} proxy --mode advisory --label 'x --mode guard' -- npx docs"),
+            format!("{real} proxy --mode=warn --label x\\ --mode\\ guard -- npx docs"),
+            format!("{real} proxy --label \"x -- npx docs"),
+            format!("{real} proxy --mode guard --mode advisory -- npx docs"),
+            // Words with spaces written bare, as a line joined on spaces
+            // would show them.
+            format!("{real} proxy --mode advisory --label x --mode guard -- npx docs"),
+        ] {
+            assert!(!with(line.clone()).trusts(&entry), "{line}");
+        }
+        for line in [
+            format!("{real} proxy --mode guard -- npx docs"),
+            format!("{real} proxy --label docs --agent cursor -- npx docs"),
+        ] {
+            assert!(with(line.clone()).trusts(&entry), "{line}");
+        }
+        assert_eq!(
+            command_line_words("a 'b c' \"d \\\" e\" f\\ g"),
+            Some(vec![
+                "a".to_string(),
+                "b c".to_string(),
+                "d \" e".to_string(),
+                "f g".to_string()
+            ])
+        );
+        assert_eq!(command_line_words("a 'b"), None);
+    }
+
     /// A configuration rewritten today and dated back with `touch -d` keeps
     /// today's status change: it is not taken as the one the agent read.
     ///
@@ -2327,5 +2520,81 @@ mod tests {
             config_settled(mtime, Some(started)),
             "the content's time alone was fooled"
         );
+    }
+
+    /// A layer emptied or rewritten in place after the agent started leaves
+    /// its folders as they were: the file itself is read, and through a
+    /// `.codex` or a `config.toml` that is a link, what it points at.
+    ///
+    /// FAILS ON REVERT of the `config.toml` place and the link reading in
+    /// `codex_layers_may_have_moved`: each change below is not seen.
+    #[cfg(unix)]
+    #[test]
+    fn a_layer_changed_in_place_after_the_agent_started_is_uncertain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let proj = dir.path().join("proj");
+        let linked = dir.path().join("linked");
+        let filed = dir.path().join("filed");
+        let elsewhere = dir.path().join("elsewhere");
+        let shared = dir.path().join("shared");
+        for folder in [&proj, &linked, &filed, &elsewhere, &shared] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let evil = "[mcp_servers.docs]\ncommand = \"docs-evil\"\n";
+        std::fs::create_dir_all(proj.join(".codex")).unwrap();
+        std::fs::write(proj.join(".codex/config.toml"), evil).unwrap();
+        // `.codex` a link to a folder elsewhere.
+        std::fs::write(elsewhere.join("config.toml"), evil).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, linked.join(".codex")).unwrap();
+        // `config.toml` a link to a file elsewhere.
+        std::fs::create_dir_all(filed.join(".codex")).unwrap();
+        std::fs::write(shared.join("layer.toml"), evil).unwrap();
+        std::os::unix::fs::symlink(shared.join("layer.toml"), filed.join(".codex/config.toml"))
+            .unwrap();
+        let trusted = vec![proj.clone(), linked.clone(), filed.clone()];
+        std::thread::sleep(SETTLE_MARGIN + Duration::from_millis(300));
+        let started = Some(SystemTime::now());
+        for cwd in [&proj, &linked, &filed] {
+            assert!(
+                !codex_layers_may_have_moved(cwd, &trusted, started),
+                "{}",
+                cwd.display()
+            );
+        }
+        // Emptied in place, the folders untouched.
+        std::fs::File::create(proj.join(".codex/config.toml")).unwrap();
+        assert!(codex_layers_may_have_moved(&proj, &trusted, started));
+        // Moved out of the folder the link points at.
+        std::fs::rename(elsewhere.join("config.toml"), dir.path().join("gone.toml")).unwrap();
+        assert!(codex_layers_may_have_moved(&linked, &trusted, started));
+        // The file the link points at, rewritten.
+        std::fs::write(shared.join("layer.toml"), "").unwrap();
+        assert!(codex_layers_may_have_moved(&filed, &trusted, started));
+    }
+
+    /// A project made trusted, or a profile chosen, on Codex's command line
+    /// is not in the user's file: what layers Codex read cannot be told.
+    ///
+    /// FAILS ON REVERT of `codex_setting_reads_layers` in
+    /// `codex_argv_sets_servers`.
+    #[test]
+    fn a_codex_command_line_that_trusts_a_project_is_told() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        for words in [
+            &["codex", "-c", "projects./work/proj.trust_level=\"trusted\""][..],
+            &["codex", "-c", "projects.\"/work/proj\".trust_level=trusted"],
+            &["codex", "--config=projects={}"],
+            &["codex", "-c", "profile=work"],
+            &["codex", "-c", "profiles.work.model=o3"],
+            &["codex", "-cprofile=work"],
+        ] {
+            assert!(codex_argv_sets_servers(&argv(words)), "{words:?}");
+        }
+        for words in [
+            &["codex", "-c", "model=\"o3\""][..],
+            &["codex", "-c", "project_doc_max_bytes=1"],
+        ] {
+            assert!(!codex_argv_sets_servers(&argv(words)), "{words:?}");
+        }
     }
 }
