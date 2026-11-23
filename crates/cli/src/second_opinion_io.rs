@@ -33,6 +33,24 @@ fn config_path() -> Option<std::path::PathBuf> {
         .or_else(|| crate::graph_io::account_config_dir().map(|dir| dir.join("llm.toml")))
 }
 
+/// The line `llm status` adds when `IW_LLM_CONFIG` is set and not read (a
+/// release build, any value but `/dev/null`), so the person is not left
+/// wondering why the config they named is not the one shown.
+fn ignored_override_line() -> Option<&'static str> {
+    let named = std::env::var("IW_LLM_CONFIG").ok()?;
+    let named = named.trim();
+    if named.is_empty()
+        || crate::graph_io::honoured_override(
+            Some(named),
+            crate::graph_io::caller_overrides_honoured(),
+        )
+        .is_some()
+    {
+        return None;
+    }
+    Some("  not read: IW_LLM_CONFIG (a release build reads the second opinion's config only from your account's home, and the variable only as /dev/null, which turns it off: the hook runs with the AI agent's environment)")
+}
+
 /// Why a config the override names carries no key, said where a key is
 /// asked of one.
 const OVERRIDE_HAS_NO_KEY: &str = "IW_LLM_CONFIG names this config, and a config an override names never carries an API key: only the llm.toml in your account's home does";
@@ -869,6 +887,9 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 None => println!(
                     "innerwarden llm - not configured. Ambiguous commands escalate to a human.\n  set one: innerwarden llm set --url <chat-completions-URL> --model <name> [--provider azure], then innerwarden llm set-key"
                 ),
+            }
+            if let Some(line) = ignored_override_line() {
+                println!("{line}");
             }
             std::process::ExitCode::SUCCESS
         }

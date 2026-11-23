@@ -74,6 +74,17 @@ user's own file, or sits in a `.codex` that is a link to the user's
 `~/.codex`, is read as a layer, not as the user's file: swapped in after
 Codex started, it leaves the call judged.
 
+What the CLI sends to a listener on this host goes straight there, never
+through a proxy the environment names (`HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`): the MCP proxy's refusal reports and `contain`'s requests to
+InnerWarden Pro's agent, the OpenClaw guard's questions to Pro, and the
+probes `status` and `serve` make of the local dashboard and port. These run
+with the AI agent's environment, and a proxy named there saw every report
+and every command sent to Pro, and could drop or change Pro's answer.
+`notify --test` with no channel configured says it sent nothing, names any
+channel variable it did not read and why, and exits 1 (it printed nothing
+and exited 0). `llm status` says when `IW_LLM_CONFIG` was set and not read.
+
 `agents connect` leaves a server the agent signs in to by itself as it is,
 instead of wrapping it in the proxy, where the sign-in was lost (every call
 came back 401). Only a server reached by URL, on another host, with nothing
