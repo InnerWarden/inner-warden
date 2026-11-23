@@ -22,7 +22,7 @@
 //! `fetch(u).then(eval)`, a file the code downloads then loads) is
 //! [`InlineReading::runs_download`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::{js_option, node_called_sinks, shell_quoted, NodeCall};
 
@@ -30,6 +30,10 @@ use super::{js_option, node_called_sinks, shell_quoted, NodeCall};
 const UNREAD: char = '\u{1}';
 /// What a piece that is not read stands as in a line: an expansion.
 const UNREAD_WORD: &str = "$IW_UNREAD";
+/// Beside [`UNREAD`]: a piece that is the name of a file a listing
+/// (a glob with a wildcard, a directory read) found, which the guard has not
+/// seen and the code may have written.
+const LISTED: char = '\u{2}';
 /// The deepest expression folded.
 const FOLD_DEPTH: u8 = 12;
 /// How many times code handed to `exec` or `eval` as a written-out string
@@ -248,6 +252,15 @@ enum Sink {
 
 fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
     use Sink::*;
+    // PHP's function names ignore case and may name the global namespace
+    // (`SYSTEM(...)`, `\system(...)`).
+    let php_name;
+    let callee = if lang == Lang::Php {
+        php_name = php_function_name(callee);
+        php_name.as_str()
+    } else {
+        callee
+    };
     Some(match lang {
         Lang::Python => match callee {
             "os.system"
@@ -307,6 +320,8 @@ fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
             "eval" | "assert" | "create_function" => Code,
             "include" | "include_once" | "require" | "require_once" => Load,
             "array_map"
+            | "call_user_func"
+            | "call_user_func_array"
             | "register_shutdown_function"
             | "register_tick_function"
             | "forward_static_call"
@@ -346,12 +361,31 @@ fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
 
 /// Where code inside a string runs where it stands, by language: Perl's
 /// `"@{[ system(...) ]}"` and `"${\ system(...) }"`, PHP's
-/// `"{${ system(...) }}"`. What stands inside is read as code in its place.
-const CODE_IN_STRINGS: &[(Lang, &str)] = &[
-    (Lang::Perl, "@{["),
-    (Lang::Perl, "${\\"),
-    (Lang::Php, "{${"),
+/// `"{${ system(...) }}"`. Each opener, then any space, then one of the
+/// marks when there are any (Perl's `"@{ [ ... ] }"` runs as well): what
+/// stands inside is read as code in its place.
+const CODE_IN_STRINGS: &[(Lang, &str, &[char])] = &[
+    (Lang::Perl, "@{", &['[', '\\']),
+    (Lang::Perl, "${", &['[', '\\']),
+    (Lang::Php, "{${", &[]),
 ];
+
+/// How deep code inside a string inside code inside a string is read;
+/// deeper, it is held as not read.
+const MAX_STRING_CODE_DEPTH: u8 = 16;
+
+/// How far the brackets of a call through a value (`("sys"."tem")(...)`,
+/// `&{...}`, `_G[...]`) are looked for at first, in bytes: a line of
+/// thousands of openers would otherwise be read once for each.
+const HEAD_WINDOW: usize = 256;
+
+/// How many heads in one piece of code are looked for past
+/// [`HEAD_WINDOW`]; past that, the code is held as not read.
+const MAX_LONG_HEADS: u8 = 64;
+
+/// How many strings joined with `.` are read as the name a PHP call of a
+/// string builds.
+const MAX_JOINED_STRINGS: usize = 32;
 
 /// How a call reaches its function through a value rather than a name.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -670,8 +704,22 @@ struct Reader<'a> {
     /// function ...`, Perl's `$f = sub ...`): a call through one runs
     /// that body, which is read where it stands.
     closures: Vec<String>,
+    /// How deep the code being read stands inside strings that run code
+    /// ([`Self::scan_code_in_strings`]).
+    string_code_depth: u8,
+    /// How many heads of calls through a value had their brackets looked
+    /// for past [`HEAD_WINDOW`] ([`Self::head_closing`]).
+    long_heads: std::cell::Cell<u8>,
+    /// Whether a head was left unread because [`MAX_LONG_HEADS`] ran out.
+    heads_unread: std::cell::Cell<bool>,
     depth: u8,
     out: InlineReading,
+    /// PHP: whether a form in the code may set any name
+    /// ([`php_unreadable_names`]).
+    php_any_name_set: bool,
+    /// PHP: the names set somewhere other than by the statements the
+    /// reader follows ([`php_unreadable_names`]).
+    php_unreadable: HashSet<String>,
 }
 
 /// Reads a piece of inline code in `lang` for the process lines it builds.
@@ -692,10 +740,18 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
         read_names: Vec::new(),
         call_list: None,
         closures: Vec::new(),
+        string_code_depth: 0,
+        long_heads: std::cell::Cell::new(0),
+        heads_unread: std::cell::Cell::new(false),
         depth,
         out: InlineReading::default(),
+        php_any_name_set: false,
+        php_unreadable: HashSet::new(),
     };
     reader.run();
+    if reader.heads_unread.get() {
+        reader.out.unread = true;
+    }
     let mut read = vec![false; normalized.len()];
     for (start, end) in &reader.read_names {
         for byte in read.iter_mut().take(*end).skip(*start) {
@@ -993,16 +1049,6 @@ fn normalized_code(lang: Lang, code: &str) -> String {
                 });
             }
             text = lua_literal_indexes(&text);
-        }
-        Lang::Php => {
-            for opener in ["call_user_func(", "call_user_func_array("] {
-                text = replace_call_heads(&text, opener, |arguments| {
-                    let (name, rest) = simple_quoted(arguments.trim_start())?;
-                    let rest = rest.trim_start();
-                    let rest = rest.strip_prefix(',').unwrap_or(rest);
-                    (!name.is_empty() && is_chain(name)).then(|| (format!("{name}("), rest.len()))
-                });
-            }
         }
         _ => {}
     }
@@ -1341,6 +1387,60 @@ fn split_top_by(text: &str, at_separator: impl Fn(&str) -> Option<usize>) -> Vec
     parts
 }
 
+/// The statements of the code in `lang` ([`statements`]). Perl ends a
+/// statement at `;` alone: a line that ends inside one (after a `,`, an
+/// operator, or a function's name with its arguments on the next line,
+/// `open my $p,\n "-|",\n "..."`, `readpipe\n"..."`) goes on.
+fn statements_of(lang: Lang, code: &str) -> Vec<(usize, usize)> {
+    let pieces = statements(code);
+    if lang != Lang::Perl {
+        return pieces;
+    }
+    let goes_on = |text: &str| {
+        let text = text.trim_end();
+        if text.ends_with([
+            ',', '.', '=', '(', '[', '{', '|', '&', '+', '-', '*', '/', '?', ':', '<', '>', '\\',
+        ]) {
+            return true;
+        }
+        let word_start = text
+            .bytes()
+            .rposition(|b| !is_name_byte(b))
+            .map_or(0, |at| at + 1);
+        matches!(
+            &text[word_start..],
+            "readpipe"
+                | "open"
+                | "system"
+                | "exec"
+                | "do"
+                | "require"
+                | "eval"
+                | "print"
+                | "return"
+                | "my"
+                | "our"
+                | "local"
+                | "and"
+                | "or"
+                | "not"
+                | "x"
+                | "qx"
+        )
+    };
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    let mut joining = false;
+    for (start, end) in pieces {
+        match merged.last_mut() {
+            Some(last) if joining => last.1 = end,
+            _ => merged.push((start, end)),
+        }
+        let (from, to) = *merged.last().unwrap_or(&(start, end));
+        joining = code.as_bytes().get(to) == Some(&b'\n') && goes_on(&code[from..to]);
+    }
+    merged
+}
+
 /// The statements of the code, as byte ranges: top-level `;` and line ends.
 fn statements(code: &str) -> Vec<(usize, usize)> {
     split_top_by(code, |rest| rest.starts_with([';', '\n']).then_some(1))
@@ -1369,14 +1469,264 @@ impl Reader<'_> {
         }
         self.fetches = self.fetch_positions();
         self.functions = defined_functions(self.lang, code);
-        for (start, end) in statements(code) {
+        if self.lang == Lang::Php {
+            (self.php_any_name_set, self.php_unreadable) = php_unreadable_names(code);
+        }
+        for (mut start, end) in statements_of(self.lang, code) {
+            // Lua needs nothing between two statements: `local e = os.execute
+            // e("...")` is an assignment, then a call through the name.
+            while self.lang == Lang::Lua {
+                let Some(split) = lua_assignment_end(&code[start..end]) else {
+                    break;
+                };
+                self.scan(start, start + split);
+                self.assign(&code[start..start + split]);
+                start += split;
+            }
+            if self.lang == Lang::Php {
+                self.bind_foreach(&code[start..end]);
+                self.php_other_assignments(&code[start..end]);
+                self.drop_php_unreadable();
+            }
             self.scan(start, end);
             self.assign(&code[start..end]);
+            if self.lang == Lang::Php {
+                self.drop_php_unreadable();
+            }
         }
         let mut seen = std::collections::HashSet::new();
         self.out
             .lines
             .retain(|line| !line.trim().is_empty() && seen.insert(line.clone()));
+    }
+
+    /// PHP's `foreach (... as $k => $f)`: each name the loop sets holds
+    /// a value of what it walks, not read, and what it held before (a
+    /// value, a function written in place) is gone. A glob with no
+    /// wildcard (`glob("config.php")`) walks that one path, so the name
+    /// holds it; a pattern with one (`glob("./*.sh")`, `glob("/dev/std*")`)
+    /// matches files the guard has not seen, maybe ones the code wrote.
+    fn bind_foreach(&mut self, statement: &str) {
+        let lower = statement.to_ascii_lowercase();
+        let starts: Vec<usize> = lower
+            .match_indices("foreach")
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                !lower[..at].bytes().next_back().is_some_and(is_name_byte)
+                    && !lower[at + 7..].bytes().next().is_some_and(is_name_byte)
+            })
+            .collect();
+        for at in starts {
+            if !self.bind_foreach_at(&statement[at + 7..]) {
+                // A loop whose head is not read may set any name.
+                self.forget_all();
+                return;
+            }
+        }
+    }
+
+    /// Reads one `foreach` head; false when it cannot be read.
+    fn bind_foreach_at(&mut self, rest: &str) -> bool {
+        let rest = without_comments(rest);
+        let Some(inner) = rest.trim_start().strip_prefix('(') else {
+            return false;
+        };
+        let Some(close) = closing(inner) else {
+            return false;
+        };
+        let head = &inner[..close];
+        let Some((as_at, as_end)) = last_as_keyword(head) else {
+            return false;
+        };
+        let walked = head[..as_at].trim();
+        let fixed_path = walked
+            .strip_prefix("glob(")
+            .and_then(|arguments| arguments.strip_suffix(')'))
+            .and_then(|arguments| simple_quoted(arguments.trim()))
+            .filter(|(pattern, after)| {
+                after.trim().is_empty() && !pattern.contains(['*', '?', '[', '{', '\\'])
+            })
+            .map(|(pattern, _)| pattern.to_owned());
+        let listing = fixed_path.is_none() && self.walks_listing(walked);
+        let bound_text = &head[as_end..];
+        let single = bound_text
+            .rsplit("=>")
+            .next()
+            .map(|last| last.trim().trim_start_matches('&').trim())
+            .filter(|last| is_variable(last));
+        for name in variables_in(bound_text) {
+            self.forget(&name);
+            let value = if listing {
+                listed()
+            } else {
+                match (&fixed_path, single) {
+                    (Some(path), Some(last)) if last == name => Value::Str(path.clone()),
+                    _ => Value::Unknown,
+                }
+            };
+            self.vars.insert(name, value);
+        }
+        true
+    }
+
+    /// Whether what a PHP `foreach` walks is names of files the guard has
+    /// not seen: a glob, a directory read, or a name holding one.
+    fn walks_listing(&self, walked: &str) -> bool {
+        let lower = walked.to_ascii_lowercase();
+        [
+            "glob",
+            "scandir",
+            "readdir",
+            "opendir",
+            "directoryiterator",
+            "filesystemiterator",
+        ]
+        .iter()
+        .any(|word| lower.contains(word))
+            || variables_in(walked).iter().any(|name| {
+                self.vars
+                    .get(name)
+                    .is_some_and(|value| value.text().contains(LISTED))
+            })
+    }
+
+    /// PHP: the names [`php_unreadable_names`] found set where the reader
+    /// does not follow lose what the reader knew of them, as on main. A
+    /// file name a listing found stays one: it is no more read.
+    fn drop_php_unreadable(&mut self) {
+        let names: Vec<String> = if self.php_any_name_set {
+            self.closures.clear();
+            self.aliases.clear();
+            self.vars.keys().cloned().collect()
+        } else {
+            self.php_unreadable.iter().cloned().collect()
+        };
+        for name in names {
+            // A name not set yet stays unset: a parameter is bound to what
+            // each call hands it ([`Self::with_parameters`]).
+            let Some(held) = self.vars.get(&name) else {
+                self.closures.retain(|closure| closure != &name);
+                self.aliases.remove(&name);
+                continue;
+            };
+            let listing = held.text().contains(LISTED);
+            self.forget(&name);
+            if listing {
+                self.vars.insert(name, listed());
+            }
+        }
+    }
+
+    /// Everything the reader knew of names is gone.
+    fn forget_all(&mut self) {
+        let names: Vec<String> = self.vars.keys().cloned().collect();
+        for name in names {
+            self.forget(&name);
+        }
+        self.closures.clear();
+        self.aliases.clear();
+    }
+
+    /// A name given a value the reader does not follow: what it held
+    /// before, and a function written in place it was set to, are gone.
+    fn forget(&mut self, name: &str) {
+        self.closures.retain(|closure| closure != name);
+        self.aliases.remove(name);
+        self.vars.insert(name.to_owned(), Value::Unknown);
+    }
+
+    /// PHP's ways to set names other than `name = value`: `list($a, $f) =`,
+    /// `[$a, $f] =`, `$GLOBALS["f"] =`, and `extract(...)`, which may set
+    /// any name. The names lose what the reader knew of them.
+    fn php_other_assignments(&mut self, statement: &str) {
+        let text = statement.trim_start();
+        let bytes = text.as_bytes();
+        let mut opens = Vec::new();
+        for (at, _) in text.match_indices("list(") {
+            if !text[..at]
+                .bytes()
+                .next_back()
+                .is_some_and(|b| is_name_byte(b) || b == b'$')
+            {
+                opens.push(at + 5);
+            }
+        }
+        for (at, _) in text.match_indices('[') {
+            let before = text[..at].trim_end();
+            if before.is_empty() || before.ends_with([';', '{', '(', ',', '}']) {
+                opens.push(at + 1);
+            }
+        }
+        for open in opens {
+            if open > bytes.len() {
+                continue;
+            }
+            let rest = &text[open..];
+            let Some(close) = closing(rest) else { continue };
+            let (names, after) = (&rest[..close], &rest[close + 1..]);
+            let after = after.trim_start();
+            if after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>") {
+                for name in names.split([',', ' ', '(', ')', '[', ']', '&']) {
+                    let name = name.rsplit("=>").next().unwrap_or(name).trim();
+                    if is_variable(name) {
+                        self.forget(name);
+                    }
+                }
+            }
+        }
+        let mut at = 0;
+        while let Some(found) = text[at..].find("$GLOBALS[") {
+            let key = &text[at + found + 9..];
+            at += found + 9;
+            if let Some((name, after)) = simple_quoted(key.trim_start()) {
+                let after = after
+                    .trim_start()
+                    .strip_prefix(']')
+                    .unwrap_or("")
+                    .trim_start();
+                if after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>") {
+                    self.forget(&format!("${name}"));
+                }
+            }
+        }
+        let lower = text.to_ascii_lowercase();
+        // `$f = readdir($d)` anywhere, as in a `while` head: a file name
+        // a directory read found.
+        for word in ["readdir", "scandir", "glob"] {
+            for (found, _) in lower.match_indices(word) {
+                if lower[..found].bytes().next_back().is_some_and(is_name_byte)
+                    || !lower[found + word.len()..].trim_start().starts_with('(')
+                {
+                    continue;
+                }
+                let before = text[..found].trim_end();
+                let Some(before) = before.strip_suffix('=') else {
+                    continue;
+                };
+                if before.ends_with(['=', '!', '<', '>']) {
+                    continue;
+                }
+                let before = before.trim_end();
+                let start = before
+                    .bytes()
+                    .rposition(|b| !is_name_byte(b))
+                    .map_or(0, |at| at + 1);
+                let name = &before[start..];
+                if is_variable(name) && word != "glob" {
+                    self.forget(name);
+                    self.vars.insert(name.to_owned(), listed());
+                }
+            }
+        }
+        if lower.match_indices("extract").any(|(found, _)| {
+            !lower[..found]
+                .bytes()
+                .next_back()
+                .is_some_and(|b| is_name_byte(b) || b == b'$')
+                && lower[found + 7..].trim_start().starts_with('(')
+        }) {
+            self.forget_all();
+        }
     }
 
     fn fetch_before(&self, at: usize) -> bool {
@@ -1485,6 +1835,11 @@ impl Reader<'_> {
         let mut sites = Vec::new();
         let mut at = start;
         while at < end {
+            if self.lang == Lang::Php && matches!(bytes[at], b'"' | b'\'') {
+                if let Some((name, arguments_at)) = self.php_called_string(at, end) {
+                    sites.push((name, at, arguments_at));
+                }
+            }
             if let Some(skip) = self.skip_literal(at, end) {
                 at = skip.max(at + 1);
                 continue;
@@ -1507,7 +1862,12 @@ impl Reader<'_> {
             let chain_end = self.chain_end(at, end);
             let chain = &code[at..chain_end];
             let mut next = chain_end;
-            while next < end && bytes[next] == b' ' {
+            // Perl and PHP take a line end as a space: `readpipe\n"..."`.
+            while next < end
+                && (bytes[next] == b' '
+                    || (matches!(self.lang, Lang::Perl | Lang::Php)
+                        && matches!(bytes[next], b'\t' | b'\n' | b'\r')))
+            {
                 next += 1;
             }
             if next < end && bytes[next] == b'(' {
@@ -1535,9 +1895,20 @@ impl Reader<'_> {
                 chain,
                 "system" | "exec" | "spawn" | "eval" | "load" | "require"
             ),
-            Lang::Perl => matches!(chain, "system" | "exec" | "eval" | "do" | "require"),
-            Lang::Php => matches!(
+            Lang::Perl => matches!(
                 chain,
+                "system"
+                    | "exec"
+                    | "eval"
+                    | "do"
+                    | "require"
+                    | "open"
+                    | "CORE::open"
+                    | "readpipe"
+                    | "CORE::readpipe"
+            ),
+            Lang::Php => matches!(
+                php_function_name(chain).as_str(),
                 "include" | "include_once" | "require" | "require_once" | "eval"
             ),
             _ => false,
@@ -1618,7 +1989,7 @@ impl Reader<'_> {
         self.scan_code_in_strings(start, end);
         for (chain, at, arguments_at) in self.call_sites(start, end) {
             let callee = if self.lang == Lang::Php && is_variable(&chain) {
-                self.called_variable(&chain)
+                self.called_php_variable(&chain)
             } else {
                 self.callee(&chain)
             };
@@ -1643,7 +2014,11 @@ impl Reader<'_> {
             } else if self.lang == Lang::Lua {
                 &code[arguments_at..self.lua_single_argument_end(arguments_at, end)]
             } else {
-                trailing_modifier_cut(&code[arguments_at..end])
+                // A call without brackets ends with its statement, which
+                // may stand inside a block: `{ require $f; }`.
+                let own = &code[arguments_at..end];
+                let own = &own[..closing(own).unwrap_or(own.len())];
+                trailing_modifier_cut(split_top(own, ";").first().copied().unwrap_or(own))
             };
             let done = arguments_at + arguments.len();
             self.with_parameters(arguments, |reader| reader.read_sink(sink, done, arguments));
@@ -1775,24 +2150,36 @@ impl Reader<'_> {
     }
 
     /// Code that runs inside a string where it stands ([`CODE_IN_STRINGS`]),
-    /// read in its place.
+    /// read in its place. Only the outermost openers are read here: the
+    /// scan of what one holds reads the openers inside it, so each piece is
+    /// read once whatever the depth.
     fn scan_code_in_strings(&mut self, start: usize, end: usize) {
         let code = self.code;
-        for &(lang, opener) in CODE_IN_STRINGS {
-            if lang != self.lang {
+        let mut at = start;
+        while at < end {
+            let Some(offset) = code[at..end].find(['@', '$', '{']) else {
+                break;
+            };
+            let opener = at + offset;
+            let Some(inner) = code_in_string(self.lang, &code[opener..end]) else {
+                at = opener + 1;
                 continue;
-            }
-            let found: Vec<usize> = code[start..end]
-                .match_indices(opener)
-                .map(|(offset, _)| start + offset + opener.len())
-                .collect();
-            for inner in found {
-                if let Some(close) = closing(&code[inner..end]) {
-                    if close > 0 {
-                        self.scan(inner, inner + close);
-                    }
+            };
+            let inner = opener + inner;
+            let Some(close) = closing(&code[inner..end]) else {
+                at = inner;
+                continue;
+            };
+            if close > 0 {
+                if self.string_code_depth >= MAX_STRING_CODE_DEPTH {
+                    self.out.unread = true;
+                    return;
                 }
+                self.string_code_depth += 1;
+                self.scan(inner, inner + close);
+                self.string_code_depth -= 1;
             }
+            at = inner + close;
         }
     }
 
@@ -1817,7 +2204,7 @@ impl Reader<'_> {
                     if before.is_some_and(|b| is_name_byte(b) || matches!(b, b'&' | b'\\')) {
                         continue;
                     }
-                    let close = open + closing(&code[open..])?;
+                    let close = open + self.head_closing(&code[open..])?;
                     // `&{...}` with no brackets calls with the caller's own
                     // arguments: what it runs is not read either.
                     let arguments_at = arguments_after(close + 1).unwrap_or(close + 1);
@@ -1853,13 +2240,18 @@ impl Reader<'_> {
                     }) {
                         continue;
                     }
-                    let close = open + closing(&code[open..])?;
+                    let close = open + self.head_closing(&code[open..])?;
                     let inner = code[open..close].trim();
                     // A function written in place is read where it stands.
                     if inner.starts_with("function")
                         || inner.starts_with("fn")
                         || inner.starts_with("static")
                     {
+                        continue;
+                    }
+                    // A cast (`(int)($x)`) or a constant: a name alone
+                    // in brackets names no function PHP calls.
+                    if !inner.contains(['$', '.']) && is_function_name(inner) {
                         continue;
                     }
                     let Some(arguments_at) = arguments_after(close + 1) else {
@@ -1872,14 +2264,121 @@ impl Reader<'_> {
                         continue;
                     }
                     // A key written out was read as the name it is
-                    // ([`normalized_code`]); this one is built at run time.
-                    return Some((UNREAD.to_string(), open));
+                    // ([`normalized_code`]); a key a name holds is folded,
+                    // one built at run time is not read. Only a call of
+                    // what the index reaches is held: `type(_G[k])` calls
+                    // nothing.
+                    let (mut name, length) = self.lua_indexed(rest)?;
+                    let mut after = code[at + length..].trim_start();
+                    if let Some(method) = after.strip_prefix(['.', ':']) {
+                        let method_end = method
+                            .bytes()
+                            .position(|b| !is_name_byte(b))
+                            .unwrap_or(method.len());
+                        if method_end == 0 {
+                            return None;
+                        }
+                        if !name.contains(UNREAD) {
+                            name = self.callee(&format!("{name}.{}", &method[..method_end]));
+                        }
+                        after = method[method_end..].trim_start();
+                    }
+                    let arguments_at = end - after.len();
+                    return if after.starts_with('(') {
+                        Some((name, arguments_at + 1))
+                    } else if after.starts_with(['"', '\'', '{'])
+                        || lua_long_bracket(after).is_some()
+                    {
+                        Some((name, arguments_at))
+                    } else {
+                        None
+                    };
                 }
             }
         }
         None
     }
 
+    /// Where the brackets a head of a call through a value opens close
+    /// ([`closing`]), looked for within [`HEAD_WINDOW`] first, and past it
+    /// only [`MAX_LONG_HEADS`] times.
+    fn head_closing(&self, text: &str) -> Option<usize> {
+        let mut window = text.len().min(HEAD_WINDOW);
+        while !text.is_char_boundary(window) {
+            window -= 1;
+        }
+        if let Some(close) = closing(&text[..window]) {
+            return Some(close);
+        }
+        if window == text.len() {
+            return None;
+        }
+        if self.long_heads.get() >= MAX_LONG_HEADS {
+            self.heads_unread.set(true);
+            return None;
+        }
+        self.long_heads.set(self.long_heads.get() + 1);
+        closing(text)
+    }
+
+    /// Lua's `os[k]` or `_G[k]` at the start of `text`: the name it reaches
+    /// (`os.execute`, or [`UNREAD`] for a key not read) and how many bytes
+    /// the index takes.
+    fn lua_indexed(&self, text: &str) -> Option<(String, usize)> {
+        let opener = CALL_THROUGH_VALUE
+            .iter()
+            .filter(|(lang, _, head)| *lang == Lang::Lua && *head == Head::Indexed)
+            .map(|(_, opener, _)| *opener)
+            .find(|opener| text.starts_with(opener))?;
+        let open = opener.len();
+        let close = open + self.head_closing(&text[open..])?;
+        let table = &opener[..open - 1];
+        let name = match self.fold(text[open..close].trim(), FOLD_DEPTH).literal() {
+            Some(key) if is_chain(key.trim()) && !key.contains('.') => {
+                self.callee(&format!("{table}.{}", key.trim()))
+            }
+            _ => UNREAD.to_string(),
+        };
+        Some((name, close + 1))
+    }
+
+    /// What a Lua name is given when its whole value is an index of a table
+    /// of functions (`local f = os[k]`): a function that starts a process,
+    /// a table of them, or [`UNREAD`] for a key not read. A call through
+    /// the name reaches it.
+    fn lua_index_name(&self, expression: &str) -> Option<String> {
+        let (name, length) = self.lua_indexed(expression)?;
+        if !expression[length..].trim().is_empty() {
+            return None;
+        }
+        let holder = SINK_HOLDERS
+            .iter()
+            .any(|&(lang, held)| lang == Lang::Lua && held == name);
+        (name.contains(UNREAD) || holder || sink_of(Lang::Lua, &name).is_some()).then_some(name)
+    }
+
+    /// PHP calls a string as the function it names: `"system"(...)`,
+    /// `"sys"."tem"(...)`. At a string that starts at `at`: the name the
+    /// strings joined up to the call build, and where its arguments start.
+    fn php_called_string(&self, at: usize, end: usize) -> Option<(String, usize)> {
+        let mut rest = &self.code[at..end];
+        let mut name = String::new();
+        for _ in 0..MAX_JOINED_STRINGS {
+            let (value, after) = self.string_at(rest, None)?;
+            name.push_str(value.literal()?);
+            rest = after.trim_start();
+            match rest.strip_prefix('.') {
+                Some(next) if !next.starts_with(['.', '=']) => rest = next.trim_start(),
+                _ => {
+                    let arguments = rest.strip_prefix('(')?;
+                    let name = name.trim();
+                    return is_function_name(name)
+                        .then(|| (name.to_owned(), end - arguments.len()));
+                }
+            }
+        }
+        None
+    }
     /// The function an expression names, when the reader can fold it to a
     /// name; [`UNREAD`] otherwise.
     fn called_name(&self, expression: &str) -> String {
@@ -1902,6 +2401,102 @@ impl Reader<'_> {
     /// The function a variable holds: a name it was set to, a function
     /// written in place (read where it stands, so it is no sink here), or
     /// [`UNREAD`].
+    /// Where each call of a function the code defines hands it its
+    /// arguments, and where the statement ends: the first 65.
+    fn calls_of(&mut self, function: &str) -> Vec<(usize, usize)> {
+        let code = self.code;
+        if self.call_list.is_none() {
+            let mut list = Vec::new();
+            for (start, end) in statements_of(self.lang, code) {
+                for (chain, at, arguments_at) in self.call_sites(start, end) {
+                    let defining = code[..at].trim_end().ends_with("def")
+                        || code[..at].trim_end().ends_with("function");
+                    if !defining {
+                        list.push((chain, arguments_at, end));
+                    }
+                }
+            }
+            self.call_list = Some(list);
+        }
+        self.call_list
+            .iter()
+            .flatten()
+            .filter(|(chain, _, _)| {
+                *chain == function
+                    || (self.lang == Lang::Php
+                        && php_function_name(chain) == php_function_name(function))
+            })
+            .map(|(_, arguments_at, end)| (*arguments_at, *end))
+            .take(65)
+            .collect()
+    }
+
+    /// Whether the `calls` calls of a PHP function the code defines are all
+    /// the places its name stands, besides its definition. A name PHP looks
+    /// up without case also runs from a string (`call_user_func("apply",
+    /// ...)`, `array_map("apply", ...)`, `register_shutdown_function`,
+    /// which hands nothing and leaves the defaults) or as a method
+    /// (`A::apply(...)`): what those hand is not read.
+    fn php_calls_all_seen(&self, function: &str, calls: usize) -> bool {
+        if self.lang != Lang::Php {
+            return true;
+        }
+        let code = self.code.to_ascii_lowercase();
+        let name = php_function_name(function);
+        if name.is_empty() {
+            return false;
+        }
+        let bytes = code.as_bytes();
+        let standing = code
+            .match_indices(name.as_str())
+            .filter(|(at, _)| {
+                !(*at > 0 && (is_name_byte(bytes[at - 1]) || bytes[at - 1] == b'$'))
+                    && !bytes.get(at + name.len()).is_some_and(|b| is_name_byte(*b))
+            })
+            .count();
+        standing == calls + 1
+    }
+
+    /// The function a PHP variable holds ([`Self::called_variable`]). A
+    /// parameter of a function the code defines holds what the calls of
+    /// that function hand it: when each hands a function written in place
+    /// or the name of one that starts no process (`apply("strtoupper",
+    /// $x)`), the call through it is no sink; anything else is not read.
+    fn called_php_variable(&mut self, variable: &str) -> String {
+        let called = self.called_variable(variable);
+        if !called.contains(UNREAD) || self.vars.contains_key(variable) {
+            return called;
+        }
+        let Some((function, index)) = self.functions.iter().find_map(|(name, parameters)| {
+            parameters
+                .iter()
+                .position(|parameter| parameter == variable)
+                .map(|index| (name.clone(), index))
+        }) else {
+            return called;
+        };
+        let calls = self.calls_of(&function);
+        if !self.php_calls_all_seen(&function, calls.len()) {
+            return called;
+        }
+        for (arguments_at, end) in calls {
+            let handed = split_top(call_arguments(&self.code[arguments_at..end]), ",");
+            let Some(argument) = handed.get(index).map(|argument| argument.trim()) else {
+                return called;
+            };
+            if written_in_place(argument) {
+                continue;
+            }
+            match self.fold(argument, FOLD_DEPTH).literal() {
+                Some(name)
+                    if is_function_name(name.trim())
+                        && sink_of(self.lang, &self.callee(name.trim())).is_none() => {}
+                _ => return called,
+            }
+        }
+        variable.to_owned()
+    }
+
     fn called_variable(&self, variable: &str) -> String {
         if self.closures.iter().any(|closure| closure == variable) {
             return variable.to_owned();
@@ -2078,27 +2673,11 @@ impl Reader<'_> {
             return;
         };
         let code = self.code;
-        if self.call_list.is_none() {
-            let mut list = Vec::new();
-            for (start, end) in statements(code) {
-                for (chain, at, arguments_at) in self.call_sites(start, end) {
-                    let defining = code[..at].trim_end().ends_with("def")
-                        || code[..at].trim_end().ends_with("function");
-                    if !defining {
-                        list.push((chain, arguments_at, end));
-                    }
-                }
-            }
-            self.call_list = Some(list);
+        let calls = self.calls_of(&function);
+        if !self.php_calls_all_seen(&function, calls.len()) {
+            read(self);
+            return;
         }
-        let calls: Vec<(usize, usize)> = self
-            .call_list
-            .iter()
-            .flatten()
-            .filter(|(chain, _, _)| *chain == function)
-            .map(|(_, arguments_at, end)| (*arguments_at, *end))
-            .take(65)
-            .collect();
         let mut bindings = Vec::new();
         {
             for (arguments_at, end) in calls {
@@ -2447,23 +3026,15 @@ impl Reader<'_> {
             }
             Sink::OpenPipe => self.read_open(done, &positional),
             Sink::Callback(index) => self.read_callback(done, &positional, usize::from(index)),
-            Sink::WriteFile => {
-                if let Some(path) = self.positional_value(&positional, 0).literal() {
-                    let text = self
-                        .positional_value(&positional, 1)
-                        .text()
-                        .replace(UNREAD, UNREAD_WORD);
-                    let written = (path.trim().to_owned(), text);
-                    if !self.out.written.contains(&written) {
-                        self.out.written.push(written);
-                    }
-                }
-            }
+            Sink::WriteFile => self.note_written(&positional),
         }
     }
 
     /// Code loaded from a path or a URL.
     fn read_load(&mut self, value: Value) {
+        if self.load_written(&value.text()) {
+            return;
+        }
         let Some(path) = value.literal() else {
             // A path built at run time whose end is not read may be any
             // file: Perl, PHP and Lua load it as code the guard has not
@@ -2490,19 +3061,9 @@ impl Reader<'_> {
             }
             return;
         }
-        // A file the code itself wrote: what it wrote is the code loaded.
-        if let Some((_, text)) = self
-            .out
-            .written
-            .iter()
-            .find(|(written, _)| same_path(written, path))
-        {
-            if text.contains(UNREAD_WORD) {
-                self.out.code_unread = true;
-            } else {
-                let inner = read_code(self.lang, &text.clone(), self.depth - 1);
-                self.out.merge(inner.nested());
-            }
+        // The process's own input: code sent on stdin, not read here.
+        if matches!(self.lang, Lang::Perl | Lang::Php | Lang::Lua) && names_stdin(path) {
+            self.out.code_unread = true;
             return;
         }
         if lower.starts_with("data:") {
@@ -2519,6 +3080,59 @@ impl Reader<'_> {
         }
     }
 
+    /// A file the code itself wrote, loaded as code: what it wrote is the
+    /// code loaded, read here ([`written_file`]). Whether `path` is one.
+    fn load_written(&mut self, path: &str) -> bool {
+        let Some(text) = self
+            .out
+            .written
+            .iter()
+            .find(|(written, _)| written_file(written, path))
+            .map(|(_, text)| text.clone())
+        else {
+            return false;
+        };
+        if text.contains(UNREAD_WORD) {
+            self.out.code_unread = true;
+        } else {
+            let inner = read_code(self.lang, &text, self.depth - 1);
+            self.out.merge(inner.nested());
+        }
+        true
+    }
+
+    /// What `file_put_contents` writes: a path built at run time is kept
+    /// when it ends in a name written out (`__DIR__ . "/x.php"`), and a
+    /// write with `FILE_APPEND`, or with flags not read, adds to what an
+    /// earlier write of the same file left there.
+    fn note_written(&mut self, positional: &[&str]) {
+        let path = self.positional_value(positional, 0).text();
+        if path.trim().is_empty() || path.trim_end().ends_with(UNREAD) {
+            return;
+        }
+        let path = path.trim().to_owned();
+        let text = self
+            .positional_value(positional, 1)
+            .text()
+            .replace(UNREAD, UNREAD_WORD);
+        let append = positional.get(2).is_some_and(|flags| {
+            let known = flags
+                .split('|')
+                .all(|flag| matches!(flag.trim(), "0" | "LOCK_EX" | "FILE_USE_INCLUDE_PATH"));
+            flags.contains("FILE_APPEND") || !known
+        });
+        match self
+            .out
+            .written
+            .iter_mut()
+            .find(|(written, _)| written_file(written, &path))
+        {
+            Some((_, before)) if append => before.push_str(&text),
+            Some((_, before)) => *before = text,
+            None => self.out.written.push((path, text)),
+        }
+    }
+
     /// A line handed to a shell.
     fn read_line(&mut self, done: usize, value: Value) {
         let text = match value {
@@ -2530,6 +3144,12 @@ impl Reader<'_> {
             }
             Value::Unknown => UNREAD.to_string(),
         };
+        // A file name a listing found, run or handed to what runs: the
+        // file is not read, whatever is written around it.
+        if text.contains(LISTED) {
+            self.out.unread = true;
+        }
+        let text = text.replace(LISTED, "");
         if text.trim_start().starts_with(UNREAD) || text.trim().is_empty() {
             self.out.unread = true;
         }
@@ -2576,6 +3196,16 @@ impl Reader<'_> {
                 other => flat.push(other),
             }
         }
+        if flat.iter().any(|word| word.text().contains(LISTED)) {
+            self.out.unread = true;
+        }
+        let flat: Vec<Value> = flat
+            .into_iter()
+            .map(|word| match word {
+                Value::Str(text) => Value::Str(text.replace(LISTED, "")),
+                other => other,
+            })
+            .collect();
         let Some(program) = flat.first() else {
             return;
         };
@@ -2736,6 +3366,20 @@ impl Reader<'_> {
                 return;
             };
         let expression = expression.trim();
+        // The latest value a name is given is the one a call through it
+        // reaches: a closure set before is gone.
+        if !append && matches!(self.lang, Lang::Php | Lang::Perl | Lang::Lua) {
+            self.closures.retain(|closure| closure != name);
+            self.aliases.remove(name);
+        }
+        // Lua's `os[k]` with a key built at run time: a call through the
+        // name reaches what the key names.
+        if self.lang == Lang::Lua && !append {
+            if let Some(held) = self.lua_index_name(expression) {
+                self.aliases.insert(name.to_owned(), held);
+                return;
+            }
+        }
         // A name given a function or a module: `s = os.system`, Lua's
         // `local e = os.execute` and `local o = os`.
         if matches!(self.lang, Lang::Python | Lang::Lua) && !append && is_chain(expression) {
@@ -2752,10 +3396,7 @@ impl Reader<'_> {
         if matches!(self.lang, Lang::Php | Lang::Perl | Lang::Lua) && !append {
             // A function written in place: a call through the name runs its
             // body, read where it stands.
-            if ["function", "fn", "sub", "static function"]
-                .iter()
-                .any(|word| expression.starts_with(word))
-            {
+            if written_in_place(expression) {
                 self.closures.push(name.to_owned());
             }
             // Perl's `$f = \&CORE::system`: the function by its name.
@@ -3119,6 +3760,12 @@ impl Reader<'_> {
             | "CGI.unescape" => first()
                 .literal()
                 .map_or(Value::Unknown, |text| capped(percent_decoded(text))),
+            "glob" | "scandir" | "readdir" if self.lang == Lang::Php => match first().literal() {
+                Some(path) if callee == "glob" && !path.contains(['*', '?', '[', '{', '\\']) => {
+                    Value::Str(path.to_owned())
+                }
+                _ => listed(),
+            },
             "strrev" => first().literal().map_or(Value::Unknown, |text| {
                 Value::Str(text.chars().rev().collect())
             }),
@@ -3426,6 +4073,8 @@ impl Reader<'_> {
             template || (quote == b'"' && matches!(self.lang, Lang::Ruby | Lang::Perl | Lang::Php));
         let value = if !escapes {
             inner.replace("\\'", "'").replace("\\\\", "\\")
+        } else if self.lang == Lang::Lua {
+            lua_unescaped(inner)
         } else {
             match (interpolating, depth) {
                 (true, Some(depth)) => match self.lang {
@@ -3604,6 +4253,48 @@ fn quoted_end(text: &str, quote: char, escapes: bool) -> Option<usize> {
         }
     }
     None
+}
+
+/// A Lua string body with its escapes read: Lua writes a byte by its
+/// decimal value (`\114` is `r`), and `\z` skips the space after it.
+fn lua_unescaped(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            plain.push(character);
+            continue;
+        }
+        match characters.peek() {
+            Some(digit) if digit.is_ascii_digit() => {
+                let mut value = 0u32;
+                for _ in 0..3 {
+                    match characters.next_if(char::is_ascii_digit) {
+                        Some(digit) => value = value * 10 + digit.to_digit(10).unwrap_or(0),
+                        None => break,
+                    }
+                }
+                match char::from_u32(value) {
+                    // Read again as a backslash written out.
+                    Some('\\') => plain.push_str("\\\\"),
+                    Some(decoded) if value < 0x80 => plain.push(decoded),
+                    _ => plain.push(UNREAD),
+                }
+            }
+            Some('z') => {
+                characters.next();
+                while characters.next_if(|c| c.is_whitespace()).is_some() {}
+            }
+            Some(_) => {
+                plain.push('\\');
+                if let Some(escaped) = characters.next() {
+                    plain.push(escaped);
+                }
+            }
+            None => plain.push('\\'),
+        }
+    }
+    unescaped(&plain)
 }
 
 /// A string body with its backslash escapes read.
@@ -3825,6 +4516,632 @@ fn is_function_name(text: &str) -> bool {
             .all(|b| is_name_byte(b) || matches!(b, b':' | b'.'))
 }
 
+/// A PHP function's name as PHP looks it up: without case, and without the
+/// backslash that names the global namespace.
+fn php_function_name(name: &str) -> String {
+    name.strip_prefix('\\').unwrap_or(name).to_ascii_lowercase()
+}
+
+/// Whether a path names the process's own input (`/dev/stdin`,
+/// `/dev/fd/0`, `/proc/self/fd/0`): code loaded from it is what is sent on
+/// stdin, which the guard does not read.
+///
+/// The path is taken as the kernel resolves it first: `file://` dropped,
+/// doubled slashes, `.` and `..` folded (`//dev/stdin`, `/dev/./stdin`,
+/// `/dev/../dev/stdin`), and any process's descriptors
+/// (`/proc/thread-self/fd/0`, `/proc/1/fd/0`).
+fn names_stdin(path: &str) -> bool {
+    let path = path
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("file://"))
+        .map_or(path, |_| &path[7..]);
+    if !path.starts_with('/') {
+        return false;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    let descriptor = |fd: &str| {
+        !fd.is_empty()
+            && fd
+                .bytes()
+                .all(|b| b.is_ascii_digit() || b"*?[]".contains(&b))
+    };
+    let process = |name: &str| {
+        matches!(name, "self" | "thread-self")
+            || (!name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b"*?[]".contains(&b)))
+    };
+    match parts.as_slice() {
+        ["dev", "stdin"] => true,
+        ["dev", "fd", fd] => descriptor(fd),
+        ["proc", name, "fd", fd] => process(name) && descriptor(fd),
+        ["proc", name, "task", task, "fd", fd] => process(name) && process(task) && descriptor(fd),
+        _ => false,
+    }
+}
+
+/// Where a Lua assignment that starts `statement` and gives a name a
+/// function, a module or what a call returns (`local e = os.execute`,
+/// `local o = rawget(_G, "os")`) ends, when another statement follows it
+/// with nothing between them but a space: a name after the value with no
+/// operator starts the next one.
+fn lua_assignment_end(statement: &str) -> Option<usize> {
+    let bytes = statement.as_bytes();
+    let skip_space = |mut at: usize| {
+        while at < bytes.len() && bytes[at].is_ascii_whitespace() {
+            at += 1;
+        }
+        at
+    };
+    let name_end = |mut at: usize| {
+        while at < bytes.len() && is_name_byte(bytes[at]) {
+            at += 1;
+        }
+        at
+    };
+    let mut at = skip_space(0);
+    if statement[at..].starts_with("local")
+        && bytes.get(at + 5).is_some_and(u8::is_ascii_whitespace)
+    {
+        at = skip_space(at + 5);
+    }
+    let name = name_end(at);
+    if name == at {
+        return None;
+    }
+    at = skip_space(name);
+    if bytes.get(at) != Some(&b'=') || bytes.get(at + 1) == Some(&b'=') {
+        return None;
+    }
+    at = skip_space(at + 1);
+    // The value: operands (a number, a string, a table, a bracketed
+    // expression, a name with its fields, calls and indexes) joined by
+    // operators: `local x = 1 local e = os.execute` holds two statements.
+    loop {
+        while let Some(rest) = statement.get(at..) {
+            if rest.starts_with("not") && rest[3..].starts_with(char::is_whitespace) {
+                at = skip_space(at + 3);
+            } else if rest.starts_with(['-', '#', '~']) && !rest.starts_with("--") {
+                at = skip_space(at + 1);
+            } else {
+                break;
+            }
+        }
+        let operand = at;
+        match bytes.get(at)? {
+            b'0'..=b'9' => {
+                while at < bytes.len()
+                    && (bytes[at].is_ascii_alphanumeric()
+                        || bytes[at] == b'.' && bytes.get(at + 1) != Some(&b'.'))
+                {
+                    at += 1;
+                }
+            }
+            quote @ (b'\'' | b'"') => {
+                at += 1;
+                while at < bytes.len() && bytes[at] != *quote {
+                    if bytes[at] == b'\\' {
+                        at += 1;
+                    }
+                    at += 1;
+                }
+                if at >= bytes.len() {
+                    return None;
+                }
+                at += 1;
+            }
+            b'[' => {
+                let (_, after) = lua_long_bracket(&statement[at..])?;
+                at = statement.len() - after.len();
+            }
+            b'{' | b'(' => at += 2 + closing(&statement[at + 1..])?,
+            _ => {}
+        }
+        if at == operand {
+            at = name_end(at);
+            if at == operand || &statement[operand..at] == "function" {
+                return None;
+            }
+        }
+        loop {
+            match bytes.get(at) {
+                Some(b'.' | b':')
+                    if bytes
+                        .get(at + 1)
+                        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') =>
+                {
+                    at = name_end(at + 1);
+                }
+                Some(b'(' | b'[') => at += 2 + closing(&statement[at + 1..])?,
+                _ => break,
+            }
+        }
+        let after = skip_space(at);
+        let rest = &statement[after..];
+        let operator = ["..", "==", "~=", "<=", ">=", "//", "<<", ">>"]
+            .iter()
+            .find(|op| rest.starts_with(**op))
+            .map(|op| op.len())
+            .or_else(|| {
+                rest.starts_with(['+', '-', '*', '/', '%', '^', '<', '>', '&', '|', '~'])
+                    .then_some(1)
+            })
+            .or_else(|| {
+                ["and", "or"].iter().find_map(|word| {
+                    rest.strip_prefix(word)
+                        .filter(|tail| {
+                            !tail.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                        })
+                        .map(|_| word.len())
+                })
+            });
+        match operator {
+            Some(length) if !rest.starts_with("--") => at = skip_space(after + length),
+            _ => break,
+        }
+    }
+    let next = skip_space(at);
+    if next == at
+        || next >= bytes.len()
+        || !(bytes[next].is_ascii_alphabetic() || bytes[next] == b'_')
+    {
+        return None;
+    }
+    let word = &statement[next..name_end(next)];
+    (!matches!(word, "and" | "or")).then_some(next)
+}
+
+/// Code inside a string that runs where it stands, opening at the start of
+/// `text` ([`CODE_IN_STRINGS`]): where the code starts.
+fn code_in_string(lang: Lang, text: &str) -> Option<usize> {
+    CODE_IN_STRINGS
+        .iter()
+        .filter(|(of, _, _)| *of == lang)
+        .find_map(|(_, opener, marks)| {
+            let rest = text.strip_prefix(opener)?;
+            if marks.is_empty() {
+                return Some(opener.len());
+            }
+            let spaced = rest.trim_start();
+            let mark = spaced.chars().next().filter(|mark| marks.contains(mark))?;
+            Some(text.len() - spaced.len() + mark.len_utf8())
+        })
+}
+
+/// Whether an expression is a function written in place: PHP's
+/// `function (...) {...}`, `fn (...) => ...` and their `static` forms,
+/// Perl's `sub {...}`, Lua's `function (...) ... end`.
+fn written_in_place(expression: &str) -> bool {
+    let expression = expression.trim_start();
+    let expression = expression
+        .strip_prefix("static")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+        .map_or(expression, str::trim_start);
+    ["function", "fn", "sub"].iter().any(|word| {
+        expression
+            .strip_prefix(word)
+            .is_some_and(|rest| rest.trim_start().starts_with(['(', '{', '&']))
+    })
+}
+
+/// A value that is a file name a listing found ([`LISTED`]).
+fn listed() -> Value {
+    Value::Str(format!("{UNREAD}{LISTED}{UNREAD}"))
+}
+
+/// PHP functions that set a name handed to them as an argument (by
+/// reference): `sscanf("...", "%s", $f)`, `preg_match($p, $s, $f)`.
+const PHP_BY_REFERENCE: &[&str] = &[
+    "sscanf",
+    "fscanf",
+    "preg_match",
+    "preg_match_all",
+    "preg_replace",
+    "preg_replace_callback",
+    "preg_replace_callback_array",
+    "str_replace",
+    "str_ireplace",
+    "settype",
+    "unset",
+    "exec",
+    "system",
+    "passthru",
+    "proc_open",
+    "array_shift",
+    "array_pop",
+    "array_push",
+    "array_unshift",
+    "array_splice",
+    "array_walk",
+    "array_walk_recursive",
+    "array_multisort",
+    "sort",
+    "rsort",
+    "usort",
+    "uasort",
+    "uksort",
+    "asort",
+    "arsort",
+    "ksort",
+    "krsort",
+    "natsort",
+    "natcasesort",
+    "shuffle",
+    "end",
+    "reset",
+    "next",
+    "prev",
+    "each",
+    "catch",
+    "fsockopen",
+    "pfsockopen",
+    "stream_socket_client",
+    "stream_socket_server",
+    "stream_select",
+    "socket_select",
+    "socket_recv",
+    "socket_recvfrom",
+    "stream_socket_recvfrom",
+    "getmxrr",
+    "dns_get_record",
+    "getimagesize",
+    "similar_text",
+    "headers_sent",
+    "is_callable",
+    "mb_convert_variables",
+    "openssl_sign",
+    "openssl_seal",
+    "openssl_open",
+    "openssl_encrypt",
+    "openssl_private_decrypt",
+    "openssl_public_encrypt",
+    "openssl_private_encrypt",
+    "openssl_public_decrypt",
+    "openssl_pkey_export",
+    "openssl_csr_export",
+    "openssl_x509_export",
+    "xml_parse_into_struct",
+    "flock",
+    "pcntl_wait",
+    "pcntl_waitpid",
+    "msg_receive",
+];
+
+/// PHP: whether a form in `code` may set any name, and the names set
+/// somewhere other than where the reader follows them. The reader follows
+/// `$f = ...` (and `.=`, `+=`) standing at the start of a top-level
+/// statement, in order, and the head of a `foreach` it reads; the value
+/// it holds for a name counts only when every place the code sets that
+/// name is one of those, and a `foreach` head is the only one or there is
+/// none. Any other form (an assignment inside a block, a loop head or an
+/// expression, an indexed or compound one, `++`, a parameter or a `use`,
+/// `list()`/`[...] =`, a function that sets its argument) makes the name
+/// not read; `$$`, `${`, `$GLOBALS`, a reference (`&$`), `extract`,
+/// `compact`, `parse_str`, `eval`, `global`, `static $`, `goto` or a
+/// comment make every name not read, as on main.
+fn php_unreadable_names(code: &str) -> (bool, HashSet<String>) {
+    let mut unreadable = HashSet::new();
+    if without_comments(code) != code {
+        return (true, unreadable);
+    }
+    let bytes = code.as_bytes();
+    let lower = code.to_ascii_lowercase();
+    let is_word_at = |at: usize, length: usize| {
+        !lower[..at]
+            .bytes()
+            .next_back()
+            .is_some_and(|b| is_name_byte(b) || b == b'>' || b == b':' || b == b'\\')
+            && !lower[at + length..]
+                .bytes()
+                .next()
+                .is_some_and(is_name_byte)
+    };
+    let words_followed_by = |word: &str, next: &[char]| -> Vec<usize> {
+        lower
+            .match_indices(word)
+            .map(|(at, _)| at)
+            .filter(|&at| {
+                is_word_at(at, word.len())
+                    && lower[at + word.len()..].trim_start().starts_with(next)
+            })
+            .collect()
+    };
+    for word in [
+        "extract",
+        "compact",
+        "parse_str",
+        "mb_parse_str",
+        "get_defined_vars",
+        "eval",
+        "assert",
+    ] {
+        if !words_followed_by(word, &['(']).is_empty() {
+            return (true, unreadable);
+        }
+    }
+    for word in ["global", "static"] {
+        if !words_followed_by(word, &['$']).is_empty() {
+            return (true, unreadable);
+        }
+    }
+    if lower.match_indices("goto").any(|(at, _)| is_word_at(at, 4)) {
+        return (true, unreadable);
+    }
+    for (at, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'$' => {
+                let next = bytes.get(at + 1).copied().unwrap_or(b' ');
+                if next == b'$' || next == b'{' || next >= 0x80 {
+                    return (true, unreadable);
+                }
+                if code[at + 1..].starts_with("GLOBALS") {
+                    return (true, unreadable);
+                }
+            }
+            b'&' if (at == 0 || bytes[at - 1] != b'&')
+                && code[at + 1..].trim_start().starts_with('$') =>
+            {
+                return (true, unreadable);
+            }
+            _ => {}
+        }
+    }
+    let starts: HashSet<usize> = statements(code)
+        .into_iter()
+        .map(|(start, end)| start + (code[start..end].len() - code[start..end].trim_start().len()))
+        .collect();
+    let mut followed: HashSet<String> = HashSet::new();
+    // Every `$name` that is set where it stands.
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] != b'$' {
+            at += 1;
+            continue;
+        }
+        let end = bytes[at + 1..]
+            .iter()
+            .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+            .map_or(bytes.len(), |length| at + 1 + length);
+        if end == at + 1 {
+            at += 1;
+            continue;
+        }
+        let name = code[at..end].to_owned();
+        let before = code[..at].trim_end();
+        let mut rest = code[end..].trim_start();
+        let mut indexed = false;
+        while let Some(open) = rest.strip_prefix(['[', '{']) {
+            indexed = true;
+            rest = closing(open).map_or("", |close| open[close + 1..].trim_start());
+        }
+        let compound = [
+            "**=", "??=", "<<=", ">>=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "++", "--",
+        ]
+        .iter()
+        .any(|op| rest.starts_with(op))
+            || before.ends_with("++")
+            || before.ends_with("--");
+        let followed_op = [".=", "+="].iter().any(|op| rest.starts_with(op))
+            || (rest.starts_with('=') && !rest.starts_with("==") && !rest.starts_with("=>"));
+        if compound || (followed_op && (indexed || !starts.contains(&at))) {
+            unreadable.insert(name);
+        } else if followed_op {
+            followed.insert(name);
+        }
+        at = end;
+    }
+    // Parameters and `use` lists of functions written in place or named.
+    for word in ["function", "fn"] {
+        for (found, _) in lower.match_indices(word) {
+            if !is_word_at(found, word.len()) {
+                continue;
+            }
+            let mut rest = code[found + word.len()..].trim_start();
+            rest = rest.trim_start_matches('&').trim_start();
+            rest = rest
+                .trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                .trim_start();
+            let Some(open) = rest.strip_prefix('(') else {
+                continue;
+            };
+            let Some(close) = closing(open) else {
+                return (true, unreadable);
+            };
+            for name in variables_in(&open[..close]) {
+                unreadable.insert(name);
+            }
+            let after = open[close + 1..].trim_start();
+            let after_lower = after.to_ascii_lowercase();
+            if after_lower.starts_with("use") {
+                if let Some(open) = after[3..].trim_start().strip_prefix('(') {
+                    let close = closing(open).unwrap_or(open.len());
+                    for name in variables_in(&open[..close]) {
+                        unreadable.insert(name);
+                    }
+                }
+            }
+        }
+    }
+    // `list(...) =` and `[...] =`.
+    let mut opens: Vec<usize> = lower
+        .match_indices("list")
+        .filter(|&(found, _)| {
+            is_word_at(found, 4) && lower[found + 4..].trim_start().starts_with('(')
+        })
+        .filter_map(|(found, _)| code[found..].find('(').map(|open| found + open + 1))
+        .collect();
+    opens.extend(code.match_indices('[').map(|(found, _)| found + 1));
+    for open in opens {
+        let inside = &code[open..];
+        let Some(close) = closing(inside) else {
+            continue;
+        };
+        let after = inside[close + 1..].trim_start();
+        if after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=>") {
+            for name in variables_in(&inside[..close]) {
+                unreadable.insert(name);
+            }
+        }
+    }
+    // Functions that set a name handed to them.
+    for &function in PHP_BY_REFERENCE {
+        for found in words_followed_by(function, &['(']) {
+            let Some(open) = code[found..].find('(').map(|open| found + open + 1) else {
+                continue;
+            };
+            let inside = &code[open..];
+            let close = closing(inside).unwrap_or(inside.len());
+            for name in variables_in(&inside[..close]) {
+                unreadable.insert(name);
+            }
+        }
+    }
+    // A `foreach` head sets its names; with a statement that sets one too,
+    // the name is set twice in ways the reader does not order.
+    let mut heads: HashMap<String, usize> = HashMap::new();
+    for (found, _) in lower.match_indices("foreach") {
+        if !is_word_at(found, 7) {
+            continue;
+        }
+        let rest = code[found + 7..].trim_start();
+        let head = rest
+            .strip_prefix('(')
+            .and_then(|inner| closing(inner).map(|close| &inner[..close]));
+        let Some(head) = head else {
+            return (true, unreadable);
+        };
+        let Some((_, as_end)) = last_as_keyword(head) else {
+            return (true, unreadable);
+        };
+        for name in variables_in(&head[as_end..]) {
+            *heads.entry(name).or_default() += 1;
+        }
+    }
+    for (name, count) in heads {
+        if count > 1 || followed.contains(&name) {
+            unreadable.insert(name);
+        }
+    }
+    (false, unreadable)
+}
+
+/// `text` with PHP's comments (`/* */`, `//`, `#`) as spaces, strings
+/// kept.
+fn without_comments(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            quote @ (b'\'' | b'"' | b'\x60') => {
+                let start = at;
+                at += 1;
+                while at < bytes.len() && bytes[at] != quote {
+                    if bytes[at] == b'\\' {
+                        at += 1;
+                    }
+                    at += 1;
+                }
+                at = (at + 1).min(bytes.len());
+                out.push_str(&text[start..at]);
+                continue;
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'*') => {
+                at = text[at + 2..]
+                    .find("*/")
+                    .map_or(bytes.len(), |end| at + 2 + end + 2);
+                out.push(' ');
+                continue;
+            }
+            b'/' if bytes.get(at + 1) == Some(&b'/') => {
+                at = text[at..].find('\n').map_or(bytes.len(), |end| at + end);
+                out.push(' ');
+                continue;
+            }
+            b'#' if bytes.get(at + 1) != Some(&b'[') => {
+                at = text[at..].find('\n').map_or(bytes.len(), |end| at + end);
+                out.push(' ');
+                continue;
+            }
+            _ => {}
+        }
+        let next = text[at..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&text[at..at + next]);
+        at += next;
+    }
+    out
+}
+
+/// Where the last `as` of a PHP `foreach` head stands, in any case,
+/// outside strings and brackets, with no name byte touching it.
+fn last_as_keyword(head: &str) -> Option<(usize, usize)> {
+    let bytes = head.as_bytes();
+    let mut found = None;
+    let mut depth = 0usize;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            quote @ (b'\'' | b'"' | b'\x60') => {
+                at += 1;
+                while at < bytes.len() && bytes[at] != quote {
+                    if bytes[at] == b'\\' {
+                        at += 1;
+                    }
+                    at += 1;
+                }
+            }
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+            b'a' | b'A'
+                if depth == 0
+                    && matches!(bytes.get(at + 1), Some(b's' | b'S'))
+                    && !(at > 0 && is_name_byte(bytes[at - 1]))
+                    && !bytes
+                        .get(at + 2)
+                        .is_some_and(|b| is_name_byte(*b) && *b != b'$') =>
+            {
+                found = Some((at, at + 2));
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    found
+}
+
+/// Each PHP variable named in `text` (`$f`, inside `list()`, `[...]`, after
+/// `=>` or `&`).
+fn variables_in(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut names = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'$' {
+            let end = bytes[at + 1..]
+                .iter()
+                .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
+                .map_or(bytes.len(), |length| at + 1 + length);
+            if end > at + 1 && !names.iter().any(|name: &String| name == &text[at..end]) {
+                names.push(text[at..end].to_owned());
+            }
+            at = end.max(at + 1);
+        } else {
+            at += 1;
+        }
+    }
+    names
+}
+
 /// Whether a callee is a variable alone (PHP's `$f`).
 fn is_variable(chain: &str) -> bool {
     chain
@@ -3905,7 +5222,11 @@ pub(crate) fn runner_of_file(line: &str, path: &str) -> Option<Runner> {
 /// The language an interpreter's program name runs (`python3.11`, `lua5.4`).
 fn interpreter_lang(name: &str) -> Option<Lang> {
     let name = name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    Lang::of(if name == "nodejs" { "node" } else { name })
+    Lang::of(match name {
+        "nodejs" => "node",
+        "luajit" => "lua",
+        other => other,
+    })
 }
 
 /// What a file the code wrote holds, read as `runner` runs it: a line for
@@ -3951,6 +5272,31 @@ pub(crate) fn written_reading(runner: Runner, text: &str, depth: u8) -> InlineRe
         _ => out.code_unread = true,
     }
     out
+}
+
+/// Whether a file the code wrote at `written` is the one it loads at
+/// `loaded`: the same path, or, where either is built at run time from a
+/// piece not read (`__DIR__`, `getcwd()`), the same name after it.
+fn written_file(written: &str, loaded: &str) -> bool {
+    if same_path(written, loaded) {
+        return true;
+    }
+    if !written.contains(UNREAD) && !loaded.contains(UNREAD) {
+        return false;
+    }
+    let tail = |path: &str| {
+        let tail = path.rsplit(UNREAD).next().unwrap_or(path).trim();
+        tail.trim_start_matches("./").to_owned()
+    };
+    let (first, second) = (tail(written), tail(loaded));
+    let (long, short) = if first.len() >= second.len() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let short = short.trim_start_matches('/');
+    !short.is_empty()
+        && (long.trim_start_matches('/') == short || long.ends_with(&format!("/{short}")))
 }
 
 fn same_path(first: &str, second: &str) -> bool {
