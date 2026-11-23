@@ -246,7 +246,6 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             std::process::ExitCode::from(2)
         }
         Action::Apply { write, tests } => {
-            let wrote = write.is_some();
             if let Some(content) = write {
                 let Some(path) = config_path() else {
                     eprintln!("innerwarden notify: cannot resolve a config path (this account has no home)");
@@ -262,9 +261,14 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 println!("innerwarden notify - saved to {}", path.display());
             }
             let attempted = tests.len();
-            if attempted == 0 && rest.iter().any(|arg| arg == "--test") {
-                // `--test` with no channel used to print nothing and exit 0,
-                // which reads as a test that passed.
+            // `--test` as the parser read it: in `--telegram-chat --test` it is
+            // the chat id, and no test was asked for.
+            let test_asked =
+                innerwarden_notify::cli::parse_set_args(rest).is_ok_and(|(_, test)| test);
+            if attempted == 0 && test_asked {
+                // `--test` with no channel used to print nothing, which
+                // reads as a test that passed. The exit code stays 0, as when
+                // every delivery fails below.
                 eprintln!(
                     "innerwarden notify - --test sent nothing: no channel is configured in {}.",
                     config_path()
@@ -276,9 +280,6 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     eprintln!("{}", not_read_line(&ignored));
                 }
                 eprintln!("  set one: innerwarden notify --telegram-token <T> --telegram-chat <C> [--slack-webhook <URL>] --test");
-                if !wrote {
-                    return std::process::ExitCode::from(1);
-                }
             }
             let delivered = tests
                 .iter()

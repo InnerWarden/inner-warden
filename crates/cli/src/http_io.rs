@@ -43,7 +43,24 @@ pub fn loopback_agent(
     status_as_error: bool,
     own_certificate: bool,
 ) -> ureq::Agent {
-    let mut config = ureq::Agent::config_builder()
+    loopback_agent_from(
+        ureq::Agent::config_builder(),
+        timeout,
+        status_as_error,
+        own_certificate,
+    )
+}
+
+/// [`loopback_agent`] over `base`: the builder ureq hands out, which already
+/// holds the environment's proxy when one is set. Apart so a test can start
+/// from a builder that carries one, as a run under `HTTPS_PROXY` does.
+fn loopback_agent_from(
+    base: ureq::config::ConfigBuilder<ureq::typestate::AgentScope>,
+    timeout: Duration,
+    status_as_error: bool,
+    own_certificate: bool,
+) -> ureq::Agent {
+    let mut config = base
         .timeout_global(Some(timeout))
         .http_status_as_error(status_as_error)
         .proxy(None);
@@ -178,15 +195,22 @@ mod tests {
         );
     }
 
-    /// The agent for this host's own listeners takes no proxy at all, and
-    /// relaxes TLS only when asked to.
+    /// The agent for this host's own listeners takes no proxy at all, even
+    /// when the builder ureq hands out already holds one (what it reads from
+    /// `HTTPS_PROXY` and the others), and relaxes TLS only when asked to.
     #[test]
     fn the_loopback_agent_takes_no_proxy() {
         for (status_as_error, own_certificate) in
             [(true, false), (false, false), (false, true), (true, true)]
         {
-            let agent =
-                loopback_agent(Duration::from_millis(700), status_as_error, own_certificate);
+            let from_env = ureq::Proxy::new("http://127.0.0.1:9").expect("a proxy url");
+            let base = ureq::Agent::config_builder().proxy(Some(from_env));
+            let agent = loopback_agent_from(
+                base,
+                Duration::from_millis(700),
+                status_as_error,
+                own_certificate,
+            );
             assert!(agent.config().proxy().is_none());
             assert_eq!(agent.config().http_status_as_error(), status_as_error);
             assert_eq!(

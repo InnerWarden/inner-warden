@@ -257,7 +257,8 @@ fn the_openclaw_guard_asks_pro_straight_and_not_through_the_environments_proxy()
 /// `notify --test` with channels only in the environment: a release build
 /// does not read them, and it used to print nothing and exit 0, which reads
 /// as a test that passed. It now says nothing was sent, names the variables
-/// it did not read and why, and exits 1. The webhook hears nothing.
+/// it did not read and why, and still exits 0 (as when every delivery
+/// fails). The webhook hears nothing.
 #[test]
 fn notify_test_with_channels_only_in_the_environment_says_they_were_not_read() {
     let webhook = Recorder::start();
@@ -270,7 +271,7 @@ fn notify_test_with_channels_only_in_the_environment_says_they_were_not_read() {
         .output()
         .expect("run notify --test");
     let text = said(&out);
-    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert_eq!(out.status.code(), Some(0), "{text}");
     assert!(text.contains("--test sent nothing"), "{text}");
     assert!(
         text.contains("not read: IW_SLACK_WEBHOOK, IW_WEBHOOK_URL"),
@@ -288,6 +289,16 @@ fn notify_test_with_channels_only_in_the_environment_says_they_were_not_read() {
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
     assert!(!said(&out).contains("sent nothing"), "{}", said(&out));
     assert_eq!(webhook.requests().len(), 1);
+
+    // `--test` as the value of `--telegram-chat` asks for no test: no line
+    // about a test that sent nothing.
+    let out = innerwarden(scratch.path())
+        .args(["notify", "--telegram-chat", "--test"])
+        .env("IW_TEST_RELEASE_OVERRIDES", "1")
+        .output()
+        .expect("run notify --telegram-chat --test");
+    assert_eq!(out.status.code(), Some(0), "{}", said(&out));
+    assert!(!said(&out).contains("sent nothing"), "{}", said(&out));
 }
 
 /// `llm status` says when `IW_LLM_CONFIG` was not read (a release build,
