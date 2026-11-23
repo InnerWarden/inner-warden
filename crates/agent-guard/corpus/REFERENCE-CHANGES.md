@@ -342,7 +342,69 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   lines; stdin as `//dev/stdin`, `/dev/./stdin`, `/dev/../dev/stdin`,
   `/proc/thread-self/fd/0`, `/proc/1/fd/0` and `file:///dev/stdin`; a PHP
   function called in another case, from a string or as a method.
-- 2026-11-22: a PHP `foreach` head read in any case and with any space or
+- 2026-11-22: new corpus cursor-exec-2026-11, read by the differential
+  check; reference.tsv unchanged. cursor-exec-2026-11/ce-01,
+  cursor-exec-2026-11/ce-02 and cursor-exec-2026-11/ce-03 (`must_refuse`)
+  start the Cursor CLI by the entry file its launcher hands its own `node`
+  with `HOME` moved: allow on main, deny now, and their 33 generated
+  variants the same. cursor-exec-2026-11/ce-04 and
+  cursor-exec-2026-11/ce-05 (`must_refuse`) run a download a command
+  printed into an `exec` file: deny on main and now. harmless-proven:
+  cursor-exec-2026-11/ce-c04, cursor-exec-2026-11/ce-c05,
+  cursor-exec-2026-11/ce-c06 go from review to allow. Each runs a file
+  `exec > r.sh` sent the output of one `echo hello` into, while that
+  `echo` sent its own output to `log.txt` (`&>`, `>`, `>> ... 2>&1`):
+  the file holds nothing. Main held them because the reading that steps
+  over launchers took `exec > r.sh` for `exec` in front of a command and
+  read `> r.sh` as a write it cannot see. Measured on this branch beside
+  them, still refused: ce-04, ce-05 and the existing
+  `only_a_redirect_of_the_standard_output_moves_it_out_of_an_exec_file`
+  lines (`>&1`, `1>&1`, `>/dev/stdout` keep the output in the file).
+  No other line of any corpus moved, from an empty home or a home with
+  keys.
+- 2026-11-22: review round 1 of the same change; reference.tsv unchanged.
+  Measured with the differential judge against main 0f6ec89 (39097 lines,
+  an empty home and a home with keys, the same in both): no line main
+  stops goes unstopped, and only these move. New must_refuse lines that
+  main allows and this branch refuses: cursor-exec-2026-11/ce-23, cursor-exec-2026-11/ce-24, cursor-exec-2026-11/ce-25, cursor-exec-2026-11/ce-27, cursor-exec-2026-11/ce-28, cursor-exec-2026-11/ce-29, cursor-exec-2026-11/ce-30
+  (a redirection in front of the name of a command, and the Cursor
+  install folder written with `//`, `/./`, a glob or reached by `cd`);
+  review on main, deny now: cursor-exec-2026-11/ce-26, cursor-exec-2026-11/ce-31, cursor-exec-2026-11/ce-32, cursor-exec-2026-11/ce-33
+  (`crontab - 2>/dev/null`, and a table from a file the line does not
+  show behind a launcher and a redirection, refused as `cat /tmp/x |
+  crontab -` is). cursor-exec-2026-11/ce-06, cursor-exec-2026-11/ce-07, cursor-exec-2026-11/ce-08, cursor-exec-2026-11/ce-09, cursor-exec-2026-11/ce-10, cursor-exec-2026-11/ce-11, cursor-exec-2026-11/ce-12, cursor-exec-2026-11/ce-13, cursor-exec-2026-11/ce-14, cursor-exec-2026-11/ce-15, cursor-exec-2026-11/ce-16, cursor-exec-2026-11/ce-17, cursor-exec-2026-11/ce-18, cursor-exec-2026-11/ce-19, cursor-exec-2026-11/ce-20, cursor-exec-2026-11/ce-21, cursor-exec-2026-11/ce-22
+  (a redirection after a launcher) are deny on main and here; the first
+  version of this change allowed them. Their generated variants move the
+  same way. New metamorphic technique env_redirect (`env 2>/dev/null
+  <word>`, one per env_prefix variant): metamorphic/adv328-c1-14-m-envr,
+  metamorphic/adv328-c2-11-m-envr, metamorphic/adv328-c2-12-m-envr go from
+  review to deny and metamorphic/adv328-c2-18-m-envr from allow to deny;
+  every other envr variant keeps main's verdict. Controls
+  cursor-exec-2026-11/ce-c07, cursor-exec-2026-11/ce-c08, cursor-exec-2026-11/ce-c09, cursor-exec-2026-11/ce-c10, cursor-exec-2026-11/ce-c11, cursor-exec-2026-11/ce-c12, cursor-exec-2026-11/ce-c13, cursor-exec-2026-11/ce-c14
+  are allowed on main and here; ce-c04, ce-c05 and ce-c06 move as recorded
+  above. No other line of any corpus moved.
+- 2026-11-23: review round 2 of the same change; reference.tsv unchanged.
+  Measured with the differential judge against main 0f6ec89 (39669 lines,
+  an empty home and a home with keys, the same in both): no line main
+  stops goes unstopped. Lines added this round: cursor-exec-2026-11/ce-34, cursor-exec-2026-11/ce-35, cursor-exec-2026-11/ce-36, cursor-exec-2026-11/ce-37, cursor-exec-2026-11/ce-38, cursor-exec-2026-11/ce-39, cursor-exec-2026-11/ce-40, cursor-exec-2026-11/ce-41, cursor-exec-2026-11/ce-42, cursor-exec-2026-11/ce-43, cursor-exec-2026-11/ce-44, cursor-exec-2026-11/ce-45, cursor-exec-2026-11/ce-46, cursor-exec-2026-11/ce-47, cursor-exec-2026-11/ce-48, cursor-exec-2026-11/ce-49, cursor-exec-2026-11/ce-50, cursor-exec-2026-11/ce-51, cursor-exec-2026-11/ce-52, cursor-exec-2026-11/ce-53, cursor-exec-2026-11/ce-54
+  (a redirection after a launcher written with a quote, an escape or an
+  expansion, `env 2>"/dev/null" sh`) are deny on main and here; round 1
+  allowed them because the launcher was no longer cut. cursor-exec-2026-11/ce-55
+  (`cat /tmp/x | env 2>"/dev/null" crontab -`, must_refuse) goes from
+  review to deny. New must_refuse lines that main allows and this branch
+  refuses: cursor-exec-2026-11/ce-56, cursor-exec-2026-11/ce-57, cursor-exec-2026-11/ce-58, cursor-exec-2026-11/ce-59, cursor-exec-2026-11/ce-60, cursor-exec-2026-11/ce-61, cursor-exec-2026-11/ce-62, cursor-exec-2026-11/ce-63, cursor-exec-2026-11/ce-64, cursor-exec-2026-11/ce-65, cursor-exec-2026-11/ce-66, cursor-exec-2026-11/ce-67, cursor-exec-2026-11/ce-68, cursor-exec-2026-11/ce-69, cursor-exec-2026-11/ce-70, cursor-exec-2026-11/ce-71, cursor-exec-2026-11/ce-72, cursor-exec-2026-11/ce-73, cursor-exec-2026-11/ce-74, cursor-exec-2026-11/ce-75, cursor-exec-2026-11/ce-76, cursor-exec-2026-11/ce-77, cursor-exec-2026-11/ce-78, cursor-exec-2026-11/ce-79, cursor-exec-2026-11/ce-80 (a redirection in front of a command behind a
+  value, `time`, a named descriptor, a here-string, a here-document or
+  written with quotes; a redirection between a launcher and its options;
+  the Cursor entry file without `.js`, the version folder, `.` from
+  inside it, and a path from a `cd` into `versions` or the install
+  folder). Their generated variants move the same way. metamorphic/adv328-c2-11-m-envr,
+  metamorphic/adv328-c2-12-m-envr, metamorphic/adv328-c4-01-m-envr and
+  metamorphic/adv328-c4-22-m-envr go from review to deny, besides
+  metamorphic/adv328-c1-14-m-envr and metamorphic/adv328-c2-18-m-envr
+  recorded above. Controls cursor-exec-2026-11/ce-c15, cursor-exec-2026-11/ce-c16, cursor-exec-2026-11/ce-c17, cursor-exec-2026-11/ce-c18, cursor-exec-2026-11/ce-c19, cursor-exec-2026-11/ce-c20, cursor-exec-2026-11/ce-c21, cursor-exec-2026-11/ce-c22 are allowed on main and here;
+  ce-c04, ce-c05 and ce-c06 move as recorded above. No other line of any
+  corpus moved.
+- 2026-11-23: a PHP `foreach` head read in any case and with any space or
   comment around `as` moves no line of any corpus. Measured against main
   9f10ffe with the differential judge (37127 lines, an empty home and a home
   with keys): no verdict changed. Every name after `as`, inside `list()`

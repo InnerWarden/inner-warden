@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use innerwarden_agent_guard::mcp_proxy::jsonrpc::envelope_of;
 use innerwarden_agent_guard::mcp_proxy::router::{route_message, Direction, PendingRequest};
-use innerwarden_agent_guard::rules::RuleEngine;
+use innerwarden_agent_guard::rules::{AtrSource, RuleEngine};
 use serde_json::{json, Value};
 
 struct Counting;
@@ -247,6 +247,11 @@ fn hostile_results_leave_the_proxys_atr_rules_within_their_heap_budget() {
     }
 
     let before = live();
+    // Every rule the proxy's surfaces select, compiled before the ordinary
+    // messages: the growth measured after is the search caches alone, not
+    // the rules a hostile text's literals reach first.
+    engine.warm(AtrSource::ToolCall);
+    engine.warm(AtrSource::McpExchange);
     let ordinary_alerts =
         tool_result(Some(&engine), &ordinary) + tool_listing(Some(&engine), &ordinary);
     let after_ordinary = live();

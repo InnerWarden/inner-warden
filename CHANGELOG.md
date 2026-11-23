@@ -5,6 +5,98 @@ follows semantic versioning.
 
 ## Unreleased
 
+`agents connect` leaves a server the agent signs in to by itself as it is,
+instead of wrapping it in the proxy, where the sign-in was lost (every call
+came back 401). Only a server reached by URL, on another host, with nothing
+the proxy would send for it (no `bearer_token_env_var`, `http_headers` or
+`env_http_headers` for Codex, no `headers` for Cursor) can be left. For
+Codex, such a server is left when `codex mcp list --json` (which names
+each server's sign-in and never a token) says Codex signs in to it, or when
+Codex cannot be asked; Codex is not asked when no server could be left. For
+Cursor, every such server is left (Cursor signs in to it by itself). The
+connect line names those servers; the agent's hook judges their calls with
+the proxy's rules. `agents list`, `status` and the dashboard count the same
+servers as left, so they never call the result unguarded.
+
+What this leaves out of the proxy that the proxy carried before: a Codex
+server reached by URL alone, on another host, that Codex signs in to (or
+any such server when Codex cannot be asked, as when it is not on the
+`PATH`), and a Cursor server reached by URL alone, on another host. Their
+calls are judged by the agent's hook, with the proxy's rules, only while
+the hook is on. A server on this host (`localhost`, a name under
+`.localhost`, `127.0.0.0/8` in any form a URL parser reads, `0.0.0.0`,
+`::1`) or behind a unix socket is always carried, and the hook reads it
+as a local server: a path its calls carry names a file here, and the path
+rules still refuse `/etc/shadow` in the default posture. So is one that
+names this host another way: an address of one of its interfaces (its LAN
+address), its own name and `<name>.local`, and a name the hosts file gives
+this host or the loopback (`ip6-localhost`), read once and never from DNS.
+A name that only a DNS record points here (`localtest.me`) is read as
+another host. On Windows the interfaces' addresses are not read; its name
+and the hosts file are.
+
+An ordinary MCP call costs the hook less: the ATR rules are read from the
+YAML once, when the binary is built, and a rule is compiled for a call only
+when the call holds one of the literals every match of its patterns
+contains, one condition at a time (median of 41 clean Codex calls on one
+machine, release build, three runs each: 13.4 ms on main, 7.3 ms on this
+build; a call that holds a rule's literals pays for that rule as before). A
+pattern only `fancy-regex` reads (look-around, a back-reference) has no
+literals and is compiled for every call: it can be undecided on a long text,
+which holds the call for review, and skipping it let a long call through in
+a hook that had not compiled it. What a rule matches is unchanged.
+
+A call is left to the proxy only when its wrapper's command is written as
+the path the guard runs as (read as text: no link, no `/proc` or `/dev`,
+no `.` or `..` part), its entry sets no `PATH`, `LD_*` or `DYLD_*`
+(nor passes one with Codex's `env_vars`, nor a file of variables) and no
+working folder, and the configuration's last change, content or status, is
+older than the agent. For Codex, also: no layer of the project
+(`.codex/config.toml` in the working folder or any folder above it, past a
+`.git`) names any server; in a project the user's file trusts, no folder
+from the working folder up to the project's, nor a `.codex` in one, nor its
+`config.toml` (a layer emptied or rewritten in place), changed after the
+agent started, read through a link to what it points at too; and the Codex
+the hook runs under was not started with `-c`/`--config mcp_servers...`,
+`projects...` (a project trusted on the command line), `profile` or
+`profiles...`, or a profile (read from its command line). For Cursor,
+also: the call's own command line is the guard's proxy in a mode that
+refuses, split as a shell splits it (a quote left open, or `--mode` named
+twice, is not the guard's: how Cursor writes a word with a space in it was
+not measured with Cursor itself), and no `.cursor/mcp.json` of a
+workspace root names a server or changed, with its folders, after the
+agent started (a file removed after Cursor read it). The agent is the
+nearest ancestor of the hook named for it, else the first that is not a
+shell or a known launcher. `touch -d` on a configuration rewritten after
+the agent started no longer passes for an old one; on a file system that
+keeps no status change apart from the content's time (FAT, exFAT) it still
+can, and such a configuration is read as settled.
+
+`git -C <folder> worktree remove <path>` (and `--git-dir`, `--work-tree`,
+`-c`, `--namespace` before the verb) is read as the same line without the
+option: the option's value is not git's verb. A worktree word whose last
+part is the guard's name (`git worktree remove --force innerwarden`) is
+refused in every form, after a `cd` too: git finds a worktree by the end of
+its path, and one registered at the guard's folder goes. `git rm`, `git
+clean`, `git worktree remove` and `git init` (with `--separate-git-dir`)
+are read at the path the `-C` options reach: `git -C ~/.config/innerwarden
+clean -fdx`, `git -C ~/.local/bin rm -f innerwarden` and `git init` into
+the guard's folder are refused as `rm` of the same path is. They were
+allowed before, on main too. git is read in the work tree it is given
+(`--work-tree`, `GIT_WORK_TREE` before the command or exported earlier,
+`-c core.worktree=`): `clean`, `rm`, `checkout`, `restore` and `reset
+--hard` (`--merge`, `--keep`) into the guard's folder are refused as `rm`
+of it is. The paths handed to `git clean` are read too (`git clean -fdx
+.config/innerwarden` after a `git init` in the home), and an alias set with
+`-c alias.<name>=` is read as the verb it runs (one that runs a shell, `!`,
+as taking the work tree). `worktree remove innerwarden/.` is read as
+`innerwarden`. `codex -c mcp_servers...` is refused as the
+override of Codex's hooks is: the server it sets runs outside the proxy.
+
+When an MCP call and the command it carries both run with a warning in the
+default posture, the warning said and recorded is the stronger of the two,
+with both findings.
+
 The LLM second opinion and the notifications read their config only from
 the account's own home, as the account database gives it, never from the
 `HOME` the caller hands down. `HOME=<dir> innerwarden check ...` read the
@@ -14,8 +106,48 @@ bearer key to the url it named, and fired the webhooks of the
 folder, as a regular file with no other name (not a symbolic or a hard
 link): `innerwarden llm set-key` stores it there, and `llm set --key-file`
 refuses a file elsewhere. `api_key_env` is honoured only in the account's
-own `llm.toml`, never in one `IW_LLM_CONFIG` names. On Windows, where no
-account database is read, the home is still `HOME`.
+own `llm.toml`, never in one `IW_LLM_CONFIG` names. On Windows the home is
+the profile folder of the account's token (`GetUserProfileDirectoryW`),
+never `HOME` or `USERPROFILE`.
+
+Nothing in the environment of the process that starts `innerwarden` chooses
+where what the guard read goes, in a release build. A hook and `check` run
+with the AI agent's environment, and the alert channels it named
+(`IW_WEBHOOK_URL`, `IW_SLACK_WEBHOOK`, `IW_DISCORD_WEBHOOK`,
+`IW_TELEGRAM_TOKEN` and `IW_TELEGRAM_CHAT`, `IW_NOTIFY_REVIEW`) received
+every command the guard refused, and an `llm.toml` or a `notify.toml` it
+named with `IW_LLM_CONFIG` or `IW_NOTIFY_CONFIG` received the commands sent
+for a second opinion (secrets redacted, no key). Alerts are wired only in
+`notify.toml` in the account's home now, and the second opinion only in its
+`llm.toml`; `innerwarden notify` says which of those variables it did not
+read. `IW_LLM_CONFIG`, `IW_NOTIFY_CONFIG` and `IW_SUPPRESS_CONFIG` are
+honoured only as `/dev/null`, which turns the feature off and is what the
+AI Jail hands its hook: an override can take a destination away, never add
+one. A debug build (the tests) still honours any path and the channel
+variables; `IW_TEST_RELEASE_OVERRIDES=1` has it read them as a release build
+does. Whoever wired alerts with those variables, or pointed `IW_LLM_CONFIG`
+at a config of their own, now writes them in `notify.toml` or `llm.toml` in
+the account's home (`innerwarden notify --webhook-url ...`, `innerwarden llm
+set ...`); a service account without a home gets neither.
+
+The second opinion and the alerts never go through a proxy the environment
+names (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`): with an `http://` url, a
+proxy the caller set received `authorization: Bearer <the account's key>`
+inside the CONNECT tunnel. They go straight to their address, or through
+the `proxy = "http://host:port"` that `llm.toml` and `notify.toml` name. A
+proxy there that is not a proxy url sends nothing, rather than going around
+it.
+
+`llm.toml` itself cannot be a link (the folder may be one, as stow makes
+it): one that is was "not configured" in `llm status` with no word of why;
+the reason is said now in `llm status` and on stderr where a second opinion
+would have been asked. `llm set` refuses a url with a backslash or a space
+(`http://A\@B/` is host A to one parser and B to another), and the key's
+origin check ends the host at a backslash. `llm status` and `llm set`
+print the url without a user part or a query (`http://user:password@host`,
+`?key=`): agents run them too. Under `IW_LLM_CONFIG`, `llm set --key-file`
+outside the folder says to unset it and store the key with `llm set-key` in
+the account's own config, where a key is sent from.
 
 A config `IW_LLM_CONFIG` names carries no API key at all: an override
 naming `~/.config/innerwarden/llm-key` (or another file under the home)
@@ -144,6 +276,36 @@ counted and wrapped by `agents connect` as a table is, and stays inline.
 The summary of an MCP call's arguments the record keeps now masks Google
 OAuth (`ya29.`), Notion (`ntn_`) and Sentry (`sntryu_`, `sntrys_`) tokens
 and any opaque run of 32 or more letters and digits.
+
+The Cursor CLI started by the entry file its launcher hands its own `node`
+(`~/.local/share/cursor-agent/versions/<version>/node .../index.js`) with
+`HOME` moved, so its user hooks are not read, is refused as `cursor-agent`
+started that way already was. The folder is read as whole parts of the
+path (`cursor-agent/versions/<version>/index.js`), also written with `//`,
+`/./` or a glob, and after a `cd` into it (`./node index.js`); a folder
+that only ends with that name (`my-cursor-agent/versions/`) or another
+file in it (`node_modules/.bin/tsc`) is not the agent. A command between
+`exec > file` and the run of that file that sends its own output
+elsewhere (`echo hi &> log`) no longer leaves the file held for review as
+unread; a launcher followed by a redirection and a command (`env
+2>/dev/null sh`) still runs that command. A redirection written in front
+of the name of a command (`2>/dev/null rm -rf ~/.innerwarden`, `f | 2>/dev/null
+tee -a ~/.bashrc`) no longer hides the command, and `crontab - 2>/dev/null`
+is read as a table from its input. The same holds when the redirection is
+written with quotes, an escape or an expansion (`env 2>"/dev/null" sh`),
+stands behind a value or `time` (`FOO=1 2>/dev/null rm`), is a here-string,
+a here-document or a named descriptor, or stands between a launcher and its
+options (`sudo 2>/dev/null -u root sh`). The Cursor CLI is also recognised
+when `node` is handed its version folder, `.` from inside it, or the entry
+file without `.js`, and through a `cd` into `versions` or the install
+folder. `innerwarden check` run by the path of
+the running guard's own file written out (a build folder), or from an
+installed folder with `HOME` or `NO_COLOR` set in front, reads its line
+as data. The path is compared as text: a link, a `.` or `..` part, `//`
+or a path under `/proc` or `/dev` is judged with its words, since the
+shell resolves it later and in its own folder. A test of the MCP proxy that
+failed on a loaded machine now waits for the server's answers instead of a
+clock, and says so when the proxy does not finish.
 
 `innerwarden setup` and the new `innerwarden status --config` say what is
 already set in the agents' own config, and change nothing. In

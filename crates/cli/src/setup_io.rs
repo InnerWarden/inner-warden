@@ -639,6 +639,7 @@ fn configure_second_opinion(theme: &ColorfulTheme, prog: &str) {
         api_key_env: None,
         api_key_file,
         min_risk: None,
+        proxy: None,
     };
     if let Err(e) = crate::second_opinion_io::write_config(&cfg) {
         println!("    ! could not save the llm config: {e}");

@@ -27,7 +27,7 @@ use innerwarden_agent_guard::mcp_proxy::jsonrpc::envelope_of;
 use innerwarden_agent_guard::mcp_proxy::router::{
     route_message, Direction, PendingRequest, ProxyDecision,
 };
-use innerwarden_agent_guard::rules::RuleEngine;
+use innerwarden_agent_guard::rules::{AtrSource, RuleEngine};
 use serde_json::{json, Value};
 
 struct Counting;
@@ -138,6 +138,11 @@ fn the_proxys_atr_rules_stay_within_their_heap_budget() {
     first_messages(None, &text);
 
     let before = live();
+    // Every rule the proxy's surfaces select, compiled: what a proxy holds
+    // at most once its traffic has reached each (an ordinary message now
+    // compiles only the rules whose literals it holds).
+    engine.warm(AtrSource::ToolCall);
+    engine.warm(AtrSource::McpExchange);
     let alerts = first_messages(Some(&engine), &text);
     let after = live();
     let used = after - before;

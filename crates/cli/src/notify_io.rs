@@ -14,26 +14,60 @@ use std::time::{Duration, Instant};
 
 use innerwarden_notify::cli::{compute, plan, Action};
 
-/// The shared notify config path (env `IW_NOTIFY_CONFIG`, else
-/// `.config/innerwarden/notify.toml` in the account's own home) - resolved by
-/// the shared crate so the Active Defence host agent reads the exact SAME file.
+/// The shared notify config path: `.config/innerwarden/notify.toml` in the
+/// account's own home, the file the Active Defence host agent reads too.
 /// The home is the account database's ([`crate::graph_io::config_home`]),
 /// never the `HOME` the caller hands down: `HOME=<dir> innerwarden check`
-/// fired the webhooks of the `notify.toml` in `<dir>`.
+/// fired the webhooks of the `notify.toml` in `<dir>`. `IW_NOTIFY_CONFIG`
+/// is honoured as `/dev/null` only (no alerts, what the jail hands its
+/// hook), and as any path in a debug build
+/// ([`crate::graph_io::override_from_env`]): an AI agent's hook runs with
+/// the agent's environment, and a `notify.toml` it named received every
+/// command the guard refused.
 fn config_path() -> Option<PathBuf> {
-    let home = crate::graph_io::config_home();
-    innerwarden_notify::config_path(|k| {
-        if k == "HOME" {
-            home.as_deref().and_then(Path::to_str).map(str::to_string)
-        } else {
-            std::env::var(k).ok()
-        }
-    })
+    crate::graph_io::override_from_env("IW_NOTIFY_CONFIG")
+        .or_else(|| crate::graph_io::account_config_dir().map(|dir| dir.join("notify.toml")))
 }
 
 /// Read the shared notify config file's contents, or `None` if unset/unreadable.
 fn config_file() -> Option<String> {
-    read_config_file(&config_path()?).ok().flatten()
+    let path = config_path()?;
+    if path == Path::new(crate::graph_io::NO_CONFIG) {
+        return None;
+    }
+    read_config_file(&path).ok().flatten()
+}
+
+/// The alert channels the environment names (`IW_WEBHOOK_URL`,
+/// `IW_SLACK_WEBHOOK`, `IW_DISCORD_WEBHOOK`, `IW_TELEGRAM_*`,
+/// `IW_NOTIFY_REVIEW`), as the resolver asks for them: never in a release
+/// build ([`crate::graph_io::caller_overrides_honoured`]). The hook runs
+/// with the AI agent's environment, and a webhook it named received every
+/// command the guard refused. Only `notify.toml` in the account's home
+/// wires a channel.
+fn caller_env(name: &str) -> Option<String> {
+    if crate::graph_io::caller_overrides_honoured() {
+        std::env::var(name).ok()
+    } else {
+        None
+    }
+}
+
+/// The variables [`caller_env`] answers for, to say they are not read.
+const CHANNEL_VARS: [&str; 6] = [
+    "IW_TELEGRAM_TOKEN",
+    "IW_TELEGRAM_CHAT",
+    "IW_SLACK_WEBHOOK",
+    "IW_DISCORD_WEBHOOK",
+    "IW_WEBHOOK_URL",
+    "IW_NOTIFY_REVIEW",
+];
+
+/// The proxy `notify.toml` names for every alert, if any. Never one from the
+/// environment ([`crate::http_io::account_agent`]).
+fn config_proxy(file: Option<&str>) -> Option<String> {
+    file.and_then(|text| innerwarden_notify::NotifyFile::parse(text).ok())
+        .and_then(|parsed| parsed.proxy)
 }
 
 fn config_parent(path: &Path, create: bool) -> Result<PathBuf, String> {
@@ -138,7 +172,7 @@ fn write_config_file(path: &Path, content: &str) -> Result<(), String> {
 /// counted from the same resolved config `fire` sends through. A count only:
 /// nothing about a channel's address leaves this function.
 pub(crate) fn channel_count() -> usize {
-    let config = innerwarden_notify::resolved(|k| std::env::var(k).ok(), config_file().as_deref());
+    let config = innerwarden_notify::resolved(caller_env, config_file().as_deref());
     [
         config.telegram.is_some(),
         config.slack_webhook.is_some(),
@@ -153,7 +187,7 @@ pub(crate) fn channel_count() -> usize {
 /// Whether at least one notification channel is already configured (used by the
 /// setup wizard to pre-check the box on a re-run).
 pub fn is_configured() -> bool {
-    match compute(&[], config_file().as_deref(), |k| std::env::var(k).ok()) {
+    match compute(&[], config_file().as_deref(), caller_env) {
         Action::Status(s) => {
             s.contains("telegram")
                 || s.contains("slack")
@@ -168,7 +202,9 @@ pub fn is_configured() -> bool {
 /// shared config file (merging, so setting one channel keeps the others), with an
 /// optional `--test` alert. Thin I/O over the pure `compute`.
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
-    match compute(rest, config_file().as_deref(), |k| std::env::var(k).ok()) {
+    let file = config_file();
+    let proxy = config_proxy(file.as_deref());
+    match compute(rest, file.as_deref(), caller_env) {
         Action::Status(status) => {
             println!("innerwarden notify - {status}");
             println!("  set: innerwarden notify --telegram-token <T> --telegram-chat <C> [--slack-webhook <URL>] [--notify-review] [--test]");
@@ -178,6 +214,18 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "(this account has no home)".into())
             );
+            let ignored: Vec<&str> = CHANNEL_VARS
+                .iter()
+                .copied()
+                .filter(|name| std::env::var(name).is_ok_and(|v| !v.trim().is_empty()))
+                .filter(|_| !crate::graph_io::caller_overrides_honoured())
+                .collect();
+            if !ignored.is_empty() {
+                println!(
+                    "  not read: {} (a channel comes only from the config file above: the hook runs with the AI agent's environment)",
+                    ignored.join(", ")
+                );
+            }
             std::process::ExitCode::SUCCESS
         }
         Action::Error(e) => {
@@ -187,7 +235,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
         Action::Apply { write, tests } => {
             if let Some(content) = write {
                 let Some(path) = config_path() else {
-                    eprintln!("innerwarden notify: cannot resolve a config path (this account has no home; set IW_NOTIFY_CONFIG)");
+                    eprintln!("innerwarden notify: cannot resolve a config path (this account has no home)");
                     return std::process::ExitCode::from(2);
                 };
                 if let Err(e) = write_config_file(&path, &content) {
@@ -202,7 +250,7 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
             let attempted = tests.len();
             let delivered = tests
                 .iter()
-                .filter(|request| send(request) == DeliveryStatus::Delivered)
+                .filter(|request| send_via(request, proxy.as_deref()) == DeliveryStatus::Delivered)
                 .count();
             if attempted > 0 && delivered == attempted {
                 println!(
@@ -235,8 +283,15 @@ fn delivery_failure_message(_req: &Request, http_status: Option<u16>) -> String 
     }
 }
 
-fn send_with_timeout(req: &Request, timeout: Duration) -> DeliveryStatus {
-    let resp = crate::http_io::agent_with_timeout(timeout)
+fn send_with_timeout(req: &Request, timeout: Duration, proxy: Option<&str>) -> DeliveryStatus {
+    let agent = match crate::http_io::account_agent(timeout, proxy) {
+        Ok(agent) => agent,
+        Err(why) => {
+            eprintln!("innerwarden: notification not sent: {why} (ignored)");
+            return DeliveryStatus::Failed;
+        }
+    };
+    let resp = agent
         .post(&req.url)
         .header("Content-Type", "application/json")
         .send(&req.body);
@@ -264,13 +319,26 @@ fn send_with_timeout(req: &Request, timeout: Duration) -> DeliveryStatus {
     }
 }
 
+#[cfg(test)]
 fn send(req: &Request) -> DeliveryStatus {
-    send_with_timeout(req, Duration::from_secs(5))
+    send_via(req, None)
+}
+
+/// [`send`] through the proxy `notify.toml` names, if any.
+fn send_via(req: &Request, proxy: Option<&str>) -> DeliveryStatus {
+    send_with_timeout(req, Duration::from_secs(5), proxy)
 }
 
 const ENFORCEMENT_DELIVERY_BUDGET: Duration = Duration::from_millis(150);
 
+#[cfg(test)]
 fn deliver_with_total_budget(requests: Vec<Request>, budget: Duration) -> usize {
+    deliver_via(requests, budget, None)
+}
+
+/// Every request within one `budget`, through `proxy` (from `notify.toml`)
+/// or straight to each address.
+fn deliver_via(requests: Vec<Request>, budget: Duration, proxy: Option<&str>) -> usize {
     if requests.is_empty() {
         return 0;
     }
@@ -286,7 +354,8 @@ fn deliver_with_total_budget(requests: Vec<Request>, budget: Duration) -> usize 
         // the blocking verdict has been decided.
         let slots = u32::try_from(total - index).unwrap_or(1).max(1);
         let timeout = remaining / slots;
-        delivered += usize::from(send_with_timeout(&request, timeout) == DeliveryStatus::Delivered);
+        delivered +=
+            usize::from(send_with_timeout(&request, timeout, proxy) == DeliveryStatus::Delivered);
     }
     delivered
 }
@@ -294,13 +363,10 @@ fn deliver_with_total_budget(requests: Vec<Request>, budget: Duration) -> usize 
 /// Fire notifications for a deny verdict (and optionally review), best-effort.
 /// No-op when nothing is configured or the verdict does not warrant one.
 pub fn fire(command: &str, verdict: &Value) {
-    let reqs = redacted_plan(
-        |k| std::env::var(k).ok(),
-        config_file().as_deref(),
-        command,
-        verdict,
-    );
-    let _ = deliver_with_total_budget(reqs, ENFORCEMENT_DELIVERY_BUDGET);
+    let file = config_file();
+    let reqs = redacted_plan(caller_env, file.as_deref(), command, verdict);
+    let proxy = config_proxy(file.as_deref());
+    let _ = deliver_via(reqs, ENFORCEMENT_DELIVERY_BUDGET, proxy.as_deref());
 }
 
 /// PURE: the requests [`fire`] sends, with the command and every string of
@@ -326,9 +392,11 @@ fn redacted_plan(
 /// channel to hear about blocks also wants to hear that the record stopped
 /// recording them. Callers must send this at most once per outage episode.
 pub fn fire_text(text: &str) {
-    let config = innerwarden_notify::resolved(|k| std::env::var(k).ok(), config_file().as_deref());
+    let file = config_file();
+    let config = innerwarden_notify::resolved(caller_env, file.as_deref());
     let requests = innerwarden_notify::text_requests(&config, text);
-    let _ = deliver_with_total_budget(requests, ENFORCEMENT_DELIVERY_BUDGET);
+    let proxy = config_proxy(file.as_deref());
+    let _ = deliver_via(requests, ENFORCEMENT_DELIVERY_BUDGET, proxy.as_deref());
 }
 
 #[cfg(test)]

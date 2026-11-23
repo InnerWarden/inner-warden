@@ -4297,24 +4297,54 @@ fn with_launchers_read_through(
     if READING_THROUGH_LAUNCHERS.with(std::cell::Cell::get) {
         return as_written;
     }
-    let Some(read) = crate::shell::runners::launchers_read_through(command) else {
+    let readings = crate::shell::runners::launchers_readings(command);
+    if readings.is_empty() {
         return as_written;
-    };
+    }
     READING_THROUGH_LAUNCHERS.with(|reading| reading.set(true));
     let _clear = LaunchersReadThrough;
-    let through =
-        analyze_command_with_its_values(&read, rule_engine, protected_reads, context, depth);
-    if through.risk_score > as_written.risk_score {
-        CommandAnalysis {
+    // Each reading is weighed against the line as written, as one reading
+    // was before; of those that weigh more, the strictest verdict stands.
+    let strictness = |analysis: &CommandAnalysis| {
+        let rank = match analysis.recommendation.as_str() {
+            "deny" => 2,
+            "review" => 1,
+            _ => 0,
+        };
+        (rank, analysis.risk_score)
+    };
+    let mut strictest: Option<CommandAnalysis> = None;
+    for read in readings {
+        let through =
+            analyze_command_with_its_values(&read, rule_engine, protected_reads, context, depth);
+        if through.risk_score <= as_written.risk_score {
+            continue;
+        }
+        if strictest
+            .as_ref()
+            .is_none_or(|kept| strictness(&through) > strictness(kept))
+        {
+            strictest = Some(through);
+        }
+        // Nothing is stricter than a refusal: the readings left are not
+        // judged.
+        if strictest
+            .as_ref()
+            .is_some_and(|kept| kept.recommendation == "deny")
+        {
+            break;
+        }
+    }
+    match strictest {
+        Some(through) => CommandAnalysis {
             command: as_written.command,
             explanation: format!(
                 "with the launchers in front of its commands read through: {}",
                 through.explanation
             ),
             ..through
-        }
-    } else {
-        as_written
+        },
+        None => as_written,
     }
 }
 
@@ -4662,6 +4692,56 @@ const GUARD_PROGRAM_DIRS: &[&str] = &[
     "~/.cargo/bin/",
 ];
 
+/// The values a line may set in front of `innerwarden check` and still have
+/// its line read as data ([`guard_check_without_its_line`]): the home it
+/// reads its own files from (its config, and the `llm.toml` and
+/// `notify.toml` a check may consult for a second opinion or an alert),
+/// and its colours.
+const CHECK_HARMLESS_VALUES: &[&str] = &["HOME", "NO_COLOR"];
+
+/// Whether `path` is, from the root, a file named `innerwarden` written as
+/// the very path of the program judging the line: the hook or the proxy
+/// that runs this code, in a build folder for one. A file of the same name
+/// anywhere else may be anything and is not the guard.
+///
+/// The text is compared, never the file system: the path is the agent's
+/// and is resolved by the shell that runs the line, later and in its own
+/// working folder, so a link the agent can change or a `/proc/self/cwd/`
+/// resolved in the guard's process says nothing about what runs (measured
+/// 2026-11-22: a link swapped in a loop let the shell run another file
+/// with the refused line). Only `current_exe()` or its canonical form,
+/// written out, with no `.` or `..` part, no `//`, and nothing under
+/// `/proc` or `/dev`.
+fn is_the_running_guard(path: &str) -> bool {
+    running_guard_path_matches(path, &RUNNING_GUARD_PATHS)
+}
+
+/// The paths of the running guard [`is_the_running_guard`] accepts:
+/// `current_exe()` as the system gives it and its canonical form, read
+/// once, the guard's own file.
+static RUNNING_GUARD_PATHS: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    let Ok(exe) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    let canonical = std::fs::canonicalize(&exe).ok();
+    std::iter::once(exe)
+        .chain(canonical)
+        .filter_map(|path| path.to_str().map(str::to_owned))
+        .collect()
+});
+
+/// [`is_the_running_guard`] against the paths `running`.
+fn running_guard_path_matches(path: &str, running: &[String]) -> bool {
+    path.starts_with('/')
+        && path.ends_with("/innerwarden")
+        && !path.contains("//")
+        && !path.split('/').any(|part| matches!(part, "." | ".."))
+        && !["/proc/", "/dev/"]
+            .iter()
+            .any(|under| path.starts_with(under))
+        && running.iter().any(|exe| exe == path)
+}
+
 /// `innerwarden check [options] '<line>'` (or `iw check`): the guard asked
 /// for its verdict on a line, which it reads and never runs. The line is
 /// data, so a dangerous one (`systemctl stop innerwarden-agent`) is not
@@ -4672,8 +4752,11 @@ const GUARD_PROGRAM_DIRS: &[&str] = &[
 /// pipe, no redirection to a file, no input from the line or a file, no
 /// substitution anywhere, every word handed over as written (quoted or
 /// not, nothing the shell expands), the program the guard's by its bare
-/// name or its path in a folder it is installed in, and the first word
-/// after it `check`. A program merely named `innerwarden` somewhere else
+/// name, its path in a folder it is installed in, or a path from the root
+/// to the very file of the program judging the line
+/// ([`is_the_running_guard`]), at most `HOME` or `NO_COLOR` set in front
+/// of it ([`CHECK_HARMLESS_VALUES`], then only by a path from the root),
+/// and the first word after it `check`. A program merely named `innerwarden` somewhere else
 /// (`./innerwarden`, `/tmp/x/innerwarden`) may be anything and is judged
 /// with its words; the guard's other commands run for real and are judged
 /// as they were.
@@ -4695,9 +4778,6 @@ fn guard_check_without_its_line(command: &str) -> Option<String> {
     {
         return None;
     }
-    let [program, subcommand, rest @ ..] = only.words.as_slice() else {
-        return None;
-    };
     if !only
         .words
         .iter()
@@ -4705,12 +4785,43 @@ fn guard_check_without_its_line(command: &str) -> Option<String> {
     {
         return None;
     }
+    // Values set in front of it, only the ones that change no program the
+    // line runs: where it reads its own files from (`HOME=/x`: its config,
+    // and the `llm.toml` and `notify.toml` a check may consult) or its
+    // colours.
+    let set_before = only
+        .words
+        .iter()
+        .take_while(|word| {
+            word.text
+                .split_once('=')
+                .is_some_and(|(name, _)| crate::threats::is_shell_name(name))
+        })
+        .count();
+    if !only.words[..set_before].iter().all(|word| {
+        word.text
+            .split_once('=')
+            .is_some_and(|(name, _)| CHECK_HARMLESS_VALUES.contains(&name))
+    }) {
+        return None;
+    }
+    let [program, subcommand, rest @ ..] = &only.words[set_before..] else {
+        return None;
+    };
     let path = program.text.as_str();
-    let guard = matches!(path, "innerwarden" | "iw")
-        || path.strip_suffix("innerwarden").is_some_and(|dir| {
-            GUARD_PROGRAM_DIRS.contains(&dir)
-                && (!dir.starts_with('~') || program.open_tildes == [0])
-        });
+    // With a value set in front, only a path the shell does not look up or
+    // expand with it: one from the root.
+    let installed = if set_before == 0 {
+        matches!(path, "innerwarden" | "iw")
+            || path.strip_suffix("innerwarden").is_some_and(|dir| {
+                GUARD_PROGRAM_DIRS.contains(&dir)
+                    && (!dir.starts_with('~') || program.open_tildes == [0])
+            })
+    } else {
+        path.strip_suffix("innerwarden")
+            .is_some_and(|dir| dir.starts_with('/') && GUARD_PROGRAM_DIRS.contains(&dir))
+    };
+    let guard = installed || is_the_running_guard(path);
     if !guard || subcommand.text != "check" {
         return None;
     }
@@ -4725,7 +4836,10 @@ fn guard_check_without_its_line(command: &str) -> Option<String> {
         return None;
     }
     Some(
-        std::iter::once(path)
+        only.words[..set_before]
+            .iter()
+            .map(|word| word.text.as_str())
+            .chain(std::iter::once(path))
             .chain(std::iter::once("check"))
             .chain(options)
             .collect::<Vec<_>>()
@@ -6425,6 +6539,65 @@ fn check_shell_internal_target(command: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The running guard's own path is read by its text, never resolved
+    /// in the guard's process: a path the shell resolves in its own
+    /// working folder (`/proc/self/cwd/`, `/dev/fd/../cwd/`) or through a
+    /// `.` or `..` part is not it, even when it leads there from here.
+    ///
+    /// FAILS ON REVERT of `running_guard_path_matches` to the file
+    /// system comparison: the `/proc` and `..` paths that lead to the
+    /// running program are accepted.
+    #[test]
+    fn the_running_guard_is_its_path_as_written() {
+        let running = vec![
+            "/home/u/src/inner-warden/target/release/innerwarden".to_string(),
+            "/opt/iw/bin/innerwarden".to_string(),
+        ];
+        for path in [
+            "/home/u/src/inner-warden/target/release/innerwarden",
+            "/opt/iw/bin/innerwarden",
+        ] {
+            assert!(running_guard_path_matches(path, &running), "{path}");
+        }
+        for path in [
+            "/proc/self/cwd/innerwarden",
+            "/proc/self/cwd/../release/innerwarden",
+            "/proc/thread-self/cwd/innerwarden",
+            "/dev/fd/../cwd/innerwarden",
+            "/proc/self/exe",
+            "/home/u/src/inner-warden/target/release/./innerwarden",
+            "/home/u/src/inner-warden/target/debug/../release/innerwarden",
+            "/home/u/src/inner-warden/target/release//innerwarden",
+            "//home/u/src/inner-warden/target/release/innerwarden",
+            "/tmp/x/innerwarden",
+            "target/release/innerwarden",
+        ] {
+            assert!(!running_guard_path_matches(path, &running), "{path}");
+        }
+        // The forms that walk the file system are refused before any
+        // comparison, whatever the running paths hold.
+        for path in [
+            "/proc/self/cwd/innerwarden",
+            "/dev/fd/../cwd/innerwarden",
+            "/a/../innerwarden",
+        ] {
+            assert!(
+                !running_guard_path_matches(path, &[path.to_string()]),
+                "{path}"
+            );
+        }
+        // With the guard's own program in the working folder, the paths
+        // through `/proc/self/cwd` still read the line as a command.
+        for path in [
+            "/proc/self/cwd/innerwarden",
+            "/proc/thread-self/cwd/innerwarden",
+            "/dev/fd/../cwd/innerwarden",
+        ] {
+            let line = format!("{path} check 'systemctl stop innerwarden-agent'");
+            assert_eq!(guard_check_without_its_line(&line), None, "{line}");
+        }
+    }
 
     /// A refusing ATR rule whose pattern cannot finish on the input (the
     /// fancy-regex backtrack limit) refuses the MCP message on each path

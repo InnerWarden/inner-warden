@@ -4,7 +4,7 @@
 Takes every must_refuse line of adversarial-323, adversarial-328 and
 data-slot-substitutions, rewrites it so bash runs the same command
 (quote_split, backslash, variable, line_continuation, absolute_path,
-env_prefix, command_prefix, builtin_prefix, extra_whitespace, eval, sh_c,
+env_prefix, env_redirect, command_prefix, builtin_prefix, extra_whitespace, eval, sh_c,
 backticks), and keeps a variant only when it is proven equivalent:
 
   1. bash -n accepts it (and sh -n accepts the original, for sh_c);
@@ -139,6 +139,7 @@ def variants(line):
         if rest[:1]==" ": v["line_continuation"] = line[:e] + " \\\n  " + rest[1:]
         if w in ABS: v["absolute_path"] = line[:s] + ABS[w] + rest
         v["env_prefix"] = line[:s] + "env " + w + rest
+        v["env_redirect"] = line[:s] + "env 2>/dev/null " + w + rest
         v["command_prefix"] = line[:s] + "command " + w + rest
         if w in BUILTINS: v["builtin_prefix"] = line[:s] + "builtin " + w + rest
         if rest[:1]==" ": v["extra_whitespace"] = line[:s] + " \t" + w + " \t " + rest[1:]
@@ -222,7 +223,7 @@ R = res
 keep = [r for r in R if r["syntax"] and r["same"]]
 RANK = {"allow":0,"review":1,"deny":2}
 SHORT = {"quote_split":"quote","backslash":"esc","variable":"var","line_continuation":"cont","eval":"eval","sh_c":"shc",
-         "absolute_path":"abs","env_prefix":"env","command_prefix":"cmd","builtin_prefix":"builtin","extra_whitespace":"ws","backticks":"bt"}
+         "absolute_path":"abs","env_prefix":"env","env_redirect":"envr","command_prefix":"cmd","builtin_prefix":"builtin","extra_whitespace":"ws","backticks":"bt"}
 def clean(s):
     s = s.replace(SP, "<dir>")
     s = re.sub(r"/home/[^ /]+", "~", s)
@@ -244,6 +245,7 @@ L.append("""# Metamorphic variants of the must_refuse lines of adversarial-323,
 #   line_continuation  curl \\<newline> -s ...
 #   absolute_path      /usr/bin/curl (only where the program lives there)
 #   env_prefix         env curl
+#   env_redirect       env 2>/dev/null curl
 #   command_prefix     command curl
 #   builtin_prefix     builtin kill (only for a shell builtin)
 #   extra_whitespace   a space and a tab around the word

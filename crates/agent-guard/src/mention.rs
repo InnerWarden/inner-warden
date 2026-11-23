@@ -1284,20 +1284,28 @@ fn command_edits(
                 }
             }
             if program == "git" {
-                let verbs: Vec<&str> = words
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|w| !w.starts_with('-'))
-                    .take(2)
-                    .collect();
+                let at = git_verb_positions(&words);
+                let verbs: Vec<&str> = at.iter().map(|i| words[*i].as_str()).collect();
                 if verbs.first() == Some(&"grep") {
-                    let from = words.iter().position(|w| w == "grep").unwrap_or(0) + 1;
+                    let from = at[0] + 1;
                     search_pattern_edits(&words[from..], from, &literal_at, &mut mask);
                 }
                 if verbs.first() == Some(&"worktree") && verbs.get(1) == Some(&"remove") {
-                    let from = words.iter().position(|w| w == verbs[1]).unwrap_or(0) + 1;
+                    let from = at[1] + 1;
+                    // A relative worktree is read in the folder `-C` names.
+                    let folder = git_folder(&words[..at[0]]);
                     for (at, word) in words.iter().enumerate().skip(from) {
-                        if !word.starts_with('-') && literal_at(at) && work_folder(word) {
+                        let path = match &folder {
+                            Some(folder) if !word.starts_with(['/', '~', '$']) => {
+                                format!("{}/{word}", folder.trim_end_matches('/'))
+                            }
+                            _ => word.clone(),
+                        };
+                        if !word.starts_with('-')
+                            && literal_at(at)
+                            && work_folder(&path)
+                            && !names_guard_folder_by_name(word)
+                        {
                             mask(at, "wt");
                         }
                     }
@@ -1338,6 +1346,86 @@ fn command_edits(
             }
         }
     }
+}
+
+/// git's options before its verb whose value is the next word: the folder
+/// it runs in (`-C`), its repository and work tree, a setting, a
+/// namespace. Their value is no verb.
+const GIT_VALUE_OPTIONS: &[&str] = &["-C", "--git-dir", "--work-tree", "-c", "--namespace"];
+
+/// The folder git's `-C` options before its verb name, each relative to
+/// the one before; `None` without one, or when one is not a literal word.
+fn git_folder(options: &[String]) -> Option<String> {
+    let mut folder: Option<String> = None;
+    let mut at = 0;
+    while at < options.len() {
+        if options[at] == "-C" {
+            let value = options.get(at + 1)?;
+            folder = Some(match folder {
+                Some(before) if !value.starts_with(['/', '~', '$']) => {
+                    format!("{}/{value}", before.trim_end_matches('/'))
+                }
+                _ => value.clone(),
+            });
+            at += 2;
+            continue;
+        }
+        at += if GIT_VALUE_OPTIONS.contains(&options[at].as_str()) {
+            2
+        } else {
+            1
+        };
+    }
+    folder
+}
+
+/// Whether a worktree named by `word` may be one of the guard's folders:
+/// git finds a worktree by the end of its path as well as by its path
+/// (`git worktree remove innerwarden` removes a worktree at
+/// `~/.config/innerwarden`, and so does `config/innerwarden`), so a word
+/// whose last part is the guard's name is never read as a work folder.
+///
+/// A word with a `.` or `..` part (`../innerwarden`) is never the end of
+/// a worktree's path, which git keeps whole: git reads it from the working
+/// folder, and [`work_folder`] decides.
+fn names_guard_folder_by_name(word: &str) -> bool {
+    // `innerwarden/.`, `./innerwarden` and `innerwarden/./` name the
+    // same path as `innerwarden`: a `.` part is dropped first.
+    let lower = word.trim_matches(['"', '\'']).to_ascii_lowercase();
+    let absolute = lower.starts_with('/');
+    let lower = lower
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>()
+        .join("/");
+    let lower = if absolute { format!("/{lower}") } else { lower };
+    if lower.split('/').any(|part| part == "..") {
+        return false;
+    }
+    let last = lower.rsplit('/').next().unwrap_or(&lower);
+    GUARD_PROGRAMS.contains(&last)
+}
+
+/// Where git's verb and the word after it are among `words` (a git
+/// line's arguments): the first two words that are not options, the value
+/// of an option before the verb ([`GIT_VALUE_OPTIONS`]) skipped. `git -C
+/// ~/repo worktree remove ../wt` is `worktree remove`, not `~/repo
+/// worktree` (BI FP-20261122-git-C-innerwarden-path-worktree-remove).
+fn git_verb_positions(words: &[String]) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < words.len() && found.len() < 2 {
+        let word = words[at].as_str();
+        if found.is_empty() && GIT_VALUE_OPTIONS.contains(&word) {
+            at += 2;
+            continue;
+        }
+        if !word.starts_with('-') {
+            found.push(at);
+        }
+        at += 1;
+    }
+    found
 }
 
 /// Subcommands of `cargo` that build, check or test what the project holds

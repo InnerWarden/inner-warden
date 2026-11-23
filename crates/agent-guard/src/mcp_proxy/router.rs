@@ -2142,14 +2142,14 @@ mod tests {
     /// regexes in every proxy before it had screened a message; an MCP client
     /// keeps one proxy per server open for its whole session. A proxy screens
     /// tool descriptions and calls (`tool_call` rules) and tool results
-    /// (`mcp_exchange` rules), so after a session's first exchange it must
-    /// hold every one of those compiled and nothing else: the `llm_io` rules
-    /// alone are about half the corpus's memory, and no proxy message reaches
-    /// them.
+    /// (`mcp_exchange` rules), so after a session's first exchange it may
+    /// hold those compiled (the ones whose literals the messages held) and
+    /// nothing else: the `llm_io` rules alone are about half the corpus's
+    /// memory, and no proxy message reaches them.
     ///
-    /// FAILS ON REVERT: compile the embedded corpus at load
-    /// (`Compile::AtLoad` in `rules::collect_embedded_rules_for`) and the
-    /// prompt rules are held compiled from the start.
+    /// FAILS ON REVERT: compile the embedded corpus at load (every rule of
+    /// `rules::embedded_rules` compiled) and the prompt rules are held
+    /// compiled from the start.
     #[test]
     fn a_proxy_compiles_the_rules_its_traffic_can_select_and_no_others() {
         let engine = RuleEngine::load_embedded();
@@ -2179,21 +2179,20 @@ mod tests {
         );
 
         let compiled = engine.compiled_rules();
-        let mut surfaces: Vec<&str> = compiled.iter().map(|(_, source)| *source).collect();
-        surfaces.sort_unstable();
-        surfaces.dedup();
-        assert_eq!(
-            surfaces,
-            vec!["mcp_exchange", "tool_call"],
-            "a proxy compiled rules for surfaces it never screens: {compiled:?}"
+        let foreign: Vec<_> = compiled
+            .iter()
+            .filter(|(_, source)| !matches!(*source, "mcp_exchange" | "tool_call"))
+            .collect();
+        assert!(
+            foreign.is_empty(),
+            "a proxy compiled rules for surfaces it never screens: {foreign:?}"
         );
         let selectable = RuleEngine::load_embedded_for(crate::rules::AtrSource::ToolCall)
             .rule_count()
             + RuleEngine::load_embedded_for(crate::rules::AtrSource::McpExchange).rule_count();
-        assert_eq!(
-            compiled.len(),
-            selectable,
-            "every rule a proxy message can select must be compiled once one has been screened"
+        assert!(
+            compiled.len() <= selectable,
+            "a proxy compiled more rules than its messages can select: {compiled:?}"
         );
     }
 

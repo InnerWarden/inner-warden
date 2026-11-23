@@ -110,12 +110,26 @@ pub struct ServerEntry {
 
 /// A wrapper's command and whether its mode refuses (`guard`, `kill`,
 /// `strict`) rather than only records (`advisory`, `warn`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Wrapper {
     /// The command as the configuration writes it.
     pub command: String,
     /// Its proxy refuses what it denies.
     pub blocks: bool,
+    /// The entry sets what decides which program its command starts or what
+    /// that program loads: `PATH`, a `LD_*` or `DYLD_*` variable in its
+    /// `env`, or a file of variables (Cursor's `envFile`) or an `env`
+    /// that cannot be read.
+    pub sets_loader_env: bool,
+    /// The entry names a working folder (`cwd`) its command starts in.
+    pub has_cwd: bool,
+}
+
+/// Whether a variable an entry sets decides which program a command starts
+/// or what it loads: `PATH` (any case: Windows reads it so), `LD_*`,
+/// `DYLD_*`.
+pub fn is_loader_variable(name: &str) -> bool {
+    name.eq_ignore_ascii_case("PATH") || name.starts_with("LD_") || name.starts_with("DYLD_")
 }
 
 /// What a client tells the hook of a call's server besides the tool name.
@@ -149,9 +163,13 @@ pub fn runs_mcp_remote(command: &str, args: &[&str]) -> bool {
         let word = word.trim();
         word == "mcp-remote" || word.starts_with("mcp-remote@")
     };
+    // An address on this host (`mcp-remote http://127.0.0.1:...`) is a
+    // local server: a path handed to it names a file here.
     let has_url = |rest: &[&str]| {
-        rest.iter()
-            .any(|a| a.starts_with("https://") || a.starts_with("http://"))
+        rest.iter().any(|a| {
+            (a.starts_with("https://") || a.starts_with("http://"))
+                && !crate::mcp_proxy::remote::is_local_url(a)
+        })
     };
     let runner = program(command);
     if runner == "mcp-remote" {
@@ -236,6 +254,246 @@ pub struct ProxyTrust {
     /// Cursor's `command` line of the server the call goes to, when it
     /// sent one: it must be the guard's proxy as well.
     pub call_command: Option<String>,
+    /// The servers Codex's project layers name ([`codex_project_layers`]):
+    /// one of them may replace the entry read from the user's file.
+    pub project_layers: ProjectLayers,
+    /// The paths this binary runs as, written as text: the one it was
+    /// started by and the same with its links resolved. A wrapper's command
+    /// must be one of them ([`Self::is_guard_absolute`]).
+    pub guard_paths: Vec<PathBuf>,
+}
+
+/// What the configuration layers of a project (Codex's `.codex/config.toml`
+/// in the folders from the working folder up to the project's root) say of
+/// the servers. Codex reads the layers of a trusted project over the user's
+/// file, so a server one of them names may not be the entry the hook read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectLayers {
+    /// The servers the layers name (none: no layer, or layers with no
+    /// server).
+    Servers(Vec<String>),
+    /// A layer is there but cannot be read, or what the agent read cannot
+    /// be told (a layer may have moved since it started, its command line
+    /// sets servers): any server may be in it.
+    Unreadable,
+}
+
+impl Default for ProjectLayers {
+    fn default() -> Self {
+        Self::Servers(Vec::new())
+    }
+}
+
+/// The configuration layers Codex may read for a session in `cwd`: each
+/// `.codex/config.toml` in `cwd` and its parents up to the first folder
+/// that holds `.git` (the project's root, inclusive), or up to the root of
+/// the file system when none does. `user_config` (the user's own file,
+/// read already) is left out.
+pub fn codex_project_layers(cwd: &Path, user_config: &Path) -> Vec<PathBuf> {
+    let user = file_id(user_config);
+    let mut layers = Vec::new();
+    // Up to the root of the file system, past a `.git`: one made after the
+    // agent started (`git init` in a folder below a layer) does not hide a
+    // layer the agent read.
+    for dir in cwd.ancestors() {
+        let layer = dir.join(".codex").join("config.toml");
+        let is_user = layer == user_config || (user.is_some() && file_id(&layer) == user);
+        if !is_user && std::fs::symlink_metadata(&layer).is_ok() {
+            layers.push(layer);
+        }
+    }
+    layers
+}
+
+/// The folders the user's Codex file (`[projects."<folder>"]` with
+/// `trust_level = "trusted"`) marks as trusted: Codex reads the project
+/// layers of a session in one of them, or below.
+pub fn codex_trusted_projects(user_config_text: &str) -> Vec<PathBuf> {
+    let Ok(doc) = user_config_text.parse::<toml_edit::DocumentMut>() else {
+        return Vec::new();
+    };
+    let Some(projects) = doc.get("projects").and_then(|item| item.as_table_like()) else {
+        return Vec::new();
+    };
+    projects
+        .iter()
+        .filter(|(_, project)| {
+            project
+                .as_table_like()
+                .and_then(|project| project.get("trust_level"))
+                .and_then(|level| level.as_str())
+                .is_some_and(|level| level.eq_ignore_ascii_case("trusted"))
+        })
+        .map(|(folder, _)| PathBuf::from(folder))
+        .collect()
+}
+
+/// Whether a layer Codex may have read when the agent started can have
+/// moved since: `cwd` is in a project the user's file trusts
+/// (`trusted`), and one of the folders from `cwd` up to that project's
+/// folder, the `.codex` in one of them or its `config.toml` changed
+/// after the agent started (or either time is unknown). A layer moved
+/// away leaves its folder changed, and one emptied or rewritten in place
+/// leaves the file changed: what the hook finds then is not what the
+/// agent read. A `.codex` or a `config.toml` that is a link is read on
+/// both sides: the link, and what it points at (a link that points at
+/// nothing counts as changed).
+pub fn codex_layers_may_have_moved(
+    cwd: &Path,
+    trusted: &[PathBuf],
+    agent_started: Option<SystemTime>,
+) -> bool {
+    let real = std::fs::canonicalize(cwd).ok();
+    let Some(root) = trusted
+        .iter()
+        .filter(|root| root.is_absolute())
+        .find(|root| {
+            cwd.starts_with(root) || real.as_ref().is_some_and(|real| real.starts_with(root))
+        })
+    else {
+        return false;
+    };
+    let base = if cwd.starts_with(root) {
+        cwd.to_path_buf()
+    } else {
+        real.unwrap_or_else(|| cwd.to_path_buf())
+    };
+    for dir in base.ancestors() {
+        if layer_may_have_moved(dir, ".codex", "config.toml", agent_started) {
+            return true;
+        }
+        if dir == root.as_path() {
+            break;
+        }
+    }
+    false
+}
+
+/// Whether the layer `<dir>/<folder>/<file>` may have changed since the
+/// agent started: `dir`, `folder` in it or the layer file changed after
+/// the start (or either time is unknown). A `folder` or a `file` that is
+/// a link is read on both sides: the link, and what it points at with the
+/// folder that holds it (a link that points at nothing counts as changed).
+pub fn layer_may_have_moved(
+    dir: &Path,
+    folder: &str,
+    file: &str,
+    agent_started: Option<SystemTime>,
+) -> bool {
+    let holder = dir.join(folder);
+    let layer = holder.join(file);
+    for place in [dir.to_path_buf(), holder, layer] {
+        match std::fs::symlink_metadata(&place) {
+            Ok(meta) => {
+                if !config_settled(last_change(&meta), agent_started) {
+                    return true;
+                }
+                if place != dir && meta.file_type().is_symlink() {
+                    // What the link points at, and the folder that holds
+                    // it: a file moved out of it leaves it changed.
+                    let Ok(target) = std::fs::canonicalize(&place) else {
+                        return true;
+                    };
+                    for followed in [Some(target.as_path()), target.parent()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        match std::fs::metadata(followed) {
+                            Ok(meta) if config_settled(last_change(&meta), agent_started) => {}
+                            _ => return true,
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+/// Whether a Codex `-c` / `--config` setting (`key=value`) sets an MCP
+/// server: its key is `mcp_servers` or under it, however its parts are
+/// quoted (`"mcp_servers".docs.command`).
+pub fn codex_setting_names_servers(setting: &str) -> bool {
+    let key: String = setting
+        .split('=')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | ' ' | '\t'))
+        .collect();
+    key == "mcp_servers" || key.starts_with("mcp_servers.")
+}
+
+/// Whether the command line Codex was started with may run a server other
+/// than the one the user's file names: a `-c` / `--config` setting of
+/// `mcp_servers` ([`codex_setting_names_servers`]), of the projects or
+/// the profile ([`codex_setting_reads_layers`]), or a profile (`-p`,
+/// `--profile`), whose settings are read over the file's.
+pub fn codex_argv_sets_servers(argv: &[String]) -> bool {
+    let mut words = argv.iter().skip(1).peekable();
+    while let Some(word) = words.next() {
+        if word == "--" {
+            break;
+        }
+        if matches!(word.as_str(), "-p" | "--profile") || word.starts_with("--profile=") {
+            return true;
+        }
+        let setting = if matches!(word.as_str(), "-c" | "--config") {
+            words.next().map(String::as_str)
+        } else if let Some(value) = word.strip_prefix("--config=") {
+            Some(value)
+        } else if let Some(value) = word
+            .strip_prefix("-c")
+            .filter(|v| !v.is_empty() && !word.starts_with("--"))
+        {
+            Some(value)
+        } else if word.starts_with("-p") && !word.starts_with("--") && word.len() > 2 {
+            return true;
+        } else {
+            None
+        };
+        if setting.is_some_and(|setting| {
+            codex_setting_names_servers(setting) || codex_setting_reads_layers(setting)
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a Codex `-c` / `--config` setting changes which layers Codex
+/// reads: one under `projects` (a folder marked trusted on the command
+/// line, whose layers the user's file does not say are read), or the
+/// profile (`profile`, `profiles.*`), whose settings are read over the
+/// file's.
+pub fn codex_setting_reads_layers(setting: &str) -> bool {
+    let key: String = setting
+        .split('=')
+        .next()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\'' | ' ' | '\t'))
+        .collect();
+    let key = key.to_ascii_lowercase();
+    key == "projects"
+        || key.starts_with("projects.")
+        || key == "profile"
+        || key == "profiles"
+        || key.starts_with("profiles.")
+}
+
+/// The servers `layers` name, read as the user's file is ([`read_entries`]).
+pub fn project_layer_servers(layers: &[PathBuf]) -> ProjectLayers {
+    let mut names = Vec::new();
+    for layer in layers {
+        match read_entries(layer) {
+            Some(entries) => names.extend(entries.into_iter().map(|entry| entry.name)),
+            None => return ProjectLayers::Unreadable,
+        }
+    }
+    ProjectLayers::Servers(names)
 }
 
 impl ProxyTrust {
@@ -248,6 +506,14 @@ impl ProxyTrust {
             path_var: std::env::var_os("PATH"),
             cwd: std::env::current_dir().ok(),
             call_command,
+            project_layers: ProjectLayers::default(),
+            guard_paths: {
+                let exe = std::env::current_exe().ok();
+                let resolved = exe
+                    .as_deref()
+                    .and_then(|exe| std::fs::canonicalize(exe).ok());
+                [exe, resolved].into_iter().flatten().collect()
+            },
         }
     }
 
@@ -273,17 +539,170 @@ impl ProxyTrust {
         if !self.config_settled || (self.hook_enforces && !wrapper.blocks) {
             return false;
         }
-        if !self.is_guard(&wrapper.command) {
+        // What the entry sets beside its command could start another program
+        // under the guard's name (`PATH`, a relative command from `cwd`) or
+        // load other code into it (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`).
+        if wrapper.sets_loader_env || wrapper.has_cwd {
+            return false;
+        }
+        // A layer that names any server may replace this entry under a name
+        // spelled another way (`my-docs` for `my_docs`, `docs__x` for a
+        // tool of `docs`): no entry is trusted while one does.
+        match &self.project_layers {
+            ProjectLayers::Unreadable => return false,
+            ProjectLayers::Servers(names) if !names.is_empty() => return false,
+            ProjectLayers::Servers(_) => {}
+        }
+        if !self.is_guard_absolute(&wrapper.command) {
             return false;
         }
         match &self.call_command {
             None => true,
-            Some(line) => {
-                let mut words = line.split_whitespace();
-                words.next().is_some_and(|c| self.is_guard(c)) && words.next() == Some("proxy")
+            Some(line) => self.call_command_is_guard_proxy(line),
+        }
+    }
+
+    /// Whether Cursor's command line for the call's server is this binary's
+    /// proxy, read as the proxy reads its own words: `<guard> proxy
+    /// [options] -- <server>`, in a mode that refuses when the hook does
+    /// (no `--mode` is the proxy's default, `guard`). The entry the line
+    /// came from may be another than the one the user's file has (a
+    /// project's `.cursor/mcp.json`), so its mode is read here.
+    ///
+    /// Words are split as a shell splits them (quotes and `\\` kept
+    /// together); a line whose quotes do not close is not read. How Cursor
+    /// writes a word with a space in it is not measured: a line that names
+    /// `--mode` more than once in its plain words, or that splits two ways
+    /// into different modes, is not taken as the guard's.
+    fn call_command_is_guard_proxy(&self, line: &str) -> bool {
+        let Some(split) = command_line_words(line) else {
+            return false;
+        };
+        let plain: Vec<&str> = line.split_whitespace().collect();
+        let modes = plain
+            .iter()
+            .filter(|word| {
+                let word = word.trim_matches(['"', '\'']);
+                word == "--mode" || word.starts_with("--mode=")
+            })
+            .count();
+        if modes > 1 {
+            return false;
+        }
+        let words: Vec<&str> = split.iter().map(String::as_str).collect();
+        self.proxy_words_refuse(&words) && self.proxy_words_refuse(&plain)
+    }
+
+    /// [`Self::call_command_is_guard_proxy`] for a line already split.
+    fn proxy_words_refuse(&self, words: &[&str]) -> bool {
+        let [program, verb, rest @ ..] = words else {
+            return false;
+        };
+        if !self.is_guard_absolute(program) || *verb != "proxy" {
+            return false;
+        }
+        let Some(separator) = rest.iter().position(|word| *word == "--") else {
+            return false;
+        };
+        if rest.get(separator + 1).is_none() {
+            return false;
+        }
+        let options: Vec<Option<&str>> = rest[..separator].iter().map(|w| Some(*w)).collect();
+        match crate::mcp_wire::wrapper_blocks(&options) {
+            Some(blocks) => blocks || !self.hook_enforces,
+            None => false,
+        }
+    }
+
+    /// [`Self::is_guard`] for a command written as an absolute path only:
+    /// a bare name is looked up in a `PATH` the agent may not share with
+    /// this hook, and a relative one is read from a folder it may not share.
+    ///
+    /// The path is read as text, as the agent will start it: no part of it
+    /// may be `.`, `..` or empty (`//`), and none may go through `/proc`
+    /// or `/dev`, whose entries this process resolves to its own folder or
+    /// files (`/proc/self/cwd/...`). It must then be the path this binary
+    /// runs as, or that path with its links resolved.
+    fn is_guard_absolute(&self, command: &str) -> bool {
+        let command = command.trim();
+        if !Path::new(command).is_absolute() || !plain_absolute_path(command) {
+            return false;
+        }
+        let named = self
+            .guard_paths
+            .iter()
+            .any(|path| path.as_os_str() == std::ffi::OsStr::new(command));
+        named && self.is_guard(command)
+    }
+}
+
+/// `line` split into words as a shell splits it: `'...'` and `"..."`
+/// hold a word together, `\\` takes the next character as it is. `None`
+/// when a quote is left open.
+fn command_line_words(line: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        other => word.push(other),
+                    }
+                }
+            }
+            '"' => {
+                in_word = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '\\' => word.push(chars.next()?),
+                        other => word.push(other),
+                    }
+                }
+            }
+            '\\' => {
+                in_word = true;
+                word.push(chars.next()?);
+            }
+            c if c.is_whitespace() => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            other => {
+                in_word = true;
+                word.push(other);
             }
         }
     }
+    if in_word {
+        words.push(word);
+    }
+    Some(words)
+}
+
+/// Whether `path` is written with no `.`, `..` or empty part and does not
+/// go through `/proc` or `/dev`.
+fn plain_absolute_path(path: &str) -> bool {
+    let separators: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+    let rest = path.trim_start_matches(separators);
+    if rest.is_empty() || path.len() - rest.len() > 1 && !cfg!(windows) {
+        return false;
+    }
+    let parts: Vec<&str> = rest.split(separators).collect();
+    if parts
+        .iter()
+        .any(|part| part.is_empty() || *part == "." || *part == "..")
+    {
+        return false;
+    }
+    !matches!(parts.first(), Some(&"proc") | Some(&"dev"))
 }
 
 /// How long before the agent's start a configuration may have changed and
@@ -305,27 +724,155 @@ pub fn config_settled(modified: Option<SystemTime>, agent_started: Option<System
 /// line runs in, a launcher): the agent is the first ancestor that is none.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const LAUNCHERS: &[&str] = &[
-    "sh", "bash", "dash", "zsh", "fish", "ksh", "env", "timeout", "nice", "nohup", "stdbuf",
+    "sh",
+    "bash",
+    "dash",
+    "zsh",
+    "fish",
+    "ksh",
+    "env",
+    "timeout",
+    "nice",
+    "nohup",
+    "stdbuf",
+    "sandbox-exec",
+    "setsid",
+    "xargs",
+    "flock",
+    "script",
+    "busybox",
+    "node",
+    "sudo",
+    "doas",
+    "time",
+    "ionice",
+    "chrt",
+    "taskset",
+    "unshare",
+    "firejail",
+    "bwrap",
 ];
 
-/// When the agent that ran this hook started: the first ancestor of this
-/// process that is not a shell or a launcher ([`LAUNCHERS`]). `None` where
-/// it cannot be read (and on systems other than Linux and macOS).
-pub fn agent_started_at() -> Option<SystemTime> {
+/// How many ancestors are looked at for the agent.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ANCESTORS_READ: usize = 12;
+
+/// The process of the agent that ran this hook, as far as it can be told.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentProcess {
+    /// Its process id.
+    pub pid: u32,
+    /// When it started. `None` when that cannot be read.
+    pub started: Option<SystemTime>,
+}
+
+/// The agent that ran this hook: the nearest ancestor of this process named
+/// for `agent` (`codex`, `cursor`, the start of the name the system
+/// keeps), else the first ancestor that is not a shell or a launcher
+/// ([`LAUNCHERS`]). An ancestor started after the agent (a wrapper the
+/// list does not know) never stands for it when one named for the agent is
+/// above it. `None` where it cannot be read (and on systems other than
+/// Linux and macOS).
+pub fn agent_process(agent: &str) -> Option<AgentProcess> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
+        let named_for = |name: &str| {
+            let name = name.to_ascii_lowercase();
+            !agent.is_empty() && name.starts_with(&agent.to_ascii_lowercase())
+        };
         let mut pid = std::os::unix::process::parent_id();
-        for _ in 0..8 {
-            let (name, parent, started) = process_facts(pid)?;
-            if !LAUNCHERS.contains(&name.as_str()) || parent <= 1 {
-                return started;
+        let mut first: Option<AgentProcess> = None;
+        for _ in 0..ANCESTORS_READ {
+            let Some((name, parent, started)) = process_facts(pid) else {
+                break;
+            };
+            if named_for(&name) {
+                return Some(AgentProcess { pid, started });
+            }
+            if first.is_none() && (!LAUNCHERS.contains(&name.as_str()) || parent <= 1) {
+                first = Some(AgentProcess { pid, started });
+            }
+            if parent <= 1 {
+                break;
             }
             pid = parent;
         }
-        None
+        first
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
+        let _ = agent;
+        None
+    }
+}
+
+/// When the agent that ran this hook started ([`agent_process`] with no
+/// agent's name to look for).
+pub fn agent_started_at() -> Option<SystemTime> {
+    agent_process("").and_then(|process| process.started)
+}
+
+/// The words a process was started with. `None` where they cannot be read.
+pub fn process_argv(pid: u32) -> Option<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        Some(
+            raw.split(|b| *b == 0)
+                .filter(|word| !word.is_empty())
+                .map(|word| String::from_utf8_lossy(word).into_owned())
+                .collect(),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // KERN_PROCARGS2: argc, then the executable's path, padding, and
+        // each argument ended by a zero.
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+        let mut size: libc::size_t = 0;
+        // SAFETY: a size query with a null buffer.
+        let asked = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if asked != 0 || size < 4 {
+            return None;
+        }
+        let mut buffer = vec![0u8; size];
+        // SAFETY: the buffer holds `size` bytes, the size the call gives.
+        let read = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buffer.as_mut_ptr().cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if read != 0 || size < 4 {
+            return None;
+        }
+        buffer.truncate(size);
+        let argc = i32::from_ne_bytes(buffer[..4].try_into().ok()?);
+        let argc = usize::try_from(argc).ok()?;
+        let rest = &buffer[4..];
+        let path_end = rest.iter().position(|b| *b == 0)?;
+        let mut words = rest[path_end..]
+            .split(|b| *b == 0)
+            .filter(|word| !word.is_empty())
+            .map(|word| String::from_utf8_lossy(word).into_owned());
+        Some(words.by_ref().take(argc).collect())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
         None
     }
 }
@@ -423,6 +970,29 @@ pub fn config_path_here(agent: &str, home: &Path) -> Option<PathBuf> {
     config_path(agent, home, std::env::var_os(CODEX_HOME_VAR).as_deref())
 }
 
+/// When a file last changed: the later of its content's time (`mtime`,
+/// which anyone who can write the file can set back with `touch -d`) and
+/// its status change (`ctime`, which the system sets on every write and
+/// on that `touch` too). `None` when neither can be read.
+pub fn last_change(meta: &std::fs::Metadata) -> Option<SystemTime> {
+    let modified = meta.modified().ok();
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        u64::try_from(meta.ctime()).ok().map(|secs| {
+            std::time::UNIX_EPOCH
+                + Duration::from_secs(secs)
+                + Duration::from_nanos(u64::try_from(meta.ctime_nsec()).unwrap_or(0))
+        })
+    };
+    #[cfg(not(unix))]
+    let changed: Option<SystemTime> = None;
+    match (modified, changed) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    }
+}
+
 /// The servers the configuration at `path` names. `None` when it is not a
 /// regular file (a FIFO is never opened: it would hold the hook until its
 /// deadline), is larger than [`MAX_CONFIG_BYTES`], cannot be read, or does
@@ -439,7 +1009,7 @@ pub fn read_config(path: &Path) -> Option<(Vec<ServerEntry>, Option<SystemTime>)
         return None;
     }
     let file = std::fs::File::open(path).ok()?;
-    let modified = file.metadata().and_then(|m| m.modified()).ok();
+    let modified = file.metadata().ok().and_then(|meta| last_change(&meta));
     let mut text = String::new();
     file.take(MAX_CONFIG_BYTES + 1)
         .read_to_string(&mut text)
@@ -488,8 +1058,10 @@ pub fn tool_of(tool_name: &str) -> Option<&str> {
 /// Where a call of `agent` to `tool_name` goes, and the server's own tools
 /// it may name.
 ///
-/// For Cursor, a call that carries the server's `url` goes to a remote
-/// server the proxy does not carry: a wrapper is a local command. A Cursor
+/// For Cursor, a call that carries the server's `url` goes to a server
+/// the proxy does not carry (a wrapper is a local command): remote, or
+/// [`Reach::Local`] for an address on this host
+/// ([`crate::mcp_proxy::remote::is_local_url`]). A Cursor
 /// call with no server name matches no entry and is [`Reach::Local`].
 /// Otherwise the tool name is matched against the servers of `entries`
 /// (Codex's names cleaned as Codex cleans them, [`codex_name`]). The call
@@ -510,8 +1082,17 @@ pub fn reach<'a>(
 ) -> Option<(Reach, Vec<&'a str>)> {
     let rest = tool_name.strip_prefix(MCP_TOOL_PREFIX)?;
     let unknown = tool_of(tool_name)?;
-    if agent == crate::cursor_hook::AGENT && call.url.is_some_and(|url| !url.trim().is_empty()) {
-        return Some((Reach::Remote, vec![unknown]));
+    if agent == crate::cursor_hook::AGENT {
+        if let Some(url) = call.url.map(str::trim).filter(|url| !url.is_empty()) {
+            // A server on this host keeps the path rules, as one run as a
+            // local command does.
+            let reach = if crate::mcp_proxy::remote::is_local_url(url) {
+                Reach::Local
+            } else {
+                Reach::Remote
+            };
+            return Some((reach, vec![unknown]));
+        }
     }
     if call.unnamed {
         return Some((Reach::Local, vec![unknown]));
@@ -758,6 +1339,7 @@ mod tests {
             wrapper: behind_proxy.then(|| Wrapper {
                 command: GUARD.to_string(),
                 blocks: true,
+                ..Wrapper::default()
             }),
             remote,
         }
@@ -773,6 +1355,8 @@ mod tests {
             path_var: guard.parent().map(|dir| dir.as_os_str().to_owned()),
             cwd: None,
             call_command: None,
+            project_layers: ProjectLayers::default(),
+            guard_paths: vec![guard.to_path_buf()],
         }
     }
 
@@ -918,6 +1502,42 @@ mod tests {
         );
     }
 
+    /// Cursor: a call that carries the address of a server on this host is
+    /// local, so the path rules still refuse a file of this host in it.
+    ///
+    /// FAILS ON REVERT of the loopback check in `reach`: the call is
+    /// remote and the default posture lets `/etc/shadow` through.
+    #[test]
+    fn a_cursor_call_to_a_server_here_is_local() {
+        let guard = Guard::new();
+        let trust = guard.trust();
+        let entries = guard.wire(vec![entry("shell", true, false)]);
+        for url in [
+            "http://127.0.0.1:8931/mcp",
+            "http://localhost:3000/mcp",
+            "http://[::1]/mcp",
+        ] {
+            let call = CallServer {
+                url: Some(url),
+                unnamed: false,
+            };
+            assert_eq!(
+                reach("cursor", "mcp__pw__get_file", call, Some(&entries), &trust),
+                Some((Reach::Local, vec!["get_file"])),
+                "{url}"
+            );
+        }
+        // An `mcp-remote` in front of an address here is a local server too.
+        assert!(!runs_mcp_remote(
+            "npx",
+            &["mcp-remote", "http://127.0.0.1:9/mcp"]
+        ));
+        assert!(runs_mcp_remote(
+            "npx",
+            &["mcp-remote", "https://x.example/mcp"]
+        ));
+    }
+
     /// Cursor: a call that carries the server's url goes to a remote server
     /// the proxy does not carry; one with no name (`unknown`) is judged.
     #[test]
@@ -996,25 +1616,28 @@ mod tests {
             wrapper: Some(Wrapper {
                 command: command.to_string(),
                 blocks,
+                ..Wrapper::default()
             }),
             remote: false,
         };
         let real = guard.path.display().to_string();
         assert!(trust.trusts(&wrapped(&real, true)));
-        // The bare name, found in PATH as a shell finds it.
-        assert!(trust.trusts(&wrapped("innerwarden", true)));
+        // The bare name, even found in PATH as a shell finds it: the agent's
+        // PATH may not be this hook's.
+        assert!(!trust.trusts(&wrapped("innerwarden", true)));
         // A file of the same name somewhere else is not the guard.
         let other = tempfile::TempDir::new().unwrap();
         let fake = other.path().join("innerwarden");
         std::fs::write(&fake, "not the guard").unwrap();
         assert!(!trust.trusts(&wrapped(&fake.display().to_string(), true)));
         assert!(!trust.trusts(&wrapped(GUARD, true)));
-        // A link to the guard runs the guard.
+        // A link to the guard runs the guard today, and whatever it is
+        // pointed at tomorrow: only the path the guard runs as is trusted.
         #[cfg(unix)]
         {
             let link = other.path().join("iw");
             std::os::unix::fs::symlink(&guard.path, &link).unwrap();
-            assert!(trust.trusts(&wrapped(&link.display().to_string(), true)));
+            assert!(!trust.trusts(&wrapped(&link.display().to_string(), true)));
         }
         // A mode that only records is not the guard refusing.
         assert!(!trust.trusts(&wrapped(&real, false)));
@@ -1404,6 +2027,574 @@ mod tests {
                 "{tool} {args}: {:?}",
                 decision.verdict.alerts
             );
+        }
+    }
+
+    /// Remains of the check on the wrapper: only an absolute command is the
+    /// guard (a relative one is read from a folder the agent may not
+    /// share), and an entry that sets `PATH`, `LD_*` or `DYLD_*`, a file
+    /// of variables or a `cwd` may start another program under the guard's
+    /// name or load other code into it: none is trusted.
+    ///
+    /// FAILS ON REVERT of the check of `sets_loader_env` and `has_cwd` in
+    /// [`ProxyTrust::trusts`], or of `is_guard_absolute`.
+    #[test]
+    fn a_wrapper_that_sets_the_loader_or_a_folder_is_not_trusted() {
+        let guard = Guard::new();
+        let trust = ProxyTrust {
+            cwd: guard.path.parent().map(Path::to_path_buf),
+            ..guard.trust()
+        };
+        let real = guard.path.display().to_string();
+        let entry = |wrapper: Wrapper| ServerEntry {
+            name: "s".to_string(),
+            wrapper: Some(wrapper),
+            remote: false,
+        };
+        let plain = Wrapper {
+            command: real.clone(),
+            blocks: true,
+            ..Wrapper::default()
+        };
+        assert!(trust.trusts(&entry(plain.clone())));
+        // Relative, found from the folder: not trusted.
+        assert!(!trust.trusts(&entry(Wrapper {
+            command: "./innerwarden".to_string(),
+            ..plain.clone()
+        })));
+        assert!(!trust.trusts(&entry(Wrapper {
+            sets_loader_env: true,
+            ..plain.clone()
+        })));
+        assert!(!trust.trusts(&entry(Wrapper {
+            has_cwd: true,
+            ..plain.clone()
+        })));
+        for (name, loader) in [
+            ("PATH", true),
+            ("Path", true),
+            ("LD_PRELOAD", true),
+            ("LD_LIBRARY_PATH", true),
+            ("DYLD_INSERT_LIBRARIES", true),
+            ("NODE_OPTIONS", false),
+            ("HOME", false),
+        ] {
+            assert_eq!(is_loader_variable(name), loader, "{name}");
+        }
+    }
+
+    /// The entries of a Codex and a Cursor config say what they set beside
+    /// their command.
+    #[test]
+    fn codex_env_vars_that_pass_the_loader_count() {
+        // FAILS ON REVERT of `env_vars_pass_loader`: `a` and `b` are not
+        // flagged.
+        let doc: toml_edit::DocumentMut = "[mcp_servers.a]\ncommand = \"/bin/iw\"\n\
+             args = [\"proxy\", \"--\", \"srv\"]\nenv_vars = [\"LD_PRELOAD\", \"PATH\"]\n\n\
+             [mcp_servers.b]\ncommand = \"/bin/iw\"\n\
+             args = [\"proxy\", \"--\", \"srv\"]\nenv_vars = [{ name = \"DYLD_INSERT_LIBRARIES\" }]\n\n\
+             [mcp_servers.c]\ncommand = \"/bin/iw\"\n\
+             args = [\"proxy\", \"--\", \"srv\"]\nenv_vars = [\"GITHUB_TOKEN\"]\n\n\
+             [mcp_servers.d]\ncommand = \"/bin/iw\"\n\
+             args = [\"proxy\", \"--\", \"srv\"]\nenv_vars = \"PATH\"\n"
+            .parse()
+            .unwrap();
+        let flags: Vec<bool> = crate::mcp_wire_toml::server_entries_toml(&doc)
+            .into_iter()
+            .map(|e| e.wrapper.expect("a wrapper").sets_loader_env)
+            .collect();
+        assert_eq!(flags, vec![true, true, false, true]);
+    }
+
+    #[test]
+    fn entries_say_what_they_set_beside_the_command() {
+        let toml_doc: toml_edit::DocumentMut = "[mcp_servers.a]\ncommand = \"/bin/iw\"\n\
+             args = [\"proxy\", \"--mode\", \"guard\", \"--\", \"srv\"]\nenv = { LD_PRELOAD = \"/tmp/x.so\" }\n\n\
+             [mcp_servers.b]\ncommand = \"/bin/iw\"\n\
+             args = [\"proxy\", \"--mode\", \"guard\", \"--\", \"srv\"]\ncwd = \"/tmp\"\n\n\
+             [mcp_servers.c]\ncommand = \"/bin/iw\"\n\
+             args = [\"proxy\", \"--mode\", \"guard\", \"--\", \"srv\"]\nenv = { TOKEN = \"x\" }\n"
+            .parse()
+            .unwrap();
+        let flags: Vec<(bool, bool)> = crate::mcp_wire_toml::server_entries_toml(&toml_doc)
+            .into_iter()
+            .map(|e| {
+                let w = e.wrapper.expect("a wrapper");
+                (w.sets_loader_env, w.has_cwd)
+            })
+            .collect();
+        assert_eq!(flags, vec![(true, false), (false, true), (false, false)]);
+
+        let wrapper = |extra: Value| {
+            let mut server = json!({"command": "/bin/iw",
+                "args": ["proxy", "--mode", "guard", "--", "srv"]});
+            for (k, v) in extra.as_object().unwrap() {
+                server[k] = v.clone();
+            }
+            server
+        };
+        let root = json!({"mcpServers": {
+            "a": wrapper(json!({"env": {"PATH": "/tmp/bin"}})),
+            "b": wrapper(json!({"envFile": ".env"})),
+            "c": wrapper(json!({"cwd": "/tmp"})),
+            "d": wrapper(json!({"env": {"TOKEN": "x"}})),
+        }});
+        let flags: Vec<(String, bool, bool)> = crate::mcp_wire::server_entries(&root)
+            .into_iter()
+            .map(|e| {
+                let w = e.wrapper.expect("a wrapper");
+                (e.name, w.sets_loader_env, w.has_cwd)
+            })
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                ("a".to_string(), true, false),
+                ("b".to_string(), true, false),
+                ("c".to_string(), false, true),
+                ("d".to_string(), false, false),
+            ]
+        );
+    }
+
+    /// A server a project layer of Codex names may be another entry than the
+    /// user's: not trusted. A layer that cannot be read may name any. The
+    /// layers run from the working folder up to the folder with `.git`.
+    ///
+    /// FAILS ON REVERT of the check of `project_layers` in
+    /// [`ProxyTrust::trusts`].
+    #[test]
+    fn a_server_a_project_layer_names_is_not_trusted() {
+        let guard = Guard::new();
+        let real = guard.path.display().to_string();
+        let entry = ServerEntry {
+            name: "docs".to_string(),
+            wrapper: Some(Wrapper {
+                command: real,
+                blocks: true,
+                ..Wrapper::default()
+            }),
+            remote: false,
+        };
+        assert!(guard.trust().trusts(&entry));
+        let named = ProxyTrust {
+            project_layers: ProjectLayers::Servers(vec!["docs".to_string()]),
+            ..guard.trust()
+        };
+        assert!(!named.trusts(&entry));
+        // A layer that names another server may name this one spelled
+        // another way (`my-docs` for `my_docs`): no entry is trusted.
+        let other = ProxyTrust {
+            project_layers: ProjectLayers::Servers(vec!["other".to_string()]),
+            ..guard.trust()
+        };
+        assert!(!other.trusts(&entry));
+        let unreadable = ProxyTrust {
+            project_layers: ProjectLayers::Unreadable,
+            ..guard.trust()
+        };
+        assert!(!unreadable.trusts(&entry));
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let repo = home.join("repo");
+        let sub = repo.join("crates/a");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let user = home.join(".codex/config.toml");
+        for layer in [
+            &user,
+            &repo.join(".codex/config.toml"),
+            &sub.join(".codex/config.toml"),
+        ] {
+            std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+        }
+        std::fs::write(&user, "[mcp_servers.user]\ncommand = \"u\"\n").unwrap();
+        std::fs::write(
+            repo.join(".codex/config.toml"),
+            "[mcp_servers.docs]\ncommand = \"evil\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sub.join(".codex/config.toml"),
+            "[mcp_servers.fs]\ncommand = \"x\"\n",
+        )
+        .unwrap();
+        let layers = codex_project_layers(&sub, &user);
+        assert_eq!(
+            layers,
+            vec![
+                sub.join(".codex/config.toml"),
+                repo.join(".codex/config.toml")
+            ]
+        );
+        assert_eq!(
+            project_layer_servers(&layers),
+            ProjectLayers::Servers(vec!["fs".to_string(), "docs".to_string()])
+        );
+        // No `.git` above: every folder up to the root, the user's file left out.
+        std::fs::remove_dir(repo.join(".git")).unwrap();
+        assert!(!codex_project_layers(&sub, &user).contains(&user));
+        std::fs::write(sub.join(".codex/config.toml"), "not = [toml").unwrap();
+        assert_eq!(
+            project_layer_servers(&codex_project_layers(&sub, &user)),
+            ProjectLayers::Unreadable
+        );
+    }
+
+    /// A layer above the project's `.git` is found: a `git init` made in a
+    /// folder below it after the agent started does not hide it.
+    ///
+    /// FAILS ON REVERT of the walk to the root in `codex_project_layers`
+    /// (it stops at the first `.git`).
+    #[test]
+    fn a_layer_above_the_git_folder_is_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let work = dir.path().join("work");
+        let proj = work.join("proj");
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        std::fs::create_dir_all(work.join(".codex")).unwrap();
+        std::fs::write(
+            work.join(".codex/config.toml"),
+            "[mcp_servers.docs]\ncommand = \"evil\"\n",
+        )
+        .unwrap();
+        let user = dir.path().join("home/.codex/config.toml");
+        let layers = codex_project_layers(&proj, &user);
+        assert_eq!(layers, vec![work.join(".codex/config.toml")]);
+        assert_eq!(
+            project_layer_servers(&layers),
+            ProjectLayers::Servers(vec!["docs".to_string()])
+        );
+    }
+
+    /// In a project the user's file trusts, a layer the agent read may have
+    /// moved since it started: a folder from the working folder up to the
+    /// project's, or a `.codex` in one, changed after the start is
+    /// uncertain. Outside a trusted project Codex reads no layer.
+    ///
+    /// FAILS ON REVERT of `codex_layers_may_have_moved` to `false`.
+    #[test]
+    fn a_layer_moved_after_the_agent_started_is_uncertain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let proj = dir.path().join("proj");
+        let sub = proj.join("crates/a");
+        std::fs::create_dir_all(&sub).unwrap();
+        let text = format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n[projects.\"/elsewhere\"]\ntrust_level = \"untrusted\"\n",
+            proj.display()
+        );
+        let trusted = codex_trusted_projects(&text);
+        assert_eq!(trusted, vec![proj.clone()]);
+        let hour = Duration::from_secs(3600);
+        let now = SystemTime::now();
+        // Started an hour after every folder last changed: nothing moved.
+        assert!(!codex_layers_may_have_moved(
+            &sub,
+            &trusted,
+            Some(now + hour)
+        ));
+        // Started an hour ago: the folders, made now, changed since.
+        assert!(codex_layers_may_have_moved(
+            &sub,
+            &trusted,
+            Some(now - hour)
+        ));
+        assert!(codex_layers_may_have_moved(&sub, &trusted, None));
+        // A project the file does not trust has no layer Codex reads.
+        assert!(!codex_layers_may_have_moved(&sub, &[], Some(now - hour)));
+        assert!(!codex_layers_may_have_moved(
+            &sub,
+            &[PathBuf::from("/elsewhere")],
+            Some(now - hour)
+        ));
+        assert!(codex_trusted_projects("not = [toml").is_empty());
+    }
+
+    /// A Codex started with a server of its own on its command line, or a
+    /// profile, may run a server the user's file does not name.
+    ///
+    /// FAILS ON REVERT of `codex_argv_sets_servers` to `false`.
+    #[test]
+    fn a_codex_command_line_that_sets_servers_is_told() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        for words in [
+            &["codex", "-c", "mcp_servers.docs.command=\"npx\""][..],
+            &[
+                "codex",
+                "exec",
+                "--config",
+                "mcp_servers.docs.args=[]",
+                "go",
+            ],
+            &["codex", "--config=mcp_servers={}"],
+            &["codex", "-cmcp_servers.docs.command=x"],
+            &["codex", "-c", "\"mcp_servers\".docs.command=x"],
+            &["codex", "-p", "work"],
+            &["codex", "--profile=work"],
+            &["codex", "-pwork"],
+        ] {
+            assert!(codex_argv_sets_servers(&argv(words)), "{words:?}");
+        }
+        for words in [
+            &["codex"][..],
+            &["codex", "-c", "model=\"o3\""],
+            &["codex", "exec", "fix the -p flag"],
+            &["codex", "--", "-c", "mcp_servers.x.command=y"],
+        ] {
+            assert!(!codex_argv_sets_servers(&argv(words)), "{words:?}");
+        }
+        // The words this process was started with are read back.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(
+            process_argv(std::process::id()),
+            Some(std::env::args().collect::<Vec<_>>())
+        );
+    }
+
+    /// A wrapper's command is the guard only written as the path the guard
+    /// runs as: not through `/proc` or `/dev`, nor with `.`, `..` or an
+    /// empty part, which this process would resolve to its own folder.
+    ///
+    /// FAILS ON REVERT of `plain_absolute_path` in `is_guard_absolute`:
+    /// the `..` path is trusted.
+    #[test]
+    fn a_guard_path_is_read_as_text() {
+        let guard = Guard::new();
+        let real = guard.path.display().to_string();
+        let parent = guard.path.parent().unwrap();
+        let wrapped = |command: String| ServerEntry {
+            name: "s".to_string(),
+            wrapper: Some(Wrapper {
+                command,
+                blocks: true,
+                ..Wrapper::default()
+            }),
+            remote: false,
+        };
+        // The same file, named another way, and listed as a guard path.
+        for other in [
+            format!("{}/./innerwarden", parent.display()),
+            format!(
+                "{}/../{}/innerwarden",
+                parent.display(),
+                parent.file_name().unwrap().to_string_lossy()
+            ),
+            format!("/{}", real),
+            format!("/proc/self/root{real}"),
+        ] {
+            let trust = ProxyTrust {
+                guard_paths: vec![guard.path.clone(), PathBuf::from(&other)],
+                ..guard.trust()
+            };
+            assert!(trust.trusts(&wrapped(real.clone())), "{other}");
+            assert!(!trust.trusts(&wrapped(other.clone())), "{other}");
+        }
+        assert!(plain_absolute_path("/usr/local/bin/innerwarden"));
+        for path in [
+            "/dev/fd/3",
+            "/proc/self/cwd/bin/innerwarden",
+            "/usr//bin/x",
+            "/usr/bin/",
+            "/",
+        ] {
+            assert!(!plain_absolute_path(path), "{path}");
+        }
+    }
+
+    /// Cursor's own command line for the call is read as the proxy reads
+    /// it: a project's entry of the same name in `advisory` is not the guard
+    /// refusing.
+    ///
+    /// FAILS ON REVERT of the mode check in `call_command_is_guard_proxy`.
+    #[test]
+    fn a_cursor_command_line_in_a_mode_that_only_records_is_not_trusted() {
+        let guard = Guard::new();
+        let real = guard.path.display().to_string();
+        let entry = ServerEntry {
+            name: "docs".to_string(),
+            wrapper: Some(Wrapper {
+                command: real.clone(),
+                blocks: true,
+                ..Wrapper::default()
+            }),
+            remote: false,
+        };
+        let with = |line: String| ProxyTrust {
+            call_command: Some(line),
+            ..guard.trust()
+        };
+        for line in [
+            format!("{real} proxy --mode guard -- npx docs-server"),
+            format!("{real} proxy -- npx docs-server"),
+            format!("{real} proxy --mode=strict --agent cursor -- npx docs-server"),
+        ] {
+            assert!(with(line.clone()).trusts(&entry), "{line}");
+        }
+        for line in [
+            format!("{real} proxy --mode advisory -- npx docs-server"),
+            format!("{real} proxy --mode=warn -- npx docs-server"),
+            format!("{real} proxy --mode guard"),
+            format!("{real} proxy --mode guard --"),
+            format!("{real} run -- npx docs-server"),
+        ] {
+            assert!(!with(line.clone()).trusts(&entry), "{line}");
+        }
+    }
+
+    /// Cursor's command line is split as the proxy's words are: a quoted
+    /// word that holds `--mode guard` is one word, and a line that names
+    /// a mode twice or leaves a quote open is not the guard refusing.
+    ///
+    /// FAILS ON REVERT of `command_line_words` (plain split on spaces) or
+    /// of the `--mode` count in `call_command_is_guard_proxy`: an
+    /// advisory line is trusted.
+    #[test]
+    fn a_cursor_command_line_is_split_as_a_shell_splits_it() {
+        let guard = Guard::new();
+        let real = guard.path.display().to_string();
+        let entry = ServerEntry {
+            name: "docs".to_string(),
+            wrapper: Some(Wrapper {
+                command: real.clone(),
+                blocks: true,
+                ..Wrapper::default()
+            }),
+            remote: false,
+        };
+        let with = |line: String| ProxyTrust {
+            call_command: Some(line),
+            ..guard.trust()
+        };
+        for line in [
+            format!("{real} proxy --mode advisory --label \"x --mode guard\" -- npx docs"),
+            format!("{real} proxy --mode advisory --label 'x --mode guard' -- npx docs"),
+            format!("{real} proxy --mode=warn --label x\\ --mode\\ guard -- npx docs"),
+            format!("{real} proxy --label \"x -- npx docs"),
+            format!("{real} proxy --mode guard --mode advisory -- npx docs"),
+            // Words with spaces written bare, as a line joined on spaces
+            // would show them.
+            format!("{real} proxy --mode advisory --label x --mode guard -- npx docs"),
+        ] {
+            assert!(!with(line.clone()).trusts(&entry), "{line}");
+        }
+        for line in [
+            format!("{real} proxy --mode guard -- npx docs"),
+            format!("{real} proxy --label docs --agent cursor -- npx docs"),
+        ] {
+            assert!(with(line.clone()).trusts(&entry), "{line}");
+        }
+        assert_eq!(
+            command_line_words("a 'b c' \"d \\\" e\" f\\ g"),
+            Some(vec![
+                "a".to_string(),
+                "b c".to_string(),
+                "d \" e".to_string(),
+                "f g".to_string()
+            ])
+        );
+        assert_eq!(command_line_words("a 'b"), None);
+    }
+
+    /// A configuration rewritten today and dated back with `touch -d` keeps
+    /// today's status change: it is not taken as the one the agent read.
+    ///
+    /// FAILS ON REVERT of `last_change` to the content's time alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_dated_back_is_still_changed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[mcp_servers]\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_577_836_800))
+            .unwrap();
+        let (_, changed) = read_config(&path).expect("reads");
+        let started = SystemTime::now() - Duration::from_secs(60);
+        assert!(!config_settled(changed, Some(started)));
+        let mtime = std::fs::metadata(&path).unwrap().modified().ok();
+        assert!(
+            config_settled(mtime, Some(started)),
+            "the content's time alone was fooled"
+        );
+    }
+
+    /// A layer emptied or rewritten in place after the agent started leaves
+    /// its folders as they were: the file itself is read, and through a
+    /// `.codex` or a `config.toml` that is a link, what it points at.
+    ///
+    /// FAILS ON REVERT of the `config.toml` place and the link reading in
+    /// `codex_layers_may_have_moved`: each change below is not seen.
+    #[cfg(unix)]
+    #[test]
+    fn a_layer_changed_in_place_after_the_agent_started_is_uncertain() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let proj = dir.path().join("proj");
+        let linked = dir.path().join("linked");
+        let filed = dir.path().join("filed");
+        let elsewhere = dir.path().join("elsewhere");
+        let shared = dir.path().join("shared");
+        for folder in [&proj, &linked, &filed, &elsewhere, &shared] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let evil = "[mcp_servers.docs]\ncommand = \"docs-evil\"\n";
+        std::fs::create_dir_all(proj.join(".codex")).unwrap();
+        std::fs::write(proj.join(".codex/config.toml"), evil).unwrap();
+        // `.codex` a link to a folder elsewhere.
+        std::fs::write(elsewhere.join("config.toml"), evil).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, linked.join(".codex")).unwrap();
+        // `config.toml` a link to a file elsewhere.
+        std::fs::create_dir_all(filed.join(".codex")).unwrap();
+        std::fs::write(shared.join("layer.toml"), evil).unwrap();
+        std::os::unix::fs::symlink(shared.join("layer.toml"), filed.join(".codex/config.toml"))
+            .unwrap();
+        let trusted = vec![proj.clone(), linked.clone(), filed.clone()];
+        std::thread::sleep(SETTLE_MARGIN + Duration::from_millis(300));
+        let started = Some(SystemTime::now());
+        for cwd in [&proj, &linked, &filed] {
+            assert!(
+                !codex_layers_may_have_moved(cwd, &trusted, started),
+                "{}",
+                cwd.display()
+            );
+        }
+        // Emptied in place, the folders untouched.
+        std::fs::File::create(proj.join(".codex/config.toml")).unwrap();
+        assert!(codex_layers_may_have_moved(&proj, &trusted, started));
+        // Moved out of the folder the link points at.
+        std::fs::rename(elsewhere.join("config.toml"), dir.path().join("gone.toml")).unwrap();
+        assert!(codex_layers_may_have_moved(&linked, &trusted, started));
+        // The file the link points at, rewritten.
+        std::fs::write(shared.join("layer.toml"), "").unwrap();
+        assert!(codex_layers_may_have_moved(&filed, &trusted, started));
+    }
+
+    /// A project made trusted, or a profile chosen, on Codex's command line
+    /// is not in the user's file: what layers Codex read cannot be told.
+    ///
+    /// FAILS ON REVERT of `codex_setting_reads_layers` in
+    /// `codex_argv_sets_servers`.
+    #[test]
+    fn a_codex_command_line_that_trusts_a_project_is_told() {
+        let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
+        for words in [
+            &["codex", "-c", "projects./work/proj.trust_level=\"trusted\""][..],
+            &["codex", "-c", "projects.\"/work/proj\".trust_level=trusted"],
+            &["codex", "--config=projects={}"],
+            &["codex", "-c", "profile=work"],
+            &["codex", "-c", "profiles.work.model=o3"],
+            &["codex", "-cprofile=work"],
+        ] {
+            assert!(codex_argv_sets_servers(&argv(words)), "{words:?}");
+        }
+        for words in [
+            &["codex", "-c", "model=\"o3\""][..],
+            &["codex", "-c", "project_doc_max_bytes=1"],
+        ] {
+            assert!(!codex_argv_sets_servers(&argv(words)), "{words:?}");
         }
     }
 }

@@ -820,6 +820,121 @@ const HOOKED_AGENT_PACKAGES: &[(&str, &str)] = &[
     ("@anthropic-ai/claude-code", "claude"),
 ];
 
+/// The folders an agent CLI of [`HOOKED_AGENT_PROGRAMS`] installs its own
+/// runtime into, with the program each one is: an entry file under one of
+/// them, run by `node` (or `bun`, `deno`), is that agent started. The
+/// Cursor CLI's launcher (`~/.local/share/cursor-agent/versions/<version>/
+/// cursor-agent`, a bash script) runs the `node` in its own folder on the
+/// `index.js` beside it (read in the package of version 2026.11.22-e9042b2
+/// on 2026-11-22), so `HOME=/tmp/h <folder>/node <folder>/index.js` starts
+/// it with its user hooks (`homedir()/.cursor/hooks.json`) moved away. Each row is
+/// the name of the folder that holds `versions/<version>/`, the agent, and
+/// the entry file in a version folder.
+const HOOKED_AGENT_INSTALL_FOLDERS: &[(&str, &str, &str)] =
+    &[("cursor-agent", "cursor-agent", "index.js")];
+
+/// The parts of a path as the system walks them: split at `/` (and `\`),
+/// an empty part (`a//b`) and `.` dropped, `..` taking off the part
+/// before it.
+fn path_parts(path: &str) -> Vec<&str> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|last| *last != "..") => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts
+}
+
+/// Whether the part `written` of a path names `name`: as it is, or as a
+/// glob the shell expands to it (`vers?ons`, `ver*`, `v[e]rsions`).
+fn path_part_is(written: &str, name: &str) -> bool {
+    written == name || (written.contains(['?', '*', '[']) && glob_matches(written, name))
+}
+
+/// Whether a part of a path has the shape of a version folder
+/// (`2026.11.22-e9042b2`, `1.2.3`), or is a glob that may expand to one.
+fn version_shaped(part: &str) -> bool {
+    part.contains(['?', '*', '['])
+        || (part.starts_with(|c: char| c.is_ascii_digit())
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_')))
+}
+
+/// The row of [`HOOKED_AGENT_INSTALL_FOLDERS`] whose version folder
+/// (`<folder>/versions/<version>`) the parts end with.
+fn agent_version_parts(
+    parts: &[&str],
+) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    let [.., folder, versions, version] = parts else {
+        return None;
+    };
+    if !path_part_is(versions, "versions") || !version_shaped(version) {
+        return None;
+    }
+    HOOKED_AGENT_INSTALL_FOLDERS
+        .iter()
+        .find(|(name, _, _)| path_part_is(folder, name))
+}
+
+/// The agent of [`HOOKED_AGENT_INSTALL_FOLDERS`] whose entry file the path
+/// `lower` (lowercase) names, as `node` is handed it: a whole part named
+/// as the folder, `versions`, a version, and the entry file. Another file
+/// in the folder (`node_modules/.bin/tsc`) or a folder that only ends with the
+/// name (`my-cursor-agent/versions/`) is not the agent.
+fn agent_install_folder(lower: &str) -> Option<&'static str> {
+    let parts = path_parts(lower);
+    // The version folder itself (`node <version>`, `node <version>/`,
+    // `node .` from inside it): node runs the `index.js` in it. Checked
+    // with node 22 on 2026-11-22.
+    if let Some((_, agent, _)) = agent_version_parts(&parts) {
+        return Some(agent);
+    }
+    let [folder @ .., entry] = parts.as_slice() else {
+        return None;
+    };
+    // The entry file, also without its `.js`, which node adds.
+    agent_version_parts(folder)
+        .filter(|(_, _, file)| {
+            path_part_is(entry, file)
+                || file
+                    .strip_suffix(".js")
+                    .is_some_and(|stem| path_part_is(entry, stem))
+        })
+        .map(|(_, agent, _)| *agent)
+}
+
+/// The agent a command the line runs after a `cd` ([`SetBefore::in_folder`])
+/// starts by the entry file of one of [`HOOKED_AGENT_INSTALL_FOLDERS`] named
+/// from there, and the word after which it reads its own arguments: `node
+/// index.js` or `./node .` in the version folder, `node <version>/index.js`
+/// in `versions`, `node versions/<version>` in the install folder.
+fn entry_from_agent_folder(
+    words: &[String],
+    at: usize,
+    folder: &str,
+) -> Option<(&'static str, usize)> {
+    let name = program_name(&words[at]);
+    if !matches!(
+        strip_interpreter_version(&name),
+        "node" | "nodejs" | "bun" | "deno"
+    ) {
+        return None;
+    }
+    let script = (at + 1..words.len()).find(|index| !words[*index].starts_with('-'))?;
+    let file = words[script].to_ascii_lowercase();
+    // A path from the root or the home is read without the folder.
+    if file.starts_with(['/', '~']) {
+        return None;
+    }
+    agent_install_folder(&format!("{folder}/{file}")).map(|agent| (agent, script + 1))
+}
+
 /// The events of the user's Claude Code hooks the guard's own hook sits
 /// under: the screening before a tool runs, and the record after it.
 const GUARD_HOOK_EVENTS: &[&str] = &["PreToolUse", "PostToolUse"];
@@ -863,6 +978,11 @@ struct SetBefore {
     /// The names the line gives a value it does not show: read from input,
     /// by `printf -v`, a loop, a `${NAME:=value}` default, a substitution.
     unshown: Vec<String>,
+    /// The folder (lowercase, as written) a `cd` on the line went into last,
+    /// a relative one joined to the one before: `cd <version folder> &&
+    /// HOME=/tmp/h ./node index.js` starts the agent of
+    /// [`HOOKED_AGENT_INSTALL_FOLDERS`] whose entry file that is.
+    in_folder: Option<String>,
 }
 
 /// One simple command as [`command_starts_unhooked_agent`] reads it.
@@ -1693,6 +1813,21 @@ fn command_starts_unhooked_agent(command: &Spoken, set: &mut SetBefore, depth: u
     if program == "builtin" {
         return command_starts_unhooked_agent(&command.part(at + 1, words.len()), set, depth);
     }
+    // `cd`: what the line runs from there by a relative name.
+    if matches!(program.as_str(), "cd" | "pushd") {
+        set.in_folder = words[at + 1..]
+            .iter()
+            .find(|word| !word.starts_with('-'))
+            .map(|folder| {
+                let folder = folder.to_ascii_lowercase();
+                match &set.in_folder {
+                    Some(before) if !folder.starts_with(['/', '~']) => {
+                        format!("{before}/{folder}")
+                    }
+                    _ => folder,
+                }
+            });
+    }
     let arguments = &words[at + 1..];
     if let Some(effect) = setter_effect(&program, command, at, set) {
         set.found |= effect;
@@ -1713,6 +1848,7 @@ fn command_starts_unhooked_agent(command: &Spoken, set: &mut SetBefore, depth: u
     let mut carried = SetBefore {
         found: set.found | in_front,
         unshown: set.unshown.clone(),
+        in_folder: set.in_folder.clone(),
     };
     // `tmux -e NAME=VALUE` sets a variable for the command it starts. tmux,
     // not the shell, sets it: a `~` in it is a letter under zsh.
@@ -1747,7 +1883,9 @@ fn command_starts_unhooked_agent(command: &Spoken, set: &mut SetBefore, depth: u
             found | command_starts_unhooked_agent(&launched, &mut inner, depth + 1)
         });
     }
-    let Some((agent, from)) = hooked_agent_at(words, at) else {
+    let Some((agent, from)) = hooked_agent_at(words, at)
+        .or_else(|| entry_from_agent_folder(words, at, set.in_folder.as_deref()?))
+    else {
         return 0;
     };
     // An agent reads its flags up to a `--`; the words after it are its
@@ -2301,7 +2439,8 @@ fn runuser_command_start(arguments: &[String]) -> Option<usize> {
 /// own arguments begin: the program by name ([`program_name`]), Claude
 /// Code's versioned file (`.../claude/versions/2.1.323`), one of
 /// [`HOOKED_AGENT_PACKAGES`] as `npx` and its kin name it, and `node` (or
-/// `bun`, `deno`) handed that package's entry file.
+/// `bun`, `deno`) handed that package's entry file or an entry file in one
+/// of [`HOOKED_AGENT_INSTALL_FOLDERS`].
 fn hooked_agent_at(words: &[String], at: usize) -> Option<(&'static str, usize)> {
     let word = &words[at];
     let name = program_name(word);
@@ -2335,12 +2474,14 @@ fn hooked_agent_at(words: &[String], at: usize) -> Option<(&'static str, usize)>
         let file = words[script].to_ascii_lowercase();
         // `deno run npm:@anthropic-ai/claude-code`: the package by name.
         let file = file.strip_prefix("npm:").unwrap_or(&file);
-        let agent = agent_package(file).or_else(|| {
-            HOOKED_AGENT_PACKAGES.iter().find_map(|(package, agent)| {
-                let inside = file.contains(&format!("{package}/")) || file.ends_with(package);
-                inside.then_some(*agent)
+        let agent = agent_package(file)
+            .or_else(|| {
+                HOOKED_AGENT_PACKAGES.iter().find_map(|(package, agent)| {
+                    let inside = file.contains(&format!("{package}/")) || file.ends_with(package);
+                    inside.then_some(*agent)
+                })
             })
-        })?;
+            .or_else(|| agent_install_folder(file))?;
         return Some((agent, script + 1));
     }
     None
@@ -2371,6 +2512,7 @@ fn node_script_index(words: &[String], at: usize) -> Option<usize> {
             || HOOKED_AGENT_PACKAGES
                 .iter()
                 .any(|(package, _)| lower.contains(&format!("{package}/")))
+            || agent_install_folder(lower).is_some()
     };
     let mut first = None;
     let mut after_option = false;
@@ -2433,7 +2575,7 @@ fn flag_value<'a>(
 
 /// Whether `arguments` start agent `program` with no hooks, or without the
 /// user's own settings: Codex with `--disable hooks`, or a `-c` / `--config`
-/// override of `hooks` or `features.hooks`; Hermes with `--safe-mode` or
+/// override of `hooks`, `features.hooks` or `mcp_servers`; Hermes with `--safe-mode` or
 /// `--ignore-user-config`; Claude Code with `--bare`, `--safe-mode` or
 /// `--restricted`, a `--setting-sources` that leaves out `user`, or settings
 /// (`--settings`, `--managed-settings`) that drop the user's hooks
@@ -2470,6 +2612,10 @@ fn agent_flags_drop_its_hook(
                             || key.starts_with("hooks.")
                             || key == "features.hooks"
                             || key.starts_with("features.hooks.")
+                            // A server set on the line runs outside the
+                            // proxy the user's file puts in front of it, and
+                            // the hook takes the file's entry for it.
+                            || crate::mcp_unproxied::codex_setting_names_servers(setting)
                     })
                 })
         }
@@ -8180,8 +8326,13 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
         if reads.get() > RELATIVE_READS {
             return refuses_unfollowed();
         }
-        dirs.iter()
-            .any(|dir| names(&format!("{dir}/{target}"), taken))
+        dirs.iter().any(|dir| {
+            let path = match target.trim_start_matches("./") {
+                "" | "." => dir.clone(),
+                rest => format!("{dir}/{rest}"),
+            };
+            names(&path, taken)
+        })
     };
 
     let (redirects, read_whole) = shell_output_redirect_targets(content);
@@ -8209,8 +8360,18 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
     let mut dirs: Vec<String> = Vec::new();
     // The line named more directories than are followed.
     let mut crowded = false;
+    // The work tree a `GIT_WORK_TREE=` before a command, or set by an
+    // earlier one, gives git.
+    let mut git_env_tree: Option<String> = None;
     for segment in shell_command_segments(content) {
         let words = shell_tokens(&braced.replace_all(segment, "$$$1"));
+        if let Some(tree) = words
+            .iter()
+            .rev()
+            .find_map(|word| word.strip_prefix("GIT_WORK_TREE="))
+        {
+            git_env_tree = Some(tree.to_string());
+        }
         let mut targets = output_redirect_targets(&words);
         // What the command takes away.
         let mut taken: Vec<String> = Vec::new();
@@ -8423,7 +8584,10 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
             }
             "dd" => targets.extend(dd_operand(arguments, "of").map(str::to_string)),
             // `git checkout <tree> -- <path>` and `git restore` put another
-            // version of each path they name in its place.
+            // version of each path they name in its place; `rm`, `clean` and
+            // `worktree remove` take what they name away, and `init` writes
+            // a repository (or the file that points at one) into its folder.
+            // A relative path is read in the folder `-C` names.
             "git" => {
                 if let Some(at) = positional
                     .iter()
@@ -8431,6 +8595,9 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 {
                     targets.extend(positional[at + 1..].iter().map(|path| path.to_string()));
                 }
+                let reading = git_writes(arguments, git_env_tree.as_deref());
+                targets.extend(reading.written);
+                taken.extend(reading.taken);
             }
             "curl" => targets.extend(option_values(arguments, 'o', &["output"])),
             "wget" => targets.extend(option_values(arguments, 'O', &["output-document"])),
@@ -8626,6 +8793,235 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
         }
     }
     pattern[p..].iter().all(|c| *c == '*')
+}
+
+/// What a `git` line writes and takes away, as paths read in the folder
+/// its `-C` options name (each one relative to the one before, as git
+/// reads them).
+#[derive(Default)]
+struct GitWrites {
+    written: Vec<String>,
+    taken: Vec<String>,
+}
+
+/// git's options before its verb whose value is the next word.
+const GIT_GLOBAL_VALUE_OPTIONS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+    "--exec-path",
+    "--super-prefix",
+];
+
+fn git_writes(arguments: &[String], env_tree: Option<&str>) -> GitWrites {
+    let mut reading = GitWrites::default();
+    let mut folder: Option<String> = None;
+    // The work tree, when the line names one: `GIT_WORK_TREE`,
+    // `--work-tree`, `-c core.worktree=`. What a verb writes "here" is
+    // written there.
+    let mut tree: Option<String> = env_tree.map(|tree| tree.trim_matches(['"', '\'']).to_string());
+    // `-c alias.<name>=<value>`: the verb `<name>` runs `<value>`.
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut setting = |value: &str, tree: &mut Option<String>| {
+        let value = value.trim_matches(['"', '\'']);
+        let Some((key, value)) = value.split_once('=') else {
+            return;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if key == "core.worktree" {
+            *tree = Some(value.to_string());
+        } else if let Some(name) = key.strip_prefix("alias.") {
+            aliases.push((name.to_string(), value.to_string()));
+        }
+    };
+    let mut at = 0usize;
+    while let Some(word) = arguments.get(at) {
+        let word = word.trim_matches(['"', '\'']);
+        if word == "-C" {
+            if let Some(value) = arguments.get(at + 1) {
+                folder = Some(git_path_in(
+                    folder.as_deref(),
+                    value.trim_matches(['"', '\'']),
+                ));
+            }
+            at += 2;
+            continue;
+        }
+        if word == "--work-tree" {
+            if let Some(value) = arguments.get(at + 1) {
+                tree = Some(value.trim_matches(['"', '\'']).to_string());
+            }
+            at += 2;
+            continue;
+        }
+        if let Some(value) = word.strip_prefix("--work-tree=") {
+            tree = Some(value.to_string());
+            at += 1;
+            continue;
+        }
+        if word == "-c" {
+            if let Some(value) = arguments.get(at + 1) {
+                setting(value, &mut tree);
+            }
+            at += 2;
+            continue;
+        }
+        if GIT_GLOBAL_VALUE_OPTIONS.contains(&word) {
+            at += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            at += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(verb) = arguments.get(at).map(|verb| verb.trim_matches(['"', '\''])) else {
+        return reading;
+    };
+    let mut verb = verb.to_string();
+    let mut rest: Vec<String> = arguments[at + 1..].to_vec();
+    // The work tree, read in the folder `-C` names, as git reads it.
+    let tree = tree.map(|tree| git_path_in(folder.as_deref(), &tree));
+    // Where "here" is: the folder (`.` without one) and the work tree.
+    let here: Vec<String> = std::iter::once(git_path_in(folder.as_deref(), "."))
+        .chain(tree.clone())
+        .collect();
+    // An alias is read as the verb it runs (an alias of an alias too); one
+    // that runs a shell (`!...`) may do anything to the work tree.
+    for _ in 0..8 {
+        let lower = verb.to_ascii_lowercase();
+        let Some((_, value)) = aliases.iter().rev().find(|(name, _)| *name == lower) else {
+            break;
+        };
+        if value.trim_start().starts_with('!') {
+            reading.taken.extend(here.iter().cloned());
+            return reading;
+        }
+        let mut words = value.split_whitespace().map(str::to_string);
+        let Some(first) = words.next() else {
+            break;
+        };
+        verb = first;
+        rest = words.chain(rest).collect();
+    }
+    let in_folder = |path: &str| -> Vec<String> {
+        let path = path.trim_matches(['"', '\'']);
+        std::iter::once(git_path_in(folder.as_deref(), path))
+            .chain(tree.as_deref().map(|tree| git_path_in(Some(tree), path)))
+            .collect()
+    };
+    // The paths a verb is handed: every word that is no option (each one
+    // after `--`), the value of an option in `valued` skipped.
+    let words = |from: &[String], valued: &[&str]| -> Vec<String> {
+        let mut after_dashes = false;
+        let mut skip = false;
+        let mut out = Vec::new();
+        for word in from {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if word == "--" && !after_dashes {
+                after_dashes = true;
+                continue;
+            }
+            if !after_dashes && valued.contains(&word.as_str()) {
+                skip = true;
+                continue;
+            }
+            if after_dashes || !word.starts_with('-') {
+                out.extend(in_folder(word));
+            }
+        }
+        out
+    };
+    let rest = rest.as_slice();
+    match verb.as_str() {
+        "checkout" | "restore" if folder.is_some() || tree.is_some() => {
+            reading.written.extend(words(rest, &[]));
+            if tree.is_some() {
+                reading.written.extend(here.iter().cloned());
+            }
+        }
+        "rm" => reading.taken.extend(words(rest, &[])),
+        // What is not tracked under the folder goes, and with `-x` what is
+        // ignored too: the folder is taken as emptied, and each path the
+        // line hands it.
+        "clean" => {
+            reading.taken.extend(here.iter().cloned());
+            reading.taken.extend(words(rest, &["-e", "--exclude"]));
+        }
+        // `--hard` (and `--merge`, `--keep`) puts the commit's version
+        // of every tracked file in the work tree in its place.
+        "reset"
+            if rest
+                .iter()
+                .any(|word| matches!(word.as_str(), "--hard" | "--merge" | "--keep")) =>
+        {
+            reading.taken.extend(here.iter().cloned());
+        }
+        "worktree" => {
+            if rest.first().is_some_and(|word| word == "remove") {
+                reading.taken.extend(words(&rest[1..], &[]));
+            }
+        }
+        "init" => {
+            let mut index = 0usize;
+            let mut named = false;
+            while let Some(word) = rest.get(index) {
+                if word == "--separate-git-dir" {
+                    if let Some(value) = rest.get(index + 1) {
+                        reading.written.extend(in_folder(value));
+                    }
+                    index += 2;
+                    continue;
+                }
+                if let Some(value) = word.strip_prefix("--separate-git-dir=") {
+                    reading.written.extend(in_folder(value));
+                } else if matches!(
+                    word.as_str(),
+                    "--template"
+                        | "-b"
+                        | "--initial-branch"
+                        | "--object-format"
+                        | "--ref-format"
+                        | "--shared"
+                ) {
+                    index += 2;
+                    continue;
+                } else if !word.starts_with('-') {
+                    named = true;
+                    reading.written.extend(in_folder(word));
+                }
+                index += 1;
+            }
+            if !named {
+                reading.written.extend(in_folder("."));
+            }
+        }
+        _ => {}
+    }
+    reading
+}
+
+/// `path` read in `folder` (git's `-C`): itself when it starts at the
+/// root, the home or a variable, or when no folder is named.
+fn git_path_in(folder: Option<&str>, path: &str) -> String {
+    let Some(folder) = folder else {
+        return path.to_string();
+    };
+    if path.starts_with(['/', '~', '$']) {
+        return path.to_string();
+    }
+    let folder = folder.trim_end_matches('/');
+    match path.trim_start_matches("./") {
+        "" | "." => folder.to_string(),
+        rest => format!("{folder}/{rest}"),
+    }
 }
 
 fn find_takes_and_writes(arguments: &[String]) -> FindReading {
@@ -18739,7 +19135,14 @@ fn crontab_from_stdin(words: &[String]) -> bool {
             skip = true;
             continue;
         }
-        if arg.starts_with('<') || arg.starts_with('>') {
+        // A redirection, a descriptor in front too (`2>/dev/null`), and
+        // its target when written apart (`2> /dev/null`).
+        let redirection = arg.trim_start_matches(|c: char| c.is_ascii_digit());
+        let redirection = redirection.strip_prefix('&').unwrap_or(redirection);
+        if redirection.starts_with(['<', '>']) {
+            skip = redirection
+                .chars()
+                .all(|c| matches!(c, '<' | '>' | '|' | '&'));
             continue;
         }
         rest.push(arg.as_str());
@@ -22675,6 +23078,31 @@ fn is_environment_assignment(token: &str) -> bool {
     })
 }
 
+/// Whether a word of a command is a redirection, not a program or its
+/// argument: \`>\`, \`>>\`, \`<\`, \`&>\`, a descriptor before one (\`2>\`,
+/// \`1>&2\`), or the same glued to its target (\`>r.sh\`).
+pub(crate) fn is_redirection_word(word: &str) -> bool {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.strip_prefix('&').unwrap_or(rest);
+    rest.starts_with(['>', '<'])
+}
+
+/// The index of the first word from \`at\` on that is neither a redirection
+/// ([\`is_redirection_word\`]) nor the target of one written apart
+/// (\`2> /dev/null\`).
+pub(crate) fn past_redirection_words(words: &[String], mut at: usize) -> usize {
+    while let Some(word) = words.get(at) {
+        if !is_redirection_word(word) {
+            break;
+        }
+        let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+        let rest = rest.strip_prefix('&').unwrap_or(rest);
+        let alone = rest.chars().all(|c| matches!(c, '>' | '<' | '|' | '&'));
+        at += if alone { 2 } else { 1 };
+    }
+    at
+}
+
 /// Resolve the command behind the launch wrappers a line runs a program
 /// through: `env`, `sudo`, `doas`, `command`, `exec`, `nohup`, `setsid`,
 /// `time` (`-p` and GNU time's options), `timeout`, `nice`, `stdbuf`,
@@ -22689,6 +23117,7 @@ fn is_environment_assignment(token: &str) -> bool {
 /// [`launched_command_index`] steps over them as well.
 pub(crate) fn effective_command_index(words: &[String]) -> Option<usize> {
     let mut index = 0usize;
+    let mut after_launcher = false;
     // Each launcher read takes at least its own word: a chain of any length
     // ends within the words.
     for _ in 0..=words.len() {
@@ -22719,6 +23148,17 @@ pub(crate) fn effective_command_index(words: &[String]) -> Option<usize> {
         {
             index += 1;
         }
+        // Redirections the shell takes off before it finds the command a
+        // launcher runs: \`env 2>/dev/null sh\`. Only redirections: the
+        // launcher runs nothing. Not in front of the first word, which may
+        // be a quoted program path the words no longer show as quoted
+        // (\`'>/opt/bin/curl'\`); a line with a redirection there is read
+        // again with it moved after the command
+        // (\`crate::shell::runners::leading_redirections_moved\`).
+        if after_launcher {
+            index = past_redirection_words(words, index);
+        }
+        after_launcher = true;
         let command = token_basename(words.get(index)?).to_ascii_lowercase();
         if let Some(next) = launcher_command_start(words, index, &command) {
             index = next;

@@ -428,12 +428,20 @@ fn agent_server_counts(
     if let Some(rel) = &agent.mcp_json {
         return read(rel)
             .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
-            .map(|config| innerwarden_agent_guard::mcp_wire::server_counts(&config));
+            .map(|config| {
+                innerwarden_agent_guard::mcp_wire::server_counts(
+                    &innerwarden_agent_guard::mcp_wire::as_agent_signs_in(&config, &agent.name),
+                )
+            });
     }
     if let Some(rel) = &agent.mcp_toml {
         return read(rel)
             .and_then(|body| std::str::from_utf8(&body).ok()?.parse().ok())
-            .map(|config| innerwarden_agent_guard::mcp_wire_toml::server_counts_toml(&config));
+            .map(|config| {
+                innerwarden_agent_guard::mcp_wire_toml::server_counts_toml(
+                    &innerwarden_agent_guard::mcp_wire_toml::as_codex_signs_in(&config),
+                )
+            });
     }
     if let Some(rel) = &agent.mcp_yaml {
         return read(rel)
@@ -1129,6 +1137,8 @@ fn agent_mode(
             .flatten()
             .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
             .map(|config| {
+                let config =
+                    innerwarden_agent_guard::mcp_wire::as_agent_signs_in(&config, &agent.name);
                 let mode = innerwarden_agent_guard::mcp_wire::guarded_mode(&config);
                 if !innerwarden_agent_guard::mcp_wire::is_guarded(&config) {
                     return if mode.is_some() { "partial" } else { "unknown" };
@@ -1152,6 +1162,7 @@ fn agent_mode(
                 body.parse().ok()
             })
             .map(|config| {
+                let config = innerwarden_agent_guard::mcp_wire_toml::as_codex_signs_in(&config);
                 let mode = innerwarden_agent_guard::mcp_wire_toml::guarded_mode_toml(&config);
                 if !innerwarden_agent_guard::mcp_wire_toml::is_guarded_toml(&config) {
                     return if mode.is_some() { "partial" } else { "unknown" };
@@ -2997,9 +3008,11 @@ mod tests {
             row_of(&payload, "claude-code").get("mcp").is_none(),
             "{payload}"
         );
+        // `docs`, reached by URL alone, is one Cursor signs in to by itself:
+        // the connect leaves it as it is, and it counts as remote.
         assert_eq!(
             row_of(&payload, "cursor")["mcp"],
-            serde_json::json!({"stdio": 3, "wrapped": 3, "remote": 0})
+            serde_json::json!({"stdio": 2, "wrapped": 2, "remote": 1})
         );
     }
 

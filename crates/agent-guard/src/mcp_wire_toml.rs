@@ -470,14 +470,49 @@ pub fn server_entries_toml(doc: &DocumentMut) -> Vec<crate::mcp_unproxied::Serve
                     Some(crate::mcp_unproxied::Wrapper {
                         command: command?.to_string(),
                         blocks: mode == WiringMode::Enforce,
+                        sets_loader_env: (match table.get("env") {
+                            None => false,
+                            Some(env) => env.as_table_like().is_none_or(|env| {
+                                env.iter()
+                                    .any(|(name, _)| crate::mcp_unproxied::is_loader_variable(name))
+                            }),
+                        }) || env_vars_pass_loader(table.get("env_vars")),
+                        has_cwd: table.contains_key("cwd"),
                     })
                 }),
-                remote: (!is_stdio_server(&table) && table.contains_key("url"))
+                remote: (!is_stdio_server(&table)
+                    && table.get("url").is_some_and(|url| {
+                        url.as_str()
+                            .is_none_or(|url| !crate::mcp_proxy::remote::is_local_url(url))
+                    }))
                     || command.is_some_and(|c| crate::mcp_unproxied::runs_mcp_remote(c, &args)),
                 name,
             }
         })
         .collect()
+}
+
+/// Whether Codex's `env_vars` (the variables a server is handed from the
+/// agent's own environment) passes one that decides which program starts
+/// or what it loads ([`crate::mcp_unproxied::is_loader_variable`]): the
+/// agent's `PATH` or `LD_PRELOAD` reaches the wrapper as if the entry set
+/// it. A list that cannot be read counts.
+fn env_vars_pass_loader(item: Option<&Item>) -> bool {
+    let Some(item) = item else {
+        return false;
+    };
+    let Some(list) = item.as_array() else {
+        return true;
+    };
+    list.iter().any(|value| {
+        let name = value.as_str().or_else(|| {
+            value
+                .as_inline_table()
+                .and_then(|table| table.get("name"))
+                .and_then(|name| name.as_str())
+        });
+        name.is_none_or(crate::mcp_unproxied::is_loader_variable)
+    })
 }
 
 /// A table that runs a local command, or a remote server the proxy carries.
@@ -786,20 +821,32 @@ fn restore_remote(server: &mut Table, url: &str, words: &[Value]) -> bool {
 }
 
 fn for_each_server(doc: &mut DocumentMut, mut f: impl FnMut(&mut Table) -> bool) -> usize {
+    for_each_named_server(doc, |_, table| f(table))
+}
+
+/// [`for_each_server`], with each server's name.
+fn for_each_named_server(
+    doc: &mut DocumentMut,
+    mut f: impl FnMut(&str, &mut Table) -> bool,
+) -> usize {
     let mut n = 0;
     match doc.get_mut("mcp_servers") {
         Some(Item::Table(servers)) => {
-            for (_name, item) in servers.iter_mut() {
+            for (name, item) in servers.iter_mut() {
+                let name = name.get().to_string();
                 match item {
-                    Item::Table(t) => n += usize::from(f(t)),
-                    Item::Value(value) => n += usize::from(change_inline(value, &mut f)),
+                    Item::Table(t) => n += usize::from(f(&name, t)),
+                    Item::Value(value) => {
+                        n += usize::from(change_inline(value, &mut |t: &mut Table| f(&name, t)))
+                    }
                     _ => {}
                 }
             }
         }
         Some(Item::Value(Value::InlineTable(servers))) => {
-            for (_name, value) in servers.iter_mut() {
-                n += usize::from(change_inline(value, &mut f));
+            for (name, value) in servers.iter_mut() {
+                let name = name.get().to_string();
+                n += usize::from(change_inline(value, &mut |t: &mut Table| f(&name, t)));
             }
         }
         _ => {}
@@ -928,6 +975,144 @@ pub fn wrap_toml_local(
     for_each_server(doc, |s| {
         is_stdio_server(s) && wrap_server(s, guard_bin, monitor, Some(agent))
     })
+}
+
+/// The servers Codex signs in to by itself, which a connect leaves as they
+/// are: through the proxy, Codex would stop signing in to them (it signs in
+/// only to a server it reaches by URL) and every call would come back 401.
+/// Their calls are judged by Codex's hook instead ([`crate::mcp_unproxied`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexSignIn {
+    /// What `codex mcp list --json` said: the servers whose sign-in is
+    /// Codex's own (logged in with `codex mcp login`, or one that asks for
+    /// it and is not logged in yet).
+    Servers(Vec<String>),
+    /// Codex could not be asked (not installed here, another home, no
+    /// answer in time, an answer that does not read): every server that has
+    /// only an address, nothing the proxy would send for it, is taken as
+    /// one Codex may sign in to.
+    NotAsked,
+}
+
+/// The servers `codex mcp list --json` says Codex signs in to: those whose
+/// `auth_status` is OAuth (`o_auth`, logged in) or not logged in yet
+/// (`not_logged_in`, a server that asks for a sign-in). Bearer tokens
+/// from a variable and servers with no sign-in are the proxy's to carry.
+/// Names only: the listing never holds a token. `None` for an answer that
+/// is not a list of servers.
+pub fn codex_sign_in_servers(list_json: &str) -> Option<Vec<String>> {
+    let listed: serde_json::Value = serde_json::from_str(list_json.trim()).ok()?;
+    let servers = listed.as_array()?;
+    let mut names = Vec::new();
+    for server in servers {
+        let name = server.get("name")?.as_str()?;
+        let status: String = server
+            .get("auth_status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if status == "oauth" || status == "notloggedin" {
+            names.push(name.to_string());
+        }
+    }
+    Some(names)
+}
+
+/// Whether a connect leaves the server `name` with `table` as it is
+/// because Codex signs in to it (see [`CodexSignIn`]): a server
+/// [`may_be_left`] that Codex named, or, when Codex could not be asked,
+/// any such server.
+fn left_for_sign_in(name: &str, table: &Table, sign_in: &CodexSignIn) -> bool {
+    may_be_left(table)
+        && match sign_in {
+            CodexSignIn::Servers(names) => names.iter().any(|n| n == name),
+            CodexSignIn::NotAsked => true,
+        }
+}
+
+/// Whether a connect may leave `table` for Codex to sign in to: a server
+/// reached by URL that the proxy could otherwise carry, with nothing but its
+/// address. One with a credential the proxy sends (`bearer_token_env_var`,
+/// `http_headers`, `env_http_headers`) is carried whatever a listing
+/// says of it, and one on this host (a loopback address,
+/// [`crate::mcp_proxy::remote::is_local_url`]) too: a path its calls carry
+/// names a file here, and the proxy's path rules are what refuse it.
+///
+/// What a connect leaves is a subset of these, so a status that reads
+/// every such server as left ([`as_codex_signs_in`]) never calls a server
+/// a connect left unguarded.
+fn may_be_left(table: &Table) -> bool {
+    !is_stdio_server(table)
+        && remote_entry(table).is_some_and(|remote| {
+            remote.keys.is_empty() && !crate::mcp_proxy::remote::is_local_url(&remote.url)
+        })
+}
+
+/// Whether any server of `doc` [`may_be_left`]: without one, a connect has
+/// nothing to ask Codex about.
+pub fn has_server_codex_may_sign_in_to(doc: &DocumentMut) -> bool {
+    server_tables(doc)
+        .iter()
+        .any(|(_, table)| may_be_left(table))
+}
+
+/// The configuration as the proxy can carry it without asking Codex: each
+/// server reached by URL alone, which Codex may sign in to by itself (see
+/// [`CodexSignIn::NotAsked`]), read as one with a sign-in key, so it counts
+/// with the servers the proxy does not carry and a status never asks for a
+/// connect that leaves it as it is. Pure.
+pub fn as_codex_signs_in(doc: &DocumentMut) -> DocumentMut {
+    let mut view = doc.clone();
+    for_each_named_server(&mut view, |name, table| {
+        if !left_for_sign_in(name, table, &CodexSignIn::NotAsked) {
+            return false;
+        }
+        table.insert("oauth", value(true));
+        true
+    });
+    view
+}
+
+/// [`wrap_toml`] on a connect a person ran, leaving the servers Codex signs
+/// in to as they are ([`CodexSignIn`]). A wrapper an earlier connect wrote
+/// is reconfigured as before.
+pub fn wrap_toml_signed_in(
+    doc: &mut DocumentMut,
+    guard_bin: &str,
+    monitor: bool,
+    agent: &str,
+    sign_in: &CodexSignIn,
+) -> usize {
+    for_each_named_server(doc, |name, table| {
+        !left_for_sign_in(name, table, sign_in)
+            && wrap_server(table, guard_bin, monitor, Some(agent))
+    })
+}
+
+/// The servers [`wrap_toml_signed_in`] leaves as they are, in file order.
+pub fn signed_in_servers_toml(doc: &DocumentMut, sign_in: &CodexSignIn) -> Vec<String> {
+    server_tables(doc)
+        .into_iter()
+        .filter(|(name, table)| left_for_sign_in(name, table, sign_in))
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// [`is_guarded_toml`] but for the servers Codex signs in to: every other
+/// server the proxy can carry goes through it. `None` when no other server
+/// is there to carry.
+pub fn is_guarded_toml_signed_in(doc: &DocumentMut, sign_in: &CodexSignIn) -> Option<bool> {
+    let carried: Vec<Table> = server_tables(doc)
+        .into_iter()
+        .filter(|(name, table)| {
+            is_proxyable_server(table) && !left_for_sign_in(name, table, sign_in)
+        })
+        .map(|(_, table)| table)
+        .collect();
+    (!carried.is_empty()).then(|| carried.iter().all(is_wrapped_server))
 }
 
 /// Whether every server that runs a local command goes through the proxy,
@@ -1954,5 +2139,104 @@ args = ["-y", "srv"]
             assert_eq!(server_counts_toml(&doc).remote, 1, "{text}");
             assert!(!is_guardable_toml(&doc), "{text}");
         }
+    }
+
+    /// The listing `codex mcp list --json` prints: the servers whose
+    /// sign-in is Codex's own, logged in or not yet, and none other.
+    #[test]
+    fn codex_listing_names_the_servers_it_signs_in_to() {
+        let listed = r#"[{"name":"a","auth_status":"o_auth"},{"name":"b","auth_status":"not_logged_in"},
+            {"name":"c","auth_status":"bearer_token"},{"name":"d","auth_status":"unsupported"},{"name":"e"},
+            {"name":"f","auth_status":"OAuth"}]"#;
+        assert_eq!(
+            codex_sign_in_servers(listed),
+            Some(vec!["a".to_string(), "b".to_string(), "f".to_string()])
+        );
+        assert_eq!(codex_sign_in_servers("[]"), Some(Vec::new()));
+        assert_eq!(
+            codex_sign_in_servers("No MCP servers configured yet."),
+            None
+        );
+        assert_eq!(codex_sign_in_servers(r#"{"name":"a"}"#), None);
+    }
+
+    /// A server Codex named is left as it is; one it did not is carried.
+    /// Not asked, only a server with nothing but its address is left.
+    #[test]
+    fn a_connect_leaves_the_servers_codex_signs_in_to() {
+        let text = "[mcp_servers.linear]\nurl = \"https://l.example/mcp\"\n\n\
+                    [mcp_servers.plain]\nurl = \"https://p.example/mcp\"\n\n\
+                    [mcp_servers.docs]\nurl = \"https://d.example/mcp\"\nbearer_token_env_var = \"T\"\n";
+        let named = CodexSignIn::Servers(vec!["linear".to_string(), "docs".to_string()]);
+        let mut doc: DocumentMut = text.parse().unwrap();
+        // `docs` sends a token the proxy can send: carried, whatever the
+        // listing says of it.
+        assert_eq!(
+            wrap_toml_signed_in(&mut doc, "/bin/iw", false, "codex", &named),
+            2
+        );
+        assert_eq!(signed_in_servers_toml(&doc, &named), vec!["linear"]);
+        assert_eq!(is_guarded_toml_signed_in(&doc, &named), Some(true));
+        assert!(!doc.to_string().contains("l.example/mcp\", \"--"), "{doc}");
+
+        let mut doc: DocumentMut = text.parse().unwrap();
+        assert_eq!(
+            wrap_toml_signed_in(&mut doc, "/bin/iw", false, "codex", &CodexSignIn::NotAsked),
+            1
+        );
+        assert_eq!(
+            signed_in_servers_toml(&doc, &CodexSignIn::NotAsked),
+            vec!["linear", "plain"]
+        );
+
+        let only: DocumentMut = "[mcp_servers.linear]\nurl = \"https://l.example/mcp\"\n"
+            .parse()
+            .unwrap();
+        assert_eq!(is_guarded_toml_signed_in(&only, &named), None);
+    }
+
+    /// A connect never leaves a server on this host, nor one with a
+    /// credential the proxy sends, whatever a listing (a `codex` found on
+    /// the PATH) says of it; and what it leaves, a status reads as left, so
+    /// it never calls the result unguarded.
+    ///
+    /// FAILS ON REVERT of `may_be_left` (loopback and keys): `local`,
+    /// `hdr` and `tok` are left.
+    #[test]
+    fn a_server_here_or_with_a_credential_is_always_carried() {
+        let text = "[mcp_servers.local]\nurl = \"http://127.0.0.1:8931/mcp\"\n\n\
+                    [mcp_servers.named]\nurl = \"http://localhost:3000/mcp\"\n\n\
+                    [mcp_servers.v6]\nurl = \"http://[::1]/mcp\"\n\n\
+                    [mcp_servers.hdr]\nurl = \"https://h.example/mcp\"\nhttp_headers = { \"X-Team\" = \"a\" }\n\n\
+                    [mcp_servers.tok]\nurl = \"https://t.example/mcp\"\nbearer_token_env_var = \"T\"\n\n\
+                    [mcp_servers.far]\nurl = \"https://f.example/mcp\"\n";
+        let all = ["local", "named", "v6", "hdr", "tok", "far"];
+        let listed = CodexSignIn::Servers(all.iter().map(|s| s.to_string()).collect());
+        for sign_in in [listed, CodexSignIn::NotAsked] {
+            let mut doc: DocumentMut = text.parse().unwrap();
+            assert_eq!(
+                wrap_toml_signed_in(&mut doc, "/bin/iw", false, "codex", &sign_in),
+                5,
+                "{sign_in:?}"
+            );
+            assert_eq!(signed_in_servers_toml(&doc, &sign_in), vec!["far"]);
+            let status = as_codex_signs_in(&doc);
+            assert!(is_guarded_toml(&status), "{sign_in:?}: {status}");
+        }
+        let doc: DocumentMut = text.parse().unwrap();
+        assert!(has_server_codex_may_sign_in_to(&doc));
+        let none: DocumentMut = "[mcp_servers.local]\nurl = \"http://127.0.0.1:1/mcp\"\n"
+            .parse()
+            .unwrap();
+        assert!(!has_server_codex_may_sign_in_to(&none));
+        // The hook reads a server on this host as local, keeping the path
+        // rules.
+        let entries = server_entries_toml(&doc);
+        let remote: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.remote)
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(remote, vec!["hdr", "tok", "far"]);
     }
 }

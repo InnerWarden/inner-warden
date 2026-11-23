@@ -40,6 +40,10 @@ pub mod mcp_proxy;
 pub mod mcp_targets;
 pub mod registry;
 pub mod rules;
+// Its literal half runs in build.rs (and the tests); the library reads only
+// rule files with it.
+#[cfg_attr(not(test), allow(dead_code))]
+mod atr_corpus;
 pub mod signatures;
 
 // ── 2. COMMUNITY BINARY + TEST SURFACE ───────────────────────────────────────

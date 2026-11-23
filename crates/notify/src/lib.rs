@@ -66,6 +66,14 @@ pub struct NotifyFile {
     pub webhook_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_review: Option<bool>,
+    /// The proxy every alert goes through (`http://host:port`), when the
+    /// machine reaches out only through one. Each product's transport decides
+    /// what to do with it: Community's `innerwarden` takes its proxy only from
+    /// here, never from the environment of the agent that starts a hook. This
+    /// crate reads nothing from the environment itself beyond what its
+    /// callers pass to [`config_path`] and [`resolved`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
 }
 
 impl NotifyFile {
@@ -86,6 +94,7 @@ impl NotifyFile {
             discord_webhook: updates.discord_webhook.or(self.discord_webhook),
             webhook_url: updates.webhook_url.or(self.webhook_url),
             notify_review: updates.notify_review.or(self.notify_review),
+            proxy: updates.proxy.or(self.proxy),
         }
     }
 
@@ -439,6 +448,19 @@ mod tests {
         assert!(s.contains("slack_webhook") && s.contains("notify_review"));
         assert!(!s.contains("telegram")); // unset omitted
         assert_eq!(NotifyFile::parse(&s).unwrap(), f);
+    }
+
+    /// A proxy set in the file survives a `notify --slack-webhook` that sets
+    /// another channel.
+    #[test]
+    fn notifyfile_overlay_keeps_the_proxy() {
+        let existing = NotifyFile::parse("proxy = \"http://127.0.0.1:3128\"\n").unwrap();
+        let merged = existing.overlay(NotifyFile {
+            slack_webhook: Some("https://s".into()),
+            ..Default::default()
+        });
+        assert_eq!(merged.proxy.as_deref(), Some("http://127.0.0.1:3128"));
+        assert_eq!(NotifyFile::parse(&merged.to_toml()).unwrap(), merged);
     }
 
     #[test]

@@ -225,8 +225,8 @@ pub(crate) fn account_home() -> Option<std::path::PathBuf> {
 /// ([`account_home`]) on Unix, never `HOME`. A hook and `check` run with
 /// the AI agent's environment, and a home the agent names would choose the
 /// `llm.toml` whose key goes to the url it names, and the `notify.toml`
-/// whose webhooks fire. Off Unix, where no account database is read, `HOME`
-/// as before.
+/// whose webhooks fire. On Windows, the profile folder of the account's
+/// token ([`windows_profile_dir`]), never `HOME` or `USERPROFILE`.
 pub(crate) fn config_home() -> Option<std::path::PathBuf> {
     #[cfg(debug_assertions)]
     if let Some(home) = test_account_home_from(std::env::var(TEST_ACCOUNT_HOME_ENV).ok().as_deref())
@@ -237,13 +237,102 @@ pub(crate) fn config_home() -> Option<std::path::PathBuf> {
     {
         account_home()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        std::env::var("HOME")
-            .ok()
-            .filter(|home| !home.trim().is_empty())
-            .map(std::path::PathBuf::from)
+        windows_profile_dir()
     }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
+/// The profile folder of the account this process runs as, from its token
+/// (`GetUserProfileDirectoryW`, which reads the profile list in the
+/// registry), never `HOME` or `USERPROFILE`: a hook runs with the agent's
+/// environment, and a home the agent names chose the config.
+#[cfg(windows)]
+fn windows_profile_dir() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::UI::Shell::GetUserProfileDirectoryW;
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the current process pseudo-handle needs no closing; `token`
+    // is an out-parameter owned here.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; 1024];
+    let mut size = buffer.len() as u32;
+    // SAFETY: `buffer` holds `size` UTF-16 units; the call writes at most
+    // that many and says how many it needs when it is too short.
+    let mut filled = unsafe { GetUserProfileDirectoryW(token, buffer.as_mut_ptr(), &mut size) };
+    if filled == 0 && size as usize > buffer.len() {
+        buffer = vec![0u16; size as usize];
+        // SAFETY: as above, with the size the first call asked for.
+        filled = unsafe { GetUserProfileDirectoryW(token, buffer.as_mut_ptr(), &mut size) };
+    }
+    // SAFETY: `token` was opened above and is closed once.
+    unsafe { CloseHandle(token) };
+    if filled == 0 {
+        return None;
+    }
+    let length = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    let dir = std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length]));
+    dir.is_absolute().then_some(dir)
+}
+
+/// What an override of a config path may name in a release build: no file
+/// at all. The jail hands its hook this for the second opinion, the
+/// notifications and the suppressions; it only takes a destination or a
+/// suppression away, never adds one.
+pub(crate) const NO_CONFIG: &str = "/dev/null";
+
+/// Debug builds only: set to `1`, the caller's environment is read as a
+/// release build reads it (no config path but [`NO_CONFIG`], no alert
+/// channel), so a test can show what a release build does with
+/// the agent's environment.
+#[cfg(debug_assertions)]
+pub(crate) const TEST_RELEASE_OVERRIDES_ENV: &str = "IW_TEST_RELEASE_OVERRIDES";
+
+/// Whether the environment of the process that starts this one may choose
+/// where the text the guard reads goes: a config path other than
+/// [`NO_CONFIG`] (`IW_LLM_CONFIG`, `IW_NOTIFY_CONFIG`,
+/// `IW_SUPPRESS_CONFIG`) or an alert channel (`IW_WEBHOOK_URL` and the
+/// rest). Never in a release build: a hook and `check` run with the AI
+/// agent's environment, and a channel it names received every command
+/// the guard refused. A debug build (the tests) honours them, unless
+/// [`TEST_RELEASE_OVERRIDES_ENV`] asks for the release reading.
+pub(crate) fn caller_overrides_honoured() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var(TEST_RELEASE_OVERRIDES_ENV).map_or(true, |value| value.trim() != "1")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+/// The path an override names when it is honoured: [`NO_CONFIG`] always,
+/// any other with `any` ([`caller_overrides_honoured`]).
+pub(crate) fn honoured_override(named: Option<&str>, any: bool) -> Option<std::path::PathBuf> {
+    let named = named.map(str::trim).filter(|named| !named.is_empty())?;
+    (any || named == NO_CONFIG).then(|| std::path::PathBuf::from(named))
+}
+
+/// The override in the environment variable `name`, when honoured
+/// ([`honoured_override`]).
+pub(crate) fn override_from_env(name: &str) -> Option<std::path::PathBuf> {
+    honoured_override(
+        std::env::var(name).ok().as_deref(),
+        caller_overrides_honoured(),
+    )
 }
 
 /// Debug builds only: the account's home for a test, so a test can store a

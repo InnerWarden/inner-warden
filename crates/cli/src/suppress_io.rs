@@ -10,7 +10,8 @@ use innerwarden_agent_guard::threats::GUARD_OPERATOR_FLAG;
 /// What `IW_SUPPRESS_CONFIG` may name, in every build: no file at all. The
 /// jail hands its hook this, so a `suppress.toml` written in the jail lifts
 /// nothing. It only takes suppressions away.
-const NO_SUPPRESSION: &str = "/dev/null";
+#[cfg(test)]
+const NO_SUPPRESSION: &str = crate::graph_io::NO_CONFIG;
 
 /// The suppression config path: `.config/innerwarden/suppress.toml` in the
 /// account's own home ([`crate::graph_io::account_config_dir`]), never the
@@ -20,19 +21,14 @@ const NO_SUPPRESSION: &str = "/dev/null";
 /// `IW_SUPPRESS_CONFIG` is honoured as [`NO_SUPPRESSION`] only, and as any
 /// other path in a debug build (the tests).
 fn config_path() -> Option<std::path::PathBuf> {
-    let named = std::env::var("IW_SUPPRESS_CONFIG").ok();
-    if let Some(path) = honoured_override(named.as_deref(), cfg!(debug_assertions)) {
+    if let Some(path) = crate::graph_io::override_from_env("IW_SUPPRESS_CONFIG") {
         return Some(path);
     }
     crate::graph_io::account_config_dir().map(|dir| dir.join("suppress.toml"))
 }
 
-/// The path `IW_SUPPRESS_CONFIG` names when it is honoured: [`NO_SUPPRESSION`]
-/// always, any other with `any` (debug builds).
-fn honoured_override(named: Option<&str>, any: bool) -> Option<std::path::PathBuf> {
-    let named = named.map(str::trim).filter(|named| !named.is_empty())?;
-    (any || named == NO_SUPPRESSION).then(|| std::path::PathBuf::from(named))
-}
+#[cfg(test)]
+use crate::graph_io::honoured_override;
 
 fn load() -> SuppressConfig {
     load_reporting(false)
