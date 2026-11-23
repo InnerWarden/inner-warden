@@ -269,7 +269,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         "contain" => format!(
             "{p} contain [--agent claude-code|openclaw] [--monitor|--enforce|--block-review]\n  \
              \x20              [--project DIR] [--deny-read GLOB] [--pass-env NAME] [--dry-run] [--setup]\n  \
-             \x20              [--identity]\n  \
+             \x20              [--identity] [--writable-user-bin]\n  \
              \x20              -- <command...>\n  \
              Run <command> inside a filesystem/namespace JAIL with the guard hook armed\n  \
              INSIDE it (Linux bwrap, macOS sandbox-exec). InnerWarden's own folder (its\n  \
@@ -299,7 +299,11 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              \x20                 made as yours (with --project <dir>), from your\n  \
              \x20                 own terminal; starts nothing (a launch whose jail\n  \
              \x20                 made such a file exits 3)\n  \
-             --identity        (Linux) record the run as an identified instance\n\
+             --identity        (Linux) record the run as an identified instance\n  \
+             --writable-user-bin  (Linux) leave the home's folders of programs in\n  \
+             \x20                 your PATH (~/.local/bin, ~/.cargo/bin, ...) writable in\n  \
+             \x20                 the jail; a program in it can then leave one there\n  \
+             \x20                 that runs as you, outside the jail (said when it starts)\n\
              \n  \
              With --identity the hook inside the jail tells this instance apart from\n  \
              the agent's other runs. Read from inside the jail, the instance is at most\n  \
@@ -401,7 +405,16 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              On Linux the folders your session runs from at the next login\n  \
              (~/.config/autostart, ~/.config/systemd, ~/.config/environment.d,\n  \
              ~/.config/upstart, ~/.local/share/systemd/user,\n  \
-             ~/.local/share/dbus-1/services) are read-only in every jail.\n\
+             ~/.local/share/dbus-1/services) are read-only in every jail.\n  \
+             So are the folders your own programs run from as you the next\n  \
+             time they start: git's config, the startup files of fish, zsh,\n  \
+             nushell, elvish, xonsh, PowerShell, neovim, vim, tmux and direnv,\n  \
+             window managers', ~/.local/share/applications and flatpak's\n  \
+             exports, also under XDG_CONFIG_HOME and XDG_DATA_HOME, and\n  \
+             ~/.config/starship.toml and the browsers' flags files. The home's\n  \
+             folders of programs in your PATH are read-only too unless\n  \
+             --writable-user-bin: update the agent, pip install --user and cargo\n  \
+             install outside the jail, and use a venv or the project inside it.\n\
              \n  \
              Everything after `--` is the jailed command line, including its own\n  \
              `--help`."
@@ -643,6 +656,8 @@ mod tests {
             "The jail shares the host's network; on Linux 6.12 or later (Landlock) its programs cannot connect to an abstract unix socket made outside it, an X server's among them. On an older kernel they still can, and the jail says so when it starts.",
             "The jail does not isolate the display: a program in it that binds a display's abstract name before that X server starts receives its clients, and an X server listening on TCP stays reachable.",
             "On Linux the folders your session runs from at the next login (~/.config/autostart, ~/.config/systemd, ~/.config/environment.d, ~/.config/upstart, ~/.local/share/systemd/user, ~/.local/share/dbus-1/services) are read-only in every jail.",
+            "So are the folders your own programs run from as you the next time they start: git's config, the startup files of fish, zsh, nushell, elvish, xonsh, PowerShell, neovim, vim, tmux and direnv, window managers', ~/.local/share/applications and flatpak's exports, also under XDG_CONFIG_HOME and XDG_DATA_HOME, and ~/.config/starship.toml and the browsers' flags files.",
+            "The home's folders of programs in your PATH are read-only too unless --writable-user-bin: update the agent, pip install --user and cargo install outside the jail, and use a venv or the project inside it.",
         ] {
             assert!(help.contains(said), "contain --help lacks {said:?}: {help}");
         }
@@ -674,6 +689,10 @@ mod tests {
             "receives the X clients of the host that connect to that display, and an X server that listens on TCP (`Xvfb -listen tcp`, `DISPLAY=127.0.0.1:7`) is reachable like any other TCP port.",
             "It does not isolate your display: a program in it that binds a display's abstract name before that X server starts receives its clients, and an X server listening on TCP stays reachable",
             "On Linux the folders the person's session runs from on its own at the next login are read-only in every jail:",
+            "nor git's config or a shell's or an editor's startup file for the next time you run them",
+            "A file where one of these folders belongs, or one the launcher cannot make, refuses the launch.",
+            "a link inside one of these folders that leads to a place the jail writes",
+            "The home's folders of programs in the person's `PATH` are read-only in every Linux jail",
             "On a kernel older than 4.8",
         ] {
             assert!(readme.contains(said), "README lacks {said:?}");

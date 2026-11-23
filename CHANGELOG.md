@@ -1004,9 +1004,62 @@ their MCP servers get no session id to match. Details and limits:
   `~/.local/share/systemd/user` and `~/.local/share/dbus-1/services` are
   read-only in every jail, made empty first where they are not there, and
   the folders above them cannot be renamed away. The agent's own folders in
-  `~/.config` stay writable. One of them reached through a link in
-  `~/.config` or `~/.local` refuses the launch. With `XDG_CONFIG_HOME`
-  set elsewhere they are not covered.
+  `~/.config` stay writable.
+- **A Linux jail cannot leave what your own programs run as you next.**
+  Beyond the login folders above, `~/.config` held files your programs run
+  the next time they start, with no login: git's config (`core.hooksPath`,
+  `core.fsmonitor`, an alias with `!` ran at your next `git`), fish's
+  `config.fish` and `conf.d`, neovim's `init.lua`. Now these folders are
+  read-only in every Linux jail too, made empty first and pinned like the
+  login folders: `~/.config/` `git`, `fish`, `zsh`, `nushell`, `elvish`,
+  `xonsh`, `powershell`, `nvim`, `vim`, `tmux`, `direnv`,
+  `plasma-workspace` (login and logout scripts) and the startup folders of
+  the window managers that keep them there (`i3`, `sway`, `hypr`, `niri`,
+  `river`, `labwc`, `openbox`, `lxsession`, `awesome`, `qtile`, `bspwm`,
+  `herbstluftwm`); and `~/.local/share/applications` (a launcher there
+  takes an installed program's place in the menu) and flatpak's exported
+  D-Bus services and launchers (`~/.local/share/flatpak/exports/share`,
+  read by the session on Fedora and Mint). Each is covered again under the
+  `XDG_CONFIG_HOME` and `XDG_DATA_HOME` of the environment that opens the
+  jail, and in each folder of `XDG_DATA_DIRS` inside the home, where the
+  jail writes them. `XDG_STATE_HOME` holds nothing that runs.
+- **A file where one of those folders belongs refuses the jail**
+  (`~/.config/git` a file): before, that place was left unprotected and
+  the jail started. So does one the launcher cannot make. The words say
+  what to do.
+- **A home with stow or a moved disk opens a jail again.** Since the login
+  folders were covered, one reached through a link in `~/.config` or
+  `~/.local` refused the launch, and the hint (link it straight to its
+  place) put the link back in a folder the jail writes. Now the place the
+  link leads to is read-only where the jail shows it, or not shown at all,
+  and the jail says in one line that a program in it could still replace
+  the link itself; replace the link with the folder to close that. Only a
+  link that leads to nothing, or loops, still refuses, with what to make.
+- **Files at the top of `~/.config` that run commands** are read-only in
+  every Linux jail too, made empty first: `starship.toml` (a `custom`
+  module runs a command at every prompt) and the flags files some
+  distributions' Chromium, Chrome, Electron and VS Code launchers read
+  (`chromium-flags.conf`, `chrome-flags.conf`, `electron-flags.conf`,
+  `code-flags.conf`). The terminals' folders (`kitty`, `alacritty`,
+  `wezterm`, `foot`, `ghostty`) and the installers' (`pip`, `uv`) join the
+  folders above.
+- **The home's folders of programs are read-only in a Linux jail.**
+  `~/.local/bin`, `~/.cargo/bin`, `~/bin`, `~/go/bin`, `~/.npm-global/bin`
+  and every folder under the home in the `PATH` of whoever opens the jail,
+  where the jail shows it: a program left there ran as you, outside the
+  jail, the next time you typed its name, and an agent updating itself
+  there from inside the jail is the same way out. Update the agent, and run
+  `pip install --user` or `cargo install`, outside the jail; inside it use
+  a venv or the project. `contain --writable-user-bin` leaves them
+  writable, and the jail says in one line what that lets a program in it
+  do.
+- **Limits.** A link inside one of those folders that leads to a place the
+  jail writes (`~/.config/git/config` a link into `~/.cache`) stays
+  writable there.
+- **A report that connects as the jail ends is written or counted.** The
+  launcher closes the record socket's backlog before its last look at it,
+  so a connect that found the socket's name before it was removed is
+  refused instead of being queued after that look and dropped unseen.
 - **No jail shows your `~/.claude` writable any more.** That folder carries
   the settings that wire the guard's hook, and a program in a jail could
   take the hook out, turn hooks off with a `settings.local.json` of its

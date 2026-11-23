@@ -188,7 +188,10 @@ guard` and the rest) are its own and are not the hook posture.
   constrained profile (bubblewrap on Linux, sandbox-exec on macOS), so a
   denied action is stopped, not only flagged. On Linux a program in it
   cannot leave an autostart entry or a systemd user unit for your next
-  login, and on Linux 6.12 or later it does not connect to an abstract unix
+  login, nor git's config or a shell's or an editor's startup file for the
+  next time you run them, nor a program in `~/.local/bin` or another folder
+  of programs in your `PATH` (unless `--writable-user-bin`), and on Linux
+  6.12 or later it does not connect to an abstract unix
   socket made outside the jail. It does not isolate your display: a program
   in it that binds a display's abstract name before that X server starts
   receives its clients, and an X server listening on TCP stays reachable

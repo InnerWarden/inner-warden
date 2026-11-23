@@ -1143,6 +1143,23 @@ fn unread(mut stream: std::os::unix::net::UnixStream, shared: &Shared) {
     shared.lose(Why::Unread);
 }
 
+/// Close the listen backlog of `listener` to new connections: the kernel
+/// refuses a connect from then on (`ECONNREFUSED`), under the same lock it
+/// queues one with, and each connection it queued before stays there to be
+/// accepted. Removing the socket's name is not enough: a connect that had
+/// found the name before could still be queued after the last accept, and
+/// closing the listener then dropped it, neither written nor counted, while
+/// its sender had connected.
+#[cfg(target_os = "linux")]
+fn close_backlog(listener: &std::os::unix::net::UnixListener) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor is the live listener's; shutdown takes no
+    // memory of ours.
+    unsafe {
+        libc::shutdown(listener.as_raw_fd(), libc::SHUT_RD);
+    }
+}
+
 /// Take every connection waiting on `listener` into `open`, or turn it
 /// away past [`Limits::max_open`].
 #[cfg(target_os = "linux")]
@@ -1262,8 +1279,11 @@ fn read_all(
     loop {
         let stopping = stop.load(std::sync::atomic::Ordering::SeqCst);
         if stopping {
-            // The socket's name is gone (`Drop`): nothing more can arrive,
-            // and what waits in the backlog is taken now.
+            // The socket's name is gone (`Drop`), and the backlog is
+            // closed: a connect that found the name before it went is
+            // refused from here on, never queued after this last look and
+            // then dropped unseen. What waits in the backlog is taken now.
+            close_backlog(listener);
             accept_waiting(listener, &mut open, shared);
         }
         let now = std::time::Instant::now();
@@ -2265,6 +2285,35 @@ mod tests {
         assert!(graph.contains("after-the-big.sh"), "{graph}");
     }
 
+    /// The backlog closed when the jail ends refuses every connect from
+    /// then on, and keeps each connection queued before for the last
+    /// accept: none is queued after that look and dropped unseen.
+    ///
+    /// FAILS ON REVERT: drop the shutdown and the late connect is queued.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_closed_backlog_refuses_new_connects_and_keeps_the_queued_ones() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let queued: Vec<_> = (0..3)
+            .map(|_| std::os::unix::net::UnixStream::connect(&path).unwrap())
+            .collect();
+        close_backlog(&listener);
+        let late = std::os::unix::net::UnixStream::connect(&path);
+        assert_eq!(
+            late.map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionRefused
+        );
+        let mut taken = 0;
+        while listener.accept().is_ok() {
+            taken += 1;
+        }
+        assert_eq!(taken, 3);
+        drop(queued);
+    }
+
     /// Reports in the listen backlog when the jail ends are taken: each is
     /// written or counted. Before, the reading thread stopped and what was
     /// still in the backlog was closed, neither written nor counted.
@@ -2291,14 +2340,28 @@ mod tests {
                             return (false, false);
                         };
                         connected.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+                        // The launcher answers or closes every connection
+                        // before `drop(channel)` returns, so the answer is
+                        // waited for, not timed: a 10 s wait on a loaded
+                        // runner took a report written late for one lost.
+                        // The bound only keeps a broken channel from
+                        // hanging the suite, and fails as itself.
+                        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(600)));
                         let mut d = decision();
                         d.command = format!("echo at-close-{n}");
                         d.event_hash = None;
                         let _ = stream.write_all(&framed(n, &encode(&d)));
                         let _ = stream.shutdown(std::net::Shutdown::Write);
                         let mut answer = Vec::new();
-                        let _ = stream.read_to_end(&mut answer);
+                        if let Err(e) = stream.read_to_end(&mut answer) {
+                            assert!(
+                                !matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ),
+                                "sender {n}: no answer and no close in 600 s"
+                            );
+                        }
                         (true, answer == WRITTEN)
                     })
                 })
