@@ -5,22 +5,36 @@ follows semantic versioning.
 
 ## Unreleased
 
-git verbs that empty or reset a work tree are read on the work tree git
-itself uses: the one the line names (`--work-tree`, `GIT_WORK_TREE`,
-`-c core.worktree=`, `--config-env`, `GIT_CONFIG_KEY_<n>` with
-`GIT_CONFIG_VALUE_<n>`), else the `core.worktree` in the repository's
-config, else the folder that holds its `.git`, found from the folder the
-command runs in. `clean` (without `-n`) and `stash -u`/`-a` are refused
-when what they reach holds one of the guard's places (its folders, the agent
-settings that load it, its program), so `git clean -fdx` in a home made a
-repository is refused; `stash`, `read-tree -u`, `checkout`, `switch`,
-`restore` and `reset --hard` are refused when the work tree, or a path they
-are handed, is one of those places or inside one; `git config core.worktree`
-pointing into the guard's folder is refused. A dotfiles repository with the
-home as its work tree keeps working: `checkout -- .bashrc`, `status` and
-`reset --hard` there are not refused, `clean` and `stash -u` are. Not
-read: a folder or value behind a variable the line does not assign, other
-than the home, and an `include` in a repository's config.
+git commands are read on the work tree git itself uses: the one the line
+names (`--work-tree`, `GIT_WORK_TREE`, `-c core.worktree=`, `--config-env`,
+`GIT_CONFIG_KEY_<n>` with `GIT_CONFIG_VALUE_<n>`), else the `core.worktree`
+in the repository's config, else the folder that holds its `.git`, found
+from the folder the agent's command runs in (the hook payload's, not the
+hook's own), a repository made earlier in the same line (`git init`,
+`git clone`) counted as found. Where that work tree is one of the guard's
+places (its folders, the agent settings that load it, its program), is
+inside one or holds one (the home, or a folder above it), only verbs that
+leave the work tree as it is pass (`status`, `log`, `diff`, `show`,
+`add`, `commit`, `fetch`, `push` and the like). Any other verb, an
+unknown one and an alias (from `-c`, the repository's config or the user's)
+included, is refused, unless the paths it is handed keep it out of the
+guard's places (`checkout -- .bashrc`), or it only puts back what the
+repository tracks (`checkout`, `restore`, `reset --hard`, `stash`,
+`read-tree -u`, `checkout-index`, `rm`, `mv`, `pull`) and neither the
+index nor the commit it puts back holds a path in the guard's places. Both
+are read from the repository's own files; git is not run.
+`git config core.worktree` pointing into the guard's folder is refused.
+
+For a home kept in git (a dotfiles repository with the home as its work
+tree): `status`, `add`, `commit`, `checkout -- <file>`, `reset --hard`,
+`stash`, `pull` and a `checkout` of a branch keep working when the
+repository does not track the guard's places; `clean -f`, `stash -u` and
+`stash -a` are refused (they remove the guard's untracked files), and so
+are `merge`, `rebase`, `apply`, `cherry-pick` and any verb or alias not
+read here. Not read: a folder or value behind a variable the line does not
+assign, other than the home; an `include` in a repository's config; what
+`pull` brings from its remote; a repository in SHA-256 or with a reftable
+(its writes there are refused).
 
 Codex: the hook no longer trusts the proxy for a call when a project layer
 above the trusted folder (in a parent up to the root of the file system,

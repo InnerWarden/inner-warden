@@ -1,6 +1,7 @@
 //! Threat detection patterns for AI agent security.
 
 mod git_tree;
+pub(crate) use git_tree::in_command_dir;
 mod glob_names;
 mod guard_doubt;
 mod guard_lowering;
