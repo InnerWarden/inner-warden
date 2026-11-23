@@ -4275,24 +4275,54 @@ fn with_launchers_read_through(
     if READING_THROUGH_LAUNCHERS.with(std::cell::Cell::get) {
         return as_written;
     }
-    let Some(read) = crate::shell::runners::launchers_read_through(command) else {
+    let readings = crate::shell::runners::launchers_readings(command);
+    if readings.is_empty() {
         return as_written;
-    };
+    }
     READING_THROUGH_LAUNCHERS.with(|reading| reading.set(true));
     let _clear = LaunchersReadThrough;
-    let through =
-        analyze_command_with_its_values(&read, rule_engine, protected_reads, context, depth);
-    if through.risk_score > as_written.risk_score {
-        CommandAnalysis {
+    // Each reading is weighed against the line as written, as one reading
+    // was before; of those that weigh more, the strictest verdict stands.
+    let strictness = |analysis: &CommandAnalysis| {
+        let rank = match analysis.recommendation.as_str() {
+            "deny" => 2,
+            "review" => 1,
+            _ => 0,
+        };
+        (rank, analysis.risk_score)
+    };
+    let mut strictest: Option<CommandAnalysis> = None;
+    for read in readings {
+        let through =
+            analyze_command_with_its_values(&read, rule_engine, protected_reads, context, depth);
+        if through.risk_score <= as_written.risk_score {
+            continue;
+        }
+        if strictest
+            .as_ref()
+            .is_none_or(|kept| strictness(&through) > strictness(kept))
+        {
+            strictest = Some(through);
+        }
+        // Nothing is stricter than a refusal: the readings left are not
+        // judged.
+        if strictest
+            .as_ref()
+            .is_some_and(|kept| kept.recommendation == "deny")
+        {
+            break;
+        }
+    }
+    match strictest {
+        Some(through) => CommandAnalysis {
             command: as_written.command,
             explanation: format!(
                 "with the launchers in front of its commands read through: {}",
                 through.explanation
             ),
             ..through
-        }
-    } else {
-        as_written
+        },
+        None => as_written,
     }
 }
 

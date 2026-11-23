@@ -64,7 +64,14 @@ unread; a launcher followed by a redirection and a command (`env
 2>/dev/null sh`) still runs that command. A redirection written in front
 of the name of a command (`2>/dev/null rm -rf ~/.innerwarden`, `f | 2>/dev/null
 tee -a ~/.bashrc`) no longer hides the command, and `crontab - 2>/dev/null`
-is read as a table from its input. `innerwarden check` run by the path of
+is read as a table from its input. The same holds when the redirection is
+written with quotes, an escape or an expansion (`env 2>"/dev/null" sh`),
+stands behind a value or `time` (`FOO=1 2>/dev/null rm`), is a here-string,
+a here-document or a named descriptor, or stands between a launcher and its
+options (`sudo 2>/dev/null -u root sh`). The Cursor CLI is also recognised
+when `node` is handed its version folder, `.` from inside it, or the entry
+file without `.js`, and through a `cd` into `versions` or the install
+folder. `innerwarden check` run by the path of
 the running guard's own file written out (a build folder), or from an
 installed folder with `HOME` or `NO_COLOR` set in front, reads its line
 as data. The path is compared as text: a link, a `.` or `..` part, `//`

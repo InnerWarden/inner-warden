@@ -357,3 +357,24 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   cursor-exec-2026-11/ce-c07, cursor-exec-2026-11/ce-c08, cursor-exec-2026-11/ce-c09, cursor-exec-2026-11/ce-c10, cursor-exec-2026-11/ce-c11, cursor-exec-2026-11/ce-c12, cursor-exec-2026-11/ce-c13, cursor-exec-2026-11/ce-c14
   are allowed on main and here; ce-c04, ce-c05 and ce-c06 move as recorded
   above. No other line of any corpus moved.
+- 2026-11-23: review round 2 of the same change; reference.tsv unchanged.
+  Measured with the differential judge against main 0f6ec89 (39669 lines,
+  an empty home and a home with keys, the same in both): no line main
+  stops goes unstopped. Lines added this round: cursor-exec-2026-11/ce-34, cursor-exec-2026-11/ce-35, cursor-exec-2026-11/ce-36, cursor-exec-2026-11/ce-37, cursor-exec-2026-11/ce-38, cursor-exec-2026-11/ce-39, cursor-exec-2026-11/ce-40, cursor-exec-2026-11/ce-41, cursor-exec-2026-11/ce-42, cursor-exec-2026-11/ce-43, cursor-exec-2026-11/ce-44, cursor-exec-2026-11/ce-45, cursor-exec-2026-11/ce-46, cursor-exec-2026-11/ce-47, cursor-exec-2026-11/ce-48, cursor-exec-2026-11/ce-49, cursor-exec-2026-11/ce-50, cursor-exec-2026-11/ce-51, cursor-exec-2026-11/ce-52, cursor-exec-2026-11/ce-53, cursor-exec-2026-11/ce-54
+  (a redirection after a launcher written with a quote, an escape or an
+  expansion, `env 2>"/dev/null" sh`) are deny on main and here; round 1
+  allowed them because the launcher was no longer cut. cursor-exec-2026-11/ce-55
+  (`cat /tmp/x | env 2>"/dev/null" crontab -`, must_refuse) goes from
+  review to deny. New must_refuse lines that main allows and this branch
+  refuses: cursor-exec-2026-11/ce-56, cursor-exec-2026-11/ce-57, cursor-exec-2026-11/ce-58, cursor-exec-2026-11/ce-59, cursor-exec-2026-11/ce-60, cursor-exec-2026-11/ce-61, cursor-exec-2026-11/ce-62, cursor-exec-2026-11/ce-63, cursor-exec-2026-11/ce-64, cursor-exec-2026-11/ce-65, cursor-exec-2026-11/ce-66, cursor-exec-2026-11/ce-67, cursor-exec-2026-11/ce-68, cursor-exec-2026-11/ce-69, cursor-exec-2026-11/ce-70, cursor-exec-2026-11/ce-71, cursor-exec-2026-11/ce-72, cursor-exec-2026-11/ce-73, cursor-exec-2026-11/ce-74, cursor-exec-2026-11/ce-75, cursor-exec-2026-11/ce-76, cursor-exec-2026-11/ce-77, cursor-exec-2026-11/ce-78, cursor-exec-2026-11/ce-79, cursor-exec-2026-11/ce-80 (a redirection in front of a command behind a
+  value, `time`, a named descriptor, a here-string, a here-document or
+  written with quotes; a redirection between a launcher and its options;
+  the Cursor entry file without `.js`, the version folder, `.` from
+  inside it, and a path from a `cd` into `versions` or the install
+  folder). Their generated variants move the same way. metamorphic/adv328-c2-11-m-envr,
+  metamorphic/adv328-c2-12-m-envr, metamorphic/adv328-c4-01-m-envr and
+  metamorphic/adv328-c4-22-m-envr go from review to deny, besides
+  metamorphic/adv328-c1-14-m-envr and metamorphic/adv328-c2-18-m-envr
+  recorded above. Controls cursor-exec-2026-11/ce-c15, cursor-exec-2026-11/ce-c16, cursor-exec-2026-11/ce-c17, cursor-exec-2026-11/ce-c18, cursor-exec-2026-11/ce-c19, cursor-exec-2026-11/ce-c20, cursor-exec-2026-11/ce-c21, cursor-exec-2026-11/ce-c22 are allowed on main and here;
+  ce-c04, ce-c05 and ce-c06 move as recorded above. No other line of any
+  corpus moved.

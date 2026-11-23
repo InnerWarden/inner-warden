@@ -889,27 +889,36 @@ fn agent_version_parts(
 /// name (`my-cursor-agent/versions/`) is not the agent.
 fn agent_install_folder(lower: &str) -> Option<&'static str> {
     let parts = path_parts(lower);
+    // The version folder itself (`node <version>`, `node <version>/`,
+    // `node .` from inside it): node runs the `index.js` in it. Checked
+    // with node 22 on 2026-11-22.
+    if let Some((_, agent, _)) = agent_version_parts(&parts) {
+        return Some(agent);
+    }
     let [folder @ .., entry] = parts.as_slice() else {
         return None;
     };
+    // The entry file, also without its `.js`, which node adds.
     agent_version_parts(folder)
-        .filter(|(_, _, file)| path_part_is(entry, file))
+        .filter(|(_, _, file)| {
+            path_part_is(entry, file)
+                || file
+                    .strip_suffix(".js")
+                    .is_some_and(|stem| path_part_is(entry, stem))
+        })
         .map(|(_, agent, _)| *agent)
 }
 
-/// The row of [`HOOKED_AGENT_INSTALL_FOLDERS`] whose version folder the path
-/// `lower` (lowercase) is, as `cd` is handed it.
-fn agent_version_folder(
-    lower: &str,
-) -> Option<&'static (&'static str, &'static str, &'static str)> {
-    agent_version_parts(&path_parts(lower))
-}
-
-/// The word after which a command the line runs in an agent's version
-/// folder ([`SetBefore::in_agent_folder`]) reads its own arguments, when
-/// it starts that agent by its entry file named from there: `node index.js`,
-/// `./node ./index.js`.
-fn entry_from_agent_folder(words: &[String], at: usize, entry: &str) -> Option<usize> {
+/// The agent a command the line runs after a `cd` ([`SetBefore::in_folder`])
+/// starts by the entry file of one of [`HOOKED_AGENT_INSTALL_FOLDERS`] named
+/// from there, and the word after which it reads its own arguments: `node
+/// index.js` or `./node .` in the version folder, `node <version>/index.js`
+/// in `versions`, `node versions/<version>` in the install folder.
+fn entry_from_agent_folder(
+    words: &[String],
+    at: usize,
+    folder: &str,
+) -> Option<(&'static str, usize)> {
     let name = program_name(&words[at]);
     if !matches!(
         strip_interpreter_version(&name),
@@ -918,11 +927,12 @@ fn entry_from_agent_folder(words: &[String], at: usize, entry: &str) -> Option<u
         return None;
     }
     let script = (at + 1..words.len()).find(|index| !words[*index].starts_with('-'))?;
-    let parts = path_parts(&words[script]);
     let file = words[script].to_ascii_lowercase();
-    let parts_lower = path_parts(&file);
-    (parts.len() == 1 && parts_lower.len() == 1 && path_part_is(parts_lower[0], entry))
-        .then_some(script + 1)
+    // A path from the root or the home is read without the folder.
+    if file.starts_with(['/', '~']) {
+        return None;
+    }
+    agent_install_folder(&format!("{folder}/{file}")).map(|agent| (agent, script + 1))
 }
 
 /// The events of the user's Claude Code hooks the guard's own hook sits
@@ -968,10 +978,11 @@ struct SetBefore {
     /// The names the line gives a value it does not show: read from input,
     /// by `printf -v`, a loop, a `${NAME:=value}` default, a substitution.
     unshown: Vec<String>,
-    /// The agent and entry file of the install folder
-    /// ([`HOOKED_AGENT_INSTALL_FOLDERS`]) a `cd` on the line went into last:
-    /// `cd <folder> && HOME=/tmp/h ./node index.js` starts that agent.
-    in_agent_folder: Option<(&'static str, &'static str)>,
+    /// The folder (lowercase, as written) a `cd` on the line went into last,
+    /// a relative one joined to the one before: `cd <version folder> &&
+    /// HOME=/tmp/h ./node index.js` starts the agent of
+    /// [`HOOKED_AGENT_INSTALL_FOLDERS`] whose entry file that is.
+    in_folder: Option<String>,
 }
 
 /// One simple command as [`command_starts_unhooked_agent`] reads it.
@@ -1802,14 +1813,20 @@ fn command_starts_unhooked_agent(command: &Spoken, set: &mut SetBefore, depth: u
     if program == "builtin" {
         return command_starts_unhooked_agent(&command.part(at + 1, words.len()), set, depth);
     }
-    // `cd` into an agent's version folder: what the line runs from there
-    // by a name in that folder.
+    // `cd`: what the line runs from there by a relative name.
     if matches!(program.as_str(), "cd" | "pushd") {
-        set.in_agent_folder = words[at + 1..]
+        set.in_folder = words[at + 1..]
             .iter()
             .find(|word| !word.starts_with('-'))
-            .and_then(|folder| agent_version_folder(&folder.to_ascii_lowercase()))
-            .map(|(_, agent, entry)| (*agent, *entry));
+            .map(|folder| {
+                let folder = folder.to_ascii_lowercase();
+                match &set.in_folder {
+                    Some(before) if !folder.starts_with(['/', '~']) => {
+                        format!("{before}/{folder}")
+                    }
+                    _ => folder,
+                }
+            });
     }
     let arguments = &words[at + 1..];
     if let Some(effect) = setter_effect(&program, command, at, set) {
@@ -1831,7 +1848,7 @@ fn command_starts_unhooked_agent(command: &Spoken, set: &mut SetBefore, depth: u
     let mut carried = SetBefore {
         found: set.found | in_front,
         unshown: set.unshown.clone(),
-        in_agent_folder: set.in_agent_folder,
+        in_folder: set.in_folder.clone(),
     };
     // `tmux -e NAME=VALUE` sets a variable for the command it starts. tmux,
     // not the shell, sets it: a `~` in it is a letter under zsh.
@@ -1866,10 +1883,9 @@ fn command_starts_unhooked_agent(command: &Spoken, set: &mut SetBefore, depth: u
             found | command_starts_unhooked_agent(&launched, &mut inner, depth + 1)
         });
     }
-    let Some((agent, from)) = hooked_agent_at(words, at).or_else(|| {
-        let (agent, entry) = set.in_agent_folder?;
-        entry_from_agent_folder(words, at, entry).map(|from| (agent, from))
-    }) else {
+    let Some((agent, from)) = hooked_agent_at(words, at)
+        .or_else(|| entry_from_agent_folder(words, at, set.in_folder.as_deref()?))
+    else {
         return 0;
     };
     // An agent reads its flags up to a `--`; the words after it are its
