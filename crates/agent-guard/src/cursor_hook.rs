@@ -59,6 +59,10 @@ pub const MCP_SERVER_UNNAMED_KEY: &str = "mcp_server_unnamed";
 /// server (a server it runs, not one it reaches by URL).
 pub const MCP_SERVER_COMMAND_KEY: &str = "mcp_server_command";
 
+/// Where the hook's call carries Cursor's `workspace_roots`: each may hold
+/// a `.cursor/mcp.json` Cursor reads over the user's.
+pub const MCP_WORKSPACE_ROOTS_KEY: &str = "mcp_workspace_roots";
+
 /// The event before the agent reads a file.
 pub const READ_EVENT: &str = "beforeReadFile";
 
@@ -189,6 +193,12 @@ pub fn read(payload: &str) -> CursorCall {
             // proxy only when this is the guard's proxy too.
             if let Some(command) = text(&value, "command") {
                 call[MCP_SERVER_COMMAND_KEY] = json!(command);
+            }
+            if let Some(roots) = value
+                .get("workspace_roots")
+                .filter(|roots| roots.is_array())
+            {
+                call[MCP_WORKSPACE_ROOTS_KEY] = roots.clone();
             }
             // The address of a server Cursor reaches by URL, never one the
             // proxy carries (a wrapper is a local command): the hook judges

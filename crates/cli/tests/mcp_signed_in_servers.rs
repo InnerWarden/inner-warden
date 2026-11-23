@@ -49,19 +49,49 @@ fn codex_config() -> String {
     )
 }
 
-/// Write an agent's configuration as one it read when it started: changed
-/// long before the hook's parent (this test) started. A configuration
-/// changed after the agent started proves nothing of the server it talks
-/// to, and every call is judged.
+/// When each configuration [`write_config`] wrote was written.
+static WRITTEN: std::sync::Mutex<Vec<(PathBuf, std::time::Instant)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// How long after a configuration was written the agent that reads it
+/// starts: past the hook's two-second margin, and past the second the
+/// system's boot time is read to (an agent's start is counted from it).
+const SETTLE: std::time::Duration = std::time::Duration::from_millis(3_200);
+
+/// Write an agent's configuration as one it read when it started: the
+/// agent ([`agent_stand_in`]) starts [`SETTLE`] after the file last
+/// changed. Dating the content back (`touch -d`) proves nothing: the hook
+/// reads the status change too. A configuration changed after the agent
+/// started proves nothing of the server it talks to, and every call is
+/// judged.
 fn write_config(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, text).unwrap();
-    std::fs::File::options()
-        .write(true)
-        .open(path)
+    WRITTEN
+        .lock()
         .unwrap()
-        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000))
-        .unwrap();
+        .push((path.to_path_buf(), std::time::Instant::now()));
+}
+
+/// What tells this test binary, run again, to stand in for the agent.
+const STAND_IN_VAR: &str = "IW_TEST_AGENT_STAND_IN";
+
+/// The agent the hook runs under: this test binary run again
+/// (`agent_stand_in`), so the agent starts after its configuration was
+/// written, as an agent that read it does. It runs the hook with the words
+/// in [`STAND_IN_VAR`], hands it its own input and output, and exits with
+/// the hook's code. In an ordinary run it does nothing.
+#[test]
+fn agent_stand_in() {
+    let Some(words) = std::env::var_os(STAND_IN_VAR) else {
+        return;
+    };
+    let words: Vec<String> = serde_json::from_str(&words.to_string_lossy()).unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_innerwarden"))
+        .args(&words)
+        .status()
+        .expect("run the hook");
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// The servers a call names as Codex names them, each one the proxy does
@@ -181,10 +211,25 @@ impl Host {
     }
 
     fn run(&self, agent: &str, extra: &[&str], payload: Value) -> (Option<i32>, String) {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_innerwarden"));
+        let home = self.home();
+        let last_written = WRITTEN
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.starts_with(&home))
+            .map(|(_, at)| *at)
+            .max();
+        if let Some(wait) = last_written
+            .and_then(|at| (at + SETTLE).checked_duration_since(std::time::Instant::now()))
+        {
+            std::thread::sleep(wait);
+        }
+        let mut words = vec!["hook".to_string(), "--agent".to_string(), agent.to_string()];
+        words.extend(extra.iter().map(|word| word.to_string()));
+        let mut command = Command::new(std::env::current_exe().unwrap());
         command
-            .args(["hook", "--agent", agent])
-            .args(extra)
+            .args(["--exact", "agent_stand_in", "--test-threads=1", "--quiet"])
+            .env(STAND_IN_VAR, serde_json::to_string(&words).unwrap())
             .env("HOME", self.home())
             .env("USERPROFILE", self.home())
             .env("IW_GRAPH_FILE", self.dir.path().join("graph.json"))
@@ -209,9 +254,15 @@ impl Host {
             .write_all(payload.to_string().as_bytes())
             .unwrap();
         let out = child.wait_with_output().unwrap();
+        // What the test harness says before the stand-in runs is not the hook's.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stdout = stdout
+            .trim_start()
+            .strip_prefix("running 1 test")
+            .unwrap_or(&stdout);
         let text = format!(
             "{}{}",
-            String::from_utf8_lossy(&out.stdout),
+            stdout.trim_start(),
             String::from_utf8_lossy(&out.stderr)
         );
         (out.status.code(), text)
@@ -689,6 +740,60 @@ fn an_install_with_no_posture_file_refuses_only_a_hard_finding() {
     assert_eq!(code, Some(2), "{text}");
 }
 
+/// A server a layer of the project Codex runs in names (its
+/// `.codex/config.toml`, read over the user's file in a trusted project)
+/// may not be the wrapper the user's file has: a call to it is judged.
+///
+/// FAILS ON REVERT of the project layers in `screen_mcp_call`: the call is
+/// left to the proxy the user's file names and exits 0.
+#[test]
+fn a_server_the_project_layer_names_is_judged() {
+    let host = Host::with_posture(Some("default"));
+    let shadow = || json!({"path": "/etc/shadow"});
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+    assert_eq!(code, Some(0), "behind the proxy by the user's file: {text}");
+    let project = host.home().join("proj");
+    std::fs::create_dir_all(project.join(".git")).unwrap();
+    write_config(
+        &project.join(".codex/config.toml"),
+        "[mcp_servers.docs]\ncommand = \"npx\"\nargs = [\"docs-server\"]\n",
+    );
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+    assert_eq!(code, Some(2), "named again by the project: {text}");
+    write_config(&project.join(".codex/config.toml"), "not = [toml");
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+    assert_eq!(code, Some(2), "a layer that cannot be read: {text}");
+}
+
+/// A call both readings find something in (the proxy's rules in the MCP
+/// call, the shell rules in the command it carries), each run with a
+/// warning in the default posture: the warning said and recorded is the
+/// stronger, the proxy's refusal, with both findings; not the shell
+/// reading's review alone.
+///
+/// FAILS ON REVERT of `raised_to_mcp_warning` in `screen_shell`: the
+/// warning says `review` and only the shell reading's words.
+#[test]
+fn the_warning_is_the_stronger_of_the_two_readings() {
+    let host = Host::with_posture(Some("default"));
+    let input = json!({"command": "chmod 777 /tmp/x", "note": "build step"});
+    let (code, text) = host.hook(&[], "mcp__linear__run", input);
+    assert_eq!(code, Some(0), "{text}");
+    assert!(
+        text.contains("InnerWarden warning (deny, ran under the default posture)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("world-writable permissions; MCP call: ATR-2026-040"),
+        "{text}"
+    );
+    let graph = host.graph();
+    assert!(
+        graph.contains("world-writable permissions; MCP call: ATR-2026-040"),
+        "{graph}"
+    );
+}
+
 /// An `execute` call of a code-mode server is read twice in the hook:
 /// by the proxy's rules for a server the proxy does not carry
 /// (`screen_mcp_call`), then, for a call those let run, by the reader of
@@ -717,9 +822,17 @@ fn a_code_mode_script_is_read_by_both_readings() {
             let tool = format!("mcp__{server}__execute");
             let (exit, text) = host.hook(&[], &tool, json!({ "code": code }));
             assert_eq!(exit, Some(0), "{tool} {code}: {text}");
+            // Where the proxy's rules also refuse the call (the metadata
+            // address, on a server the proxy does not carry), the warning
+            // is the stronger of the two readings, with both findings
+            // (`the_warning_is_the_stronger_of_the_two_readings`).
+            let warning = if code == metadata && server != "docs" {
+                "InnerWarden warning (deny, ran under the default posture)"
+            } else {
+                "InnerWarden warning (review, ran under the default posture)"
+            };
             assert!(
-                text.contains("InnerWarden warning (review, ran under the default posture)")
-                    && text.contains("deletes, purges or takes away"),
+                text.contains(warning) && text.contains("deletes, purges or takes away"),
                 "{tool} {code}: {text}"
             );
             let (exit, text) = host.hook(&["--block-review"], &tool, json!({ "code": code }));
@@ -754,4 +867,201 @@ fn a_code_mode_script_is_read_by_both_readings() {
         );
         assert_eq!((exit, text.trim()), (Some(0), ""), "{tool}");
     }
+}
+
+/// A server on this host (a loopback address) is a local server: a path
+/// handed to it names a file here, so in the default posture the path
+/// rules still refuse `/etc/shadow`, for Codex by its configuration and
+/// for Cursor by the address its call carries.
+///
+/// FAILS ON REVERT of `is_local_url` in `mcp_wire_toml::server_entries_toml`
+/// and in `mcp_unproxied::reach`: both calls are remote, run with a
+/// warning and exit 0.
+#[test]
+fn a_server_on_this_host_keeps_the_path_rules() {
+    let host = Host::with_posture(Some("default"));
+    write_config(
+        &host.home().join(".codex/config.toml"),
+        &format!(
+            "{}\n[mcp_servers.pw]\nurl = \"http://127.0.0.1:8931/mcp\"\n",
+            codex_config()
+        ),
+    );
+    let shadow = || json!({"path": "/etc/shadow"});
+    let (code, text) = host.hook(&[], "mcp__pw__get_file", shadow());
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("AG-FILE"), "{text}");
+    for url in ["http://127.0.0.1:8931/mcp", "http://localhost:8931/mcp"] {
+        let (code, text) = host.cursor(&[], "get_file", shadow(), Some(url));
+        assert_eq!(code, Some(2), "{url}: {text}");
+    }
+    // A server elsewhere is remote as before: a warning in this posture.
+    let (code, text) = host.cursor(&[], "get_file", shadow(), Some("https://mcp.example/mcp"));
+    assert_eq!(code, Some(0), "{text}");
+}
+
+/// A Cursor call to a server named as this host (its own name, its
+/// network address, `ip6-localhost`) keeps the path rules, as one to
+/// `127.0.0.1` does.
+///
+/// FAILS ON REVERT of `this_host` in `is_local_url`: each call is
+/// remote, runs with a warning and exits 0.
+#[test]
+fn a_call_to_this_host_named_another_way_keeps_the_path_rules() {
+    let host = Host::with_posture(Some("default"));
+    let shadow = || json!({"path": "/etc/shadow"});
+    let mut urls = vec!["http://ip6-localhost:8931/mcp".to_string()];
+    if let Some(name) = std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty() && !name.contains(char::is_whitespace))
+    {
+        urls.push(format!("http://{name}:8931/mcp"));
+    }
+    if let Some(ip) = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| {
+            socket.connect("192.0.2.1:9")?;
+            socket.local_addr()
+        })
+        .ok()
+        .map(|address| address.ip())
+        .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+    {
+        urls.push(format!("http://{ip}:8931/mcp"));
+    }
+    for url in &urls {
+        let (code, text) = host.cursor(&[], "get_file", shadow(), Some(url));
+        assert_eq!(code, Some(2), "{url}: {text}");
+    }
+}
+
+/// A project layer that names a server spelled another way than the
+/// user's entry (`docs__x` read as a tool of `docs`, `my-docs` for
+/// `my_docs`) or that sits above a `.git` made later still takes the
+/// call away from the user's entry: any server a layer names leaves every
+/// call judged.
+///
+/// FAILS ON REVERT of the name check in `ProxyTrust::trusts` (exact name
+/// only) and of the walk past `.git` in `codex_project_layers`: each
+/// exits 0.
+#[test]
+fn a_project_layer_judges_every_call_whatever_it_names() {
+    let host = Host::with_posture(Some("default"));
+    let shadow = || json!({"path": "/etc/shadow"});
+    let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+    assert_eq!(code, Some(0), "behind the proxy by the user's file: {text}");
+    let proj = host.home().join("proj");
+    for layer in [
+        "[mcp_servers.docs__x]\ncommand = \"npx\"\nargs = [\"docs-server\"]\n",
+        "[mcp_servers.\"do.cs\"]\ncommand = \"npx\"\n",
+    ] {
+        write_config(&proj.join(".codex/config.toml"), layer);
+        let (code, text) = host.hook(&[], "mcp__docs__get_file", shadow());
+        assert_eq!(code, Some(2), "{layer}: {text}");
+    }
+    std::fs::remove_file(proj.join(".codex/config.toml")).unwrap();
+    // A layer in the folder above a project's `.git` (`sub` holds the
+    // project `sub/inner`), not the user's own file.
+    let sub = host.home().join("sub");
+    std::fs::create_dir_all(sub.join("inner/.git")).unwrap();
+    write_config(
+        &sub.join(".codex/config.toml"),
+        "[mcp_servers.docs]\ncommand = \"npx\"\nargs = [\"docs-server\"]\n",
+    );
+    let payload = {
+        let mut payload = host.codex_payload("mcp__docs__get_file", shadow());
+        payload["cwd"] = json!(sub.join("inner"));
+        payload
+    };
+    let (code, text) = host.run("codex", &[], payload);
+    assert_eq!(code, Some(2), "a layer above .git: {text}");
+}
+
+/// Cursor: a call whose own command line is the guard's proxy in a mode
+/// that only records, or that comes from a workspace whose
+/// `.cursor/mcp.json` names servers, is judged though the user's entry is
+/// the guard's proxy.
+///
+/// FAILS ON REVERT of the mode check in `call_command_is_guard_proxy` and
+/// of the workspace layers in the hook: each exits 0.
+#[test]
+fn a_cursor_call_from_a_project_entry_is_judged() {
+    let host = Host::with_posture(Some("default"));
+    let guard = env!("CARGO_BIN_EXE_innerwarden");
+    let entry = format!(
+        "{{\"command\": \"{guard}\", \"args\": [\"proxy\", \"--mode\", \"guard\", \"--\", \"npx\", \"docs-server\"]}}"
+    );
+    write_config(
+        &host.home().join(".cursor/mcp.json"),
+        &format!("{{\"mcpServers\": {{\"docs\": {entry}}}}}"),
+    );
+    let shadow = || json!({"path": "/etc/shadow"});
+    let call = |command: String| json!({"mcp_server_name": "docs", "command": command});
+    let (code, text) = host.cursor_with(
+        &[],
+        "get_file",
+        shadow(),
+        None,
+        call(format!("{guard} proxy --mode guard -- npx docs-server")),
+    );
+    assert_eq!(code, Some(0), "the guard's proxy: {text}");
+    let (code, text) = host.cursor_with(
+        &[],
+        "get_file",
+        shadow(),
+        None,
+        call(format!("{guard} proxy --mode advisory -- npx docs-server")),
+    );
+    assert_eq!(code, Some(2), "advisory: {text}");
+    write_config(
+        &host.home().join("proj/.cursor/mcp.json"),
+        &format!("{{\"mcpServers\": {{\"docs\": {entry}}}}}"),
+    );
+    let (code, text) = host.cursor_with(
+        &[],
+        "get_file",
+        shadow(),
+        None,
+        call(format!("{guard} proxy --mode guard -- npx docs-server")),
+    );
+    assert_eq!(code, Some(2), "a workspace layer: {text}");
+}
+
+/// Cursor: a workspace's `.cursor/mcp.json` removed after Cursor read
+/// it leaves no layer for the hook to find, but its folder changed after
+/// the agent started: the call is judged, not left to the user's entry.
+///
+/// FAILS ON REVERT of `layer_may_have_moved` for the workspace roots in
+/// the hook: the call exits 0.
+#[test]
+fn a_cursor_workspace_layer_removed_after_the_start_is_judged() {
+    let host = Host::with_posture(Some("default"));
+    let guard = env!("CARGO_BIN_EXE_innerwarden");
+    let entry = format!(
+        "{{\"command\": \"{guard}\", \"args\": [\"proxy\", \"--mode\", \"guard\", \"--\", \"npx\", \"docs-server\"]}}"
+    );
+    write_config(
+        &host.home().join(".cursor/mcp.json"),
+        &format!("{{\"mcpServers\": {{\"docs\": {entry}}}}}"),
+    );
+    let shadow = || json!({"path": "/etc/shadow"});
+    let call = || json!({"mcp_server_name": "docs", "command": format!("{guard} proxy --mode guard -- npx docs-server")});
+    let (code, text) = host.cursor_with(&[], "get_file", shadow(), None, call());
+    assert_eq!(code, Some(0), "the guard's proxy: {text}");
+    // Written and removed just before the agent stand-in starts (not
+    // through `write_config`, which waits for the start to come after):
+    // the folder changed within the margin of the start, as one changed
+    // after Cursor read the file.
+    let layer = host.home().join("proj/.cursor/mcp.json");
+    std::fs::create_dir_all(layer.parent().unwrap()).unwrap();
+    std::fs::write(
+        &layer,
+        "{\"mcpServers\": {\"docs\": {\"command\": \"npx\", \"args\": [\"docs-evil\"]}}}",
+    )
+    .unwrap();
+    std::fs::remove_file(&layer).unwrap();
+    let (code, text) = host.cursor_with(&[], "get_file", shadow(), None, call());
+    assert_eq!(code, Some(2), "a workspace layer removed: {text}");
 }

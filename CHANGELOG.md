@@ -5,6 +5,98 @@ follows semantic versioning.
 
 ## Unreleased
 
+`agents connect` leaves a server the agent signs in to by itself as it is,
+instead of wrapping it in the proxy, where the sign-in was lost (every call
+came back 401). Only a server reached by URL, on another host, with nothing
+the proxy would send for it (no `bearer_token_env_var`, `http_headers` or
+`env_http_headers` for Codex, no `headers` for Cursor) can be left. For
+Codex, such a server is left when `codex mcp list --json` (which names
+each server's sign-in and never a token) says Codex signs in to it, or when
+Codex cannot be asked; Codex is not asked when no server could be left. For
+Cursor, every such server is left (Cursor signs in to it by itself). The
+connect line names those servers; the agent's hook judges their calls with
+the proxy's rules. `agents list`, `status` and the dashboard count the same
+servers as left, so they never call the result unguarded.
+
+What this leaves out of the proxy that the proxy carried before: a Codex
+server reached by URL alone, on another host, that Codex signs in to (or
+any such server when Codex cannot be asked, as when it is not on the
+`PATH`), and a Cursor server reached by URL alone, on another host. Their
+calls are judged by the agent's hook, with the proxy's rules, only while
+the hook is on. A server on this host (`localhost`, a name under
+`.localhost`, `127.0.0.0/8` in any form a URL parser reads, `0.0.0.0`,
+`::1`) or behind a unix socket is always carried, and the hook reads it
+as a local server: a path its calls carry names a file here, and the path
+rules still refuse `/etc/shadow` in the default posture. So is one that
+names this host another way: an address of one of its interfaces (its LAN
+address), its own name and `<name>.local`, and a name the hosts file gives
+this host or the loopback (`ip6-localhost`), read once and never from DNS.
+A name that only a DNS record points here (`localtest.me`) is read as
+another host. On Windows the interfaces' addresses are not read; its name
+and the hosts file are.
+
+An ordinary MCP call costs the hook less: the ATR rules are read from the
+YAML once, when the binary is built, and a rule is compiled for a call only
+when the call holds one of the literals every match of its patterns
+contains, one condition at a time (median of 41 clean Codex calls on one
+machine, release build, three runs each: 13.4 ms on main, 7.3 ms on this
+build; a call that holds a rule's literals pays for that rule as before). A
+pattern only `fancy-regex` reads (look-around, a back-reference) has no
+literals and is compiled for every call: it can be undecided on a long text,
+which holds the call for review, and skipping it let a long call through in
+a hook that had not compiled it. What a rule matches is unchanged.
+
+A call is left to the proxy only when its wrapper's command is written as
+the path the guard runs as (read as text: no link, no `/proc` or `/dev`,
+no `.` or `..` part), its entry sets no `PATH`, `LD_*` or `DYLD_*`
+(nor passes one with Codex's `env_vars`, nor a file of variables) and no
+working folder, and the configuration's last change, content or status, is
+older than the agent. For Codex, also: no layer of the project
+(`.codex/config.toml` in the working folder or any folder above it, past a
+`.git`) names any server; in a project the user's file trusts, no folder
+from the working folder up to the project's, nor a `.codex` in one, nor its
+`config.toml` (a layer emptied or rewritten in place), changed after the
+agent started, read through a link to what it points at too; and the Codex
+the hook runs under was not started with `-c`/`--config mcp_servers...`,
+`projects...` (a project trusted on the command line), `profile` or
+`profiles...`, or a profile (read from its command line). For Cursor,
+also: the call's own command line is the guard's proxy in a mode that
+refuses, split as a shell splits it (a quote left open, or `--mode` named
+twice, is not the guard's: how Cursor writes a word with a space in it was
+not measured with Cursor itself), and no `.cursor/mcp.json` of a
+workspace root names a server or changed, with its folders, after the
+agent started (a file removed after Cursor read it). The agent is the
+nearest ancestor of the hook named for it, else the first that is not a
+shell or a known launcher. `touch -d` on a configuration rewritten after
+the agent started no longer passes for an old one; on a file system that
+keeps no status change apart from the content's time (FAT, exFAT) it still
+can, and such a configuration is read as settled.
+
+`git -C <folder> worktree remove <path>` (and `--git-dir`, `--work-tree`,
+`-c`, `--namespace` before the verb) is read as the same line without the
+option: the option's value is not git's verb. A worktree word whose last
+part is the guard's name (`git worktree remove --force innerwarden`) is
+refused in every form, after a `cd` too: git finds a worktree by the end of
+its path, and one registered at the guard's folder goes. `git rm`, `git
+clean`, `git worktree remove` and `git init` (with `--separate-git-dir`)
+are read at the path the `-C` options reach: `git -C ~/.config/innerwarden
+clean -fdx`, `git -C ~/.local/bin rm -f innerwarden` and `git init` into
+the guard's folder are refused as `rm` of the same path is. They were
+allowed before, on main too. git is read in the work tree it is given
+(`--work-tree`, `GIT_WORK_TREE` before the command or exported earlier,
+`-c core.worktree=`): `clean`, `rm`, `checkout`, `restore` and `reset
+--hard` (`--merge`, `--keep`) into the guard's folder are refused as `rm`
+of it is. The paths handed to `git clean` are read too (`git clean -fdx
+.config/innerwarden` after a `git init` in the home), and an alias set with
+`-c alias.<name>=` is read as the verb it runs (one that runs a shell, `!`,
+as taking the work tree). `worktree remove innerwarden/.` is read as
+`innerwarden`. `codex -c mcp_servers...` is refused as the
+override of Codex's hooks is: the server it sets runs outside the proxy.
+
+When an MCP call and the command it carries both run with a warning in the
+default posture, the warning said and recorded is the stronger of the two,
+with both findings.
+
 The LLM second opinion and the notifications read their config only from
 the account's own home, as the account database gives it, never from the
 `HOME` the caller hands down. `HOME=<dir> innerwarden check ...` read the

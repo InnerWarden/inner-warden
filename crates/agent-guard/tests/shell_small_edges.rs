@@ -113,3 +113,236 @@ fn the_default_posture_flag_is_refused_to_an_agent_as_the_guard_flag_is() {
     assert_eq!(verdict("innerwarden install claude-code --strict"), "allow");
     assert_eq!(verdict("innerwarden install claude-code"), "allow");
 }
+
+/// `git -C <folder>` before the verb: the folder is the value of `-C`,
+/// not git's verb, so a worktree's removal is read as it is without `-C`
+/// (seen three times on 2026-11-22: a deny for "flags between verb and
+/// target" with `-C`, a review without). The same for git's other
+/// options that take a value.
+///
+/// FAILS ON REVERT of `git_verb_positions` in mention.rs (the `-C` lines
+/// are a deny).
+#[test]
+fn a_worktree_removed_with_git_c_is_read_as_without_it() {
+    for plain in [
+        "git worktree remove ~/innerwarden-wt2",
+        "git worktree remove --force ~/innerwarden-wt2",
+        "git worktree remove ~/innerwarden/wt-197-base",
+    ] {
+        let without = verdict(plain);
+        assert_ne!(without, "deny", "{plain}");
+        let rest = plain.trim_start_matches("git ");
+        for options in [
+            "-C ~/innerwarden",
+            "-C /home/u/innerwarden",
+            "--git-dir ~/innerwarden/.git",
+            "-c core.quotepath=off",
+            "-C ~/innerwarden -c color.ui=never",
+        ] {
+            let with = format!("git {options} {rest}");
+            assert_eq!(verdict(&with), without, "{with}");
+        }
+    }
+    // The removal of the guard's own folder stays what it was.
+    assert_eq!(
+        verdict("git -C /tmp worktree remove --force ~/.config/innerwarden"),
+        verdict("git worktree remove --force ~/.config/innerwarden"),
+    );
+}
+
+/// A Codex started with an MCP server on its own command line runs that
+/// server outside the proxy the user's file puts in front of it, and the
+/// hook would take the file's entry for it: read as the override of its
+/// hooks is.
+///
+/// FAILS ON REVERT of `codex_setting_names_servers` in
+/// `agent_flags_drop_its_hook`: the two lines are allowed.
+#[test]
+fn a_codex_started_with_a_server_of_its_own_is_refused() {
+    for line in [
+        "codex -c mcp_servers.docs.command=\"npx\" exec \"fix it\"",
+        "codex --config mcp_servers.docs.args=[] exec go",
+    ] {
+        assert_eq!(
+            verdict(line),
+            verdict("codex -c hooks.PreToolUse=[] exec \"fix it\""),
+            "{line}"
+        );
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    assert_eq!(verdict("codex -c model=\"o3\" exec go"), "allow");
+    assert_eq!(
+        verdict("codex exec \"fix the mcp_servers parser\""),
+        "allow"
+    );
+}
+
+/// git finds a worktree by the end of its path: a worktree registered at the
+/// guard's folder is removed by its last name alone, from any repository
+/// that holds it. Such a word is never read as a work folder, with or
+/// without the options before the verb, and after a `cd` too.
+///
+/// FAILS ON REVERT of `names_guard_folder_by_name` in mention.rs: each line
+/// is a review.
+#[test]
+fn a_worktree_named_as_the_guard_folder_is_refused_in_every_form() {
+    for options in [
+        "",
+        "-C r ",
+        "-C ~/src/r ",
+        "-c core.x=1 ",
+        "--namespace n ",
+        "--git-dir r/.git ",
+        "--work-tree r ",
+        "-C r -c color.ui=never ",
+    ] {
+        for name in [
+            "innerwarden",
+            "innerwarden/",
+            "'innerwarden'",
+            "config/innerwarden",
+        ] {
+            let line = format!("git {options}worktree remove --force {name}");
+            assert_eq!(verdict(&line), "deny", "{line}");
+        }
+    }
+    assert_eq!(
+        verdict("cd r && git worktree remove --force innerwarden"),
+        "deny"
+    );
+    // A work folder is still one. A path with `..` is read from the
+    // working folder, as git reads it: what main says of it.
+    assert_ne!(verdict("git -C r worktree remove ../wt"), "deny");
+    assert_eq!(verdict("git worktree remove ../innerwarden"), "review");
+    assert_eq!(
+        verdict("git -C ~/.config/r worktree remove ../innerwarden"),
+        "deny"
+    );
+    assert_ne!(
+        verdict("git -C ~/src/innerwarden worktree remove wt-5"),
+        "deny"
+    );
+}
+
+/// What git takes away or writes through `-C` is the path read in that
+/// folder: `clean` and `rm` of the guard's folder or program, and `init`
+/// that writes a repository (or the file pointing at one) into the guard's
+/// folder, are what `rm` of the same path is. Before, each was allowed
+/// (BI NEW-20261122-git-c-guard-folder-forms).
+///
+/// FAILS ON REVERT of `git_writes` in threats.rs: each line is allowed.
+#[test]
+fn git_through_c_is_read_at_the_path_it_reaches() {
+    for (line, same_as) in [
+        (
+            "git -C ~/.config/innerwarden clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -C ~/.config/innerwarden rm -rf .",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -C ~/.config -C innerwarden rm -r .",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -C ~/.local/bin rm -f innerwarden",
+            "rm -f ~/.local/bin/innerwarden",
+        ),
+        (
+            "git -C ~/.local/bin rm -- innerwarden",
+            "rm -f ~/.local/bin/innerwarden",
+        ),
+        (
+            "cd ~/.config/innerwarden && git clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git init --separate-git-dir r/.git/worktrees/wt ~/.config/innerwarden",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git init --separate-git-dir=~/.config/innerwarden r",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -C ~/.config init innerwarden",
+            "rm -rf ~/.config/innerwarden",
+        ),
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+        assert_eq!(verdict(line), verdict(same_as), "{line}");
+    }
+    for line in [
+        "git -C ~/src/app clean -fdx",
+        "git -C ~/src/app rm -rf build",
+        "git init --separate-git-dir ../meta.git proj",
+        "git -C ~/src/app init",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
+/// FAILS ON REVERT of the work tree, pathspec or alias reading in
+/// `git_writes` (each line allowed), or of the `.` part dropped in
+/// `names_guard_folder_by_name` (the worktree line a review).
+#[test]
+fn git_is_read_in_the_work_tree_it_is_given_and_through_its_aliases() {
+    for (line, same_as) in [
+        (
+            "git init -q . && git clean -fdx .config/innerwarden",
+            "rm -rf .config/innerwarden",
+        ),
+        (
+            "git --git-dir=r/.git --work-tree=$HOME/.config/innerwarden clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git --work-tree ~/.config/innerwarden clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "GIT_DIR=r/.git GIT_WORK_TREE=$HOME/.config/innerwarden git clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "export GIT_WORK_TREE=$HOME/.config/innerwarden; git clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -c core.worktree=$HOME/.config/innerwarden clean -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -c alias.nuke=clean -C ~/.config/innerwarden nuke -fdx",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -c alias.nuke='!git clean -fdx' -C ~/.config/innerwarden nuke",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git --work-tree=$HOME/.config/innerwarden reset --hard",
+            "rm -rf ~/.config/innerwarden",
+        ),
+        (
+            "git -C r worktree remove --force innerwarden/.",
+            "git -C r worktree remove --force innerwarden",
+        ),
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+        assert_eq!(verdict(line), verdict(same_as), "{line}");
+    }
+    for line in [
+        "git --work-tree=$HOME/src/app clean -fdx",
+        "GIT_WORK_TREE=$HOME/src/app git checkout -f",
+        "git -c alias.st=status st",
+        "git -c alias.nuke=clean -C ~/src/app nuke -fdx",
+        "git reset --hard HEAD~1",
+        "git clean -fdx build",
+        "git -C ~/src/app clean -fdx -e .env",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}

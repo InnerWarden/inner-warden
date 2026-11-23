@@ -2433,7 +2433,7 @@ fn flag_value<'a>(
 
 /// Whether `arguments` start agent `program` with no hooks, or without the
 /// user's own settings: Codex with `--disable hooks`, or a `-c` / `--config`
-/// override of `hooks` or `features.hooks`; Hermes with `--safe-mode` or
+/// override of `hooks`, `features.hooks` or `mcp_servers`; Hermes with `--safe-mode` or
 /// `--ignore-user-config`; Claude Code with `--bare`, `--safe-mode` or
 /// `--restricted`, a `--setting-sources` that leaves out `user`, or settings
 /// (`--settings`, `--managed-settings`) that drop the user's hooks
@@ -2470,6 +2470,10 @@ fn agent_flags_drop_its_hook(
                             || key.starts_with("hooks.")
                             || key == "features.hooks"
                             || key.starts_with("features.hooks.")
+                            // A server set on the line runs outside the
+                            // proxy the user's file puts in front of it, and
+                            // the hook takes the file's entry for it.
+                            || crate::mcp_unproxied::codex_setting_names_servers(setting)
                     })
                 })
         }
@@ -8180,8 +8184,13 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
         if reads.get() > RELATIVE_READS {
             return refuses_unfollowed();
         }
-        dirs.iter()
-            .any(|dir| names(&format!("{dir}/{target}"), taken))
+        dirs.iter().any(|dir| {
+            let path = match target.trim_start_matches("./") {
+                "" | "." => dir.clone(),
+                rest => format!("{dir}/{rest}"),
+            };
+            names(&path, taken)
+        })
     };
 
     let (redirects, read_whole) = shell_output_redirect_targets(content);
@@ -8209,8 +8218,18 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
     let mut dirs: Vec<String> = Vec::new();
     // The line named more directories than are followed.
     let mut crowded = false;
+    // The work tree a `GIT_WORK_TREE=` before a command, or set by an
+    // earlier one, gives git.
+    let mut git_env_tree: Option<String> = None;
     for segment in shell_command_segments(content) {
         let words = shell_tokens(&braced.replace_all(segment, "$$$1"));
+        if let Some(tree) = words
+            .iter()
+            .rev()
+            .find_map(|word| word.strip_prefix("GIT_WORK_TREE="))
+        {
+            git_env_tree = Some(tree.to_string());
+        }
         let mut targets = output_redirect_targets(&words);
         // What the command takes away.
         let mut taken: Vec<String> = Vec::new();
@@ -8423,7 +8442,10 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
             }
             "dd" => targets.extend(dd_operand(arguments, "of").map(str::to_string)),
             // `git checkout <tree> -- <path>` and `git restore` put another
-            // version of each path they name in its place.
+            // version of each path they name in its place; `rm`, `clean` and
+            // `worktree remove` take what they name away, and `init` writes
+            // a repository (or the file that points at one) into its folder.
+            // A relative path is read in the folder `-C` names.
             "git" => {
                 if let Some(at) = positional
                     .iter()
@@ -8431,6 +8453,9 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                 {
                     targets.extend(positional[at + 1..].iter().map(|path| path.to_string()));
                 }
+                let reading = git_writes(arguments, git_env_tree.as_deref());
+                targets.extend(reading.written);
+                taken.extend(reading.taken);
             }
             "curl" => targets.extend(option_values(arguments, 'o', &["output"])),
             "wget" => targets.extend(option_values(arguments, 'O', &["output-document"])),
@@ -8626,6 +8651,235 @@ fn glob_matches(pattern: &str, text: &str) -> bool {
         }
     }
     pattern[p..].iter().all(|c| *c == '*')
+}
+
+/// What a `git` line writes and takes away, as paths read in the folder
+/// its `-C` options name (each one relative to the one before, as git
+/// reads them).
+#[derive(Default)]
+struct GitWrites {
+    written: Vec<String>,
+    taken: Vec<String>,
+}
+
+/// git's options before its verb whose value is the next word.
+const GIT_GLOBAL_VALUE_OPTIONS: &[&str] = &[
+    "-C",
+    "-c",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--config-env",
+    "--exec-path",
+    "--super-prefix",
+];
+
+fn git_writes(arguments: &[String], env_tree: Option<&str>) -> GitWrites {
+    let mut reading = GitWrites::default();
+    let mut folder: Option<String> = None;
+    // The work tree, when the line names one: `GIT_WORK_TREE`,
+    // `--work-tree`, `-c core.worktree=`. What a verb writes "here" is
+    // written there.
+    let mut tree: Option<String> = env_tree.map(|tree| tree.trim_matches(['"', '\'']).to_string());
+    // `-c alias.<name>=<value>`: the verb `<name>` runs `<value>`.
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    let mut setting = |value: &str, tree: &mut Option<String>| {
+        let value = value.trim_matches(['"', '\'']);
+        let Some((key, value)) = value.split_once('=') else {
+            return;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if key == "core.worktree" {
+            *tree = Some(value.to_string());
+        } else if let Some(name) = key.strip_prefix("alias.") {
+            aliases.push((name.to_string(), value.to_string()));
+        }
+    };
+    let mut at = 0usize;
+    while let Some(word) = arguments.get(at) {
+        let word = word.trim_matches(['"', '\'']);
+        if word == "-C" {
+            if let Some(value) = arguments.get(at + 1) {
+                folder = Some(git_path_in(
+                    folder.as_deref(),
+                    value.trim_matches(['"', '\'']),
+                ));
+            }
+            at += 2;
+            continue;
+        }
+        if word == "--work-tree" {
+            if let Some(value) = arguments.get(at + 1) {
+                tree = Some(value.trim_matches(['"', '\'']).to_string());
+            }
+            at += 2;
+            continue;
+        }
+        if let Some(value) = word.strip_prefix("--work-tree=") {
+            tree = Some(value.to_string());
+            at += 1;
+            continue;
+        }
+        if word == "-c" {
+            if let Some(value) = arguments.get(at + 1) {
+                setting(value, &mut tree);
+            }
+            at += 2;
+            continue;
+        }
+        if GIT_GLOBAL_VALUE_OPTIONS.contains(&word) {
+            at += 2;
+            continue;
+        }
+        if word.starts_with('-') {
+            at += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(verb) = arguments.get(at).map(|verb| verb.trim_matches(['"', '\''])) else {
+        return reading;
+    };
+    let mut verb = verb.to_string();
+    let mut rest: Vec<String> = arguments[at + 1..].to_vec();
+    // The work tree, read in the folder `-C` names, as git reads it.
+    let tree = tree.map(|tree| git_path_in(folder.as_deref(), &tree));
+    // Where "here" is: the folder (`.` without one) and the work tree.
+    let here: Vec<String> = std::iter::once(git_path_in(folder.as_deref(), "."))
+        .chain(tree.clone())
+        .collect();
+    // An alias is read as the verb it runs (an alias of an alias too); one
+    // that runs a shell (`!...`) may do anything to the work tree.
+    for _ in 0..8 {
+        let lower = verb.to_ascii_lowercase();
+        let Some((_, value)) = aliases.iter().rev().find(|(name, _)| *name == lower) else {
+            break;
+        };
+        if value.trim_start().starts_with('!') {
+            reading.taken.extend(here.iter().cloned());
+            return reading;
+        }
+        let mut words = value.split_whitespace().map(str::to_string);
+        let Some(first) = words.next() else {
+            break;
+        };
+        verb = first;
+        rest = words.chain(rest).collect();
+    }
+    let in_folder = |path: &str| -> Vec<String> {
+        let path = path.trim_matches(['"', '\'']);
+        std::iter::once(git_path_in(folder.as_deref(), path))
+            .chain(tree.as_deref().map(|tree| git_path_in(Some(tree), path)))
+            .collect()
+    };
+    // The paths a verb is handed: every word that is no option (each one
+    // after `--`), the value of an option in `valued` skipped.
+    let words = |from: &[String], valued: &[&str]| -> Vec<String> {
+        let mut after_dashes = false;
+        let mut skip = false;
+        let mut out = Vec::new();
+        for word in from {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if word == "--" && !after_dashes {
+                after_dashes = true;
+                continue;
+            }
+            if !after_dashes && valued.contains(&word.as_str()) {
+                skip = true;
+                continue;
+            }
+            if after_dashes || !word.starts_with('-') {
+                out.extend(in_folder(word));
+            }
+        }
+        out
+    };
+    let rest = rest.as_slice();
+    match verb.as_str() {
+        "checkout" | "restore" if folder.is_some() || tree.is_some() => {
+            reading.written.extend(words(rest, &[]));
+            if tree.is_some() {
+                reading.written.extend(here.iter().cloned());
+            }
+        }
+        "rm" => reading.taken.extend(words(rest, &[])),
+        // What is not tracked under the folder goes, and with `-x` what is
+        // ignored too: the folder is taken as emptied, and each path the
+        // line hands it.
+        "clean" => {
+            reading.taken.extend(here.iter().cloned());
+            reading.taken.extend(words(rest, &["-e", "--exclude"]));
+        }
+        // `--hard` (and `--merge`, `--keep`) puts the commit's version
+        // of every tracked file in the work tree in its place.
+        "reset"
+            if rest
+                .iter()
+                .any(|word| matches!(word.as_str(), "--hard" | "--merge" | "--keep")) =>
+        {
+            reading.taken.extend(here.iter().cloned());
+        }
+        "worktree" => {
+            if rest.first().is_some_and(|word| word == "remove") {
+                reading.taken.extend(words(&rest[1..], &[]));
+            }
+        }
+        "init" => {
+            let mut index = 0usize;
+            let mut named = false;
+            while let Some(word) = rest.get(index) {
+                if word == "--separate-git-dir" {
+                    if let Some(value) = rest.get(index + 1) {
+                        reading.written.extend(in_folder(value));
+                    }
+                    index += 2;
+                    continue;
+                }
+                if let Some(value) = word.strip_prefix("--separate-git-dir=") {
+                    reading.written.extend(in_folder(value));
+                } else if matches!(
+                    word.as_str(),
+                    "--template"
+                        | "-b"
+                        | "--initial-branch"
+                        | "--object-format"
+                        | "--ref-format"
+                        | "--shared"
+                ) {
+                    index += 2;
+                    continue;
+                } else if !word.starts_with('-') {
+                    named = true;
+                    reading.written.extend(in_folder(word));
+                }
+                index += 1;
+            }
+            if !named {
+                reading.written.extend(in_folder("."));
+            }
+        }
+        _ => {}
+    }
+    reading
+}
+
+/// `path` read in `folder` (git's `-C`): itself when it starts at the
+/// root, the home or a variable, or when no folder is named.
+fn git_path_in(folder: Option<&str>, path: &str) -> String {
+    let Some(folder) = folder else {
+        return path.to_string();
+    };
+    if path.starts_with(['/', '~', '$']) {
+        return path.to_string();
+    }
+    let folder = folder.trim_end_matches('/');
+    match path.trim_start_matches("./") {
+        "" | "." => folder.to_string(),
+        rest => format!("{folder}/{rest}"),
+    }
 }
 
 fn find_takes_and_writes(arguments: &[String]) -> FindReading {
