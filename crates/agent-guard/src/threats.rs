@@ -3300,6 +3300,22 @@ fn text_expands_name(text: &str, name: &str) -> bool {
 
 /// [`check_guard_self_disable`] on the command as written.
 fn check_guard_self_disable_read(content: &str) -> Option<(&'static str, u32)> {
+    // A folder above the guard's configuration names none of the words
+    // below (`mv ~/.config x`), so it is asked first. One the text does not
+    // read (`$(echo ~)/.config`) is held for review when nothing else is
+    // found.
+    match guard_config_ancestor_taken(content, 0) {
+        Some(AncestorTaken::Named) => Some((GUARD_CONFIG_ANCESTOR_TAKEN, 60)),
+        Some(AncestorTaken::Unread) => {
+            guard_self_disable_by_words(content).or(Some((GUARD_CONFIG_ANCESTOR_UNREAD, 25)))
+        }
+        None => guard_self_disable_by_words(content),
+    }
+}
+
+/// [`check_guard_self_disable_read`] past the folders above the guard's
+/// configuration.
+fn guard_self_disable_by_words(content: &str) -> Option<(&'static str, u32)> {
     const NEEDLES: &[&str] = &[
         "innerwarden",
         "openclaw",
@@ -3412,7 +3428,8 @@ const GUARD_DISARMED: &str = "disarms the guard, or asks it to authorise itself"
 /// What [`check_guard_self_disable`] says of the guard's own loosening
 /// verbs ([`runs_guard_loosening_verb`]).
 const GUARD_LOOSENING_VERB: &str =
-    "runs the guard's own hook, its allow, mute or monitor command, one of its agent \
+    "runs the guard's own hook, its allow, mute or monitor command, a command that changes \
+     its configuration (llm set, llm set-key, setup, notify with a channel), one of its agent \
      decisions (approve, profile, allow, revoke), an approval of a changed MCP tool (mcp approve) \
      or dropping a server's pinned tools (mcp forget), disconnects an agent or connects or \
      installs it in monitor, uninstalls it, or starts a jail, which only the person \
@@ -7276,6 +7293,9 @@ const GUARD_VERB_HEADS: &[&str] = &[
     "uninstall",
     "mcp",
     "mcp-proxy",
+    "llm",
+    "setup",
+    "notify",
 ];
 
 /// The arguments after `innerwarden`: whether they widen what is let through.
@@ -7333,6 +7353,20 @@ fn guard_verb_loosens(arguments: &[String]) -> bool {
         // the agent starts itself stands between it and a server on terms it
         // chose (a monitor default of an older release).
         "mcp-proxy" => !asks_for_help,
+        // `innerwarden llm set|set-key` points the second opinion at another
+        // address, model or key, `setup` rewires the agents, the alerts and
+        // the second opinion, and `notify` with a channel sends every refusal
+        // where its flags say: each one writes the guard's own configuration,
+        // as `allow` does. Showing it (`llm`, `llm status`, a bare
+        // `notify`), a test alert (`notify --test`) and help change nothing.
+        "llm" => {
+            !asks_for_help
+                && first_positional(&rest).is_some_and(|first| {
+                    matches!(first.to_ascii_lowercase().as_str(), "set" | "set-key")
+                })
+        }
+        "setup" => !asks_for_help,
+        "notify" => !asks_for_help && rest.iter().any(|argument| *argument != "--test"),
         // `innerwarden agents approve|profile|allow|revoke`: the decisions
         // about an agent are the person's, every one of them. Listing the
         // agents, connecting them and asking for help are not decisions.
@@ -7440,6 +7474,793 @@ pub const AGENT_DECISION_VERBS: &[&str] = &["approve", "profile", "allow", "revo
 /// the directory is recognised: [`writes_place`].
 fn writes_guard_config(content: &str, depth: u8) -> bool {
     writes_place(content, depth, |target, _| names_guard_config(target), true)
+}
+
+/// What the shell side says of a line that moves, removes or fills a folder
+/// above the guard's configuration ([`guard_config_ancestor_taken`]).
+const GUARD_CONFIG_ANCESTOR_TAKEN: &str =
+    "moves, links, removes or fills a folder that holds the guard's own configuration (a home, \
+     the .config folder in it, or the guard's folder through a pattern), so a folder put in its \
+     place, or a tree merged into it, is read as the guard's settings";
+
+/// What the shell side says of a line that moves or removes a `.config`
+/// folder or a home through a part of the path it does not read.
+const GUARD_CONFIG_ANCESTOR_UNREAD: &str =
+    "moves or removes a .config folder or a home through a part of the path the guard does not \
+     read (a command substitution, a variable the line does not set, or .. with no known working \
+     directory): it may be the folder that holds the guard's own configuration";
+
+/// A folder above the guard's configuration (`~/.config/innerwarden`), as a
+/// path names it ([`above_guard_config`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AboveGuardConfig {
+    /// A folder every home is in (`/home`, `/Users`).
+    Homes,
+    /// A home.
+    Home,
+    /// The `.config` folder of a home.
+    Config,
+    /// The guard's own folder, or a path inside it, named through a pattern
+    /// that can match it (`~/.config/*`, `~/.config/inner*/guard.toml`).
+    Guard,
+}
+
+/// How a line takes a folder above the guard's configuration.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum AncestorTaken {
+    /// Through a part of the path the guard does not read: review.
+    Unread,
+    /// A path the guard reads: refused.
+    Named,
+}
+
+/// What a path names, for [`guard_config_ancestor_taken`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AncestorReading {
+    Above(AboveGuardConfig),
+    Unread,
+    Other,
+}
+
+/// Whether a word holds a pattern the shell expands.
+fn holds_glob(text: &str) -> bool {
+    text.contains(['*', '?', '['])
+}
+
+/// Whether one path component written as a shell pattern can match `name`:
+/// `*`, `?`, a bracket class (`[c]`, `[!x]`, `[a-z]`, a named class
+/// `[[:alpha:]]` as anything) and a backslash escape. A leading dot is
+/// matched only by a dot written out, as bash does without `dotglob`: `~/*`
+/// is not `~/.config`, `~/.c*` is.
+fn glob_component_matches(pattern: &str, name: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    if name.starts_with('.') && !(pattern.starts_with(b".") || pattern.starts_with(b"\\.")) {
+        return false;
+    }
+    // A pattern of many stars costs more than it can tell: read as matching.
+    if pattern.iter().filter(|b| **b == b'*').count() > 8 {
+        return true;
+    }
+    glob_bytes_match(pattern, name.as_bytes())
+}
+
+fn glob_bytes_match(pattern: &[u8], name: &[u8]) -> bool {
+    match pattern.first() {
+        None => name.is_empty(),
+        Some(b'*') => (0..=name.len()).any(|at| glob_bytes_match(&pattern[1..], &name[at..])),
+        Some(b'?') => !name.is_empty() && glob_bytes_match(&pattern[1..], &name[1..]),
+        Some(b'[') => match glob_bracket(&pattern[1..], name.first().copied()) {
+            Some((hit, rest)) => hit && glob_bytes_match(rest, &name[1..]),
+            None => name.first() == Some(&b'[') && glob_bytes_match(&pattern[1..], &name[1..]),
+        },
+        Some(b'\\') if pattern.len() > 1 => {
+            name.first() == Some(&pattern[1]) && glob_bytes_match(&pattern[2..], &name[1..])
+        }
+        Some(byte) => name.first() == Some(byte) && glob_bytes_match(&pattern[1..], &name[1..]),
+    }
+}
+
+/// A bracket class after its `[`: whether `byte` is in it, and the pattern
+/// after its `]`; `None` when it never closes (the `[` is then a letter).
+fn glob_bracket(class: &[u8], byte: Option<u8>) -> Option<(bool, &[u8])> {
+    let byte = byte?;
+    let (negated, mut at) = match class.first() {
+        Some(b'!' | b'^') => (true, 1),
+        _ => (false, 0),
+    };
+    let first = at;
+    let mut hit = false;
+    while at < class.len() {
+        let here = class[at];
+        if here == b']' && at > first {
+            return Some((hit != negated, &class[at + 1..]));
+        }
+        if here == b'[' && class.get(at + 1) == Some(&b':') {
+            let named_end = class[at + 2..].windows(2).position(|pair| pair == b":]")?;
+            hit = true;
+            at += named_end + 4;
+            continue;
+        }
+        if at + 2 < class.len() && class[at + 1] == b'-' && class[at + 2] != b']' {
+            hit |= (here..=class[at + 2]).contains(&byte);
+            at += 3;
+            continue;
+        }
+        hit |= here == byte;
+        at += 1;
+    }
+    None
+}
+
+/// Whether a path names a folder above the guard's configuration directory
+/// (`~/.config/innerwarden`), and which: a home itself (`~`, `$HOME`,
+/// `${HOME}`, `~user`, `/home/<user>`, `/Users/<user>`, `/root`,
+/// `/var/root`, or one of `homes`, the homes the caller knows), the
+/// `.config` folder in one (`$XDG_CONFIG_HOME` too), a folder every home is
+/// in (`/home`, `/Users`), or, through a pattern, the guard's folder
+/// itself (`~/.config/*`). The path is read as the shell reads it: `//`,
+/// `./` and `..` collapse, and a pattern that can match one of them counts
+/// as matching it (`~/.conf*`, `~/.[c]onfig`). A folder INSIDE `.config` is
+/// none of these. The root itself is left to the rules on removing
+/// everything.
+fn above_guard_config(target: &str, homes: &[String]) -> Option<AboveGuardConfig> {
+    let spelled = home_spelled(&fold_braced_names(&fold_home_expansions(target)));
+    let named = named_path(&spelled)?;
+    let components: Vec<&str> = named
+        .path
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    let globbed = components.iter().any(|component| holds_glob(component));
+    // Whether the path's first components can be the template's.
+    let fits_start = |template: &[&str]| {
+        template.len() <= components.len()
+            && template
+                .iter()
+                .zip(&components)
+                .all(|(wanted, written)| match *wanted {
+                    "*" => true,
+                    "~" => written.starts_with('~') && !matches!(*written, "~+" | "~-"),
+                    wanted => glob_component_matches(written, wanted),
+                })
+    };
+    let fits = |template: &[&str]| template.len() == components.len() && fits_start(template);
+    let under = |base: &[&str]| {
+        let mut template = base.to_vec();
+        if fits(&template) {
+            return Some(AboveGuardConfig::Home);
+        }
+        template.push(".config");
+        if fits(&template) {
+            return Some(AboveGuardConfig::Config);
+        }
+        template.push("innerwarden");
+        if globbed && fits(&template) {
+            return Some(AboveGuardConfig::Guard);
+        }
+        // Inside the guard's folder through a pattern that can match it or a
+        // folder above it (`~/.config/inner*/guard.toml`, `~/.config/*/*`):
+        // the folder written out with a pattern only below it is
+        // [`writes_guard_config`]'s.
+        (components.len() > template.len()
+            && components[..template.len()]
+                .iter()
+                .any(|component| holds_glob(component))
+            && fits_start(&template))
+        .then_some(AboveGuardConfig::Guard)
+    };
+    if !named.rooted {
+        return components
+            .first()
+            .is_some_and(|first| first.starts_with('~'))
+            .then(|| under(&["~"]))
+            .flatten();
+    }
+    if components.is_empty() {
+        return None;
+    }
+    // A pattern in the first folder under the root (`rm -rf /*` after a
+    // `cd /`, which matches `/root` and `/home`) is left to the rules on
+    // removing everything.
+    if holds_glob(components[0]) {
+        return None;
+    }
+    if matches!(components[..], ["home"] | ["users"]) {
+        return Some(AboveGuardConfig::Homes);
+    }
+    let known: Vec<String> = homes
+        .iter()
+        .map(|home| collapse_path(home).to_lowercase())
+        .collect();
+    [
+        &["home", "*"][..],
+        &["users", "*"],
+        &["root"],
+        &["var", "root"],
+    ]
+    .into_iter()
+    .find_map(under)
+    .or_else(|| {
+        known.iter().find_map(|home| {
+            let base: Vec<&str> = home.split('/').filter(|c| !c.is_empty()).collect();
+            (!base.is_empty()).then(|| under(&base)).flatten()
+        })
+    })
+}
+
+/// The values a line gives names literally (`C=~/.config`), lowercase names.
+fn ancestor_literal_values(content: &str) -> std::collections::HashMap<String, String> {
+    static ASSIGNMENT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let assignment = ASSIGNMENT.get_or_init(|| {
+        regex::Regex::new(r#"(?i)(?:^|[\s;&|(])([a-z_][a-z0-9_]*)=("[^"]*"|'[^']*'|[^\s;&|]*)"#)
+            .expect("static assignment regex")
+    });
+    assignment
+        .captures_iter(content)
+        .map(|captures| {
+            (
+                captures[1].to_ascii_lowercase(),
+                captures[2].trim_matches(['"', '\'']).to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A path read from its text alone, with the directories a `cd` on the line
+/// went to (`dirs`, as written) and the values it gives names.
+fn ancestor_reading_of_text(
+    path: &str,
+    dirs: &[String],
+    values: &std::collections::HashMap<String, String>,
+    depth: u8,
+) -> AncestorReading {
+    let path = path.trim();
+    if path.is_empty() || depth > 4 {
+        return AncestorReading::Other;
+    }
+    if let Some(above) = above_guard_config(path, &[]) {
+        return AncestorReading::Above(above);
+    }
+    let unquoted: String = path.chars().filter(|c| !matches!(c, '"' | '\'')).collect();
+    let lowered = fold_braced_names(&unquoted).to_ascii_lowercase();
+    // The part of the path after an unread head, as the tail that names a
+    // `.config` folder and nothing more.
+    let tail_names_config = |tail: &str| {
+        let components: Vec<&str> = tail.split('/').filter(|c| !c.is_empty()).collect();
+        components.len() == 1 && glob_component_matches(components[0], ".config")
+    };
+    if let Some(rest) = lowered.strip_prefix('$') {
+        let name_end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        let (name, tail) = rest.split_at(name_end);
+        if let Some(value) = values.get(name) {
+            return ancestor_reading_of_text(&format!("{value}{tail}"), dirs, values, depth + 1);
+        }
+        // A substitution that prints a home (`$(echo ~)`) taken whole.
+        let home_whole = name == UNREAD_HOME_SUBSTITUTION && tail.trim_matches('/').is_empty();
+        return if home_whole || (!name.is_empty() && tail_names_config(tail)) {
+            AncestorReading::Unread
+        } else {
+            AncestorReading::Other
+        };
+    }
+    if lowered.starts_with(['/', '~']) {
+        return AncestorReading::Other;
+    }
+    let joined = dirs.iter().take(DIRECTORIES_FOLLOWED).find_map(|dir| {
+        let joined = match lowered.trim_start_matches("./") {
+            "" | "." => dir.clone(),
+            rest => format!("{dir}/{rest}"),
+        };
+        above_guard_config(&joined, &[])
+    });
+    if let Some(above) = joined {
+        return AncestorReading::Above(above);
+    }
+    // `..` with no directory known: `mv ../.config x`, `mv .. /tmp/h` may
+    // be the home the agent's project is in.
+    let mut rest = lowered.trim_end_matches('/').trim_start_matches("./");
+    let mut climbed = false;
+    while let Some(after) = rest.strip_prefix("..") {
+        if !(after.is_empty() || after.starts_with('/')) {
+            break;
+        }
+        climbed = true;
+        rest = after.trim_start_matches('/');
+    }
+    if climbed && (rest.is_empty() || tail_names_config(rest)) {
+        return AncestorReading::Unread;
+    }
+    AncestorReading::Other
+}
+
+/// The names [`substitutions_named`] gives a command substitution: one
+/// whose text may print a home (`$(echo ~)`, `$(getent passwd u | cut -d:
+/// -f6)`), and any other.
+const UNREAD_HOME_SUBSTITUTION: &str = "__iw_unread_home";
+const UNREAD_SUBSTITUTION: &str = "__iw_unread";
+
+/// A segment with every command substitution (`$(...)`, backticks) put as
+/// one variable the line does not set, so the tokenizer keeps the path it
+/// heads whole (`$(echo ~)/.config` is read as `$__iw_unread_home/.config`).
+fn substitutions_named(segment: &str) -> std::borrow::Cow<'_, str> {
+    if !segment.contains("$(") && !segment.contains('`') {
+        return std::borrow::Cow::Borrowed(segment);
+    }
+    let name = |said: &str| {
+        let said = said.to_ascii_lowercase();
+        let home = ["~", "home", "pwd", "getent", "passwd", "user"]
+            .iter()
+            .any(|word| said.contains(word));
+        let name = if home {
+            UNREAD_HOME_SUBSTITUTION
+        } else {
+            UNREAD_SUBSTITUTION
+        };
+        format!("${name}")
+    };
+    let mut out = String::with_capacity(segment.len());
+    let mut rest = segment;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("$(") {
+            let mut depth = 1usize;
+            let close = after.char_indices().find_map(|(at, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                (depth == 0).then_some(at)
+            });
+            let Some(close) = close else {
+                out.push_str(rest);
+                break;
+            };
+            out.push_str(&name(&after[..close]));
+            rest = &after[close + 1..];
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix('`') {
+            let Some(close) = after.find('`') else {
+                out.push_str(rest);
+                break;
+            };
+            out.push_str(&name(&after[..close]));
+            rest = &after[close + 1..];
+            continue;
+        }
+        let c = rest.chars().next().unwrap_or_default();
+        out.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// What one command does to folders, for [`guard_config_ancestor_taken`]:
+/// the paths it moves away, links, removes or trashes (`taken`), and the
+/// folders it writes a tree into (`fills`: the folder, the source when the
+/// command names one, and whether the source's contents are merged into
+/// the folder rather than the source put in it).
+#[derive(Default)]
+struct AncestorActs {
+    taken: Vec<String>,
+    fills: Vec<(String, Option<String>, bool)>,
+}
+
+/// [`AncestorActs`] of one command, by its name and its arguments.
+fn ancestor_acts(name: &str, arguments: &[String]) -> AncestorActs {
+    let mut acts = AncestorActs::default();
+    let positional: Vec<String> = operands(arguments).into_iter().cloned().collect();
+    let flag = |long: &[&str], short: char| {
+        arguments.iter().any(|argument| {
+            long.contains(&argument.as_str())
+                || (argument.starts_with('-')
+                    && !argument.starts_with("--")
+                    && argument[1..].contains(short))
+        })
+    };
+    let unquoted = |word: &str| word.trim_matches(['"', '\'']).to_string();
+    match name {
+        "rm" | "rmdir" | "unlink" | "trash" | "trash-put" | "gtrash" => {
+            acts.taken = positional;
+        }
+        "mv" | "ln" | "cp" => {
+            let explicit = target_directory(arguments);
+            let mut sources: Vec<String> = positional
+                .iter()
+                .filter(|path| explicit.as_deref() != Some(path.as_str()))
+                .cloned()
+                .collect();
+            let destination = match explicit {
+                Some(directory) => Some(directory),
+                None if sources.len() >= 2 => sources.pop(),
+                None => None,
+            };
+            let whole = flag(&["--no-target-directory"], 'T');
+            let recursive = name != "cp"
+                || flag(&["--recursive", "--archive"], 'r')
+                || flag(&[], 'R')
+                || flag(&[], 'a');
+            if let Some(destination) = destination {
+                // A folder named as it is, with one source and no `/` at its
+                // end, is replaced by the source; a home is always there, so
+                // `mv x ~` puts `x` in it.
+                let bare = unquoted(&destination);
+                let replaced = name != "cp"
+                    && sources.len() == 1
+                    && (whole
+                        || (!bare.ends_with('/')
+                            && named_path(&home_spelled(&destination)).is_some_and(|named| {
+                                named.path.trim_end_matches('/').ends_with(".config")
+                            })));
+                if replaced {
+                    acts.taken.push(destination.clone());
+                }
+                if recursive {
+                    for source in &sources {
+                        let source = unquoted(source);
+                        let contents = whole || source == "." || source.ends_with("/.");
+                        acts.fills
+                            .push((destination.clone(), Some(source), contents));
+                    }
+                }
+            }
+            if name != "cp" {
+                acts.taken.extend(sources);
+            }
+        }
+        "rsync" => {
+            let mut sources = positional;
+            if let Some(destination) = (sources.len() >= 2).then(|| sources.pop()).flatten() {
+                for source in &sources {
+                    let source = unquoted(source);
+                    let contents = source.ends_with('/') || source.ends_with("/.");
+                    acts.fills
+                        .push((destination.clone(), Some(source), contents));
+                }
+            }
+            if arguments
+                .iter()
+                .any(|argument| argument == "--remove-source-files")
+            {
+                acts.taken.extend(sources);
+            }
+        }
+        "tar" | "bsdtar" | "gtar" => {
+            // The archive (`-f X`, `-cfX`, `--file X`, `cf X`) and the
+            // folder it works in (`-C X`, `--directory X`) are no files it
+            // is given.
+            let mut skip: Vec<String> = Vec::new();
+            let mut directory: Option<String> = None;
+            let mut extracts = false;
+            for (at, argument) in arguments.iter().enumerate() {
+                let next = arguments.get(at + 1).cloned();
+                if let Some(long) = argument.strip_prefix("--") {
+                    let (option, value) = match long.split_once('=') {
+                        Some((option, value)) => (option, Some(value.to_string())),
+                        None => (long, None),
+                    };
+                    if matches!(option, "extract" | "get") {
+                        extracts = true;
+                    }
+                    if option == "file" {
+                        skip.extend(value.or(next));
+                    } else if option == "directory" {
+                        directory = value.or(next);
+                        skip.extend(directory.clone());
+                    }
+                    continue;
+                }
+                let cluster = match argument.strip_prefix('-') {
+                    Some(cluster) => cluster,
+                    // The first word may be a cluster without its dash.
+                    None if at == 0 && !argument.contains(['/', '.']) => argument.as_str(),
+                    None => continue,
+                };
+                if cluster.contains('x') {
+                    extracts = true;
+                }
+                if let Some(letter_at) = cluster.find(['f', 'C']) {
+                    let attached = &cluster[letter_at + 1..];
+                    let value = if attached.is_empty() {
+                        next
+                    } else {
+                        Some(attached.to_string())
+                    };
+                    if cluster[letter_at..].starts_with('C') {
+                        directory = value.clone();
+                    }
+                    skip.extend(value);
+                }
+            }
+            if extracts {
+                acts.fills
+                    .push((directory.unwrap_or_else(|| ".".to_string()), None, true));
+            }
+            if arguments
+                .iter()
+                .any(|argument| argument == "--remove-files")
+            {
+                let first = arguments.first();
+                acts.taken.extend(positional.into_iter().filter(|path| {
+                    !skip.contains(path) && !(first == Some(path) && !path.contains(['/', '.']))
+                }));
+            }
+        }
+        "unzip" => {
+            let directory = arguments
+                .iter()
+                .position(|argument| argument == "-d")
+                .and_then(|at| arguments.get(at + 1).cloned())
+                .unwrap_or_else(|| ".".to_string());
+            acts.fills.push((directory, None, true));
+        }
+        "zip" if flag(&["--move"], 'm') => {
+            acts.taken.extend(positional.into_iter().skip(1));
+        }
+        "gio" => {
+            let sub = positional.first().map(|sub| sub.to_ascii_lowercase());
+            let rest: Vec<String> = positional.iter().skip(1).cloned().collect();
+            match sub.as_deref() {
+                Some("trash" | "remove" | "rm" | "rename") => acts.taken = rest,
+                Some("move" | "mv") if rest.len() >= 2 => {
+                    acts.taken = rest[..rest.len() - 1].to_vec();
+                }
+                _ => {}
+            }
+        }
+        "rename" | "prename" | "file-rename" | "perl-rename" => {
+            let expression = positional.first().map(|first| unquoted(first));
+            let perl = expression.as_deref().is_some_and(|expression| {
+                ["s", "y", "tr"].iter().any(|op| {
+                    expression.strip_prefix(op).is_some_and(|rest| {
+                        rest.starts_with(|c: char| {
+                            !c.is_ascii_alphanumeric() && !matches!(c, '_' | '.' | '-')
+                        })
+                    })
+                })
+            });
+            if perl {
+                acts.taken.extend(positional.into_iter().skip(1));
+            } else if positional.len() >= 3 {
+                // util-linux: `rename FROM TO FILE...`. Each file is taken,
+                // and the name it gets may put it in a folder's place.
+                let (from, to) = (unquoted(&positional[0]), unquoted(&positional[1]));
+                for file in positional.iter().skip(2) {
+                    acts.taken.push(file.clone());
+                    if !from.is_empty() {
+                        acts.taken.push(unquoted(file).replacen(&from, &to, 1));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    acts
+}
+
+/// [`AncestorActs`] judged with a reading of each path: `Named` when a
+/// path taken names a folder above the guard's configuration, or a fill
+/// writes into one a tree that may hold the guard's folder (contents merged
+/// into a `.config`, a source whose name can be `innerwarden` put in one,
+/// an archive unpacked in one, a source whose name can be `.config` put in
+/// a home); `Unread` when only an unread path may be one.
+fn ancestor_acts_taken(
+    acts: &AncestorActs,
+    read: &dyn Fn(&str) -> AncestorReading,
+) -> Option<AncestorTaken> {
+    let mut found = None;
+    for path in &acts.taken {
+        match read(path) {
+            AncestorReading::Above(_) => return Some(AncestorTaken::Named),
+            AncestorReading::Unread => found = Some(AncestorTaken::Unread),
+            AncestorReading::Other => {}
+        }
+    }
+    for (destination, source, contents) in &acts.fills {
+        let AncestorReading::Above(above) = read(destination) else {
+            continue;
+        };
+        let last = source.as_deref().map(|source| {
+            source
+                .trim_end_matches('/')
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        });
+        let fills = match above {
+            AboveGuardConfig::Config | AboveGuardConfig::Guard => {
+                source.is_none()
+                    || *contents
+                    || last.as_deref().is_some_and(|last| {
+                        glob_component_matches(last, "innerwarden") || last.starts_with('$')
+                    })
+            }
+            AboveGuardConfig::Home => {
+                !*contents
+                    && last
+                        .as_deref()
+                        .is_some_and(|last| glob_component_matches(last, ".config"))
+            }
+            AboveGuardConfig::Homes => false,
+        };
+        if fills {
+            return Some(AncestorTaken::Named);
+        }
+    }
+    found
+}
+
+/// Whether a line can take a folder above the guard's configuration at all:
+/// a cheap look before the reading.
+fn may_take_guard_config_ancestor(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    [
+        "mv", "rm", "ln", "unlink", "eval", "cp", "rsync", "tar", "zip", "gio", "trash", "rename",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+        && [
+            "~", "$", "home", "/root", "/users", "config", "cd", "..", "`", "*", "?", "[",
+        ]
+        .iter()
+        .any(|word| lower.contains(word))
+}
+
+/// Whether a command line moves, links, removes or fills a folder above the
+/// guard's configuration ([`above_guard_config`]), read from its text alone:
+/// `mv ~/.config x`, `mv ~ /tmp/h`, `rm -r ${HOME}/.config`, `mv ~//.config
+/// x`, `mv ~/.conf* x`, `rename .config old ~/.config`, `rm -rf ~/.config/*`,
+/// `rm -rf "${HOME:?}/.config"`, `mv ~/.conf{ig,}`, `rm -f
+/// ~/.config/inner*/guard.toml`, `ln -s ~/.config c`, a move or link that puts another folder in the
+/// place of one (`mv ~/w ~/.config`), and a tree merged into `.config`
+/// (`cp -rT ~/w ~/.config`, `cp -r ~/w/. ~/.config/`, `rsync -a ~/w/
+/// ~/.config/`, `tar -xf x.tar -C ~/.config`). With the folder moved aside
+/// or filled, a folder the agent wrote (`~/w/innerwarden/llm.toml`) is read
+/// by the guard as its own settings, without the line ever naming
+/// `.config/innerwarden`. The guard's own folder named as it is is held by
+/// [`writes_guard_config`]; this is every folder above it.
+///
+/// Work inside `.config` is not this: `mv ~/.config/nvim x`, `rm -r
+/// ~/.config/foo`, `cp -r ~/dotfiles/nvim ~/.config/`, a copy of `~/.config`
+/// (a read) and a move INTO a home (`mv x ~`) all pass. Unpacking into a
+/// home is left as work too (`tar -xf a.tar -C ~`). A path the text does
+/// not read that may be one (`$(echo ~)/.config`, `$PWD/.config`, or `..`
+/// with no directory known) is `Unread`; the hook, which knows the
+/// directory, reads it ([`guard_config_ancestor_in_place`]).
+fn guard_config_ancestor_taken(content: &str, depth: u8) -> Option<AncestorTaken> {
+    if depth > 4 || !may_take_guard_config_ancestor(content) {
+        return None;
+    }
+    let values = ancestor_literal_values(content);
+    let made = ReadingBudget::for_braces();
+    let mut dirs: Vec<String> = Vec::new();
+    let mut found = None;
+    for segment in shell_command_segments(content) {
+        let words = shell_tokens(&ancestor_segment_read(&substitutions_named(segment), &made));
+        let Some(index) = effective_command_index(&words) else {
+            continue;
+        };
+        let name = token_basename(&words[index]).to_ascii_lowercase();
+        let arguments = &words[index + 1..];
+        let taken = if SHELLS.contains(&name.as_str()) || name == "eval" {
+            let payload = if name == "eval" {
+                Some(arguments.join(" "))
+            } else {
+                command_string_argument(&name, arguments).map(str::to_string)
+            };
+            payload.and_then(|payload| guard_config_ancestor_taken(&payload, depth + 1))
+        } else if matches!(name.as_str(), "cd" | "pushd") {
+            let dir = operands(arguments).first().map_or("~".to_string(), |dir| {
+                dir.trim_matches(['"', '\'']).to_string()
+            });
+            let mut named = vec![dir.clone()];
+            if !dir.starts_with(['/', '~', '$']) {
+                named.extend(dirs.iter().map(|before| format!("{before}/{dir}")));
+            }
+            for dir in named {
+                if !dirs.contains(&dir) && dirs.len() < DIRECTORIES_FOLLOWED {
+                    dirs.push(dir);
+                }
+            }
+            None
+        } else {
+            let acts = ancestor_acts(&name, arguments);
+            let read = |path: &str| ancestor_reading_of_text(path, &dirs, &values, 0);
+            ancestor_acts_taken(&acts, &read)
+        };
+        match taken {
+            Some(AncestorTaken::Named) => return Some(AncestorTaken::Named),
+            Some(AncestorTaken::Unread) => found = Some(AncestorTaken::Unread),
+            None => {}
+        }
+    }
+    found
+}
+
+/// A segment as [`guard_config_ancestor_taken`] reads its words: a home
+/// with an operator (`${HOME:?}`, `${HOME:-/root}`, `${HOME%/}`) as the
+/// home, `${HOME}` as `$HOME`, and each brace expansion made as the shell
+/// makes it (`~/.conf{ig,}` is `~/.config ~/.conf`, `~/.c{o,}nfig` is
+/// `~/.config ~/.cnfig`), from `made`.
+fn ancestor_segment_read(segment: &str, made: &ReadingBudget) -> String {
+    expand_braces(&fold_braced_names(&fold_home_expansions(segment)), made)
+}
+
+/// [`guard_config_ancestor_taken`] where the line runs: each path resolved
+/// against the working directory the hook was given and the `cd`s of the
+/// line (`mv ../.config x` from `~/proj`, `cd .. && mv .config x`,
+/// `mv .. /tmp/h`), with the home the caller knows and the account's own
+/// home from the account database, wherever it is (`/srv/u`, not only under
+/// `/home`). A path that does not resolve keeps its reading from the text.
+/// `Some` only for a path this reading names; what only the text reads is
+/// [`check_guard_self_disable`]'s.
+pub fn guard_config_ancestor_in_place(
+    content: &str,
+    cwd: &str,
+    home: Option<&str>,
+) -> Option<(&'static str, u32)> {
+    if !may_take_guard_config_ancestor(content) {
+        return None;
+    }
+    let mut homes: Vec<String> = home.map(str::to_string).into_iter().collect();
+    if let Some(account) = crate::file_tools::home_of_this_account() {
+        homes.push(account.to_string_lossy().into_owned());
+    }
+    ancestor_in_place(content, cwd, home, &homes, 0).then_some((GUARD_CONFIG_ANCESTOR_TAKEN, 60))
+}
+
+/// [`guard_config_ancestor_in_place`] with the homes it compares against.
+fn ancestor_in_place(
+    content: &str,
+    cwd: &str,
+    home: Option<&str>,
+    homes: &[String],
+    depth: u8,
+) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    let mut place = CommandPlace::new(cwd, home);
+    let made = ReadingBudget::for_braces();
+    for segment in shell_command_segments(content) {
+        let Some(words) = place.step(&ancestor_segment_read(segment, &made)) else {
+            continue;
+        };
+        let Some(index) = effective_command_index(&words) else {
+            continue;
+        };
+        let name = token_basename(&words[index]).to_ascii_lowercase();
+        let arguments = &words[index + 1..];
+        if SHELLS.contains(&name.as_str()) || name == "eval" {
+            let here = place.cwd.clone().unwrap_or_default();
+            let payload = if name == "eval" {
+                Some(arguments.join(" "))
+            } else {
+                command_string_argument(&name, arguments).map(str::to_string)
+            };
+            if payload
+                .is_some_and(|payload| ancestor_in_place(&payload, &here, home, homes, depth + 1))
+            {
+                return true;
+            }
+            continue;
+        }
+        let acts = ancestor_acts(&name, arguments);
+        let read = |path: &str| {
+            let above = match place.resolve(path) {
+                Some(resolved) => above_guard_config(&resolved, homes),
+                None => above_guard_config(path, homes),
+            };
+            above.map_or(AncestorReading::Other, AncestorReading::Above)
+        };
+        if ancestor_acts_taken(&acts, &read) == Some(AncestorTaken::Named) {
+            return true;
+        }
+    }
+    false
 }
 
 /// What the shell side says of a line that writes the SSH client
@@ -8948,6 +9769,59 @@ fn git_writes(arguments: &[String], env_tree: Option<&str>) -> GitWrites {
             }
         }
         "rm" => reading.taken.extend(words(rest, &[])),
+        // `git clone <repository> <directory>` writes the folder it is
+        // given, and the one `--separate-git-dir` names. One cloned without
+        // a folder is named by the repository, whose name the line holds
+        // only as data.
+        "clone" => {
+            const VALUED: &[&str] = &[
+                "-b",
+                "--branch",
+                "-o",
+                "--origin",
+                "-u",
+                "--upload-pack",
+                "--reference",
+                "--reference-if-able",
+                "--separate-git-dir",
+                "--depth",
+                "--shallow-since",
+                "--shallow-exclude",
+                "-c",
+                "--config",
+                "--template",
+                "-j",
+                "--jobs",
+                "--filter",
+                "--bundle-uri",
+                "--server-option",
+                "--ref-format",
+            ];
+            let mut given: Vec<&str> = Vec::new();
+            let mut after_dashes = false;
+            let mut index = 0usize;
+            while let Some(word) = rest.get(index) {
+                let word = word.as_str();
+                index += 1;
+                if after_dashes || !word.starts_with('-') {
+                    given.push(word);
+                } else if word == "--" {
+                    after_dashes = true;
+                } else if word == "--separate-git-dir" {
+                    if let Some(value) = rest.get(index) {
+                        reading.written.extend(in_folder(value));
+                    }
+                    index += 1;
+                } else if let Some(value) = word.strip_prefix("--separate-git-dir=") {
+                    reading.written.extend(in_folder(value));
+                } else if VALUED.contains(&word) {
+                    index += 1;
+                }
+            }
+            if let [_, directory, ..] = given.as_slice() {
+                reading.written.extend(in_folder(directory));
+            }
+        }
         // What is not tracked under the folder goes, and with `-x` what is
         // ignored too: the folder is taken as emptied, and each path the
         // line hands it.
@@ -33286,11 +34160,19 @@ mod redirect_fallback_tests {
             "cp -r ~/.claude /tmp/claude-backup",
             "ls ~/.claude",
             "rm -rf ~/.claudette",
-            "rm -rf ~/.config",
         ] {
             assert!(!writes_guard_carrier(line), "walk: {line}");
             assert_eq!(check_guard_self_disable(line), None, "engine: {line}");
         }
+        // `~/.config` holds no agent's settings, so the walk of the carrier
+        // still takes nothing from it; it holds the guard's own
+        // configuration, so the engine refuses it as a folder above that
+        // (`guard_config_ancestor_taken`; before 2026-11-22: None).
+        assert!(!writes_guard_carrier("rm -rf ~/.config"));
+        assert_eq!(
+            check_guard_self_disable("rm -rf ~/.config"),
+            Some((GUARD_CONFIG_ANCESTOR_TAKEN, 60))
+        );
     }
 
     /// Every place the guard is carried by reaches the rule: the fast way
