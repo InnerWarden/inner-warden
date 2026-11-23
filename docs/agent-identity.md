@@ -352,10 +352,84 @@ links that enable them and `user.conf`), `~/.config/environment.d`,
 `~/.config/upstart`, `~/.local/share/systemd/user` and `~/.local/share/dbus-1/services`.
 `contain` makes each empty where it is not there and the folder above it is, so a
 program in the jail cannot make one either; the agent's own folders in `~/.config`
-stay writable. One of them reached through a link in `~/.config` or `~/.local`
-(`~/.config/systemd` a link to a dotfiles folder) refuses the launch: a program in
-the jail could replace that link. With `XDG_CONFIG_HOME` set to another folder the
-session reads those places there, and the jail does not cover them.
+stay writable.
+
+The same holds for the folders the person's own programs run from, as the person,
+the next time they start: `~/.config/git` (`core.hooksPath`, `core.fsmonitor`, an
+alias with `!`), the startup files of the shells that keep them in `~/.config`
+(`fish`, `zsh`, `nushell`, `elvish`, `xonsh`, `powershell`), `nvim`, `vim`, `tmux`,
+`direnv`, `plasma-workspace`, the window managers that read their startup file
+there (`i3`, `sway`, `hypr`, `niri`, `river`, `labwc`, `openbox`, `lxsession`,
+`awesome`, `qtile`, `bspwm`, `herbstluftwm`), `~/.local/share/applications` and
+flatpak's exported D-Bus services and launchers
+(`~/.local/share/flatpak/exports/share`). Each is covered in the home and again
+under the `XDG_CONFIG_HOME` and `XDG_DATA_HOME` of the environment that opens the
+jail, and in each folder of `XDG_DATA_DIRS` inside the home, wherever the jail
+writes it; one the jail shows nowhere needs nothing. `XDG_STATE_HOME` holds
+nothing that runs. A file where one of these folders belongs, or one the launcher
+cannot make, refuses the launch.
+
+One reached through a link in `~/.config` or `~/.local` (`~/.config/git` a link
+into a dotfiles folder, as stow makes it) is read-only where the link leads when
+the jail shows that place, and not shown when it does not; the jail says in one
+line that a program in it could still replace the link itself, since no mount
+holds a link in place. Replace the link with the folder it leads to to close
+that. A link that leads to nothing, or loops, refuses the launch and says what
+to make. Limits: a link inside one of these folders that leads to a place the
+jail writes (`~/.config/git/config` a link into `~/.cache`) stays writable
+there.
+
+The files at the top of `~/.config` that make a program run a command
+(`starship.toml`, and the `chromium-flags.conf`, `chrome-flags.conf`,
+`electron-flags.conf` and `code-flags.conf` some launchers read) are read-only the
+same way, made empty first; so are the terminals' folders (`kitty`, `alacritty`,
+`wezterm`, `foot`, `ghostty`) and the installers' (`pip`, `uv`).
+
+The home's folders of programs in the person's `PATH` are read-only in every Linux jail
+too: `~/.local/bin`, `~/.cargo/bin`, `~/bin`, `~/go/bin`, `~/.npm-global/bin` and every
+folder under the home in the `PATH` of whoever opens the jail, where the jail shows
+it. A program left there ran as the person, outside the jail, the next time they
+typed its name; an agent updating itself there from inside the jail is the same way
+out. Update the agent, `pip install --user` and `cargo install` outside the jail;
+inside it use a venv or the project. `contain --writable-user-bin` leaves those
+folders writable, and the jail says so in one line when it starts. A folder of
+`PATH` that is the project, holds it or lies in it (`.venv/bin`,
+`node_modules/.bin`, the project itself), or a `--rw` path, stays writable, and
+none is made there. An entry of `PATH` that is a file is held read-only as a
+file.
+
+Under the same flag, read-only too: Python's user site
+(`~/.local/lib/python3.*/site-packages`, for each Python on the host: a `.pth`
+file or `usercustomize.py` runs in every Python the person starts), each folder
+of `~/.rustup/toolchains`, and what each link in a folder of programs leads to
+where the jail writes it: the file itself, or the whole venv of a pipx or uv tool.
+In every jail, flag or not: `~/.cargo/env`, `env.fish` and `env.nu`,
+`~/.cargo/config.toml` and `~/.cargo/config` (with neither there, `config.toml` is
+made empty and readable and `config` empty with no permission at all; with one
+there, the other is made empty with no permission; never as a second name of the
+other: cargo on the host cannot open the one made, reads the person's file or the
+empty one as before and warns of nothing new), and
+`~/.rustup/settings.toml` where it is there.
+
+What the launcher makes on the host for a jail (the folders and files above that
+were not there, and the folders above them) stays there, empty, when the jail ends:
+nothing takes it away, so a jail that ends never takes away a place another jail of
+the same home still shows read-only. A place still missing from the plan when the
+launch is ready (removed while it planned) refuses the launch: the jail never opens
+without its read-only places. A Ctrl-C, a hangup or a `kill` of the launcher ends
+the jail first. An OpenClaw jail makes and holds these places as
+Claude Code's does.
+
+Limits: not covered, and writable in a jail: `~/.local/share/bash-completion`,
+`~/.local/share/nvim/site` (plugins neovim loads), editors' settings in
+`~/.config` (VS Code's `Code/User/settings.json`), direnv's allow list,
+Jupyter's kernels (`~/.local/share/jupyter/kernels`), a new folder in
+`~/.rustup/toolchains`, cargo's and rustup's files under a `CARGO_HOME` or
+`RUSTUP_HOME` elsewhere, and the project's `.git/hooks` (the jail writes the
+project). Also still writable: a `.pth` file in the user site of a Python the host
+does not have yet, a new file in `~/.local/share/claude/versions` (only the version
+a link runs is held), and a `build.rs` in cargo's `registry/src`. The empty folders
+made for a jail stay on the host after it.
 
 A tool that reads the command line of a running jail's bubblewrap (from
 `/proc`) finds an identified jail's filter first: that command line starts

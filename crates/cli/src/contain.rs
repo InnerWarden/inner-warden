@@ -95,6 +95,11 @@ pub struct ContainArgs {
     /// `--identity`: write a launch record for this instance. OFF by default;
     /// off, the jail and its argv are exactly what they were before the flag.
     pub identity: bool,
+    /// `--writable-user-bin`: the home's folders of programs in the
+    /// person's `PATH` ([`user_bin_places`]) stay writable in a Linux
+    /// jail, and the launcher says in one line what that lets a program in
+    /// it do. OFF by default: they are read-only.
+    pub writable_user_bin: bool,
     /// When an identified jail starts its command: a jail profile's `start`
     /// ([`apply_jail_profile`]); [`JailStart::Always`] without one.
     ///
@@ -463,6 +468,7 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
     let mut dry_run = false;
     let mut setup_only = false;
     let mut identity = false;
+    let mut writable_user_bin = false;
     let mut deny_read: Vec<String> = DEFAULT_DENY_READ.iter().map(|s| s.to_string()).collect();
     let mut pass_env: Vec<String> = Vec::new();
     let extra_rw: Vec<PathBuf> = Vec::new();
@@ -511,6 +517,7 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
             },
             "--dry-run" => dry_run = true,
             "--setup" => setup_only = true,
+            WRITABLE_USER_BIN_FLAG => writable_user_bin = true,
             innerwarden_agent_guard::identity::IDENTITY_FLAG => identity = true,
             other if other.starts_with('-') => {
                 return Err(ContainError::UnknownFlag(other.to_string()))
@@ -550,6 +557,7 @@ pub fn parse_contain_args(argv: &[String]) -> Result<ContainArgs, ContainError> 
         extra_ro_unheld: Vec::new(),
         deny_read,
         identity,
+        writable_user_bin,
         start: innerwarden_agent_guard::profiles::JailStart::Always,
         hide_home: Vec::new(),
         openclaw_held: Vec::new(),
@@ -2406,8 +2414,29 @@ pub struct JailInputs {
     /// environment that runs at the next login, outside the jail. The real
     /// run makes each one that is not there first ([`crate::contain_io`]).
     /// Empty on macOS, in a dry run where none is there, and in the tests'
-    /// common inputs.
+    /// common inputs. All of [`run_as_person_places`]: one reached through
+    /// a link in a folder the jail writes is laid where it leads
+    /// ([`run_place_link_kept`]), and one the jail shows nowhere is left
+    /// out (a program in the jail cannot write it).
     pub autostart_dirs: Vec<PathBuf>,
+    /// Linux: each of those places that is not there, in a folder the jail
+    /// writes: the real run makes it, empty, before the jail is planned
+    /// again, and refuses the launch where it cannot
+    /// ([`run_place_not_made`]).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub autostart_missing: Vec<PathBuf>,
+    /// Linux: each of [`AUTOSTART_FILES`] there, laid like
+    /// [`JailInputs::autostart_dirs`]: read-only, a bind holds the file in
+    /// place.
+    pub autostart_files: Vec<PathBuf>,
+    /// Linux: each of those files not there, in a folder the jail writes:
+    /// the real run makes it, empty, first.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub autostart_missing_files: Vec<PathBuf>,
+    /// Linux: the home's folders of programs in the person's `PATH`
+    /// ([`user_bin_places`]), laid like [`JailInputs::autostart_dirs`]:
+    /// read-only. Empty with [`ContainArgs::writable_user_bin`].
+    pub user_bin_dirs: Vec<PathBuf>,
     /// Variables the launcher keeps out of the programs it runs to start the
     /// jail, handed to the jail's command as they were ([`launch_env`]).
     /// Empty unless the launch asked for an identity record.
@@ -2555,7 +2584,387 @@ pub const AUTOSTART_PLACES: &[&str] = &[
     ".config/upstart",
     ".local/share/systemd/user",
     ".local/share/dbus-1/services",
+    // (The six above are [`LOGIN_PLACES`].)
+    // What the person's own programs run, as the person, the next time
+    // they start, with no login: git's config (`core.hooksPath`,
+    // `core.fsmonitor`, an alias with `!`), the startup files of the
+    // shells that keep them in `~/.config` (fish, zsh with `ZDOTDIR` there,
+    // nushell, elvish, xonsh, PowerShell), the editors' (neovim, vim) and
+    // tmux's, direnv's library, Plasma's login and logout scripts, and what
+    // the window managers that read their startup file from `~/.config`
+    // start at login. A tool that keeps such a file at the top of
+    // `~/.config` (`starship.toml`) is not covered.
+    ".config/git",
+    ".config/fish",
+    ".config/zsh",
+    ".config/nushell",
+    ".config/elvish",
+    ".config/xonsh",
+    ".config/powershell",
+    ".config/nvim",
+    ".config/vim",
+    ".config/tmux",
+    ".config/direnv",
+    ".config/plasma-workspace",
+    ".config/i3",
+    ".config/sway",
+    ".config/hypr",
+    ".config/niri",
+    ".config/river",
+    ".config/labwc",
+    ".config/openbox",
+    ".config/lxsession",
+    ".config/awesome",
+    ".config/qtile",
+    ".config/bspwm",
+    ".config/herbstluftwm",
+    // The terminals' (a shell or a command each starts with), and the
+    // package installers' (an index or a build hook the next install
+    // runs).
+    ".config/kitty",
+    ".config/alacritty",
+    ".config/wezterm",
+    ".config/foot",
+    ".config/ghostty",
+    ".config/pip",
+    ".config/uv",
+    // The desktop's launchers (a `.desktop` there takes the place of an
+    // installed program's in the menu), and flatpak's exports of D-Bus
+    // services and launchers, which the session reads like its own (Fedora
+    // and Mint put them in `XDG_DATA_DIRS`).
+    ".local/share/applications",
+    ".local/share/flatpak/exports/share/dbus-1/services",
+    ".local/share/flatpak/exports/share/applications",
 ];
+
+/// The first six of [`AUTOSTART_PLACES`], in the home: what the session
+/// runs on its own at the next login. One reached through a link in a
+/// folder the jail writes (`~/.config/systemd` a link into a dotfiles
+/// folder, or `~/.local/share` a link above two of them) refuses the
+/// launch ([`steered_link_refused`]), as it did before the other places
+/// were covered: no mount holds a link, so a program in the jail could
+/// replace it with a folder of its own and the session would run what it
+/// put there. The places added after them were writable before; a link on
+/// their way is said, and the jail opens.
+pub const LOGIN_PLACES: &[&str] = AUTOSTART_PLACES.split_at(6).0;
+
+/// The files at the top of `~/.config` that make a program the person runs
+/// run a command of their choosing: starship's prompt (`custom` modules
+/// run a command at every prompt) and the flags files the Chromium,
+/// Chrome, Electron and VS Code launchers of some distributions read (a
+/// `--renderer-cmd-prefix`). Read-only in every Linux jail like
+/// [`AUTOSTART_PLACES`], made empty first where they are not there.
+pub const AUTOSTART_FILES: &[&str] = &[
+    ".config/starship.toml",
+    ".config/chromium-flags.conf",
+    ".config/chrome-flags.conf",
+    ".config/electron-flags.conf",
+    ".config/code-flags.conf",
+];
+
+/// The files in `~/.cargo` that make what the person runs next run a
+/// command of their choosing: rustup's environment scripts (the shell
+/// startup files rustup edits source `~/.cargo/env` at every login) and
+/// cargo's own config (`build.rustc-wrapper`, a `runner`, an alias), in
+/// both names cargo reads. Read-only in every Linux jail like
+/// [`AUTOSTART_FILES`], made first where they are not there: with
+/// neither `config` nor `config.toml` there, `config.toml` empty and
+/// readable and `config` with no permission; with one there, the other
+/// with no permission ([`cargo_config_partner`]), so cargo on the host
+/// cannot open the one made and reads the person's as before, saying
+/// nothing new.
+pub const CARGO_FILES: &[&str] = &[
+    ".cargo/env",
+    ".cargo/env.fish",
+    ".cargo/env.nu",
+    ".cargo/config.toml",
+    ".cargo/config",
+];
+
+/// PURE. The other name cargo reads its config by, beside `file`
+/// (`~/.cargo/config` for `~/.cargo/config.toml` and back): two files it
+/// can open make it warn on every run, and an empty `config` would hide
+/// `config.toml`, so the launcher makes `config` with no permission, and
+/// `config.toml` too where the person's `config` is there.
+/// `None` for any other file.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn cargo_config_partner(file: &Path) -> Option<PathBuf> {
+    let parent = file.parent()?;
+    if parent.file_name()? != ".cargo" {
+        return None;
+    }
+    match file.file_name()?.to_str()? {
+        "config" => Some(parent.join("config.toml")),
+        "config.toml" => Some(parent.join("config")),
+        _ => None,
+    }
+}
+
+/// PURE. `place` is one of `writable`, holds one or lies in one: a
+/// folder of programs there is the jail's to write anyway (the project, a
+/// `--rw` path), so keeping it read-only gains nothing and takes the
+/// project's writes away (a `.venv/bin` in `PATH`, the project in
+/// `PATH` itself).
+pub fn overlaps_any(place: &Path, writable: &[PathBuf]) -> bool {
+    writable
+        .iter()
+        .any(|folder| place.starts_with(folder) || folder.starts_with(place))
+}
+
+/// PURE. The version of a Python whose library folder is named `name`
+/// (`python3.12` gives `3.12`), `None` for any other name.
+pub fn python_version_of(name: &str) -> Option<String> {
+    let rest = name.strip_prefix("python3.")?;
+    (!rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())).then(|| format!("3.{rest}"))
+}
+
+/// PURE. Python's user site folders in the home for each of `versions`
+/// (`~/.local/lib/python3.12/site-packages`): every Python the person
+/// runs of that version reads each `.pth` file there at start, and
+/// imports `usercustomize` from it, as the person. Each once.
+pub fn python_user_sites(home: &Path, versions: &[String]) -> Vec<PathBuf> {
+    let mut sites: Vec<PathBuf> = Vec::new();
+    for version in versions {
+        let site = home
+            .join(".local/lib")
+            .join(format!("python{version}"))
+            .join("site-packages");
+        if !sites.contains(&site) {
+            sites.push(site);
+        }
+    }
+    sites
+}
+
+/// The flag that keeps the home's folders of programs writable in a Linux
+/// jail ([`ContainArgs::writable_user_bin`]).
+pub const WRITABLE_USER_BIN_FLAG: &str = "--writable-user-bin";
+
+/// The home's folders of programs that are commonly in the person's
+/// `PATH`, before the system's: a program left there runs as the person,
+/// outside the jail, the next time they type its name.
+pub const USER_BIN_PLACES: &[&str] = &[
+    ".local/bin",
+    ".cargo/bin",
+    "bin",
+    "go/bin",
+    ".npm-global/bin",
+];
+
+/// PURE. The home's folders of programs a Linux jail keeps read-only
+/// unless [`WRITABLE_USER_BIN_FLAG`]: each of [`USER_BIN_PLACES`], and
+/// each folder of `path` (the `PATH` of the environment that opens the
+/// jail) inside the home that is a plain absolute path. Each once.
+pub fn user_bin_places(home: &Path, path: Option<&str>) -> Vec<PathBuf> {
+    let mut places: Vec<PathBuf> = USER_BIN_PLACES.iter().map(|name| home.join(name)).collect();
+    for entry in path
+        .unwrap_or_default()
+        .split(':')
+        .filter_map(plain_xdg_dir)
+    {
+        if entry != home && entry.starts_with(home) && !places.contains(&entry) {
+            places.push(entry);
+        }
+    }
+    places
+}
+
+/// PURE. Each of [`AUTOSTART_FILES`] in the home, and again under a
+/// `XDG_CONFIG_HOME` that names another folder (as
+/// [`run_as_person_places`] takes it). Each once.
+pub fn run_as_person_files(home: &Path, xdg_config_home: Option<&str>) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = AUTOSTART_FILES.iter().map(|name| home.join(name)).collect();
+    if let Some(config) = xdg_config_home.and_then(plain_xdg_dir) {
+        for rest in AUTOSTART_FILES
+            .iter()
+            .filter_map(|name| name.strip_prefix(".config/"))
+        {
+            let file = config.join(rest);
+            if !files.contains(&file) {
+                files.push(file);
+            }
+        }
+    }
+    files
+}
+
+/// An XDG base folder as the XDG rule takes it: a plain absolute path, as
+/// its plain steps; `None` for a relative value, an empty one or one with
+/// a `..`.
+fn plain_xdg_dir(value: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let dir = Path::new(value);
+    (dir.is_absolute()
+        && dir
+            .components()
+            .all(|step| matches!(step, Component::RootDir | Component::Normal(_))))
+    .then(|| dir.components().collect())
+}
+
+/// Said when [`WRITABLE_USER_BIN_FLAG`] keeps `dirs` writable in a jail.
+pub fn writable_user_bin_said(dirs: &[PathBuf]) -> String {
+    let named: Vec<String> = dirs.iter().map(|dir| printable(dir)).collect();
+    format!(
+        "{WRITABLE_USER_BIN_FLAG}: {} stay writable in the jail; a program in it can leave a \
+         program there that runs as you, outside the jail, the next time you run that name",
+        named.join(", ")
+    )
+}
+
+/// The places of [`AUTOSTART_PLACES`] under the data folder
+/// (`~/.local/share`), named from it: those a folder of `XDG_DATA_DIRS`
+/// in the home holds too.
+const DATA_DIRS_PLACES: &[&str] = &["systemd/user", "dbus-1/services", "applications"];
+
+/// PURE. Every place a Linux jail keeps read-only so nothing it leaves
+/// there runs as the person outside it ([`AUTOSTART_PLACES`]): each in
+/// the home, and each again where the person's `XDG_CONFIG_HOME` and
+/// `XDG_DATA_HOME` (as the launcher's environment has them) name another
+/// folder, since the session, systemd and git read them there; and each of
+/// [`DATA_DIRS_PLACES`] in every folder of `XDG_DATA_DIRS` inside the home
+/// (flatpak's exports). A value that is not a plain absolute path is
+/// ignored, as the XDG rule says and as [`launch::records_dir`] takes it.
+/// Each once, in that order.
+pub fn run_as_person_places(
+    home: &Path,
+    xdg_config_home: Option<&str>,
+    xdg_data_home: Option<&str>,
+    xdg_data_dirs: Option<&str>,
+) -> Vec<PathBuf> {
+    let plain = plain_xdg_dir;
+    let config = xdg_config_home.and_then(plain);
+    let data = xdg_data_home.and_then(plain);
+    let mut places: Vec<PathBuf> = Vec::new();
+    let mut add = |place: PathBuf| {
+        if !places.contains(&place) {
+            places.push(place);
+        }
+    };
+    for name in AUTOSTART_PLACES {
+        add(home.join(name));
+    }
+    for name in AUTOSTART_PLACES {
+        if let (Some(dir), Some(rest)) = (&config, name.strip_prefix(".config/")) {
+            add(dir.join(rest));
+        }
+        if let (Some(dir), Some(rest)) = (&data, name.strip_prefix(".local/share/")) {
+            add(dir.join(rest));
+        }
+    }
+    for entry in xdg_data_dirs
+        .unwrap_or_default()
+        .split(':')
+        .filter_map(plain)
+    {
+        if entry != home && entry.starts_with(home) {
+            for name in DATA_DIRS_PLACES {
+                add(entry.join(name));
+            }
+        }
+    }
+    places
+}
+
+/// One of the places that run as the person ([`run_as_person_places`]) is
+/// there but is not a folder (a file at `~/.config/git`): a program in
+/// the jail could take it away and make the folder, so the jail does not
+/// start.
+pub fn run_place_not_a_folder(place: &Path, leads_to: &Path) -> ContainError {
+    let at = if leads_to == place {
+        String::new()
+    } else {
+        format!(" (it leads to {})", printable(leads_to))
+    };
+    ContainError::Unsupported(format!(
+        "{}{at} is not a folder, where a program you run looks for one: a program in the jail \
+         could take it away and make that folder, and what it put there would run as you, \
+         outside the jail. Move it aside (or make it a folder) and start the jail again",
+        printable(place)
+    ))
+}
+
+/// [`run_place_not_a_folder`], for one of [`AUTOSTART_FILES`] that is
+/// there and not a file.
+pub fn run_place_not_a_file(place: &Path, leads_to: &Path) -> ContainError {
+    let at = if leads_to == place {
+        String::new()
+    } else {
+        format!(" (it leads to {})", printable(leads_to))
+    };
+    ContainError::Unsupported(format!(
+        "{}{at} is not a file, where a program you run looks for one: the jail cannot keep it \
+         read-only as that file. Move it aside and start the jail again",
+        printable(place)
+    ))
+}
+
+/// One of the places that run as the person cannot be made empty before
+/// the jail starts: a program in the jail could make it, so the jail does
+/// not start.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn run_place_not_made(place: &Path, why: &str) -> ContainError {
+    ContainError::Unsupported(format!(
+        "{} cannot be made ({why}): a program in the jail could make it and leave there what \
+         runs as you, outside the jail. Make it yourself as an empty folder and start the jail \
+         again",
+        printable(place)
+    ))
+}
+
+/// One of the places that run as the person goes through `link`, a link
+/// in a folder the jail writes (a dotfiles manager's `~/.config/git`), and
+/// it leads to nothing the jail can keep read-only (`leads_to` is not
+/// there, or the links loop) in a folder the jail shows: a program in the
+/// jail could make it there. The words say what to do: make the place the
+/// link leads to, or put the folder in place of the link.
+pub fn run_place_link_refused(place: &Path, link: &Path, leads_to: Option<&Path>) -> ContainError {
+    let fix = match leads_to {
+        Some(target) => format!(
+            "Make {} (an empty folder will do), or replace the link {} with a folder, and start \
+             the jail again",
+            printable(target),
+            printable(link)
+        ),
+        None => format!(
+            "Its links loop: replace the link {} with a folder and start the jail again",
+            printable(link)
+        ),
+    };
+    ContainError::Unsupported(format!(
+        "{} goes through {}, a link in a folder a program in the jail can write, to a place \
+         the jail cannot keep read-only, where a program in it could leave what runs as you, \
+         outside the jail. {fix}",
+        printable(place),
+        printable(link)
+    ))
+}
+
+/// Said of a place that runs as the person reached through `link`, a link
+/// in a folder the jail writes (`~/.config/git` linked into a dotfiles
+/// folder): what it leads to is read-only in the jail, or not shown at all,
+/// but a program in the jail could replace the link itself, and no mount
+/// holds a link in place.
+pub fn run_place_link_kept(place: &Path, link: &Path, leads_to: &Path) -> String {
+    let way = if link == place {
+        format!(
+            "{} goes through {}: it is a link in a folder a program in the jail can write",
+            printable(place),
+            printable(leads_to)
+        )
+    } else {
+        format!(
+            "{} goes through {}, a link in a folder a program in the jail can write, to {}",
+            printable(place),
+            printable(link),
+            printable(leads_to)
+        )
+    };
+    format!(
+        "{way}: the jail keeps {}, where it leads, out of its reach, but that program could \
+         replace the link; to close that too, replace the link with the folder it leads to",
+        printable(leads_to)
+    )
+}
 /// Claude Code's folder in the home. The host's is never shown writable in
 /// a jail: each jail has one of its own ([`ProjectClaude`]).
 pub(crate) const CLAUDE_DIR: &str = ".claude";
@@ -3756,7 +4165,14 @@ pub fn linux_pins(input: &JailInputs) -> Vec<(PinRoot, PathBuf)> {
     // The folders the session runs from on its own, read-only: a rename of
     // `~/.config/systemd` or `~/.local/share` took that bind away with
     // it, and the jail made a folder of its own at the name.
-    places.extend(input.autostart_dirs.iter().map(PathBuf::as_path));
+    places.extend(
+        input
+            .autostart_dirs
+            .iter()
+            .chain(&input.user_bin_dirs)
+            .chain(&input.autostart_files)
+            .map(PathBuf::as_path),
+    );
     if let Some(claude) = &input.project_claude {
         places.extend(claude.covered.iter().map(PathBuf::as_path));
     }
@@ -4317,7 +4733,12 @@ pub fn build_linux_jail(input: &JailInputs) -> Result<LinuxJailPlan, ContainErro
     // environment written there ran as the person, outside the jail. Never
     // `-try`: the launcher made each one, and bwrap stops on one gone
     // since. Each folder above one is pinned ([`linux_pins`]). ---
-    for dir in &input.autostart_dirs {
+    for dir in input
+        .autostart_dirs
+        .iter()
+        .chain(&input.user_bin_dirs)
+        .chain(&input.autostart_files)
+    {
         let dest = dir.to_string_lossy().to_string();
         push(&["--ro-bind", &dest, &dest]);
     }
@@ -6886,6 +7307,7 @@ mod tests {
             extra_ro_unheld: vec![],
             deny_read: DEFAULT_DENY_READ.iter().map(|s| s.to_string()).collect(),
             identity: false,
+            writable_user_bin: false,
             start: innerwarden_agent_guard::profiles::JailStart::Always,
             hide_home: vec![],
             openclaw_held: Vec::new(),
@@ -6938,6 +7360,10 @@ mod tests {
             profiles_marker_fd: None,
             records_dirs: vec![],
             autostart_dirs: vec![],
+            autostart_missing: vec![],
+            autostart_files: vec![],
+            autostart_missing_files: vec![],
+            user_bin_dirs: vec![],
             child_env: vec![],
             close_userns: false,
             // A plain jail on a host that takes the terminal filter.
@@ -16275,6 +16701,163 @@ mod tests {
         let end = a.iter().position(|x| x == "--").unwrap();
         assert_eq!(a[end + 2], launch::GATE_VERB);
         assert!(!a.iter().any(|x| x == launch::EXEC_VERB), "{a:?}");
+    }
+
+    /// The pieces that keep a folder of programs the project's, and name
+    /// what Python and cargo read as the person: a place that is, holds or
+    /// lies in a folder the jail writes overlaps it (a sibling does not);
+    /// cargo's two config names pair up only in a `.cargo` folder; a
+    /// Python library folder gives its version and the user site of each.
+    /// The link line names where the link leads.
+    ///
+    /// FAILS ON REVERT: compare only one way (a `.venv/bin` in the project,
+    /// or the project in `PATH`, stays read-only), pair any `config`.
+    #[test]
+    fn program_folders_in_the_project_and_what_python_and_cargo_read() {
+        let project = vec![PathBuf::from("/home/dev/proj")];
+        assert!(overlaps_any(
+            Path::new("/home/dev/proj/.venv/bin"),
+            &project
+        ));
+        assert!(overlaps_any(Path::new("/home/dev/proj"), &project));
+        assert!(overlaps_any(Path::new("/home/dev"), &project));
+        assert!(!overlaps_any(Path::new("/home/dev/proj2/bin"), &project));
+        assert!(!overlaps_any(Path::new("/home/dev/.local/bin"), &project));
+        assert_eq!(
+            cargo_config_partner(Path::new("/home/dev/.cargo/config")),
+            Some(PathBuf::from("/home/dev/.cargo/config.toml"))
+        );
+        assert_eq!(
+            cargo_config_partner(Path::new("/home/dev/.cargo/config.toml")),
+            Some(PathBuf::from("/home/dev/.cargo/config"))
+        );
+        assert_eq!(
+            cargo_config_partner(Path::new("/home/dev/.cargo/env")),
+            None
+        );
+        assert_eq!(
+            cargo_config_partner(Path::new("/home/dev/.git/config")),
+            None
+        );
+        assert_eq!(python_version_of("python3.12").as_deref(), Some("3.12"));
+        assert_eq!(python_version_of("python3"), None);
+        assert_eq!(python_version_of("python3.12d"), None);
+        assert_eq!(
+            python_user_sites(
+                Path::new("/home/dev"),
+                &["3.12".to_string(), "3.12".to_string()]
+            ),
+            vec![PathBuf::from(
+                "/home/dev/.local/lib/python3.12/site-packages"
+            )]
+        );
+        let itself = run_place_link_kept(
+            Path::new("/home/dev/.config/git"),
+            Path::new("/home/dev/.config/git"),
+            Path::new("/home/dev/dotfiles/git"),
+        );
+        assert!(
+            itself.starts_with("/home/dev/.config/git goes through /home/dev/dotfiles/git"),
+            "{itself}"
+        );
+        assert!(
+            !itself.contains(".config/git goes through /home/dev/.config/git"),
+            "{itself}"
+        );
+    }
+
+    /// The home's folders of programs: the common ones always, and each
+    /// folder of `PATH` inside the home; one outside it, a relative one or
+    /// one through `..` adds nothing. The files at the top of `~/.config`
+    /// are named in the home and again under a `XDG_CONFIG_HOME` elsewhere.
+    /// `--writable-user-bin` is read.
+    ///
+    /// FAILS ON REVERT: read only the fixed folders, or not the flag.
+    #[test]
+    fn the_homes_program_folders_and_config_files_are_named() {
+        let home = Path::new("/home/dev");
+        let bins = user_bin_places(
+            home,
+            Some("/home/dev/.local/bin:/home/dev/tools/bin:/usr/bin:rel/bin:/home/dev/x/../y:/home/dev"),
+        );
+        for bin in [
+            "/home/dev/.local/bin",
+            "/home/dev/.cargo/bin",
+            "/home/dev/bin",
+            "/home/dev/go/bin",
+            "/home/dev/.npm-global/bin",
+            "/home/dev/tools/bin",
+        ] {
+            assert!(bins.contains(&PathBuf::from(bin)), "{bin}: {bins:?}");
+        }
+        assert_eq!(bins.len(), USER_BIN_PLACES.len() + 1, "{bins:?}");
+        let files = run_as_person_files(home, Some("/home/dev/.local/cfg"));
+        assert!(files.contains(&PathBuf::from("/home/dev/.config/starship.toml")));
+        assert!(files.contains(&PathBuf::from("/home/dev/.local/cfg/starship.toml")));
+        assert_eq!(files.len(), 2 * AUTOSTART_FILES.len());
+        assert_eq!(
+            run_as_person_files(home, Some("cfg")).len(),
+            AUTOSTART_FILES.len()
+        );
+        let on: Vec<String> = [WRITABLE_USER_BIN_FLAG, "--", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_contain_args(&on).unwrap().writable_user_bin);
+        let off: Vec<String> = ["--", "true"].iter().map(|s| s.to_string()).collect();
+        assert!(!parse_contain_args(&off).unwrap().writable_user_bin);
+    }
+
+    /// The places that run as the person are named in the home, again under
+    /// a `XDG_CONFIG_HOME` and a `XDG_DATA_HOME` that name other folders,
+    /// and under each folder of `XDG_DATA_DIRS` inside the home (flatpak's
+    /// exports); a value that is not a plain absolute path is ignored, and
+    /// a folder of `XDG_DATA_DIRS` outside the home adds nothing.
+    ///
+    /// FAILS ON REVERT: read only the home's `~/.config` and `~/.local/share`.
+    #[test]
+    fn places_that_run_as_the_person_follow_the_xdg_folders() {
+        let home = Path::new("/home/dev");
+        let plain = run_as_person_places(home, None, None, None);
+        assert_eq!(plain.len(), AUTOSTART_PLACES.len());
+        for name in [
+            ".config/git",
+            ".config/fish",
+            ".config/nvim",
+            ".config/systemd",
+        ] {
+            assert!(plain.contains(&home.join(name)), "{name}");
+        }
+        assert!(plain.contains(&home.join(".local/share/flatpak/exports/share/dbus-1/services")));
+        let moved = run_as_person_places(
+            home,
+            Some("/home/dev/.local/cfg"),
+            Some("/data/share"),
+            Some("/home/dev/.local/share/flatpak/exports/share:/home/dev/apps/share:/usr/share"),
+        );
+        for place in [
+            "/home/dev/.local/cfg/git",
+            "/home/dev/.local/cfg/systemd",
+            "/home/dev/.local/cfg/autostart",
+            "/data/share/systemd/user",
+            "/data/share/dbus-1/services",
+            "/home/dev/apps/share/dbus-1/services",
+            "/home/dev/apps/share/systemd/user",
+            "/home/dev/apps/share/applications",
+        ] {
+            assert!(moved.contains(&PathBuf::from(place)), "{place}: {moved:?}");
+        }
+        assert!(moved.iter().all(|p| !p.starts_with("/usr")), "{moved:?}");
+        let mut once = moved.clone();
+        once.dedup();
+        assert_eq!(once.len(), moved.len());
+        for bad in ["cfg", "", "/home/dev/../etc", "/home/dev/./x/.."] {
+            assert_eq!(
+                run_as_person_places(home, Some(bad), Some(bad), Some(bad)),
+                plain,
+                "{bad:?}"
+            );
+        }
     }
 
     /// The home folders the person's session runs from on its own at the
