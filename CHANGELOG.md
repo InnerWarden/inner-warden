@@ -43,11 +43,17 @@ is in. `core.worktree` given to `git clone -c`, and a file written from
 inside a `.git` folder (`cd e/.git`, then a redirection or a command that
 writes), count as rewriting the work tree for the rest of the line.
 Without `--`, `checkout <name>` reads a name that can be a branch as a
-branch, as git does, even when a file or folder has that name;
-`switch -c <new>` with no start point passes, as `checkout -b <new>`
-does. `GIT_CEILING_DIRECTORIES` stops the search for a repository, as it
-stops git's. Each folder and each git command is read once per line, so a
-line of thousands of git commands costs what its distinct ones cost.
+branch, as git does, even when a file or folder has that name, and a name
+written as a revision (`evil~0`, `evil^0`, `:/evil`, `main@{1}`, `@`)
+as a commit; `switch -c <new>` with no start point passes, as
+`checkout -b <new>` does, and a start point after `--` counts as one.
+`GIT_CEILING_DIRECTORIES` stops the search for a repository, as it stops
+git's, read only from the hook's environment (the agent's): a line that
+names it, `unset`s a variable or runs `env -u` or `env -i` is read
+without it. Each folder is read once per line, and each git command once
+per line with the same words, folder and variables (its own
+`GIT_DIR=... git` or `env VAR=... git` among them), so a line of
+thousands of git commands costs what its distinct ones cost.
 
 For a home kept in git (a dotfiles repository with the home as its work
 tree): `status`, `add`, `commit`, `diff`, `fetch`, `push` to another
@@ -72,7 +78,11 @@ parent such as the home changes all the time), and the user's own
 the trusted folder is not seen. A project layer that is a link to the
 user's own file, or sits in a `.codex` that is a link to the user's
 `~/.codex`, is read as a layer, not as the user's file: swapped in after
-Codex started, it leaves the call judged.
+Codex started, it leaves the call judged. So is the trusted folder itself
+(or one below it) when it leads to the home through a link (renamed away
+and a link to the home put in its place, or a link there pointed at the
+home): its own link and time are read, and a change after Codex started
+leaves the call judged.
 
 What the CLI sends to a listener on this host goes straight there, never
 through a proxy the environment names (`HTTP_PROXY`, `HTTPS_PROXY`,

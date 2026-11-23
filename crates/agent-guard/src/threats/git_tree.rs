@@ -259,6 +259,32 @@ fn ceiling_directories(value: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
     out
 }
 
+/// Whether the line may change `GIT_CEILING_DIRECTORIES` for the git it
+/// runs: it names the variable, or runs `unset` or `env` with an option
+/// that removes variables (`-u`, `--unset`, `-i`, `--ignore-environment`,
+/// `-`), whatever variable they name (`unset $V`).
+fn touches_ceiling(content: &str) -> bool {
+    if content.contains("GIT_CEILING") {
+        return true;
+    }
+    shell_command_segments(content).into_iter().any(|segment| {
+        let words: Vec<String> = shell_tokens(segment).iter().map(|w| unquote(w)).collect();
+        words.iter().enumerate().any(|(at, word)| {
+            let name = token_basename(word).to_ascii_lowercase();
+            (name == "unset" || name == "env")
+                && (name == "unset"
+                    || words[at + 1..].iter().any(|option| {
+                        option == "-"
+                            || option.starts_with("--unset")
+                            || option.starts_with("--ignore-environment")
+                            || (option.starts_with('-')
+                                && !option.starts_with("--")
+                                && option[1..].contains(['u', 'i']))
+                    }))
+        })
+    })
+}
+
 /// [`git_takes_guard_place_in`] with the ceiling folders given.
 fn git_takes_guard_place_with(
     content: &str,
@@ -270,6 +296,13 @@ fn git_takes_guard_place_with(
     if !may_take(content) {
         return false;
     }
+    // A line that undoes the ceiling (`unset`, `GIT_CEILING_DIRECTORIES=`,
+    // `env -u`, `env -i`) runs its git without it.
+    let ceilings = if touches_ceiling(content) {
+        &[][..]
+    } else {
+        ceilings
+    };
     let places = guard_places(home, xdg);
     if places.is_empty() {
         return false;
@@ -292,6 +325,7 @@ fn git_takes_guard_place_with(
     let cache = Cache::default();
     for segment in shell_command_segments(content) {
         let segment = mark_empty_words(segment);
+        let segment = mark_reflog_braces(&segment);
         let words: Vec<String> = shell_tokens(&segment).iter().map(|w| unquote(w)).collect();
         for word in &words {
             if let Some((name, value)) = assignment(word) {
@@ -850,6 +884,7 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
             // even when a file or a folder has that name too.
             let is_path = !new_branch
                 && !could_be_branch(first)
+                && !is_revision(first)
                 && line
                     .resolve(first, folder)
                     .is_some_and(|path| path.symlink_metadata().is_ok());
@@ -866,12 +901,14 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
             let creates = has(&["-c", "-C", "--create", "--force-create"])
                 || has_prefix("--create=")
                 || has_prefix("--force-create=");
-            let (before, _) = operands(
+            // A start point after `--` counts as one before it.
+            let (before, after) = operands(
                 rest,
                 &["-c", "-C", "--create", "--force-create", "--orphan"],
             );
             if creates
                 && before.is_empty()
+                && after.is_none_or(|after| after.is_empty())
                 && !has(&[
                     "-f",
                     "--force",
@@ -936,6 +973,17 @@ fn could_be_branch(name: &str) -> bool {
         && name
             .split('/')
             .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+/// Whether `name` is written as a revision (`evil~0`, `evil^0`,
+/// `:/evil`, `HEAD:file`, `main@{1}`, `a...b`, `@`): git reads such a
+/// word given alone to `checkout` as a commit first, even when a file has
+/// that name.
+fn is_revision(name: &str) -> bool {
+    name == "@"
+        || name.contains(['~', '^', ':', REFLOG_OPEN])
+        || name.contains("@{")
+        || name.contains("...")
 }
 
 /// The long options of the verbs [`plan`] reads, and their short options
@@ -1188,9 +1236,12 @@ struct Line<'a> {
 }
 
 /// A git command as judged: its words, the folder it starts in, whether a
-/// step before rewrote the repository or went to a folder not known, and
-/// how many repositories the line made before it.
-type JudgedKey = (Vec<String>, PathBuf, [bool; 2], usize);
+/// step before rewrote the repository or went to a folder not known, how
+/// many repositories the line made before it, and how many variables the
+/// line assigned up to it (its own, `GIT_DIR=... git` and
+/// `env VAR=... git`, among them): the same words with another
+/// environment are another command.
+type JudgedKey = (Vec<String>, PathBuf, [bool; 2], usize, usize);
 
 /// What a line has read already, kept for the rest of the line: each
 /// folder, file and command is read once, so a line of thousands of git
@@ -1251,6 +1302,39 @@ fn mark_empty_words(segment: &str) -> std::borrow::Cow<'_, str> {
     }
     std::borrow::Cow::Owned(out)
 }
+
+/// The braces of a revision such as `main@{1}` or `@{-1}`, written as
+/// [`REFLOG_OPEN`] and [`REFLOG_CLOSE`]: the words of a line split at a
+/// brace, and `git checkout main@{1}` would read as `main@` and `1`.
+fn mark_reflog_braces(segment: &str) -> std::borrow::Cow<'_, str> {
+    if !segment.contains("@{") {
+        return std::borrow::Cow::Borrowed(segment);
+    }
+    let mut out = String::with_capacity(segment.len());
+    let mut rest = segment;
+    while let Some(at) = rest.find("@{") {
+        out.push_str(&rest[..=at]);
+        let after = &rest[at + 2..];
+        match after.find(|c: char| c == '}' || c.is_whitespace()) {
+            Some(end) if after[end..].starts_with('}') => {
+                out.push(REFLOG_OPEN);
+                out.push_str(&after[..end]);
+                out.push(REFLOG_CLOSE);
+                rest = &after[end + 1..];
+            }
+            _ => {
+                out.push('{');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
+/// What [`mark_reflog_braces`] writes for `{` and `}` in a revision.
+const REFLOG_OPEN: char = '\u{e000}';
+const REFLOG_CLOSE: char = '\u{e001}';
 
 /// `text` with the shell's working folder (`$PWD`, `$(pwd)`) written
 /// out as `start`, the folder the shell is in.
@@ -1560,6 +1644,7 @@ impl Line<'_> {
             start.to_path_buf(),
             [self.tree_unknown, self.start_unknown],
             self.created.len(),
+            self.assigned.len(),
         );
         if let Some(known) = self.cache.judged.borrow().get(&key) {
             return *known;
@@ -2765,6 +2850,91 @@ mod tests {
             "git checkout -b x",
         ] {
             assert!(!takes(line, h, h), "{line}");
+        }
+    }
+
+    /// FAILS ON REVERT of the variables in `JudgedKey`: the same git words
+    /// with another environment (`GIT_DIR=... GIT_WORK_TREE=... git`,
+    /// `env VAR=... git`) are judged again, not taken from the cache of
+    /// the first.
+    #[test]
+    fn the_same_words_with_another_environment_are_judged_again() {
+        let dir = home_repository();
+        let h = dir.path();
+        let proj = h.join("proj");
+        for line in [
+            "GIT_DIR=$HOME/.git GIT_WORK_TREE=$HOME git reset --hard",
+            "git reset --hard; GIT_DIR=$HOME/.git GIT_WORK_TREE=$HOME git reset --hard",
+            "git reset --hard && env GIT_DIR=$HOME/.git GIT_WORK_TREE=$HOME git reset --hard",
+        ] {
+            assert!(takes(line, h, &proj), "{line}");
+        }
+        assert!(!takes("git reset --hard; git reset --hard", h, &proj));
+    }
+
+    /// FAILS ON REVERT of `after` in the `switch` arm: a start point
+    /// after `--` is a start point.
+    #[test]
+    fn a_start_point_after_the_dashes_counts() {
+        let dir = home_repository();
+        let h = dir.path();
+        std::fs::write(h.join("evil"), "").unwrap();
+        for line in ["git switch -c x -- evil", "git switch --create x -- evil"] {
+            assert!(takes(line, h, h), "{line}");
+        }
+        assert!(!takes("git switch -c x --", h, h));
+    }
+
+    /// FAILS ON REVERT of `is_revision` in the `checkout` arm: given alone,
+    /// a word written as a revision is a commit to git, even when a file
+    /// has that name.
+    #[test]
+    fn a_revision_named_as_a_file_is_a_revision() {
+        let dir = home_repository();
+        let h = dir.path();
+        std::fs::create_dir_all(h.join(":")).unwrap();
+        let words = ["evil~0", "evil^0", ":/evil", "main@{1}", "@"];
+        for word in words {
+            std::fs::write(h.join(word), "").unwrap();
+        }
+        for word in words {
+            let line = format!("git checkout {word}");
+            assert!(takes(&line, h, h), "{line}");
+        }
+        // After `--` they are paths.
+        for word in words {
+            let line = format!("git checkout -- {word}");
+            assert!(!takes(&line, h, h), "{line}");
+        }
+    }
+
+    /// FAILS ON REVERT of `touches_ceiling`: a line that undoes
+    /// `GIT_CEILING_DIRECTORIES` runs its git without the ceiling of the
+    /// hook's environment.
+    #[test]
+    fn a_line_that_undoes_the_ceiling_is_read_without_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let checkout = dir.path().join("checkout");
+        let place = checkout.join("target/tmp/place");
+        let h = place.join("home");
+        let work = place.join("work");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::create_dir_all(h.join(".config/innerwarden")).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let ceilings = ceiling_directories(Some(place.as_os_str()));
+        let judged =
+            |line: &str| git_takes_guard_place_with(line, Some(&h), None, Some(&work), &ceilings);
+        assert!(!judged("git worktree add ../x"));
+        for line in [
+            "unset GIT_CEILING_DIRECTORIES; git worktree add ../x",
+            "GIT_CEILING_DIRECTORIES= git worktree add ../x",
+            "export GIT_CEILING_DIRECTORIES=/; git worktree add ../x",
+            "env -u GIT_CEILING_DIRECTORIES git worktree add ../x",
+            "env --unset=GIT_CEILING_DIRECTORIES git worktree add ../x",
+            "env -i git worktree add ../x",
+            "V=GIT_CEILING_DIRECTORIES; unset $V; git worktree add ../x",
+        ] {
+            assert!(judged(line), "{line}");
         }
     }
 

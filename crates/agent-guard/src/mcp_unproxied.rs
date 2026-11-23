@@ -405,10 +405,14 @@ pub fn codex_layers_may_have_moved_beside(
 
 /// Whether `layer` (`<dir>/.codex/config.toml`) is the user's own file
 /// `user` itself, not a layer that leads to it: the same path, or the
-/// same folder under another spelling with neither the `.codex` nor the
-/// file a link. A layer that is a link (or a hard link, or sits in a
-/// `.codex` that is a link) to the user's file is read as a layer: what
-/// it pointed at when the agent started is not known.
+/// same folder under another spelling with no link on the way (`dir` is
+/// the folder it resolves to) and neither the `.codex` nor the file a
+/// link. A layer that is a link (or a hard link, or sits in a `.codex`
+/// that is a link) to the user's file is read as a layer: what it pointed
+/// at when the agent started is not known. So is the layer of a folder
+/// reached through a link that now leads to the user's home (a trusted
+/// `~/proj` swapped for a link to `~`): the folder itself, the link,
+/// stays read.
 fn is_the_users_own(dir: &Path, layer: &Path, user: &Path) -> bool {
     if layer == user {
         return true;
@@ -425,7 +429,7 @@ fn is_the_users_own(dir: &Path, layer: &Path, user: &Path) -> bool {
         && not_link(layer)
         && matches!(
             (std::fs::canonicalize(dir), std::fs::canonicalize(user_dir)),
-            (Ok(a), Ok(b)) if a == b
+            (Ok(a), Ok(b)) if a == b && a == dir
         )
 }
 
@@ -2772,6 +2776,86 @@ mod tests {
         assert!(codex_layers_may_have_moved_beside(
             &dir_proj,
             &trusted,
+            started,
+            Some(&user)
+        ));
+    }
+
+    /// A trusted folder that, after the agent started, leads to the user's
+    /// home through a link (renamed away and a link to the home put in its
+    /// place, a link to `.` in the home, or a link there from the start
+    /// pointed at the home) has moved: the folder is read, not left out as
+    /// the user's own.
+    ///
+    /// FAILS ON REVERT of the "no link on the way" part of
+    /// `is_the_users_own` (`a == dir`).
+    #[cfg(unix)]
+    #[test]
+    fn a_trusted_folder_turned_into_a_link_to_the_home_has_moved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let user_codex = home.join(".codex");
+        let user = user_codex.join("config.toml");
+        std::fs::create_dir_all(&user_codex).unwrap();
+        std::fs::write(&user, "[mcp_servers.docs]\ncommand = \"proxy\"\n").unwrap();
+        let evil = "[mcp_servers.docs-evil]\ncommand = \"docs\"\n";
+        // Form 1: a real folder, renamed away and replaced by a link to the
+        // home. Form 2: the same with a link to `.`. Form 3: a link from
+        // the start, to another project, pointed at the home later.
+        let moved = home.join("moved");
+        let dotted = home.join("dotted");
+        let linked = home.join("linked");
+        let other = home.join("other");
+        for proj in [&moved, &dotted, &other] {
+            std::fs::create_dir_all(proj.join(".codex")).unwrap();
+            std::fs::write(proj.join(".codex/config.toml"), evil).unwrap();
+        }
+        std::os::unix::fs::symlink(&other, &linked).unwrap();
+        let trusted = vec![moved.clone(), dotted.clone(), linked.clone()];
+        std::thread::sleep(SETTLE_MARGIN + Duration::from_millis(300));
+        let started = Some(SystemTime::now());
+        for proj in [&moved, &dotted, &linked] {
+            assert!(
+                !codex_layers_may_have_moved_beside(proj, &trusted, started, Some(&user)),
+                "{}",
+                proj.display()
+            );
+        }
+        std::fs::rename(&moved, home.join("moved.old")).unwrap();
+        std::os::unix::fs::symlink(&home, &moved).unwrap();
+        std::fs::rename(&dotted, home.join("dotted.old")).unwrap();
+        std::os::unix::fs::symlink(".", &dotted).unwrap();
+        std::fs::remove_file(&linked).unwrap();
+        std::os::unix::fs::symlink(&home, &linked).unwrap();
+        for proj in [&moved, &dotted, &linked] {
+            assert_eq!(
+                std::fs::canonicalize(proj).unwrap(),
+                std::fs::canonicalize(&home).unwrap()
+            );
+            assert!(
+                codex_layers_may_have_moved_beside(proj, &trusted, started, Some(&user)),
+                "{}",
+                proj.display()
+            );
+            // A folder below it, as well.
+            assert!(
+                codex_layers_may_have_moved_beside(
+                    &proj.join(".codex"),
+                    &trusted,
+                    started,
+                    Some(&user)
+                ),
+                "{}",
+                proj.display()
+            );
+        }
+        // The home itself, trusted and spelled as it is: the user's own
+        // file left out, as before.
+        let trusted_home = vec![home.clone()];
+        std::fs::write(&user, "[mcp_servers.docs]\ncommand = \"proxy\"\n# seen\n").unwrap();
+        assert!(!codex_layers_may_have_moved_beside(
+            &home,
+            &trusted_home,
             started,
             Some(&user)
         ));
