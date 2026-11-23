@@ -195,6 +195,28 @@ fn what_lowers_nothing_and_the_person_are_not_refused() {
     );
 }
 
+/// `contain --setup` only arms the hook: one it could not arm (settings
+/// that are not JSON) fails and never says "armed". FAILS ON REVERT: it said
+/// "hook armed" and exited 0 after "could not arm the in-jail hook".
+#[test]
+fn a_setup_that_could_not_arm_the_hook_fails() {
+    let home = tempfile::TempDir::new().expect("scratch home");
+    let claude = home.path().join(".claude");
+    std::fs::create_dir_all(&claude).unwrap();
+    let settings = claude.join("settings.json");
+    std::fs::write(&settings, "{ not json").unwrap();
+    let out = run(home.path(), &["contain", "--setup", "--enforce"], None);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert_ne!(out.status.code(), Some(0), "{said}{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("could not arm the in-jail hook"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!said.contains("armed"), "{said}");
+    assert_eq!(std::fs::read_to_string(&settings).unwrap(), "{ not json");
+}
+
 /// Live gate of Active Defence 0.17.4, G2: a `contain` that asks for no mode
 /// keeps the hook's (an enforcing one stays enforcing), and says it; one that
 /// asks for monitor sets monitor. FAILS ON REVERT (the default monitor).

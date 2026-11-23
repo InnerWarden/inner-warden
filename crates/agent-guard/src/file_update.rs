@@ -780,6 +780,20 @@ pub fn replace(path: &Path, body: &[u8]) -> Result<(), String> {
     .map_err(String::from)
 }
 
+/// The end of every error that says this write lost a race to another
+/// writer of the same file (the file changed after it was read, or the
+/// update lock was replaced while it was held). Nothing was written, and the
+/// same update tried again, on what the file holds now, can go through.
+/// Callers that retry match it with [`lost_race`], never with their own copy
+/// of the words.
+pub const LOST_RACE_RETRY: &str = "; retry";
+
+/// Whether `error` (as any write here returns it, possibly wrapped by the
+/// caller) says the write lost a race and may be tried again.
+pub fn lost_race(error: &str) -> bool {
+    error.contains(LOST_RACE_RETRY)
+}
+
 /// Compare-and-replace variant for read/modify/write operations. `expected`
 /// carries the exact bytes read by the caller (`None` means the file was absent).
 /// If an editor or agent changes the file before commit, fail and ask for a retry
@@ -813,7 +827,7 @@ pub fn remove_if_unchanged(path: &Path, expected: &[u8]) -> Result<(), String> {
         .map_err(String::from)?;
     if current_bytes(&target, MAX_CONFIG_BYTES)?.as_deref() != Some(expected) {
         return Err(format!(
-            "{} changed while InnerWarden was preparing the update; retry",
+            "{} changed while InnerWarden was preparing the update{LOST_RACE_RETRY}",
             path.display()
         ));
     }
@@ -1034,7 +1048,7 @@ fn write_inner_with(
             if let Some(expected) = expected {
                 if read_current()?.as_deref() != expected {
                     return Err(format!(
-                        "{} changed while InnerWarden was preparing the update; retry",
+                        "{} changed while InnerWarden was preparing the update{LOST_RACE_RETRY}",
                         requested_path.display()
                     )
                     .into());
@@ -1103,7 +1117,7 @@ fn write_inner_with(
         // the same update: give this one up to be retried (see `open_lock`).
         if !lock.still_named() {
             return Err(format!(
-                "the lock on {} was replaced while this write held it; retry",
+                "the lock on {} was replaced while this write held it{LOST_RACE_RETRY}",
                 requested_path.display()
             ));
         }
@@ -1114,7 +1128,7 @@ fn write_inner_with(
         if let Some(expected) = expected.as_ref() {
             if read_current()? != *expected {
                 return Err(format!(
-                    "{} changed while InnerWarden was preparing the update; retry",
+                    "{} changed while InnerWarden was preparing the update{LOST_RACE_RETRY}",
                     requested_path.display()
                 ));
             }

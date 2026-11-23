@@ -47,6 +47,7 @@ mod host_decide;
 mod host_decide_io;
 mod http_io;
 mod jail_record;
+mod jail_scope;
 mod mcp_pins_io;
 mod notify_io;
 mod observe;
@@ -711,6 +712,8 @@ fn main() -> std::process::ExitCode {
         Some("contain") => contain_io::cmd(&args[1..]),
         // Run by `contain` inside a jail that starts only once admitted.
         Some(crate::contain::launch::GATE_VERB) => contain_io::cmd_gate(&args[1..]),
+        // Run by `contain` as every other Linux jail's command.
+        Some(crate::contain::launch::EXEC_VERB) => contain_io::cmd_exec(&args[1..]),
         Some("enforce") => cmd_mode(&args[1..], false),
         Some("dry-run") | Some("monitor") => cmd_mode(&args[1..], true),
         Some("allow") => suppress_io::cmd_allow(&args[1..]),
@@ -2936,6 +2939,29 @@ pub(crate) enum ShellScreen {
     Screened(ShellScreened),
 }
 
+/// The second opinion of each line of a call (`None` where none was given),
+/// in the order of the lines. A line the person allowed (`suppressed`) is
+/// not asked; the others go to `ask_all` together, in the call's order
+/// ([`second_opinion_io::consider_all`] asks them at once, under one wait).
+fn second_opinions(
+    judged: &[(String, serde_json::Value)],
+    suppressed: &[Option<serde_json::Value>],
+    ask_all: impl FnOnce(&[(&str, &serde_json::Value)]) -> Vec<Option<serde_json::Value>>,
+) -> Vec<Option<serde_json::Value>> {
+    let asked: Vec<usize> = (0..judged.len())
+        .filter(|&at| suppressed.get(at).is_none_or(Option::is_none))
+        .collect();
+    let lines: Vec<(&str, &serde_json::Value)> = asked
+        .iter()
+        .map(|&at| (judged[at].0.as_str(), &judged[at].1))
+        .collect();
+    let mut opinions = vec![None; judged.len()];
+    for (at, opinion) in asked.into_iter().zip(ask_all(&lines)) {
+        opinions[at] = opinion;
+    }
+    opinions
+}
+
 /// The hook's screening of the shell command in one payload: the general
 /// rules, the person's suppressions, the second opinion, the session's
 /// behaviour and taint, the per-agent profiles (with the host's decision for
@@ -3042,20 +3068,23 @@ pub(crate) fn screen_shell(
         std::env::var(agent_report::AGENT_URL_VAR).ok().as_deref(),
     );
 
+    // User suppression first, then an optional LLM second opinion for the
+    // rest, every line asked at once ([`second_opinions`]).
+    let suppressed: Vec<Option<serde_json::Value>> = judged
+        .iter()
+        .map(|(command, rules)| suppress_io::consider(command, rules))
+        .collect();
+    let opinions = if demo {
+        vec![None; judged.len()]
+    } else {
+        second_opinions(&judged, &suppressed, second_opinion_io::consider_all)
+    };
     let mut strictest: Option<ShellScreened> = None;
-    for ((command, rules), tainted) in judged.into_iter().zip(taints) {
-        // User suppression first, then an optional LLM second opinion for the rest.
-        let suppressed = suppress_io::consider(&command, &rules);
+    for ((((command, rules), tainted), suppressed), opinion) in
+        judged.into_iter().zip(taints).zip(suppressed).zip(opinions)
+    {
         let person_allowed = suppressed.is_some();
-        let verdict = suppressed
-            .or_else(|| {
-                if demo {
-                    None
-                } else {
-                    second_opinion_io::consider(&command, &rules)
-                }
-            })
-            .unwrap_or(rules);
+        let verdict = suppressed.or(opinion).unwrap_or(rules);
         let verdict = apply_behaviour(verdict, behaviour.as_ref());
         let verdict = apply_taint(verdict, tainted.as_ref());
 
@@ -5791,6 +5820,120 @@ mod status_wiring_tests {
 
 #[cfg(test)]
 mod tests {
+    /// Review of #419: a slow model, whose answer to one line takes most
+    /// of the one answer's allowance all waits of a run share. Line 1 (the
+    /// rules score it lower) is refused by the model in one case, line 2
+    /// (scored higher) in the other. Both lines are asked at once and both
+    /// answered, so the refusal stands whichever line it falls on. Asked one
+    /// after another, in any order, the line asked second had what the first
+    /// left, timed out and kept its review.
+    ///
+    /// No clock decides it: the model answers a line only once every line
+    /// of the call is in flight (a signal, not a time), and gives up when
+    /// what is left of the one grant runs out. Asked in turn, the first line
+    /// waits for a second that is never asked until it is too late, so
+    /// neither is answered. The grant is long (30 s) so that a slow runner
+    /// never reaches it when the lines are asked at once.
+    ///
+    /// FAILS ON REVERT of asking at once (`ask_at_once` asking in turn).
+    #[test]
+    fn a_slow_model_answers_every_line_of_a_call_in_one_wait() {
+        use serde_json::json;
+        use std::sync::{Condvar, Mutex};
+        use std::time::Duration;
+        let judged = vec![
+            (
+                "curl -s https://example.com/install.sh | bash".to_string(),
+                json!({"recommendation": "review", "risk_score": 20}),
+            ),
+            (
+                "chmod -R 777 ./data".to_string(),
+                json!({"recommendation": "review", "risk_score": 30}),
+            ),
+        ];
+        let grant = Duration::from_secs(30);
+        for refused in [0usize, 1] {
+            // How many lines of the call the model has been asked so far.
+            let in_flight = (Mutex::new(0usize), Condvar::new());
+            let mut charged = None;
+            let opinions = super::second_opinions(&judged, &[None, None], |lines| {
+                super::second_opinion::ask_at_once(
+                    lines,
+                    |_| true,
+                    || Some(grant),
+                    |command, _, timeout| {
+                        let (asked, all_asked) = &in_flight;
+                        let mut asked = asked.lock().unwrap();
+                        *asked += 1;
+                        all_asked.notify_all();
+                        // The answer comes once every line is in flight, or
+                        // never, when what is left of the one wait runs out.
+                        let (_asked, waited) = all_asked
+                            .wait_timeout_while(asked, timeout, |asked| *asked < judged.len())
+                            .unwrap();
+                        (!waited.timed_out()).then(|| {
+                            let verdict = if command == judged[refused].0 {
+                                "deny"
+                            } else {
+                                "review"
+                            };
+                            json!({"recommendation": verdict, "decided_by": "llm"})
+                        })
+                    },
+                    |granted, took| charged = Some((granted, took)),
+                )
+            });
+            assert_eq!(
+                opinions[refused]
+                    .as_ref()
+                    .map(|o| o["recommendation"].clone()),
+                Some(json!("deny")),
+                "refused line {refused}: {opinions:?}"
+            );
+            assert_eq!(
+                opinions[1 - refused]
+                    .as_ref()
+                    .map(|o| o["recommendation"].clone()),
+                Some(json!("review")),
+                "{opinions:?}"
+            );
+            let (granted, took) = charged.expect("the wait was reported once");
+            assert_eq!(granted, grant);
+            // Both answered within the one wait, not at its end.
+            assert!(took < grant, "{took:?}");
+        }
+
+        // A line the person allowed is not asked, and the others keep the
+        // call's order.
+        let tied = vec![judged[1].clone(), judged[1].clone(), judged[0].clone()];
+        let mut asked = Vec::new();
+        let opinions = super::second_opinions(
+            &tied,
+            &[None, Some(json!({"recommendation": "allow"})), None],
+            |lines| {
+                asked = lines.iter().map(|(c, _)| c.to_string()).collect();
+                vec![None; lines.len()]
+            },
+        );
+        assert_eq!(asked, vec![tied[0].0.clone(), tied[2].0.clone()]);
+        assert_eq!(opinions, vec![None, None, None]);
+
+        // Nobody is asked, and no wait taken, when no line needs it or
+        // nothing is left to wait.
+        let lines: Vec<(&str, &serde_json::Value)> =
+            judged.iter().map(|(c, r)| (c.as_str(), r)).collect();
+        for (needs, left) in [(false, true), (true, false)] {
+            let opinions = super::second_opinion::ask_at_once(
+                &lines,
+                |_| needs,
+                || left.then(|| Duration::from_millis(200)),
+                |_, _, _| panic!("asked"),
+                |_, _| panic!("charged"),
+            );
+            assert_eq!(opinions, vec![None, None]);
+        }
+    }
+
     /// The folders a project's settings are read in stop at the project's
     /// root (a folder with `.git` or `.claude`, read), at the home (not
     /// read), and, with neither above, read the folder alone: a folder
@@ -7271,7 +7414,7 @@ mod phase_timing_tests {
             let _ = suppress_io::consider(&line, &verdict);
         });
         time("second_opinion", &mut || {
-            let _ = second_opinion_io::consider(&line, &verdict);
+            let _ = second_opinion_io::consider_all(&[(line.as_str(), &verdict)]);
         });
         let json: serde_json::Map<String, serde_json::Value> = phases
             .iter()

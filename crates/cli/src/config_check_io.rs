@@ -716,10 +716,27 @@ env = {{ AWS_ACCESS_KEY_ID = "{FAKE_AWS}" }}
     ///
     /// FAILS ON REVERT: call `check()` (which reads the variables) in those
     /// tests and the run with the variables set fails.
+    ///
+    /// It runs the test binary again itself, straight, with libtest's own
+    /// arguments (`<name> --exact --test-threads=1`): a run through a
+    /// wrapper (`cross`, qemu, any `CARGO_TARGET_<triple>_RUNNER`) would
+    /// start a binary built for another machine with no wrapper, so where
+    /// such a runner is set in the environment it says so and checks
+    /// nothing. A runner set only in `.cargo/config.toml` is not seen here.
     #[test]
     fn the_tests_read_only_the_home_they_make() {
         const CHILD: &str = "IW_CONFIG_CHECK_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
+            return;
+        }
+        if let Some((runner, _)) = std::env::vars_os().find(|(name, _)| {
+            name.to_str()
+                .is_some_and(|n| n.starts_with("CARGO_TARGET_") && n.ends_with("_RUNNER"))
+        }) {
+            eprintln!(
+                "skipped: {} is set, and this test runs its own binary with no runner",
+                runner.to_string_lossy()
+            );
             return;
         }
         let other = home_with(&[
@@ -833,6 +850,47 @@ default_tools_approval_mode = "auto"
             .iter()
             .all(|f| f.kind == Kind::AutoApprove
                 && f.next.contains("innerwarden agents connect codex")));
+    }
+
+    /// What a Codex finding of `approve` says to do: set `prompt`, since a
+    /// server with the field removed takes `auto`, which still runs the
+    /// tools that call themselves read-only without asking. Gemini's `trust`
+    /// is still to be removed.
+    ///
+    /// FAILS ON REVERT: Codex told "Remove it so the agent asks before each
+    /// call".
+    #[test]
+    fn a_codex_approve_finding_says_to_set_prompt() {
+        let home = home_with(&[
+            (
+                ".codex/config.toml",
+                "[mcp_servers.a]\ncommand = \"a-server\"\ndefault_tools_approval_mode = \"approve\"\n",
+            ),
+            (
+                ".gemini/settings.json",
+                r#"{"mcpServers": {"g": {"command": "g-server", "trust": true}}}"#,
+            ),
+        ]);
+        let report = check_in(home.path(), None, None);
+        let codex: Vec<&str> = report
+            .findings
+            .iter()
+            .filter(|f| f.kind == Kind::AutoApprove && f.what.contains("approval_mode"))
+            .map(|f| f.next.as_str())
+            .collect();
+        assert_eq!(codex.len(), 1, "{report:#?}");
+        assert!(
+            codex[0].contains("`\"prompt\"`") && !codex[0].contains("Remove it"),
+            "{}",
+            codex[0]
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.what.contains("`trust`") && f.next.starts_with("Remove it")),
+            "{report:#?}"
+        );
     }
 
     /// A file that grows past the limit while it is read is not taken whole.

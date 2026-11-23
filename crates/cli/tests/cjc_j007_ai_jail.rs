@@ -853,9 +853,18 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
         identified.contains(" --ro-bind-data 10 /run/innerwarden/instance.json --die-with-parent "),
         "the record is the last mount: {identified}"
     );
+    // The jail's command starts through the launcher's own binary, which
+    // closes the abstract unix sockets made outside the jail first.
     assert!(
-        identified.contains("--info-fd 9 -- /bin/true"),
+        identified.contains(&format!(
+            "--info-fd 9 -- {} contain-exec -- /bin/true",
+            bin()
+        )),
         "{identified}"
+    );
+    assert!(
+        plain.contains(&format!(" -- {} contain-exec -- /bin/true", bin())),
+        "{plain}"
     );
     // The key of Active Defence is handed in, just before the record, only
     // where the host has a key the launcher believes; with no key file there
