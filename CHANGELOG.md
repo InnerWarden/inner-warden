@@ -5,6 +5,85 @@ follows semantic versioning.
 
 ## Unreleased
 
+git commands are read on the work tree git itself uses: the one the line
+names (`--work-tree`, `GIT_WORK_TREE`, `-c core.worktree=`, `--config-env`,
+`GIT_CONFIG_KEY_<n>` with `GIT_CONFIG_VALUE_<n>`), else the `core.worktree`
+in the repository's config, else the folder that holds its `.git`, found
+from the folder the agent's command runs in (the hook payload's, not the
+hook's own), a repository made earlier in the same line (`git init`,
+`git clone`) counted as found. Where that work tree is one of the guard's
+places (its folders, the agent settings that load it, its program), is
+inside one or holds one (the home, or a folder above it), only verbs that
+leave the work tree as it is pass (`status`, `log`, `diff`, `show`,
+`add`, `commit`, `fetch` and the like). Any other verb is refused: one
+that puts back what the repository tracks (`checkout`, `restore`,
+`reset --hard`, `stash`, `read-tree -u`, `checkout-index`, `rm`, `mv`,
+`pull`, `merge`, `rebase`), one that removes untracked files (`clean`,
+`stash -u`), an unknown verb and an alias (from `-c`, the repository's
+config or the user's). The one way through is paths that keep the verb out
+of the guard's places (`checkout -- .bashrc`). The hook does not read what
+the repository tracks (its index, objects or packs): that is input an
+attacker shapes, and reading it was found to let a line run.
+`git config core.worktree` pointing into the guard's folder is refused. A
+step of the line that writes a `.git`, a `gitdir` or a `core.worktree`
+(`git config core.worktree`, a redirection, `ln`, `cp`, `git worktree`)
+leaves the work tree of the git commands after it unknown, and a verb that
+writes is refused. `push` to a repository on this machine whose work tree
+reaches the guard's places is refused. The files still read (a `.git`
+file, a repository's config, its `commondir`) are read only as regular
+files, not links, of at most 64 KiB; one that cannot be read so counts as
+unknown, and a verb that writes there is refused.
+Options are read as git reads them: a long option shortened to a prefix
+only it starts (`reset --har`, `checkout --forc`), short options grouped
+or with a value glued on (`checkout -bx <start>`). A `-C`, a `cd` or a
+`--git-dir` naming a folder the line does not say (`-C ""`, `-C "$DIR"`,
+`cd "$DIR"`, a `$(...)`) leaves the work tree unknown, and a verb that
+writes is refused; `$PWD` and `$(pwd)` are read as the folder the shell
+is in. `core.worktree` given to `git clone -c`, and a file written from
+inside a `.git` folder (`cd e/.git`, then a redirection or a command that
+writes), count as rewriting the work tree for the rest of the line.
+Without `--`, `checkout <name>` reads a name that can be a branch as a
+branch, as git does, even when a file or folder has that name, and a name
+written as a revision (`evil~0`, `evil^0`, `:/evil`, `main@{1}`, `@`)
+as a commit; `switch -c <new>` with no start point passes, as
+`checkout -b <new>` does, and a start point after `--` counts as one.
+`GIT_CEILING_DIRECTORIES` stops the search for a repository, as it stops
+git's, read only from the hook's environment (the agent's): a line that
+names it, `unset`s a variable or runs `env -u` or `env -i` is read
+without it. Each folder is read once per line, and each git command once
+per line with the same words, folder and variables (its own
+`GIT_DIR=... git` or `env VAR=... git` among them), so a line of
+thousands of git commands costs what its distinct ones cost.
+
+For a home kept in git (a dotfiles repository with the home as its work
+tree): `status`, `add`, `commit`, `diff`, `fetch`, `push` to another
+host, `checkout -- <file>`, `checkout <branch> -- <file>` and
+`restore <file>` keep working. `reset --hard`, `stash`, `pull`, a
+`checkout` or `switch` of a branch, `clean`, `merge`, `rebase`, `apply`,
+`cherry-pick` and any verb or alias not read here are refused on such a
+home, whatever the repository tracks: run them with paths outside the
+guard's places, or by hand. Not read: a folder or value behind a variable
+the line does not assign, other than the home; an `include` or
+`url.<base>.insteadOf` in a repository's config.
+
+Codex: the hook no longer trusts the proxy for a call when a project layer
+above the trusted folder (in a parent up to the root of the file system,
+past the repository's root) changed after Codex started, when the folder
+the call runs in is not there any more, or, with a trusted project in the
+user's file, when the folder Codex names for the call is not the folder the
+hook runs in. Such calls are judged by the hook. Above the trusted folder
+the `.codex` and its `config.toml` are read, not the folder itself (a
+parent such as the home changes all the time), and the user's own
+`~/.codex` is left out: a whole `.codex` renamed out of a parent above
+the trusted folder is not seen. A project layer that is a link to the
+user's own file, or sits in a `.codex` that is a link to the user's
+`~/.codex`, is read as a layer, not as the user's file: swapped in after
+Codex started, it leaves the call judged. So is the trusted folder itself
+(or one below it) when it leads to the home through a link (renamed away
+and a link to the home put in its place, or a link there pointed at the
+home): its own link and time are read, and a change after Codex started
+leaves the call judged.
+
 What the CLI sends to a listener on this host goes straight there, never
 through a proxy the environment names (`HTTP_PROXY`, `HTTPS_PROXY`,
 `ALL_PROXY`): the MCP proxy's refusal reports and `contain`'s requests to

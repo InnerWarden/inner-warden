@@ -3892,7 +3892,12 @@ pub fn analyze_command_in(
     rule_engine: Option<&RuleEngine>,
     context: Option<&WorkingContext>,
 ) -> CommandAnalysis {
-    analyze_command_at(command, rule_engine, &[], context, 0)
+    // git commands are read from the folder the command runs in, not from
+    // this process's (`crate::threats::in_command_dir`).
+    let dir = context.map(|place| std::path::Path::new(place.cwd.as_str()));
+    crate::threats::in_command_dir(dir, || {
+        analyze_command_at(command, rule_engine, &[], context, 0)
+    })
 }
 
 /// How many startup-file payloads deep [`analyze_command_at`] follows: a
