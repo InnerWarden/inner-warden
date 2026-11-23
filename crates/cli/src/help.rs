@@ -35,6 +35,39 @@
 
 use crate::prog;
 
+/// Every verb `main` dispatches natively. Kept beside the usage table so the
+/// synopsis rule is checked against all of them, and read by the typo hint in
+/// `main` so a suggested verb is always one this binary answers.
+pub(crate) const NATIVE_VERBS: &[&str] = &[
+    "check",
+    "serve",
+    "proxy",
+    "hook",
+    "setup",
+    "dashboard",
+    "upgrade",
+    "update",
+    "self-update",
+    "install",
+    "uninstall",
+    "status",
+    "demo",
+    "agents",
+    "contain",
+    "enforce",
+    "dry-run",
+    "monitor",
+    "allow",
+    "mute",
+    "notify",
+    "observe",
+    "openclaw",
+    "graph",
+    "llm",
+    "host",
+    "mcp",
+];
+
 /// The two spellings of "explain yourself".
 pub(crate) fn is_help_flag(arg: &str) -> bool {
     arg == "--help" || arg == "-h"
@@ -1277,36 +1310,4 @@ mod tests {
             }
         }
     }
-
-    /// Every verb `main` dispatches natively. Kept beside the usage table so the
-    /// synopsis rule above is checked against all of them.
-    const NATIVE_VERBS: &[&str] = &[
-        "check",
-        "serve",
-        "proxy",
-        "hook",
-        "setup",
-        "dashboard",
-        "upgrade",
-        "update",
-        "self-update",
-        "install",
-        "uninstall",
-        "status",
-        "demo",
-        "agents",
-        "contain",
-        "enforce",
-        "dry-run",
-        "monitor",
-        "allow",
-        "mute",
-        "notify",
-        "observe",
-        "openclaw",
-        "graph",
-        "llm",
-        "host",
-        "mcp",
-    ];
 }
