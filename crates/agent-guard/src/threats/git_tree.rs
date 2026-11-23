@@ -18,29 +18,39 @@
 //! Where the work tree reaches a place of the guard (is one, is inside one,
 //! or holds one: the home or a folder above it), only a verb that leaves the
 //! work tree as it is passes (`status`, `log`, `diff`, `show`, `add`,
-//! `commit` and the like, [`KEEPS_TREE`]). Every other verb, a verb not
-//! known here and an alias (from `-c`, from the repository's config or the
-//! user's) included, is refused, unless:
+//! `commit` and the like, [`KEEPS_TREE`]). Every other verb is refused: one
+//! that puts back what the repository tracks (`checkout`, `restore`,
+//! `reset --hard`, `stash`, `read-tree -u`, `checkout-index`, `rm`,
+//! `mv`, `pull`), one that removes what it does not track (`clean`,
+//! `stash -u`), and a verb not known here or an alias (from `-c`, from the
+//! repository's config or the user's). The one way through is paths that
+//! keep the verb out of the guard's places (`checkout -- .bashrc`). What
+//! the repository tracks is not read: its index, objects and packs are
+//! input an attacker shapes, and reading them in the hook was found to let
+//! a line run (a `.git` linked to `/dev/zero`, a pack whose delta grows to
+//! gigabytes, each killing the hook).
 //!
-//! * the paths it is handed keep it out of the guard's places
-//!   (`checkout -- .bashrc`), or
-//! * it only puts back what the repository tracks (`checkout`, `restore`,
-//!   `reset --hard`, `stash`, `read-tree -u`, `checkout-index`, `rm`,
-//!   `mv`, `pull`), and neither its index nor the commit it puts back holds
-//!   a path of the guard's places. Both are read from the repository's files
-//!   ([`objects`]); git is not run.
+//! Besides that:
 //!
-//! A verb that removes what is not tracked (`clean`, `stash -u`/`-a`)
-//! has no such second way: run on a work tree that holds the guard's places,
-//! it removes them. `git config core.worktree <place>` naming a place of the
-//! guard or a folder inside one is refused.
+//! * `git config core.worktree <place>` naming a place of the guard or a
+//!   folder inside one is refused;
+//! * a step of the line that writes a `.git`, a `gitdir` or a
+//!   `core.worktree` (a redirection, `ln`, `cp`, `git config
+//!   core.worktree`, `git worktree`) leaves the work tree of every git
+//!   command after it unknown: a verb that writes is refused;
+//! * `push` to a repository on this machine whose work tree reaches a place
+//!   of the guard is refused (`receive.denyCurrentBranch=updateInstead`
+//!   and the remote's hooks write that work tree).
+//!
+//! The few files still read (a `.git` file, a repository's config, its
+//! `commondir`) are read only when they are regular files, not links, of at
+//! most [`READ_BYTES`]; one that cannot be read so leaves the work tree
+//! unknown, and a verb that writes is refused.
 //!
 //! Not read: a folder or a value behind a variable the line does not assign
-//! (other than the home), an `include` in a repository's config, a
-//! repository found more than [`DISCOVERY_DEPTH`] folders up, and what
-//! `pull` brings from its remote.
-
-mod objects;
+//! (other than the home), an `include` or `url.<base>.insteadOf` in a
+//! repository's config, a repository found more than [`DISCOVERY_DEPTH`]
+//! folders up.
 
 use super::{
     collapse_path, effective_command_index, shell_command_segments, shell_tokens, token_basename,
@@ -64,8 +74,37 @@ const CREATED: usize = 16;
 /// How many folders up a repository is looked for.
 const DISCOVERY_DEPTH: usize = 64;
 
-/// Largest repository config read.
-const CONFIG_BYTES: u64 = 1 << 20;
+/// Largest file of a repository read (a `.git` file, a config,
+/// `commondir`): larger, it is not read.
+const READ_BYTES: u64 = 64 * 1024;
+
+/// Commands that only read the files they name: a `.git` named in one of
+/// them, with no redirection, is not written.
+const READS_ONLY: &[&str] = &[
+    "cat",
+    "diff",
+    "du",
+    "echo",
+    "file",
+    "grep",
+    "head",
+    "less",
+    "ls",
+    "md5sum",
+    "more",
+    "printf",
+    "readlink",
+    "realpath",
+    "rg",
+    "sha1sum",
+    "sha256sum",
+    "stat",
+    "tail",
+    "test",
+    "tree",
+    "wc",
+    "[",
+];
 
 /// The verbs that leave the work tree as it is: they read it, or write only
 /// the index, the references or the objects. A verb read here as writing
@@ -133,15 +172,6 @@ const KEEPS_TREE: &[&str] = &[
     "version",
     "whatchanged",
     "write-tree",
-];
-
-/// Variables that move what git reads as the repository's index or
-/// objects: with one assigned, what the repository tracks is not known.
-const STORE_VARIABLES: &[&str] = &[
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
 ];
 
 thread_local! {
@@ -219,6 +249,8 @@ pub(super) fn git_takes_guard_place_in(
     let mut made_dirs: Vec<PathBuf> = Vec::new();
     // The folders the latest `cd` may have gone to.
     let mut last_cd: Vec<PathBuf> = Vec::new();
+    // A step before wrote a `.git`, a `gitdir` or a `core.worktree`.
+    let mut tree_unknown = false;
     for segment in shell_command_segments(content) {
         let words: Vec<String> = shell_tokens(segment).iter().map(|w| unquote(w)).collect();
         for word in &words {
@@ -227,6 +259,9 @@ pub(super) fn git_takes_guard_place_in(
             }
         }
         let Some(index) = effective_command_index(&words) else {
+            if rewrites_repository(&words, None, &assigned) {
+                tree_unknown = true;
+            }
             continue;
         };
         let name = token_basename(&words[index]).to_ascii_lowercase();
@@ -235,6 +270,7 @@ pub(super) fn git_takes_guard_place_in(
             home,
             assigned: &assigned,
             created: &created,
+            tree_unknown,
         };
         match name.as_str() {
             "cd" | "pushd" => {
@@ -302,8 +338,138 @@ pub(super) fn git_takes_guard_place_in(
             }
             _ => {}
         }
+        if rewrites_repository(&words, Some(index), &assigned) {
+            tree_unknown = true;
+        }
     }
     false
+}
+
+/// Whether a step of the line writes what tells git where a repository or
+/// its work tree is: a `.git` (the folder, a file in it, a `.git` file), a
+/// `gitdir` or `core.worktree`. `index` is where the command is in
+/// `words`.
+fn rewrites_repository(
+    words: &[String],
+    index: Option<usize>,
+    assigned: &[(String, String)],
+) -> bool {
+    if super::output_redirect_targets(words)
+        .iter()
+        .any(|target| names_git(target, assigned))
+    {
+        return true;
+    }
+    let Some(index) = index else {
+        return false;
+    };
+    let name = token_basename(&words[index]).to_ascii_lowercase();
+    let arguments = &words[index + 1..];
+    match name.as_str() {
+        "cd" | "pushd" | "popd" => false,
+        // `git config core.worktree`, and the subcommands that write a
+        // `.git` file or a `gitdir` (`worktree add`, `submodule update`).
+        "git" => {
+            let lower: Vec<String> = arguments
+                .iter()
+                .map(|word| word.to_ascii_lowercase())
+                .collect();
+            lower.iter().any(|word| word == "core.worktree")
+                || lower.windows(2).any(|pair| match pair[0].as_str() {
+                    "worktree" => matches!(pair[1].as_str(), "add" | "move" | "repair"),
+                    "submodule" => matches!(
+                        pair[1].as_str(),
+                        "add" | "update" | "init" | "deinit" | "absorbgitdirs"
+                    ),
+                    _ => false,
+                })
+        }
+        _ if READS_ONLY.contains(&name.as_str()) => false,
+        _ => arguments.iter().any(|word| names_git(word, assigned)),
+    }
+}
+
+/// Whether `word` names a `.git` (a part of a path, a glob that matches
+/// one), or `gitdir` or `core.worktree`, the variables the line
+/// assigned read.
+fn names_git(word: &str, assigned: &[(String, String)]) -> bool {
+    let mut text = word.to_string();
+    for _ in 0..4 {
+        let Some(at) = text.find('$') else { break };
+        let rest = &text[at + 1..];
+        let (name, after) = if let Some(braced) = rest.strip_prefix('{') {
+            match braced.find('}') {
+                Some(end) => (&braced[..end], &braced[end + 1..]),
+                None => break,
+            }
+        } else {
+            let end = rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len());
+            (&rest[..end], &rest[end..])
+        };
+        let Some((_, value)) = assigned.iter().rev().find(|(assigned, _)| assigned == name) else {
+            break;
+        };
+        text = format!("{}{value}{after}", &text[..at]);
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("gitdir") || lower.contains("core.worktree") {
+        return true;
+    }
+    lower
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '/' | '\'' | '"' | '=' | ':' | ',' | '(' | ')' | ';' | '<' | '>' | '|' | '&'
+                )
+        })
+        .any(|part| part == ".git" || (part.starts_with('.') && glob_matches(&part[1..], "git")))
+}
+
+/// Whether the shell pattern `pattern` (`*`, `?`, `[...]`) matches
+/// `text`. A pattern with none of them is not read as one.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    fn at(pattern: &[char], text: &[char]) -> bool {
+        match pattern.first() {
+            None => text.is_empty(),
+            Some('*') => (0..=text.len()).any(|skip| at(&pattern[1..], &text[skip..])),
+            Some('?') => !text.is_empty() && at(&pattern[1..], &text[1..]),
+            Some('[') => {
+                let Some(end) = pattern[1..].iter().position(|c| *c == ']') else {
+                    return false;
+                };
+                let set = &pattern[1..=end];
+                let (negated, set) = match set.first() {
+                    Some('!' | '^') => (true, &set[1..]),
+                    _ => (false, set),
+                };
+                let Some(first) = text.first() else {
+                    return false;
+                };
+                let mut found = false;
+                let mut i = 0usize;
+                while i < set.len() {
+                    if i + 2 < set.len() && set[i + 1] == '-' {
+                        found |= (set[i]..=set[i + 2]).contains(first);
+                        i += 3;
+                    } else {
+                        found |= set[i] == *first;
+                        i += 1;
+                    }
+                }
+                found != negated && at(&pattern[end + 2..], &text[1..])
+            }
+            Some(c) => text.first() == Some(c) && at(&pattern[1..], &text[1..]),
+        }
+    }
+    if !pattern.contains(['*', '?', '[']) {
+        return false;
+    }
+    let pattern: Vec<char> = pattern.chars().take(64).collect();
+    let text: Vec<char> = text.chars().collect();
+    at(&pattern, &text)
 }
 
 /// The guard's places, written out from the home: its folders, the agent
@@ -367,28 +533,6 @@ fn reaches(path: &Path, places: &[String]) -> bool {
     })
 }
 
-/// The guard's places as paths in a work tree at `tree`, lowercase: an
-/// empty one when the tree is a place of the guard or inside one.
-fn tree_targets(tree: &Path, places: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for tree in spellings(tree) {
-        let tree = tree.trim_end_matches('/');
-        for place in places {
-            let target = if is_within(place, tree) {
-                place[tree.len()..].trim_start_matches('/').to_string()
-            } else if is_within(tree, place) {
-                String::new()
-            } else {
-                continue;
-            };
-            if !out.contains(&target) {
-                out.push(target);
-            }
-        }
-    }
-    out
-}
-
 /// A word without its quotes.
 fn unquote(word: &str) -> String {
     word.chars().filter(|c| !matches!(c, '"' | '\'')).collect()
@@ -411,23 +555,15 @@ struct Repository {
     top: PathBuf,
 }
 
-/// Where a verb takes what it puts in the work tree from.
-enum Source {
-    /// The repository's index.
-    Index,
-    /// The tree of the commit a name points at.
-    Rev(String),
-}
-
 /// What a git verb does to the work tree.
 enum Plan {
     /// Leaves it as it is.
     Keeps,
     /// Removes what is not tracked, below the paths when it is handed some.
     Untracked(Vec<String>),
-    /// Puts in place what the sources track, below the paths when it is
-    /// handed some.
-    Tracked(Vec<String>, Vec<Source>),
+    /// Puts in place what the repository tracks, below the paths when it
+    /// is handed some.
+    Tracked(Vec<String>),
     /// Writes to it in a way not read here.
     Writes,
     /// Writes what the index tracks below another folder
@@ -511,7 +647,6 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
         }
         paths
     };
-    let head = || Source::Rev("HEAD".to_string());
     match verb {
         "config" => {
             // `git config [set] core.worktree <value>`.
@@ -537,14 +672,7 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
             let sub = words.first().copied();
             match sub {
                 Some("list" | "show" | "create" | "store" | "drop" | "clear") => Plan::Keeps,
-                Some("pop" | "apply" | "branch") => {
-                    let named = match sub {
-                        Some("branch") => words.get(2),
-                        _ => words.get(1),
-                    };
-                    let stash = named.map_or("refs/stash", |name| *name).to_string();
-                    Plan::Tracked(Vec::new(), vec![Source::Index, head(), Source::Rev(stash)])
-                }
+                Some("pop" | "apply" | "branch") => Plan::Tracked(Vec::new()),
                 None | Some("push" | "save") => {
                     let mut paths: Vec<String> = after
                         .unwrap_or_default()
@@ -558,7 +686,7 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
                     if has(&["--include-untracked", "--all"]) || short_has(&['u', 'a']) {
                         Plan::Untracked(paths)
                     } else {
-                        Plan::Tracked(paths, vec![Source::Index, head()])
+                        Plan::Tracked(paths)
                     }
                 }
                 Some(_) => Plan::Writes,
@@ -571,10 +699,7 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
             if has_prefix("--prefix") {
                 return Plan::Writes;
             }
-            let (trees, _) = operands(rest, &[]);
-            let mut from = vec![Source::Index];
-            from.extend(trees.into_iter().map(|tree| Source::Rev(tree.to_string())));
-            Plan::Tracked(Vec::new(), from)
+            Plan::Tracked(Vec::new())
         }
         "checkout-index" => {
             if let Some(prefix) = option_value(rest, &["--prefix"]) {
@@ -585,21 +710,25 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
             } else {
                 with_unknown(both(operands(rest, &[])))
             };
-            Plan::Tracked(paths, vec![Source::Index])
+            Plan::Tracked(paths)
         }
         "checkout" => {
             let new_branch = has(&["-b", "-B", "--orphan"]);
             let (before, after) = operands(rest, &["-b", "-B", "--orphan"]);
             if let Some(after) = after {
                 let paths = after.into_iter().map(str::to_string).collect();
-                let from = match before.first() {
-                    Some(rev) => vec![Source::Rev(rev.to_string())],
-                    None => vec![Source::Index],
-                };
-                return Plan::Tracked(with_unknown(paths), from);
+                return Plan::Tracked(with_unknown(paths));
             }
             let Some(first) = before.first() else {
-                return Plan::Tracked(with_unknown(Vec::new()), vec![Source::Index, head()]);
+                // With nothing named and nothing forced, checkout moves no
+                // file (`git checkout`, `checkout -b <new>`).
+                if !unknown_paths
+                    && !has(&["-f", "--force", "-m", "--merge"])
+                    && !short_has(&['f', 'm'])
+                {
+                    return Plan::Keeps;
+                }
+                return Plan::Tracked(with_unknown(Vec::new()));
             };
             let is_path = !new_branch
                 && line
@@ -607,76 +736,53 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
                     .is_some_and(|path| path.symlink_metadata().is_ok());
             if is_path {
                 let paths = before.iter().map(|word| word.to_string()).collect();
-                return Plan::Tracked(with_unknown(paths), vec![Source::Index]);
+                return Plan::Tracked(with_unknown(paths));
             }
             let paths = before[1..].iter().map(|word| word.to_string()).collect();
-            Plan::Tracked(
-                with_unknown(paths),
-                vec![Source::Index, Source::Rev(first.to_string())],
-            )
+            Plan::Tracked(with_unknown(paths))
         }
-        "switch" => {
-            let (before, _) = operands(
-                rest,
-                &["-c", "-C", "--orphan", "--create", "--force-create"],
-            );
-            let from = match before.first() {
-                Some(rev) => Source::Rev(rev.to_string()),
-                None => head(),
-            };
-            Plan::Tracked(Vec::new(), vec![Source::Index, from])
-        }
+        "switch" => Plan::Tracked(Vec::new()),
         "restore" => {
             let staged = has(&["--staged", "-S"]);
             let worktree = has(&["--worktree", "-W"]);
             if staged && !worktree {
                 return Plan::Keeps;
             }
-            let mut from = match option_value(rest, &["-s", "--source"]) {
-                Some(source) => vec![Source::Rev(source.to_string())],
-                None => vec![Source::Index],
-            };
-            if staged {
-                from.push(head());
-            }
             let paths = both(operands(rest, &["-s", "--source"]));
-            Plan::Tracked(with_unknown(paths), from)
+            Plan::Tracked(with_unknown(paths))
         }
         "reset" => {
             if !has(&["--hard", "--merge", "--keep"]) {
                 return Plan::Keeps;
             }
-            let (before, _) = operands(rest, &[]);
-            let commit = before.first().map_or("HEAD", |commit| *commit);
-            Plan::Tracked(
-                Vec::new(),
-                vec![Source::Index, Source::Rev(commit.to_string())],
-            )
+            Plan::Tracked(Vec::new())
         }
         "rm" => {
             if has(&["--cached", "--dry-run"]) || short_has(&['n']) {
                 return Plan::Keeps;
             }
-            Plan::Tracked(with_unknown(both(operands(rest, &[]))), vec![Source::Index])
+            Plan::Tracked(with_unknown(both(operands(rest, &[]))))
         }
         "mv" => {
             if has(&["--dry-run"]) || short_has(&['n']) {
                 return Plan::Keeps;
             }
-            Plan::Tracked(with_unknown(both(operands(rest, &[]))), vec![Source::Index])
+            Plan::Tracked(with_unknown(both(operands(rest, &[]))))
         }
-        "pull" => Plan::Tracked(Vec::new(), vec![Source::Index, head()]),
+        "pull" => Plan::Tracked(Vec::new()),
         _ if KEEPS_TREE.contains(&verb) => Plan::Keeps,
         _ => Plan::Writes,
     }
 }
 
-/// What the line has said so far: the home, the variables it assigned and
-/// the repositories it made.
+/// What the line has said so far: the home, the variables it assigned,
+/// the repositories it made, and whether a step before rewrote where a
+/// repository or its work tree is ([`rewrites_repository`]).
 struct Line<'a> {
     home: Option<&'a Path>,
     assigned: &'a [(String, String)],
     created: &'a [Repository],
+    tree_unknown: bool,
 }
 
 /// A git command's global options, read.
@@ -925,7 +1031,12 @@ impl Line<'_> {
         let folder = &invocation.folder;
         let plan = plan(&verb, rest, folder, self);
         if matches!(plan, Plan::Keeps) {
-            return false;
+            return verb == "push" && self.pushes_to_guard(rest, &invocation, places);
+        }
+        // Where the repository and its work tree are was rewritten earlier
+        // in the line: not known here.
+        if self.tree_unknown {
+            return true;
         }
 
         // The repository: named, made before in the line, or found from the
@@ -935,7 +1046,10 @@ impl Line<'_> {
             .as_deref()
             .and_then(|text| self.resolve(text, folder));
         let found = if invocation.git_dir_text.is_none() {
-            self.discover(folder)
+            match self.discover(folder) {
+                Ok(found) => found,
+                Err(Unread) => return true,
+            }
         } else {
             None
         };
@@ -958,7 +1072,11 @@ impl Line<'_> {
                     .is_some_and(|tree| reaches(&tree, places))
                 && !matches!(plan, Plan::Points(_));
         }
-        let config_tree = git_dir.as_deref().and_then(core_worktree);
+        let config_tree = match git_dir.as_deref().map(core_worktree) {
+            Some(Err(Unread)) => return true,
+            Some(Ok(tree)) => tree,
+            None => None,
+        };
         // `core.worktree`, relative, is read in the repository's folder.
         let tree = if let Some(text) = &invocation.tree_text {
             self.resolve(text, folder)
@@ -1024,101 +1142,326 @@ impl Line<'_> {
                 };
                 reaches(&scope, places) && !kept_out(&paths)
             }
-            Plan::Tracked(paths, from) => {
-                if !reaches(&tree, places) || kept_out(&paths) {
-                    return false;
-                }
-                if made
-                    || STORE_VARIABLES
-                        .iter()
-                        .any(|name| self.variable(name).is_some())
-                {
-                    return true;
-                }
-                let Some(repository) = git_dir.as_deref().and_then(objects::Repo::open) else {
-                    return true;
-                };
-                let targets = tree_targets(&tree, places);
-                from.iter().any(|source| {
-                    let holds = match source {
-                        Source::Index => repository.index_holds(&targets),
-                        Source::Rev(rev) => repository.rev_holds(rev, &targets),
-                    };
-                    holds != Some(false)
-                })
-            }
+            Plan::Tracked(paths) => reaches(&tree, places) && !kept_out(&paths),
         }
     }
 
     /// The repository git finds from `folder` up, a repository the line
-    /// made counted: a `.git` folder, or a `.git` file that names one
-    /// (`gitdir: <path>`).
-    fn discover(&self, folder: &Path) -> Option<Repository> {
+    /// made counted. `Err` when a `.git` on the way cannot be read.
+    fn discover(&self, folder: &Path) -> Result<Option<Repository>, Unread> {
         for dir in folder.ancestors().take(DISCOVERY_DEPTH) {
             if let Some(made) = self.created.iter().find(|made| made.top == dir) {
-                return Some(made.clone());
+                return Ok(Some(made.clone()));
             }
-            let dot_git = dir.join(".git");
-            let Ok(meta) = std::fs::metadata(&dot_git) else {
+            if let Some(repository) = repository_at(dir)? {
+                return Ok(Some(repository));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether `git push <rest>` sends to a repository on this machine
+    /// whose work tree reaches a place of the guard: the remote's
+    /// `receive.denyCurrentBranch=updateInstead` or its hooks write that
+    /// work tree. A remote the line names that the repository's config does
+    /// not hold is read as a path, as git reads it; with none named, every
+    /// remote of the config is read.
+    fn pushes_to_guard(&self, rest: &[String], invocation: &Invocation, places: &[String]) -> bool {
+        let folder = &invocation.folder;
+        let (named, _) = operands(
+            rest,
+            &["--repo", "-o", "--push-option", "--receive-pack", "--exec"],
+        );
+        let target = option_value(rest, &["--repo"]).or(named.first().copied());
+        let git_dir = match invocation.git_dir_text.as_deref() {
+            Some(text) => self.resolve(text, folder),
+            None => match self.discover(folder) {
+                Ok(found) => found.map(|repository| repository.git_dir),
+                Err(Unread) => return true,
+            },
+        };
+        let entries = match git_dir.as_deref().filter(|git_dir| git_dir.is_dir()) {
+            Some(git_dir) => match repository_config(git_dir) {
+                Ok(entries) => entries,
+                Err(Unread) => return true,
+            },
+            None => Vec::new(),
+        };
+        let urls_of = |remote: Option<&str>| -> Vec<String> {
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.section == "remote"
+                        && matches!(entry.key.as_str(), "url" | "pushurl")
+                        && remote.is_none_or(|remote| entry.sub.as_deref() == Some(remote))
+                })
+                .map(|entry| entry.value.clone())
+                .collect()
+        };
+        let urls = match target {
+            Some(target) => {
+                let configured = urls_of(Some(target));
+                if configured.is_empty() {
+                    vec![target.to_string()]
+                } else {
+                    configured
+                }
+            }
+            None => urls_of(None),
+        };
+        urls.iter().any(|url| {
+            let Some(path) = self.local_path(url, folder) else {
+                return false;
+            };
+            match pushed_tree(&path) {
+                Ok(Some(tree)) => reaches(&tree, places),
+                Ok(None) => false,
+                Err(Unread) => true,
+            }
+        })
+    }
+
+    /// The path a remote's URL names on this machine: a path or a
+    /// `file://` URL; `None` for one on another host.
+    fn local_path(&self, url: &str, folder: &Path) -> Option<PathBuf> {
+        let url = url.strip_prefix("file://").unwrap_or(url);
+        if url.contains("://") {
+            return None;
+        }
+        if !url.starts_with(['/', '~', '.', '$']) {
+            if let Some(colon) = url.find(':') {
+                if !url[..colon].contains('/') {
+                    return None;
+                }
+            }
+        }
+        self.resolve(url, folder)
+    }
+}
+
+/// A file of a repository that could not be read as a small regular file.
+struct Unread;
+
+/// The text of `path` when it is a regular file, not a link, of at most
+/// [`READ_BYTES`]; `Ok(None)` when it is not there. Opened without
+/// following a link and without waiting (a FIFO, a device), then checked
+/// on the open file.
+fn read_small(path: &Path) -> Result<Option<String>, Unread> {
+    use std::io::Read;
+    let missing = |error: &std::io::Error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        )
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return Err(Unread),
+        Err(error) if missing(&error) => return Ok(None),
+        Err(_) => return Err(Unread),
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if missing(&error) => return Ok(None),
+        Err(_) => return Err(Unread),
+    };
+    let meta = file.metadata().map_err(|_| Unread)?;
+    if !meta.is_file() || meta.len() > READ_BYTES {
+        return Err(Unread);
+    }
+    let mut bytes = Vec::new();
+    file.take(READ_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| Unread)?;
+    if bytes.len() as u64 > READ_BYTES {
+        return Err(Unread);
+    }
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// The repository whose `.git` is in `dir`: a `.git` folder, or a `.git`
+/// file that names one (`gitdir: <path>`).
+fn repository_at(dir: &Path) -> Result<Option<Repository>, Unread> {
+    let dot_git = dir.join(".git");
+    let Ok(meta) = std::fs::metadata(&dot_git) else {
+        // A link to nowhere, or to a loop: git cannot use it either, but
+        // it is not read as missing.
+        return match std::fs::symlink_metadata(&dot_git) {
+            Ok(_) => Err(Unread),
+            Err(_) => Ok(None),
+        };
+    };
+    if meta.is_dir() {
+        return Ok(Some(Repository {
+            git_dir: dot_git,
+            top: dir.to_path_buf(),
+        }));
+    }
+    let Some(text) = read_small(&dot_git)? else {
+        return Ok(None);
+    };
+    let Some(named) = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gitdir:"))
+    else {
+        return Err(Unread);
+    };
+    let named = PathBuf::from(named.trim());
+    let git_dir = if named.is_absolute() {
+        named
+    } else {
+        dir.join(named)
+    };
+    Ok(Some(Repository {
+        git_dir,
+        top: dir.to_path_buf(),
+    }))
+}
+
+/// The work tree of the repository at `path` (its top, or a git folder),
+/// as a push to it would write it: `None` when there is no repository
+/// there or it has no work tree (bare).
+fn pushed_tree(path: &Path) -> Result<Option<PathBuf>, Unread> {
+    let mut with_suffix = path.as_os_str().to_owned();
+    with_suffix.push(".git");
+    for candidate in [path.to_path_buf(), PathBuf::from(with_suffix)] {
+        let (git_dir, top) = match repository_at(&candidate)? {
+            Some(repository) => (repository.git_dir, Some(repository.top)),
+            None if candidate.join("HEAD").is_file() && candidate.join("objects").is_dir() => {
+                (candidate.clone(), None)
+            }
+            None => continue,
+        };
+        let entries = repository_config(&git_dir)?;
+        if let Some(tree) = single_worktree(&entries)? {
+            let tree = PathBuf::from(&tree);
+            let tree = if tree.is_absolute() {
+                tree
+            } else {
+                git_dir.join(tree)
+            };
+            return Ok(Some(PathBuf::from(collapse_path(&tree.to_string_lossy()))));
+        }
+        if let Some(top) = top {
+            return Ok(Some(top));
+        }
+        let bare = entries
+            .iter()
+            .rev()
+            .find(|entry| entry.section == "core" && entry.sub.is_none() && entry.key == "bare");
+        if bare.is_some_and(|entry| entry.value.eq_ignore_ascii_case("true")) {
+            return Ok(None);
+        }
+        return Ok(git_dir.parent().map(Path::to_path_buf));
+    }
+    Ok(None)
+}
+
+/// One setting of a git config: `[section "sub"] key = value`, the section
+/// and key lowercase.
+struct Entry {
+    section: String,
+    sub: Option<String>,
+    key: String,
+    value: String,
+}
+
+/// The settings of a config's text, as git writes them (an `include` is
+/// not followed).
+fn parse_config(text: &str, out: &mut Vec<Entry>) {
+    let mut section = String::new();
+    let mut sub: Option<String> = None;
+    for line in text.lines() {
+        let mut body = line.trim();
+        if let Some(rest) = body.strip_prefix('[') {
+            let Some(end) = rest.find(']') else {
                 continue;
             };
-            if meta.is_dir() {
-                return Some(Repository {
-                    git_dir: dot_git,
-                    top: dir.to_path_buf(),
-                });
-            }
-            let text = std::fs::read_to_string(&dot_git).ok()?;
-            let named = text
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("gitdir:"))?;
-            let named = PathBuf::from(named.trim());
-            let git_dir = if named.is_absolute() {
-                named
-            } else {
-                dir.join(named)
+            let head = rest[..end].trim();
+            let (name, named) = match head.split_once(char::is_whitespace) {
+                Some((name, named)) => (name, Some(named.trim().trim_matches('"').to_string())),
+                None => match head.split_once('.') {
+                    Some((name, named)) => (name, Some(named.to_string())),
+                    None => (head, None),
+                },
             };
-            return Some(Repository {
-                git_dir,
-                top: dir.to_path_buf(),
-            });
+            section = name.to_ascii_lowercase();
+            sub = named;
+            body = rest[end + 1..].trim();
         }
-        None
+        if body.is_empty() || body.starts_with(['#', ';']) {
+            continue;
+        }
+        let (key, value) = match body.split_once('=') {
+            Some((key, value)) => (key.trim(), value.trim()),
+            None => (body, "true"),
+        };
+        let value = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .unwrap_or(value);
+        out.push(Entry {
+            section: section.clone(),
+            sub: sub.clone(),
+            key: key.to_ascii_lowercase(),
+            value: value.to_string(),
+        });
+    }
+}
+
+/// The settings of the repository at `git_dir`: its `config`, the config
+/// of the folder its `commondir` names (a linked work tree) and its
+/// `config.worktree`.
+fn repository_config(git_dir: &Path) -> Result<Vec<Entry>, Unread> {
+    let mut entries = Vec::new();
+    if let Some(common) = read_small(&git_dir.join("commondir"))? {
+        let common = PathBuf::from(common.trim());
+        let common = if common.is_absolute() {
+            common
+        } else {
+            git_dir.join(common)
+        };
+        if let Some(text) = read_small(&common.join("config"))? {
+            parse_config(&text, &mut entries);
+        }
+    }
+    for name in ["config", "config.worktree"] {
+        if let Some(text) = read_small(&git_dir.join(name))? {
+            parse_config(&text, &mut entries);
+        }
+    }
+    Ok(entries)
+}
+
+/// The one `core.worktree` the settings hold; `Err` when they hold more
+/// than one value (which one git takes is not read here).
+fn single_worktree(entries: &[Entry]) -> Result<Option<String>, Unread> {
+    let mut values: Vec<&str> = entries
+        .iter()
+        .filter(|entry| entry.section == "core" && entry.sub.is_none() && entry.key == "worktree")
+        .map(|entry| entry.value.as_str())
+        .collect();
+    values.sort_unstable();
+    values.dedup();
+    match values.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some((*one).to_string())),
+        _ => Err(Unread),
     }
 }
 
 /// The `core.worktree` of the repository at `git_dir`, as its config
 /// writes it.
-fn core_worktree(git_dir: &Path) -> Option<String> {
-    use std::io::Read;
-    let file = std::fs::File::open(git_dir.join("config")).ok()?;
-    let mut text = String::new();
-    file.take(CONFIG_BYTES).read_to_string(&mut text).ok()?;
-    let mut in_core = false;
-    let mut value = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(section) = line.strip_prefix('[') {
-            let name = section.split(']').next().unwrap_or("").trim();
-            in_core = name.eq_ignore_ascii_case("core");
-            continue;
-        }
-        if !in_core {
-            continue;
-        }
-        let Some((key, found)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case("worktree") {
-            let found = found.trim();
-            let found = found
-                .strip_prefix('"')
-                .and_then(|found| found.strip_suffix('"'))
-                .unwrap_or(found);
-            value = Some(found.to_string());
-        }
-    }
-    value
+fn core_worktree(git_dir: &Path) -> Result<Option<String>, Unread> {
+    single_worktree(&repository_config(git_dir)?)
 }
 
 #[cfg(test)]
@@ -1179,9 +1522,8 @@ mod tests {
         assert!(takes("git stash -u", h, h));
         assert!(takes("cd ~ && git clean -ffdx", h, &h.join("proj/src")));
         assert!(takes("git clean -fdx .config", h, h));
-        // A checkout on a home made a repository whose files cannot be
-        // read (this `.git` is an empty folder): what it puts back is not
-        // known.
+        // A checkout of a branch on a home made a repository: what it
+        // puts back is not read.
         assert!(takes("git checkout main", h, h));
         // Dry runs, and a clean below the home that does not reach it.
         assert!(!takes("git clean -n -dx", h, h));
@@ -1399,9 +1741,9 @@ mod tests {
         assert!(!takes("git -C r checkout-index -a -f", h, h));
     }
 
-    /// FAILS ON REVERT of reading what the repository tracks: a clone whose
-    /// files include the guard's, its work tree the home. No line names the
-    /// guard's folder.
+    /// A clone whose files include the guard's, its work tree the home. No
+    /// line names the guard's folder; what the clone tracks is not read, the
+    /// verb that puts it back is refused.
     #[cfg(unix)]
     #[test]
     fn a_clone_tracking_the_guard_folder_put_on_the_home_is_refused() {
@@ -1428,6 +1770,7 @@ mod tests {
         );
         assert!(takes(&line, h, h), "{line}");
         // Taken out of the index first: the commit still holds it.
+        // (Nothing of the repository is read: refused as before.)
         git(
             h,
             &[
@@ -1452,9 +1795,12 @@ mod tests {
         ));
     }
 
-    /// A dotfiles repository that does not track the guard's places keeps
-    /// working on the home: put back, reset, stash, pull, a branch; what
-    /// removes untracked files does not.
+    /// FAILS ON REVERT of the `Tracked` arm read without the repository's
+    /// files: a dotfiles repository on the home keeps what reads, records,
+    /// or puts back a file named outside the guard's places; a verb that
+    /// puts back the whole tree (`reset --hard`, `stash`, `pull`, a
+    /// branch) or removes untracked files is refused, whatever the
+    /// repository tracks.
     #[cfg(unix)]
     #[test]
     fn a_dotfiles_repository_keeps_working() {
@@ -1469,17 +1815,20 @@ mod tests {
             "status",
             "add .bashrc",
             "commit -m x",
+            "checkout",
+            "checkout -b topic",
             "checkout -- .bashrc",
             "checkout .bashrc",
+            "checkout other -- .bashrc",
             "restore .bashrc",
-            "reset --hard",
-            "reset --hard HEAD",
-            "stash",
-            "stash pop",
-            "pull",
-            "checkout other",
-            "switch main",
+            "restore --staged .bashrc",
+            "reset",
+            "reset --soft HEAD",
+            "stash list",
+            "fetch",
+            "push",
             "diff",
+            "log -1",
         ] {
             let line = format!("git --git-dir=$HOME/.dotfiles --work-tree=$HOME {verb}");
             assert!(!takes(&line, h, h), "{line}");
@@ -1491,28 +1840,148 @@ mod tests {
             "stash --all",
             "merge other",
             "apply x.patch",
+            "reset --hard",
+            "reset --hard HEAD",
+            "stash",
+            "stash pop",
+            "pull",
+            "checkout other",
+            "switch main",
+            "checkout -f",
+            "checkout -m",
+            "checkout -- .",
+            "rm -r .config",
         ] {
             let line = format!("git --git-dir=$HOME/.dotfiles --work-tree=$HOME {verb}");
             assert!(takes(&line, h, h), "{line}");
         }
-        // Moved by `reset --soft` to a commit that holds the guard's
-        // folder, without the index: the commit is read.
-        let other = tempfile::TempDir::new().unwrap();
-        let s = other.path().join("s");
-        repository_with(&s, &[".config/innerwarden/posture"]);
-        let url = s.to_string_lossy().into_owned();
-        git(h, &[d[0], "fetch", "-q", &url, "main:evil"]);
-        assert!(takes(
-            "git --git-dir=$HOME/.dotfiles --work-tree=$HOME checkout evil",
-            h,
-            h
-        ));
-        git(h, &[d[0], d[1], "reset", "-q", "--soft", "evil"]);
-        assert!(takes(
-            "git --git-dir=$HOME/.dotfiles --work-tree=$HOME reset --hard",
-            h,
-            h
-        ));
+    }
+
+    /// FAILS ON REVERT of [`read_small`] (a `.git` or a config read whole,
+    /// following a link, from a device or a FIFO): what cannot be read as a
+    /// small regular file leaves the work tree unknown, and a verb that
+    /// writes is refused, at once.
+    #[cfg(unix)]
+    #[test]
+    fn a_git_file_that_is_not_a_small_regular_file_is_not_read() {
+        let dir = guarded_home();
+        let h = dir.path();
+        std::fs::create_dir_all(h.join("w")).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", h.join("w/.git")).unwrap();
+        let started = std::time::Instant::now();
+        assert!(takes("git -C w checkout -f", h, h));
+        assert!(takes("git -C w clean -fdx", h, h));
+        assert!(!takes("git -C w status", h, h));
+        // A link to a gitdir file is not followed either.
+        std::fs::create_dir_all(h.join("v")).unwrap();
+        std::fs::write(h.join("gitfile"), "gitdir: ../proj/.git\n").unwrap();
+        std::os::unix::fs::symlink(h.join("gitfile"), h.join("v/.git")).unwrap();
+        assert!(takes("git -C v reset --hard", h, h));
+        // A FIFO as the config: opened without waiting, not read.
+        repository_with(&h.join("f"), &["a.txt"]);
+        std::fs::remove_file(h.join("f/.git/config")).unwrap();
+        let fifo =
+            std::ffi::CString::new(h.join("f/.git/config").to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(takes("git -C f checkout -- a.txt", h, h));
+        // A config past the size read.
+        repository_with(&h.join("g"), &["a.txt"]);
+        let big = format!("[core]\n#{}\n", "x".repeat(READ_BYTES as usize));
+        std::fs::write(h.join("g/.git/config"), big).unwrap();
+        assert!(takes("git -C g checkout -- a.txt", h, h));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        // A project with its own config, below the home, works as before.
+        repository_with(&h.join("proj"), &["a.txt"]);
+        assert!(!takes("git -C proj checkout -- a.txt", h, h));
+        assert!(!takes("git -C proj reset --hard", h, h));
+        assert!(!takes("git -C proj clean -fdx", h, h));
+    }
+
+    /// FAILS ON REVERT of [`rewrites_repository`]: a step of the line that
+    /// writes a `.git`, a `gitdir` or a `core.worktree` leaves the work
+    /// tree of the git commands after it unknown. Each line, run for real,
+    /// resets the home to a repository's files.
+    #[cfg(unix)]
+    #[test]
+    fn a_line_that_rewrites_where_the_repository_is_is_refused() {
+        let dir = guarded_home();
+        let h = dir.path();
+        repository_with(&h.join("e"), &["README"]);
+        for line in [
+            "git -C e config core.worktree $HOME && git -C e reset --hard",
+            "git -C e config --unset core.worktree; git -C e checkout -f",
+            "printf '[core]\\n\\tworktree = /h\\n' >> e/.git/config && git -C e reset --hard",
+            "printf 'gitdir: /h/e/.git' > ~/.git && git -C ~ checkout -f",
+            "ln -s $HOME/e/.git ~/.git && git -C ~ reset --hard",
+            "ln -s e/.g?t ~/ && git -C ~ reset --hard",
+            "D=.git; cp -r e/$D ~/ && git -C ~ reset --hard",
+            "cd e && sed -i 's/x/y/' .git/config && git stash",
+            "git -C e worktree add ~/x && git -C ~/x checkout -f",
+        ] {
+            assert!(takes(line, h, h), "{line}");
+        }
+        // Reading a `.git`, or writing other files, leaves the line as it is.
+        repository_with(&h.join("proj"), &["a.txt"]);
+        let p = h.join("proj");
+        for line in [
+            "cat .git/config && git checkout -- a.txt",
+            "ls .git && git reset --hard",
+            "echo x > notes.txt && git checkout -- a.txt",
+            "printf 'target/\\n' >> .gitignore && git stash",
+            "git config user.name x && git reset --hard",
+            "git worktree remove --force ../wt && git worktree prune",
+            "git submodule status && git checkout -- a.txt",
+        ] {
+            assert!(!takes(line, h, &p), "{line}");
+        }
+    }
+
+    /// FAILS ON REVERT of [`Line::pushes_to_guard`]: a push to a repository
+    /// on this machine whose work tree is the home.
+    #[cfg(unix)]
+    #[test]
+    fn a_push_to_a_repository_on_the_home_is_refused() {
+        let dir = guarded_home();
+        let h = dir.path();
+        git(h, &["init", "-q", "."]);
+        git(h, &["add", ".bashrc"]);
+        git(h, &["commit", "-q", "-m", "c"]);
+        let away = tempfile::TempDir::new().unwrap();
+        let c = away.path().join("c");
+        let home_url = h.to_string_lossy().into_owned();
+        git(away.path(), &["clone", "-q", &home_url, "c"]);
+        let c_text = c.to_string_lossy().into_owned();
+        for line in [
+            format!("git -C {c_text} push origin main"),
+            format!("git -C {c_text} push"),
+            format!("git -C {c_text} push $HOME main"),
+            format!("git -C {c_text} push file://{home_url} main"),
+            format!("git -C {c_text} push {home_url}/.git main"),
+        ] {
+            assert!(takes(&line, h, h), "{line}");
+        }
+        // A bare repository, a project below the home and a host elsewhere.
+        git(h, &["init", "-q", "--bare", "b.git"]);
+        repository_with(&h.join("proj"), &["a.txt"]);
+        git(
+            &c,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://example.invalid/r.git",
+            ],
+        );
+        for line in [
+            format!("git -C {c_text} push $HOME/b.git main"),
+            format!("git -C {c_text} push $HOME/b main"),
+            format!("git -C {c_text} push $HOME/proj main"),
+            format!("git -C {c_text} push origin main"),
+            format!("git -C {c_text} push git@example.invalid:r.git main"),
+        ] {
+            assert!(!takes(&line, h, h), "{line}");
+        }
     }
 
     /// FAILS ON REVERT of `in_command_dir`: the folder the command runs in

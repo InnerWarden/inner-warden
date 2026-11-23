@@ -15,26 +15,35 @@ hook's own), a repository made earlier in the same line (`git init`,
 places (its folders, the agent settings that load it, its program), is
 inside one or holds one (the home, or a folder above it), only verbs that
 leave the work tree as it is pass (`status`, `log`, `diff`, `show`,
-`add`, `commit`, `fetch`, `push` and the like). Any other verb, an
-unknown one and an alias (from `-c`, the repository's config or the user's)
-included, is refused, unless the paths it is handed keep it out of the
-guard's places (`checkout -- .bashrc`), or it only puts back what the
-repository tracks (`checkout`, `restore`, `reset --hard`, `stash`,
-`read-tree -u`, `checkout-index`, `rm`, `mv`, `pull`) and neither the
-index nor the commit it puts back holds a path in the guard's places. Both
-are read from the repository's own files; git is not run.
-`git config core.worktree` pointing into the guard's folder is refused.
+`add`, `commit`, `fetch` and the like). Any other verb is refused: one
+that puts back what the repository tracks (`checkout`, `restore`,
+`reset --hard`, `stash`, `read-tree -u`, `checkout-index`, `rm`, `mv`,
+`pull`, `merge`, `rebase`), one that removes untracked files (`clean`,
+`stash -u`), an unknown verb and an alias (from `-c`, the repository's
+config or the user's). The one way through is paths that keep the verb out
+of the guard's places (`checkout -- .bashrc`). The hook does not read what
+the repository tracks (its index, objects or packs): that is input an
+attacker shapes, and reading it was found to let a line run.
+`git config core.worktree` pointing into the guard's folder is refused. A
+step of the line that writes a `.git`, a `gitdir` or a `core.worktree`
+(`git config core.worktree`, a redirection, `ln`, `cp`, `git worktree`)
+leaves the work tree of the git commands after it unknown, and a verb that
+writes is refused. `push` to a repository on this machine whose work tree
+reaches the guard's places is refused. The files still read (a `.git`
+file, a repository's config, its `commondir`) are read only as regular
+files, not links, of at most 64 KiB; one that cannot be read so counts as
+unknown, and a verb that writes there is refused.
 
 For a home kept in git (a dotfiles repository with the home as its work
-tree): `status`, `add`, `commit`, `checkout -- <file>`, `reset --hard`,
-`stash`, `pull` and a `checkout` of a branch keep working when the
-repository does not track the guard's places; `clean -f`, `stash -u` and
-`stash -a` are refused (they remove the guard's untracked files), and so
-are `merge`, `rebase`, `apply`, `cherry-pick` and any verb or alias not
-read here. Not read: a folder or value behind a variable the line does not
-assign, other than the home; an `include` in a repository's config; what
-`pull` brings from its remote; a repository in SHA-256 or with a reftable
-(its writes there are refused).
+tree): `status`, `add`, `commit`, `diff`, `fetch`, `push` to another
+host, `checkout -- <file>`, `checkout <branch> -- <file>` and
+`restore <file>` keep working. `reset --hard`, `stash`, `pull`, a
+`checkout` or `switch` of a branch, `clean`, `merge`, `rebase`, `apply`,
+`cherry-pick` and any verb or alias not read here are refused on such a
+home, whatever the repository tracks: run them with paths outside the
+guard's places, or by hand. Not read: a folder or value behind a variable
+the line does not assign, other than the home; an `include` or
+`url.<base>.insteadOf` in a repository's config.
 
 Codex: the hook no longer trusts the proxy for a call when a project layer
 above the trusted folder (in a parent up to the root of the file system,

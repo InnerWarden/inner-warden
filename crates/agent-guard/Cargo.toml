@@ -47,9 +47,6 @@ tree-sitter-bash = "0.25"
 # (`mcp_proxy::remote`). Already in the tree through the CLI; same version and
 # features (rustls, the system's roots).
 ureq = { version = "3", features = ["json"] }
-# Inflate a repository's objects to read what a commit tracks without running
-# git (`threats::git_tree`). Already in the tree through `ureq`; same version.
-flate2 = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
