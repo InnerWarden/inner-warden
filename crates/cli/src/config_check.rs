@@ -389,8 +389,17 @@ fn servers(
         };
         let (command, args, wrapped) = launch(server);
         for why in auto_approved(agent, server) {
+            // Codex: with the field gone, `auto` applies, which still runs
+            // the tools that call themselves read-only (or neither
+            // destructive nor open-world) without asking; `prompt` asks
+            // before each call.
+            const CODEX_PROMPT: &str = "Set it to `\"prompt\"` so Codex asks before each call (with it removed, Codex's default `auto` still runs tools that call themselves read-only without asking)";
             let next = match agent {
-                "cursor" | "gemini" | "codex" if !wrapped => format!(
+                "codex" if !wrapped => format!(
+                    "{CODEX_PROMPT}; `innerwarden agents connect codex` puts the guard in front of this server's calls."
+                ),
+                "codex" => format!("{CODEX_PROMPT}."),
+                "cursor" | "gemini" if !wrapped => format!(
                     "Remove it so the agent asks before each call; `innerwarden agents connect {agent}` puts the guard in front of this server's calls."
                 ),
                 _ => "Remove it so the agent asks before each call.".to_string(),
@@ -464,7 +473,8 @@ fn is_innerwarden(program: &str) -> bool {
     stem(program) == "innerwarden"
 }
 
-/// Why a server's calls run without asking, or `None`. Only a field the
+/// Why a server's calls run without asking, one line each (empty when they
+/// do not). Only a field the
 /// agent's own docs say skips its confirmation is counted:
 ///
 /// * Gemini CLI: `trust: true` "bypasses all tool call confirmations for
@@ -493,10 +503,15 @@ fn is_innerwarden(program: &str) -> bool {
 ///   (codex-rs/codex-mcp/src/mcp/mod.rs:102), and
 ///   `requires_mcp_tool_approval_for_mode` gives false
 ///   (codex-rs/core/src/mcp_tool_call.rs:2878). Counted.
-/// * `auto` is the default: a tool runs without asking only when it calls
-///   itself read-only (`readOnlyHint`), else Codex asks
-///   (codex-rs/core/src/mcp_tool_call.rs:2853-2866, 2873). It is what every
-///   server gets when nothing is set, so it is not counted.
+/// * `auto` is the default: a tool runs without asking when it calls
+///   itself read-only (`readOnlyHint`), and also when it says it is neither
+///   destructive nor open-world (`destructiveHint` and `openWorldHint` both
+///   false); else Codex asks (codex-rs/core/src/mcp_tool_call.rs:2853-2866,
+///   2873). It is what every server gets when nothing is set, so it is not
+///   counted.
+/// * `writes` is another mode; it is not counted here (only `approve`,
+///   which asks for nothing, is).
+/// * `prompt` asks before every call; it is what the finding suggests.
 fn auto_approved(agent: &str, server: &Value) -> Vec<String> {
     match agent {
         "gemini" if server.get("trust").and_then(Value::as_bool) == Some(true) => {

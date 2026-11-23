@@ -5,6 +5,35 @@ follows semantic versioning.
 
 ## Unreleased
 
+The LLM second opinion and the notifications read their config only from
+the account's own home, as the account database gives it, never from the
+`HOME` the caller hands down. `HOME=<dir> innerwarden check ...` read the
+`llm.toml` in `<dir>` and sent the file its `api_key_file` named as the
+bearer key to the url it named, and fired the webhooks of the
+`notify.toml` there. The key file is read only from inside the config's
+folder, as a regular file with no other name (not a symbolic or a hard
+link): `innerwarden llm set-key` stores it there, and `llm set --key-file`
+refuses a file elsewhere. `api_key_env` is honoured only in the account's
+own `llm.toml`, never in one `IW_LLM_CONFIG` names. On Windows, where no
+account database is read, the home is still `HOME`.
+
+A config `IW_LLM_CONFIG` names carries no API key at all: an override
+naming `~/.config/innerwarden/llm-key` (or another file under the home)
+sent the account's stored key to the url it named. An account whose home
+is not in the account database, or does not exist, and that relied on
+`IW_LLM_CONFIG` for a cloud endpoint loses the key; only an endpoint
+without one works that way, and `llm status` says why. The account's own
+`llm.toml` and its key are read through one handle on the config folder
+(the folder may be a link), the key by plain name and without blocking, so
+the folder cannot be swapped between the two reads and a FIFO never holds
+`check`. `llm set --url` to another address drops the key settings unless
+the same call gives `--key-file` or `--key-env`; run `llm set-key` again.
+A key named and not read is said on stderr. The suppressions
+(`suppress.toml`) come only from the account's own home too:
+`IW_SUPPRESS_CONFIG` is honoured only as `/dev/null` (no suppressions,
+what the jail hands its hook). Under `sudo -E`, `llm set`, `allow` and
+`mute` now write root's config, not the invoking user's.
+
 An MCP server in code mode (one tool that runs a script against its API,
 such as Cloudflare's `search` and `execute`) is judged by the API calls in
 the script, in the hook and in the MCP proxy alike. A call to a tool named
@@ -945,6 +974,39 @@ their MCP servers get no session id to match. Details and limits:
 
 ### AI Jail
 
+- **A Linux jail's programs do not connect to abstract unix sockets made
+  outside it.** The jail shares the host's network, where an X server's
+  `@/tmp/.X11-unix/X0` lives, so a program in it could type into your other
+  windows. Every Linux jail now starts its command through
+  `innerwarden contain-exec -- <command>` (it shows in the jail's command
+  line and in `--dry-run`), which puts it under Landlock's abstract socket
+  scope and replaces itself with the command. TCP, unix sockets reached by a
+  path and abstract sockets the jail's own programs make work as before. A
+  session bus or agent socket your session offers only as
+  `unix:abstract=` (in `DBUS_SESSION_BUS_ADDRESS`) is now out of the jail's
+  reach. Before Linux 6.12 (no Landlock ABI 6) the jail does NOT have this
+  protection: it says so in one line when it starts, and runs as before.
+  The scope limits connecting out, not binding nor connections in, so the
+  display is not isolated: a program in the jail that binds a display's
+  abstract name before that X server starts receives its clients, and an X
+  server listening on TCP stays reachable. Only a network namespace of the
+  jail's own would close that.
+- **A command the jail cannot run exits 127 or 126.** A jailed command that
+  is not there exits 127, and one that cannot be run (no permission) 126,
+  with `innerwarden contain: cannot run ...`. Before, bubblewrap said
+  `bwrap: execvp ...` and the jail exited 1.
+- **A Linux jail cannot leave what your session runs at the next login.**
+  Every jail showed `~/.config` and `~/.local` writable, so a program in it
+  could write `~/.config/autostart/*.desktop`, a systemd user unit and the
+  link that enables it, or `~/.config/environment.d`, and the session ran
+  it as you, outside the jail, at the next login. Now `~/.config/autostart`,
+  `~/.config/systemd`, `~/.config/environment.d`, `~/.config/upstart`,
+  `~/.local/share/systemd/user` and `~/.local/share/dbus-1/services` are
+  read-only in every jail, made empty first where they are not there, and
+  the folders above them cannot be renamed away. The agent's own folders in
+  `~/.config` stay writable. One of them reached through a link in
+  `~/.config` or `~/.local` refuses the launch. With `XDG_CONFIG_HOME`
+  set elsewhere they are not covered.
 - **No jail shows your `~/.claude` writable any more.** That folder carries
   the settings that wire the guard's hook, and a program in a jail could
   take the hook out, turn hooks off with a `settings.local.json` of its

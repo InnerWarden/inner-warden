@@ -1008,6 +1008,12 @@ mod tests {
     /// tries: on a loaded machine (other builds and suites beside it,
     /// 2026-11-21) eight one-second waits gave up and the prompt was lost.
     ///
+    /// The write's deadline here is out of reach (`OUT_OF_REACH`): with the
+    /// whole suite beside it at load 16 to 18, the 32 writers in turn took
+    /// longer than [`UPDATE_DEADLINE`] and the last one gave up, so the clock
+    /// decided, not the rounds. Only a write that loses its rounds fails now,
+    /// which is what this test is about.
+    ///
     /// FAILS ON REVERT: read the record before the lock and compare after it,
     /// and with every run reading at once each round has few winners; runs
     /// that lose all of their attempts lose their prompt (the write fails).
@@ -1015,6 +1021,7 @@ mod tests {
     fn more_prompts_at_once_than_attempts_are_all_kept() {
         let (_tmp, dir) = dir();
         const RUNS: usize = 4 * UPDATE_ATTEMPTS;
+        const OUT_OF_REACH: std::time::Duration = std::time::Duration::from_secs(600);
         let start = std::sync::Barrier::new(RUNS);
         let failed = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
@@ -1022,12 +1029,13 @@ mod tests {
                 let (dir, start, failed) = (&dir, &start, &failed);
                 scope.spawn(move || {
                     start.wait();
-                    if record_in(
+                    if record_in_waiting(
                         dir,
-                        Some(SESSION),
+                        SESSION,
                         None,
                         &format!("open ticket-{i} now"),
                         NOW,
+                        OUT_OF_REACH,
                     )
                     .is_err()
                     {

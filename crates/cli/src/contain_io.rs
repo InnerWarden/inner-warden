@@ -9,7 +9,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use innerwarden_agent_guard::hook;
+use innerwarden_agent_guard::{file_update, hook};
 
 use crate::contain::{
     build_linux_jail, build_macos_profile, parse_contain_args, validate_jail_inputs_for,
@@ -130,23 +130,18 @@ pub fn cmd(rest: &[String]) -> ExitCode {
     let settings_named = (claude_dir != home.join(crate::contain::CLAUDE_DIR))
         .then_some(claude_settings_arg.as_str());
     if !mode_given && !openclaw {
-        if let Some((block_review, monitor)) = std::fs::read_to_string(&claude_settings)
-            .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .as_ref()
-            .and_then(hook::kept_hook_flags)
-        {
-            args.mode = match (block_review, monitor) {
-                (true, _) => crate::contain::Mode::BlockReview,
-                (false, true) => crate::contain::Mode::Monitor,
-                (false, false) => crate::contain::Mode::Enforce,
-            };
+        if let Some(mode) = kept_mode(&claude_settings) {
+            args.mode = mode;
         }
     }
-    let (block_review, monitor) = args.mode.hook_flags();
     if args.setup_only {
-        match arm_with_retry(
-            || {
+        // `--setup` only arms the hook: one it could not arm is a failure,
+        // never "armed".
+        match arm_hook(
+            &claude_settings,
+            mode_given,
+            args.mode.clone(),
+            |block_review, monitor| {
                 hook::install_hook(
                     &home,
                     &args.agent,
@@ -158,13 +153,12 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             },
             arm_wait,
         ) {
-            Ok(_) => {}
-            Err(e) => eprintln!(
-                "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
-            ),
+            Ok(mode) => args.mode = mode,
+            Err(e) => {
+                eprintln!("innerwarden contain: could not arm the in-jail hook: {e}");
+                return ExitCode::FAILURE;
+            }
         }
-    }
-    if args.setup_only {
         println!(
             "innerwarden contain - hook armed for {} (mode: {}).",
             args.agent,
@@ -300,8 +294,11 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         );
     }
     if !input.args.dry_run && !openclaw {
-        match arm_with_retry(
-            || {
+        match arm_hook(
+            &claude_settings,
+            mode_given,
+            input.args.mode.clone(),
+            |block_review, monitor| {
                 hook::install_hook(
                     &input.home,
                     &input.args.agent,
@@ -314,16 +311,19 @@ pub fn cmd(rest: &[String]) -> ExitCode {
             arm_wait,
         ) {
             // Said every time, so a change of mode is never silent.
-            Ok(_) => eprintln!(
-                "innerwarden contain: the guard hook for {} is in {}{}.",
-                input.args.agent,
-                match input.args.mode {
-                    crate::contain::Mode::Monitor => "monitor (records, never blocks)",
-                    crate::contain::Mode::Enforce => "enforce (blocks dangerous commands)",
-                    crate::contain::Mode::BlockReview => "enforce with review",
-                },
-                if mode_given { "" } else { ", as it was" }
-            ),
+            Ok(mode) => {
+                input.args.mode = mode;
+                eprintln!(
+                    "innerwarden contain: the guard hook for {} is in {}{}.",
+                    input.args.agent,
+                    match input.args.mode {
+                        crate::contain::Mode::Monitor => "monitor (records, never blocks)",
+                        crate::contain::Mode::Enforce => "enforce (blocks dangerous commands)",
+                        crate::contain::Mode::BlockReview => "enforce with review",
+                    },
+                    if mode_given { "" } else { ", as it was" }
+                )
+            }
             Err(e) => eprintln!(
                 "innerwarden contain: could not arm the in-jail hook: {e} (running with walls only)"
             ),
@@ -334,11 +334,20 @@ pub fn cmd(rest: &[String]) -> ExitCode {
         let records_made = make_plain_records(&input);
         #[cfg(not(target_os = "linux"))]
         let records_made = false;
+        // And the folders the session runs from on its own, read-only in
+        // the jail, so a program in it never makes one.
+        #[cfg(target_os = "linux")]
+        let autostart_made = make_autostart_dirs(&input);
+        #[cfg(not(target_os = "linux"))]
+        let autostart_made = false;
         // On an account where Claude Code never ran, arming the hook made
         // `~/.claude` after the jail was planned without it: the jail would
         // show no `~/.claude`, so no settings file and no hook. The jail is
         // planned again, and checked again, on what is there now.
-        if records_made || existing_home_paths(&input.home) != input.existing_paths {
+        if records_made
+            || autostart_made
+            || existing_home_paths(&input.home) != input.existing_paths
+        {
             input = match resolve_screened(
                 input.args.clone(),
                 input.home.clone(),
@@ -518,7 +527,53 @@ pub fn cmd_gate(rest: &[String]) -> ExitCode {
         eprintln!("innerwarden contain: {GATE_REFUSED}");
         return ExitCode::from(2);
     }
+    if let Err(code) = close_abstract_sockets() {
+        return code;
+    }
     run_in_place(command)
+}
+
+/// `innerwarden contain-exec -- <command...>`: run inside a Linux jail as
+/// its command ([`crate::contain::launch::exec_child`]). It closes the
+/// abstract unix sockets made outside the jail ([`crate::jail_scope`]) and
+/// replaces itself with `command`.
+pub fn cmd_exec(rest: &[String]) -> ExitCode {
+    let Some(command) = crate::contain::launch::parse_exec_args(rest) else {
+        eprintln!("innerwarden contain: contain-exec takes -- <command>");
+        return ExitCode::from(2);
+    };
+    if let Err(code) = close_abstract_sockets() {
+        return code;
+    }
+    run_in_place(command)
+}
+
+/// Close the abstract unix sockets made outside the jail to this process
+/// and what it runs. A kernel without Landlock scopes is said once and the
+/// command starts as it did before; one that has them and still refuses
+/// ends the launch (exit 126), so a jail never runs without a rule its
+/// kernel takes.
+#[cfg(target_os = "linux")]
+fn close_abstract_sockets() -> Result<(), ExitCode> {
+    match crate::jail_scope::close_abstract_sockets() {
+        Ok(crate::jail_scope::Kernel::Scopes) => Ok(()),
+        Ok(crate::jail_scope::Kernel::NoScopes) => {
+            eprintln!("{}", crate::jail_scope::NO_SCOPES_SAID);
+            Ok(())
+        }
+        Err(error) => {
+            eprintln!(
+                "innerwarden contain: cannot close the abstract unix sockets outside the jail \
+                 ({error}); its command does not start"
+            );
+            Err(ExitCode::from(126))
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn close_abstract_sockets() -> Result<(), ExitCode> {
+    Ok(())
 }
 
 /// Replace this process with `command`, as the jail's own child would have
@@ -1701,6 +1756,39 @@ fn resolve_planned(
             .collect()
     };
 
+    // Linux: the home folders the person's session runs from on its own,
+    // read-only in the jail, each that is there (the real run makes the
+    // others first, [`make_autostart_dirs`]). Never through a link in a
+    // folder the jail writes (`~/.config/systemd` a link): no mount pins a
+    // link, so a program in the jail could replace it with a folder of its
+    // own and the session would run what it put there.
+    let autostart_dirs = if cfg!(target_os = "linux") && !facts.macos {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for place in crate::contain::AUTOSTART_PLACES
+            .iter()
+            .map(|name| home.join(name))
+        {
+            let (_, links) = trace_links(&place);
+            if let Some(link) = crate::contain::steering_link(&links, None, &facts.writable) {
+                return Err(crate::contain::steered_link_refused(&place, link));
+            }
+            if !std::fs::symlink_metadata(&place).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+            let real = leads_to(&place).unwrap_or_else(|| place.clone());
+            let named = [place.clone(), real.clone()];
+            let others = crate::contain::other_jail_views(&real, &named, &shown);
+            for dir in named.into_iter().chain(others) {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+        dirs
+    } else {
+        Vec::new()
+    };
+
     // The project's Claude Code folder and MCP servers file, where each is
     // there and no link: read-only in the jail.
     let project_guard_files = crate::contain::PROJECT_GUARD_NAMES
@@ -1733,6 +1821,7 @@ fn resolve_planned(
         key_fd: None,
         profiles_marker_fd: None,
         records_dirs,
+        autostart_dirs,
         child_env,
         close_userns: false,
         seccomp_fd: None,
@@ -3581,6 +3670,37 @@ fn copy_claude_login(claude: &Path, source: &Path, uid: u32) -> Result<(), Strin
     write_private_file(source, &to, &temp, &bytes, uid)
         .map(|_| ())
         .map_err(|e| format!("Claude Code's login cannot be copied for the jail ({e})"))
+}
+
+/// Linux, the real run, once the jail was planned with every check passed:
+/// each home folder the person's session runs from on its own
+/// ([`crate::contain::AUTOSTART_PLACES`]) made, empty, where it is not
+/// there and the dotdir it is in (`~/.config`, `~/.local`) is, so the jail
+/// is planned again and shows it read-only, and never makes one of its
+/// own. Whether one was made now. One that cannot be made is said: the
+/// jail could then make it.
+#[cfg(target_os = "linux")]
+fn make_autostart_dirs(input: &JailInputs) -> bool {
+    let mut made = false;
+    for name in crate::contain::AUTOSTART_PLACES {
+        let place = input.home.join(name);
+        let Some(top) = Path::new(name).components().next() else {
+            continue;
+        };
+        let dotdir_bound = std::fs::metadata(input.home.join(top)).is_ok_and(|m| m.is_dir());
+        if !dotdir_bound || std::fs::symlink_metadata(&place).is_ok() {
+            continue;
+        }
+        match std::fs::create_dir_all(&place) {
+            Ok(()) => made = true,
+            Err(e) => eprintln!(
+                "innerwarden contain: {} cannot be made ({e}); a program in the jail could make \
+                 it and leave there what the session runs at the next login",
+                crate::contain::printable(&place)
+            ),
+        }
+    }
+    made
 }
 
 /// Linux, the real run of a plain jail, once the jail was planned with
@@ -5620,12 +5740,55 @@ fn print_plan_env(env: &[(String, String)]) {
     }
 }
 
+/// The mode InnerWarden's hook has in the Claude Code settings at `settings`
+/// (its strongest, where it is wired more than once), or `None` where the
+/// file is not there, does not read, or wires no hook of InnerWarden's.
+fn kept_mode(settings: &Path) -> Option<crate::contain::Mode> {
+    let text = std::fs::read_to_string(settings).ok()?;
+    let value = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    Some(match hook::kept_hook_flags(&value)? {
+        (true, _) => crate::contain::Mode::BlockReview,
+        (false, true) => crate::contain::Mode::Monitor,
+        (false, false) => crate::contain::Mode::Enforce,
+    })
+}
+
+/// Arm the in-jail hook through `install` (given the hook flags), with the
+/// retry of [`arm_with_retry`], and answer the mode it was armed in. A mode
+/// asked for on the command line is armed at every try. With none, each try
+/// first reads again the mode the hook has in `settings`: a try that lost
+/// the race to another jail's write arms the mode that jail left (its
+/// `--enforce`), never the one read before the race. Both places that arm
+/// the hook come through here.
+fn arm_hook<T>(
+    settings: &Path,
+    mode_given: bool,
+    mode: crate::contain::Mode,
+    mut install: impl FnMut(bool, bool) -> Result<T, String>,
+    wait: impl FnMut(u32),
+) -> Result<crate::contain::Mode, String> {
+    let mut armed = mode;
+    arm_with_retry(
+        || {
+            if !mode_given {
+                if let Some(kept) = kept_mode(settings) {
+                    armed = kept;
+                }
+            }
+            let (block_review, monitor) = armed.hook_flags();
+            install(block_review, monitor)
+        },
+        wait,
+    )?;
+    Ok(armed)
+}
+
 /// How many times arming the in-jail hook is tried in all.
 const ARM_TRIES: u32 = 5;
 
 /// Arm the in-jail hook. Two jails that start at the same moment write the
 /// same settings file; the update refuses the one whose read came before the
-/// other's write and says "retry" (`file_update`). That one is tried again,
+/// other's write and says so ([`file_update::lost_race`]). That one is tried again,
 /// on what the file holds now, up to `ARM_TRIES` times in all, so it does
 /// not run with walls only. Any other error is returned at once.
 fn arm_with_retry<T>(
@@ -5636,7 +5799,7 @@ fn arm_with_retry<T>(
     loop {
         tried += 1;
         match arm() {
-            Err(error) if tried < ARM_TRIES && error.contains("; retry") => wait(tried),
+            Err(error) if tried < ARM_TRIES && file_update::lost_race(&error) => wait(tried),
             done => return done,
         }
     }
@@ -6983,6 +7146,71 @@ mod tests {
         let (_, at, _) = open_held(&home.join(".cache/x"), &wide, &[home.join(".cache")]).unwrap();
         assert_eq!(at, home.join("disk/cache/x"));
         assert!(open_held(&home.join("shared/ro"), &wide, &[home.join(".cache")]).is_err());
+    }
+
+    /// The home folders the person's session runs from on its own: the
+    /// plan lists each one that is there, as named; the real run makes the
+    /// others where the dotdir they are in is there (none under a `~/.local`
+    /// that is not), and the plan made again lists them all. One reached
+    /// through a link in a folder the jail writes (`~/.config/systemd` a
+    /// link) refuses the launch.
+    ///
+    /// FAILS ON REVERT: list none, make none, or plan through the link.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_sessions_autostart_folders_are_made_and_listed_for_the_jail() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = std::fs::canonicalize(root.path()).unwrap();
+        let home = r.join("home");
+        std::fs::create_dir_all(home.join(".config/autostart")).unwrap();
+        std::fs::create_dir_all(home.join(".config/myagent")).unwrap();
+        let project = r.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let rest: Vec<String> = ["--project", project.to_str().unwrap(), "--", "true"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let args = parse_contain_args(&rest).unwrap();
+        let resolve = || resolve_inputs(args.clone(), home.clone(), PathBuf::from("/usr/bin/true"));
+        let first = resolve().unwrap();
+        assert_eq!(first.autostart_dirs, [home.join(".config/autostart")]);
+        assert!(make_autostart_dirs(&first));
+        for name in [
+            ".config/systemd",
+            ".config/environment.d",
+            ".config/upstart",
+        ] {
+            assert!(home.join(name).is_dir(), "{name}");
+        }
+        assert!(
+            !home.join(".local").exists(),
+            "no ~/.local, nothing made in it"
+        );
+        let again = resolve().unwrap();
+        let want: Vec<PathBuf> = crate::contain::AUTOSTART_PLACES
+            .iter()
+            .filter(|name| name.starts_with(".config/"))
+            .map(|name| home.join(name))
+            .collect();
+        assert_eq!(again.autostart_dirs, want);
+        assert!(!make_autostart_dirs(&again), "all there: nothing made");
+        // With a `~/.local`, its places are made and listed too.
+        std::fs::create_dir_all(home.join(".local")).unwrap();
+        assert!(make_autostart_dirs(&resolve().unwrap()));
+        assert_eq!(
+            resolve().unwrap().autostart_dirs.len(),
+            crate::contain::AUTOSTART_PLACES.len()
+        );
+        // A link in `~/.config`, which the jail writes: refused.
+        std::fs::remove_dir(home.join(".config/systemd")).unwrap();
+        std::fs::create_dir_all(r.join("dots/systemd")).unwrap();
+        symlink(r.join("dots/systemd"), home.join(".config/systemd")).unwrap();
+        let refused = resolve().unwrap_err().to_string();
+        assert!(
+            refused.contains("a link in a folder a program in the jail can write"),
+            "{refused}"
+        );
     }
 
     /// A plain jail's real run makes the launcher's records folder and this
@@ -8664,6 +8892,35 @@ mod tests {
         assert!(none.is_empty() && same.bind_fds.is_empty());
     }
 
+    /// The `innerwarden` binary cargo built beside this test binary
+    /// (`target/<profile>/innerwarden`, next to `deps/`), for a test that
+    /// runs a jail's plan with the host's bwrap: the plan starts the jail's
+    /// command through it ([`crate::contain::launch::exec_child`]). A
+    /// `cargo test` that builds the package's integration tests builds it
+    /// too. Missing: a failure in CI, said and skipped elsewhere.
+    #[cfg(target_os = "linux")]
+    fn built_launcher(test: &str) -> Option<PathBuf> {
+        let built = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent()?.parent().map(|dir| dir.join("innerwarden")))
+            .filter(|path| path.is_file());
+        if built.is_none() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "{test}: no innerwarden binary beside the test binary"
+            );
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(
+                format!(
+                    "SKIPPED {test}: no innerwarden binary beside the test binary \
+                     (run the package's tests, which build it)\n"
+                )
+                .as_bytes(),
+            );
+        }
+        built
+    }
+
     /// CWWT-SEC-1, live (Linux, the host's own bwrap): a program in a jail
     /// of the project `app` lays it out as its own repository (`HEAD`,
     /// `objects`, `refs`, `worktrees/x` naming its `.git` back), puts `L`, a
@@ -8734,7 +8991,15 @@ mod tests {
         .collect();
         let mut args = parse_contain_args(&rest).unwrap();
         args.extra_ro = vec![vendor.clone()];
-        let input = resolve_inputs(args, home.clone(), PathBuf::from("/usr/bin/true")).unwrap();
+        // The launcher the jail's command starts through
+        // (`<launcher> contain-exec -- /bin/sh ...`): the real one, or the
+        // script never runs. `/usr/bin/true` here exited 0 for it.
+        let Some(launcher) = built_launcher(
+            "a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writable",
+        ) else {
+            return;
+        };
+        let input = resolve_inputs(args, home.clone(), launcher).unwrap();
         assert_eq!(input.worktree, None);
         assert!(
             input.left.contains(&crate::contain::worktree_left_out(
@@ -9201,8 +9466,10 @@ mod tests {
     /// settings file is tried again, up to `ARM_TRIES` times in all; any
     /// other error is said at once.
     ///
-    /// FAILS ON REVERT: call `hook::install_hook` once and the second of
-    /// two jails starting together runs with walls only.
+    /// FAILS ON REVERT of the loop in `arm_with_retry` (one try only). It
+    /// calls the function alone: that both places that arm the hook come
+    /// through it is held by
+    /// `both_places_that_arm_the_hook_come_through_arm_hook`.
     #[test]
     fn arming_the_hook_is_tried_again_after_a_lost_race() {
         let lost =
@@ -9244,5 +9511,155 @@ mod tests {
         );
         assert!(armed.is_err());
         assert_eq!(calls, 1);
+    }
+
+    /// A Claude Code home under `dir` whose settings wire InnerWarden's hook
+    /// in the mode given by the flags, written by the real installer.
+    fn hook_home(dir: &std::path::Path, block_review: bool, monitor: bool) -> std::path::PathBuf {
+        super::hook::install_hook(
+            dir,
+            "claude-code",
+            None,
+            std::path::Path::new("/usr/local/bin/innerwarden"),
+            block_review,
+            monitor,
+        )
+        .expect("the installer writes a scratch home");
+        dir.join(".claude").join("settings.json")
+    }
+
+    /// The error a write that lost the race returns, as `file_update` words
+    /// it: the file holds other bytes than the ones the write read.
+    fn real_lost_race(dir: &std::path::Path) -> String {
+        let path = dir.join("raced.json");
+        std::fs::write(&path, b"theirs").unwrap();
+        super::file_update::replace_if_unchanged(&path, Some(b"mine"), b"new")
+            .expect_err("a write over bytes it did not read is refused")
+    }
+
+    /// The retry matches the words `file_update` really returns for a lost
+    /// race (the shared mark, not a copy of the text here), and only those.
+    ///
+    /// FAILS ON REVERT: `file_update` reworded with no change here (the
+    /// retry never fires), or the retry matching its own copy of the words.
+    #[test]
+    fn the_retry_reads_the_lost_race_file_update_returns() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let lost = real_lost_race(dir.path());
+        assert!(super::file_update::lost_race(&lost), "{lost}");
+        let mut calls = 0;
+        let armed = super::arm_with_retry(
+            || {
+                calls += 1;
+                if calls < 2 {
+                    Err(lost.clone())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(armed, Ok(()));
+        assert_eq!(calls, 2);
+    }
+
+    /// With no mode asked for, a try that lost the race to another jail's
+    /// `--enforce` arms enforce: the mode is read again for every try.
+    ///
+    /// FAILS ON REVERT: arm every try with the mode read before the race
+    /// (monitor goes back over the other jail's enforce).
+    #[test]
+    fn a_retry_with_no_mode_given_arms_the_mode_the_other_jail_left() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = hook_home(dir.path(), false, true);
+        assert_eq!(
+            super::kept_mode(&settings),
+            Some(crate::contain::Mode::Monitor)
+        );
+        let lost = real_lost_race(dir.path());
+        let mut tries = Vec::new();
+        let armed = super::arm_hook(
+            &settings,
+            false,
+            crate::contain::Mode::Monitor,
+            |block_review, monitor| {
+                tries.push((block_review, monitor));
+                if tries.len() == 1 {
+                    // The other jail's `--enforce` lands between this one's
+                    // read and its write.
+                    hook_home(dir.path(), false, false);
+                    return Err(lost.clone());
+                }
+                super::hook::install_hook(
+                    dir.path(),
+                    "claude-code",
+                    None,
+                    std::path::Path::new("/usr/local/bin/innerwarden"),
+                    block_review,
+                    monitor,
+                )
+                .map(|_| ())
+            },
+            |_| {},
+        );
+        assert_eq!(armed, Ok(crate::contain::Mode::Enforce));
+        assert_eq!(tries, vec![(false, true), (false, false)]);
+        assert_eq!(
+            super::kept_mode(&settings),
+            Some(crate::contain::Mode::Enforce)
+        );
+    }
+
+    /// A mode asked for on the command line is armed at every try, whatever
+    /// the file holds.
+    ///
+    /// FAILS ON REVERT: read the mode again with a mode given.
+    #[test]
+    fn a_retry_with_a_mode_given_arms_that_mode() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let settings = hook_home(dir.path(), false, false);
+        let lost = real_lost_race(dir.path());
+        let mut tries = Vec::new();
+        let armed = super::arm_hook(
+            &settings,
+            true,
+            crate::contain::Mode::Monitor,
+            |block_review, monitor| {
+                tries.push((block_review, monitor));
+                if tries.len() == 1 {
+                    Err(lost.clone())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {},
+        );
+        assert_eq!(armed, Ok(crate::contain::Mode::Monitor));
+        assert_eq!(tries, vec![(false, true), (false, true)]);
+    }
+
+    /// Both places that arm the in-jail hook (`--setup` and a launch) arm
+    /// it through `arm_hook`, so both get its retry and its mode read again.
+    ///
+    /// FAILS ON REVERT: either place calling `hook::install_hook` straight
+    /// (the tests of `arm_hook` and `arm_with_retry` stay green then).
+    #[test]
+    fn both_places_that_arm_the_hook_come_through_arm_hook() {
+        let text = include_str!("contain_io.rs");
+        let shipped = &text[..text.find("#[cfg(test)]\nmod tests {").unwrap_or(text.len())];
+        let calls: Vec<usize> = shipped
+            .match_indices("hook::install_hook(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(calls.len(), 2, "the places that arm the hook changed");
+        for at in calls {
+            let before = &shipped[..at];
+            let opened = before.rfind("arm_hook(").expect("an arm_hook call before");
+            assert!(
+                !before[opened..].contains(';'),
+                "hook::install_hook called outside arm_hook: {}",
+                &shipped[opened..at]
+            );
+        }
     }
 }
