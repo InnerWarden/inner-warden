@@ -2584,6 +2584,7 @@ pub const AUTOSTART_PLACES: &[&str] = &[
     ".config/upstart",
     ".local/share/systemd/user",
     ".local/share/dbus-1/services",
+    // (The six above are [`LOGIN_PLACES`].)
     // What the person's own programs run, as the person, the next time
     // they start, with no login: git's config (`core.hooksPath`,
     // `core.fsmonitor`, an alias with `!`), the startup files of the
@@ -2635,6 +2636,17 @@ pub const AUTOSTART_PLACES: &[&str] = &[
     ".local/share/flatpak/exports/share/dbus-1/services",
     ".local/share/flatpak/exports/share/applications",
 ];
+
+/// The first six of [`AUTOSTART_PLACES`], in the home: what the session
+/// runs on its own at the next login. One reached through a link in a
+/// folder the jail writes (`~/.config/systemd` a link into a dotfiles
+/// folder, or `~/.local/share` a link above two of them) refuses the
+/// launch ([`steered_link_refused`]), as it did before the other places
+/// were covered: no mount holds a link, so a program in the jail could
+/// replace it with a folder of its own and the session would run what it
+/// put there. The places added after them were writable before; a link on
+/// their way is said, and the jail opens.
+pub const LOGIN_PLACES: &[&str] = AUTOSTART_PLACES.split_at(6).0;
 
 /// The files at the top of `~/.config` that make a program the person runs
 /// run a command of their choosing: starship's prompt (`custom` modules

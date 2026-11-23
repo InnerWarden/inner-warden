@@ -387,6 +387,76 @@ echo DONE
         .is_none());
 }
 
+/// A link on the way to one of the places the session runs at the next
+/// login (`~/.config/systemd` or `~/.config/autostart` a link into a
+/// dotfiles folder, or `~/.local/share` a link above two of them), in a
+/// folder the jail writes, refuses the jail, as before the other places
+/// were covered: a program in the jail could replace the link with a
+/// folder of its own, and the session would run what it put there. The
+/// link is left as it was, and nothing lands on the host.
+///
+/// FAILS ON REVERT: open the jail with a warning (the program in it
+/// replaces the link with a folder, and its unit is on the host).
+#[test]
+fn a_link_on_the_way_to_a_login_place_refuses_the_jail() {
+    use std::os::unix::fs::symlink;
+    let test = "a_link_on_the_way_to_a_login_place_refuses_the_jail";
+    if !jail_opens_here(test) {
+        return;
+    }
+    let script = r#"try() { what=$1; shift; if "$@" 2>/dev/null; then echo "$what ok"; else echo "$what refused"; fi; }
+try unit sh -c 'rm -f "$HOME/.config/systemd" && mkdir -p "$HOME/.config/systemd/user" && echo "[Service]" > "$HOME/.config/systemd/user/x.service"'
+try autostart sh -c 'rm -f "$HOME/.config/autostart" && mkdir -p "$HOME/.config/autostart" && echo "[Desktop Entry]" > "$HOME/.config/autostart/z.desktop"'
+try localunit sh -c 'rm -f "$HOME/.local/share" && mkdir -p "$HOME/.local/share/systemd/user" && echo "[Service]" > "$HOME/.local/share/systemd/user/x.service"'
+echo DONE
+"#;
+    // (link, where it leads, what a program in the jail would leave)
+    let cases = [
+        (
+            ".config/systemd",
+            "dotfiles/systemd",
+            ".config/systemd/user/x.service",
+        ),
+        (
+            ".config/autostart",
+            ".local/dots/autostart",
+            ".config/autostart/z.desktop",
+        ),
+        (
+            ".local/share",
+            "data/share",
+            ".local/share/systemd/user/x.service",
+        ),
+    ];
+    for (link, target, left) in cases {
+        let home = tempfile::TempDir::new().unwrap();
+        let h = std::fs::canonicalize(home.path()).unwrap();
+        for dir in [".config/myagent", ".local/state", target] {
+            std::fs::create_dir_all(h.join(dir)).unwrap();
+        }
+        symlink(h.join(target), h.join(link)).unwrap();
+        let out = run_jail(&h, script, &[]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{link}: {stdout}\n{stderr}");
+        assert!(!stdout.contains("DONE"), "{link}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains("a link in a folder a program in the jail can write"),
+            "{link}: {stderr}"
+        );
+        assert_eq!(
+            std::fs::read_link(h.join(link)).unwrap(),
+            h.join(target),
+            "{link}: the link changed"
+        );
+        assert!(!h.join(left).exists(), "{link}: {left} on the host");
+        assert!(
+            std::fs::read_dir(h.join(target)).unwrap().next().is_none(),
+            "{link}: something in {target}"
+        );
+    }
+}
+
 /// The home's folders of programs in your `PATH` (`~/.local/bin` here)
 /// are read-only in a real jail, so a program in it cannot leave a `git`
 /// there that runs as you next; `starship.toml` at the top of
@@ -1195,6 +1265,44 @@ fn a_ctrl_c_ends_the_jail() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.contains("DONE"), "{stdout}");
+}
+
+/// A SIGINT sent to the launcher alone (`kill -INT <pid>`, no terminal)
+/// ends the jail at once, and the launcher with 130, as before the
+/// launcher held the signal.
+///
+/// FAILS ON REVERT: keep a SIGINT that came from a program to the launcher
+/// (the jail runs its 60 s and says DONE).
+#[test]
+fn a_sigint_to_the_launcher_alone_ends_the_jail() {
+    let test = "a_sigint_to_the_launcher_alone_ends_the_jail";
+    if !jail_opens_here(test) {
+        return;
+    }
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    for dir in [".config/myagent", ".local/state", ".cargo"] {
+        std::fs::create_dir_all(h.join(dir)).unwrap();
+    }
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let (child, _graph) = launch(&h, &p, "touch \"$PWD/runs\"; sleep 60; echo DONE", |_| {});
+    wait_for(&p.join("runs"));
+    let kill = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let start = std::time::Instant::now();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        start.elapsed().as_secs() < 30,
+        "the jail outlived the SIGINT"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stdout.contains("DONE"), "{stdout}\n{stderr}");
+    assert_eq!(out.status.code(), Some(130), "{stdout}\n{stderr}");
 }
 
 /// Eight jails of one home opened within about 0.7 s, half with an

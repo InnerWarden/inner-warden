@@ -1826,6 +1826,17 @@ fn resolve_planned(
             std::env::var("XDG_DATA_HOME").ok().as_deref(),
             std::env::var("XDG_DATA_DIRS").ok().as_deref(),
         );
+        // The login places through a link the jail can change refuse the
+        // launch, wherever the link leads ([`crate::contain::LOGIN_PLACES`]).
+        for place in crate::contain::LOGIN_PLACES
+            .iter()
+            .map(|name| home.join(name))
+        {
+            let (_, links) = trace_links(&place);
+            if let Some(link) = crate::contain::steering_link(&links, None, &facts.writable) {
+                return Err(crate::contain::steered_link_refused(&place, link));
+            }
+        }
         let (dirs, missing, said) = run_as_person_dirs(&places, &shown, &facts.writable, true)?;
         autostart_missing = missing;
         left.extend(said);
@@ -4060,11 +4071,21 @@ fn make_autostart_entries(input: &JailInputs) -> Result<bool, crate::contain::Co
 static JAIL_CHILD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 #[cfg(target_os = "linux")]
-extern "C" fn pass_end_signal(signal: libc::c_int) {
-    // A Ctrl-C reaches the jail's process group on its own; a `kill` of
-    // the launcher, or a hangup, is passed on, so the jail ends with the
-    // launcher and none runs on unwatched.
-    if signal != libc::SIGINT {
+extern "C" fn pass_end_signal(
+    signal: libc::c_int,
+    info: *mut libc::siginfo_t,
+    _context: *mut libc::c_void,
+) {
+    // A Ctrl-C at the terminal (sent by the kernel) reaches the jail's
+    // process group on its own, and is not sent twice: a second Ctrl-C
+    // means "quit now" to some agents. A signal a program sent the
+    // launcher (`kill`, `kill -INT`, a hangup) is passed on, so the jail
+    // ends with the launcher, as it did before the launcher held them,
+    // and none runs on unwatched.
+    // SAFETY: with SA_SIGINFO the kernel hands a valid siginfo.
+    let from_terminal =
+        signal == libc::SIGINT && !info.is_null() && unsafe { (*info).si_code } == libc::SI_KERNEL;
+    if !from_terminal {
         let child = JAIL_CHILD.load(std::sync::atomic::Ordering::SeqCst);
         if child > 0 {
             // SAFETY: kill is async-signal-safe.
@@ -4086,8 +4107,10 @@ fn hold_end_signals() {
         // handler only reads an atomic and calls kill.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = pass_end_signal as extern "C" fn(libc::c_int) as usize;
-            action.sa_flags = libc::SA_RESTART;
+            action.sa_sigaction = pass_end_signal
+                as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+                as usize;
+            action.sa_flags = libc::SA_RESTART | libc::SA_SIGINFO;
             libc::sigemptyset(&mut action.sa_mask);
             libc::sigaction(signal, &action, std::ptr::null_mut());
         }
@@ -7615,18 +7638,19 @@ mod tests {
             resolve().unwrap().autostart_dirs.len(),
             crate::contain::AUTOSTART_PLACES.len()
         );
-        // A link in `~/.config`, which the jail writes, to a folder the
-        // jail shows nowhere (a dotfiles manager's): the jail starts, does
-        // not show that folder, and says the link itself can be replaced.
-        std::fs::remove_dir(home.join(".config/systemd")).unwrap();
-        std::fs::create_dir_all(r.join("dots/systemd")).unwrap();
-        symlink(r.join("dots/systemd"), home.join(".config/systemd")).unwrap();
+        // A link in `~/.config`, which the jail writes, at one of the
+        // places covered since (`~/.config/git`), to a folder the jail
+        // shows nowhere (a dotfiles manager's): the jail starts, does not
+        // show that folder, and says the link itself can be replaced.
+        std::fs::remove_dir(home.join(".config/git")).unwrap();
+        std::fs::create_dir_all(r.join("dots/git")).unwrap();
+        symlink(r.join("dots/git"), home.join(".config/git")).unwrap();
         let linked = resolve().unwrap();
         assert!(
             !linked
                 .autostart_dirs
                 .iter()
-                .any(|dir| dir.ends_with(".config/systemd") || dir.starts_with(r.join("dots"))),
+                .any(|dir| dir.ends_with(".config/git") || dir.starts_with(r.join("dots"))),
             "{:?}",
             linked.autostart_dirs
         );
@@ -7634,10 +7658,19 @@ mod tests {
             linked
                 .left
                 .iter()
-                .any(|line| line.contains(".config/systemd goes through")
+                .any(|line| line.contains(".config/git goes through")
                     && line.contains("a link in a folder a program in the jail can write")),
             "{:?}",
             linked.left
+        );
+        // The same at a login place (`~/.config/systemd`): refused.
+        std::fs::remove_dir(home.join(".config/systemd")).unwrap();
+        std::fs::create_dir_all(r.join("dots/systemd")).unwrap();
+        symlink(r.join("dots/systemd"), home.join(".config/systemd")).unwrap();
+        let refused = resolve().unwrap_err().to_string();
+        assert!(
+            refused.contains("a link in a folder a program in the jail can write"),
+            "{refused}"
         );
     }
 

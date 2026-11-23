@@ -1027,14 +1027,20 @@ their MCP servers get no session id to match. Details and limits:
   (`~/.config/git` a file): before, that place was left unprotected and
   the jail started. So does one the launcher cannot make. The words say
   what to do.
-- **A home with stow or a moved disk opens a jail again.** Since the login
-  folders were covered, one reached through a link in `~/.config` or
-  `~/.local` refused the launch, and the hint (link it straight to its
-  place) put the link back in a folder the jail writes. Now the place the
+- **A home with stow or a moved disk opens a jail again, except on the
+  way to a login folder.** One of the folders covered now (`~/.config/git`,
+  `~/.config/nvim`, the others above) reached through a link in
+  `~/.config` or `~/.local` no longer refuses the launch: the place the
   link leads to is read-only where the jail shows it, or not shown at all,
   and the jail says in one line that a program in it could still replace
-  the link itself; replace the link with the folder to close that. Only a
-  link that leads to nothing, or loops, still refuses, with what to make.
+  the link itself; replace the link with the folder to close that. A link
+  that leads to nothing, or loops, refuses, with what to make. A link on
+  the way to one of the six login folders (`~/.config/autostart`,
+  `~/.config/systemd`, `~/.config/environment.d`, `~/.config/upstart`,
+  `~/.local/share/systemd/user`, `~/.local/share/dbus-1/services`, or a
+  link above them such as `~/.local/share`) still refuses the launch, as
+  before: a program in the jail could replace that link with a folder of
+  its own, and the session would run at the next login what it put there.
 - **Files at the top of `~/.config` that run commands** are read-only in
   every Linux jail too, made empty first: `starship.toml` (a `custom`
   module runs a command at every prompt) and the flags files some
@@ -1078,17 +1084,24 @@ their MCP servers get no session id to match. Details and limits:
   nothing new, and an edit of `config.toml` during the jail (`sed -i`)
   leaves no stale `config` behind.
 - **A Linux jail leaves empty folders in `~/.config` and `~/.local`.**
-  Each place the launcher makes so the jail cannot (about 30 folders in
-  `~/.config` and `~/.local`, the folders above them, and a few empty
-  files, cargo's two config files among them) stays on the host, empty,
-  after the jail ends: nothing takes it away, so no jail that ends can
+  Each place the launcher makes so the jail cannot stays on the host,
+  empty, after the jail ends. In a new home, measured: 35 folders in
+  `~/.config` (and `~/.config/innerwarden`), 16 in `~/.local` with the
+  folders above them (on a host with one Python), `~/.cargo/bin`, and 10 empty files (5 at the top of
+  `~/.config`, 5 in `~/.cargo`). Two of those files are cargo's
+  `config.toml` and `config`, one or both with no permission at all
+  (above): a root that reads your cargo folder (`sudo -E cargo`, which
+  keeps your `HOME`) finds both, warns that both exist, reads the empty
+  one and loses the alias in yours; remove the empty one, or run cargo
+  without `sudo`. Nothing takes them away, so no jail that ends can
   take away a place another jail of the same home still shows read-only.
   To link a folder of your dotfiles in their place (`ln -s
   ~/dotfiles/nvim ~/.config/nvim`), remove the empty one first. A jail
   never opens without its read-only places: one still missing when the
   launch is ready (removed while it planned) refuses the launch, and it
   says to run the command again. A Ctrl-C, a hangup or a `kill` of the
-  launcher ends the jail first. An OpenClaw jail (`--agent openclaw`) now makes the places that
+  launcher (`kill -INT` too, sent to the launcher alone) ends the jail
+  first. An OpenClaw jail (`--agent openclaw`) now makes the places that
   are not there and holds them read-only too; before, with
   `~/.config/git` absent, git's config, fish's startup file, an
   autostart entry and `~/.cargo/env` written in it reached the host.
