@@ -237,6 +237,36 @@ The summary of an MCP call's arguments the record keeps now masks Google
 OAuth (`ya29.`), Notion (`ntn_`) and Sentry (`sntryu_`, `sntrys_`) tokens
 and any opaque run of 32 or more letters and digits.
 
+The Cursor CLI started by the entry file its launcher hands its own `node`
+(`~/.local/share/cursor-agent/versions/<version>/node .../index.js`) with
+`HOME` moved, so its user hooks are not read, is refused as `cursor-agent`
+started that way already was. The folder is read as whole parts of the
+path (`cursor-agent/versions/<version>/index.js`), also written with `//`,
+`/./` or a glob, and after a `cd` into it (`./node index.js`); a folder
+that only ends with that name (`my-cursor-agent/versions/`) or another
+file in it (`node_modules/.bin/tsc`) is not the agent. A command between
+`exec > file` and the run of that file that sends its own output
+elsewhere (`echo hi &> log`) no longer leaves the file held for review as
+unread; a launcher followed by a redirection and a command (`env
+2>/dev/null sh`) still runs that command. A redirection written in front
+of the name of a command (`2>/dev/null rm -rf ~/.innerwarden`, `f | 2>/dev/null
+tee -a ~/.bashrc`) no longer hides the command, and `crontab - 2>/dev/null`
+is read as a table from its input. The same holds when the redirection is
+written with quotes, an escape or an expansion (`env 2>"/dev/null" sh`),
+stands behind a value or `time` (`FOO=1 2>/dev/null rm`), is a here-string,
+a here-document or a named descriptor, or stands between a launcher and its
+options (`sudo 2>/dev/null -u root sh`). The Cursor CLI is also recognised
+when `node` is handed its version folder, `.` from inside it, or the entry
+file without `.js`, and through a `cd` into `versions` or the install
+folder. `innerwarden check` run by the path of
+the running guard's own file written out (a build folder), or from an
+installed folder with `HOME` or `NO_COLOR` set in front, reads its line
+as data. The path is compared as text: a link, a `.` or `..` part, `//`
+or a path under `/proc` or `/dev` is judged with its words, since the
+shell resolves it later and in its own folder. A test of the MCP proxy that
+failed on a loaded machine now waits for the server's answers instead of a
+clock, and says so when the proxy does not finish.
+
 `innerwarden setup` and the new `innerwarden status --config` say what is
 already set in the agents' own config, and change nothing. In
 `~/.claude/settings.json`, `~/.claude.json`, `~/.cursor/mcp.json`,

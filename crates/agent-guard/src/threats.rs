@@ -820,6 +820,121 @@ const HOOKED_AGENT_PACKAGES: &[(&str, &str)] = &[
     ("@anthropic-ai/claude-code", "claude"),
 ];
 
+/// The folders an agent CLI of [`HOOKED_AGENT_PROGRAMS`] installs its own
+/// runtime into, with the program each one is: an entry file under one of
+/// them, run by `node` (or `bun`, `deno`), is that agent started. The
+/// Cursor CLI's launcher (`~/.local/share/cursor-agent/versions/<version>/
+/// cursor-agent`, a bash script) runs the `node` in its own folder on the
+/// `index.js` beside it (read in the package of version 2026.11.22-e9042b2
+/// on 2026-11-22), so `HOME=/tmp/h <folder>/node <folder>/index.js` starts
+/// it with its user hooks (`homedir()/.cursor/hooks.json`) moved away. Each row is
+/// the name of the folder that holds `versions/<version>/`, the agent, and
+/// the entry file in a version folder.
+const HOOKED_AGENT_INSTALL_FOLDERS: &[(&str, &str, &str)] =
+    &[("cursor-agent", "cursor-agent", "index.js")];
+
+/// The parts of a path as the system walks them: split at `/` (and `\`),
+/// an empty part (`a//b`) and `.` dropped, `..` taking off the part
+/// before it.
+fn path_parts(path: &str) -> Vec<&str> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." if parts.last().is_some_and(|last| *last != "..") => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    parts
+}
+
+/// Whether the part `written` of a path names `name`: as it is, or as a
+/// glob the shell expands to it (`vers?ons`, `ver*`, `v[e]rsions`).
+fn path_part_is(written: &str, name: &str) -> bool {
+    written == name || (written.contains(['?', '*', '[']) && glob_matches(written, name))
+}
+
+/// Whether a part of a path has the shape of a version folder
+/// (`2026.11.22-e9042b2`, `1.2.3`), or is a glob that may expand to one.
+fn version_shaped(part: &str) -> bool {
+    part.contains(['?', '*', '['])
+        || (part.starts_with(|c: char| c.is_ascii_digit())
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_')))
+}
+
+/// The row of [`HOOKED_AGENT_INSTALL_FOLDERS`] whose version folder
+/// (`<folder>/versions/<version>`) the parts end with.
+fn agent_version_parts(
+    parts: &[&str],
+) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    let [.., folder, versions, version] = parts else {
+        return None;
+    };
+    if !path_part_is(versions, "versions") || !version_shaped(version) {
+        return None;
+    }
+    HOOKED_AGENT_INSTALL_FOLDERS
+        .iter()
+        .find(|(name, _, _)| path_part_is(folder, name))
+}
+
+/// The agent of [`HOOKED_AGENT_INSTALL_FOLDERS`] whose entry file the path
+/// `lower` (lowercase) names, as `node` is handed it: a whole part named
+/// as the folder, `versions`, a version, and the entry file. Another file
+/// in the folder (`node_modules/.bin/tsc`) or a folder that only ends with the
+/// name (`my-cursor-agent/versions/`) is not the agent.
+fn agent_install_folder(lower: &str) -> Option<&'static str> {
+    let parts = path_parts(lower);
+    // The version folder itself (`node <version>`, `node <version>/`,
+    // `node .` from inside it): node runs the `index.js` in it. Checked
+    // with node 22 on 2026-11-22.
+    if let Some((_, agent, _)) = agent_version_parts(&parts) {
+        return Some(agent);
+    }
+    let [folder @ .., entry] = parts.as_slice() else {
+        return None;
+    };
+    // The entry file, also without its `.js`, which node adds.
+    agent_version_parts(folder)
+        .filter(|(_, _, file)| {
+            path_part_is(entry, file)
+                || file
+                    .strip_suffix(".js")
+                    .is_some_and(|stem| path_part_is(entry, stem))
+        })
+        .map(|(_, agent, _)| *agent)
+}
+
+/// The agent a command the line runs after a `cd` ([`SetBefore::in_folder`])
+/// starts by the entry file of one of [`HOOKED_AGENT_INSTALL_FOLDERS`] named
+/// from there, and the word after which it reads its own arguments: `node
+/// index.js` or `./node .` in the version folder, `node <version>/index.js`
+/// in `versions`, `node versions/<version>` in the install folder.
+fn entry_from_agent_folder(
+    words: &[String],
+    at: usize,
+    folder: &str,
+) -> Option<(&'static str, usize)> {
+    let name = program_name(&words[at]);
+    if !matches!(
+        strip_interpreter_version(&name),
+        "node" | "nodejs" | "bun" | "deno"
+    ) {
+        return None;
+    }
+    let script = (at + 1..words.len()).find(|index| !words[*index].starts_with('-'))?;
+    let file = words[script].to_ascii_lowercase();
+    // A path from the root or the home is read without the folder.
+    if file.starts_with(['/', '~']) {
+        return None;
+    }
+    agent_install_folder(&format!("{folder}/{file}")).map(|agent| (agent, script + 1))
+}
+
 /// The events of the user's Claude Code hooks the guard's own hook sits
 /// under: the screening before a tool runs, and the record after it.
 const GUARD_HOOK_EVENTS: &[&str] = &["PreToolUse", "PostToolUse"];
@@ -863,6 +978,11 @@ struct SetBefore {
     /// The names the line gives a value it does not show: read from input,
     /// by `printf -v`, a loop, a `${NAME:=value}` default, a substitution.
     unshown: Vec<String>,
+    /// The folder (lowercase, as written) a `cd` on the line went into last,
+    /// a relative one joined to the one before: `cd <version folder> &&
+    /// HOME=/tmp/h ./node index.js` starts the agent of
+    /// [`HOOKED_AGENT_INSTALL_FOLDERS`] whose entry file that is.
+    in_folder: Option<String>,
 }
 
 /// One simple command as [`command_starts_unhooked_agent`] reads it.
@@ -1693,6 +1813,21 @@ fn command_starts_unhooked_agent(command: &Spoken, set: &mut SetBefore, depth: u
     if program == "builtin" {
         return command_starts_unhooked_agent(&command.part(at + 1, words.len()), set, depth);
     }
+    // `cd`: what the line runs from there by a relative name.
+    if matches!(program.as_str(), "cd" | "pushd") {
+        set.in_folder = words[at + 1..]
+            .iter()
+            .find(|word| !word.starts_with('-'))
+            .map(|folder| {
+                let folder = folder.to_ascii_lowercase();
+                match &set.in_folder {
+                    Some(before) if !folder.starts_with(['/', '~']) => {
+                        format!("{before}/{folder}")
+                    }
+                    _ => folder,
+                }
+            });
+    }
     let arguments = &words[at + 1..];
     if let Some(effect) = setter_effect(&program, command, at, set) {
         set.found |= effect;
@@ -1713,6 +1848,7 @@ fn command_starts_unhooked_agent(command: &Spoken, set: &mut SetBefore, depth: u
     let mut carried = SetBefore {
         found: set.found | in_front,
         unshown: set.unshown.clone(),
+        in_folder: set.in_folder.clone(),
     };
     // `tmux -e NAME=VALUE` sets a variable for the command it starts. tmux,
     // not the shell, sets it: a `~` in it is a letter under zsh.
@@ -1747,7 +1883,9 @@ fn command_starts_unhooked_agent(command: &Spoken, set: &mut SetBefore, depth: u
             found | command_starts_unhooked_agent(&launched, &mut inner, depth + 1)
         });
     }
-    let Some((agent, from)) = hooked_agent_at(words, at) else {
+    let Some((agent, from)) = hooked_agent_at(words, at)
+        .or_else(|| entry_from_agent_folder(words, at, set.in_folder.as_deref()?))
+    else {
         return 0;
     };
     // An agent reads its flags up to a `--`; the words after it are its
@@ -2301,7 +2439,8 @@ fn runuser_command_start(arguments: &[String]) -> Option<usize> {
 /// own arguments begin: the program by name ([`program_name`]), Claude
 /// Code's versioned file (`.../claude/versions/2.1.323`), one of
 /// [`HOOKED_AGENT_PACKAGES`] as `npx` and its kin name it, and `node` (or
-/// `bun`, `deno`) handed that package's entry file.
+/// `bun`, `deno`) handed that package's entry file or an entry file in one
+/// of [`HOOKED_AGENT_INSTALL_FOLDERS`].
 fn hooked_agent_at(words: &[String], at: usize) -> Option<(&'static str, usize)> {
     let word = &words[at];
     let name = program_name(word);
@@ -2335,12 +2474,14 @@ fn hooked_agent_at(words: &[String], at: usize) -> Option<(&'static str, usize)>
         let file = words[script].to_ascii_lowercase();
         // `deno run npm:@anthropic-ai/claude-code`: the package by name.
         let file = file.strip_prefix("npm:").unwrap_or(&file);
-        let agent = agent_package(file).or_else(|| {
-            HOOKED_AGENT_PACKAGES.iter().find_map(|(package, agent)| {
-                let inside = file.contains(&format!("{package}/")) || file.ends_with(package);
-                inside.then_some(*agent)
+        let agent = agent_package(file)
+            .or_else(|| {
+                HOOKED_AGENT_PACKAGES.iter().find_map(|(package, agent)| {
+                    let inside = file.contains(&format!("{package}/")) || file.ends_with(package);
+                    inside.then_some(*agent)
+                })
             })
-        })?;
+            .or_else(|| agent_install_folder(file))?;
         return Some((agent, script + 1));
     }
     None
@@ -2371,6 +2512,7 @@ fn node_script_index(words: &[String], at: usize) -> Option<usize> {
             || HOOKED_AGENT_PACKAGES
                 .iter()
                 .any(|(package, _)| lower.contains(&format!("{package}/")))
+            || agent_install_folder(lower).is_some()
     };
     let mut first = None;
     let mut after_option = false;
@@ -18993,7 +19135,14 @@ fn crontab_from_stdin(words: &[String]) -> bool {
             skip = true;
             continue;
         }
-        if arg.starts_with('<') || arg.starts_with('>') {
+        // A redirection, a descriptor in front too (`2>/dev/null`), and
+        // its target when written apart (`2> /dev/null`).
+        let redirection = arg.trim_start_matches(|c: char| c.is_ascii_digit());
+        let redirection = redirection.strip_prefix('&').unwrap_or(redirection);
+        if redirection.starts_with(['<', '>']) {
+            skip = redirection
+                .chars()
+                .all(|c| matches!(c, '<' | '>' | '|' | '&'));
             continue;
         }
         rest.push(arg.as_str());
@@ -22929,6 +23078,31 @@ fn is_environment_assignment(token: &str) -> bool {
     })
 }
 
+/// Whether a word of a command is a redirection, not a program or its
+/// argument: \`>\`, \`>>\`, \`<\`, \`&>\`, a descriptor before one (\`2>\`,
+/// \`1>&2\`), or the same glued to its target (\`>r.sh\`).
+pub(crate) fn is_redirection_word(word: &str) -> bool {
+    let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+    let rest = rest.strip_prefix('&').unwrap_or(rest);
+    rest.starts_with(['>', '<'])
+}
+
+/// The index of the first word from \`at\` on that is neither a redirection
+/// ([\`is_redirection_word\`]) nor the target of one written apart
+/// (\`2> /dev/null\`).
+pub(crate) fn past_redirection_words(words: &[String], mut at: usize) -> usize {
+    while let Some(word) = words.get(at) {
+        if !is_redirection_word(word) {
+            break;
+        }
+        let rest = word.trim_start_matches(|c: char| c.is_ascii_digit());
+        let rest = rest.strip_prefix('&').unwrap_or(rest);
+        let alone = rest.chars().all(|c| matches!(c, '>' | '<' | '|' | '&'));
+        at += if alone { 2 } else { 1 };
+    }
+    at
+}
+
 /// Resolve the command behind the launch wrappers a line runs a program
 /// through: `env`, `sudo`, `doas`, `command`, `exec`, `nohup`, `setsid`,
 /// `time` (`-p` and GNU time's options), `timeout`, `nice`, `stdbuf`,
@@ -22943,6 +23117,7 @@ fn is_environment_assignment(token: &str) -> bool {
 /// [`launched_command_index`] steps over them as well.
 pub(crate) fn effective_command_index(words: &[String]) -> Option<usize> {
     let mut index = 0usize;
+    let mut after_launcher = false;
     // Each launcher read takes at least its own word: a chain of any length
     // ends within the words.
     for _ in 0..=words.len() {
@@ -22973,6 +23148,17 @@ pub(crate) fn effective_command_index(words: &[String]) -> Option<usize> {
         {
             index += 1;
         }
+        // Redirections the shell takes off before it finds the command a
+        // launcher runs: \`env 2>/dev/null sh\`. Only redirections: the
+        // launcher runs nothing. Not in front of the first word, which may
+        // be a quoted program path the words no longer show as quoted
+        // (\`'>/opt/bin/curl'\`); a line with a redirection there is read
+        // again with it moved after the command
+        // (\`crate::shell::runners::leading_redirections_moved\`).
+        if after_launcher {
+            index = past_redirection_words(words, index);
+        }
+        after_launcher = true;
         let command = token_basename(words.get(index)?).to_ascii_lowercase();
         if let Some(next) = launcher_command_start(words, index, &command) {
             index = next;
