@@ -342,3 +342,14 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   lines; stdin as `//dev/stdin`, `/dev/./stdin`, `/dev/../dev/stdin`,
   `/proc/thread-self/fd/0`, `/proc/1/fd/0` and `file:///dev/stdin`; a PHP
   function called in another case, from a string or as a method.
+- 2026-11-22: a PHP `foreach` head read in any case and with any space or
+  comment around `as` moves no line of any corpus. Measured against main
+  9f10ffe with the differential judge (37127 lines, an empty home and a home
+  with keys): no verdict changed. Every name after `as`, inside `list()`
+  and `[...]` too, loses what it held, and a statement whose `foreach` head
+  cannot be read loses what the reader knew of every name. A file name a
+  glob with a wildcard or a directory read (`scandir`, `readdir`) found,
+  written into a line a process runs (`"sh " . $f`, `"./$f"`), is reviewed.
+  Held in `tests/inline_reader_perl_php_lua.rs`. This pull request as a
+  whole also makes benign code nested 20 levels deep or more a review (pre
+  and main: allow); up to 16 levels stays allow.
