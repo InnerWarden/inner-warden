@@ -5033,7 +5033,19 @@ fn analyze_command_as_read(
     // agent edits source that quotes a guard command through an inline
     // interpreter; the way to make that edit is the agent's file edit tool or
     // a script saved to a file, not a here-document or `-c`.
-    let self_disable = guard_self_disable_on(cmd, &projection)
+    // A folder above the guard's configuration reached through the working
+    // directory the hook was given (`mv ../.config x` from a project in the
+    // home), or a home the text alone does not know, is asked first: the
+    // text alone may only hold it for review.
+    let self_disable = context
+        .and_then(|place| {
+            threats::guard_config_ancestor_in_place(
+                &projection.scan,
+                &place.cwd,
+                place.home.as_deref(),
+            )
+        })
+        .or_else(|| guard_self_disable_on(cmd, &projection))
         // The same program fed to the interpreter as a here-document is read as
         // the same code given inline (`python3 -c`), so a rewrite of an agent's
         // settings or of the guard's configuration is refused either way.

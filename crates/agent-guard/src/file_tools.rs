@@ -1157,7 +1157,7 @@ const HOME_GUARD_TREES: &[&str] = &[
 /// The account's home from the account database, for a hook run without
 /// `HOME`.
 #[cfg(unix)]
-fn home_of_this_account() -> Option<PathBuf> {
+pub(crate) fn home_of_this_account() -> Option<PathBuf> {
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt;
     let mut buffer = vec![0 as libc::c_char; 16 * 1024];
@@ -1184,7 +1184,7 @@ fn home_of_this_account() -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn home_of_this_account() -> Option<PathBuf> {
+pub(crate) fn home_of_this_account() -> Option<PathBuf> {
     None
 }
 
