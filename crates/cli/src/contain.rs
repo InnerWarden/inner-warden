@@ -2655,10 +2655,12 @@ pub const AUTOSTART_FILES: &[&str] = &[
 /// startup files rustup edits source `~/.cargo/env` at every login) and
 /// cargo's own config (`build.rustc-wrapper`, a `runner`, an alias), in
 /// both names cargo reads. Read-only in every Linux jail like
-/// [`AUTOSTART_FILES`], made first where they are not there: `config`
-/// and `config.toml` ([`cargo_config_partner`]) with no permission at
-/// all, so cargo on the host cannot open the one made and reads the
-/// other as before, saying nothing.
+/// [`AUTOSTART_FILES`], made first where they are not there: with
+/// neither `config` nor `config.toml` there, `config.toml` empty and
+/// readable and `config` with no permission; with one there, the other
+/// with no permission ([`cargo_config_partner`]), so cargo on the host
+/// cannot open the one made and reads the person's as before, saying
+/// nothing new.
 pub const CARGO_FILES: &[&str] = &[
     ".cargo/env",
     ".cargo/env.fish",
@@ -2670,7 +2672,8 @@ pub const CARGO_FILES: &[&str] = &[
 /// PURE. The other name cargo reads its config by, beside `file`
 /// (`~/.cargo/config` for `~/.cargo/config.toml` and back): two files it
 /// can open make it warn on every run, and an empty `config` would hide
-/// `config.toml`, so the launcher makes either with no permission.
+/// `config.toml`, so the launcher makes `config` with no permission, and
+/// `config.toml` too where the person's `config` is there.
 /// `None` for any other file.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn cargo_config_partner(file: &Path) -> Option<PathBuf> {

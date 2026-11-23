@@ -1070,26 +1070,25 @@ their MCP servers get no session id to match. Details and limits:
   nu forms, which the shell startup files rustup edits source),
   `~/.cargo/config.toml` and `~/.cargo/config` (a `rustc-wrapper`, a
   `runner`, an alias), and rustup's `settings.toml` where it is there.
-  Where one of cargo's two config files is not there it is made empty
-  and with no permission at all, never as a second name of the other:
-  cargo on the host cannot open it, so it reads your config as before and
-  warns of nothing, and an edit of `config.toml` during the jail
-  (`sed -i`) leaves no stale `config` behind.
-- **The host keeps no empty folder or file the launcher made for a jail.**
-  Each place it makes so the jail cannot (about 30 folders in `~/.config`
-  and `~/.local`, a few files) is taken away again when the jail ends,
-  where it is still the entry it made, still holds nothing and no running
-  jail shows it; a folder above one it made goes the same way. What a
-  jail shows is read from the mounts of every live process of the
-  account (`/proc/*/mountinfo`), not from a lock: a launch with another
-  `XDG_RUNTIME_DIR`, or the runtime folder removed at logout while a jail
-  runs in tmux, no longer lets the jail that ends first take away a place
-  another still shows read-only (its late autostart entry or user unit
-  reached the host). Each launch writes down what it made, so the last
-  one to end takes away what another had to leave. A Ctrl-C, a hangup or
-  a `kill` of the launcher ends the jail first and the launcher still
-  takes away what it made; before, it died and left them until the next
-  jail. An OpenClaw jail (`--agent openclaw`) now makes the places that
+  Where neither of cargo's two config files is there, `config.toml` is
+  made empty and readable and `config` empty with no permission at all;
+  where one is there, the other is made empty with no permission. Never as
+  a second name of the other: cargo on the host cannot open the one made,
+  so it reads your config (or the empty one) as before and warns of
+  nothing new, and an edit of `config.toml` during the jail (`sed -i`)
+  leaves no stale `config` behind.
+- **A Linux jail leaves empty folders in `~/.config` and `~/.local`.**
+  Each place the launcher makes so the jail cannot (about 30 folders in
+  `~/.config` and `~/.local`, the folders above them, and a few empty
+  files, cargo's two config files among them) stays on the host, empty,
+  after the jail ends: nothing takes it away, so no jail that ends can
+  take away a place another jail of the same home still shows read-only.
+  To link a folder of your dotfiles in their place (`ln -s
+  ~/dotfiles/nvim ~/.config/nvim`), remove the empty one first. A jail
+  never opens without its read-only places: one still missing when the
+  launch is ready (removed while it planned) refuses the launch, and it
+  says to run the command again. A Ctrl-C, a hangup or a `kill` of the
+  launcher ends the jail first. An OpenClaw jail (`--agent openclaw`) now makes the places that
   are not there and holds them read-only too; before, with
   `~/.config/git` absent, git's config, fish's startup file, an
   autostart entry and `~/.cargo/env` written in it reached the host.
@@ -1110,9 +1109,7 @@ their MCP servers get no session id to match. Details and limits:
   site of a Python the host does not have yet (no folder of it is held),
   a new file in `~/.local/share/claude/versions` (only the version a link
   runs is held), and a `build.rs` in cargo's `registry/src` (sources
-  cargo builds the next time). While a jail runs, the empty folders made
-  for it are on the host: a `ln -s` onto one of them then lands inside
-  it. A launch that cannot read `/proc` takes nothing away.
+  cargo builds the next time).
 - **A report that connects as the jail ends is written or counted.** The
   launcher closes the record socket's backlog before its last look at it,
   so a connect that found the socket's name before it was removed is
