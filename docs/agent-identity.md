@@ -404,19 +404,24 @@ file or `usercustomize.py` runs in every Python the person starts), each folder
 of `~/.rustup/toolchains`, and what each link in a folder of programs leads to
 where the jail writes it: the file itself, or the whole venv of a pipx or uv tool.
 In every jail, flag or not: `~/.cargo/env`, `env.fish` and `env.nu`,
-`~/.cargo/config.toml` and `~/.cargo/config` (made as one file, a hard link,
-where neither is there, so cargo warns of nothing), and `~/.rustup/settings.toml`
-where it is there.
+`~/.cargo/config.toml` and `~/.cargo/config` (the one not there is made empty with
+no permission at all, never as a second name of the other: cargo on the host
+cannot open it, reads the person's file as before and warns of nothing), and
+`~/.rustup/settings.toml` where it is there.
 
 What the launcher makes on the host for a jail (the folders and files above that
 were not there, and the folders above them) it takes away again when the jail
 ends, where each is still the entry it made (same device and inode) and holds
-nothing. The launches of one home share a lock, in the account's runtime folder
-(else the temporary folder), that no jail sees: each holds it shared while its
-jail runs, and only a launch that can take it alone when its jail ends takes
-anything away, since taking a folder away on the host would undo another jail's
-mount of it. Each launch writes down there what it made, so the one that ends
-alone takes away what the others made too.
+nothing, and no running jail shows it: taking a folder away on the host would undo
+another jail's mount of it. Which entries a jail shows is read from the mounts of
+every live process of the account (`/proc/*/mountinfo`, each mount namespace once),
+so it does not depend on the environment a launch had or on a file that can vanish.
+Each launch writes down what it made, in the account's runtime folder and the
+temporary folder, where no jail sees them, so the last launch to end takes away what
+another had to leave; those notes only add entries to look at, the mounts decide.
+A Ctrl-C, a hangup or a `kill` of the launcher ends the jail first, and the launcher
+still takes away what it made. An OpenClaw jail makes and holds these places as
+Claude Code's does.
 
 Limits: not covered, and writable in a jail: `~/.local/share/bash-completion`,
 `~/.local/share/nvim/site` (plugins neovim loads), editors' settings in
@@ -424,7 +429,11 @@ Limits: not covered, and writable in a jail: `~/.local/share/bash-completion`,
 Jupyter's kernels (`~/.local/share/jupyter/kernels`), a new folder in
 `~/.rustup/toolchains`, cargo's and rustup's files under a `CARGO_HOME` or
 `RUSTUP_HOME` elsewhere, and the project's `.git/hooks` (the jail writes the
-project). While a jail runs, the empty folders made for it are on the host.
+project). Also still writable: a `.pth` file in the user site of a Python the host
+does not have yet, a new file in `~/.local/share/claude/versions` (only the version
+a link runs is held), and a `build.rs` in cargo's `registry/src`. While a jail runs,
+the empty folders made for it are on the host. A launch that cannot read `/proc`
+takes nothing away.
 
 A tool that reads the command line of a running jail's bubblewrap (from
 `/proc`) finds an identified jail's filter first: that command line starts

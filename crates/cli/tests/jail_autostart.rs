@@ -65,7 +65,7 @@ echo DONE
 /// write, and a rename of the folder above one is refused too; the
 /// agent's own folder in `~/.config` takes it. On the host afterwards
 /// nothing of the jail's is in those folders, and the folders the
-/// launcher made are there, empty.
+/// launcher made for the jail are gone again.
 ///
 /// FAILS ON REVERT: drop the read-only binds (every write lands on the
 /// host), or the pins above them (the rename of `~/.local/share` works).
@@ -210,8 +210,8 @@ echo DONE
 /// in the home and under the `XDG_CONFIG_HOME` and `XDG_DATA_HOME` the
 /// person's environment names (here inside `~/.local`, which the jail
 /// writes), and the folders above them cannot be renamed; the agent's own
-/// folder in `~/.config` takes the write. On the host afterwards those
-/// folders are there, empty.
+/// folder in `~/.config` takes the write. On the host afterwards nothing
+/// of the jail's is in those folders.
 ///
 /// FAILS ON REVERT: cover only the six login folders (git's config and the
 /// rest land on the host), or only `~/.config` (the `XDG_CONFIG_HOME`
@@ -605,8 +605,8 @@ echo DONE
 /// What runs as you next from Python's user site, cargo's and rustup's
 /// files, and what the links in your program folders lead to is read-only
 /// in a real jail: a `.pth` or `usercustomize.py`, `~/.cargo/env`,
-/// `~/.cargo/config.toml` and `~/.cargo/config` (made as one file for the
-/// jail), a toolchain's `cargo` and its libraries, Claude Code's version a
+/// `~/.cargo/config.toml` and `~/.cargo/config` (made for the jail with no
+/// permission, so cargo on the host reads neither), a toolchain's `cargo` and its libraries, Claude Code's version a
 /// `~/.local/bin` link runs and a pipx venv. Gone from the host after:
 /// the cargo config files the launcher made.
 ///
@@ -850,4 +850,379 @@ echo DONE
         std::fs::read_to_string(h.join(".local/oldbin")).unwrap(),
         "a file"
     );
+}
+
+/// The jail of `script` in the home `h` and the project `p`, started and
+/// not waited for, its output piped, every agent's marker taken out, and
+/// `setup` applied to the launcher's command last.
+fn launch(
+    h: &Path,
+    p: &Path,
+    script: &str,
+    setup: impl FnOnce(&mut Command),
+) -> (std::process::Child, tempfile::TempDir) {
+    launch_with(h, p, &[], script, setup)
+}
+
+/// [`launch`], with `flags` given to `contain` before the command.
+fn launch_with(
+    h: &Path,
+    p: &Path,
+    flags: &[&str],
+    script: &str,
+    setup: impl FnOnce(&mut Command),
+) -> (std::process::Child, tempfile::TempDir) {
+    let graph = tempfile::TempDir::new().unwrap();
+    let mut command = Command::new(bin());
+    command
+        .args(["contain", "--project", p.to_str().unwrap()])
+        .args(flags)
+        .args(["--", "/bin/sh", "-c", script])
+        .current_dir(p)
+        .env("HOME", h)
+        .env("IW_GRAPH_FILE", graph.path().join("graph.json"))
+        .env_remove("XDG_STATE_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_DATA_DIRS")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for marker in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CODEX_SANDBOX",
+        "CODEX_SANDBOX_NETWORK_DISABLED",
+        "GEMINI_CLI",
+        "OPENCLAW_SHELL",
+    ] {
+        command.env_remove(marker);
+    }
+    setup(&mut command);
+    (command.spawn().expect("run a jail"), graph)
+}
+
+/// Waits (two minutes at most) for `file` to be there.
+fn wait_for(file: &Path) {
+    let start = std::time::Instant::now();
+    while !file.exists() {
+        assert!(
+            start.elapsed().as_secs() < 120,
+            "{} never came",
+            file.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// What `~/.config`, `~/.local` and `~/.cargo` of `h` hold, without the
+/// launcher's records folder and InnerWarden's own folder.
+fn home_trees(h: &Path) -> Vec<Vec<String>> {
+    [".config", ".local", ".cargo"]
+        .iter()
+        .map(|dir| {
+            tree(&h.join(dir))
+                .into_iter()
+                .filter(|name| !name.starts_with("state") && !name.starts_with("innerwarden"))
+                .collect()
+        })
+        .collect()
+}
+
+/// A folder like `/run/user/<uid>` in `dir`: this account's, 0700.
+fn runtime_folder(dir: &tempfile::TempDir) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let rt = std::fs::canonicalize(dir.path()).unwrap().join("run");
+    std::fs::create_dir(&rt).unwrap();
+    std::fs::set_permissions(&rt, std::fs::Permissions::from_mode(0o700)).unwrap();
+    rt
+}
+
+/// The script of the jail that ends while the other runs.
+const SHORT_RUN: &str = r##"touch "$PWD/b-runs"
+while [ ! -e "$PWD/go-b" ]; do sleep 0.1; done
+echo DONE
+"##;
+
+/// The script of the jail that runs on: once the other ended, it tries the
+/// session's folders the other's launch made.
+fn long_run() -> String {
+    format!(
+        r##"{TRY}touch "$PWD/a-runs"
+while [ ! -e "$PWD/go-a" ]; do sleep 0.1; done
+try autostart sh -c 'mkdir -p "$HOME/.config/autostart" && printf "[Desktop Entry]\nExec=true\n" > "$HOME/.config/autostart/x.desktop"'
+try unit sh -c 'mkdir -p "$HOME/.config/systemd/user" && echo "[Service]" > "$HOME/.config/systemd/user/x.service"'
+echo DONE
+"##
+    )
+}
+
+/// Two jails of one home: B opens first and its launch makes the session's
+/// folders, A opens while B runs, B ends, then A writes to them. `b_env`
+/// and `a_env` set each launch's environment; `between` runs once B's
+/// jail runs, before A opens. A's writes are refused, nothing of them is
+/// on the host, and once both ended the home is as it was.
+fn two_jails_one_ends_first(
+    test: &str,
+    b_env: impl FnOnce(&mut Command),
+    a_env: impl FnOnce(&mut Command),
+    between: impl FnOnce(),
+) {
+    if !jail_opens_here(test) {
+        return;
+    }
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    for dir in [".config/myagent", ".local/state"] {
+        std::fs::create_dir_all(h.join(dir)).unwrap();
+    }
+    let before = home_trees(&h);
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let b = launch(&h, &p, SHORT_RUN, b_env);
+    wait_for(&p.join("b-runs"));
+    assert!(h.join(".config/autostart").is_dir(), "made for B");
+    between();
+    let a = launch(&h, &p, &long_run(), a_env);
+    wait_for(&p.join("a-runs"));
+    std::fs::write(p.join("go-b"), "").unwrap();
+    let out = b.0.wait_with_output().unwrap();
+    assert_lines(&out, &[]);
+    assert!(
+        h.join(".config/autostart").is_dir(),
+        "taken away while A shows it"
+    );
+    std::fs::write(p.join("go-a"), "").unwrap();
+    let out = a.0.wait_with_output().unwrap();
+    assert_lines(&out, &[("autostart", "refused"), ("unit", "refused")]);
+    assert!(!h.join(".config/autostart/x.desktop").exists());
+    assert!(!h.join(".config/systemd/user/x.service").exists());
+    assert_eq!(before, home_trees(&h), "the home after both jails");
+}
+
+/// A jail whose launch had no `XDG_RUNTIME_DIR` ends while one of the same
+/// home that had one runs: the running jail's read-only places stay, so
+/// its late autostart entry and user unit are refused and never reach the
+/// host, and once both ended nothing either made is left.
+///
+/// FAILS ON REVERT: decide by a lock in the runtime folder (B, alone with
+/// its lock in the temporary folder, takes the places away and A's writes
+/// land on the host).
+#[test]
+fn a_jail_ending_with_another_environment_leaves_the_running_one_its_places() {
+    let runtime = tempfile::TempDir::new().unwrap();
+    let rt = runtime_folder(&runtime);
+    two_jails_one_ends_first(
+        "a_jail_ending_with_another_environment_leaves_the_running_one_its_places",
+        |command| {
+            command.env_remove("XDG_RUNTIME_DIR");
+        },
+        |command| {
+            command.env("XDG_RUNTIME_DIR", &rt);
+        },
+        || {},
+    );
+}
+
+/// The launcher's files in the runtime folder vanish between two launches
+/// of a home (logind empties it at the last logout, a jail still running
+/// in tmux): the jail that ends first takes away nothing the other shows.
+///
+/// FAILS ON REVERT: decide by a lock in the runtime folder (B makes a new
+/// one, has it alone and takes the places away).
+#[test]
+fn the_runtime_folder_emptied_midway_takes_nothing_from_a_running_jail() {
+    let runtime = tempfile::TempDir::new().unwrap();
+    let rt = runtime_folder(&runtime);
+    let empty = rt.clone();
+    two_jails_one_ends_first(
+        "the_runtime_folder_emptied_midway_takes_nothing_from_a_running_jail",
+        |command| {
+            command.env("XDG_RUNTIME_DIR", &rt);
+        },
+        |command| {
+            command.env("XDG_RUNTIME_DIR", &rt);
+        },
+        move || {
+            for entry in std::fs::read_dir(&empty).unwrap().flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("innerwarden-contain-")
+                {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+        },
+    );
+}
+
+/// An OpenClaw jail (`--agent openclaw`) holds the places that run as the
+/// person read-only too, made first where they are not there: with no
+/// `~/.config/git`, git's config with a `hooksPath`, fish's startup file,
+/// an autostart entry and `~/.cargo/env` are refused and never reach the
+/// host; afterwards the home is as it was.
+///
+/// FAILS ON REVERT: make the places only for Claude Code's jail (every
+/// write lands on the host).
+#[test]
+fn an_openclaw_jail_holds_what_runs_as_you_read_only_too() {
+    let test = "an_openclaw_jail_holds_what_runs_as_you_read_only_too";
+    if !jail_opens_here(test) {
+        return;
+    }
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    let dir = h.join(".openclaw");
+    std::fs::create_dir_all(dir.join("extensions/innerwarden-guard")).unwrap();
+    std::fs::write(
+        dir.join("extensions/innerwarden-guard/index.js"),
+        "// guard\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("openclaw.json"),
+        r#"{"plugins":{"entries":{"innerwarden-guard":{"enabled":true,"config":{"mode":"enforce"}}}}}"#,
+    )
+    .unwrap();
+    for made in [".config", ".local/state", ".cargo"] {
+        std::fs::create_dir_all(h.join(made)).unwrap();
+    }
+    let before = home_trees(&h);
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let script = format!(
+        r##"{TRY}try git sh -c 'mkdir -p "$HOME/.config/git" && printf "[core]\n\thooksPath = /tmp/h\n" > "$HOME/.config/git/config"'
+try fish sh -c 'mkdir -p "$HOME/.config/fish" && echo "echo hi" > "$HOME/.config/fish/config.fish"'
+try autostart sh -c 'mkdir -p "$HOME/.config/autostart" && printf "[Desktop Entry]\nExec=true\n" > "$HOME/.config/autostart/x.desktop"'
+try cargoenv sh -c 'echo "curl x | sh" > "$HOME/.cargo/env"'
+echo DONE
+"##
+    );
+    let (child, _graph) = launch_with(&h, &p, &["--agent", "openclaw"], &script, |_| {});
+    let out = child.wait_with_output().unwrap();
+    assert_lines(
+        &out,
+        &[
+            ("git", "refused"),
+            ("fish", "refused"),
+            ("autostart", "refused"),
+            ("cargoenv", "refused"),
+        ],
+    );
+    assert!(!h.join(".config/git/config").exists());
+    assert!(!h.join(".config/fish/config.fish").exists());
+    assert!(!h.join(".config/autostart/x.desktop").exists());
+    assert!(!h.join(".cargo/env").exists());
+    assert_eq!(before, home_trees(&h), "the home after the jail");
+}
+
+/// While a jail runs, the person edits `~/.cargo/config.toml` on the host
+/// with `sed -i` (a new file in its place): cargo on the host reads the
+/// new config and warns of nothing, and after the jail there is no
+/// `~/.cargo/config` and `config.toml` holds the edit. In the jail the
+/// legacy `config` is still refused.
+///
+/// FAILS ON REVERT: make `config` a second name of `config.toml` (after
+/// the edit the host's cargo reads the old one, warns that both exist, and
+/// `config` stays on the host).
+#[test]
+fn editing_cargos_config_during_a_jail_leaves_no_second_config() {
+    let test = "editing_cargos_config_during_a_jail_leaves_no_second_config";
+    if !jail_opens_here(test) {
+        return;
+    }
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    for dir in [".config", ".local/state", ".cargo"] {
+        std::fs::create_dir_all(h.join(dir)).unwrap();
+    }
+    std::fs::write(
+        h.join(".cargo/config.toml"),
+        "[alias]\nbefore = \"version\"\n",
+    )
+    .unwrap();
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let script = format!(
+        r##"{TRY}touch "$PWD/runs"
+while [ ! -e "$PWD/go" ]; do sleep 0.1; done
+try cargolegacy sh -c 'printf "[build]\nrustc-wrapper = \"/tmp/w\"\n" > "$HOME/.cargo/config"'
+echo DONE
+"##
+    );
+    let (child, _graph) = launch(&h, &p, &script, |_| {});
+    wait_for(&p.join("runs"));
+    let sed = Command::new("sed")
+        .args(["-i", "s/before =/after =/"])
+        .arg(h.join(".cargo/config.toml"))
+        .status()
+        .unwrap();
+    assert!(sed.success());
+    let elsewhere = tempfile::TempDir::new().unwrap();
+    let cargo = Command::new(env!("CARGO"))
+        .arg("after")
+        .current_dir(elsewhere.path())
+        .env("CARGO_HOME", h.join(".cargo"))
+        .env("HOME", &h)
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&cargo.stderr);
+    assert!(cargo.status.success(), "the host's cargo: {said}");
+    assert!(!said.contains("both"), "the host's cargo: {said}");
+    std::fs::write(p.join("go"), "").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_lines(&out, &[("cargolegacy", "refused")]);
+    assert!(!h.join(".cargo/config").exists(), "config left on the host");
+    assert_eq!(
+        std::fs::read_to_string(h.join(".cargo/config.toml")).unwrap(),
+        "[alias]\nafter = \"version\"\n"
+    );
+}
+
+/// A Ctrl-C (SIGINT to the launcher's process group) while the jail runs
+/// ends the jail, and the launcher still takes away what it made: the home
+/// is as it was.
+///
+/// FAILS ON REVERT: let SIGINT end the launcher (the empty folders it made
+/// stay until the next jail).
+#[test]
+fn a_ctrl_c_still_takes_away_what_the_launch_made() {
+    use std::os::unix::process::CommandExt;
+    let test = "a_ctrl_c_still_takes_away_what_the_launch_made";
+    if !jail_opens_here(test) {
+        return;
+    }
+    let home = tempfile::TempDir::new().unwrap();
+    let h = std::fs::canonicalize(home.path()).unwrap();
+    for dir in [".config/myagent", ".local/state", ".cargo"] {
+        std::fs::create_dir_all(h.join(dir)).unwrap();
+    }
+    let before = home_trees(&h);
+    let project = tempfile::TempDir::new().unwrap();
+    let p = std::fs::canonicalize(project.path()).unwrap();
+    let (child, _graph) = launch(
+        &h,
+        &p,
+        "touch \"$PWD/runs\"; sleep 60; echo DONE",
+        |command| {
+            command.process_group(0);
+        },
+    );
+    wait_for(&p.join("runs"));
+    assert!(h.join(".config/fish").is_dir(), "made for the jail");
+    let group = format!("-{}", child.id());
+    let kill = Command::new("kill")
+        .args(["-INT", "--", &group])
+        .status()
+        .unwrap();
+    assert!(kill.success());
+    let start = std::time::Instant::now();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        start.elapsed().as_secs() < 30,
+        "the jail outlived the Ctrl-C"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!stdout.contains("DONE"), "{stdout}");
+    assert_eq!(before, home_trees(&h), "the home after the Ctrl-C");
 }

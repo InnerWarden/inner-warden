@@ -1070,16 +1070,29 @@ their MCP servers get no session id to match. Details and limits:
   nu forms, which the shell startup files rustup edits source),
   `~/.cargo/config.toml` and `~/.cargo/config` (a `rustc-wrapper`, a
   `runner`, an alias), and rustup's `settings.toml` where it is there.
-  Where cargo's config is not there it is made as one file under both
-  names, so cargo reads it once and warns of nothing.
+  Where one of cargo's two config files is not there it is made empty
+  and with no permission at all, never as a second name of the other:
+  cargo on the host cannot open it, so it reads your config as before and
+  warns of nothing, and an edit of `config.toml` during the jail
+  (`sed -i`) leaves no stale `config` behind.
 - **The host keeps no empty folder or file the launcher made for a jail.**
   Each place it makes so the jail cannot (about 30 folders in `~/.config`
   and `~/.local`, a few files) is taken away again when the jail ends,
-  where it is still the entry it made and still holds nothing; a folder
-  above one it made goes the same way. While another jail of the same home
-  runs, nothing is taken away (it still shows those places read-only); the
-  launch that ends with no other jail of the home running takes away what
-  every launch made.
+  where it is still the entry it made, still holds nothing and no running
+  jail shows it; a folder above one it made goes the same way. What a
+  jail shows is read from the mounts of every live process of the
+  account (`/proc/*/mountinfo`), not from a lock: a launch with another
+  `XDG_RUNTIME_DIR`, or the runtime folder removed at logout while a jail
+  runs in tmux, no longer lets the jail that ends first take away a place
+  another still shows read-only (its late autostart entry or user unit
+  reached the host). Each launch writes down what it made, so the last
+  one to end takes away what another had to leave. A Ctrl-C, a hangup or
+  a `kill` of the launcher ends the jail first and the launcher still
+  takes away what it made; before, it died and left them until the next
+  jail. An OpenClaw jail (`--agent openclaw`) now makes the places that
+  are not there and holds them read-only too; before, with
+  `~/.config/git` absent, git's config, fish's startup file, an
+  autostart entry and `~/.cargo/env` written in it reached the host.
 - **The line said of a stowed folder names where the link leads**
   (`~/.config/git goes through ~/dotfiles/git`), not the link again.
 - **Limits.** A link inside one of those folders that leads to a place the
@@ -1093,8 +1106,13 @@ their MCP servers get no session id to match. Details and limits:
   `~/.rustup/toolchains` (a project's `rust-toolchain.toml` that names it
   runs it), cargo's and rustup's files when `CARGO_HOME` or `RUSTUP_HOME`
   name another folder, and the project's own `.git/hooks` and files (the
-  jail writes the project). While a jail runs, the empty folders made for
-  it are on the host: a `ln -s` onto one of them then lands inside it.
+  jail writes the project). Still writable too: a `.pth` file in the user
+  site of a Python the host does not have yet (no folder of it is held),
+  a new file in `~/.local/share/claude/versions` (only the version a link
+  runs is held), and a `build.rs` in cargo's `registry/src` (sources
+  cargo builds the next time). While a jail runs, the empty folders made
+  for it are on the host: a `ln -s` onto one of them then lands inside
+  it. A launch that cannot read `/proc` takes nothing away.
 - **A report that connects as the jail ends is written or counted.** The
   launcher closes the record socket's backlog before its last look at it,
   so a connect that found the socket's name before it was removed is

@@ -2656,8 +2656,9 @@ pub const AUTOSTART_FILES: &[&str] = &[
 /// cargo's own config (`build.rustc-wrapper`, a `runner`, an alias), in
 /// both names cargo reads. Read-only in every Linux jail like
 /// [`AUTOSTART_FILES`], made first where they are not there: `config`
-/// and `config.toml` as one file ([`cargo_config_partner`]), so cargo
-/// sees no second config and says nothing.
+/// and `config.toml` ([`cargo_config_partner`]) with no permission at
+/// all, so cargo on the host cannot open the one made and reads the
+/// other as before, saying nothing.
 pub const CARGO_FILES: &[&str] = &[
     ".cargo/env",
     ".cargo/env.fish",
@@ -2667,10 +2668,10 @@ pub const CARGO_FILES: &[&str] = &[
 ];
 
 /// PURE. The other name cargo reads its config by, beside `file`
-/// (`~/.cargo/config` for `~/.cargo/config.toml` and back): where cargo
-/// finds both as one file (a hard link) it reads it once and warns of
-/// nothing, while two files make it warn on every run. `None` for any
-/// other file.
+/// (`~/.cargo/config` for `~/.cargo/config.toml` and back): two files it
+/// can open make it warn on every run, and an empty `config` would hide
+/// `config.toml`, so the launcher makes either with no permission.
+/// `None` for any other file.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn cargo_config_partner(file: &Path) -> Option<PathBuf> {
     let parent = file.parent()?;
