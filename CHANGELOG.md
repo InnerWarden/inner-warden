@@ -33,6 +33,21 @@ reaches the guard's places is refused. The files still read (a `.git`
 file, a repository's config, its `commondir`) are read only as regular
 files, not links, of at most 64 KiB; one that cannot be read so counts as
 unknown, and a verb that writes there is refused.
+Options are read as git reads them: a long option shortened to a prefix
+only it starts (`reset --har`, `checkout --forc`), short options grouped
+or with a value glued on (`checkout -bx <start>`). A `-C`, a `cd` or a
+`--git-dir` naming a folder the line does not say (`-C ""`, `-C "$DIR"`,
+`cd "$DIR"`, a `$(...)`) leaves the work tree unknown, and a verb that
+writes is refused; `$PWD` and `$(pwd)` are read as the folder the shell
+is in. `core.worktree` given to `git clone -c`, and a file written from
+inside a `.git` folder (`cd e/.git`, then a redirection or a command that
+writes), count as rewriting the work tree for the rest of the line.
+Without `--`, `checkout <name>` reads a name that can be a branch as a
+branch, as git does, even when a file or folder has that name;
+`switch -c <new>` with no start point passes, as `checkout -b <new>`
+does. `GIT_CEILING_DIRECTORIES` stops the search for a repository, as it
+stops git's. Each folder and each git command is read once per line, so a
+line of thousands of git commands costs what its distinct ones cost.
 
 For a home kept in git (a dotfiles repository with the home as its work
 tree): `status`, `add`, `commit`, `diff`, `fetch`, `push` to another
@@ -54,7 +69,10 @@ hook runs in. Such calls are judged by the hook. Above the trusted folder
 the `.codex` and its `config.toml` are read, not the folder itself (a
 parent such as the home changes all the time), and the user's own
 `~/.codex` is left out: a whole `.codex` renamed out of a parent above
-the trusted folder is not seen.
+the trusted folder is not seen. A project layer that is a link to the
+user's own file, or sits in a `.codex` that is a link to the user's
+`~/.codex`, is read as a layer, not as the user's file: swapped in after
+Codex started, it leaves the call judged.
 
 `agents connect` leaves a server the agent signs in to by itself as it is,
 instead of wrapping it in the proxy, where the sign-in was lost (every call

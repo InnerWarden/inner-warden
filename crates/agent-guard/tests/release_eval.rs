@@ -153,6 +153,11 @@ fn board_with(
 /// folder, so the number is the same on a laptop, a lab machine and CI. Not under
 /// `/tmp`: `find /tmp -name '*.toml' -delete` would then search the home.
 ///
+/// The place may sit inside a git work tree (CI puts the cargo target inside
+/// the checkout): `GIT_CEILING_DIRECTORIES` names the place, so neither git
+/// nor the guard's reading of git looks for a repository above it, and a
+/// checkout around it does not count as a repository holding the home.
+///
 /// The guard reads the home from the process environment, not from an argument,
 /// so this binary holds ONE test on purpose: nothing else runs beside it while
 /// the home is changed, and the home, `XDG_CONFIG_HOME` and the working folder
@@ -161,6 +166,7 @@ struct EmptyPlace {
     _dir: tempfile::TempDir,
     home: Option<std::ffi::OsString>,
     xdg: Option<std::ffi::OsString>,
+    ceilings: Option<std::ffi::OsString>,
     cwd: std::path::PathBuf,
 }
 
@@ -174,9 +180,11 @@ impl EmptyPlace {
         let saved = EmptyPlace {
             home: std::env::var_os("HOME"),
             xdg: std::env::var_os("XDG_CONFIG_HOME"),
+            ceilings: std::env::var_os("GIT_CEILING_DIRECTORIES"),
             cwd: std::env::current_dir().expect("the working folder"),
             _dir: dir,
         };
+        std::env::set_var("GIT_CEILING_DIRECTORIES", saved._dir.path());
         std::env::set_var("HOME", &home);
         std::env::remove_var("XDG_CONFIG_HOME");
         std::env::set_current_dir(&work).expect("judge from the empty folder");
@@ -194,6 +202,10 @@ impl Drop for EmptyPlace {
         match &self.xdg {
             Some(x) => std::env::set_var("XDG_CONFIG_HOME", x),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match &self.ceilings {
+            Some(c) => std::env::set_var("GIT_CEILING_DIRECTORIES", c),
+            None => std::env::remove_var("GIT_CEILING_DIRECTORIES"),
         }
     }
 }

@@ -365,7 +365,6 @@ pub fn codex_layers_may_have_moved_beside(
     agent_started: Option<SystemTime>,
     user_config: Option<&Path>,
 ) -> bool {
-    let user = user_config.and_then(file_id);
     let real = std::fs::canonicalize(cwd).ok();
     let Some(root) = trusted
         .iter()
@@ -391,8 +390,7 @@ pub fn codex_layers_may_have_moved_beside(
             return true;
         }
         let layer = dir.join(".codex").join("config.toml");
-        let is_user =
-            user_config == Some(layer.as_path()) || (user.is_some() && file_id(&layer) == user);
+        let is_user = user_config.is_some_and(|user| is_the_users_own(dir, &layer, user));
         if !is_user
             && layer_places_may_have_moved(dir, ".codex", "config.toml", agent_started, !above)
         {
@@ -403,6 +401,32 @@ pub fn codex_layers_may_have_moved_beside(
         }
     }
     false
+}
+
+/// Whether `layer` (`<dir>/.codex/config.toml`) is the user's own file
+/// `user` itself, not a layer that leads to it: the same path, or the
+/// same folder under another spelling with neither the `.codex` nor the
+/// file a link. A layer that is a link (or a hard link, or sits in a
+/// `.codex` that is a link) to the user's file is read as a layer: what
+/// it pointed at when the agent started is not known.
+fn is_the_users_own(dir: &Path, layer: &Path, user: &Path) -> bool {
+    if layer == user {
+        return true;
+    }
+    let not_link = |path: &Path| {
+        std::fs::symlink_metadata(path).is_ok_and(|meta| !meta.file_type().is_symlink())
+    };
+    let Some(user_dir) = user.parent().and_then(Path::parent) else {
+        return false;
+    };
+    user.file_name() == layer.file_name()
+        && user.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".codex"))
+        && not_link(&dir.join(".codex"))
+        && not_link(layer)
+        && matches!(
+            (std::fs::canonicalize(dir), std::fs::canonicalize(user_dir)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// Whether the folder Codex says a call runs in (`payload`, its hook's
@@ -2688,6 +2712,69 @@ mod tests {
         // The file the link points at, rewritten.
         std::fs::write(shared.join("layer.toml"), "").unwrap();
         assert!(codex_layers_may_have_moved(&filed, &trusted, started));
+    }
+
+    /// A project layer swapped, after the agent started, for a link to the
+    /// user's own file (the file a link, or the `.codex` a link to the
+    /// user's `.codex`) is a layer that moved: what the agent read was the
+    /// project's, not the user's. The user's own file, rewritten, is still
+    /// left out.
+    ///
+    /// FAILS ON REVERT of `is_the_users_own` (back to "the same file as
+    /// the user's, links followed").
+    #[cfg(unix)]
+    #[test]
+    fn a_layer_swapped_for_a_link_to_the_users_file_has_moved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let home = dir.path().join("home");
+        let user_codex = home.join(".codex");
+        let user = user_codex.join("config.toml");
+        std::fs::create_dir_all(&user_codex).unwrap();
+        std::fs::write(&user, "[mcp_servers.docs]\ncommand = \"proxy\"\n").unwrap();
+        let evil = "[mcp_servers.docs-evil]\ncommand = \"docs\"\n";
+        let file_proj = home.join("file-proj");
+        let dir_proj = home.join("dir-proj");
+        for proj in [&file_proj, &dir_proj] {
+            std::fs::create_dir_all(proj.join(".codex")).unwrap();
+            std::fs::write(proj.join(".codex/config.toml"), evil).unwrap();
+        }
+        let trusted = vec![file_proj.clone(), dir_proj.clone()];
+        std::thread::sleep(SETTLE_MARGIN + Duration::from_millis(300));
+        let started = Some(SystemTime::now());
+        for proj in [&file_proj, &dir_proj] {
+            assert!(!codex_layers_may_have_moved_beside(
+                proj,
+                &trusted,
+                started,
+                Some(&user)
+            ));
+        }
+        // The user's own file, rewritten by Codex: not a layer.
+        std::fs::write(&user, "[mcp_servers.docs]\ncommand = \"proxy\"\n# seen\n").unwrap();
+        assert!(!codex_layers_may_have_moved_beside(
+            &file_proj,
+            &trusted,
+            started,
+            Some(&user)
+        ));
+        // The layer file swapped for a link to the user's file.
+        std::fs::remove_file(file_proj.join(".codex/config.toml")).unwrap();
+        std::os::unix::fs::symlink(&user, file_proj.join(".codex/config.toml")).unwrap();
+        assert!(codex_layers_may_have_moved_beside(
+            &file_proj,
+            &trusted,
+            started,
+            Some(&user)
+        ));
+        // The project's `.codex` swapped for a link to the user's.
+        std::fs::remove_dir_all(dir_proj.join(".codex")).unwrap();
+        std::os::unix::fs::symlink(&user_codex, dir_proj.join(".codex")).unwrap();
+        assert!(codex_layers_may_have_moved_beside(
+            &dir_proj,
+            &trusted,
+            started,
+            Some(&user)
+        ));
     }
 
     /// A project made trusted, or a profile chosen, on Codex's command line

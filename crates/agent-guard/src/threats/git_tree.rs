@@ -228,12 +228,44 @@ fn may_take(content: &str) -> bool {
 }
 
 /// [`git_takes_guard_place`] with the home, `XDG_CONFIG_HOME` and the
-/// working folder given.
+/// working folder given, `GIT_CEILING_DIRECTORIES` read from this
+/// process's environment (the agent's, which its commands inherit).
 pub(super) fn git_takes_guard_place_in(
     content: &str,
     home: Option<&Path>,
     xdg: Option<&Path>,
     cwd: Option<&Path>,
+) -> bool {
+    let ceilings = ceiling_directories(std::env::var_os("GIT_CEILING_DIRECTORIES").as_deref());
+    git_takes_guard_place_with(content, home, xdg, cwd, &ceilings)
+}
+
+/// The folders `GIT_CEILING_DIRECTORIES` names: git does not look for a
+/// repository in them or above them (the folder it starts in is still
+/// looked at). Entries that are not absolute are left out, as git does.
+fn ceiling_directories(value: Option<&std::ffi::OsStr>) -> Vec<PathBuf> {
+    let Some(value) = value else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in std::env::split_paths(value).take(STARTS) {
+        if !entry.is_absolute() {
+            continue;
+        }
+        let real = std::fs::canonicalize(&entry).ok();
+        out.push(entry);
+        out.extend(real);
+    }
+    out
+}
+
+/// [`git_takes_guard_place_in`] with the ceiling folders given.
+fn git_takes_guard_place_with(
+    content: &str,
+    home: Option<&Path>,
+    xdg: Option<&Path>,
+    cwd: Option<&Path>,
+    ceilings: &[PathBuf],
 ) -> bool {
     if !may_take(content) {
         return false;
@@ -251,8 +283,16 @@ pub(super) fn git_takes_guard_place_in(
     let mut last_cd: Vec<PathBuf> = Vec::new();
     // A step before wrote a `.git`, a `gitdir` or a `core.worktree`.
     let mut tree_unknown = false;
+    // A `cd` went to a folder the line does not say: git commands after
+    // it run in a folder not known.
+    let mut start_unknown = false;
+    // The latest `cd` went into a git folder (`cd e/.git`): a step that
+    // writes there may rewrite the repository's config.
+    let mut inside_git = false;
+    let cache = Cache::default();
     for segment in shell_command_segments(content) {
-        let words: Vec<String> = shell_tokens(segment).iter().map(|w| unquote(w)).collect();
+        let segment = mark_empty_words(segment);
+        let words: Vec<String> = shell_tokens(&segment).iter().map(|w| unquote(w)).collect();
         for word in &words {
             if let Some((name, value)) = assignment(word) {
                 assigned.push((name, value));
@@ -266,23 +306,44 @@ pub(super) fn git_takes_guard_place_in(
         };
         let name = token_basename(&words[index]).to_ascii_lowercase();
         let arguments = &words[index + 1..];
+        if inside_git
+            && !matches!(name.as_str(), "cd" | "pushd" | "popd" | "git")
+            && (!super::output_redirect_targets(&words).is_empty()
+                || (!READS_ONLY.contains(&name.as_str()) && !arguments.is_empty()))
+        {
+            tree_unknown = true;
+        }
         let line = Line {
             home,
             assigned: &assigned,
             created: &created,
             tree_unknown,
+            start_unknown,
+            ceilings,
+            cache: &cache,
         };
         match name.as_str() {
-            "cd" | "pushd" => {
+            "cd" | "pushd" | "popd" => {
                 let dir = arguments
                     .iter()
-                    .find(|word| !word.starts_with('-'))
+                    .find(|word| !word.starts_with('-') || word.as_str() == "-")
                     .map_or("~", String::as_str);
-                let named: Vec<PathBuf> = starts
-                    .iter()
-                    .filter_map(|start| line.resolve(dir, start))
-                    .chain(line.resolve(dir, Path::new("/")))
-                    .collect();
+                let named: Vec<PathBuf> = if name == "popd" || dir == "-" {
+                    Vec::new()
+                } else {
+                    starts
+                        .iter()
+                        .filter_map(|start| line.resolve(&with_pwd(dir, start), start))
+                        .chain(line.resolve(dir, Path::new("/")))
+                        .collect()
+                };
+                if named.is_empty() {
+                    start_unknown = true;
+                }
+                inside_git = named.iter().any(|dir| {
+                    dir.components()
+                        .any(|part| part.as_os_str().eq_ignore_ascii_case(".git"))
+                }) || (named.is_empty() && (inside_git || names_git(dir, &assigned)));
                 last_cd.clone_from(&named);
                 for dir in named {
                     if starts.len() < STARTS && !starts.contains(&dir) {
@@ -374,7 +435,7 @@ fn rewrites_repository(
                 .iter()
                 .map(|word| word.to_ascii_lowercase())
                 .collect();
-            lower.iter().any(|word| word == "core.worktree")
+            lower.iter().any(|word| word.contains("core.worktree"))
                 || lower.windows(2).any(|pair| match pair[0].as_str() {
                     "worktree" => matches!(pair[1].as_str(), "add" | "move" | "repair"),
                     "submodule" => matches!(
@@ -431,45 +492,100 @@ fn names_git(word: &str, assigned: &[(String, String)]) -> bool {
 /// Whether the shell pattern `pattern` (`*`, `?`, `[...]`) matches
 /// `text`. A pattern with none of them is not read as one.
 fn glob_matches(pattern: &str, text: &str) -> bool {
-    fn at(pattern: &[char], text: &[char]) -> bool {
-        match pattern.first() {
-            None => text.is_empty(),
-            Some('*') => (0..=text.len()).any(|skip| at(&pattern[1..], &text[skip..])),
-            Some('?') => !text.is_empty() && at(&pattern[1..], &text[1..]),
-            Some('[') => {
-                let Some(end) = pattern[1..].iter().position(|c| *c == ']') else {
-                    return false;
-                };
-                let set = &pattern[1..=end];
-                let (negated, set) = match set.first() {
-                    Some('!' | '^') => (true, &set[1..]),
-                    _ => (false, set),
-                };
-                let Some(first) = text.first() else {
-                    return false;
-                };
-                let mut found = false;
-                let mut i = 0usize;
-                while i < set.len() {
-                    if i + 2 < set.len() && set[i + 1] == '-' {
-                        found |= (set[i]..=set[i + 2]).contains(first);
-                        i += 3;
-                    } else {
-                        found |= set[i] == *first;
-                        i += 1;
-                    }
-                }
-                found != negated && at(&pattern[end + 2..], &text[1..])
-            }
-            Some(c) => text.first() == Some(c) && at(&pattern[1..], &text[1..]),
-        }
+    /// One part of a pattern.
+    enum Part {
+        Any,
+        One,
+        Set(Vec<char>, bool),
+        Char(char),
     }
     if !pattern.contains(['*', '?', '[']) {
         return false;
     }
     let pattern: Vec<char> = pattern.chars().take(64).collect();
+    let mut parts: Vec<Part> = Vec::new();
+    let mut i = 0usize;
+    while i < pattern.len() {
+        match pattern[i] {
+            // A run of `*` is one `*`.
+            '*' => {
+                if !matches!(parts.last(), Some(Part::Any)) {
+                    parts.push(Part::Any);
+                }
+                i += 1;
+            }
+            '?' => {
+                parts.push(Part::One);
+                i += 1;
+            }
+            '[' => {
+                let Some(end) = pattern[i + 1..].iter().position(|c| *c == ']') else {
+                    return false;
+                };
+                let set = &pattern[i + 1..i + 1 + end];
+                let (negated, set) = match set.first() {
+                    Some('!' | '^') => (true, &set[1..]),
+                    _ => (false, set),
+                };
+                parts.push(Part::Set(set.to_vec(), negated));
+                i += end + 2;
+            }
+            c => {
+                parts.push(Part::Char(c));
+                i += 1;
+            }
+        }
+    }
+    let in_set = |set: &[char], c: char| {
+        let mut j = 0usize;
+        while j < set.len() {
+            if j + 2 < set.len() && set[j + 1] == '-' {
+                if (set[j]..=set[j + 2]).contains(&c) {
+                    return true;
+                }
+                j += 3;
+            } else {
+                if set[j] == c {
+                    return true;
+                }
+                j += 1;
+            }
+        }
+        false
+    };
+    // Which prefixes of the text the parts read so far can match: linear
+    // in the pattern times the text.
     let text: Vec<char> = text.chars().collect();
-    at(&pattern, &text)
+    let mut can = vec![false; text.len() + 1];
+    can[0] = true;
+    for part in &parts {
+        let mut next = vec![false; text.len() + 1];
+        match part {
+            Part::Any => {
+                let mut seen = false;
+                for (n, cell) in next.iter_mut().enumerate() {
+                    seen |= can[n];
+                    *cell = seen;
+                }
+            }
+            _ => {
+                for n in 0..text.len() {
+                    if !can[n] {
+                        continue;
+                    }
+                    let c = text[n];
+                    next[n + 1] = match part {
+                        Part::One => true,
+                        Part::Set(set, negated) => in_set(set, c) != *negated,
+                        Part::Char(want) => *want == c,
+                        Part::Any => unreachable!(),
+                    };
+                }
+            }
+        }
+        can = next;
+    }
+    can[text.len()]
 }
 
 /// The guard's places, written out from the home: its folders, the agent
@@ -713,7 +829,7 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
             Plan::Tracked(paths)
         }
         "checkout" => {
-            let new_branch = has(&["-b", "-B", "--orphan"]);
+            let new_branch = has(&["-b", "-B", "--orphan"]) || has_prefix("--orphan=");
             let (before, after) = operands(rest, &["-b", "-B", "--orphan"]);
             if let Some(after) = after {
                 let paths = after.into_iter().map(str::to_string).collect();
@@ -730,7 +846,10 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
                 }
                 return Plan::Tracked(with_unknown(Vec::new()));
             };
+            // Without `--`, git reads a name that can be a branch as one,
+            // even when a file or a folder has that name too.
             let is_path = !new_branch
+                && !could_be_branch(first)
                 && line
                     .resolve(first, folder)
                     .is_some_and(|path| path.symlink_metadata().is_ok());
@@ -741,7 +860,33 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
             let paths = before[1..].iter().map(|word| word.to_string()).collect();
             Plan::Tracked(with_unknown(paths))
         }
-        "switch" => Plan::Tracked(Vec::new()),
+        "switch" => {
+            // `switch -c <new>` with no start point moves no file, as
+            // `checkout -b <new>`; `--orphan` empties the tree.
+            let creates = has(&["-c", "-C", "--create", "--force-create"])
+                || has_prefix("--create=")
+                || has_prefix("--force-create=");
+            let (before, _) = operands(
+                rest,
+                &["-c", "-C", "--create", "--force-create", "--orphan"],
+            );
+            if creates
+                && before.is_empty()
+                && !has(&[
+                    "-f",
+                    "--force",
+                    "--discard-changes",
+                    "-m",
+                    "--merge",
+                    "--orphan",
+                ])
+                && !has_prefix("--orphan=")
+                && !short_has(&['f', 'm'])
+            {
+                return Plan::Keeps;
+            }
+            Plan::Tracked(Vec::new())
+        }
         "restore" => {
             let staged = has(&["--staged", "-S"]);
             let worktree = has(&["--worktree", "-W"]);
@@ -775,6 +920,258 @@ fn plan(verb: &str, rest: &[String], folder: &Path, line: &Line<'_>) -> Plan {
     }
 }
 
+/// Whether `name` can name a branch (`git check-ref-format`): a word
+/// that cannot (`.bashrc`, `a..b`, `x.lock`) is read only as a path.
+fn could_be_branch(name: &str) -> bool {
+    !name.is_empty()
+        && name != "@"
+        && !name.starts_with('-')
+        && !name.ends_with('/')
+        && !name.ends_with('.')
+        && !name.contains("..")
+        && !name.contains("@{")
+        && !name
+            .chars()
+            .any(|c| c.is_control() || matches!(c, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+        && name
+            .split('/')
+            .all(|part| !part.is_empty() && !part.starts_with('.') && !part.ends_with(".lock"))
+}
+
+/// The long options of the verbs [`plan`] reads, and their short options
+/// that take a value: git takes a long option shortened to a prefix only
+/// it starts (`--har` is `--hard`), and a value glued to a short one or
+/// a short one inside a group (`-bx`, `-fb x`).
+fn verb_options(verb: &str) -> (&'static [&'static str], &'static [char]) {
+    match verb {
+        "reset" => (
+            &[
+                "--quiet",
+                "--no-quiet",
+                "--refresh",
+                "--no-refresh",
+                "--mixed",
+                "--soft",
+                "--hard",
+                "--merge",
+                "--keep",
+                "--recurse-submodules",
+                "--no-recurse-submodules",
+                "--patch",
+                "--intent-to-add",
+                "--pathspec-from-file",
+                "--pathspec-file-nul",
+            ],
+            &[],
+        ),
+        "checkout" => (
+            &[
+                "--quiet",
+                "--progress",
+                "--no-progress",
+                "--force",
+                "--merge",
+                "--conflict",
+                "--detach",
+                "--track",
+                "--no-track",
+                "--guess",
+                "--no-guess",
+                "--orphan",
+                "--ignore-skip-worktree-bits",
+                "--ignore-other-worktrees",
+                "--ours",
+                "--theirs",
+                "--patch",
+                "--recurse-submodules",
+                "--no-recurse-submodules",
+                "--overlay",
+                "--no-overlay",
+                "--pathspec-from-file",
+                "--pathspec-file-nul",
+            ],
+            &['b', 'B'],
+        ),
+        "switch" => (
+            &[
+                "--create",
+                "--force-create",
+                "--guess",
+                "--no-guess",
+                "--discard-changes",
+                "--detach",
+                "--track",
+                "--no-track",
+                "--merge",
+                "--conflict",
+                "--quiet",
+                "--progress",
+                "--no-progress",
+                "--force",
+                "--orphan",
+                "--ignore-other-worktrees",
+                "--recurse-submodules",
+                "--no-recurse-submodules",
+            ],
+            &['c', 'C'],
+        ),
+        "restore" => (
+            &[
+                "--source",
+                "--patch",
+                "--worktree",
+                "--staged",
+                "--quiet",
+                "--progress",
+                "--no-progress",
+                "--ours",
+                "--theirs",
+                "--merge",
+                "--conflict",
+                "--ignore-unmerged",
+                "--ignore-skip-worktree-bits",
+                "--recurse-submodules",
+                "--no-recurse-submodules",
+                "--overlay",
+                "--no-overlay",
+                "--pathspec-from-file",
+                "--pathspec-file-nul",
+            ],
+            &['s'],
+        ),
+        "clean" => (
+            &[
+                "--quiet",
+                "--dry-run",
+                "--force",
+                "--interactive",
+                "--exclude",
+            ],
+            &['e'],
+        ),
+        "stash" => (
+            &[
+                "--patch",
+                "--staged",
+                "--keep-index",
+                "--no-keep-index",
+                "--include-untracked",
+                "--only-untracked",
+                "--all",
+                "--quiet",
+                "--message",
+                "--pathspec-from-file",
+                "--pathspec-file-nul",
+                "--index",
+            ],
+            &['m'],
+        ),
+        "rm" => (
+            &[
+                "--cached",
+                "--dry-run",
+                "--force",
+                "--ignore-unmatch",
+                "--quiet",
+                "--sparse",
+                "--pathspec-from-file",
+                "--pathspec-file-nul",
+            ],
+            &[],
+        ),
+        "mv" => (&["--dry-run", "--force", "--verbose", "--sparse"], &[]),
+        "read-tree" => (
+            &[
+                "--index-output",
+                "--empty",
+                "--verbose",
+                "--trivial",
+                "--aggressive",
+                "--reset",
+                "--prefix",
+                "--exclude-per-directory",
+                "--no-sparse-checkout",
+                "--recurse-submodules",
+                "--no-recurse-submodules",
+                "--dry-run",
+                "--quiet",
+            ],
+            &[],
+        ),
+        "checkout-index" => (
+            &[
+                "--all",
+                "--force",
+                "--quiet",
+                "--no-create",
+                "--index",
+                "--stdin",
+                "--temp",
+                "--prefix",
+                "--stage",
+                "--ignore-skip-worktree-bits",
+            ],
+            &[],
+        ),
+        _ => (&[], &[]),
+    }
+}
+
+/// `rest` with its options written as git reads them ([`verb_options`]):
+/// a long option shortened to a prefix only it starts written out whole,
+/// a group of short options split, a value glued to a short option that
+/// takes one put in its own word. Words after `--` are kept as they are.
+fn normalize_options(verb: &str, rest: &[String]) -> Vec<String> {
+    let (long, valued) = verb_options(verb);
+    let mut out = Vec::with_capacity(rest.len());
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if word == "--" {
+            out.push(word.clone());
+            out.extend(words.by_ref().cloned());
+            break;
+        }
+        if let Some(body) = word.strip_prefix("--") {
+            let (name, value) = match body.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (body, None),
+            };
+            let written = format!("--{name}");
+            if !name.is_empty() && !long.contains(&written.as_str()) {
+                let mut starts = long.iter().filter(|option| option.starts_with(&written));
+                if let (Some(only), None) = (starts.next(), starts.next()) {
+                    out.push(match value {
+                        Some(value) => format!("{only}={value}"),
+                        None => (*only).to_string(),
+                    });
+                    continue;
+                }
+            }
+            out.push(word.clone());
+            continue;
+        }
+        let Some(group) = word.strip_prefix('-') else {
+            out.push(word.clone());
+            continue;
+        };
+        if group.chars().count() < 2 || long.is_empty() {
+            out.push(word.clone());
+            continue;
+        }
+        for (at, letter) in group.char_indices() {
+            out.push(format!("-{letter}"));
+            if valued.contains(&letter) {
+                let glued = &group[at + letter.len_utf8()..];
+                if !glued.is_empty() {
+                    out.push(glued.to_string());
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// What the line has said so far: the home, the variables it assigned,
 /// the repositories it made, and whether a step before rewrote where a
 /// repository or its work tree is ([`rewrites_repository`]).
@@ -783,12 +1180,97 @@ struct Line<'a> {
     assigned: &'a [(String, String)],
     created: &'a [Repository],
     tree_unknown: bool,
+    /// A `cd` before went to a folder not known.
+    start_unknown: bool,
+    /// `GIT_CEILING_DIRECTORIES`.
+    ceilings: &'a [PathBuf],
+    cache: &'a Cache,
+}
+
+/// A git command as judged: its words, the folder it starts in, whether a
+/// step before rewrote the repository or went to a folder not known, and
+/// how many repositories the line made before it.
+type JudgedKey = (Vec<String>, PathBuf, [bool; 2], usize);
+
+/// What a line has read already, kept for the rest of the line: each
+/// folder, file and command is read once, so a line of thousands of git
+/// commands costs what its distinct ones cost.
+#[derive(Default)]
+struct Cache {
+    repositories:
+        std::cell::RefCell<std::collections::HashMap<PathBuf, Result<Option<Repository>, Unread>>>,
+    trees: std::cell::RefCell<std::collections::HashMap<PathBuf, Result<Option<String>, Unread>>>,
+    reached: std::cell::RefCell<std::collections::HashMap<PathBuf, bool>>,
+    judged: std::cell::RefCell<std::collections::HashMap<JudgedKey, bool>>,
+}
+
+/// `segment` with each empty quoted word (`""`, `''`) written as a
+/// variable no line assigns: the words of a line drop an empty word, and
+/// `git -C "" reset --hard` would read as `git -C reset --hard`.
+fn mark_empty_words(segment: &str) -> std::borrow::Cow<'_, str> {
+    if !segment.contains("\"\"") && !segment.contains("''") {
+        return std::borrow::Cow::Borrowed(segment);
+    }
+    let chars: Vec<char> = segment.chars().collect();
+    let mut out = String::with_capacity(segment.len());
+    let mut at = 0usize;
+    let mut quote: Option<char> = None;
+    while at < chars.len() {
+        let c = chars[at];
+        let alone = |before: Option<&char>, after: Option<&char>| {
+            before.is_none_or(|c| c.is_whitespace()) && after.is_none_or(|c| c.is_whitespace())
+        };
+        if quote.is_none()
+            && matches!(c, '"' | '\'')
+            && chars.get(at + 1) == Some(&c)
+            && alone(
+                at.checked_sub(1).and_then(|b| chars.get(b)),
+                chars.get(at + 2),
+            )
+        {
+            out.push_str("$IW_EMPTY_WORD");
+            at += 2;
+            continue;
+        }
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(open), _) if open == c => quote = None,
+            (None, '\\') => {
+                out.push(c);
+                at += 1;
+                if let Some(next) = chars.get(at) {
+                    out.push(*next);
+                }
+                at += 1;
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c);
+        at += 1;
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// `text` with the shell's working folder (`$PWD`, `$(pwd)`) written
+/// out as `start`, the folder the shell is in.
+fn with_pwd(text: &str, start: &Path) -> String {
+    if !text.contains("PWD") && !text.contains("pwd") {
+        return text.to_string();
+    }
+    let start = start.to_string_lossy();
+    text.replace("$(pwd)", &start)
+        .replace("`pwd`", &start)
+        .replace("${PWD}", &start)
+        .replace("$PWD", &start)
 }
 
 /// A git command's global options, read.
 struct Invocation {
     /// The folder it runs in (`-C`).
     folder: PathBuf,
+    /// A `-C` named a folder not known (`-C "$DIR"`, `-C ""`).
+    folder_unknown: bool,
     git_dir_text: Option<String>,
     tree_text: Option<String>,
     /// `core.worktree` set for this command only.
@@ -798,6 +1280,52 @@ struct Invocation {
 }
 
 impl Line<'_> {
+    /// Whether `dir` is a folder of `GIT_CEILING_DIRECTORIES`.
+    fn is_ceiling(&self, dir: &Path) -> bool {
+        !self.ceilings.is_empty()
+            && (self.ceilings.iter().any(|ceiling| ceiling == dir)
+                || std::fs::canonicalize(dir).is_ok_and(|real| self.ceilings.contains(&real)))
+    }
+
+    /// [`reaches`], read once per path for the line.
+    fn reaches(&self, path: &Path, places: &[String]) -> bool {
+        if let Some(known) = self.cache.reached.borrow().get(path) {
+            return *known;
+        }
+        let reached = reaches(path, places);
+        self.cache
+            .reached
+            .borrow_mut()
+            .insert(path.to_path_buf(), reached);
+        reached
+    }
+
+    /// [`repository_at`], read once per folder for the line.
+    fn repository_at(&self, dir: &Path) -> Result<Option<Repository>, Unread> {
+        if let Some(known) = self.cache.repositories.borrow().get(dir) {
+            return known.clone();
+        }
+        let found = repository_at(dir);
+        self.cache
+            .repositories
+            .borrow_mut()
+            .insert(dir.to_path_buf(), found.clone());
+        found
+    }
+
+    /// [`core_worktree`], read once per repository for the line.
+    fn core_worktree(&self, git_dir: &Path) -> Result<Option<String>, Unread> {
+        if let Some(known) = self.cache.trees.borrow().get(git_dir) {
+            return known.clone();
+        }
+        let tree = core_worktree(git_dir);
+        self.cache
+            .trees
+            .borrow_mut()
+            .insert(git_dir.to_path_buf(), tree.clone());
+        tree
+    }
+
     fn variable(&self, name: &str) -> Option<String> {
         self.assigned
             .iter()
@@ -844,10 +1372,10 @@ impl Line<'_> {
         Some(PathBuf::from(collapse_path(&path.to_string_lossy())))
     }
 
-    /// The global options of `git <arguments>` run in `start`; `None` when
-    /// the folder it runs in is not known.
-    fn invocation(&self, arguments: &[String], start: &Path) -> Option<Invocation> {
+    /// The global options of `git <arguments>` run in `start`.
+    fn invocation(&self, arguments: &[String], start: &Path) -> Invocation {
         let mut folder = start.to_path_buf();
+        let mut folder_unknown = false;
         let mut git_dir_text = self.variable("GIT_DIR");
         let mut tree_text = self.variable("GIT_WORK_TREE");
         // `core.worktree` set for this command only, read in the
@@ -880,7 +1408,10 @@ impl Line<'_> {
             match word.as_str() {
                 "-C" => {
                     if let Some(value) = next {
-                        folder = self.resolve(value, &folder)?;
+                        match self.resolve(&with_pwd(value, start), &folder) {
+                            Some(named) => folder = named,
+                            None => folder_unknown = true,
+                        }
                     }
                     at += 2;
                     continue;
@@ -925,19 +1456,23 @@ impl Line<'_> {
             }
             at += 1;
         }
-        Some(Invocation {
+        Invocation {
             folder,
+            folder_unknown,
             git_dir_text,
             tree_text,
             set_tree,
             verb_at: at,
-        })
+        }
     }
 
     /// The repository `git <arguments>` makes, run in `start`: `git init`
     /// or `git clone` with a work tree.
     fn git_makes(&self, arguments: &[String], start: &Path) -> Option<Repository> {
-        let invocation = self.invocation(arguments, start)?;
+        let invocation = self.invocation(arguments, start);
+        if invocation.folder_unknown {
+            return None;
+        }
         let verb = arguments.get(invocation.verb_at)?.to_ascii_lowercase();
         let rest = &arguments[invocation.verb_at + 1..];
         if rest
@@ -1020,22 +1555,39 @@ impl Line<'_> {
     /// Whether `git <arguments>`, run in `start`, writes to a work tree
     /// that holds a place of `places`, or points one at them.
     fn git_takes(&self, arguments: &[String], start: &Path, places: &[String]) -> bool {
-        let Some(invocation) = self.invocation(arguments, start) else {
-            return false;
-        };
+        let key = (
+            arguments.to_vec(),
+            start.to_path_buf(),
+            [self.tree_unknown, self.start_unknown],
+            self.created.len(),
+        );
+        if let Some(known) = self.cache.judged.borrow().get(&key) {
+            return *known;
+        }
+        let takes = self.git_takes_once(arguments, start, places);
+        self.cache.judged.borrow_mut().insert(key, takes);
+        takes
+    }
+
+    fn git_takes_once(&self, arguments: &[String], start: &Path, places: &[String]) -> bool {
+        let invocation = self.invocation(arguments, start);
         let Some(verb) = arguments.get(invocation.verb_at) else {
             return false;
         };
         let verb = verb.to_ascii_lowercase();
         let rest = &arguments[invocation.verb_at + 1..];
         let folder = &invocation.folder;
-        let plan = plan(&verb, rest, folder, self);
+        let normalized = normalize_options(&verb, rest);
+        let plan = plan(&verb, &normalized, folder, self);
         if matches!(plan, Plan::Keeps) {
-            return verb == "push" && self.pushes_to_guard(rest, &invocation, places);
+            return verb == "push"
+                && !invocation.folder_unknown
+                && self.pushes_to_guard(rest, &invocation, places);
         }
         // Where the repository and its work tree are was rewritten earlier
-        // in the line: not known here.
-        if self.tree_unknown {
+        // in the line, or the folder git runs in is not known (a `cd` or a
+        // `-C` the line does not say): not known here.
+        if self.tree_unknown || self.start_unknown || invocation.folder_unknown {
             return true;
         }
 
@@ -1045,6 +1597,14 @@ impl Line<'_> {
             .git_dir_text
             .as_deref()
             .and_then(|text| self.resolve(text, folder));
+        // A repository named by a text not known (`--git-dir="$(...)"`):
+        // its work tree is not known either.
+        if invocation.git_dir_text.is_some()
+            && named_git_dir.is_none()
+            && !matches!(plan, Plan::Points(_))
+        {
+            return true;
+        }
         let found = if invocation.git_dir_text.is_none() {
             match self.discover(folder) {
                 Ok(found) => found,
@@ -1069,10 +1629,13 @@ impl Line<'_> {
                     .tree_text
                     .as_deref()
                     .and_then(|text| self.resolve(text, folder))
-                    .is_some_and(|tree| reaches(&tree, places))
+                    .is_some_and(|tree| self.reaches(&tree, places))
                 && !matches!(plan, Plan::Points(_));
         }
-        let config_tree = match git_dir.as_deref().map(core_worktree) {
+        let config_tree = match git_dir
+            .as_deref()
+            .map(|git_dir| self.core_worktree(git_dir))
+        {
             Some(Err(Unread)) => return true,
             Some(Ok(tree)) => tree,
             None => None,
@@ -1116,7 +1679,7 @@ impl Line<'_> {
             !paths.is_empty()
                 && paths
                     .iter()
-                    .all(|word| resolve_path(word).is_some_and(|path| !reaches(&path, places)))
+                    .all(|word| resolve_path(word).is_some_and(|path| !self.reaches(&path, places)))
         };
         match plan {
             Plan::Keeps => false,
@@ -1128,9 +1691,9 @@ impl Line<'_> {
                         .any(|path| places.iter().any(|place| is_within(path, place)))
                 })
             }
-            Plan::Writes => reaches(&tree, places),
+            Plan::Writes => self.reaches(&tree, places),
             Plan::WritesBelow(prefix) => match self.resolve(&prefix, folder) {
-                Some(below) => reaches(&below, places),
+                Some(below) => self.reaches(&below, places),
                 None => true,
             },
             Plan::Untracked(paths) => {
@@ -1140,9 +1703,9 @@ impl Line<'_> {
                 } else {
                     tree.clone()
                 };
-                reaches(&scope, places) && !kept_out(&paths)
+                self.reaches(&scope, places) && !kept_out(&paths)
             }
-            Plan::Tracked(paths) => reaches(&tree, places) && !kept_out(&paths),
+            Plan::Tracked(paths) => self.reaches(&tree, places) && !kept_out(&paths),
         }
     }
 
@@ -1150,10 +1713,14 @@ impl Line<'_> {
     /// made counted. `Err` when a `.git` on the way cannot be read.
     fn discover(&self, folder: &Path) -> Result<Option<Repository>, Unread> {
         for dir in folder.ancestors().take(DISCOVERY_DEPTH) {
+            // `GIT_CEILING_DIRECTORIES`: git goes no higher.
+            if dir != folder && self.is_ceiling(dir) {
+                break;
+            }
             if let Some(made) = self.created.iter().find(|made| made.top == dir) {
                 return Ok(Some(made.clone()));
             }
-            if let Some(repository) = repository_at(dir)? {
+            if let Some(repository) = self.repository_at(dir)? {
                 return Ok(Some(repository));
             }
         }
@@ -1214,7 +1781,7 @@ impl Line<'_> {
                 return false;
             };
             match pushed_tree(&path) {
-                Ok(Some(tree)) => reaches(&tree, places),
+                Ok(Some(tree)) => self.reaches(&tree, places),
                 Ok(None) => false,
                 Err(Unread) => true,
             }
@@ -1240,6 +1807,7 @@ impl Line<'_> {
 }
 
 /// A file of a repository that could not be read as a small regular file.
+#[derive(Clone)]
 struct Unread;
 
 /// The text of `path` when it is a regular file, not a link, of at most
@@ -1290,6 +1858,8 @@ fn read_small(path: &Path) -> Result<Option<String>, Unread> {
 /// The repository whose `.git` is in `dir`: a `.git` folder, or a `.git`
 /// file that names one (`gitdir: <path>`).
 fn repository_at(dir: &Path) -> Result<Option<Repository>, Unread> {
+    #[cfg(test)]
+    tests::FOLDERS_READ.with(|read| read.set(read.get() + 1));
     let dot_git = dir.join(".git");
     let Ok(meta) = std::fs::metadata(&dot_git) else {
         // A link to nowhere, or to a loop: git cannot use it either, but
@@ -2015,5 +2585,224 @@ mod tests {
             .expect("context");
         let analysis = crate::mcp::analyze_command_in(line, None, Some(&context));
         assert_eq!(analysis.recommendation, "deny", "{analysis:?}");
+    }
+    thread_local! {
+        /// How many folders [`repository_at`] read on this thread.
+        pub(super) static FOLDERS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// A home made a repository, the guard's folder in it.
+    fn home_repository() -> tempfile::TempDir {
+        let dir = home();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        dir
+    }
+
+    /// FAILS ON REVERT of the ceiling in `discover`: with the eval's empty
+    /// place inside a checkout (the cargo target in the repository, as CI
+    /// lays it out), the checkout around it counted as a repository holding
+    /// the home, and a plain `git worktree add` was refused.
+    #[test]
+    fn a_ceiling_folder_stops_the_search_for_a_repository() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let checkout = dir.path().join("checkout");
+        let place = checkout.join("target/tmp/place");
+        let h = place.join("home");
+        let work = place.join("work");
+        std::fs::create_dir_all(checkout.join(".git")).unwrap();
+        std::fs::create_dir_all(h.join(".config/innerwarden")).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let line = "git worktree add ../x";
+        assert!(git_takes_guard_place_with(
+            line,
+            Some(&h),
+            None,
+            Some(&work),
+            &[]
+        ));
+        let ceilings = ceiling_directories(Some(place.as_os_str()));
+        assert!(!git_takes_guard_place_with(
+            line,
+            Some(&h),
+            None,
+            Some(&work),
+            &ceilings
+        ));
+        // The folder git starts in is still read.
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        let ceilings = ceiling_directories(Some(work.as_os_str()));
+        assert!(!git_takes_guard_place_with(
+            line,
+            Some(&h),
+            None,
+            Some(&work),
+            &ceilings
+        ));
+        // A relative entry is left out, as git leaves it.
+        assert!(ceiling_directories(Some(std::ffi::OsStr::new("target"))).is_empty());
+    }
+
+    /// FAILS ON REVERT of `normalize_options`: git takes a long option
+    /// shortened to a prefix only it starts, and a value glued to a short
+    /// option.
+    #[test]
+    fn shortened_long_options_are_read_whole() {
+        let dir = home_repository();
+        let h = dir.path();
+        std::fs::write(h.join("evil"), "").unwrap();
+        for line in [
+            "git reset --har",
+            "git reset --ha",
+            "git reset --kee",
+            "git reset --mer",
+            "git checkout --forc",
+            "git checkout -bx evil",
+            "git checkout -fb x evil",
+            "git stash push --mes .bashrc",
+            "git restore --sou=HEAD .",
+            "git clean --forc -d",
+        ] {
+            assert!(takes(line, h, h), "{line}");
+        }
+        for line in [
+            "git reset --sof",
+            "git reset --mix",
+            "git checkout -bx",
+            "git clean --dry -fd",
+            "git restore --stag .config",
+        ] {
+            assert!(!takes(line, h, h), "{line}");
+        }
+    }
+
+    /// FAILS ON REVERT of `folder_unknown` and `start_unknown`: a `-C`, a
+    /// `cd` or a `--git-dir` the line does not say leaves the work tree
+    /// unknown, and a verb that writes is refused. `$PWD` is the folder
+    /// the shell is in.
+    #[test]
+    fn a_folder_the_line_does_not_say_is_not_known() {
+        let dir = home_repository();
+        let h = dir.path();
+        let proj = h.join("proj");
+        for line in [
+            "git -C \"\" reset --hard",
+            "git -C \"$X\" reset --hard",
+            "git -C $(echo ~) reset --hard",
+            "git --git-dir=\"$(echo .git)\" reset --hard",
+            "cd \"$X\" && git reset --hard",
+            "cd - && git checkout -f",
+            "pushd /tmp && popd && git reset --hard",
+        ] {
+            assert!(takes(line, h, &proj), "{line}");
+        }
+        for line in [
+            "git -C \"$PWD\" reset --hard",
+            "git -C \"$(pwd)\" reset --hard",
+            "cd \"$PWD\" && git reset --hard",
+            "git -C \"$X\" status",
+            "cd \"$X\" && git log",
+            "git reset --hard",
+        ] {
+            assert!(!takes(line, h, &proj), "{line}");
+        }
+        // `$PWD` is the folder the shell is in: here, the home.
+        assert!(takes("git -C \"$PWD\" reset --hard", h, h));
+    }
+
+    /// FAILS ON REVERT of the `core.worktree` word and of `inside_git` in
+    /// the line's reading: a clone given `core.worktree` and a config
+    /// written from inside a `.git` repoint the work tree for the rest of
+    /// the line.
+    #[test]
+    fn a_work_tree_repointed_earlier_in_the_line_is_not_known() {
+        let dir = home();
+        let h = dir.path();
+        let proj = h.join("proj");
+        std::fs::create_dir_all(proj.join("e/.git")).unwrap();
+        for line in [
+            "git clone -c core.worktree=$HOME src x && git -C x reset --hard",
+            "git clone --config=core.worktree=$HOME src x && git -C x reset --hard",
+            "cd e/.git && printf '[core]\\n\\tworktree = /h\\n' >> config && cd ../.. && git -C e reset --hard",
+            "cd e/.git && sed -i s/x/y/ config && cd ../.. && git -C e reset --hard",
+        ] {
+            assert!(takes(line, h, &proj), "{line}");
+        }
+        for line in [
+            "git clone src x && git -C x reset --hard",
+            "cd e/.git && cat config && cd ../.. && git -C e reset --hard",
+            "cd e/.git && ls && cd ../.. && git -C e checkout -f",
+        ] {
+            assert!(!takes(line, h, &proj), "{line}");
+        }
+    }
+
+    /// FAILS ON REVERT of `could_be_branch` and of the `switch` arm:
+    /// without `--`, git reads a name that can be a branch as one even when
+    /// a file or folder has that name; `switch -c` with no start point
+    /// moves no file.
+    #[test]
+    fn a_branch_named_as_a_file_is_a_branch() {
+        let dir = home_repository();
+        let h = dir.path();
+        std::fs::create_dir_all(h.join("docs")).unwrap();
+        std::fs::write(h.join("evil"), "").unwrap();
+        std::fs::write(h.join(".bashrc"), "").unwrap();
+        for line in [
+            "git branch docs evil && git checkout docs",
+            "git checkout evil",
+            "git switch -c x evil",
+            "git switch --orphan x",
+            "git switch -c x -f",
+            "git switch main",
+        ] {
+            assert!(takes(line, h, h), "{line}");
+        }
+        for line in [
+            "git checkout .bashrc",
+            "git checkout -- evil",
+            "git switch -c x",
+            "git switch --create=x",
+            "git checkout -b x",
+        ] {
+            assert!(!takes(line, h, h), "{line}");
+        }
+    }
+
+    /// FAILS ON REVERT of the pattern reading in `glob_matches` (back to
+    /// trying every split) and of the line's `Cache`: thousands of
+    /// patterns of stars, and thousands of git commands after many `cd`,
+    /// are read in well under the hook's deadline.
+    #[test]
+    fn a_long_line_costs_what_its_distinct_parts_cost() {
+        let dir = home();
+        let h = dir.path();
+        let proj = h.join("proj");
+        let stars = format!(".{}x", "*".repeat(60));
+        let words: Vec<String> = (0..4000).map(|_| stars.clone()).collect();
+        let line = format!("touch {} ; git status", words.join(" "));
+        let started = std::time::Instant::now();
+        assert!(!takes(&line, h, &proj));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(glob_matches(".*g*i*t", ".git") || glob_matches("*g*i*t", "git"));
+        assert!(glob_matches("[!a]i?", "git"));
+        assert!(!glob_matches("*x", "git"));
+        let mut parts: Vec<String> = (0..16).map(|n| format!("cd d{n}")).collect();
+        parts.extend((0..12000).map(|_| "git checkout -- a".to_string()));
+        let line = parts.join(" && ");
+        FOLDERS_READ.with(|read| read.set(0));
+        let started = std::time::Instant::now();
+        assert!(!takes(&line, h, &proj));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // Each folder is read once for the line, not once per command.
+        let read = FOLDERS_READ.with(std::cell::Cell::get);
+        assert!(read < 2000, "{read} folders read");
     }
 }
