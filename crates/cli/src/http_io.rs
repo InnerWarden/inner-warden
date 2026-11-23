@@ -28,6 +28,49 @@ pub fn agent_with_timeout(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
+/// An agent for a request that carries what the guard read off this
+/// machine (the second opinion, an alert), bounded by `timeout`, that goes
+/// through `proxy` (from the account's own config) or straight to the
+/// address, and never through a proxy the environment names. ureq takes
+/// `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` from the environment by
+/// default, and a hook runs with the AI agent's: a proxy it named received
+/// the account's bearer key inside the CONNECT tunnel of an `http://` url.
+/// `Err` with why when `proxy` is not a proxy url: then nothing is sent,
+/// rather than sent around the proxy the person configured.
+pub fn account_agent(timeout: Duration, proxy: Option<&str>) -> Result<ureq::Agent, String> {
+    account_agent_with(timeout, proxy, true)
+}
+
+/// [`account_agent`] that hands back every status as a response instead of
+/// an error, for a caller that reads the status itself (the second opinion
+/// tells a busy 429 apart, with its Retry-After headers).
+pub fn account_agent_reading_status(
+    timeout: Duration,
+    proxy: Option<&str>,
+) -> Result<ureq::Agent, String> {
+    account_agent_with(timeout, proxy, false)
+}
+
+fn account_agent_with(
+    timeout: Duration,
+    proxy: Option<&str>,
+    status_as_error: bool,
+) -> Result<ureq::Agent, String> {
+    let proxy = match proxy.map(str::trim).filter(|proxy| !proxy.is_empty()) {
+        None => None,
+        Some(url) => Some(
+            ureq::Proxy::new(url)
+                .map_err(|e| format!("the configured proxy is not a proxy url ({e})"))?,
+        ),
+    };
+    Ok(ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(status_as_error)
+        .proxy(proxy)
+        .build()
+        .into())
+}
+
 /// Did the server answer at all, whatever it answered?
 ///
 /// A 4xx or 5xx is still an answer: something is listening and speaking HTTP.
@@ -80,6 +123,30 @@ mod tests {
         assert_eq!(status_of(&ureq::Error::StatusCode(404)), Some(404));
         assert_eq!(status_of(&ureq::Error::HostNotFound), None);
         assert_eq!(status_of(&ureq::Error::RedirectFailed), None);
+    }
+
+    /// The agent that carries what the guard read takes no proxy from the
+    /// environment, only the one it is given.
+    #[test]
+    fn the_account_agent_takes_its_proxy_only_from_the_config() {
+        let direct = account_agent(Duration::from_millis(400), None).unwrap();
+        assert!(direct.config().proxy().is_none());
+        assert_eq!(
+            direct.config().timeouts().global,
+            Some(Duration::from_millis(400))
+        );
+        let configured =
+            account_agent(Duration::from_millis(400), Some("http://127.0.0.1:3128")).unwrap();
+        assert!(configured.config().proxy().is_some());
+        assert!(account_agent(Duration::from_millis(400), Some("::not a url::")).is_err());
+        assert!(direct.config().http_status_as_error());
+        let reading = account_agent_reading_status(Duration::from_millis(400), None).unwrap();
+        assert!(reading.config().proxy().is_none());
+        assert!(!reading.config().http_status_as_error());
+        assert!(
+            account_agent_reading_status(Duration::from_millis(400), Some("::not a url::"))
+                .is_err()
+        );
     }
 
     /// The agent is the only thing carrying the bound now, so a builder that
