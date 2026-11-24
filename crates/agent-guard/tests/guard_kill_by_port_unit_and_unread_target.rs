@@ -101,3 +101,38 @@ fn kills_of_other_processes_stay_allowed() {
         "allow",
     );
 }
+
+/// The findings say what the line does: a kill by the guard's port, or a
+/// kill of ids the line does not say, not a pattern or a pgrep it does not
+/// hold.
+///
+/// FAILS ON REVERT: take `kill_by_port` or `kill_of_unread_ids` out of
+/// `security_tamper_as_written` and the words are another finding's.
+#[test]
+fn the_findings_say_what_the_line_does() {
+    let said = |line: &str| -> String {
+        analyze_command(line, None)
+            .signals
+            .iter()
+            .map(|signal| signal.detail.clone())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    };
+    for line in [
+        "fuser -k 8787/tcp",
+        "lsof -ti:8787 | xargs kill",
+        "kill $(lsof -t -i:8787)",
+    ] {
+        let words = said(line);
+        assert!(words.contains("dashboard's port"), "{line}: {words}");
+        assert!(!words.contains("pgrep or pidof"), "{line}: {words}");
+    }
+    for line in ["xargs kill < pids.txt", "cat pids | xargs kill -9"] {
+        let words = said(line);
+        assert!(
+            words.contains("ids the line does not say"),
+            "{line}: {words}"
+        );
+        assert!(!words.contains("a pattern that matches"), "{line}: {words}");
+    }
+}

@@ -21093,6 +21093,10 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
             60,
         ));
     }
+    // The guard's dashboard port, or its program's path, killed through.
+    if guard_lowering::kill_by_port(content) {
+        return Some((guard_lowering::GUARD_PORT_KILLED, 60));
+    }
     let fed = guard_lowering::pgrep_feeds_a_kill_of_the_guard(content);
     if fed == PkillReach::NamesGuard {
         return Some((
@@ -21176,6 +21180,10 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
             "kill processes the guard's are among (a pattern that matches a whole word of its command line or name)",
             25,
         ));
+    }
+    // Ids the line does not say may be the guard's: a person decides.
+    if guard_lowering::kill_of_unread_ids(content) {
+        return Some((guard_lowering::UNREAD_IDS_KILLED, 25));
     }
     None
 }

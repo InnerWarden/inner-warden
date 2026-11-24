@@ -1243,18 +1243,74 @@ pub(crate) fn lists_only_other_processes(text: &str) -> bool {
 /// a pipe into `kill` or `xargs kill`, or as a substitution in a `kill`'s
 /// words. The strongest such hand-over of the line.
 pub(super) fn pgrep_feeds_a_kill_of_the_guard(text: &str) -> PkillReach {
-    let fuser = if text.contains("fuser") {
-        fuser_reach(text, 0)
-    } else {
-        PkillReach::Misses
-    };
-    if !["grep", "pidof", "awk", "lsof", "xargs"]
+    if !["grep", "pidof", "awk", "lsof"]
         .iter()
         .any(|word| text.contains(word))
     {
-        return fuser;
+        return PkillReach::Misses;
     }
-    feeds_kill(text, 0).max(fuser)
+    feeds_kill(text, 0)
+}
+
+/// What a line that kills by the guard's port says it does.
+pub(super) const GUARD_PORT_KILLED: &str =
+    "kill InnerWarden (the processes on its dashboard's port or running its program, killed by fuser or handed to kill by lsof)";
+
+/// What a line that kills ids it does not say says it does.
+pub(super) const UNREAD_IDS_KILLED: &str =
+    "kill processes whose ids the line does not say (read from a file, or from a pipe that lists no process), which may be the guard's";
+
+/// Whether the line kills the guard by its dashboard's port or by its
+/// program's path: `fuser -k` ([`fuser_reach`]), or a terse `lsof`
+/// ([`lsof_reach`]) whose ids a `kill` of the same line takes.
+pub(super) fn kill_by_port(text: &str) -> bool {
+    (text.contains("fuser") && fuser_reach(text, 0) == PkillReach::NamesGuard)
+        || (text.contains("lsof") && lsof_feeds_kill(text, 0))
+}
+
+fn lsof_feeds_kill(text: &str, depth: u8) -> bool {
+    let line = read_line(text);
+    let lists_guard = |command: &Command| {
+        plain_words(command).is_some_and(|words| {
+            launched_command_index(&words).is_some_and(|at| {
+                program_name(&words[at]) == "lsof"
+                    && lsof_reach(&words[at + 1..]) == PkillReach::NamesGuard
+            })
+        })
+    };
+    if line.commands.iter().any(runs_kill) {
+        let substituted: Vec<Command> = line
+            .commands
+            .iter()
+            .flat_map(|command| &command.words)
+            .flat_map(|word| &word.substitutions)
+            .flat_map(|inner| read_line(inner).commands)
+            .collect();
+        if line.commands.iter().chain(&substituted).any(lists_guard) {
+            return true;
+        }
+    }
+    depth < NESTED_DEPTH
+        && line
+            .nested
+            .iter()
+            .any(|inner| lsof_feeds_kill(inner, depth + 1))
+}
+
+/// Whether the line hands `kill` ids it does not say ([`xargs_kill_unread`]),
+/// in itself or in a command it runs from inside.
+pub(super) fn kill_of_unread_ids(text: &str) -> bool {
+    text.contains("xargs") && unread_ids_in(text, 0)
+}
+
+fn unread_ids_in(text: &str, depth: u8) -> bool {
+    let line = read_line(text);
+    (0..line.commands.len()).any(|index| xargs_kill_unread(&line.commands, index))
+        || (depth < NESTED_DEPTH
+            && line
+                .nested
+                .iter()
+                .any(|inner| unread_ids_in(inner, depth + 1)))
 }
 
 /// What a pipe of filters ending right before a `kill` hands it: a
@@ -1385,10 +1441,6 @@ fn feeds_kill(text: &str, depth: u8) -> PkillReach {
     for (index, command) in line.commands.iter().enumerate() {
         if command.piped && line.commands.get(index + 1).is_some_and(runs_kill) {
             reach = reach.max(filtered_list_reach(&line.commands, index));
-        }
-        // Ids the line does not say may be the guard's: a person decides.
-        if xargs_kill_unread(&line.commands, index) {
-            reach = reach.max(PkillReach::Broad);
         }
         if runs_kill(command) {
             for inner in command.words.iter().flat_map(|word| &word.substitutions) {
