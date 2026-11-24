@@ -3081,7 +3081,9 @@ pub(crate) fn inline_code_reading(source: &str) -> InlineReading {
     // What the code prints may reach a command: piped on, or written to a
     // file on a line that runs more (`perl -e 'print q{...}' > x.sh && sh
     // x.sh`). Its strings are then read as the line holds them.
-    if code_output_reaches_a_command(source) {
+    // Nor is it only text where a later step of the line may run a file
+    // the code wrote (`ruby -e 'File.write("x.sh", ...)' && sh x.sh`).
+    if code_output_reaches_a_command(source) || inline_calls::line_may_run_a_written_file(source) {
         reading.data_blanked.clear();
     }
     reading
@@ -3141,7 +3143,28 @@ fn shell_heredoc_data_blanked(source: &str) -> Vec<(String, String)> {
         if !reads_input {
             continue;
         }
+        // What an echo writes is text only where no step of the line, in
+        // the body or around it, may run, source, mark as a program or
+        // install as a hook the file it wrote: every other command must be
+        // one that runs nothing ([`command_runs_nothing_written`]).
+        let others_inert = line.nested.is_empty()
+            && line.arrays.is_empty()
+            && line
+                .commands
+                .iter()
+                .filter(|other| !std::ptr::eq(*other, command))
+                .all(command_runs_nothing_written);
+        if !others_inert {
+            continue;
+        }
         for body in &command.inputs {
+            let body_line = crate::shell_words::read_line(body);
+            if !body_line.nested.is_empty()
+                || !body_line.arrays.is_empty()
+                || !body_line.commands.iter().all(command_runs_nothing_written)
+            {
+                continue;
+            }
             let blanked = echo_lines_blanked(body, source);
             if blanked != *body {
                 out.push((body.clone(), blanked));
@@ -3149,6 +3172,28 @@ fn shell_heredoc_data_blanked(source: &str) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Whether a command, in a here-document handed to a shell or on the line
+/// around it, can run nothing an `echo` of the same body wrote: it writes
+/// text, makes a folder or moves to one that holds no hooks. Any other
+/// command (`sh`, `source`, `chmod`, a glob, a function, `if`) may run
+/// the file, so the body is read whole.
+fn command_runs_nothing_written(command: &crate::shell_words::Command) -> bool {
+    let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+    let Some(at) = crate::threats::effective_command_index(&words) else {
+        return words.is_empty();
+    };
+    if at != 0 || !command.words[at].is_plain() {
+        return false;
+    }
+    match words[at].as_str() {
+        "echo" | "printf" | "mkdir" | "true" | ":" | "pwd" | "touch" => true,
+        "cd" => !words[1..]
+            .iter()
+            .any(|word| word.to_ascii_lowercase().contains("hook")),
+        _ => false,
+    }
 }
 
 /// `body` with the words of each line that only writes text to a file of

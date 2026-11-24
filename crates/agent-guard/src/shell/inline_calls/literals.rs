@@ -88,17 +88,40 @@ fn delimited(bytes: &[u8], at: usize) -> Option<((usize, usize), usize)> {
     }
 }
 
-/// Text Perl fills in where it stands that runs code: `@{[ ... ]}`,
-/// `${\ ...}`.
+/// Text Perl fills in where it stands that runs code: a block after `$`,
+/// `@` or `$#` that is more than a name (`@{[ ... ]}`, `${\ ...}`,
+/// `@{ do { ... } }`, `${ f(); \1 }`). `${name}` and `@{name}` are
+/// variables.
 fn perl_interpolation_runs_code(text: &str) -> bool {
-    static RUNS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    RUNS.get_or_init(|| regex::Regex::new(r"[$@]\{\s*[\[\\]").expect("valid regex"))
-        .is_match(text)
+    let bytes = text.as_bytes();
+    (0..bytes.len()).any(|at| {
+        let sigil = at > 0 && matches!(bytes[at - 1], b'$' | b'@');
+        let last_index = at > 1 && bytes[at - 1] == b'#' && bytes[at - 2] == b'$';
+        if bytes[at] != b'{' || !(sigil || last_index) {
+            return false;
+        }
+        let mut i = at + 1;
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        if bytes.get(i) == Some(&b'^') {
+            i += 1;
+        }
+        let name_start = i;
+        while bytes.get(i).is_some_and(|b| is_name_byte(*b)) {
+            i += 1;
+        }
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        !(i > name_start && bytes.get(i) == Some(&b'}'))
+    })
 }
 
-/// A Perl regular expression that runs code: `(?{ })`, `(??{ })`.
-fn perl_pattern_runs_code(text: &str) -> bool {
-    text.contains("(?{") || text.contains("(??{") || perl_interpolation_runs_code(text)
+/// A Perl regular expression that runs code where it stands, whatever
+/// its delimiter: `(?{ })`, `(??{ })`, `(*{ })`.
+fn perl_pattern_block(text: &str) -> bool {
+    text.contains("(?{") || text.contains("(??{") || text.contains("(*{")
 }
 
 enum Quoted {
@@ -181,10 +204,14 @@ fn perl_quote_like(code: &str, at: usize) -> Quoted {
     let runs = match name {
         "s" => {
             flags.contains('e')
-                || (interpolates && perl_pattern_runs_code(text(&ranges[0])))
+                || perl_pattern_block(text(&ranges[0]))
+                || (interpolates && perl_interpolation_runs_code(text(&ranges[0])))
                 || (interpolates && perl_interpolation_runs_code(text(&ranges[1])))
         }
-        "m" | "qr" => interpolates && perl_pattern_runs_code(text(&ranges[0])),
+        "m" | "qr" => {
+            perl_pattern_block(text(&ranges[0]))
+                || (interpolates && perl_interpolation_runs_code(text(&ranges[0])))
+        }
         "qq" => interpolates && perl_interpolation_runs_code(text(&ranges[0])),
         _ => false,
     };

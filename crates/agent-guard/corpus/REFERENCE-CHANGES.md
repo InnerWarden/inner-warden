@@ -448,3 +448,27 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   is reverted. A clone with no folder (`cd ~/.config && git clone
   .../innerwarden.git`) stays a review, as the repository's name is read
   as data.
+- 2026-11-24: text that inline code or a shell's here-document only
+  prints or writes is read as data; reference.tsv unchanged.
+  harmless-proven:
+  adversarial-323/adv-q2, adversarial-323/adv-q3, adversarial-323/adv-q6,
+  adversarial-323/adv-q7, adversarial-323/adv-p21, adversarial-323/adv-p22,
+  adversarial-323/adv-p23, adversarial-323/adv-h6 go from deny to allow.
+  Each prints a line with Perl `q{}` or Lua `print`, writes it to a file
+  with Perl's output (`> x.sh`, no other command on the line), or writes
+  it with `echo` inside `bash <<'EOF'` to `notes.txt`, and nothing on the
+  line runs, sources, marks as a program or installs that text: the
+  same line is allowed on main as a plain `echo '...' > notes.txt`. Main
+  refused them for the words of the text. Measured on this branch
+  beside them, still refused as on main (deny): the must_refuse lines of
+  adversarial-323 where a step of the same line runs the text (adv-h1,
+  adv-h1b, adv-h3, adv-h4: a here-document that runs, by name, by glob or
+  as a hook marked executable, the file its `echo` wrote; adv-p1, adv-p9,
+  adv-p10: Perl, Lua or Ruby code writes a file and `sh` runs it;
+  adv-p5, adv-p5b, adv-p6, adv-p7: Perl code in `(?{ })`, `@{ }` or
+  `${ }` inside a pattern or string; adv-p15b: a Ruby method taken by a
+  `%s` symbol with `instance_method` and called with `bind`), and their
+  generated variants. Each family is held by a test in
+  `tests/text_a_later_step_runs.rs` that fails when its part is
+  reverted. No other line of any corpus moved, from an empty home or a
+  home with keys.

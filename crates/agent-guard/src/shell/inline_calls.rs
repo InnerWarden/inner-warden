@@ -944,7 +944,9 @@ fn ruby_percent_literal(code: &str, at: usize) -> RubyLiteral {
     } else {
         return RubyLiteral::Operator;
     };
-    if matches!(kind, b'x' | b'r') {
+    // A command, a regular expression, or symbols: a symbol names a
+    // method (`instance_method(%s(system))`), so it is not data.
+    if matches!(kind, b'x' | b'r' | b's' | b'i' | b'I') {
         return RubyLiteral::Code;
     }
     let delimiter = bytes[open];
@@ -1132,7 +1134,7 @@ fn may_run_beyond_reading(lang: Lang, outside: &str) -> bool {
             )
             .expect("valid regex"),
             regex::Regex::new(
-                r"\b(?:system|exec|spawn|popen\w*|capture\w*|Open3|PTY|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec|send|public_send|__send__|method|define_method|load|require\w*|fork|syscall|Kernel|IO|binding|ObjectSpace|const_get|Process|open|ENV|Dir|home|expand_path)\b",
+                r"\b(?:system|exec|spawn|popen\w*|capture\w*|Open3|PTY|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec|send|public_send|__send__|method|\w+_method|method_\w+|bind\w*|to_proc|load|require\w*|fork|syscall|Kernel|IO|binding|ObjectSpace|const_get|Process|open|ENV|Dir|home|expand_path)\b",
             )
             .expect("valid regex"),
         ]
@@ -5457,6 +5459,48 @@ pub(crate) fn runner_of_file(line: &str, path: &str) -> Option<Runner> {
         }
     }
     None
+}
+
+/// Whether a command of the shell line `line`, which holds more than one,
+/// may run a file a step before it wrote: a shell or an interpreter handed
+/// a file rather than code of its own (`sh x.sh`, `bash` reading its
+/// input), `source`, `chmod`, a program named by a path or built by the
+/// shell (`./x.sh`, `sh *.sh`, `"$f"`), or a command that runs others
+/// (`xargs`, `find`, `eval`). What inline code writes or prints on such a
+/// line is not only text: a later step may run it.
+pub(crate) fn line_may_run_a_written_file(line: &str) -> bool {
+    let read = crate::shell_words::read_line(line);
+    if read.commands.len() < 2 {
+        return false;
+    }
+    read.commands.iter().any(|command| {
+        let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+        let Some(at) = crate::threats::effective_command_index(&words) else {
+            return false;
+        };
+        if !command.words[at].is_plain() || words[at].contains('/') {
+            return true;
+        }
+        let name = crate::threats::token_basename(&words[at]).to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "chmod" | "xargs" | "find" | "eval" | "exec" | "install" | "crontab" | "at" | "batch"
+        ) {
+            return true;
+        }
+        let shell = SCRIPT_SHELLS.contains(&name.as_str());
+        if !shell && interpreter_lang(&name).is_none() {
+            return false;
+        }
+        // Code of its own on the line: a shell's `-c`; an interpreter's
+        // `-c`, `-e`, `-E`, `-r` or `--eval`.
+        let flags: &[char] = if shell { &['c'] } else { &['c', 'e', 'E', 'r'] };
+        let own_code = words[at + 1..].iter().any(|word| {
+            (word.starts_with('-') && !word.starts_with("--") && word[1..].contains(flags))
+                || word == "--eval"
+        });
+        !own_code
+    })
 }
 
 /// The language an interpreter's program name runs (`python3.11`, `lua5.4`).
