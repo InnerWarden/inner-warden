@@ -4185,6 +4185,7 @@ const HOST_BLOCK_REMEDY: &str =
 /// and wrapped MCP servers are reconfigured in place, so the dashboard posture
 /// describes the same mode the integrations actually run.
 fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
+    let (rest, operator) = suppress_io::split_operator_flag(rest);
     if !rest.is_empty() {
         eprintln!(
             "innerwarden {}: unexpected argument `{}`",
@@ -4201,6 +4202,16 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
             "innerwarden dry-run: refused inside an AI agent's shell. Monitor lowers the guard \
              that screens the agent, so it is set by the person, from their own terminal. \
              Nothing was changed."
+        );
+        return std::process::ExitCode::from(1);
+    }
+    // A missing marker is no proof that a person runs it: a caller with no
+    // terminal is refused too, unless an operator's script says so
+    // ([`suppress_io::may_widen`]), as allowing and muting are.
+    if monitor && !suppress_io::may_widen(operator) {
+        eprintln!(
+            "innerwarden dry-run: refused, no terminal. Monitor lowers the guard that screens \
+             the agent, so it is set by a person at their own terminal. Nothing was changed."
         );
         return std::process::ExitCode::from(1);
     }

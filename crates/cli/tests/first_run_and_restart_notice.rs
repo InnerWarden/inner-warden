@@ -192,7 +192,8 @@ fn a_mode_switch_says_how_to_restart_each_connected_agent() {
     let connected = run(home.path(), &["agents", "connect", "--all", "--monitor"]);
     assert!(connected.contains("new-agent"), "{connected}");
     for verb in ["enforce", "dry-run"] {
-        let out = run(home.path(), &[verb]);
+        // Run as an operator's script (no terminal here).
+        let out = run(home.path(), &[verb, "--operator"]);
         assert!(out.contains("Restart guarded agents"), "{verb}: {out}");
         assert!(
             out.contains("  New Agent: Quit New Agent and start it again."),

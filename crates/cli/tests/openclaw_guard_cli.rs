@@ -401,7 +401,7 @@ fn connect_lays_the_guard_in_monitor_and_enforce_turns_it_on() {
         host.config()["plugins"]["entries"]["innerwarden-guard"]["config"]["mode"],
         "enforce"
     );
-    host.run(&["dry-run"], "");
+    host.run(&["dry-run", "--operator"], "");
     assert_eq!(
         host.config()["plugins"]["entries"]["innerwarden-guard"]["config"]["mode"],
         "monitor"

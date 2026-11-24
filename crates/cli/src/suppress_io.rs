@@ -182,6 +182,13 @@ pub(crate) const AGENT_SHELL_MARKERS: &[&str] = &[
     // its `terminal` shell included (`hermes_cli/main.py`), measured with
     // its terminal tool on 2026-11-20.
     "HERMES_AGENT",
+    // Cursor's terminal documentation (cursor.com/docs/agent/terminal, read
+    // 2026-11-24) names it for a shell to tell an agent's run; not every
+    // Cursor CLI release sets it, so it is one barrier of several.
+    "CURSOR_AGENT",
+    // Goose sets `GOOSE_TERMINAL=1` in every shell command it runs (block/goose
+    // pull request 7017, read 2026-11-24).
+    "GOOSE_TERMINAL",
 ];
 
 /// Whether this process runs in an AI agent's shell, by its markers.

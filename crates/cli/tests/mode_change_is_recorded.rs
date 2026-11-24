@@ -102,7 +102,7 @@ fn settings(home: &Path) -> String {
 #[test]
 fn every_switch_of_mode_or_posture_is_recorded() {
     for (args, command, mode, posture) in [
-        (&["dry-run"][..], "dry-run", "monitor", None),
+        (&["dry-run", "--operator"][..], "dry-run", "monitor", None),
         (&["enforce"], "enforce", "enforce", None),
         (
             &["agents", "disconnect", "--all"],
@@ -207,7 +207,7 @@ fn a_switch_reaches_the_configured_channel() {
         format!("slack_webhook = \"http://{address}/hook\"\n"),
     )
     .unwrap();
-    let out = run(home.path(), &["dry-run"], None, Some(&config));
+    let out = run(home.path(), &["dry-run", "--operator"], None, Some(&config));
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
     let request = server.join().unwrap();
     assert!(
