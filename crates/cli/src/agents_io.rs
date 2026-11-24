@@ -505,8 +505,8 @@ pub(crate) fn help_text() -> String {
     let p = crate::prog();
     format!(
         "{p} agents [list]\n\
-         {p} agents connect [<name>|--all] [--monitor|--strict|--guard|--block-review]\n\
-         {p} agents disconnect [<name>|--all]\n\
+         {p} agents connect [<name>|--all] [--monitor|--strict|--guard|--block-review] [--operator]\n\
+         {p} agents disconnect [<name>|--all] [--operator]\n\
          {p} agents auto-connect [--monitor|--off|status]\n\
          {decisions}\n\
          \n  \
@@ -521,6 +521,7 @@ pub(crate) fn help_text() -> String {
          --guard         move a strict install to the default hook posture (your terminal only)\n  \
          --block-review  refuse every review too\n  \
          --monitor       record every call and refuse nothing\n  \
+         --operator      for a person's script without a terminal, outside an agent's shell\n  \
          Automatic setup is opt-in and monitor-only; unknown flags fail without\n  \
          changing anything.\n  \
          approve, profile, allow and revoke record your decisions about a type of\n  \

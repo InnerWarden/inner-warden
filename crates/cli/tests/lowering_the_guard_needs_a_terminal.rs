@@ -264,3 +264,111 @@ fn a_jail_and_accepting_its_files_need_a_terminal() {
     let out = run(home.path(), &["contain", "--dry-run", "--", "true"], None);
     assert!(!stderr(&out).contains("refused"), "{}", stderr(&out));
 }
+
+/// Setup connects agents in dry run: inside an AI agent's shell it is
+/// refused before anything else, for every agent's marker, and nothing is
+/// written.
+///
+/// FAILS ON REVERT: take the `in_agent_shell` check out of
+/// `setup_io::cmd` and setup prints its summary and exits 0.
+#[test]
+fn setup_is_refused_inside_an_agents_shell() {
+    for marker in AGENT_SHELL_MARKERS {
+        let home = enforced_home();
+        let before = settings(home.path());
+        let out = run(home.path(), &["setup"], Some(marker));
+        assert_eq!(out.status.code(), Some(1), "{marker}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("refused inside an AI agent's shell"),
+            "{marker}: {}",
+            stderr(&out)
+        );
+        assert_eq!(settings(home.path()), before, "{marker}: setup wrote");
+    }
+}
+
+/// The run that was measured: setup in a terminal `script` allocates, every
+/// question answered with Enter. With an agent's marker it is refused; with
+/// none (a terminal that looks like a person's) the hook already in enforce
+/// stays in enforce.
+///
+/// FAILS ON REVERT: take either the `in_agent_shell` check or
+/// `split_already_wired` out of `setup_io::cmd` and the hook is rewritten
+/// with `--monitor`.
+#[cfg(target_os = "linux")]
+#[test]
+fn setup_in_a_terminal_an_agent_allocated_keeps_the_hook_in_enforce() {
+    use std::io::Write;
+    let script = ["/usr/bin/script", "/bin/script"]
+        .into_iter()
+        .find(|path| Path::new(path).exists());
+    let Some(script) = script else {
+        eprintln!("no `script` on this host; skipped");
+        return;
+    };
+    for marker in [Some("CLAUDECODE"), None] {
+        let home = enforced_home();
+        let line = format!("{} setup", bin());
+        let mut command = Command::new(script);
+        command
+            .args(["-qec", line.as_str(), "/dev/null"])
+            .env("HOME", home.path())
+            .env("IW_GRAPH_FILE", home.path().join("graph.json"))
+            .env("IW_NOTIFY_CONFIG", home.path().join("absent-notify.toml"))
+            .env("INNERWARDEN_AGENT_URL", "off")
+            .env("PATH", path_without_codex())
+            .env("SHELL", "/bin/sh")
+            .env_remove("CODEX_HOME")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for name in AGENT_SHELL_MARKERS {
+            command.env_remove(name);
+        }
+        if let Some(name) = marker {
+            command.env(name, "1");
+        }
+        let mut child = command.spawn().expect("run script");
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&b"\n".repeat(12))
+            .unwrap();
+        let out = child.wait_with_output().expect("wait for script");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let now = settings(home.path());
+        assert!(!now.contains("--monitor"), "{marker:?}: {now}\n{text}");
+        assert!(
+            now.contains("innerwarden hook"),
+            "{marker:?}: {now}\n{text}"
+        );
+        if marker.is_some() {
+            assert!(
+                text.contains("refused inside an AI agent's shell"),
+                "{marker:?}: {text}"
+            );
+        }
+    }
+}
+
+/// Every verb that lowers the guard names `--operator` in its help.
+#[test]
+fn the_verbs_that_lower_the_guard_name_the_operator_flag() {
+    let home = enforced_home();
+    for verb in [
+        &["uninstall", "--help"][..],
+        &["dry-run", "--help"],
+        &["monitor", "--help"],
+        &["agents", "--help"],
+        &["install", "--help"],
+        &["contain", "--help"],
+    ] {
+        let out = run(home.path(), verb, None);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            text.contains("--operator") && text.contains("outside an agent's shell"),
+            "{verb:?}: {text}"
+        );
+    }
+}

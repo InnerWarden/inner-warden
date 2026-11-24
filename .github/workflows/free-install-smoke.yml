@@ -51,7 +51,7 @@ jobs:
           cmds = [h.get("command", "") for g in d["hooks"]["PreToolUse"] for h in g["hooks"]]
           assert any("innerwarden" in c for c in cmds), cmds
           PY
-          innerwarden uninstall claude-code
+          innerwarden uninstall claude-code --operator
           echo "== upgrade --check answers"
           innerwarden upgrade --check
           echo "== status"

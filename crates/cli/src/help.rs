@@ -227,7 +227,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         "dashboard" => crate::dashboard::help_text(),
         "upgrade" | "update" | "self-update" => crate::upgrade::help_text(verb),
         "install" => format!(
-            "{p} install [<agent>] [--settings PATH] [--strict|--guard] [--block-review] [--monitor]\n  \
+            "{p} install [<agent>] [--settings PATH] [--strict|--guard] [--block-review] [--monitor] [--operator]\n  \
              Wire the guardrail into an agent as a blocking PreToolUse hook, so every\n  \
              shell command it proposes is screened before it runs, and its file tools\n  \
              cannot change a privileged file. Idempotent, and it preserves the settings\n  \
@@ -242,11 +242,12 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              \x20                 refuses only the high-certainty class and warns of the rest\n  \
              --guard           move a strict install to the default hook posture (your terminal only)\n  \
              --block-review    refuse `review` verdicts everywhere (default: a review asks you on Claude Code and Hermes, runs with a warning on Codex, is refused elsewhere)\n  \
-             --monitor         record every command and never block"
+             --monitor         record every command and never block\n  \
+             --operator        for a person's script without a terminal, outside an agent's shell"
         ),
         "uninstall" => format!(
-            "{p} uninstall <agent> [--settings PATH]\n\
-             {p} uninstall [--purge|--all] [--dry-run]\n\
+            "{p} uninstall <agent> [--settings PATH] [--operator]\n\
+             {p} uninstall [--purge|--all] [--dry-run] [--operator]\n\
              \n  \
              With an agent named, remove only that agent's guard hook and leave every\n  \
              other setting untouched.\n  \
@@ -259,7 +260,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              --dry-run   print exactly what a full uninstall would remove; nothing is\n  \
              \x20           changed or written\n  \
              --purge     accepted for parity with the installer (local state lives\n  \
-             \x20           under the config directory, so it goes either way)"
+             \x20           under the config directory, so it goes either way)\n  \
+             --operator  for a person's script without a terminal, outside an agent's shell"
         ),
         "status" => format!(
             "{p} status [--config]\n  \
@@ -302,7 +304,7 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         "contain" => format!(
             "{p} contain [--agent claude-code|openclaw] [--monitor|--enforce|--block-review]\n  \
              \x20              [--project DIR] [--deny-read GLOB] [--pass-env NAME] [--dry-run] [--setup]\n  \
-             \x20              [--identity] [--writable-user-bin]\n  \
+             \x20              [--identity] [--writable-user-bin] [--operator]\n  \
              \x20              -- <command...>\n  \
              Run <command> inside a filesystem/namespace JAIL with the guard hook armed\n  \
              INSIDE it (Linux bwrap, macOS sandbox-exec). InnerWarden's own folder (its\n  \
@@ -336,7 +338,8 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              --writable-user-bin  (Linux) leave the home's folders of programs in\n  \
              \x20                 your PATH (~/.local/bin, ~/.cargo/bin, ...) writable in\n  \
              \x20                 the jail; a program in it can then leave one there\n  \
-             \x20                 that runs as you, outside the jail (said when it starts)\n\
+             \x20                 that runs as you, outside the jail (said when it starts)\n  \
+             --operator        for a person's script without a terminal, outside an agent's shell\n\
              \n  \
              With --identity the hook inside the jail tells this instance apart from\n  \
              the agent's other runs. Read from inside the jail, the instance is at most\n  \
@@ -459,10 +462,12 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
              Takes no arguments. The opposite is `{p} dry-run`."
         ),
         "dry-run" | "monitor" => format!(
-            "{p} {verb}\n  \
+            "{p} {verb} [--operator]\n  \
              Put every connected agent into MONITOR: every command is recorded and none\n  \
              is blocked. This is where a new install should start.\n  \
-             Takes no arguments. The opposite is `{p} enforce`."
+             The opposite is `{p} enforce`.\n\
+             \n  \
+             --operator   for a person's script without a terminal, outside an agent's shell"
         ),
         "allow" => format!(
             "{p} allow [--operator] \"<glob>\"\n\
