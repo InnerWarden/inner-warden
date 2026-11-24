@@ -240,6 +240,23 @@ fn route_server_to_client(
     if let Some(t) = taint.as_deref_mut() {
         record_server_text(env, responded, t);
     }
+    // A request the server makes of the client (a message for the model to
+    // complete, a question for the person) carries text the model or the
+    // person reads: read for orders like an answer. A mode that blocks
+    // holds the request back (the transport's `server_output`).
+    if let (Some(method), Some(params)) = (env.method.as_deref(), env.params.as_ref()) {
+        if SERVER_REQUESTS.contains(&method) {
+            return ProxyDecision {
+                verdict: inspect_server_text(params, engine),
+                direction: dir.label(),
+                method: Some(method.into()),
+                tool_name: None,
+                tool_summary: None,
+                request_id: env.id.clone(),
+                deciding_layer: None,
+            };
+        }
+    }
     match (responded.map(|r| r.method.as_str()), env.result.as_ref()) {
         (Some("tools/list"), Some(result)) => {
             // What the server says each tool does, so a call to a tool it
@@ -380,8 +397,38 @@ fn route_server_to_client(
                 deciding_layer: None,
             }
         }
+        (Some(method @ ("prompts/get" | "completion/complete")), Some(result)) => {
+            // A prompt's messages go to the model as the conversation, and
+            // a completion is offered as what the person types: read like a
+            // tool's answer, and held back whole in a mode that blocks.
+            ProxyDecision {
+                verdict: inspect_server_text(result, engine),
+                direction: dir.label(),
+                method: Some(method.into()),
+                tool_name: None,
+                tool_summary: None,
+                request_id: env.id.clone(),
+                deciding_layer: None,
+            }
+        }
         _ => pass_through(dir),
     }
+}
+
+/// The requests a server makes of the client whose text reaches the model
+/// or the person, read for orders ([`route_server_to_client`]).
+pub(super) const SERVER_REQUESTS: &[&str] = &["sampling/createMessage", "elicitation/create"];
+
+/// [`inspect_answer`] on every text a server's message holds
+/// ([`json_leaves`]), secrets masked first, read up to
+/// [`MAX_SCANNED_RESULT_BYTES`].
+fn inspect_server_text(value: &Value, engine: Option<&RuleEngine>) -> Verdict {
+    let whole = json_leaves(value);
+    let length = whole.len();
+    let scanned = truncate_on_boundary(whole, MAX_SCANNED_RESULT_BYTES);
+    let read = scanned.len();
+    let content = crate::redact::redact_secrets(&scanned).text;
+    inspect_answer(&content, (read, length), engine)
 }
 
 /// Inspect what a tool or a resource hands back ([`mcp::inspect_response`]),

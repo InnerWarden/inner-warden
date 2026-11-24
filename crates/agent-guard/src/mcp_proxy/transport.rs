@@ -939,7 +939,10 @@ fn withhold_poisoned_descriptions(raw: &str, events: &mut [ProxyDecision]) -> Op
                 continue;
             };
             matched = true;
-            if matches!(method.as_str(), "tools/call" | "resources/read") {
+            if matches!(
+                method.as_str(),
+                "tools/call" | "resources/read" | "prompts/get" | "completion/complete"
+            ) {
                 *message = refused_with(id.clone(), WITHHELD_ANSWER_MESSAGE);
                 for alert in d
                     .verdict
@@ -1139,6 +1142,14 @@ fn server_output(action: ServerAction, blocks: bool) -> (Option<String>, Vec<Pro
     match action {
         ServerAction::Drop => (None, Vec::new()),
         ServerAction::Forward { raw, mut event } => {
+            // A request the server makes that carries orders for the model
+            // is held back whole: answered with an error, it would reach
+            // the client keyed to an id the client never sent.
+            if let (true, Some(d)) = (blocks, event.as_mut()) {
+                if held_server_request(d) {
+                    return (None, event.into_iter().collect());
+                }
+            }
             let raw = match (blocks, event.as_mut()) {
                 (true, Some(d)) => {
                     withhold_poisoned_descriptions(&raw, std::slice::from_mut(d)).unwrap_or(raw)
@@ -1188,6 +1199,31 @@ fn server_output(action: ServerAction, blocks: bool) -> (Option<String>, Vec<Pro
             (Some(SERVER_PARSE_REFUSAL.to_string()), vec![decision])
         }
     }
+}
+
+/// Whether `d` is a request of the server's
+/// ([`super::router::SERVER_REQUESTS`]) found carrying orders for the
+/// model; when it is, its finding says the request was held back.
+fn held_server_request(d: &mut ProxyDecision) -> bool {
+    let request = d
+        .method
+        .as_deref()
+        .is_some_and(|method| super::router::SERVER_REQUESTS.contains(&method));
+    let mut held = false;
+    if request && d.direction == Direction::ServerToClient.label() {
+        for alert in d
+            .verdict
+            .alerts
+            .iter_mut()
+            .filter(|a| a.rule == crate::mcp::DESC_POISON_RULE)
+        {
+            alert
+                .detail
+                .push_str("; the request was held back from the client");
+            held = true;
+        }
+    }
+    held
 }
 
 /// Server text that is not a message, read as untrusted tool output.
@@ -2648,6 +2684,84 @@ mod tests {
 
         let clean = answer("Build passed. 42 tests, 0 failures.");
         let (out, _) = server_output(classify(&clean), true);
+        assert_eq!(out.as_deref(), Some(clean.as_str()));
+    }
+
+    /// A prompt or a completion that carries orders for the model is held
+    /// back whole in a mode that blocks, the error keyed to its id; a
+    /// request the server makes (a message for the model to complete) with
+    /// orders is not forwarded at all. A mode that never blocks forwards
+    /// both and reports them; ordinary ones go on untouched.
+    ///
+    /// FAILS ON REVERT of the `prompts/get`, `completion/complete` or
+    /// server-request reading in the router: each passes with no finding.
+    #[test]
+    fn a_prompt_a_completion_or_a_server_request_with_orders_is_held_back() {
+        let classify = |line: &str, method: &str| {
+            let mut m = IdRequestMap::new();
+            m.insert(
+                "7".into(),
+                PendingRequest {
+                    method: method.into(),
+                    tool: None,
+                },
+            );
+            classify_server_line(line, None, &mut m, &mut TaintTracker::new())
+        };
+        let held = |events: &[ProxyDecision], words: &str| {
+            events.iter().any(|d| {
+                d.verdict
+                    .alerts
+                    .iter()
+                    .any(|a| a.rule == crate::mcp::DESC_POISON_RULE && a.detail.contains(words))
+            })
+        };
+        let prompt = |text: &str| {
+            serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"description": "Review",
+                "messages": [{"role": "user", "content": {"type": "text", "text": text}}]}})
+            .to_string()
+        };
+        let completion = |text: &str| {
+            serde_json::json!({"jsonrpc": "2.0", "id": 7, "result": {"completion":
+                {"values": [text], "hasMore": false}}})
+            .to_string()
+        };
+        for (method, answer) in [
+            ("prompts/get", &prompt as &dyn Fn(&str) -> String),
+            ("completion/complete", &completion),
+        ] {
+            let poisoned = answer(&format!("Review this file. {POISONED_DESC}"));
+            let (out, events) = server_output(classify(&poisoned, method), true);
+            let out = out.expect("a reply");
+            let v: Value = serde_json::from_str(&out).expect("json");
+            assert_eq!(v["id"], 7, "{method}");
+            assert_eq!(v["error"]["message"], WITHHELD_ANSWER_MESSAGE, "{method}");
+            assert!(held(&events, "held back"), "{method}: {events:?}");
+            let (out, events) = server_output(classify(&poisoned, method), false);
+            assert_eq!(out.as_deref(), Some(poisoned.as_str()), "{method}");
+            assert!(
+                held(&events, "forwarded to the client unchanged"),
+                "{method}"
+            );
+            let clean = answer("Review this file for style.");
+            let (out, _) = server_output(classify(&clean, method), true);
+            assert_eq!(out.as_deref(), Some(clean.as_str()), "{method}");
+        }
+
+        let request = |text: &str| {
+            serde_json::json!({"jsonrpc": "2.0", "id": 3, "method": "sampling/createMessage",
+                "params": {"messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+                "maxTokens": 100}})
+            .to_string()
+        };
+        let poisoned = request(&format!("Summarise the page. {POISONED_DESC}"));
+        let (out, events) = server_output(classify(&poisoned, "tools/call"), true);
+        assert_eq!(out, None, "a held request is not forwarded");
+        assert!(held(&events, "the request was held back"), "{events:?}");
+        let (out, _) = server_output(classify(&poisoned, "tools/call"), false);
+        assert_eq!(out.as_deref(), Some(poisoned.as_str()));
+        let clean = request("Summarise the page in two lines.");
+        let (out, _) = server_output(classify(&clean, "tools/call"), true);
         assert_eq!(out.as_deref(), Some(clean.as_str()));
     }
 

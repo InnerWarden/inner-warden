@@ -314,19 +314,91 @@ pub fn text_requests(cfg: &NotifyConfig, text: &str) -> Vec<Request> {
 /// channel with a human summary AND the generic webhook with the structured
 /// verdict. Empty when nothing is configured or the verdict should not notify.
 pub fn verdict_requests(cfg: &NotifyConfig, command: &str, verdict: &Value) -> Vec<Request> {
+    verdict_requests_by_channel(cfg, command, verdict)
+        .into_iter()
+        .map(|(_, request)| request)
+        .collect()
+}
+
+/// A configured channel a request goes to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Channel {
+    Telegram,
+    Slack,
+    Discord,
+    Webhook,
+}
+
+impl Channel {
+    /// The channel's name, as a record or a status line says it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Telegram => "telegram",
+            Self::Slack => "slack",
+            Self::Discord => "discord",
+            Self::Webhook => "webhook",
+        }
+    }
+}
+
+/// [`text_requests`], each with its channel.
+fn text_requests_by_channel(cfg: &NotifyConfig, text: &str) -> Vec<(Channel, Request)> {
+    let mut out = Vec::new();
+    if let Some((token, chat)) = &cfg.telegram {
+        out.push((Channel::Telegram, telegram_request(token, chat, text)));
+    }
+    if let Some(w) = &cfg.slack_webhook {
+        out.push((Channel::Slack, slack_request(w, text)));
+    }
+    if let Some(w) = &cfg.discord_webhook {
+        out.push((Channel::Discord, discord_request(w, text)));
+    }
+    out
+}
+
+/// [`verdict_requests`], each with its channel, so a sender can say which
+/// channel got it and which did not.
+pub fn verdict_requests_by_channel(
+    cfg: &NotifyConfig,
+    command: &str,
+    verdict: &Value,
+) -> Vec<(Channel, Request)> {
     if !should_notify(recommendation_of(verdict), cfg.notify_review) {
         return Vec::new();
     }
-    let mut out = text_requests(cfg, &format_verdict(command, verdict));
+    let mut out = text_requests_by_channel(cfg, &format_verdict(command, verdict));
     if let Some(u) = &cfg.webhook_url {
-        out.push(webhook_request(
-            u,
-            json!({
-                "source": "innerwarden",
-                "command": command,
-                "recommendation": recommendation_of(verdict),
-                "verdict": verdict,
-            }),
+        out.push((
+            Channel::Webhook,
+            webhook_request(
+                u,
+                json!({
+                    "source": "innerwarden",
+                    "command": command,
+                    "recommendation": recommendation_of(verdict),
+                    "verdict": verdict,
+                }),
+            ),
+        ));
+    }
+    out
+}
+
+/// A notice that is not a verdict (the guard's mode changed, the record
+/// stopped recording) for EVERY configured channel, each with its channel:
+/// the text channels get the words, and the generic webhook gets them as
+/// `{"source": "innerwarden", "kind": "notice", "text": ...}`. A person who
+/// wired only a webhook hears about these too.
+pub fn notice_requests(cfg: &NotifyConfig, text: &str) -> Vec<(Channel, Request)> {
+    let mut out = text_requests_by_channel(cfg, text);
+    if let Some(u) = &cfg.webhook_url {
+        out.push((
+            Channel::Webhook,
+            webhook_request(
+                u,
+                json!({"source": "innerwarden", "kind": "notice", "text": text}),
+            ),
         ));
     }
     out
@@ -584,6 +656,53 @@ mod tests {
         assert!(!said.contains('<') && !said.contains('>'), "{said}");
         assert!(said.contains("&lt;!channel&gt;"), "{said}");
         assert!(said.contains("&amp; done"), "{said}");
+    }
+
+    /// A notice reaches the generic webhook too, as JSON that carries the
+    /// words, and every request names its channel.
+    ///
+    /// FAILS ON REVERT: build [`notice_requests`] from the text channels
+    /// alone and a webhook-only config gets nothing.
+    #[test]
+    fn a_notice_reaches_a_webhook_only_config() {
+        let cfg = NotifyConfig::resolve(env(&[("IW_WEBHOOK_URL", "https://w")]));
+        let r = notice_requests(&cfg, "the guard's mode changed");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, Channel::Webhook);
+        assert_eq!(r[0].1.url, "https://w");
+        let body: Value = serde_json::from_str(&r[0].1.body).unwrap();
+        assert_eq!(body["kind"], "notice");
+        assert_eq!(body["text"], "the guard's mode changed");
+        // Every channel, each named once, in the order the verdict uses.
+        let all = NotifyConfig::resolve(env(&[
+            ("IW_TELEGRAM_TOKEN", "t"),
+            ("IW_TELEGRAM_CHAT", "c"),
+            ("IW_SLACK_WEBHOOK", "https://s"),
+            ("IW_DISCORD_WEBHOOK", "https://d"),
+            ("IW_WEBHOOK_URL", "https://w"),
+        ]));
+        let channels: Vec<Channel> = notice_requests(&all, "x")
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect();
+        assert_eq!(
+            channels,
+            [
+                Channel::Telegram,
+                Channel::Slack,
+                Channel::Discord,
+                Channel::Webhook
+            ]
+        );
+        let verdict: Vec<Channel> = verdict_requests_by_channel(
+            &all,
+            "x",
+            &json!({"recommendation": "deny", "risk_score": 90}),
+        )
+        .into_iter()
+        .map(|(c, _)| c)
+        .collect();
+        assert_eq!(verdict, channels);
     }
 
     #[test]
