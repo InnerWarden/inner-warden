@@ -40,6 +40,8 @@ fn a_kill_by_the_guards_port_is_refused() {
             "lsof -ti tcp:8787 | xargs -r kill",
             "kill $(lsof -t -i:8787)",
             "kill -9 `lsof -ti:8787`",
+            // A file the line fills with the guard's own processes.
+            "pgrep innerwarden > /tmp/p; xargs kill < /tmp/p",
         ],
         "deny",
     );
@@ -75,6 +77,8 @@ fn a_daemons_name_piece_or_ids_the_line_does_not_say_are_held_for_review() {
             "xargs kill < pids.txt",
             "cat pids | xargs kill -9",
             "xargs -a pids.txt kill",
+            // A file the line fills with a daemon's name piece.
+            "pgrep -f sensor > /tmp/p; xargs kill < /tmp/p",
         ],
         "review",
     );
@@ -97,6 +101,9 @@ fn kills_of_other_processes_stay_allowed() {
             "pkill -f 'cargo test'",
             "systemctl kill nginx",
             "seq 3 | xargs echo",
+            // The line shows where the ids come from: another program's.
+            "pgrep -f vite > /tmp/p; xargs kill < /tmp/p",
+            "pidof node > pids; xargs kill -9 < pids",
         ],
         "allow",
     );

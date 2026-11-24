@@ -991,7 +991,7 @@ const PROCESS_LISTERS: &[&str] = &["pgrep", "pidof", "lsof", "ps", "fuser", "pst
 /// not say: from a file (`xargs kill < pids.txt`), from a pipe whose
 /// commands list no process (`cat pids | xargs kill -9`), or from no
 /// input the line gives it.
-fn xargs_kill_unread(commands: &[Command], index: usize) -> bool {
+fn xargs_kill_unread(commands: &[Command], index: usize, text: &str) -> bool {
     let command = &commands[index];
     let Some(words) = plain_words(command) else {
         return false;
@@ -1002,8 +1002,14 @@ fn xargs_kill_unread(commands: &[Command], index: usize) -> bool {
     if program_name(&words[at]) != "xargs" || !runs_kill(command) {
         return false;
     }
-    if !command.reads.is_empty() || !command.inputs.is_empty() {
+    if !command.inputs.is_empty() {
         return true;
+    }
+    // A file the line itself filled with a listing (`pgrep -f vite > p; xargs
+    // kill < p`) holds that listing's ids: read where the listing is read
+    // ([`feeds_kill`]).
+    if let Some(read) = command.reads.first() {
+        return file_written_by_a_lister(commands, index, &read.text, text).is_none();
     }
     let mut at = index;
     while at > 0 && commands[at - 1].piped {
@@ -1016,6 +1022,39 @@ fn xargs_kill_unread(commands: &[Command], index: usize) -> bool {
         }
     }
     true
+}
+
+/// The command before `index` that lists processes ([`PROCESS_LISTERS`])
+/// and writes `file`, the file the command at `index` reads, as the line
+/// `text` shows it (`pgrep -f vite > /tmp/p`).
+fn file_written_by_a_lister<'a>(
+    commands: &'a [Command],
+    index: usize,
+    file: &str,
+    text: &str,
+) -> Option<&'a Command> {
+    if file.is_empty() {
+        return None;
+    }
+    let redirected = [format!(">{file}"), format!("> {file}")]
+        .iter()
+        .any(|form| {
+            text.match_indices(form.as_str()).any(|(at, found)| {
+                text[at + found.len()..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| c.is_whitespace() || matches!(c, ';' | '&' | '|' | ')'))
+            })
+        });
+    if !redirected {
+        return None;
+    }
+    commands[..index].iter().rev().find(|command| {
+        command.writes_file
+            && plain_words(command)
+                .and_then(|words| launched_command_index(&words).map(|i| program_name(&words[i])))
+                .is_some_and(|name| PROCESS_LISTERS.contains(&name.as_str()))
+    })
 }
 
 /// Whether `command` runs `kill` on what it is handed: `kill` itself, or
@@ -1305,7 +1344,7 @@ pub(super) fn kill_of_unread_ids(text: &str) -> bool {
 
 fn unread_ids_in(text: &str, depth: u8) -> bool {
     let line = read_line(text);
-    (0..line.commands.len()).any(|index| xargs_kill_unread(&line.commands, index))
+    (0..line.commands.len()).any(|index| xargs_kill_unread(&line.commands, index, text))
         || (depth < NESTED_DEPTH
             && line
                 .nested
@@ -1441,6 +1480,17 @@ fn feeds_kill(text: &str, depth: u8) -> PkillReach {
     for (index, command) in line.commands.iter().enumerate() {
         if command.piped && line.commands.get(index + 1).is_some_and(runs_kill) {
             reach = reach.max(filtered_list_reach(&line.commands, index));
+        }
+        // A file the line filled with a listing, read by the kill: the
+        // listing's reach (`pgrep -f sensor > p; xargs kill < p`).
+        if runs_kill(command) {
+            if let Some(writer) = command
+                .reads
+                .first()
+                .and_then(|read| file_written_by_a_lister(&line.commands, index, &read.text, text))
+            {
+                reach = reach.max(listed_reach(writer));
+            }
         }
         if runs_kill(command) {
             for inner in command.words.iter().flat_map(|word| &word.substitutions) {
