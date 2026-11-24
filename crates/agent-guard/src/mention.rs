@@ -1692,10 +1692,7 @@ pub(crate) fn work_folder_path(path: &str) -> bool {
         .split('/')
         .filter(|p| !p.is_empty() && *p != ".")
         .collect();
-    if parts
-        .iter()
-        .any(|part| part.starts_with('.') && *part != "..")
-    {
+    if parts.iter().any(|part| hidden_part(part)) {
         return false;
     }
     let Some(last) = parts.last() else {
@@ -1730,9 +1727,27 @@ fn work_folder(folder: &str) -> bool {
     } else {
         lower.as_str()
     };
-    !rest
-        .split('/')
-        .any(|part| part.starts_with('.') && part != "." && part != "..")
+    !rest.split('/').any(hidden_part)
+}
+
+/// Whether a part of a path is a hidden folder, where settings and the
+/// guard's own places live (`.config`, `.claude`, `.local`). `.` and
+/// `..` are no folder of their own, and `.worktrees`, the folder a
+/// repository's worktrees are commonly kept in, holds checkouts only.
+fn hidden_part(part: &str) -> bool {
+    part.starts_with('.') && !matches!(part, "." | ".." | ".worktrees")
+}
+
+/// Whether an expansion is `$HOME` on a line that never names `HOME`
+/// otherwise: no `HOME=`, `export HOME`, `read HOME`, `for HOME in`
+/// or `unset HOME` can have changed what it stands for.
+fn home_kept(expansion: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    if text(expansion, source) != "$HOME" {
+        return false;
+    }
+    let line = String::from_utf8_lossy(source);
+    line.match_indices("HOME")
+        .all(|(at, _)| line[..at].ends_with('$'))
 }
 
 /// Programs that run what they read or are handed as words: text masked
@@ -1786,6 +1801,10 @@ fn reads_whole(root: tree_sitter::Node<'_>, source: &[u8]) -> bool {
             // `$(date -u '+%F')` in a note: its output is the time, whatever
             // word the line masks.
             "command_substitution" if only_the_date(node, source) => continue,
+            // `$HOME` is the home, as `~` is, on a line that sets no
+            // `HOME` of its own: what a path through it names is read
+            // as the same path under `~`.
+            "simple_expansion" if home_kept(node, source) => continue,
             "expansion"
             | "simple_expansion"
             | "command_substitution"
