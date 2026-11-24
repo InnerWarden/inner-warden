@@ -182,6 +182,13 @@ pub(crate) const AGENT_SHELL_MARKERS: &[&str] = &[
     // its `terminal` shell included (`hermes_cli/main.py`), measured with
     // its terminal tool on 2026-11-20.
     "HERMES_AGENT",
+    // Cursor's terminal documentation (cursor.com/docs/agent/terminal, read
+    // 2026-11-24) names it for a shell to tell an agent's run; not every
+    // Cursor CLI release sets it, so it is one barrier of several.
+    "CURSOR_AGENT",
+    // Goose sets `GOOSE_TERMINAL=1` in every shell command it runs (block/goose
+    // pull request 7017, read 2026-11-24).
+    "GOOSE_TERMINAL",
 ];
 
 /// Whether this process runs in an AI agent's shell, by its markers.
@@ -202,6 +209,27 @@ pub(crate) fn in_agent_shell() -> bool {
 /// this raises the cost, it does not close the route.
 pub(crate) fn may_widen(operator_flag: bool) -> bool {
     std::io::IsTerminal::is_terminal(&std::io::stdin()) || (operator_flag && !in_agent_shell())
+}
+
+/// The refusal of a change that LOWERS the guard that screens an agent
+/// (monitor, a disconnect, an uninstall, a jail) where no person is at a
+/// terminal ([`may_widen`]): a missing agent's marker is no proof that a
+/// person runs it. Addressed to the person; it names no way past itself.
+pub(crate) fn refuse_lowering_without_terminal(verb: &str, what: &str) -> std::process::ExitCode {
+    eprintln!(
+        "innerwarden {verb}: refused, no terminal. {what} lowers the guard that screens the \
+         agent, so it is done by a person at their own terminal. Nothing was changed."
+    );
+    std::process::ExitCode::from(1)
+}
+
+/// [`split_operator_flag`] over the words before `--` only: what follows is
+/// the command a jail runs, and its words are its own.
+pub(crate) fn split_operator_flag_before_command(rest: &[String]) -> (Vec<String>, bool) {
+    let end = rest.iter().position(|a| a == "--").unwrap_or(rest.len());
+    let (mut head, operator) = split_operator_flag(&rest[..end]);
+    head.extend(rest[end..].iter().cloned());
+    (head, operator)
 }
 
 /// The refusal, addressed to the person. It names no way past itself: the

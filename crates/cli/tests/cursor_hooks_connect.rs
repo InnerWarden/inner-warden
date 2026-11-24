@@ -176,7 +176,10 @@ fn connect_writes_cursors_hooks_and_disconnect_takes_out_only_ours() {
         "{status}"
     );
 
-    let out = run(home.path(), &["agents", "disconnect", "cursor"]);
+    let out = run(
+        home.path(),
+        &["agents", "disconnect", "--operator", "cursor"],
+    );
     let said = text(&out);
     assert_eq!(out.status.code(), Some(0), "{said}");
     assert!(said.contains("cursor, disconnected"), "{said}");
@@ -189,7 +192,10 @@ fn connect_writes_cursors_hooks_and_disconnect_takes_out_only_ours() {
 #[test]
 fn monitor_writes_entries_that_never_refuse() {
     let home = a_cursor_home();
-    let out = run(home.path(), &["agents", "connect", "cursor", "--monitor"]);
+    let out = run(
+        home.path(),
+        &["agents", "connect", "cursor", "--monitor", "--operator"],
+    );
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     let file = hooks_file(home.path());
     for event in EVENTS {
@@ -333,7 +339,7 @@ fn uninstall_takes_cursors_hooks_out_before_the_binary() {
         1,
         "the connect wrote no hook, so the rest proves nothing: {connected}"
     );
-    let out = as_person(&["uninstall"]);
+    let out = as_person(&["uninstall", "--operator"]);
     let said = text(&out);
     assert_eq!(out.status.code(), Some(0), "{said}");
     assert!(!exe.exists(), "the binary must be gone: {said}");

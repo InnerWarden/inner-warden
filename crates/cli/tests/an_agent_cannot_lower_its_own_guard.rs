@@ -82,19 +82,25 @@ fn stderr(out: &Output) -> String {
 fn inside_an_agents_shell_wiring_that_lowers_the_guard_is_refused() {
     for marker in AGENT_SHELL_MARKERS {
         for args in [
-            &["agents", "disconnect", "--all"][..],
-            &["agents", "disconnect", "claude-code"],
-            &["agents", "connect", "claude-code", "--monitor"],
-            &["contain", "--", "true"],
-            &["contain", "--setup"],
+            &["agents", "disconnect", "--operator", "--all"][..],
+            &["agents", "disconnect", "--operator", "claude-code"],
+            &[
+                "agents",
+                "connect",
+                "claude-code",
+                "--monitor",
+                "--operator",
+            ],
+            &["contain", "--operator", "--", "true"],
+            &["contain", "--operator", "--setup"],
             // Review of 1.6.6, H1.
-            &["install", "claude-code", "--monitor"],
+            &["install", "claude-code", "--monitor", "--operator"],
             // Live gate of Active Defence 0.17.5, J1 and J2: the hook off,
             // or monitor, from a script the agent wrote as much as typed.
-            &["uninstall", "claude-code"],
-            &["uninstall"],
-            &["uninstall", "--purge"],
-            &["dry-run"],
+            &["uninstall", "--operator", "claude-code"],
+            &["uninstall", "--operator"],
+            &["uninstall", "--operator", "--purge"],
+            &["dry-run", "--operator"],
             &["monitor"],
         ] {
             let home = enforced_home();
@@ -137,8 +143,8 @@ fn inside_a_hermes_shell_its_hook_is_not_lowered() {
     let before = std::fs::read(&config).expect("connect wrote the hook");
     assert!(String::from_utf8_lossy(&before).contains("hook --agent hermes"));
     for args in [
-        &["agents", "disconnect", "hermes"][..],
-        &["agents", "connect", "hermes", "--monitor"],
+        &["agents", "disconnect", "--operator", "hermes"][..],
+        &["agents", "connect", "hermes", "--monitor", "--operator"],
     ] {
         let mut command = Command::new(bin());
         command
@@ -173,9 +179,9 @@ fn inside_a_hermes_shell_its_hook_is_not_lowered() {
 fn what_lowers_nothing_and_the_person_are_not_refused() {
     for args in [
         &["agents", "connect", "claude-code"][..],
-        &["contain", "--dry-run", "--", "true"],
+        &["contain", "--operator", "--dry-run", "--", "true"],
         &["install", "claude-code"],
-        &["uninstall", "--dry-run"],
+        &["uninstall", "--operator", "--dry-run"],
         &["enforce"],
     ] {
         let home = enforced_home();
@@ -187,7 +193,11 @@ fn what_lowers_nothing_and_the_person_are_not_refused() {
         );
     }
     let home = enforced_home();
-    let out = run(home.path(), &["agents", "disconnect", "--all"], None);
+    let out = run(
+        home.path(),
+        &["agents", "disconnect", "--operator", "--all"],
+        None,
+    );
     assert!(
         !stderr(&out).contains("refused inside an AI agent's shell"),
         "{}",
@@ -205,7 +215,11 @@ fn a_setup_that_could_not_arm_the_hook_fails() {
     std::fs::create_dir_all(&claude).unwrap();
     let settings = claude.join("settings.json");
     std::fs::write(&settings, "{ not json").unwrap();
-    let out = run(home.path(), &["contain", "--setup", "--enforce"], None);
+    let out = run(
+        home.path(),
+        &["contain", "--operator", "--setup", "--enforce"],
+        None,
+    );
     let said = String::from_utf8_lossy(&out.stdout);
     assert_ne!(out.status.code(), Some(0), "{said}{}", stderr(&out));
     assert!(
@@ -224,7 +238,7 @@ fn a_setup_that_could_not_arm_the_hook_fails() {
 fn a_jail_keeps_the_hooks_mode_unless_asked() {
     let home = enforced_home();
     let settings = home.path().join(".claude/settings.json");
-    let out = run(home.path(), &["contain", "--setup"], None);
+    let out = run(home.path(), &["contain", "--operator", "--setup"], None);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let text = std::fs::read_to_string(&settings).unwrap();
     assert!(
@@ -236,7 +250,17 @@ fn a_jail_keeps_the_hooks_mode_unless_asked() {
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
-    let out = run(home.path(), &["contain", "--setup", "--monitor"], None);
+    let out = run(
+        home.path(),
+        &[
+            "contain",
+            "--operator",
+            "--setup",
+            "--monitor",
+            "--operator",
+        ],
+        None,
+    );
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     assert!(std::fs::read_to_string(&settings)
         .unwrap()

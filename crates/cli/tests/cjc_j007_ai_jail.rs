@@ -49,6 +49,7 @@ fn unsafe_project_is_rejected_before_the_host_hook_is_mutated() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             home.path().to_str().unwrap(),
             "--",
@@ -97,6 +98,7 @@ fn linux_backend_masks_innerwarden_secrets_and_keeps_project_available() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             project.path().to_str().unwrap(),
             "--",
@@ -136,6 +138,7 @@ fn exported_credentials_stay_out_of_the_jail_unless_passed_by_name() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--pass-env",
             "ANTHROPIC_API_KEY",
             "--project",
@@ -234,6 +237,7 @@ fn a_deny_read_link_into_a_home_folder_cannot_be_moved_from_its_name() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             project.path().to_str().unwrap(),
             "--",
@@ -526,6 +530,7 @@ fn identity_flag_mounts_the_record_read_only_inside_and_keeps_a_private_copy() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.path().to_str().unwrap(),
@@ -681,7 +686,7 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
     let project = tempfile::TempDir::new().unwrap();
     let output = cli()
         .args([
-            "contain",
+            "contain", "--operator",
             "--project",
             project.path().to_str().unwrap(),
             "--",
@@ -817,7 +822,7 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
     let home = tempfile::TempDir::new().unwrap();
     let project = tempfile::TempDir::new().unwrap();
     let dry = |identity: bool| {
-        let mut args = vec!["contain", "--dry-run"];
+        let mut args = vec!["contain", "--operator", "--dry-run"];
         if identity {
             args.push("--identity");
         }
@@ -1063,7 +1068,7 @@ fn dry_run_shows_the_record_and_info_descriptors_only_with_the_identity_flag() {
 fn unsupported_platform_fails_without_claiming_a_jail() {
     let home = tempfile::TempDir::new().unwrap();
     let output = cli()
-        .args(["contain", "--", "echo", "ok"])
+        .args(["contain", "--operator", "--", "echo", "ok"])
         .env("HOME", home.path())
         .output()
         .expect("run contain");
@@ -1101,6 +1106,7 @@ fn identity_hides_the_launchers_records_and_names_the_jails_mount_namespace() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.path().to_str().unwrap(),
@@ -1227,6 +1233,7 @@ fn a_jail_the_host_did_not_admit_never_runs_its_command() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.path().to_str().unwrap(),
@@ -1338,6 +1345,7 @@ fn a_launcher_that_dies_before_the_host_answers_starts_nothing() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.path().to_str().unwrap(),
@@ -1468,6 +1476,7 @@ fn a_launcher_that_dies_with_its_jail_held_stopped_starts_nothing() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.path().to_str().unwrap(),
@@ -1658,6 +1667,7 @@ fn a_state_home_spelled_through_a_parent_step_never_shows_the_home() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.path().to_str().unwrap(),
@@ -1730,6 +1740,7 @@ fn identified_in(
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.to_str().unwrap(),
@@ -1913,6 +1924,7 @@ fn a_hidden_home_path_behind_a_link_hides_what_it_leads_to() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.path().to_str().unwrap(),
@@ -1972,6 +1984,7 @@ fn a_hidden_home_path_behind_a_link_the_jail_can_replace_stops_the_launch() {
         command
             .args([
                 "contain",
+                "--operator",
                 "--identity",
                 "--project",
                 project.path().to_str().unwrap(),
@@ -2053,6 +2066,7 @@ fn a_hidden_home_path_made_after_the_jail_started_stays_hidden() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.path().to_str().unwrap(),
@@ -2120,6 +2134,7 @@ fn a_home_folder_linked_outside_the_home_hides_where_it_leads() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.path().to_str().unwrap(),
@@ -2202,6 +2217,7 @@ fn a_planted_link_never_moves_a_hidden_home_path() {
         command
             .args([
                 "contain",
+                "--operator",
                 "--identity",
                 "--project",
                 project.path().to_str().unwrap(),
@@ -2233,6 +2249,7 @@ fn identified_sh(
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             project.to_str().unwrap(),
@@ -2672,6 +2689,7 @@ fn a_read_only_path_of_a_profile_inside_the_project_is_never_written() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             p.to_str().unwrap(),
@@ -2743,6 +2761,7 @@ fn a_running_identified_jail_hands_its_filter_before_any_descriptor_bind() {
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             p.to_str().unwrap(),
@@ -2888,7 +2907,7 @@ fn a_strict_profile_never_starts_where_bwrap_cannot_keep_its_read_only_path() {
     );
     for dry in [true, false] {
         let mut command = cli();
-        command.arg("contain").arg("--identity");
+        command.args(["contain", "--operator"]).arg("--identity");
         if dry {
             command.arg("--dry-run");
         }
@@ -3224,6 +3243,7 @@ fn a_read_only_path_that_is_a_link_stays_read_only_where_it_leads() {
         let dry = cli()
             .args([
                 "contain",
+                "--operator",
                 "--identity",
                 "--dry-run",
                 "--project",
@@ -3502,6 +3522,7 @@ fn a_git_file_that_names_a_folder_of_the_home_never_shows_it_writable() {
     command
         .args([
             "contain",
+            "--operator",
             "--project",
             p.to_str().unwrap(),
             "--",
@@ -3535,7 +3556,7 @@ fn plain_jail(
     script: &str,
 ) -> (Option<i32>, String, String) {
     let mut command = cli();
-    command.args(["contain", "--project", p.to_str().unwrap()]);
+    command.args(["contain", "--operator", "--project", p.to_str().unwrap()]);
     if dry_run {
         command.arg("--dry-run");
     }
@@ -4026,6 +4047,7 @@ fn a_worktree_forged_through_a_missing_folder_never_makes_a_read_only_path_writa
     command
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--project",
             p.to_str().unwrap(),
@@ -4091,6 +4113,7 @@ fn on_macos_a_link_at_a_read_only_path_is_denied_as_named_and_where_it_leads() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--identity",
             "--dry-run",
             "--project",
@@ -4268,6 +4291,7 @@ fn a_project_whose_settings_turn_the_hooks_off_never_starts_a_jail() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             project.path().to_str().unwrap(),
             "--",
@@ -4328,6 +4352,7 @@ fn a_jail_cannot_change_the_settings_that_carry_the_guards_hook() {
             cli()
                 .args([
                     "contain",
+                    "--operator",
                     "--project",
                     project.path().to_str().unwrap(),
                     "--",
@@ -4367,6 +4392,7 @@ fn a_jail_cannot_change_the_settings_that_carry_the_guards_hook() {
             cli()
                 .args([
                     "contain",
+                    "--operator",
                     "--project",
                     project.path().to_str().unwrap(),
                     "--",
@@ -4518,6 +4544,7 @@ fn the_folder_claude_config_dir_names_is_checked_and_armed() {
         cli()
             .args([
                 "contain",
+                "--operator",
                 "--pass-env",
                 "CLAUDE_CONFIG_DIR",
                 "--project",
@@ -4583,7 +4610,7 @@ fn a_claude_config_dir_that_cannot_be_guarded_refuses_before_anything_is_written
     std::fs::create_dir_all(h.join(".local/claude")).unwrap();
     std::fs::create_dir_all(p.join("cfg")).unwrap();
     let run = |setup: bool, value: &std::path::Path| {
-        let mut args = vec!["contain", "--pass-env", "CLAUDE_CONFIG_DIR"];
+        let mut args = vec!["contain", "--operator", "--pass-env", "CLAUDE_CONFIG_DIR"];
         if setup {
             args.push("--setup");
         } else {
@@ -4659,6 +4686,7 @@ fn the_folder_claude_config_dir_names_is_never_written_in_the_jail() {
     let out = cli()
         .args([
             "contain",
+            "--operator",
             "--pass-env",
             "CLAUDE_CONFIG_DIR",
             "--project",
@@ -4749,6 +4777,7 @@ fn a_jails_project_file_fails_the_launch_and_waits_for_the_persons_accept() {
     let accepted = cli()
         .args([
             "contain",
+            "--operator",
             "--accept-project-files",
             "--project",
             p.to_str().unwrap(),
@@ -4822,6 +4851,7 @@ fn every_doubt_in_the_persons_claude_settings_refuses_the_start() {
         let output = cli()
             .args([
                 "contain",
+                "--operator",
                 "--project",
                 project.path().to_str().unwrap(),
                 "--",
@@ -4906,7 +4936,15 @@ fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     let project = tempfile::TempDir::new().unwrap();
     let p = project.path().to_str().unwrap().to_string();
     let plain_dry = cli()
-        .args(["contain", "--dry-run", "--project", &p, "--", "/bin/true"])
+        .args([
+            "contain",
+            "--operator",
+            "--dry-run",
+            "--project",
+            &p,
+            "--",
+            "/bin/true",
+        ])
         .env("HOME", h)
         .output()
         .expect("a plain dry run");
@@ -4919,6 +4957,7 @@ fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     let mut dry = cli();
     dry.args([
         "contain",
+        "--operator",
         "--identity",
         "--dry-run",
         "--project",
@@ -4960,7 +4999,7 @@ fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     let ph = plain_home.path();
     std::fs::create_dir_all(ph.join(".claude")).unwrap();
     let plain = cli()
-        .args(["contain", "--project", &p, "--", "/bin/true"])
+        .args(["contain", "--operator", "--project", &p, "--", "/bin/true"])
         .env("HOME", ph)
         .output()
         .expect("run a plain jail");
@@ -4998,6 +5037,7 @@ fn the_first_launch_on_a_home_with_no_claude_folder_shows_the_hook() {
             cli()
                 .args([
                     "contain",
+                    "--operator",
                     "--project",
                     project.path().to_str().unwrap(),
                     "--",
@@ -5060,6 +5100,7 @@ fn a_secret_folder_shown_through_another_linked_home_folder_stays_hidden() {
             cli()
                 .args([
                     "contain",
+                    "--operator",
                     "--project",
                     project.path().to_str().unwrap(),
                     "--",
@@ -5113,6 +5154,7 @@ fn jail_sh(
         cli()
             .args([
                 "contain",
+                "--operator",
                 "--project",
                 project.to_str().unwrap(),
                 "--",
@@ -5207,6 +5249,7 @@ fn on_macos_a_dotdir_linked_into_a_folder_the_jail_writes_stays_hidden() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             project.path().to_str().unwrap(),
             "--",
@@ -5270,6 +5313,7 @@ fn on_macos_a_dotdir_a_link_leads_outside_the_home_is_denied_there() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             project.path().to_str().unwrap(),
             "--",
@@ -5321,6 +5365,7 @@ fn on_macos_innerwardens_folder_linked_out_of_the_home_is_denied_where_it_leads(
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             project.path().to_str().unwrap(),
             "--",
@@ -5370,6 +5415,7 @@ fn on_macos_a_deny_read_link_out_of_the_home_is_denied_where_it_leads() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             project.path().to_str().unwrap(),
             "--",
@@ -5567,6 +5613,7 @@ fn a_dotdir_through_a_link_the_jail_can_change_is_refused_and_the_hosts_link_sta
             cli()
                 .args([
                     "contain",
+                    "--operator",
                     "--dry-run",
                     "--project",
                     project.path().to_str().unwrap(),
@@ -5696,7 +5743,7 @@ fn a_link_inside_a_dotdir_the_jail_never_shows_is_hidden_where_it_leads() {
             dots.display()
         );
         let mut command = cli();
-        command.arg("contain");
+        command.args(["contain", "--operator"]);
         if identity {
             command.arg("--identity");
         }
@@ -5949,6 +5996,7 @@ fn on_macos_a_denied_place_below_a_folder_the_jail_writes_stays_where_the_hosts_
         let output = cli()
             .args([
                 "contain",
+                "--operator",
                 "--project",
                 p.to_str().unwrap(),
                 "--",
@@ -6030,6 +6078,7 @@ fn on_macos_no_folder_above_what_the_jail_denies_moves() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             p.to_str().unwrap(),
             "--deny-read",
@@ -6092,6 +6141,7 @@ fn on_macos_the_launcher_makes_a_missing_config_folder_before_the_sandbox() {
     let dry = cli()
         .args([
             "contain",
+            "--operator",
             "--dry-run",
             "--project",
             p.to_str().unwrap(),
@@ -6128,6 +6178,7 @@ fn on_macos_the_launcher_makes_a_missing_config_folder_before_the_sandbox() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             p.to_str().unwrap(),
             "--",
@@ -6156,7 +6207,14 @@ fn on_macos_the_launcher_makes_a_missing_config_folder_before_the_sandbox() {
     assert!(h.join(".config/app/x").exists() && !h.join(".config-old").exists());
     // Made once: a later run makes nothing, and says nothing of it.
     let again = cli()
-        .args(["contain", "--project", p.to_str().unwrap(), "--", "true"])
+        .args([
+            "contain",
+            "--operator",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "true",
+        ])
         .env("HOME", &h)
         .output()
         .expect("run the macOS jail again");
@@ -6190,6 +6248,7 @@ fn on_macos_every_folder_the_launcher_makes_is_said() {
     let dry = cli()
         .args([
             "contain",
+            "--operator",
             "--dry-run",
             "--project",
             p.to_str().unwrap(),
@@ -6209,7 +6268,14 @@ fn on_macos_every_folder_the_launcher_makes_is_said() {
     );
     assert!(!made.exists(), "a dry run made {}", made.display());
     let output = cli()
-        .args(["contain", "--project", p.to_str().unwrap(), "--", "true"])
+        .args([
+            "contain",
+            "--operator",
+            "--project",
+            p.to_str().unwrap(),
+            "--",
+            "true",
+        ])
         .env("HOME", &h)
         .output()
         .expect("run the macOS jail");
@@ -6272,6 +6338,7 @@ fn on_macos_a_folder_kept_in_place_still_reads_as_writable() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--project",
             p.to_str().unwrap(),
             "--",
@@ -6349,6 +6416,7 @@ fn a_worktree_named_onto_where_a_hidden_dotdir_leads_is_left_out() {
         cli()
             .args([
                 "contain",
+                "--operator",
                 "--project",
                 p.to_str().unwrap(),
                 "--",
@@ -6434,6 +6502,7 @@ fn ordinary_dotdirs_are_hidden_as_before_and_nothing_is_added() {
     let dry = cli()
         .args([
             "contain",
+            "--operator",
             "--dry-run",
             "--project",
             p.to_str().unwrap(),
@@ -6574,6 +6643,7 @@ fn innerwardens_folder_that_is_a_link_is_refused_and_the_hosts_link_stays() {
             cli()
                 .args([
                     "contain",
+                    "--operator",
                     "--dry-run",
                     "--project",
                     project.path().to_str().unwrap(),
@@ -6705,7 +6775,12 @@ fn the_jails_record_of_decisions_is_out_of_the_agents_reach() {
         } else {
             let mut command = cli();
             command
-                .args(["contain", "--project", project.path().to_str().unwrap()])
+                .args([
+                    "contain",
+                    "--operator",
+                    "--project",
+                    project.path().to_str().unwrap(),
+                ])
                 .args(["--", "/bin/sh", "-c", &script])
                 .env("HOME", h);
             command.output().expect("run the jail")
@@ -6954,7 +7029,12 @@ fn record_jail_sh(
     } else {
         let mut command = cli();
         command
-            .args(["contain", "--project", project.to_str().unwrap()])
+            .args([
+                "contain",
+                "--operator",
+                "--project",
+                project.to_str().unwrap(),
+            ])
             .args(["--", "/bin/sh", "-c", script])
             .env("HOME", home);
         command
@@ -7557,7 +7637,7 @@ fn no_jail_on_this_disk_makes_a_subvolume_or_snapshot(disk: &SubvolumeDisk) {
     let jailed = |text: &str, at: &std::path::Path, identity: bool| {
         let home = state_home();
         let mut command = cli();
-        command.arg("contain");
+        command.args(["contain", "--operator"]);
         if identity {
             command.arg("--identity");
         }
@@ -7814,6 +7894,7 @@ fn openclaws_jail_holds_its_wiring_read_only_in_a_real_bwrap() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--agent",
             "openclaw",
             "--project",
@@ -7889,6 +7970,7 @@ fn openclaws_jail_does_not_start_through_a_link() {
     let output = cli()
         .args([
             "contain",
+            "--operator",
             "--agent",
             "openclaw",
             "--project",

@@ -42,12 +42,49 @@ fn connect_setup_agents(
     })
 }
 
+/// The agents setup may connect in dry run, and the names of those it leaves
+/// as they are. An agent already wired keeps its wiring: rewired in dry run,
+/// a hook in enforce would refuse nothing. Setup is the first-run flow and
+/// never lowers a guard already up, whoever answers it (a terminal an agent
+/// allocated looks like a person's); `dry-run` does that, by the person.
+fn split_already_wired(
+    home: &std::path::Path,
+    agents: &[innerwarden_agent_guard::agents::AgentStatus],
+) -> (
+    Vec<innerwarden_agent_guard::agents::AgentStatus>,
+    Vec<String>,
+) {
+    let mut connect = Vec::with_capacity(agents.len());
+    let mut kept = Vec::new();
+    for agent in agents {
+        if innerwarden_agent_guard::agents_ops::status_has_guard_wiring(home, agent) {
+            kept.push(agent.name.clone());
+        } else {
+            connect.push(agent.clone());
+        }
+    }
+    (connect, kept)
+}
+
 /// `innerwarden setup` - the friendly first-run flow. Sequential yes/no questions,
 /// each with a plain-language prompt; details are asked only after a "yes". Guards
 /// in DRY RUN so nothing is ever blocked until the user runs `innerwarden enforce`.
 /// With no terminal (piped `curl | sh`, CI) it prints the options + exact commands.
 pub fn cmd(_rest: &[String]) -> ExitCode {
     let prog = crate::prog();
+
+    // Setup connects agents in dry run, which lowers the guard that screens
+    // them: the person's, never a command an AI agent's shell runs, as for
+    // `dry-run`, `agents` and `install`. Checked before anything else, a
+    // terminal the agent allocated for itself (`script`) included.
+    if crate::suppress_io::in_agent_shell() {
+        eprintln!(
+            "{prog} setup: refused inside an AI agent's shell. Setup connects agents in dry \
+             run, which lowers the guard that screens them, so it is run by the person, from \
+             their own terminal. Nothing was changed."
+        );
+        return ExitCode::from(1);
+    }
 
     if !std::io::stdin().is_terminal() {
         println!("{}", setup::noninteractive_summary(&prog));
@@ -133,6 +170,12 @@ pub fn cmd(_rest: &[String]) -> ExitCode {
         if guard {
             offer_auto_connect = true;
             let was_wired = crate::posture_io::already_wired(&home);
+            let (agents, kept) = split_already_wired(&home, &agents);
+            for name in &kept {
+                println!(
+                    "  {name} - already guarded; left in the mode it runs in (dry run:  {prog} dry-run)"
+                );
+            }
             match connect_setup_agents(&home, &agents, &bin) {
                 Ok(results) => {
                     for result in results {
@@ -692,5 +735,45 @@ mod tests {
         let config = std::fs::read_to_string(home.path().join(".cursor/mcp.json")).unwrap();
         assert!(config.contains("innerwarden"));
         assert!(config.contains("advisory"));
+    }
+
+    /// An agent whose hook is already up is left out of setup's dry-run
+    /// connect; an agent with no wiring is connected as before.
+    ///
+    /// FAILS ON REVERT: without `split_already_wired` setup rewires Claude
+    /// Code's enforcing hook to `--monitor`.
+    #[test]
+    fn setup_leaves_a_hook_already_up_as_it_is() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude/settings.json"),
+            serde_json::json!({
+                "hooks": { "PreToolUse": [ { "matcher": "Bash", "hooks": [
+                    { "type": "command", "command": "innerwarden hook --agent claude-code" }
+                ] } ] }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.path().join(".cursor")).unwrap();
+        std::fs::write(
+            home.path().join(".cursor/mcp.json"),
+            r#"{"mcpServers":{"local":{"command":"npx"}}}"#,
+        )
+        .unwrap();
+        let rows: Vec<_> = innerwarden_agent_guard::agents_ops::rows(home.path())
+            .into_iter()
+            .filter(|agent| agent.name == "claude-code" || agent.name == "cursor")
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+
+        let (connect, kept) = split_already_wired(home.path(), &rows);
+
+        assert_eq!(kept, vec!["claude-code".to_string()]);
+        assert_eq!(
+            connect.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["cursor"]
+        );
     }
 }

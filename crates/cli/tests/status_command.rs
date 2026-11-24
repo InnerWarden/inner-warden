@@ -186,7 +186,10 @@ fn a_record_that_was_never_written_is_not_a_read_failure() {
 fn the_mode_line_tracks_what_the_wiring_actually_does() {
     let home = tempfile::TempDir::new().expect("temp home");
 
-    let installed = run(home.path(), &["install", "claude-code", "--monitor"]);
+    let installed = run(
+        home.path(),
+        &["install", "claude-code", "--monitor", "--operator"],
+    );
     assert!(
         home.path().join(".claude/settings.json").exists(),
         "the hook must be wired for this test to mean anything: {installed}"
@@ -361,7 +364,10 @@ fn status_names_the_tool_classes_an_agent_hook_judges() {
 fn status_names_a_codex_hook_that_codex_does_not_run() {
     let home = tempfile::TempDir::new().expect("temp home");
     std::fs::create_dir_all(home.path().join(".codex")).expect("codex dir");
-    let connected = run(home.path(), &["agents", "connect", "codex", "--monitor"]);
+    let connected = run(
+        home.path(),
+        &["agents", "connect", "codex", "--monitor", "--operator"],
+    );
     assert!(
         home.path().join(".codex/hooks.json").is_file(),
         "the connect wrote no Codex hook, so the rest of this test proves \
@@ -393,7 +399,10 @@ fn status_names_a_codex_hook_that_codex_does_not_run() {
 fn status_names_the_folder_codex_home_sends_codex_to() {
     let home = tempfile::TempDir::new().expect("temp home");
     std::fs::create_dir_all(home.path().join(".codex")).expect("codex dir");
-    let connected = run(home.path(), &["agents", "connect", "codex", "--monitor"]);
+    let connected = run(
+        home.path(),
+        &["agents", "connect", "codex", "--monitor", "--operator"],
+    );
     assert!(
         home.path().join(".codex/hooks.json").is_file(),
         "the connect wrote no Codex hook, so the rest of this test proves \

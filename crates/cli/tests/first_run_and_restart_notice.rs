@@ -162,7 +162,10 @@ fn connecting_an_agent_says_it_must_be_restarted() {
     let home = tempfile::TempDir::new().unwrap();
     a_guardable_agent(home.path());
 
-    let out = run(home.path(), &["agents", "connect", "--all", "--monitor"]);
+    let out = run(
+        home.path(),
+        &["agents", "connect", "--all", "--monitor", "--operator"],
+    );
 
     assert!(
         out.contains("new-agent"),
@@ -189,10 +192,14 @@ fn connecting_an_agent_says_it_must_be_restarted() {
 fn a_mode_switch_says_how_to_restart_each_connected_agent() {
     let home = tempfile::TempDir::new().unwrap();
     a_guardable_agent(home.path());
-    let connected = run(home.path(), &["agents", "connect", "--all", "--monitor"]);
+    let connected = run(
+        home.path(),
+        &["agents", "connect", "--all", "--monitor", "--operator"],
+    );
     assert!(connected.contains("new-agent"), "{connected}");
     for verb in ["enforce", "dry-run"] {
-        let out = run(home.path(), &[verb]);
+        // Run as an operator's script (no terminal here).
+        let out = run(home.path(), &[verb, "--operator"]);
         assert!(out.contains("Restart guarded agents"), "{verb}: {out}");
         assert!(
             out.contains("  New Agent: Quit New Agent and start it again."),
@@ -217,7 +224,10 @@ fn a_mode_switch_says_how_to_restart_each_connected_agent() {
 fn a_mode_switch_that_stops_codexs_hook_exits_1_and_names_the_step() {
     let home = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(home.path().join(".codex")).unwrap();
-    let connected = run(home.path(), &["agents", "connect", "codex", "--monitor"]);
+    let connected = run(
+        home.path(),
+        &["agents", "connect", "codex", "--monitor", "--operator"],
+    );
     assert!(
         home.path().join(".codex/hooks.json").is_file(),
         "the connect wrote no Codex hook, so the rest of this test proves \
@@ -255,7 +265,10 @@ fn a_mode_switch_that_stops_codexs_hook_exits_1_and_names_the_step() {
 fn a_moved_hook_whose_command_says_failed_does_not_fail_the_disconnect() {
     let home = tempfile::TempDir::new().unwrap();
     std::fs::create_dir_all(home.path().join(".codex")).unwrap();
-    let connected = run(home.path(), &["agents", "connect", "codex", "--monitor"]);
+    let connected = run(
+        home.path(),
+        &["agents", "connect", "codex", "--monitor", "--operator"],
+    );
     let file = home.path().join(".codex/hooks.json");
     let mut settings: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&file)
@@ -269,7 +282,7 @@ fn a_moved_hook_whose_command_says_failed_does_not_fail_the_disconnect() {
     std::fs::write(&file, settings.to_string()).unwrap();
 
     let out = cli(home.path())
-        .args(["agents", "disconnect", "codex"])
+        .args(["agents", "disconnect", "--operator", "codex"])
         .output()
         .expect("run innerwarden agents disconnect");
     let said = format!(
@@ -313,9 +326,15 @@ fn install_says_how_to_restart_claude_code() {
 fn disconnecting_never_tells_anyone_to_restart() {
     let home = tempfile::TempDir::new().unwrap();
     a_guardable_agent(home.path());
-    run(home.path(), &["agents", "connect", "--all", "--monitor"]);
+    run(
+        home.path(),
+        &["agents", "connect", "--all", "--monitor", "--operator"],
+    );
 
-    let out = run(home.path(), &["agents", "disconnect", "--all"]);
+    let out = run(
+        home.path(),
+        &["agents", "disconnect", "--operator", "--all"],
+    );
 
     assert!(
         out.contains("new-agent"),

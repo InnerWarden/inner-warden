@@ -401,7 +401,7 @@ fn connect_lays_the_guard_in_monitor_and_enforce_turns_it_on() {
         host.config()["plugins"]["entries"]["innerwarden-guard"]["config"]["mode"],
         "enforce"
     );
-    host.run(&["dry-run"], "");
+    host.run(&["dry-run", "--operator"], "");
     assert_eq!(
         host.config()["plugins"]["entries"]["innerwarden-guard"]["config"]["mode"],
         "monitor"
@@ -427,7 +427,7 @@ fn connect_lays_the_guard_in_monitor_and_enforce_turns_it_on() {
     );
     assert!(!status.contains("No agent is wired"), "{status}");
 
-    host.run(&["agents", "disconnect", "openclaw"], "");
+    host.run(&["agents", "disconnect", "--operator", "openclaw"], "");
     assert!(host.config()["plugins"]["entries"]
         .get("innerwarden-guard")
         .is_none());
@@ -442,7 +442,7 @@ fn openclaws_exec_shell_cannot_lower_the_guard() {
     host.run(&["agents", "connect", "openclaw"], "");
     let mut command = Command::new(bin());
     command
-        .args(["agents", "disconnect", "openclaw"])
+        .args(["agents", "disconnect", "--operator", "openclaw"])
         .env("HOME", host.home())
         .env("IW_GRAPH_FILE", host.graph())
         .env("INNERWARDEN_AGENT_URL", "off")
