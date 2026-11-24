@@ -3076,6 +3076,176 @@ pub(crate) fn inline_code_reading(source: &str) -> InlineReading {
         }
     }
     reading
+        .data_blanked
+        .extend(shell_heredoc_data_blanked(source));
+    // What the code prints may reach a command: piped on, or written to a
+    // file on a line that runs more (`perl -e 'print q{...}' > x.sh && sh
+    // x.sh`). Its strings are then read as the line holds them.
+    // Nor is it only text where a later step of the line may run a file
+    // the code wrote (`ruby -e 'File.write("x.sh", ...)' && sh x.sh`).
+    if code_output_reaches_a_command(source) || inline_calls::line_may_run_a_written_file(source) {
+        reading.data_blanked.clear();
+    }
+    reading
+}
+
+/// Whether a program that runs inline code (an interpreter, or a shell
+/// handed a here-document) sends what it prints on: into a pipe, or to a
+/// file on a line with another command.
+fn code_output_reaches_a_command(source: &str) -> bool {
+    let line = crate::shell_words::read_line(source);
+    line.commands.iter().any(|command| {
+        let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+        let Some(at) = crate::threats::effective_command_index(&words) else {
+            return false;
+        };
+        let program = crate::threats::token_basename(&words[at]).to_ascii_lowercase();
+        let runs_code = [
+            "python", "node", "deno", "bun", "ruby", "perl", "php", "lua", "bash", "sh", "zsh",
+            "dash", "ksh",
+        ]
+        .iter()
+        .any(|name| program.starts_with(name));
+        runs_code && (command.piped || (command.writes_file && line.commands.len() > 1))
+    })
+}
+
+/// The here-documents a shell is handed (`bash <<'EOF'`) with every line
+/// that only writes text with `echo` or `printf` to a file of the working
+/// tree taken out: what such a line writes is data, not a command, as the
+/// same line on its own is (`echo 'rm -rf "$dir"/b' > notes.txt`, allowed
+/// on main, refused inside `bash <<'EOF'` on main, measured 2026-11-20). A
+/// line that writes a startup file, a scheduler's, the sudo rules or a
+/// unit, any place outside the tree, or text that names one, or whose
+/// words a substitution builds, stays read.
+fn shell_heredoc_data_blanked(source: &str) -> Vec<(String, String)> {
+    if !source.contains("<<") {
+        return Vec::new();
+    }
+    let line = crate::shell_words::read_line(source);
+    let mut out = Vec::new();
+    for command in &line.commands {
+        if command.inputs.is_empty() {
+            continue;
+        }
+        let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+        let Some(at) = crate::threats::effective_command_index(&words) else {
+            continue;
+        };
+        let program = crate::threats::token_basename(&words[at]).to_ascii_lowercase();
+        if !matches!(program.as_str(), "bash" | "sh" | "zsh" | "dash" | "ksh") {
+            continue;
+        }
+        // The shell reads its script on its input: no `-c`, no file.
+        let reads_input = words[at + 1..]
+            .iter()
+            .all(|word| word.starts_with('-') && word[1..].bytes().all(|b| b"esuxv".contains(&b)));
+        if !reads_input {
+            continue;
+        }
+        // What an echo writes is text only where no step of the line, in
+        // the body or around it, may run, source, mark as a program or
+        // install as a hook the file it wrote: every other command must be
+        // one that runs nothing ([`command_runs_nothing_written`]).
+        let others_inert = line.nested.is_empty()
+            && line.arrays.is_empty()
+            && line
+                .commands
+                .iter()
+                .filter(|other| !std::ptr::eq(*other, command))
+                .all(command_runs_nothing_written);
+        if !others_inert {
+            continue;
+        }
+        for body in &command.inputs {
+            let body_line = crate::shell_words::read_line(body);
+            if !body_line.nested.is_empty()
+                || !body_line.arrays.is_empty()
+                || !body_line.commands.iter().all(command_runs_nothing_written)
+            {
+                continue;
+            }
+            let blanked = echo_lines_blanked(body, source);
+            if blanked != *body {
+                out.push((body.clone(), blanked));
+            }
+        }
+    }
+    out
+}
+
+/// Whether a command, in a here-document handed to a shell or on the line
+/// around it, can run nothing an `echo` of the same body wrote: it writes
+/// text, makes a folder or moves to one that holds no hooks. Any other
+/// command (`sh`, `source`, `chmod`, a glob, a function, `if`) may run
+/// the file, so the body is read whole.
+fn command_runs_nothing_written(command: &crate::shell_words::Command) -> bool {
+    let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+    let Some(at) = crate::threats::effective_command_index(&words) else {
+        return words.is_empty();
+    };
+    if at != 0 || !command.words[at].is_plain() {
+        return false;
+    }
+    match words[at].as_str() {
+        "echo" | "printf" | "mkdir" | "true" | ":" | "pwd" | "touch" => true,
+        "cd" => !words[1..]
+            .iter()
+            .any(|word| word.to_ascii_lowercase().contains("hook")),
+        _ => false,
+    }
+}
+
+/// `body` with the words of each line that only writes text to a file of
+/// the tree with `echo` or `printf` blanked ([`shell_heredoc_data_blanked`]).
+fn echo_lines_blanked(body: &str, source: &str) -> String {
+    static WRITE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let write = WRITE.get_or_init(|| {
+        regex::Regex::new(
+            r#"^(\s*(?:echo|printf)\s)(.*?)(\s*>>?\s*([A-Za-z0-9_][A-Za-z0-9_./-]*)\s*)$"#,
+        )
+        .expect("valid regex")
+    });
+    body.split_inclusive('\n')
+        .map(|raw| {
+            let text = raw.strip_suffix('\n').unwrap_or(raw);
+            let ending = &raw[text.len()..];
+            let Some(found) = write.captures(text) else {
+                return raw.to_owned();
+            };
+            let (head, words, target) = (&found[1], &found[2], &found[4]);
+            // A file the line names again may be run or read as code.
+            if text.contains("$(")
+                || text.contains('`')
+                || target.contains("..")
+                || source.matches(target).count() > 1
+            {
+                return raw.to_owned();
+            }
+            if inline_calls::names_a_place_outside_the_tree(target)
+                || inline_calls::names_a_place_outside_the_tree(words)
+            {
+                return raw.to_owned();
+            }
+            let read = crate::shell_words::read_line(text);
+            let [command] = read.commands.as_slice() else {
+                return raw.to_owned();
+            };
+            let clean = read.nested.is_empty()
+                && command.inputs.is_empty()
+                && command.reads.is_empty()
+                && command.writes_file
+                && command
+                    .words
+                    .iter()
+                    .all(|word| word.substitutions.is_empty())
+                && command.words.iter().all(|word| word.one_word);
+            if !clean {
+                return raw.to_owned();
+            }
+            format!("{head}{}{}{ending}", " ".repeat(words.len()), &found[3])
+        })
+        .collect()
 }
 
 /// The shell line `scan` with the strings of its inline code taken out
@@ -11030,11 +11200,25 @@ fn line_gives_folder_queries_cause(root: tree_sitter::Node<'_>, text: &str, dept
                 line_gives_folder_queries_cause(tree.root_node(), &line, depth + 1)
             });
     }
-    let built = only_command_built_by_a_substitution(root, source);
-    if built.is_some_and(|built| {
-        runs_more_than_once(built)
-            || built_program_is_pointed_elsewhere(built, source)
-            || built_program_installs(built, source)
+    // The commands a folder query builds: one, or several read as one
+    // when each is a plain tool ([`built_program_is_a_plain_tool`]):
+    // `npm ci && "$(npm bin)/eslint" . && "$(npm bin)/jest" --ci` asks of
+    // the line what one of them would. Several where one is not a plain
+    // tool are no set: the line is in doubt, as it was.
+    let all_built = commands_built_by_a_substitution(root, source);
+    let built: Vec<tree_sitter::Node<'_>> = if all_built.len() == 1
+        || all_built
+            .iter()
+            .all(|built| built_program_is_a_plain_tool(*built, source))
+    {
+        all_built
+    } else {
+        Vec::new()
+    };
+    if built.iter().any(|built| {
+        runs_more_than_once(*built)
+            || built_program_is_pointed_elsewhere(*built, source)
+            || built_program_installs(*built, source)
     }) {
         return true;
     }
@@ -11042,19 +11226,22 @@ fn line_gives_folder_queries_cause(root: tree_sitter::Node<'_>, text: &str, dept
     // beside a registry install or a move into a folder of the project
     // ([`command_installs_or_enters_the_project`]); nothing else on the line
     // is let change that.
-    let plain_tool = built.is_some_and(|built| built_program_is_a_plain_tool(built, source));
+    let plain_tool = !built.is_empty()
+        && built
+            .iter()
+            .all(|built| built_program_is_a_plain_tool(*built, source));
     let mut commands = Vec::new();
     collect_all_commands(root, &mut commands, 0);
     if commands.into_iter().any(|command| {
-        built.is_none_or(|built| built.id() != command.id())
+        !built.iter().any(|built| built.id() == command.id())
             && !command_writes_and_runs_nothing(command, source)
             && !(plain_tool && command_installs_or_enters_the_project(command, source))
     }) {
         return true;
     }
-    if line_sets_what_a_query_may_read(root, source, built)
+    if line_sets_what_a_query_may_read(root, source, &built)
         || line_reads_what_a_command_set(root, source)
-        || line_writes_a_file(root, source, built)
+        || line_writes_a_file(root, source, &built)
         || line_reckons_arithmetic(root, text)
     {
         return true;
@@ -11902,9 +12089,11 @@ fn setting_in_front_of_the_program(name: &str, value: Option<&str>) -> bool {
 fn line_sets_what_a_query_may_read(
     root: tree_sitter::Node<'_>,
     source: &[u8],
-    built: Option<tree_sitter::Node<'_>>,
+    built: &[tree_sitter::Node<'_>],
 ) -> bool {
-    let program_runs_code = built.is_some_and(|built| built_program_runs_code(built, source));
+    let program_runs_code = built
+        .iter()
+        .any(|built| built_program_runs_code(*built, source));
     let mut assignments = Vec::new();
     collect_nodes_of_kind(root, "variable_assignment", &mut assignments, 0);
     if assignments.into_iter().any(|assignment| {
@@ -11923,7 +12112,7 @@ fn line_sets_what_a_query_may_read(
             None => Some(String::new()),
             Some(value) => literal_value(value, source),
         };
-        let in_front_of_the_program = built.is_some_and(|built| {
+        let in_front_of_the_program = built.iter().any(|built| {
             assignment
                 .parent()
                 .is_some_and(|parent| parent.id() == built.id())
@@ -12013,27 +12202,26 @@ fn redirect_writes_a_file(redirect: tree_sitter::Node<'_>, source: &[u8]) -> boo
     }
 }
 
-/// The one command of a line whose program word holds a command
+/// The commands of a line whose program word holds a command
 /// substitution, behind any wrapper the guard unwraps
-/// (`sudo "$(brew --prefix)/bin/nginx"`), when there is exactly one.
-fn only_command_built_by_a_substitution<'tree>(
+/// (`sudo "$(brew --prefix)/bin/nginx"`).
+fn commands_built_by_a_substitution<'tree>(
     root: tree_sitter::Node<'tree>,
     source: &[u8],
-) -> Option<tree_sitter::Node<'tree>> {
+) -> Vec<tree_sitter::Node<'tree>> {
     let mut commands = Vec::new();
     collect_all_commands(root, &mut commands, 0);
     let substituted = |word: &String| word.contains("$(") || word.contains('`');
-    let mut built = commands.into_iter().filter(|command| {
-        command_words(*command, source).is_some_and(|words| {
-            substituted(&words[0])
-                || effective_command_words(&words, 0)
-                    .is_some_and(|effective| substituted(&effective[0]))
+    commands
+        .into_iter()
+        .filter(|command| {
+            command_words(*command, source).is_some_and(|words| {
+                substituted(&words[0])
+                    || effective_command_words(&words, 0)
+                        .is_some_and(|effective| substituted(&effective[0]))
+            })
         })
-    });
-    match (built.next(), built.next()) {
-        (Some(only), None) => Some(only),
-        _ => None,
-    }
+        .collect()
 }
 
 /// Whether a write redirection is the output of the program a folder query
@@ -12072,7 +12260,7 @@ fn writes_only_its_own_output(
 fn line_writes_a_file(
     root: tree_sitter::Node<'_>,
     source: &[u8],
-    built: Option<tree_sitter::Node<'_>>,
+    built: &[tree_sitter::Node<'_>],
 ) -> bool {
     let named_descriptor = ["file_redirect", "heredoc_redirect", "herestring_redirect"]
         .iter()
@@ -12093,8 +12281,14 @@ fn line_writes_a_file(
     let mut redirects = Vec::new();
     collect_nodes_of_kind(root, "file_redirect", &mut redirects, 0);
     redirects.into_iter().any(|redirect| {
+        // Only the last tool's own output: a file an earlier one writes is
+        // there before a later query is read (`"$(go env GOPATH)/bin/x" >
+        // go.mod; "$(go env GOPATH)/bin/y"`).
         redirect_writes_a_file(redirect, source)
-            && built.is_none_or(|built| !writes_only_its_own_output(redirect, built, source))
+            && !built
+                .iter()
+                .max_by_key(|built| built.start_byte())
+                .is_some_and(|built| writes_only_its_own_output(redirect, *built, source))
     })
 }
 

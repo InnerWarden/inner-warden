@@ -26,6 +26,8 @@ use std::collections::{HashMap, HashSet};
 
 use super::{js_option, node_called_sinks, shell_quoted, NodeCall};
 
+mod literals;
+
 /// Where a piece of a string is not read.
 const UNREAD: char = '\u{1}';
 /// What a piece that is not read stands as in a line: an expansion.
@@ -777,11 +779,14 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
 /// here from code (a regular expression, a Ruby command quote or
 /// here-document). Only Python, Node and Ruby are read.
 fn data_literal_ranges(lang: Lang, code: &str) -> Option<Vec<(usize, usize)>> {
-    if !matches!(lang, Lang::Python | Lang::Js | Lang::Ruby) {
-        return None;
+    if matches!(lang, Lang::Perl | Lang::Php | Lang::Lua) {
+        return literals::literal_ranges(lang, code);
     }
     let bytes = code.as_bytes();
     let mut ranges = Vec::new();
+    // Ruby here-documents opened on the line being read, whose bodies
+    // start at its end.
+    let mut pending: Vec<RubyHeredoc> = Vec::new();
     let mut at = 0;
     while at < bytes.len() {
         if !code.is_char_boundary(at) {
@@ -790,6 +795,10 @@ fn data_literal_ranges(lang: Lang, code: &str) -> Option<Vec<(usize, usize)>> {
         }
         let byte = bytes[at];
         let rest = &code[at..];
+        if byte == b'\n' && !pending.is_empty() {
+            at = ruby_heredoc_bodies(code, at + 1, &mut pending, &mut ranges)?;
+            continue;
+        }
         let comment = match lang {
             Lang::Python | Lang::Ruby => byte == b'#',
             _ => rest.starts_with("//"),
@@ -820,8 +829,29 @@ fn data_literal_ranges(lang: Lang, code: &str) -> Option<Vec<(usize, usize)>> {
             // a Ruby here-document: not read here.
             b'/' | b'\x60' if lang != Lang::Python => return None,
             b'\x60' => return None,
-            b'%' if lang == Lang::Ruby => return None,
-            b'<' if lang == Lang::Ruby && rest.starts_with("<<") => return None,
+            b'%' if lang == Lang::Ruby => match ruby_percent_literal(code, at) {
+                RubyLiteral::Operator => {
+                    at += 1;
+                    continue;
+                }
+                RubyLiteral::Code => return None,
+                RubyLiteral::Data(range, next) => {
+                    ranges.push(range);
+                    at = next;
+                    continue;
+                }
+            },
+            b'<' if lang == Lang::Ruby && rest.starts_with("<<") => {
+                match ruby_heredoc_open(code, at) {
+                    RubyHeredocOpen::Operator => at += 2,
+                    RubyHeredocOpen::Code => return None,
+                    RubyHeredocOpen::Opens(heredoc, next) => {
+                        pending.push(heredoc);
+                        at = next;
+                    }
+                }
+                continue;
+            }
             _ => {
                 at += 1;
                 continue;
@@ -873,11 +903,212 @@ fn data_literal_ranges(lang: Lang, code: &str) -> Option<Vec<(usize, usize)>> {
         ranges.push((at + open, end - open));
         at = end;
     }
+    // A here-document whose body never came.
+    if !pending.is_empty() {
+        return None;
+    }
     Some(ranges)
 }
 
+/// What a Ruby `%` starts.
+enum RubyLiteral {
+    /// The remainder operator.
+    Operator,
+    /// A literal that runs code: `%x`, a regular expression `%r`, an
+    /// interpolation with an expression in it.
+    Code,
+    /// A string, word list or symbol: its text, and the index past it.
+    Data((usize, usize), usize),
+}
+
+/// The Ruby `%` literal (`%q{}`, `%Q()`, `%w[]`, `%()`) at `at`.
+fn ruby_percent_literal(code: &str, at: usize) -> RubyLiteral {
+    let bytes = code.as_bytes();
+    let Some(&next) = bytes.get(at + 1) else {
+        return RubyLiteral::Operator;
+    };
+    // `x % 2`, `a%b`, `f(x)%y`: the operator.
+    let before = at.checked_sub(1).map(|i| bytes[i]);
+    if next.is_ascii_whitespace()
+        || before.is_some_and(|b| is_name_byte(b) || matches!(b, b')' | b']' | b'}'))
+    {
+        return RubyLiteral::Operator;
+    }
+    let (kind, open) = if b"qQwWiIsrx".contains(&next) {
+        match bytes.get(at + 2) {
+            Some(d) if d.is_ascii_punctuation() => (next, at + 2),
+            _ => return RubyLiteral::Operator,
+        }
+    } else if b"([{<|!/^:".contains(&next) {
+        (b'Q', at + 1)
+    } else {
+        return RubyLiteral::Operator;
+    };
+    // A command, a regular expression, or symbols: a symbol names a
+    // method (`instance_method(%s(system))`), so it is not data.
+    if matches!(kind, b'x' | b'r' | b's' | b'i' | b'I') {
+        return RubyLiteral::Code;
+    }
+    let delimiter = bytes[open];
+    let close = match delimiter {
+        b'(' => b')',
+        b'[' => b']',
+        b'{' => b'}',
+        b'<' => b'>',
+        other => other,
+    };
+    let mut depth = 0usize;
+    let mut end = open + 1;
+    loop {
+        let Some(&b) = bytes.get(end) else {
+            return RubyLiteral::Code;
+        };
+        if b == b'\\' {
+            end += 2;
+            continue;
+        }
+        if b == close && depth == 0 {
+            break;
+        }
+        if close != delimiter {
+            if b == delimiter {
+                depth += 1;
+            } else if b == close {
+                depth -= 1;
+            }
+        }
+        end += 1;
+    }
+    let inner = (open + 1, end);
+    if matches!(kind, b'Q' | b'W' | b'I') && code[inner.0..inner.1].contains("#{") {
+        return RubyLiteral::Code;
+    }
+    RubyLiteral::Data(inner, end + 1)
+}
+
+/// A Ruby here-document opened on a line: its terminator, whether the
+/// terminator may be indented (`<<~`, `<<-`), and whether its body
+/// fills in `#{...}`.
+struct RubyHeredoc {
+    terminator: String,
+    indented: bool,
+    interpolates: bool,
+}
+
+/// What a Ruby `<<` starts.
+enum RubyHeredocOpen {
+    /// The append or shift operator.
+    Operator,
+    /// A here-document that runs its body: `<<\`EOS\``.
+    Code,
+    /// A here-document, and the index past its opening.
+    Opens(RubyHeredoc, usize),
+}
+
+/// The Ruby `<<` at `at`.
+fn ruby_heredoc_open(code: &str, at: usize) -> RubyHeredocOpen {
+    let bytes = code.as_bytes();
+    let mut i = at + 2;
+    let indented = matches!(bytes.get(i), Some(b'~' | b'-'));
+    if indented {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(b'\x60') => RubyHeredocOpen::Code,
+        Some(&quote @ (b'\'' | b'"')) => {
+            let Some(len) = code[i + 1..].find(quote as char) else {
+                return RubyHeredocOpen::Code;
+            };
+            let terminator = code[i + 1..i + 1 + len].to_owned();
+            if terminator.is_empty() || terminator.contains('\n') {
+                return RubyHeredocOpen::Code;
+            }
+            RubyHeredocOpen::Opens(
+                RubyHeredoc {
+                    terminator,
+                    indented,
+                    interpolates: quote == b'"',
+                },
+                i + 2 + len,
+            )
+        }
+        Some(&first) if first.is_ascii_uppercase() || (indented && first == b'_') => {
+            let end = (i..bytes.len())
+                .find(|&j| !is_name_byte(bytes[j]))
+                .unwrap_or(bytes.len());
+            RubyHeredocOpen::Opens(
+                RubyHeredoc {
+                    terminator: code[i..end].to_owned(),
+                    indented,
+                    interpolates: true,
+                },
+                end,
+            )
+        }
+        Some(first) if indented && first.is_ascii_lowercase() => {
+            let end = (i..bytes.len())
+                .find(|&j| !is_name_byte(bytes[j]))
+                .unwrap_or(bytes.len());
+            RubyHeredocOpen::Opens(
+                RubyHeredoc {
+                    terminator: code[i..end].to_owned(),
+                    indented,
+                    interpolates: true,
+                },
+                end,
+            )
+        }
+        _ => RubyHeredocOpen::Operator,
+    }
+}
+
+/// The bodies of the here-documents `pending`, one after the other from
+/// `start` (the first byte after the line that opened them), each pushed
+/// to `ranges` as data; the index past the last terminator's line.
+/// `None` when a body never ends, or fills in an expression.
+fn ruby_heredoc_bodies(
+    code: &str,
+    start: usize,
+    pending: &mut Vec<RubyHeredoc>,
+    ranges: &mut Vec<(usize, usize)>,
+) -> Option<usize> {
+    let mut body_start = start;
+    for heredoc in pending.drain(..) {
+        let mut cursor = body_start;
+        let body_end;
+        loop {
+            if cursor > code.len() {
+                return None;
+            }
+            let line_end = code[cursor..].find('\n').map_or(code.len(), |n| cursor + n);
+            let line = &code[cursor..line_end];
+            let ends = if heredoc.indented {
+                line.trim() == heredoc.terminator
+            } else {
+                line == heredoc.terminator
+            };
+            if ends {
+                body_end = cursor;
+                cursor = line_end;
+                break;
+            }
+            if line_end >= code.len() {
+                return None;
+            }
+            cursor = line_end + 1;
+        }
+        if heredoc.interpolates && code[body_start..body_end].contains("#{") {
+            return None;
+        }
+        ranges.push((body_start, body_end));
+        body_start = (cursor + 1).min(code.len());
+    }
+    // Back on the newline after the last terminator, read as code.
+    Some(body_start.saturating_sub(1).max(start))
+}
+
 /// Whether the text of a string names a place outside the working tree.
-fn names_a_place_outside_the_tree(text: &str) -> bool {
+pub(crate) fn names_a_place_outside_the_tree(text: &str) -> bool {
     static PLACE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let place = PLACE.get_or_init(|| {
         regex::Regex::new(
@@ -903,7 +1134,7 @@ fn may_run_beyond_reading(lang: Lang, outside: &str) -> bool {
             )
             .expect("valid regex"),
             regex::Regex::new(
-                r"\b(?:system|exec|spawn|popen\w*|capture\w*|Open3|PTY|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec|send|public_send|__send__|method|define_method|load|require\w*|fork|syscall|Kernel|IO|binding|ObjectSpace|const_get|Process|open|ENV|Dir|home|expand_path)\b",
+                r"\b(?:system|exec|spawn|popen\w*|capture\w*|Open3|PTY|eval|instance_eval|class_eval|module_eval|instance_exec|class_exec|send|public_send|__send__|method|\w+_method|method_\w+|bind\w*|to_proc|load|require\w*|fork|syscall|Kernel|IO|binding|ObjectSpace|const_get|Process|open|ENV|Dir|home|expand_path)\b",
             )
             .expect("valid regex"),
         ]
@@ -912,7 +1143,8 @@ fn may_run_beyond_reading(lang: Lang, outside: &str) -> bool {
         Lang::Python => python.is_match(outside),
         Lang::Js => js.is_match(outside),
         Lang::Ruby => ruby.is_match(outside),
-        _ => true,
+        // Read the other way round: only names known to start nothing.
+        _ => !literals::only_known_names(lang, outside),
     }
 }
 
@@ -947,6 +1179,16 @@ pub(crate) fn data_literals_blanked(
     if ranges
         .iter()
         .any(|&(start, end)| names_a_place_outside_the_tree(&code[start..end]))
+    {
+        return None;
+    }
+    // A Perl `open` whose mode or name pipes to a process (`"|-"`,
+    // `"| sh"`, `"cmd |"`) runs what it is written.
+    if lang == Lang::Perl
+        && ranges.iter().any(|&(start, end)| {
+            let text = code[start..end].trim();
+            text.starts_with('|') || text.ends_with('|')
+        })
     {
         return None;
     }
@@ -5217,6 +5459,48 @@ pub(crate) fn runner_of_file(line: &str, path: &str) -> Option<Runner> {
         }
     }
     None
+}
+
+/// Whether a command of the shell line `line`, which holds more than one,
+/// may run a file a step before it wrote: a shell or an interpreter handed
+/// a file rather than code of its own (`sh x.sh`, `bash` reading its
+/// input), `source`, `chmod`, a program named by a path or built by the
+/// shell (`./x.sh`, `sh *.sh`, `"$f"`), or a command that runs others
+/// (`xargs`, `find`, `eval`). What inline code writes or prints on such a
+/// line is not only text: a later step may run it.
+pub(crate) fn line_may_run_a_written_file(line: &str) -> bool {
+    let read = crate::shell_words::read_line(line);
+    if read.commands.len() < 2 {
+        return false;
+    }
+    read.commands.iter().any(|command| {
+        let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+        let Some(at) = crate::threats::effective_command_index(&words) else {
+            return false;
+        };
+        if !command.words[at].is_plain() || words[at].contains('/') {
+            return true;
+        }
+        let name = crate::threats::token_basename(&words[at]).to_ascii_lowercase();
+        if matches!(
+            name.as_str(),
+            "chmod" | "xargs" | "find" | "eval" | "exec" | "install" | "crontab" | "at" | "batch"
+        ) {
+            return true;
+        }
+        let shell = SCRIPT_SHELLS.contains(&name.as_str());
+        if !shell && interpreter_lang(&name).is_none() {
+            return false;
+        }
+        // Code of its own on the line: a shell's `-c`; an interpreter's
+        // `-c`, `-e`, `-E`, `-r` or `--eval`.
+        let flags: &[char] = if shell { &['c'] } else { &['c', 'e', 'E', 'r'] };
+        let own_code = words[at + 1..].iter().any(|word| {
+            (word.starts_with('-') && !word.starts_with("--") && word[1..].contains(flags))
+                || word == "--eval"
+        });
+        !own_code
+    })
 }
 
 /// The language an interpreter's program name runs (`python3.11`, `lua5.4`).
