@@ -1417,6 +1417,21 @@ pub fn read_hook_line(hook: &Value) -> Option<HookLine> {
     })
 }
 
+/// Whether `settings` (an agent's settings or hooks file, read as JSON)
+/// holds a line of ours that also refuses `review` (`--block-review`),
+/// wherever in the file it is listed. A switch of mode reads it so it never
+/// writes a line that refuses less over one that refuses more.
+pub fn holds_a_block_review_line(settings: &Value) -> bool {
+    match settings {
+        Value::Object(map) => {
+            read_hook_line(settings).is_some_and(|line| line.block_review && !line.monitor)
+                || map.values().any(holds_a_block_review_line)
+        }
+        Value::Array(items) => items.iter().any(holds_a_block_review_line),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BashMatcherCoverage {
     Includes,
@@ -2239,6 +2254,34 @@ pub fn uninstall_hook(
 
 #[cfg(test)]
 mod tests {
+
+    /// A line of ours with `--block-review` is found in any file shape an
+    /// agent keeps it in; a plain or monitor line, or a person's own command
+    /// that names the flag, is not one.
+    ///
+    /// FAILS ON REVERT: make [`holds_a_block_review_line`] look only at
+    /// Claude Code's `hooks.PreToolUse` and the Codex shape is missed.
+    #[test]
+    fn a_block_review_line_is_found_in_every_shape_and_only_there() {
+        let bin = Path::new("/usr/local/bin/innerwarden");
+        let strict = hook_command_for(bin, true, false, Some("claude-code"));
+        let plain = hook_command_for(bin, false, false, Some("claude-code"));
+        let monitor = hook_command_for(bin, false, true, Some("claude-code"));
+        let claude = |command: &str| {
+            json!({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": command}
+            ]}]}})
+        };
+        assert!(holds_a_block_review_line(&claude(&strict)));
+        assert!(!holds_a_block_review_line(&claude(&plain)));
+        assert!(!holds_a_block_review_line(&claude(&monitor)));
+        let codex = json!({"hooks": {"PreToolUse": [{"hooks": []}, {"hooks": [
+            {"type": "command", "command": crate::agent_hooks::CODEX.command(bin, true, false)}
+        ]}]}});
+        assert!(holds_a_block_review_line(&codex));
+        assert!(!holds_a_block_review_line(&claude("echo --block-review")));
+        assert!(!holds_a_block_review_line(&json!({})));
+    }
     use super::*;
 
     /// The tail [`hook_command_for`] writes after a refusing hook on this

@@ -1,7 +1,9 @@
 //! `innerwarden agents` for Community Edition - a thin wrapper over the shared
 //! agent discovery/wiring engine plus the persisted Community auto-connect policy.
 
-use innerwarden_agent_guard::{agents_ops, hook};
+use std::path::Path;
+
+use innerwarden_agent_guard::{agent_hooks, agents_ops, hermes_hook, hook};
 
 use crate::agent_policy::{self, DesiredMode};
 
@@ -15,6 +17,125 @@ pub(crate) fn lowers_a_guard(rest: &[String]) -> bool {
         Some("connect") => rest.iter().any(|a| a == "--monitor" || a == "--guard"),
         _ => false,
     }
+}
+
+/// Whether the guard's hook for the agent named `name` under `home` also
+/// refuses `review` (`--block-review`). A switch of mode passes this on,
+/// so it rewrites the line in the mode asked for and never drops the flag:
+/// only the person, with `agents connect` or `install` from their own
+/// terminal, takes it off.
+pub(crate) fn wiring_blocks_review(home: &Path, name: &str) -> bool {
+    if name == hermes_hook::AGENT {
+        return match hermes_hook::state(home, None) {
+            hermes_hook::State::On { block_review, .. } => block_review,
+            // A line not read as on is kept as written when it names the
+            // flag: keeping it never refuses less.
+            _ => std::fs::read_to_string(hermes_hook::config_path(home))
+                .is_ok_and(|text| text.contains("--block-review")),
+        };
+    }
+    let files: Vec<std::path::PathBuf> = if name == "claude-code" {
+        [".claude/settings.json", ".claude/settings.local.json"]
+            .iter()
+            .map(|rel| home.join(rel))
+            .collect()
+    } else {
+        // Every agent with a hook file of its own, from the one table the
+        // wiring reads (`agent_hooks::spec_for`): an agent added there is
+        // read here too.
+        agent_hooks::spec_for(name)
+            .map(|spec| vec![spec.path(home)])
+            .unwrap_or_default()
+    };
+    files
+        .iter()
+        .filter_map(|path| std::fs::read(path).ok())
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .any(|settings| hook::holds_a_block_review_line(&settings))
+}
+
+/// Whether any agent's hook under `home` refuses `review`
+/// ([`wiring_blocks_review`]): every agent the listing finds that can be
+/// guarded (the rows a mode switch rewrites), and Claude Code's settings
+/// read directly, as [`crate::posture_io::already_wired`] reads them.
+pub(crate) fn any_wiring_blocks_review(home: &Path) -> bool {
+    wiring_blocks_review(home, "claude-code")
+        || agents_ops::rows(home)
+            .iter()
+            .filter(|agent| agent.guardable())
+            .any(|agent| wiring_blocks_review(home, &agent.name))
+}
+
+/// PURE: the `guard.mode_changed` line for a change of what the guard
+/// refuses: `command` as typed (`enforce`, `dry-run`, `agents connect`,
+/// `agents disconnect`), the `mode` it set, the posture it asked for, the
+/// agents it reached, and whether it ran inside an AI agent's shell.
+pub(crate) fn mode_change_line(
+    ts: u64,
+    change: &ModeChange<'_>,
+    from_agent_shell: bool,
+    session: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "guard.mode_changed",
+        "ts": ts,
+        "command": change.command,
+        "mode": change.mode,
+        "posture": change.posture,
+        "agents": change.agents,
+        "from_agent_shell": from_agent_shell,
+        "session": session,
+    })
+}
+
+/// PURE: the words a configured channel gets for [`ModeChange`].
+pub(crate) fn mode_change_text(change: &ModeChange<'_>, from_agent_shell: bool) -> String {
+    let agents = if change.agents.is_empty() {
+        "no agent".to_string()
+    } else {
+        change.agents.join(", ")
+    };
+    let posture = change
+        .posture
+        .map(|word| format!(", posture {word}"))
+        .unwrap_or_default();
+    let who = if from_agent_shell {
+        " It was run inside an AI agent's shell."
+    } else {
+        ""
+    };
+    format!(
+        "InnerWarden: the guard's mode changed on this machine. `innerwarden {}` set {}{posture} for {agents}.{who} If this was not you, run `innerwarden status`.",
+        change.command, change.mode
+    )
+}
+
+/// One change of what the guard refuses, as [`record_mode_change`] tells it.
+pub(crate) struct ModeChange<'a> {
+    pub command: &'a str,
+    pub mode: &'a str,
+    pub posture: Option<&'a str>,
+    pub agents: Vec<String>,
+}
+
+/// Record a change of mode or posture in `guard-events.jsonl` and tell the
+/// configured channels. A switch that refuses less, done without a trace,
+/// is the one change a person most needs to hear about, so every switch is
+/// recorded and sent, raising ones too. Best-effort, like every line of the
+/// record: neither can undo or block the change it reports.
+pub(crate) fn record_mode_change(change: &ModeChange<'_>) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let in_shell = crate::suppress_io::in_agent_shell();
+    crate::graph_io::append_guard_event(&mode_change_line(
+        ts,
+        change,
+        in_shell,
+        &crate::graph_io::session_id(None),
+    ));
+    crate::notify_io::fire_text(&mode_change_text(change, in_shell));
 }
 
 /// The program this process was started as, the way the hook line names it:
@@ -172,6 +293,27 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
         );
         return std::process::ExitCode::from(1);
     }
+    // A connect from an AI agent's shell that names no mode writes the line
+    // in enforce, which over a line that also refuses `review` refuses
+    // less. Run there, it keeps `--block-review`: only the person, from
+    // their own terminal, takes it off.
+    let kept: Vec<String>;
+    let rest = if connecting
+        && crate::suppress_io::in_agent_shell()
+        && !rest
+            .iter()
+            .any(|a| a == "--monitor" || a == "--block-review" || a == "--strict")
+        && any_wiring_blocks_review(&home)
+    {
+        kept = rest
+            .iter()
+            .cloned()
+            .chain(std::iter::once("--block-review".to_string()))
+            .collect();
+        kept.as_slice()
+    } else {
+        rest
+    };
     let mutating = matches!(
         rest.first().map(String::as_str),
         Some("connect" | "disconnect")
@@ -230,6 +372,20 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     let failed = outcome.lines.iter().any(|line| line.contains("failed:"));
     for line in &outcome.lines {
         println!("{line}");
+    }
+    if mutating {
+        if let Some(mode) = mode_set_by(rest, posture_asked) {
+            record_mode_change(&ModeChange {
+                command: if connecting {
+                    "agents connect"
+                } else {
+                    "agents disconnect"
+                },
+                mode,
+                posture: posture_asked.map(|posture| posture.word()),
+                agents: vec![command_target(rest).unwrap_or("all").to_string()],
+            });
+        }
     }
     if connecting && !failed {
         match crate::posture_io::settle(&home, posture_asked, was_wired) {
@@ -408,6 +564,26 @@ fn openclaw_guard_lines(home: &std::path::Path, rest: &[String]) -> Vec<String> 
         }
         Some("disconnect") => guard::uninstall(home),
         _ => Vec::new(),
+    }
+}
+
+/// PURE: the mode an `agents` command sets when it changes what the guard
+/// refuses: a disconnect, a connect in monitor, or a connect that names a
+/// posture. `None` for a connect that leaves the mode as it was asked
+/// before.
+fn mode_set_by(
+    rest: &[String],
+    posture: Option<innerwarden_agent_guard::posture::Posture>,
+) -> Option<&'static str> {
+    match rest.first().map(String::as_str) {
+        Some("disconnect") => Some("off"),
+        Some("connect") if rest.iter().any(|a| a == "--monitor") => Some("monitor"),
+        Some("connect") => match posture {
+            Some(innerwarden_agent_guard::posture::Posture::Strict) => Some("block-review"),
+            Some(innerwarden_agent_guard::posture::Posture::Default) => Some("enforce"),
+            None => None,
+        },
+        _ => None,
     }
 }
 

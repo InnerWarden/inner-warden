@@ -4235,8 +4235,13 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
             attempted += 1;
             // A switch rewrites the wiring that is there. It installs no hook
             // an agent did not have: that is `agents connect` and setup.
+            // Enforce keeps a line that also refuses `review`: the switch
+            // raises what the guard refuses and never lowers it, whoever
+            // runs it. Taking `--block-review` off is `agents connect`,
+            // by the person.
+            let strict = !monitor && agents_io::wiring_blocks_review(&home, &agent.name);
             let result = innerwarden_agent_guard::agents_ops::switch_mode_one_result(
-                &home, agent, &guard_bin, false, monitor,
+                &home, agent, &guard_bin, strict, monitor,
             );
             if result.configured() {
                 flipped += 1;
@@ -4287,6 +4292,14 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
     };
+    if attempted > 0 {
+        agents_io::record_mode_change(&agents_io::ModeChange {
+            command: if monitor { "dry-run" } else { "enforce" },
+            mode: if monitor { "monitor" } else { "enforce" },
+            posture: None,
+            agents: configured.clone(),
+        });
+    }
     if attempted == 0 {
         println!(
             "innerwarden {} - no guarded agent found. Run `innerwarden setup` first (or `innerwarden agents connect --all{}`).",
@@ -4488,6 +4501,14 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
         }
     };
 
+    // An install from an AI agent's shell keeps a line that also refuses
+    // `review` (`--block-review`): written in plain enforce over it, it
+    // would refuse less. Only the person, from their own terminal, takes it
+    // off.
+    let block_review = block_review
+        || (!monitor
+            && suppress_io::in_agent_shell()
+            && agents_io::wiring_blocks_review(&home, &agent));
     let was_wired = posture_io::already_wired(&home);
     match hook::install_hook(
         &home,
