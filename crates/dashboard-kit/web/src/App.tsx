@@ -673,8 +673,8 @@ export function App({
   const navigation = deriveShellNavigation(bootstrap, edition, contributed, community?.screens);
   // A contributed screen can render its own unavailable state without a tab.
   // It still names that page; loading without a known screen keeps the generic title.
-  const pageLabel = navigation.find((item) => item.route === route)?.label
-    ?? (edition === "enterprise" ? contributed.find((screen) => screen.route === route)?.label : undefined);
+  const pageLabel = (navigation.find((item) => item.route === route)
+    ?? (edition === "enterprise" ? contributed.find((item) => item.route === route) : undefined))?.label;
   const pageTitle = pageLabel === undefined
     ? `InnerWarden ${editionLabel}: Agent Security`
     : `${pageLabel} - InnerWarden ${editionLabel}`;
