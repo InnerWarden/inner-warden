@@ -279,3 +279,50 @@ fn the_person_still_lowers_it_and_nothing_is_raised_unasked() {
         said(&out)
     );
 }
+
+/// The same for an agent whose hook has a file of its own (Cursor,
+/// Antigravity): a person connects it with `--strict`, and `enforce` or a
+/// plain connect from an AI agent's shell keeps `--block-review` in its
+/// file. Neither agent needs to be installed: the hook file is enough.
+///
+/// FAILS ON REVERT: read only Codex's and Gemini's files in
+/// `agents_io::wiring_blocks_review` and the line loses the flag.
+#[cfg(unix)]
+#[test]
+fn a_switch_keeps_block_review_in_an_agents_own_hook_file() {
+    for (agent, folder, file) in [
+        ("cursor", ".cursor", ".cursor/hooks.json"),
+        (
+            "antigravity",
+            ".gemini/antigravity-cli",
+            ".gemini/config/hooks.json",
+        ),
+    ] {
+        for args in [
+            &["enforce"][..],
+            &["agents", "connect", agent],
+            &["agents", "connect", "--all"],
+        ] {
+            let home = tempfile::TempDir::new().expect("scratch home");
+            std::fs::create_dir_all(home.path().join(folder)).unwrap();
+            let out = run(
+                home.path(),
+                &["agents", "connect", agent, "--strict"],
+                None,
+                None,
+            );
+            assert_eq!(out.status.code(), Some(0), "{agent}: {}", said(&out));
+            let hooks = home.path().join(file);
+            let before = std::fs::read_to_string(&hooks)
+                .unwrap_or_else(|_| panic!("{agent}: the connect wrote no hook\n{}", said(&out)));
+            assert!(before.contains("--block-review"), "{agent}: {before}");
+            let out = run(home.path(), args, Some("CLAUDECODE"), None);
+            let after = std::fs::read_to_string(&hooks).unwrap();
+            assert!(
+                after.contains("--block-review"),
+                "{agent} {args:?} dropped --block-review:\n{after}\n{}",
+                said(&out)
+            );
+        }
+    }
+}

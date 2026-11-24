@@ -40,11 +40,12 @@ pub(crate) fn wiring_blocks_review(home: &Path, name: &str) -> bool {
             .map(|rel| home.join(rel))
             .collect()
     } else {
-        [&agent_hooks::CODEX, &agent_hooks::GEMINI]
-            .into_iter()
-            .filter(|spec| spec.agent == name)
-            .map(|spec| spec.path(home))
-            .collect()
+        // Every agent with a hook file of its own, from the one table the
+        // wiring reads (`agent_hooks::spec_for`): an agent added there is
+        // read here too.
+        agent_hooks::spec_for(name)
+            .map(|spec| vec![spec.path(home)])
+            .unwrap_or_default()
     };
     files
         .iter()
@@ -54,16 +55,15 @@ pub(crate) fn wiring_blocks_review(home: &Path, name: &str) -> bool {
 }
 
 /// Whether any agent's hook under `home` refuses `review`
-/// ([`wiring_blocks_review`]).
+/// ([`wiring_blocks_review`]): every agent the listing finds that can be
+/// guarded (the rows a mode switch rewrites), and Claude Code's settings
+/// read directly, as [`crate::posture_io::already_wired`] reads them.
 pub(crate) fn any_wiring_blocks_review(home: &Path) -> bool {
-    [
-        "claude-code",
-        agent_hooks::CODEX.agent,
-        agent_hooks::GEMINI.agent,
-        hermes_hook::AGENT,
-    ]
-    .iter()
-    .any(|name| wiring_blocks_review(home, name))
+    wiring_blocks_review(home, "claude-code")
+        || agents_ops::rows(home)
+            .iter()
+            .filter(|agent| agent.guardable())
+            .any(|agent| wiring_blocks_review(home, &agent.name))
 }
 
 /// PURE: the `guard.mode_changed` line for a change of what the guard
