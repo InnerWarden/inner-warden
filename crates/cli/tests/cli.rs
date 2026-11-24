@@ -1438,7 +1438,14 @@ fn contain_macos_jail_blocks_the_api_key_but_allows_the_project() {
 
     // 1. dry-run: the profile denies the innerwarden dir + the env is secret-safe.
     let dry = cli()
-        .args(["contain", "--dry-run", "--", "/bin/echo", "ok"])
+        .args([
+            "contain",
+            "--operator",
+            "--dry-run",
+            "--",
+            "/bin/echo",
+            "ok",
+        ])
         .env("HOME", home.path())
         .current_dir(proj.path())
         .output()
@@ -1452,7 +1459,13 @@ fn contain_macos_jail_blocks_the_api_key_but_allows_the_project() {
 
     // 2. real: reading the seeded key inside the jail must FAIL and never leak it.
     let denied = cli()
-        .args(["contain", "--", "/bin/cat", keyfile.to_str().unwrap()])
+        .args([
+            "contain",
+            "--operator",
+            "--",
+            "/bin/cat",
+            keyfile.to_str().unwrap(),
+        ])
         .env("HOME", home.path())
         .current_dir(proj.path())
         .output()
@@ -1461,6 +1474,12 @@ fn contain_macos_jail_blocks_the_api_key_but_allows_the_project() {
         "{}{}",
         String::from_utf8_lossy(&denied.stdout),
         String::from_utf8_lossy(&denied.stderr)
+    );
+    // The jail ran and the read failed inside it: a `contain` refused
+    // before any jail (no terminal on CI) also leaves the key unread.
+    assert!(
+        !combined.contains("innerwarden contain: refused"),
+        "contain must run the jail, not refuse before it: {combined}"
     );
     assert!(
         !combined.contains("SENTINEL-SECRET"),
@@ -1471,6 +1490,7 @@ fn contain_macos_jail_blocks_the_api_key_but_allows_the_project() {
     let allowed = cli()
         .args([
             "contain",
+            "--operator",
             "--",
             "/bin/cat",
             proj.path().join("allowed.txt").to_str().unwrap(),
