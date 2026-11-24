@@ -111,6 +111,9 @@ pub(crate) struct Command {
     pub(crate) piped: bool,
     /// It sends what it prints to a file (`/dev/null` is none).
     pub(crate) writes_file: bool,
+    /// The files it writes: the targets of `>`, `>>`, `>|`, `&>`, `&>>`,
+    /// `<>` and of a `>&` that names no descriptor (`/dev/null` too).
+    pub(crate) writes: Vec<Word>,
     /// Text it reads on its input from the line itself: a here-document's
     /// body, a here-string's word.
     pub(crate) inputs: Vec<String>,
@@ -676,13 +679,20 @@ impl Lexer {
             "<" => self.command.reads.push(target),
             "<>" => {
                 self.command.writes_file |= to_a_file;
+                self.command.writes.push(target.clone());
                 self.command.reads.push(target);
             }
-            ">" | ">>" | ">|" | "&>" | "&>>" => self.command.writes_file |= to_a_file,
+            ">" | ">>" | ">|" | "&>" | "&>>" => {
+                self.command.writes_file |= to_a_file;
+                self.command.writes.push(target);
+            }
             ">&" => {
                 let descriptor =
                     target.text == "-" || target.text.chars().all(|c| c.is_ascii_digit());
                 self.command.writes_file |= to_a_file && !descriptor;
+                if !descriptor {
+                    self.command.writes.push(target);
+                }
             }
             _ => {}
         }
