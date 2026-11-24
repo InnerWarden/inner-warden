@@ -131,6 +131,18 @@ impl GuardLine {
                     {
                         reach = PkillReach::Broad;
                     }
+                    // A piece of [`NAME_PIECE`] bytes or more of the
+                    // program's own file name past the guard's name (`sensor`
+                    // of `innerwarden-sensor`, `dns-guard`): the word is in
+                    // other programs' names too, so a person decides.
+                    if word.start == self.folder_end
+                        && word.end <= program_end
+                        && word.start <= range.start
+                        && range.end <= word.end
+                        && range.len() >= NAME_PIECE
+                    {
+                        reach = PkillReach::Broad;
+                    }
                 }
                 start = at + 1;
             }
@@ -858,6 +870,7 @@ fn listed_reach(command: &Command) -> PkillReach {
                 .collect();
             super::pkill_reach(&segment.join(" "))
         }
+        "lsof" => lsof_reach(&words[at + 1..]),
         "pidof" => {
             let mut reach = PkillReach::Misses;
             let mut rest = words[at + 1..].iter();
@@ -872,6 +885,137 @@ fn listed_reach(command: &Command) -> PkillReach {
         }
         _ => PkillReach::Misses,
     }
+}
+
+/// The ports the guard answers on (its dashboard).
+const GUARD_PORTS: &[&str] = &["8787"];
+
+/// Whether `word` names one of [`GUARD_PORTS`] as `lsof` and `fuser` take
+/// a port: after a colon (`:8787`, `-ti:8787`, `tcp:8787`) or before a
+/// protocol (`8787/tcp`).
+fn names_a_guard_port(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    GUARD_PORTS.iter().any(|port| {
+        lower.match_indices(port).any(|(at, _)| {
+            let before = lower[..at].chars().next_back();
+            let after = lower[at + port.len()..].chars().next();
+            let ends = after.is_none_or(|c| !c.is_ascii_digit());
+            (before == Some(':') && ends)
+                || (before.is_none_or(|c| !c.is_ascii_digit())
+                    && (lower[at + port.len()..].starts_with("/tcp")
+                        || lower[at + port.len()..].starts_with("/udp")))
+        })
+    })
+}
+
+/// What an `lsof` that prints only process ids (`-t`, alone or in a group
+/// of letters) lists: the guard's processes when it asks for one of
+/// [`GUARD_PORTS`] or a program of the guard by its path.
+fn lsof_reach(arguments: &[String]) -> PkillReach {
+    let terse = arguments.iter().any(|word| {
+        word.starts_with('-')
+            && !word.starts_with("--")
+            && word[1..]
+                .split(':')
+                .next()
+                .is_some_and(|flags| flags.contains('t'))
+    });
+    let guard = arguments.iter().any(|word| {
+        names_a_guard_port(word)
+            || (!word.starts_with('-') && word.contains('/') && names_a_guard_process(word, false))
+    });
+    if terse && guard {
+        PkillReach::NamesGuard
+    } else {
+        PkillReach::Misses
+    }
+}
+
+/// What a `fuser -k` (`--kill`, or `k` in a group of letters) kills of the
+/// guard: the processes on one of [`GUARD_PORTS`] (`8787/tcp`, or `8787`
+/// after `-n tcp`) or running a program of the guard by its path. Read in
+/// the line and in every command it runs from inside.
+fn fuser_reach(text: &str, depth: u8) -> PkillReach {
+    let line = read_line(text);
+    let mut reach = PkillReach::Misses;
+    for command in &line.commands {
+        let Some(words) = plain_words(command) else {
+            continue;
+        };
+        let Some(at) = launched_command_index(&words) else {
+            continue;
+        };
+        if program_name(&words[at]) != "fuser" {
+            continue;
+        }
+        let arguments = &words[at + 1..];
+        let kills = arguments.iter().any(|word| {
+            word == "--kill"
+                || (word.starts_with('-')
+                    && !word.starts_with("--")
+                    && word.len() > 1
+                    && word[1..].chars().all(|c| c.is_ascii_lowercase())
+                    && word.contains('k'))
+        });
+        if !kills {
+            continue;
+        }
+        let by_port = arguments
+            .windows(2)
+            .any(|pair| pair[0] == "-n" && matches!(pair[1].as_str(), "tcp" | "udp"));
+        let guard = arguments.iter().any(|word| {
+            names_a_guard_port(word)
+                || (by_port && GUARD_PORTS.contains(&word.as_str()))
+                || (!word.starts_with('-')
+                    && word.contains('/')
+                    && names_a_guard_process(word, false))
+        });
+        if guard {
+            return PkillReach::NamesGuard;
+        }
+    }
+    if depth < NESTED_DEPTH {
+        for inner in &line.nested {
+            reach = reach.max(fuser_reach(inner, depth + 1));
+        }
+    }
+    reach
+}
+
+/// The programs whose output names processes a line can read: an `xargs
+/// kill` fed by one of them (through filters) kills what that listing
+/// names, which the rest of this module reads.
+const PROCESS_LISTERS: &[&str] = &["pgrep", "pidof", "lsof", "ps", "fuser", "pstree", "jobs"];
+
+/// Whether the `xargs` at `index` that runs `kill` takes ids the line does
+/// not say: from a file (`xargs kill < pids.txt`), from a pipe whose
+/// commands list no process (`cat pids | xargs kill -9`), or from no
+/// input the line gives it.
+fn xargs_kill_unread(commands: &[Command], index: usize) -> bool {
+    let command = &commands[index];
+    let Some(words) = plain_words(command) else {
+        return false;
+    };
+    let Some(at) = effective_command_index(&words) else {
+        return false;
+    };
+    if program_name(&words[at]) != "xargs" || !runs_kill(command) {
+        return false;
+    }
+    if !command.reads.is_empty() || !command.inputs.is_empty() {
+        return true;
+    }
+    let mut at = index;
+    while at > 0 && commands[at - 1].piped {
+        at -= 1;
+        let lists = plain_words(&commands[at])
+            .and_then(|words| launched_command_index(&words).map(|i| program_name(&words[i])))
+            .is_some_and(|name| PROCESS_LISTERS.contains(&name.as_str()));
+        if lists {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether `command` runs `kill` on what it is handed: `kill` itself, or
@@ -1099,10 +1243,18 @@ pub(crate) fn lists_only_other_processes(text: &str) -> bool {
 /// a pipe into `kill` or `xargs kill`, or as a substitution in a `kill`'s
 /// words. The strongest such hand-over of the line.
 pub(super) fn pgrep_feeds_a_kill_of_the_guard(text: &str) -> PkillReach {
-    if !text.contains("grep") && !text.contains("pidof") && !text.contains("awk") {
-        return PkillReach::Misses;
+    let fuser = if text.contains("fuser") {
+        fuser_reach(text, 0)
+    } else {
+        PkillReach::Misses
+    };
+    if !["grep", "pidof", "awk", "lsof", "xargs"]
+        .iter()
+        .any(|word| text.contains(word))
+    {
+        return fuser;
     }
-    feeds_kill(text, 0)
+    feeds_kill(text, 0).max(fuser)
 }
 
 /// What a pipe of filters ending right before a `kill` hands it: a
@@ -1233,6 +1385,10 @@ fn feeds_kill(text: &str, depth: u8) -> PkillReach {
     for (index, command) in line.commands.iter().enumerate() {
         if command.piped && line.commands.get(index + 1).is_some_and(runs_kill) {
             reach = reach.max(filtered_list_reach(&line.commands, index));
+        }
+        // Ids the line does not say may be the guard's: a person decides.
+        if xargs_kill_unread(&line.commands, index) {
+            reach = reach.max(PkillReach::Broad);
         }
         if runs_kill(command) {
             for inner in command.words.iter().flat_map(|word| &word.substitutions) {
@@ -1495,9 +1651,18 @@ fn systemctl_lowers(rest: &[String]) -> Option<&'static str> {
     if !matches!(*verb, "stop" | "disable" | "mask" | "kill" | "freeze") {
         return None;
     }
-    units
-        .iter()
-        .find_map(|unit| protected_target(unit).or_else(|| glob_target(unit)))
+    units.iter().find_map(|unit| {
+        protected_target(unit)
+            .or_else(|| glob_target(unit))
+            .or_else(|| shortcut_unit(unit))
+    })
+}
+
+/// A unit named for one of the guard's shortcuts (`iw-guard`,
+/// `iw-guard.service`): the guard's.
+fn shortcut_unit(unit: &str) -> Option<&'static str> {
+    let name = unit.strip_suffix(".service").unwrap_or(unit);
+    GUARD_SHORTCUTS.contains(&name).then_some("innerwarden")
 }
 
 /// The units of the guard, as its installers name them.
