@@ -591,6 +591,16 @@ pub const INNERWARDEN_SELF_PATHS: &[&str] = &[
     "/sys/fs/bpf/innerwarden",
 ];
 
+/// The guard's systemd units of an account, as a line spells their folder
+/// (`~/.config/systemd/user/innerwarden-agent.service`, through `~`,
+/// `$HOME` or `$XDG_CONFIG_HOME`, and `/etc/systemd/user`), lowercase.
+/// They start the guard for that account as the system's units do for the
+/// host: `rm -f ~/.config/systemd/user/innerwarden-agent.service` was
+/// allowed while the same removal of the system's unit was refused
+/// (measured 2026-11-24). A unit of another program in the folder is not
+/// one.
+pub const GUARD_USER_UNITS: &str = "systemd/user/innerwarden-";
+
 /// The other places the installers of Community and Pro write (read
 /// 2026-11-19 from Pro's `scripts/web-install.sh` and `scripts/install.sh`
 /// and Community's `iw-guard-install.sh` and `.deb`/`.rpm`), lowercase, as
@@ -605,6 +615,7 @@ pub const INNERWARDEN_INSTALL_PATHS: &[&str] = &[
     "/usr/local/lib/innerwarden",
     "/run/innerwarden",
     "/etc/systemd/system/innerwarden-",
+    GUARD_USER_UNITS,
     ".wants/innerwarden-",
     "/etc/sudoers.d/innerwarden",
     "/etc/audit/rules.d/innerwarden",
@@ -659,6 +670,19 @@ fn dangerous_command_regexes() -> &'static [(regex::Regex, &'static str, bool)] 
                     .map(|re| (re, cmd.description, cmd.block))
             })
             .collect()
+    })
+}
+
+/// Whether a redirect of a command (`>`, `>>`, `>|`, `&>`) writes a file
+/// whose path holds one of `places`, quoted or not.
+fn redirects_onto(command: &str, places: &[&str]) -> bool {
+    command.split('>').skip(1).any(|after| {
+        after
+            .trim_start_matches(['>', '|'])
+            .trim_start()
+            .split(|c: char| c.is_whitespace() || ";&|<()".contains(c))
+            .next()
+            .is_some_and(|target| places.iter().any(|place| target.contains(place)))
     })
 }
 
@@ -3512,6 +3536,9 @@ pub(crate) fn check_guard_takedown(content: &str) -> Option<(&'static str, u32)>
     }
     if guard_takedown::copies_onto_guard_place(content) {
         return Some((guard_takedown::COPIED_ONTO_GUARD_PLACE, 60));
+    }
+    if guard_takedown::sed_edits_guard_file(content) {
+        return Some((guard_takedown::SED_EDITS_GUARD_FILE, 60));
     }
     guard_takedown::programs_searches_run(content)
         .iter()
@@ -21169,7 +21196,14 @@ fn security_tamper_as_written(content: &str) -> Option<(&'static str, u32)> {
                 .chain(INNERWARDEN_INSTALL_PATHS)
                 .any(|p| seg.contains(p))
     });
-    if redirect_over_self || removal_of_self {
+    // A redirect onto a unit of the guard in a home, or the link that
+    // enables it, rewrites what starts the guard for that account: the
+    // target starts at a home (`> ~/.config/...`, `> "$HOME/..."`), so the
+    // redirect above, which reads paths from the root, does not see it.
+    let rewrite_of_user_unit = shell_command_segments(&lower)
+        .into_iter()
+        .any(|seg| redirects_onto(seg, &[GUARD_USER_UNITS, ".wants/innerwarden-"]));
+    if redirect_over_self || removal_of_self || rewrite_of_user_unit {
         return Some(("removing or altering InnerWarden files", 60));
     }
     // A pattern broad enough to take the guard's processes with others

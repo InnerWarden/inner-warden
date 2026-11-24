@@ -274,6 +274,82 @@ pub(super) fn copies_onto_guard_place(content: &str) -> bool {
     })
 }
 
+/// What [`sed_edits_guard_file`] says.
+pub(super) const SED_EDITS_GUARD_FILE: &str =
+    "sed edits a file of the guard in place (its configuration, program or unit)";
+
+/// Whether a `sed` of the line edits in place (`-i`, `-i.bak`, `-Ei`,
+/// `--in-place`) a file whose path holds a place of the guard
+/// ([`INNERWARDEN_SELF_PATHS`], [`INNERWARDEN_INSTALL_PATHS`]): `sed -i
+/// ... ~/.config/systemd/user/innerwarden-agent.service` and the same of
+/// `/etc/systemd/system/innerwarden-agent.service` were allowed (measured
+/// 2026-11-24). Only the files `sed` edits are read, not its script: `sed
+/// -i 's|/usr/local/bin/innerwarden|x|' notes.md` edits a note.
+pub(super) fn sed_edits_guard_file(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if !lower.contains("sed") || !lower.contains("innerwarden") {
+        return false;
+    }
+    read_line(content).commands.iter().any(|command| {
+        // Flags as written: `-E` is not `-e`.
+        let words: Vec<String> = command.words.iter().map(|word| word.text.clone()).collect();
+        let Some(at) = effective_command_index(&words) else {
+            return false;
+        };
+        if !matches!(program_name(&words[at]).as_str(), "sed" | "gsed") {
+            return false;
+        }
+        let mut in_place = false;
+        let mut script_given = false;
+        let mut operands: Vec<&String> = Vec::new();
+        let mut rest = words[at + 1..].iter();
+        while let Some(word) = rest.next() {
+            if word.starts_with("--in-place") {
+                in_place = true;
+            } else if word == "--expression" || word == "--file" {
+                script_given = true;
+                rest.next();
+            } else if word.starts_with("--expression=") || word.starts_with("--file=") {
+                script_given = true;
+            } else if word.starts_with("--") {
+            } else if let Some(flags) = word.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+                // A cluster of flags: `i` takes the rest as its suffix, `e`
+                // and `f` take the rest, or the next word, as the script.
+                for (index, flag) in flags.char_indices() {
+                    match flag {
+                        'i' => {
+                            in_place = true;
+                            break;
+                        }
+                        'e' | 'f' => {
+                            script_given = true;
+                            if index + 1 == flags.len() {
+                                rest.next();
+                            }
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            } else {
+                operands.push(word);
+            }
+        }
+        let files = if script_given {
+            &operands[..]
+        } else {
+            operands.get(1..).unwrap_or(&[])
+        };
+        in_place
+            && files.iter().any(|file| {
+                INNERWARDEN_SELF_PATHS
+                    .iter()
+                    .chain(INNERWARDEN_INSTALL_PATHS)
+                    .any(|place| file.to_ascii_lowercase().contains(place))
+            })
+    })
+}
+
 /// The lines a search runs as a program on each file it reads: `rg --pre
 /// PROG` (`PROG FILE`) and `git grep -O PROG` (`PROG FILE...`), each
 /// with the paths the search names. The program is read as a command, with
