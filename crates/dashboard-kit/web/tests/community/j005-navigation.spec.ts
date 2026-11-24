@@ -22,6 +22,19 @@ function decisionsRequests(page: import("@playwright/test").Page) {
 }
 
 test.describe("CJC-090-J005 activity filters, pagination, and drilldown", () => {
+  test("the tab title names the current page on direct load, navigation, and back", async ({ page }) => {
+    await page.goto("/?view=activity");
+    await expect(page).toHaveTitle("Decisions - InnerWarden Community");
+
+    const navigation = page.getByRole("navigation", { name: "Dashboard views" });
+    await navigation.getByRole("button", { name: "Agents", exact: true }).click();
+    await expect(page).toHaveTitle("Agents - InnerWarden Community");
+    await page.goBack();
+    await expect(page).toHaveTitle("Decisions - InnerWarden Community");
+    await page.reload();
+    await expect(page).toHaveTitle("Decisions - InnerWarden Community");
+  });
+
   test("filters by outcome, reason and words on the server, and says when nothing matches", async ({ page }) => {
     const seen = decisionsRequests(page);
     await page.route(guardRoute("decisions"), (route) => {
@@ -101,6 +114,7 @@ test.describe("CJC-090-J005 activity filters, pagination, and drilldown", () => 
   test("a link written for the paid Cases opens the same decision here", async ({ page }) => {
     await page.goto(`/?view=cases&case=${encodeURIComponent(CASE.wouldRefuse)}&lane=everything&window=7d`);
     await expect(page).toHaveURL(`/?view=activity&decision=${encodeURIComponent(CASE.wouldRefuse)}`);
+    await expect(page).toHaveTitle("Decisions - InnerWarden Community");
     await expect(page.locator(`section[data-decision="${CASE.wouldRefuse}"]`)).toBeVisible();
   });
 
