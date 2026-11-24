@@ -5541,14 +5541,80 @@ fn unknown_command_lines(prog: &str, attempted: &str) -> Vec<String> {
             "Flags this accepts: --help, --version. Try:  {prog} --help"
         ));
     } else {
+        if let Some(verb) = nearest_verb(attempted) {
+            out.push(format!("Did you mean `{verb}`?"));
+        }
         out.push(format!("Run  {prog} --help  for the list of commands."));
     }
     out
 }
 
+/// The one verb a mistyped `attempted` most plausibly meant, if there is one.
+///
+/// Only a verb within an edit distance of 2 counts, and only when that distance
+/// is held by exactly one verb: a tie is no suggestion at all. This only names
+/// a verb; it never runs one.
+fn nearest_verb(attempted: &str) -> Option<&'static str> {
+    let mut best: Option<(usize, &'static str)> = None;
+    let mut tied = false;
+    for &verb in help::NATIVE_VERBS {
+        let distance = edit_distance(attempted, verb);
+        match best {
+            Some((best_distance, _)) if distance > best_distance => {}
+            Some((best_distance, _)) if distance == best_distance => tied = true,
+            _ => {
+                best = Some((distance, verb));
+                tied = false;
+            }
+        }
+    }
+    best.filter(|(distance, _)| *distance <= 2 && !tied)
+        .map(|(_, verb)| verb)
+}
+
+/// Levenshtein distance over characters: insertions, deletions and substitutions
+/// each cost 1.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = diagonal + usize::from(ca != *cb);
+            diagonal = row[j + 1];
+            row[j + 1] = substitute.min(row[j + 1] + 1).min(row[j] + 1);
+        }
+    }
+    row[b.len()]
+}
+
 #[cfg(test)]
 mod unknown_command_tests {
     use super::unknown_command_lines;
+
+    /// A typo of a real verb names it, and the message still fits the 3-line
+    /// cap: the reason, the suggestion, and the pointer to help.
+    #[test]
+    fn a_typo_of_a_verb_suggests_it_within_three_lines() {
+        let lines = unknown_command_lines("innerwarden", "statsu");
+        assert!(lines.len() <= 3, "{}", lines.join("\n"));
+        assert!(
+            lines.iter().any(|l| l == "Did you mean `status`?"),
+            "{}",
+            lines.join("\n")
+        );
+    }
+
+    /// Past an edit distance of 2 there is no suggestion, and a flag never gets
+    /// one, however close it is to a verb.
+    #[test]
+    fn no_suggestion_beyond_distance_two_or_for_a_flag() {
+        let far = unknown_command_lines("innerwarden", "xyzzy").join("\n");
+        assert!(!far.contains("Did you mean"), "{far}");
+        let flag = unknown_command_lines("innerwarden", "-statsu").join("\n");
+        assert!(!flag.contains("Did you mean"), "{flag}");
+    }
 
     /// THE REGRESSION. The error must be readable on the screen it lands on.
     ///
