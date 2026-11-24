@@ -1128,14 +1128,16 @@ fn matched_words(field: AtrField, regex: &CompiledRegex, value: &str) -> String 
     format!("{} `{}`", field_words(field), excerpt.replace('`', "'"))
 }
 
-/// The severity a rule that could not be read to the end is held at: a
-/// review, never an allow and never a refusal the rule did not make.
+/// The severity a `high` rule that could not be read to the end is held
+/// at: a review, never an allow.
 const UNDECIDED_SEVERITY: &str = "medium";
 
 /// A rule whose pattern could not finish on the text: it is held, not
-/// passed. A rule that refuses (`critical`, `high`) is held for review
+/// passed. A `critical` rule keeps its severity, so a shell line is refused
+/// as an MCP message is: text that makes the pattern run out is the one
+/// thing such a rule cannot let decide. A `high` rule is held for review
 /// (`medium`) on a shell line and refused on an MCP message
-/// ([`AtrMatch::refuses_a_call`]); a lighter one is kept at its own
+/// ([`AtrMatch::refuses_a_call`]). A lighter one is kept at its own
 /// severity, as if it had matched. Said in the match and in a warning, so it
 /// is seen.
 fn undecided_match(rule: &CompiledRule, condition: &CompiledCondition) -> AtrMatch {
@@ -1151,9 +1153,13 @@ fn undecided_match(rule: &CompiledRule, condition: &CompiledCondition) -> AtrMat
         ),
         field_words(condition.field).to_string(),
     );
-    if matches!(rule.severity.as_str(), "critical" | "high") {
-        held.severity = UNDECIDED_SEVERITY.to_string();
-        held.undecided_refusal = true;
+    match rule.severity.as_str() {
+        "critical" => held.undecided_refusal = true,
+        "high" => {
+            held.severity = UNDECIDED_SEVERITY.to_string();
+            held.undecided_refusal = true;
+        }
+        _ => {}
     }
     held
 }
@@ -1635,14 +1641,69 @@ detection:
         dir
     }
 
+    /// On a shell line, a `critical` rule whose pattern cannot finish refuses
+    /// the line, as it refuses an MCP message; a `high` one holds it for
+    /// review, as the default posture decides only the high-certainty class.
+    ///
+    /// FAILS ON REVERT: hold a `critical` rule at `medium` in
+    /// `undecided_match` and the line reads `review`.
+    #[test]
+    fn a_critical_rule_that_cannot_finish_refuses_a_shell_line() {
+        let pattern = "(a*)*\\1b";
+        // A line the command reading hands to the rules (a plain `echo` is
+        // read as printing and never reaches them).
+        let line = format!("node -e 'x=1' {}c", "a".repeat(40));
+        for (severity, expected) in [("critical", "deny"), ("high", "review")] {
+            let rule = format!(
+                r#"
+title: "Slow pattern on a shell line"
+id: ATR-TEST-SLOW-SHELL
+severity: {severity}
+detection_tier: pattern
+tags:
+  category: test
+detection:
+  conditions:
+    - field: tool_args
+      operator: regex
+      value: '{pattern}'
+      description: "slow pattern"
+"#
+            );
+            let dir = create_temp_rules(&[&rule]);
+            let engine = RuleEngine::load(dir.path()).unwrap();
+            let direct = engine.check_context(AtrContext::shell_command(&line));
+            assert!(
+                direct.iter().any(|m| m.undecided_refusal),
+                "{severity}: {direct:?}"
+            );
+            let verdict = crate::mcp::analyze_command(&line, Some(&engine));
+            assert_eq!(verdict.recommendation, expected, "{severity}: {verdict:?}");
+            assert!(
+                verdict
+                    .atr_matches
+                    .iter()
+                    .any(|m| m.undecided_refusal && m.refuses_a_call()),
+                "{severity}: {verdict:?}"
+            );
+            // Without the rule the line is allowed: the rule decided.
+            assert_eq!(
+                crate::mcp::analyze_command(&line, None).recommendation,
+                "allow"
+            );
+        }
+    }
+
     /// A refusing rule whose pattern cannot finish on the input (fancy-regex
     /// past its backtrack limit) held nothing: the runtime error read as "no
-    /// match", so the rule let the input through. Now it is held for review
-    /// (`medium`), named as such, whichever way the rule joins its
-    /// conditions.
+    /// match", so the rule let the input through. Now it is held, named as
+    /// such, whichever way the rule joins its conditions: a `critical` rule
+    /// keeps its severity (a shell line is refused, as an MCP message is),
+    /// a `high` one is held for review (`medium`).
     ///
     /// FAILS ON REVERT: `unwrap_or(false)` on the fancy match again and both
-    /// rules return no match.
+    /// rules return no match; hold a `critical` rule at `medium` again and
+    /// the shell line is only reviewed.
     #[test]
     fn a_pattern_that_cannot_finish_holds_the_input_for_review() {
         let pattern = "(a*)*\\1b";
@@ -1694,7 +1755,12 @@ detection:
         let matches = engine.check_user_input(&text);
         assert_eq!(matches.len(), 2, "{matches:?}");
         for m in &matches {
-            assert_eq!(m.severity, "medium", "{m:?}");
+            let held_at = if m.rule_id == "ATR-TEST-SLOW-ANY" {
+                "critical"
+            } else {
+                "medium"
+            };
+            assert_eq!(m.severity, held_at, "{m:?}");
             assert!(m.matched_condition.contains("could not finish"), "{m:?}");
             assert!(m.undecided_refusal && m.refuses_a_call(), "{m:?}");
         }
