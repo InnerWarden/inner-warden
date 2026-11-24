@@ -115,7 +115,7 @@ fn path_without_codex() -> std::ffi::OsString {
 }
 
 fn run_uninstall(exe: &Path, home: &Path, extra: &[&str]) -> Output {
-    let mut args = vec!["uninstall"];
+    let mut args = vec!["uninstall", "--operator"];
     args.extend_from_slice(extra);
     run_cli(exe, home, &args)
 }
@@ -287,7 +287,7 @@ fn the_codex_and_gemini_hooks_go_before_the_binary() {
         let connected = text(&run_cli(
             &exe,
             home.path(),
-            &["agents", "connect", *agent, "--monitor"],
+            &["agents", "connect", *agent, "--monitor", "--operator"],
         ));
         let held = std::fs::read_to_string(file).unwrap_or_default();
         assert!(
@@ -331,7 +331,7 @@ fn a_hook_the_disconnect_left_behind_stops_the_uninstall() {
     let connected = text(&run_cli(
         &exe,
         home.path(),
-        &["agents", "connect", "gemini", "--monitor"],
+        &["agents", "connect", "gemini", "--monitor", "--operator"],
     ));
     let whole = std::fs::read_to_string(&settings).expect("read the settings");
     assert!(

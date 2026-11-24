@@ -4209,11 +4209,7 @@ fn cmd_mode(rest: &[String], monitor: bool) -> std::process::ExitCode {
     // terminal is refused too, unless an operator's script says so
     // ([`suppress_io::may_widen`]), as allowing and muting are.
     if monitor && !suppress_io::may_widen(operator) {
-        eprintln!(
-            "innerwarden dry-run: refused, no terminal. Monitor lowers the guard that screens \
-             the agent, so it is set by a person at their own terminal. Nothing was changed."
-        );
-        return std::process::ExitCode::from(1);
+        return suppress_io::refuse_lowering_without_terminal("dry-run", "Monitor");
     }
     let home = match hook::home_dir() {
         Ok(h) => h,
@@ -4446,6 +4442,8 @@ fn parse_install_args(rest: &[String]) -> InstallArgs {
 }
 
 fn cmd_install(rest: &[String]) -> std::process::ExitCode {
+    let (owned, operator) = suppress_io::split_operator_flag(rest);
+    let rest = owned.as_slice();
     let (agent, settings, block_review, monitor) = match parse_install_args(rest) {
         InstallArgs::Run {
             agent,
@@ -4484,6 +4482,12 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
              from their own terminal. Nothing was changed."
         );
         return std::process::ExitCode::from(1);
+    }
+    if (monitor || guard_asked) && !suppress_io::may_widen(operator) {
+        return suppress_io::refuse_lowering_without_terminal(
+            "install",
+            "Installing the hook in monitor or the default posture",
+        );
     }
 
     let home = match hook::home_dir() {
@@ -4596,6 +4600,8 @@ fn cmd_install(rest: &[String]) -> std::process::ExitCode {
 /// installed (removes 0). Does not delete the binary: it names the full
 /// `uninstall`, which decides whether the binary is this install's to delete.
 fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
+    let (owned, operator) = suppress_io::split_operator_flag(rest);
+    let rest = owned.as_slice();
     // Taking InnerWarden off, all of it or one agent's hook, takes off the
     // guard that screens the agent: the person's, never a command an AI
     // agent's shell runs, a script it wrote included (live gate of Active
@@ -4607,6 +4613,9 @@ fn cmd_uninstall(rest: &[String]) -> std::process::ExitCode {
              terminal. Nothing was changed."
         );
         return std::process::ExitCode::from(1);
+    }
+    if !rest.iter().any(|a| a == "--dry-run") && !suppress_io::may_widen(operator) {
+        return suppress_io::refuse_lowering_without_terminal("uninstall", "Uninstalling");
     }
     // Bare `uninstall` (or with --all / --purge) removes InnerWarden entirely:
     // the agent hook, the config directory, the binary and its shortcuts. `uninstall
@@ -4835,7 +4844,13 @@ fn cmd_uninstall_self(purge: bool) -> std::process::ExitCode {
     //
     // Reuses the same entry point `agents disconnect --all` uses, so the two can
     // never disagree about what unwiring means.
-    let disconnected = crate::agents_io::cmd(&["disconnect".into(), "--all".into()]);
+    // Already let through by `cmd_uninstall`, as the person or an operator's
+    // script: the disconnect it runs is theirs.
+    let disconnected = crate::agents_io::cmd(&[
+        "disconnect".into(),
+        "--all".into(),
+        innerwarden_agent_guard::threats::GUARD_OPERATOR_FLAG.into(),
+    ]);
     if disconnected == std::process::ExitCode::SUCCESS {
         println!("  agents  : disconnected every wired agent");
     } else {

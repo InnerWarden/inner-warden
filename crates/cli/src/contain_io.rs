@@ -20,8 +20,10 @@ use crate::contain::{
 /// [--project DIR] [--dry-run] [--setup] -- <command...>` - run the command inside
 /// a filesystem/namespace jail with the InnerWarden hook active inside it.
 pub fn cmd(rest: &[String]) -> ExitCode {
+    let (owned, operator) = crate::suppress_io::split_operator_flag_before_command(rest);
+    let rest = owned.as_slice();
     if let Some(asked) = accept_request(rest) {
-        return cmd_accept(asked);
+        return cmd_accept(asked, operator);
     }
     let args = match parse_contain_args(rest) {
         Ok(a) => a,
@@ -40,6 +42,12 @@ pub fn cmd(rest: &[String]) -> ExitCode {
              was changed."
         );
         return ExitCode::from(1);
+    }
+    if !args.dry_run && !crate::suppress_io::may_widen(operator) {
+        return crate::suppress_io::refuse_lowering_without_terminal(
+            "contain",
+            "A jail rewires the agent's hook and",
+        );
     }
 
     let home = match std::env::var_os("HOME").map(PathBuf::from) {
@@ -520,7 +528,7 @@ fn accept_request(rest: &[String]) -> Option<Result<PathBuf, String>> {
 
 /// `innerwarden contain --accept-project-files`, as the person runs it
 /// ([`accept_project_files`]).
-fn cmd_accept(asked: Result<PathBuf, String>) -> ExitCode {
+fn cmd_accept(asked: Result<PathBuf, String>, operator: bool) -> ExitCode {
     let project = match asked {
         Ok(project) => project,
         Err(why) => {
@@ -534,6 +542,12 @@ fn cmd_accept(asked: Result<PathBuf, String>) -> ExitCode {
              jail made is the person's, from their own terminal. Nothing was changed."
         );
         return ExitCode::from(1);
+    }
+    if !crate::suppress_io::may_widen(operator) {
+        return crate::suppress_io::refuse_lowering_without_terminal(
+            "contain",
+            "Accepting the files a jail made",
+        );
     }
     let home = match std::env::var_os("HOME").map(PathBuf::from) {
         Some(h) if !h.as_os_str().is_empty() => h,

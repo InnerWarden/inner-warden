@@ -96,7 +96,7 @@ err="$work/err"
 # shellcheck disable=SC2016
 literal='$IW_ESCAPE_LITERAL'
 IW_ESCAPE_LITERAL=expanded \
-    "$iw" contain --identity --project "$project" -- /bin/sh "$project/probe.sh" "$literal" \
+    "$iw" contain --operator --identity --project "$project" -- /bin/sh "$project/probe.sh" "$literal" \
     >"$out" 2>"$err"
 rc=$?
 

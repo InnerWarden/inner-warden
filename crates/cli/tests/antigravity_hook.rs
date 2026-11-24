@@ -519,7 +519,7 @@ fn connect_and_disconnect_give_back_the_hooks_file_to_the_byte() {
         .unwrap_or_else(|| panic!("no antigravity row: {listed}"));
     assert!(row.contains("guarded (hook, enforce)"), "{row}");
 
-    let out = cli(home, &["agents", "disconnect", "antigravity"]);
+    let out = cli(home, &["agents", "disconnect", "--operator", "antigravity"]);
     let text = said(&out);
     assert_eq!(out.status.code(), Some(0), "{text}");
     assert!(text.contains("antigravity, disconnected"), "{text}");
@@ -535,12 +535,21 @@ fn a_hooks_file_connect_created_goes_with_the_disconnect() {
     std::fs::write(home.join(".gemini/antigravity-cli/settings.json"), "{}\n").unwrap();
     let hooks = home.join(".gemini/config/hooks.json");
 
-    let out = cli(home, &["agents", "connect", "antigravity", "--monitor"]);
+    let out = cli(
+        home,
+        &[
+            "agents",
+            "connect",
+            "antigravity",
+            "--monitor",
+            "--operator",
+        ],
+    );
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
     assert!(hooks.is_file());
     let listed = said(&cli(home, &["agents"]));
     assert!(listed.contains("guarded (hook, monitor)"), "{listed}");
-    let out = cli(home, &["agents", "disconnect", "antigravity"]);
+    let out = cli(home, &["agents", "disconnect", "--operator", "antigravity"]);
     assert_eq!(out.status.code(), Some(0), "{}", said(&out));
     assert!(!hooks.exists());
 }

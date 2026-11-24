@@ -235,6 +235,10 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
     if rest.first().map(String::as_str) == Some("rewire") {
         return cmd_rewire();
     }
+    // The operator's flag ([`crate::suppress_io::may_widen`]) is no word of
+    // the wiring engine's.
+    let (owned, operator) = crate::suppress_io::split_operator_flag(rest);
+    let rest = owned.as_slice();
     // The posture flags are this command's own: the wiring engine, which
     // Active Defence shares, reads `--strict` as `--block-review`.
     let original = rest;
@@ -292,6 +296,12 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
              it is done by the person, from their own terminal. Nothing was changed."
         );
         return std::process::ExitCode::from(1);
+    }
+    if lowers_a_guard(original) && !crate::suppress_io::may_widen(operator) {
+        return crate::suppress_io::refuse_lowering_without_terminal(
+            "agents",
+            "Disconnecting an agent, or connecting it in monitor or with --guard,",
+        );
     }
     // A connect from an AI agent's shell that names no mode writes the line
     // in enforce, which over a line that also refuses `review` refuses

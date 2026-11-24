@@ -180,3 +180,87 @@ fn the_person_at_a_terminal_sets_monitor() {
         settings(home.path())
     );
 }
+
+/// `args`, run with no terminal and no agent's marker, is refused for no
+/// terminal and writes nothing to the agent's settings.
+fn refused_without_a_terminal(args: &[&str]) {
+    let home = enforced_home();
+    let before = settings(home.path());
+    let out = run(home.path(), args, None);
+    assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("refused, no terminal"),
+        "{args:?}: {}",
+        stderr(&out)
+    );
+    assert_eq!(settings(home.path()), before, "{args:?} wrote");
+}
+
+/// `args` with the operator's flag, outside an agent's shell, is not
+/// refused for want of a terminal.
+fn an_operators_script_is_not_refused(args: &[&str]) {
+    let home = enforced_home();
+    let mut with_flag: Vec<&str> = args.to_vec();
+    with_flag.push("--operator");
+    let out = run(home.path(), &with_flag, None);
+    assert!(
+        !stderr(&out).contains("refused, no terminal"),
+        "{with_flag:?}: {}",
+        stderr(&out)
+    );
+}
+
+/// FAILS ON REVERT: take the `may_widen` check out of `agents_io::cmd`.
+#[test]
+fn a_disconnect_needs_a_terminal() {
+    refused_without_a_terminal(&["agents", "disconnect", "--all"]);
+    refused_without_a_terminal(&["agents", "disconnect", "claude-code"]);
+    an_operators_script_is_not_refused(&["agents", "disconnect", "claude-code"]);
+}
+
+/// FAILS ON REVERT: take the `may_widen` check out of `agents_io::cmd`.
+#[test]
+fn a_connect_in_monitor_or_the_default_posture_needs_a_terminal() {
+    refused_without_a_terminal(&["agents", "connect", "claude-code", "--monitor"]);
+    refused_without_a_terminal(&["agents", "connect", "claude-code", "--guard"]);
+    an_operators_script_is_not_refused(&["agents", "connect", "claude-code", "--monitor"]);
+}
+
+/// FAILS ON REVERT: take the `may_widen` check out of `cmd_install`.
+#[test]
+fn an_install_in_monitor_or_the_default_posture_needs_a_terminal() {
+    refused_without_a_terminal(&["install", "claude-code", "--monitor"]);
+    refused_without_a_terminal(&["install", "claude-code", "--guard"]);
+    an_operators_script_is_not_refused(&["install", "claude-code", "--monitor"]);
+}
+
+/// FAILS ON REVERT: take the `may_widen` check out of `cmd_uninstall`. Its
+/// own dry run changes nothing and stays open.
+#[test]
+fn an_uninstall_needs_a_terminal() {
+    refused_without_a_terminal(&["uninstall", "claude-code"]);
+    refused_without_a_terminal(&["uninstall"]);
+    refused_without_a_terminal(&["uninstall", "--purge"]);
+    an_operators_script_is_not_refused(&["uninstall", "claude-code"]);
+    let home = enforced_home();
+    let out = run(home.path(), &["uninstall", "--dry-run"], None);
+    assert!(!stderr(&out).contains("refused"), "{}", stderr(&out));
+}
+
+/// FAILS ON REVERT: take the `may_widen` checks out of `contain_io::cmd`
+/// and `cmd_accept`. Its own dry run changes nothing and stays open.
+#[test]
+fn a_jail_and_accepting_its_files_need_a_terminal() {
+    refused_without_a_terminal(&["contain", "--", "true"]);
+    refused_without_a_terminal(&["contain", "--setup"]);
+    let project = tempfile::TempDir::new().unwrap();
+    refused_without_a_terminal(&[
+        "contain",
+        "--accept-project-files",
+        "--project",
+        project.path().to_str().unwrap(),
+    ]);
+    let home = enforced_home();
+    let out = run(home.path(), &["contain", "--dry-run", "--", "true"], None);
+    assert!(!stderr(&out).contains("refused"), "{}", stderr(&out));
+}

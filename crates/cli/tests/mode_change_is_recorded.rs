@@ -105,19 +105,25 @@ fn every_switch_of_mode_or_posture_is_recorded() {
         (&["dry-run", "--operator"][..], "dry-run", "monitor", None),
         (&["enforce"], "enforce", "enforce", None),
         (
-            &["agents", "disconnect", "--all"],
+            &["agents", "disconnect", "--operator", "--all"],
             "agents disconnect",
             "off",
             None,
         ),
         (
-            &["agents", "connect", "claude-code", "--monitor"],
+            &[
+                "agents",
+                "connect",
+                "claude-code",
+                "--monitor",
+                "--operator",
+            ],
             "agents connect",
             "monitor",
             None,
         ),
         (
-            &["agents", "connect", "claude-code", "--guard"],
+            &["agents", "connect", "claude-code", "--guard", "--operator"],
             "agents connect",
             "enforce",
             Some("default"),

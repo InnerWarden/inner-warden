@@ -240,7 +240,12 @@ print('PROBE outside=%s own=%s tcp=%s' % (
 "#;
     let mut command = Command::new(bin());
     command
-        .args(["contain", "--project", project.path().to_str().unwrap()])
+        .args([
+            "contain",
+            "--operator",
+            "--project",
+            project.path().to_str().unwrap(),
+        ])
         .args(["--pass-env", "IW_OUT", "--pass-env", "IW_TCP"])
         .args(["--", python, "-c", script])
         .env("HOME", home.path())

@@ -315,7 +315,7 @@ fn an_agent_cannot_move_its_own_install_to_the_default_posture() {
     );
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     // And the CLI itself, run from an agent's shell.
-    let mut command = host.command(&["agents", "connect", "--guard"]);
+    let mut command = host.command(&["agents", "connect", "--guard", "--operator"]);
     command.env("CLAUDECODE", "1");
     let out = host.run(command, b"");
     assert_ne!(out.status.code(), Some(0), "{out:?}");
@@ -360,7 +360,7 @@ fn connect_starts_a_new_install_in_the_default_posture_and_keeps_an_old_one_stri
     assert_eq!(posture().as_deref(), Some("strict\n"));
     // The person moves it with --guard.
     let out = host.run(
-        host.command(&["agents", "connect", "claude-code", "--guard"]),
+        host.command(&["agents", "connect", "claude-code", "--guard", "--operator"]),
         b"",
     );
     assert!(out.status.success(), "{out:?}");
@@ -377,8 +377,8 @@ fn connect_starts_a_new_install_in_the_default_posture_and_keeps_an_old_one_stri
     );
     // Two postures at once, or a posture with monitor, are refused.
     for args in [
-        &["agents", "connect", "--guard", "--strict"][..],
-        &["agents", "connect", "--monitor", "--strict"][..],
+        &["agents", "connect", "--guard", "--operator", "--strict"][..],
+        &["agents", "connect", "--monitor", "--operator", "--strict"][..],
     ] {
         let out = host.run(host.command(args), b"");
         assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");

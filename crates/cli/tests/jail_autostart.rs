@@ -84,7 +84,12 @@ fn a_jail_cannot_leave_what_the_session_runs_at_the_next_login() {
     let graph = tempfile::TempDir::new().unwrap();
     let mut command = Command::new(bin());
     command
-        .args(["contain", "--project", project.path().to_str().unwrap()])
+        .args([
+            "contain",
+            "--operator",
+            "--project",
+            project.path().to_str().unwrap(),
+        ])
         .args(["--", "/bin/sh", "-c", SCRIPT])
         .env("HOME", &h)
         .env("IW_GRAPH_FILE", graph.path().join("graph.json"))
@@ -159,7 +164,12 @@ fn run_jail(h: &Path, script: &str, env: &[(&str, &Path)]) -> std::process::Outp
     let graph = tempfile::TempDir::new().unwrap();
     let mut command = Command::new(bin());
     command
-        .args(["contain", "--project", project.path().to_str().unwrap()])
+        .args([
+            "contain",
+            "--operator",
+            "--project",
+            project.path().to_str().unwrap(),
+        ])
         .args(["--", "/bin/sh", "-c", script])
         .env("HOME", h)
         .env("IW_GRAPH_FILE", graph.path().join("graph.json"))
@@ -489,7 +499,7 @@ echo DONE
             let graph = tempfile::TempDir::new().unwrap();
             let mut command = Command::new(bin());
             command
-                .args(["contain", "--writable-user-bin", "--project"])
+                .args(["contain", "--operator", "--writable-user-bin", "--project"])
                 .arg(project.path())
                 .args(["--", "/bin/sh", "-c", script])
                 .env("HOME", &h)
@@ -548,7 +558,12 @@ fn run_jail_in(h: &Path, project: &Path, path: &str, script: &str) -> std::proce
     let graph = tempfile::TempDir::new().unwrap();
     let mut command = Command::new(bin());
     command
-        .args(["contain", "--project", project.to_str().unwrap()])
+        .args([
+            "contain",
+            "--operator",
+            "--project",
+            project.to_str().unwrap(),
+        ])
         .args(["--", "/bin/sh", "-c", script])
         .current_dir(project)
         .env("HOME", h)
@@ -831,7 +846,7 @@ fn a_jail_ending_takes_nothing_from_another_of_the_home() {
         let graph = tempfile::TempDir::new().unwrap();
         let mut command = Command::new(bin());
         command
-            .args(["contain", "--project", p.to_str().unwrap()])
+            .args(["contain", "--operator", "--project", p.to_str().unwrap()])
             .args(["--", "/bin/sh", "-c", &script])
             .current_dir(&p)
             .env("HOME", &h)
@@ -929,7 +944,7 @@ fn launch_with(
     let graph = tempfile::TempDir::new().unwrap();
     let mut command = Command::new(bin());
     command
-        .args(["contain", "--project", p.to_str().unwrap()])
+        .args(["contain", "--operator", "--project", p.to_str().unwrap()])
         .args(flags)
         .args(["--", "/bin/sh", "-c", script])
         .current_dir(p)
