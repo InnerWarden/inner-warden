@@ -684,14 +684,119 @@ fn outbox_holds_any(dir: &Path) -> bool {
     })
 }
 
+/// The file that says a sender is at work on the outbox: made with
+/// `create_new`, holding the sender's process id once it runs.
+const SENDER_LOCK: &str = "sender.lock";
+
+/// How long a lock with no process id in it yet is taken as held: the
+/// moment between making it and starting its sender.
+const LOCK_BEING_TAKEN: Duration = Duration::from_secs(10);
+
+/// Whether the process `pid` is running.
+#[cfg(unix)]
+fn process_runs(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // Signal 0 checks the process without touching it; EPERM means it runs
+    // as another user.
+    pid > 0
+        && (unsafe { libc::kill(pid, 0) } == 0
+            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
+}
+
+#[cfg(not(unix))]
+fn process_runs(_pid: u32) -> bool {
+    true
+}
+
+/// Whether the lock at `path` belongs to a sender still at work: its
+/// process runs, or it was made a moment ago and has no process id yet. A
+/// lock whose time cannot be read counts as held until it can.
+fn lock_is_held(path: &Path) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match text.trim().parse::<u32>() {
+            Ok(pid) => process_runs(pid),
+            Err(_) => std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|made| made.elapsed().ok())
+                .is_none_or(|age| age < LOCK_BEING_TAKEN),
+        },
+        // Gone between the two looks: not held.
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Take the sender lock in `dir`, `true` when this caller holds it now.
+/// One whose sender stopped is taken over; one held is left alone, so at
+/// most one sender works on the outbox at a time.
+fn take_sender_lock(dir: &Path) -> bool {
+    let path = dir.join(SENDER_LOCK);
+    for _ in 0..2 {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(_) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_is_held(&path) {
+                    return false;
+                }
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Write `pid` into a lock this caller holds. Never makes the file: a
+/// sender that already finished and let it go is not given it back.
+fn mark_sender_lock(dir: &Path, pid: u32) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(dir.join(SENDER_LOCK))
+    {
+        use std::io::Write;
+        let _ = file.write_all(pid.to_string().as_bytes());
+    }
+}
+
+/// Let the lock go, when it is this process's or has no process id yet.
+fn release_sender_lock(dir: &Path) {
+    let path = dir.join(SENDER_LOCK);
+    let mine = std::fs::read_to_string(&path).is_ok_and(|text| {
+        let text = text.trim();
+        text.is_empty() || text == std::process::id().to_string()
+    });
+    if mine {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Start `innerwarden notify --send-outbox` on its own, with no stdio of
-/// this process: a hook's agent waits for the hook's output to close, and
-/// this one never holds it.
+/// this process (a hook's agent waits for the hook's output to close, and
+/// this one never holds it), unless a sender is already at work: that one
+/// takes every alert in the outbox, so a burst of alerts starts one sender,
+/// never one each.
 fn start_sender() {
     if std::env::var_os(SENDER_ENV).is_some() {
         return;
     }
+    let Some(dir) = outbox_dir() else {
+        return;
+    };
+    if !take_sender_lock(&dir) {
+        return;
+    }
     let Ok(program) = std::env::current_exe() else {
+        release_sender_lock(&dir);
         return;
     };
     let mut command = std::process::Command::new(program);
@@ -706,37 +811,69 @@ fn start_sender() {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    if let Ok(mut child) = command.spawn() {
-        // A long-lived caller (the MCP proxy) reaps it; a hook exits first.
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+    match command.spawn() {
+        Ok(mut child) => {
+            mark_sender_lock(&dir, child.id());
+            // A long-lived caller (the MCP proxy) reaps it; a hook exits first.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(_) => release_sender_lock(&dir),
     }
+}
+
+/// Whether the outbox holds an alert no sender has tried yet (one send, the
+/// first): it came in after a sender's last pass.
+fn outbox_holds_untried(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.flatten().any(|entry| {
+            entry.file_name().to_string_lossy().ends_with(".json")
+                && std::fs::read(entry.path())
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Pending>(&bytes).ok())
+                    .is_some_and(|pending| pending.attempts <= 1)
+        })
+    })
 }
 
 /// `innerwarden notify --send-outbox`: send every alert in the outbox to
 /// the channels still owed it, a few rounds apart, and record each that
-/// arrives late or is given up.
+/// arrives late or is given up. It holds the sender lock while it works
+/// (started by [`start_sender`], or taken here when run by hand), and
+/// before it lets go it looks once more for alerts that came in after its
+/// last pass, so none waits for the next alert to start a sender.
 fn cmd_send_outbox() -> std::process::ExitCode {
     let Some(dir) = outbox_dir() else {
         return std::process::ExitCode::SUCCESS;
     };
+    let started_by_a_caller = std::env::var_os(SENDER_ENV).is_some();
+    if !started_by_a_caller && !take_sender_lock(&dir) {
+        return std::process::ExitCode::SUCCESS;
+    }
     let file = config_file();
     let config = innerwarden_notify::resolved(caller_env, file.as_deref());
     let proxy = config_proxy(file.as_deref());
-    for wait in [
-        Duration::ZERO,
-        Duration::from_secs(5),
-        Duration::from_secs(30),
-    ] {
-        std::thread::sleep(wait);
-        send_outbox_once(
-            &dir,
-            &config,
-            |request| send_with_timeout(request, LATER_SEND_TIMEOUT, proxy.as_deref()),
-            &record_delivery,
-        );
-        if !outbox_holds_any(&dir) {
+    loop {
+        mark_sender_lock(&dir, std::process::id());
+        for wait in [
+            Duration::ZERO,
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        ] {
+            std::thread::sleep(wait);
+            send_outbox_once(
+                &dir,
+                &config,
+                |request| send_with_timeout(request, LATER_SEND_TIMEOUT, proxy.as_deref()),
+                &record_delivery,
+            );
+            if !outbox_holds_any(&dir) {
+                break;
+            }
+        }
+        release_sender_lock(&dir);
+        if !outbox_holds_untried(&dir) || !take_sender_lock(&dir) {
             break;
         }
     }
@@ -1303,5 +1440,35 @@ mod tests {
                 MAX_ATTEMPTS
             )]
         );
+    }
+
+    /// One sender at a time: a lock held by a running process is not taken;
+    /// one whose process stopped is taken over; one let go is free again.
+    ///
+    /// FAILS ON REVERT: let [`take_sender_lock`] take a held lock and the
+    /// second take succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn the_sender_lock_admits_one_sender_and_outlives_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(take_sender_lock(dir.path()));
+        mark_sender_lock(dir.path(), std::process::id());
+        assert!(
+            !take_sender_lock(dir.path()),
+            "a running sender's lock was taken"
+        );
+        // A process that has stopped holds nothing.
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        mark_sender_lock(dir.path(), pid);
+        assert!(
+            take_sender_lock(dir.path()),
+            "a stopped sender's lock was kept"
+        );
+        // Taken and not yet marked: held, for the moment its sender starts.
+        assert!(!take_sender_lock(dir.path()));
+        release_sender_lock(dir.path());
+        assert!(take_sender_lock(dir.path()));
     }
 }
