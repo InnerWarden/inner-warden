@@ -425,10 +425,16 @@ fn a_proxy_the_agents_environment_names_receives_nothing() {
         )),
     );
     check(scratch.path(), &account, REVIEW_LINE, &[]);
-    assert_eq!(
-        configured.requests().len(),
-        2,
-        "the configured proxy is used for both"
+    // The model, and the alert at least once: this proxy answers no
+    // tunnel, so the alert fails and is sent again later, through the same
+    // proxy and never another way.
+    let carried = configured.requests();
+    assert!(
+        carried.len() >= 2
+            && carried
+                .iter()
+                .all(|request| request.starts_with("CONNECT ")),
+        "the configured proxy is used for both: {carried:?}"
     );
     assert!(proxy.requests().is_empty());
 }
