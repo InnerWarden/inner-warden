@@ -4,6 +4,7 @@ mod git_tree;
 pub(crate) use git_tree::in_command_dir;
 mod glob_names;
 mod guard_doubt;
+mod guard_file_targets;
 mod guard_lowering;
 pub(crate) use guard_lowering::lists_only_other_processes;
 mod credential_removal_by_code;
@@ -3544,6 +3545,9 @@ pub(crate) fn check_guard_takedown(content: &str) -> Option<(&'static str, u32)>
     }
     if guard_takedown::editor_edits_guard_file(content) {
         return Some((guard_takedown::EDITOR_EDITS_GUARD_FILE, 60));
+    }
+    if guard_file_targets::removal_reaches_guard_file(content) {
+        return Some((guard_file_targets::GUARD_FILE_REACHED, 60));
     }
     guard_takedown::programs_searches_run(content)
         .iter()
