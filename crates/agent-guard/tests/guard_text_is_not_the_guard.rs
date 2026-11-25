@@ -308,8 +308,8 @@ fn a_worktree_in_a_folder_named_for_the_guard_is_not_disabling_it() {
         "git worktree remove --force ~/github/_innerwarden/.worktrees/t219",
         "git worktree remove ~/github/_innerwarden/.worktrees/t219",
         "cd ~/github/_innerwarden/inner-warden && git worktree remove --force ~/github/_innerwarden/.worktrees/t219 && git branch -D t219",
-        "git worktree remove --force $HOME/innerwarden/wt-219",
-        "git -C $HOME/innerwarden/inner-warden worktree remove --force $HOME/innerwarden/wt-219",
+        "git worktree remove --force $HOME/innerwarden/wt-review",
+        "git -C $HOME/innerwarden/inner-warden worktree remove --force $HOME/innerwarden/wt-review",
     ] {
         assert_eq!(verdict(line).0, "review", "{line}");
     }
@@ -326,7 +326,7 @@ fn a_worktree_in_a_folder_named_for_the_guard_is_not_disabling_it() {
         "git worktree remove --force ~/github/_innerwarden/.worktrees/innerwarden",
         "git worktree remove --force ~/github/_innerwarden/.worktrees/../../.config/innerwarden",
         "git worktree remove --force ~/.worktrees/.config/innerwarden",
-        "HOME=/etc; git worktree remove --force $HOME/innerwarden/wt-219",
+        "HOME=/etc; git worktree remove --force $HOME/innerwarden/wt-review",
         "export HOME=/etc && git worktree remove --force $HOME/innerwarden/x",
         "rm -rf $HOME/.config/innerwarden",
         "systemctl --user disable --now innerwarden-agent",
