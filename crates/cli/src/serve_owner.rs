@@ -79,7 +79,7 @@ pub fn explain(failure: &BindFailure, bind: &str, io_error: &str) -> String {
     match failure {
         BindFailure::ContractAlreadyServed => format!(
             "innerwarden: {bind} is already serving /api/agent/check-command.\n  \
-             That is InnerWarden Pro, which answers the same contract with host \
+             That is InnerWarden's host install, which answers the same contract with host \
              context this process does not have. Nothing to fix, and nothing to start.\n  \
              To run a second, separate screener anyway:  innerwarden serve --bind 127.0.0.1:8790"
         ),
@@ -114,7 +114,10 @@ mod tests {
         assert_eq!(f, BindFailure::ContractAlreadyServed);
         let msg = explain(&f, "127.0.0.1:8787", "address in use");
         assert!(msg.contains("already serving"));
-        assert!(msg.contains("InnerWarden Pro"), "must name what owns it");
+        assert!(
+            msg.contains("InnerWarden's host install"),
+            "must name what owns it"
+        );
         assert!(msg.contains("Nothing to fix"));
         assert!(
             msg.contains("--bind"),

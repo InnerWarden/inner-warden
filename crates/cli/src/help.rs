@@ -563,9 +563,9 @@ pub(crate) fn usage(verb: &str, rest: &[String]) -> Option<String> {
         ),
         "host" => format!(
             "{p} host <command> [args...]\n  \
-             Run a command in the InnerWarden Pro host layer, even when this binary has\n  \
-             a verb by the same name. Without InnerWarden Pro installed it says so\n  \
-             rather than guessing."
+             Run a command in the InnerWarden host layer, even when this binary has\n  \
+             a verb by the same name. Without the host install it says so rather\n  \
+             than guessing."
         ),
         _ => return None,
     };
@@ -602,6 +602,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `host --help` is fixed text and cannot read the host's licence, so it
+    /// names the layer without a tier: it is shown on a host installed with
+    /// no licence too. FAILS ON REVERT: it said "the InnerWarden Pro host
+    /// layer" there.
+    #[test]
+    fn the_host_help_names_no_tier() {
+        let text = usage("host", &[]).expect("host has a usage");
+        let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains("Run a command in the InnerWarden host layer,"),
+            "{text}"
+        );
+        assert!(!text.contains("Pro"), "{text}");
     }
 
     /// The hook's usage names every agent's file tools it judges, Hermes's
