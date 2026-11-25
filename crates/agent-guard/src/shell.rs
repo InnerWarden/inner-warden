@@ -12,6 +12,7 @@ mod git_editor;
 mod inline_calls;
 pub(crate) mod output_options;
 pub(crate) mod runners;
+mod sql_runner;
 mod sql_text;
 mod unread_parts;
 
@@ -185,7 +186,25 @@ fn masks_are_in_doubt(root: tree_sitter::Node<'_>, text: &str) -> bool {
         let Some(name) = command_name(command, source) else {
             return false;
         };
-        if name.contains(['$', '`', '{', '/']) || runs_unseen_text(&name, true) {
+        if name.contains(['$', '`', '{', '/']) {
+            return true;
+        }
+        // A SQL client run by name, behind a container runner or as the
+        // remote line of `ssh`, runs none of its words: what the masks
+        // hide of it is SQL that is only data ([`sql_runner`]).
+        // Its input fed from a substitution is not on the line as the
+        // client reads it (`ssh h psql < <(echo ...)`): that stays in doubt.
+        let redirected = command
+            .parent()
+            .filter(|parent| parent.kind() == "redirected_statement")
+            .unwrap_or(command);
+        if sql_runner::runs_sql_client(command, source)
+            && !node_contains_kind(redirected, "process_substitution", 0)
+            && !node_contains_kind(redirected, "command_substitution", 0)
+        {
+            return false;
+        }
+        if runs_unseen_text(&name, true) {
             return true;
         }
         let mut cursor = command.walk();
@@ -13647,15 +13666,26 @@ fn mask_literal_command_args(
             }
         }
         // The SQL a client is handed on the line, where it is only data
-        // ([`sql_text::sql_text_is_data`]).
-        client if sql_text::is_sql_client(client) => {
-            let words: Vec<String> = arguments
+        // ([`sql_text::sql_text_is_data`]): the client run by name, behind
+        // the wrappers the guard reads through, behind a container runner,
+        // or as the remote line of `ssh` ([`sql_runner`]).
+        _ => {
+            let Some(words) = command_words(command, source) else {
+                return;
+            };
+            let Some((client, at)) = sql_runner::sql_client_at(&words, 0) else {
+                if let Some(masks) = sql_runner::ssh_sql_masks(command, source) {
+                    masked.extend(masks);
+                }
+                return;
+            };
+            let words: Vec<String> = words[at + 1..]
                 .iter()
-                .map(|argument| shell_word(&node_text(*argument, source)))
+                .map(|word| shell_word(word))
                 .collect();
-            for (index, sql) in sql_text::sql_arguments(client, &words) {
+            for (index, sql) in sql_text::sql_arguments(&client, &words) {
                 if let Some(argument) = arguments
-                    .get(index)
+                    .get(at + index)
                     .filter(|_| sql_text::sql_text_is_data(&sql))
                 {
                     mask_preserving_substitutions(
@@ -13667,7 +13697,6 @@ fn mask_literal_command_args(
                 }
             }
         }
-        _ => {}
     }
 }
 
@@ -13708,19 +13737,22 @@ fn echo_feeds_sql_data(command: tree_sitter::Node<'_>, name: &str, source: &[u8]
 }
 
 /// The SQL client a command runs, behind the wrappers the guard unwraps,
-/// with the words after its name,
-/// shell quotes taken off.
+/// a container runner or `ssh` ([`sql_runner`]), with the words after
+/// its name, shell quotes taken off.
 fn sql_client_words(
     command: tree_sitter::Node<'_>,
     source: &[u8],
 ) -> Option<(String, Vec<String>)> {
     let words = command_words(command, source)?;
-    let effective = effective_command_words(&words, 0)?;
-    let name = normalized_command_name(effective.first()?);
-    sql_text::is_sql_client(&name).then(|| {
-        let args = effective[1..].iter().map(|word| shell_word(word)).collect();
-        (name, args)
-    })
+    if let Some((name, at)) = sql_runner::sql_client_at(&words, 0) {
+        let args = words[at + 1..]
+            .iter()
+            .map(|word| shell_word(word))
+            .collect();
+        return Some((name, args));
+    }
+    let (line, _) = sql_runner::ssh_remote_line(command, source)?;
+    sql_runner::line_sql_client(&line)
 }
 
 #[derive(Clone, Copy)]

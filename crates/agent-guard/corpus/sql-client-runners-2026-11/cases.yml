@@ -1,0 +1,481 @@
+# SQL handed to a SQL client that runs inside a container or on another
+# host: docker exec, podman exec, kubectl exec ... -- and the remote line of
+# ssh, with the client named after them (psql, sqlite3, mysql, mariadb,
+# duckdb), by -c, -e, a positional argument, a here-document, a here-string
+# or a pipe from echo. Measured 2026-11-25 with analyze_command: the verdict
+# of the branch before the change is in the comment above each case. The
+# srn-0NN cases are the lines sessions write into a database, an INSERT or
+# UPDATE whose string names the guard (benign); srn-1NN are what the client
+# or the runner runs as a shell (a backslash command, a dot command, system,
+# COPY ... PROGRAM, sh -c, a second command on the line, a pager, a
+# substitution), must_refuse: true with expect: deny. The proof is
+# tests/sql_through_container_and_ssh.rs; read by the differential check.
+# Known limit, not read: SQL that is data on the line can still reach a
+# shell through what the database already holds (a trigger or a user
+# function on the table, plsh and the like); the line does not show it,
+# the same as for the client run here.
+# Nothing in this file is executed.
+cases:
+  # before: deny
+  - id: srn-001
+    category: sql_through_runner_data
+    label: benign
+    input: "ssh crm \"sudo docker exec -i crm-postgres psql -U postgres -d crm -v ON_ERROR_STOP=1\" <<'SQL'\nINSERT INTO product.items (key, title) VALUES ('FP-1', 'agent ran innerwarden disable and the guard refused it');\nSQL"
+  # before: allow
+  - id: srn-002
+    category: sql_through_runner_data
+    label: benign
+    input: "ssh crm \"sudo docker exec -i crm-postgres psql -U postgres -d crm -v ON_ERROR_STOP=1\" < x.sql"
+  # before: deny
+  - id: srn-003
+    category: sql_through_runner_data
+    label: benign
+    input: "docker exec -i crm-postgres psql -U postgres -d crm <<'SQL'\nINSERT INTO t VALUES ('innerwarden disable');\nSQL"
+  # before: deny
+  - id: srn-004
+    category: sql_through_runner_data
+    label: benign
+    input: "sudo docker exec -i crm-postgres psql -U postgres -d crm -v ON_ERROR_STOP=1 <<'SQL'\nUPDATE product.items SET status='fixed' WHERE title LIKE '%systemctl stop innerwarden-agent%';\nSQL"
+  # before: deny
+  - id: srn-005
+    category: sql_through_runner_data
+    label: benign
+    input: "docker exec crm-postgres psql -U postgres -d crm -c \"INSERT INTO t VALUES ('innerwarden disable')\""
+  # before: deny
+  - id: srn-006
+    category: sql_through_runner_data
+    label: benign
+    input: "docker exec -it crm-postgres psql -c \"UPDATE t SET note='innerwarden uninstall' WHERE id=1\""
+  # before: deny
+  - id: srn-007
+    category: sql_through_runner_data
+    label: benign
+    input: "docker exec -u postgres -w /tmp crm-postgres psql -d crm -c \"INSERT INTO t VALUES ('innerwarden disable')\""
+  # before: deny
+  - id: srn-008
+    category: sql_through_runner_data
+    label: benign
+    input: "podman exec -i pg psql -d crm <<'SQL'\nINSERT INTO t VALUES ('innerwarden disable');\nSQL"
+  # before: deny
+  - id: srn-009
+    category: sql_through_runner_data
+    label: benign
+    input: "kubectl exec -i pg-0 -- psql -d crm -c \"INSERT INTO t VALUES ('innerwarden disable')\""
+  # before: deny
+  - id: srn-010
+    category: sql_through_runner_data
+    label: benign
+    input: "kubectl exec -n db pg-0 -c postgres -- psql -d crm <<'SQL'\nINSERT INTO t VALUES ('innerwarden disable');\nSQL"
+  # before: deny
+  - id: srn-011
+    category: sql_through_runner_data
+    label: benign
+    input: "kubectl -n db exec -i pg-0 -- psql -d crm -c \"INSERT INTO t VALUES ('innerwarden disable')\""
+  # before: deny
+  - id: srn-012
+    category: sql_through_runner_data
+    label: benign
+    input: "ssh crm \"psql -d crm -c \\\"INSERT INTO t VALUES ('innerwarden disable')\\\"\""
+  # before: deny
+  - id: srn-013
+    category: sql_through_runner_data
+    label: benign
+    input: "ssh crm psql -d crm <<'SQL'\nINSERT INTO t VALUES ('innerwarden disable');\nSQL"
+  # before: deny
+  - id: srn-014
+    category: sql_through_runner_data
+    label: benign
+    input: "ssh -p 2222 crm \"sudo docker exec -i crm-postgres psql -U postgres -d crm\" <<< \"INSERT INTO t VALUES ('innerwarden disable')\""
+  # before: deny
+  - id: srn-015
+    category: sql_through_runner_data
+    label: benign
+    input: "echo \"INSERT INTO t VALUES ('innerwarden disable')\" | docker exec -i crm-postgres psql -d crm"
+  # before: deny
+  - id: srn-016
+    category: sql_through_runner_data
+    label: benign
+    input: "docker exec -i db mysql -e \"INSERT INTO t VALUES ('innerwarden disable')\""
+  # before: deny
+  - id: srn-017
+    category: sql_through_runner_data
+    label: benign
+    input: "docker exec app sqlite3 /data/notes.db \"INSERT INTO notes VALUES ('innerwarden disable')\""
+  # before: allow
+  - id: srn-018
+    category: sql_through_runner_data
+    label: benign
+    input: "docker exec -i crm-postgres psql -c 'select 1'"
+  # before: deny
+  - id: srn-019
+    category: sql_through_runner_data
+    label: benign
+    input: "ssh crm psql -f - <<'SQL'\nINSERT INTO t VALUES ('innerwarden disable');\nSQL"
+  # before: deny
+  - id: srn-020
+    category: sql_through_runner_data
+    label: benign
+    input: "docker exec -i c psql -f /dev/stdin <<'SQL'\nINSERT INTO t VALUES ('innerwarden disable');\nSQL"
+  # before: deny
+  - id: srn-021
+    category: sql_through_runner_data
+    label: benign
+    input: "ssh crm \"sudo -u postgres psql -c \\\"INSERT INTO t VALUES ('innerwarden disable')\\\"\""
+  # before: deny
+  - id: srn-022
+    category: sql_through_runner_data
+    label: benign
+    input: "ssh crm docker exec -i c psql <<'SQL'\nINSERT INTO t VALUES ('innerwarden disable');\nSQL"
+  # before: deny
+  - id: srn-023
+    category: sql_through_runner_data
+    label: benign
+    input: "kubectl exec -it pg-0 -- sudo -u postgres psql -c \"INSERT INTO t VALUES ('innerwarden disable')\""
+  # before: deny
+  - id: srn-024
+    category: sql_through_runner_data
+    label: benign
+    input: "ssh crm \"kubectl exec pg-0 -- psql -c \\\"INSERT INTO t VALUES ('innerwarden disable')\\\"\""
+  # before: deny
+  - id: srn-101
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec crm-postgres psql -c '\\! innerwarden disable'"
+  # before: deny
+  - id: srn-102
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec -i crm-postgres psql <<'SQL'\n\\! innerwarden disable\nSQL"
+  # before: deny
+  - id: srn-103
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"sudo docker exec -i crm-postgres psql -d crm\" <<'SQL'\n\\! innerwarden disable\nSQL"
+  # before: deny
+  - id: srn-104
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"sudo docker exec -i crm-postgres psql -d crm -c '\\! innerwarden disable'\""
+  # before: deny
+  - id: srn-105
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "kubectl exec pg-0 -- psql -c \"COPY t FROM PROGRAM 'innerwarden disable'\""
+  # before: deny
+  - id: srn-106
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec app sqlite3 db '.shell innerwarden disable'"
+  # before: deny
+  - id: srn-107
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "podman exec -i db mysql -e 'system innerwarden disable'"
+  # before: deny
+  - id: srn-108
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "echo '\\! innerwarden disable' | docker exec -i crm-postgres psql"
+  # before: deny
+  - id: srn-109
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec crm-postgres sh -c \"psql -c \\\"INSERT INTO t VALUES ('innerwarden disable')\\\"\""
+  # before: deny
+  - id: srn-110
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec -i crm-postgres bash <<'X'\ninnerwarden disable\nX"
+  # before: deny
+  - id: srn-111
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec crm-postgres innerwarden disable"
+  # before: deny
+  - id: srn-112
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm innerwarden disable"
+  # before: deny
+  - id: srn-113
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"innerwarden disable\""
+  # before: deny
+  - id: srn-114
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql -d crm -c \\\"INSERT INTO t VALUES ('x')\\\"; innerwarden disable\""
+  # before: deny
+  - id: srn-115
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql -d crm -c \\\"INSERT INTO t VALUES ('x')\\\" && innerwarden disable\""
+  # before: deny
+  - id: srn-116
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"sudo docker exec -i crm-postgres psql -d crm\" <<'SQL'\nINSERT INTO t VALUES ('x');\nSQL\ninnerwarden disable"
+  # before: deny
+  - id: srn-117
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec -i crm-postgres psql -c \"INSERT INTO t VALUES ('x')\"; innerwarden disable"
+  # before: deny
+  - id: srn-118
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec crm-postgres psql -c \"INSERT INTO t VALUES ('innerwarden disable')\" > x.sh && sh x.sh"
+  # before: deny
+  - id: srn-119
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec -e PSQL_PAGER='innerwarden disable' crm-postgres psql -c \"INSERT INTO t VALUES ('x')\""
+  # before: deny
+  - id: srn-120
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"PAGER='innerwarden disable' psql -c \\\"select 1\\\"\""
+  # before: deny
+  - id: srn-121
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh -o ProxyCommand='innerwarden disable' crm psql -c 'select 1'"
+  # before: deny
+  - id: srn-122
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec crm-postgres psql -c \"select sys_exec('innerwarden disable')\""
+  # before: deny
+  - id: srn-123
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql -o '|innerwarden disable' -c 'select 1'\""
+  # before: deny
+  - id: srn-124
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec crm-postgres psql -o '|innerwarden disable' -c \"INSERT INTO t VALUES ('innerwarden disable')\""
+  # before: deny
+  - id: srn-125
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec db mysql --pager='innerwarden disable' -e \"INSERT INTO t VALUES ('x')\""
+  # before: deny
+  - id: srn-126
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec crm-postgres psql -c \"INSERT INTO t VALUES ('innerwarden disable')\" -c '\\! innerwarden disable'"
+  # before: deny
+  - id: srn-127
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql -c \\\"INSERT INTO t VALUES ('innerwarden disable')\\\" -c '\\! innerwarden disable'\""
+  # before: deny
+  - id: srn-128
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec crm-postgres psql -c '\\! rm -rf ~'"
+  # before: deny
+  - id: srn-129
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql -c \\\"INSERT INTO t VALUES ('x')\\\"\" ; rm -rf ~"
+  # before: deny
+  - id: srn-130
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"sudo docker exec -i c psql -c \\\"\\\\! innerwarden disable\\\"\""
+  # before: deny
+  - id: srn-131
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"inner\"\"warden disable\""
+  # before: deny
+  - id: srn-132
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm psql -c \"'\\! innerwarden disable'\""
+  # before: deny
+  - id: srn-133
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec c psql -c \"INSERT INTO t VALUES ('$(innerwarden disable)')\""
+  # before: deny
+  - id: srn-134
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql -c \\\"INSERT INTO t VALUES ('\\$(innerwarden disable)')\\\"\""
+  # before: deny
+  - id: srn-135
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "kubectl exec pg-0 -- sh -c \"psql -c \\\"INSERT INTO t VALUES ('innerwarden disable')\\\"\""
+  # before: deny
+  - id: srn-136
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "kubectl exec pg-0 -- innerwarden disable"
+  # before: deny
+  - id: srn-137
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec c sqlite3 db -cmd '.shell innerwarden disable' \"INSERT INTO t VALUES ('x')\""
+  # before: deny
+  - id: srn-138
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql -c \\\"INSERT INTO t VALUES ('x')\\\"\" && ssh crm \"innerwarden disable\""
+  # before: deny
+  - id: srn-139
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh -t crm \"cat ~/.ssh/id_ed25519\""
+  # before: deny
+  - id: srn-140
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql -c \\\"select 'innerwarden disable'\\\"\" | sh"
+  # before: deny
+  - id: srn-141
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec -i c psql < <(echo '\\! innerwarden disable')"
+  # before: deny
+  - id: srn-142
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql\" < <(echo '\\! innerwarden disable')"
+  # before: deny
+  - id: srn-143
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm psql < <(printf '%s\n' '\\! innerwarden disable')"
+  # before: deny
+  - id: srn-144
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql -c \\\"INSERT INTO t VALUES ('x')\\\"\" < <(echo '\\! innerwarden disable')"
+  # before: deny
+  - id: srn-145
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "docker exec -i c psql <<SQL\nINSERT INTO t VALUES ('$(innerwarden disable)');\nSQL"
+  # before: deny
+  - id: srn-146
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm psql <<SQL\nINSERT INTO t VALUES ('$(innerwarden disable)');\nSQL"
+  # before: deny
+  - id: srn-147
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "$(docker exec c psql -tAc \"select 'innerwarden disable'\")"
+  # before: deny
+  - id: srn-148
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm psql -tAc \"\\\"select 'innerwarden disable'\\\"\" '|' sh"
+  # before: deny
+  - id: srn-149
+    category: sql_through_runner_shell
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ssh crm \"psql && bash\" <<'SQL'\nINSERT INTO t VALUES ('x');\ninnerwarden disable\nSQL"
