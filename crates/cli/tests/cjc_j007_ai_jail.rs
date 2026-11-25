@@ -736,7 +736,7 @@ fn without_the_identity_flag_no_record_is_written_and_nothing_changes() {
     // which of the project's Claude Code files were not there
     // (`<folder>.run.<pid>`, beside the folder, out of the jail's reach) is
     // taken away as the launch ends cleanly, and a jail that made nothing
-    // leaves no `<folder>.made` (T-109; before, a `<folder>.absent` stayed).
+    // leaves no `<folder>.made` (before, a `<folder>.absent` stayed).
     let projects: Vec<_> = std::fs::read_dir(state.join("jail-claude"))
         .expect("this project's folder for Claude Code's settings file")
         .map(|e| e.unwrap().path())
@@ -4515,7 +4515,7 @@ fn what_a_jail_writes_in_the_projects_claude_files_never_reaches_the_host() {
         err.contains("settings.local.json appeared while a jail ran"),
         "{err}"
     );
-    // T-109 item 1: the launch does not end in success.
+    // The launch does not end in success.
     assert_eq!(made.status.code(), Some(3), "{err}");
     let next = jail_sh(false, h, a, "echo STARTED");
     let err = String::from_utf8_lossy(&next.stderr);
@@ -4719,7 +4719,7 @@ fn the_folder_claude_config_dir_names_is_never_written_in_the_jail() {
     assert!(!text.contains("WROTE") && !text.contains("MADE"), "{text}");
 }
 
-/// T-109, items 1 and 3: a file the person makes in the project between two
+/// A file the person makes in the project between two
 /// runs (hooks of their own) is theirs, and the next jail starts; one a jail
 /// makes during its run (MCP servers) ends that launch with exit status 3,
 /// refuses the next start naming how to accept it, and once the person
@@ -4899,7 +4899,7 @@ fn claude_codes_own_folder_is_made_only_by_a_real_launch() {
     // cleanly: the launch's note of which of the project's Claude Code files
     // were not there (`<folder>.run.<pid>`, beside the folder, out of the
     // jail's reach) is taken away at its end, and a jail that made nothing
-    // leaves no `<folder>.made` (T-109; before, `<folder>.absent` stayed).
+    // leaves no `<folder>.made` (before, `<folder>.absent` stayed).
     let entries = |h: &std::path::Path| -> Vec<std::path::PathBuf> {
         std::fs::read_dir(h.join(".local/state/innerwarden/jail-claude"))
             .map(|dir| dir.map(|e| e.unwrap().path()).collect())

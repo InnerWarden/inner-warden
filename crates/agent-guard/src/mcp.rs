@@ -5828,6 +5828,10 @@ fn analyze_command_as_read(
             });
             score += 50;
         } else if crate::threats::destructive_rm_credentials(&lower)
+            || threats::interpreter_code_removes_credentials(scan_cmd)
+            || crate::shell::interpreter_input_as_inline_code(cmd)
+                .iter()
+                .any(|code| threats::interpreter_code_removes_credentials(code))
             || {
                 let normalized = threats::normalize_command(&lower);
                 normalized != lower && crate::threats::destructive_rm_credentials(&normalized)

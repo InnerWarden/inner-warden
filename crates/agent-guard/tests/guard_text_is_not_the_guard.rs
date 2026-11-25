@@ -212,9 +212,9 @@ fn a_kill_beside_a_folder_named_for_the_guard_is_not_disabling_it() {
 #[test]
 fn paths_and_text_that_name_the_guard_stay_allowed() {
     assert_allowed(&[
-        "cd ~/innerwarden/wt-T-002 && git log --oneline -3 && echo $(git rev-parse HEAD)",
+        "cd ~/innerwarden/wt-a && git log --oneline -3 && echo $(git rev-parse HEAD)",
         "cd ~/innerwarden/wt && SHA=$(git rev-parse HEAD) && echo $SHA",
-        "mkdir -p ~/iwt-journal && D=$(date -u +%Y-%m-%dT%H:%MZ) && SHA=$(git -C ~/innerwarden/inner-warden rev-parse --short HEAD) && echo \"$D $SHA\" >> ~/iwt-journal/T-003.md",
+        "mkdir -p ~/notes && D=$(date -u +%Y-%m-%dT%H:%MZ) && SHA=$(git -C ~/innerwarden/inner-warden rev-parse --short HEAD) && echo \"$D $SHA\" >> ~/notes/today.md",
         "ls /opt/innerwarden/ && x=$(ls /opt/innerwarden | wc -l)",
         "sed -i 's#~/.config/innerwarden/hook.sh#X#' notes.md",
         "git commit -F - <<'MSG'\nGuard: read text as text\n\nThe at job runs at 5pm; innerwarden disarm stays refused.\nMSG",
@@ -289,5 +289,47 @@ fn the_guard_run_by_path_variable_or_built_words_stays_refused() {
         "tmux send-keys -t innerwarden \"innerwarden monitor\" Enter",
         "cat <<EOF | sh\n$(innerwarden monitor)\nEOF",
         "git commit -F - <<MSG\n$(innerwarden monitor)\nMSG",
+    ]);
+}
+
+/// A worktree kept under a project's `.worktrees`, or named through
+/// `$HOME`, in a folder whose name holds the guard's, is a work folder:
+/// `git worktree remove` of one is not disabling the guard. Measured
+/// 2026-11-24 on main 30ce33d: each line was a deny for "disable
+/// InnerWarden (flags between verb and target)"; the same worktree named
+/// through `~` with no hidden folder was already a review.
+///
+/// FAILS ON REVERT of `hidden_part` (the `.worktrees` lines) or of
+/// `home_kept` in `reads_whole` (the `$HOME` lines), mention.rs: each
+/// is a deny again.
+#[test]
+fn a_worktree_in_a_folder_named_for_the_guard_is_not_disabling_it() {
+    for line in [
+        "git worktree remove --force ~/github/_innerwarden/.worktrees/t219",
+        "git worktree remove ~/github/_innerwarden/.worktrees/t219",
+        "cd ~/github/_innerwarden/inner-warden && git worktree remove --force ~/github/_innerwarden/.worktrees/t219 && git branch -D t219",
+        "git worktree remove --force $HOME/innerwarden/wt-review",
+        "git -C $HOME/innerwarden/inner-warden worktree remove --force $HOME/innerwarden/wt-review",
+    ] {
+        assert_eq!(verdict(line).0, "review", "{line}");
+    }
+    // The guard's own places, its programs and its name stay refused,
+    // through `.worktrees` and through `$HOME`, and so does a `$HOME`
+    // the line points somewhere else first.
+    assert_denied(&[
+        "git worktree remove --force ~/.config/innerwarden",
+        "git worktree remove --force ~/.local/bin/innerwarden",
+        "git worktree remove /etc/innerwarden",
+        "git worktree remove --force /var/lib/innerwarden",
+        "git worktree remove --force $HOME/.config/innerwarden",
+        "git worktree remove --force $HOME/innerwarden",
+        "git worktree remove --force ~/github/_innerwarden/.worktrees/innerwarden",
+        "git worktree remove --force ~/github/_innerwarden/.worktrees/../../.config/innerwarden",
+        "git worktree remove --force ~/.worktrees/.config/innerwarden",
+        "HOME=/etc; git worktree remove --force $HOME/innerwarden/wt-review",
+        "export HOME=/etc && git worktree remove --force $HOME/innerwarden/x",
+        "rm -rf $HOME/.config/innerwarden",
+        "systemctl --user disable --now innerwarden-agent",
+        "pkill -9 innerwarden-agent",
     ]);
 }

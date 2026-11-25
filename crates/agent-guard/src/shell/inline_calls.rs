@@ -338,6 +338,10 @@ fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
         },
         Lang::Lua => match callee {
             "os.execute" | "io.popen" => Line,
+            // luaposix: `posix.spawn({words})`, `posix.spawn("line")` or
+            // `posix.spawn("prog", "arg", ...)`. Its `exec` is held by name,
+            // as every `exec(` is.
+            "posix.spawn" => LineOrWords,
             "load" | "loadstring" => Code,
             "dofile" | "loadfile" | "require" => Load,
             "pcall" => Callback(0),
@@ -418,6 +422,8 @@ const CALL_THROUGH_VALUE: &[(Lang, &str, Head)] = &[
     (Lang::Lua, "_ENV[", Head::Indexed),
     (Lang::Lua, "os[", Head::Indexed),
     (Lang::Lua, "io[", Head::Indexed),
+    (Lang::Lua, "package.loaded[", Head::Indexed),
+    (Lang::Lua, "require(", Head::Indexed),
 ];
 
 /// The names, by language, that hold the functions a process is started
@@ -425,13 +431,18 @@ const CALL_THROUGH_VALUE: &[(Lang, &str, Head)] = &[
 const SINK_HOLDERS: &[(Lang, &str)] = &[
     (Lang::Lua, "os"),
     (Lang::Lua, "io"),
+    (Lang::Lua, "posix"),
     (Lang::Lua, "_G"),
     (Lang::Lua, "_ENV"),
 ];
 
 /// The prefixes, by language, that name the table every global stands
 /// in: `_G.os.execute` is `os.execute`.
-const GLOBAL_TABLES: &[(Lang, &str)] = &[(Lang::Lua, "_G."), (Lang::Lua, "_ENV.")];
+const GLOBAL_TABLES: &[(Lang, &str)] = &[
+    (Lang::Lua, "_G."),
+    (Lang::Lua, "_ENV."),
+    (Lang::Lua, "package.loaded."),
+];
 
 /// What a load from each scheme runs, by language: PHP's `php://input`
 /// is the code sent on stdin, `expect://` a line run by a shell.
@@ -1290,6 +1301,7 @@ fn normalized_code(lang: Lang, code: &str) -> String {
                         .then(|| format!("{object}.{name}"))
                 });
             }
+            text = lua_required_modules(&text);
             text = lua_literal_indexes(&text);
         }
         _ => {}
@@ -1428,6 +1440,82 @@ fn ruby_written_name(argument: &str) -> Option<&str> {
 /// Whether `inner` is one string in plain quotes and nothing else.
 fn whole_literal(inner: &str) -> bool {
     simple_quoted(inner.trim()).is_some_and(|(_, rest)| rest.trim().is_empty())
+}
+
+/// Whether a Lua name is a table of the functions a process is started
+/// with ([`SINK_HOLDERS`]).
+fn is_lua_sink_holder(name: &str) -> bool {
+    SINK_HOLDERS
+        .iter()
+        .any(|&(lang, held)| lang == Lang::Lua && held == name)
+}
+
+/// Lua's `require` of a module written out, outside strings: one that
+/// holds the functions a process is started with is that table
+/// (`require("os").execute`, `require "io"`, `(require 'os')` are `os.execute`,
+/// `io`, `os`); `require (m)` is written `require(m)`, read as an index
+/// ([`Head::Indexed`]). Any other module is left as it is written.
+fn lua_required_modules(code: &str) -> String {
+    const WORD: &str = "require";
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if matches!(byte, b'\'' | b'"') {
+            let end = quoted_end(&code[at + 1..], byte as char, true)
+                .map_or(code.len(), |end| at + end + 2);
+            out.push_str(&code[at..end]);
+            at = end;
+            continue;
+        }
+        let word_end = at + WORD.len();
+        if code[at..].starts_with(WORD)
+            && starts_a_call(code, at)
+            && bytes.get(word_end).is_none_or(|&b| !is_name_byte(b))
+        {
+            let after = code[word_end..].trim_start();
+            let bracketed = after.strip_prefix('(').map(str::trim_start);
+            let module = match bracketed {
+                Some(inner) => simple_quoted(inner).and_then(|(name, rest)| {
+                    rest.trim_start().strip_prefix(')').map(|rest| (name, rest))
+                }),
+                None => simple_quoted(after).or_else(|| lua_long_bracket(after)),
+            };
+            if let Some((name, rest)) = module.filter(|(name, _)| is_lua_sink_holder(name.trim())) {
+                let mut rest = rest;
+                // `(require "os").execute`: the brackets around it group,
+                // they call nothing.
+                let open = out.trim_end().len();
+                let grouped = out[..open].ends_with('(')
+                    && out[..open - 1]
+                        .trim_end()
+                        .bytes()
+                        .next_back()
+                        .is_none_or(|b| {
+                            !is_name_byte(b) && !matches!(b, b')' | b']' | b'"' | b'\'')
+                        });
+                if grouped {
+                    if let Some(closed) = rest.trim_start().strip_prefix(')') {
+                        out.truncate(open - 1);
+                        rest = closed;
+                    }
+                }
+                out.push_str(name.trim());
+                at = code.len() - rest.len();
+                continue;
+            }
+            if bracketed.is_some() {
+                out.push_str("require(");
+                at = code.len() - after.len() + 1;
+                continue;
+            }
+        }
+        let width = code[at..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&code[at..at + width]);
+        at += width;
+    }
+    out
 }
 
 /// Lua's `t["name"]` written as `t.name`, outside strings: `_G["os"]
@@ -2575,9 +2663,20 @@ impl Reader<'_> {
         let open = opener.len();
         let close = open + self.head_closing(&text[open..])?;
         let table = &opener[..open - 1];
-        let name = match self.fold(text[open..close].trim(), FOLD_DEPTH).literal() {
-            Some(key) if is_chain(key.trim()) && !key.contains('.') => {
-                self.callee(&format!("{table}.{}", key.trim()))
+        let key = self.fold(text[open..close].trim(), FOLD_DEPTH);
+        let key = key.literal().map(str::trim);
+        let name = match key {
+            // `require(m)` is the module `m` names: only one that holds the
+            // functions a process is started with is read as a table here;
+            // any other module is the load it is.
+            Some(key) if table == "require" => {
+                if !is_lua_sink_holder(key) {
+                    return None;
+                }
+                key.to_owned()
+            }
+            Some(key) if is_chain(key) && !key.contains('.') => {
+                self.callee(&format!("{table}.{key}"))
             }
             _ => UNREAD.to_string(),
         };
@@ -2589,14 +2688,27 @@ impl Reader<'_> {
     /// a table of them, or [`UNREAD`] for a key not read. A call through
     /// the name reaches it.
     fn lua_index_name(&self, expression: &str) -> Option<String> {
-        let (name, length) = self.lua_indexed(expression)?;
-        if !expression[length..].trim().is_empty() {
+        let (mut name, length) = self.lua_indexed(expression)?;
+        // `require(m).execute`: the function of the table the index reaches.
+        let mut rest = expression[length..].trim();
+        while let Some(field) = rest.strip_prefix('.') {
+            let field_end = field
+                .bytes()
+                .position(|b| !is_name_byte(b))
+                .unwrap_or(field.len());
+            if field_end == 0 {
+                return None;
+            }
+            if !name.contains(UNREAD) {
+                name = self.callee(&format!("{name}.{}", &field[..field_end]));
+            }
+            rest = field[field_end..].trim_start();
+        }
+        if !rest.is_empty() {
             return None;
         }
-        let holder = SINK_HOLDERS
-            .iter()
-            .any(|&(lang, held)| lang == Lang::Lua && held == name);
-        (name.contains(UNREAD) || holder || sink_of(Lang::Lua, &name).is_some()).then_some(name)
+        (name.contains(UNREAD) || is_lua_sink_holder(&name) || sink_of(Lang::Lua, &name).is_some())
+            .then_some(name)
     }
 
     /// PHP calls a string as the function it names: `"system"(...)`,
@@ -3153,10 +3265,13 @@ impl Reader<'_> {
             }
             Sink::LineOrWords => {
                 // An environment first (Ruby's `{ "A" => "b" }`) and options
-                // last (`chdir: "/"`) are not the command.
+                // last (`chdir: "/"`) are not the command. In Lua a table is
+                // the program and its arguments.
                 let values: Vec<Value> = positional
                     .iter()
-                    .filter(|part| !part.starts_with('{') && !ruby_option(part))
+                    .filter(|part| {
+                        self.lang == Lang::Lua || (!part.starts_with('{') && !ruby_option(part))
+                    })
                     .map(|part| self.fold(part, FOLD_DEPTH))
                     .collect();
                 match values.as_slice() {

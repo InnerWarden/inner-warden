@@ -117,7 +117,7 @@ impl Host {
     }
 }
 
-/// T-109, review of #361 item 2: the launcher's notes of what a jail made in
+/// Review of #361 item 2: the launcher's notes of what a jail made in
 /// a project (`~/.local/state/innerwarden/jail-claude/<key>.made`, the run
 /// notes beside it) and that whole folder are held as the guard's own
 /// settings are: an agent outside the jail that took `.made` away would let
@@ -169,7 +169,7 @@ fn the_launchers_notes_of_what_a_jail_made_are_out_of_the_agents_reach() {
     }
 }
 
-/// T-109, review of #361 item 5: interpreter code that writes the project's
+/// Review of #361 item 5: interpreter code that writes the project's
 /// `.mcp.json` is refused as the shell and the file tools are.
 #[test]
 fn interpreter_code_that_writes_the_projects_mcp_file_is_refused() {
@@ -188,7 +188,7 @@ fn interpreter_code_that_writes_the_projects_mcp_file_is_refused() {
     assert!(through.is_empty(), "let through:\n{}", through.join("\n"));
 }
 
-/// T-109, review of #361 item 7: accepting what a jail made is the person's;
+/// Review of #361 item 7: accepting what a jail made is the person's;
 /// the agent's `contain --accept-project-files` is refused under every name
 /// and wrapper of the program.
 #[test]
