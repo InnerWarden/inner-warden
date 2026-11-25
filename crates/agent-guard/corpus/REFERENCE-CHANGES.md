@@ -484,4 +484,6 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   function, or a string inside a function that is not a plain value is
   read as before, every word of it as a shell line; held by
   `tests/sql_text_is_data.rs`, whose allowed lines fail on revert. No
-  other line of any corpus moved.
+  other line of any corpus moved. harmless-proven: own-work/own-027
+  goes from deny to allow for the reason above: the client stores the
+  string and nothing on the line runs it.
