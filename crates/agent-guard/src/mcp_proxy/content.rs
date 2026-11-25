@@ -2109,6 +2109,11 @@ pub(crate) enum ReadPlace {
     /// place (a blob read decoded, a value read serialized, the fields of a
     /// link): it goes whole.
     Whole(String),
+    /// A number at the top of a message (a request's `maxTokens` or
+    /// `temperature`): it holds no text for the model, so it stays wherever
+    /// it falls, and a request held back in part is still one the client
+    /// can run.
+    Setting(String),
     /// The whole result, read serialized (a shape not recognised).
     Result,
 }

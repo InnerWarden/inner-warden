@@ -26,8 +26,9 @@
 //! answer are masked before the client sees them (see
 //! [`classify_server_line_in`]), text in a listing or in the server's
 //! instructions that carries orders for the model is withheld from the client
-//! (see `withhold_poisoned_descriptions`), the part of a tool result or a
-//! resource past what the proxy reads is held back (see `withhold_unread`),
+//! (see `withhold_poisoned_descriptions`), the part of a tool result, a
+//! resource, a prompt or a message the server asks the client to complete
+//! past what the proxy reads is held back (see `withhold_unread`),
 //! and a server line the proxy cannot read is refused rather than forwarded
 //! unread (see `server_output`).
 //!
@@ -845,22 +846,31 @@ fn classify_server_line_in(
     }
 }
 
-/// In a mode that blocks, hold back the part of an answer to a `tools/call`
-/// or a `resources/read` that the router does not read
-/// ([`super::router::withhold_unread_tail`]): what was not read never reaches
-/// the model. `message` is the answer as it goes on; `env` the same answer as
-/// routed. Returns how many bytes were held back, `None` when none were.
+/// In a mode that blocks, hold back the part the router does not read
+/// ([`super::router::withhold_unread_tail`]) of an answer to a `tools/call`,
+/// a `resources/read` or a `prompts/get`, and of the messages a server's
+/// `sampling/createMessage` asks the client to complete: what was not read
+/// never reaches the model. `message` is the message as it goes on; `env`
+/// the same message as routed. Returns how many bytes were held back, `None`
+/// when none were.
 fn withhold_unread(
     message: &mut Value,
     env: &JsonRpcEnvelope,
     map: &IdRequestMap,
 ) -> Option<usize> {
-    if env.method.is_some() {
-        return None;
-    }
-    let method = map.get(&map.key(env.id.as_ref()?))?.method.clone();
-    let result = message.as_object_mut()?.get_mut("result")?;
-    super::router::withhold_unread_tail(&method, result)
+    let (method, part) = match env.method.as_deref() {
+        Some(method @ "sampling/createMessage") => (method.to_string(), "params"),
+        Some(_) => return None,
+        None => {
+            let method = &map.get(&map.key(env.id.as_ref()?))?.method;
+            match method.as_str() {
+                "tools/call" | "resources/read" | "prompts/get" => (method.clone(), "result"),
+                _ => return None,
+            }
+        }
+    };
+    let held = message.as_object_mut()?.get_mut(part)?;
+    super::router::withhold_unread_tail(&method, held)
 }
 
 /// Say, on the finding that an answer was read only in part

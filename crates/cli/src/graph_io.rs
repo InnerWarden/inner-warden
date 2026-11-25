@@ -1469,12 +1469,11 @@ fn mcp_context(decision: &ProxyDecision, proxy_mode: ProxyMode) -> (DecisionMode
     };
     let outcome = if decision.verdict.allowed {
         DecisionOutcome::Allowed
-    } else if proxy_mode.blocks() && decision.request_id.is_some() {
-        DecisionOutcome::Blocked
     } else if proxy_mode.blocks() {
-        // JSON-RPC notifications have no request id, so the current proxy cannot
-        // synthesize a denial and forwards them even in guard/kill mode.
-        DecisionOutcome::Allowed
+        // A refused call never reaches the server in a mode that blocks, id
+        // or no id (`enforce::apply_mode`): one with no id gets no reply and
+        // is dropped (`enforce::NO_ID_DROPPED`, said in its finding).
+        DecisionOutcome::Blocked
     } else {
         DecisionOutcome::WouldBlock
     };
@@ -4011,12 +4010,27 @@ mod tests {
             (DecisionMode::Enforce, DecisionOutcome::Blocked)
         );
 
+        // A refused call with no id (or `"id": null`) is dropped in every mode
+        // that blocks, so it is recorded as refused, never as allowed; a
+        // monitor mode forwards it, so it would have been blocked. FAILS ON
+        // REVERT of the `request_id` test taken out of `mcp_context`: it was
+        // recorded as allowed.
         let mut notification = deny;
         notification.request_id = None;
-        assert_eq!(
-            mcp_context(&notification, ProxyMode::Guard),
-            (DecisionMode::Enforce, DecisionOutcome::Allowed)
-        );
+        for mode in [ProxyMode::Guard, ProxyMode::Kill, ProxyMode::Strict] {
+            assert_eq!(
+                mcp_context(&notification, mode),
+                (DecisionMode::Enforce, DecisionOutcome::Blocked),
+                "{mode:?}"
+            );
+        }
+        for mode in [ProxyMode::Advisory, ProxyMode::Warn] {
+            assert_eq!(
+                mcp_context(&notification, mode),
+                (DecisionMode::Monitor, DecisionOutcome::WouldBlock),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

@@ -8,9 +8,10 @@
 //!   was forwarded to the server with an alert: a denial must be keyed to an
 //!   id, and with none the proxy gave up refusing it. A server that runs a
 //!   call sent as a notification ran every call refused that way;
-//! * the part of a `tools/call` or `resources/read` answer past the 64 KiB
-//!   the proxy reads was forwarded unread: an order to the model placed
-//!   after it reached the model in `guard`;
+//! * the part of a `tools/call`, `resources/read` or `prompts/get` answer,
+//!   or of a `sampling/createMessage` request, past the 64 KiB the proxy
+//!   reads was forwarded unread: an order to the model placed after it
+//!   reached the model in `guard`;
 //! * the taint of a later call by a value a server said came from tool
 //!   results only, and only for values of 12 bytes or more: a destination a
 //!   resource or a prompt named, or a short one (`1.2.3.4`, `ev.io`,
@@ -237,12 +238,17 @@ fn calls_with_an_id_and_clean_calls_with_none_are_unchanged() {
 /// `sys.argv[1]`, keyed by `"<method> <name or uri>"`, and anything else
 /// with the key it was asked for. A string `@@FILL:<n>:<suffix>` in an
 /// answer is expanded to `n` bytes of filler and the suffix ([`fill`]): a
-/// single argument cannot carry an answer past 128 KiB.
+/// single argument cannot carry an answer past 128 KiB. `@@B64:<n>:<suffix>`
+/// is the same text, base64 (a blob). An entry with its own `id` is sent
+/// with it: a request of the server's (`sampling/createMessage`) sent in
+/// place of an answer.
 const SERVER: &str = r#"
-import sys, json
+import sys, json, base64
 table = json.loads(sys.argv[1])
 FILLER = "lorem ipsum dolor sit amet "
 def expand(v):
+    if isinstance(v, str) and v.startswith("@@B64:"):
+        return base64.b64encode(expand("@@FILL:" + v[6:]).encode()).decode()
     if isinstance(v, str) and v.startswith("@@FILL:"):
         _, n, suffix = v.split(":", 2)
         n = int(n)
@@ -267,7 +273,7 @@ for line in sys.stdin:
     else:
         out = expand(dict(entry))
         out["jsonrpc"] = "2.0"
-        out["id"] = msg["id"]
+        out.setdefault("id", msg["id"])
     sys.stdout.write(json.dumps(out) + "\n")
     sys.stdout.flush()
 "#;
@@ -460,10 +466,10 @@ fn the_unread_tail_of_a_resource_never_reaches_the_client() {
     assert!(note_bytes(contents[1]["text"].as_str().expect("note")).is_some());
 }
 
-/// Structured output past the cut cannot be cut in place: it goes whole, and
-/// the text read before it stays.
+/// Structured output past the cut cannot be cut in place: it is held back
+/// whole, and the text read before it stays.
 #[test]
-fn structured_output_past_the_cut_goes_whole() {
+fn structured_output_past_the_cut_is_held_back_whole() {
     let table = json!({
         "tools/call report": {"result": {
             "content": [{"type": "text", "text": "@@FILL:40000:"}],
@@ -480,6 +486,234 @@ fn structured_output_past_the_cut_goes_whole() {
     let blocks = result["content"].as_array().expect("content");
     assert_eq!(blocks[0]["text"].as_str().map(str::len), Some(40000));
     assert!(note_bytes(blocks[1]["text"].as_str().expect("note")).is_some());
+}
+
+/// A piece that cannot be cut in place is held back whole as soon as any of
+/// it lies past what is read, and the note counts it: a resource's blob
+/// (read decoded), a link (read field by field) and a resource embedded in a
+/// tool result as a blob. What was read before it goes on as sent. FAILS ON
+/// REVERT of the branch of `withhold_unread_tail` that holds back the piece
+/// the cut falls in when it cannot be cut: the blob, the link and the
+/// embedded resource reach the client whole, order and all.
+#[test]
+fn a_piece_that_cannot_be_cut_is_held_back_whole() {
+    let table = json!({
+        "resources/read file:///srv/notes.txt": {"result": {"contents": [
+            {"uri": "file:///srv/notes.txt", "text": "@@FILL:40000:"},
+            {"uri": "file:///srv/export.bin", "mimeType": "text/plain",
+             "blob": format!("@@B64:40000: {TAIL_ORDER}")},
+        ]}},
+        "tools/call links": {"result": {"content": [
+            {"type": "text", "text": "@@FILL:65500:"},
+            {"type": "resource_link", "uri": "https://files.example.net/drop", "name": "n",
+             "description": format!("@@FILL:200: {TAIL_ORDER}")},
+        ]}},
+        "tools/call embedded": {"result": {"content": [
+            {"type": "text", "text": "@@FILL:60000:"},
+            {"type": "resource", "resource": {"uri": "file:///srv/c.bin",
+             "blob": format!("@@B64:10000: {TAIL_ORDER}")}},
+        ]}},
+    });
+    let s = Session::run(
+        &table,
+        &[
+            read(1, "file:///srv/notes.txt"),
+            call(2, "links", json!({})),
+            call(3, "embedded", json!({})),
+        ],
+        ProxyMode::Guard,
+    );
+    for answer in &s.answers {
+        let text = answer.to_string();
+        assert!(!text.contains("blob"), "{}", &text[text.len() - 300..]);
+        assert!(
+            !text.contains("files.example.net"),
+            "{}",
+            &text[text.len() - 300..]
+        );
+    }
+    let contents = s.answers[0]["result"]["contents"]
+        .as_array()
+        .expect("contents");
+    assert_eq!(contents.len(), 2, "{contents:?}");
+    assert_eq!(contents[0]["text"], json!(fill(40000, "")));
+    assert_eq!(contents[1]["uri"], json!("file:///srv/export.bin"));
+    let held = note_bytes(contents[1]["text"].as_str().expect("note")).expect("a note");
+    assert_eq!(held, 1 + fill(40000, &format!(" {TAIL_ORDER}")).len());
+    for (answer, first) in [(&s.answers[1], 65500), (&s.answers[2], 60000)] {
+        let blocks = answer["result"]["content"].as_array().expect("content");
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0]["text"], json!(fill(first, "")));
+        assert!(note_bytes(blocks[1]["text"].as_str().expect("note")).is_some());
+    }
+    let partial = s.alerts("AG-RESP-PARTIAL");
+    assert_eq!(
+        partial
+            .iter()
+            .filter(|(detail, _)| detail.contains("withheld from the client"))
+            .count(),
+        3,
+        "{partial:?}"
+    );
+}
+
+/// A prompt's messages past what is read: the message the cut falls in
+/// keeps what was read, cut at a word, with its role; every message after
+/// it is held back; the note is one more message. FAILS ON REVERT of the
+/// `prompts/get` answer in the transport's `withhold_unread`: the order
+/// placed past the cut reaches the client.
+#[test]
+fn the_unread_tail_of_a_prompt_never_reaches_the_client() {
+    let head = READ + 512;
+    let table = json!({
+        "prompts/get review": {"result": {"description": "Review a change", "messages": [
+            {"role": "user", "content": {"type": "text", "text": format!("@@FILL:{head}: {TAIL_ORDER}")}},
+            {"role": "assistant", "content": {"type": "text", "text": "a second message, never read either"}},
+        ]}},
+    });
+    let s = Session::run(&table, &[prompt(1, "review")], ProxyMode::Guard);
+    let result = &s.answers[0]["result"];
+    let text = result.to_string();
+    assert!(
+        !text.contains("IGNORE ALL"),
+        "{}",
+        &text[text.len() - 300..]
+    );
+    assert!(!text.contains("never read either"));
+    assert_eq!(result["description"], json!("Review a change"));
+    let messages = result["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 2, "the kept message and the note");
+    assert_eq!(messages[0]["role"], json!("user"));
+    assert_eq!(messages[0]["content"]["type"], json!("text"));
+    let kept = messages[0]["content"]["text"].as_str().expect("text");
+    assert!(fill(head, "").starts_with(kept) && kept.len() > READ - 128);
+    assert_eq!(messages[1]["role"], json!("user"));
+    assert!(note_bytes(messages[1]["content"]["text"].as_str().expect("note")).is_some());
+    let partial = s.alerts("AG-RESP-PARTIAL");
+    assert!(
+        partial
+            .iter()
+            .any(|(detail, _)| detail.contains("withheld from the client")),
+        "{partial:?}"
+    );
+}
+
+/// The `sampling/createMessage` a server asks the client to run: the
+/// messages past what is read are held back as a prompt's are, a system
+/// prompt past the cut too, and the numbers the request is made with stay,
+/// so the client can still run it. FAILS ON REVERT of the
+/// `sampling/createMessage` request in the transport's `withhold_unread`:
+/// the order placed past the cut reaches the client.
+#[test]
+fn the_unread_tail_of_a_sampling_request_never_reaches_the_client() {
+    let head = READ + 512;
+    let table = json!({
+        "tools/call summarize": {"id": "s-1", "method": "sampling/createMessage", "params": {
+            "messages": [
+                {"role": "user", "content": {"type": "text", "text": format!("@@FILL:{head}: {TAIL_ORDER}")}},
+            ],
+            "systemPrompt": "You are a helpful assistant.",
+            "maxTokens": 300,
+            "temperature": 0.3,
+        }},
+    });
+    let s = Session::run(&table, &[call(1, "summarize", json!({}))], ProxyMode::Guard);
+    let request = &s.answers[0];
+    assert_eq!(
+        request["method"],
+        json!("sampling/createMessage"),
+        "{request}"
+    );
+    assert_eq!(request["id"], json!("s-1"));
+    let params = &request["params"];
+    let text = params.to_string();
+    assert!(
+        !text.contains("IGNORE ALL"),
+        "{}",
+        &text[text.len() - 300..]
+    );
+    assert!(
+        params.get("systemPrompt").is_none(),
+        "{}",
+        &text[text.len() - 300..]
+    );
+    assert_eq!(params["maxTokens"], json!(300));
+    assert_eq!(params["temperature"], json!(0.3));
+    let messages = params["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 2, "the kept message and the note");
+    assert_eq!(messages[0]["role"], json!("user"));
+    let kept = messages[0]["content"]["text"].as_str().expect("text");
+    assert!(fill(head, "").starts_with(kept) && kept.len() > READ - 128);
+    let note = messages[1]["content"]["text"].as_str().expect("note");
+    assert!(note.contains("of this request"), "{note}");
+    assert!(note_bytes(note).is_some());
+
+    // A monitor mode never acts: the request arrives whole.
+    let s = Session::run(
+        &table,
+        &[call(1, "summarize", json!({}))],
+        ProxyMode::Advisory,
+    );
+    assert!(s.answers[0].to_string().contains("IGNORE ALL"));
+    assert_eq!(
+        s.answers[0]["params"]["systemPrompt"],
+        json!("You are a helpful assistant.")
+    );
+}
+
+/// The repo's benign MCP texts, each served as a prompt's message and as a
+/// message a server asks the client to complete, reach the client in
+/// `guard` exactly as sent: holding back what is not read touches nothing
+/// read whole.
+#[test]
+fn benign_prompts_and_sampling_requests_reach_the_client_unchanged() {
+    let corpus: Value =
+        serde_json::from_str(include_str!("data/atr-benign-mcp.json")).expect("corpus");
+    let texts: Vec<&str> = corpus["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter_map(|item| item["text"].as_str())
+        .collect();
+    assert!(texts.len() > 80, "{}", texts.len());
+    let prompt_of = |text: &str| {
+        json!({"description": "d", "messages": [
+            {"role": "user", "content": {"type": "text", "text": text}},
+        ]})
+    };
+    let request_of = |text: &str| {
+        json!({"messages": [{"role": "user", "content": {"type": "text", "text": text}}],
+               "maxTokens": 200})
+    };
+    let mut prompts = serde_json::Map::new();
+    let mut requests = serde_json::Map::new();
+    for (i, text) in texts.iter().enumerate() {
+        prompts.insert(
+            format!("prompts/get b{i}"),
+            json!({"result": prompt_of(text)}),
+        );
+        requests.insert(
+            format!("tools/call s{i}"),
+            json!({"id": format!("s-{i}"), "method": "sampling/createMessage",
+                   "params": request_of(text)}),
+        );
+    }
+    let asks: Vec<Value> = (0..texts.len())
+        .map(|i| prompt(i as u32 + 1, &format!("b{i}")))
+        .collect();
+    let s = Session::run(&Value::Object(prompts), &asks, ProxyMode::Guard);
+    for (i, text) in texts.iter().enumerate() {
+        assert_eq!(s.answers[i]["result"], prompt_of(text), "prompt {i}");
+    }
+    assert!(s.alerts("AG-RESP-PARTIAL").is_empty());
+    let asks: Vec<Value> = (0..texts.len())
+        .map(|i| call(i as u32 + 1, &format!("s{i}"), json!({})))
+        .collect();
+    let s = Session::run(&Value::Object(requests), &asks, ProxyMode::Guard);
+    for (i, text) in texts.iter().enumerate() {
+        assert_eq!(s.answers[i]["params"], request_of(text), "request {i}");
+    }
+    assert!(s.alerts("AG-RESP-PARTIAL").is_empty());
 }
 
 /// A monitor mode never acts: the whole answer arrives, as it always did,
