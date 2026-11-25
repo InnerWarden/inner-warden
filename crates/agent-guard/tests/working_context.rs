@@ -603,7 +603,7 @@ fn a_whole_read_of_the_home_is_a_read_of_its_secrets() {
     }
     // A grep of the whole home for a narrow text opens the key too, but
     // prints from it only a line holding that text: a person's call
-    // (`review`), still named by the key, not a hard refusal (T-009 item 4).
+    // (`review`), still named by the key, not a hard refusal.
     for command in ["grep -rn TODO ~/", "grep -rl 'fn main' ~"] {
         let analysis = in_place_at(command, &from_work);
         assert_eq!(analysis.recommendation, "review", "{command}: {analysis:?}");
