@@ -21,10 +21,3 @@ export function hostInstallOf(meta: Pick<DashboardMeta, "active_defence_installe
   if (meta?.active_defence_installed !== true) return undefined;
   return meta.host_install === "pro" || meta.host_install === "free_tier" ? meta.host_install : "unknown";
 }
-
-/** What a sentence calls the host install, as the CLI calls it. */
-export const HOST_INSTALL_NAMES: Record<HostInstall, string> = {
-  pro: "InnerWarden Pro",
-  free_tier: "InnerWarden's host install (free tier, no licence)",
-  unknown: "InnerWarden's host install",
-};

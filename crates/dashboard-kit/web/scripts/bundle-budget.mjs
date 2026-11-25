@@ -11,12 +11,15 @@ import { fileURLToPath } from "node:url";
  * Raising a ceiling is a decision, made here on purpose with its reason in
  * the commit, never by a build that happens to be larger.
  *
- * JS: 610,000 bytes. The v2 pages measured 606,403 at the end of the review
+ * JS: 610,400 bytes. The v2 pages measured 606,403 at the end of the review
  * pass that added this gate, above the 590,000 first planned for v2; the
- * difference is listed for a later trim.
+ * difference is listed for a later trim. Raised from 610,000 to the next
+ * hundred above 610,394, the bundle that names the host install by its
+ * licence (the line at the foot of Protection and the words on a decision
+ * the host made).
  * CSS: 56,000 bytes.
  */
-export const MAX_JS_BYTES = 610_000;
+export const MAX_JS_BYTES = 610_400;
 export const MAX_CSS_BYTES = 56_000;
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");

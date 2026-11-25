@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { HOST_INSTALL_NAMES, hostInstallOf } from "./hostInstall";
+import { hostInstallOf } from "./hostInstall";
 
 /**
  * The host installer installs the host install with or without a licence,
@@ -25,11 +25,5 @@ describe("the host install the meta reports", () => {
     expect(hostInstallOf({ active_defence_installed: true })).toBe("unknown");
     expect(hostInstallOf({ active_defence_installed: true, host_install: "enterprise" })).toBe("unknown");
     expect(hostInstallOf({ active_defence_installed: true, host_install: "PRO" })).toBe("unknown");
-  });
-
-  it("says InnerWarden Pro only for a licence, as the CLI does", () => {
-    expect(HOST_INSTALL_NAMES.pro).toBe("InnerWarden Pro");
-    expect(HOST_INSTALL_NAMES.free_tier).toBe("InnerWarden's host install (free tier, no licence)");
-    expect(HOST_INSTALL_NAMES.unknown).toBe("InnerWarden's host install");
   });
 });

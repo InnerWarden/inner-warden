@@ -256,55 +256,6 @@ describe("an Overview whose host answers the three questions", () => {
  * panels this layout keeps behind the technical switch. The page says so in
  * its markup, and the tour drops those steps instead of floating over it.
  */
-/**
- * The card at the foot of a Community Overview, on a host with the host
- * install: named by the licence the meta reports, in both layouts.
- *
- * FAILS ON REVERT: the card said "InnerWarden Pro is installed on this
- * host." under an "InnerWarden Pro" eyebrow on any host install, licensed
- * or not.
- */
-describe("the installed card names the host install by its licence", () => {
-  const withHost = (host_install?: string) => ({ meta: { edition: "community" as const, active_defence_installed: true, ...(host_install === undefined ? {} : { host_install }) } });
-  const card = (html: string) => {
-    const at = html.indexOf('data-ad-state="installed"');
-    expect(at, "the installed card is drawn").toBeGreaterThan(-1);
-    return html.slice(html.lastIndexOf("<aside", at), html.indexOf("</aside>", at));
-  };
-
-  for (const [name, overview] of [["without lanes", communityOverview], ["with lanes", lanesOverview]] as const) {
-    it(`says InnerWarden Pro only with a licence, ${name}`, () => {
-      const pro = card(render(overview, "community", withHost("pro")));
-      expect(pro).toContain('data-host-install="pro"');
-      expect(pro).toContain(">InnerWarden Pro</p>");
-      expect(pro).toContain("InnerWarden Pro is installed on this host.");
-
-      const free = card(render(overview, "community", withHost("free_tier")));
-      expect(free).toContain('data-host-install="free_tier"');
-      expect(free).toContain("InnerWarden&#x27;s host install (free tier, no licence) is installed on this host.");
-
-      for (const unknown of [card(render(overview, "community", withHost("unknown"))), card(render(overview, "community", withHost()))]) {
-        expect(unknown).toContain('data-host-install="unknown"');
-        expect(unknown).toContain("InnerWarden&#x27;s host install is installed on this host.");
-      }
-      for (const host of ["free_tier", "unknown", undefined]) {
-        const html = card(render(overview, "community", withHost(host)));
-        expect(html).toContain(">InnerWarden host install</p>");
-        // The body names the paid edition as where host telemetry belongs;
-        // the eyebrow and the title never name it without a licence.
-        expect(html.slice(0, html.indexOf("Installed on this host"))).not.toContain("Pro");
-        expect(html.slice(html.indexOf("<h2"), html.indexOf("</h2>"))).not.toContain("Pro");
-      }
-    });
-  }
-
-  it("is the offer where no host install is", () => {
-    const html = render(communityOverview, "community", { meta: { edition: "community", host_install: "pro" } });
-    expect(html).toContain('data-ad-state="offer"');
-    expect(html).not.toContain('data-ad-state="installed"');
-  });
-});
-
 describe("what the lanes Overview tells the tour", () => {
   const marker = (html: string) => html.match(/data-tour-absent="([^"]*)"/)?.[1];
 

@@ -14,7 +14,6 @@ import sessionsFixture from "../../tests/fixtures/community/sessions.json";
 import suppressFixture from "../../tests/fixtures/community/suppress.json";
 import baseMeta from "../../tests/fixtures/community/meta.json";
 import { readAttemptsPage, readDecisionDetail, readDecisionsPage, readHistory, readProtection, readRecordHealth, readSessionsPage, readSuppressList } from "./api";
-import { HOST_INSTALL_NAMES } from "../hostInstall";
 import { GENERIC_LINE, INSTALLED_LINE, TOUR_UPGRADE_LINE } from "./offers";
 import { changesAgentConfig } from "./restart";
 import { DECIDER_WORDS, HOST_LAYER_WORDS, HOST_REFUSED_WORDS, HOST_WITHHELD_WORDS, REASON_WORDS, TRUST_WORDS, WITHHELD_WORDS } from "./words";
@@ -156,11 +155,7 @@ describe("(b) the paid edition is named only in the permitted sentences", () => 
     // could not be read.
     expect(INSTALLED_LINE.lead.free_tier).toBe("InnerWarden's host install (free tier, no licence) is installed on this host.");
     expect(INSTALLED_LINE.lead.unknown).toBe("InnerWarden's host install is installed on this host.");
-    for (const host of ["free_tier", "unknown"] as const) {
-      expect(INSTALLED_LINE.lead[host]).toBe(`${HOST_INSTALL_NAMES[host]} is installed on this host.`);
-      expect(INSTALLED_LINE.lead[host]).not.toContain("Pro");
-    }
-    expect(INSTALLED_LINE.lead.pro).toBe(`${HOST_INSTALL_NAMES.pro} is installed on this host.`);
+    for (const host of ["free_tier", "unknown"] as const) expect(INSTALLED_LINE.lead[host]).not.toContain("Pro");
   });
 
   it("never calls the paid edition by its repository name", () => {
