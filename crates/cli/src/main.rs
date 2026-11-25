@@ -2144,9 +2144,16 @@ fn apply_taint(
         .and_then(|e| e.as_str())
         .unwrap_or("")
         .to_string();
-    let reason = format!(
-        "argument `{value}` did not come from you: it arrived in a result from {tool} earlier in this session"
-    );
+    let reason = if tool == session_store::UNREAD_KEPT_CHANGES {
+        format!(
+            "{value} change(s) kept beside this session's record were left unread before this \
+             answer, so whether an argument arrived in a tool result is not known"
+        )
+    } else {
+        format!(
+            "argument `{value}` did not come from you: it arrived in a result from {tool} earlier in this session"
+        )
+    };
     let joined = if previous.is_empty() {
         reason
     } else {
