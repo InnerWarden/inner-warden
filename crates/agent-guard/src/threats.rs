@@ -6,9 +6,11 @@ mod glob_names;
 mod guard_doubt;
 mod guard_lowering;
 pub(crate) use guard_lowering::lists_only_other_processes;
+mod credential_removal_by_code;
 mod guard_takedown;
 mod instruction_files;
 mod words_after;
+pub(crate) use credential_removal_by_code::interpreter_code_removes_credentials;
 
 pub(crate) use instruction_files::{instruction_file_payloads, names_a_secret, order_reading};
 
@@ -3539,6 +3541,9 @@ pub(crate) fn check_guard_takedown(content: &str) -> Option<(&'static str, u32)>
     }
     if guard_takedown::sed_edits_guard_file(content) {
         return Some((guard_takedown::SED_EDITS_GUARD_FILE, 60));
+    }
+    if guard_takedown::editor_edits_guard_file(content) {
+        return Some((guard_takedown::EDITOR_EDITS_GUARD_FILE, 60));
     }
     guard_takedown::programs_searches_run(content)
         .iter()

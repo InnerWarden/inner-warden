@@ -350,6 +350,164 @@ pub(super) fn sed_edits_guard_file(content: &str) -> bool {
     })
 }
 
+/// What [`editor_edits_guard_file`] says.
+pub(super) const EDITOR_EDITS_GUARD_FILE: &str =
+    "an editor edits a file of the guard in place (its configuration, program or unit)";
+
+/// Whether a word names a file of the guard
+/// ([`INNERWARDEN_SELF_PATHS`], [`INNERWARDEN_INSTALL_PATHS`]).
+fn names_guard_file(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    INNERWARDEN_SELF_PATHS
+        .iter()
+        .chain(INNERWARDEN_INSTALL_PATHS)
+        .any(|place| lower.contains(place))
+}
+
+/// Whether an editor other than `sed` writes a file of the guard in place,
+/// as [`sed_edits_guard_file`] reads `sed -i`: `perl -i` (`-pi`, `-i.bak`),
+/// `ed` and `ex`, `vi`, `vim` and `nvim` (not `-R` nor `view`), and
+/// `awk -i inplace`. Measured 2026-11-24 on the branch: `perl -pi` of
+/// `~/.config/systemd/user/innerwarden-agent.service`, `ed -s`, `ex -sc`,
+/// `vim -c ... -c wq` and `awk -i inplace` of `/etc/innerwarden/guard.toml`
+/// were allowed. Only the files the editor is handed are read, not its
+/// script nor its commands: `vim -c 'r /etc/innerwarden/guard.toml' notes.md`
+/// edits a note.
+pub(super) fn editor_edits_guard_file(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    if !lower.contains("innerwarden") {
+        return false;
+    }
+    read_line(content).commands.iter().any(|command| {
+        let words: Vec<String> = command.words.iter().map(|word| word.text.clone()).collect();
+        let Some(at) = effective_command_index(&words) else {
+            return false;
+        };
+        let program = program_name(&words[at]);
+        let program = program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+        let args = &words[at + 1..];
+        let files = match program {
+            "perl" => perl_in_place_files(args),
+            "ed" | "red" => Some(plain_operands(args, &["-p"])),
+            "ex" | "vi" | "vim" | "nvim" | "gvim" => vim_files(args),
+            "awk" | "gawk" => awk_in_place_files(args),
+            _ => None,
+        };
+        files.is_some_and(|files| files.iter().any(|file| names_guard_file(file)))
+    })
+}
+
+/// The words of a command that are not options, skipping the value of each
+/// option in `takes_value`.
+fn plain_operands<'a>(args: &'a [String], takes_value: &[&str]) -> Vec<&'a String> {
+    let mut files = Vec::new();
+    let mut rest = args.iter();
+    while let Some(word) = rest.next() {
+        if takes_value.contains(&word.as_str()) {
+            rest.next();
+        } else if !word.starts_with('-') && !word.starts_with('+') {
+            files.push(word);
+        }
+    }
+    files
+}
+
+/// The files `perl` edits in place, `None` when it does not edit in place:
+/// `-i` alone or in a cluster (`-pi`, `-pie` takes `e` as its suffix,
+/// `-i.bak`), each file after the script.
+fn perl_in_place_files(args: &[String]) -> Option<Vec<&String>> {
+    let mut in_place = false;
+    let mut script_given = false;
+    let mut operands = Vec::new();
+    let mut rest = args.iter();
+    while let Some(word) = rest.next() {
+        if word == "--" {
+            operands.extend(rest.by_ref());
+            break;
+        }
+        if let Some(flags) = word.strip_prefix('-').filter(|flags| !flags.is_empty()) {
+            for (index, flag) in flags.char_indices() {
+                match flag {
+                    'i' => {
+                        in_place = true;
+                        break;
+                    }
+                    'e' | 'E' => {
+                        script_given = true;
+                        if index + 1 == flags.len() {
+                            rest.next();
+                        }
+                        break;
+                    }
+                    'M' | 'm' | 'I' | 'x' | 'C' | 'd' | 'D' | 'l' | '0' => break,
+                    _ => {}
+                }
+            }
+        } else {
+            operands.push(word);
+        }
+    }
+    if !in_place {
+        return None;
+    }
+    let skip = usize::from(!script_given);
+    Some(operands.into_iter().skip(skip).collect())
+}
+
+/// The files `vi`, `vim` or `ex` opens to edit, `None` when it opens them
+/// read only (`-R`, `-M`).
+fn vim_files(args: &[String]) -> Option<Vec<&String>> {
+    if args.iter().any(|word| word == "-R" || word == "-M") {
+        return None;
+    }
+    Some(plain_operands(
+        args,
+        &[
+            "-c", "--cmd", "-S", "-u", "-U", "-i", "-T", "-w", "-W", "-t", "-q",
+        ],
+    ))
+}
+
+/// The files `awk` edits in place, `None` without `-i inplace`: each
+/// operand after the program text (all of them with `-f` or `-e`).
+fn awk_in_place_files(args: &[String]) -> Option<Vec<&String>> {
+    let mut in_place = false;
+    let mut program_given = false;
+    let mut operands = Vec::new();
+    let mut rest = args.iter();
+    while let Some(word) = rest.next() {
+        let include = if word == "-i" || word == "--include" {
+            rest.next().map(String::as_str)
+        } else {
+            word.strip_prefix("--include=")
+                .or_else(|| word.strip_prefix("-i").filter(|value| !value.is_empty()))
+        };
+        if let Some(include) = include {
+            in_place |= include.starts_with("inplace");
+        } else if matches!(word.as_str(), "-f" | "-e" | "--file" | "--source") {
+            program_given = true;
+            rest.next();
+        } else if matches!(
+            word.as_str(),
+            "-v" | "-F" | "-l" | "--assign" | "--field-separator" | "--load"
+        ) {
+            rest.next();
+        } else if word.starts_with("-f")
+            || word.starts_with("--file=")
+            || word.starts_with("--source=")
+        {
+            program_given = true;
+        } else if !word.starts_with('-') {
+            operands.push(word);
+        }
+    }
+    if !in_place {
+        return None;
+    }
+    let skip = usize::from(!program_given);
+    Some(operands.into_iter().skip(skip).collect())
+}
+
 /// The lines a search runs as a program on each file it reads: `rg --pre
 /// PROG` (`PROG FILE`) and `git grep -O PROG` (`PROG FILE...`), each
 /// with the paths the search names. The program is read as a command, with

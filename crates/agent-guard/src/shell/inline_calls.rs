@@ -338,6 +338,10 @@ fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
         },
         Lang::Lua => match callee {
             "os.execute" | "io.popen" => Line,
+            // luaposix: `posix.spawn({words})`, `posix.spawn("line")` or
+            // `posix.spawn("prog", "arg", ...)`. Its `exec` is held by name,
+            // as every `exec(` is.
+            "posix.spawn" => LineOrWords,
             "load" | "loadstring" => Code,
             "dofile" | "loadfile" | "require" => Load,
             "pcall" => Callback(0),
@@ -427,6 +431,7 @@ const CALL_THROUGH_VALUE: &[(Lang, &str, Head)] = &[
 const SINK_HOLDERS: &[(Lang, &str)] = &[
     (Lang::Lua, "os"),
     (Lang::Lua, "io"),
+    (Lang::Lua, "posix"),
     (Lang::Lua, "_G"),
     (Lang::Lua, "_ENV"),
 ];
@@ -3260,10 +3265,13 @@ impl Reader<'_> {
             }
             Sink::LineOrWords => {
                 // An environment first (Ruby's `{ "A" => "b" }`) and options
-                // last (`chdir: "/"`) are not the command.
+                // last (`chdir: "/"`) are not the command. In Lua a table is
+                // the program and its arguments.
                 let values: Vec<Value> = positional
                     .iter()
-                    .filter(|part| !part.starts_with('{') && !ruby_option(part))
+                    .filter(|part| {
+                        self.lang == Lang::Lua || (!part.starts_with('{') && !ruby_option(part))
+                    })
                     .map(|part| self.fold(part, FOLD_DEPTH))
                     .collect();
                 match values.as_slice() {
