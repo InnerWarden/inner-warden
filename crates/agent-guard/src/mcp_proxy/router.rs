@@ -14,7 +14,7 @@
 
 use serde_json::Value;
 
-use super::content;
+use super::content::{self, ReadPiece, ReadPlace};
 use super::jsonrpc::JsonRpcEnvelope;
 use super::taint::{Provenance, TaintTracker};
 use crate::mcp::{self, Verdict, VerdictAlert};
@@ -86,7 +86,8 @@ pub struct PendingRequest {
 ///
 /// `taint` is the per-connection [`TaintTracker`] owned by the transport (its
 /// only mutable state): a server→client tool-call *result* records its long
-/// tokens, with the [`Provenance`] its tool gives them; a client→server tool
+/// tokens, with the [`Provenance`] its tool gives them (a resource read or a
+/// prompt records them as content); a client→server tool
 /// *call* whose argument is derived from a recorded result token is escalated
 /// (confused-deputy / indirect prompt injection), unless it is a read-only
 /// filesystem call reading back a name the server listed. A token the call
@@ -379,13 +380,14 @@ fn route_server_to_client(
             let read = scanned.len();
             let content = crate::redact::redact_secrets(&scanned).text;
             // What a resource holds reached the model: a value in it is not
-            // one that came from nowhere (`super::effect`).
+            // one that came from nowhere (`super::effect`), and a later call
+            // that carries one was steered by it, as by a tool's result
+            // (`super::taint`).
             if let Some(t) = taint {
                 if read < length {
                     t.seen.note_unread();
-                } else {
-                    t.seen.record(&content);
                 }
+                t.record_result(&content, Provenance::Content);
             }
             ProxyDecision {
                 verdict: inspect_answer(&content, (read, length), engine),
@@ -401,6 +403,16 @@ fn route_server_to_client(
             // A prompt's messages go to the model as the conversation, and
             // a completion is offered as what the person types: read like a
             // tool's answer, and held back whole in a mode that blocks.
+            // A value a prompt hands the model taints a later call that
+            // carries it, as a tool's result does (`super::taint`); its text
+            // is already kept as said (`record_server_text`).
+            if let (Some(t), "prompts/get") = (taint, method) {
+                let read = truncate_on_boundary(json_leaves(result), MAX_SCANNED_RESULT_BYTES);
+                t.record_tokens(
+                    &crate::redact::redact_secrets(&read).text,
+                    Provenance::Content,
+                );
+            }
             ProxyDecision {
                 verdict: inspect_server_text(result, engine),
                 direction: dir.label(),
@@ -443,8 +455,10 @@ fn inspect_server_text(value: &Value, engine: Option<&RuleEngine>) -> Verdict {
 ///
 /// `(read, length)` is how many bytes of the answer were handed here out of
 /// how many it holds ([`MAX_SCANNED_RESULT_BYTES`]). An answer cut there
-/// says so with AG-RESP-PARTIAL, an alert that does not block: what lies
-/// past the cut reaches the model unread.
+/// says so with AG-RESP-PARTIAL, an alert that does not block the answer. In
+/// a mode that never blocks, what lies past the cut reaches the model
+/// unread; in one that blocks, the transport holds it back
+/// ([`withhold_unread_tail`]).
 fn inspect_answer(
     content: &str,
     (read, length): (usize, usize),
@@ -883,13 +897,27 @@ fn truncate_on_boundary(mut s: String, max: usize) -> String {
 /// by [`MAX_SCANNED_RESULT_BYTES`], and returned with the length of the
 /// whole payload, so a cut can be reported.
 fn concat_text_content(result: &Value) -> (String, usize) {
-    let mut parts = Vec::new();
+    let whole = content::join_pieces(&answer_pieces(result));
+    let length = whole.len();
+    (
+        truncate_on_boundary(whole, MAX_SCANNED_RESULT_BYTES),
+        length,
+    )
+}
+
+/// [`concat_text_content`] piece by piece, with where each sits in `result`.
+fn answer_pieces(result: &Value) -> Vec<ReadPiece> {
+    let mut pieces = Vec::new();
+    let mut push = |text: String, place: ReadPlace| pieces.push(ReadPiece { text, place });
     if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
-        for block in content {
+        for (at, block) in content.iter().enumerate() {
             match block.get("type").and_then(|t| t.as_str()) {
                 Some("text") => {
                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
-                        parts.push(text.to_string());
+                        push(
+                            text.to_string(),
+                            ReadPlace::Text(format!("/content/{at}/text")),
+                        );
                     }
                 }
                 // An embedded resource reaches the model as text does, and
@@ -899,14 +927,23 @@ fn concat_text_content(result: &Value) -> (String, usize) {
                         let text =
                             content::resource_text(&serde_json::json!({ "contents": [resource] }));
                         if !text.is_empty() {
-                            parts.push(text);
+                            // Read as its own text, it can be cut there; read
+                            // decoded or serialized, the block goes whole.
+                            let place = if resource.get("text").and_then(Value::as_str)
+                                == Some(text.as_str())
+                            {
+                                ReadPlace::Text(format!("/content/{at}/resource/text"))
+                            } else {
+                                ReadPlace::Whole(format!("/content/{at}"))
+                            };
+                            push(text, place);
                         }
                     }
                 }
                 Some("resource_link") => {
                     for key in ["name", "title", "description", "uri"] {
                         if let Some(text) = block.get(key).and_then(|t| t.as_str()) {
-                            parts.push(text.to_string());
+                            push(text.to_string(), ReadPlace::Whole(format!("/content/{at}")));
                         }
                     }
                 }
@@ -917,14 +954,17 @@ fn concat_text_content(result: &Value) -> (String, usize) {
     // Structured tool output is attacker-influenced too, and is not a text block.
     if let Some(sc) = result.get("structuredContent") {
         if !sc.is_null() {
-            parts.push(match sc.as_str() {
-                Some(s) => s.to_string(),
-                None => sc.to_string(),
-            });
+            match sc.as_str() {
+                Some(s) => push(s.to_string(), ReadPlace::Text("/structuredContent".into())),
+                None => push(
+                    sc.to_string(),
+                    ReadPlace::Whole("/structuredContent".into()),
+                ),
+            }
         }
     }
     // Unrecognised, non-empty shape: scan it rather than pass it through blind.
-    if parts.is_empty() {
+    if pieces.is_empty() {
         let non_empty = match result {
             Value::Object(map) => !map.is_empty(),
             Value::Array(items) => !items.is_empty(),
@@ -932,15 +972,182 @@ fn concat_text_content(result: &Value) -> (String, usize) {
             _ => true,
         };
         if non_empty {
-            parts.push(result.to_string());
+            pieces.push(ReadPiece {
+                text: result.to_string(),
+                place: ReadPlace::Result,
+            });
         }
     }
-    let whole = parts.join("\n");
+    pieces
+}
+
+/// The note put in place of the part of an answer past what is read
+/// ([`withhold_unread_tail`]).
+pub(crate) fn unread_tail_note(bytes: usize) -> String {
+    format!("[InnerWarden withheld the last {bytes} bytes of this answer: they were past what it reads]")
+}
+
+/// In a mode that blocks, hold back the part of a `tools/call` or
+/// `resources/read` `result` past what the router reads
+/// ([`MAX_SCANNED_RESULT_BYTES`]): unread, it would reach the model unread.
+/// Each piece read whole stays as it is; the one the cut falls in is cut back
+/// to the last whitespace before the cut, so no word (a secret, an address)
+/// is left half there, or goes whole when it cannot be cut in place
+/// ([`ReadPlace::Whole`]); every piece after it goes. A short note says how
+/// many bytes were held back ([`unread_tail_note`]), as one more text of the
+/// answer. Returns that number, or `None` when the answer was read whole.
+///
+/// The pieces are the ones the router reads, in the order it reads them
+/// ([`answer_pieces`], [`content::resource_pieces`]), so what is kept is
+/// what was read.
+pub(crate) fn withhold_unread_tail(method: &str, result: &mut Value) -> Option<usize> {
+    let pieces = match method {
+        "tools/call" => answer_pieces(result),
+        "resources/read" => content::resource_pieces(result),
+        _ => return None,
+    };
+    let whole = content::join_pieces(&pieces);
     let length = whole.len();
-    (
-        truncate_on_boundary(whole, MAX_SCANNED_RESULT_BYTES),
-        length,
-    )
+    let read = truncate_on_boundary(whole, MAX_SCANNED_RESULT_BYTES).len();
+    if read >= length {
+        return None;
+    }
+    // Where each piece starts in the text read: one line break between two.
+    let mut starts = Vec::with_capacity(pieces.len());
+    let mut start = 0;
+    for piece in &pieces {
+        starts.push(start);
+        start += piece.text.len() + 1;
+    }
+    // The piece the cut falls in: the first that ends past it.
+    let c = (0..pieces.len()).find(|&i| starts[i] + pieces[i].text.len() > read)?;
+    let mut cut: Option<(String, usize)> = None;
+    let mut gone: Vec<&ReadPlace> = pieces[c + 1..].iter().map(|p| &p.place).collect();
+    // How much of it was read: none when the cut falls on the line break
+    // before it.
+    let into = read.saturating_sub(starts[c]);
+    let at = word_boundary_before(&pieces[c].text, into);
+    let kept = match &pieces[c].place {
+        ReadPlace::Text(pointer) if at > 0 => {
+            cut = Some((pointer.clone(), at));
+            starts[c] + at
+        }
+        place => {
+            // It goes whole, with every piece read from the same entry.
+            gone.insert(0, place);
+            let entry = place_entry(place);
+            let first = (0..=c)
+                .find(|&i| place_entry(&pieces[i].place) == entry)
+                .unwrap_or(c);
+            starts[first].saturating_sub(1)
+        }
+    };
+    let held = length - kept;
+    if let Some((pointer, at)) = cut {
+        if let Some(Value::String(text)) = result.pointer_mut(&pointer) {
+            text.truncate(at);
+        }
+    }
+    let note = unread_tail_note(held);
+    if gone.iter().any(|place| **place == ReadPlace::Result) {
+        *result = match method {
+            "tools/call" => serde_json::json!({"content": [{"type": "text", "text": note}]}),
+            _ => {
+                serde_json::json!({"contents": [{"uri": "", "mimeType": "text/plain", "text": note}]})
+            }
+        };
+        return Some(held);
+    }
+    // Take out what goes, the last first, so each pointer still names its
+    // entry when it is reached.
+    let mut entries: Vec<&str> = gone.iter().filter_map(|place| place_entry(place)).collect();
+    entries.dedup();
+    let uri = resource_uri_near(result, &entries);
+    for pointer in entries.iter().rev() {
+        remove_at(result, pointer);
+    }
+    let (list, entry) = match method {
+        "tools/call" => ("content", serde_json::json!({"type": "text", "text": note})),
+        _ => (
+            "contents",
+            serde_json::json!({"uri": uri, "mimeType": "text/plain", "text": note}),
+        ),
+    };
+    if let Value::Object(map) = result {
+        match map.get_mut(list) {
+            Some(Value::Array(items)) => items.push(entry),
+            _ => {
+                map.insert(list.to_string(), Value::Array(vec![entry]));
+            }
+        }
+    }
+    Some(held)
+}
+
+/// The byte position, at or before `at`, where `text` can be cut without
+/// leaving a word half there: `at` itself when a whitespace follows it,
+/// else the start of the last whitespace before it, else 0.
+fn word_boundary_before(text: &str, at: usize) -> usize {
+    let mut at = at.min(text.len());
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    if at == text.len() || text[at..].starts_with(char::is_whitespace) {
+        return at;
+    }
+    text[..at].rfind(char::is_whitespace).unwrap_or(0)
+}
+
+/// [`entry_of`] for a piece's place; `None` for the whole result.
+fn place_entry(place: &ReadPlace) -> Option<&str> {
+    match place {
+        ReadPlace::Text(pointer) | ReadPlace::Whole(pointer) => Some(entry_of(pointer)),
+        ReadPlace::Result => None,
+    }
+}
+
+/// The entry a piece's pointer names that goes whole when the piece goes:
+/// the content block or resource it is the text of, or the value itself.
+fn entry_of(pointer: &str) -> &str {
+    for list in ["/content/", "/contents/"] {
+        if let Some(rest) = pointer.strip_prefix(list) {
+            let index = rest.split('/').next().unwrap_or(rest);
+            return &pointer[..list.len() + index.len()];
+        }
+    }
+    pointer
+}
+
+/// The `uri` of the first resource of a `resources/read` result among the
+/// entries that go (`gone`), else of its first resource, else empty: the
+/// note held in place of a resource's text names the resource.
+fn resource_uri_near(result: &Value, gone: &[&str]) -> String {
+    gone.iter()
+        .filter_map(|pointer| result.pointer(pointer))
+        .chain(result.pointer("/contents/0"))
+        .find_map(|entry| entry.get("uri").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Remove the entry at `pointer` (an array element or an object key).
+fn remove_at(result: &mut Value, pointer: &str) {
+    let Some((parent, last)) = pointer.rsplit_once('/') else {
+        return;
+    };
+    match result.pointer_mut(parent) {
+        Some(Value::Array(items)) => {
+            if let Ok(index) = last.parse::<usize>() {
+                if index < items.len() {
+                    items.remove(index);
+                }
+            }
+        }
+        Some(Value::Object(map)) => {
+            map.remove(last);
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -1421,6 +1628,121 @@ mod tests {
                 d.verdict.alerts
             );
         }
+    }
+
+    /// What [`withhold_unread_tail`] keeps of `result` (`method`'s answer),
+    /// and how many bytes it says it held back.
+    fn withheld(method: &str, mut result: Value) -> (Value, Option<usize>) {
+        let held = withhold_unread_tail(method, &mut result);
+        (result, held)
+    }
+
+    /// The note an answer ends with, and the bytes it names.
+    fn note_of(entry: &Value) -> usize {
+        let text = entry["text"].as_str().expect("note text");
+        text.strip_prefix("[InnerWarden withheld the last ")
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("not a note: {text}"))
+    }
+
+    /// The cut never leaves a word half there: a secret that straddles it is
+    /// held back whole, from the whitespace before it. What is kept plus what
+    /// is held back is the whole answer. FAILS ON REVERT of the cut back to a
+    /// word (`word_boundary_before`): the key's first bytes reach the client.
+    #[test]
+    fn the_cut_falls_before_a_word_it_would_split() {
+        let key = format!("sk-{}", "lab-reporting-key-7c41d09e2b");
+        let pad = "a ".repeat((MAX_SCANNED_RESULT_BYTES - 6) / 2);
+        let text = format!("{pad}{key} and more");
+        let (kept, held) = withheld(
+            "tools/call",
+            serde_json::json!({"content": [{"type": "text", "text": text}]}),
+        );
+        let first = kept["content"][0]["text"].as_str().expect("text");
+        assert!(!first.contains("sk-"), "{}", &first[first.len() - 20..]);
+        assert!(text.starts_with(first));
+        assert_eq!(held, Some(text.len() - first.len()));
+        assert_eq!(note_of(&kept["content"][1]), text.len() - first.len());
+    }
+
+    /// A piece that cannot be cut in place goes whole: a resource blob read
+    /// decoded, a link whose fields straddle the cut (with the fields of it
+    /// already read), and a result of a shape not recognised, which is
+    /// replaced by the note.
+    #[test]
+    fn a_piece_that_cannot_be_cut_goes_whole() {
+        use base64::Engine as _;
+        let big = "b".repeat(MAX_SCANNED_RESULT_BYTES);
+        let blob = base64::engine::general_purpose::STANDARD.encode(format!("tail {big}"));
+        let (kept, held) = withheld(
+            "resources/read",
+            serde_json::json!({"contents": [
+                {"uri": "docs://a", "text": "read whole"},
+                {"uri": "docs://b", "blob": blob},
+            ]}),
+        );
+        let contents = kept["contents"].as_array().expect("contents");
+        assert_eq!(contents.len(), 2, "{contents:?}");
+        assert_eq!(contents[0]["text"], "read whole");
+        assert_eq!(
+            contents[1]["uri"], "docs://b",
+            "the note names what it holds back"
+        );
+        assert_eq!(held, Some(1 + "tail ".len() + big.len()));
+
+        let fill = "c".repeat(MAX_SCANNED_RESULT_BYTES - 8);
+        let (kept, held) = withheld(
+            "tools/call",
+            serde_json::json!({"content": [
+                {"type": "text", "text": fill},
+                {"type": "resource_link", "uri": "docs://x", "name": "n",
+                 "description": "d".repeat(64)},
+            ]}),
+        );
+        let blocks = kept["content"].as_array().expect("content");
+        assert_eq!(blocks.len(), 2, "{blocks:?}");
+        assert_eq!(blocks[0]["text"].as_str().map(str::len), Some(fill.len()));
+        assert_eq!(held, Some(1 + 1 + 1 + 64 + 1 + "docs://x".len()));
+        assert_eq!(note_of(&blocks[1]), held.expect("held"));
+
+        let (kept, held) = withheld(
+            "tools/call",
+            serde_json::json!({"odd": "e".repeat(MAX_SCANNED_RESULT_BYTES)}),
+        );
+        assert!(
+            kept.get("odd").is_none(),
+            "an unread shape is not forwarded"
+        );
+        assert_eq!(note_of(&kept["content"][0]), held.expect("held"));
+    }
+
+    /// An answer read whole is not touched, and neither is any other method.
+    #[test]
+    fn an_answer_read_whole_is_not_touched() {
+        let short = serde_json::json!({"content": [{"type": "text", "text": "x".repeat(1000)}]});
+        assert_eq!(withheld("tools/call", short.clone()), (short, None));
+        let big = serde_json::json!({"contents": [{"uri": "a", "text": "y".repeat(70 * 1024)}]});
+        assert_eq!(withheld("prompts/get", big.clone()), (big, None));
+    }
+
+    /// The text read is the same before and after the pieces it is made of
+    /// were given their places: one source for what is read and what is cut.
+    #[test]
+    fn the_pieces_join_to_the_text_read() {
+        let result = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "one"},
+                {"type": "resource", "resource": {"uri": "a", "text": "two"}},
+                {"type": "resource_link", "uri": "b", "name": "three"},
+                {"type": "image", "data": "AAAA"},
+            ],
+            "structuredContent": {"four": 4},
+        });
+        assert_eq!(
+            concat_text_content(&result).0,
+            "one\ntwo\nthree\nb\n{\"four\":4}"
+        );
     }
 
     /// An order to set the model's rules aside followed by an action is held

@@ -2096,24 +2096,69 @@ pub fn inspect_resource_read(
 /// non-empty result with neither is scanned whole, as a tool result of an
 /// unknown shape is.
 pub fn resource_text(result: &Value) -> String {
-    let mut parts = Vec::new();
+    join_pieces(&resource_pieces(result))
+}
+
+/// Where one piece of the text an answer is read as sits in the answer
+/// ([`ReadPiece`]), so the part of it past what was read can be held back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReadPlace {
+    /// A string at this JSON pointer, read as it is: it can be cut.
+    Text(String),
+    /// The entry at this JSON pointer, read in a form that cannot be cut in
+    /// place (a blob read decoded, a value read serialized, the fields of a
+    /// link): it goes whole.
+    Whole(String),
+    /// The whole result, read serialized (a shape not recognised).
+    Result,
+}
+
+/// One piece of the text an answer is read as, in the order it is read, and
+/// where it sits in the answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadPiece {
+    pub(crate) text: String,
+    pub(crate) place: ReadPlace,
+}
+
+/// The pieces, one per line, as they are read.
+pub(crate) fn join_pieces(pieces: &[ReadPiece]) -> String {
+    pieces
+        .iter()
+        .map(|piece| piece.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// [`resource_text`] piece by piece, with where each sits in `result`.
+pub(crate) fn resource_pieces(result: &Value) -> Vec<ReadPiece> {
+    let mut pieces = Vec::new();
     if let Some(contents) = result.get("contents").and_then(Value::as_array) {
-        for item in contents {
+        for (at, item) in contents.iter().enumerate() {
             if let Some(text) = item.get("text").and_then(Value::as_str) {
-                parts.push(text.to_string());
+                pieces.push(ReadPiece {
+                    text: text.to_string(),
+                    place: ReadPlace::Text(format!("/contents/{at}/text")),
+                });
             } else if let Some(text) = item
                 .get("blob")
                 .and_then(Value::as_str)
                 .and_then(decoded_text)
             {
-                parts.push(text);
+                pieces.push(ReadPiece {
+                    text,
+                    place: ReadPlace::Whole(format!("/contents/{at}")),
+                });
             }
         }
     }
-    if parts.is_empty() && result.as_object().is_some_and(|map| !map.is_empty()) {
-        parts.push(result.to_string());
+    if pieces.is_empty() && result.as_object().is_some_and(|map| !map.is_empty()) {
+        pieces.push(ReadPiece {
+            text: result.to_string(),
+            place: ReadPlace::Result,
+        });
     }
-    parts.join("\n")
+    pieces
 }
 
 #[cfg(test)]

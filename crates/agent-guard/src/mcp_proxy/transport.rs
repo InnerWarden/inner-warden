@@ -19,14 +19,17 @@
 //!
 //! Default mode is **advisory**: a transparent, alerting pipe. `guard` replies
 //! to the client with a denial instead of forwarding a disallowed `tools/call`
-//! or `resources/read`; `kill` additionally terminates the child. Server-side
+//! or `resources/read` (one with no id, which nothing can answer, is dropped);
+//! `kill` additionally terminates the child. Server-side
 //! findings (poisoned `tools/list`, injected results) are alert-only, with
-//! three exceptions in `guard` and `kill`: secret-shaped values in a server
+//! four exceptions in `guard` and `kill`: secret-shaped values in a server
 //! answer are masked before the client sees them (see
 //! [`classify_server_line_in`]), text in a listing or in the server's
 //! instructions that carries orders for the model is withheld from the client
-//! (see `withhold_poisoned_descriptions`), and a server line the proxy cannot
-//! read is refused rather than forwarded unread (see `server_output`).
+//! (see `withhold_poisoned_descriptions`), the part of a tool result or a
+//! resource past what the proxy reads is held back (see `withhold_unread`),
+//! and a server line the proxy cannot read is refused rather than forwarded
+//! unread (see `server_output`).
 //!
 //! # Lifetime
 //!
@@ -327,7 +330,9 @@ enum ClientAction {
         event: Option<ProxyDecision>,
     },
     /// Reply to the client with `denial` instead of forwarding; always alerts.
-    /// `kill` additionally terminates the child after replying.
+    /// `kill` additionally terminates the child after replying. `denial` is
+    /// empty for a refused request with no id: nothing can answer it, so
+    /// nothing is written, and it is still not forwarded.
     Deny {
         denial: String,
         decision: ProxyDecision,
@@ -525,7 +530,9 @@ fn classify_client_batch(
                 decision,
                 kill: ends,
             } => {
-                replies.push(denial);
+                if !denial.is_empty() {
+                    replies.push(denial);
+                }
                 events.push(decision);
                 refused = true;
                 kill |= ends;
@@ -616,6 +623,11 @@ fn classify_client_message(
     if matches!(action, ProxyAction::Block { .. } | ProxyAction::Kill { .. }) {
         if let Some((key, before)) = pending {
             forget_refused(map, key, before);
+        }
+        // A refused request with no id is dropped: no reply can be keyed to
+        // it, and it never reaches the server. Its record says so.
+        if decision.request_id.is_none() {
+            super::enforce::note_dropped_without_id(&mut decision);
         }
     }
     match action {
@@ -774,17 +786,27 @@ fn classify_server_line_in(
                 (None, Some(id)) => map.answer_context(id),
                 _ => super::content::AnswerContext::default(),
             };
+            // Read whole for secrets first, so a value said again in the
+            // part held back is masked where it is kept too.
             let findings = super::content::scan_answer(&message, context);
+            let held = if mode.blocks() {
+                withhold_unread(&mut message, &env, map)
+            } else {
+                None
+            };
             if !findings.is_empty() {
                 if mode.blocks() {
                     super::content::mask_message(&mut message, &findings);
-                    raw = message.to_string();
                 }
                 secret = Some(findings.alert(mode.blocks()));
             }
+            if mode.blocks() && (held.is_some() || secret.is_some()) {
+                raw = message.to_string();
+            }
+            let event = classify_server_message(&env, engine, map, taint, secret);
             ServerAction::Forward {
                 raw,
-                event: classify_server_message(&env, engine, map, taint, secret),
+                event: note_withheld(event, held),
             }
         }
         ParsedLine::Batch(mut items) => {
@@ -799,12 +821,19 @@ fn classify_server_line_in(
                     _ => super::content::AnswerContext::default(),
                 };
                 let findings = super::content::scan_answer(item, context);
+                let held = if mode.blocks() {
+                    withhold_unread(item, &env, map)
+                } else {
+                    None
+                };
+                rewritten |= held.is_some();
                 let secret = (!findings.is_empty()).then(|| findings.alert(mode.blocks()));
                 if secret.is_some() && mode.blocks() {
                     super::content::mask_message(item, &findings);
                     rewritten = true;
                 }
-                events.extend(classify_server_message(&env, engine, map, taint, secret));
+                let event = classify_server_message(&env, engine, map, taint, secret);
+                events.extend(note_withheld(event, held));
             }
             let raw = if rewritten {
                 Value::Array(items).to_string()
@@ -814,6 +843,42 @@ fn classify_server_line_in(
             ServerAction::ForwardBatch { raw, events }
         }
     }
+}
+
+/// In a mode that blocks, hold back the part of an answer to a `tools/call`
+/// or a `resources/read` that the router does not read
+/// ([`super::router::withhold_unread_tail`]): what was not read never reaches
+/// the model. `message` is the answer as it goes on; `env` the same answer as
+/// routed. Returns how many bytes were held back, `None` when none were.
+fn withhold_unread(
+    message: &mut Value,
+    env: &JsonRpcEnvelope,
+    map: &IdRequestMap,
+) -> Option<usize> {
+    if env.method.is_some() {
+        return None;
+    }
+    let method = map.get(&map.key(env.id.as_ref()?))?.method.clone();
+    let result = message.as_object_mut()?.get_mut("result")?;
+    super::router::withhold_unread_tail(&method, result)
+}
+
+/// Say, on the finding that an answer was read only in part
+/// (`AG-RESP-PARTIAL`), that the rest was held back from the client.
+fn note_withheld(mut event: Option<ProxyDecision>, held: Option<usize>) -> Option<ProxyDecision> {
+    if let (Some(d), Some(bytes)) = (event.as_mut(), held) {
+        for alert in d
+            .verdict
+            .alerts
+            .iter_mut()
+            .filter(|a| a.rule == "AG-RESP-PARTIAL")
+        {
+            alert.detail.push_str(&format!(
+                "; the last {bytes} bytes were withheld from the client"
+            ));
+        }
+    }
+    event
 }
 
 /// `event` with `alert` added, or a new server-side decision holding only
@@ -1551,8 +1616,12 @@ where
                                 }
                             }
                             ClientAction::Deny { denial, decision, kill } => {
-                                if let Err(e) = write_line(&mut client_out, &denial).await {
-                                    break Err(e);
+                                // Empty for a request with no id: nothing
+                                // answers it, and it is not forwarded.
+                                if !denial.is_empty() {
+                                    if let Err(e) = write_line(&mut client_out, &denial).await {
+                                        break Err(e);
+                                    }
                                 }
                                 on_event(&decision);
                                 if kill {
