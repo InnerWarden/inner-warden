@@ -72,15 +72,66 @@ fn find_ad_cli() -> Option<std::path::PathBuf> {
     ))
 }
 
+/// Where the host install keeps its licence. The host installer makes
+/// `/etc/innerwarden` world-searchable, so any account can see whether the
+/// file is there (never read it).
+const HOST_LICENCE: &str = "/etc/innerwarden/license.key";
+
+/// The host install on this machine, by the name it is sold under.
+///
+/// The host installer installs `innerwarden-ctl` with or without a licence,
+/// so the binary alone says a host install is here, not that it is
+/// InnerWarden Pro. A host with no licence (the installer's own word for it
+/// is the free tier) was told "InnerWarden Pro is installed here".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostInstall {
+    /// A licence file is on the host.
+    Pro,
+    /// No licence file: the free tier of the host install.
+    FreeTier,
+    /// Whether a licence is there could not be read.
+    Unknown,
+}
+
+impl HostInstall {
+    /// PURE. From `lstat` of the licence file: only "not found" is the free
+    /// tier; a file there is Pro, whatever its state; anything else is not
+    /// known, and named without a tier.
+    pub fn of_licence(lstat: std::io::Result<std::fs::Metadata>) -> Self {
+        match lstat {
+            Ok(_) => Self::Pro,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::FreeTier,
+            Err(_) => Self::Unknown,
+        }
+    }
+
+    /// What a sentence calls it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Pro => "InnerWarden Pro",
+            Self::FreeTier => "InnerWarden's host install (free tier, no licence)",
+            Self::Unknown => "InnerWarden's host install",
+        }
+    }
+}
+
+/// The host install on this machine, `None` when there is none.
+pub fn host_install() -> Option<HostInstall> {
+    find_ad_cli().map(|_| HostInstall::of_licence(std::fs::symlink_metadata(HOST_LICENCE)))
+}
+
 /// The second line `innerwarden --version` prints, on stderr, when the host
 /// stack is installed. `innerwarden --version` is the FREE CLI's release, and
 /// the install docs once told paid operators it confirmed the release they
 /// had installed. stderr, so every script that reads the version from stdout
 /// still reads exactly one line.
-pub fn version_host_hint(ad_installed: bool) -> Option<&'static str> {
-    ad_installed.then_some(
-        "InnerWarden Pro is installed here; its host stack has its own release: innerwarden-ctl --version",
-    )
+pub fn version_host_hint(host: Option<HostInstall>) -> Option<String> {
+    host.map(|host| {
+        format!(
+            "{} is installed here; its host stack has its own release: innerwarden-ctl --version",
+            host.name()
+        )
+    })
 }
 
 /// Whether the paid Active Defence host stack is INSTALLED on this machine.
@@ -125,12 +176,46 @@ pub fn is_shared_verb(verb: &str) -> bool {
 /// Defence is installed. `None` when it is not, so a free-only machine is never
 /// told about a command it does not have.
 pub fn shared_verb_hint(verb: &str) -> Option<String> {
-    if !is_shared_verb(verb) || find_ad_cli().is_none() {
+    if !is_shared_verb(verb) {
         return None;
     }
+    shared_verb_hint_for(verb, host_install())
+}
+
+/// PURE. [`shared_verb_hint`] for a known host install, named by what it is.
+fn shared_verb_hint_for(verb: &str, host: Option<HostInstall>) -> Option<String> {
+    let host = host.filter(|_| is_shared_verb(verb))?;
     Some(format!(
-        "  InnerWarden Pro has its own `{verb}` for the host layer:  innerwarden host {verb}"
+        "  {} has its own `{verb}` for the host layer:  innerwarden host {verb}",
+        host.name()
     ))
+}
+
+/// PURE. What `innerwarden host` prints without a verb. The layer is named
+/// by the host install's licence, as [`HostInstall`] names it: InnerWarden
+/// Pro only where a licence is.
+fn host_usage(host: Option<HostInstall>) -> String {
+    let layer = match host {
+        Some(HostInstall::Pro) => "the InnerWarden Pro host layer",
+        _ => "the InnerWarden host layer",
+    };
+    format!(
+        "innerwarden host <command> [args]\n  \
+         Runs a command in {layer}.\n  \
+         Use it to reach a host command whose name this binary also has:\n    \
+         {}",
+        SHARED_VERBS.join(", ")
+    )
+}
+
+/// PURE. The words for a host CLI that could not be run, named by the
+/// licence like [`host_usage`].
+fn host_cli_not_run(host: Option<HostInstall>) -> String {
+    let cli = match host {
+        Some(HostInstall::Pro) => "the InnerWarden Pro CLI",
+        _ => "the InnerWarden host CLI",
+    };
+    format!("could not run {cli}")
 }
 
 pub fn try_delegate(command: &str, args: &[String]) -> Option<ExitCode> {
@@ -142,7 +227,7 @@ pub fn try_delegate(command: &str, args: &[String]) -> Option<ExitCode> {
     Some(match status {
         Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(0, 255) as u8),
         Err(e) => {
-            eprintln!("innerwarden: could not run InnerWarden Pro CLI: {e}");
+            eprintln!("innerwarden: {}: {e}", host_cli_not_run(host_install()));
             ExitCode::from(1)
         }
     })
@@ -182,10 +267,7 @@ pub fn cmd_host(rest: &[String]) -> ExitCode {
     // `help::for_invocation`.
     let asked_for_help = rest.first().is_some_and(|a| a == "help");
     let Some(verb) = rest.first().filter(|_| !asked_for_help) else {
-        eprintln!("innerwarden host <command> [args]");
-        eprintln!("  Runs a command in the InnerWarden Pro host layer.");
-        eprintln!("  Use it to reach a host command whose name this binary also has:");
-        eprintln!("    {}", SHARED_VERBS.join(", "));
+        eprintln!("{}", host_usage(host_install()));
         return if asked_for_help {
             ExitCode::SUCCESS
         } else {
@@ -201,7 +283,7 @@ pub fn cmd_host(rest: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     try_delegate(verb, &rest[1..]).unwrap_or_else(|| {
-        eprintln!("innerwarden host: could not run the InnerWarden Pro CLI");
+        eprintln!("innerwarden host: {}", host_cli_not_run(host_install()));
         ExitCode::from(1)
     })
 }
@@ -332,9 +414,85 @@ mod active_defence_detection_tests {
     /// nothing about a product that is not there.
     #[test]
     fn the_version_points_at_the_host_release_only_when_it_is_installed() {
-        let hint = version_host_hint(true).expect("installed: a hint");
-        assert!(hint.contains("innerwarden-ctl --version"), "{hint}");
-        assert_eq!(version_host_hint(false), None);
+        for host in [
+            HostInstall::Pro,
+            HostInstall::FreeTier,
+            HostInstall::Unknown,
+        ] {
+            let hint = version_host_hint(Some(host)).expect("installed: a hint");
+            assert!(hint.contains("innerwarden-ctl --version"), "{hint}");
+        }
+        assert_eq!(version_host_hint(None), None);
+    }
+
+    /// The host install is named by its licence: InnerWarden Pro only where
+    /// a licence file is. FAILS ON REVERT: a host installed with no licence
+    /// (the free tier) was told "InnerWarden Pro is installed here" by
+    /// `innerwarden --version` (an upgrade test, 2026-11-25).
+    #[test]
+    fn the_host_install_is_named_by_its_licence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let licence = touch(dir.path(), "license.key");
+        assert_eq!(
+            HostInstall::of_licence(std::fs::symlink_metadata(&licence)),
+            HostInstall::Pro
+        );
+        assert_eq!(
+            HostInstall::of_licence(std::fs::symlink_metadata(dir.path().join("absent"))),
+            HostInstall::FreeTier
+        );
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(HostInstall::of_licence(Err(denied)), HostInstall::Unknown);
+
+        for host in [HostInstall::FreeTier, HostInstall::Unknown] {
+            let said = [
+                version_host_hint(Some(host)).expect("a hint"),
+                shared_verb_hint_for("setup", Some(host)).expect("a hint"),
+            ];
+            for line in said {
+                assert!(!line.contains("Pro"), "{host:?}: {line}");
+            }
+        }
+        assert!(version_host_hint(Some(HostInstall::FreeTier))
+            .expect("a hint")
+            .contains("free tier"));
+        for line in [
+            version_host_hint(Some(HostInstall::Pro)).expect("a hint"),
+            shared_verb_hint_for("setup", Some(HostInstall::Pro)).expect("a hint"),
+        ] {
+            assert!(line.contains("InnerWarden Pro"), "{line}");
+        }
+        assert_eq!(shared_verb_hint_for("check", Some(HostInstall::Pro)), None);
+        assert_eq!(shared_verb_hint_for("setup", None), None);
+    }
+
+    /// `innerwarden host` names its layer by the licence too: the usage it
+    /// prints without a verb and the line for a host CLI that could not run
+    /// say InnerWarden Pro only where a licence is. FAILS ON REVERT: both
+    /// said "InnerWarden Pro" on a host installed with no licence.
+    #[test]
+    fn innerwarden_host_says_pro_only_with_a_licence() {
+        for host in [
+            None,
+            Some(HostInstall::FreeTier),
+            Some(HostInstall::Unknown),
+        ] {
+            let usage = host_usage(host);
+            assert!(
+                usage.contains("Runs a command in the InnerWarden host layer."),
+                "{host:?}: {usage}"
+            );
+            for line in [usage, host_cli_not_run(host)] {
+                assert!(!line.contains("Pro"), "{host:?}: {line}");
+            }
+        }
+        let pro = Some(HostInstall::Pro);
+        assert!(host_usage(pro).contains("Runs a command in the InnerWarden Pro host layer."));
+        assert!(host_usage(pro).ends_with(&SHARED_VERBS.join(", ")));
+        assert_eq!(
+            host_cli_not_run(pro),
+            "could not run the InnerWarden Pro CLI"
+        );
     }
 
     #[test]

@@ -1257,14 +1257,14 @@ fn a_jail_the_host_did_not_admit_never_runs_its_command() {
     assert_eq!(status.code(), Some(2), "{stderr}");
     assert!(
         stderr.contains(
-            "innerwarden contain: InnerWarden Pro on this host did not admit this jail, and its \
+            "innerwarden contain: InnerWarden's host install on this host did not admit this jail, and its \
              profile starts it only when admitted."
         ),
         "{stderr}"
     );
     assert!(
         stderr.contains(&format!(
-            "innerwarden contain: Check that InnerWarden Pro is running (systemctl status \
+            "innerwarden contain: Check that InnerWarden's host install is running (systemctl status \
              innerwarden-agent), then try again. The jail waits for it because of start = \
              \"only_when_admitted\" in {}.",
             home.path()

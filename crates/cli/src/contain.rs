@@ -6428,7 +6428,8 @@ pub mod launch {
 
     /// What the launcher says, and exits 2 on, when a profile starts the
     /// jail only once the host has admitted it and the host has not.
-    pub const NOT_ADMITTED: &str = "InnerWarden Pro on this host did not admit this jail, and \
+    pub const NOT_ADMITTED: &str =
+        "InnerWarden's host install on this host did not admit this jail, and \
          its profile starts it only when admitted.";
 
     /// PURE. Whether Active Defence on this host admitted the jail: its
@@ -6555,11 +6556,11 @@ pub mod launch {
             files.join(" and ")
         };
         let check = match unbelieved {
-            None => "Check that InnerWarden Pro is running (systemctl status innerwarden-agent)"
+            None => "Check that InnerWarden's host install is running (systemctl status innerwarden-agent)"
                 .to_string(),
             Some(Unbelieved::NoKey) => format!(
-                "Check that InnerWarden Pro on this host publishes its key at {}, root's, in \
-                 folders only root can write (an older InnerWarden Pro does not)",
+                "Check that InnerWarden's host install on this host publishes its key at {}, root's, in \
+                 folders only root can write (an older one does not)",
                 innerwarden_agent_guard::identity::AGENT_TLS_SPKI_PATH
             ),
             Some(Unbelieved::Address(_)) => format!(
@@ -13517,7 +13518,7 @@ mod tests {
         assert!(starts(JailStart::OnlyWhenAdmitted, true));
         assert_eq!(
             NOT_ADMITTED,
-            "InnerWarden Pro on this host did not admit this jail, and its profile starts it \
+            "InnerWarden's host install on this host did not admit this jail, and its profile starts it \
              only when admitted."
         );
         // A launch with no profile starts as it always did.
@@ -13589,13 +13590,13 @@ mod tests {
         assert!(!admission.admitted);
         assert!(taken
             .unwrap_err()
-            .contains("InnerWarden Pro is not running"));
+            .contains("InnerWarden's host install is not running"));
         assert_eq!(
             launch::not_admitted_remedy(
                 &["/home/dev/.config/innerwarden/agent-profiles.toml".into()],
                 None
             ),
-            "Check that InnerWarden Pro is running (systemctl status innerwarden-agent), then try \
+            "Check that InnerWarden's host install is running (systemctl status innerwarden-agent), then try \
              again. The jail waits for it because of start = \"only_when_admitted\" in \
              /home/dev/.config/innerwarden/agent-profiles.toml."
         );
@@ -13641,7 +13642,9 @@ mod tests {
         );
         let remedy = not_admitted_remedy(&[], Some(&Unbelieved::NoKey));
         assert!(
-            remedy.starts_with("Check that InnerWarden Pro on this host publishes its key at "),
+            remedy.starts_with(
+                "Check that InnerWarden's host install on this host publishes its key at "
+            ),
             "{remedy}"
         );
         assert!(!remedy.contains("systemctl status"), "{remedy}");
