@@ -58,7 +58,7 @@ fn a_value_the_line_assigns_reaches_the_target_of_a_removal() {
     }
 }
 
-/// The program word from a variable the line sets (T-089, item 2).
+/// The program word from a variable the line sets.
 #[test]
 fn a_program_word_the_line_assigns_is_read_as_the_program() {
     for line in [

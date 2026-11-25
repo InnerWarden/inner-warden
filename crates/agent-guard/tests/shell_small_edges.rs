@@ -9,7 +9,7 @@
 //!   job in a here-document with a quoted delimiter (`at now <<'EOF'`) was
 //!   still refused for its form on main 0d44931 (2026-11-22): its body is
 //!   not expanded, and is judged as the pipe and the here-string are.
-//! - `git worktree remove ~/innerwarden/wt-T-136-prefix` was not refused
+//! - `git worktree remove ~/innerwarden/wt-a-prefix` was not refused
 //!   (review, the guard's name as a folder of a repository), nor the two
 //!   lines `at_job_from_pipe.rs` pins; the install stays refused.
 //! - `--default` names the posture `--guard` moves an install to, and was
@@ -80,7 +80,7 @@ fn a_working_folder_named_for_the_guard_is_not_its_install() {
     for command in [
         "rm -rf ~/innerwarden/target-132-base",
         "git worktree remove --force ~/innerwarden/wt-132-base",
-        "git worktree remove ~/innerwarden/wt-T-136-prefix",
+        "git worktree remove ~/innerwarden/wt-a-prefix",
     ] {
         assert_ne!(verdict(command), "deny", "{command}");
     }

@@ -8105,7 +8105,7 @@ mod tests {
         assert!(project_files_made(&input).is_empty());
     }
 
-    /// T-109 item 3, as the launcher sees each run: a file the person makes
+    /// As the launcher sees each run: a file the person makes
     /// in the project between two runs (here, hooks of their own in
     /// `.claude/settings.json`) is theirs and refuses no start; one a jail
     /// makes during its run (MCP servers in `.mcp.json`) is said as the run
@@ -8172,7 +8172,7 @@ mod tests {
         assert!(project_files_made(&input).is_empty());
     }
 
-    /// T-109 item 3: a launch that stopped before its end (no clean end, so
+    /// A launch that stopped before its end (no clean end, so
     /// no judgement) leaves its run marker, and what its jail may have made
     /// refuses the next start; an earlier launcher's `.absent` is read the
     /// same way. A start that passes the check takes away what launches that
@@ -8345,7 +8345,7 @@ mod tests {
         assert!(!marker_launch_runs(&own));
     }
 
-    /// T-109 item 3: the request to accept is the flag with `--project` and
+    /// The request to accept is the flag with `--project` and
     /// nothing else; after the agent's command a flag is the command's.
     #[test]
     fn accepting_takes_only_a_project() {
@@ -8377,7 +8377,7 @@ mod tests {
         assert_eq!(accept_request(&s(&["--enforce", "--", "claude"])), None);
     }
 
-    /// T-109 item 2: on macOS too, the launcher clears what a jail wrote in
+    /// On macOS too, the launcher clears what a jail wrote in
     /// its own `~/.claude` at a name the person's folder lacks before the
     /// next run, and links each shared name the person has
     /// (`CLAUDE_READ_ONLY_SHARED`) that the jail's folder lacks.
