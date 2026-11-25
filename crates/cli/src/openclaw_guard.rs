@@ -551,8 +551,17 @@ impl ProStatus {
             (Some(false), _) => "not valid".to_string(),
             (None, _) => "not reported".to_string(),
         };
+        // Named by the licence Pro reported: InnerWarden Pro only with a
+        // valid one, the host install without the word where it is not
+        // valid or was not said.
+        let host = if self.licence_valid == Some(true) {
+            crate::upsell_io::HostInstall::Pro
+        } else {
+            crate::upsell_io::HostInstall::Unknown
+        };
         format!(
-            "InnerWarden Pro on this host: Execution Gate for this agent {}, DNS Guard {}, licence {licence}.",
+            "{} on this host: Execution Gate for this agent {}, DNS Guard {}, licence {licence}.",
+            host.name(),
             said(gate),
             said(self.dns_guard.as_deref()),
         )
@@ -1264,6 +1273,34 @@ mod tests {
             .line_seen_from_outside()
             .contains("Execution Gate for this agent enforce"));
         assert_eq!(inside.seen_from_outside(), inside);
+    }
+
+    /// Pro's line is named by the licence Pro reported: InnerWarden Pro only
+    /// with a valid one. FAILS ON REVERT: `openclaw status` and the approval
+    /// card said "InnerWarden Pro on this host: ..., licence not valid" on a
+    /// host install whose licence is not valid.
+    #[test]
+    fn the_hosts_line_says_pro_only_with_a_valid_licence() {
+        let mut pro = ProStatus {
+            licence_valid: Some(true),
+            exec_gate: Some("observe".into()),
+            in_scope: Some(true),
+            dns_guard: Some("enforce".into()),
+            ..ProStatus::default()
+        };
+        for line in [pro.line(), pro.line_seen_from_outside()] {
+            assert!(line.starts_with("InnerWarden Pro on this host:"), "{line}");
+        }
+        for licence in [Some(false), None] {
+            pro.licence_valid = licence;
+            for line in [pro.line(), pro.line_seen_from_outside()] {
+                assert!(
+                    line.starts_with("InnerWarden's host install on this host:"),
+                    "{licence:?}: {line}"
+                );
+                assert!(!line.contains("Pro"), "{licence:?}: {line}");
+            }
+        }
     }
 
     /// The record's facts, read for the dashboard: monitor letting a call

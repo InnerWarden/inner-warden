@@ -191,6 +191,33 @@ fn shared_verb_hint_for(verb: &str, host: Option<HostInstall>) -> Option<String>
     ))
 }
 
+/// PURE. What `innerwarden host` prints without a verb. The layer is named
+/// by the host install's licence, as [`HostInstall`] names it: InnerWarden
+/// Pro only where a licence is.
+fn host_usage(host: Option<HostInstall>) -> String {
+    let layer = match host {
+        Some(HostInstall::Pro) => "the InnerWarden Pro host layer",
+        _ => "the InnerWarden host layer",
+    };
+    format!(
+        "innerwarden host <command> [args]\n  \
+         Runs a command in {layer}.\n  \
+         Use it to reach a host command whose name this binary also has:\n    \
+         {}",
+        SHARED_VERBS.join(", ")
+    )
+}
+
+/// PURE. The words for a host CLI that could not be run, named by the
+/// licence like [`host_usage`].
+fn host_cli_not_run(host: Option<HostInstall>) -> String {
+    let cli = match host {
+        Some(HostInstall::Pro) => "the InnerWarden Pro CLI",
+        _ => "the InnerWarden host CLI",
+    };
+    format!("could not run {cli}")
+}
+
 pub fn try_delegate(command: &str, args: &[String]) -> Option<ExitCode> {
     let cli = find_ad_cli()?;
     let status = std::process::Command::new(cli)
@@ -200,7 +227,7 @@ pub fn try_delegate(command: &str, args: &[String]) -> Option<ExitCode> {
     Some(match status {
         Ok(s) => ExitCode::from(s.code().unwrap_or(1).clamp(0, 255) as u8),
         Err(e) => {
-            eprintln!("innerwarden: could not run InnerWarden Pro CLI: {e}");
+            eprintln!("innerwarden: {}: {e}", host_cli_not_run(host_install()));
             ExitCode::from(1)
         }
     })
@@ -240,10 +267,7 @@ pub fn cmd_host(rest: &[String]) -> ExitCode {
     // `help::for_invocation`.
     let asked_for_help = rest.first().is_some_and(|a| a == "help");
     let Some(verb) = rest.first().filter(|_| !asked_for_help) else {
-        eprintln!("innerwarden host <command> [args]");
-        eprintln!("  Runs a command in the InnerWarden Pro host layer.");
-        eprintln!("  Use it to reach a host command whose name this binary also has:");
-        eprintln!("    {}", SHARED_VERBS.join(", "));
+        eprintln!("{}", host_usage(host_install()));
         return if asked_for_help {
             ExitCode::SUCCESS
         } else {
@@ -259,7 +283,7 @@ pub fn cmd_host(rest: &[String]) -> ExitCode {
         return ExitCode::from(1);
     }
     try_delegate(verb, &rest[1..]).unwrap_or_else(|| {
-        eprintln!("innerwarden host: could not run the InnerWarden Pro CLI");
+        eprintln!("innerwarden host: {}", host_cli_not_run(host_install()));
         ExitCode::from(1)
     })
 }
@@ -440,6 +464,35 @@ mod active_defence_detection_tests {
         }
         assert_eq!(shared_verb_hint_for("check", Some(HostInstall::Pro)), None);
         assert_eq!(shared_verb_hint_for("setup", None), None);
+    }
+
+    /// `innerwarden host` names its layer by the licence too: the usage it
+    /// prints without a verb and the line for a host CLI that could not run
+    /// say InnerWarden Pro only where a licence is. FAILS ON REVERT: both
+    /// said "InnerWarden Pro" on a host installed with no licence.
+    #[test]
+    fn innerwarden_host_says_pro_only_with_a_licence() {
+        for host in [
+            None,
+            Some(HostInstall::FreeTier),
+            Some(HostInstall::Unknown),
+        ] {
+            let usage = host_usage(host);
+            assert!(
+                usage.contains("Runs a command in the InnerWarden host layer."),
+                "{host:?}: {usage}"
+            );
+            for line in [usage, host_cli_not_run(host)] {
+                assert!(!line.contains("Pro"), "{host:?}: {line}");
+            }
+        }
+        let pro = Some(HostInstall::Pro);
+        assert!(host_usage(pro).contains("Runs a command in the InnerWarden Pro host layer."));
+        assert!(host_usage(pro).ends_with(&SHARED_VERBS.join(", ")));
+        assert_eq!(
+            host_cli_not_run(pro),
+            "could not run the InnerWarden Pro CLI"
+        );
     }
 
     #[test]
