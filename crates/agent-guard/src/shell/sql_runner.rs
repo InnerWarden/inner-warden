@@ -139,7 +139,7 @@ fn kubectl_exec_program(args: &[String]) -> Option<usize> {
             args.get(index + 1)?;
             return (exec && pod).then_some(index + 1);
         }
-        if arg.starts_with('-') {
+        if let Some(flags) = arg.strip_prefix('-') {
             if let Some((option, _)) = arg.split_once('=') {
                 if !KUBECTL_VALUED.contains(&option) {
                     return None;
@@ -148,9 +148,9 @@ fn kubectl_exec_program(args: &[String]) -> Option<usize> {
             } else if KUBECTL_VALUED.contains(&arg.as_str()) {
                 index += 2;
             } else if KUBECTL_FLAGS.contains(&arg.as_str())
-                || (!arg.starts_with("--")
-                    && arg.len() > 1
-                    && arg[1..].chars().all(|c| matches!(c, 'i' | 't' | 'q')))
+                || (!flags.is_empty()
+                    && !flags.starts_with('-')
+                    && flags.chars().all(|c| matches!(c, 'i' | 't' | 'q')))
             {
                 index += 1;
             } else {

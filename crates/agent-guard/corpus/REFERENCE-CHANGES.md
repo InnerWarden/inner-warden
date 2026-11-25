@@ -487,3 +487,23 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   other line of any corpus moved. harmless-proven: own-work/own-027
   goes from deny to allow for the reason above: the client stores the
   string and nothing on the line runs it.
+- 2026-11-25: sql-client-runners-2026-11 is new. SQL handed to a SQL
+  client (psql, sqlite3, mysql, mariadb, duckdb) named after `docker
+  exec`, `podman exec`, `kubectl exec ... --` or as the remote line of
+  `ssh` is read as the same client run here (own-work/own-027 above):
+  an `INSERT` or `UPDATE` whose string names the guard is data
+  (`src/shell/sql_runner.rs`). The client's own ways to a shell (a
+  backslash or dot command, `system`, `COPY ... PROGRAM`, a pager), a
+  substitution the local shell expands, a second command on the line or
+  on the remote line, an option of the runner that runs a program, and
+  any other program behind the runner (`sh -c`, `bash`) are read as
+  before; the 49 must_refuse lines of the corpus stay refused, held by
+  `tests/sql_through_container_and_ssh.rs`, whose allowed lines fail on
+  revert. A trigger or user function the database already holds is not
+  on the line: a known limit, not read. Against the branch before the
+  change no other line moved (every corpus line and generated variant);
+  against main, no other line goes from a stop to allow, from an empty
+  home or a home with keys. harmless-proven:
+  sql-client-runners-2026-11/srn-001 sql-client-runners-2026-11/srn-003 sql-client-runners-2026-11/srn-004 sql-client-runners-2026-11/srn-005 sql-client-runners-2026-11/srn-006 sql-client-runners-2026-11/srn-007 sql-client-runners-2026-11/srn-008 sql-client-runners-2026-11/srn-009 sql-client-runners-2026-11/srn-010 sql-client-runners-2026-11/srn-011 sql-client-runners-2026-11/srn-012 sql-client-runners-2026-11/srn-013 sql-client-runners-2026-11/srn-014 sql-client-runners-2026-11/srn-015 sql-client-runners-2026-11/srn-016 sql-client-runners-2026-11/srn-017 sql-client-runners-2026-11/srn-019 sql-client-runners-2026-11/srn-020 sql-client-runners-2026-11/srn-021 sql-client-runners-2026-11/srn-022 sql-client-runners-2026-11/srn-023 sql-client-runners-2026-11/srn-024
+  go from deny to allow for the reason above: the client stores the
+  string and nothing on the line runs it.
