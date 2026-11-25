@@ -1670,29 +1670,29 @@ pub(crate) fn work_folder_path(path: &str) -> bool {
     {
         return false;
     }
-    let rest = if let Some(rest) = lower
+    let (rest, relative) = if let Some(rest) = lower
         .strip_prefix("~/")
         .or_else(|| lower.strip_prefix("$home/"))
     {
-        rest
+        (rest, false)
     } else if let Some(rest) = lower
         .strip_prefix("/home/")
         .or_else(|| lower.strip_prefix("/users/"))
     {
         match rest.split_once('/') {
-            Some((_, rest)) => rest,
+            Some((_, rest)) => (rest, false),
             None => return false,
         }
     } else if lower.starts_with('/') || lower.starts_with('~') || lower.starts_with('$') {
         return false;
     } else {
-        lower.as_str()
+        (lower.as_str(), true)
     };
     let parts: Vec<&str> = rest
         .split('/')
         .filter(|p| !p.is_empty() && *p != ".")
         .collect();
-    if parts.iter().any(|part| hidden_part(part)) {
+    if parts.iter().any(|part| hidden_part(part)) || leaves_a_folder(&parts, relative) {
         return false;
     }
     let Some(last) = parts.last() else {
@@ -1711,23 +1711,44 @@ fn work_folder(folder: &str) -> bool {
     if crate::threats::names_guard_carrier_path(&lower) {
         return false;
     }
-    let rest = if let Some(rest) = lower
+    let (rest, relative) = if let Some(rest) = lower
         .strip_prefix("~/")
         .or_else(|| lower.strip_prefix("$home/"))
         .or_else(|| lower.strip_prefix("/tmp/"))
     {
-        rest
+        (rest, false)
     } else if let Some(rest) = lower
         .strip_prefix("/home/")
         .or_else(|| lower.strip_prefix("/users/"))
     {
-        rest
+        (rest, false)
     } else if lower.starts_with(['/', '~', '$']) {
         return false;
     } else {
-        lower.as_str()
+        (lower.as_str(), true)
     };
-    !rest.split('/').any(hidden_part)
+    let parts: Vec<&str> = rest
+        .split('/')
+        .filter(|p| !p.is_empty() && *p != ".")
+        .collect();
+    !parts.iter().any(|part| hidden_part(part)) && !leaves_a_folder(&parts, relative)
+}
+
+/// Whether a path goes back out of a folder it named: a `..` after a
+/// folder of its own (`.worktrees/../x`, `wt/../../x`), or any `..` in
+/// a path from the home or `/tmp`. What such a path names is no longer
+/// read from its words, so it is not taken as a work folder. A relative
+/// path that starts with `..` names a folder beside the project, as
+/// before.
+fn leaves_a_folder(parts: &[&str], relative: bool) -> bool {
+    if relative {
+        parts
+            .iter()
+            .skip_while(|part| **part == "..")
+            .any(|part| *part == "..")
+    } else {
+        parts.contains(&"..")
+    }
 }
 
 /// Whether a part of a path is a hidden folder, where settings and the
@@ -1745,7 +1766,13 @@ fn home_kept(expansion: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     if text(expansion, source) != "$HOME" {
         return false;
     }
-    let line = String::from_utf8_lossy(source);
+    // The shell joins a word's pieces before it reads a name, so
+    // `HO""ME=`, `H"O"ME`, `HO\ME` and `printf -v HO''ME` all name
+    // `HOME`: the line is searched with its quotes and escapes taken out.
+    let line: String = String::from_utf8_lossy(source)
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
     line.match_indices("HOME")
         .all(|(at, _)| line[..at].ends_with('$'))
 }
