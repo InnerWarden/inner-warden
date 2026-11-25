@@ -5447,7 +5447,8 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
     let report_to = reporter.sender();
     let on_event = move |d: &ProxyDecision| {
         // The graph is an action timeline: persist every client tools/call,
-        // including allows, but never persist a server response as a command.
+        // including allows, and every finding on a server's message, named
+        // as the server's (`graph_io::record_mcp`), never as a call.
         graph_io::record_mcp(
             d,
             mode,
@@ -5462,8 +5463,10 @@ fn cmd_proxy(rest: &[String]) -> std::process::ExitCode {
             &report_to,
             agent_report::block_report(&label, mode, d, identity.as_ref()),
         ) {
-            // Full: the agent is not keeping up; the local record stands.
-            let _ = tx.try_send(body);
+            // Full: the agent is not keeping up; the local record stands,
+            // and the report turned away is counted and said
+            // (`agent_report::lost_line`).
+            tx.send(body);
         }
     };
     let result = rt.block_on(run_proxy_pinned(

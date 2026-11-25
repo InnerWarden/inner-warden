@@ -32,6 +32,9 @@ fn proxy(mode: &str, call: &serde_json::Value) -> (String, serde_json::Value) {
         .env("IW_GRAPH_FILE", &graph)
         .env("IW_MCP_PINS", dir.path().join("mcp-pins.json"))
         .env("INNERWARDEN_AGENT_URL", "off")
+        // The copy of a refusal into the guard's own record stays here.
+        .env("IW_TEST_ACCOUNT_HOME", dir.path())
+        .env("IW_TEST_GUARD_CONFIG", dir.path().join("no-guard.toml"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -54,13 +57,20 @@ fn proxy(mode: &str, call: &serde_json::Value) -> (String, serde_json::Value) {
     )
 }
 
-/// The one command the record holds.
+/// The one call the record holds. A finding on what `cat` echoes back (the
+/// call's own secret, in a mode that forwards it) is the server's, recorded
+/// as `mcp server: ...`, not a call.
 fn command(record: &serde_json::Value) -> serde_json::Value {
     let commands: Vec<&serde_json::Value> = record["nodes"]
         .as_array()
         .expect("nodes")
         .iter()
-        .filter(|node| node["kind"] == "command")
+        .filter(|node| {
+            node["kind"] == "command"
+                && !node["label"]
+                    .as_str()
+                    .is_some_and(|label| label.starts_with("mcp server: "))
+        })
         .collect();
     assert_eq!(commands.len(), 1, "{record}");
     commands[0].clone()

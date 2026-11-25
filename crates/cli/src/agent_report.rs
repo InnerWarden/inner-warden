@@ -11,6 +11,17 @@
 //! call, the rule ids that fired and the mode. Never the raw arguments. The
 //! report says nothing about who sent it; that is for the agent to establish.
 //!
+//! A server's message the proxy acted on in a mode that blocks is reported
+//! the same way ([`server_held`]): a description or an answer carrying orders
+//! for the model withheld, a tool whose definition changed held, a line it
+//! cannot read refused, a secret-shaped value masked. Its body says
+//! `"direction": "server->client"` and its `command` names the server's
+//! message ([`server_summary`]), never a call the agent made.
+//!
+//! A report is never lost unsaid: one the full queue ([`REPORT_QUEUE`])
+//! turns away, or one still queued when the proxy exits, is counted, and the
+//! count is said in one line on stderr ([`lost_line`]).
+//!
 //! Standalone is the normal case. With no agent, an agent that does not take
 //! the route, or any other failure, the proxy says so ONCE on stderr and goes
 //! on exactly as before. Reports go out from a thread of their own, so a slow
@@ -22,7 +33,9 @@
 //! moved the proxy's (`graph_io::record_mcp`), so the agent still reads its
 //! `guard.blocked` line where it reads the shared record.
 
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use innerwarden_agent_guard::mcp_proxy::enforce::{apply_mode, ProxyAction, ProxyMode};
@@ -44,8 +57,11 @@ const REPORT_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long the proxy waits, on exit, for its last reports.
 pub const REPORT_DRAIN: Duration = Duration::from_secs(3);
 
-/// Reports queued at once; past it a report is dropped.
-const REPORT_QUEUE: usize = 32;
+/// Reports queued at once; past it a report is dropped, and counted.
+pub const REPORT_QUEUE: usize = 32;
+
+/// The direction of a decision on a server's message.
+pub const FROM_SERVER: &str = "server->client";
 
 /// Longest label, tool or rule id the agent takes.
 const NAME_CHARS: usize = 96;
@@ -79,25 +95,60 @@ fn mode_word(mode: ProxyMode) -> &'static str {
     }
 }
 
-/// PURE. The report for a decision the proxy REFUSED (answered with a denial,
-/// never passed to the server), or `None`. Decided by `apply_mode`, the same
-/// function the proxy's transport acts on.
+/// PURE. Whether the proxy, in `mode`, acted on what a finding on a
+/// server's message names. A mode that blocks withholds a description or an
+/// answer carrying orders for the model, holds a tool whose definition
+/// changed and refuses a line it cannot read (each is a finding that refuses:
+/// `verdict.allowed` is false), and masks a secret-shaped value
+/// (`AG-SECRET-OUT`). A mode that never blocks forwards all of it.
+pub fn server_held(d: &ProxyDecision, mode: ProxyMode) -> bool {
+    d.direction == FROM_SERVER
+        && mode.blocks()
+        && (!d.verdict.allowed
+            || d.verdict
+                .alerts
+                .iter()
+                .any(|a| a.rule == innerwarden_agent_guard::mcp_proxy::content::SECRET_OUT_RULE))
+}
+
+/// PURE. What a finding on a server's message is recorded and reported as:
+/// the server's message, by its method, never a call the agent made.
+pub fn server_summary(d: &ProxyDecision) -> String {
+    let what = d
+        .method
+        .as_deref()
+        .unwrap_or("a line that is not a JSON-RPC message");
+    match d.tool_name.as_deref() {
+        Some(tool) => format!("mcp server: {what} ({tool})"),
+        None => format!("mcp server: {what}"),
+    }
+}
+
+/// PURE. The report for a decision the proxy REFUSED (a call answered with a
+/// denial, never passed to the server) or, on a server's message, held back
+/// or masked ([`server_held`]), or `None`. A call's refusal is decided by
+/// `apply_mode`, the same function the proxy's transport acts on.
 pub fn block_report(
     label: &str,
     mode: ProxyMode,
     d: &ProxyDecision,
     identity: Option<&crate::hook_identity::Identity>,
 ) -> Option<Value> {
-    let refused = matches!(
-        apply_mode(d, mode, false),
-        ProxyAction::Block { .. } | ProxyAction::Kill { .. }
-    );
+    let from_server = d.direction == FROM_SERVER;
+    let refused = if from_server {
+        server_held(d, mode)
+    } else {
+        matches!(
+            apply_mode(d, mode, false),
+            ProxyAction::Block { .. } | ProxyAction::Kill { .. }
+        )
+    };
     if !refused {
         return None;
     }
-    let summary: String = d
-        .tool_summary
-        .clone()
+    let summary: String = from_server
+        .then(|| server_summary(d))
+        .or_else(|| d.tool_summary.clone())
         .or_else(|| d.tool_name.clone())
         .unwrap_or_else(|| "tools/call".to_string())
         .chars()
@@ -133,6 +184,11 @@ pub fn block_report(
     // The mode the proxy runs in, where the class does not already say it.
     if body["mode"] != mode_word(mode) {
         body["proxy_mode"] = json!(mode_word(mode));
+    }
+    // What the server sent, not a call: an agent that does not read this
+    // field files it as a refused call, with the summary naming the server.
+    if from_server {
+        body["direction"] = json!(FROM_SERVER);
     }
     // Labels from the proxy's own view, never proof; absent without a record.
     if let Some(identity) = identity {
@@ -211,10 +267,67 @@ pub fn send_report(url: &str, body: &Value) -> Result<(), String> {
     }
 }
 
+/// What became of the reports the proxy queued: taken by the queue, done
+/// with by the thread that sends them (sent or not taken by the agent, said
+/// once), and turned away by a full queue.
+#[derive(Debug, Default)]
+struct Tally {
+    queued: AtomicUsize,
+    done: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+/// PURE. The line that says how many reports never reached the agent:
+/// `dropped` turned away by the full queue, `unsent` still queued when the
+/// proxy exited. `None` when none were lost.
+pub fn lost_line(dropped: usize, unsent: usize) -> Option<String> {
+    let lost = dropped + unsent;
+    if lost == 0 {
+        return None;
+    }
+    let mut why = Vec::new();
+    if dropped > 0 {
+        why.push(format!(
+            "{dropped} turned away while its queue ({REPORT_QUEUE}) was full"
+        ));
+    }
+    if unsent > 0 {
+        why.push(format!("{unsent} still queued when the proxy exited"));
+    }
+    Some(format!(
+        "innerwarden proxy: {lost} report(s) to the local InnerWarden agent were not sent ({}); \
+         each is in this proxy's own record",
+        why.join(", ")
+    ))
+}
+
+/// Where the proxy's callback queues a report: never blocks the proxy, and
+/// counts a report the full queue turns away.
+#[derive(Clone)]
+pub struct ReportSender {
+    tx: SyncSender<Value>,
+    tally: Arc<Tally>,
+}
+
+impl ReportSender {
+    /// Queue `body`; a full queue (or a sending thread gone) counts it lost.
+    pub fn send(&self, body: Value) {
+        match self.tx.try_send(body) {
+            Ok(()) => {
+                self.tally.queued.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.tally.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
 /// Sends refusal reports from a thread of its own.
 pub struct BlockReporter {
     tx: Option<SyncSender<Value>>,
     done: Option<Receiver<()>>,
+    tally: Arc<Tally>,
 }
 
 impl BlockReporter {
@@ -236,6 +349,7 @@ impl BlockReporter {
         Self {
             tx: None,
             done: None,
+            tally: Arc::default(),
         }
     }
 
@@ -243,11 +357,29 @@ impl BlockReporter {
     pub fn start(url: String) -> Self {
         let (tx, rx) = std::sync::mpsc::sync_channel::<Value>(REPORT_QUEUE);
         let (done_tx, done) = std::sync::mpsc::channel();
+        let tally = Arc::new(Tally::default());
+        let counts = Arc::clone(&tally);
         let spawned = std::thread::Builder::new()
             .name("proxy-report".to_string())
             .spawn(move || {
                 let mut warned = false;
-                for body in rx {
+                let mut next = None;
+                loop {
+                    let body = match next.take() {
+                        Some(body) => body,
+                        None => {
+                            // The queue is empty: what the full queue turned
+                            // away since it was last said is said now, once.
+                            let dropped = counts.dropped.swap(0, Ordering::SeqCst);
+                            if let Some(line) = lost_line(dropped, 0) {
+                                eprintln!("{line}");
+                            }
+                            match rx.recv() {
+                                Ok(body) => body,
+                                Err(_) => break,
+                            }
+                        }
+                    };
                     if let Err(why) = send_report(&url, &body) {
                         if !warned {
                             warned = true;
@@ -257,6 +389,12 @@ impl BlockReporter {
                             );
                         }
                     }
+                    counts.done.fetch_add(1, Ordering::SeqCst);
+                    match rx.try_recv() {
+                        Ok(body) => next = Some(body),
+                        Err(TryRecvError::Empty) => {}
+                        Err(TryRecvError::Disconnected) => break,
+                    }
                 }
                 let _ = done_tx.send(());
             });
@@ -264,22 +402,39 @@ impl BlockReporter {
             Ok(_) => Self {
                 tx: Some(tx),
                 done: Some(done),
+                tally,
             },
             Err(_) => Self::off(),
         }
     }
 
     /// A handle the proxy's callback queues reports on, `None` when off.
-    pub fn sender(&self) -> Option<SyncSender<Value>> {
-        self.tx.clone()
+    pub fn sender(&self) -> Option<ReportSender> {
+        self.tx.clone().map(|tx| ReportSender {
+            tx,
+            tally: Arc::clone(&self.tally),
+        })
     }
 
     /// Stop taking reports and wait, at most `wait`, for the queued ones.
-    pub fn finish(mut self, wait: Duration) {
+    /// What was lost (turned away and not said yet, or still queued) is said
+    /// in one line, and returned.
+    pub fn finish(mut self, wait: Duration) -> Option<String> {
         drop(self.tx.take());
         if let Some(done) = self.done.take() {
             let _ = done.recv_timeout(wait);
         }
+        let dropped = self.tally.dropped.swap(0, Ordering::SeqCst);
+        let unsent = self
+            .tally
+            .queued
+            .load(Ordering::SeqCst)
+            .saturating_sub(self.tally.done.load(Ordering::SeqCst));
+        let line = lost_line(dropped, unsent);
+        if let Some(line) = &line {
+            eprintln!("{line}");
+        }
+        line
     }
 }
 
@@ -474,7 +629,7 @@ mod tests {
         assert!(send_report(&url, &json!({})).is_err());
         let reporter = BlockReporter::start(url);
         let tx = reporter.sender().expect("on");
-        tx.try_send(json!({"kind": "mcp_proxy_block"})).unwrap();
+        tx.send(json!({"kind": "mcp_proxy_block"}));
         drop(tx);
         let started = std::time::Instant::now();
         reporter.finish(Duration::from_secs(10));
@@ -517,5 +672,125 @@ mod tests {
         let (_, sent) = request.split_once("\r\n\r\n").expect("a body");
         let sent: Value = serde_json::from_str(sent).expect("a JSON body");
         assert_eq!(sent, body);
+    }
+
+    /// A finding on a server's message, as the transport hands it on.
+    fn from_server(method: Option<&str>, allowed: bool, rule: &str) -> ProxyDecision {
+        use innerwarden_agent_guard::mcp::{Verdict, VerdictAlert};
+        ProxyDecision {
+            verdict: Verdict {
+                allowed,
+                alerts: vec![VerdictAlert {
+                    rule: rule.into(),
+                    detail: "found".into(),
+                    block: !allowed,
+                    category: None,
+                    owasp: None,
+                    mitre: None,
+                }],
+            },
+            direction: FROM_SERVER,
+            method: method.map(str::to_string),
+            tool_name: None,
+            tool_summary: None,
+            request_id: Some(json!(3)),
+            deciding_layer: None,
+        }
+    }
+
+    /// What the proxy held back or masked of a server's message in a mode
+    /// that blocks is reported as the server's, and nothing is in a mode
+    /// that never blocks, or for a finding it did not act on.
+    ///
+    /// FAILS ON REVERT of `server_held` in `block_report` (back to
+    /// `apply_mode` alone): no finding on a server's message is reported.
+    #[test]
+    fn a_server_finding_the_proxy_acted_on_is_reported_as_the_servers() {
+        let cases = [
+            (Some("tools/list"), false, "AG-DESC-POISON"),
+            (Some("tools/list"), false, "AG-MCP-TOOL-CHANGED"),
+            (None, false, "AG-MCP-PARSE"),
+            (Some("tools/call"), true, "AG-SECRET-OUT"),
+        ];
+        for (method, allowed, rule) in cases {
+            let d = from_server(method, allowed, rule);
+            for mode in [ProxyMode::Guard, ProxyMode::Kill, ProxyMode::Strict] {
+                let body = block_report("lab", mode, &d, None)
+                    .unwrap_or_else(|| panic!("{rule} in {mode:?}"));
+                assert_eq!(body["kind"], "mcp_proxy_block");
+                assert_eq!(body["direction"], FROM_SERVER);
+                assert_eq!(body["rule_ids"], json!([rule]));
+                assert!(
+                    body["command"]
+                        .as_str()
+                        .is_some_and(|c| c.starts_with("mcp server: ")),
+                    "{body}"
+                );
+                assert!(body["tool"].is_null(), "{body}");
+            }
+            for mode in [ProxyMode::Advisory, ProxyMode::Warn] {
+                assert_eq!(block_report("lab", mode, &d, None), None, "{rule}");
+            }
+        }
+        // An alert the proxy did not act on (a long answer read in part, an
+        // injection phrase alerted only) is not a refusal.
+        let partial = from_server(Some("tools/call"), true, "AG-RESP-PARTIAL");
+        assert_eq!(block_report("lab", ProxyMode::Guard, &partial, None), None);
+        // A call's report is the one it always was: no direction.
+        let call = block_report("l", ProxyMode::Guard, &routed(CRED_CALL), None).unwrap();
+        assert!(call.get("direction").is_none(), "{call}");
+        assert_eq!(
+            server_summary(&from_server(None, false, "AG-MCP-PARSE")),
+            "mcp server: a line that is not a JSON-RPC message"
+        );
+    }
+
+    /// Reports the full queue turns away, and the ones still queued when the
+    /// proxy exits, are counted and said in one line, never lost unsaid. An
+    /// agent that takes the connection and never answers holds the first
+    /// report for the whole of its timeout; the queue takes 32 more.
+    ///
+    /// FAILS ON REVERT of the counting in `ReportSender::send` and
+    /// `BlockReporter::finish`: 40 reports, and no line says what became of
+    /// them.
+    #[test]
+    fn reports_the_queue_could_not_take_are_counted_in_one_line() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Takes every connection and answers none.
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        let reporter = BlockReporter::start(format!("http://127.0.0.1:{port}{PROXY_BLOCK_PATH}"));
+        let sender = reporter.sender().expect("on");
+        let body = block_report("l", ProxyMode::Guard, &routed(CRED_CALL), None).unwrap();
+        for _ in 0..40 {
+            sender.send(body.clone());
+        }
+        let dropped = reporter.tally.dropped.load(Ordering::SeqCst);
+        assert!((7..=8).contains(&dropped), "{dropped}");
+        let line = reporter
+            .finish(Duration::from_millis(100))
+            .expect("a line for the lost reports");
+        assert!(
+            line.starts_with(
+                "innerwarden proxy: 40 report(s) to the local InnerWarden agent were not sent ("
+            ),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!(
+                "{dropped} turned away while its queue (32) was full"
+            )),
+            "{line}"
+        );
+        assert!(
+            line.contains("still queued when the proxy exited"),
+            "{line}"
+        );
+        assert_eq!(lost_line(0, 0), None);
     }
 }

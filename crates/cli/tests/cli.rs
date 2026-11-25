@@ -473,17 +473,23 @@ fn proxy_advisory_records_all_calls_without_recording_responses_or_clean_alerts(
     );
     assert!(body.contains("[REDACTED]"));
     let graph: serde_json::Value = serde_json::from_str(&body).unwrap();
-    let commands: Vec<_> = graph["nodes"]
+    let (server, commands): (Vec<_>, Vec<_>) = graph["nodes"]
         .as_array()
         .unwrap()
         .iter()
         .filter(|n| n["kind"] == "command")
-        .collect();
+        .partition(|n| n["label"].as_str().unwrap().starts_with("mcp server: "));
     assert_eq!(
         commands.len(),
         2,
         "cat echoed both requests as server traffic; responses must not become duplicate commands"
     );
+    // The echo of the call that carried a secret is a finding on what the
+    // server sent: recorded as the server's, never as a call. The clean echo
+    // is traffic, not recorded.
+    assert_eq!(server.len(), 1, "{server:?}");
+    assert_eq!(server[0]["attrs"]["rules"], "AG-SECRET-OUT");
+    assert_eq!(server[0]["attrs"]["outcome"], "allowed");
     assert!(graph["nodes"]
         .as_array()
         .unwrap()
