@@ -116,13 +116,30 @@ describe("decisionRecordCta", () => {
 describe("the InnerWarden Pro card", () => {
   it("stops offering the product on a host that already has it", () => {
     // FAILS ON REVERT: make the state unconditional and this trips.
-    expect(activeDefenceCardState(true)).toBe("installed");
-    expect(ACTIVE_DEFENCE_COPY.installed.title).not.toContain("Extend protection");
+    for (const host of ["pro", "free_tier", "unknown"] as const) {
+      expect(activeDefenceCardState(host)).toBe("installed");
+      expect(ACTIVE_DEFENCE_COPY.installed.title[host]).not.toContain("Extend protection");
+    }
+  });
+
+  it("names the host install by its licence: InnerWarden Pro only with one", () => {
+    // FAILS ON REVERT: the card said "InnerWarden Pro is installed on this
+    // host." under an "InnerWarden Pro" eyebrow on a host installed with no
+    // licence, and where the licence could not be read.
+    const copy = ACTIVE_DEFENCE_COPY.installed;
+    expect(copy.title.pro).toBe("InnerWarden Pro is installed on this host.");
+    expect(copy.eyebrow.pro).toBe("InnerWarden Pro");
+    expect(copy.title.free_tier).toBe("InnerWarden's host install (free tier, no licence) is installed on this host.");
+    expect(copy.title.unknown).toBe("InnerWarden's host install is installed on this host.");
+    for (const host of ["free_tier", "unknown"] as const) {
+      expect(copy.title[host]).not.toContain("Pro");
+      expect(copy.eyebrow[host]).toBe("InnerWarden host install");
+    }
   });
 
   it("still offers it on a host that does not", () => {
     // The other half. Without it, deleting the card passes the test above.
-    expect(activeDefenceCardState(false)).toBe("offer");
+    expect(activeDefenceCardState(undefined)).toBe("offer");
     expect(ACTIVE_DEFENCE_COPY.offer.title).toContain("Extend protection");
   });
 
@@ -131,7 +148,8 @@ describe("the InnerWarden Pro card", () => {
     // kernel guard is on would be a claim it has no way to check, which on a
     // security product is worse than saying too little.
     const shown = [
-      ACTIVE_DEFENCE_COPY.installed.title,
+      ...Object.values(ACTIVE_DEFENCE_COPY.installed.title),
+      ...Object.values(ACTIVE_DEFENCE_COPY.installed.eyebrow),
       ACTIVE_DEFENCE_COPY.installed.body,
       ACTIVE_DEFENCE_COPY.installed.badge,
     ].join(" ");
@@ -150,7 +168,8 @@ describe("the InnerWarden Pro card", () => {
   });
 
   it("does not send an installed host to the acquisition page", () => {
-    const shown = Object.values(ACTIVE_DEFENCE_COPY.installed).join(" ");
+    const { title, eyebrow, ...rest } = ACTIVE_DEFENCE_COPY.installed;
+    const shown = [...Object.values(title), ...Object.values(eyebrow), ...Object.values(rest)].join(" ");
     expect(shown).not.toContain("innerwarden.com/enterprise");
     expect(shown).not.toContain("Explore InnerWarden Pro");
   });

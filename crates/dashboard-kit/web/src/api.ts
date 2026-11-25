@@ -45,6 +45,13 @@ export type DashboardMeta = {
    */
   active_defence_installed?: boolean;
   /**
+   * The host install named by its licence, beside `active_defence_installed`:
+   * `pro` where a licence is, `free_tier` where none is, `unknown` where that
+   * could not be read. Absent from an older server, which is read as
+   * `unknown` (`hostInstallOf`): InnerWarden Pro only on the server's `pro`.
+   */
+  host_install?: string;
+  /**
    * True when the binary on disk has been replaced since this process
    * started: `version` is then this process, not the installation, and
    * `update_note` says what to do. Omitted when nothing is pending.

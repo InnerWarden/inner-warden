@@ -38,7 +38,7 @@ export function capabilityBoundaryMessage(
   if (state === "authentication_required") {
     return {
       title: "Sign in to see this",
-      body: "This data stays behind the InnerWarden Pro sign-in. Nothing is loaded until that succeeds.",
+      body: "This data stays behind the sign-in of InnerWarden's host install. Nothing is loaded until that succeeds.",
       status: "unavailable",
     };
   }

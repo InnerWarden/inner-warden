@@ -22,6 +22,16 @@ name the host layer without a tier, and so do the words the hook, `contain`,
 refuses to admit a jail for want of a licence, and that refusal said
 "InnerWarden Pro on this host did not admit this jail").
 
+The dashboard names the host install the same way. Its Overview card and
+the line at the foot of Protection say InnerWarden Pro only where a licence
+is; on a host installed without one they name the host install's free tier,
+and where the licence could not be read, or an older dashboard server does
+not say, the host install with no tier. `/api/meta` carries `host_install`
+(`pro`, `free_tier`, `unknown`) beside `active_defence_installed`, from the
+same read the CLI uses. The words that say the host decided a command, and
+the sign-in words, name the host install without a tier: a recorded
+decision does not say which licence decided it.
+
 git commands are read on the work tree git itself uses: the one the line
 names (`--work-tree`, `GIT_WORK_TREE`, `-c core.worktree=`, `--config-env`,
 `GIT_CONFIG_KEY_<n>` with `GIT_CONFIG_VALUE_<n>`), else the `core.worktree`

@@ -14,9 +14,10 @@ import sessionsFixture from "../../tests/fixtures/community/sessions.json";
 import suppressFixture from "../../tests/fixtures/community/suppress.json";
 import baseMeta from "../../tests/fixtures/community/meta.json";
 import { readAttemptsPage, readDecisionDetail, readDecisionsPage, readHistory, readProtection, readRecordHealth, readSessionsPage, readSuppressList } from "./api";
+import { HOST_INSTALL_NAMES } from "../hostInstall";
 import { GENERIC_LINE, INSTALLED_LINE, TOUR_UPGRADE_LINE } from "./offers";
 import { changesAgentConfig } from "./restart";
-import { WITHHELD_WORDS } from "./words";
+import { DECIDER_WORDS, HOST_LAYER_WORDS, HOST_REFUSED_WORDS, HOST_WITHHELD_WORDS, REASON_WORDS, TRUST_WORDS, WITHHELD_WORDS } from "./words";
 
 /**
  * The Community copy sweep (spec 16.1): what every Community page may say,
@@ -24,9 +25,12 @@ import { WITHHELD_WORDS } from "./words";
  * from the CLI's fixtures.
  *
  *  (a) none of the words a screen must never use;
- *  (b) the paid edition named only in the permitted sentences: the three
- *      offer sentences and the words that say which layer decided a command.
- *      An allow-list of what may be said, never a list of names;
+ *  (b) the paid edition named only in the permitted sentences: the two
+ *      offer sentences, the installed line where the host install has a
+ *      licence, and the Linux relaxation sentence. The words that say the
+ *      host decided a command name the host install, never the paid edition:
+ *      a recorded decision carries no licence. An allow-list of what may be
+ *      said, never a list of names;
  *  (c) no Title-Case "<Word> Guard" or "<Word> Gate", and no "kernel";
  *  (d) every step whose command changes an agent's config carries that
  *      agent's restart words beside it;
@@ -99,9 +103,8 @@ describe("(a) the words a Community screen never uses", () => {
   });
 });
 
-/** The only sentences that may name the paid edition, and the attribution words. */
-const PERMITTED = [GENERIC_LINE, TOUR_UPGRADE_LINE, INSTALLED_LINE.lead, WITHHELD_WORDS.linux];
-const ATTRIBUTION = /InnerWarden Pro on (?:this|its|the) host/g;
+/** The only sentences that may name the paid edition. */
+const PERMITTED = [GENERIC_LINE, TOUR_UPGRADE_LINE, INSTALLED_LINE.lead.pro, WITHHELD_WORDS.linux];
 
 describe("(b) the paid edition is named only in the permitted sentences", () => {
   it("holds every line of every Community source, comments included", () => {
@@ -112,12 +115,31 @@ describe("(b) the paid edition is named only in the permitted sentences", () => 
         named += 1;
         let rest = line;
         for (const sentence of PERMITTED) rest = rest.split(sentence).join("");
-        rest = rest.replace(ATTRIBUTION, "");
         expect(rest, `${file.path}:${index + 1} names the paid edition outside the permitted sentences`).not.toContain("InnerWarden Pro");
       });
     }
-    // Anti-vacuous: the offer and the attribution words are still here.
-    expect(named).toBeGreaterThan(5);
+    // Anti-vacuous: every permitted sentence is still here.
+    expect(named).toBeGreaterThanOrEqual(PERMITTED.length);
+  });
+
+  it("names the host that decided a command by the host install, never the paid edition", () => {
+    // The host installer installs the host install with or without a
+    // licence, and a recorded decision does not say which. FAILS ON REVERT:
+    // each of these said "InnerWarden Pro on this host" on any host install.
+    const attributions = [
+      DECIDER_WORDS.host,
+      TRUST_WORDS["observed:host"].tooltip,
+      REASON_WORDS.host_decided,
+      WITHHELD_WORDS.linuxWithActiveDefence,
+      HOST_WITHHELD_WORDS,
+      HOST_REFUSED_WORDS,
+      HOST_LAYER_WORDS.agent_type,
+      HOST_LAYER_WORDS.instance,
+    ];
+    for (const words of attributions) {
+      expect(words).toContain("InnerWarden's host install on this host");
+      expect(words).not.toContain("Pro");
+    }
   });
 
   it("says the three offer sentences exactly, each about what the edition is for", () => {
@@ -125,7 +147,20 @@ describe("(b) the paid edition is named only in the permitted sentences", () => 
     expect(TOUR_UPGRADE_LINE).toBe(
       "Community screens what your AI agents try to run. InnerWarden Pro, the paid edition, adds host-level protection for Linux servers.",
     );
-    expect(INSTALLED_LINE.lead).toBe("InnerWarden Pro is installed on this host.");
+    expect(INSTALLED_LINE.lead.pro).toBe("InnerWarden Pro is installed on this host.");
+  });
+
+  it("names the host install on the installed line by its licence, the paid edition only with one", () => {
+    // FAILS ON REVERT: the line said "InnerWarden Pro is installed on this
+    // host." on a host installed with no licence, and where the licence
+    // could not be read.
+    expect(INSTALLED_LINE.lead.free_tier).toBe("InnerWarden's host install (free tier, no licence) is installed on this host.");
+    expect(INSTALLED_LINE.lead.unknown).toBe("InnerWarden's host install is installed on this host.");
+    for (const host of ["free_tier", "unknown"] as const) {
+      expect(INSTALLED_LINE.lead[host]).toBe(`${HOST_INSTALL_NAMES[host]} is installed on this host.`);
+      expect(INSTALLED_LINE.lead[host]).not.toContain("Pro");
+    }
+    expect(INSTALLED_LINE.lead.pro).toBe(`${HOST_INSTALL_NAMES.pro} is installed on this host.`);
   });
 
   it("never calls the paid edition by its repository name", () => {

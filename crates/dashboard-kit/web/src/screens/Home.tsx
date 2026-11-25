@@ -23,6 +23,7 @@ import { hasControlCharacters, humanizeToken, normaliseMode, formatCount } from 
 import { When } from "../components/When";
 import { isCaseListWindow, WINDOW_WORDS } from "../windows";
 import { countWords } from "../readCount";
+import { HOST_INSTALL_NAMES, hostInstallOf, type HostInstall } from "../hostInstall";
 import { EMPTY_BODY, EYEBROW_CYAN, EYEBROW_SLATE, SECTION_HEAD, STAT_VALUE, TITLE_SM, TONE_AMBER, TONE_BLUE } from "../components/classes";
 
 type ActivityLink = { id?: string; session?: string; verdict?: string; action?: string };
@@ -367,9 +368,9 @@ export function OverviewScreen({
         machinePanels={machinePanels}
         accessClaim={accessClaim}
         onOpenAuditTrail={onOpenAuditTrail}
-        // `?? false` reads an older server the way the layout without lanes
-        // reads it: as an offer.
-        activeDefenceInstalled={meta?.active_defence_installed ?? false}
+        // An older server that sends no field reads the way the layout
+        // without lanes reads it: as an offer.
+        hostInstall={hostInstallOf(meta)}
       />
     );
   }
@@ -399,11 +400,11 @@ export function OverviewScreen({
       />
 
       {edition === "enterprise" ? null : <CommunityIncluded />}
-      {/* `?? false` reads an older server, which does not send the field, the
-          way it always read it: as an offer. Being wrong toward offering is
+      {/* An older server, which does not send the field, reads the way it
+          always read: as an offer. Being wrong toward offering is
           recoverable; being wrong toward silence hides the product. */}
       {edition === "community" ? (
-        <ActiveDefenceCard installed={meta?.active_defence_installed ?? false} />
+        <ActiveDefenceCard host={hostInstallOf(meta)} />
       ) : null}
     </div>
   );
@@ -450,14 +451,15 @@ function LanesOverview({
   onOpenQueue,
   onOpenLane,
   machinePanels,
-  activeDefenceInstalled,
+  hostInstall,
   accessClaim,
   onOpenAuditTrail,
 }: {
   overview: Overview;
   laneCards: LaneCard[];
   technical: boolean;
-  activeDefenceInstalled: boolean;
+  /** The host install named by its licence; `undefined` where there is none. */
+  hostInstall: HostInstall | undefined;
   accessClaim?: string;
   onOpenAuditTrail?: () => void;
   mode: GuardrailMode;
@@ -540,7 +542,7 @@ function LanesOverview({
 
       {edition === "enterprise" ? null : <CommunityIncluded />}
       {edition === "community" ? (
-        <ActiveDefenceCard installed={activeDefenceInstalled} />
+        <ActiveDefenceCard host={hostInstall} />
       ) : null}
     </div>
   );
@@ -1810,7 +1812,21 @@ export const ACTIVE_DEFENCE_COPY = {
   },
   installed: {
     badge: "Installed on this host",
-    title: "InnerWarden Pro is installed on this host.",
+    /**
+     * Named by the host install's licence, as the CLI names it: the host
+     * installer installs it with or without one, so the paid edition is
+     * named only where the server says a licence is.
+     */
+    eyebrow: {
+      pro: HOST_INSTALL_NAMES.pro,
+      free_tier: "InnerWarden host install",
+      unknown: "InnerWarden host install",
+    } satisfies Record<HostInstall, string>,
+    title: {
+      pro: `${HOST_INSTALL_NAMES.pro} is installed on this host.`,
+      free_tier: `${HOST_INSTALL_NAMES.free_tier} is installed on this host.`,
+      unknown: `${HOST_INSTALL_NAMES.unknown} is installed on this host.`,
+    } satisfies Record<HostInstall, string>,
     body: "This page covers the agent layer only. Host telemetry, incident triage and the kernel Execution Gate belong to InnerWarden Pro, and this dashboard runs unprivileged, so it cannot read kernel state and does not report here what is running or what is turned on. Ask the host itself:",
     /**
      * Verified against a real installation before being written down: on
@@ -1824,28 +1840,29 @@ export const ACTIVE_DEFENCE_COPY = {
 } as const;
 
 /**
- * Which state the card is in. Trivial today, and named anyway: it is the seam
- * the tests assert through, and it is where a third state would land if one
- * ever arrives (installed-but-unlicensed, say).
+ * Which state the card is in: installed wherever a host install is, whatever
+ * its licence (the copy names which), and the offer where none is. It is the
+ * seam the tests assert through.
  */
-export function activeDefenceCardState(installed: boolean): "installed" | "offer" {
-  return installed ? "installed" : "offer";
+export function activeDefenceCardState(host: HostInstall | undefined): "installed" | "offer" {
+  return host === undefined ? "offer" : "installed";
 }
 
-function ActiveDefenceCard({ installed }: { installed: boolean }) {
-  if (activeDefenceCardState(installed) === "installed") {
+function ActiveDefenceCard({ host }: { host: HostInstall | undefined }) {
+  if (host !== undefined && activeDefenceCardState(host) === "installed") {
     const copy = ACTIVE_DEFENCE_COPY.installed;
     return (
       <aside
         data-ad-state="installed"
+        data-host-install={host}
         className="rounded-2xl border border-slate-200 bg-white p-5 sm:p-6"
         aria-labelledby="active-defence-title"
       >
         <div className="flex flex-wrap items-center gap-2">
-          <p className={EYEBROW_SLATE}>InnerWarden Pro</p>
+          <p className={EYEBROW_SLATE}>{copy.eyebrow[host]}</p>
           <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-0.5 text-[10px] font-semibold text-slate-600">{copy.badge}</span>
         </div>
-        <h2 id="active-defence-title" className="mt-2 text-lg font-semibold text-slate-950">{copy.title}</h2>
+        <h2 id="active-defence-title" className="mt-2 text-lg font-semibold text-slate-950">{copy.title[host]}</h2>
         <p className="mt-1 max-w-3xl text-sm leading-6 text-slate-600">{copy.body}</p>
         <code className="mt-3 inline-block rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 font-mono text-sm text-slate-800">{copy.command}</code>
       </aside>

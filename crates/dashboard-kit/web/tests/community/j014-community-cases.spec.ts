@@ -117,7 +117,7 @@ test("a refused case and a check by hand carry no offer", async ({ page }) => {
 });
 
 test("a host with InnerWarden Pro installed gets the installed line, never an offer", async ({ page }) => {
-  await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true }));
+  await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true, host_install: "pro" }));
   await openCase(page, CASE.wouldRefuse);
   // Nothing on a decision: the installed line is Protection's.
   await expect(page.locator("[data-ad-state]")).toHaveCount(0);

@@ -2,6 +2,7 @@ import { useMemo, type ReactNode } from "react";
 import type { CommunityScreenContext } from "../App";
 import type { Overview as OverviewPayload } from "../api";
 import { TechnicalOnly } from "../components/TechnicalDetail";
+import { hostInstallOf } from "../hostInstall";
 import { formatAbsolute, formatCount } from "../presentation";
 import { factsOf } from "./agentsView";
 import { readOverviewRecord, type AllowEntry, type History, type Protection, type RecordHealth, type RecordSpan, type SuppressCounts, type SuppressList } from "./api";
@@ -69,7 +70,7 @@ export function CommunityProtection({ context }: { context: CommunityScreenConte
   ];
   const summary = `${agentsFailed || facts !== undefined ? screeningSummary(rows) : "Screening: checking."} ${protection.data === undefined ? (protection.error === undefined ? "Optional: checking." : "Optional: not read.") : optionalSummary(optional)}`;
   const verdict = modeBox({ agents: facts?.agents, failed: agentsFailed, now });
-  const installed = context.meta?.active_defence_installed === true;
+  const host = hostInstallOf(context.meta);
 
   return (
     <div data-protection className="min-w-0 space-y-8">
@@ -120,7 +121,7 @@ export function CommunityProtection({ context }: { context: CommunityScreenConte
 
       <Exceptions protection={protection.data} history={history.data} now={now} />
 
-      <FooterOffer installed={installed} />
+      <FooterOffer host={host} />
     </div>
   );
 }

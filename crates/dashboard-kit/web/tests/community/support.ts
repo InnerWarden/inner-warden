@@ -178,8 +178,9 @@ export async function pageWidth(page: Page) {
  */
 /**
  * The only words a Community page may name the paid edition in (spec 10.6):
- * the generic line, the installed line, the Linux relaxation sentence, and
- * the attribution words that say which layer decided a command. An
+ * the generic line, the installed line where the host install has a
+ * licence, and the Linux relaxation sentence. The words that say the host
+ * decided a command name the host install, never the paid edition. An
  * allow-list of what may be said, never a list of names.
  */
 export const EDITION_LINES = {
@@ -187,13 +188,12 @@ export const EDITION_LINES = {
   installed: "InnerWarden Pro is installed on this host.",
   relaxation: "Per-agent relaxations apply on Linux with InnerWarden Pro, for an agent started with innerwarden contain --identity.",
 } as const;
-const ATTRIBUTION = /InnerWarden Pro on (?:this|its|the) host/g;
 
 /** Everything the page says about the paid edition is one of `EDITION_LINES`, or an attribution. */
 export async function expectOnlyEditionLines(page: Page) {
   let rest = await page.locator("body").innerText();
   for (const line of Object.values(EDITION_LINES)) rest = rest.split(line).join("");
-  expect(rest.replace(ATTRIBUTION, ""), "the page names the paid edition outside the permitted lines").not.toContain("InnerWarden Pro");
+  expect(rest, "the page names the paid edition outside the permitted lines").not.toContain("InnerWarden Pro");
 }
 
 export async function expectHonestUpsell(page: Page) {
