@@ -8,6 +8,7 @@
 
 use std::ops::Range;
 
+mod git_editor;
 mod inline_calls;
 pub(crate) mod output_options;
 pub(crate) mod runners;
@@ -3700,6 +3701,14 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             }
         }
     }
+    // The message a git whose editor is a shell or an interpreter runs, and
+    // the line an alias that starts with `!` runs ([`git_editor`]).
+    handed.lines.extend(git_editor::message_lines(
+        tree.root_node(),
+        bytes,
+        &commands,
+        &assignments,
+    ));
     // What a pipe hands a shell that reads its script from stdin (`cat
     // <<'EOF' | sh`, `printf '...' | bash`), when the line writes it out.
     // Text it does not write out is held by the reading of unread parts
