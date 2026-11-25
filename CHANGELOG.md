@@ -5,6 +5,14 @@ follows semantic versioning.
 
 ## Unreleased
 
+`innerwarden --version`, the hint that points `setup`, `dashboard`, `upgrade`
+and `uninstall` at the host layer, and `innerwarden openclaw status` name the
+host install on the machine by what it has: InnerWarden Pro only where a
+licence file is at `/etc/innerwarden/license.key`, the host install's free
+tier where none is. The host installer installs `innerwarden-ctl` with or
+without a licence, and a host installed without one was told "InnerWarden Pro
+is installed here".
+
 git commands are read on the work tree git itself uses: the one the line
 names (`--work-tree`, `GIT_WORK_TREE`, `-c core.worktree=`, `--config-env`,
 `GIT_CONFIG_KEY_<n>` with `GIT_CONFIG_VALUE_<n>`), else the `core.worktree`

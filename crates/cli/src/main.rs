@@ -743,8 +743,7 @@ fn main() -> std::process::ExitCode {
         // screen by 61 lines of usage. Nothing else in this CLI claims `-v`.
         Some("--version") | Some("-V") | Some("-v") | Some("version") => {
             println!("{} {}", prog(), env!("CARGO_PKG_VERSION"));
-            if let Some(hint) = upsell_io::version_host_hint(upsell_io::active_defence_installed())
-            {
+            if let Some(hint) = upsell_io::version_host_hint(upsell_io::host_install()) {
                 eprintln!("{hint}");
             }
             std::process::ExitCode::SUCCESS

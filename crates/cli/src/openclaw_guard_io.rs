@@ -908,11 +908,13 @@ pub(crate) fn status_lines(home: &Path) -> Vec<String> {
     if let Some(pro) = &pro {
         lines.push(format!("  {}", pro.line_seen_from_outside()));
     } else if pro_installed {
-        lines.push(
-            "  InnerWarden Pro is installed here; its status could not be read on this host's \
-             loopback (it is not running, or its release does not serve it yet)."
-                .into(),
-        );
+        let host =
+            crate::upsell_io::host_install().unwrap_or(crate::upsell_io::HostInstall::Unknown);
+        lines.push(format!(
+            "  {} is installed here; its status could not be read on this host's \
+             loopback (it is not running, or its release does not serve it yet).",
+            host.name()
+        ));
     }
     let pro = pro.as_ref().map(ProStatus::seen_from_outside);
     if let Some(line) = take_suggestion(Some(Trigger::OwnerAsked), true, pro_installed, pro) {
