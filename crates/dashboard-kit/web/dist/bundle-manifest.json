@@ -1,12 +1,12 @@
 {
   "schema": "innerwarden.dashboard.bundle.v1",
-  "source_digest": "sha256:d868dc58c3d298d18da92e4fcde708b007e1cc59ddf889b82fa83c3b3abaf71f",
+  "source_digest": "sha256:9940e695c61b46c7ef6526dbd1cd0841a8b98c127d2a20bb7b6be75a7d64bb3f",
   "entrypoint": "index.html",
   "assets": [
     {
-      "path": "assets/index-Cq5kf2Aq.js",
-      "sha256": "sha256:dfade8c1826d5afabf2312f5107c49779db9cac1d651ed1c034b516bdb10c53b",
-      "size": 609972
+      "path": "assets/index-D8TFxXGD.js",
+      "sha256": "sha256:ba4f1168e08ba27460f27ac7625aebc74efb3bfddeecedc3ae5335f3e9fb2b56",
+      "size": 610394
     },
     {
       "path": "assets/index-DaJcN31N.css",
@@ -15,7 +15,7 @@
     },
     {
       "path": "index.html",
-      "sha256": "sha256:62897f1ecff5f3df31fe25909d44944e3cad27c398062150b922e8c54c23d274",
+      "sha256": "sha256:9d41bc776dfa791b7b2bd4c8934356e6cd6cba2daf2f4b933126a8a287ce86c6",
       "size": 543
     }
   ]

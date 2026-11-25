@@ -1,3 +1,4 @@
+import type { HostInstall } from "../hostInstall";
 import type { OfferSlot } from "./dismiss";
 
 /**
@@ -49,12 +50,18 @@ export function protectionOffer(): Offer {
 }
 
 /**
- * Said in place of the offer on a machine where the paid edition is
+ * Said in place of the offer on a machine where the host install is
  * installed. INSTALLED, never armed: this dashboard runs without privileges
  * and cannot read the host stack, so it claims nothing about what runs there.
+ * The lead names the host install by its licence (`hostInstall.ts`): the
+ * paid edition only where the server says a licence is.
  */
 export const INSTALLED_LINE = {
-  lead: "InnerWarden Pro is installed on this host.",
+  lead: {
+    pro: "InnerWarden Pro is installed on this host.",
+    free_tier: "InnerWarden's host install (free tier, no licence) is installed on this host.",
+    unknown: "InnerWarden's host install is installed on this host.",
+  } satisfies Record<HostInstall, string>,
   body: "This dashboard runs without privileges and cannot read it, so it does not say what is running there. Ask the host:",
   command: "innerwarden get status",
 } as const;

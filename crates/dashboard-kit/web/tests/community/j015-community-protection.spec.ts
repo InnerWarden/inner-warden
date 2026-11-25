@@ -62,7 +62,7 @@ test("Not in Community names the paid features, says nothing of how one works, a
 });
 
 test("where InnerWarden Pro is installed, the section says so and links nowhere", async ({ page }) => {
-  await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true }));
+  await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true, host_install: "pro" }));
   await page.goto("/?view=posture");
   const installed = page.locator('[data-tour="upgrade"] [data-ad-state="installed"]');
   await expect(installed).toBeVisible();
@@ -70,6 +70,29 @@ test("where InnerWarden Pro is installed, the section says so and links nowhere"
   await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
   await expect(page.locator("li[data-paid]")).toHaveCount(0);
 });
+
+/**
+ * The host installer installs the host install with or without a licence.
+ * FAILS ON REVERT: a host installed with no licence, and one whose licence
+ * could not be read (or an older server that does not say), were told
+ * "InnerWarden Pro is installed on this host."
+ */
+for (const [host, words] of [
+  ["free_tier", "InnerWarden's host install (free tier, no licence) is installed on this host."],
+  ["unknown", "InnerWarden's host install is installed on this host."],
+  [undefined, "InnerWarden's host install is installed on this host."],
+] as const) {
+  test(`a host install named ${host ?? "by an older server"} is never called InnerWarden Pro`, async ({ page }) => {
+    const meta = { ...META, active_defence_installed: true, ...(host === undefined ? {} : { host_install: host }) };
+    await page.route(guardRoute("meta"), (route) => fulfillJson(route, meta));
+    await page.goto("/?view=posture");
+    const installed = page.locator('[data-tour="upgrade"] [data-ad-state="installed"]');
+    await expect(installed).toBeVisible();
+    await expect(installed).toContainText(words);
+    await expect(page.locator("main")).not.toContainText("InnerWarden Pro");
+    await expect(page.locator('a[href^="https://innerwarden.com"]')).toHaveCount(0);
+  });
+}
 
 /**
  * FAILS ON REVERT: the hero once said "0 Refusing" and a ladder "watching

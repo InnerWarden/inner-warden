@@ -113,6 +113,16 @@ impl HostInstall {
             Self::Unknown => "InnerWarden's host install",
         }
     }
+
+    /// The token the dashboard's `/api/meta` carries in `host_install`, for
+    /// the page to name the host install the way [`Self::name`] does.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Pro => "pro",
+            Self::FreeTier => "free_tier",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 /// The host install on this machine, `None` when there is none.
