@@ -997,7 +997,10 @@ pub fn record_place_finding(place: &RecordPlace) -> Finding {
         let where_to = if place.pro_reads {
             format!("{} instead", place.dir)
         } else {
-            format!("{} instead, which InnerWarden Pro does not read", place.dir)
+            format!(
+                "{} instead, which InnerWarden's host install does not read",
+                place.dir
+            )
         };
         return Finding::NotWorking {
             what: format!(
@@ -1005,7 +1008,7 @@ pub fn record_place_finding(place: &RecordPlace) -> Finding {
                  so its decisions go to {where_to}."
             ),
             next: format!(
-                "sudo innerwarden-ctl agent-user add {account} (on the InnerWarden Pro \
+                "sudo innerwarden-ctl agent-user add {account} (on the InnerWarden host \
                  install), then run innerwarden status again"
             ),
         };
@@ -1016,9 +1019,9 @@ pub fn record_place_finding(place: &RecordPlace) -> Finding {
         .map(|name| format!(", the folder /etc/innerwarden/guard.toml gives this account ({name})"))
         .unwrap_or_default();
     let read = if place.pro_reads {
-        "InnerWarden Pro reads them there"
+        "InnerWarden's host install reads them there"
     } else {
-        "InnerWarden Pro does not read them there"
+        "InnerWarden's host install does not read them there"
     };
     Finding::Working(format!(
         "Decisions are recorded in {}{given}; {read}.",
@@ -1064,13 +1067,13 @@ pub fn record_kept_apart_finding(apart: &RecordKeptApart) -> Finding {
             "Record integrity: this account may not write the shared record in {}, \
              so its decisions go to {} instead. Every call is still screened, but \
              those decisions can be edited or deleted by this account (and the \
-             agent running as it), and InnerWarden Pro on this machine does not \
+             agent running as it), and InnerWarden's host install on this machine does not \
              see them.",
             apart.shared_dir, apart.own_dir
         ),
         next: format!(
-            "sudo innerwarden-ctl agent-user add {user} (on the InnerWarden Pro \
-             install: a folder of its own for this account that Pro reads; never add \
+            "sudo innerwarden-ctl agent-user add {user} (on the InnerWarden host \
+             install: a folder of its own for this account that it reads; never add \
              an AI agent's account to the innerwarden group), then run innerwarden \
              status again"
         ),
@@ -1085,7 +1088,7 @@ pub fn kept_apart_before_finding(own_dir: &str) -> Finding {
     Finding::Unknown {
         what: format!(
             "Decisions this account recorded while it was refused the shared record \
-             are still in {own_dir}. InnerWarden Pro never saw them, and this account \
+             are still in {own_dir}. InnerWarden's host install never saw them, and this account \
              could edit or delete them there."
         ),
         why: format!(
@@ -2662,6 +2665,38 @@ mod tests {
         }
     }
 
+    /// The record findings speak of the host install on this machine, which
+    /// the host installer puts there with or without a licence, and none of
+    /// them reads the licence: none names it InnerWarden Pro. FAILS ON
+    /// REVERT of any of their host words.
+    #[test]
+    fn the_record_findings_never_call_the_host_install_pro() {
+        let mut said = Vec::new();
+        for (account_problem, pro_reads) in [
+            (None, true),
+            (None, false),
+            (Some("account_directory_not_its_own"), true),
+            (Some("account_directory_not_its_own"), false),
+        ] {
+            said.push(record_place_finding(&RecordPlace {
+                dir: "/var/lib/innerwarden-agents/bot".into(),
+                account: Some("bot".into()),
+                account_problem,
+                pro_reads,
+            }));
+        }
+        said.push(record_kept_apart_finding(&RecordKeptApart {
+            shared_dir: "/var/lib/innerwarden/guard".into(),
+            own_dir: "/home/agent/.config/innerwarden".into(),
+            user_name: LinuxUserName("agent".into()),
+        }));
+        said.push(kept_apart_before_finding("/home/agent/.config/innerwarden"));
+        for finding in said {
+            let words = format!("{finding:?}");
+            assert!(!words.contains("Pro"), "{words}");
+        }
+    }
+
     /// `status` says where decisions are recorded and whether InnerWarden Pro
     /// reads them, before the count; an entry this account has and that was
     /// not honoured is a fault with the Pro command that makes the folder.
@@ -2685,7 +2720,10 @@ mod tests {
         let line = findings[at].to_string();
         assert!(line.contains("/var/lib/innerwarden-agents/bot"), "{line}");
         assert!(line.contains("(bot)"), "{line}");
-        assert!(line.contains("InnerWarden Pro reads them there"), "{line}");
+        assert!(
+            line.contains("InnerWarden's host install reads them there"),
+            "{line}"
+        );
         let count = findings
             .iter()
             .position(|f| f.to_string().contains("screening decision(s) recorded"))
@@ -2700,7 +2738,7 @@ mod tests {
         });
         assert!(assess(&facts).iter().any(|f| f
             .to_string()
-            .contains("InnerWarden Pro does not read them there")));
+            .contains("InnerWarden's host install does not read them there")));
 
         facts.record_place = Some(RecordPlace {
             dir: "/var/lib/innerwarden/guard".into(),

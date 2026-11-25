@@ -537,6 +537,17 @@ impl ProStatus {
         self.line_with_gate(gate)
     }
 
+    /// PURE. The host install that answered, named by the licence it
+    /// reported: InnerWarden Pro only with a valid one, the host install
+    /// without the word where it is not valid or was not said.
+    pub fn host(&self) -> crate::upsell_io::HostInstall {
+        if self.licence_valid == Some(true) {
+            crate::upsell_io::HostInstall::Pro
+        } else {
+            crate::upsell_io::HostInstall::Unknown
+        }
+    }
+
     /// PURE. One line for the person: tier, the gate for this agent, the DNS
     /// Guard and the licence, each as Pro said it.
     pub fn line(&self) -> String {
@@ -551,17 +562,9 @@ impl ProStatus {
             (Some(false), _) => "not valid".to_string(),
             (None, _) => "not reported".to_string(),
         };
-        // Named by the licence Pro reported: InnerWarden Pro only with a
-        // valid one, the host install without the word where it is not
-        // valid or was not said.
-        let host = if self.licence_valid == Some(true) {
-            crate::upsell_io::HostInstall::Pro
-        } else {
-            crate::upsell_io::HostInstall::Unknown
-        };
         format!(
             "{} on this host: Execution Gate for this agent {}, DNS Guard {}, licence {licence}.",
-            host.name(),
+            self.host().name(),
             said(gate),
             said(self.dns_guard.as_deref()),
         )
@@ -628,20 +631,23 @@ pub fn suggestion(facts: &SuggestionFacts) -> Option<String> {
     if !facts.pro_installed {
         return facts.linux.then(|| GET_PRO_LINE.to_string());
     }
-    let gate = facts.pro.as_ref().and_then(ProStatus::gate_for_agent);
-    match gate {
-        Some("enforce") => None,
-        Some("observe") => Some(
-            "Next step for InnerWarden Pro: rehearse the Execution Gate for this agent \
-             (sudo innerwarden-ctl exec-gate rehearse --pid <gateway pid>), then enforce it."
-                .to_string(),
-        ),
-        Some(_) => Some(
-            "Next step for InnerWarden Pro: arm the Execution Gate around this agent in observe \
-             (sudo innerwarden-ctl exec-gate arm --pid <gateway pid> --observe), then rehearse."
-                .to_string(),
-        ),
+    let Some(pro) = facts.pro.as_ref() else {
         // Pro did not answer: nothing is said about what runs there.
+        return None;
+    };
+    // Named by the licence the host install reported, as its line is.
+    let host = pro.host().name();
+    match pro.gate_for_agent() {
+        Some("enforce") => None,
+        Some("observe") => Some(format!(
+            "Next step for {host}: rehearse the Execution Gate for this agent \
+             (sudo innerwarden-ctl exec-gate rehearse --pid <gateway pid>), then enforce it."
+        )),
+        Some(_) => Some(format!(
+            "Next step for {host}: arm the Execution Gate around this agent in observe \
+             (sudo innerwarden-ctl exec-gate arm --pid <gateway pid> --observe), then rehearse."
+        )),
+        // Pro said nothing about this agent's gate: no step rests on it.
         None => None,
     }
 }
@@ -1299,6 +1305,40 @@ mod tests {
                     "{licence:?}: {line}"
                 );
                 assert!(!line.contains("Pro"), "{licence:?}: {line}");
+            }
+        }
+    }
+
+    /// The next step is named like the host's line: InnerWarden Pro only
+    /// where the host install reported a valid licence. FAILS ON REVERT:
+    /// `openclaw status` said "Next step for InnerWarden Pro" on a host
+    /// install whose licence is not valid or was not said.
+    #[test]
+    fn the_next_step_says_pro_only_with_a_valid_licence() {
+        let mut with = facts(Some(Trigger::OwnerAsked));
+        with.pro_installed = true;
+        for mode in ["observe", "off"] {
+            let mut pro = ProStatus {
+                licence_valid: Some(true),
+                exec_gate: Some(mode.into()),
+                in_scope: Some(true),
+                ..ProStatus::default()
+            };
+            with.pro = Some(pro.clone());
+            let step = suggestion(&with).expect("a step");
+            assert!(
+                step.starts_with("Next step for InnerWarden Pro: "),
+                "{step}"
+            );
+            for licence in [Some(false), None] {
+                pro.licence_valid = licence;
+                with.pro = Some(pro.clone());
+                let step = suggestion(&with).expect("a step");
+                assert!(
+                    step.starts_with("Next step for InnerWarden's host install: "),
+                    "{licence:?}: {step}"
+                );
+                assert!(!step.contains("Pro"), "{licence:?}: {step}");
             }
         }
     }

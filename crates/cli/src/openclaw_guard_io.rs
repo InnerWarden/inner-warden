@@ -107,7 +107,7 @@ pub(crate) fn help_text() -> String {
          \n\
          Usage:\n  \
          {prog} openclaw [status]      is the plugin installed, in which mode, and\n  \
-         \x20                             what InnerWarden Pro says about this host\n\
+         \x20                             what InnerWarden's host install says about this host\n\
          \n\
          The plugin itself runs `{prog} openclaw screen|resolved|ran`; they read\n\
          one call as JSON on stdin and are not meant to be typed.",

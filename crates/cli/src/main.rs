@@ -3418,7 +3418,7 @@ fn warn_agent(agent: Option<&str>, line: &str) -> bool {
 }
 
 /// The words a record keeps for a recommendation of the host's own.
-pub(crate) const HOST_READING_WORDS: &str = "InnerWarden Pro on this host";
+pub(crate) const HOST_READING_WORDS: &str = "InnerWarden's host install on this host";
 
 /// PURE. The verdict once the host's own recommendation is heard: the
 /// stricter of the two (`deny` over `review` over `allow`), with what the host
@@ -4174,7 +4174,7 @@ fn hook_block_remedy(verdict: &serde_json::Value) -> &'static str {
 
 /// The remedy after a refusal of Active Defence's own on the host.
 const HOST_BLOCK_REMEDY: &str =
-    "  For the person supervising this agent: InnerWarden Pro on this host refused \
+    "  For the person supervising this agent: InnerWarden's host install on this host refused \
      this command on its own, and `innerwarden allow` does not lift that; its settings \
      on this host decide. An agent cannot authorise it and should ask you instead of \
      retrying.";
@@ -5520,7 +5520,7 @@ fn help_text() -> String {
            \x20                                wire a PreToolUse hook into Claude Code (--monitor = records, never blocks)\n  \
            {p} uninstall claude-code     remove that hook (leaves other settings untouched)\n  \
            {p} upgrade                   update to the latest signed release (verifies before replacing)\n  \
-         {p} host <command>            run a command in the InnerWarden Pro host layer\n  \
+         {p} host <command>            run a command in the InnerWarden host layer\n  \
            {p} uninstall                 remove InnerWarden entirely: hook, config, binary and its iw shortcuts\n  \
            {p} agents [connect [--strict|--monitor]|disconnect [--all|<name>]]\n  \
            \x20                                find AI agents on this machine + connect the guard\n  \
@@ -6185,7 +6185,9 @@ mod tests {
         let said = super::hook_block_remedy(&host);
         assert!(!said.contains("innerwarden allow --help"), "{said}");
         assert!(
-            said.contains("InnerWarden Pro on this host refused this command on its own"),
+            said.contains(
+                "InnerWarden's host install on this host refused this command on its own"
+            ),
             "{said}"
         );
         for other in [
@@ -6279,6 +6281,52 @@ mod tests {
             "claude-code".into(),
             "--purge".into()
         ]));
+    }
+
+    /// What the hook, `contain`, `serve` and a profile change say about the
+    /// host install on this machine. The host installer puts it there with or
+    /// without a licence, and none of these reads the licence (the host
+    /// refuses to admit a jail for want of one): none names it InnerWarden
+    /// Pro. FAILS ON REVERT of any of their host words.
+    #[test]
+    fn what_is_said_about_the_host_install_never_calls_it_pro() {
+        let said = [
+            HOST_READING_WORDS.to_string(),
+            HOST_BLOCK_REMEDY.to_string(),
+            host_decide::HOST_DENY_SENTENCE.to_string(),
+            contain::launch::NOT_ADMITTED.to_string(),
+            host_decide_io::NoAnswer::Refused.to_string(),
+            serve_owner::explain(
+                &serve_owner::BindFailure::ContractAlreadyServed,
+                "127.0.0.1:8787",
+                "",
+            ),
+            agent_decisions::ask_host_sentence("claude-code", 1, 1),
+            contain::launch::not_admitted_remedy(&[], None),
+            contain::launch::not_admitted_remedy(&[], Some(&contain::launch::Unbelieved::NoKey)),
+        ];
+        for words in said {
+            assert!(!words.contains("Pro"), "{words}");
+            assert!(words.contains("host"), "{words}");
+        }
+    }
+
+    /// `--help` is fixed text and cannot read the host's licence, so the
+    /// `host` line names the layer without a tier: it is shown on a host
+    /// installed with no licence too. FAILS ON REVERT: it said "run a command
+    /// in the InnerWarden Pro host layer" there.
+    #[test]
+    fn the_host_line_of_help_names_no_tier() {
+        let help = help_text();
+        let line = help
+            .lines()
+            .find(|line| line.trim_start().contains(" host <command> "))
+            .unwrap_or_else(|| panic!("no host line: {help}"));
+        assert!(
+            line.ends_with("run a command in the InnerWarden host layer"),
+            "{line}"
+        );
+        assert!(!line.contains("Pro"), "{line}");
     }
 
     /// Customers buy InnerWarden Community, InnerWarden Pro and Enterprise.
@@ -7448,7 +7496,7 @@ mod host_reading_tests {
         assert!(raised["explanation"]
             .as_str()
             .unwrap()
-            .contains("InnerWarden Pro on this host answered deny"));
+            .contains("InnerWarden's host install on this host answered deny"));
 
         let allowed = json!({"recommendation": "allow", "risk_score": 0});
         assert_eq!(
