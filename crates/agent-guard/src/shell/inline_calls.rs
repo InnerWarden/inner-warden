@@ -339,12 +339,14 @@ fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
         Lang::Lua => match callee {
             "os.execute" | "io.popen" => Line,
             // luaposix: `posix.spawn({words})`, `posix.spawn("line")` or
-            // `posix.spawn("prog", "arg", ...)`. Its `exec` is held by name,
-            // as every `exec(` is.
+            // `posix.spawn("prog", "arg", ...)`; `exec` and `execp` of
+            // `posix` and `posix.unistd` take a program and the table of
+            // its arguments (`exec` is also held by name, as every `exec(`).
             "posix.spawn" => LineOrWords,
+            "posix.exec" | "posix.execp" | "posix.unistd.exec" | "posix.unistd.execp" => PathList,
             "load" | "loadstring" => Code,
             "dofile" | "loadfile" | "require" => Load,
-            "pcall" => Callback(0),
+            "pcall" | "xpcall" => Callback(0),
             _ => return None,
         },
         Lang::Js => match callee {
@@ -432,6 +434,7 @@ const SINK_HOLDERS: &[(Lang, &str)] = &[
     (Lang::Lua, "os"),
     (Lang::Lua, "io"),
     (Lang::Lua, "posix"),
+    (Lang::Lua, "posix.unistd"),
     (Lang::Lua, "_G"),
     (Lang::Lua, "_ENV"),
 ];
@@ -1301,6 +1304,7 @@ fn normalized_code(lang: Lang, code: &str) -> String {
                         .then(|| format!("{object}.{name}"))
                 });
             }
+            text = lua_protected_requires(&text);
             text = lua_required_modules(&text);
             text = lua_literal_indexes(&text);
         }
@@ -1516,6 +1520,21 @@ fn lua_required_modules(code: &str) -> String {
         at += width;
     }
     out
+}
+
+/// Lua's `local ok, m = pcall(require, "os")`: the second name is given
+/// the module, as `local m = require("os")` gives it; written that way so
+/// [`lua_required_modules`] reads it.
+fn lua_protected_requires(code: &str) -> String {
+    static PROTECTED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"(local\s+)?([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*=\s*x?pcall\s*\(\s*require\s*,\s*(?:[A-Za-z_]\w*\s*,\s*)?("[\w.]+"|'[\w.]+')\s*\)"#,
+        )
+        .expect("static protected require regex")
+    });
+    PROTECTED
+        .replace_all(code, "${1}${2} = true; ${1}${3} = require(${4})")
+        .into_owned()
 }
 
 /// Lua's `t["name"]` written as `t.name`, outside strings: `_G["os"]
@@ -2332,11 +2351,16 @@ impl Reader<'_> {
                 continue;
             };
             let handed = call_arguments(&code[arguments_at..end]);
-            if self.name_lifted(
-                sink,
-                split_top(handed, ",").first(),
-                arguments_at + handed.len(),
-            ) {
+            // luaposix's `exec` keeps the name every `exec(` is held by:
+            // its program and arguments are read below as well.
+            let held_by_name = self.lang == Lang::Lua && callee.ends_with(".exec");
+            if !held_by_name
+                && self.name_lifted(
+                    sink,
+                    split_top(handed, ",").first(),
+                    arguments_at + handed.len(),
+                )
+            {
                 self.read_names.push((at, at + chain.len()));
             }
             let arguments = if code.as_bytes()[arguments_at - 1] == b'(' {
