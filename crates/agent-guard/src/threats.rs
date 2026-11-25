@@ -29314,7 +29314,7 @@ mod brq_evaluation_tests {
     ///
     /// FAILS ON REVERT: drop the `disconnect`, `connect --monitor` or
     /// `contain` arm and its forms are `None` again.
-    /// T-109: accepting the project files a jail made is the person's; an
+    /// Accepting the project files a jail made is the person's; an
     /// agent's `innerwarden contain --accept-project-files` is stopped like
     /// every other `contain` that is not help or a dry run.
     #[test]

@@ -212,9 +212,9 @@ fn a_kill_beside_a_folder_named_for_the_guard_is_not_disabling_it() {
 #[test]
 fn paths_and_text_that_name_the_guard_stay_allowed() {
     assert_allowed(&[
-        "cd ~/innerwarden/wt-T-002 && git log --oneline -3 && echo $(git rev-parse HEAD)",
+        "cd ~/innerwarden/wt-a && git log --oneline -3 && echo $(git rev-parse HEAD)",
         "cd ~/innerwarden/wt && SHA=$(git rev-parse HEAD) && echo $SHA",
-        "mkdir -p ~/iwt-journal && D=$(date -u +%Y-%m-%dT%H:%MZ) && SHA=$(git -C ~/innerwarden/inner-warden rev-parse --short HEAD) && echo \"$D $SHA\" >> ~/iwt-journal/T-003.md",
+        "mkdir -p ~/notes && D=$(date -u +%Y-%m-%dT%H:%MZ) && SHA=$(git -C ~/innerwarden/inner-warden rev-parse --short HEAD) && echo \"$D $SHA\" >> ~/notes/today.md",
         "ls /opt/innerwarden/ && x=$(ls /opt/innerwarden | wc -l)",
         "sed -i 's#~/.config/innerwarden/hook.sh#X#' notes.md",
         "git commit -F - <<'MSG'\nGuard: read text as text\n\nThe at job runs at 5pm; innerwarden disarm stays refused.\nMSG",
