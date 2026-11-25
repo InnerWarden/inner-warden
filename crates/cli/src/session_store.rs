@@ -236,7 +236,7 @@ const _: () = assert!(STORE_LOCK_WAIT.as_millis() * 10 <= crate::hook_net::DEADL
 /// dropping what another writer had added after that, the values a tool
 /// result left (the taint) among them; held by the agent, the lock sent every
 /// writer that way, and one that dropped its change on a busy lock dropped
-/// the taint at once (V-443, 2026-11-25).
+/// the taint at once (2026-11-25).
 fn update_store(path: &Path, now: i64, change: impl FnOnce(&mut Store)) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -358,8 +358,7 @@ fn euid() -> u32 {
 /// is not waited on: the open does neither, and what it opened is looked at
 /// before a byte is read. The agent runs as this user, and a pipe it made
 /// under a name the store's readers read held every hook on its first read,
-/// until the screening's deadline, with no writer ever coming (V-443-r1,
-/// 2026-11-25).
+/// until the screening's deadline, with no writer ever coming (2026-11-25).
 fn read_own_file(path: &Path, max: u64) -> Option<String> {
     use std::io::Read;
     let mut options = std::fs::OpenOptions::new();
@@ -445,8 +444,8 @@ const MAX_PENDING_BYTES: u64 = 4 << 20;
 /// after their half hour. Every call of the agent waits for its hook to
 /// read them, before its answer, under the screening's deadline
 /// ([`crate::hook_net::DEADLINE`], 10 s). At these bounds the hook answered
-/// in under a second on the bench (vm-iw-review-3, 2026-11-25, numbers in
-/// the commit).
+/// in under a second on a 16-core test host (2026-11-25, numbers in the
+/// commit).
 const MAX_PENDING_READ: usize = 1024;
 const MAX_PENDING_TOTAL: u64 = 16 << 20;
 
@@ -461,7 +460,7 @@ static SAID_SKIPPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// else under such a name (a pipe, a link, a folder, an empty file, a file
 /// of another user or one too large: none of them a writer's) is skipped,
 /// and how many were is said once on stderr. Read by name it waited on a
-/// pipe the agent made there, which no hook ever wrote to (V-443-r1).
+/// pipe the agent made there, which no hook ever wrote to.
 fn pending(path: &Path) -> Kept {
     let (Some(dir), prefix) = (path.parent(), temporary_prefix(path)) else {
         return Kept::default();

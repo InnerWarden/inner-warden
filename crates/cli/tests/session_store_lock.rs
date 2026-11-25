@@ -1,5 +1,5 @@
 //! The session store's lock held by another process never blinds the hook to
-//! where a value came from (V-443, 2026-11-25).
+//! where a value came from (2026-11-25).
 //!
 //! The agent can take the store's lock: `flock` on the lock file, a
 //! read-only open and `flock` from any interpreter, or a folder made where
@@ -250,7 +250,7 @@ const QUICK: std::time::Duration = std::time::Duration::from_secs(5);
 /// FAILS ON REVERT of reading each kept change only as a regular file of
 /// this user (`pending` in session_store.rs reading every name with
 /// `read_to_string`): both hooks wait on the pipe until the deadline, and
-/// the upload is refused as unscreened (V-443-r1).
+/// the upload is refused as unscreened.
 #[cfg(unix)]
 #[test]
 fn a_pipe_under_a_kept_changes_name_holds_no_enforcing_hook() {

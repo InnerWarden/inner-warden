@@ -9313,7 +9313,7 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
             // A pipe, a node or a file of a size made under a name the
             // place's readers read is as much theirs as one written there:
             // a pipe under the name of a change kept beside the hook's
-            // session store held every hook that read it (V-443-r1).
+            // session store held every hook that read it.
             "unlink" | "shred" | "truncate" | "sponge" | "mkfifo" | "mknod" | "fallocate" => {
                 targets.extend(positional.iter().map(|path| path.to_string()));
             }
@@ -29946,7 +29946,7 @@ mod brq_evaluation_tests {
     /// A pipe, a node, a link or a file of a size made in the guard's
     /// configuration directory is a write there: the hook reads the changes
     /// kept beside its session store there by name, and a pipe under such a
-    /// name held every hook until its deadline (V-443-r1, 2026-11-25: each of
+    /// name held every hook until its deadline (2026-11-25: each of
     /// these lines but the link by `ln` was allowed). The same made elsewhere
     /// is not.
     ///
