@@ -472,3 +472,16 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   `tests/text_a_later_step_runs.rs` that fails when its part is
   reverted. No other line of any corpus moved, from an empty home or a
   home with keys.
+- 2026-11-25: own-work/own-027 goes from deny to allow: SQL handed to a
+  SQL client (psql, sqlite3, mysql, mariadb, duckdb, by -c, -e, a
+  positional argument, a here-document, a here-string or a pipe from echo
+  or printf) is data where it holds no way to the shell or the machine
+  (`src/shell/sql_text.rs`). own-027 is an `update ... set body = body ||
+  '...'` in a quoted here-document to psql whose string names the guard;
+  the client stores the string, nothing runs it. SQL with a client
+  command (a backslash command, a dot command, `system`, `pager`), a
+  backtick, a dollar quote, `COPY`, `PROGRAM`, `LANGUAGE`, a file
+  function, or a string inside a function that is not a plain value is
+  read as before, every word of it as a shell line; held by
+  `tests/sql_text_is_data.rs`, whose allowed lines fail on revert. No
+  other line of any corpus moved.

