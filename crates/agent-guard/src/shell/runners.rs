@@ -1119,6 +1119,19 @@ mod tests {
             ("watch", "watch rm -rf ~/.ssh"),
             ("su", "su -c 'rm -rf ~/.ssh'"),
             ("systemd-run", "systemd-run rm -rf ~/.ssh"),
+            ("runuser", "runuser -u x -- rm -rf ~/.ssh"),
+            ("flock", "flock /tmp/l rm -rf ~/.ssh"),
+            ("setpriv", "setpriv --reuid=0 rm -rf ~/.ssh"),
+            ("chroot", "chroot / rm -rf ~/.ssh"),
+            ("unshare", "unshare -r rm -rf ~/.ssh"),
+            ("nsenter", "nsenter -t 1234 -m rm -rf ~/.ssh"),
+            ("prlimit", "prlimit --nofile=1024 rm -rf ~/.ssh"),
+            ("pkexec", "pkexec rm -rf ~/.ssh"),
+            ("ionice", "ionice -c3 rm -rf ~/.ssh"),
+            ("chrt", "chrt 0 rm -rf ~/.ssh"),
+            ("taskset", "taskset -c 0 rm -rf ~/.ssh"),
+            ("caffeinate", "caffeinate -i rm -rf ~/.ssh"),
+            ("arch", "arch -x86_64 rm -rf ~/.ssh"),
         ];
         let launchers: Vec<&str> = every_program()
             .filter(|(_, row)| row.launcher)

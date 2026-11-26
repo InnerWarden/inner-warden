@@ -116,10 +116,24 @@ language = "shell"
 launcher = true
 prefix = true
 
+# These run the command written after their own options and operands too:
+# as another user (`runuser -u`, `setpriv`, `pkexec`), under a lock
+# (`flock FILE`), in another root or namespace (`chroot`, `unshare`,
+# `nsenter`), with other limits, priorities or CPUs (`prlimit`, `ionice`,
+# `chrt`, `taskset`), as a unit (`systemd-run`), kept awake or on another
+# architecture (macOS `caffeinate`, `arch`). Their options are read by
+# `effective_command_index`; an option it does not know leaves the line
+# as written.
+[[program]]
+names = ["runuser", "flock", "setpriv", "chroot", "unshare", "nsenter", "prlimit", "pkexec", "ionice", "chrt", "taskset", "systemd-run", "caffeinate", "arch"]
+language = "shell"
+launcher = true
+prefix = true
+
 # These run a command too, in a shape of their own (`find . -exec`,
 # `su -c`, `busybox sh`).
 [[program]]
-names = ["busybox", "find", "watch", "su", "systemd-run"]
+names = ["busybox", "find", "watch", "su"]
 language = "shell"
 launcher = true
 
