@@ -9310,7 +9310,11 @@ fn writes_place(content: &str, depth: u8, names: fn(&str, bool) -> bool, code: b
                         .map(|path| path.to_string()),
                 );
             }
-            "unlink" | "shred" | "truncate" | "sponge" => {
+            // A pipe, a node or a file of a size made under a name the
+            // place's readers read is as much theirs as one written there:
+            // a pipe under the name of a change kept beside the hook's
+            // session store held every hook that read it.
+            "unlink" | "shred" | "truncate" | "sponge" | "mkfifo" | "mknod" | "fallocate" => {
                 targets.extend(positional.iter().map(|path| path.to_string()));
             }
             "patch" => {
@@ -10985,7 +10989,7 @@ fn code_names_and_writes_guard_config(code: &str) -> bool {
     });
     let writes = WRITES.get_or_init(|| {
         regex::Regex::new(
-            r#"["'](?:w|a|x|wb|ab|w\+|a\+|r\+)["']|\bwrite|\bdump\b|filesync|appendfile|copyfile|copy2?\(|\bunlink|\bremove\(|\brmtree|\brename|\breplace\(|\bmove\(|\btruncate|file_put_contents|\bopen\(.{0,200}>"#,
+            r#"["'](?:w|a|x|wb|ab|w\+|a\+|r\+)["']|\bwrite|\bdump\b|filesync|appendfile|copyfile|copy2?\(|\bunlink|\bremove\(|\brmtree|\brename|\breplace\(|\bmove\(|\btruncate|\bmkfifo|\bmknod|\bsymlink|file_put_contents|\bopen\(.{0,200}>"#,
         )
         .expect("static interpreter write regex")
     });
@@ -29935,6 +29939,46 @@ mod brq_evaluation_tests {
             assert!(
                 check_guard_self_disable(cmd).is_some(),
                 "a write into the guard's configuration disables it: {cmd}"
+            );
+        }
+    }
+
+    /// A pipe, a node, a link or a file of a size made in the guard's
+    /// configuration directory is a write there: the hook reads the changes
+    /// kept beside its session store there by name, and a pipe under such a
+    /// name held every hook until its deadline (2026-11-25: each of
+    /// these lines but the link by `ln` was allowed). The same made elsewhere
+    /// is not.
+    ///
+    /// FAILS ON REVERT of `mkfifo`, `mknod` and `fallocate` in
+    /// `writes_place`, and of `mkfifo`, `mknod` and `symlink` among the
+    /// writes of interpreter code (`code_names_and_writes_guard_config`).
+    #[test]
+    fn a_pipe_or_a_node_made_in_the_guard_config_is_a_write() {
+        for cmd in [
+            "mkfifo ~/.config/innerwarden/.sessions.json.1.pending",
+            "mkfifo -m 600 /home/dev/.config/innerwarden/.sessions.json.1.pending",
+            "mknod ~/.config/innerwarden/.sessions.json.2.pending p",
+            "fallocate -l 100 ~/.config/innerwarden/.sessions.json.3.pending",
+            "cd ~/.config/innerwarden && mkfifo .sessions.json.4.pending",
+            "python3 -c \"import os; os.mkfifo('/home/dev/.config/innerwarden/.sessions.json.5.pending')\"",
+            "python3 -c \"import os; os.mknod('/home/dev/.config/innerwarden/x.pending')\"",
+            "python3 -c \"import os; os.symlink('/tmp/p', '/home/dev/.config/innerwarden/.sessions.json.6.pending')\"",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_some(),
+                "a pipe made in the guard's configuration: {cmd}"
+            );
+        }
+        for cmd in [
+            "mkfifo ./build/pipe",
+            "mknod ./build/null c 1 3",
+            "fallocate -l 1G ./disk.img",
+            "python3 -c \"import os; os.mkfifo('/tmp/build-pipe')\"",
+        ] {
+            assert!(
+                check_guard_self_disable(cmd).is_none(),
+                "made elsewhere: {cmd}"
             );
         }
     }
