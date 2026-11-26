@@ -5330,9 +5330,9 @@ fn analyze_command_as_read(
 
     // A file size limit lowered on the agent kills the hook it starts at
     // its first write past the limit (SIGXFSZ), and an agent runs a call
-    // whose hook gave no answer: refused. Any other process's limit, or the
-    // shell's own, is held for the person
-    // ([`threats::resource_limits`]).
+    // whose hook gave no answer: refused. Another process's file size or
+    // core limit is held for the person; the shell's own counts only when
+    // the line then starts an agent ([`threats::resource_limits`]).
     if let Some((what, s)) = threats::resource_limits::check_limit_lowered(cmd) {
         signals.push(AnalysisSignal {
             signal: "security_tooling_tamper".into(),

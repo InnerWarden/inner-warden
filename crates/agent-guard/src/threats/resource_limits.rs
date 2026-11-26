@@ -23,9 +23,9 @@
 //!   innerwarden hook`): refused. An agent, the guard or `ppid` named
 //!   anywhere else on the line does not count;
 //! - a file size or core limit lowered for any other process (`prlimit
-//!   --pid N`, `resource.prlimit(pid, ...)`), or a file size limit lowered
-//!   in the shell or the program itself (`ulimit -f N`, `setrlimit`), which
-//!   every program it starts later inherits: held for the person.
+//!   --pid N`, `resource.prlimit(pid, ...)`): held for the person; the
+//!   shell's or the program's own (`ulimit -f N`, `setrlimit`, `prlimit
+//!   --pid $$`) with no agent started after it: allowed.
 //!
 //! `ulimit` and `setrlimit` set the limit of the shell or the program
 //! itself and of its children: refused only when a command after them on
@@ -79,8 +79,7 @@ pub(crate) const AGENT_LIMIT_LOWERED: &str =
 
 /// What a hold says.
 pub(crate) const PROCESS_LIMIT_LOWERED: &str =
-    "lowers the file size or core limit of another process, \
-     or the file size limit of the shell for what it starts later";
+    "lowers the file size or core limit of another process";
 
 /// `--fsize`, `--core` or another limit the hook depends on, with a value
 /// (`prlimit`'s long options).
@@ -280,9 +279,6 @@ struct Lowered {
     other_file_size: bool,
     /// A core limit of another process the line names by pid.
     other_core: bool,
-    /// A file size limit of the shell or the program itself (`ulimit -f`,
-    /// `setrlimit`, `prlimit --pid $$`).
-    own_file_size: bool,
 }
 
 /// Whether a word of the segment is `prlimit` (by any path) or a name the
@@ -477,7 +473,7 @@ fn read(line: &str) -> Lowered {
             continue;
         }
         match pid_value(segment, prlimit) {
-            Some(pid) if OWN_PID.is_match(&pid) => found.own_file_size |= file_size,
+            Some(pid) if OWN_PID.is_match(&pid) => {}
             Some(pid) if pid_is_agent(&pid, line, 0) => {
                 found.agent_file_size |= file_size;
                 found.agent_hook_limit |= hook_limit;
@@ -495,15 +491,11 @@ fn read(line: &str) -> Lowered {
     // (`ulimit -n 3; claude`, `setrlimit(...); exec "claude"`). An agent,
     // the guard or `ppid` named in a path, an argument or an option is no
     // start (`ulimit -n 512 && cargo test -p innerwarden`). Otherwise only
-    // the file size limit is held.
+    // they are left alone.
     for caps in ULIMIT.captures_iter(line) {
         let starts = later_starts_an_agent(&line[caps.get(0).map_or(0, |m| m.end())..]);
         let file_size = caps[1].contains('f') && lowers(&caps[2]);
-        if file_size && starts {
-            found.agent_file_size = true;
-        } else if file_size {
-            found.own_file_size = true;
-        }
+        found.agent_file_size |= file_size && starts;
         if starts {
             for letter in caps[1].chars() {
                 if let Some(
@@ -519,7 +511,6 @@ fn read(line: &str) -> Lowered {
         let starts = later_starts_an_agent(&line[caps.get(0).map_or(0, |m| m.end())..]);
         match Limit::by_code(&caps[1]) {
             Some(Limit::FileSize) if starts => found.agent_file_size = true,
-            Some(Limit::FileSize) => found.own_file_size = true,
             Some(limit @ (Limit::Cpu | Limit::Memory | Limit::OpenFiles | Limit::Stack))
                 if starts =>
             {
@@ -534,7 +525,7 @@ fn read(line: &str) -> Lowered {
         let own = OWN_PID.is_match(pid);
         let agent = !own && pid_is_agent(pid, line, 0);
         match Limit::by_code(&caps[2]) {
-            Some(Limit::FileSize) if own => found.own_file_size = true,
+            Some(Limit::FileSize) if own => {}
             Some(Limit::FileSize) if agent => found.agent_file_size = true,
             Some(Limit::FileSize) => found.other_file_size = true,
             Some(Limit::Core) if !own => found.other_core = true,
@@ -561,7 +552,7 @@ pub(crate) fn check_limit_lowered(command: &str) -> Option<(&'static str, u32)> 
     if found.agent_hook_limit {
         return Some((AGENT_LIMIT_LOWERED, 60));
     }
-    if found.other_file_size || found.other_core || found.own_file_size {
+    if found.other_file_size || found.other_core {
         return Some((PROCESS_LIMIT_LOWERED, 30));
     }
     None
@@ -609,19 +600,17 @@ mod tests {
         }
     }
 
-    /// Another process's limit, or the shell's own file size limit, is held
-    /// for the person.
+    /// Another process's file size or core limit is held for the person.
+    /// (The shell's own file size limit was held here too until 2026-11-26;
+    /// it is allowed now, see
+    /// `the_shells_limit_with_an_agent_only_named_is_allowed`.)
     ///
     /// FAILS ON REVERT: allowed without the check.
     #[test]
     fn another_process_limit_or_the_shells_own_is_held() {
         for line in [
-            "ulimit -f 1",
-            "ulimit -S -f 100",
             "prlimit --pid 4242 --fsize=1024",
             "prlimit --pid 4242 --core=0",
-            "prlimit --pid $$ --fsize=1",
-            "python3 -c 'import resource; resource.setrlimit(resource.RLIMIT_FSIZE, (1, 1))'",
             "python3 -c 'import resource; resource.prlimit(4242, resource.RLIMIT_CORE, (0, 0))'",
         ] {
             assert_eq!(verdict(line), "review", "{line}");
@@ -806,14 +795,21 @@ mod tests {
             assert_eq!(check_limit_lowered(line), None, "{line}");
             assert_eq!(verdict(line), "allow", "{line}");
         }
-        // The file size limit of the shell is still held, not refused,
-        // when no agent starts after it.
-        let line = "ulimit -f 2048 && cargo test -p innerwarden";
-        assert_eq!(
-            check_limit_lowered(line).map(|(what, _)| what),
-            Some(PROCESS_LIMIT_LOWERED),
-            "{line}"
-        );
-        assert_ne!(verdict(line), "deny", "{line}");
+    }
+
+    /// The shell's or the program's own file size limit with no agent
+    /// started after it: allowed (held for review until 2026-11-26).
+    #[test]
+    fn the_shells_own_file_size_limit_is_allowed() {
+        for line in [
+            "ulimit -f 2048 && cargo test -p innerwarden",
+            "ulimit -f 1",
+            "ulimit -S -f 100",
+            "prlimit --pid $$ --fsize=1",
+            "python3 -c 'import resource; resource.setrlimit(resource.RLIMIT_FSIZE, (1, 1))'",
+        ] {
+            assert_eq!(check_limit_lowered(line), None, "{line}");
+            assert_eq!(verdict(line), "allow", "{line}");
+        }
     }
 }
