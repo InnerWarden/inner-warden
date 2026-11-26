@@ -3602,6 +3602,11 @@ const HANDED_LEVELS_READ: u8 = 4;
 /// read here (the line does not show it).
 pub(crate) fn shell_scripts_as_handed(source: &str) -> Vec<String> {
     let mut scripts = Vec::new();
+    // A quote closed and reopened (`'\''`, `'"'"'`) has its own two readings
+    // (`analyze_command_unwrapped` in mcp.rs), the stronger standing.
+    if source.contains("'\\''") || source.contains("'\"'\"'") {
+        return scripts;
+    }
     for command in crate::shell_words::read_line(source).commands {
         if command
             .words
@@ -3618,8 +3623,21 @@ pub(crate) fn shell_scripts_as_handed(source: &str) -> Vec<String> {
         if !crate::threats::is_shell_program(&program) {
             continue;
         }
+        // `-n` reads the script and runs nothing.
+        let options = texts[at + 1..]
+            .iter()
+            .take_while(|word| word.starts_with('-') && !word.starts_with("--"));
+        if options.clone().any(|word| word.contains('n')) {
+            continue;
+        }
         if let Some(script) = crate::agent_instructions::shell_line(&texts[at + 1..]) {
-            if !script.trim().is_empty() {
+            // A script written as one literal in quotes is the tree's to read
+            // (it knows a branch that never runs): only the spellings it
+            // does not read as one script are read here.
+            let written_whole = source.contains(&format!("'{script}'"))
+                || (!script.contains(['$', '`', '\\', '"'])
+                    && source.contains(&format!("\"{script}\"")));
+            if !script.trim().is_empty() && !written_whole {
                 scripts.push(script.to_string());
             }
         }
