@@ -80,30 +80,26 @@ fn the_hook_refuses_the_notes_file_run() {
 
 /// A journal entry as an agent writes one: the date and a commit taken by
 /// command substitution before notes appended by `cat` that quote a
-/// here-document handed to `python3`, then the file shown. Measured
-/// 2026-11-26 on the branch before this change: exit 2, with and without
-/// the last `cat`.
-///
-/// FAILS ON REVERT of the head reading in `text_written_by_cat_blanked`
-/// (`crates/agent-guard/src/shell.rs`).
+/// here-document handed to `python3`, then the file shown. Refused: a
+/// known false positive, kept on purpose, since a substitution before the
+/// notes may start a job that outlives it and runs the notes once written.
 #[test]
-fn the_hook_lets_a_journal_entry_with_substitutions_run() {
+fn the_hook_refuses_a_journal_entry_with_substitutions() {
     let home = tempfile::tempdir().unwrap();
     let entry = "mkdir -p ~/journal && D=$(date -u +%Y-%m-%dT%H:%MZ) && SHA=$(git -C ~/src/repo rev-parse --short HEAD) && cat >> ~/journal/T-1.md <<EOF\n$D PR ready (commit $SHA)\n$D OUT OF SCOPE: python3 - <<'EOF' + open('~/.claude/settings.json','w') -> allow on main\nEOF\n";
-    for then in ["", "cat ~/journal/T-1.md"] {
+    for then in ["", "cat ~/journal/T-1.md", "bash ~/journal/T-1.md"] {
         let line = format!("{entry}{then}");
-        assert_eq!(hook_exit(home.path(), &line), Some(0), "{line}");
+        assert_eq!(hook_exit(home.path(), &line), Some(2), "{line}");
     }
-    let run = format!("{entry}bash ~/journal/T-1.md");
-    assert_eq!(hook_exit(home.path(), &run), Some(2), "{run}");
 }
 
 /// A substitution before the notes that sends a run of the notes file to
 /// the background outlives the head and runs the notes once written.
-/// Measured 2026-11-26 in review: exit 0 on the branch before this change.
+/// Measured 2026-11-26 in review: let through by readings of the head
+/// since dropped.
 ///
-/// FAILS ON REVERT of `command_substitutes_only_listed` in
-/// `crates/agent-guard/src/shell.rs`.
+/// FAILS ON REVERT of the `line.nested` check in
+/// `text_written_by_cat_blanked` (`crates/agent-guard/src/shell.rs`).
 #[test]
 fn the_hook_refuses_a_head_substitution_that_outlives_it() {
     let home = tempfile::tempdir().unwrap();
@@ -111,6 +107,8 @@ fn the_hook_refuses_a_head_substitution_that_outlives_it() {
         "D=$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & ) && ",
         "D=$(date -u +%F) && SHA=$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & echo abc) && ",
         "true >(sleep 2; bash ~/j.md) && ",
+        "X='a[$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & )]' && D=$[X] && ",
+        "V=-v && D=$(printf $V'a[$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & )]' x) && ",
     ] {
         let line = format!("{head}{NOTES}cat ~/j.md");
         assert_eq!(hook_exit(home.path(), &line), Some(2), "{line}");

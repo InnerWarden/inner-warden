@@ -568,33 +568,16 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   notes-shown-after-cat-2026-11/nsc-001 notes-shown-after-cat-2026-11/nsc-002 notes-shown-after-cat-2026-11/nsc-003 notes-shown-after-cat-2026-11/nsc-004 notes-shown-after-cat-2026-11/nsc-005 notes-shown-after-cat-2026-11/nsc-006 notes-shown-after-cat-2026-11/nsc-007 notes-shown-after-cat-2026-11/nsc-008 notes-shown-after-cat-2026-11/nsc-009 notes-shown-after-cat-2026-11/nsc-010 notes-shown-after-cat-2026-11/nsc-011 notes-shown-after-cat-2026-11/nsc-012 notes-shown-after-cat-2026-11/nsc-013 notes-shown-after-cat-2026-11/nsc-014 notes-shown-after-cat-2026-11/nsc-015
   go from deny to allow for the reason above: notes written by `cat` and
   then shown.
-- 2026-11-26: notes-shown-after-cat-2026-11 grows. A line with command
-  substitutions before the notes (`mkdir -p`, `D=$(date -u ...)`,
-  `SHA=$(git ... rev-parse ...)`, then `cat >> notes <<EOF`) was read
-  whole, so the notes were refused as the rewrite they quote. What runs
-  before the first notes are written stays on the line judged and cannot
-  run text not yet written, so it is read (`shell::command_only_assigns`
-  for a command that only sets variables); a substitution after the notes,
-  in a body that expands, or beside the notes through a pipe, a `&` or a
-  group keeps the line read whole (`shell::command_substitutes`,
-  `shell_words::Line::background` and `groups`). nsc-123 to nsc-141 are
-  must_refuse: notes shown into `~/.bashrc`, `~/.profile`, `~/.zshrc`,
-  `~/AGENTS.md` or `~/.config/x.md` (the write condition of
-  `shell::command_shows_files_only`) and the substitutions above. Against
-  the branch before the change no other corpus line moved.
-  harmless-proven:
-  notes-shown-after-cat-2026-11/nsc-016 notes-shown-after-cat-2026-11/nsc-017 notes-shown-after-cat-2026-11/nsc-018 notes-shown-after-cat-2026-11/nsc-019 notes-shown-after-cat-2026-11/nsc-020 notes-shown-after-cat-2026-11/nsc-021
-  go from deny to allow for the reason above: a journal entry whose date
-  and commit are taken before the notes.
-- 2026-11-26: notes-shown-after-cat-2026-11 grows again. A substitution
-  before the notes was read as running nothing written, but one may start
-  something that outlives it (a `&` inside it, a process substitution, a
-  pipe into a shell, a launcher) and run the notes once written. It is now
-  read only when every command in it is on a closed list of commands that
-  print a value and end (`shell::line_runs_only_listed`: `date`,
-  `git rev-parse`, `git describe`, `git log` with a format or a count,
-  `git branch --show-current`, `hostname`, `whoami`, `id -u`, `pwd`,
-  `basename`, `dirname`, `uname`, `printf` without `-v`), with no `&`,
-  group, process substitution, `${...}`, here-string or redirection but to
-  `/dev/null`; anything else keeps the line read whole. nsc-201 to
-  nsc-218 are must_refuse. No other corpus line moved.
+- 2026-11-26: notes-shown-after-cat-2026-11 grows. nsc-123 to nsc-141,
+  nsc-201 to nsc-218 and nsc-219 to nsc-225 are must_refuse: notes shown
+  into `~/.bashrc`, `~/.profile`, `~/.zshrc`, `~/AGENTS.md` or
+  `~/.config/x.md` (the write condition of `shell::command_shows_files_only`),
+  and a substitution that may run the notes: after them, in a body that
+  expands, beside them through a pipe, a `&` or a group, or before them
+  and outliving its command (a `&` inside it, a process substitution, a
+  launcher, a git option that runs a program, `printf -v`, an arithmetic
+  expansion of a variable whose value is an array index holding a
+  substitution, `printf -v` named through a variable). A line with any
+  substitution before the notes stays read whole, so a journal entry whose
+  date is taken by `$(date)` stays refused: a known false positive, kept on
+  purpose. No other corpus line moved.

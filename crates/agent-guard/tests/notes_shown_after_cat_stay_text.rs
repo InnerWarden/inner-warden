@@ -111,8 +111,7 @@ fn a_here_document_handed_to_an_interpreter_stays_refused() {
 /// commit taken by command substitution, notes appended by `cat` that
 /// quote a here-document handed to `python3` which opens an agent's
 /// settings, the date and the commit expanded in the notes, and the file
-/// shown. Measured 2026-11-26 on the branch before this change: refused
-/// (`guard_self_disable`), with and without the last `cat`.
+/// shown.
 const JOURNAL_HEAD: &str = "mkdir -p ~/journal && D=$(date -u +%Y-%m-%dT%H:%MZ) && SHA=$(git -C ~/src/repo rev-parse --short HEAD) && ";
 const JOURNAL_NOTES: &str = "cat >> ~/journal/T-1.md <<EOF
 $D PR ready: repo fix/heredoc \"Guard: read a quoted here-document\" (commit $SHA; tests green)
@@ -121,36 +120,43 @@ $D OUT OF SCOPE: python3 -c \"...s.replace('innerwarden allow x', ...)...\" stay
 EOF
 ";
 
-/// FAILS ON REVERT of the head reading in `text_written_by_cat_blanked`
-/// (`shell.rs`: a line with any command substitution read whole): each
-/// line is refused for taking the guard down.
+/// A journal entry whose values are taken by command substitution before
+/// the notes stays refused. This is a known false positive, kept on
+/// purpose: a substitution before the notes may start a job that outlives
+/// it and runs the notes once they are written (a `&` inside it, a process
+/// substitution, an arithmetic expansion of a variable that holds one,
+/// `printf -v` named through a variable), and no reading of such a head
+/// held up in review. A line with a substitution is read whole, the notes
+/// with it, as before notes written by `cat` were read as text. A reading
+/// of the head that lets any of these through fails here.
 #[test]
-fn a_journal_entry_with_substitutions_before_the_notes_stays_text() {
+fn a_journal_entry_with_substitutions_before_the_notes_stays_refused() {
     let heads = [
         JOURNAL_HEAD,
         "D=$(date -u +%Y-%m-%dT%H:%MZ) && SHA=$(git -C ~/src/repo rev-parse --short HEAD) && ",
         "mkdir -p ~/journal && D=$(date -u +%Y-%m-%dT%H:%MZ) && ",
         "D=$(date -u +%Y-%m-%dT%H:%MZ) && ",
         "mkdir -p ~/journal; D=`date -u +%F`; ",
+        "D=$(git log -1 --format=%h) && ",
+        "B=$(git -C ~/src/repo branch --show-current) && V=$(git describe --tags --always) && ",
+        "H=$(hostname -s) && U=$(whoami) && I=$(id -un) && K=$(uname -r) && ",
+        "D=$(date -u +%F 2>/dev/null) && T=$(printf '%s-%s' a b) && ",
     ];
     for head in heads {
         for tail in ["", "cat ~/journal/T-1.md", "tail -n 3 ~/journal/T-1.md"] {
             let line = format!("{head}{JOURNAL_NOTES}{tail}");
             let analysis = analyze_command(&line, None);
-            assert_eq!(analysis.recommendation, "allow", "{line}: {analysis:?}");
+            assert_eq!(analysis.recommendation, "deny", "{line}: {analysis:?}");
         }
     }
 }
 
-/// A substitution that may run the notes, or text not yet blanked, keeps
-/// the line read whole: after the notes, in a body that expands, beside the
-/// notes through a pipe, a `&` or a group, or a variable that changes what
-/// runs next.
+/// A substitution that may run the notes keeps the line read whole: after
+/// the notes, in a body that expands, or beside the notes through a pipe, a
+/// `&` or a group.
 ///
-/// FAILS ON REVERT of each guard around the head reading in
-/// `text_written_by_cat_blanked` (`shell.rs`): `command_substitutes`
-/// after the notes, `inputs_run` in `command_substitutes` (a body that
-/// expands), and `background`, `groups` and the pipe before the notes.
+/// FAILS ON REVERT of the `line.nested` check in
+/// `text_written_by_cat_blanked` (`shell.rs`).
 #[test]
 fn substitutions_that_may_run_the_notes_stay_refused() {
     let notes = "cat > ~/j.md <<'EOF'\nNotes on the hook test\npython3 - <<'EOF'\nopen('/home/u/.claude/settings.json','w').write('{}')\nEOF\n";
@@ -179,36 +185,16 @@ fn substitutions_that_may_run_the_notes_stay_refused() {
     }
 }
 
-/// A journal entry whose head takes its values only through the closed
-/// list of commands that print a value and end (`date`, `git log` with a
-/// format, `git branch --show-current`, `git describe`, `hostname`,
-/// `whoami`, `id -un`, `uname`, `basename`, `dirname`, `pwd`,
-/// `printf`) stays text, as the date and the commit do.
-#[test]
-fn a_journal_entry_whose_head_runs_only_listed_commands_stays_text() {
-    for head in [
-        "D=$(git log -1 --format=%h) && ",
-        "D=$(git -C ~/src/repo log -n 1 --pretty=format:%s main) && ",
-        "B=$(git -C ~/src/repo branch --show-current) && V=$(git describe --tags --always) && ",
-        "H=$(hostname -s) && U=$(whoami) && I=$(id -un) && K=$(uname -r) && ",
-        "R=$(basename \"$(pwd)\") && P=$(dirname ~/journal/T-1.md) && ",
-        "D=$(date -u +%F 2>/dev/null) && T=$(printf '%s-%s' a b) && ",
-    ] {
-        let line = format!("{head}{JOURNAL_NOTES}cat ~/journal/T-1.md");
-        let analysis = analyze_command(&line, None);
-        assert_eq!(analysis.recommendation, "allow", "{line}: {analysis:?}");
-    }
-}
-
 /// A substitution before the notes that starts something which outlives
 /// it runs the notes once written: a `&` inside it, a process
-/// substitution, a pipe into a shell, a launcher, a command off the list,
-/// a git option that runs a program, `printf -v`, a nested substitution
-/// off the list. Measured 2026-11-26 in review: allowed by the branch
-/// before this change, and bash ran the notes after the line returned in
-/// four of these spellings.
+/// substitution, a pipe into a shell, a launcher, a git option that runs a
+/// program, `printf -v`, a nested substitution, an arithmetic expansion of
+/// a variable whose value is an array index holding a substitution, and
+/// `printf -v` named through a variable. Measured 2026-11-26 in review:
+/// bash ran the notes after the line returned in several of these
+/// spellings.
 ///
-/// FAILS ON REVERT of `command_substitutes_only_listed` in
+/// FAILS ON REVERT of the `line.nested` check in
 /// `text_written_by_cat_blanked` (`shell.rs`).
 #[test]
 fn a_substitution_before_the_notes_that_may_outlive_it_stays_refused() {
@@ -232,6 +218,14 @@ fn a_substitution_before_the_notes_that_may_outlive_it_stays_refused() {
         "D=$(date <<< x) && ",
         "mkdir -p <(date) && ",
         "P='$( (sleep 2; bash ~/j.md) & )' && D=${P@P} && ",
+        "X='a[$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & )]' && D=$[X] && ",
+        "X='a[$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & )]'; D=$[X]; ",
+        "X='a[$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & )]' && D=$[X+1] && ",
+        "X='a[$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & )]' && D=$((X)) && ",
+        "X='a[$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & )]' && D=$(date -u +%F$[X]) && ",
+        "X='a[$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & )]' && D=$(printf %s $[X]) && ",
+        "V=-v && D=$(printf $V 'a[$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & )]' x) && ",
+        "V=-v && D=$(printf $V'a[$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & )]' x) && ",
     ] {
         for tail in ["", "cat ~/j.md"] {
             let line = format!("{head}{notes}{tail}");
