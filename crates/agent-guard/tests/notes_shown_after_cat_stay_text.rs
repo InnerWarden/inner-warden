@@ -179,6 +179,68 @@ fn substitutions_that_may_run_the_notes_stay_refused() {
     }
 }
 
+/// A journal entry whose head takes its values only through the closed
+/// list of commands that print a value and end (`date`, `git log` with a
+/// format, `git branch --show-current`, `git describe`, `hostname`,
+/// `whoami`, `id -un`, `uname`, `basename`, `dirname`, `pwd`,
+/// `printf`) stays text, as the date and the commit do.
+#[test]
+fn a_journal_entry_whose_head_runs_only_listed_commands_stays_text() {
+    for head in [
+        "D=$(git log -1 --format=%h) && ",
+        "D=$(git -C ~/src/repo log -n 1 --pretty=format:%s main) && ",
+        "B=$(git -C ~/src/repo branch --show-current) && V=$(git describe --tags --always) && ",
+        "H=$(hostname -s) && U=$(whoami) && I=$(id -un) && K=$(uname -r) && ",
+        "R=$(basename \"$(pwd)\") && P=$(dirname ~/journal/T-1.md) && ",
+        "D=$(date -u +%F 2>/dev/null) && T=$(printf '%s-%s' a b) && ",
+    ] {
+        let line = format!("{head}{JOURNAL_NOTES}cat ~/journal/T-1.md");
+        let analysis = analyze_command(&line, None);
+        assert_eq!(analysis.recommendation, "allow", "{line}: {analysis:?}");
+    }
+}
+
+/// A substitution before the notes that starts something which outlives
+/// it runs the notes once written: a `&` inside it, a process
+/// substitution, a pipe into a shell, a launcher, a command off the list,
+/// a git option that runs a program, `printf -v`, a nested substitution
+/// off the list. Measured 2026-11-26 in review: allowed by the branch
+/// before this change, and bash ran the notes after the line returned in
+/// four of these spellings.
+///
+/// FAILS ON REVERT of `command_substitutes_only_listed` in
+/// `text_written_by_cat_blanked` (`shell.rs`).
+#[test]
+fn a_substitution_before_the_notes_that_may_outlive_it_stays_refused() {
+    let notes = "cat >> ~/j.md <<EOF\nNotes on the hook test\npython3 - <<'EOF'\nopen('/home/u/.claude/settings.json','w').write('{}')\nEOF\n";
+    for head in [
+        "D=$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & ) && ",
+        "D=$( { sleep 2; bash ~/j.md; } >/dev/null 2>&1 & echo x) && ",
+        "D=$(date -u +%F) && SHA=$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & echo abc) && ",
+        "D=$(tail -n0 -F ~/j.md 2>/dev/null | sh >/dev/null 2>&1 &) && ",
+        "D=$(nohup sh -c 'sleep 2; sh ~/j.md' >/dev/null 2>&1 &) && ",
+        "true >(sleep 2; bash ~/j.md) && ",
+        "mkdir -p <(sleep 2; bash ~/j.md) && ",
+        "D=$(setsid -f bash -c 'sleep 2; bash ~/j.md') && ",
+        "D=$(date -u +%F $(sleep 2 &)) && ",
+        "D=`(sleep 2; bash ~/j.md) &` && ",
+        "D=${X:-$( (sleep 2; bash ~/j.md) & )} && ",
+        "D=$(git -c core.pager='sh ~/j.md' log -1) && ",
+        "D=$(git log -1 --output=/home/u/.bashrc) && ",
+        "D=$(printf -v X %s 1) && ",
+        "D=$(date > ~/j.md) && ",
+        "D=$(date <<< x) && ",
+        "mkdir -p <(date) && ",
+        "P='$( (sleep 2; bash ~/j.md) & )' && D=${P@P} && ",
+    ] {
+        for tail in ["", "cat ~/j.md"] {
+            let line = format!("{head}{notes}{tail}");
+            let analysis = analyze_command(&line, None);
+            assert_eq!(analysis.recommendation, "deny", "{line}: {analysis:?}");
+        }
+    }
+}
+
 /// Showing the notes into a file that is not a notes file (a shell's
 /// startup file, an agent's instructions, a file in an agent's folder)
 /// writes them where they are read or run: the line stays read whole.

@@ -97,3 +97,22 @@ fn the_hook_lets_a_journal_entry_with_substitutions_run() {
     let run = format!("{entry}bash ~/journal/T-1.md");
     assert_eq!(hook_exit(home.path(), &run), Some(2), "{run}");
 }
+
+/// A substitution before the notes that sends a run of the notes file to
+/// the background outlives the head and runs the notes once written.
+/// Measured 2026-11-26 in review: exit 0 on the branch before this change.
+///
+/// FAILS ON REVERT of `command_substitutes_only_listed` in
+/// `crates/agent-guard/src/shell.rs`.
+#[test]
+fn the_hook_refuses_a_head_substitution_that_outlives_it() {
+    let home = tempfile::tempdir().unwrap();
+    for head in [
+        "D=$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & ) && ",
+        "D=$(date -u +%F) && SHA=$( (sleep 2; bash ~/j.md) >/dev/null 2>&1 & echo abc) && ",
+        "true >(sleep 2; bash ~/j.md) && ",
+    ] {
+        let line = format!("{head}{NOTES}cat ~/j.md");
+        assert_eq!(hook_exit(home.path(), &line), Some(2), "{line}");
+    }
+}

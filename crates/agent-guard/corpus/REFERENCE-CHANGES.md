@@ -586,3 +586,15 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   notes-shown-after-cat-2026-11/nsc-016 notes-shown-after-cat-2026-11/nsc-017 notes-shown-after-cat-2026-11/nsc-018 notes-shown-after-cat-2026-11/nsc-019 notes-shown-after-cat-2026-11/nsc-020 notes-shown-after-cat-2026-11/nsc-021
   go from deny to allow for the reason above: a journal entry whose date
   and commit are taken before the notes.
+- 2026-11-26: notes-shown-after-cat-2026-11 grows again. A substitution
+  before the notes was read as running nothing written, but one may start
+  something that outlives it (a `&` inside it, a process substitution, a
+  pipe into a shell, a launcher) and run the notes once written. It is now
+  read only when every command in it is on a closed list of commands that
+  print a value and end (`shell::line_runs_only_listed`: `date`,
+  `git rev-parse`, `git describe`, `git log` with a format or a count,
+  `git branch --show-current`, `hostname`, `whoami`, `id -u`, `pwd`,
+  `basename`, `dirname`, `uname`, `printf` without `-v`), with no `&`,
+  group, process substitution, `${...}`, here-string or redirection but to
+  `/dev/null`; anything else keeps the line read whole. nsc-201 to
+  nsc-218 are must_refuse. No other corpus line moved.

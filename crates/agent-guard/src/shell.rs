@@ -3204,9 +3204,10 @@ fn shell_heredoc_data_blanked(source: &str) -> Vec<(String, String)> {
 /// settings, or to the terminal. A body the shell expands into commands (a
 /// substitution, `${...}`) and a line with any other command that may run
 /// what was written stay read whole ([`command_runs_nothing_written`]).
-/// Before the first notes, a command that only sets variables and any
-/// substitution are read: they stay on the line judged again and run before
-/// the notes exist. After the notes, a substitution keeps the line read
+/// Before the first notes, a command that only sets variables and a
+/// substitution that runs only commands of a closed list that print a value
+/// and end ([`command_substitutes_only_listed`]) are read: they stay on the
+/// line judged again and end before the notes exist. After the notes, a substitution keeps the line read
 /// whole ([`command_substitutes`]), and so does one before them when a
 /// pipe, a `&` or a group may run it beside the notes. `None` when no
 /// body is blanked.
@@ -3252,6 +3253,13 @@ pub(crate) fn text_written_by_cat_blanked(source: &str) -> Option<String> {
     if head.iter().any(command_substitutes)
         && (line.background || line.groups || head.iter().any(|command| command.piped))
     {
+        return None;
+    }
+    // A substitution there may also start something that outlives it (a
+    // `&` inside it, a process substitution, a launcher) and runs the
+    // notes once written: it is read only when it runs nothing but
+    // commands of a closed list that print a value and end.
+    if !head.iter().all(command_substitutes_only_listed) {
         return None;
     }
     let mut out = source.to_owned();
@@ -3308,6 +3316,166 @@ fn command_substitutes(command: &crate::shell_words::Command) -> bool {
         || command.words.iter().any(runs)
         || command.writes.iter().any(runs)
         || command.reads.iter().any(runs)
+}
+
+/// Whether every substitution in a command before the notes runs only
+/// commands that print a value and end ([`line_runs_only_listed`]), with
+/// no process substitution and no `${...}`. A command with none is.
+fn command_substitutes_only_listed(command: &crate::shell_words::Command) -> bool {
+    !command.inputs_run
+        && command
+            .words
+            .iter()
+            .chain(&command.writes)
+            .chain(&command.reads)
+            .all(|word| word_substitutes_only_listed(word, 0))
+}
+
+/// Whether the substitutions of a word run only listed commands. A process
+/// substitution runs beside the line and a `${...}` may hide one (`@P`,
+/// an index): neither is.
+fn word_substitutes_only_listed(word: &crate::shell_words::Word, depth: usize) -> bool {
+    use crate::shell_words::Mark;
+    let chars: Vec<char> = word.text.chars().collect();
+    let beside = chars
+        .windows(2)
+        .zip(word.marks.windows(2))
+        .any(|(c, m)| matches!(c[0], '<' | '>') && c[1] == '(' && m[0] == Mark::Expansion);
+    let braces = chars
+        .windows(2)
+        .zip(word.marks.windows(2))
+        .any(|(c, m)| c[0] == '$' && c[1] == '{' && m[0] == Mark::Expansion);
+    !beside
+        && !braces
+        && word
+            .substitutions
+            .iter()
+            .all(|inner| line_runs_only_listed(inner, depth + 1))
+}
+
+/// Whether a substitution's command line runs only commands of a closed
+/// list that print a value and end, and start nothing that outlives them:
+/// `date`, `git rev-parse`, `git describe`, `git log` with a format or a
+/// count, `git branch --show-current`, `hostname`, `whoami`, `id -u`,
+/// `pwd`, `basename`, `dirname`, `uname`, `printf` without `-v`. No
+/// `&`, group, here-document, file read or redirection but to
+/// `/dev/null`; a substitution inside it is held to the same list.
+///
+/// Measured 2026-11-26 (review of a journal-entry fix): a substitution
+/// before the notes that sent `bash notes` to the background, through
+/// `&`, `<(...)`, `nohup` or `tail -F | sh`, ran the notes after they
+/// were written and the line was allowed.
+fn line_runs_only_listed(text: &str, depth: usize) -> bool {
+    if depth > 4 {
+        return false;
+    }
+    let line = crate::shell_words::read_line(text);
+    !line.background
+        && !line.groups
+        && line.arrays.is_empty()
+        && !line.commands.is_empty()
+        && line.commands.iter().all(|command| {
+            command.inputs.is_empty()
+                && !command.inputs_run
+                && command.reads.is_empty()
+                && command
+                    .writes
+                    .iter()
+                    .all(|target| target.is_plain() && target.text == "/dev/null")
+                && command
+                    .words
+                    .iter()
+                    .all(|word| word_substitutes_only_listed(word, depth))
+                && command_is_listed(command)
+        })
+}
+
+/// The closed list of [`line_runs_only_listed`], read word by word.
+fn command_is_listed(command: &crate::shell_words::Command) -> bool {
+    let Some(first) = command.words.first() else {
+        return false;
+    };
+    if !first.is_plain() {
+        return false;
+    }
+    let args: Vec<&str> = command.words[1..].iter().map(|w| w.text.as_str()).collect();
+    match first.text.as_str() {
+        "date" | "pwd" | "basename" | "dirname" | "uname" => true,
+        "whoami" => args.is_empty(),
+        "hostname" => args.iter().all(|arg| {
+            matches!(
+                *arg,
+                "-s" | "-f" | "-i" | "-I" | "-d" | "-A" | "--short" | "--fqdn" | "--long"
+            )
+        }),
+        "id" => args
+            .iter()
+            .all(|arg| matches!(*arg, "-u" | "-n" | "-un" | "-nu" | "-g" | "-gn" | "-ng")),
+        "printf" => !args.first().is_some_and(|arg| arg.starts_with("-v")),
+        "git" => git_is_listed(&args),
+        _ => false,
+    }
+}
+
+/// `git` with only `-C <dir>` or `--no-pager` before `rev-parse`,
+/// `describe` (not `--dirty` or `--broken`, which refresh the index),
+/// `log` with only a format, a count and revisions, or `branch
+/// --show-current`. Any other option may run a program (`-c`, `--output`,
+/// a diff driver, a signature check).
+fn git_is_listed(args: &[&str]) -> bool {
+    let mut at = 0;
+    loop {
+        match args.get(at) {
+            Some(&"-C") => at += 2,
+            Some(&"--no-pager") => at += 1,
+            _ => break,
+        }
+    }
+    let Some(sub) = args.get(at) else {
+        return false;
+    };
+    let rest = &args[at + 1..];
+    match *sub {
+        "rev-parse" => true,
+        "describe" => !rest
+            .iter()
+            .any(|arg| arg.starts_with("--dirty") || arg.starts_with("--broken")),
+        "branch" => rest == ["--show-current"],
+        "log" => {
+            let mut i = 0;
+            while let Some(arg) = rest.get(i) {
+                let format = arg
+                    .strip_prefix("--format=")
+                    .or_else(|| arg.strip_prefix("--pretty="));
+                let ok = match format {
+                    Some(format) => !format.contains("%G"),
+                    None if *arg == "-n" => {
+                        i += 1;
+                        rest.get(i)
+                            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+                    }
+                    None => {
+                        *arg == "--oneline"
+                            || *arg == "--"
+                            || arg
+                                .strip_prefix("-n")
+                                .or_else(|| arg.strip_prefix("--max-count="))
+                                .or_else(|| arg.strip_prefix('-'))
+                                .is_some_and(|n| {
+                                    !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())
+                                })
+                            || !arg.starts_with('-')
+                    }
+                };
+                if !ok {
+                    return false;
+                }
+                i += 1;
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Whether a command only sets shell variables (`D=$(date -u +%F)`):
