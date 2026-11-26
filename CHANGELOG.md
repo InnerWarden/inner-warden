@@ -12,14 +12,11 @@ or by the agent's file tool, recorded as refused. It changes what the guard
 decides and who hears of it, as lowering the guard does. Everything else in
 monitor is still only recorded. Starting an AI agent with `IW_NOTIFY_CONFIG`,
 `IW_LLM_CONFIG` or `XDG_CONFIG_HOME` named elsewhere is refused as starting
-it with its hook moved: a release build honours `IW_NOTIFY_CONFIG=/dev/null`,
-which switched the child's alerts off.
+it with its hook moved, so a child agent's alerts reach the same person.
 
-On Gemini CLI that monitor refusal is now a refusal too: the monitor line
-`agents connect gemini --monitor` writes turned every end of the guard but 0
-into 1, Gemini's "warn and run", so the write ran. The new line passes the
-refusal on and still lets the call run when the guard is gone or cannot
-start; run `innerwarden agents connect gemini --monitor` once to replace
+On Gemini CLI that monitor refusal is a refusal too: the line
+`agents connect gemini --monitor` writes passes the refusal on and still
+lets the call run when the guard is gone or cannot start; run `innerwarden agents connect gemini --monitor` once to replace
 the line an earlier version wrote. An order written into Claude Code's
 custom commands or subagents (`.claude/commands/*.md`, `.claude/agents/*.md`)
 is read as one written into `CLAUDE.md`, and so is a file an instruction
