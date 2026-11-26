@@ -147,16 +147,30 @@ impl Outage {
         Some(remedy)
     }
 
-    /// One line, safe to print anywhere: no paths, no command text.
-    pub fn summary(&self) -> String {
+    /// How long the episode has lasted, in words.
+    fn lasted(&self) -> String {
         let secs = self.seconds();
-        let ago = if secs >= 7200 {
+        if secs >= 7200 {
             format!("{} hours", secs / 3600)
         } else if secs >= 120 {
             format!("{} minutes", secs / 60)
         } else {
             format!("{secs} seconds")
-        };
+        }
+    }
+
+    /// One line, safe to print anywhere: no paths, no command text.
+    pub fn summary(&self) -> String {
+        let ago = self.lasted();
+        if self.code == SINK_NOT_WRITTEN {
+            return format!(
+                "InnerWarden has not added to guard-events.jsonl for {ago} ({} guard event(s) lost, {}). \
+                 Screening still ran and the local record keeps the decisions, but InnerWarden's host \
+                 install reads that file and has not seen these. Check the disk's free space and the \
+                 file's size limit; the count is written into the file once it can be written again.",
+                self.lost, self.code
+            );
+        }
         let lost = if self.lost == 0 {
             "actions lost".to_string()
         } else {
@@ -176,6 +190,25 @@ impl Outage {
             ),
         }
     }
+
+    /// The line that tells an episode ended, as plainly as [`Self::summary`]
+    /// told it began. No paths, no command text.
+    pub fn recovered_summary(&self) -> String {
+        let (what, unit) = if self.code == SINK_NOT_WRITTEN {
+            (
+                "InnerWarden is adding to guard-events.jsonl again",
+                "guard event(s)",
+            )
+        } else {
+            ("InnerWarden is recording again", "action(s)")
+        };
+        format!(
+            "{what}, after {} ({} {unit} lost, {}).",
+            self.lasted(),
+            self.lost,
+            self.code
+        )
+    }
 }
 
 fn parse(bytes: &str) -> Option<Outage> {
@@ -187,27 +220,31 @@ fn parse(bytes: &str) -> Option<Outage> {
     })
 }
 
-/// The persisted outage for this graph path, if any. Never read through a link
-/// at the name: the directory is shared with the agent's account, and a root
-/// run would read whatever it points at.
+/// The persisted outage for this graph path, if any: beside the graph, else
+/// where it is kept when the graph's folder cannot be written
+/// ([`fallback_path`]). Never read through a link at the name: the
+/// directory is shared with the agent's account, and a root run would read
+/// whatever it points at.
 pub fn read_at(graph: &Path) -> Option<Outage> {
-    use std::io::Read;
-    let mut body = String::new();
-    innerwarden_safe_io::open_no_follow(&health_path(graph))
-        .ok()?
-        .take(64 * 1024)
-        .read_to_string(&mut body)
-        .ok()?;
-    parse(&body)
+    read_marker(&health_path(graph))
 }
 
-/// The outage to REPORT for this graph path.
+/// The outage to REPORT for this graph path: the graph's own
+/// ([`report_graph_at`]), else lines of `guard-events.jsonl` lost
+/// ([`note_sink_failure_in`]).
+pub fn report_at(graph: &Path) -> Option<Outage> {
+    report_graph_at(graph).or_else(|| read_sink_marker(&graph.with_file_name(SINK_HEALTH_FILE)))
+}
+
+/// The outage of the graph's own record.
 ///
 /// A marker file cannot cover every fault: the commonest one, a graph directory
-/// that is not writable, also stops the marker being written. So when there is
-/// no marker, probe. The graph's own mtime dates the episode, which is the
-/// precise fact the operator wanted ("the newest entry is six hours old").
-pub fn report_at(graph: &Path) -> Option<Outage> {
+/// that is not writable, also stops the marker being written beside it (it is
+/// then kept in [`fallback_path`], when the home can be written). So when
+/// there is no marker, probe. The graph's own mtime dates the episode, which
+/// is the precise fact the operator wanted ("the newest entry is six hours
+/// old").
+pub fn report_graph_at(graph: &Path) -> Option<Outage> {
     // First: the health record may itself be the refused file, and then what
     // it holds is not to be believed.
     if let Some(refused) = refused_file(graph) {
@@ -328,8 +365,8 @@ fn probe_writable(dir: &Path) -> bool {
 /// The open refuses a symbolic link. A HARD link opens fine, so the file is
 /// truncated and rewritten only when its link count says this name is its only
 /// one; the existing file is opened without `O_TRUNC` so nothing is cut before
-/// that is known.
-fn write_health(path: &Path, body: &[u8]) {
+/// that is known. Whether the record was written.
+fn write_health(path: &Path, body: &[u8]) -> bool {
     use std::io::Write;
     let mut create = std::fs::OpenOptions::new();
     create.write(true).create_new(true);
@@ -350,21 +387,19 @@ fn write_health(path: &Path, body: &[u8]) {
             innerwarden_safe_io::harden(&mut existing);
             match existing.open(path) {
                 Ok(file) => file,
-                Err(_) => return,
+                Err(_) => return false,
             }
         }
-        Err(_) => return,
+        Err(_) => return false,
     };
     if !file
         .metadata()
         .is_ok_and(|metadata| innerwarden_safe_io::is_regular_file_with_one_name(&metadata))
     {
-        return;
+        return false;
     }
     let mut file = file;
-    if file.set_len(0).is_ok() {
-        let _ = file.write_all(body);
-    }
+    file.set_len(0).is_ok() && file.write_all(body).is_ok()
 }
 
 fn last_write_unix(graph: &Path) -> Option<u64> {
@@ -388,65 +423,231 @@ pub fn current() -> Option<Outage> {
     report_at(&crate::graph_io::graph_path()?)
 }
 
+/// One lost write noted, and whether it is the one to tell someone about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Noted {
+    pub outage: Outage,
+    /// True when this failure opened a new episode and the episode was kept
+    /// where the next failure reads it. Repeats within an episode stay quiet
+    /// or a broken install would send a notification per command; and an
+    /// episode kept nowhere cannot tell its next failure from its first, so
+    /// it is not told either (stderr says each failure, and `status` and
+    /// `innerwarden graph --stats` probe the folder).
+    pub first_of_episode: bool,
+}
+
 /// Record one lost write, preserving the episode's start time.
 ///
-/// Returns the resulting state so a caller can decide whether this is the first
-/// failure of an episode and therefore worth an out-of-band notification.
-pub fn note_failure_at(graph: &Path, code: &str) -> Outage {
+/// Returns the resulting state and whether this failure opened the episode,
+/// and so is worth an out-of-band notification.
+pub fn note_failure_at(graph: &Path, code: &str) -> Noted {
     note_failures_at(graph, code, 1)
 }
 
 /// [`note_failure_at`] for `lost` writes at once (at least one): a writer
 /// that counts losses as they happen and notes them in batches, so a flood
 /// of them costs one write of the health file, not one each.
-pub fn note_failures_at(graph: &Path, code: &str, lost: u64) -> Outage {
-    let lost = lost.max(1);
-    let previous = read_at(graph);
-    // A new fault opens a new episode, so it may notify again. Only a REPEAT of
-    // the same fault must stay quiet, or a broken install sends one message per
-    // command.
-    let first_of_episode = previous.as_ref().is_none_or(|p| p.code != code);
-    let outage = match previous {
-        Some(p) if p.code == code => Outage {
-            lost: p.lost.saturating_add(lost),
-            ..p
-        },
-        // A DIFFERENT failure code restarts the episode: it is a new fault, and
-        // carrying the old start time forward would misreport how long this one
-        // has been happening.
-        _ => Outage {
-            code: code.to_string(),
-            since_unix: now_unix(),
-            lost,
-        },
-    };
-    let body = json!({
-        "code": outage.code,
-        "since_unix": outage.since_unix,
-        "lost": outage.lost,
-        "first_of_episode": first_of_episode,
-    });
-    write_health(&health_path(graph), body.to_string().as_bytes());
-    outage
+pub fn note_failures_at(graph: &Path, code: &str, lost: u64) -> Noted {
+    note_in(&health_path(graph), code, lost)
 }
 
 /// Clear the outage after a write succeeds. Returns the episode that just
 /// ended, so recovery can be reported as plainly as the failure was.
 pub fn note_success_at(graph: &Path) -> Option<Outage> {
-    let previous = read_at(graph)?;
-    let _ = std::fs::remove_file(health_path(graph));
-    Some(previous)
+    clear_in(&health_path(graph))
 }
 
-/// True when this failure opened a new episode, i.e. worth telling someone
-/// about. Repeats within an episode must stay quiet or a broken install would
-/// send a notification per command.
-pub fn is_first_of_episode_at(graph: &Path) -> bool {
-    std::fs::read_to_string(health_path(graph))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("first_of_episode").and_then(Value::as_bool))
-        .unwrap_or(false)
+/// The guard event sink's own outage record, in the sink's folder: lines of
+/// `guard-events.jsonl` that could not be appended. Apart from
+/// [`HEALTH_FILE`], which every graph write that works clears: the two fail
+/// apart (a size limit or a full disk can refuse an append and leave the
+/// graph's rewrite room), and one must not end the other's episode.
+const SINK_HEALTH_FILE: &str = "guard-events-health.json";
+
+/// The code of a sink outage: lines of `guard-events.jsonl` not written.
+pub(crate) const SINK_NOT_WRITTEN: &str = "guard_events_not_written";
+
+/// One line of `guard-events.jsonl` lost (an append that failed or was
+/// refused), noted in the sink's own outage record for the folder `dir`.
+pub fn note_sink_failure_in(dir: &Path) -> Noted {
+    note_in(&dir.join(SINK_HEALTH_FILE), SINK_NOT_WRITTEN, 1)
+}
+
+/// The sink's outage for the folder `dir`, if one is open.
+pub fn sink_outage_in(dir: &Path) -> Option<Outage> {
+    read_sink_marker(&dir.join(SINK_HEALTH_FILE))
+}
+
+/// The sink's outage record, only as this module writes it. The folder is
+/// one the guarded agent's account may write, and what is read here goes
+/// into `guard-events.jsonl` itself: a record it planted with words of its
+/// own is not read.
+fn read_sink_marker(beside: &Path) -> Option<Outage> {
+    read_marker(beside).filter(|outage| outage.code == SINK_NOT_WRITTEN)
+}
+
+/// Clear the sink's outage after an append works. Returns the episode that
+/// ended, whose count the caller writes into the sink.
+pub fn note_sink_success_in(dir: &Path) -> Option<Outage> {
+    clear_in(&dir.join(SINK_HEALTH_FILE)).filter(|outage| outage.code == SINK_NOT_WRITTEN)
+}
+
+/// The folder an outage record is kept in when its own folder cannot be
+/// written: `.local/state/innerwarden` in the account's own home
+/// ([`crate::graph_io::config_home`]), never a folder the caller's
+/// environment names. Without it, a record folder that cannot be written
+/// could not keep the episode either, and no outage of that kind was ever
+/// told to anyone.
+const STATE_DIR: &str = ".local/state/innerwarden";
+
+/// [`STATE_DIR`] under a scratch home of this test process's own.
+#[cfg(test)]
+fn fallback_dir() -> Option<PathBuf> {
+    Some(
+        std::env::temp_dir()
+            .join(format!("iw-record-health-{}", std::process::id()))
+            .join(STATE_DIR),
+    )
+}
+
+/// [`STATE_DIR`] in the account's home. A debug build run by a test with no
+/// test account home keeps it under the `HOME` the test gave it, so a test
+/// that breaks a record folder never writes the real home's.
+#[cfg(not(test))]
+fn fallback_dir() -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os(crate::graph_io::TEST_ACCOUNT_HOME_ENV).is_none() {
+        if let Some(home) = std::env::var_os("HOME") {
+            return Some(PathBuf::from(home).join(STATE_DIR));
+        }
+    }
+    crate::graph_io::config_home().map(|home| home.join(STATE_DIR))
+}
+
+/// Where the record `beside` is kept when its folder cannot be written: one
+/// file per folder and kind, named by a digest of the folder, so two records
+/// never share an episode.
+fn fallback_path(beside: &Path) -> Option<PathBuf> {
+    use sha2::{Digest, Sha256};
+    let name = beside.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".json").unwrap_or(name);
+    let folder = beside.parent().unwrap_or_else(|| Path::new(""));
+    let digest = Sha256::digest(folder.to_string_lossy().as_bytes());
+    let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    Some(fallback_dir()?.join(format!("{stem}-{hex}.json")))
+}
+
+/// The places an outage record is kept, in the order they are tried.
+fn places(beside: &Path) -> impl Iterator<Item = PathBuf> {
+    std::iter::once(beside.to_path_buf()).chain(fallback_path(beside))
+}
+
+/// The outage a record holds, never read through a link at the name: the
+/// directory is shared with the agent's account, and a root run would read
+/// whatever it points at.
+fn read_outage(path: &Path) -> Option<Outage> {
+    use std::io::Read;
+    let mut body = String::new();
+    innerwarden_safe_io::open_no_follow(path)
+        .ok()?
+        .take(64 * 1024)
+        .read_to_string(&mut body)
+        .ok()?;
+    parse(&body)
+}
+
+/// The outage the record `beside` holds, or its fallback.
+fn read_marker(beside: &Path) -> Option<Outage> {
+    places(beside).find_map(|place| read_outage(&place))
+}
+
+/// Note `lost` failures of `code` in the first place that takes the write:
+/// beside the record, else its fallback ([`fallback_path`]). The episode
+/// is read from the place written, so a stale record left in a folder that
+/// can no longer be written never makes every failure the first.
+fn note_in(beside: &Path, code: &str, lost: u64) -> Noted {
+    let lost = lost.max(1);
+    for place in places(beside) {
+        let previous = read_outage(&place);
+        // A new fault opens a new episode, so it may notify again. Only a
+        // REPEAT of the same fault must stay quiet, or a broken install sends
+        // one message per command.
+        let first_of_episode = previous.as_ref().is_none_or(|p| p.code != code);
+        let outage = match previous {
+            Some(p) if p.code == code => Outage {
+                lost: p.lost.saturating_add(lost),
+                ..p
+            },
+            // A DIFFERENT failure code restarts the episode: it is a new
+            // fault, and carrying the old start time forward would misreport
+            // how long this one has been happening.
+            _ => Outage {
+                code: code.to_string(),
+                since_unix: now_unix(),
+                lost,
+            },
+        };
+        let body = json!({
+            "code": outage.code,
+            "since_unix": outage.since_unix,
+            "lost": outage.lost,
+            "first_of_episode": first_of_episode,
+        });
+        if place != beside {
+            make_state_dir(&place);
+        }
+        if write_health(&place, body.to_string().as_bytes()) {
+            return Noted {
+                outage,
+                first_of_episode,
+            };
+        }
+    }
+    Noted {
+        outage: Outage {
+            code: code.to_string(),
+            since_unix: now_unix(),
+            lost,
+        },
+        first_of_episode: false,
+    }
+}
+
+/// The fallback's folder, owner only.
+fn make_state_dir(place: &Path) {
+    let Some(dir) = place.parent() else {
+        return;
+    };
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    let _ = builder.create(dir);
+}
+
+/// Clear every place the record `beside` is kept. The episode that ended
+/// is returned only when its record is gone, so one recovery is told once.
+fn clear_in(beside: &Path) -> Option<Outage> {
+    let mut ended = None;
+    for place in places(beside) {
+        let Some(outage) = read_outage(&place) else {
+            continue;
+        };
+        if forget(&place) {
+            ended.get_or_insert(outage);
+        }
+    }
+    ended
+}
+
+/// Remove a record, or empty it where its folder no longer lets it be
+/// removed. Whether it no longer holds an outage.
+fn forget(path: &Path) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => write_health(path, b""),
+    }
 }
 
 #[cfg(test)]
@@ -467,9 +668,9 @@ mod tests {
         let g = graph_in(&dir);
         assert!(read_at(&g).is_none(), "healthy install reports nothing");
 
-        let outage = note_failure_at(&g, "write_failed");
-        assert_eq!(outage.lost, 1);
-        assert!(is_first_of_episode_at(&g));
+        let noted = note_failure_at(&g, "write_failed");
+        assert_eq!(noted.outage.lost, 1);
+        assert!(noted.first_of_episode);
 
         let read_back = read_at(&g).expect("outage is durable");
         assert_eq!(read_back.code, "write_failed");
@@ -482,18 +683,18 @@ mod tests {
     fn repeats_accumulate_losses_and_keep_the_first_timestamp() {
         let dir = tempfile::tempdir().unwrap();
         let g = graph_in(&dir);
-        let first = note_failure_at(&g, "write_failed");
+        let first = note_failure_at(&g, "write_failed").outage;
         let third = {
             note_failure_at(&g, "write_failed");
             note_failure_at(&g, "write_failed")
         };
-        assert_eq!(third.lost, 3);
+        assert_eq!(third.outage.lost, 3);
         assert_eq!(
-            third.since_unix, first.since_unix,
+            third.outage.since_unix, first.since_unix,
             "the episode start must not move"
         );
         assert!(
-            !is_first_of_episode_at(&g),
+            !third.first_of_episode,
             "only the first failure may notify, or a broken install spams"
         );
     }
@@ -507,9 +708,9 @@ mod tests {
         note_failure_at(&g, "write_failed");
         note_failure_at(&g, "write_failed");
         let other = note_failure_at(&g, "lock_timed_out");
-        assert_eq!(other.code, "lock_timed_out");
-        assert_eq!(other.lost, 1, "losses belong to their own episode");
-        assert!(is_first_of_episode_at(&g), "a new fault may notify again");
+        assert_eq!(other.outage.code, "lock_timed_out");
+        assert_eq!(other.outage.lost, 1, "losses belong to their own episode");
+        assert!(other.first_of_episode, "a new fault may notify again");
     }
 
     #[test]
@@ -665,7 +866,7 @@ mod tests {
         let g = graph_in(&dir);
         std::fs::write(health_path(&g), "{not json").unwrap();
         assert!(read_at(&g).is_none());
-        assert!(!is_first_of_episode_at(&g));
+        assert!(note_success_at(&g).is_none());
     }
 
     /// The health record sits in a directory the guarded agent's uid writes,
@@ -865,5 +1066,118 @@ mod tests {
             report_at(&g).unwrap().code,
             "record_health_has_a_second_name"
         );
+    }
+
+    /// REGRESSION ANCHOR (record folder that cannot be written). The
+    /// episode could not be kept beside the graph, so every failure read as
+    /// "not the first" and the outage was never told to anyone. It is kept
+    /// in the account's own state folder instead: told once, counted, read
+    /// back by `report_at`, and ended once the folder takes writes again.
+    ///
+    /// FAILS ON REVERT: take the fallback out of `places` and the first
+    /// failure is kept nowhere, so it is never the one told.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_written_keeps_its_episode_elsewhere_and_tells_it_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let g = store.join("graph.json");
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if probe_writable(&store) {
+            // Root writes any folder: nothing to prove here.
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        let first = note_failure_at(&g, "graph_lock_unavailable");
+        let second = note_failure_at(&g, "graph_lock_unavailable");
+        assert!(first.first_of_episode, "the first failure is told");
+        assert!(!second.first_of_episode, "a repeat is not");
+        assert!(!health_path(&g).exists());
+        let reported = report_at(&g).expect("the kept episode is reported");
+        assert_eq!(reported.code, "graph_lock_unavailable");
+        assert_eq!(reported.lost, 2);
+
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ended = note_success_at(&g).expect("the episode ends");
+        assert_eq!(ended.lost, 2);
+        assert!(ended.recovered_summary().contains("recording again"));
+        assert!(read_at(&g).is_none(), "both places are cleared");
+        assert!(note_success_at(&g).is_none(), "one end, told once");
+    }
+
+    /// A record of an earlier fault left in a folder that no longer takes
+    /// writes is read, but the episode is kept where it is written, so a
+    /// repeat of the new fault is not told again.
+    ///
+    /// FAILS ON REVERT: read the episode beside the graph whatever place took
+    /// the write, and every failure differs from the stale code and is told.
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_record_beside_never_makes_every_failure_the_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let g = store.join("graph.json");
+        note_failure_at(&g, "graph_write_failed");
+        std::fs::set_permissions(health_path(&g), std::fs::Permissions::from_mode(0o400)).unwrap();
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if probe_writable(&store) {
+            std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+        assert!(note_failure_at(&g, "graph_lock_unavailable").first_of_episode);
+        assert!(!note_failure_at(&g, "graph_lock_unavailable").first_of_episode);
+        assert!(!note_failure_at(&g, "graph_lock_unavailable").first_of_episode);
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(health_path(&g), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(note_success_at(&g).is_some());
+        assert!(read_at(&g).is_none());
+    }
+
+    /// Lines of `guard-events.jsonl` lost are counted in a record of their
+    /// own: a graph write that works does not end them, they are reported
+    /// when the graph has nothing to report, and their end is returned once.
+    ///
+    /// FAILS ON REVERT: keep the sink's losses in the graph's record and the
+    /// graph write that works clears them uncounted.
+    #[test]
+    fn lost_sink_lines_are_an_episode_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = graph_in(&dir);
+        let first = note_sink_failure_in(dir.path());
+        assert!(first.first_of_episode);
+        let again = note_sink_failure_in(dir.path());
+        assert!(!again.first_of_episode);
+        assert_eq!(again.outage.lost, 2);
+        assert!(note_success_at(&g).is_none(), "the graph's record is apart");
+        let reported = report_at(&g).expect("the sink's loss is reported");
+        assert_eq!(reported.code, SINK_NOT_WRITTEN);
+        assert_eq!(reported.lost, 2);
+        let said = reported.summary();
+        assert!(
+            said.contains("guard-events.jsonl") && said.contains("2 guard event(s) lost"),
+            "{said}"
+        );
+        assert!(!said.contains('/'), "no paths in a health line: {said}");
+        let ended = note_sink_success_in(dir.path()).expect("the episode ends");
+        assert_eq!(ended.lost, 2);
+        assert!(ended
+            .recovered_summary()
+            .contains("adding to guard-events.jsonl again"));
+        assert!(sink_outage_in(dir.path()).is_none());
+        assert!(report_at(&g).is_none());
+
+        // A record planted with words of its own is never read back.
+        std::fs::write(
+            dir.path().join(SINK_HEALTH_FILE),
+            r#"{"code":"see http://x.example","since_unix":1,"lost":9}"#,
+        )
+        .unwrap();
+        assert!(sink_outage_in(dir.path()).is_none());
+        assert!(report_at(&g).is_none());
+        assert!(note_sink_success_in(dir.path()).is_none());
     }
 }

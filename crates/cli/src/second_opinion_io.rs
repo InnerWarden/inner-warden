@@ -534,7 +534,8 @@ pub fn verify_endpoint(cfg: &LlmConfig) -> Result<(), String> {
 /// The full second-opinion flow, for every line of a call, in their order:
 /// only a `review`, only when the user configured an endpoint. Each answer
 /// is an overriding verdict (`decided_by = llm`) or `None` to keep the
-/// rules verdict (which then escalates to a human via notify). The lines
+/// rules verdict (a `review` the channels announce when the person opted in
+/// with `innerwarden notify --notify-review`, refused or not). The lines
 /// that need one are asked at once, under one model answer's wait
 /// ([`ask_at_once_or_again`]).
 pub fn consider_all(lines: &[(&str, &Value)]) -> Vec<Option<Value>> {

@@ -879,9 +879,9 @@ impl Shared {
             if n == 0 {
                 continue;
             }
-            let outage = crate::record_health::note_failures_at(&self.graph, why.code(), n);
-            if crate::record_health::is_first_of_episode_at(&self.graph) {
-                crate::notify_io::fire_text(&outage.summary());
+            let noted = crate::record_health::note_failures_at(&self.graph, why.code(), n);
+            if noted.first_of_episode {
+                crate::notify_io::fire_text(&noted.outage.summary());
             }
         }
     }

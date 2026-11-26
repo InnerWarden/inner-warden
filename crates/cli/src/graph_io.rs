@@ -1708,17 +1708,21 @@ pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Dec
         eprintln!("innerwarden: graph record skipped ({error})");
         // stderr alone hid a six-hour outage. Persist it where the CLI and the
         // dashboard can find it, and tell someone ONCE per episode.
-        let outage = crate::record_health::note_failure_at(path, &error.to_string());
-        if crate::record_health::is_first_of_episode_at(path) {
-            crate::notify_io::fire_text(&outage.summary());
+        let noted = crate::record_health::note_failure_at(path, &error.to_string());
+        if noted.first_of_episode {
+            crate::notify_io::fire_text(&noted.outage.summary());
         }
         false
     } else {
+        // The end of an episode is told where its start was: a person who
+        // heard the record stop has to hear it start again, or the channel
+        // reads as an outage that never ended.
         if let Some(ended) = crate::record_health::note_success_at(path) {
             eprintln!(
                 "innerwarden: recording recovered after {} lost action(s)",
                 ended.lost
             );
+            crate::notify_io::fire_text(&ended.recovered_summary());
         }
         true
     };
@@ -1984,7 +1988,16 @@ pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) -> bool
     }
     let path = dir.join("guard-events.jsonl");
     create_sink_with_directory_ownership(&path);
-    let mut record = line.to_string();
+    // Lines this sink lost earlier are counted in the same write, ahead of
+    // this one: the sink is what InnerWarden's host install reads, so the
+    // count goes where it reads ([`SINK_LOST_KIND`]).
+    let lost_before = crate::record_health::sink_outage_in(dir);
+    let mut record = String::new();
+    if let Some(lost) = &lost_before {
+        record.push_str(&sink_lost_line(lost).to_string());
+        record.push('\n');
+    }
+    record.push_str(&line.to_string());
     record.push('\n');
     // Never through a link, never waiting on a FIFO, only into a plain file
     // that has no other name. The directory is shared with the guarded agent's
@@ -1993,10 +2006,11 @@ pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) -> bool
     // line of its choosing there. `harden` refuses a symbolic link at open; a
     // HARD link opens fine and is only visible in the link count.
     //
-    // A refused or failed append is said on stderr, and the condition behind
-    // it is what `record_health::report_at` reports as an outage, so the
-    // dashboard and `innerwarden graph` show the sink as not recording rather
-    // than as a quiet, healthy host.
+    // A refused or failed append is said on stderr and counted in the sink's
+    // own outage record (`record_health::note_sink_failure_in`), which
+    // `record_health::report_at` reports, so the dashboard, `innerwarden
+    // graph` and `status` show the sink as not recording rather than as a
+    // quiet, healthy host, and the configured channels hear it once.
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     innerwarden_safe_io::harden(&mut options);
@@ -2018,8 +2032,37 @@ pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) -> bool
             "innerwarden: a guard event was not recorded: guard-events.jsonl {why}. \
              `innerwarden graph --stats` says what to do."
         );
+        // stderr alone lost the line in silence: counted, and told once per
+        // episode, as a graph write that fails is.
+        let noted = crate::record_health::note_sink_failure_in(dir);
+        if noted.first_of_episode {
+            crate::notify_io::fire_text(&noted.outage.summary());
+        }
+    } else if lost_before.is_some() {
+        if let Some(ended) = crate::record_health::note_sink_success_in(dir) {
+            crate::notify_io::fire_text(&ended.recovered_summary());
+        }
     }
     refused.is_none()
+}
+
+/// The kind of the line that counts what `guard-events.jsonl` lost, written
+/// into it by the first append that works after the loss.
+pub(crate) const SINK_LOST_KIND: &str = "guard.events_lost";
+
+/// PURE. The [`SINK_LOST_KIND`] line for an episode of lost lines.
+pub(crate) fn sink_lost_line(lost: &crate::record_health::Outage) -> Value {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    serde_json::json!({
+        "kind": SINK_LOST_KIND,
+        "ts": ts,
+        "since": lost.since_unix,
+        "lost": lost.lost,
+        "code": lost.code,
+    })
 }
 
 /// Create the sink, if it does not exist yet, with the mode AND group its
@@ -3862,13 +3905,66 @@ mod tests {
         );
 
         // Not a refusal of every existing sink: once the second name is gone the
-        // same file is the sink's own again and is appended to.
+        // same file is the sink's own again and is appended to, after the
+        // line that counts the one it refused.
         std::fs::remove_file(&victim).unwrap();
         append_guard_event_at(dir.path(), &json!({"kind": "guard.blocked"}));
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("guard-events.jsonl")).unwrap(),
-            "# untouched\n{\"kind\":\"guard.blocked\"}\n"
-        );
+        let text = std::fs::read_to_string(dir.path().join("guard-events.jsonl")).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines[0], "# untouched");
+        let lost: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(lost["kind"], SINK_LOST_KIND, "{text}");
+        assert_eq!(lost["lost"], 1, "{text}");
+        assert_eq!(lines[2], "{\"kind\":\"guard.blocked\"}");
+    }
+
+    /// REGRESSION ANCHOR (a guard event lost with only a line on stderr). An
+    /// append that fails is counted in the sink's own outage record, told
+    /// once per episode, and the count is written into the sink, where
+    /// InnerWarden's host install reads, by the first append that works;
+    /// the episode then ends and a later append writes no count again.
+    ///
+    /// FAILS ON REVERT: drop `note_sink_failure_in` from the failed append
+    /// and nothing counts the loss; drop the count from the next write and
+    /// the sink never says it.
+    #[cfg(unix)]
+    #[test]
+    fn a_lost_sink_line_is_counted_and_written_where_the_sink_is_read() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sink = dir.path().join("guard-events.jsonl");
+        // A directory standing at the sink's name refuses every append.
+        std::fs::create_dir(&sink).unwrap();
+        for _ in 0..3 {
+            assert!(!append_guard_event_at(
+                dir.path(),
+                &json!({"kind": "guard.blocked"})
+            ));
+        }
+        let open = crate::record_health::sink_outage_in(dir.path()).expect("counted");
+        assert_eq!(open.lost, 3);
+        std::fs::remove_dir(&sink).unwrap();
+
+        assert!(append_guard_event_at(
+            dir.path(),
+            &json!({"kind": "guard.blocked", "n": 4})
+        ));
+        assert!(append_guard_event_at(
+            dir.path(),
+            &json!({"kind": "guard.blocked", "n": 5})
+        ));
+        let lines: Vec<Value> = std::fs::read_to_string(&sink)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines[0]["kind"], SINK_LOST_KIND);
+        assert_eq!(lines[0]["lost"], 3);
+        assert_eq!(lines[0]["since"], open.since_unix);
+        assert_eq!(lines[1]["n"], 4);
+        assert_eq!(lines[2]["n"], 5);
+        assert!(crate::record_health::sink_outage_in(dir.path()).is_none());
     }
 
     #[test]

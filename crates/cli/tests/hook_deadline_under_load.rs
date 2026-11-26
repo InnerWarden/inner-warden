@@ -326,6 +326,16 @@ fn a_record_held_back_by_the_disk_does_not_cost_the_call_its_answer() {
             run.said
         );
         assert!(health(&host).is_null(), "the episode is over");
+        // The end is told once, where the start was.
+        assert_eq!(
+            hook.bodies()
+                .iter()
+                .filter(|body| body.contains("recording again"))
+                .count(),
+            1,
+            "the episode's end: {:?}",
+            hook.bodies()
+        );
     }
     assert_eq!(
         episode_alerts(&hook),
@@ -408,10 +418,12 @@ fn a_session_store_held_back_by_the_disk_does_not_cost_the_call_its_answer() {
 
 /// The alerts the webhook heard that are not the refusal's: a lost
 /// record's, told on the text channels once per episode.
+/// The alerts that an episode began: not the refusals' own, and not the
+/// line that says it ended.
 fn episode_alerts(hook: &Webhook) -> usize {
     hook.bodies()
         .iter()
-        .filter(|body| !body.contains("x.sh"))
+        .filter(|body| !body.contains("x.sh") && !body.contains("recording again"))
         .count()
 }
 
