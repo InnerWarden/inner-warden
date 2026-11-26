@@ -1616,6 +1616,8 @@ pub(crate) fn lua_builtin_aliases_in_line(line: &str) -> String {
 
 /// [`lua_builtin_aliases`], reading names inside strings or not.
 fn lua_builtin_aliases_reading(code: &str, skip_strings: bool) -> String {
+    let spelled = lua_builtin_spellings(code);
+    let code: &str = &spelled;
     static GIVEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?:^|[^\w.:])(?:local\s+)?([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)")
             .expect("static lua alias regex")
@@ -1677,6 +1679,96 @@ fn lua_builtin_aliases_reading(code: &str, skip_strings: bool) -> String {
             format!("require({module})")
         })
         .into_owned()
+}
+
+/// Lua's built-ins of [`LUA_LOADERS`] reached by other spellings, written
+/// as the plain name: through the globals table (`_G.require`,
+/// `_G["require"]`, `_ENV.require`, `rawget(_G, "require")`), in brackets
+/// that are no call's (`(require)("os")`, `local r = (require)`), given in
+/// a list (`local a, r = 1, require`, written one name at a time), or kept
+/// in a table's field (`local t = {r = require}; t.r("os")`).
+fn lua_builtin_spellings(code: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    static PATTERNS: std::sync::LazyLock<[regex::Regex; 4]> = std::sync::LazyLock::new(|| {
+        let names = LUA_LOADERS.join("|");
+        [
+            format!(
+                r#"\b(?:(?:_G|_ENV)\s*(?:\.\s*({names})\b|\[\s*["']({names})["']\s*\])|rawget\s*\(\s*(?:_G|_ENV)\s*,\s*["']({names})["']\s*\))"#
+            ),
+            format!(r"\(\s*({names})\s*\)"),
+            r#"(^|[;\n'"]|\bdo\b|\bthen\b)(\s*)(local\s+)?([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)+)\s*=\s*([^;\n=(){}'"]+)"#.to_string(),
+            format!(r"\b([A-Za-z_]\w*)\s*=\s*\{{[^{{}}]*?\b([A-Za-z_]\w*)\s*=\s*({names})\b\s*[,;}}]"),
+        ]
+        .map(|pattern| regex::Regex::new(&pattern).expect("static lua spelling regex"))
+    });
+    let [global, bracketed, listed, field] = &*PATTERNS;
+    if !LUA_LOADERS.iter().any(|name| code.contains(name)) {
+        return Cow::Borrowed(code);
+    }
+    let mut text = global
+        .replace_all(code, |found: &regex::Captures| {
+            (1..=3)
+                .find_map(|group| found.get(group))
+                .map_or(String::new(), |name| name.as_str().to_owned())
+        })
+        .into_owned();
+    // Brackets around the name alone are no call's when nothing that ends
+    // a value stands before them.
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for found in bracketed.captures_iter(&text) {
+        let whole = found.get(0).expect("whole match");
+        let before = text[..whole.start()].trim_end().chars().next_back();
+        if before
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | ')' | ']' | '}' | '"' | '\''))
+        {
+            continue;
+        }
+        out.push_str(&text[last..whole.start()]);
+        out.push_str(&found[1]);
+        last = whole.end();
+    }
+    out.push_str(&text[last..]);
+    text = out;
+    text = listed
+        .replace_all(&text, |found: &regex::Captures| {
+            let names: Vec<&str> = found[4].split(',').map(str::trim).collect();
+            let values: Vec<&str> = found[5].split(',').map(str::trim).collect();
+            if names.len() != values.len()
+                || !values.iter().any(|value| LUA_LOADERS.contains(value))
+            {
+                return found[0].to_owned();
+            }
+            let local = found.get(3).map_or("", |m| m.as_str());
+            let each: Vec<String> = names
+                .iter()
+                .zip(&values)
+                .map(|(name, value)| format!("{local}{name} = {value}"))
+                .collect();
+            format!("{}{}{}", &found[1], &found[2], each.join("; "))
+        })
+        .into_owned();
+    let fields: Vec<(String, String, String)> = field
+        .captures_iter(&text)
+        .map(|found| {
+            (
+                found[1].to_owned(),
+                found[2].to_owned(),
+                found[3].to_owned(),
+            )
+        })
+        .collect();
+    for (table, key, builtin) in fields {
+        let reach = format!(
+            r#"\b{table}\s*(?:\.\s*{key}\b|\[\s*["']{key}["']\s*\])"#,
+            table = regex::escape(&table),
+            key = regex::escape(&key)
+        );
+        if let Ok(reach) = regex::Regex::new(&reach) {
+            text = reach.replace_all(&text, builtin.as_str()).into_owned();
+        }
+    }
+    Cow::Owned(text)
 }
 
 /// `code` with each use of `name` as a name, outside strings, written as

@@ -118,3 +118,27 @@ fn the_rest_of_monitor_still_only_records() {
     let settings = home.path().join(".claude/settings.json");
     assert_eq!(write_file(home.path(), &settings), Some(0));
 }
+
+/// The guard's state folder (`~/.local/state/innerwarden`) is held as its
+/// configuration is: a write there is refused in monitor too, by a shell
+/// line or by the file tool. Measured 2026-11-26 before the change: each
+/// ran (exit 0).
+///
+/// FAILS ON REVERT of `.local/state/innerwarden` in `GUARD_CONFIG_FOLDERS`
+/// (`file_tools.rs`) and `GUARD_CONFIG_PLACES` (`threats.rs`).
+#[test]
+fn a_write_into_the_guards_state_folder_is_refused_in_monitor() {
+    let home = tempfile::tempdir().unwrap();
+    for line in [
+        "echo x > ~/.local/state/innerwarden/graph.json",
+        "rm -rf ~/.local/state/innerwarden",
+    ] {
+        assert_eq!(shell(home.path(), line), Some(2), "{line}");
+    }
+    let path = home.path().join(".local/state/innerwarden/graph.json");
+    assert_eq!(write_file(home.path(), &path), Some(2));
+    assert_eq!(
+        shell(home.path(), "cat ~/.local/state/innerwarden/graph.json"),
+        Some(0)
+    );
+}

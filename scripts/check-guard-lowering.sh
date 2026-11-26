@@ -38,6 +38,28 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 2
 fi
 
+# A throwaway home and record for the run, removed at the end. The hook
+# records every refusal and may alert, rewire the agent settings in the home
+# and keep sessions: run against the person's own home it wrote thousands of
+# refusals of this self-test into the real record (and, where the host
+# product's config points it there, the shared one). Everything the hook
+# writes is pointed here; the product config's shared record gives way to
+# IW_GRAPH_FILE when no account entry names this account.
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/iw-lowering-check.XXXXXX")" || {
+    echo "check-guard-lowering: could not make a scratch folder" >&2
+    exit 2
+}
+trap 'rm -rf "$scratch"' EXIT
+mkdir -p "$scratch/home/.config/innerwarden"
+export HOME="$scratch/home"
+export USERPROFILE="$scratch/home"
+unset XDG_CONFIG_HOME XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME
+export IW_GRAPH_FILE="$scratch/graph.json"
+export IW_SESSION_FILE="$scratch/sessions.json"
+export IW_NOTIFY_CONFIG="$scratch/home/.config/innerwarden/notify.toml"
+export IW_LLM_CONFIG="$scratch/home/.config/innerwarden/llm.toml"
+export IW_SUPPRESS_CONFIG="$scratch/home/.config/innerwarden/suppress.toml"
+
 # The agent shell the hook expects: Claude Code sets these, and the CLI's own
 # refusal keys off them. The hook screens the tool call regardless, so a deny
 # does not depend on them, but running as the agent does keeps the proof honest.

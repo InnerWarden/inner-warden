@@ -3595,6 +3595,38 @@ const HANDED_LEVELS_READ: u8 = 4;
 /// positional parameter is the argument that stands for it (`bash -c "$1" _
 /// 'rm -rf /'`). Any other operand that starts with an expansion is not
 /// read and is reported ([`HandedLines::not_literal`]).
+/// Each shell's `-c` script of the line as the shell hands it over: a word
+/// whose quotes are glued (`"curl ... ev"'.io'`), escaped by backslashes
+/// (`curl\ -d\ ...`) or written `$'...'` is one script, read as the shell
+/// reads it, behind `env` and the like too. A word with an expansion is not
+/// read here (the line does not show it).
+pub(crate) fn shell_scripts_as_handed(source: &str) -> Vec<String> {
+    let mut scripts = Vec::new();
+    for command in crate::shell_words::read_line(source).commands {
+        if command
+            .words
+            .iter()
+            .any(|word| word.has(crate::shell_words::Mark::Expansion))
+        {
+            continue;
+        }
+        let texts: Vec<String> = command.words.iter().map(|word| word.text.clone()).collect();
+        let Some(at) = crate::threats::effective_command_index(&texts) else {
+            continue;
+        };
+        let program = crate::threats::token_basename(&texts[at]).to_ascii_lowercase();
+        if !crate::threats::is_shell_program(&program) {
+            continue;
+        }
+        if let Some(script) = crate::agent_instructions::shell_line(&texts[at + 1..]) {
+            if !script.trim().is_empty() {
+                scripts.push(script.to_string());
+            }
+        }
+    }
+    scripts
+}
+
 pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
     let mut handed = HandedLines::default();
     let Some((tree, _doubt)) = parse_line(source) else {
@@ -4000,6 +4032,12 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                 // A download alone: the download rules' own.
                 None => {}
             }
+        }
+    }
+    // The `-c` script as the shell hands it over ([`shell_scripts_as_handed`]).
+    for script in shell_scripts_as_handed(source) {
+        if !handed.lines.contains(&script) {
+            handed.lines.push(script);
         }
     }
     handed.lines.retain(|line| !line.trim().is_empty());
@@ -9813,10 +9851,20 @@ fn names_ls_lists(words: &[crate::shell_words::Word]) -> Option<Vec<String>> {
                 return None;
             }
         } else {
+            // A folder's names are its entries, printed bare: a word with no
+            // pattern may be one, so its entries (`*`) are listed beside it.
+            let pattern = word.text.contains(['*', '?', '[']);
             names.push(word.text.clone());
+            if !pattern && !names.iter().any(|name| name == "*") {
+                names.push("*".to_string());
+            }
         }
     }
-    (!names.is_empty()).then_some(names)
+    // `ls` alone lists the entries of the folder it runs in.
+    if names.is_empty() {
+        names.push("*".to_string());
+    }
+    Some(names)
 }
 
 /// The files `find` given `words` prints, as the line names them: each
@@ -9875,8 +9923,29 @@ pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
     use crate::shell_words::read_line;
     let line = read_line(source);
     let mut built = Vec::new();
-    for pair in line.commands.windows(2) {
-        let [feeder, runner] = pair else { continue };
+    for (index, runner) in line.commands.iter().enumerate().skip(1) {
+        // The command that lists the names: back past the filters that only
+        // pass names on (`| sort |`, `| grep -v x |`, `| head -n 9 |`), each
+        // of which hands on some of them at most.
+        let mut at = index - 1;
+        while at > 0
+            && line.commands[at].piped
+            && line.commands[at - 1].piped
+            && passes_names_on(&line.commands[at].words)
+        {
+            at -= 1;
+        }
+        let feeder = &line.commands[at];
+        // The folder the last `cd` before it moved to, written out: the
+        // names it lists are read from there.
+        let folder =
+            line.commands[..at]
+                .iter()
+                .rev()
+                .find_map(|command| match command.words.as_slice() {
+                    [cd, to] if cd.text == "cd" && to.is_plain() => Some(to.text.clone()),
+                    _ => None,
+                });
         // A pattern is kept: what it names is what is listed.
         if !feeder.piped
             || feeder
@@ -9990,6 +10059,7 @@ pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
                 format!("'{}'", item.replace('\'', "'\\''"))
             }
         };
+        let before = built.len();
         match replace {
             Some(token) => {
                 for item in items.iter().take(64) {
@@ -10009,8 +10079,30 @@ pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
                 built.push(words.join(" "));
             }
         }
+        if let Some(folder) = folder {
+            let from = format!("cd {} && ", quoted(&folder));
+            for line in &mut built[before..] {
+                line.insert_str(0, &from);
+            }
+        }
     }
     built
+}
+
+/// Whether a command of a pipe only hands on some of the lines it is given,
+/// as they are: `sort`, `uniq`, `tac`, `shuf`, `head`, `tail`, `grep` (any
+/// pattern: what it keeps is among them) and `cat` with no file of its own.
+fn passes_names_on(words: &[crate::shell_words::Word]) -> bool {
+    let Some(program) = words.first() else {
+        return false;
+    };
+    match program.text.rsplit('/').next() {
+        Some("sort" | "uniq" | "tac" | "shuf" | "head" | "tail" | "grep" | "egrep" | "fgrep") => {
+            true
+        }
+        Some("cat") => words[1..].iter().all(|word| word.text.starts_with('-')),
+        _ => false,
+    }
 }
 
 pub(crate) fn line_through_links(source: &str) -> Option<String> {

@@ -10687,9 +10687,18 @@ fn writes_jail_record(content: &str) -> bool {
 
 /// Whether a path names the guard's configuration directory or a file in it.
 fn names_guard_config(target: &str) -> bool {
-    named_path(&home_spelled(target))
-        .is_some_and(|named| Place::Components(".config/innerwarden").holds(&named))
+    named_path(&home_spelled(target)).is_some_and(|named| {
+        GUARD_CONFIG_PLACES
+            .iter()
+            .any(|place| Place::Components(place).holds(&named))
+    })
 }
+
+/// The guard's own folders in a home, protected alike: its configuration,
+/// and the state folder that holds the jail's notes and the record kept when
+/// the shared one cannot be written.
+pub(crate) const GUARD_CONFIG_PLACES: &[&str] =
+    &[".config/innerwarden", ".local/state/innerwarden"];
 
 /// What [`PRIVILEGED_WRITE_TARGETS`] calls the settings the guard is loaded
 /// by, and its own program: the two groups the guard is carried by.
@@ -11065,7 +11074,7 @@ fn code_names_and_writes_guard_config(code: &str) -> bool {
     static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
         regex::Regex::new(
-            r#"\.config\W{1,8}innerwarden|xdg_config_home\W{1,24}innerwarden|innerwarden\W{1,8}jail-claude"#,
+            r#"\.config\W{1,8}innerwarden|xdg_config_home\W{1,24}innerwarden|innerwarden\W{1,8}jail-claude|\.local\W{1,8}state\W{1,8}innerwarden"#,
         )
         .expect("static config path regex")
     });
@@ -13982,8 +13991,8 @@ pub fn check_command_except(content: &str, lifted: &[&str]) -> Option<(&'static 
         }
     }
     // A `PATH=` value is read as the shell hands it over: `PATH=\/tmp/x:...`
-    // sets the same PATH as `PATH=/tmp/x:...`.
-    if content.contains('\\') {
+    // and `PATH=/"tmp"/x:...` set the same PATH as `PATH=/tmp/x:...`.
+    if content.contains("PATH=") {
         for assignment in path_assignments_as_read(content) {
             if let Some(hit) = dangerous_command_in(&assignment) {
                 return Some(hit);
@@ -23227,12 +23236,14 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
             Place::Components(".openclaw/hooks"),
             // The Community configuration, its allow rules and its record.
             Place::Components(".config/innerwarden"),
-            // The jail launcher's folder of each project's own Claude Code
-            // folder, and beside each its notes of what a jail made in the
-            // project (`<key>.made`, `<key>.run.<pid>`, `<key>.absent`):
-            // an agent outside the jail that took a note away would let the
-            // next jail start on a file the person never accepted.
-            Place::Components(".local/state/innerwarden/jail-claude"),
+            // The guard's state folder: the jail launcher's folder of each
+            // project's own Claude Code folder, and beside each its notes of
+            // what a jail made in the project (`<key>.made`,
+            // `<key>.run.<pid>`, `<key>.absent`): an agent outside the jail
+            // that took a note away would let the next jail start on a file
+            // the person never accepted; and the record kept there when the
+            // shared one cannot be written.
+            Place::Components(".local/state/innerwarden"),
             // INNERWARDEN_SELF_PATHS, but for the binary, which is a program.
             Place::Tree("/etc/innerwarden"),
             Place::Tree("/var/lib/innerwarden"),

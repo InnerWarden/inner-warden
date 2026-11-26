@@ -4391,7 +4391,57 @@ fn analyze_command_as_sent(
         as_decoded.command = command.trim().to_string();
         return as_decoded;
     }
+    // A shell's `-c` script whose quotes are glued or escaped by backslashes
+    // (`bash -c "curl ... i"'.sh | sh'`) is the script the shell hands over,
+    // written as one literal: the stronger of the two readings stands.
+    if let Some(literal) = sole_script_as_handed(command) {
+        let as_handed =
+            analyze_command_unwrapped(&literal, rule_engine, protected_reads, context, depth);
+        let mut as_written =
+            analyze_command_unwrapped(command, rule_engine, protected_reads, context, depth);
+        if verdict_strength(&as_handed) > verdict_strength(&as_written) {
+            let mut as_handed = as_handed;
+            as_handed.command = command.trim().to_string();
+            return as_handed;
+        }
+        as_written.command = command.trim().to_string();
+        return as_written;
+    }
     analyze_command_unwrapped(command, rule_engine, protected_reads, context, depth)
+}
+
+/// A line that only runs a shell's `-c` script whose word is not one
+/// single-quoted literal (glued quotes, backslashes), written as `<shell> -c
+/// '<script>'` with the script as the shell hands it over. `None` for any
+/// other line, a word with an expansion, or a script holding a `'`.
+fn sole_script_as_handed(command: &str) -> Option<String> {
+    if sole_literal_shell_code(command).is_some() || !command.contains("-c") {
+        return None;
+    }
+    let line = crate::shell_words::read_line(command);
+    let [only] = line.commands.as_slice() else {
+        return None;
+    };
+    if !line.nested.is_empty()
+        || only
+            .words
+            .iter()
+            .any(|word| word.has(crate::shell_words::Mark::Expansion))
+    {
+        return None;
+    }
+    let [program, dash_c, script] = only.words.as_slice() else {
+        return None;
+    };
+    let shell = program.text.rsplit('/').next().unwrap_or(&program.text);
+    if !matches!(shell, "bash" | "sh" | "dash" | "zsh" | "ksh")
+        || dash_c.text != "-c"
+        || script.text.trim().is_empty()
+        || script.text.contains('\'')
+    {
+        return None;
+    }
+    Some(format!("{shell} -c '{}'", script.text))
 }
 
 /// [`analyze_command_at`] past the `innerwarden check` and `$'...'`
@@ -5192,11 +5242,23 @@ fn analyze_command_as_read(
 
     // Read on the line as the shell hands it over too: taking backslashes out
     // of code in quotes can change what that code runs.
-    let flow = crate::shell::executable_data_flow(scan_cmd).or_else(|| {
-        (raw_scan != scan_cmd)
-            .then(|| crate::shell::executable_data_flow(raw_scan))
-            .flatten()
-    });
+    // And in a shell's `-c` script as the shell hands it over: glued quotes
+    // or backslashes keep the tree from reading it as one script.
+    let flow = crate::shell::executable_data_flow(scan_cmd)
+        .or_else(|| {
+            (raw_scan != scan_cmd)
+                .then(|| crate::shell::executable_data_flow(raw_scan))
+                .flatten()
+        })
+        .or_else(|| {
+            (depth < STARTUP_PAYLOAD_DEPTH)
+                .then(|| {
+                    crate::shell::shell_scripts_as_handed(cmd)
+                        .iter()
+                        .find_map(|script| crate::shell::executable_data_flow(script))
+                })
+                .flatten()
+        });
     if let Some(flow) = flow {
         // Text of the project's own files placed into code is a warning;
         // every other flow is a refusal.

@@ -289,6 +289,7 @@ fn names_or_holds_guard_file(path: &Path) -> bool {
 fn removal_operands(program: &str, args: &[Word]) -> Option<(Vec<Word>, bool)> {
     let mut operands = Vec::new();
     let mut recursive = false;
+    let mut forced = false;
     let mut rest = args.iter();
     let mut options = true;
     while let Some(word) = rest.next() {
@@ -297,6 +298,10 @@ fn removal_operands(program: &str, args: &[Word]) -> Option<(Vec<Word>, bool)> {
             options = false;
         } else if options && text.starts_with("--") {
             recursive |= text == "--recursive";
+            forced |= text == "--force";
+            if program == "ln" && text == "--target-directory" {
+                rest.next();
+            }
             if program == "truncate" && (text == "--size" || text == "--reference") {
                 rest.next();
             }
@@ -305,6 +310,10 @@ fn removal_operands(program: &str, args: &[Word]) -> Option<(Vec<Word>, bool)> {
             }
         } else if options && text.starts_with('-') && text.len() > 1 {
             recursive |= program == "rm" && text.contains(['r', 'R']);
+            forced |= program == "ln" && text.contains('f');
+            if program == "ln" && text == "-t" {
+                rest.next();
+            }
             if program == "truncate" && (text == "-s" || text == "-r") {
                 rest.next();
             }
@@ -321,6 +330,11 @@ fn removal_operands(program: &str, args: &[Word]) -> Option<(Vec<Word>, bool)> {
         "mv" => Some((operands, true)),
         "rm" => Some((operands, recursive)),
         "unlink" | "rmdir" | "shred" | "truncate" => Some((operands, false)),
+        // `ln -sf /dev/null <unit>` puts a link in the place of the name it
+        // makes, the last operand: that file is gone as a removal takes it.
+        "ln" if forced && operands.len() >= 2 => {
+            Some((operands.split_off(operands.len() - 1), false))
+        }
         _ => None,
     }
 }
@@ -429,7 +443,7 @@ pub(super) fn removal_reaches_guard_file_from(
     let lower = content.to_ascii_lowercase();
     if ![
         "rm", "mv", "unlink", "shred", "truncate", "find", "sed", "vi", "ex", "ed", "emacs",
-        "perl", "ruby", "awk",
+        "perl", "ruby", "awk", "ln",
     ]
     .iter()
     .any(|word| lower.contains(word))

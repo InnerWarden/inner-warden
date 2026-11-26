@@ -23,7 +23,8 @@ start; run `innerwarden agents connect gemini --monitor` once to replace
 the line an earlier version wrote. An order written into Claude Code's
 custom commands or subagents (`.claude/commands/*.md`, `.claude/agents/*.md`)
 is read as one written into `CLAUDE.md`, and so is a file an instruction
-file imports with `@path`.
+file imports with `@path`. The guard's state folder (`~/.local/state/innerwarden`)
+is held as its configuration folder is, in every mode.
 
 `innerwarden --version`, the hint that points `setup`, `dashboard`, `upgrade`
 and `uninstall` at the host layer, and `innerwarden openclaw status` name the

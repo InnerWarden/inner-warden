@@ -1368,15 +1368,18 @@ pub fn writes_own_guard_config(path: &str, context: &WriteContext<'_>) -> bool {
     [Some(written), real].into_iter().flatten().any(|path| {
         homes(context).iter().any(|home| {
             home_relative(&path, home).is_some_and(|relative| {
-                relative == GUARD_CONFIG_FOLDER
-                    || relative.starts_with(&format!("{GUARD_CONFIG_FOLDER}/"))
+                GUARD_CONFIG_FOLDERS.iter().any(|folder| {
+                    relative == *folder || relative.starts_with(&format!("{folder}/"))
+                })
             })
         })
     })
 }
 
-/// The guard's own configuration folder, relative to the home.
-const GUARD_CONFIG_FOLDER: &str = ".config/innerwarden";
+/// The guard's own folders, relative to the home: its configuration, and its
+/// state (the jail's notes, the record kept when the shared one cannot be
+/// written).
+const GUARD_CONFIG_FOLDERS: &[&str] = &[".config/innerwarden", ".local/state/innerwarden"];
 
 /// The home as given and as its links resolve (a home under a linked
 /// directory is reached by either name).
