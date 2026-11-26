@@ -21373,7 +21373,7 @@ fn disable_verb_before(
             // with an incidental mention of the target. And in the same
             // command: `pkill -f x; cd ~/innerwarden/wt` kills `x`, then
             // enters a folder whose name holds the guard's. And a word of
-            // its own: the `kill` in a package named `innerwarden-killchain`
+            // its own: the `kill` in a package named `acme-killswitch`
             // or a test named `kill_switch` is no verb.
             if verb_at < target_at
                 && verb_is_a_word(lower, verb_at, verb.len())
@@ -21398,7 +21398,7 @@ fn disable_verb_before(
 /// joined to a name by `-` or `_`: no letter, digit, `-` or `_` right
 /// before it, no `-` or `_` right after it. `kill`, `/usr/bin/pkill`,
 /// `'stop'`, a D-Bus method (`KillUnit`, `Manager.StopUnit`) and
-/// `./stop.sh` are verbs; the `kill` of `innerwarden-killchain`,
+/// `./stop.sh` are verbs; the `kill` of `acme-killswitch`,
 /// `skill-killer`, `kill_switch` or `kill-cases.json` is none.
 fn verb_is_a_word(lower: &str, at: usize, len: usize) -> bool {
     let before = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_');

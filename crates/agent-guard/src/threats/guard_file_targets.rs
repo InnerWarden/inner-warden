@@ -613,10 +613,13 @@ fn home_given(command: &crate::shell_words::Command, place: &Place) -> Option<Ho
         let texts: Vec<String> = words.iter().map(|word| word.text.clone()).collect();
         let at = effective_command_index(&texts)?;
         let args = &words[at + 1..];
-        if !args.iter().any(names_home) {
+        let program = program_name(&texts[at]);
+        // `printf -vHOME` names it glued to its option: [`printf_gives_home`]
+        // reads the name out of the word.
+        if program != "printf" && !args.iter().any(names_home) {
             return None;
         }
-        let given = match program_name(&texts[at]).as_str() {
+        let given = match program.as_str() {
             "read" => read_gives_home(args, place.input.as_deref()),
             "printf" => printf_gives_home(args),
             "mapfile" | "readarray" => Some(None),

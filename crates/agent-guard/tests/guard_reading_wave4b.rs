@@ -234,6 +234,29 @@ fn a_constructed_call_bound_to_a_name_or_through_dict_is_read() {
     }
 }
 
+/// `printf -vHOME`, the name glued to its option, gives the home the value
+/// it prints, as `printf -v HOME` does: the line before the change let
+/// `HOME` stand for the account's home.
+///
+/// FAILS ON REVERT of the `printf` exception to the name filter of
+/// `home_given` (`threats/guard_file_targets.rs`).
+#[test]
+fn printf_with_home_glued_to_v_sets_the_home() {
+    for line in [
+        "printf -vHOME /etc; rm -rf ~/innerwarden",
+        "printf -vHOME '%s' /etc; rm -rf ~/innerwarden",
+    ] {
+        assert_eq!(verdict(line), "deny", "{line}");
+    }
+    assert_eq!(verdict("printf -v HOME /etc; rm -rf ~/innerwarden"), "deny");
+    for line in [
+        "printf -vHOME /tmp/sandbox; rm -rf ~/build",
+        "printf -vNAME /etc; rm -rf ~/innerwarden-notes/old",
+    ] {
+        assert_eq!(verdict(line), "allow", "{line}");
+    }
+}
+
 /// FAILS ON REVERT of the pattern characters in the first test of
 /// `removal_may_reach_guard_file` (`threats/guard_file_targets.rs`).
 #[test]

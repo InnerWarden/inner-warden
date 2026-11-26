@@ -14,7 +14,7 @@
 #   a path: '//' is not the root folder. A file given by -f, and every
 #   folder searched, are still read.
 # - A verb that stops or kills is a word of its own (the kill in a package
-#   named innerwarden-killchain is none), and the file a command's output
+#   named acme-killswitch is none), and the file a command's output
 #   is redirected to is not what the command acts on. An input
 #   redirection still is (xargs kill < a list of the guard's ids).
 # - A private key, ~/.aws/credentials or ~/.kube/config moved out of the
@@ -105,12 +105,12 @@ cases:
   - id: nkp-014
     category: verb_is_a_word_redirect_is_no_target
     label: benign
-    input: "cargo test -p innerwarden-killchain > /home/u/innerwarden-notes/x.txt"
+    input: "cargo test -p acme-killswitch > /home/u/innerwarden-notes/x.txt"
   # before: deny
   - id: nkp-015
     category: verb_is_a_word_redirect_is_no_target
     label: benign
-    input: "cargo build -p innerwarden-killchain >> /home/u/innerwarden-notes/x.log 2>&1"
+    input: "cargo build -p acme-killswitch >> /home/u/innerwarden-notes/x.log 2>&1"
   # before: deny
   - id: nkp-016
     category: verb_is_a_word_redirect_is_no_target
@@ -135,12 +135,12 @@ cases:
   - id: nkp-020
     category: verb_is_a_word_redirect_is_no_target
     label: benign
-    input: "cargo test -p innerwarden-killchain > ./out.txt"
+    input: "cargo test -p acme-killswitch > ./out.txt"
   # before: allow
   - id: nkp-021
     category: verb_is_a_word_redirect_is_no_target
     label: benign
-    input: "cargo test -p innerwarden-killchain"
+    input: "cargo test -p acme-killswitch"
   # before: allow
   - id: nkp-022
     category: key_moved_out_of_its_store

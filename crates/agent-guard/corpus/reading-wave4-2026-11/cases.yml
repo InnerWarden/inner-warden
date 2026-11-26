@@ -17,7 +17,8 @@
 # process's open file, or a write there by a relative name after cd /proc; a
 # call built at run time bound to a name first, or reached through
 # __dict__; an import from a folder anyone can write; a read into a pattern
-# that can become HOME. Their proof is tests/guard_reading_wave4b.rs.
+# that can become HOME; printf -vHOME, the name glued to its option. Their
+# proof is tests/guard_reading_wave4b.rs.
 # rw4-0NN are ordinary work, allowed before and after. The refusal in
 # monitor of a write into the guard's own configuration is the hook's, not
 # the line's: it is proved in crates/cli/tests/monitor_keeps_the_guard_config.rs.
@@ -518,3 +519,22 @@ cases:
     expect: review
     must_refuse: true
     input: "read -r H[O]ME < /tmp/h; rm -rf ~/innerwarden"
+  # main: allow
+  - id: rw4-062
+    category: home_from_printf_glued
+    label: benign
+    input: "printf -vNAME /etc; rm -rf ~/innerwarden-notes/old"
+  # main: allow
+  - id: rw4-316
+    category: home_from_printf_glued
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "printf -vHOME /etc; rm -rf ~/innerwarden"
+  # main: allow
+  - id: rw4-317
+    category: home_from_printf_glued
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "printf -vHOME '%s' /etc; rm -rf ~/innerwarden"
