@@ -45,7 +45,13 @@ impl Host {
 }
 
 /// Wait for `child` to end by itself; its exit code and stderr.
-fn ended(mut child: Child, what: &str) -> (Option<i32>, String) {
+fn ended(child: Child, what: &str) -> (Option<i32>, String) {
+    let (code, _, said) = ended_with_stdout(child, what);
+    (code, said)
+}
+
+/// [`ended`], with what the hook wrote to stdout too.
+fn ended_with_stdout(mut child: Child, what: &str) -> (Option<i32>, String, String) {
     let started = Instant::now();
     loop {
         if child.try_wait().expect("wait").is_some() {
@@ -61,6 +67,7 @@ fn ended(mut child: Child, what: &str) -> (Option<i32>, String) {
     let out = child.wait_with_output().expect("collect output");
     (
         out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
         String::from_utf8_lossy(&out.stderr).into_owned(),
     )
 }
@@ -290,14 +297,22 @@ fn a_tool_result_past_the_cap_is_recorded_not_refused() {
             assert!(said.contains("not read whole"), "{tool}: {said}");
             assert!(said.contains(tool), "{tool}: {said}");
         }
-        // The same call, as one about to run: still past the cap.
+        // The same call, as one about to run: still past the cap. A file
+        // change is judged by its path and asks the person
+        // (`a_large_file_write_is_judged_by_its_path`); any other call is
+        // refused as one not read.
         let before = call("PreToolUse", tool, input.clone(), response.clone());
         let (code, said) = run(&[], before);
-        assert_eq!(code, Some(2), "{tool} PreToolUse: {said}");
-        assert!(
-            said.contains("longer than the 1 MiB the hook reads"),
-            "{said}"
-        );
+        if ["Edit", "MultiEdit", "Write", "NotebookEdit"].contains(tool) {
+            assert_eq!(code, Some(0), "{tool} PreToolUse: {said}");
+            assert!(!said.contains("not read whole"), "{tool}: {said}");
+        } else {
+            assert_eq!(code, Some(2), "{tool} PreToolUse: {said}");
+            assert!(
+                said.contains("longer than the 1 MiB the hook reads"),
+                "{said}"
+            );
+        }
     }
     // The path of a file tool is named in what the hook says.
     let (_, said) = run(
@@ -310,13 +325,24 @@ fn a_tool_result_past_the_cap_is_recorded_not_refused() {
         ),
     );
     assert!(said.contains(path), "{said}");
-    // The event only after what the call carries: not read, so refused.
+    // The event only after what the call carries: not read, so the call is
+    // not taken for a result. Its path is judged, and the person is asked.
     let late = format!(
         r#"{{"tool_name":"Write","tool_input":{{"file_path":"/p/a","content":{}}},"hook_event_name":"PostToolUse"}}"#,
         quoted(&big)
     );
     let (code, said) = run(&[], late);
-    assert_eq!(code, Some(2), "event past the cap: {said}");
+    assert_eq!(code, Some(0), "event past the cap: {said}");
+    assert!(
+        !said.contains("not read whole"),
+        "event past the cap: {said}"
+    );
+    let late_shell = format!(
+        r#"{{"tool_name":"Bash","tool_input":{{"command":{}}},"hook_event_name":"PostToolUse"}}"#,
+        quoted(&big)
+    );
+    let (code, said) = run(&[], late_shell);
+    assert_eq!(code, Some(2), "shell event past the cap: {said}");
     // A call about to run, with no event, whose content starts with the words
     // of a PostToolUse: those are text it writes, not its event.
     let content =
@@ -327,4 +353,258 @@ fn a_tool_result_past_the_cap_is_recorded_not_refused() {
     );
     let (code, said) = run(&[], posing);
     assert_eq!(code, Some(2), "posing as a result: {said}");
+}
+
+/// A file change past the cap is given for a path, and the agent sends the
+/// path before the content: the path is judged as in a call read whole, and
+/// the content the hook did not read never runs quietly. A 2 MiB Write to
+/// an everyday file asks the person (Claude Code), and says why; the same
+/// Write to the guard's own configuration, or to the keys that let a person
+/// in over SSH, is refused by name. An agent that cannot ask, or a line
+/// with `--block-review`, refuses it with the same reason; monitor lets it
+/// run and says so. A relative path is judged from the call's folder, and
+/// every path field in the head is judged. A content sent before the path
+/// the tool writes to leaves nothing to judge: refused as not read, as
+/// before, even with another path field in front of the content.
+///
+/// FAILS ON REVERT of `large_file_write`: the everyday Write is refused (2)
+/// as a call not read, and nobody is asked.
+#[test]
+fn a_large_file_write_is_judged_by_its_path() {
+    /// A tool's input, for a path.
+    type Input<'a> = Box<dyn Fn(&str) -> String + 'a>;
+    /// A whole call, for the host's home.
+    type Body<'a> = Box<dyn Fn(&std::path::Path) -> String + 'a>;
+    const BIG: usize = 2 * 1024 * 1024;
+    const UNSCREENED: &str = "content longer than the hook reads, not screened";
+    let big = "a".repeat(BIG);
+    let quoted = |s: &str| serde_json::Value::from(s).to_string();
+    // Claude Code's own order: the folder, the event and the tool before
+    // what the tool carries, the path before the content.
+    let call = |cwd: &std::path::Path, tool: &str, input: String| {
+        format!(
+            r#"{{"session_id":"s-big","transcript_path":"/t.jsonl","cwd":{},"permission_mode":"default","hook_event_name":"PreToolUse","tool_name":{},"tool_input":{input}}}"#,
+            quoted(&cwd.to_string_lossy()),
+            quoted(tool),
+        )
+    };
+    let write = |path: &str| {
+        format!(
+            r#"{{"file_path":{},"content":{}}}"#,
+            quoted(path),
+            quoted(&big)
+        )
+    };
+    // Each run on a fresh host: `body` is handed the host's home.
+    let run = |flags: &[&str], body: &dyn Fn(&std::path::Path) -> String| {
+        let host = Host::new();
+        let home = host.dir.path().join("home");
+        let body = body(&home);
+        assert!(body.len() > BIG, "{}", body.len());
+        let mut child = host.hook(flags).spawn().expect("run innerwarden hook");
+        let mut stdin = child.stdin.take().expect("stdin");
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(body.as_bytes());
+        });
+        let out = ended_with_stdout(child, "long file write");
+        let _ = writer.join();
+        out
+    };
+    let in_home = |home: &std::path::Path, rel: &str| home.join(rel).to_string_lossy().into_owned();
+
+    // An everyday file, by each of Claude Code's file tools: asked.
+    let tools: Vec<(&str, Input<'_>)> = vec![
+        ("Write", Box::new(write)),
+        (
+            "Edit",
+            Box::new(|path: &str| {
+                format!(
+                    r#"{{"file_path":{},"old_string":"a","new_string":{}}}"#,
+                    quoted(path),
+                    quoted(&big)
+                )
+            }),
+        ),
+        (
+            "MultiEdit",
+            Box::new(|path: &str| {
+                format!(
+                    r#"{{"file_path":{},"edits":[{{"old_string":"a","new_string":{}}}]}}"#,
+                    quoted(path),
+                    quoted(&big)
+                )
+            }),
+        ),
+        (
+            "NotebookEdit",
+            Box::new(|path: &str| {
+                format!(
+                    r#"{{"notebook_path":{},"new_source":{}}}"#,
+                    quoted(path),
+                    quoted(&big)
+                )
+            }),
+        ),
+    ];
+    for (tool, input) in &tools {
+        let (code, out, said) = run(&[], &|home: &std::path::Path| {
+            call(
+                &home.join("proj"),
+                tool,
+                input(&in_home(home, "proj/src/big.txt")),
+            )
+        });
+        assert_eq!(code, Some(0), "{tool}: {said}");
+        let answer: serde_json::Value =
+            serde_json::from_str(out.trim()).unwrap_or_else(|_| panic!("{tool}: {out}"));
+        let decision = &answer["hookSpecificOutput"];
+        assert_eq!(decision["permissionDecision"], "ask", "{tool}: {out}");
+        let reason = decision["permissionDecisionReason"].as_str().unwrap_or("");
+        assert!(reason.contains(UNSCREENED), "{tool}: {reason}");
+        assert!(reason.contains("proj/src/big.txt"), "{tool}: {reason}");
+        assert!(!said.contains("refusing it"), "{tool}: {said}");
+    }
+
+    // The guard's own configuration, and the SSH keys of the home: refused
+    // by name, whatever the content. Named relative to the call's folder,
+    // or in a second path field of the head, the same.
+    let refused: Vec<(&str, Body<'_>)> = vec![
+        (
+            "guard config",
+            Box::new(|home: &std::path::Path| {
+                call(
+                    &home.join("proj"),
+                    "Write",
+                    write(&in_home(home, ".config/innerwarden/x")),
+                )
+            }),
+        ),
+        (
+            "authorized_keys",
+            Box::new(|home: &std::path::Path| {
+                call(
+                    &home.join("proj"),
+                    "Write",
+                    write(&in_home(home, ".ssh/authorized_keys")),
+                )
+            }),
+        ),
+        // A relative path, from the call's folder.
+        (
+            "relative",
+            Box::new(|home: &std::path::Path| {
+                call(
+                    &home.join("proj/src"),
+                    "Write",
+                    write("../../.ssh/authorized_keys"),
+                )
+            }),
+        ),
+        // The guard's own program, named from its folder: from the hook's
+        // folder the same name is an everyday file.
+        (
+            "relative guard program",
+            Box::new(|_: &std::path::Path| {
+                let program = std::path::Path::new(env!("CARGO_BIN_EXE_innerwarden"));
+                call(
+                    program.parent().expect("the program's folder"),
+                    "Write",
+                    write(
+                        &program
+                            .file_name()
+                            .expect("the program's name")
+                            .to_string_lossy(),
+                    ),
+                )
+            }),
+        ),
+        (
+            "second path field",
+            Box::new(|home: &std::path::Path| {
+                call(
+                    &home.join("proj"),
+                    "Write",
+                    format!(
+                        r#"{{"file_path":{},"path":{},"content":{}}}"#,
+                        quoted(&in_home(home, "proj/src/big.txt")),
+                        quoted(&in_home(home, ".ssh/authorized_keys")),
+                        quoted(&big)
+                    ),
+                )
+            }),
+        ),
+    ];
+    for (what, body) in &refused {
+        let (code, out, said) = run(&[], body.as_ref());
+        assert_eq!(code, Some(2), "{what}: {said}");
+        assert!(said.contains("blocked this file change"), "{what}: {said}");
+        assert!(!out.contains("\"ask\""), "{what}: {out}");
+    }
+
+    // An everyday file where nobody can be asked: refused, with the reason.
+    let everyday = |home: &std::path::Path| {
+        call(
+            &home.join("proj"),
+            "Write",
+            write(&in_home(home, "proj/a.txt")),
+        )
+    };
+    for flags in [
+        &["--block-review"][..],
+        &["--agent", "gemini"][..],
+        &["--agent", "codex"][..],
+    ] {
+        let (code, out, said) = run(flags, &everyday);
+        assert_eq!(code, Some(2), "{flags:?}: {said}");
+        assert!(said.contains(UNSCREENED), "{flags:?}: {said}");
+        assert!(!out.contains("\"ask\""), "{flags:?}: {out}");
+    }
+    // Monitor never blocks, and says the content went unscreened.
+    let (code, _, said) = run(&["--monitor"], &everyday);
+    assert_eq!(code, Some(1), "monitor: {said}");
+    assert!(said.contains(UNSCREENED), "monitor: {said}");
+    assert!(said.contains("it was NOT screened"), "monitor: {said}");
+
+    // The content before the path: no path in the part read, so the call
+    // is refused as one not read, as before.
+    let (code, _, said) = run(&[], &|home: &std::path::Path| {
+        call(
+            &home.join("proj"),
+            "Write",
+            format!(
+                r#"{{"content":{},"file_path":{}}}"#,
+                quoted(&big),
+                quoted(&in_home(home, "proj/a.txt"))
+            ),
+        )
+    });
+    assert_eq!(code, Some(2), "content first: {said}");
+    assert!(
+        said.contains("longer than the 1 MiB the hook reads"),
+        "content first: {said}"
+    );
+    // A path in another field in front of the one the tool writes to, which
+    // comes after the content: what the tool writes is not read, so the
+    // call is refused as one not read, and nobody is asked about the other.
+    let (code, out, said) = run(&[], &|home: &std::path::Path| {
+        call(
+            &home.join("proj"),
+            "Write",
+            format!(
+                r#"{{"path":{},"content":{},"file_path":{}}}"#,
+                quoted(&in_home(home, "proj/src/big.txt")),
+                quoted(&big),
+                quoted(&in_home(home, ".ssh/authorized_keys"))
+            ),
+        )
+    });
+    assert_eq!(code, Some(2), "written field after the content: {said}");
+    assert!(
+        said.contains("longer than the 1 MiB the hook reads"),
+        "written field after the content: {said}"
+    );
+    assert!(
+        !out.contains("\"ask\""),
+        "written field after the content: {out}"
+    );
 }
