@@ -43,13 +43,13 @@ describe("the one offer", () => {
   });
 
   it("claims installation, never enforcement, where the paid edition is installed", () => {
-    const words = `${INSTALLED_LINE.lead} ${INSTALLED_LINE.body}`;
+    const words = `${Object.values(INSTALLED_LINE.lead).join(" ")} ${INSTALLED_LINE.body}`;
     for (const forbidden of ["armed", "enforcing", "enforced", "protected"]) expect(words.toLowerCase()).not.toContain(forbidden);
     expect(INSTALLED_LINE.command).toBe("innerwarden get status");
   });
 
   it("keeps every sentence short, and carries no em or en dash", () => {
-    for (const line of [GENERIC_LINE, TOUR_UPGRADE_LINE, INSTALLED_LINE.lead, INSTALLED_LINE.body]) {
+    for (const line of [GENERIC_LINE, TOUR_UPGRADE_LINE, ...Object.values(INSTALLED_LINE.lead), INSTALLED_LINE.body]) {
       expect(line).not.toMatch(DASHES);
       for (const sentence of line.split(/(?<=\.)\s+/)) expect(sentence.split(/\s+/).length, sentence).toBeLessThanOrEqual(20);
     }

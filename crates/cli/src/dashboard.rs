@@ -73,6 +73,15 @@ struct DashboardMeta<'a> {
     /// it always sent and no existing reader has to learn a field.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     active_defence_installed: bool,
+    /// The host install named by its licence, from the same read the CLI
+    /// names it by (`upsell_io::HostInstall`): `pro` where a licence file is,
+    /// `free_tier` where none is, `unknown` where that could not be read. The
+    /// page says InnerWarden Pro only for `pro`.
+    ///
+    /// Omitted with `active_defence_installed`, so a host without the host
+    /// install sends the payload it always sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    host_install: Option<&'static str>,
 }
 
 /// `/api/agents` contract version. Version 2 distinguishes executable presence
@@ -1263,15 +1272,15 @@ fn aggregate_modes(modes: &[&str]) -> &'static str {
 /// false claim with a call to action attached — the exact failure this whole
 /// field exists to prevent, pointed the other way.
 ///
-/// `active_defence_installed` is a PARAMETER rather than a filesystem read made
-/// in here, so both answers are reachable from a test. Reading the real disk at
-/// this point would leave the field asserted only against whatever the machine
-/// running the test happens to have installed.
+/// The host install (`None` where there is none) is a PARAMETER rather than a
+/// filesystem read made in here, so every answer is reachable from a test.
+/// Reading the real disk at this point would leave the field asserted only
+/// against whatever the machine running the test happens to have installed.
 fn meta_json_with_freshness(
     exposed: bool,
     status: &GuardrailStatus,
     freshness: crate::binary_freshness::Freshness,
-    active_defence_installed: bool,
+    host: Option<crate::upsell_io::HostInstall>,
 ) -> String {
     let superseded = freshness == crate::binary_freshness::Freshness::Superseded;
     serde_json::to_string(&DashboardMeta {
@@ -1281,7 +1290,8 @@ fn meta_json_with_freshness(
         guardrail: status,
         update_pending: superseded,
         update_note: superseded.then_some(crate::binary_freshness::SUPERSEDED_NOTE),
-        active_defence_installed,
+        active_defence_installed: host.is_some(),
+        host_install: host.map(crate::upsell_io::HostInstall::token),
     })
     .unwrap_or_else(|_| "{}".into())
 }
@@ -1755,9 +1765,10 @@ pub fn cmd(rest: &[String]) -> std::process::ExitCode {
                 // days is exactly where a boot-time answer goes stale.
                 let freshness = started_as.freshness();
                 // Re-stat this too, and for the same reason: Active Defence can
-                // be installed while this dashboard is open, and a boot-time
-                // answer would keep offering it for the rest of the session.
-                let ad_installed = crate::upsell_io::active_defence_installed();
+                // be installed (or licensed) while this dashboard is open, and a
+                // boot-time answer would keep offering it for the rest of the
+                // session. One read for both fields, so they cannot disagree.
+                let ad_installed = crate::upsell_io::host_install();
                 match agent_snapshot.as_ref() {
                     Some(shared) => {
                         let snapshot = read_agent_snapshot(shared);
@@ -3492,7 +3503,7 @@ mod tests {
             false,
             &status,
             crate::binary_freshness::Freshness::Current,
-            false,
+            None,
         );
         assert!(m.contains("\"version\""));
         assert!(m.contains(env!("CARGO_PKG_VERSION")));
@@ -3506,7 +3517,7 @@ mod tests {
             true,
             &status,
             crate::binary_freshness::Freshness::Current,
-            false,
+            None,
         ))
         .unwrap();
         assert_eq!(e["exposed"], true);
@@ -3531,7 +3542,7 @@ mod tests {
             false,
             &status,
             crate::binary_freshness::Freshness::Superseded,
-            false,
+            None,
         );
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         // `version` still reports what this process runs. That is the honest
@@ -3562,7 +3573,7 @@ mod tests {
             false,
             &status,
             crate::binary_freshness::Freshness::Unknown,
-            false,
+            None,
         ))
         .unwrap();
         assert!(v.get("update_pending").is_none());
@@ -3591,7 +3602,7 @@ mod tests {
             false,
             &status,
             crate::binary_freshness::Freshness::Current,
-            true,
+            Some(crate::upsell_io::HostInstall::Pro),
         ))
         .unwrap();
         assert_eq!(
@@ -3617,7 +3628,7 @@ mod tests {
             false,
             &status,
             crate::binary_freshness::Freshness::Current,
-            false,
+            None,
         );
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(
@@ -3641,7 +3652,7 @@ mod tests {
             false,
             &status,
             crate::binary_freshness::Freshness::Current,
-            true,
+            Some(crate::upsell_io::HostInstall::Pro),
         );
         for forbidden in ["armed", "enforcing", "enforced", "protected"] {
             assert!(
@@ -3655,6 +3666,43 @@ mod tests {
             json.contains("active_defence_installed"),
             "the field has to be present for the absences to mean anything"
         );
+    }
+
+    /// The host install is named by its licence on the page too: the meta
+    /// carries the same `HostInstall` the CLI names it by, one token per
+    /// state, beside `active_defence_installed`. FAILS ON REVERT: the page
+    /// had only "installed" and called a host installed with no licence
+    /// "InnerWarden Pro".
+    #[test]
+    fn the_meta_names_the_host_install_by_its_licence() {
+        use crate::upsell_io::HostInstall;
+        let status = GuardrailStatus {
+            mode: "monitor".into(),
+            guarded_agents: 0,
+        };
+        for (host, token) in [
+            (HostInstall::Pro, "pro"),
+            (HostInstall::FreeTier, "free_tier"),
+            (HostInstall::Unknown, "unknown"),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(&meta_json_with_freshness(
+                false,
+                &status,
+                crate::binary_freshness::Freshness::Current,
+                Some(host),
+            ))
+            .unwrap();
+            assert_eq!(v["active_defence_installed"], true, "{host:?}");
+            assert_eq!(v["host_install"], token, "{host:?}");
+        }
+        let none: serde_json::Value = serde_json::from_str(&meta_json_with_freshness(
+            false,
+            &status,
+            crate::binary_freshness::Freshness::Current,
+            None,
+        ))
+        .unwrap();
+        assert!(none.get("host_install").is_none(), "{none}");
     }
 
     #[test]
