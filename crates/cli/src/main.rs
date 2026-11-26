@@ -42,6 +42,7 @@ mod first_run;
 mod graph_io;
 mod help;
 mod hook_identity;
+mod hook_limits;
 mod hook_net;
 mod host_decide;
 mod host_decide_io;
@@ -2655,6 +2656,7 @@ fn antigravity_unknown_tool(
 }
 
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
+    hook_limits::keep_limits_from_killing_the_hook();
     let exit = cmd_hook_screen(rest);
     say_mcp_pending(agent_flag(rest).as_deref(), exit);
     let exit = match agent_flag(rest).as_deref() {
