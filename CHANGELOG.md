@@ -28,7 +28,7 @@ written into `CLAUDE.md`. A shell's `-c` script
 written after its options and a `--` (`bash -c -x -- LINE`, `sh -c -- LINE`)
 is read as the script it is, as the shell runs it, and `timeout -- 5 CMD`
 runs `CMD`. A command run behind a launcher that only runs another one is
-judged as the command alone, with the launcher's options and its `--`:
+judged as the command alone, read past the launcher's own options:
 `runuser -u`, `flock`, `setpriv`, `chroot`, `unshare`, `nsenter`,
 `prlimit`, `pkexec`, `ionice`, `taskset`, `chrt`, `systemd-run`, `stdbuf`,
 and macOS `caffeinate` and `arch`, a download piped into a shell behind
