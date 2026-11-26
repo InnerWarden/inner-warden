@@ -29,7 +29,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use innerwarden_agent_guard::session::{Alert, PersistedSession};
+use innerwarden_agent_guard::session::{Alert, PersistedSession, TaintDropped};
 
 /// Sessions kept in the file. Old ones are evicted oldest-first so a machine
 /// that runs agents for months does not accumulate state without end.
@@ -89,8 +89,18 @@ fn record_tool_result_at(session: Option<&str>, tool: &str, result: &str, path: 
     save_after_answer(path, now, move |store| {
         let entry = store.sessions.entry(session).or_default();
         entry.last_seen_ms = now;
-        entry.state.record_tool_result(&tool, &result, now);
+        say_dropped(entry.state.record_tool_result(&tool, &result, now));
     });
+}
+
+/// Say on stderr, in one line, what a session's full record of values that
+/// tool results carried in dropped to make room. Never silent: a value
+/// dropped is a later command that carries it no longer traced to the result
+/// it came from.
+fn say_dropped(dropped: TaintDropped) {
+    if let Some(line) = dropped.line() {
+        eprintln!("{line}");
+    }
 }
 
 /// Record one screened call AND report, for each command line it carries,
@@ -592,7 +602,7 @@ fn merge(store: &mut Store, change: Store, now: i64) {
             }
         }
         state.tainted_values.sort_by_key(|value| value.seen_ms);
-        state.expire_taint(now);
+        say_dropped(state.expire_taint(now));
     }
 }
 

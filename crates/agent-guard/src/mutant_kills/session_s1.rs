@@ -51,7 +51,8 @@ fn an_eight_character_value_is_long_enough_to_taint() {
 /// repeat is stored again: a file naming a decoy host first and the real
 /// destination second would leave the real destination untainted.
 ///
-/// FAILS ON REVERT: replace `==` with `!=` in `.any(|e: &String| e == v)`.
+/// FAILS ON REVERT: push every match without asking `seen.insert(v)` (the
+/// dedupe was `.any(|e: &String| e == v)` when the sweep found the mutant).
 #[test]
 fn every_distinct_value_in_one_result_is_kept_once() {
     let result = "primary alpha.example.com, fallback beta.example.com, again alpha.example.com";
