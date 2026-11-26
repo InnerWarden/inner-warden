@@ -1029,6 +1029,15 @@ fn xargs_kill_unread(commands: &[Command], index: usize) -> bool {
 /// ([`PROCESS_LISTERS`]): `pgrep -f vite > /tmp/p`. A file another command
 /// wrote last (`pgrep -f vite > q; cat ids > p`) holds ids the line does
 /// not show.
+///
+/// The listing is read only when the file the kill reads is that listing
+/// and nothing else: the reader takes one file on its input and no
+/// `-a`/`--arg-file` of its own, and no command between the listing and
+/// the kill names the file to write it (`cp ids p`, `mv`, `dd of=p`,
+/// `tee p`, `sed -i .. p`) or changes the folder a relative name is read
+/// from (`cd`). The same file is the same name written as `./p`,
+/// `$PWD/p` or `p`; the listing itself is read only when it writes the
+/// file under the name the kill reads.
 fn file_written_by_a_lister<'a>(
     commands: &'a [Command],
     index: usize,
@@ -1037,18 +1046,152 @@ fn file_written_by_a_lister<'a>(
     if file.is_empty() {
         return None;
     }
-    commands[..index]
+    let reader = &commands[index];
+    if reader.reads.len() != 1 || xargs_reads_an_argument_file(reader) {
+        return None;
+    }
+    let at = commands[..index].iter().rposition(|command| {
+        command
+            .writes
+            .iter()
+            .any(|written| same_file(&written.text, file))
+    })?;
+    if commands[at + 1..index]
         .iter()
-        .rev()
-        .find(|command| command.writes.iter().any(|written| written.text == file))
-        .filter(|command| {
-            command.writes_file
-                && plain_words(command)
-                    .and_then(|words| {
-                        launched_command_index(&words).map(|i| program_name(&words[i]))
-                    })
-                    .is_some_and(|name| PROCESS_LISTERS.contains(&name.as_str()))
+        .any(|between| may_change_file(between, file))
+    {
+        return None;
+    }
+    // The listing is taken only when it names the file as the kill does;
+    // the same file under another spelling is still a writer of it above.
+    Some(&commands[at]).filter(|command| {
+        command.writes.iter().any(|written| written.text == file)
+            && command.writes_file
+            && plain_words(command)
+                .and_then(|words| launched_command_index(&words).map(|i| program_name(&words[i])))
+                .is_some_and(|name| PROCESS_LISTERS.contains(&name.as_str()))
+    })
+}
+
+/// A file name as the shell finds it from the folder the line runs in:
+/// `./p`, `$PWD/p` and `p` are one file.
+fn file_key(path: &str) -> String {
+    let mut rest = path;
+    for here in ["$PWD/", "${PWD}/"] {
+        if let Some(under) = rest.strip_prefix(here) {
+            rest = under;
+            break;
+        }
+    }
+    let parts: Vec<&str> = rest
+        .split('/')
+        .enumerate()
+        .filter(|(at, part)| *at == 0 || (!part.is_empty() && *part != "."))
+        .map(|(_, part)| part)
+        .collect();
+    let joined = parts.join("/");
+    let mut key = joined.as_str();
+    while let Some(under) = key.strip_prefix("./") {
+        key = under;
+    }
+    key.to_owned()
+}
+
+fn same_file(a: &str, b: &str) -> bool {
+    file_key(a) == file_key(b)
+}
+
+/// Whether the `xargs` of `command` reads its arguments from a file of its
+/// own (`-a ids`, `-aids`, `--arg-file=ids`) rather than its input.
+fn xargs_reads_an_argument_file(command: &Command) -> bool {
+    let Some(words) = plain_words(command) else {
+        return true;
+    };
+    let Some(at) = effective_command_index(&words) else {
+        return false;
+    };
+    words[at + 1..]
+        .iter()
+        .take_while(|word| word.starts_with('-'))
+        .any(|word| {
+            word.starts_with("--arg-file") || (!word.starts_with("--") && word[1..].contains('a'))
         })
+}
+
+/// The programs that only read the files they are named: naming the file
+/// a kill reads leaves it as the listing wrote it.
+const FILE_READERS: &[&str] = &[
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "less",
+    "more",
+    "file",
+    "stat",
+    "ls",
+    "md5sum",
+    "sha256sum",
+    "test",
+    "[",
+    "echo",
+    "printf",
+];
+
+/// The programs whose last word is the file they write and whose other
+/// words are files they read.
+const FILE_COPIERS: &[&str] = &["cp", "install", "rsync", "ln", "scp"];
+
+/// Whether `command`, run between the listing that wrote `file` and the
+/// kill that reads it, may change what the kill reads: it names the file
+/// to write it, or moves the shell to another folder when the name is
+/// relative.
+fn may_change_file(command: &Command, file: &str) -> bool {
+    let relative = !file_key(file).starts_with('/');
+    let Some(words) = plain_words(command) else {
+        // Words the line does not spell out may name the file.
+        return true;
+    };
+    let Some(at) = launched_command_index(&words) else {
+        return false;
+    };
+    let program = program_name(&words[at]);
+    if relative && matches!(program.as_str(), "cd" | "pushd" | "popd") {
+        return true;
+    }
+    if command
+        .writes
+        .iter()
+        .any(|written| same_file(&written.text, file))
+    {
+        return true;
+    }
+    let names = |word: &String| {
+        same_file(word, file)
+            || word
+                .split_once('=')
+                .is_some_and(|(_, value)| same_file(value, file))
+    };
+    let arguments = &words[at + 1..];
+    if FILE_READERS.contains(&program.as_str()) {
+        return false;
+    }
+    if FILE_COPIERS.contains(&program.as_str()) {
+        let operands: Vec<&String> = arguments
+            .iter()
+            .filter(|word| !word.starts_with('-'))
+            .collect();
+        return operands.last().is_some_and(|last| names(last))
+            || arguments
+                .iter()
+                .filter(|word| word.starts_with('-'))
+                .any(names);
+    }
+    arguments.iter().any(names)
 }
 
 /// Whether `command` runs `kill` on what it is handed: `kill` itself, or

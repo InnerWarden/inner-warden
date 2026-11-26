@@ -3946,7 +3946,21 @@ fn analyze_command_at(
     depth: u8,
 ) -> CommandAnalysis {
     let analysis = analyze_command_as_sent(command, rule_engine, protected_reads, context, depth);
+    let analysis = if depth == 0 {
+        cat_notes_as_text(command, analysis, |blanked| {
+            analyze_command_as_sent(blanked, rule_engine, protected_reads, context, depth)
+        })
+    } else {
+        analysis
+    };
     if depth != 0 || analysis.recommendation != "deny" {
+        return analysis;
+    }
+    // A file of the guard reached from the folder the line runs in is an
+    // action on it, never a mention.
+    if context.is_some_and(|place| {
+        threats::guard_file_reached_in_place(command, &place.cwd, place.home.as_deref()).is_some()
+    }) {
         return analysis;
     }
     mention_only(
@@ -3955,6 +3969,50 @@ fn analyze_command_at(
         analysis,
         |masked| analyze_command_as_sent(masked, rule_engine, protected_reads, context, depth),
     )
+}
+
+/// A here-document that `cat` only writes out as notes is text: what it
+/// says of a settings file, a guard command or code is not the line taking
+/// the guard down ([`crate::shell::text_written_by_cat_blanked`]). The line
+/// is judged again with that text blanked; the reading is taken only when
+/// all it drops is the refusal for taking the guard down
+/// (`guard_self_disable`) and it finds nothing the line as written did
+/// not: any other finding of the text (a secret written into the notes)
+/// stands.
+fn cat_notes_as_text(
+    command: &str,
+    analysis: CommandAnalysis,
+    judge: impl Fn(&str) -> CommandAnalysis,
+) -> CommandAnalysis {
+    if !analysis
+        .signals
+        .iter()
+        .any(|signal| signal.signal == "guard_self_disable" && signal.score > 0)
+    {
+        return analysis;
+    }
+    let Some(blanked) = crate::shell::text_written_by_cat_blanked(command) else {
+        return analysis;
+    };
+    let mut lowered = judge(&blanked);
+    let charged = |of: &CommandAnalysis| -> Vec<String> {
+        of.signals
+            .iter()
+            .filter(|signal| signal.score > 0)
+            .map(|signal| signal.signal.clone())
+            .collect()
+    };
+    let before = charged(&analysis);
+    let after = charged(&lowered);
+    let drops_only_takedown = before
+        .iter()
+        .all(|signal| signal == "guard_self_disable" || after.contains(signal));
+    let adds_nothing = after.iter().all(|signal| before.contains(signal));
+    if !drops_only_takedown || !adds_nothing || after.iter().any(|s| s == "guard_self_disable") {
+        return analysis;
+    }
+    lowered.command = analysis.command;
+    lowered
 }
 
 /// A line the guard refuses ONLY for the words it watches, where those
@@ -4468,7 +4526,11 @@ fn analyze_command_with_its_values(
     if READING_LINE_VALUES.with(std::cell::Cell::get) {
         return as_written;
     }
-    let readings = crate::line_values::readings_in_effect(command);
+    let mut readings = crate::line_values::readings_in_effect(command);
+    if let Some(spelled) = names_set_only_when_spelled_out(command) {
+        readings.extend(crate::line_values::readings_in_effect(&spelled));
+        readings.push(spelled);
+    }
     if readings.is_empty() {
         return as_written;
     }
@@ -4491,6 +4553,34 @@ fn analyze_command_with_its_values(
         },
         _ => as_written,
     }
+}
+
+/// The line with its names spelled out ([`crate::threats::names_spelled_out`])
+/// when that names a name the line as written does not, and the line
+/// reads it (`$NAME`, `${NAME}`): `export {HO,}ME=/etc; rm -rf
+/// $HOME/x` and `export HO\` with `ME=/etc` on the next line set `HOME`
+/// as `export HOME=/etc` does, and are read with that value as it is.
+/// `None` otherwise. The line as written is read as well, and the
+/// reading that scores higher stands.
+fn names_set_only_when_spelled_out(command: &str) -> Option<String> {
+    if !command.contains(['{', '\\']) || !command.contains('$') {
+        return None;
+    }
+    let spelled = crate::threats::names_spelled_out(command)?;
+    if spelled == command {
+        return None;
+    }
+    let before = crate::threats::names_a_line_may_set(command);
+    let name_read = crate::threats::names_a_line_may_set(&spelled)
+        .into_iter()
+        .filter(|name| {
+            !before.contains(name)
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        })
+        .any(|name| {
+            spelled.contains(&format!("${name}")) || spelled.contains(&format!("${{{name}"))
+        });
+    name_read.then_some(spelled)
 }
 
 /// The bash reading and, where they differ, the sh and dash reading of
@@ -5062,7 +5152,14 @@ fn analyze_command_as_read(
         // Inline code that writes, removes or moves a place of the guard or
         // signals its processes, a copy onto one of its places, and a
         // program a search runs that does either ([`threats::check_guard_takedown`]).
-        .or_else(|| threats::check_guard_takedown(cmd));
+        .or_else(|| threats::check_guard_takedown(cmd))
+        // A file of the guard named relative to the folder the hook was
+        // given (`rm -rf innerwarden/rules` run in `/etc`).
+        .or_else(|| {
+            context.and_then(|place| {
+                threats::guard_file_reached_in_place(cmd, &place.cwd, place.home.as_deref())
+            })
+        });
     if let Some((what, s)) = self_disable {
         signals.push(AnalysisSignal {
             signal: "guard_self_disable".into(),
@@ -5850,6 +5947,21 @@ fn analyze_command_as_read(
                 detail: "removal of the account's keys or credential store".into(),
             });
             score += 50;
+        } else if crate::threats::moves_credentials_out(
+            command_scan,
+            context.map_or("", |place| place.cwd.as_str()),
+            context.and_then(|place| place.home.as_deref()),
+        ) {
+            // A key moved out of the store the account keeps it in is as
+            // gone from where ssh, gpg or the cloud tools look as a removed one.
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: "moves the account's keys or credential store out of the place that \
+                         holds them"
+                    .into(),
+            });
+            score += 50;
         } else if crate::threats::destructive_rm_in_place(
             command_scan,
             context.map_or("", |place| place.cwd.as_str()),
@@ -6088,8 +6200,18 @@ fn analyze_command_as_read(
         // (`review`), the agent is not blocked outright.
         // The pattern is judged on the line as written: the scanned reading
         // has it blanked as data.
+        // A search's pattern is text, never a folder it reads: a finding
+        // that only the pattern of the line as written makes
+        // (`grep -rln '//' crates`, the root) is none.
         let found =
-            threats::stored_secret_read_in_place(scan_cmd, &place.cwd, place.home.as_deref());
+            threats::stored_secret_read_in_place(scan_cmd, &place.cwd, place.home.as_deref())
+                .filter(|_| {
+                    !threats::search_pattern_alone_reaches_secret(
+                        cmd,
+                        &place.cwd,
+                        place.home.as_deref(),
+                    )
+                });
         let searched = matches!(found, Some((_, threats::SecretReach::Folder)))
             && threats::searches_home_for_narrow_text(cmd, &place.cwd, place.home.as_deref());
         if let Some((path, _)) = found.as_ref().filter(|_| searched) {

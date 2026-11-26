@@ -472,3 +472,84 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   `tests/text_a_later_step_runs.rs` that fails when its part is
   reverted. No other line of any corpus moved, from an empty home or a
   home with keys.
+- 2026-11-25: own-work/own-027 goes from deny to allow: SQL handed to a
+  SQL client (psql, sqlite3, mysql, mariadb, duckdb, by -c, -e, a
+  positional argument, a here-document, a here-string or a pipe from echo
+  or printf) is data where it holds no way to the shell or the machine
+  (`src/shell/sql_text.rs`). own-027 is an `update ... set body = body ||
+  '...'` in a quoted here-document to psql whose string names the guard;
+  the client stores the string, nothing runs it. SQL with a client
+  command (a backslash command, a dot command, `system`, `pager`), a
+  backtick, a dollar quote, `COPY`, `PROGRAM`, `LANGUAGE`, a file
+  function, or a string inside a function that is not a plain value is
+  read as before, every word of it as a shell line; held by
+  `tests/sql_text_is_data.rs`, whose allowed lines fail on revert. No
+  other line of any corpus moved. harmless-proven: own-work/own-027
+  goes from deny to allow for the reason above: the client stores the
+  string and nothing on the line runs it.
+- 2026-11-25: sql-client-runners-2026-11 is new. SQL handed to a SQL
+  client (psql, sqlite3, mysql, mariadb, duckdb) named after `docker
+  exec`, `podman exec`, `kubectl exec ... --` or as the remote line of
+  `ssh` is read as the same client run here (own-work/own-027 above):
+  an `INSERT` or `UPDATE` whose string names the guard is data
+  (`src/shell/sql_runner.rs`). The client's own ways to a shell (a
+  backslash or dot command, `system`, `COPY ... PROGRAM`, a pager), a
+  substitution the local shell expands, a second command on the line or
+  on the remote line, an option of the runner that runs a program, and
+  any other program behind the runner (`sh -c`, `bash`) are read as
+  before; the 49 must_refuse lines of the corpus stay refused, held by
+  `tests/sql_through_container_and_ssh.rs`, whose allowed lines fail on
+  revert. A trigger or user function the database already holds is not
+  on the line: a known limit, not read. Against the branch before the
+  change no other line moved (every corpus line and generated variant);
+  against main, no other line goes from a stop to allow, from an empty
+  home or a home with keys. harmless-proven:
+  sql-client-runners-2026-11/srn-001 sql-client-runners-2026-11/srn-003 sql-client-runners-2026-11/srn-004 sql-client-runners-2026-11/srn-005 sql-client-runners-2026-11/srn-006 sql-client-runners-2026-11/srn-007 sql-client-runners-2026-11/srn-008 sql-client-runners-2026-11/srn-009 sql-client-runners-2026-11/srn-010 sql-client-runners-2026-11/srn-011 sql-client-runners-2026-11/srn-012 sql-client-runners-2026-11/srn-013 sql-client-runners-2026-11/srn-014 sql-client-runners-2026-11/srn-015 sql-client-runners-2026-11/srn-016 sql-client-runners-2026-11/srn-017 sql-client-runners-2026-11/srn-019 sql-client-runners-2026-11/srn-020 sql-client-runners-2026-11/srn-021 sql-client-runners-2026-11/srn-022 sql-client-runners-2026-11/srn-023 sql-client-runners-2026-11/srn-024
+  go from deny to allow for the reason above: the client stores the
+  string and nothing on the line runs it.
+- 2026-11-25: worktree-paths-spelled-home-2026-11 is new. A relative
+  worktree (`git worktree remove`) or relative path through a folder named
+  after the guard (`../../../etc/innerwarden`, `innerwarden/rules` after
+  `cd /etc`) is read from the folder the line runs in and from every
+  `cd` or `pushd` on it that names a folder from the root or the home,
+  and a path with a `..` inside it is
+  read where it points, before the guard decides that it only names a work
+  folder (`src/mention.rs`, `worktree_readings`, `resolved_path`,
+  `line_folders`). Where the folder is not known (no working context, a
+  relative `cd`, `cd -`, `popd`, a home the line sets) such a path is in
+  doubt and is read as written as well, as before: held for review as a
+  mention when it is a work folder beside the project. A path read this way
+  is not taken for a worktree found by the end of its name (the word has a
+  `..`, which git reads as a path). `HOME` and `PWD` named by a brace
+  expansion or a line continuation (`export {HO,}ME=/etc`, `HO{,}ME`,
+  `export HO\` and `ME=` on the next line) are a value the line sets, as
+  written plainly (`threats::names_spelled_out`, used by
+  `with_home_named`, `home_kept` and the reading of the line's values).
+  The wsh-1NN lines are must_refuse, held by
+  `tests/worktree_paths_and_spelled_home.rs`, whose lines fail on revert.
+  Against the branch before the change no other corpus line moved.
+  harmless-proven:
+  worktree-paths-spelled-home-2026-11/wsh-001 worktree-paths-spelled-home-2026-11/wsh-002 worktree-paths-spelled-home-2026-11/wsh-003 worktree-paths-spelled-home-2026-11/wsh-004 worktree-paths-spelled-home-2026-11/wsh-005
+  go from deny to review for the reason above: `/tmp/x/../wt`,
+  `~/src/../wt` and `git -C ~/src/app worktree remove ../wt` name a
+  worktree in the home or `/tmp`, held for review as a mention.
+- 2026-11-26: notes-key-moves-patterns-2026-11 is new. A here-document that `cat` only
+  writes out as notes is text (`shell::text_written_by_cat_blanked`,
+  `mcp::cat_notes_as_text`): the line is judged again with the body
+  blanked, and that reading is taken only when all it drops is the
+  refusal for taking the guard down. The pattern a search looks for is no
+  path (`threats::search_pattern_words`). A stop or kill verb is a word
+  of its own and an output redirection's file is not its target
+  (`verb_is_a_word`, `in_output_redirect_target`). A key or credential
+  store moved out of its store is a removal
+  (`threats::moves_credentials_out`). A file of the guard is read from
+  the folder the hook was given and with `~` and `$HOME` standing for a
+  `HOME` the line sets (`guard_file_targets::removal_reaches_guard_file_from`).
+  The nkp-1NN lines are must_refuse, held by
+  `tests/notes_key_moves_patterns_and_home.rs`, whose lines fail on revert.
+  harmless-proven:
+  notes-key-moves-patterns-2026-11/nkp-002 notes-key-moves-patterns-2026-11/nkp-003 notes-key-moves-patterns-2026-11/nkp-006 notes-key-moves-patterns-2026-11/nkp-007 notes-key-moves-patterns-2026-11/nkp-008 notes-key-moves-patterns-2026-11/nkp-009 notes-key-moves-patterns-2026-11/nkp-010 notes-key-moves-patterns-2026-11/nkp-014 notes-key-moves-patterns-2026-11/nkp-015 notes-key-moves-patterns-2026-11/nkp-016 notes-key-moves-patterns-2026-11/nkp-017 notes-key-moves-patterns-2026-11/nkp-018 notes-key-moves-patterns-2026-11/nkp-019
+  go from deny (or review) to allow for the reasons above: notes written by
+  `cat`, a search pattern of `/` or `//`, a package or test whose name
+  holds `kill`, and `systemctl stop nginx` whose output goes to a file in
+  a folder named after the guard.

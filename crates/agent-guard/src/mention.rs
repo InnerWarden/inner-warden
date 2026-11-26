@@ -342,6 +342,7 @@ pub(crate) fn masked(command: &str, cwd: Option<&str>) -> Option<String> {
     }
     let relative_ok =
         cwd.is_none_or(work_folder) && changes_folder_only_to_work_folders(root, source);
+    let folders = line_folders(root, source, cwd);
     let mut edits: Vec<(usize, usize, String)> = Vec::new();
     let mut stack = vec![(root, 0usize)];
     while let Some((node, depth)) = stack.pop() {
@@ -351,7 +352,7 @@ pub(crate) fn masked(command: &str, cwd: Option<&str>) -> Option<String> {
         match node.kind() {
             "heredoc_body" => heredoc_edit(node, source, relative_ok, &mut edits),
             "herestring_redirect" => herestring_edit(node, source, relative_ok, &mut edits),
-            "command" => command_edits(node, source, relative_ok, &mut edits),
+            "command" => command_edits(node, source, relative_ok, &folders, &mut edits),
             _ => {}
         }
         let mut cursor = node.walk();
@@ -1189,6 +1190,7 @@ fn command_edits(
     command: tree_sitter::Node<'_>,
     source: &[u8],
     relative_ok: bool,
+    folders: &LineFolders,
     edits: &mut Vec<(usize, usize, String)>,
 ) {
     let stays = output_stays(command, source);
@@ -1303,7 +1305,15 @@ fn command_edits(
                         };
                         if !word.starts_with('-')
                             && literal_at(at)
-                            && work_folder(&path)
+                            && worktree_readings(&path, folders).is_some_and(|readings| {
+                                // git finds a worktree by the end of the
+                                // word as written, not of the path it is
+                                // read as (`names_guard_folder_by_name`).
+                                readings.iter().all(|reading| {
+                                    work_folder(reading)
+                                        || beside_a_project_outside_the_home(reading, folders)
+                                })
+                            })
                             && !names_guard_folder_by_name(word)
                         {
                             mask(at, "wt");
@@ -1339,13 +1349,191 @@ fn command_edits(
             continue;
         }
         let shown = text(node, source);
-        if work_folder_path(&shown.replace(['\'', '"'], "")) {
+        let path = shown.replace(['\'', '"'], "");
+        // `../../../etc/innerwarden/rules` and `innerwarden/rules` after
+        // `cd /etc` are read from where the line runs, as a worktree is.
+        let relative = !path.starts_with(['/', '~', '$']);
+        let read_where_it_points = !relative
+            || worktree_readings(&path, folders).is_some_and(|readings| {
+                readings.iter().all(|reading| {
+                    work_folder_path(reading) || beside_a_project_outside_the_home(reading, folders)
+                })
+            });
+        if work_folder_path(&path) && read_where_it_points {
             let renamed = replace_ignoring_case(shown, "innerwarden", "proj");
             if renamed != shown {
                 edits.push((node.start_byte(), node.end_byte(), renamed));
             }
         }
     }
+}
+
+/// The paths a worktree named by `path` may be, with its `.` and `..`
+/// parts read ([`resolved_path`]): `/tmp/x/../wt` is `/tmp/wt` and
+/// `~/src/../wt` is `~/wt`. A relative path is read from each folder the
+/// line may run in that is known ([`LineFolders`]): `cd ~/.config && git
+/// worktree remove ../../../etc/x` names `/etc/x`, and `cd /etc && rm -rf
+/// innerwarden/x` names `/etc/innerwarden/x`, whatever the words say.
+/// Where one is not known the path is in doubt and is also read as
+/// written, as before: a work folder beside the project, held for review
+/// as a mention. `None` when a path goes above the home it starts from.
+fn worktree_readings(path: &str, folders: &LineFolders) -> Option<Vec<String>> {
+    if path.starts_with(['/', '~', '$']) {
+        return resolved_path(path).map(|reading| vec![reading]);
+    }
+    let mut readings: Vec<String> = folders
+        .known
+        .iter()
+        .map(|folder| resolved_path(&format!("{}/{path}", folder.trim_end_matches('/'))))
+        .collect::<Option<_>>()?;
+    if folders.unknown {
+        readings.push(path.to_string());
+    }
+    Some(readings)
+}
+
+/// `path` from the root or the home (`~`, `$HOME`) with its `.` and
+/// `..` parts read, as the words go: `/tmp/x/../wt` is
+/// `/tmp/wt`. `None` for a relative path and for one that goes above
+/// the home it starts from (`~/../x`), whose place depends on where the
+/// home is. A `..` at the root stays there, as the shell's does.
+fn resolved_path(path: &str) -> Option<String> {
+    let (root, rest) = if let Some(rest) = path.strip_prefix('/') {
+        ("/", rest)
+    } else if path == "~" || path == "$HOME" {
+        ("~/", "")
+    } else {
+        let rest = path
+            .strip_prefix("~/")
+            .or_else(|| path.strip_prefix("$HOME/"))?;
+        ("~/", rest)
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() && root != "/" {
+                    return None;
+                }
+            }
+            part => parts.push(part),
+        }
+    }
+    Some(format!("{root}{}", parts.join("/")))
+}
+
+/// The folders a relative path on the line may be read from.
+#[derive(Default)]
+struct LineFolders {
+    /// The folder the line runs in and every folder a `cd` or `pushd` on
+    /// it names from the root or the home, each with its `..` read. A
+    /// `cd` that fails leaves the line where it was, so the folder it runs
+    /// in is always one.
+    known: Vec<String>,
+    /// One more the words do not settle: the folder the line runs in when
+    /// the caller does not say it, a relative `cd` (`CDPATH` may send it
+    /// anywhere), one through an expansion, `cd -`, `popd`, or a home the
+    /// line may have given a value of its own.
+    unknown: bool,
+}
+
+/// Top folders of the system: a project is never read as living in one.
+const SYSTEM_TOPS: &[&str] = &[
+    "etc", "usr", "var", "lib", "lib32", "lib64", "bin", "sbin", "boot", "root", "proc", "sys",
+    "dev", "run", "snap",
+];
+
+/// Whether `reading`, a path a `..` reached from a folder the line runs
+/// in, stays in that folder's own top folder when it is outside the home
+/// and `/tmp` (a project in `/opt/app` or `/workspace/app` with a
+/// worktree beside it), through no hidden folder and none of the guard's
+/// places, programs or units. [`work_folder`] decides under the home and
+/// `/tmp`.
+fn beside_a_project_outside_the_home(reading: &str, folders: &LineFolders) -> bool {
+    let lower = reading.to_ascii_lowercase();
+    let parts: Vec<&str> = lower.split('/').filter(|part| !part.is_empty()).collect();
+    let (Some(top), Some(last)) = (parts.first(), parts.last()) else {
+        return false;
+    };
+    let same_top = |folder: &String| {
+        folder
+            .to_ascii_lowercase()
+            .strip_prefix('/')
+            .and_then(|rest| rest.split('/').next().map(str::to_string))
+            .is_some_and(|own| own == *top)
+    };
+    lower.starts_with('/')
+        && parts.len() >= 2
+        && !matches!(*top, "home" | "users" | "tmp")
+        && !SYSTEM_TOPS.contains(top)
+        && !parts.iter().any(|part| hidden_part(part))
+        && !GUARD_PROGRAMS.contains(last)
+        && !last.ends_with(".service")
+        && !crate::threats::names_guard_carrier_path(&lower)
+        && folders.known.iter().any(same_top)
+}
+
+/// [`LineFolders`] of the line, run in `cwd` when it is known.
+fn line_folders(root: tree_sitter::Node<'_>, source: &[u8], cwd: Option<&str>) -> LineFolders {
+    let mut folders = LineFolders::default();
+    match cwd.and_then(resolved_path) {
+        Some(folder) => folders.known.push(folder),
+        None => folders.unknown = true,
+    }
+    let home_named = crate::threats::names_home_besides_reading(&String::from_utf8_lossy(source));
+    let mut stack = vec![(root, 0usize)];
+    while let Some((node, depth)) = stack.pop() {
+        if depth > 64 {
+            folders.unknown = true;
+            break;
+        }
+        if node.kind() == "command" {
+            let Some((program, arguments)) = program_and_arguments(node, source) else {
+                folders.unknown = true;
+                continue;
+            };
+            let words: Vec<String> = arguments.iter().map(|a| unquoted(*a, source)).collect();
+            if program == "popd" || words.iter().any(|word| word == "popd") {
+                folders.unknown = true;
+            }
+            let after = if program == "cd" || program == "pushd" {
+                Some(0)
+            } else {
+                words
+                    .iter()
+                    .position(|word| matches!(word.as_str(), "cd" | "pushd"))
+                    .map(|at| at + 1)
+            };
+            if let Some(from) = after {
+                let target: Vec<usize> = (from..arguments.len())
+                    .filter(|at| !text(arguments[*at], source).starts_with('-'))
+                    .collect();
+                let named = match target.as_slice() {
+                    [one] => {
+                        let word = &words[*one];
+                        let through_home = word.starts_with('~') || word.starts_with("$HOME");
+                        if literal_or_home(arguments[*one], source) && !(through_home && home_named)
+                        {
+                            resolved_path(word)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                match named {
+                    Some(folder) => folders.known.push(folder),
+                    None => folders.unknown = true,
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            stack.push((child, depth + 1));
+        }
+    }
+    folders
 }
 
 /// git's options before its verb whose value is the next word: the folder
@@ -1761,7 +1949,8 @@ fn hidden_part(part: &str) -> bool {
 
 /// Whether an expansion is `$HOME` on a line that never names `HOME`
 /// otherwise: no `HOME=`, `export HOME`, `read HOME`, `for HOME in`
-/// or `unset HOME` can have changed what it stands for.
+/// or `unset HOME` can have changed what it stands for, written plainly
+/// or with a brace expansion or a line continuation.
 fn home_kept(expansion: tree_sitter::Node<'_>, source: &[u8]) -> bool {
     if text(expansion, source) != "$HOME" {
         return false;
@@ -1773,8 +1962,12 @@ fn home_kept(expansion: tree_sitter::Node<'_>, source: &[u8]) -> bool {
         .chars()
         .filter(|c| !matches!(c, '\'' | '"' | '\\'))
         .collect();
+    // `export {HO,}ME=/etc` and `export HO\` with `ME=/etc` on the next
+    // line name it as well: the shell makes the braces and joins the lines
+    // before it reads a name.
     line.match_indices("HOME")
         .all(|(at, _)| line[..at].ends_with('$'))
+        && !crate::threats::names_home_besides_reading(&String::from_utf8_lossy(source))
 }
 
 /// Programs that run what they read or are handed as words: text masked

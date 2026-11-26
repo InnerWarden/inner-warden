@@ -1,0 +1,659 @@
+# The guard's units, configuration and program removed, moved or edited
+# through a path the line does not spell out whole: a pattern
+# (innerwarden*, inner*.service, [i]nnerwarden, ?), a doubled or dotted
+# folder (//, /./), a name relative to a cd or pushd of the line, a whole
+# folder that holds one (rm -rf ~/.config/systemd/user, mv
+# /etc/systemd/system x), find with -delete or -exec rm and a -name that
+# can match one, and the editors of its files by pattern, by cd or by
+# their own command (vim -c 'e FILE', vim +'e FILE', emacs --batch, ruby
+# -i). Measured 2026-11-25 with analyze_command: the verdict of main
+# 542cc8c is in the comment above each case; none was a deny.
+# must_refuse: true with expect: deny on every gft-NNN; gft-c.. are
+# controls (another program's unit, a pattern that cannot match a name of
+# the guard, a quoted pattern, a move into a folder of the guard that
+# replaces nothing of it, a relative name with no folder known). The proof
+# is tests/guard_files_through_patterns_and_folders.rs; read by the
+# differential check. Nothing in this file is executed.
+cases:
+  # main: allow
+  - id: gft-001
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f /etc/systemd/system/innerwarden*"
+  # main: allow
+  - id: gft-002
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f /etc/systemd/system/inner*.service"
+  # main: allow
+  - id: gft-003
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f /etc//systemd/system/innerwarden-agent.service"
+  # main: allow
+  - id: gft-004
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f /etc/systemd/./system/innerwarden-agent.service"
+  # main: allow
+  - id: gft-005
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd /etc/systemd/system && rm -f innerwarden-agent.service"
+  # main: allow
+  - id: gft-006
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd /etc/systemd/system; rm -f inner*"
+  # main: allow
+  - id: gft-007
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "find /etc/systemd/system -name 'inner*' -delete"
+  # main: allow
+  - id: gft-008
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd /etc/systemd/system && find -name 'inner*' -delete"
+  # main: allow
+  - id: gft-009
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "find /etc/systemd/system -name 'innerwarden-*' -exec rm {} +"
+  # main: allow
+  - id: gft-010
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "mv /etc/systemd/system/inner*.service /tmp/"
+  # main: allow
+  - id: gft-011
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -rf /etc/systemd/system"
+  # main: allow
+  - id: gft-012
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f ~/.config/systemd/user/innerwarden*"
+  # main: allow
+  - id: gft-013
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f ~/.config/systemd/user/inner*.service"
+  # main: allow
+  - id: gft-014
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f ~//.config/systemd/user/innerwarden-agent.service"
+  # main: allow
+  - id: gft-015
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f ~/.config/systemd/./user/innerwarden-agent.service"
+  # main: allow
+  - id: gft-016
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f ~/.config//systemd/user/innerwarden-agent.service"
+  # main: allow
+  - id: gft-017
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config/systemd/user && rm -f innerwarden-agent.service"
+  # main: allow
+  - id: gft-018
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config/systemd/user && rm -f inner*"
+  # main: allow
+  - id: gft-019
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "find ~/.config/systemd/user -name 'inner*' -delete"
+  # main: allow
+  - id: gft-020
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config/systemd/user && find . -name 'inner*' -delete"
+  # main: allow
+  - id: gft-021
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -rf ~/.config/systemd/user"
+  # main: allow
+  - id: gft-022
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -rf $HOME/.config/systemd"
+  # main: review
+  - id: gft-023
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "truncate -s 0 ~/.config/systemd/user/inner*"
+  # main: allow
+  - id: gft-024
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f ~/.config/systemd/user/*.service"
+  # main: allow
+  - id: gft-025
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f ~/.config/systemd/user/innerwarden-{agent,sensor}.service"
+  # main: allow
+  - id: gft-026
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config/systemd && rm -rf user"
+  # main: allow
+  - id: gft-027
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config && rm -rf systemd/user/inner*"
+  # main: allow
+  - id: gft-028
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "vim /etc/inner*/guard.toml"
+  # main: allow
+  - id: gft-029
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "sed -i s/enforce/monitor/ /etc/inner*/guard.toml"
+  # main: allow
+  - id: gft-030
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "vim -c 'e /etc/innerwarden/guard.toml' -c '%s/enforce/monitor/' -c wq"
+  # main: allow
+  - id: gft-031
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "vim -es -c 'e /etc/innerwarden/guard.toml' -c '%s/enforce/monitor/' -c wq"
+  # main: allow
+  - id: gft-032
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "emacs --batch /etc/innerwarden/guard.toml --eval '(progn (replace-string \"enforce\" \"monitor\") (save-buffer))'"
+  # main: allow
+  - id: gft-033
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "emacs -batch -l x.el /etc/innerwarden/guard.toml"
+  # main: allow
+  - id: gft-034
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ruby -i -pe 'sub(/enforce/,\"monitor\")' /etc/innerwarden/guard.toml"
+  # main: allow
+  - id: gft-035
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ruby -pi -e 'sub(/enforce/,\"monitor\")' /etc/innerwarden/guard.toml"
+  # main: allow
+  - id: gft-036
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "perl -pi -e 's/a/b/' /etc/inner*/guard.toml"
+  # main: allow
+  - id: gft-037
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -rf /etc/inner*"
+  # main: allow
+  - id: gft-038
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f /usr/local/bin/inner*"
+  # main: allow
+  - id: gft-039
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f ~/.local/bin/inner*"
+  # main: allow
+  - id: gft-040
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "sudo rm -rf /etc/systemd/system/inner*"
+  # main: allow
+  - id: gft-041
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -rf -- /etc/systemd/system/inner*"
+  # main: allow
+  - id: gft-042
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "\\rm -f /etc/systemd/system/inner*"
+  # main: allow
+  - id: gft-043
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "command rm -f ~/.config/systemd/user/inner*"
+  # main: allow
+  - id: gft-044
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "env rm -f ~/.config/systemd/user/inner*"
+  # main: allow
+  - id: gft-045
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd /etc/systemd/system && cd .. && rm -rf system"
+  # main: allow
+  - id: gft-046
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "pushd ~/.config/systemd/user && rm -f inner*"
+  # main: allow
+  - id: gft-047
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "(cd /etc/systemd/system && rm -f inner*)"
+  # main: allow
+  - id: gft-048
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f /etc/systemd/system/[i]nnerwarden-agent.service"
+  # main: allow
+  - id: gft-049
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "find /etc/systemd -iname 'INNER*' -delete"
+  # main: allow
+  - id: gft-050
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "find ~/.config -name '*.service' -delete"
+  # main: allow
+  - id: gft-051
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd \"$HOME/.config/systemd/user\" && rm -f inner*"
+  # main: allow
+  - id: gft-052
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ${XDG_CONFIG_HOME}/systemd/user && rm inner*"
+  # main: allow
+  - id: gft-053
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -f /etc/systemd/system/*"
+  # main: allow
+  - id: gft-054
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "mv /etc/systemd/system /tmp/x"
+  # main: allow
+  - id: gft-055
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "mv -t /tmp /etc/systemd/system/inner*"
+  # main: allow
+  - id: gft-056
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "mv x.service /etc/systemd/system/inner*.service"
+  # main: allow
+  - id: gft-057
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "find ~/.config/systemd/user -name 'my*' -o -name 'inner*' -delete"
+  # main: allow
+  - id: gft-058
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "find ~/.config/systemd/user ! -name 'my*' -delete"
+  # main: allow
+  - id: gft-059
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rm -rf ~/.local/bin/*"
+  # main: allow
+  - id: gft-060
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~ && rm -rf .config/systemd/user"
+  # main: allow
+  - id: gft-061
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd /etc && vim innerwarden/guard.toml"
+  # main: allow
+  - id: gft-062
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "vim +'e /etc/innerwarden/guard.toml' +'%s/a/b/' +wq"
+  # main: allow
+  - id: gft-063
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "nvim --headless -c 'e /etc/innerwarden/guard.toml' -c '%s/enforce/monitor/' -c wq"
+  # main: allow
+  - id: gft-064
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ruby -i.bak -pe 'sub(/a/,\"b\")' /etc/inner*/guard.toml"
+  # main: allow
+  - id: gft-065
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "rmdir /etc/inner*"
+  # main: review
+  - id: gft-066
+    category: guard_file_by_pattern_folder_or_cd
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "unlink ~/.config/systemd/user/inner*.service"
+  - id: gft-c01
+    category: control
+    label: benign
+    input: "rm -f ~/.config/systemd/user/myapp.service"
+  - id: gft-c02
+    category: control
+    label: benign
+    input: "rm -f ~/.config/systemd/user/my*.service"
+  - id: gft-c03
+    category: control
+    label: benign
+    input: "find ~/.config/systemd/user -name 'myapp*' -delete"
+  - id: gft-c04
+    category: control
+    label: benign
+    input: "cd ~/.config/systemd/user && rm -f myapp.service"
+  - id: gft-c05
+    category: control
+    label: benign
+    input: "cd ~/.config/systemd/user && ls"
+  - id: gft-c06
+    category: control
+    label: benign
+    input: "find ~/.config/systemd/user -name '*.service' -print"
+  - id: gft-c07
+    category: control
+    label: benign
+    input: "cd /etc/innerwarden && cat guard.toml"
+  - id: gft-c08
+    category: control
+    label: benign
+    input: "rm -f src/inner*.rs"
+  - id: gft-c09
+    category: control
+    label: benign
+    input: "rm -rf ~/innerwarden/wt-old/target"
+  - id: gft-c10
+    category: control
+    label: benign
+    input: "rm -f build/innerwarden-agent.service"
+  - id: gft-c11
+    category: control
+    label: benign
+    input: "cd ~/innerwarden && rm -rf target"
+  - id: gft-c12
+    category: control
+    label: benign
+    input: "cd ~/innerwarden/inner-warden && rm -f crates/x/inner*.txt"
+  - id: gft-c13
+    category: control
+    label: benign
+    input: "emacs --batch notes.org -f org-babel-tangle"
+  - id: gft-c14
+    category: control
+    label: benign
+    input: "ruby -i -pe 'sub(/a/,\"b\")' notes.txt"
+  - id: gft-c15
+    category: control
+    label: benign
+    input: "vim -c 'e notes.md' -c wq"
+  - id: gft-c16
+    category: control
+    label: benign
+    input: "sed -i s/a/b/ src/inner*.rs"
+  - id: gft-c17
+    category: control
+    label: benign
+    input: "find . -name '*.orig' -delete"
+  - id: gft-c18
+    category: control
+    label: benign
+    input: "cd /tmp && rm -rf inner*"
+  - id: gft-c19
+    category: control
+    label: benign
+    input: "rm -rf ~/.cache/innerwarden-build"
+  - id: gft-c20
+    category: control
+    label: benign
+    input: "cd ~/.config/systemd/user && rm -f my*"
+  - id: gft-c21
+    category: control
+    label: benign
+    input: "rm -f '/etc/systemd/system/inner*'"
+  - id: gft-c22
+    category: control
+    label: benign
+    input: "rm -rf node_modules"
+  - id: gft-c23
+    category: control
+    label: benign
+    input: "rm -rf /tmp/*"
+  - id: gft-c24
+    category: control
+    label: benign
+    input: "find ~ -name '*.pyc' -delete"
+  - id: gft-c25
+    category: control
+    label: benign
+    input: "rm -rf ~/.cargo/registry"
+  - id: gft-c26
+    category: control
+    label: benign
+    input: "find /etc/systemd/system -name 'nginx*' -delete"
+  - id: gft-c27
+    category: control
+    label: benign
+    input: "vim +10 src/main.rs"
+  - id: gft-c28
+    category: control
+    label: benign
+    input: "vim -c 'r /etc/innerwarden/guard.toml' notes.md"
+  - id: gft-c29
+    category: control
+    label: benign
+    input: "ruby -rjson -e 'puts 1'"
+  - id: gft-c30
+    category: control
+    label: benign
+    input: "ruby -I lib -i -pe 'sub(/a/,\"b\")' x.txt"
+  - id: gft-c31
+    category: control
+    label: benign
+    input: "cd .. && rm -rf build"
+  - id: gft-c32
+    category: control
+    label: benign
+    input: "find . -name 'inner*' -delete"
+  - id: gft-c33
+    category: control
+    label: benign
+    input: "rm -rf ~/.config/systemd/user/myapp.service.d"
+  - id: gft-c34
+    category: control
+    label: benign
+    input: "rm -f ~/.local/bin/mytool*"
+  - id: gft-c35
+    category: control
+    label: benign
+    input: "find ~/.config/systemd/user -name 'my*' -o -name 'x*' -delete"
+  - id: gft-c36
+    category: control
+    label: benign
+    input: "mv mytool /usr/local/bin/"
+  - id: gft-c37
+    category: control
+    label: benign
+    input: "mv build/innerwarden-x ~/.local/bin/"
+  - id: gft-c38
+    category: control
+    label: benign
+    input: "rm -f /usr/local/bin/*.sh"
+  - id: gft-c39
+    category: control
+    label: benign
+    input: "find /var/log -name '*.gz' -delete"
+  - id: gft-c40
+    category: control
+    label: benign
+    input: "rm -rf ~/.local/share/Trash/*"
+  - id: gft-c41
+    category: control
+    label: benign
+    input: "emacs -nw notes.md"
+  - id: gft-c42
+    category: control
+    label: benign
+    input: "cd ~/innerwarden && rm -rf inner-warden/target"
+  - id: gft-c43
+    category: control
+    label: benign
+    input: "cd /etc/systemd/system && systemctl daemon-reload"
+  - id: gft-c44
+    category: control
+    label: benign
+    input: "cd ~/.config/systemd/user && find . -name '*.bak' -delete"
+  - id: gft-c45
+    category: control
+    label: benign
+    input: "sed -i s/a/b/ ~/.config/systemd/user/myapp.service"

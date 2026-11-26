@@ -8,9 +8,12 @@
 
 use std::ops::Range;
 
+mod git_editor;
 mod inline_calls;
 pub(crate) mod output_options;
 pub(crate) mod runners;
+mod sql_runner;
+mod sql_text;
 mod unread_parts;
 
 pub(crate) use inline_calls::InlineReading;
@@ -183,7 +186,25 @@ fn masks_are_in_doubt(root: tree_sitter::Node<'_>, text: &str) -> bool {
         let Some(name) = command_name(command, source) else {
             return false;
         };
-        if name.contains(['$', '`', '{', '/']) || runs_unseen_text(&name, true) {
+        if name.contains(['$', '`', '{', '/']) {
+            return true;
+        }
+        // A SQL client run by name, behind a container runner or as the
+        // remote line of `ssh`, runs none of its words: what the masks
+        // hide of it is SQL that is only data ([`sql_runner`]).
+        // Its input fed from a substitution is not on the line as the
+        // client reads it (`ssh h psql < <(echo ...)`): that stays in doubt.
+        let redirected = command
+            .parent()
+            .filter(|parent| parent.kind() == "redirected_statement")
+            .unwrap_or(command);
+        if sql_runner::runs_sql_client(command, source)
+            && !node_contains_kind(redirected, "process_substitution", 0)
+            && !node_contains_kind(redirected, "command_substitution", 0)
+        {
+            return false;
+        }
+        if runs_unseen_text(&name, true) {
             return true;
         }
         let mut cursor = command.walk();
@@ -3174,6 +3195,105 @@ fn shell_heredoc_data_blanked(source: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The line with the body of each here-document that `cat` only writes out
+/// as text blanked: `cat > NOTES.md <<'EOF'` or `cat <<'EOF'` alone, the
+/// `cat` reading nothing but the body and handing what it prints to no
+/// other command, into a notes file (`.md`, `.txt`, `.rst`, `.adoc`,
+/// `.org`, `.log`, `.csv`) that no agent loads as its instructions or
+/// settings, or to the terminal. A body the shell expands into commands (a
+/// substitution, `${...}`) and a line with any other command that may run
+/// what was written stay read whole ([`command_runs_nothing_written`]).
+/// `None` when no body is blanked.
+///
+/// Measured 2026-11-25 (a line of Pro's hook tests): notes written with
+/// `cat` that described how a settings file can be rewritten through
+/// `node -e` were refused as that rewrite, read from the text of the notes.
+pub(crate) fn text_written_by_cat_blanked(source: &str) -> Option<String> {
+    if !source.contains("<<") || !source.contains("cat") {
+        return None;
+    }
+    let line = crate::shell_words::read_line(source);
+    if !line.nested.is_empty() || !line.arrays.is_empty() {
+        return None;
+    }
+    let notes = |command: &crate::shell_words::Command| {
+        let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+        let Some(first) = command.words.first() else {
+            return false;
+        };
+        let options_only = words[1..]
+            .iter()
+            .all(|word| word.starts_with('-') && word.len() > 1);
+        first.is_plain()
+            && words[0] == "cat"
+            && options_only
+            && !command.piped
+            && !command.inputs.is_empty()
+            && command.reads.is_empty()
+            && command.writes.iter().all(|target| {
+                target.is_plain() && (target.text == "/dev/null" || is_notes_file(&target.text))
+            })
+    };
+    let mut out = source.to_owned();
+    let mut changed = false;
+    for command in &line.commands {
+        if !notes(command) {
+            if command_runs_nothing_written(command) {
+                continue;
+            }
+            return None;
+        }
+        for body in &command.inputs {
+            if body.trim().is_empty() || source.matches(body.as_str()).count() != 1 {
+                return None;
+            }
+            let blank: String = body
+                .split_inclusive('\n')
+                .map(|row| {
+                    if row.ends_with('\n') {
+                        "text\n"
+                    } else {
+                        "text"
+                    }
+                })
+                .collect();
+            out = out.replacen(body.as_str(), &blank, 1);
+            changed = true;
+        }
+    }
+    changed.then_some(out)
+}
+
+/// Whether a file a line writes is a notes file: a document by its
+/// extension, that no agent loads as instructions or settings and that
+/// sits in no folder of an agent, a hook or the guard.
+fn is_notes_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let document = [".md", ".txt", ".rst", ".adoc", ".org", ".log", ".csv"]
+        .iter()
+        .any(|extension| name.len() > extension.len() && name.ends_with(extension));
+    let instructions = matches!(
+        name,
+        "claude.md" | "claude.local.md" | "agents.md" | "gemini.md" | "copilot-instructions.md"
+    ) || name.starts_with(".cursorrules")
+        || name.starts_with(".windsurfrules");
+    let agent_folder = [
+        ".claude",
+        ".codex",
+        ".cursor",
+        ".gemini",
+        ".openclaw",
+        ".github",
+        "hooks",
+        "innerwarden",
+        ".config",
+    ]
+    .iter()
+    .any(|folder| lower.split('/').any(|part| part == *folder));
+    document && !instructions && !agent_folder && !lower.contains("..")
+}
+
 /// Whether a command, in a here-document handed to a shell or on the line
 /// around it, can run nothing an `echo` of the same body wrote: it writes
 /// text, makes a folder or moves to one that holds no hooks. Any other
@@ -3700,6 +3820,14 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
             }
         }
     }
+    // The message a git whose editor is a shell or an interpreter runs, and
+    // the line an alias that starts with `!` runs ([`git_editor`]).
+    handed.lines.extend(git_editor::message_lines(
+        tree.root_node(),
+        bytes,
+        &commands,
+        &assignments,
+    ));
     // What a pipe hands a shell that reads its script from stdin (`cat
     // <<'EOF' | sh`, `printf '...' | bash`), when the line writes it out.
     // Text it does not write out is held by the reading of unread parts
@@ -12796,6 +12924,11 @@ fn unlisted_runner_code(name: &str, args: &[String]) -> Option<String> {
             },
             _ => continue,
         };
+        // SQL a client runs in the database is data; a client command
+        // that reaches the shell makes it not data ([`sql_text`]).
+        if takes_code && sql_text::is_sql_client(name) && sql_text::sql_text_is_data(&value) {
+            continue;
+        }
         if takes_code {
             lines.extend(code_value_lines(&value));
         } else {
@@ -13514,7 +13647,10 @@ fn mask_literal_command_args(
                     !pipeline_is_data_only(pipeline, source)
                 }
             });
-    if in_non_data_pipeline
+    // `echo 'INSERT ...' | psql`: the text goes into a SQL client only.
+    let feeds_sql_data =
+        matches!(name.as_str(), "echo" | "printf") && echo_feeds_sql_data(command, &name, source);
+    if (in_non_data_pipeline && !feeds_sql_data)
         || has_execution_sink_ancestor(command, source)
         || writes_security_or_execution_sink(command, source)
         || writes_payload_executed_later(command, source)
@@ -13628,8 +13764,94 @@ fn mask_literal_command_args(
                 mask_preserving_substitutions(argument, source, masked, executable_inside_mask);
             }
         }
-        _ => {}
+        // The SQL a client is handed on the line, where it is only data
+        // ([`sql_text::sql_text_is_data`]): the client run by name, behind
+        // the wrappers the guard reads through, behind a container runner,
+        // or as the remote line of `ssh` ([`sql_runner`]).
+        _ => {
+            let Some(words) = command_words(command, source) else {
+                return;
+            };
+            let Some((client, at)) = sql_runner::sql_client_at(&words, 0) else {
+                if let Some(masks) = sql_runner::ssh_sql_masks(command, source) {
+                    masked.extend(masks);
+                }
+                return;
+            };
+            let words: Vec<String> = words[at + 1..]
+                .iter()
+                .map(|word| shell_word(word))
+                .collect();
+            for (index, sql) in sql_text::sql_arguments(&client, &words) {
+                if let Some(argument) = arguments
+                    .get(at + index)
+                    .filter(|_| sql_text::sql_text_is_data(&sql))
+                {
+                    mask_preserving_substitutions(
+                        *argument,
+                        source,
+                        masked,
+                        executable_inside_mask,
+                    );
+                }
+            }
+        }
     }
+}
+
+/// Whether `command`, an `echo` or `printf`, is the first of a pipeline
+/// of two whose second is a SQL client, and all it prints is SQL that is
+/// only data ([`sql_text::sql_text_is_data`]): `echo "INSERT ..." | psql`.
+/// An `echo` with options, or a `printf` format with escapes other than a
+/// line end or a tab, is not read.
+fn echo_feeds_sql_data(command: tree_sitter::Node<'_>, name: &str, source: &[u8]) -> bool {
+    let Some(pipeline) = command.parent().and_then(nearest_pipeline) else {
+        return false;
+    };
+    if inside_a_substitution(pipeline) {
+        return false;
+    }
+    let mut commands = Vec::new();
+    collect_commands(pipeline, &mut commands, 0);
+    let [first, second] = commands.as_slice() else {
+        return false;
+    };
+    if first.id() != command.id() || sql_client_words(*second, source).is_none() {
+        return false;
+    }
+    let mut texts: Vec<String> = command_arguments(command)
+        .iter()
+        .map(|argument| shell_word(&node_text(*argument, source)))
+        .collect();
+    if texts.is_empty() || texts.iter().any(|text| text.starts_with('-')) {
+        return false;
+    }
+    if name == "printf" {
+        match sql_text::printf_format_text(&texts[0]) {
+            Some(format) => texts[0] = format,
+            None => return false,
+        }
+    }
+    texts.iter().all(|text| sql_text::sql_text_is_data(text))
+}
+
+/// The SQL client a command runs, behind the wrappers the guard unwraps,
+/// a container runner or `ssh` ([`sql_runner`]), with the words after
+/// its name, shell quotes taken off.
+fn sql_client_words(
+    command: tree_sitter::Node<'_>,
+    source: &[u8],
+) -> Option<(String, Vec<String>)> {
+    let words = command_words(command, source)?;
+    if let Some((name, at)) = sql_runner::sql_client_at(&words, 0) {
+        let args = words[at + 1..]
+            .iter()
+            .map(|word| shell_word(word))
+            .collect();
+        return Some((name, args));
+    }
+    let (line, _) = sql_runner::ssh_remote_line(command, source)?;
+    sql_runner::line_sql_client(&line)
 }
 
 #[derive(Clone, Copy)]
@@ -14336,7 +14558,13 @@ fn mask_data_heredoc(
     let redefined = owner
         .as_deref()
         .is_some_and(|name| line_redefines(root_node(body), name, source));
+    // A SQL client reads its input as SQL: data where the SQL is only data.
+    let sql_data = owner_command.is_some_and(|command| {
+        sql_client_words(command, source).is_some()
+            && sql_text::sql_text_is_data(&node_text(body, source))
+    });
     if (matches!(owner.as_deref(), Some("cat" | "tee"))
+        || sql_data
         || owner_command.is_some_and(|command| reads_stdin_as_message(command, redirected, source)))
         && !redefined
         && data_only_pipeline
@@ -14346,7 +14574,51 @@ fn mask_data_heredoc(
             .is_some_and(|command| heredoc_writes_download_value(command, body, source))
     {
         mask_preserving_substitutions(body, source, masked, executable_inside_mask);
+        // The grammar does not always make a backtick substitution in the
+        // body a node of its own: an unquoted body runs it all the same.
+        if heredoc_body_expands(body, source) {
+            executable_inside_mask.extend(backtick_runs(body, source));
+        }
     }
+}
+
+/// Whether the shell expands the body of the here-document `body`: its
+/// delimiter is written with no quote and no backslash (`<<EOF`, not
+/// `<<'EOF'`, `<<"EOF"` or `<<\EOF`).
+fn heredoc_body_expands(body: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let Some(redirect) = body.parent() else {
+        return true;
+    };
+    let mut cursor = redirect.walk();
+    let start = redirect
+        .children(&mut cursor)
+        .find(|child| child.kind() == "heredoc_start");
+    start.is_none_or(|start| !node_text(start, source).contains(['\'', '"', '\\']))
+}
+
+/// The byte ranges of the backtick substitutions in the text of `node`
+/// (an escaped backtick is a letter; one never closed runs to the end).
+fn backtick_runs(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Range<usize>> {
+    let range = node.byte_range();
+    let bytes = &source[range.clone()];
+    let mut runs = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 1,
+            b'`' => match open.take() {
+                Some(start) => runs.push(range.start + start..range.start + at + 1),
+                None => open = Some(at),
+            },
+            _ => {}
+        }
+        at += 1;
+    }
+    if let Some(start) = open {
+        runs.push(range.start + start..range.end);
+    }
+    runs
 }
 
 /// Whether the unquoted here-document `body` of `command` expands a value
@@ -14444,7 +14716,15 @@ fn mask_message_herestring(
     // The grammar hangs a here-string on its command, or on the statement
     // around it.
     let redirected = ancestor_of_kind(redirect, "redirected_statement").unwrap_or(owner);
-    if !reads_stdin_as_message(owner, redirected, source)
+    let Some(value) = redirect.named_child((redirect.named_child_count() as u32).saturating_sub(1))
+    else {
+        return;
+    };
+    // A SQL client reads the here-string as SQL: data where the SQL is
+    // only data.
+    let sql_data = sql_client_words(owner, source).is_some()
+        && sql_text::sql_text_is_data(&shell_word(&node_text(value, source)));
+    if !(sql_data || reads_stdin_as_message(owner, redirected, source))
         || output_piped_past_data(owner, redirected, source)
         || has_execution_sink_ancestor(owner, source)
         || command_name(owner, source).is_some_and(|name| {
@@ -14453,10 +14733,6 @@ fn mask_message_herestring(
     {
         return;
     }
-    let Some(value) = redirect.named_child((redirect.named_child_count() as u32).saturating_sub(1))
-    else {
-        return;
-    };
     // The word stays a word: masked whole, `<<<` is left without one, the
     // projection no longer parses and the rest of the line goes unread
     // (`git commit -F - <<< 'x'; sh <(curl -s URL)` fell from deny to
