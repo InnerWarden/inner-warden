@@ -241,6 +241,7 @@ fn make_what_no_writer_makes(host: &Host, lock_taken: bool) {
 /// How long one hook of these may take: the screening's deadline is 10 s,
 /// and a hook that waited on the pipe was refused there (enforce) or let
 /// through unscreened (monitor), its result's record cut at 17 s.
+#[cfg(unix)]
 const QUICK: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// A pipe, a link to one, a folder and an empty file under the name of a
