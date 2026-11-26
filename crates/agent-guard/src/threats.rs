@@ -24253,8 +24253,9 @@ fn shell_interpreter_executes_target(
         if matches!(argument.as_str(), "-c" | "--command")
             || short_flags.is_some_and(|flags| flags.contains('c'))
         {
-            if arguments.get(index + 1).is_some_and(|payload| {
-                shell_payload_executes_target(payload, target, cwd, variables, depth + 1)
+            // The shell reads its options past `-c` (`sh -c -- CODE`).
+            if crate::shell::shell_c_script_from(arguments, index + 1).is_some_and(|at| {
+                shell_payload_executes_target(&arguments[at], target, cwd, variables, depth + 1)
             }) {
                 return true;
             }

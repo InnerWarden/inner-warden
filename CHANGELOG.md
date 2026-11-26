@@ -24,7 +24,13 @@ the line an earlier version wrote. An order written into Claude Code's
 custom commands or subagents (`.claude/commands/*.md`, `.claude/agents/*.md`)
 is read as one written into `CLAUDE.md`, and so is a file an instruction
 file imports with `@path`. The guard's state folder (`~/.local/state/innerwarden`)
-is held as its configuration folder is, in every mode.
+is held as its configuration folder is, in every mode. An order written into
+Claude Code's skills (`.claude/skills/<name>/SKILL.md`, in a project or the
+home) or Codex's custom prompts (`~/.codex/prompts/*.md`) is read as one
+written into `CLAUDE.md`. A shell's `-c` script
+written after its options and a `--` (`bash -c -x -- LINE`, `sh -c -- LINE`)
+is read as the script it is, as the shell runs it, and `timeout -- 5 CMD`
+runs `CMD`.
 
 `innerwarden --version`, the hint that points `setup`, `dashboard`, `upgrade`
 and `uninstall` at the host layer, and `innerwarden openclaw status` name the

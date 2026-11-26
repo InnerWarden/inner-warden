@@ -6328,7 +6328,12 @@ fn shell_c_operand(args: &[String]) -> Option<usize> {
     let mut index = 0;
     let mut wants_line = false;
     while let Some(argument) = args.get(index) {
-        if argument == "--" || !(argument.starts_with('-') || argument.starts_with('+')) {
+        if matches!(argument.as_str(), "--" | "-") {
+            // `--` ends the options: after a `-c` the word past it is the
+            // line; before one, `-c` is a script's name (`bash -- -c`).
+            return (wants_line && index + 1 < args.len()).then_some(index + 1);
+        }
+        if !(argument.starts_with('-') || argument.starts_with('+')) {
             break;
         }
         if matches!(
@@ -8364,19 +8369,23 @@ fn stdin_code_language(command: tree_sitter::Node<'_>, source: &[u8]) -> Option<
 }
 
 fn shell_command_payload(words: &[String]) -> Option<String> {
+    let args: Vec<String> = words.iter().skip(1).map(|word| shell_word(word)).collect();
+    let script = |index: usize| shell_c_script_from(&args, index).map(|at| args[at].clone());
     let mut index = 1;
     while let Some(argument) = words.get(index).map(|argument| shell_word(argument)) {
         if matches!(argument.as_str(), "-c" | "--command") {
-            return words.get(index + 1).map(|payload| shell_word(payload));
+            return script(index);
         }
-        if argument == "--" || (!argument.starts_with('-') && !argument.starts_with('+')) {
+        if matches!(argument.as_str(), "--" | "-")
+            || (!argument.starts_with('-') && !argument.starts_with('+'))
+        {
             return None;
         }
         if argument
             .strip_prefix(['-', '+'])
             .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
         {
-            return words.get(index + 1).map(|payload| shell_word(payload));
+            return script(index);
         }
         if matches!(argument.as_str(), "-o" | "+o" | "-O" | "+O") {
             index += 2;
@@ -10339,6 +10348,35 @@ fn shell_inline_code_payload(words: &[String]) -> Option<String> {
     shell_inline_code_place(words).map(|at| shell_literal_word(&words[at]))
 }
 
+/// The place in `args` (a shell's arguments, unquoted) of the script its
+/// `-c` hands it, the words after the one holding `-c` read from `from`
+/// on. A shell reads all its options first: `-c` only makes the first
+/// operand the script, so `bash -c -x -- LINE`, `sh -c -- LINE` and `bash
+/// -c - LINE` run `LINE` (bash 5.2, dash and busybox measured
+/// 2026-11-26). `--` or `-` ends the options: the word after it is the
+/// script, even one that starts with `-`.
+pub(crate) fn shell_c_script_from(args: &[String], from: usize) -> Option<usize> {
+    let mut index = from;
+    while let Some(argument) = args.get(index) {
+        let argument = argument.as_str();
+        if matches!(argument, "--" | "-") {
+            return (index + 1 < args.len()).then_some(index + 1);
+        }
+        if !(argument.starts_with('-') || argument.starts_with('+')) {
+            return Some(index);
+        }
+        index += if matches!(
+            argument,
+            "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file"
+        ) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
 /// The place in `words` (a shell's name first) of the code a shell runs
 /// with `-c` (`bash -c LINE`, `sh -ec LINE`, `zsh -o x -c LINE`), when
 /// there is one.
@@ -10359,9 +10397,11 @@ pub(crate) fn shell_inline_code_place(words: &[String]) -> Option<usize> {
                 .strip_prefix('-')
                 .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
         {
-            return (index + 2 < words.len()).then_some(index + 2);
+            return shell_c_script_from(&args, index + 1).map(|at| at + 1);
         }
-        if argument == "--" || (!argument.starts_with('-') && !argument.starts_with('+')) {
+        if matches!(argument.as_str(), "--" | "-")
+            || (!argument.starts_with('-') && !argument.starts_with('+'))
+        {
             return None;
         }
         if matches!(argument.as_str(), "-o" | "+o" | "-O" | "+O") {
@@ -11097,13 +11137,15 @@ fn shell_command_waits_for_xargs_payload(words: &[String]) -> bool {
     if !is_shell_name(&name) {
         return false;
     }
-    words.iter().enumerate().skip(1).any(|(index, argument)| {
-        let argument = shell_word(argument);
+    // xargs puts its words last: a `-c` with no script after it, past
+    // its options and `--` (`sh -c --`), runs the first of them.
+    let args: Vec<String> = words.iter().skip(1).map(|word| shell_word(word)).collect();
+    args.iter().enumerate().any(|(index, argument)| {
         (argument == "-c"
             || argument
                 .strip_prefix('-')
                 .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c')))
-            && index + 1 >= words.len()
+            && shell_c_script_from(&args, index + 1).is_none()
     })
 }
 
@@ -13282,10 +13324,8 @@ fn shell_code_input(args: &[String]) -> CodeInput {
                 .strip_prefix('-')
                 .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
         {
-            return args
-                .get(index + 1)
-                .cloned()
-                .map(CodeInput::Argument)
+            return shell_c_script_from(args, index + 1)
+                .map(|at| CodeInput::Argument(args[at].clone()))
                 .unwrap_or(CodeInput::None);
         }
         if argument == "-s"
@@ -14574,8 +14614,16 @@ fn command_executes_target(
     let mut index = 1;
     while let Some(argument) = effective.get(index).map(|argument| shell_word(argument)) {
         if matches!(argument.as_str(), "-c" | "--command") {
-            return effective
-                .get(index + 1)
+            // A shell reads its options past `-c` (`sh -c -- ./x.sh`).
+            let line_at = if is_shell_name(&executable_name) {
+                let args: Vec<String> =
+                    effective[1..].iter().map(|word| shell_word(word)).collect();
+                shell_c_script_from(&args, index).map(|at| at + 1)
+            } else {
+                Some(index + 1)
+            };
+            return line_at
+                .and_then(|at| effective.get(at))
                 .is_some_and(|script| script.contains(target));
         }
         if argument == "--" {
@@ -15990,7 +16038,8 @@ fn unwrap_timeout(args: &[String]) -> WrapperTarget {
     let mut index = 0;
     while let Some(arg) = args.get(index).map(|arg| shell_word(arg)) {
         match arg.as_str() {
-            "--" => return command_at(args, index + 1),
+            // The duration is the first operand: `timeout -- 5 CMD`.
+            "--" => return command_at(args, index + 2),
             "-k" | "--kill-after" | "-s" | "--signal" => {
                 if index + 1 >= args.len() {
                     return WrapperTarget::Unknown;
@@ -16462,6 +16511,41 @@ mod tests {
     fn a_program_named_at_run_time_with_an_unread_c_line_is_marked() {
         assert!(handed_shell_lines("X=$(which bash); $X -c \"$CMD\"").not_literal);
         assert!(!handed_shell_lines("$CC -c main.c -o main.o").not_literal);
+    }
+
+    /// A shell reads its options past `-c`, and `--` or `-` ends them: the
+    /// word after it is the line handed. Before `-c`, `--` makes `-c` a
+    /// script's name and no line is handed.
+    ///
+    /// FAILS ON REVERT of the `--` term in [`shell_c_operand`]: the line
+    /// handed was `--`, and the value of `C` was never read.
+    #[test]
+    fn a_double_dash_after_c_hands_the_word_after_it() {
+        for shell in [
+            "sh -c --",
+            "bash -c -x --",
+            "bash -xc -",
+            "bash -c -o errexit --",
+        ] {
+            let line = format!("C='rm -rf /'; {shell} \"$C\"");
+            let handed = handed_shell_lines(&line);
+            assert!(
+                handed.lines.iter().any(|handed| handed == "rm -rf /"),
+                "{line}: {handed:?}"
+            );
+            assert!(
+                !handed
+                    .lines
+                    .iter()
+                    .any(|handed| handed == "--" || handed == "-"),
+                "{line}: {handed:?}"
+            );
+        }
+        let handed = handed_shell_lines("C='rm -rf /'; bash -- -c \"$C\"");
+        assert!(
+            !handed.lines.iter().any(|handed| handed == "rm -rf /"),
+            "{handed:?}"
+        );
     }
 
     /// The dangerous fragment these cases carry, assembled rather than written
