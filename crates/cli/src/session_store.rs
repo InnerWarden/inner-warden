@@ -1091,6 +1091,7 @@ mod tests {
 
     /// `work` run on its own thread, or `None` where it has not ended in
     /// `limit`: a reader that waits on a pipe never ends.
+    #[cfg(unix)]
     fn ends_within<T: Send + 'static>(
         limit: std::time::Duration,
         work: impl FnOnce() -> T + Send + 'static,
