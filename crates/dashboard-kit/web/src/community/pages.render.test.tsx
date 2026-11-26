@@ -856,6 +856,33 @@ describe("Protection, Agents and Tokens", () => {
     expect(render(<CommunityProtection context={{ ...context(), bootstrap: undefined }} />)).toContain("Protection on this machine");
   });
 
+  it("names the host install at the foot by its licence: InnerWarden Pro only with one", () => {
+    // FAILS ON REVERT: the foot said "InnerWarden Pro is installed on this
+    // host." on a host installed with no licence, and where the licence
+    // could not be read.
+    const foot = (meta: DashboardMeta) => {
+      const html = protectionHtml("", meta);
+      const at = html.indexOf('data-ad-state="installed"');
+      expect(at, "the installed line is drawn").toBeGreaterThan(-1);
+      return html.slice(html.lastIndexOf("<div", at), html.indexOf("</div>", at));
+    };
+    const installed = { ...META, active_defence_installed: true };
+    const pro = foot({ ...installed, host_install: "pro" });
+    expect(pro).toContain('data-host-install="pro"');
+    expect(textOf(pro)).toContain("InnerWarden Pro is installed on this host.");
+    const free = foot({ ...installed, host_install: "free_tier" });
+    expect(free).toContain('data-host-install="free_tier"');
+    expect(textOf(free)).toContain("InnerWarden's host install (free tier, no licence) is installed on this host.");
+    for (const meta of [{ ...installed, host_install: "unknown" }, installed]) {
+      const unknown = foot(meta);
+      expect(unknown).toContain('data-host-install="unknown"');
+      expect(textOf(unknown)).toContain("InnerWarden's host install is installed on this host.");
+    }
+    for (const meta of [{ ...installed, host_install: "free_tier" }, { ...installed, host_install: "unknown" }, installed]) {
+      expect(textOf(protectionHtml("", meta))).not.toContain("InnerWarden Pro");
+    }
+  });
+
   it("draws the mode box with both definitions, the switch, every agent's restart and the way back", () => {
     const html = protectionHtml();
     const box = html.slice(html.indexOf('id="mode"'), html.indexOf('id="screening"'));

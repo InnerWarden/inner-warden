@@ -440,6 +440,10 @@ fn status_io_cmd_rest(
             account_problem: place.account_problem,
             pro_reads: place.pro_reads,
         }),
+        record_outage: record_health::current().map(|outage| status::RecordOutage {
+            sink_only: outage.code == record_health::SINK_NOT_WRITTEN,
+            summary: outage.summary(),
+        }),
         project_settings: std::env::current_dir()
             .map(|dir| project_settings_in(&dir, home.as_deref()))
             .unwrap_or_default(),
@@ -1363,9 +1367,16 @@ pub(crate) struct TooLongCall {
     pub(crate) event: Option<String>,
     pub(crate) tool: Option<String>,
     pub(crate) session: Option<String>,
+    /// The folder the agent runs in (`cwd`), when it is in the head: a
+    /// relative path is judged from it, as in a call read whole.
+    pub(crate) cwd: Option<String>,
     /// The file the tool worked on (`file_path`, `notebook_path` or `path`
     /// of `tool_input`), when it is in the head.
     pub(crate) path: Option<String>,
+    /// Every such field whose value is whole in the head, as its key and
+    /// value, in the order read, the same key twice included: a file tool
+    /// past the cap is judged on each ([`large_file_write`]).
+    pub(crate) paths: Vec<(String, String)>,
 }
 
 impl TooLongCall {
@@ -1379,19 +1390,21 @@ impl TooLongCall {
                 }
                 ("tool_name" | "toolName", json_head::Value::Str(s)) => call.tool = Some(s),
                 ("session_id" | "sessionId", json_head::Value::Str(s)) => call.session = Some(s),
+                ("cwd", json_head::Value::Str(s)) => call.cwd = Some(s),
                 ("tool_input" | "toolInput", json_head::Value::Object) => {
-                    let mut path = None;
+                    let mut paths = Vec::new();
                     json_head::object(head, at, &mut |key, value, _, _| {
                         if let ("file_path" | "notebook_path" | "path", json_head::Value::Str(s)) =
                             (key.as_str(), value)
                         {
-                            path.get_or_insert(s);
+                            paths.push((key.to_string(), s));
                         }
                         true
                     });
-                    if path.is_some() {
-                        call.path = path;
+                    if let Some((_, first)) = paths.first() {
+                        call.path = Some(first.clone());
                     }
+                    call.paths.extend(paths);
                 }
                 _ => {}
             }
@@ -1602,6 +1615,9 @@ fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::E
         return std::process::ExitCode::SUCCESS;
     }
     if !call.already_ran() {
+        if let Some(exit) = large_file_write(&call, rest, monitor) {
+            return exit;
+        }
         return hook_unreadable("", rest, TOOL_CALL_TOO_LONG, monitor);
     }
     hook_net::already_ran(result_unread_to_agent(rest));
@@ -1620,6 +1636,148 @@ fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::E
          read whole)."
     );
     std::process::ExitCode::SUCCESS
+}
+
+/// What the hook says of a file tool call past the cap whose path it judged:
+/// the path was read, the content was not.
+pub(crate) const LARGE_CONTENT_UNSCREENED: &str =
+    "content longer than the hook reads, not screened";
+
+/// What the agent is told when such a call is refused.
+const LARGE_WRITE_REMEDY: &str =
+    "  A change under 1 MiB is read whole and screened: write the file in parts, or ask the \
+     person supervising this agent to make the change.";
+
+/// A file tool call past the cap, about to run (`Write`, `Edit`,
+/// `MultiEdit`, `NotebookEdit`, and the `write_file` and `replace` of Gemini
+/// CLI and Hermes Agent). Such a call is given for a path, and the agent
+/// sends the path before the content: every path field whole in the head is
+/// judged as a call read whole is ([`screen_file_writes`]), so a privileged
+/// file, the guard's own configuration, a credential, or any file of a
+/// revoked agent is refused by name. Only the content goes unread, and that
+/// is never let through quietly: the person is asked where the agent can
+/// ask ([`review_answer`]), and the call is refused where it cannot, or
+/// where the line refuses every review (`--block-review`). Monitor never
+/// blocks, and says the content went unscreened.
+///
+/// `None`, so the call stays refused as one not read, for any other tool (a
+/// shell line, a patch whose files are named inside its text), for a head
+/// without the field the tool writes to ([`written_path_key`]: the content
+/// sent before the path, or another path field standing in front of it),
+/// and for the Cursor and Antigravity lines, which read calls in their own
+/// shapes. The path the person is asked about is the one the tool writes.
+fn large_file_write(
+    call: &TooLongCall,
+    rest: &[String],
+    monitor: bool,
+) -> Option<std::process::ExitCode> {
+    use innerwarden_agent_guard::{antigravity_hook, cursor_hook, file_tools};
+    let agent = agent_flag(rest);
+    if matches!(agent.as_deref(), Some(name) if name == cursor_hook::AGENT || name == antigravity_hook::AGENT)
+    {
+        return None;
+    }
+    let tool = call.tool.as_deref()?;
+    if !file_tools::FILE_TOOLS.contains(&tool) && !file_tools::GEMINI_FILE_TOOLS.contains(&tool) {
+        return None;
+    }
+    // The field the tool writes to must be in the head: a path in another
+    // field (`{"path": "a.txt", <content>, "file_path": "~/.ssh/..."}`)
+    // would be judged and named to the person in its place.
+    let written = written_path_key(tool, agent.as_deref());
+    let path = call
+        .paths
+        .iter()
+        .find(|(key, path)| key == written && !path.trim().is_empty())
+        .map(|(_, path)| path.trim().to_string())?;
+    let paths: Vec<String> = call
+        .paths
+        .iter()
+        .map(|(_, path)| path)
+        .filter(|path| !path.trim().is_empty())
+        .cloned()
+        .collect();
+    // What the head says of the call, for the file screen and the record:
+    // the folder a relative path is judged from, the session, the event.
+    let mut payload = serde_json::json!({ "tool_name": tool, "tool_input": {} });
+    for (key, value) in [
+        ("hook_event_name", &call.event),
+        ("session_id", &call.session),
+        ("cwd", &call.cwd),
+    ] {
+        if let Some(value) = value {
+            payload[key] = value.clone().into();
+        }
+    }
+    let buf = payload.to_string();
+    let screen = screen_file_writes(&buf, rest, monitor, false, tool, &paths);
+    if !matches!(screen, FileScreen::Pass) {
+        return file_screen_exit(&buf, rest, screen, monitor, false);
+    }
+    let command = format!("{tool} {path}");
+    let explanation = format!("{command}: {LARGE_CONTENT_UNSCREENED}");
+    let block_review = rest.iter().any(|a| a == "--block-review");
+    let answer = review_answer(agent.as_deref());
+    let asks = matches!(
+        answer,
+        ReviewAnswer::AskClaudeCode
+            | ReviewAnswer::AskHermes
+            | ReviewAnswer::AskCursor
+            | ReviewAnswer::AskAntigravity
+    );
+    let refused = block_review || !asks;
+    let verdict = serde_json::json!({
+        "command": command,
+        "risk_score": 40,
+        "severity": "medium",
+        "signals": [{
+            "signal": "content_unscreened",
+            "score": 40,
+            "detail": explanation,
+        }],
+        "recommendation": "review",
+        "explanation": explanation,
+    });
+    record_shell(
+        &buf, rest, &command, &verdict, monitor, refused, None, false,
+    );
+    if monitor {
+        eprintln!(
+            "InnerWarden hook: {explanation}; it was NOT screened (monitor mode never blocks)."
+        );
+        return Some(std::process::ExitCode::from(unreadable_exit_code(true)));
+    }
+    if !refused {
+        if let Some(line) = review_answer_line(answer, &explanation) {
+            println!("{line}");
+            HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Some(std::process::ExitCode::SUCCESS);
+        }
+    }
+    let said = if block_review {
+        format!(
+            "InnerWarden blocked this file change (recommendation=review): {explanation}; its \
+             hook line has --block-review, which refuses every review."
+        )
+    } else {
+        review_refusal_line(&explanation)
+    };
+    note_refusal(said.clone());
+    eprintln!("{said}");
+    eprintln!("{LARGE_WRITE_REMEDY}");
+    Some(std::process::ExitCode::from(2))
+}
+
+/// The field of `tool_input` a file tool writes to: `notebook_path` for
+/// `NotebookEdit`, `path` for Hermes Agent's `write_file`, `file_path` for
+/// every other (Claude Code's tools, Gemini CLI's `write_file` and
+/// `replace`).
+fn written_path_key(tool: &str, agent: Option<&str>) -> &'static str {
+    match (tool, agent) {
+        ("NotebookEdit", _) => "notebook_path",
+        ("write_file" | "replace", Some(innerwarden_agent_guard::hermes_hook::AGENT)) => "path",
+        _ => "file_path",
+    }
 }
 
 /// Whether the agent of this hook line reads a PostToolUse hook's
@@ -2143,9 +2301,16 @@ fn apply_taint(
         .and_then(|e| e.as_str())
         .unwrap_or("")
         .to_string();
-    let reason = format!(
-        "argument `{value}` did not come from you: it arrived in a result from {tool} earlier in this session"
-    );
+    let reason = if tool == session_store::UNREAD_KEPT_CHANGES {
+        format!(
+            "{value} change(s) kept beside this session's record were left unread before this \
+             answer, so whether an argument arrived in a tool result is not known"
+        )
+    } else {
+        format!(
+            "argument `{value}` did not come from you: it arrived in a result from {tool} earlier in this session"
+        )
+    };
     let joined = if previous.is_empty() {
         reason
     } else {
@@ -2391,7 +2556,8 @@ fn antigravity_answer(exit: std::process::ExitCode, monitor: bool) -> std::proce
     if HOOK_ANSWERED.load(std::sync::atomic::Ordering::SeqCst) {
         return std::process::ExitCode::SUCCESS;
     }
-    if exit == std::process::ExitCode::SUCCESS || monitor {
+    let held = HELD_IN_MONITOR.load(std::sync::atomic::Ordering::SeqCst);
+    if exit == std::process::ExitCode::SUCCESS || (monitor && !held) {
         println!("{}", antigravity_hook::allow());
     } else {
         let reason = HOOK_REFUSAL
@@ -2403,6 +2569,25 @@ fn antigravity_answer(exit: std::process::ExitCode, monitor: bool) -> std::proce
     }
     std::process::ExitCode::SUCCESS
 }
+
+/// The exit of a refusal: 2, the refusal every agent reads, but for one
+/// that monitor holds on Gemini's line. That line turns every end other than
+/// 0 into 1, "warn, run the tool" (a guard that is gone must not hold Gemini
+/// up in a mode that never blocks), except
+/// [`innerwarden_agent_guard::hook::MONITOR_HELD_EXIT`], which it turns into
+/// 2. A write into the guard's own configuration is refused in every mode and
+/// for every agent.
+fn refusal_exit(rest: &[String], held_in_monitor: bool) -> std::process::ExitCode {
+    if held_in_monitor && agent_flag(rest).as_deref() == Some("gemini") {
+        std::process::ExitCode::from(innerwarden_agent_guard::hook::MONITOR_HELD_EXIT)
+    } else {
+        std::process::ExitCode::from(2)
+    }
+}
+
+/// Set when monitor refuses a call all the same: a write into the guard's
+/// own configuration ([`innerwarden_agent_guard::threats::verdict_writes_guard_config`]).
+static HELD_IN_MONITOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// An Antigravity tool the guard does not read (`AgyCall::Unknown`): never
 /// let through as a call that names nothing. In enforce mode the person is
@@ -2708,7 +2893,13 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    if !monitor && would_block_under_policy {
+    // Monitor only records, but for a write into the guard's own
+    // configuration: that is refused in every mode, as lowering the guard is.
+    let held_in_monitor = monitor
+        && would_block_under_policy
+        && innerwarden_agent_guard::threats::verdict_writes_guard_config(&command, &verdict);
+    if (!monitor || held_in_monitor) && would_block_under_policy {
+        HELD_IN_MONITOR.store(held_in_monitor, std::sync::atomic::Ordering::SeqCst);
         let rec = verdict
             .get("recommendation")
             .and_then(|r| r.as_str())
@@ -2742,7 +2933,7 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         // reaches the agent first, and a ready-to-run `innerwarden allow '<cmd>'`
         // here was an instruction the agent could follow to lift its own block.
         eprintln!("{}", hook_block_remedy(&verdict));
-        std::process::ExitCode::from(2)
+        refusal_exit(rest, held_in_monitor)
     } else if !monitor && runs_with_a_warning(warned, &verdict, posture) {
         // The default posture: a refusal outside the high-certainty class,
         // or a review outside it, runs. It is in the record, and the agent
@@ -3222,12 +3413,19 @@ pub(crate) fn screen_shell(
         if warned {
             record_shell_warned(buf, rest, &command, &verdict, deciding_layer.clone(), demo);
         } else {
+            // A write into the guard's own configuration is refused in
+            // monitor too, and recorded as refused.
+            let held_in_monitor = monitor
+                && would_block_under_policy
+                && innerwarden_agent_guard::threats::verdict_writes_guard_config(
+                    &command, &verdict,
+                );
             record_shell(
                 buf,
                 rest,
                 &command,
                 &verdict,
-                monitor,
+                monitor && !held_in_monitor,
                 would_block_under_policy,
                 deciding_layer.clone(),
                 demo,
@@ -3303,8 +3501,11 @@ fn record_shell_now(
     // busy disk, and an end at the limit on the clock while it runs must not
     // take the alert with it. In monitor mode this is a would-block alert;
     // in enforce it accompanies the real block. Alerting must not change the
-    // hook outcome.
-    if would_block && !demo {
+    // hook outcome. A `review` that runs is handed on too: the channels'
+    // own filter sends it only to a person who opted in to hear reviews
+    // (`innerwarden notify --notify-review`), and that opt-in said nothing
+    // for every review that was not refused.
+    if !demo && (would_block || innerwarden_notify::recommendation_of(verdict) == "review") {
         notify_io::fire(command, verdict);
     }
     let source_session = hook_session(buf);
@@ -3391,7 +3592,11 @@ fn hook_posture(monitor: bool, block_review: bool) -> innerwarden_agent_guard::p
 /// The default posture's warning, written where `agent` shows a hook's
 /// words without refusing or asking: a `systemMessage` on stdout for Claude
 /// Code, Codex and Gemini CLI, Cursor's `allow` with the words, and stderr
-/// (exit 0) for every other agent. `true` when stdout was written.
+/// (exit 0) for every other agent. Hermes is one of those: its hook answers
+/// block, modify or approve (its approval gate, which asks), and none of
+/// them runs a call with words beside it, so the line is in its debug log
+/// only and the person sees it in the record and on the alert channels
+/// (docs/features.md says so). `true` when stdout was written.
 fn warn_agent(agent: Option<&str>, line: &str) -> bool {
     use innerwarden_agent_guard::cursor_hook;
     match agent {
@@ -3887,19 +4092,23 @@ fn file_screen_exit(
     match screen {
         FileScreen::Pass => None,
         FileScreen::Unreadable(why) => Some(hook_unreadable(buf, rest, why, monitor)),
-        FileScreen::Refused { explanation } => {
+        FileScreen::Refused {
+            explanation,
+            held_in_monitor,
+        } => {
             if demo {
                 println!(
                     "{}",
                     demo::hook_report(Some("deny"), true, Some(&explanation))
                 );
             }
-            if monitor {
+            if monitor && !held_in_monitor {
                 return Some(std::process::ExitCode::SUCCESS);
             }
+            HELD_IN_MONITOR.store(held_in_monitor, std::sync::atomic::Ordering::SeqCst);
             eprintln!("InnerWarden blocked this file change (recommendation=deny): {explanation}");
             eprintln!("{}", FILE_BLOCK_REMEDY);
-            Some(std::process::ExitCode::from(2))
+            Some(refusal_exit(rest, held_in_monitor))
         }
     }
 }
@@ -3910,8 +4119,12 @@ pub(crate) enum FileScreen {
     /// nothing was recorded.
     Pass,
     /// Refused (in enforce; recorded as `would_block` in monitor), with the
-    /// person's words for why.
-    Refused { explanation: String },
+    /// person's words for why. `held_in_monitor`: refused in monitor too (a
+    /// write into the guard's own configuration), and recorded as refused.
+    Refused {
+        explanation: String,
+        held_in_monitor: bool,
+    },
     /// A path of the call could not be read, so what it changes is not
     /// known. Refused in enforce, said in monitor, and not recorded, as
     /// every call the hook cannot read.
@@ -3977,6 +4190,11 @@ pub(crate) fn screen_file_writes(
     };
     let verdict = file_tools::refusal_verdict(tool, path, what);
     let command = format!("{tool} {}", path.trim());
+    let held_in_monitor = monitor
+        && judged
+            .iter()
+            .any(|(path, _)| file_tools::writes_own_guard_config(path, &context));
+    let recorded_as_monitor = monitor && !held_in_monitor;
     // A change to a privileged file is a hard rule: no profile has a word
     // about it. Where profiles are in force the record says which layer.
     let deciding_layer = match agent_profiles_io::load() {
@@ -3997,7 +4215,7 @@ pub(crate) fn screen_file_writes(
         graph_io::record_hook(
             &command,
             &verdict,
-            monitor,
+            recorded_as_monitor,
             true,
             payload_session.as_deref(),
             hook_event_id(buf).as_deref(),
@@ -4010,6 +4228,7 @@ pub(crate) fn screen_file_writes(
     });
     FileScreen::Refused {
         explanation: file_tools::refusal_explanation(tool, path, what),
+        held_in_monitor,
     }
 }
 
@@ -4079,7 +4298,10 @@ fn screen_instruction_orders(
         return FileScreen::Pass;
     }
     record_shell(buf, rest, &command, &verdict, monitor, true, None, demo);
-    FileScreen::Refused { explanation }
+    FileScreen::Refused {
+        explanation,
+        held_in_monitor: false,
+    }
 }
 
 /// A file change that is not to a privileged file: refused (outside monitor)
@@ -4134,7 +4356,10 @@ fn file_tool_revoked(
             demo,
         );
     });
-    FileScreen::Refused { explanation }
+    FileScreen::Refused {
+        explanation,
+        held_in_monitor: false,
+    }
 }
 
 /// A profiles file that cannot be used, in enforce: the call is refused, as a
@@ -7608,5 +7833,61 @@ mod phase_timing_tests {
             .map(|(name, ms)| (name.to_string(), ((ms * 100.0).round() / 100.0).into()))
             .collect();
         println!("PHASES {}", serde_json::Value::Object(json));
+    }
+}
+
+#[cfg(test)]
+mod too_long_call_tests {
+    use super::{written_path_key, TooLongCall};
+
+    /// The field each file tool writes to, by agent.
+    ///
+    /// FAILS ON REVERT to any path field: Hermes's `write_file` and
+    /// `NotebookEdit` name theirs apart.
+    #[test]
+    fn each_file_tool_writes_to_its_own_field() {
+        for (tool, agent, key) in [
+            ("Write", None, "file_path"),
+            ("Edit", None, "file_path"),
+            ("MultiEdit", Some("claude-code"), "file_path"),
+            ("NotebookEdit", None, "notebook_path"),
+            ("write_file", Some("gemini"), "file_path"),
+            ("replace", Some("gemini"), "file_path"),
+            ("write_file", Some("hermes"), "path"),
+        ] {
+            assert_eq!(written_path_key(tool, agent), key, "{tool} {agent:?}");
+        }
+    }
+
+    /// The head of a file tool call past the cap: the folder and every path
+    /// field whole in it are read, in order, a key named twice included; a
+    /// path in the content, or one cut short by the end of the head, is
+    /// not.
+    ///
+    /// FAILS ON REVERT of `cwd` and `paths` in `TooLongCall::read`: the
+    /// folder is lost and only the first path is kept.
+    #[test]
+    fn the_head_of_a_long_file_write_gives_its_folder_and_every_path() {
+        let head = br#"{"session_id":"s","cwd":"/home/u/proj","hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":"src/a.rs","path":"/home/u/.ssh/authorized_keys","file_path":"b.rs","content":"\"file_path\":\"/etc/passwd\" and more"#;
+        let call = TooLongCall::read(head);
+        assert_eq!(call.cwd.as_deref(), Some("/home/u/proj"));
+        assert_eq!(call.tool.as_deref(), Some("Write"));
+        assert_eq!(call.path.as_deref(), Some("src/a.rs"));
+        assert_eq!(
+            call.paths,
+            [
+                ("file_path", "src/a.rs"),
+                ("path", "/home/u/.ssh/authorized_keys"),
+                ("file_path", "b.rs"),
+            ]
+            .map(|(key, path)| (key.to_string(), path.to_string()))
+        );
+
+        // The content before the path: no path is read.
+        let late = br#"{"tool_name":"Write","tool_input":{"content":"abc"#;
+        assert!(TooLongCall::read(late).paths.is_empty());
+        // A path cut short by the end of the head is not read either.
+        let cut = br#"{"tool_name":"Write","tool_input":{"file_path":"/home/u/.ss"#;
+        assert!(TooLongCall::read(cut).paths.is_empty());
     }
 }

@@ -207,6 +207,13 @@ fn millis(duration: Duration) -> u64 {
 pub fn arm(monitor: bool) -> Result<(), &'static str> {
     let named = std::env::var(DEADLINE_ENV).ok();
     #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var(TEST_AFTER_ANSWER_ENV)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+    {
+        AFTER_ANSWER_MS.store(ms, Ordering::SeqCst);
+    }
+    #[cfg(debug_assertions)]
     if named.is_none() {
         let raised = std::env::var(TEST_DEADLINE_ENV).ok();
         if let Some(deadline) = test_deadline_from(raised.as_deref()) {
@@ -282,7 +289,19 @@ pub fn after_answer(work: impl FnOnce() + Send + 'static) {
 /// [`after_answer`] kept runs, still under [`WALL_CAP`]; past it, and on a
 /// fault or a panic, the hook ends with `code` and not with a refusal.
 pub fn answered(code: u8) {
+    #[cfg(debug_assertions)]
+    if let Some((armed, queue)) = ARMED.get() {
+        let _ = ANSWERED_AT.set((armed.elapsed(), queue.since_armed()));
+    }
     ANSWER.store(u16::from(code), Ordering::SeqCst);
+    // The watchdog may sleep until the limit on the clock: past the answer
+    // a test's limit (`TEST_AFTER_ANSWER_ENV`) may come first.
+    #[cfg(debug_assertions)]
+    if AFTER_ANSWER_MS.load(Ordering::SeqCst) != 0 {
+        if let Some(watchdog) = WATCHDOG.get() {
+            watchdog.unpark();
+        }
+    }
     let take = |queue: &std::sync::Mutex<Vec<Deferred>>| {
         queue
             .lock()
@@ -345,6 +364,64 @@ const AFTER_ANSWER_FAULT: &str =
 /// cost a call its answer. A release build does not read it.
 #[cfg(debug_assertions)]
 pub const TEST_RECORD_DELAY_ENV: &str = "IW_TEST_HOOK_RECORD_DELAY_MS";
+
+/// Ends the hook this many milliseconds of its own work after it has
+/// answered, in a DEBUG build only: the limit on what runs after the answer
+/// (the record, the alert, the session store), for the tests of a cut there.
+/// Counted from the answer, and as the deadline counts (time spent waiting
+/// for a CPU left out), so the screening before the answer and a loaded
+/// runner do not move where the cut falls; a test that lowered the deadline
+/// to get a cut there lowered the limit on the clock with it, and on a loaded
+/// runner the cut came before the refusal's line went out, or before the
+/// answer (2026-11-25). The limit on the clock still holds. A release build
+/// does not read it.
+#[cfg(debug_assertions)]
+pub const TEST_AFTER_ANSWER_ENV: &str = "IW_TEST_HOOK_AFTER_ANSWER_MS";
+
+/// [`TEST_AFTER_ANSWER_ENV`] in milliseconds, zero where it is not set.
+#[cfg(debug_assertions)]
+static AFTER_ANSWER_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Where the hook stood when it answered: the clock since [`arm`] and the
+/// time the screening thread had waited for a CPU, in milliseconds. Read
+/// against [`AFTER_ANSWER_MS`].
+#[cfg(debug_assertions)]
+static ANSWERED_AT: std::sync::OnceLock<(Duration, Duration)> = std::sync::OnceLock::new();
+
+/// PURE: what is left of `budget` after the answer, or `None` once it is
+/// spent: the hook's work since the answer is the clock since it, `wall`
+/// less `at`'s, less the wait for a CPU since it.
+#[cfg(debug_assertions)]
+fn after_answer_left(
+    wall: Duration,
+    queued: Duration,
+    at: (Duration, Duration),
+    budget: Duration,
+) -> Option<Duration> {
+    let worked = wall
+        .saturating_sub(at.0)
+        .saturating_sub(queued.saturating_sub(at.1));
+    budget.checked_sub(worked).filter(|left| !left.is_zero())
+}
+
+/// Holds the write of the session store back, in milliseconds, in a DEBUG
+/// build only: the same busy disk, for the tests that prove a slow write of
+/// the store does not cost a call its answer. A release build does not read
+/// it.
+#[cfg(debug_assertions)]
+pub const TEST_SESSION_DELAY_ENV: &str = "IW_TEST_HOOK_SESSION_DELAY_MS";
+
+/// Debug builds: wait as long as [`TEST_SESSION_DELAY_ENV`] says, before
+/// the session store is written.
+#[cfg(debug_assertions)]
+pub fn test_session_delay() {
+    if let Some(ms) = std::env::var(TEST_SESSION_DELAY_ENV)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+}
 
 /// Debug builds: wait as long as [`TEST_RECORD_DELAY_ENV`] says, before the
 /// record is written. Nothing in a release build.
@@ -590,13 +667,20 @@ fn watch(armed: Instant, queue: &RunQueue) -> ! {
         let deadline = Duration::from_millis(DEADLINE_MS.load(Ordering::SeqCst));
         let cap = Duration::from_millis(WALL_MS.load(Ordering::SeqCst));
         let answer = answer();
-        match time_left(
-            armed.elapsed(),
-            queue.since_armed(),
-            deadline,
-            cap,
-            answer.is_some(),
-        ) {
+        let wall = armed.elapsed();
+        let queued = queue.since_armed();
+        let left = time_left(wall, queued, deadline, cap, answer.is_some());
+        #[cfg(debug_assertions)]
+        let left = match (answer, ANSWERED_AT.get()) {
+            (Some(_), Some(&at)) if AFTER_ANSWER_MS.load(Ordering::SeqCst) != 0 => {
+                let budget = Duration::from_millis(AFTER_ANSWER_MS.load(Ordering::SeqCst));
+                left.and_then(|left| {
+                    after_answer_left(wall, queued, at, budget).map(|after| after.min(left))
+                })
+            }
+            _ => left,
+        };
+        match left {
             // Woken early by `waited`, which puts the limits back.
             Some(left) => std::thread::park_timeout(left.max(Duration::from_millis(1))),
             None => {
@@ -759,6 +843,33 @@ mod fault {
 
 #[cfg(test)]
 mod tests {
+    /// The test limit after the answer counts the hook's own work since the
+    /// answer: the screening before it and a wait for a CPU after it move
+    /// nothing.
+    ///
+    /// FAILS ON REVERT of counting from the answer (from `arm`), or of
+    /// leaving out the wait for a CPU.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_test_limit_after_the_answer_counts_work_since_the_answer() {
+        use super::after_answer_left;
+        let ms = std::time::Duration::from_millis;
+        let budget = ms(1500);
+        // Answered 9 s in (most of it queued); 1 s of work since: 500 ms left.
+        let at = (ms(9_000), ms(7_000));
+        assert_eq!(
+            after_answer_left(ms(10_000), ms(7_000), at, budget),
+            Some(ms(500))
+        );
+        // 3 s on the clock since the answer, 2.5 s of it queued: 1 s left.
+        assert_eq!(
+            after_answer_left(ms(12_000), ms(9_500), at, budget),
+            Some(ms(1_000))
+        );
+        // 1.5 s of work since the answer: spent.
+        assert_eq!(after_answer_left(ms(10_500), ms(7_000), at, budget), None);
+    }
+
     use super::*;
     use std::process::{Command, Stdio};
 

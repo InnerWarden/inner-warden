@@ -1592,9 +1592,13 @@ fn recording_recovers_on_a_graph_that_is_already_over_the_old_limit() {
     );
 
     // And the outage state must be clear, so no surface claims a live failure.
+    let health: Value = std::fs::read_to_string(dir.path().join("record-health.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
     assert!(
-        !dir.path().join("record-health.json").exists(),
-        "a successful write must clear the outage marker"
+        health["code"].is_null(),
+        "a successful write must clear the outage marker: {health}"
     );
 }
 
@@ -1648,7 +1652,16 @@ fn a_recording_failure_is_stated_by_the_cli_not_only_on_a_hook_stderr() {
     // Restore permissions so the temp dir can be cleaned up.
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-    // And once writing works again, the CLI stops claiming an outage.
+    // And once a write works again, the CLI stops claiming an outage. The
+    // episode is kept outside the folder while it cannot be written
+    // (`record_health::fallback_path`), so it ends with the next record, as
+    // the outage line says ("after the next command").
+    let next = cli()
+        .args(["check", "echo hello"])
+        .env("IW_GRAPH_FILE", &graph)
+        .output()
+        .expect("run check once the store is writable");
+    assert!(next.status.success());
     let healthy = cli()
         .args(["graph", "--stats"])
         .env("IW_GRAPH_FILE", &graph)

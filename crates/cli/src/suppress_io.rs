@@ -68,10 +68,59 @@ fn save(cfg: &SuppressConfig) -> Result<(), String> {
     }
     let before = load();
     std::fs::write(&path, cfg.to_toml()).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    for (action, pattern) in suppression_delta(&before, cfg) {
-        crate::graph_io::record_suppression_change(action, &pattern, counts(cfg));
+    let delta = suppression_delta(&before, cfg);
+    for (action, pattern) in &delta {
+        crate::graph_io::record_suppression_change(action, pattern, counts(cfg));
+    }
+    // A line in the record is read by whoever looks; the channels are how a
+    // person hears that the guard now lets more through. Told once per
+    // command, with every change in it, as a switch of mode is.
+    if !delta.is_empty() {
+        crate::notify_io::fire_text(&suppression_change_text(&delta, in_agent_shell()));
     }
     Ok(())
+}
+
+/// The longest a pattern is quoted in an alert, in characters.
+const ALERT_PATTERN_CHARS: usize = 120;
+
+/// PURE. What the configured channels are told about one `allow` or `mute`:
+/// each change, its pattern redacted as the record keeps it, and whether an
+/// AI agent's shell ran it.
+pub(crate) fn suppression_change_text(
+    delta: &[(&'static str, String)],
+    from_agent_shell: bool,
+) -> String {
+    let changes: Vec<String> = delta
+        .iter()
+        .map(|(action, pattern)| {
+            let safe = innerwarden_agent_guard::redact::redact_secrets(pattern).text;
+            let quoted = if safe.chars().count() > ALERT_PATTERN_CHARS {
+                let cut: String = safe.chars().take(ALERT_PATTERN_CHARS).collect();
+                format!("{cut}...")
+            } else {
+                safe
+            };
+            let what = match *action {
+                "allow_added" => "`innerwarden allow` let through",
+                "allow_removed" => "`innerwarden allow --remove` took back",
+                "mute_rule_added" => "`innerwarden mute` muted the rule",
+                "mute_category_added" => "`innerwarden mute` muted the category",
+                "mute_rule_removed" => "`innerwarden mute --remove` unmuted the rule",
+                _ => "`innerwarden mute --remove` unmuted the category",
+            };
+            format!("{what} \"{quoted}\"")
+        })
+        .collect();
+    let who = if from_agent_shell {
+        " It was run inside an AI agent's shell."
+    } else {
+        ""
+    };
+    format!(
+        "InnerWarden: what the guard lets through changed on this machine. {}.{who} If this was not you, run `innerwarden allow --list` and `innerwarden mute --list`.",
+        changes.join("; ")
+    )
 }
 
 fn counts(cfg: &SuppressConfig) -> (usize, usize, usize) {
@@ -381,6 +430,41 @@ mod tests {
             mute_rules: rules.iter().map(|s| s.to_string()).collect(),
             mute_categories: cats.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    /// The alert names every change, redacts a key on the pattern, cuts a
+    /// long one, and says when an AI agent's shell ran the command.
+    #[test]
+    fn the_alert_says_what_changed_and_who_ran_it() {
+        let text = suppression_change_text(
+            &[
+                ("allow_added", "curl --password=hunter2secret *".to_string()),
+                ("mute_rule_added", "ATR-2026-00001".to_string()),
+                ("mute_category_removed", "exfiltration".to_string()),
+            ],
+            false,
+        );
+        assert!(
+            text.contains("`innerwarden allow` let through \"curl"),
+            "{text}"
+        );
+        assert!(!text.contains("hunter2secret"), "{text}");
+        assert!(text.contains("muted the rule \"ATR-2026-00001\""), "{text}");
+        assert!(
+            text.contains("unmuted the category \"exfiltration\""),
+            "{text}"
+        );
+        assert!(!text.contains("AI agent's shell"), "{text}");
+        let long = "x".repeat(400);
+        let text = suppression_change_text(&[("allow_added", long)], true);
+        assert!(
+            text.contains(&format!("\"{}...\"", "x".repeat(ALERT_PATTERN_CHARS))),
+            "{text}"
+        );
+        assert!(
+            text.contains("It was run inside an AI agent's shell."),
+            "{text}"
+        );
     }
 
     /// Turning a guard off is a security event. This is the one the guard used to

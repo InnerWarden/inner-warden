@@ -664,16 +664,24 @@ than letting it run unscreened. To stop this, put the innerwarden program back, 
 innerwarden hook from the agent settings by hand (~/.claude/settings.json, ~/.codex/hooks.json \
 or ~/.gemini/settings.json).\" >&2; exit 2";
 
-/// PURE: a hook line with a fail-closed tail an earlier version wrote
-/// ([`FAIL_CLOSED_TAIL_1615`]) given today's, and any other line as it is.
-/// Two lines that differ only there run the guard the same way.
+/// PURE: a hook line with a tail an earlier version wrote
+/// ([`FAIL_CLOSED_TAIL_1615`], [`FAIL_OPEN_TAIL_1615`]) given today's, and any
+/// other line as it is. Two fail-closed lines that differ only there run the
+/// guard the same way; the old fail-open line is still a monitor line of ours,
+/// read as on, and `agents connect` replaces it with today's, which passes on
+/// the refusal monitor keeps ([`MONITOR_HELD_EXIT`]).
 pub fn with_current_tail(command: &str) -> std::borrow::Cow<'_, str> {
-    match command.find(FAIL_CLOSED_TAIL_1615) {
-        Some(at) if command[at + FAIL_CLOSED_TAIL_1615.len()..].starts_with('\'') => {
-            std::borrow::Cow::Owned(command.replacen(FAIL_CLOSED_TAIL_1615, FAIL_CLOSED_TAIL, 1))
+    for (old, today) in [
+        (FAIL_CLOSED_TAIL_1615, FAIL_CLOSED_TAIL),
+        (FAIL_OPEN_TAIL_1615, FAIL_OPEN_TAIL),
+    ] {
+        if let Some(at) = command.find(old) {
+            if command[at + old.len()..].starts_with('\'') {
+                return std::borrow::Cow::Owned(command.replacen(old, today, 1));
+            }
         }
-        _ => std::borrow::Cow::Borrowed(command),
     }
+    std::borrow::Cow::Borrowed(command)
 }
 
 /// What the Gemini monitor line runs after the guard ([`FAIL_CLOSED_TAIL`]
@@ -682,9 +690,31 @@ pub fn with_current_tail(command: &str) -> std::borrow::Cow<'_, str> {
 /// monitor line whose program is gone (127), cannot start (126) or is killed
 /// held every call up: a mode that never refuses refused everything. 1 is
 /// Gemini's "warn, run the tool". No `'` and no `\`, as in the other tail.
-const FAIL_OPEN_TAIL: &str = "; s=$?; case $s in 0) exit 0;; esac; echo \"InnerWarden \
+///
+/// One end is passed on as a refusal: [`MONITOR_HELD_EXIT`], which the guard
+/// ends with only when monitor refuses a call all the same (a write into the
+/// guard's own configuration, refused in every mode and for every agent). It
+/// becomes 2, Gemini's refusal with the reason on stderr. Any other end that
+/// is not 0, a usage error's 2 included, still lets the call run.
+pub(crate) const FAIL_OPEN_TAIL: &str =
+    "; s=$?; case $s in 0) exit 0;; 3) exit 2;; esac; echo \"InnerWarden \
 hook: the innerwarden program ended without an answer (exit $s); this tool call was NOT \
 screened (monitor mode never blocks).\" >&2; exit 1";
+
+/// [`FAIL_OPEN_TAIL`] as 1.6.15 wrote it, before it passed on the refusal of
+/// a write into the guard's own configuration: that refusal became 1, and
+/// Gemini ran the call. A line that ends with it is still ours, to read,
+/// repair and take out, and `agents connect` writes today's in its place.
+pub(crate) const FAIL_OPEN_TAIL_1615: &str =
+    "; s=$?; case $s in 0) exit 0;; esac; echo \"InnerWarden \
+hook: the innerwarden program ended without an answer (exit $s); this tool call was NOT \
+screened (monitor mode never blocks).\" >&2; exit 1";
+
+/// The exit of a monitor run that refused all the same, on the Gemini line
+/// ([`FAIL_OPEN_TAIL`] turns it into 2). Never an end the shell, a signal or
+/// a usage error gives: 2 is clap's, 126 and 127 the shell's, 128 and up a
+/// signal's, 101 a panic's.
+pub const MONITOR_HELD_EXIT: u8 = 3;
 
 /// The agent whose monitor line is the fail-open script: the one agent that
 /// refuses a call on an exit a plain monitor line can end with.
@@ -1188,7 +1218,12 @@ fn guard_words(command: &str) -> Option<(Vec<String>, LineShape)> {
         .or_else(|| guard.strip_suffix(JSON_FAIL_CLOSED_TAIL))
     {
         Some(guard) => (guard, LineShape::FailClosed),
-        None => (guard.strip_suffix(FAIL_OPEN_TAIL)?, LineShape::FailOpen),
+        None => (
+            guard
+                .strip_suffix(FAIL_OPEN_TAIL)
+                .or_else(|| guard.strip_suffix(FAIL_OPEN_TAIL_1615))?,
+            LineShape::FailOpen,
+        ),
     };
     if !guard.starts_with(' ') {
         return None;
@@ -4522,6 +4557,49 @@ mod tests {
         let (code, stderr) = run_line(&monitor(&answers), "{}");
         assert_eq!(code, Some(0), "{stderr}");
         assert!(stderr.is_empty(), "{stderr}");
+    }
+
+    /// Gemini's monitor line passes on the one refusal monitor keeps (a write
+    /// into the guard's own configuration, [`MONITOR_HELD_EXIT`]) as 2, which
+    /// Gemini reads as a refusal; any other end but 0, a usage error's 2
+    /// included, is still 1. The line 1.6.15 wrote, which turned that refusal
+    /// into 1, is still read as ours, in monitor mode, and is today's line to
+    /// the judge, so `agents connect` replaces it where it sits.
+    ///
+    /// FAILS ON REVERT of the `3) exit 2;;` arm in `FAIL_OPEN_TAIL`: the held
+    /// refusal ends with 1 and Gemini runs the call; or of
+    /// `FAIL_OPEN_TAIL_1615` in `guard_words`: the old line is no longer ours.
+    #[cfg(unix)]
+    #[test]
+    fn geminis_monitor_line_passes_on_the_refusal_monitor_keeps() {
+        let dir = tempfile::tempdir().unwrap();
+        let monitor = |guard: &Path| hook_command_shaped(guard, false, true, Some("gemini"), true);
+        let held = stand_in(
+            dir.path(),
+            &format!("cat >/dev/null; echo held >&2; exit {MONITOR_HELD_EXIT}"),
+        );
+        let (code, stderr) = run_line(&monitor(&held), "{}");
+        assert_eq!(code, Some(2), "{stderr}");
+        assert!(stderr.contains("held"), "{stderr}");
+        assert!(!stderr.contains("NOT screened"), "{stderr}");
+        let usage = stand_in(dir.path(), "cat >/dev/null; exit 2");
+        let (code, stderr) = run_line(&monitor(&usage), "{}");
+        assert_eq!(code, Some(1), "{stderr}");
+
+        let today = monitor(Path::new(GUARD));
+        let old = today.replacen(FAIL_OPEN_TAIL, FAIL_OPEN_TAIL_1615, 1);
+        assert_ne!(old, today);
+        let line = |command: &str| read_hook_line(&json!({"type": "command", "command": command}));
+        let read = line(&old).expect("the 1.6.15 monitor line is ours");
+        assert!(read.monitor && read.fail_open);
+        assert_eq!(Some(read), line(&today));
+        assert_eq!(with_current_tail(&old), today);
+        // Run as it was, the old line let the held refusal through.
+        let (code, _) = run_line(
+            &monitor(&held).replacen(FAIL_OPEN_TAIL, FAIL_OPEN_TAIL_1615, 1),
+            "{}",
+        );
+        assert_eq!(code, Some(1));
     }
 
     /// Whether Claude Code's settings still run this binary, read apart:

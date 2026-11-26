@@ -55,7 +55,6 @@ fn a_mention_of_the_guard_is_held_for_review_not_refused() {
         // A folder of a repository or a worktree.
         "git worktree remove ../innerwarden",
         "git worktree remove --force /home/u/src/innerwarden-fix",
-        "mv ~/work/innerwarden/scripts/kill-cases.json ~/work/innerwarden/scripts/k.json",
         // A string in code that acts on nothing of the guard's.
         "python3 - <<'EOF'\np = 'src/rules.rs'\ns = open(p).read()\ns = s.replace('systemctl stop innerwarden-agent', 'innerwarden status')\nopen(p, 'w').write(s)\nEOF",
         "python3 -c \"import json; d = json.load(open('report.json')); print(d['innerwarden']['mode'])\"",
@@ -73,6 +72,12 @@ fn a_mention_of_the_guard_is_held_for_review_not_refused() {
         let (recommendation, _, why) = verdict(&case.input);
         assert_eq!(recommendation, "review", "{}: {why}", case.id);
     }
+    // A file whose name holds `kill` (`kill-cases.json`) is moved: no stop
+    // or kill verb stands as a word of its own, so nothing is refused and
+    // there is no mention to hold.
+    let (recommendation, _, why) =
+        verdict("mv ~/work/innerwarden/scripts/kill-cases.json ~/work/innerwarden/scripts/k.json");
+    assert_eq!(recommendation, "allow", "{why}");
 }
 
 /// The actions beside and inside those slots stay refused: a message or a

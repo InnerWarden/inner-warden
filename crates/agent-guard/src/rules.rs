@@ -658,6 +658,32 @@ impl std::fmt::Display for RuleLoadFailure {
     }
 }
 
+/// A YAML file in a rules folder that is not an ATR rule (a Sigma rule, any
+/// other YAML): not read as one, and so never a broken rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredRuleFile {
+    pub path: std::path::PathBuf,
+    /// Why the file is not read as an ATR rule.
+    pub reason: String,
+}
+
+impl std::fmt::Display for IgnoredRuleFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.path.display(), self.reason)
+    }
+}
+
+/// What one YAML file of a rules folder gave.
+enum RuleFile {
+    /// A rule the engine runs.
+    Rule(Box<CompiledRule>),
+    /// An ATR rule the engine does not run: not pattern tier, or without a
+    /// regex condition.
+    NotRun,
+    /// Not an ATR rule; the reason why.
+    Foreign(String),
+}
+
 /// A pattern of a rule read from disk that neither regex engine accepts.
 #[derive(Debug)]
 struct PatternError {
@@ -685,16 +711,20 @@ pub struct RuleEngine {
     /// without a rule its operator wrote lets through what that rule
     /// refuses, and a warning in a log said nothing to whoever ran the call.
     broken: Vec<RuleLoadFailure>,
+    /// YAML files read from disk that are not ATR rules ([`IgnoredRuleFile`]).
+    ignored: Vec<IgnoredRuleFile>,
 }
 
 impl RuleEngine {
     /// Load ATR YAML rules from a directory (recursively reads `*.yaml`).
     /// A file that fails to read, parse or compile is not loaded and is kept
     /// in [`Self::load_failures`]; while there is one, every check refuses
-    /// (see [`BROKEN_RULES_ID`]).
+    /// (see [`BROKEN_RULES_ID`]). A YAML file that is not an ATR rule is
+    /// left out with a warning and kept in [`Self::ignored_files`].
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
         let mut rules = Vec::new();
         let mut broken = Vec::new();
+        let mut ignored = Vec::new();
 
         if !dir.exists() {
             warn!(path = %dir.display(), "ATR rules directory not found, starting with 0 rules");
@@ -704,8 +734,9 @@ impl RuleEngine {
         let yaml_files = collect_yaml_files(dir)?;
         for path in &yaml_files {
             match load_rule_file(path) {
-                Ok(Some(rule)) => rules.push(rule),
-                Ok(None) => {} // skipped (not pattern tier)
+                Ok(RuleFile::Rule(rule)) => rules.push(*rule),
+                Ok(RuleFile::NotRun) => {} // skipped (not pattern tier)
+                Ok(RuleFile::Foreign(reason)) => ignored.push(ignore_file(path, reason)),
                 Err(failure) => {
                     warn!(failure = %failure, "failed to load ATR rule; every check refuses until it is fixed or removed");
                     broken.push(failure);
@@ -714,7 +745,11 @@ impl RuleEngine {
         }
 
         tracing::info!(rules = rules.len(), dir = %dir.display(), "ATR rule engine loaded");
-        Ok(Self { rules, broken })
+        Ok(Self {
+            rules,
+            broken,
+            ignored,
+        })
     }
 
     /// Load only the embedded rules that could ever fire for `source`.
@@ -808,19 +843,28 @@ impl RuleEngine {
         // `~/.local`. Nothing said a word, because the log only counted files.
         let mut shadowed: Vec<String> = Vec::new();
         let mut broken: Vec<RuleLoadFailure> = Vec::new();
+        // The folder is shared: `/etc/innerwarden/rules` also holds the Sigma
+        // rules and other YAML of the host's own engines. A valid Sigma rule
+        // whose shape the ATR reader refuses (a `condition` list, several
+        // documents, `references` as maps) was a "broken rule" here, and every
+        // call of every agent was refused for it.
+        let mut ignored: Vec<IgnoredRuleFile> = Vec::new();
         if override_dir.exists() {
             match collect_yaml_files(override_dir) {
                 Ok(files) => {
                     for path in &files {
                         match load_rule_file(path) {
-                            Ok(Some(rule)) => {
+                            Ok(RuleFile::Rule(rule)) => {
                                 if by_id.contains_key(&rule.id) {
                                     shadowed.push(rule.id.clone());
                                 }
-                                by_id.insert(rule.id.clone(), rule);
+                                by_id.insert(rule.id.clone(), *rule);
                                 overlaid += 1;
                             }
-                            Ok(None) => {}
+                            Ok(RuleFile::NotRun) => {}
+                            Ok(RuleFile::Foreign(reason)) => {
+                                ignored.push(ignore_file(path, reason));
+                            }
                             Err(failure) => {
                                 warn!(failure = %failure, "failed to load overlay ATR rule; every check refuses until it is fixed or removed");
                                 broken.push(failure);
@@ -844,6 +888,7 @@ impl RuleEngine {
             total = rules.len(),
             embedded = embedded_count,
             overlay_files = overlaid,
+            ignored_files = ignored.len(),
             overrides = shadowed.len(),
             dir = %override_dir.display(),
             "ATR rule engine loaded (embedded + overlay)"
@@ -861,13 +906,28 @@ impl RuleEngine {
                  shipped detection is not the one running"
             );
         }
-        (Self { rules, broken }, shadowed)
+        (
+            Self {
+                rules,
+                broken,
+                ignored,
+            },
+            shadowed,
+        )
     }
 
     /// The rule files read from disk that did not load. Empty for an engine
     /// of the embedded corpus alone.
     pub fn load_failures(&self) -> &[RuleLoadFailure] {
         &self.broken
+    }
+
+    /// The YAML files read from disk that are not ATR rules (a Sigma rule,
+    /// any other YAML), each with why. Left out of the engine with a
+    /// warning; never a refusal. Empty for an engine of the embedded corpus
+    /// alone.
+    pub fn ignored_files(&self) -> &[IgnoredRuleFile] {
+        &self.ignored
     }
 
     /// Create an empty rule engine (no rules loaded).
@@ -879,6 +939,7 @@ impl RuleEngine {
         Self {
             rules,
             broken: Vec::new(),
+            ignored: Vec::new(),
         }
     }
 
@@ -1303,14 +1364,19 @@ fn parse_field(raw: &str) -> AtrField {
 }
 
 /// Load one rule file from disk. A failure names the file and, for a YAML
-/// error or a pattern that does not compile, the line.
-fn load_rule_file(path: &Path) -> Result<Option<CompiledRule>, RuleLoadFailure> {
+/// error or a pattern that does not compile, the line. A file that is not
+/// an ATR rule ([`not_an_atr_rule`]) is [`RuleFile::Foreign`], never a
+/// failure.
+fn load_rule_file(path: &Path) -> Result<RuleFile, RuleLoadFailure> {
     let failure = |line: Option<usize>, error: String| RuleLoadFailure {
         path: path.to_path_buf(),
         line,
         error,
     };
     let content = std::fs::read_to_string(path).map_err(|e| failure(None, e.to_string()))?;
+    if let Some(reason) = not_an_atr_rule(&content) {
+        return Ok(RuleFile::Foreign(reason));
+    }
     let mut failed = Vec::new();
     let rule = load_rule_str_reporting(&content, &mut failed).map_err(|e| match e
         .downcast_ref::<serde_yaml::Error>()
@@ -1323,8 +1389,67 @@ fn load_rule_file(path: &Path) -> Result<Option<CompiledRule>, RuleLoadFailure> 
             pattern_line(&content, &pattern.pattern),
             pattern.to_string(),
         )),
-        None => Ok(rule),
+        None => Ok(rule.map_or(RuleFile::NotRun, |rule| RuleFile::Rule(Box::new(rule)))),
     }
+}
+
+/// The ignored file, said in a warning that names it and why.
+fn ignore_file(path: &Path, reason: String) -> IgnoredRuleFile {
+    let file = IgnoredRuleFile {
+        path: path.to_path_buf(),
+        reason,
+    };
+    warn!(file = %file, "not an ATR rule, ignored by the ATR engine");
+    file
+}
+
+/// Why `content` is not an ATR rule, or `None` when it is read as one.
+///
+/// A document is an ATR rule when it holds a field only that format has:
+/// `detection_tier`, `agent_source`, or an `id` starting `ATR-` (every
+/// shipped rule has all three). A file without any never ran as a rule (the
+/// engine runs `detection_tier: pattern` only), so leaving it out drops no
+/// detection: what changes is that a file of another format whose shape the
+/// ATR reader refuses is no longer a broken rule refusing every call.
+///
+/// Read as a rule, so a broken one still refuses: a text that is not YAML,
+/// and a file with an ATR document among several.
+fn not_an_atr_rule(content: &str) -> Option<String> {
+    use serde::Deserialize;
+
+    let mut documents = Vec::new();
+    for document in serde_yaml::Deserializer::from_str(content) {
+        let value = serde_yaml::Value::deserialize(document).ok()?;
+        if !value.is_null() {
+            documents.push(value);
+        }
+    }
+    if documents.iter().any(is_atr_document) {
+        return None;
+    }
+    let what = if documents
+        .iter()
+        .any(|document| document.get("logsource").is_some())
+    {
+        "a Sigma rule (it has `logsource`)"
+    } else {
+        "no field of an ATR rule (`detection_tier`, `agent_source`, an `ATR-` id)"
+    };
+    Some(match documents.len() {
+        0 => "no YAML document in it".to_string(),
+        1 => format!("{what}, not an ATR rule"),
+        n => format!("{n} YAML documents, {what}, not an ATR rule"),
+    })
+}
+
+/// Whether a YAML document holds a field only an ATR rule has.
+fn is_atr_document(document: &serde_yaml::Value) -> bool {
+    document.get("detection_tier").is_some()
+        || document.get("agent_source").is_some()
+        || document
+            .get("id")
+            .and_then(serde_yaml::Value::as_str)
+            .is_some_and(|id| id.trim().to_ascii_uppercase().starts_with("ATR-"))
 }
 
 /// The 1-based line of `content` that holds `pattern`, as written plain,

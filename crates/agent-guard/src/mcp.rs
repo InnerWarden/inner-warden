@@ -3946,7 +3946,21 @@ fn analyze_command_at(
     depth: u8,
 ) -> CommandAnalysis {
     let analysis = analyze_command_as_sent(command, rule_engine, protected_reads, context, depth);
+    let analysis = if depth == 0 {
+        cat_notes_as_text(command, analysis, |blanked| {
+            analyze_command_as_sent(blanked, rule_engine, protected_reads, context, depth)
+        })
+    } else {
+        analysis
+    };
     if depth != 0 || analysis.recommendation != "deny" {
+        return analysis;
+    }
+    // A file of the guard reached from the folder the line runs in is an
+    // action on it, never a mention.
+    if context.is_some_and(|place| {
+        threats::guard_file_reached_in_place(command, &place.cwd, place.home.as_deref()).is_some()
+    }) {
         return analysis;
     }
     mention_only(
@@ -3955,6 +3969,50 @@ fn analyze_command_at(
         analysis,
         |masked| analyze_command_as_sent(masked, rule_engine, protected_reads, context, depth),
     )
+}
+
+/// A here-document that `cat` only writes out as notes is text: what it
+/// says of a settings file, a guard command or code is not the line taking
+/// the guard down ([`crate::shell::text_written_by_cat_blanked`]). The line
+/// is judged again with that text blanked; the reading is taken only when
+/// all it drops is the refusal for taking the guard down
+/// (`guard_self_disable`) and it finds nothing the line as written did
+/// not: any other finding of the text (a secret written into the notes)
+/// stands.
+fn cat_notes_as_text(
+    command: &str,
+    analysis: CommandAnalysis,
+    judge: impl Fn(&str) -> CommandAnalysis,
+) -> CommandAnalysis {
+    if !analysis
+        .signals
+        .iter()
+        .any(|signal| signal.signal == "guard_self_disable" && signal.score > 0)
+    {
+        return analysis;
+    }
+    let Some(blanked) = crate::shell::text_written_by_cat_blanked(command) else {
+        return analysis;
+    };
+    let mut lowered = judge(&blanked);
+    let charged = |of: &CommandAnalysis| -> Vec<String> {
+        of.signals
+            .iter()
+            .filter(|signal| signal.score > 0)
+            .map(|signal| signal.signal.clone())
+            .collect()
+    };
+    let before = charged(&analysis);
+    let after = charged(&lowered);
+    let drops_only_takedown = before
+        .iter()
+        .all(|signal| signal == "guard_self_disable" || after.contains(signal));
+    let adds_nothing = after.iter().all(|signal| before.contains(signal));
+    if !drops_only_takedown || !adds_nothing || after.iter().any(|s| s == "guard_self_disable") {
+        return analysis;
+    }
+    lowered.command = analysis.command;
+    lowered
 }
 
 /// A line the guard refuses ONLY for the words it watches, where those
@@ -4133,6 +4191,142 @@ fn instruction_order(
     })
 }
 
+/// The most files an instruction text's `@` imports are followed for, and
+/// how much of each is read.
+const MAX_IMPORTS: usize = 8;
+const MAX_IMPORT_BYTES: u64 = 64 * 1024;
+
+/// Folders anyone on the host can write: an import from one says what
+/// another account puts there later.
+const SHARED_FOLDERS: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/"];
+
+/// The `@path` imports of an instruction text (Claude Code reads the file
+/// `@~/x.md`, `@/abs/x.md` or `@docs/x.md` names as part of the text):
+/// a `@` at the start of a word, outside backquotes, then a path with a
+/// `/` or a `.` in it. `@maintainer` and `a@b.com` import nothing.
+fn instruction_imports(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut in_code = false;
+        let mut before = ' ';
+        let chars: Vec<char> = line.chars().collect();
+        let mut at = 0;
+        while at < chars.len() {
+            let c = chars[at];
+            if c == '\x60' {
+                in_code = !in_code;
+            } else if c == '@' && !in_code && before.is_whitespace() {
+                let path: String = chars[at + 1..]
+                    .iter()
+                    .take_while(|c| {
+                        !c.is_whitespace() && !matches!(c, '\x60' | '"' | '\'' | ')' | ']' | ',')
+                    })
+                    .collect();
+                let path = path.trim_end_matches(['.', ':', ';']).to_string();
+                if path.contains(['/', '.']) && !path.starts_with('@') {
+                    found.push(path);
+                    if found.len() >= MAX_IMPORTS {
+                        return found;
+                    }
+                }
+            }
+            before = c;
+            at += 1;
+        }
+    }
+    found
+}
+
+/// Why the files `text` imports (`@path`, [`instruction_imports`]) make it
+/// an order, written into the instruction file `file`: an imported file
+/// that holds one is read as part of the text, with the score its order
+/// takes. An import from outside the instruction file's folder of a file in
+/// a folder anyone can write, or of one that is not there yet, says what
+/// someone puts there later: held for review ([`INSTRUCTION_ORDER_UNREAD_SCORE`]). A
+/// file inside the folder that is not there is a name, nothing more.
+fn imported_instruction_order(
+    file: &str,
+    text: &str,
+    rule_engine: Option<&RuleEngine>,
+    depth: u8,
+) -> Option<(String, u32)> {
+    let file = file.trim().trim_matches(['"', '\'']);
+    let folder = std::path::Path::new(file)
+        .parent()
+        .filter(|folder| folder.is_absolute());
+    let mut held: Option<(String, u32)> = None;
+    for import in instruction_imports(text) {
+        let (path, outside) = if let Some(rest) = import.strip_prefix("~/") {
+            let Ok(home) = crate::hook::home_dir() else {
+                held.get_or_insert((
+                    format!("imports `{import}` from a home the guard cannot tell"),
+                    INSTRUCTION_ORDER_UNREAD_SCORE,
+                ));
+                continue;
+            };
+            (home.join(rest), true)
+        } else if import.starts_with('/') {
+            let path = std::path::PathBuf::from(&import);
+            let outside = folder.is_none_or(|folder| !path.starts_with(folder));
+            (path, outside)
+        } else {
+            let Some(folder) = folder else { continue };
+            (folder.join(&import), import.starts_with("../"))
+        };
+        let read = std::fs::File::open(&path).and_then(|opened| {
+            use std::io::Read;
+            let mut body = String::new();
+            opened.take(MAX_IMPORT_BYTES).read_to_string(&mut body)?;
+            Ok(body)
+        });
+        if let Ok(body) = &read {
+            if let Some((why, score)) = instruction_order(body, rule_engine, depth) {
+                return Some((
+                    format!("imports `{import}`, which holds an order: {why}"),
+                    score,
+                ));
+            }
+        }
+        let shown = path.display().to_string();
+        if outside
+            && SHARED_FOLDERS
+                .iter()
+                .any(|shared| shown.starts_with(shared))
+        {
+            held.get_or_insert((
+                format!(
+                    "imports `{import}`, a file in a folder anyone on the host can write, as \
+                     its instructions"
+                ),
+                INSTRUCTION_ORDER_UNREAD_SCORE,
+            ));
+            continue;
+        }
+        match read {
+            Ok(_) => {}
+            Err(_) if outside => {
+                held.get_or_insert((
+                    format!(
+                        "imports `{import}`, outside the instruction file's folder and not \
+                         there to read: what it will say is not known"
+                    ),
+                    INSTRUCTION_ORDER_UNREAD_SCORE,
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    held
+}
+
 /// Why `text`, written into `path` by an agent's own file tool (`Write`,
 /// `Edit`, `write_file`, `apply_patch`, ...), is an order to every later
 /// session, if `path` is a file an agent reads as its instructions and the
@@ -4150,7 +4344,8 @@ pub fn written_instruction_order(
     if text.trim().is_empty() || !crate::agent_instructions::is_instruction_file(path) {
         return None;
     }
-    let (why, score) = instruction_order(text, rule_engine, 0)?;
+    let (why, score) = instruction_order(text, rule_engine, 0)
+        .or_else(|| imported_instruction_order(path, text, rule_engine, 0))?;
     let shown: String = path.trim().chars().take(200).collect();
     Some((
         format!(
@@ -4468,7 +4663,11 @@ fn analyze_command_with_its_values(
     if READING_LINE_VALUES.with(std::cell::Cell::get) {
         return as_written;
     }
-    let readings = crate::line_values::readings_in_effect(command);
+    let mut readings = crate::line_values::readings_in_effect(command);
+    if let Some(spelled) = names_set_only_when_spelled_out(command) {
+        readings.extend(crate::line_values::readings_in_effect(&spelled));
+        readings.push(spelled);
+    }
     if readings.is_empty() {
         return as_written;
     }
@@ -4491,6 +4690,34 @@ fn analyze_command_with_its_values(
         },
         _ => as_written,
     }
+}
+
+/// The line with its names spelled out ([`crate::threats::names_spelled_out`])
+/// when that names a name the line as written does not, and the line
+/// reads it (`$NAME`, `${NAME}`): `export {HO,}ME=/etc; rm -rf
+/// $HOME/x` and `export HO\` with `ME=/etc` on the next line set `HOME`
+/// as `export HOME=/etc` does, and are read with that value as it is.
+/// `None` otherwise. The line as written is read as well, and the
+/// reading that scores higher stands.
+fn names_set_only_when_spelled_out(command: &str) -> Option<String> {
+    if !command.contains(['{', '\\']) || !command.contains('$') {
+        return None;
+    }
+    let spelled = crate::threats::names_spelled_out(command)?;
+    if spelled == command {
+        return None;
+    }
+    let before = crate::threats::names_a_line_may_set(command);
+    let name_read = crate::threats::names_a_line_may_set(&spelled)
+        .into_iter()
+        .filter(|name| {
+            !before.contains(name)
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        })
+        .any(|name| {
+            spelled.contains(&format!("${name}")) || spelled.contains(&format!("${{{name}"))
+        });
+    name_read.then_some(spelled)
 }
 
 /// The bash reading and, where they differ, the sh and dash reading of
@@ -4965,11 +5192,23 @@ fn analyze_command_as_read(
 
     // Read on the line as the shell hands it over too: taking backslashes out
     // of code in quotes can change what that code runs.
-    let flow = crate::shell::executable_data_flow(scan_cmd).or_else(|| {
-        (raw_scan != scan_cmd)
-            .then(|| crate::shell::executable_data_flow(raw_scan))
-            .flatten()
-    });
+    // And in a shell's `-c` script as the shell hands it over: glued quotes
+    // or backslashes keep the tree from reading it as one script.
+    let flow = crate::shell::executable_data_flow(scan_cmd)
+        .or_else(|| {
+            (raw_scan != scan_cmd)
+                .then(|| crate::shell::executable_data_flow(raw_scan))
+                .flatten()
+        })
+        .or_else(|| {
+            (depth < STARTUP_PAYLOAD_DEPTH)
+                .then(|| {
+                    crate::shell::shell_scripts_as_handed(cmd)
+                        .iter()
+                        .find_map(|script| crate::shell::executable_data_flow(script))
+                })
+                .flatten()
+        });
     if let Some(flow) = flow {
         // Text of the project's own files placed into code is a warning;
         // every other flow is a refusal.
@@ -5062,7 +5301,14 @@ fn analyze_command_as_read(
         // Inline code that writes, removes or moves a place of the guard or
         // signals its processes, a copy onto one of its places, and a
         // program a search runs that does either ([`threats::check_guard_takedown`]).
-        .or_else(|| threats::check_guard_takedown(cmd));
+        .or_else(|| threats::check_guard_takedown(cmd))
+        // A file of the guard named relative to the folder the hook was
+        // given (`rm -rf innerwarden/rules` run in `/etc`).
+        .or_else(|| {
+            context.and_then(|place| {
+                threats::guard_file_reached_in_place(cmd, &place.cwd, place.home.as_deref())
+            })
+        });
     if let Some((what, s)) = self_disable {
         signals.push(AnalysisSignal {
             signal: "guard_self_disable".into(),
@@ -5400,7 +5646,9 @@ fn analyze_command_as_read(
         if let Some((file, (why, order_score))) = threats::instruction_file_payloads(cmd)
             .into_iter()
             .filter_map(|(file, text)| {
-                instruction_order(&text, rule_engine, depth).map(|order| (file, order))
+                instruction_order(&text, rule_engine, depth)
+                    .or_else(|| imported_instruction_order(&file, &text, rule_engine, depth))
+                    .map(|order| (file, order))
             })
             .max_by_key(|(_, (_, score))| *score)
         {
@@ -5850,6 +6098,21 @@ fn analyze_command_as_read(
                 detail: "removal of the account's keys or credential store".into(),
             });
             score += 50;
+        } else if crate::threats::moves_credentials_out(
+            command_scan,
+            context.map_or("", |place| place.cwd.as_str()),
+            context.and_then(|place| place.home.as_deref()),
+        ) {
+            // A key moved out of the store the account keeps it in is as
+            // gone from where ssh, gpg or the cloud tools look as a removed one.
+            signals.push(AnalysisSignal {
+                signal: "destructive_command".into(),
+                score: 50,
+                detail: "moves the account's keys or credential store out of the place that \
+                         holds them"
+                    .into(),
+            });
+            score += 50;
         } else if crate::threats::destructive_rm_in_place(
             command_scan,
             context.map_or("", |place| place.cwd.as_str()),
@@ -6088,8 +6351,18 @@ fn analyze_command_as_read(
         // (`review`), the agent is not blocked outright.
         // The pattern is judged on the line as written: the scanned reading
         // has it blanked as data.
+        // A search's pattern is text, never a folder it reads: a finding
+        // that only the pattern of the line as written makes
+        // (`grep -rln '//' crates`, the root) is none.
         let found =
-            threats::stored_secret_read_in_place(scan_cmd, &place.cwd, place.home.as_deref());
+            threats::stored_secret_read_in_place(scan_cmd, &place.cwd, place.home.as_deref())
+                .filter(|_| {
+                    !threats::search_pattern_alone_reaches_secret(
+                        cmd,
+                        &place.cwd,
+                        place.home.as_deref(),
+                    )
+                });
         let searched = matches!(found, Some((_, threats::SecretReach::Folder)))
             && threats::searches_home_for_narrow_text(cmd, &place.cwd, place.home.as_deref());
         if let Some((path, _)) = found.as_ref().filter(|_| searched) {

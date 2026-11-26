@@ -299,10 +299,26 @@ pub(super) fn sed_edits_guard_file(content: &str) -> bool {
         if !matches!(program_name(&words[at]).as_str(), "sed" | "gsed") {
             return false;
         }
+        sed_in_place_files(&words[at + 1..]).is_some_and(|files| {
+            files.iter().any(|file| {
+                INNERWARDEN_SELF_PATHS
+                    .iter()
+                    .chain(INNERWARDEN_INSTALL_PATHS)
+                    .any(|place| file.to_ascii_lowercase().contains(place))
+            })
+        })
+    })
+}
+
+/// The files `sed` edits in place (`-i`, `-i.bak`, `-Ei`,
+/// `--in-place`), `None` when it does not edit in place: each operand
+/// after the script, all of them with `-e` or `-f`.
+fn sed_in_place_files(args: &[String]) -> Option<Vec<&String>> {
+    {
         let mut in_place = false;
         let mut script_given = false;
         let mut operands: Vec<&String> = Vec::new();
-        let mut rest = words[at + 1..].iter();
+        let mut rest = args.iter();
         while let Some(word) = rest.next() {
             if word.starts_with("--in-place") {
                 in_place = true;
@@ -335,19 +351,12 @@ pub(super) fn sed_edits_guard_file(content: &str) -> bool {
                 operands.push(word);
             }
         }
-        let files = if script_given {
-            &operands[..]
-        } else {
-            operands.get(1..).unwrap_or(&[])
-        };
-        in_place
-            && files.iter().any(|file| {
-                INNERWARDEN_SELF_PATHS
-                    .iter()
-                    .chain(INNERWARDEN_INSTALL_PATHS)
-                    .any(|place| file.to_ascii_lowercase().contains(place))
-            })
-    })
+        if !in_place {
+            return None;
+        }
+        let skip = usize::from(!script_given);
+        Some(operands.into_iter().skip(skip).collect())
+    }
 }
 
 /// What [`editor_edits_guard_file`] says.
@@ -397,6 +406,112 @@ pub(super) fn editor_edits_guard_file(content: &str) -> bool {
     })
 }
 
+/// A file an editor writes, for [`super::guard_file_targets`]: an operand
+/// of the command, by its index among the arguments, or a name written
+/// inside one of its commands (`vim -c 'e /etc/innerwarden/guard.toml'`).
+pub(super) enum Edited {
+    Operand(usize),
+    Named(String),
+}
+
+/// The files `program` writes when handed `args`: `sed -i`, `perl -i`,
+/// `ruby -i`, `ed`, `ex`, `vi`, `vim` and `nvim` (with the files their
+/// `-c`, `--cmd` and `+` commands open), `awk -i inplace`, and `emacs`
+/// (its `--batch` runs whatever its `--eval` or `-l` says on the files it
+/// visits). Measured 2026-11-25: `vim -c 'e /etc/innerwarden/guard.toml'
+/// -c '%s/enforce/monitor/' -c wq`, `emacs --batch` and `ruby -i` of
+/// the guard's configuration were allowed.
+pub(super) fn files_an_editor_writes(program: &str, args: &[String]) -> Vec<Edited> {
+    let program = program.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    let files = match program {
+        "sed" | "gsed" => sed_in_place_files(args),
+        "perl" => perl_in_place_files(args),
+        "ruby" => ruby_in_place_files(args),
+        "ed" | "red" => Some(plain_operands(args, &["-p"])),
+        "ex" | "vi" | "vim" | "nvim" | "gvim" => vim_files(args),
+        "awk" | "gawk" => awk_in_place_files(args),
+        "emacs" => Some(plain_operands(
+            args,
+            &[
+                "-l",
+                "--load",
+                "--eval",
+                "--execute",
+                "-f",
+                "--funcall",
+                "-L",
+                "--directory",
+                "--insert",
+                "-t",
+                "--terminal",
+                "-d",
+                "--display",
+                "--chdir",
+                "--script",
+                "-x",
+            ],
+        )),
+        _ => None,
+    };
+    let mut edited: Vec<Edited> = files
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|file| args.iter().position(|arg| std::ptr::eq(arg, file)))
+        .map(Edited::Operand)
+        .collect();
+    if matches!(program, "ex" | "vi" | "vim" | "nvim" | "gvim")
+        && !args.iter().any(|word| word == "-R" || word == "-M")
+    {
+        edited.extend(vim_command_files(args).into_iter().map(Edited::Named));
+    }
+    if program == "emacs" {
+        for pair in args.windows(2) {
+            if matches!(pair[0].as_str(), "--file" | "--visit" | "--find-file") {
+                edited.push(Edited::Named(pair[1].clone()));
+            }
+        }
+        for arg in args {
+            for prefix in ["--file=", "--visit=", "--find-file="] {
+                if let Some(name) = arg.strip_prefix(prefix) {
+                    edited.push(Edited::Named(name.to_owned()));
+                }
+            }
+        }
+    }
+    edited
+}
+
+/// The files the commands of `vim` open or write: `e`, `edit`, `tabe`,
+/// `sp`, `vs`, `new`, `badd`, `w`, `sav` and their long forms, in
+/// `-c`, `--cmd` and `+` (a command split by `|` read piece by piece).
+/// `r` reads a file into the buffer and is not one.
+fn vim_command_files(args: &[String]) -> Vec<String> {
+    const OPENS: &[&str] = &[
+        "e", "e!", "edit", "edit!", "tabe", "tabedit", "tabnew", "sp", "split", "vs", "vsplit",
+        "new", "vnew", "badd", "w", "w!", "write", "write!", "sav", "saveas", "wq", "x", "drop",
+        "find",
+    ];
+    let mut commands: Vec<&str> = Vec::new();
+    let mut rest = args.iter();
+    while let Some(word) = rest.next() {
+        if word == "-c" || word == "--cmd" {
+            commands.extend(rest.next().map(String::as_str));
+        } else if let Some(command) = word.strip_prefix('+') {
+            commands.push(command);
+        }
+    }
+    commands
+        .iter()
+        .flat_map(|command| command.split('|'))
+        .filter_map(|piece| {
+            let mut words = piece.split_whitespace();
+            let verb = words.next()?.trim_start_matches(':');
+            let file = words.next()?;
+            OPENS.contains(&verb).then(|| file.to_owned())
+        })
+        .collect()
+}
+
 /// The words of a command that are not options, skipping the value of each
 /// option in `takes_value`.
 fn plain_operands<'a>(args: &'a [String], takes_value: &[&str]) -> Vec<&'a String> {
@@ -416,6 +531,18 @@ fn plain_operands<'a>(args: &'a [String], takes_value: &[&str]) -> Vec<&'a Strin
 /// `-i` alone or in a cluster (`-pi`, `-pie` takes `e` as its suffix,
 /// `-i.bak`), each file after the script.
 fn perl_in_place_files(args: &[String]) -> Option<Vec<&String>> {
+    in_place_files(args, &['M', 'm', 'I', 'x', 'C', 'd', 'D', 'l', '0'])
+}
+
+/// The files `ruby` edits in place: `-i` as `perl` reads it, the
+/// options that take the rest of their word (`-rjson`, `-Ilib`) skipped.
+fn ruby_in_place_files(args: &[String]) -> Option<Vec<&String>> {
+    in_place_files(args, &['r', 'I', 'C', 'E', 'x', 'K', 'T', 'W', '0', 'F'])
+}
+
+/// [`perl_in_place_files`] and [`ruby_in_place_files`]: a cluster stops at
+/// an option of `breakers`, which takes the rest of its word.
+fn in_place_files<'a>(args: &'a [String], breakers: &[char]) -> Option<Vec<&'a String>> {
     let mut in_place = false;
     let mut script_given = false;
     let mut operands = Vec::new();
@@ -439,7 +566,7 @@ fn perl_in_place_files(args: &[String]) -> Option<Vec<&String>> {
                         }
                         break;
                     }
-                    'M' | 'm' | 'I' | 'x' | 'C' | 'd' | 'D' | 'l' | '0' => break,
+                    other if breakers.contains(&other) => break,
                     _ => {}
                 }
             }

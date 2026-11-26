@@ -17,7 +17,7 @@ import { EDITION_LINES, expectHonestUpsell, FIXTURE_NOW_MS, fulfillJson, guardRo
 
 test.describe("CJC-J006 the InnerWarden Pro card reads the host", () => {
   test("stops offering the product on a host that already runs it", async ({ page }) => {
-    await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true }));
+    await page.route(guardRoute("meta"), (route) => fulfillJson(route, { ...META, active_defence_installed: true, host_install: "pro" }));
     await page.goto("/?view=posture");
     const installed = page.locator('[data-tour="upgrade"] [data-ad-state="installed"]');
     await expect(installed).toBeVisible();

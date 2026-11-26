@@ -1,4 +1,5 @@
 import { useId, useRef, useState } from "react";
+import type { HostInstall } from "../hostInstall";
 import { dismiss, dismissed } from "./dismiss";
 import { INSTALLED_LINE, protectionOffer } from "./offers";
 import { CopyCommand } from "./parts";
@@ -14,7 +15,7 @@ import { BODY_TEXT, LINK_TEXT, PANEL } from "./ui/blocks";
  * title, so a keyboard reader is not dropped at the top of the page. The
  * tour's upgrade step points at the wrapper, which stays either way.
  */
-export function FooterOffer({ installed }: { installed: boolean }) {
+export function FooterOffer({ host }: { host: HostInstall | undefined }) {
   const offer = protectionOffer();
   const lineId = useId();
   const box = useRef<HTMLElement>(null);
@@ -27,8 +28,8 @@ export function FooterOffer({ installed }: { installed: boolean }) {
   };
   return (
     <div data-tour="upgrade" className="min-w-0">
-      {installed ? (
-        <InstalledLine />
+      {host !== undefined ? (
+        <InstalledLine host={host} />
       ) : hidden ? null : (
         <aside ref={box} aria-labelledby={lineId} data-offer={offer.key} data-ad-state="offer" className={PANEL}>
           <p id={lineId} className={BODY_TEXT}>{offer.body}</p>
@@ -53,14 +54,15 @@ export function FooterOffer({ installed }: { installed: boolean }) {
 }
 
 /**
- * Said in place of the offer on a machine where the paid edition is
- * installed. Claims installation and nothing about what runs there.
+ * Said in place of the offer on a machine where the host install is
+ * installed, named by its licence. Claims installation and nothing about
+ * what runs there.
  */
-export function InstalledLine() {
+export function InstalledLine({ host }: { host: HostInstall }) {
   return (
-    <div data-ad-state="installed" className={PANEL}>
+    <div data-ad-state="installed" data-host-install={host} className={PANEL}>
       <p className={BODY_TEXT}>
-        <span className="font-semibold text-(--iw-ink)">{INSTALLED_LINE.lead}</span> {INSTALLED_LINE.body}
+        <span className="font-semibold text-(--iw-ink)">{INSTALLED_LINE.lead[host]}</span> {INSTALLED_LINE.body}
       </p>
       <CopyCommand command={INSTALLED_LINE.command} className="mt-2" />
     </div>

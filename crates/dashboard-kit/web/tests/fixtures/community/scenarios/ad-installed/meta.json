@@ -6,5 +6,6 @@
     "mode": "partial",
     "guarded_agents": 3
   },
-  "active_defence_installed": true
+  "active_defence_installed": true,
+  "host_install": "pro"
 }

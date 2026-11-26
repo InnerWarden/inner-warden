@@ -46,6 +46,20 @@ pub(crate) const INSTRUCTION_FOLDERS: &[&str] = &[
     ".github/instructions/",
 ];
 
+/// Folders whose Markdown files an agent reads as orders when it is asked
+/// to: Claude Code's custom commands (`/deploy` runs
+/// `.claude/commands/deploy.md` as the prompt) and subagents (the body of
+/// `.claude/agents/<name>.md` is that agent's instructions) and skills
+/// (`.claude/skills/<name>/SKILL.md` and the files beside it), in a project
+/// or in the home; and Codex's custom prompts (`~/.codex/prompts/<name>.md`
+/// runs as `/prompts:<name>`).
+pub(crate) const INSTRUCTION_MARKDOWN_FOLDERS: &[&str] = &[
+    ".claude/commands/",
+    ".claude/agents/",
+    ".claude/skills/",
+    ".codex/prompts/",
+];
+
 /// Whether `path` names a file an agent reads as its instructions.
 pub fn is_instruction_file(path: &str) -> bool {
     let lower = path
@@ -53,14 +67,16 @@ pub fn is_instruction_file(path: &str) -> bool {
         .to_ascii_lowercase()
         .replace('\\', "/");
     let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let in_folder =
+        |folder: &&str| lower.starts_with(folder) || lower.contains(&format!("/{folder}"));
     INSTRUCTION_NAMES.contains(&name)
         || name.ends_with(".instructions.md")
-        || INSTRUCTION_FOLDERS
-            .iter()
-            .any(|folder| lower.starts_with(folder) || lower.contains(&format!("/{folder}")))
+        || INSTRUCTION_FOLDERS.iter().any(in_folder)
+        || (name.ends_with(".md") && INSTRUCTION_MARKDOWN_FOLDERS.iter().any(in_folder))
 }
 
-/// The line a shell runs from its `-c` (`-lc`, `-ec`): the word after it.
+/// The line a shell runs from its `-c` (`-lc`, `-ec`): the first operand
+/// after it, past the options and a `--`.
 pub(crate) fn shell_line(args: &[String]) -> Option<&str> {
     let at = args.iter().position(|arg| {
         arg.len() > 1
@@ -69,7 +85,8 @@ pub(crate) fn shell_line(args: &[String]) -> Option<&str> {
             && arg[1..].chars().all(|c| c.is_ascii_alphabetic())
             && arg.contains('c')
     })?;
-    args.get(at + 1).map(String::as_str)
+    // The shell reads its options past `-c` (`bash -c -x -- LINE`).
+    crate::shell::shell_c_script_from(args, at + 1).map(|line| args[line].as_str())
 }
 
 /// How many shells deep a `-c` line is read for a copy.
@@ -259,6 +276,7 @@ pub(crate) fn mentions_one(content: &str) -> bool {
     INSTRUCTION_NAMES
         .iter()
         .chain(INSTRUCTION_FOLDERS)
+        .chain(INSTRUCTION_MARKDOWN_FOLDERS)
         .any(|name| lower.contains(name.trim_end_matches('/')))
         || lower.contains(".instructions.md")
 }

@@ -5,6 +5,30 @@ follows semantic versioning.
 
 ## Unreleased
 
+The hook in monitor refuses one thing: a write into the guard's own
+configuration (`~/.config/innerwarden`: `notify.toml`, `posture`,
+`suppress.toml`, `guard.toml` and the rest of the folder), by a shell line
+or by the agent's file tool, recorded as refused. It changes what the guard
+decides and who hears of it, as lowering the guard does. Everything else in
+monitor is still only recorded. Starting an AI agent with `IW_NOTIFY_CONFIG`,
+`IW_LLM_CONFIG` or `XDG_CONFIG_HOME` named elsewhere is refused as starting
+it with its hook moved, so a child agent's alerts reach the same person.
+
+On Gemini CLI that monitor refusal is a refusal too: the line
+`agents connect gemini --monitor` writes passes the refusal on and still
+lets the call run when the guard is gone or cannot start; run `innerwarden agents connect gemini --monitor` once to replace
+the line an earlier version wrote. An order written into Claude Code's
+custom commands or subagents (`.claude/commands/*.md`, `.claude/agents/*.md`)
+is read as one written into `CLAUDE.md`, and so is a file an instruction
+file imports with `@path`. The guard's state folder (`~/.local/state/innerwarden`)
+is held as its configuration folder is, in every mode. An order written into
+Claude Code's skills (`.claude/skills/<name>/SKILL.md`, in a project or the
+home) or Codex's custom prompts (`~/.codex/prompts/*.md`) is read as one
+written into `CLAUDE.md`. A shell's `-c` script
+written after its options and a `--` (`bash -c -x -- LINE`, `sh -c -- LINE`)
+is read as the script it is, as the shell runs it, and `timeout -- 5 CMD`
+runs `CMD`.
+
 `innerwarden --version`, the hint that points `setup`, `dashboard`, `upgrade`
 and `uninstall` at the host layer, and `innerwarden openclaw status` name the
 host install on the machine by what it has: InnerWarden Pro only where a
@@ -21,6 +45,15 @@ name the host layer without a tier, and so do the words the hook, `contain`,
 `serve`, `status` and a profile change say about the host install (the host
 refuses to admit a jail for want of a licence, and that refusal said
 "InnerWarden Pro on this host did not admit this jail").
+
+The dashboard names the host install the same way. The line at the foot of
+Protection says InnerWarden Pro only where a licence is; on a host installed
+without one it names the host install's free tier, and where the licence
+could not be read, or an older dashboard server does not say, the host
+install with no tier. `/api/meta` carries `host_install` (`pro`,
+`free_tier`, `unknown`) beside `active_defence_installed`, from the same read
+the CLI uses. The words on a decision the host made name the host install
+without a tier: a recorded decision does not say which licence decided it.
 
 git commands are read on the work tree git itself uses: the one the line
 names (`--work-tree`, `GIT_WORK_TREE`, `-c core.worktree=`, `--config-env`,
