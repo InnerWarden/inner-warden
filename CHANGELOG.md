@@ -3,7 +3,25 @@
 All notable changes to InnerWarden are documented here. This project
 follows semantic versioning.
 
-## Unreleased
+## 1.6.16 - 2026-11-26
+
+Cursor and the Antigravity CLI are screened through their own hooks, and MCP
+servers reached by URL now go through the proxy. A new install starts in a
+default posture that refuses what the guard is highly certain of and records
+the rest; `--strict` refuses every deny and every review. Lowering the guard
+needs a person at a terminal, and every change of its mode is recorded and
+announced. The MCP proxy reads an order to the assistant by its shape and
+refuses a payment, a message, a share or a delete that carries a value a
+server said. Every destination a tool result names stays in the session's
+taint, and a file write too long for the hook to read is judged by its
+path. A command behind a launcher, a shell's `-c` script past its options
+and a `--`, and an order in a skill or a custom prompt are read as the
+command or the instruction file they are. In a mode that blocks, the MCP
+proxy holds back what it does not read, and drops a refused call that has
+no id. What the guard changes or loses reaches a person once, and the hook
+answers under resource limits lowered for it. The AI Jail keeps what runs
+as you next out of a jailed program's reach. Alerts and the second opinion
+read their settings only from your own home.
 
 The hook in monitor refuses one thing: a write into the guard's own
 configuration (`~/.config/innerwarden`: `notify.toml`, `posture`,
