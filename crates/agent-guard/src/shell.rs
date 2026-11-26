@@ -3195,6 +3195,105 @@ fn shell_heredoc_data_blanked(source: &str) -> Vec<(String, String)> {
     out
 }
 
+/// The line with the body of each here-document that `cat` only writes out
+/// as text blanked: `cat > NOTES.md <<'EOF'` or `cat <<'EOF'` alone, the
+/// `cat` reading nothing but the body and handing what it prints to no
+/// other command, into a notes file (`.md`, `.txt`, `.rst`, `.adoc`,
+/// `.org`, `.log`, `.csv`) that no agent loads as its instructions or
+/// settings, or to the terminal. A body the shell expands into commands (a
+/// substitution, `${...}`) and a line with any other command that may run
+/// what was written stay read whole ([`command_runs_nothing_written`]).
+/// `None` when no body is blanked.
+///
+/// Measured 2026-11-25 (a line of Pro's hook tests): notes written with
+/// `cat` that described how a settings file can be rewritten through
+/// `node -e` were refused as that rewrite, read from the text of the notes.
+pub(crate) fn text_written_by_cat_blanked(source: &str) -> Option<String> {
+    if !source.contains("<<") || !source.contains("cat") {
+        return None;
+    }
+    let line = crate::shell_words::read_line(source);
+    if !line.nested.is_empty() || !line.arrays.is_empty() {
+        return None;
+    }
+    let notes = |command: &crate::shell_words::Command| {
+        let words: Vec<String> = command.words.iter().map(|w| w.text.clone()).collect();
+        let Some(first) = command.words.first() else {
+            return false;
+        };
+        let options_only = words[1..]
+            .iter()
+            .all(|word| word.starts_with('-') && word.len() > 1);
+        first.is_plain()
+            && words[0] == "cat"
+            && options_only
+            && !command.piped
+            && !command.inputs.is_empty()
+            && command.reads.is_empty()
+            && command.writes.iter().all(|target| {
+                target.is_plain() && (target.text == "/dev/null" || is_notes_file(&target.text))
+            })
+    };
+    let mut out = source.to_owned();
+    let mut changed = false;
+    for command in &line.commands {
+        if !notes(command) {
+            if command_runs_nothing_written(command) {
+                continue;
+            }
+            return None;
+        }
+        for body in &command.inputs {
+            if body.trim().is_empty() || source.matches(body.as_str()).count() != 1 {
+                return None;
+            }
+            let blank: String = body
+                .split_inclusive('\n')
+                .map(|row| {
+                    if row.ends_with('\n') {
+                        "text\n"
+                    } else {
+                        "text"
+                    }
+                })
+                .collect();
+            out = out.replacen(body.as_str(), &blank, 1);
+            changed = true;
+        }
+    }
+    changed.then_some(out)
+}
+
+/// Whether a file a line writes is a notes file: a document by its
+/// extension, that no agent loads as instructions or settings and that
+/// sits in no folder of an agent, a hook or the guard.
+fn is_notes_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let document = [".md", ".txt", ".rst", ".adoc", ".org", ".log", ".csv"]
+        .iter()
+        .any(|extension| name.len() > extension.len() && name.ends_with(extension));
+    let instructions = matches!(
+        name,
+        "claude.md" | "claude.local.md" | "agents.md" | "gemini.md" | "copilot-instructions.md"
+    ) || name.starts_with(".cursorrules")
+        || name.starts_with(".windsurfrules");
+    let agent_folder = [
+        ".claude",
+        ".codex",
+        ".cursor",
+        ".gemini",
+        ".openclaw",
+        ".github",
+        "hooks",
+        "innerwarden",
+        ".config",
+    ]
+    .iter()
+    .any(|folder| lower.split('/').any(|part| part == *folder));
+    document && !instructions && !agent_folder && !lower.contains("..")
+}
+
 /// Whether a command, in a here-document handed to a shell or on the line
 /// around it, can run nothing an `echo` of the same body wrote: it writes
 /// text, makes a folder or moves to one that holds no hooks. Any other

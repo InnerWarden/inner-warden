@@ -533,3 +533,23 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   go from deny to review for the reason above: `/tmp/x/../wt`,
   `~/src/../wt` and `git -C ~/src/app worktree remove ../wt` name a
   worktree in the home or `/tmp`, held for review as a mention.
+- 2026-11-26: notes-key-moves-patterns-2026-11 is new. A here-document that `cat` only
+  writes out as notes is text (`shell::text_written_by_cat_blanked`,
+  `mcp::cat_notes_as_text`): the line is judged again with the body
+  blanked, and that reading is taken only when all it drops is the
+  refusal for taking the guard down. The pattern a search looks for is no
+  path (`threats::search_pattern_words`). A stop or kill verb is a word
+  of its own and an output redirection's file is not its target
+  (`verb_is_a_word`, `in_output_redirect_target`). A key or credential
+  store moved out of its store is a removal
+  (`threats::moves_credentials_out`). A file of the guard is read from
+  the folder the hook was given and with `~` and `$HOME` standing for a
+  `HOME` the line sets (`guard_file_targets::removal_reaches_guard_file_from`).
+  The nkp-1NN lines are must_refuse, held by
+  `tests/notes_key_moves_patterns_and_home.rs`, whose lines fail on revert.
+  harmless-proven:
+  notes-key-moves-patterns-2026-11/nkp-002 notes-key-moves-patterns-2026-11/nkp-003 notes-key-moves-patterns-2026-11/nkp-006 notes-key-moves-patterns-2026-11/nkp-007 notes-key-moves-patterns-2026-11/nkp-008 notes-key-moves-patterns-2026-11/nkp-009 notes-key-moves-patterns-2026-11/nkp-010 notes-key-moves-patterns-2026-11/nkp-014 notes-key-moves-patterns-2026-11/nkp-015 notes-key-moves-patterns-2026-11/nkp-016 notes-key-moves-patterns-2026-11/nkp-017 notes-key-moves-patterns-2026-11/nkp-018 notes-key-moves-patterns-2026-11/nkp-019
+  go from deny (or review) to allow for the reasons above: notes written by
+  `cat`, a search pattern of `/` or `//`, a package or test whose name
+  holds `kill`, and `systemctl stop nginx` whose output goes to a file in
+  a folder named after the guard.

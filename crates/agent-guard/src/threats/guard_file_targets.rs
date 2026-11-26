@@ -22,8 +22,8 @@ use crate::shell_words::{read_line, Mark, Word};
 
 /// What [`removal_reaches_guard_file`] says.
 pub(super) const GUARD_FILE_REACHED: &str = "removes, moves or edits a file of the guard (its \
-     configuration, program or unit) through a pattern, a folder that holds it, or a name \
-     relative to a cd of the line";
+     configuration, program or unit) through a pattern, a folder that holds it, a name \
+     relative to the folder the line runs in or to a cd of the line, or a HOME the line sets";
 
 /// Concrete files and folders of the guard, as an install lays them out, a
 /// home written `~`. A path the line names is compared with each of them,
@@ -155,6 +155,33 @@ fn split(chars: &[char], marks: &[Mark]) -> Vec<Part> {
 /// relative one. `None` for a word whose path the text does not give: an
 /// expansion other than the home, or a relative name with no folder known.
 fn resolve(word: &Word, cwd: Option<&Path>) -> Option<Path> {
+    resolve_from(word, cwd, &HomeAs::Account)
+}
+
+/// What `~` and `$HOME` stand for where a command of the line runs.
+#[derive(Clone, Debug)]
+enum HomeAs {
+    /// The account's home, written `~`.
+    Account,
+    /// A folder an earlier command of the line gave `HOME` (`export
+    /// HOME=/etc`).
+    Set(Path),
+    /// A value the text does not give (`read HOME`, `HOME=$(mktemp -d)`).
+    Unknown,
+}
+
+impl HomeAs {
+    fn start(&self) -> Option<Path> {
+        match self {
+            HomeAs::Account => Some(vec![Part::plain("~")]),
+            HomeAs::Set(path) => Some(path.clone()),
+            HomeAs::Unknown => None,
+        }
+    }
+}
+
+/// [`resolve`], with `~` and `$HOME` standing for `home`.
+fn resolve_from(word: &Word, cwd: Option<&Path>, home: &HomeAs) -> Option<Path> {
     let chars: Vec<char> = word.text.chars().collect();
     let marks = &word.marks;
     if chars.is_empty() || marks.len() != chars.len() {
@@ -163,9 +190,9 @@ fn resolve(word: &Word, cwd: Option<&Path>) -> Option<Path> {
     let text: String = chars.iter().collect();
     let (mut start, skip): (Vec<Part>, usize) = if word.open_tildes.first() == Some(&0) {
         let end = chars.iter().position(|c| *c == '/').unwrap_or(chars.len());
-        (vec![Part::plain("~")], end)
+        (home.start()?, end)
     } else if let Some(prefix) = ["${HOME}", "$HOME"].iter().find(|p| text.starts_with(**p)) {
-        (vec![Part::plain("~")], prefix.chars().count())
+        (home.start()?, prefix.chars().count())
     } else if let Some(prefix) = ["${XDG_CONFIG_HOME}", "$XDG_CONFIG_HOME"]
         .iter()
         .find(|p| text.starts_with(**p))
@@ -214,12 +241,18 @@ fn guard_files() -> impl Iterator<Item = Vec<&'static str>> {
         })
 }
 
+/// Whether `path` can name something inside the guard's folder `file`
+/// (`/etc/innerwarden/rules`): a file or folder of the guard as well.
+fn within(path: &Path, file: &[&str]) -> bool {
+    path.len() > file.len() && path.iter().zip(file).all(|(part, name)| part.can_be(name))
+}
+
 fn names_guard_file(path: &Path) -> bool {
-    guard_files().any(|file| names(path, &file))
+    guard_files().any(|file| names(path, &file) || within(path, &file))
 }
 
 fn names_or_holds_guard_file(path: &Path) -> bool {
-    guard_files().any(|file| names(path, &file) || holds(path, &file))
+    guard_files().any(|file| names(path, &file) || holds(path, &file) || within(path, &file))
 }
 
 /// The operands of `rm`-like programs, and whether they remove folders whole.
@@ -264,7 +297,7 @@ fn removal_operands(program: &str, args: &[Word]) -> Option<(Vec<Word>, bool)> {
 
 /// The paths `find` starts from, and whether what it finds under them that
 /// can be one of the guard's files is removed.
-fn find_reaches(args: &[Word], cwd: Option<&Path>) -> bool {
+fn find_reaches(args: &[Word], cwd: Option<&Path>, home: &HomeAs) -> bool {
     let first_expression = args
         .iter()
         .position(|word| {
@@ -299,7 +332,7 @@ fn find_reaches(args: &[Word], cwd: Option<&Path>) -> bool {
     } else {
         starts
             .iter()
-            .filter_map(|word| resolve(word, cwd))
+            .filter_map(|word| resolve_from(word, cwd, home))
             .collect()
     };
     starts.iter().any(|start| {
@@ -343,6 +376,26 @@ fn find_reaches(args: &[Word], cwd: Option<&Path>) -> bool {
 /// guard through a pattern, a folder that holds it, or a name relative to a
 /// `cd` of the line.
 pub(super) fn removal_reaches_guard_file(content: &str) -> bool {
+    removal_reaches_guard_file_from(content, None, None)
+}
+
+/// [`removal_reaches_guard_file`] for a line run in the folder `cwd` (the
+/// one the hook was given, an absolute path), the account's home being
+/// `home` when known: a relative name is read from that folder until a
+/// `cd` of the line moves it (`rm -rf innerwarden/rules` run in `/etc`).
+/// A folder that is not absolute, or none, leaves a relative name unread,
+/// as the line alone does.
+///
+/// The line is read a second time with `~` and `$HOME` standing for the
+/// folder a command of the line gave `HOME` (`export HOME=/etc; rm -rf
+/// ~/innerwarden`), its names spelled out first
+/// ([`super::names_spelled_out`]: `export {HO,}ME=/etc`): either reading
+/// that reaches a file of the guard is enough.
+pub(super) fn removal_reaches_guard_file_from(
+    content: &str,
+    cwd: Option<&str>,
+    home: Option<&str>,
+) -> bool {
     let lower = content.to_ascii_lowercase();
     if ![
         "rm", "mv", "unlink", "shred", "truncate", "find", "sed", "vi", "ex", "ed", "emacs",
@@ -353,11 +406,74 @@ pub(super) fn removal_reaches_guard_file(content: &str) -> bool {
     {
         return false;
     }
-    let mut cwd: Option<Path> = None;
+    let start = cwd
+        .filter(|cwd| cwd.starts_with('/'))
+        .and_then(|cwd| folder_of(cwd, home));
+    if walk(content, start.clone(), false) {
+        return true;
+    }
+    // `HOME` named, or a name the shell may spell out of pieces into it.
+    if !lower.contains("home") && !content.contains(['{', '\\']) {
+        return false;
+    }
+    let spelled = super::names_spelled_out(content);
+    walk(spelled.as_deref().unwrap_or(content), start, true)
+}
+
+/// The path of an absolute folder, under `home` written `~`.
+fn folder_of(folder: &str, home: Option<&str>) -> Option<Path> {
+    let folder = match home
+        .map(|home| home.trim_end_matches('/'))
+        .filter(|home| !home.is_empty())
+        .and_then(|home| folder.strip_prefix(home))
+    {
+        Some("") => "~".to_string(),
+        Some(rest) if rest.starts_with('/') => format!("~{rest}"),
+        _ => folder.to_string(),
+    };
+    let word = read_line(&shell_quoted_path(&folder))
+        .commands
+        .into_iter()
+        .next()?
+        .words
+        .into_iter()
+        .next()?;
+    let word = if folder.starts_with('~') {
+        Word {
+            open_tildes: vec![0],
+            ..word
+        }
+    } else {
+        word
+    };
+    resolve(&word, None)
+}
+
+/// A path written so the shell reads it as one plain word: single quoted,
+/// a leading `~` left out of the quotes.
+fn shell_quoted_path(path: &str) -> String {
+    let (tilde, rest) = match path.strip_prefix('~') {
+        Some(rest) => ("~", rest),
+        None => ("", path),
+    };
+    if rest.is_empty() {
+        return tilde.to_string();
+    }
+    format!("{tilde}'{}'", rest.replace('\'', "'\\''"))
+}
+
+/// One reading of [`removal_reaches_guard_file_from`]: from the folder
+/// `start`, following what the line gives `HOME` when `follow_home`.
+fn walk(content: &str, start: Option<Path>, follow_home: bool) -> bool {
+    let mut place = Place {
+        cwd: start,
+        home: HomeAs::Account,
+        follow_home,
+    };
     // A subshell's `cd` ends with it: the folder each open `(` restores
     // at its `)`, read from the segment's text as
     // `relative_execution_in_temp_directory` reads it.
-    let mut subshells: Vec<Option<Path>> = Vec::new();
+    let mut subshells: Vec<(Option<Path>, HomeAs)> = Vec::new();
     // The commands as the shell reads the whole line (a here-document's
     // body is no command); the segments only say where a subshell opens
     // and closes, and a command of a segment is read when it is the next
@@ -382,7 +498,7 @@ pub(super) fn removal_reaches_guard_file(content: &str) -> bool {
             .count()
             .saturating_sub(rest.matches('(').count());
         for _ in 0..opens {
-            subshells.push(cwd.clone());
+            subshells.push((place.cwd.clone(), place.home.clone()));
         }
         for piece in read_line(rest).commands {
             let Some(command) = commands.get(next) else {
@@ -392,22 +508,103 @@ pub(super) fn removal_reaches_guard_file(content: &str) -> bool {
                 continue;
             }
             next += 1;
-            if command_reaches(command, &mut cwd) {
+            if command_reaches(command, &mut place) {
                 return true;
             }
         }
         for _ in 0..closes {
-            if let Some(saved) = subshells.pop() {
-                cwd = saved;
+            if let Some((cwd, home)) = subshells.pop() {
+                place.cwd = cwd;
+                place.home = home;
             }
         }
     }
     false
 }
 
+/// Where a command of the line runs, as [`walk`] reads it.
+struct Place {
+    cwd: Option<Path>,
+    home: HomeAs,
+    follow_home: bool,
+}
+
+/// What a command that only sets variables, or `export`, `declare`,
+/// `typeset`, `readonly` or `local`, gives `HOME`; `read`, `printf -v`
+/// and `mapfile` naming it give a value the text does not hold. `None`
+/// when the command leaves `HOME` as it is. A `HOME=` in front of a
+/// program sets it for that program alone, after the shell has read the
+/// program's words.
+fn home_given(command: &crate::shell_words::Command, place: &Place) -> Option<HomeAs> {
+    let words = &command.words;
+    let first = words.first()?;
+    let setter = matches!(
+        first.text.as_str(),
+        "export" | "declare" | "typeset" | "readonly" | "local"
+    );
+    let assignments: &[Word] = if setter {
+        &words[1..]
+    } else if words.iter().all(|word| is_assignment(&word.text)) {
+        words
+    } else {
+        if matches!(
+            first.text.as_str(),
+            "read" | "printf" | "mapfile" | "readarray"
+        ) && words[1..].iter().any(|word| word.text == "HOME")
+        {
+            return Some(HomeAs::Unknown);
+        }
+        return None;
+    };
+    let mut given = None;
+    for word in assignments {
+        let Some(value) = word.text.strip_prefix("HOME=") else {
+            continue;
+        };
+        let at = "HOME=".chars().count();
+        let value_word = Word {
+            text: value.to_string(),
+            marks: word
+                .marks
+                .get(at..)
+                .map(<[Mark]>::to_vec)
+                .unwrap_or_default(),
+            open_tildes: word
+                .open_tildes
+                .iter()
+                .filter_map(|tilde| tilde.checked_sub(at))
+                .collect(),
+            ..Word::default()
+        };
+        given = Some(
+            resolve_from(&value_word, place.cwd.as_ref(), &place.home)
+                .map_or(HomeAs::Unknown, HomeAs::Set),
+        );
+    }
+    given
+}
+
+/// Whether a word is a shell assignment (`NAME=value`).
+fn is_assignment(word: &str) -> bool {
+    word.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty()
+            && !name.starts_with(|c: char| c.is_ascii_digit())
+            && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+    })
+}
+
 /// One command of [`removal_reaches_guard_file`]: a `cd` moves `cwd`, a
 /// removal, move or edit is read against it.
-fn command_reaches(command: &crate::shell_words::Command, cwd: &mut Option<Path>) -> bool {
+fn command_reaches(command: &crate::shell_words::Command, place: &mut Place) -> bool {
+    if place.follow_home {
+        if let Some(home) = home_given(command, place) {
+            place.home = home;
+            return false;
+        }
+    }
+    let home = place.home.clone();
+    let cwd = &mut place.cwd;
+    let resolve = |word: &Word, cwd: Option<&Path>| resolve_from(word, cwd, &home);
     let texts: Vec<String> = command.words.iter().map(|word| word.text.clone()).collect();
     let Some(at) = effective_command_index(&texts) else {
         return false;
@@ -422,14 +619,14 @@ fn command_reaches(command: &crate::shell_words::Command, cwd: &mut Option<Path>
                 .iter()
                 .find(|word| word.text == "-" || !word.text.starts_with('-'));
             *cwd = match target {
-                None => Some(vec![Part::plain("~")]),
+                None => home.start(),
                 Some(word) if word.text == "-" => None,
                 Some(word) => resolve(word, cwd.as_ref()),
             };
             return false;
         }
         "find" => {
-            if find_reaches(args, cwd.as_ref()) {
+            if find_reaches(args, cwd.as_ref(), &home) {
                 return true;
             }
             return false;
