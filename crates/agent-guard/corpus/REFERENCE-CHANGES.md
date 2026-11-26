@@ -553,3 +553,18 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   `cat`, a search pattern of `/` or `//`, a package or test whose name
   holds `kill`, and `systemctl stop nginx` whose output goes to a file in
   a folder named after the guard.
+- 2026-11-26: notes-shown-after-cat-2026-11 is new. Notes that `cat` writes
+  into a notes file stay text when the line then only shows that file
+  (`shell::command_shows_files_only`, read by
+  `shell::text_written_by_cat_blanked`): `cat`, `head` or `tail`, and
+  `less`, `more` or `bat` with no option, every word written as it runs,
+  what they print going into no pipe and no file but a notes file or
+  `/dev/null`. Showing a file never runs it. A line that runs, sources or
+  pipes the file, or hands a pager a command, a key file or another pager,
+  is read whole as before. The nsc-1NN lines are must_refuse, held by
+  `tests/notes_shown_after_cat_stay_text.rs`, whose shown lines fail on
+  revert. Against the branch before the change no other corpus line moved.
+  harmless-proven:
+  notes-shown-after-cat-2026-11/nsc-001 notes-shown-after-cat-2026-11/nsc-002 notes-shown-after-cat-2026-11/nsc-003 notes-shown-after-cat-2026-11/nsc-004 notes-shown-after-cat-2026-11/nsc-005 notes-shown-after-cat-2026-11/nsc-006 notes-shown-after-cat-2026-11/nsc-007 notes-shown-after-cat-2026-11/nsc-008 notes-shown-after-cat-2026-11/nsc-009 notes-shown-after-cat-2026-11/nsc-010 notes-shown-after-cat-2026-11/nsc-011 notes-shown-after-cat-2026-11/nsc-012 notes-shown-after-cat-2026-11/nsc-013 notes-shown-after-cat-2026-11/nsc-014 notes-shown-after-cat-2026-11/nsc-015
+  go from deny to allow for the reason above: notes written by `cat` and
+  then shown.
