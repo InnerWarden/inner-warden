@@ -11266,7 +11266,8 @@ pub fn check_data_destruction(content: &str) -> Option<(&'static str, u32)> {
 /// Only the uppercase name, whole (`$HOMEDIR` and `$home` are other, usually
 /// unset, variables), and only when nothing else in the text names `HOME`:
 /// `HOME=/ ; rm -rf $HOME/etc` or `export HOME=...` change what it holds, and
-/// the text is then judged as written.
+/// the text is then judged as written, and so do the same names spelled
+/// with a brace expansion or a line continuation ([`names_home_besides_reading`]).
 fn with_home_named(content: &str) -> std::borrow::Cow<'_, str> {
     static HOME_VARIABLE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     if !content.contains("HOME") {
@@ -11276,7 +11277,8 @@ fn with_home_named(content: &str) -> std::borrow::Cow<'_, str> {
         regex::Regex::new(r"\$\{HOME\}|\$HOME\b").expect("static home-variable regex")
     });
     let named = home.replace_all(content, "/home/~");
-    if named.contains("HOME") {
+    // `export {HO,}ME=/etc` names it too, once its braces are made.
+    if named.contains("HOME") || names_home_besides_reading(content) {
         return std::borrow::Cow::Borrowed(content);
     }
     std::borrow::Cow::Owned(named.into_owned())
@@ -13191,6 +13193,110 @@ fn expand_braces(s: &str, made: &ReadingBudget) -> String {
     }
     flush(&mut word, &mut out);
     out
+}
+
+/// The line with its names spelled out as the shell spells them before it
+/// reads one: a line continuation (`\` and a newline) joined, and every
+/// word with a brace expansion in it made into its words, the quotes in
+/// such a word taken out first. `export {HO,}ME=/etc`, `HO{,}ME=/etc`,
+/// `declare -x {HO,X}ME=/etc` and `export HO\` with `ME=/etc` on the
+/// next line all give `HOME` a value. A `${...}` is a parameter, not a
+/// group, and stays as written. `None` when the words would be more than
+/// [`BRACE_EXPANSION_BYTES`]: what the line names is then not known.
+/// Pure text work, never run.
+pub(crate) fn names_spelled_out(content: &str) -> Option<String> {
+    // Two characters no shell text holds stand for the braces of a
+    // `${...}` while the groups are made.
+    const OPEN: char = '\u{e002}';
+    const CLOSE: char = '\u{e003}';
+    let joined = content.replace("\\\r\n", "").replace("\\\n", "");
+    if !joined.contains('{') {
+        return Some(joined);
+    }
+    let made = ReadingBudget::for_braces();
+    let mut out = String::with_capacity(joined.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| -> bool {
+        if !word.contains('{') {
+            out.push_str(word);
+            word.clear();
+            return true;
+        }
+        let mut protected = String::with_capacity(word.len());
+        let mut chars = word.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' | '"' => {}
+                '$' if chars.peek() == Some(&'{') => {
+                    protected.push('$');
+                    let mut depth = 0usize;
+                    for inner in chars.by_ref() {
+                        match inner {
+                            '{' => {
+                                depth += 1;
+                                protected.push(OPEN);
+                            }
+                            '}' => {
+                                protected.push(CLOSE);
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
+                            other => protected.push(other),
+                        }
+                    }
+                }
+                other => protected.push(other),
+            }
+        }
+        let Some(words) = brace_words(&protected, &made) else {
+            return false;
+        };
+        if words.len() == 1 && words[0] == protected {
+            // No group the shell makes: the word as written, quotes kept.
+            out.push_str(word);
+            word.clear();
+            return true;
+        }
+        let restored: Vec<String> = words
+            .iter()
+            .map(|made| made.replace(OPEN, "{").replace(CLOSE, "}"))
+            .collect();
+        out.push_str(&restored.join(" "));
+        word.clear();
+        true
+    };
+    for c in joined.chars() {
+        if c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')') {
+            if !flush(&mut word, &mut out) {
+                return None;
+            }
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out).then_some(out)
+}
+
+/// Whether the line names `HOME` other than to read it as `$HOME` or
+/// `${HOME}`, once
+/// its names are spelled out ([`names_spelled_out`]) and its quotes and
+/// escapes taken out (`HO""ME=`, `printf -v HO''ME`): a line that may give
+/// the home a value of its own. A line too large to spell out may.
+pub(crate) fn names_home_besides_reading(content: &str) -> bool {
+    let Some(spelled) = names_spelled_out(content) else {
+        return true;
+    };
+    let line: String = spelled
+        .chars()
+        .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+        .collect();
+    line.match_indices("HOME").any(|(at, _)| {
+        let before = &line[..at];
+        !(before.ends_with('$') || (before.ends_with("${") && line[at + 4..].starts_with('}')))
+    })
 }
 
 /// Every word `word` expands to, in the shell's order, or `None` when
@@ -16883,7 +16989,7 @@ pub(crate) fn shell_tokens_with_braces(segment: &str) -> Vec<String> {
 /// `printf -v HOME`, `: ${HOME:=x}` and `declare -n ref=HOME` all leave
 /// `HOME` here. A name the line builds (`export "$(printf HOME)=x"`) or
 /// takes from a file is not here: the text does not show it.
-fn names_a_line_may_set(line: &str) -> std::collections::HashSet<String> {
+pub(crate) fn names_a_line_may_set(line: &str) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
     for token in shell_tokens_with_braces(line) {
         let mut start = None;

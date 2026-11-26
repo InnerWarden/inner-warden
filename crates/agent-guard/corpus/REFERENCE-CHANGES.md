@@ -507,3 +507,29 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   sql-client-runners-2026-11/srn-001 sql-client-runners-2026-11/srn-003 sql-client-runners-2026-11/srn-004 sql-client-runners-2026-11/srn-005 sql-client-runners-2026-11/srn-006 sql-client-runners-2026-11/srn-007 sql-client-runners-2026-11/srn-008 sql-client-runners-2026-11/srn-009 sql-client-runners-2026-11/srn-010 sql-client-runners-2026-11/srn-011 sql-client-runners-2026-11/srn-012 sql-client-runners-2026-11/srn-013 sql-client-runners-2026-11/srn-014 sql-client-runners-2026-11/srn-015 sql-client-runners-2026-11/srn-016 sql-client-runners-2026-11/srn-017 sql-client-runners-2026-11/srn-019 sql-client-runners-2026-11/srn-020 sql-client-runners-2026-11/srn-021 sql-client-runners-2026-11/srn-022 sql-client-runners-2026-11/srn-023 sql-client-runners-2026-11/srn-024
   go from deny to allow for the reason above: the client stores the
   string and nothing on the line runs it.
+- 2026-11-25: worktree-paths-spelled-home-2026-11 is new. A relative
+  worktree (`git worktree remove`) or relative path through a folder named
+  after the guard (`../../../etc/innerwarden`, `innerwarden/rules` after
+  `cd /etc`) is read from the folder the line runs in and from every
+  `cd` or `pushd` on it that names a folder from the root or the home,
+  and a path with a `..` inside it is
+  read where it points, before the guard decides that it only names a work
+  folder (`src/mention.rs`, `worktree_readings`, `resolved_path`,
+  `line_folders`). Where the folder is not known (no working context, a
+  relative `cd`, `cd -`, `popd`, a home the line sets) such a path is in
+  doubt and is read as written as well, as before: held for review as a
+  mention when it is a work folder beside the project. A path read this way
+  is not taken for a worktree found by the end of its name (the word has a
+  `..`, which git reads as a path). `HOME` and `PWD` named by a brace
+  expansion or a line continuation (`export {HO,}ME=/etc`, `HO{,}ME`,
+  `export HO\` and `ME=` on the next line) are a value the line sets, as
+  written plainly (`threats::names_spelled_out`, used by
+  `with_home_named`, `home_kept` and the reading of the line's values).
+  The wsh-1NN lines are must_refuse, held by
+  `tests/worktree_paths_and_spelled_home.rs`, whose lines fail on revert.
+  Against the branch before the change no other corpus line moved.
+  harmless-proven:
+  worktree-paths-spelled-home-2026-11/wsh-001 worktree-paths-spelled-home-2026-11/wsh-002 worktree-paths-spelled-home-2026-11/wsh-003 worktree-paths-spelled-home-2026-11/wsh-004 worktree-paths-spelled-home-2026-11/wsh-005
+  go from deny to review for the reason above: `/tmp/x/../wt`,
+  `~/src/../wt` and `git -C ~/src/app worktree remove ../wt` name a
+  worktree in the home or `/tmp`, held for review as a mention.

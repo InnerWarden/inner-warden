@@ -1,0 +1,289 @@
+# A relative worktree or path (with or without `..` in front), read from
+# where the line runs (the folder it runs in and each `cd` on it), and a path with a
+# `..` inside it read where it points before the guard decides whether it
+# only names a work folder; and `HOME` (or `PWD`) given a value by a
+# brace expansion (`{HO,}ME=`, `HO{,}ME=`, `{G..H}OME=`) or a line
+# continuation, read as the same name written plainly. Measured 2026-11-25
+# with analyze_command: the verdict of main before the change is in the
+# comment above each case. wsh-0NN are benign: worktrees through a `..`
+# that stays in the home or /tmp (expect: review, held as a mention) and
+# brace expansions that set nothing the line reads (allowed, as before);
+# wsh-1NN reach a place of the guard's, must_refuse: true with expect: deny.
+# A relative path that climbs from a folder the line runs in that is not
+# known (no working context) is in doubt and held for review, as before:
+# it is in the test, with and without a folder, not here.
+# The proof is tests/worktree_paths_and_spelled_home.rs; read by the
+# differential check. Nothing in this file is executed.
+cases:
+  # before: deny
+  - id: wsh-001
+    category: worktree_path_read_where_it_points
+    label: benign
+    expect: review
+    input: "git worktree remove /tmp/x/../innerwarden-wt"
+  # before: deny
+  - id: wsh-002
+    category: worktree_path_read_where_it_points
+    label: benign
+    expect: review
+    input: "git worktree remove ~/src/../innerwarden-wt"
+  # before: deny
+  - id: wsh-003
+    category: worktree_path_read_where_it_points
+    label: benign
+    expect: review
+    input: "git worktree remove --force ~/.worktrees/../innerwarden-wt"
+  # before: deny
+  - id: wsh-004
+    category: worktree_path_read_where_it_points
+    label: benign
+    expect: review
+    input: "git -C ~/src/app worktree remove ../innerwarden-wt"
+  # before: deny
+  - id: wsh-005
+    category: worktree_path_read_where_it_points
+    label: benign
+    expect: review
+    input: "git worktree remove --force /tmp/build/../innerwarden-feature"
+  # before: allow
+  - id: wsh-006
+    category: name_spelled_by_braces_or_continuation
+    label: benign
+    input: "rm -rf $HOME/innerwarden-wt/{target,dist}"
+  # before: allow
+  - id: wsh-007
+    category: name_spelled_by_braces_or_continuation
+    label: benign
+    input: "rm -rf $HOME/.cache/{pip,npm}"
+  # before: allow
+  - id: wsh-008
+    category: name_spelled_by_braces_or_continuation
+    label: benign
+    input: "OUT=dist; mkdir -p $OUT/{js,css} && cp -r src/* $OUT/js"
+  # before: allow
+  - id: wsh-009
+    category: name_spelled_by_braces_or_continuation
+    label: benign
+    input: "cd ~/src/app && cargo test \\\n  --workspace"
+  # before: review
+  - id: wsh-101
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config && git worktree remove --force ../../../etc/innerwarden"
+  # before: review
+  - id: wsh-102
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config && git worktree remove --force ../../../usr/local/bin/innerwarden"
+  # before: review
+  - id: wsh-104
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd /tmp && git worktree remove ../etc/innerwarden"
+  # before: review
+  - id: wsh-105
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/src && git worktree remove ../../../etc/innerwarden"
+  # before: review
+  - id: wsh-106
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config/x && git worktree remove ../innerwarden"
+  # before: review
+  - id: wsh-107
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config && git worktree remove ../../../etc/innerwarden/x"
+  # before: deny
+  - id: wsh-108
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "git worktree remove ~/src/../.config/innerwarden"
+  # before: deny
+  - id: wsh-109
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "git worktree remove /tmp/../etc/innerwarden"
+  # before: deny
+  - id: wsh-110
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "git worktree remove ~/../../etc/innerwarden"
+  # before: deny
+  - id: wsh-111
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "git worktree remove /tmp/x/../../etc/innerwarden"
+  # before: allow
+  - id: wsh-113
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export {HO,}ME=/etc; rm -rf $HOME/innerwarden"
+  # before: allow
+  - id: wsh-114
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export HO{,}ME=/etc; rm -rf $HOME/innerwarden"
+  # before: allow
+  - id: wsh-115
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export H{O,O}ME=/etc; rm -rf $HOME/innerwarden"
+  # before: allow
+  - id: wsh-116
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "declare -x {HO,X}ME=/etc; rm -rf $HOME/innerwarden"
+  # before: allow
+  - id: wsh-117
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "read -r {HO,}ME <<< /etc; rm -rf $HOME/innerwarden"
+  # before: allow
+  - id: wsh-118
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "printf -v {HO,}ME /etc; rm -rf $HOME/innerwarden"
+  # before: allow
+  - id: wsh-119
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export HO\\\nME=/etc; rm -rf $HOME/innerwarden"
+  # before: allow
+  - id: wsh-120
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export {G..H}OME=/etc; rm -rf $HOME/innerwarden"
+  # before: allow
+  - id: wsh-121
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export {H{O,},}ME=/etc; rm -rf $HOME/innerwarden"
+  # before: allow
+  - id: wsh-122
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export {\"HO\",}ME=/etc; rm -rf $HOME/innerwarden"
+  # before: deny
+  - id: wsh-123
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export {HO,}ME=/etc; git worktree remove $HOME/innerwarden"
+  # before: deny
+  - id: wsh-124
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export {HO,}ME=/etc; git worktree remove --force $HOME/innerwarden-wt"
+  # before: allow
+  - id: wsh-125
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export HO{,}ME=/etc && cd $HOME/innerwarden && git worktree remove wt"
+  # before: allow
+  - id: wsh-126
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export {HO,}ME=/usr/local/bin; rm -f $HOME/innerwarden"
+  # before: allow
+  - id: wsh-127
+    category: name_spelled_by_braces_or_continuation
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export {PW,}D=/etc; rm -rf $PWD/innerwarden"
+  # before: review
+  - id: wsh-010
+    category: worktree_path_read_where_it_points
+    label: benign
+    expect: review
+    input: "cd ~/src && git worktree remove app/innerwarden-wt"
+  # before: review
+  - id: wsh-011
+    category: worktree_path_read_where_it_points
+    label: benign
+    expect: review
+    input: "git worktree remove wt/innerwarden-x"
+  # before: review
+  - id: wsh-128
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config && git worktree remove innerwarden/x"
+  # before: review
+  - id: wsh-129
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config && rm -rf innerwarden/rules"
+  # before: review
+  - id: wsh-130
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd /etc && git worktree remove --force innerwarden/x"
+  # before: review
+  - id: wsh-131
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd /etc && rm -rf innerwarden/rules"
+  # before: review
+  - id: wsh-132
+    category: worktree_path_read_where_it_points
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd ~/.config && git worktree remove innerwarden-x"

@@ -4468,7 +4468,11 @@ fn analyze_command_with_its_values(
     if READING_LINE_VALUES.with(std::cell::Cell::get) {
         return as_written;
     }
-    let readings = crate::line_values::readings_in_effect(command);
+    let mut readings = crate::line_values::readings_in_effect(command);
+    if let Some(spelled) = names_set_only_when_spelled_out(command) {
+        readings.extend(crate::line_values::readings_in_effect(&spelled));
+        readings.push(spelled);
+    }
     if readings.is_empty() {
         return as_written;
     }
@@ -4491,6 +4495,34 @@ fn analyze_command_with_its_values(
         },
         _ => as_written,
     }
+}
+
+/// The line with its names spelled out ([`crate::threats::names_spelled_out`])
+/// when that names a name the line as written does not, and the line
+/// reads it (`$NAME`, `${NAME}`): `export {HO,}ME=/etc; rm -rf
+/// $HOME/x` and `export HO\` with `ME=/etc` on the next line set `HOME`
+/// as `export HOME=/etc` does, and are read with that value as it is.
+/// `None` otherwise. The line as written is read as well, and the
+/// reading that scores higher stands.
+fn names_set_only_when_spelled_out(command: &str) -> Option<String> {
+    if !command.contains(['{', '\\']) || !command.contains('$') {
+        return None;
+    }
+    let spelled = crate::threats::names_spelled_out(command)?;
+    if spelled == command {
+        return None;
+    }
+    let before = crate::threats::names_a_line_may_set(command);
+    let name_read = crate::threats::names_a_line_may_set(&spelled)
+        .into_iter()
+        .filter(|name| {
+            !before.contains(name)
+                && name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        })
+        .any(|name| {
+            spelled.contains(&format!("${name}")) || spelled.contains(&format!("${{{name}"))
+        });
+    name_read.then_some(spelled)
 }
 
 /// The bash reading and, where they differ, the sh and dash reading of
