@@ -377,6 +377,12 @@ list, with every limit.
   different surface: the local check-command contract served by `innerwarden
   serve`.
 - Notifications: surfaces verdicts and events through your configured channels.
+  A record that stops (a folder it cannot write, writes that fail, lines of
+  `guard-events.jsonl` that cannot be added) is told once, and its end once
+  writes have worked for ten minutes: a fault that comes back inside those
+  ten minutes is the same outage, not a new alert. At most three outages of
+  one kind are told an hour; the next alert about it says how many more
+  there were.
 - Conversation attempts: records what an agent was ASKED to do when the ask is
   dangerous, including the asks a model refuses on its own. Those produce no
   command, so they reach nothing else in the product. An ask is dangerous when
@@ -458,9 +464,14 @@ An enforcing hook line with no mode flag runs in the posture kept in
 
   Every other refusal, and every review, runs: the record keeps it as
   `would_block` on an enforcing line, an alert goes out as for a monitor
-  would-block, and the agent shows one line (`systemMessage` for Claude
-  Code, Codex and Gemini CLI; `permission: "allow"` with the words for
-  Cursor; stderr, exit 0, for Hermes and any other agent).
+  would-block (a review only when you opted in with `innerwarden notify
+  --notify-review`), and Claude Code, Codex and Gemini CLI show one line
+  (`systemMessage`), as Cursor does (`permission: "allow"` with the words).
+  Hermes Agent's hook can block a call, change it or send it to its approval
+  gate, and has no way to let it run with words beside it: for Hermes, and
+  any other agent, the line goes to stderr with exit 0, which Hermes keeps
+  in its debug log only. There you see the warning in the record
+  (`innerwarden graph`) and on the alert channels, not in the agent.
 - `strict`, or no file, or a file that holds anything else: every `deny`
   is refused and a `review` is answered as the table below says. This is
   the enforce of every release before the posture existed, so a home wired

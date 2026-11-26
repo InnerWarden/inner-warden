@@ -1921,6 +1921,9 @@ const GUARD_UNITS: &[&str] = &[
 /// pattern that cannot be read (an unclosed `[`) is taken as reaching the
 /// guard.
 fn glob_target(unit: &str) -> Option<&'static str> {
+    // A pattern of unit files (`~/.config/systemd/user/inner*`, what `ls`
+    // hands `xargs`) names the units by its last part.
+    let unit = unit.rsplit('/').next().unwrap_or(unit);
     if !unit.contains(['*', '?', '[']) {
         return None;
     }

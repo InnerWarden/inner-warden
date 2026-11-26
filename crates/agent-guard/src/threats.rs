@@ -796,6 +796,12 @@ pub(crate) fn check_child_agent_without_its_hook(content: &str) -> Option<(&'sta
 pub const CHILD_AGENT_UNHOOKED: &str =
     "starts an AI agent with the hook that screens it switched off or moved away";
 
+/// What [`child_agent_without_its_hook`] says when the line names the
+/// guard's own alerts or configuration elsewhere for the agent it starts.
+pub const CHILD_AGENT_GUARD_CONFIG: &str = "starts an AI agent with the guard's alerts or its \
+     configuration named elsewhere (IW_NOTIFY_CONFIG, IW_LLM_CONFIG or XDG_CONFIG_HOME): what the \
+     guard refuses in that agent would reach nobody";
+
 /// What [`child_agent_without_its_hook`] says when all the line moves is
 /// Claude Code's own folder: `CLAUDE_CONFIG_DIR` naming another one, which
 /// holds no hook of the guard's until one is installed there.
@@ -816,7 +822,12 @@ pub const CHILD_AGENT_OTHER_FOLDER: &str = "starts Claude Code with CLAUDE_CONFI
 /// `CLAUDE_CODE_RESTRICT_PERSONAL_CONFIG` and
 /// `CLAUDE_CODE_REMOTE_SESSION_ORIGIN` (read in Claude Code 2.1.323; the last
 /// one leaves the user's settings out with three other remote variables set
-/// beside it). Lowercase.
+/// beside it). And the guard's own: `IW_NOTIFY_CONFIG` and `IW_LLM_CONFIG`,
+/// which the hook of the child reads from the environment it is handed
+/// (a release build honours `/dev/null`, which switches the alerts or the
+/// second opinion off; measured 2026-11-26), and `XDG_CONFIG_HOME`, the
+/// folder of the configuration of the agents that read one there.
+/// Lowercase.
 const AGENT_HOOK_VARIABLES: &[&str] = &[
     "home",
     "codex_home",
@@ -835,6 +846,9 @@ const AGENT_HOOK_VARIABLES: &[&str] = &[
     "claude_code_personal_hooks_off",
     "claude_code_restrict_personal_config",
     "claude_code_remote_session_origin",
+    "xdg_config_home",
+    "iw_notify_config",
+    "iw_llm_config",
 ];
 
 /// The agent CLIs whose hook (or, for the Cursor CLI, whose MCP wiring) the
@@ -997,6 +1011,10 @@ const UNHOOKED: u8 = 1;
 /// A finding of [`child_agent_without_its_hook`]: Claude Code's own folder
 /// named elsewhere ([`CHILD_AGENT_OTHER_FOLDER`]).
 const OTHER_FOLDER: u8 = 2;
+
+/// A finding of [`child_agent_without_its_hook`]: the guard's alerts or its
+/// configuration named elsewhere ([`CHILD_AGENT_GUARD_CONFIG`]).
+const GUARD_CONFIG: u8 = 4;
 
 /// What a line has set by the time it reaches a command, as
 /// [`child_agent_without_its_hook`] reads it.
@@ -1165,6 +1183,7 @@ fn keeps_its_folder(name: &str, given: Given<'_>) -> bool {
     match name {
         "home" => rest.is_empty(),
         "claude_config_dir" => plain("/.claude"),
+        "xdg_config_home" => plain("/.config"),
         _ => false,
     }
 }
@@ -1202,6 +1221,8 @@ fn child_agent_without_its_hook(content: &str) -> Option<(&'static str, u32)> {
         Some((CHILD_AGENT_UNHOOKED, 60))
     } else if found & OTHER_FOLDER != 0 {
         Some((CHILD_AGENT_OTHER_FOLDER, 60))
+    } else if found & GUARD_CONFIG != 0 {
+        Some((CHILD_AGENT_GUARD_CONFIG, 60))
     } else {
         None
     }
@@ -1236,6 +1257,7 @@ fn variable_effect(name: &str, value: Given<'_>) -> u8 {
     }
     match name.as_str() {
         "claude_config_dir" => OTHER_FOLDER,
+        "xdg_config_home" | "iw_notify_config" | "iw_llm_config" => GUARD_CONFIG,
         _ => UNHOOKED,
     }
 }
@@ -3485,6 +3507,43 @@ const CARRIER_REWRITES: &[&str] = &[
     "removes or moves aside the plugin or hook that carries the guard in OpenClaw",
 ];
 
+/// Whether a verdict holds a write into the guard's own configuration
+/// (`~/.config/innerwarden`: its alerts, posture, mute and allow rules):
+/// what the hook refuses in every mode, monitor included, as lowering the
+/// guard is. The folder reached through a pattern of `command` counts; a
+/// line that takes a folder above it (the home, `~/.config`) stays
+/// observed in monitor, as the rest of monitor is.
+pub fn verdict_writes_guard_config(command: &str, verdict: &serde_json::Value) -> bool {
+    // The guard's folder reached through a pattern (`~/.config/inner*/x`) is
+    // said in the words of a folder above it taken: told apart by the path.
+    let through_pattern = || {
+        crate::shell_words::read_line(command)
+            .commands
+            .iter()
+            .flat_map(|line| line.words.iter())
+            .any(|word| above_guard_config(&word.text, &[]) == Some(AboveGuardConfig::Guard))
+    };
+    let says = |text: &str| {
+        text.contains(GUARD_CONFIG_WRITTEN)
+            || (text.contains(GUARD_CONFIG_ANCESTOR_TAKEN) && through_pattern())
+    };
+    verdict
+        .get("explanation")
+        .and_then(|explanation| explanation.as_str())
+        .is_some_and(says)
+        || verdict
+            .get("signals")
+            .and_then(|signals| signals.as_array())
+            .is_some_and(|signals| {
+                signals.iter().any(|signal| {
+                    signal
+                        .get("detail")
+                        .and_then(|detail| detail.as_str())
+                        .is_some_and(says)
+                })
+            })
+}
+
 /// What [`guard_self_disable_in`] says of a write into the guard's own
 /// configuration.
 const GUARD_CONFIG_WRITTEN: &str =
@@ -3573,6 +3632,10 @@ pub(crate) fn check_guard_takedown(content: &str) -> Option<(&'static str, u32)>
                 .or_else(|| check_security_tamper(line))
         })
         .map(|_| (SEARCH_RUNS_TAKEDOWN, 60))
+        .or_else(|| {
+            guard_file_targets::removal_may_reach_guard_file(content)
+                .then_some((guard_file_targets::GUARD_FILE_MAYBE_REACHED, 25))
+        })
 }
 
 /// What [`check_guard_takedown`] says of a search whose program takes the
@@ -10625,9 +10688,18 @@ fn writes_jail_record(content: &str) -> bool {
 
 /// Whether a path names the guard's configuration directory or a file in it.
 fn names_guard_config(target: &str) -> bool {
-    named_path(&home_spelled(target))
-        .is_some_and(|named| Place::Components(".config/innerwarden").holds(&named))
+    named_path(&home_spelled(target)).is_some_and(|named| {
+        GUARD_CONFIG_PLACES
+            .iter()
+            .any(|place| Place::Components(place).holds(&named))
+    })
 }
+
+/// The guard's own folders in a home, protected alike: its configuration,
+/// and the state folder that holds the jail's notes and the record kept when
+/// the shared one cannot be written.
+pub(crate) const GUARD_CONFIG_PLACES: &[&str] =
+    &[".config/innerwarden", ".local/state/innerwarden"];
 
 /// What [`PRIVILEGED_WRITE_TARGETS`] calls the settings the guard is loaded
 /// by, and its own program: the two groups the guard is carried by.
@@ -11003,7 +11075,7 @@ fn code_names_and_writes_guard_config(code: &str) -> bool {
     static WRITES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let names = NAMES.get_or_init(|| {
         regex::Regex::new(
-            r#"\.config\W{1,8}innerwarden|xdg_config_home\W{1,24}innerwarden|innerwarden\W{1,8}jail-claude"#,
+            r#"\.config\W{1,8}innerwarden|xdg_config_home\W{1,24}innerwarden|innerwarden\W{1,8}jail-claude|\.local\W{1,8}state\W{1,8}innerwarden"#,
         )
         .expect("static config path regex")
     });
@@ -13919,6 +13991,15 @@ pub fn check_command_except(content: &str, lifted: &[&str]) -> Option<(&'static 
             return Some(hit);
         }
     }
+    // A `PATH=` value is read as the shell hands it over: `PATH=\/tmp/x:...`
+    // and `PATH=/"tmp"/x:...` set the same PATH as `PATH=/tmp/x:...`.
+    if content.contains("PATH=") {
+        for assignment in path_assignments_as_read(content) {
+            if let Some(hit) = dangerous_command_in(&assignment) {
+                return Some(hit);
+            }
+        }
+    }
     if unfiltered_find_delete(content)
         || (normalized_differs && unfiltered_find_delete(&normalized))
     {
@@ -13931,6 +14012,23 @@ pub fn check_command_except(content: &str, lifted: &[&str]) -> Option<(&'static 
         return Some(("host shutdown or reboot", true));
     }
     None
+}
+
+/// Each `PATH=` assignment of the line written `PATH=<value>` with the
+/// value as the shell hands it over, its quotes and backslash escapes taken
+/// out (`export PATH=\/tmp/x:$PATH` is `PATH=/tmp/x:$PATH`): in front of a
+/// command, alone, or a word of `export`, `declare`, `typeset`,
+/// `readonly`, `local` or `env`. An expansion stays as written.
+fn path_assignments_as_read(content: &str) -> Vec<String> {
+    crate::shell_words::read_line(content)
+        .commands
+        .iter()
+        .flat_map(|command| command.words.iter())
+        .filter_map(|word| {
+            let value = word.text.strip_prefix("PATH=")?;
+            Some(format!("PATH={value}"))
+        })
+        .collect()
 }
 
 /// Whether a command of `content` powers the host off or restarts it:
@@ -21285,7 +21383,7 @@ fn disable_verb_before(
             // with an incidental mention of the target. And in the same
             // command: `pkill -f x; cd ~/innerwarden/wt` kills `x`, then
             // enters a folder whose name holds the guard's. And a word of
-            // its own: the `kill` in a package named `innerwarden-killchain`
+            // its own: the `kill` in a package named `acme-killswitch`
             // or a test named `kill_switch` is no verb.
             if verb_at < target_at
                 && verb_is_a_word(lower, verb_at, verb.len())
@@ -21310,7 +21408,7 @@ fn disable_verb_before(
 /// joined to a name by `-` or `_`: no letter, digit, `-` or `_` right
 /// before it, no `-` or `_` right after it. `kill`, `/usr/bin/pkill`,
 /// `'stop'`, a D-Bus method (`KillUnit`, `Manager.StopUnit`) and
-/// `./stop.sh` are verbs; the `kill` of `innerwarden-killchain`,
+/// `./stop.sh` are verbs; the `kill` of `acme-killswitch`,
 /// `skill-killer`, `kill_switch` or `kill-cases.json` is none.
 fn verb_is_a_word(lower: &str, at: usize, len: usize) -> bool {
     let before = |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '_');
@@ -23139,12 +23237,14 @@ const PRIVILEGED_WRITE_TARGETS: &[PrivilegedGroup] = &[
             Place::Components(".openclaw/hooks"),
             // The Community configuration, its allow rules and its record.
             Place::Components(".config/innerwarden"),
-            // The jail launcher's folder of each project's own Claude Code
-            // folder, and beside each its notes of what a jail made in the
-            // project (`<key>.made`, `<key>.run.<pid>`, `<key>.absent`):
-            // an agent outside the jail that took a note away would let the
-            // next jail start on a file the person never accepted.
-            Place::Components(".local/state/innerwarden/jail-claude"),
+            // The guard's state folder: the jail launcher's folder of each
+            // project's own Claude Code folder, and beside each its notes of
+            // what a jail made in the project (`<key>.made`,
+            // `<key>.run.<pid>`, `<key>.absent`): an agent outside the jail
+            // that took a note away would let the next jail start on a file
+            // the person never accepted; and the record kept there when the
+            // shared one cannot be written.
+            Place::Components(".local/state/innerwarden"),
             // INNERWARDEN_SELF_PATHS, but for the binary, which is a program.
             Place::Tree("/etc/innerwarden"),
             Place::Tree("/var/lib/innerwarden"),
@@ -24154,8 +24254,9 @@ fn shell_interpreter_executes_target(
         if matches!(argument.as_str(), "-c" | "--command")
             || short_flags.is_some_and(|flags| flags.contains('c'))
         {
-            if arguments.get(index + 1).is_some_and(|payload| {
-                shell_payload_executes_target(payload, target, cwd, variables, depth + 1)
+            // The shell reads its options past `-c` (`sh -c -- CODE`).
+            if crate::shell::shell_c_script_from(arguments, index + 1).is_some_and(|at| {
+                shell_payload_executes_target(&arguments[at], target, cwd, variables, depth + 1)
             }) {
                 return true;
             }
@@ -25333,9 +25434,13 @@ fn download_output_targets(words: &[String]) -> Vec<String> {
         return Vec::new();
     }
     let mut targets = redirect_targets(&words[command_index + 1..]);
+    let redirected = targets.len();
     let args = &words[command_index + 1..];
     let mut index = 0usize;
     let mut remote_name = false;
+    // The folder curl's `--output-dir` (wget's `-P`, `--directory-prefix`)
+    // puts a file it names by `-o` or by the remote name in.
+    let mut folder: Option<String> = None;
     // BSD `fetch URL` saves under the URL's last path component, like wget.
     let fetch_default_name = command == "fetch"
         && !args.iter().any(|argument| {
@@ -25374,6 +25479,25 @@ fn download_output_targets(words: &[String]) -> Vec<String> {
                 }
             }
         }
+        let folder_word = match command.as_str() {
+            "curl" => ["--output-dir"].as_slice(),
+            "wget" => ["-P", "--directory-prefix"].as_slice(),
+            _ => [].as_slice(),
+        };
+        if folder_word.contains(&argument.as_str()) {
+            folder = args.get(index + 1).cloned();
+            index += 2;
+            continue;
+        }
+        if let Some(value) = folder_word
+            .iter()
+            .filter(|word| word.starts_with("--"))
+            .find_map(|word| argument.strip_prefix(&format!("{word}=")))
+        {
+            folder = Some(value.to_string());
+            index += 1;
+            continue;
+        }
         let takes_next = match command.as_str() {
             "curl" | "fetch" => matches!(argument.as_str(), "-o" | "--output"),
             "wget" => matches!(argument.as_str(), "-O" | "--output-document"),
@@ -25406,6 +25530,17 @@ fn download_output_targets(words: &[String]) -> Vec<String> {
     if command == "wget" || (command == "curl" && remote_name) || fetch_default_name {
         if let Some(name) = args.iter().find_map(|argument| remote_basename(argument)) {
             targets.push(name);
+        }
+    }
+    // A name of the downloader's own, not a path from `/` or `~`, lands in
+    // the folder it was given: `curl --output-dir ~/.ssh -O URL` writes
+    // `~/.ssh/<remote name>`.
+    if let Some(folder) = folder.filter(|folder| !folder.is_empty()) {
+        let folder = folder.trim_end_matches('/');
+        for target in &mut targets[redirected..] {
+            if !target.starts_with('/') && !target.starts_with('~') {
+                *target = format!("{folder}/{target}");
+            }
         }
     }
     targets

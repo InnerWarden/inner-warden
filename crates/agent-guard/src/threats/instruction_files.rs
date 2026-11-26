@@ -643,6 +643,7 @@ fn holds_one_of(word: &str, triggers: &[&str]) -> bool {
 /// clause is lowered once, a sentence keeps flags rather than its text, and
 /// past [`MAX_PIECES`] pieces the rest is still read for prose.
 pub(crate) fn order_reading(text: &str) -> OrderReading {
+    let text = &joined_continuations(text);
     let mut reading = OrderReading::default();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut firm_text = 0usize;
@@ -742,6 +743,33 @@ pub(crate) fn order_reading(text: &str) -> OrderReading {
         }
     }
     reading
+}
+
+/// A text with each line the shell would carry on joined to the next, as
+/// the shell reads it when the line is run: one that ends in `\` (the
+/// backslash goes), `|`, `&&` or `||`. A line that starts with `|` (a
+/// Markdown table's row) is left as it is.
+fn joined_continuations(text: &str) -> std::borrow::Cow<'_, str> {
+    let carries_on = |line: &str| {
+        let line = line.trim_end();
+        !line.trim_start().starts_with('|')
+            && (line.ends_with('\\') || line.ends_with('|') || line.ends_with("&&"))
+    };
+    if !text.lines().any(carries_on) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        if carries_on(line) {
+            let line = line.trim_end();
+            out.push_str(line.strip_suffix('\\').unwrap_or(line));
+            out.push(' ');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// A text cut at line ends, sentence ends, `;`, and the words that join

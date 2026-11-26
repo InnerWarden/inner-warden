@@ -8,7 +8,7 @@
 //! - the pattern `'//'` or `'/'` of a `grep` whose output feeds a reader
 //!   was read as the root folder, and the search refused for reading the
 //!   home's credentials (`a_search_pattern_is_no_path`);
-//! - `cargo test -p innerwarden-killchain > ~/innerwarden-notes/x.txt` was
+//! - `cargo test -p acme-killswitch > ~/innerwarden-notes/x.txt` was
 //!   refused as disabling the guard: the `kill` inside the package's name
 //!   was read as the verb and the redirection's file as its target
 //!   (`a_verb_is_a_word_and_a_redirection_is_no_target`);
@@ -127,8 +127,8 @@ fn a_search_pattern_is_no_path() {
 #[test]
 fn a_verb_is_a_word_and_a_redirection_is_no_target() {
     for line in [
-        "cargo test -p innerwarden-killchain > /home/u/innerwarden-notes/x.txt",
-        "cargo build -p innerwarden-killchain >> /home/u/innerwarden-notes/x.log 2>&1",
+        "cargo test -p acme-killswitch > /home/u/innerwarden-notes/x.txt",
+        "cargo build -p acme-killswitch >> /home/u/innerwarden-notes/x.log 2>&1",
         "cargo test -p skill-killer > /home/u/innerwarden-notes/x.txt",
         "cargo test --test kill_switch > /home/u/innerwarden-notes/x.txt",
         "cargo test --test kill_chain -p innerwarden-agent-guard 2>&1 | tail",

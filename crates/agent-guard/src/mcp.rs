@@ -4201,6 +4201,142 @@ fn instruction_order(
     })
 }
 
+/// The most files an instruction text's `@` imports are followed for, and
+/// how much of each is read.
+const MAX_IMPORTS: usize = 8;
+const MAX_IMPORT_BYTES: u64 = 64 * 1024;
+
+/// Folders anyone on the host can write: an import from one says what
+/// another account puts there later.
+const SHARED_FOLDERS: &[&str] = &["/tmp/", "/var/tmp/", "/dev/shm/"];
+
+/// The `@path` imports of an instruction text (Claude Code reads the file
+/// `@~/x.md`, `@/abs/x.md` or `@docs/x.md` names as part of the text):
+/// a `@` at the start of a word, outside backquotes, then a path with a
+/// `/` or a `.` in it. `@maintainer` and `a@b.com` import nothing.
+fn instruction_imports(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let mut in_code = false;
+        let mut before = ' ';
+        let chars: Vec<char> = line.chars().collect();
+        let mut at = 0;
+        while at < chars.len() {
+            let c = chars[at];
+            if c == '\x60' {
+                in_code = !in_code;
+            } else if c == '@' && !in_code && before.is_whitespace() {
+                let path: String = chars[at + 1..]
+                    .iter()
+                    .take_while(|c| {
+                        !c.is_whitespace() && !matches!(c, '\x60' | '"' | '\'' | ')' | ']' | ',')
+                    })
+                    .collect();
+                let path = path.trim_end_matches(['.', ':', ';']).to_string();
+                if path.contains(['/', '.']) && !path.starts_with('@') {
+                    found.push(path);
+                    if found.len() >= MAX_IMPORTS {
+                        return found;
+                    }
+                }
+            }
+            before = c;
+            at += 1;
+        }
+    }
+    found
+}
+
+/// Why the files `text` imports (`@path`, [`instruction_imports`]) make it
+/// an order, written into the instruction file `file`: an imported file
+/// that holds one is read as part of the text, with the score its order
+/// takes. An import from outside the instruction file's folder of a file in
+/// a folder anyone can write, or of one that is not there yet, says what
+/// someone puts there later: held for review ([`INSTRUCTION_ORDER_UNREAD_SCORE`]). A
+/// file inside the folder that is not there is a name, nothing more.
+fn imported_instruction_order(
+    file: &str,
+    text: &str,
+    rule_engine: Option<&RuleEngine>,
+    depth: u8,
+) -> Option<(String, u32)> {
+    let file = file.trim().trim_matches(['"', '\'']);
+    let folder = std::path::Path::new(file)
+        .parent()
+        .filter(|folder| folder.is_absolute());
+    let mut held: Option<(String, u32)> = None;
+    for import in instruction_imports(text) {
+        let (path, outside) = if let Some(rest) = import.strip_prefix("~/") {
+            let Ok(home) = crate::hook::home_dir() else {
+                held.get_or_insert((
+                    format!("imports `{import}` from a home the guard cannot tell"),
+                    INSTRUCTION_ORDER_UNREAD_SCORE,
+                ));
+                continue;
+            };
+            (home.join(rest), true)
+        } else if import.starts_with('/') {
+            let path = std::path::PathBuf::from(&import);
+            let outside = folder.is_none_or(|folder| !path.starts_with(folder));
+            (path, outside)
+        } else {
+            let Some(folder) = folder else { continue };
+            (folder.join(&import), import.starts_with("../"))
+        };
+        let read = std::fs::File::open(&path).and_then(|opened| {
+            use std::io::Read;
+            let mut body = String::new();
+            opened.take(MAX_IMPORT_BYTES).read_to_string(&mut body)?;
+            Ok(body)
+        });
+        if let Ok(body) = &read {
+            if let Some((why, score)) = instruction_order(body, rule_engine, depth) {
+                return Some((
+                    format!("imports `{import}`, which holds an order: {why}"),
+                    score,
+                ));
+            }
+        }
+        let shown = path.display().to_string();
+        if outside
+            && SHARED_FOLDERS
+                .iter()
+                .any(|shared| shown.starts_with(shared))
+        {
+            held.get_or_insert((
+                format!(
+                    "imports `{import}`, a file in a folder anyone on the host can write, as \
+                     its instructions"
+                ),
+                INSTRUCTION_ORDER_UNREAD_SCORE,
+            ));
+            continue;
+        }
+        match read {
+            Ok(_) => {}
+            Err(_) if outside => {
+                held.get_or_insert((
+                    format!(
+                        "imports `{import}`, outside the instruction file's folder and not \
+                         there to read: what it will say is not known"
+                    ),
+                    INSTRUCTION_ORDER_UNREAD_SCORE,
+                ));
+            }
+            Err(_) => {}
+        }
+    }
+    held
+}
+
 /// Why `text`, written into `path` by an agent's own file tool (`Write`,
 /// `Edit`, `write_file`, `apply_patch`, ...), is an order to every later
 /// session, if `path` is a file an agent reads as its instructions and the
@@ -4218,7 +4354,8 @@ pub fn written_instruction_order(
     if text.trim().is_empty() || !crate::agent_instructions::is_instruction_file(path) {
         return None;
     }
-    let (why, score) = instruction_order(text, rule_engine, 0)?;
+    let (why, score) = instruction_order(text, rule_engine, 0)
+        .or_else(|| imported_instruction_order(path, text, rule_engine, 0))?;
     let shown: String = path.trim().chars().take(200).collect();
     Some((
         format!(
@@ -5065,11 +5202,23 @@ fn analyze_command_as_read(
 
     // Read on the line as the shell hands it over too: taking backslashes out
     // of code in quotes can change what that code runs.
-    let flow = crate::shell::executable_data_flow(scan_cmd).or_else(|| {
-        (raw_scan != scan_cmd)
-            .then(|| crate::shell::executable_data_flow(raw_scan))
-            .flatten()
-    });
+    // And in a shell's `-c` script as the shell hands it over: glued quotes
+    // or backslashes keep the tree from reading it as one script.
+    let flow = crate::shell::executable_data_flow(scan_cmd)
+        .or_else(|| {
+            (raw_scan != scan_cmd)
+                .then(|| crate::shell::executable_data_flow(raw_scan))
+                .flatten()
+        })
+        .or_else(|| {
+            (depth < STARTUP_PAYLOAD_DEPTH)
+                .then(|| {
+                    crate::shell::shell_scripts_as_handed(cmd)
+                        .iter()
+                        .find_map(|script| crate::shell::executable_data_flow(script))
+                })
+                .flatten()
+        });
     if let Some(flow) = flow {
         // Text of the project's own files placed into code is a warning;
         // every other flow is a refusal.
@@ -5521,7 +5670,9 @@ fn analyze_command_as_read(
         if let Some((file, (why, order_score))) = threats::instruction_file_payloads(cmd)
             .into_iter()
             .filter_map(|(file, text)| {
-                instruction_order(&text, rule_engine, depth).map(|order| (file, order))
+                instruction_order(&text, rule_engine, depth)
+                    .or_else(|| imported_instruction_order(&file, &text, rule_engine, depth))
+                    .map(|order| (file, order))
             })
             .max_by_key(|(_, (_, score))| *score)
         {

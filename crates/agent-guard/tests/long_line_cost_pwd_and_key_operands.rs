@@ -20,7 +20,6 @@
 //! The lines of `corpus/key-operands-2026-11` are the attacks and controls.
 
 use innerwarden_agent_guard::mcp::{analyze_command, analyze_command_in, WorkingContext};
-use std::time::{Duration, Instant};
 
 #[derive(serde::Deserialize)]
 struct Corpus {
@@ -49,37 +48,87 @@ fn repeated(unit: &str, bytes: usize) -> String {
     line
 }
 
-/// The shortest of three judgements of `line`: the least disturbed by
-/// whatever else the machine runs.
-fn cost(line: &str) -> Duration {
-    (0..3)
-        .map(|_| {
-            let started = Instant::now();
-            let _ = analyze_command(line, None);
-            started.elapsed()
-        })
-        .min()
-        .expect("three runs")
+/// The processor time this thread has used so far: the work it did, not the
+/// time it waited while other programs had the processor. In nanoseconds;
+/// only the ratio of two costs is ever compared.
+#[cfg(unix)]
+fn thread_cpu() -> u128 {
+    let mut now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `now` is a live timespec for the call to write.
+    let read = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut now) };
+    assert_eq!(read, 0, "the thread's processor clock reads");
+    let seconds = u128::try_from(now.tv_sec).expect("seconds");
+    let nanos = u128::try_from(now.tv_nsec).expect("nanoseconds");
+    seconds * 1_000_000_000 + nanos
+}
+
+/// The processor time this thread has used so far, in the processor cycles
+/// Windows counts for it: the work it did, not the time it waited while
+/// other programs had the processor. Only the ratio of two costs is ever
+/// compared.
+#[cfg(windows)]
+fn thread_cpu() -> u128 {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> *mut std::ffi::c_void;
+        fn QueryThreadCycleTime(thread: *mut std::ffi::c_void, cycles: *mut u64) -> i32;
+    }
+    let mut cycles = 0u64;
+    // SAFETY: the handle is the calling thread's own pseudo handle, which is
+    // never closed, and `cycles` is a live u64 for the call to write.
+    let read = unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) };
+    assert_ne!(read, 0, "the thread's cycle count reads");
+    u128::from(cycles)
+}
+
+/// What one judgement of `line` costs this thread ([`thread_cpu`]).
+fn cost(line: &str) -> u128 {
+    let started = thread_cpu();
+    let _ = analyze_command(line, None);
+    thread_cpu() - started
+}
+
+/// The middle one of `costs`.
+fn median(mut costs: Vec<u128>) -> u128 {
+    costs.sort_unstable();
+    costs[costs.len() / 2]
 }
 
 /// FAILS ON REVERT of the per-tree kind index and of the values carried per
-/// command: on main each shape cost about ten times as much in 8 KB as in
-/// 2 KB (3964 / 504 ms and 3009 / 320 ms in a debug build). A line four
-/// times as long is held to six times the cost, five and a margin; nothing
-/// is measured in absolute time.
+/// command. Measured 2026-11-26 in a debug build, 16 KB against 1 KB: with
+/// `tree_lacks_kind` never saying a kind is absent, `echo hi | cat; ` cost
+/// 84 times as much; with every value of the line carried to every command
+/// (`handed_shell_lines` as it was before), `X=1 true; ` cost 75 times as
+/// much and `(X=#); echo $X; ` 50 to 63 times. As shipped, the four shapes
+/// cost 16 to 27 times as much (the lines that read `$X` in every command
+/// keep a small square term). A line sixteen times as long is held to 48
+/// times the cost: three times what a cost in proportion to the length
+/// would be, a fifth of the square.
+///
+/// What is measured is the processor time of the thread that judges
+/// ([`thread_cpu`]), never a clock on the wall: until 2026-11-26 this test
+/// took the shortest of three wall-clock runs of 2 KB and of 8 KB, and the
+/// macOS runner, shared with other jobs, failed it on lines whose cost had
+/// not changed (2 KB 48 ms, 8 KB 290 ms). The two lengths are judged in
+/// turn, five times each, and the medians compared, so a judgement slowed
+/// by something else moves neither. The sixteenfold length keeps the
+/// margins wide on both sides: at four times the length, the costliest
+/// shape cost 5.1 times as much as shipped, 7.6 times with the values
+/// reverted and 9.4 times with the index reverted.
 ///
 /// Skipped under coverage only: instrumented, with the other tests of the
-/// binary running beside it, the ratio crossed six on the runner on lines
-/// whose cost had not changed (2026-11-22, the coverage job of several PRs),
-/// while the build job, which runs it as shipped, kept it. The square it
-/// guards against is ten times in a debug build, so the build job alone still
-/// catches a revert.
+/// binary running beside it, a ratio measures the instrumentation (the
+/// coverage job of several PRs crossed the old bound, 2026-11-22). The build
+/// job runs it as shipped, so it still catches a revert.
 #[cfg_attr(
     tarpaulin,
     ignore = "a perf ratio under instrumentation measures the instrumentation"
 )]
 #[test]
-fn a_line_four_times_as_long_costs_about_four_times_as_much() {
+fn a_line_sixteen_times_as_long_costs_nowhere_near_the_square() {
     // Compiles the rules once, outside what is measured.
     let _ = analyze_command(&repeated("true; ", 512), None);
     for unit in [
@@ -88,11 +137,18 @@ fn a_line_four_times_as_long_costs_about_four_times_as_much() {
         "X=1 true; ",
         "echo hi | cat; ",
     ] {
-        let short = cost(&repeated(unit, 2048));
-        let long = cost(&repeated(unit, 8192));
+        let short_line = repeated(unit, 1024);
+        let long_line = repeated(unit, 16 * 1024);
+        let (mut short, mut long) = (Vec::new(), Vec::new());
+        for _ in 0..5 {
+            short.push(cost(&short_line));
+            long.push(cost(&long_line));
+        }
+        let (short, long) = (median(short), median(long));
         assert!(
-            long <= short * 6,
-            "{unit:?}: 2 KB took {short:?}, 8 KB took {long:?}"
+            long <= short * 48,
+            "{unit:?}: 1 KB cost {short}, 16 KB cost {long}, {:.1} times as much",
+            long as f64 / short as f64
         );
     }
 }

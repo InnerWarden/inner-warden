@@ -342,7 +342,7 @@ fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
             // `posix.spawn("prog", "arg", ...)`; `exec` and `execp` of
             // `posix` and `posix.unistd` take a program and the table of
             // its arguments (`exec` is also held by name, as every `exec(`).
-            "posix.spawn" => LineOrWords,
+            "posix.spawn" | "posix.spawn.spawn" => LineOrWords,
             "posix.exec" | "posix.execp" | "posix.unistd.exec" | "posix.unistd.execp" => PathList,
             "load" | "loadstring" => Code,
             "dofile" | "loadfile" | "require" => Load,
@@ -435,6 +435,7 @@ const SINK_HOLDERS: &[(Lang, &str)] = &[
     (Lang::Lua, "io"),
     (Lang::Lua, "posix"),
     (Lang::Lua, "posix.unistd"),
+    (Lang::Lua, "posix.spawn"),
     (Lang::Lua, "_G"),
     (Lang::Lua, "_ENV"),
 ];
@@ -712,6 +713,9 @@ struct Reader<'a> {
     functions: Vec<(String, Vec<String>)>,
     /// Where the name of each call the reader read stands, in bytes.
     read_names: Vec<(usize, usize)>,
+    /// The names bound to a value whose target is built at run time
+    /// ([`Self::bound_constructed_name`]).
+    built_targets: Vec<String>,
     /// Every call site that is not a definition, statement by statement:
     /// the callee, where its arguments start and where its statement ends.
     /// Listed once, the first time a helper's calls are looked for.
@@ -754,6 +758,7 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
         node_calls: Vec::new(),
         functions: Vec::new(),
         read_names: Vec::new(),
+        built_targets: Vec::new(),
         call_list: None,
         closures: Vec::new(),
         string_code_depth: 0,
@@ -1261,6 +1266,7 @@ fn normalized_code(lang: Lang, code: &str) -> String {
                 (is_chain(object) && rest.trim().is_empty() && is_chain(name))
                     .then(|| format!("{object}.{name}"))
             });
+            text = python_literal_dict_lookups(&text);
         }
         Lang::Ruby => {
             for opener in [
@@ -1304,6 +1310,7 @@ fn normalized_code(lang: Lang, code: &str) -> String {
                         .then(|| format!("{object}.{name}"))
                 });
             }
+            text = lua_builtin_aliases(&text);
             text = lua_protected_requires(&text);
             text = lua_required_modules(&text);
             text = lua_literal_indexes(&text);
@@ -1311,6 +1318,48 @@ fn normalized_code(lang: Lang, code: &str) -> String {
         _ => {}
     }
     text
+}
+
+/// Python's `x.__dict__['name']` and `x.__dict__.get('name')`, a name
+/// written out, as the attribute they look up: `x.name`. A name that is not
+/// one plain string is left for [`constructed_lookup`].
+fn python_literal_dict_lookups(code: &str) -> String {
+    const DICT: &str = ".__dict__";
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(found) = rest.find(DICT) {
+        let after = &rest[found + DICT.len()..];
+        let (inner, tail) = if let Some(open) = after.strip_prefix('[') {
+            match closing(open) {
+                Some(close) => (&open[..close], &open[close + 1..]),
+                None => ("", ""),
+            }
+        } else if let Some(open) = after.strip_prefix(".get(") {
+            match closing(open) {
+                Some(close) => (&open[..close], &open[close + 1..]),
+                None => ("", ""),
+            }
+        } else {
+            ("", "")
+        };
+        let name = simple_quoted(inner.trim())
+            .filter(|(name, rest)| rest.trim().is_empty() && is_chain(name))
+            .map(|(name, _)| name);
+        match name {
+            Some(name) => {
+                out.push_str(&rest[..found]);
+                out.push('.');
+                out.push_str(name);
+                rest = tail;
+            }
+            None => {
+                out.push_str(&rest[..found + DICT.len()]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// A way code reaches a function by a name it builds at run time, found
@@ -1353,6 +1402,17 @@ fn constructed_lookup(lang: Lang, text: &str, call_start: bool) -> Option<Lookup
     };
     match lang {
         Lang::Python => {
+            // An object's own table of names, indexed by one it builds
+            // (`os.__dict__['sys'+'tem']`, `.get(...)`); one written out is
+            // the attribute ([`python_literal_dict_lookups`]).
+            if !call_start {
+                if text.starts_with("__dict__.get(") {
+                    return Some(lookup("__dict__.get", true, false, false));
+                }
+                if text.starts_with("__dict__[") {
+                    return Some(lookup("__dict__", false, false, false));
+                }
+            }
             for name in [
                 "operator.methodcaller",
                 "importlib.import_module",
@@ -1514,6 +1574,228 @@ fn lua_required_modules(code: &str) -> String {
                 at = code.len() - after.len() + 1;
                 continue;
             }
+        }
+        let width = code[at..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&code[at..at + width]);
+        at += width;
+    }
+    out
+}
+
+/// The built-ins that load a module or call a function protected, which a
+/// Lua line may call through a name of its own.
+const LUA_LOADERS: &[&str] = &[
+    "require",
+    "pcall",
+    "xpcall",
+    "select",
+    "load",
+    "loadstring",
+    "dofile",
+];
+
+/// How many names given names [`lua_builtin_aliases`] follows.
+const LUA_ALIAS_ROUNDS: usize = 4;
+
+/// Lua's built-ins given another name (`local r = require`, `local p =
+/// pcall`, and a name given that name) written back as themselves wherever
+/// the name is used, outside strings; and the module a protected `require`
+/// hands back, picked by `select(2, ...)` or by `({...})[2]`, written as
+/// the `require` it is. `local r = require; r("os").execute(...)` is read
+/// as `require("os").execute(...)`, which is `os.execute(...)`.
+pub(crate) fn lua_builtin_aliases(code: &str) -> String {
+    lua_builtin_aliases_reading(code, true)
+}
+
+/// [`lua_builtin_aliases`] of a whole shell line that hands inline code to
+/// an interpreter: the code stands in the line's quotes, so a name is read
+/// inside strings too.
+pub(crate) fn lua_builtin_aliases_in_line(line: &str) -> String {
+    lua_builtin_aliases_reading(line, false)
+}
+
+/// [`lua_builtin_aliases`], reading names inside strings or not.
+fn lua_builtin_aliases_reading(code: &str, skip_strings: bool) -> String {
+    let spelled = lua_builtin_spellings(code);
+    let code: &str = &spelled;
+    static GIVEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:^|[^\w.:])(?:local\s+)?([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)")
+            .expect("static lua alias regex")
+    });
+    static PICKED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"\bselect\s*\(\s*(?:2|-1)\s*,\s*x?pcall\s*\(\s*require\s*,\s*("[\w./-]+"|'[\w./-]+')\s*\)\s*\)|\(\s*\{\s*x?pcall\s*\(\s*require\s*,\s*("[\w./-]+"|'[\w./-]+')\s*\)\s*\}\s*\)\s*\[\s*2\s*\]"#,
+        )
+        .expect("static lua select regex")
+    });
+    let mut aliases: Vec<(String, &'static str)> = Vec::new();
+    for _ in 0..LUA_ALIAS_ROUNDS {
+        let before = aliases.len();
+        for found in GIVEN.captures_iter(code) {
+            let (Some(name), Some(value)) = (found.get(1), found.get(2)) else {
+                continue;
+            };
+            // The built-in itself, not a call of it: nothing that calls,
+            // indexes or reads a field follows the name.
+            let next = code[value.end()..]
+                .trim_start_matches([' ', '\t'])
+                .chars()
+                .next();
+            if next.is_some_and(|c| matches!(c, '(' | '"' | '\'' | '[' | '{' | '.' | ':')) {
+                continue;
+            }
+            let builtin = LUA_LOADERS
+                .iter()
+                .copied()
+                .find(|builtin| *builtin == value.as_str())
+                .or_else(|| {
+                    aliases
+                        .iter()
+                        .find(|(alias, _)| alias == value.as_str())
+                        .map(|(_, builtin)| *builtin)
+                });
+            let Some(builtin) = builtin else {
+                continue;
+            };
+            if name.as_str() != builtin && !aliases.iter().any(|(alias, _)| alias == name.as_str())
+            {
+                aliases.push((name.as_str().to_owned(), builtin));
+            }
+        }
+        if aliases.len() == before {
+            break;
+        }
+    }
+    let mut text = code.to_owned();
+    for (alias, builtin) in &aliases {
+        text = lua_name_written_as(&text, alias, builtin, skip_strings);
+    }
+    PICKED
+        .replace_all(&text, |found: &regex::Captures| {
+            let module = found
+                .get(1)
+                .or_else(|| found.get(2))
+                .map_or("", |m| m.as_str());
+            format!("require({module})")
+        })
+        .into_owned()
+}
+
+/// Lua's built-ins of [`LUA_LOADERS`] reached by other spellings, written
+/// as the plain name: through the globals table (`_G.require`,
+/// `_G["require"]`, `_ENV.require`, `rawget(_G, "require")`), in brackets
+/// that are no call's (`(require)("os")`, `local r = (require)`), given in
+/// a list (`local a, r = 1, require`, written one name at a time), or kept
+/// in a table's field (`local t = {r = require}; t.r("os")`).
+fn lua_builtin_spellings(code: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    static PATTERNS: std::sync::LazyLock<[regex::Regex; 4]> = std::sync::LazyLock::new(|| {
+        let names = LUA_LOADERS.join("|");
+        [
+            format!(
+                r#"\b(?:(?:_G|_ENV)\s*(?:\.\s*({names})\b|\[\s*["']({names})["']\s*\])|rawget\s*\(\s*(?:_G|_ENV)\s*,\s*["']({names})["']\s*\))"#
+            ),
+            format!(r"\(\s*({names})\s*\)"),
+            r#"(^|[;\n'"]|\bdo\b|\bthen\b)(\s*)(local\s+)?([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)+)\s*=\s*([^;\n=(){}'"]+)"#.to_string(),
+            format!(r"\b([A-Za-z_]\w*)\s*=\s*\{{[^{{}}]*?\b([A-Za-z_]\w*)\s*=\s*({names})\b\s*[,;}}]"),
+        ]
+        .map(|pattern| regex::Regex::new(&pattern).expect("static lua spelling regex"))
+    });
+    let [global, bracketed, listed, field] = &*PATTERNS;
+    if !LUA_LOADERS.iter().any(|name| code.contains(name)) {
+        return Cow::Borrowed(code);
+    }
+    let mut text = global
+        .replace_all(code, |found: &regex::Captures| {
+            (1..=3)
+                .find_map(|group| found.get(group))
+                .map_or(String::new(), |name| name.as_str().to_owned())
+        })
+        .into_owned();
+    // Brackets around the name alone are no call's when nothing that ends
+    // a value stands before them.
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    for found in bracketed.captures_iter(&text) {
+        let whole = found.get(0).expect("whole match");
+        let before = text[..whole.start()].trim_end().chars().next_back();
+        if before
+            .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | ')' | ']' | '}' | '"' | '\''))
+        {
+            continue;
+        }
+        out.push_str(&text[last..whole.start()]);
+        out.push_str(&found[1]);
+        last = whole.end();
+    }
+    out.push_str(&text[last..]);
+    text = out;
+    text = listed
+        .replace_all(&text, |found: &regex::Captures| {
+            let names: Vec<&str> = found[4].split(',').map(str::trim).collect();
+            let values: Vec<&str> = found[5].split(',').map(str::trim).collect();
+            if names.len() != values.len()
+                || !values.iter().any(|value| LUA_LOADERS.contains(value))
+            {
+                return found[0].to_owned();
+            }
+            let local = found.get(3).map_or("", |m| m.as_str());
+            let each: Vec<String> = names
+                .iter()
+                .zip(&values)
+                .map(|(name, value)| format!("{local}{name} = {value}"))
+                .collect();
+            format!("{}{}{}", &found[1], &found[2], each.join("; "))
+        })
+        .into_owned();
+    let fields: Vec<(String, String, String)> = field
+        .captures_iter(&text)
+        .map(|found| {
+            (
+                found[1].to_owned(),
+                found[2].to_owned(),
+                found[3].to_owned(),
+            )
+        })
+        .collect();
+    for (table, key, builtin) in fields {
+        let reach = format!(
+            r#"\b{table}\s*(?:\.\s*{key}\b|\[\s*["']{key}["']\s*\])"#,
+            table = regex::escape(&table),
+            key = regex::escape(&key)
+        );
+        if let Ok(reach) = regex::Regex::new(&reach) {
+            text = reach.replace_all(&text, builtin.as_str()).into_owned();
+        }
+    }
+    Cow::Owned(text)
+}
+
+/// `code` with each use of `name` as a name, outside strings, written as
+/// `target`; where the name is given a value (`name = ...`) it stays.
+fn lua_name_written_as(code: &str, name: &str, target: &str, skip_strings: bool) -> String {
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if skip_strings && matches!(byte, b'\'' | b'"') {
+            let end = quoted_end(&code[at + 1..], byte as char, true)
+                .map_or(code.len(), |end| at + end + 2);
+            out.push_str(&code[at..end]);
+            at = end;
+            continue;
+        }
+        let end = at + name.len();
+        if code[at..].starts_with(name)
+            && (at == 0 || !(is_name_byte(bytes[at - 1]) || matches!(bytes[at - 1], b'.' | b':')))
+            && bytes.get(end).is_none_or(|&b| !is_name_byte(b))
+        {
+            let after = code[end..].trim_start();
+            let given = after.starts_with('=') && !after.starts_with("==");
+            out.push_str(if given { name } else { target });
+            at = end;
+            continue;
         }
         let width = code[at..].chars().next().map_or(1, char::len_utf8);
         out.push_str(&code[at..at + width]);
@@ -2337,6 +2619,10 @@ impl Reader<'_> {
         }
         self.scan_code_in_strings(start, end);
         for (chain, at, arguments_at) in self.call_sites(start, end) {
+            if let Some(skip) = self.built_target_call(&chain) {
+                self.read_constructed_call(arguments_at, end, skip);
+                continue;
+            }
             let callee = if self.lang == Lang::Php && is_variable(&chain) {
                 self.called_php_variable(&chain)
             } else {
@@ -2414,7 +2700,13 @@ impl Reader<'_> {
                 if let Some(lookup) =
                     constructed_lookup(self.lang, &code[at..end], starts_a_call(code, at))
                 {
-                    for (arguments_at, skip) in self.constructed_calls(at, end, lookup) {
+                    let calls = self.constructed_calls(at, end, lookup);
+                    if calls.is_empty() {
+                        if let Some(name) = self.bound_constructed_name(start, at, end, lookup) {
+                            self.built_targets.push(name);
+                        }
+                    }
+                    for (arguments_at, skip) in calls {
                         self.read_constructed_call(arguments_at, end, skip);
                     }
                 }
@@ -2477,6 +2769,86 @@ impl Reader<'_> {
             }
         }
         calls
+    }
+
+    /// The name a value whose target is built at run time is bound to, when
+    /// it is not called where it is built: `f = getattr(os, 'sys'+'tem')`,
+    /// `s = os.__dict__[n]`, Node's `const f = require(m)[n]`, Ruby's `m =
+    /// Kernel.method(n)`. A later call of the name, or of its `.call`, is
+    /// read as the call itself ([`Self::built_target_call`]).
+    fn bound_constructed_name(
+        &self,
+        start: usize,
+        at: usize,
+        end: usize,
+        lookup: Lookup,
+    ) -> Option<String> {
+        let code = self.code;
+        let bytes = code.as_bytes();
+        // Whether the value's target is built: the walk of
+        // [`Self::constructed_calls`], up to the value's end.
+        let mut cursor = at + lookup.name_len;
+        let mut own = lookup.own_group;
+        let mut built = lookup.built;
+        while cursor < end {
+            let rest = &code[cursor..end];
+            match rest.as_bytes()[0] {
+                b'(' | b'[' | b'{' => {
+                    let close = closing(&rest[1..])?;
+                    let inner = &rest[1..1 + close];
+                    if own || rest.starts_with('[') {
+                        built |= !whole_literal(inner);
+                    }
+                    own = false;
+                    cursor += close + 2;
+                }
+                b'.' => {
+                    let name = rest[1..].bytes().take_while(|b| is_name_byte(*b)).count();
+                    if name == 0 {
+                        break;
+                    }
+                    cursor += 1 + name;
+                }
+                _ => break,
+            }
+        }
+        if !built {
+            return None;
+        }
+        // The chain the lookup stands in (`os.__dict__[...]`), then the
+        // name it is bound to: `name = `, `name=`, never `==`.
+        let mut chain = at;
+        while chain > start && (is_name_byte(bytes[chain - 1]) || bytes[chain - 1] == b'.') {
+            chain -= 1;
+        }
+        let before = code[start..chain].trim_end().strip_suffix('=')?;
+        if before.ends_with(['=', '!', '<', '>', ':']) {
+            return None;
+        }
+        let before = before.trim_end();
+        let name_len = before
+            .bytes()
+            .rev()
+            .take_while(|b| is_name_byte(*b))
+            .count();
+        let name = &before[before.len() - name_len..];
+        (!name.is_empty() && !name.as_bytes()[0].is_ascii_digit()).then(|| name.to_string())
+    }
+
+    /// For a call of a name bound to a value whose target is built at run
+    /// time ([`Self::bound_constructed_name`]), how many lead arguments are
+    /// not handed to the target: none for `f(x)` and Ruby's `m.call(x)`,
+    /// the `this` of Node's `f.call(this, x)`.
+    fn built_target_call(&self, chain: &str) -> Option<usize> {
+        self.built_targets.iter().find_map(|name| {
+            if chain == name {
+                Some(0)
+            } else if chain.strip_prefix(name.as_str()) == Some(".call") {
+                Some(usize::from(self.lang == Lang::Js))
+            } else {
+                None
+            }
+        })
     }
 
     /// A call whose target is built at run time: not read, and what it is

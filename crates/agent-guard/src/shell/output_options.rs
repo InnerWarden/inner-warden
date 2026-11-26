@@ -271,10 +271,32 @@ pub(crate) fn outputs_as_redirections(line: &str) -> Option<String> {
 /// is named before one that is; [`ProcessStream::injects`] says which.
 pub(crate) fn writes_into_another_process(line: &str) -> Option<ProcessStream> {
     let mut targets = crate::threats::lexical_output_redirect_targets(line);
+    // The folder an earlier `cd` to a path written out moved to: a relative
+    // target after it is read from there (`cd /proc && echo x > 1/fd/0`).
+    let mut folder: Option<String> = None;
     for segment in crate::threats::shell_command_segments(line) {
-        targets.extend(crate::threats::tee_write_targets(
-            &crate::threats::shell_tokens(segment),
-        ));
+        let tokens = crate::threats::shell_tokens(segment);
+        if let [cd, to] = tokens.as_slice() {
+            if cd == "cd" {
+                folder = to.starts_with('/').then(|| to.clone());
+                continue;
+            }
+        }
+        let mut written = crate::threats::tee_write_targets(&tokens);
+        written.extend(copy_destinations(&tokens));
+        if let Some(folder) = &folder {
+            written.extend(
+                crate::threats::lexical_output_redirect_targets(segment)
+                    .into_iter()
+                    .chain(written.clone())
+                    .filter(|target| {
+                        let target = target.trim_matches(|c| c == '"' || c == '\'');
+                        !target.is_empty() && !target.starts_with(['/', '~', '$', '&'])
+                    })
+                    .map(|target| format!("{}/{target}", folder.trim_end_matches('/'))),
+            );
+        }
+        targets.extend(written);
     }
     targets
         .into_iter()
@@ -282,6 +304,50 @@ pub(crate) fn writes_into_another_process(line: &str) -> Option<ProcessStream> {
             another_process_stream(&target).map(|injects| ProcessStream { target, injects })
         })
         .max_by_key(|stream| stream.injects)
+}
+
+/// Where a copy writes, as [`writes_into_another_process`] asks it: the
+/// last operand of `cp`, `install`, `mv` and `rsync` (with two operands
+/// or more), the folder of `-t` / `--target-directory`, and `dd`'s `of=`.
+fn copy_destinations(tokens: &[String]) -> Vec<String> {
+    let Some(at) = crate::threats::effective_command_index(tokens) else {
+        return Vec::new();
+    };
+    let command = crate::threats::token_basename(&tokens[at]).to_ascii_lowercase();
+    let args = &tokens[at + 1..];
+    match command.as_str() {
+        "dd" => args
+            .iter()
+            .filter_map(|word| word.strip_prefix("of="))
+            .map(str::to_string)
+            .collect(),
+        "cp" | "install" | "mv" | "rsync" => {
+            let mut found = Vec::new();
+            let mut operands = Vec::new();
+            let mut index = 0;
+            while let Some(word) = args.get(index) {
+                if word == "-t" || word == "--target-directory" {
+                    found.extend(args.get(index + 1).cloned());
+                    index += 2;
+                    continue;
+                }
+                if let Some(folder) = word.strip_prefix("--target-directory=") {
+                    found.push(folder.to_string());
+                } else if word == "--" {
+                    operands.extend(args[index + 1..].iter().cloned());
+                    break;
+                } else if !word.starts_with('-') || word == "-" {
+                    operands.push(word.clone());
+                }
+                index += 1;
+            }
+            if operands.len() >= 2 {
+                found.extend(operands.pop());
+            }
+            found
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// A file of another process the line writes into.
