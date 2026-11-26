@@ -768,6 +768,10 @@ pub struct Facts {
     /// Where this account's decisions are recorded and whether InnerWarden
     /// Pro reads them there. `None` when nothing names a record.
     pub record_place: Option<RecordPlace>,
+    /// A recording outage in progress (`record_health`): the record's
+    /// folder that cannot be written, writes that fail, or lines of
+    /// `guard-events.jsonl` lost. `None` when the record is recording.
+    pub record_outage: Option<RecordOutage>,
     /// Settings files of the project in the folder `status` runs in that
     /// switch an agent's hooks off there, or run hooks of their own.
     pub project_settings: Vec<ProjectSettings>,
@@ -1029,6 +1033,32 @@ pub fn record_place_finding(place: &RecordPlace) -> Finding {
     ))
 }
 
+/// A recording outage in progress, as `status` says it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecordOutage {
+    /// The outage in words, with no path and no command in it.
+    pub summary: String,
+    /// Only lines of `guard-events.jsonl` are lost: the decisions
+    /// themselves are still recorded.
+    pub sink_only: bool,
+}
+
+/// The line that says the record has stopped. It replaces the line that
+/// says where decisions are recorded, which an outage of the record makes
+/// false; lines of `guard-events.jsonl` lost leave that line true and are
+/// said beside it.
+pub fn record_outage_finding(outage: &RecordOutage) -> Finding {
+    let what = if outage.sink_only {
+        "Record: guard-events.jsonl is not being written."
+    } else {
+        "Record: decisions are not being recorded."
+    };
+    Finding::NotWorking {
+        what: format!("{what} {}", outage.summary),
+        next: "innerwarden graph --stats once the cause is fixed, to see it record again".into(),
+    }
+}
+
 /// The shared record directory this account may not write, and the folder
 /// its decisions are kept in instead. Paths as the reader should see them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1245,8 +1275,14 @@ pub fn assess(facts: &Facts) -> Vec<Finding> {
     if let Some(own_dir) = facts.kept_apart_before.as_deref() {
         out.push(kept_apart_before_finding(own_dir));
     }
+    // A record that has stopped is said before the count it makes stale,
+    // and in place of the line that says decisions are recorded.
+    if let Some(outage) = facts.record_outage.as_ref() {
+        out.push(record_outage_finding(outage));
+    }
+    let recording = facts.record_outage.as_ref().is_none_or(|o| o.sink_only);
     // Where the count below is read from, unless the line above already said.
-    if facts.record_kept_apart.is_none() {
+    if facts.record_kept_apart.is_none() && recording {
         if let Some(place) = facts.record_place.as_ref() {
             out.push(record_place_finding(place));
         }
@@ -2578,6 +2614,7 @@ mod tests {
             record_kept_apart: None,
             kept_apart_before: None,
             record_place: None,
+            record_outage: None,
             project_settings: vec![],
         }
     }
@@ -2703,6 +2740,49 @@ mod tests {
     ///
     /// FAILS ON REVERT: drop the finding from `assess` and nothing says where
     /// an agent account's decisions go or that the paid product misses them.
+    #[test]
+    fn a_record_that_stopped_is_said_in_place_of_recorded() {
+        let mut facts = healthy();
+        facts.record_place = Some(RecordPlace {
+            dir: "/home/op/.config/innerwarden".into(),
+            account: None,
+            account_problem: None,
+            pro_reads: false,
+        });
+        facts.record_outage = Some(RecordOutage {
+            summary: "InnerWarden has not recorded for 5 minutes.".into(),
+            sink_only: false,
+        });
+        let said: Vec<String> = assess(&facts).iter().map(ToString::to_string).collect();
+        assert!(
+            said.iter().any(|l| l.contains("[off]")
+                && l.contains("decisions are not being recorded")
+                && l.contains("5 minutes")),
+            "{said:#?}"
+        );
+        assert!(
+            !said.iter().any(|l| l.contains("Decisions are recorded in")),
+            "{said:#?}"
+        );
+
+        // Lines of guard-events.jsonl lost: the decisions are still recorded.
+        facts.record_outage = Some(RecordOutage {
+            summary: "3 guard event(s) lost.".into(),
+            sink_only: true,
+        });
+        let said: Vec<String> = assess(&facts).iter().map(ToString::to_string).collect();
+        assert!(
+            said.iter()
+                .any(|l| l.contains("[off]")
+                    && l.contains("guard-events.jsonl is not being written")),
+            "{said:#?}"
+        );
+        assert!(
+            said.iter().any(|l| l.contains("Decisions are recorded in")),
+            "{said:#?}"
+        );
+    }
+
     #[test]
     fn status_says_where_decisions_go_and_whether_the_pro_reads_them() {
         let mut facts = healthy();
@@ -3023,6 +3103,7 @@ mod tests {
             record_kept_apart: None,
             kept_apart_before: None,
             record_place: None,
+            record_outage: None,
             project_settings: vec![],
         };
         for finding in assess(&facts) {

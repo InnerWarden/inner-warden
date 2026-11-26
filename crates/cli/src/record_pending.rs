@@ -287,14 +287,16 @@ fn sweep_removing(
     // busy disk, say) takes the cut records into its count, without a new
     // alert: a fresh episode under this code reset its start and its count
     // and alerted again, and the two codes took turns on a busy disk.
-    match crate::record_health::report_at(graph) {
+    // The graph's own outage only: lines of `guard-events.jsonl` lost are
+    // an episode of their own, never a home for the graph's lost records.
+    match crate::record_health::report_graph_at(graph) {
         Some(going) if going.code != CUT_CODE => {
             crate::record_health::note_failures_at(graph, &going.code, lost);
         }
         _ => {
-            let outage = crate::record_health::note_failures_at(graph, CUT_CODE, lost);
-            if crate::record_health::is_first_of_episode_at(graph) {
-                alert(&outage.summary());
+            let noted = crate::record_health::note_failures_at(graph, CUT_CODE, lost);
+            if let Some(line) = noted.alert() {
+                alert(&line);
             }
         }
     }
@@ -431,7 +433,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let graph = dir.path().join("graph.json");
         std::fs::write(&graph, "{}").unwrap();
-        let first = crate::record_health::note_failure_at(&graph, "lock_timed_out");
+        let first = crate::record_health::note_failure_at(&graph, "lock_timed_out").outage;
         let gone = 4_194_304u32 + 29;
         std::fs::write(
             dir.path().join(format!("{MARK_PREFIX}{gone}")),
@@ -443,6 +445,43 @@ mod tests {
         assert_eq!(outage.code, "lock_timed_out");
         assert_eq!(outage.lost, 2);
         assert_eq!(outage.since_unix, first.since_unix);
+    }
+
+    /// Lines of `guard-events.jsonl` lost are an episode of their own: a cut
+    /// record found while one is open opens the graph's episode, told, and
+    /// the sink's count stays the sink's.
+    ///
+    /// FAILS ON REVERT: read the outage to join with `report_at` again and
+    /// the cut is counted as a lost sink line, with no alert.
+    #[cfg(unix)]
+    #[test]
+    fn a_cut_during_lost_sink_lines_is_the_graphs_own_episode() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph.json");
+        std::fs::write(&graph, "{}").unwrap();
+        crate::record_health::note_sink_failure_in(
+            dir.path(),
+            &crate::record_health::sink_before(dir.path()),
+        );
+        let gone = 4_194_304u32 + 31;
+        std::fs::write(
+            dir.path().join(format!("{MARK_PREFIX}{gone}")),
+            now_unix().to_string(),
+        )
+        .unwrap();
+        let mut told = None;
+        assert_eq!(sweep_with(&graph, |said| told = Some(said.to_string())), 1);
+        assert!(told.is_some_and(|said| said.contains("has not recorded")));
+        assert_eq!(
+            crate::record_health::read_at(&graph).unwrap().code,
+            CUT_CODE
+        );
+        assert_eq!(
+            crate::record_health::sink_outage_in(dir.path())
+                .unwrap()
+                .lost,
+            1
+        );
     }
 
     /// FAILS ON REVERT of the sweep: a mark left by a hook that is gone (a

@@ -309,6 +309,8 @@ fn a_record_held_back_by_the_disk_does_not_cost_the_call_its_answer() {
     let slow = [
         ("IW_TEST_HOOK_RECORD_DELAY_MS", "300".to_string()),
         ("IW_SLACK_WEBHOOK", hook.url()),
+        // The end is told by the first write that works, no quiet window.
+        ("IW_TEST_RECORD_QUIET_SECS", "0".to_string()),
     ];
     let alerts_before = episode_alerts(&hook);
     let run = host.hook(&host.bash("ls -la"), &slow, true);
@@ -325,7 +327,17 @@ fn a_record_held_back_by_the_disk_does_not_cost_the_call_its_answer() {
             "{}",
             run.said
         );
-        assert!(health(&host).is_null(), "the episode is over");
+        assert!(health(&host)["code"].is_null(), "the episode is over");
+        // The end is told once, where the start was.
+        assert_eq!(
+            hook.bodies()
+                .iter()
+                .filter(|body| body.contains("recording again"))
+                .count(),
+            1,
+            "the episode's end: {:?}",
+            hook.bodies()
+        );
     }
     assert_eq!(
         episode_alerts(&hook),
@@ -408,10 +420,12 @@ fn a_session_store_held_back_by_the_disk_does_not_cost_the_call_its_answer() {
 
 /// The alerts the webhook heard that are not the refusal's: a lost
 /// record's, told on the text channels once per episode.
+/// The alerts that an episode began: not the refusals' own, and not the
+/// line that says it ended.
 fn episode_alerts(hook: &Webhook) -> usize {
     hook.bodies()
         .iter()
-        .filter(|body| !body.contains("x.sh"))
+        .filter(|body| !body.contains("x.sh") && !body.contains("recording again"))
         .count()
 }
 

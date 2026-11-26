@@ -440,6 +440,10 @@ fn status_io_cmd_rest(
             account_problem: place.account_problem,
             pro_reads: place.pro_reads,
         }),
+        record_outage: record_health::current().map(|outage| status::RecordOutage {
+            sink_only: outage.code == record_health::SINK_NOT_WRITTEN,
+            summary: outage.summary(),
+        }),
         project_settings: std::env::current_dir()
             .map(|dir| project_settings_in(&dir, home.as_deref()))
             .unwrap_or_default(),
@@ -3497,8 +3501,11 @@ fn record_shell_now(
     // busy disk, and an end at the limit on the clock while it runs must not
     // take the alert with it. In monitor mode this is a would-block alert;
     // in enforce it accompanies the real block. Alerting must not change the
-    // hook outcome.
-    if would_block && !demo {
+    // hook outcome. A `review` that runs is handed on too: the channels'
+    // own filter sends it only to a person who opted in to hear reviews
+    // (`innerwarden notify --notify-review`), and that opt-in said nothing
+    // for every review that was not refused.
+    if !demo && (would_block || innerwarden_notify::recommendation_of(verdict) == "review") {
         notify_io::fire(command, verdict);
     }
     let source_session = hook_session(buf);
@@ -3585,7 +3592,11 @@ fn hook_posture(monitor: bool, block_review: bool) -> innerwarden_agent_guard::p
 /// The default posture's warning, written where `agent` shows a hook's
 /// words without refusing or asking: a `systemMessage` on stdout for Claude
 /// Code, Codex and Gemini CLI, Cursor's `allow` with the words, and stderr
-/// (exit 0) for every other agent. `true` when stdout was written.
+/// (exit 0) for every other agent. Hermes is one of those: its hook answers
+/// block, modify or approve (its approval gate, which asks), and none of
+/// them runs a call with words beside it, so the line is in its debug log
+/// only and the person sees it in the record and on the alert channels
+/// (docs/features.md says so). `true` when stdout was written.
 fn warn_agent(agent: Option<&str>, line: &str) -> bool {
     use innerwarden_agent_guard::cursor_hook;
     match agent {
