@@ -24649,7 +24649,9 @@ pub(crate) fn past_redirection_words(words: &[String], mut at: usize) -> usize {
 /// through: `env`, `sudo`, `doas`, `command`, `exec`, `nohup`, `setsid`,
 /// `time` (`-p` and GNU time's options), `timeout`, `nice`, `stdbuf`,
 /// `ionice`, `caffeinate`, `chronic`, `unbuffer`, `coproc`, `chrt`,
-/// `taskset`, `strace`, `ltrace`, `flock` and `systemd-run`.
+/// `taskset`, `strace`, `ltrace`, `flock`, `systemd-run`, `runuser -u`,
+/// `setpriv`, `chroot`, `unshare`, `nsenter`, `prlimit`, `pkexec` and macOS
+/// `arch`, each with its own options and its `--` where it takes one.
 /// Unknown/inspection-only option shapes of `env`, `sudo`, `doas`,
 /// `command` and `nohup` return `None` rather than inventing an executable
 /// target; the launchers read since leave such a shape as it was, the
@@ -24989,6 +24991,10 @@ pub(crate) fn effective_command_index(words: &[String]) -> Option<usize> {
             "stdbuf" => {
                 index += 1;
                 while let Some(word) = words.get(index) {
+                    if word == "--" {
+                        index += 1;
+                        break;
+                    }
                     if matches!(word.as_str(), "-i" | "-o" | "-e") {
                         index += 2;
                     } else if word.starts_with("--input=")
@@ -25289,6 +25295,167 @@ const SYSTEMD_RUN: LauncherOptions = LauncherOptions {
     operands: 0,
 };
 
+/// `setpriv [options] COMMAND` (util-linux): its ids, groups and
+/// capabilities, given glued on with `=` or as the next word.
+const SETPRIV: LauncherOptions = LauncherOptions {
+    flags: "d",
+    optional: "",
+    valued: "",
+    long_flags: &[
+        "dump",
+        "nnp",
+        "no-new-privs",
+        "clear-groups",
+        "init-groups",
+        "keep-groups",
+        "reset-env",
+        "list-caps",
+    ],
+    long_valued: &[
+        "ruid",
+        "euid",
+        "rgid",
+        "egid",
+        "reuid",
+        "regid",
+        "groups",
+        "inh-caps",
+        "ambient-caps",
+        "bounding-set",
+        "securebits",
+        "pdeathsig",
+        "selinux-label",
+        "apparmor-profile",
+        "landlock-access",
+        "landlock-rule",
+        "seccomp-filter",
+    ],
+    operands: 0,
+};
+
+/// `chroot [options] NEWROOT COMMAND`.
+const CHROOT: LauncherOptions = LauncherOptions {
+    flags: "",
+    optional: "",
+    valued: "",
+    long_flags: &["skip-chdir"],
+    long_valued: &["userspec", "groups"],
+    operands: 1,
+};
+
+/// `unshare [options] COMMAND` (util-linux): the namespace letters take a
+/// file only in their own word (`-m/run/ns`, `--mount=/run/ns`).
+const UNSHARE: LauncherOptions = LauncherOptions {
+    flags: "frcV",
+    optional: "mUipnuCT",
+    valued: "SGRwl",
+    long_flags: &[
+        "mount",
+        "uts",
+        "ipc",
+        "net",
+        "pid",
+        "user",
+        "cgroup",
+        "time",
+        "fork",
+        "kill-child",
+        "mount-proc",
+        "mount-binfmt",
+        "map-root-user",
+        "map-current-user",
+        "map-auto",
+        "keep-caps",
+    ],
+    long_valued: &[
+        "propagation",
+        "setgroups",
+        "setuid",
+        "setgid",
+        "root",
+        "wd",
+        "map-user",
+        "map-group",
+        "map-users",
+        "map-groups",
+        "monotonic",
+        "boottime",
+        "load-interp",
+    ],
+    operands: 0,
+};
+
+/// `nsenter [options] COMMAND` (util-linux): the namespace letters, `-r`
+/// and `-w` take a file or folder only in their own word.
+const NSENTER: LauncherOptions = LauncherOptions {
+    flags: "aFZceV",
+    optional: "muinpUCTrw",
+    valued: "tSGW",
+    long_flags: &[
+        "all",
+        "mount",
+        "uts",
+        "ipc",
+        "net",
+        "pid",
+        "user",
+        "cgroup",
+        "time",
+        "root",
+        "wd",
+        "no-fork",
+        "follow-context",
+        "preserve-credentials",
+        "keep-caps",
+        "env",
+        "join-cgroup",
+        "user-parent",
+    ],
+    long_valued: &["target", "setuid", "setgid", "wdns"],
+    operands: 0,
+};
+
+/// `prlimit [options] COMMAND` (util-linux): a limit takes its value only
+/// in its own word (`-n1024`, `--nofile=1024`); `--cpu 10` runs `10`.
+const PRLIMIT: LauncherOptions = LauncherOptions {
+    flags: "V",
+    optional: "cdefilmnqrstuvxy",
+    valued: "po",
+    long_flags: &[
+        "core",
+        "data",
+        "nice",
+        "fsize",
+        "sigpending",
+        "memlock",
+        "rss",
+        "nofile",
+        "msgqueue",
+        "rtprio",
+        "stack",
+        "cpu",
+        "nproc",
+        "as",
+        "locks",
+        "rttime",
+        "noheadings",
+        "raw",
+        "verbose",
+    ],
+    long_valued: &["pid", "output"],
+    operands: 0,
+};
+
+/// `pkexec [--user USER] [--disable-internal-agent] [--keep-cwd] COMMAND`.
+const PKEXEC: LauncherOptions = LauncherOptions {
+    flags: "",
+    optional: "",
+    valued: "u",
+    long_flags: &["disable-internal-agent", "keep-cwd"],
+    long_valued: &["user"],
+    operands: 0,
+};
+
 /// Where the command of launcher `command` (`words[at]`) starts, for the
 /// launchers [`effective_command_index`] reads beyond its own arms: `None`
 /// when `command` is not one of them, or when an option is one this reading
@@ -25308,8 +25475,43 @@ fn launcher_command_start(words: &[String], at: usize, command: &str) -> Option<
         "chronic" => launcher_options_end(words, at, &CHRONIC),
         "unbuffer" => launcher_options_end(words, at, &UNBUFFER),
         "systemd-run" => launcher_options_end(words, at, &SYSTEMD_RUN),
+        "setpriv" => launcher_options_end(words, at, &SETPRIV),
+        "chroot" => launcher_options_end(words, at, &CHROOT),
+        "unshare" => launcher_options_end(words, at, &UNSHARE),
+        "nsenter" => launcher_options_end(words, at, &NSENTER),
+        "prlimit" => launcher_options_end(words, at, &PRLIMIT),
+        "pkexec" => launcher_options_end(words, at, &PKEXEC),
+        "runuser" => runuser_command_start(&words[at + 1..]).map(|start| at + 1 + start),
+        "arch" => arch_command_start(words, at),
         _ => None,
     }
+}
+
+/// Where the command of macOS `arch` starts: after its architecture
+/// options (`-x86_64`, `-arm64`, `-arch NAME`), `-c`, `-32`, `-64`, and
+/// `-e NAME=VALUE` or `-d NAME`. `None` for any other word before the
+/// command, or no command (Linux `arch` prints the machine and runs none).
+fn arch_command_start(words: &[String], at: usize) -> Option<usize> {
+    const ARCHITECTURES: &[&str] = &[
+        "i386", "x86_64", "x86_64h", "arm64", "arm64e", "ppc", "ppc64",
+    ];
+    let mut index = at + 1;
+    while let Some(word) = words.get(index) {
+        if word == "--" {
+            index += 1;
+            break;
+        }
+        match word.as_str() {
+            "-arch" | "-e" | "-d" => index += 2,
+            "-c" | "-32" | "-64" => index += 1,
+            _ => match word.strip_prefix('-') {
+                Some(name) if ARCHITECTURES.contains(&name) => index += 1,
+                Some(_) => return None,
+                None => break,
+            },
+        }
+    }
+    (index < words.len()).then_some(index)
 }
 
 /// The command `words` run as [`child_agent_without_its_hook`] reads them:
