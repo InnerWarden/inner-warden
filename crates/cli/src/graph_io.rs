@@ -1318,10 +1318,14 @@ fn hook_mode_outcome(
     }
 }
 
-/// Record one MCP client→server `tools/call`. Clean calls are included; server
-/// responses are deliberately ignored so a response cannot masquerade as an
-/// action in the activity timeline. The router exposes only a bounded, redacted
-/// tool summary, never raw arguments, at this persistence boundary.
+/// Record one MCP client→server `tools/call`. Clean calls are included. A
+/// server's message is recorded only when the proxy found something in it
+/// (a description or an answer carrying orders, a tool whose definition
+/// changed, a line it cannot read, a secret-shaped value), and is named as the
+/// server's (`agent_report::server_summary`, `mcp server: <method>`), so a
+/// response never masquerades as an action in the activity timeline. The
+/// router exposes only a bounded, redacted tool summary, never raw arguments,
+/// at this persistence boundary.
 pub fn record_mcp(
     decision: &ProxyDecision,
     proxy_mode: ProxyMode,
@@ -1359,11 +1363,26 @@ pub fn record_mcp_as(
     agent: Option<&str>,
     identity: Option<&Identity>,
 ) {
-    if decision.direction != "client->server" || decision.method.as_deref() != Some("tools/call") {
-        return;
-    }
-    let Some(summary) = decision.tool_summary.as_deref() else {
-        return;
+    let from_server = decision.direction == crate::agent_report::FROM_SERVER;
+    let server_summary;
+    let summary = if from_server {
+        // A server's message with nothing found in it is traffic, not a
+        // finding.
+        if decision.verdict.alerts.is_empty() {
+            return;
+        }
+        server_summary = crate::agent_report::server_summary(decision);
+        server_summary.as_str()
+    } else {
+        if decision.direction != "client->server"
+            || decision.method.as_deref() != Some("tools/call")
+        {
+            return;
+        }
+        let Some(summary) = decision.tool_summary.as_deref() else {
+            return;
+        };
+        summary
     };
 
     let verdict = mcp_graph_verdict(decision);
@@ -1461,6 +1480,10 @@ fn refusal_copy_path(
     (moved.path.as_deref() != Some(local.as_path())).then_some(local)
 }
 
+/// The mode and outcome of an MCP decision. A finding on a server's message
+/// refuses (`verdict.allowed` false) only where the proxy acts on it in a
+/// mode that blocks (a description or an answer withheld, a changed tool
+/// held, an unreadable line refused), so the same reading holds for it.
 fn mcp_context(decision: &ProxyDecision, proxy_mode: ProxyMode) -> (DecisionMode, DecisionOutcome) {
     let mode = if proxy_mode.blocks() {
         DecisionMode::Enforce
@@ -1469,12 +1492,11 @@ fn mcp_context(decision: &ProxyDecision, proxy_mode: ProxyMode) -> (DecisionMode
     };
     let outcome = if decision.verdict.allowed {
         DecisionOutcome::Allowed
-    } else if proxy_mode.blocks() && decision.request_id.is_some() {
-        DecisionOutcome::Blocked
     } else if proxy_mode.blocks() {
-        // JSON-RPC notifications have no request id, so the current proxy cannot
-        // synthesize a denial and forwards them even in guard/kill mode.
-        DecisionOutcome::Allowed
+        // A refused call never reaches the server in a mode that blocks, id
+        // or no id (`enforce::apply_mode`): one with no id gets no reply and
+        // is dropped (`enforce::NO_ID_DROPPED`, said in its finding).
+        DecisionOutcome::Blocked
     } else {
         DecisionOutcome::WouldBlock
     };
@@ -4230,12 +4252,27 @@ mod tests {
             (DecisionMode::Enforce, DecisionOutcome::Blocked)
         );
 
+        // A refused call with no id (or `"id": null`) is dropped in every mode
+        // that blocks, so it is recorded as refused, never as allowed; a
+        // monitor mode forwards it, so it would have been blocked. FAILS ON
+        // REVERT of the `request_id` test taken out of `mcp_context`: it was
+        // recorded as allowed.
         let mut notification = deny;
         notification.request_id = None;
-        assert_eq!(
-            mcp_context(&notification, ProxyMode::Guard),
-            (DecisionMode::Enforce, DecisionOutcome::Allowed)
-        );
+        for mode in [ProxyMode::Guard, ProxyMode::Kill, ProxyMode::Strict] {
+            assert_eq!(
+                mcp_context(&notification, mode),
+                (DecisionMode::Enforce, DecisionOutcome::Blocked),
+                "{mode:?}"
+            );
+        }
+        for mode in [ProxyMode::Advisory, ProxyMode::Warn] {
+            assert_eq!(
+                mcp_context(&notification, mode),
+                (DecisionMode::Monitor, DecisionOutcome::WouldBlock),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

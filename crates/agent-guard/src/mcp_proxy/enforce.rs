@@ -52,8 +52,12 @@
 //!
 //! Scope of blocking in this version: only a **client→server request** can be
 //! blocked (the agent invoking a dangerous tool, or reading a resource it must
-//! not), because a denial must be a reply keyed to that request's id. The
-//! router raises a blocking verdict on a `tools/call` and a `resources/read`.
+//! not). The router raises a blocking verdict on a `tools/call` and a
+//! `resources/read`. A refused request with an id is answered with a denial
+//! keyed to it; one with no id (a notification, or `"id": null`, which reads
+//! as absent) has nothing that can answer it, so it is dropped, never
+//! forwarded: a server that runs a `tools/call` sent as a notification would
+//! otherwise run every call refused that way.
 //! Server→client findings (poisoned `tools/list`, injection in a tool result)
 //! are alert-only here; the rewrites of what a server sends (masking
 //! secret-shaped values, withholding listing text that carries orders for the
@@ -119,7 +123,9 @@ pub enum ProxyAction {
     /// Forward the original raw bytes AND emit an operator alert.
     ForwardWithAlert,
     /// Do NOT forward; write `response_line` back to the client (a denial keyed
-    /// to the request id) and emit an alert.
+    /// to the request id) and emit an alert. `response_line` is empty when the
+    /// request has no id ([`NO_ID_DROPPED`]): nothing can answer it, so the
+    /// client is sent nothing, and the request is still not forwarded.
     Block { response_line: String },
     /// Like `Block`, plus terminate the child server after replying.
     Kill { response_line: String },
@@ -133,9 +139,10 @@ pub enum ProxyAction {
 /// operators who want a hard structural reject.
 pub fn apply_mode(d: &ProxyDecision, mode: ProxyMode, as_protocol_error: bool) -> ProxyAction {
     let has_alerts = !d.verdict.alerts.is_empty();
-    // A denial must be a reply to a request → only client→server tool calls
-    // with a known id are blockable in this version.
-    let can_block = d.direction == "client->server" && !d.verdict.allowed && d.request_id.is_some();
+    // A refused client request never reaches the server in a mode that
+    // blocks, id or no id. One with no id gets no reply (`denial` is empty):
+    // the transport drops it.
+    let can_block = d.direction == "client->server" && !d.verdict.allowed;
 
     match mode {
         ProxyMode::Advisory | ProxyMode::Warn => {
@@ -146,10 +153,10 @@ pub fn apply_mode(d: &ProxyDecision, mode: ProxyMode, as_protocol_error: bool) -
             }
         }
         ProxyMode::Guard | ProxyMode::Strict if can_block => ProxyAction::Block {
-            response_line: synthesize_denial(d, as_protocol_error),
+            response_line: denial(d, as_protocol_error),
         },
         ProxyMode::Kill if can_block => ProxyAction::Kill {
-            response_line: synthesize_denial(d, as_protocol_error),
+            response_line: denial(d, as_protocol_error),
         },
         // guard/kill/strict but nothing blockable → behave like advisory.
         ProxyMode::Guard | ProxyMode::Kill | ProxyMode::Strict => {
@@ -159,6 +166,36 @@ pub fn apply_mode(d: &ProxyDecision, mode: ProxyMode, as_protocol_error: bool) -
                 ProxyAction::Forward
             }
         }
+    }
+}
+
+/// What is said of a refused request that has no id: the transport drops it,
+/// and this is added to the refusal's alert ([`note_dropped_without_id`]).
+pub const NO_ID_DROPPED: &str =
+    "the request has no id, so no reply can be sent: it was dropped, not forwarded to the server";
+
+/// The denial for a refused request: [`synthesize_denial`] when it has an id
+/// to answer, else empty (nothing can answer it; the transport sends nothing).
+fn denial(d: &ProxyDecision, as_protocol_error: bool) -> String {
+    if d.request_id.is_some() {
+        synthesize_denial(d, as_protocol_error)
+    } else {
+        String::new()
+    }
+}
+
+/// Say, on each alert that refuses `d`, that the request was dropped for
+/// having no id ([`NO_ID_DROPPED`]). The transport calls it when it drops one.
+pub fn note_dropped_without_id(d: &mut ProxyDecision) {
+    let any_blocks = d.verdict.alerts.iter().any(|a| a.block);
+    for alert in d
+        .verdict
+        .alerts
+        .iter_mut()
+        .filter(|a| a.block || !any_blocks)
+    {
+        alert.detail.push_str("; ");
+        alert.detail.push_str(NO_ID_DROPPED);
     }
 }
 
@@ -267,8 +304,13 @@ pub fn lower_code_mode_refusals(d: &mut ProxyDecision) {
 /// The rule the note on a refusal by name made a warning is reported under.
 pub const POSTURE_RULE: &str = "AG-POSTURE";
 
-/// The findings that say a value the call carries was said by a server.
-const SERVER_SAID_RULES: &[&str] = &["AG-TAINT", super::effect::EFFECT_RULE];
+/// Whether a finding says a value the call carries was said by a server:
+/// an `AG-TAINT` that refuses, or any finding of [`super::effect`]. An
+/// `AG-TAINT` that does not block says the call only reaches a place a
+/// result named (`super::taint`), not that it carries a server's value.
+pub(crate) fn says_a_server_value(alert: &crate::mcp::VerdictAlert) -> bool {
+    (alert.rule == "AG-TAINT" && alert.block) || alert.rule == super::effect::EFFECT_RULE
+}
 
 /// Make a warning of a client `tools/call` refused only by ATR rules that
 /// match its skeleton: the tool's name and its keys, every string emptied and
@@ -290,10 +332,7 @@ pub fn lower_name_refusals(
         return;
     }
     let alerts = &d.verdict.alerts;
-    if alerts
-        .iter()
-        .any(|alert| SERVER_SAID_RULES.contains(&alert.rule.as_str()))
-    {
+    if alerts.iter().any(says_a_server_value) {
         return;
     }
     let refusing: Vec<&str> = alerts
@@ -730,7 +769,9 @@ fn apply_profile(
 /// Build the denial line sent back to the client for a blocked `tools/call`.
 ///
 /// The original request id is echoed **verbatim** (as a raw [`Value`]) so the
-/// client correlates the reply; a blocked request is never silently dropped.
+/// client correlates the reply; a blocked request with an id is never left
+/// unanswered. One with no id is dropped, and its alert says so
+/// ([`note_dropped_without_id`]).
 pub fn synthesize_denial(d: &ProxyDecision, as_protocol_error: bool) -> String {
     // A tool-execution error (`isError`) is an answer only a `tools/call` can
     // take; any other refused request gets a JSON-RPC error, the one shape
@@ -1409,6 +1450,24 @@ mod tests {
         }
     }
 
+    /// A place a result named, reached by a call that sends it nothing, is
+    /// an `AG-TAINT` that does not block (`super::taint`): not a value a
+    /// server said. A refusal by name stands for it only as it stands for
+    /// any value a server said (the router's `effect::said_value` note).
+    /// FAILS ON REVERT of `says_a_server_value` to any `AG-TAINT`.
+    #[test]
+    fn a_taint_that_does_not_block_is_not_a_value_a_server_said() {
+        let alert =
+            |rule: &str, block: bool| crate::mcp::VerdictAlert::builtin(rule, String::new(), block);
+        assert!(says_a_server_value(&alert("AG-TAINT", true)));
+        assert!(!says_a_server_value(&alert("AG-TAINT", false)));
+        assert!(says_a_server_value(&alert(
+            super::super::effect::EFFECT_RULE,
+            false
+        )));
+        assert!(!says_a_server_value(&alert("ATR-2026-040", true)));
+    }
+
     /// FAILS ON REVERT: lower in every mode and `kill` / `strict` forward.
     #[test]
     fn kill_and_strict_keep_every_refusal_by_name() {
@@ -1435,7 +1494,7 @@ mod tests {
     /// The same calls, carrying what an injection read this session said,
     /// stay refused in the default posture.
     ///
-    /// FAILS ON REVERT: drop the `SERVER_SAID_RULES` check and they forward;
+    /// FAILS ON REVERT: drop the `says_a_server_value` check and they forward;
     /// drop the router's `effect::said_value` alert and the delete of file
     /// `13` forwards.
     #[test]
