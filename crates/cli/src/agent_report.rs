@@ -750,6 +750,14 @@ mod tests {
     /// agent that takes the connection and never answers holds the first
     /// report for the whole of its timeout; the queue takes 32 more.
     ///
+    /// The sending thread says what the queue turned away each time it finds
+    /// the queue empty, so the test hands it the first report and waits for
+    /// that report's connection before sending the other 39: the thread has
+    /// then been through its empty-queue check and sits in the first POST
+    /// (3 s) for the rest of the test. A thread that starts late is waited
+    /// for, never counted in a second line (CI, ubuntu, 4d77bcbb: it started
+    /// after the 40 sends and said 8 itself, `finish` said 32).
+    ///
     /// FAILS ON REVERT of the counting in `ReportSender::send` and
     /// `BlockReporter::finish`: 40 reports, and no line says what became of
     /// them.
@@ -757,39 +765,35 @@ mod tests {
     fn reports_the_queue_could_not_take_are_counted_in_one_line() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        // Takes every connection and answers none.
+        let (taken_tx, taken) = std::sync::mpsc::channel();
+        // Takes every connection and answers none; says when it took one.
         std::thread::spawn(move || {
             let mut held = Vec::new();
             for stream in listener.incoming().flatten() {
                 held.push(stream);
+                let _ = taken_tx.send(());
             }
         });
         let reporter = BlockReporter::start(format!("http://127.0.0.1:{port}{PROXY_BLOCK_PATH}"));
         let sender = reporter.sender().expect("on");
         let body = block_report("l", ProxyMode::Guard, &routed(CRED_CALL), None).unwrap();
-        for _ in 0..40 {
+        sender.send(body.clone());
+        taken
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the sending thread took the first report to the agent");
+        for _ in 1..40 {
             sender.send(body.clone());
         }
-        let dropped = reporter.tally.dropped.load(Ordering::SeqCst);
-        assert!((7..=8).contains(&dropped), "{dropped}");
+        assert_eq!(reporter.tally.dropped.load(Ordering::SeqCst), 7);
+        assert_eq!(reporter.tally.queued.load(Ordering::SeqCst), 33);
         let line = reporter
             .finish(Duration::from_millis(100))
             .expect("a line for the lost reports");
-        assert!(
-            line.starts_with(
-                "innerwarden proxy: 40 report(s) to the local InnerWarden agent were not sent ("
-            ),
-            "{line}"
-        );
-        assert!(
-            line.contains(&format!(
-                "{dropped} turned away while its queue (32) was full"
-            )),
-            "{line}"
-        );
-        assert!(
-            line.contains("still queued when the proxy exited"),
-            "{line}"
+        assert_eq!(
+            line,
+            "innerwarden proxy: 40 report(s) to the local InnerWarden agent were not sent \
+             (7 turned away while its queue (32) was full, 33 still queued when the proxy \
+             exited); each is in this proxy's own record"
         );
         assert_eq!(lost_line(0, 0), None);
     }
