@@ -16,25 +16,33 @@
 //! inline program and a here-document included):
 //!
 //! - a file size limit lowered by `prlimit` or code whose target is the
-//!   agent: the pid it is given is the agent's (`$PPID`, `getppid`, a
-//!   `ppid` read from `ps`, the pid `pgrep` or `pidof` finds for an agent
-//!   or the guard, a variable the line gave one of those), or the program
-//!   `prlimit` starts is an agent or the guard (`prlimit --fsize=1
-//!   innerwarden hook`): refused. An agent, the guard or `ppid` named
-//!   anywhere else on the line does not count;
+//!   agent: the limit is set on a pid and the line refers to the agent's
+//!   process anywhere (`$PPID`, `getppid`, `process.ppid`, a `ppid` read
+//!   from `ps`, an agent or the guard named, as `pgrep` or `pidof` find
+//!   it), or the program `prlimit` starts is an agent or the guard
+//!   (`prlimit --fsize=1 innerwarden hook`): refused. The pid may reach the
+//!   call through a variable, an array, backquotes or a loop
+//!   (`p = os.getppid(); resource.prlimit(p, ...)`, `for p in $(pgrep
+//!   claude); do prlimit --pid $p ...`), so the line counts, not the pid
+//!   alone (decided 2026-11-26, after a round that read the pid alone held
+//!   those as another process's or allowed them);
 //! - a file size or core limit lowered for any other process (`prlimit
-//!   --pid N`, `resource.prlimit(pid, ...)`): held for the person; the
-//!   shell's or the program's own (`ulimit -f N`, `setrlimit`, `prlimit
-//!   --pid $$`) with no agent started after it: allowed.
+//!   --pid N`, `resource.prlimit(pid, ...)`) on a line that does not refer
+//!   to the agent: held for the person; the shell's or the program's own
+//!   (`ulimit -f N`, `setrlimit`, `prlimit --pid $$`) with no agent started
+//!   after it: allowed.
 //!
 //! `ulimit` and `setrlimit` set the limit of the shell or the program
-//! itself and of its children: refused only when a command after them on
-//! the line starts an agent or the guard's hook (`ulimit -n 3; claude`,
-//! `(ulimit -t 0; exec codex)`, `ulimit -n 3 && npx @anthropic-ai/claude-code`),
-//! read by its command word. An agent, the guard or `ppid` named in a path,
-//! an argument or an option does not count (decided 2026-11-26, after
-//! `ulimit -n 256` on a line that only named `codex`, `ppid` or the guard
-//! was refused).
+//! itself and of its children, as `prlimit` and `resource.prlimit` do on
+//! their own pid (`$$`, `0`, `getpid`): refused only when a command after
+//! them on the line starts an agent or the guard's hook (`ulimit -n 3;
+//! claude`, `(ulimit -t 0; exec codex)`, `ulimit -n 3 && npx
+//! @anthropic-ai/claude-code`), read by its command word. An agent, the
+//! guard or `ppid` named in a path, an argument or an option does not count
+//! there (decided 2026-11-26, after `ulimit -n 256` on a line that only
+//! named `codex`, `ppid` or the guard was refused). A `-p` among the
+//! options of the program `prlimit` starts is that program's, not a pid
+//! (`prlimit --nofile=256 cargo test -p innerwarden-agent-guard`).
 //!
 //! Raising a limit (`unlimited`), reading one (`ulimit -f`, `prlimit --pid
 //! N`), the other limits (`ulimit -n 4096`, `prlimit --nofile=...`,
@@ -96,9 +104,10 @@ static SHORT_OPTION: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// The option that gives `prlimit` its pid: `--pid N`, `--pid=N`, `-p N`,
-/// `-pN`; the value is read by [`pid_value`].
+/// `-pN`, and the same as items of a list in code (`['--pid', pid]`); the
+/// value is read by [`pid_value`].
 static PID_OPTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?:--pid(?:=|\s+)|(?:^|\s)-p\s*)").expect("static pid option regex")
+    Regex::new(r"(?:--pid(?:=|[\s,]+)|(?:^|[\s,\[])-p[\s,]*)").expect("static pid option regex")
 });
 
 /// `ulimit` with its options and the value after them (`-n 3`, `-n3`).
@@ -190,7 +199,7 @@ impl Limit {
 /// suffix), or that is not spelled as a number at all (a variable). An
 /// empty value is a read; `unlimited` raises.
 fn below_floor(limit: Limit, value: &str, unit: u64) -> bool {
-    let value = value.trim_end_matches([';', '&', '|', ')']);
+    let value = value.trim_end_matches([';', '&', '|', ')', ']', ',']);
     value.split(':').any(|part| {
         let part = part.trim().to_ascii_lowercase();
         if part.is_empty() || part == "unlimited" || part == "-1" || part.ends_with("infinity") {
@@ -238,7 +247,7 @@ fn joined(command: &str) -> String {
 /// not `unlimited` (a number, a variable, a suffix such as `10M`). An
 /// empty value is a read.
 fn lowers(value: &str) -> bool {
-    let value = value.trim_end_matches([';', '&', '|', ')']);
+    let value = value.trim_end_matches([';', '&', '|', ')', ']', ',']);
     value.split(':').any(|part| {
         let part = part.trim().to_ascii_lowercase();
         !part.is_empty() && part != "unlimited" && part != "infinity" && part != "-1"
@@ -290,14 +299,56 @@ fn runs_prlimit(segment: &str, aliases: &[String]) -> bool {
         .any(|word| word == "prlimit" || aliases.iter().any(|alias| alias == word))
 }
 
+/// Where `inner`, a slice of `outer`, starts in it.
+fn offset_in(outer: &str, inner: &str) -> usize {
+    (inner.as_ptr() as usize).saturating_sub(outer.as_ptr() as usize)
+}
+
+/// Where `prlimit`'s own options end in the segment: the first word after
+/// them that is neither an option nor its value (the program it starts,
+/// `cargo` in `prlimit --nofile=256 cargo test -p x`), or the end of the
+/// segment. A `+`, `,` or bracket of code that joins its arguments is
+/// passed over.
+fn options_end(segment: &str, aliases: &[String]) -> usize {
+    let mut words = segment.split_whitespace().skip_while(|word| {
+        let name = word.rsplit(['/', '(']).next().unwrap_or(word);
+        !(name == "prlimit" || aliases.iter().any(|alias| alias == name))
+    });
+    if words.next().is_none() {
+        return segment.len();
+    }
+    let mut rest = words.peekable();
+    while let Some(word) = rest.next() {
+        if word == "--" || word.chars().all(|c| matches!(c, '+' | ',' | '[' | ']')) {
+            continue;
+        }
+        if word.starts_with('-') {
+            let glued = word.contains('=') || (!word.starts_with("--") && word.len() > 2);
+            if !glued
+                && rest.peek().is_some_and(|next| {
+                    next.starts_with(|c: char| c.is_ascii_digit() || matches!(c, '$' | ':' | '`'))
+                })
+            {
+                rest.next();
+            }
+            continue;
+        }
+        return offset_in(segment, word);
+    }
+    segment.len()
+}
+
 /// The pid value after `--pid` or `-p`: a whole `$(...)` (`$(pgrep -n
-/// claude)`), or the next word; a `+` of code that joins strings
-/// (`"--pid " + process.ppid`) is passed over.
-fn pid_value(segment: &str, prlimit: bool) -> Option<String> {
+/// claude)`), or the next word; a `+` or `,` of code that joins strings
+/// (`"--pid " + process.ppid`, `['--pid', pid]`) is passed over. A `-p`
+/// after the program `prlimit` starts is that program's own option.
+fn pid_value(segment: &str, prlimit: bool, aliases: &[String]) -> Option<String> {
+    let end = options_end(segment, aliases);
     let option = PID_OPTION
         .find_iter(segment)
-        .find(|m| prlimit || m.as_str().contains("--pid"))?;
-    let rest = segment[option.end()..].trim_start_matches(|c: char| c.is_whitespace() || c == '+');
+        .find(|m| m.as_str().contains("--pid") || (prlimit && m.start() < end))?;
+    let rest = segment[option.end()..]
+        .trim_start_matches(|c: char| c.is_whitespace() || matches!(c, '+' | ','));
     if let Some(inner) = rest.strip_prefix("$(") {
         let mut depth = 1usize;
         for (at, c) in inner.char_indices() {
@@ -314,42 +365,18 @@ fn pid_value(segment: &str, prlimit: bool) -> Option<String> {
         }
         return Some(rest.to_string());
     }
-    let word = rest.split_whitespace().next()?;
-    Some(word.trim_end_matches(')').to_string())
+    let word = rest.split([' ', '\t', ',']).find(|word| !word.is_empty())?;
+    Some(word.trim_end_matches([')', ']']).to_string())
 }
 
-/// `NAME=` given a value on the line: `pid=$(ps -o ppid= -p $$)`.
-fn assigned(line: &str, name: &str) -> Option<String> {
-    let pattern = format!(r"(?:^|[\s;&|(]){}=(\$\([^)]*\)?|\S+)", regex::escape(name));
-    let caps = Regex::new(&pattern).ok()?.captures(line)?;
-    Some(caps[1].to_string())
-}
-
-/// Whether a pid names the agent: its parent's pid in any language
-/// (`$PPID`, `os.getppid()`, `process.ppid`, a `ppid` read from `ps`),
-/// the pid `pgrep` or `pidof` finds for an agent or the guard, or a
-/// variable the line gave one of those. Only the pid counts: an agent
-/// named anywhere else on the line does not.
-fn pid_is_agent(pid: &str, line: &str, depth: u8) -> bool {
-    if PARENT.is_match(pid) {
-        return true;
-    }
-    if ["pgrep", "pidof", "pstree"]
-        .iter()
-        .any(|finder| pid.contains(finder))
-        && names_an_agent(pid)
-    {
-        return true;
-    }
-    let name = pid
-        .trim_start_matches('$')
-        .trim_start_matches('{')
-        .trim_end_matches('}');
-    depth < 2
-        && pid.starts_with('$')
-        && !name.is_empty()
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && assigned(line, name).is_some_and(|value| pid_is_agent(&value, line, depth + 1))
+/// Whether the line refers to the agent's process anywhere: its parent's
+/// pid in any language (`$PPID`, `os.getppid()`, `process.ppid`, a `ppid`
+/// read from `ps`) or an agent or the guard by name (as `pgrep claude` or
+/// `pidof codex` find it). Read for a limit set on another process by pid:
+/// the pid reaches the call through a variable, an array, backquotes or a
+/// loop as easily as in place, so the line counts, not the pid alone.
+fn refers_to_agent(line: &str) -> bool {
+    PARENT.is_match(line) || names_an_agent(line)
 }
 
 /// Whether `prlimit` without a pid starts an agent or the guard: the first
@@ -472,11 +499,19 @@ fn read(line: &str) -> Lowered {
             found.agent_hook_limit |= hook_limit;
             continue;
         }
-        match pid_value(segment, prlimit) {
-            Some(pid) if OWN_PID.is_match(&pid) => {}
-            Some(pid) if pid_is_agent(&pid, line, 0) => {
+        match pid_value(segment, prlimit, &aliases) {
+            // Its own pid is the shell's limit: as `ulimit`, below.
+            Some(pid) if OWN_PID.is_match(&pid) => {
+                let rest = &line[offset_in(line, segment) + segment.len()..];
+                if later_starts_an_agent(rest) {
+                    found.agent_file_size |= file_size;
+                    found.agent_hook_limit |= hook_limit;
+                }
+            }
+            Some(_) if refers_to_agent(line) => {
                 found.agent_file_size |= file_size;
                 found.agent_hook_limit |= hook_limit;
+                found.other_core |= core;
             }
             Some(_) => {
                 found.other_file_size |= file_size;
@@ -523,10 +558,17 @@ fn read(line: &str) -> Lowered {
         let pid = caps[1].trim();
         let value = caps.get(3).map_or("", |m| m.as_str());
         let own = OWN_PID.is_match(pid);
-        let agent = !own && pid_is_agent(pid, line, 0);
+        // Another process's pid: the line refers to the agent anywhere
+        // (`p = os.getppid(); resource.prlimit(p, ...)`). Its own pid: an
+        // agent the program starts after it, as `setrlimit` above.
+        let agent = if own {
+            later_starts_an_agent(&line[caps.get(0).map_or(0, |m| m.end())..])
+        } else {
+            refers_to_agent(line)
+        };
         match Limit::by_code(&caps[2]) {
-            Some(Limit::FileSize) if own => {}
             Some(Limit::FileSize) if agent => found.agent_file_size = true,
+            Some(Limit::FileSize) if own => {}
             Some(Limit::FileSize) => found.other_file_size = true,
             Some(Limit::Core) if !own => found.other_core = true,
             Some(limit @ (Limit::Cpu | Limit::Memory | Limit::OpenFiles | Limit::Stack))
@@ -790,7 +832,141 @@ mod tests {
             "ulimit -n 2048; node server.js",
             "ulimit -Sn 4096 && npm run build",
             "ulimit -n 256 && echo claude",
-            "prlimit --pid 4242 --nofile=3 && echo $PPID",
+            "prlimit --nofile=256 cargo test -p innerwarden-agent-guard",
+        ] {
+            assert_eq!(check_limit_lowered(line), None, "{line}");
+            assert_eq!(verdict(line), "allow", "{line}");
+        }
+    }
+
+    /// A limit set on a pid the line takes from the agent through a
+    /// variable, a list in code, backquotes or a loop, and the limits that
+    /// end the hook before it runs set the same ways: refused, as the agent's.
+    /// The round that read the pid alone held the first three as another
+    /// process's, the fourth only for its backquotes, and allowed the
+    /// limits that end the hook (measured 2026-11-26 through the hook of a
+    /// release build).
+    ///
+    /// FAILS ON REVERT: with only the pid read for the agent again (or
+    /// `refers_to_agent` always false), each is held for review or allowed.
+    #[test]
+    fn a_limit_set_on_a_pid_the_line_takes_from_the_agent_is_refused() {
+        for (line, what) in [
+            (
+                "python3 -c 'import os, resource; p = os.getppid(); resource.prlimit(p, resource.RLIMIT_FSIZE, (1, 1))'",
+                AGENT_FILE_SIZE_LOWERED,
+            ),
+            (
+                "node -e \"require('child_process').spawnSync('prlimit', ['--pid', String(process.ppid), '--fsize=1024'])\"",
+                AGENT_FILE_SIZE_LOWERED,
+            ),
+            (
+                "for p in $(pgrep claude); do prlimit --pid $p --fsize=1024; done",
+                AGENT_FILE_SIZE_LOWERED,
+            ),
+            (
+                "prlimit --pid `pgrep -o claude` --nofile=3",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "python3 -c 'import os, resource; p = os.getppid(); resource.prlimit(p, resource.RLIMIT_NOFILE, (3, 3))'",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "python3 -c 'import os, resource; p = os.getppid(); resource.prlimit(p, resource.RLIMIT_CPU, (0, 0))'",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "python3 -c 'import os, resource as r; pid = os.getppid(); r.prlimit(pid, r.RLIMIT_STACK, (16384, 16384))'",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "node -e \"require('child_process').spawnSync('prlimit', ['--pid', String(process.ppid), '--nofile=3'])\"",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "node -e \"require('child_process').spawnSync('prlimit', ['--pid', String(process.ppid), '--as=16777216'])\"",
+                AGENT_LIMIT_LOWERED,
+            ),
+            // The same ways, other limits and finders.
+            (
+                "prlimit --pid `pgrep -o claude` --fsize=1024",
+                AGENT_FILE_SIZE_LOWERED,
+            ),
+            (
+                "for p in $(pgrep claude); do prlimit --pid $p --nofile=3; done",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "for p in $(pgrep -f claude-code); do prlimit --pid $p --cpu=0; done",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "ps -o ppid= -p $$ | xargs -I{} prlimit --pid {} --nofile=3",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "pgrep -n claude | xargs -I% prlimit --pid % --nofile=3",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "p=$PPID; prlimit --pid $p --nofile=3",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "read p <<< $PPID; prlimit --pid $p --nofile=3",
+                AGENT_LIMIT_LOWERED,
+            ),
+            // Its own pid, then an agent started: the shell's limit, which
+            // the agent inherits.
+            (
+                "prlimit --pid $$ --nofile=3; claude -p hi",
+                AGENT_LIMIT_LOWERED,
+            ),
+            (
+                "python3 -c 'import os, resource; resource.prlimit(0, resource.RLIMIT_FSIZE, (1, 1)); os.execvp(\"claude\", [\"claude\"])'",
+                AGENT_FILE_SIZE_LOWERED,
+            ),
+            // A pid given with the agent's named elsewhere on the line is
+            // read as the agent's: the line counts, not the pid alone.
+            (
+                "prlimit --pid 4242 --nofile=3 && echo $PPID",
+                AGENT_LIMIT_LOWERED,
+            ),
+        ] {
+            assert_eq!(verdict(line), "deny", "{line}");
+            assert_eq!(
+                check_limit_lowered(line).map(|(found, _)| found),
+                Some(what),
+                "{line}"
+            );
+        }
+    }
+
+    /// A limit set on another process's pid on a line that does not refer
+    /// to the agent stays as it was: a file size or core limit held, the
+    /// other limits allowed; and a `-p` of the program `prlimit` starts is
+    /// no pid.
+    #[test]
+    fn a_limit_on_another_pid_with_no_agent_on_the_line_stays_as_it_was() {
+        for line in [
+            "prlimit --pid 4242 --fsize=1024",
+            "prlimit --pid 4242 --core=0",
+            "for p in $(pgrep nginx); do prlimit --pid $p --fsize=1024; done",
+            "python3 -c 'import os, resource; p = 4242; resource.prlimit(p, resource.RLIMIT_FSIZE, (1, 1))'",
+        ] {
+            assert_eq!(verdict(line), "review", "{line}");
+            assert_eq!(
+                check_limit_lowered(line).map(|(found, _)| found),
+                Some(PROCESS_LIMIT_LOWERED),
+                "{line}"
+            );
+        }
+        for line in [
+            "prlimit --pid 4242 --nofile=3",
+            "prlimit --nofile=256 cargo test -p innerwarden-agent-guard",
+            "prlimit --nofile=256 ./tool -p 4242",
+            "prlimit --pid $$ --nofile=3",
         ] {
             assert_eq!(check_limit_lowered(line), None, "{line}");
             assert_eq!(verdict(line), "allow", "{line}");
