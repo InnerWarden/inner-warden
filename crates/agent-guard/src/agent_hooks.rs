@@ -2256,6 +2256,42 @@ mod tests {
         assert_eq!(uninstall(home.path(), &GEMINI), Ok(0));
     }
 
+    /// The Gemini monitor line 1.6.15 wrote, which let the refusal monitor
+    /// keeps run, is replaced where it sits by `agents connect` (one entry of
+    /// ours, the person's hook kept), and a second run writes nothing. Until
+    /// then the judge reads it as on, in monitor mode: it still records.
+    ///
+    /// FAILS ON REVERT of `FAIL_OPEN_TAIL_1615` in `hook::guard_words`: the
+    /// old line is not ours, so the connect adds a second entry beside it.
+    #[test]
+    fn connect_replaces_the_old_gemini_monitor_line() {
+        let home = tempfile::TempDir::new().unwrap();
+        let today = GEMINI.command(Path::new(BIN), false, true);
+        let old = today.replacen(hook::FAIL_OPEN_TAIL, hook::FAIL_OPEN_TAIL_1615, 1);
+        assert_ne!(old, today);
+        let before = json!({"hooks": {"BeforeTool": [theirs(), gemini_entry(&old)]}});
+        write(home.path(), GEMINI.file, &before.to_string());
+        assert_eq!(
+            state_with(home.path(), &GEMINI, |_| hook::ProgramFact::Executable),
+            HookState::On {
+                monitor: true,
+                block_review: false
+            }
+        );
+        assert_eq!(
+            install(home.path(), &GEMINI, Path::new(BIN), false, true),
+            Ok(true)
+        );
+        assert_eq!(
+            read(home.path(), GEMINI.file),
+            json!({"hooks": {"BeforeTool": [theirs(), gemini_entry(&today)]}})
+        );
+        assert_eq!(
+            install(home.path(), &GEMINI, Path::new(BIN), false, true),
+            Ok(false)
+        );
+    }
+
     #[test]
     fn install_creates_the_file_and_a_second_run_writes_nothing() {
         let home = tempfile::TempDir::new().unwrap();

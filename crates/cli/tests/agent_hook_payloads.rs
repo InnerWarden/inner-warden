@@ -655,6 +655,65 @@ fn gemini_payloads_are_refused_before_they_run_and_ordinary_work_runs() {
     assert_runs_on(gemini_reads, &run(mcp), "an MCP tool the proxy screens");
 }
 
+/// Gemini CLI in monitor: a write into the guard's own configuration, by
+/// its shell tool or by `write_file`, is refused through the monitor line
+/// `agents connect gemini --monitor` writes, read as Gemini reads a hook's
+/// answer; what enforce refuses (`rm -rf ~`) and ordinary work run. The
+/// line 1.6.15 wrote let the same write run with a warning (exit 1).
+///
+/// Measured 2026-11-26 before the change: both writes ended with 1 and
+/// Gemini ran them.
+///
+/// FAILS ON REVERT of `refusal_exit` in the hook (the held refusal ends
+/// with 2, which the line turns into 1), or of the `3) exit 2;;` arm of
+/// the line's tail.
+#[cfg(unix)]
+#[test]
+fn gemini_in_monitor_refuses_a_write_into_the_guard_config() {
+    let host = Host::new();
+    let line = GEMINI.command(bin(), false, true);
+    let run = |payload: Value| host.run("bash", &line, &payload);
+    let shell = |command: &str| {
+        host.gemini(
+            "run_shell_command",
+            json!({"command": command, "description": "d", "is_background": false}),
+        )
+    };
+    let refused = |answer: &Answer, what: &str| {
+        assert_eq!(answer.code, Some(2), "{what}: {}", answer.stderr);
+        assert_eq!(gemini_reads(answer), Call::Refused, "{what}");
+        assert!(answer.stderr.contains("InnerWarden blocked"), "{what}");
+    };
+    refused(
+        &run(shell("rm ~/.config/innerwarden/notify.toml")),
+        "rm of the alerts config",
+    );
+    refused(
+        &run(shell("echo strict > ~/.config/innerwarden/posture")),
+        "a write of the posture",
+    );
+    let notify = host.home().join(".config/innerwarden/notify.toml");
+    refused(
+        &run(host.gemini("write_file", json!({"file_path": notify, "content": "x"}))),
+        "write_file over the alerts config",
+    );
+    for command in [
+        "rm -rf ~",
+        "ls -la",
+        "cat ~/.config/innerwarden/notify.toml",
+    ] {
+        let answer = run(shell(command));
+        assert_eq!(answer.code, Some(0), "{command}: {}", answer.stderr);
+        assert_eq!(gemini_reads(&answer), Call::Runs, "{command}");
+    }
+    // The 1.6.15 line, whose tail turned every end but 0 into 1.
+    let old = line.replacen("3) exit 2;; ", "", 1);
+    assert_ne!(old, line);
+    let answer = host.run("bash", &old, &shell("rm ~/.config/innerwarden/notify.toml"));
+    assert_eq!(answer.code, Some(1), "{}", answer.stderr);
+    assert_eq!(gemini_reads(&answer), Call::Runs);
+}
+
 /// Claude Code: a Bash call through the line `agents connect claude-code`
 /// writes, started with `sh -c` as Claude Code starts it.
 #[test]

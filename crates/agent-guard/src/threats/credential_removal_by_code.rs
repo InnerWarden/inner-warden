@@ -75,7 +75,7 @@ static ASSIGNMENT: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// the module itself.
 static MODULE_BY_CALL: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
-        r#"\b(?:__import__|(?:[A-Za-z_]\w*\.)?import_module)\s*\(\s*\\?["']([\w.]+)\\?["']\s*\)|\brequire\s*\(?\s*\\?["']([\w.]+)\\?["']\s*\)?"#,
+        r#"\b(?:__import__|(?:[A-Za-z_]\w*\.)?import_module)\s*\(\s*\\?["']([\w.]+)\\?["']\s*\)|\brequire\s*\(?\s*\\?["'](?:node:)?([\w./-]+)\\?["']\s*\)?"#,
     )
     .expect("static module call regex")
 });
@@ -112,6 +112,34 @@ static NAME_GIVEN_NAME: LazyLock<regex::Regex> = LazyLock::new(|| {
     .expect("static name given name regex")
 });
 
+/// Node's `import('fs/promises')`, the module a dynamic import loads.
+static MODULE_BY_IMPORT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"\bimport\s*\(\s*\\?["'](?:node:)?([\w./-]+)\\?["']\s*\)"#)
+        .expect("static dynamic import regex")
+});
+
+/// The name a promise's `.then` hands a module to: `fs.promises.then(f =>`,
+/// `.then((f) =>`, `.then(function (f)`.
+static THEN_NAME: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"\b([A-Za-z_][\w.]*)\.then\(\s*(?:function\s*\(\s*([A-Za-z_]\w*)\s*\)|\(?\s*([A-Za-z_]\w*)\s*\)?\s*=>)",
+    )
+    .expect("static then regex")
+});
+
+/// An ES module's `import {rm, unlink as u} from 'fs/promises'`, `import *
+/// as f from 'fs'` and `import f from 'fs'`.
+static ESM_IMPORT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"\bimport\s+(.+?)\s+from\s+\\?["'](?:node:)?([\w./-]+)\\?["']"#)
+        .expect("static esm import regex")
+});
+
+/// A destructuring of a module or a value: `const {rm, unlink: u} = fs.promises`.
+static DESTRUCTURED: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\b(?:const|let|var)\s*\{([^{}]*)\}\s*=\s*([A-Za-z_][\w.]*)")
+        .expect("static destructuring regex")
+});
+
 /// Strings joined by an operator: `'/home/u/.s' + 'sh/id_rsa'`, Lua's
 /// `..`, Perl's and PHP's `.`.
 static JOINED_STRINGS: LazyLock<regex::Regex> = LazyLock::new(|| {
@@ -134,18 +162,61 @@ const ALIAS_ROUNDS: usize = 4;
 /// `os.remove(p)`, Lua's `local o = require("os"); o.remove(p)` as
 /// `os.remove(p)`.
 fn canonical_code(code: &str) -> String {
+    let code = crate::shell::lua_builtin_aliases_in_line(code);
     let mut text = MODULE_BY_CALL
-        .replace_all(code, |found: &regex::Captures| {
+        .replace_all(&code, |found: &regex::Captures| {
+            // Node's `require('fs/promises')` is `fs.promises`.
             found
                 .get(1)
                 .or_else(|| found.get(2))
-                .map_or(String::new(), |module| module.as_str().to_owned())
+                .map_or(String::new(), |module| module.as_str().replace('/', "."))
         })
+        .into_owned();
+    text = MODULE_BY_IMPORT
+        .replace_all(&text, |found: &regex::Captures| found[1].replace('/', "."))
         .into_owned();
     text = GETATTR.replace_all(&text, "${1}.${2}").into_owned();
     let mut aliases: Vec<(String, String)> = Vec::new();
+    for found in THEN_NAME.captures_iter(&text) {
+        if let Some(name) = found.get(2).or_else(|| found.get(3)) {
+            aliases.push((name.as_str().to_owned(), found[1].to_owned()));
+        }
+    }
+    for found in DESTRUCTURED.captures_iter(&text) {
+        for field in found[1].split(',') {
+            let field = field.split('=').next().unwrap_or("").trim();
+            let (key, name) = field.split_once(':').unwrap_or((field, field));
+            let (key, name) = (key.trim(), name.trim());
+            if !key.is_empty() && !name.is_empty() {
+                aliases.push((name.to_owned(), format!("{}.{key}", &found[2])));
+            }
+        }
+    }
     for statement in text.split([';', '\n']) {
-        if let Some(from) = FROM_IMPORT.captures(statement) {
+        if let Some(esm) = ESM_IMPORT.captures(statement) {
+            let module = esm[2].replace('/', ".");
+            let names = esm[1].trim();
+            if let Some(star) = names.strip_prefix('*') {
+                if let Some(name) = star.trim().strip_prefix("as") {
+                    aliases.push((name.trim().to_owned(), module.clone()));
+                }
+            }
+            let (default, braced) = match names.split_once('{') {
+                Some((default, braced)) => (default, braced.trim_end_matches('}')),
+                None => (names, ""),
+            };
+            let default = default.trim().trim_end_matches(',').trim();
+            if !default.is_empty() && !default.starts_with('*') {
+                aliases.push((default.to_owned(), module.clone()));
+            }
+            for field in braced.split(',') {
+                let mut words = field.split_whitespace();
+                let (Some(key), alias) = (words.next(), words.nth(1)) else {
+                    continue;
+                };
+                aliases.push((alias.unwrap_or(key).to_owned(), format!("{module}.{key}")));
+            }
+        } else if let Some(from) = FROM_IMPORT.captures(statement) {
             let module = &from[1];
             for name in from[2].split(',') {
                 let mut words = name.split_whitespace();

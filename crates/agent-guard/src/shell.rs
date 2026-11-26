@@ -10,6 +10,7 @@ use std::ops::Range;
 
 mod git_editor;
 mod inline_calls;
+pub(crate) use inline_calls::lua_builtin_aliases_in_line;
 pub(crate) mod output_options;
 pub(crate) mod runners;
 mod sql_runner;
@@ -3594,6 +3595,56 @@ const HANDED_LEVELS_READ: u8 = 4;
 /// positional parameter is the argument that stands for it (`bash -c "$1" _
 /// 'rm -rf /'`). Any other operand that starts with an expansion is not
 /// read and is reported ([`HandedLines::not_literal`]).
+/// Each shell's `-c` script of the line as the shell hands it over: a word
+/// whose quotes are glued (`"curl ... ev"'.io'`), escaped by backslashes
+/// (`curl\ -d\ ...`) or written `$'...'` is one script, read as the shell
+/// reads it, behind `env` and the like too. A word with an expansion is not
+/// read here (the line does not show it).
+pub(crate) fn shell_scripts_as_handed(source: &str) -> Vec<String> {
+    let mut scripts = Vec::new();
+    // A quote closed and reopened (`'\''`, `'"'"'`) has its own two readings
+    // (`analyze_command_unwrapped` in mcp.rs), the stronger standing.
+    if source.contains("'\\''") || source.contains("'\"'\"'") {
+        return scripts;
+    }
+    for command in crate::shell_words::read_line(source).commands {
+        if command
+            .words
+            .iter()
+            .any(|word| word.has(crate::shell_words::Mark::Expansion))
+        {
+            continue;
+        }
+        let texts: Vec<String> = command.words.iter().map(|word| word.text.clone()).collect();
+        let Some(at) = crate::threats::effective_command_index(&texts) else {
+            continue;
+        };
+        let program = crate::threats::token_basename(&texts[at]).to_ascii_lowercase();
+        if !crate::threats::is_shell_program(&program) {
+            continue;
+        }
+        // `-n` reads the script and runs nothing.
+        let options = texts[at + 1..]
+            .iter()
+            .take_while(|word| word.starts_with('-') && !word.starts_with("--"));
+        if options.clone().any(|word| word.contains('n')) {
+            continue;
+        }
+        if let Some(script) = crate::agent_instructions::shell_line(&texts[at + 1..]) {
+            // A script written as one literal in quotes is the tree's to read
+            // (it knows a branch that never runs): only the spellings it
+            // does not read as one script are read here.
+            let written_whole = source.contains(&format!("'{script}'"))
+                || (!script.contains(['$', '`', '\\', '"'])
+                    && source.contains(&format!("\"{script}\"")));
+            if !script.trim().is_empty() && !written_whole {
+                scripts.push(script.to_string());
+            }
+        }
+    }
+    scripts
+}
+
 pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
     let mut handed = HandedLines::default();
     let Some((tree, _doubt)) = parse_line(source) else {
@@ -3999,6 +4050,12 @@ pub(crate) fn handed_shell_lines(source: &str) -> HandedLines {
                 // A download alone: the download rules' own.
                 None => {}
             }
+        }
+    }
+    // The `-c` script as the shell hands it over ([`shell_scripts_as_handed`]).
+    for script in shell_scripts_as_handed(source) {
+        if !handed.lines.contains(&script) {
+            handed.lines.push(script);
         }
     }
     handed.lines.retain(|line| !line.trim().is_empty());
@@ -6271,7 +6328,12 @@ fn shell_c_operand(args: &[String]) -> Option<usize> {
     let mut index = 0;
     let mut wants_line = false;
     while let Some(argument) = args.get(index) {
-        if argument == "--" || !(argument.starts_with('-') || argument.starts_with('+')) {
+        if matches!(argument.as_str(), "--" | "-") {
+            // `--` ends the options: after a `-c` the word past it is the
+            // line; before one, `-c` is a script's name (`bash -- -c`).
+            return (wants_line && index + 1 < args.len()).then_some(index + 1);
+        }
+        if !(argument.starts_with('-') || argument.starts_with('+')) {
             break;
         }
         if matches!(
@@ -8307,19 +8369,23 @@ fn stdin_code_language(command: tree_sitter::Node<'_>, source: &[u8]) -> Option<
 }
 
 fn shell_command_payload(words: &[String]) -> Option<String> {
+    let args: Vec<String> = words.iter().skip(1).map(|word| shell_word(word)).collect();
+    let script = |index: usize| shell_c_script_from(&args, index).map(|at| args[at].clone());
     let mut index = 1;
     while let Some(argument) = words.get(index).map(|argument| shell_word(argument)) {
         if matches!(argument.as_str(), "-c" | "--command") {
-            return words.get(index + 1).map(|payload| shell_word(payload));
+            return script(index);
         }
-        if argument == "--" || (!argument.starts_with('-') && !argument.starts_with('+')) {
+        if matches!(argument.as_str(), "--" | "-")
+            || (!argument.starts_with('-') && !argument.starts_with('+'))
+        {
             return None;
         }
         if argument
             .strip_prefix(['-', '+'])
             .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
         {
-            return words.get(index + 1).map(|payload| shell_word(payload));
+            return script(index);
         }
         if matches!(argument.as_str(), "-o" | "+o" | "-O" | "+O") {
             index += 2;
@@ -9786,18 +9852,134 @@ fn stands_in_an_argument(node: tree_sitter::Node<'_>) -> bool {
 
 /// The command lines `xargs` builds from the words a literal `echo` or
 /// `printf` hands it through a pipe: `echo / | xargs -I X rm -rf X` runs
-/// `rm -rf /`, which the line as written does not show. With a replace
-/// string (`-I R`, `-i`) one line per word, else one line with every
-/// word added. Words the text does not show whole, input from a file
-/// (`-a`) or options this reading does not know build nothing: the line is
-/// judged as written, as before.
+/// `rm -rf /`, which the line as written does not show. The names `ls`
+/// lists and the files `find` finds are handed on the same way, each as the
+/// pattern or the folder the line names (`ls ~/.config/systemd/user/inner*
+/// | xargs rm` is `rm ~/.config/systemd/user/inner*`, `find dir -name 'x*'
+/// | xargs rm` is `rm dir/x*`). With a replace string (`-I R`, `-i`) one
+/// line per word, else one line with every word added. Words the text does
+/// not show whole, input from a file (`-a`) or options this reading does
+/// not know build nothing: the line is judged as written, as before.
+/// The names `ls` given `words` lists, as the line names them: each
+/// operand (a pattern stays one). `None` for an `ls` of the folder it runs
+/// in, or with an option that prints more than names (`-l`).
+fn names_ls_lists(words: &[crate::shell_words::Word]) -> Option<Vec<String>> {
+    const NAME_ONLY: &[&str] = &["-1", "-d", "-a", "-A", "-t", "-r", "-S", "-U", "-v", "-X"];
+    let mut names = Vec::new();
+    let mut options = true;
+    for word in words {
+        if options && word.text == "--" {
+            options = false;
+        } else if options && word.text.starts_with('-') && word.text.len() > 1 {
+            let flags_known = word.text[1..]
+                .chars()
+                .all(|flag| NAME_ONLY.iter().any(|known| known[1..].starts_with(flag)));
+            if !flags_known {
+                return None;
+            }
+        } else {
+            // A folder's names are its entries, printed bare: a word with no
+            // pattern may be one, so its entries (`*`) are listed beside it.
+            let pattern = word.text.contains(['*', '?', '[']);
+            names.push(word.text.clone());
+            if !pattern && !names.iter().any(|name| name == "*") {
+                names.push("*".to_string());
+            }
+        }
+    }
+    // `ls` alone lists the entries of the folder it runs in.
+    if names.is_empty() {
+        names.push("*".to_string());
+    }
+    Some(names)
+}
+
+/// The files `find` given `words` prints, as the line names them: each
+/// starting folder joined to the pattern of its `-name` or `-iname`, the
+/// pattern of `-path` as it is, or the folder's contents (`dir/*`) with
+/// neither. `None` for a `find` that runs or prints something else
+/// (`-exec`, `-printf`, `-delete`), or with no starting folder.
+fn files_find_lists(words: &[crate::shell_words::Word]) -> Option<Vec<String>> {
+    let texts: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
+    let start = texts
+        .iter()
+        .position(|text| text.starts_with('-') || matches!(*text, "(" | "!" | ","))
+        .unwrap_or(texts.len());
+    let folders: Vec<&str> = texts[..start]
+        .iter()
+        .copied()
+        .filter(|text| !matches!(*text, "-H" | "-L" | "-P"))
+        .collect();
+    if folders.is_empty() {
+        return None;
+    }
+    let mut patterns: Vec<String> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
+    let mut at = start;
+    while at < texts.len() {
+        match texts[at] {
+            "-name" | "-iname" => {
+                patterns.push(texts.get(at + 1)?.to_string());
+                at += 2;
+            }
+            "-path" | "-ipath" | "-wholename" => {
+                paths.push(texts.get(at + 1)?.to_string());
+                at += 2;
+            }
+            "-type" | "-maxdepth" | "-mindepth" | "-newer" | "-mtime" | "-mmin" | "-size"
+            | "-user" | "-group" | "-perm" => at += 2,
+            "-print" | "-print0" | "-o" | "-or" | "-a" | "-and" | "-not" | "!" | "(" | ")"
+            | "-xdev" | "-mount" | "-follow" | "-depth" | "-empty" => at += 1,
+            _ => return None,
+        }
+    }
+    let mut files = paths;
+    for folder in &folders {
+        let folder = folder.trim_end_matches('/');
+        if patterns.is_empty() {
+            files.push(format!("{folder}/*"));
+        }
+        for pattern in &patterns {
+            files.push(format!("{folder}/{pattern}"));
+        }
+    }
+    Some(files)
+}
+
 pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
     use crate::shell_words::read_line;
     let line = read_line(source);
     let mut built = Vec::new();
-    for pair in line.commands.windows(2) {
-        let [feeder, runner] = pair else { continue };
-        if !feeder.piped || !feeder.words.iter().all(|word| word.is_plain()) {
+    for (index, runner) in line.commands.iter().enumerate().skip(1) {
+        // The command that lists the names: back past the filters that only
+        // pass names on (`| sort |`, `| grep -v x |`, `| head -n 9 |`), each
+        // of which hands on some of them at most.
+        let mut at = index - 1;
+        while at > 0
+            && line.commands[at].piped
+            && line.commands[at - 1].piped
+            && passes_names_on(&line.commands[at].words)
+        {
+            at -= 1;
+        }
+        let feeder = &line.commands[at];
+        // The folder the last `cd` before it moved to, written out: the
+        // names it lists are read from there.
+        let folder =
+            line.commands[..at]
+                .iter()
+                .rev()
+                .find_map(|command| match command.words.as_slice() {
+                    [cd, to] if cd.text == "cd" && to.is_plain() => Some(to.text.clone()),
+                    _ => None,
+                });
+        // A pattern is kept: what it names is what is listed.
+        if !feeder.piped
+            || feeder
+                .words
+                .iter()
+                .any(|word| word.has(crate::shell_words::Mark::Expansion))
+        {
             continue;
         }
         let Some(program) = feeder.words.first() else {
@@ -9832,6 +10014,14 @@ pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
                     .map(str::to_string)
                     .collect(),
                 _ => continue,
+            },
+            Some("ls") => match names_ls_lists(&feeder.words[1..]) {
+                Some(names) => names,
+                None => continue,
+            },
+            Some("find") => match files_find_lists(&feeder.words[1..]) {
+                Some(files) => files,
+                None => continue,
             },
             _ => continue,
         };
@@ -9884,17 +10074,19 @@ pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
         if program_words.is_empty() {
             program_words.push("echo");
         }
-        // An item goes to the program as one word, never through a shell.
+        // An item goes to the program as one word, never through a shell; a
+        // pattern stays one, standing for the names it lists.
         let quoted = |item: &str| {
             if item
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_./~@%+=:,-".contains(c))
+                .all(|c| c.is_ascii_alphanumeric() || "_./~@%+=:,-*?[]".contains(c))
             {
                 item.to_string()
             } else {
                 format!("'{}'", item.replace('\'', "'\\''"))
             }
         };
+        let before = built.len();
         match replace {
             Some(token) => {
                 for item in items.iter().take(64) {
@@ -9914,8 +10106,30 @@ pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
                 built.push(words.join(" "));
             }
         }
+        if let Some(folder) = folder {
+            let from = format!("cd {} && ", quoted(&folder));
+            for line in &mut built[before..] {
+                line.insert_str(0, &from);
+            }
+        }
     }
     built
+}
+
+/// Whether a command of a pipe only hands on some of the lines it is given,
+/// as they are: `sort`, `uniq`, `tac`, `shuf`, `head`, `tail`, `grep` (any
+/// pattern: what it keeps is among them) and `cat` with no file of its own.
+fn passes_names_on(words: &[crate::shell_words::Word]) -> bool {
+    let Some(program) = words.first() else {
+        return false;
+    };
+    match program.text.rsplit('/').next() {
+        Some("sort" | "uniq" | "tac" | "shuf" | "head" | "tail" | "grep" | "egrep" | "fgrep") => {
+            true
+        }
+        Some("cat") => words[1..].iter().all(|word| word.text.starts_with('-')),
+        _ => false,
+    }
 }
 
 pub(crate) fn line_through_links(source: &str) -> Option<String> {
@@ -10134,6 +10348,35 @@ fn shell_inline_code_payload(words: &[String]) -> Option<String> {
     shell_inline_code_place(words).map(|at| shell_literal_word(&words[at]))
 }
 
+/// The place in `args` (a shell's arguments, unquoted) of the script its
+/// `-c` hands it, the words after the one holding `-c` read from `from`
+/// on. A shell reads all its options first: `-c` only makes the first
+/// operand the script, so `bash -c -x -- LINE`, `sh -c -- LINE` and `bash
+/// -c - LINE` run `LINE` (bash 5.2, dash and busybox measured
+/// 2026-11-26). `--` or `-` ends the options: the word after it is the
+/// script, even one that starts with `-`.
+pub(crate) fn shell_c_script_from(args: &[String], from: usize) -> Option<usize> {
+    let mut index = from;
+    while let Some(argument) = args.get(index) {
+        let argument = argument.as_str();
+        if matches!(argument, "--" | "-") {
+            return (index + 1 < args.len()).then_some(index + 1);
+        }
+        if !(argument.starts_with('-') || argument.starts_with('+')) {
+            return Some(index);
+        }
+        index += if matches!(
+            argument,
+            "-o" | "+o" | "-O" | "+O" | "--rcfile" | "--init-file"
+        ) {
+            2
+        } else {
+            1
+        };
+    }
+    None
+}
+
 /// The place in `words` (a shell's name first) of the code a shell runs
 /// with `-c` (`bash -c LINE`, `sh -ec LINE`, `zsh -o x -c LINE`), when
 /// there is one.
@@ -10154,9 +10397,11 @@ pub(crate) fn shell_inline_code_place(words: &[String]) -> Option<usize> {
                 .strip_prefix('-')
                 .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
         {
-            return (index + 2 < words.len()).then_some(index + 2);
+            return shell_c_script_from(&args, index + 1).map(|at| at + 1);
         }
-        if argument == "--" || (!argument.starts_with('-') && !argument.starts_with('+')) {
+        if matches!(argument.as_str(), "--" | "-")
+            || (!argument.starts_with('-') && !argument.starts_with('+'))
+        {
             return None;
         }
         if matches!(argument.as_str(), "-o" | "+o" | "-O" | "+O") {
@@ -10892,13 +11137,15 @@ fn shell_command_waits_for_xargs_payload(words: &[String]) -> bool {
     if !is_shell_name(&name) {
         return false;
     }
-    words.iter().enumerate().skip(1).any(|(index, argument)| {
-        let argument = shell_word(argument);
+    // xargs puts its words last: a `-c` with no script after it, past
+    // its options and `--` (`sh -c --`), runs the first of them.
+    let args: Vec<String> = words.iter().skip(1).map(|word| shell_word(word)).collect();
+    args.iter().enumerate().any(|(index, argument)| {
         (argument == "-c"
             || argument
                 .strip_prefix('-')
                 .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c')))
-            && index + 1 >= words.len()
+            && shell_c_script_from(&args, index + 1).is_none()
     })
 }
 
@@ -13077,10 +13324,8 @@ fn shell_code_input(args: &[String]) -> CodeInput {
                 .strip_prefix('-')
                 .is_some_and(|flags| !flags.starts_with('-') && flags.contains('c'))
         {
-            return args
-                .get(index + 1)
-                .cloned()
-                .map(CodeInput::Argument)
+            return shell_c_script_from(args, index + 1)
+                .map(|at| CodeInput::Argument(args[at].clone()))
                 .unwrap_or(CodeInput::None);
         }
         if argument == "-s"
@@ -14369,8 +14614,16 @@ fn command_executes_target(
     let mut index = 1;
     while let Some(argument) = effective.get(index).map(|argument| shell_word(argument)) {
         if matches!(argument.as_str(), "-c" | "--command") {
-            return effective
-                .get(index + 1)
+            // A shell reads its options past `-c` (`sh -c -- ./x.sh`).
+            let line_at = if is_shell_name(&executable_name) {
+                let args: Vec<String> =
+                    effective[1..].iter().map(|word| shell_word(word)).collect();
+                shell_c_script_from(&args, index).map(|at| at + 1)
+            } else {
+                Some(index + 1)
+            };
+            return line_at
+                .and_then(|at| effective.get(at))
                 .is_some_and(|script| script.contains(target));
         }
         if argument == "--" {
@@ -15785,7 +16038,8 @@ fn unwrap_timeout(args: &[String]) -> WrapperTarget {
     let mut index = 0;
     while let Some(arg) = args.get(index).map(|arg| shell_word(arg)) {
         match arg.as_str() {
-            "--" => return command_at(args, index + 1),
+            // The duration is the first operand: `timeout -- 5 CMD`.
+            "--" => return command_at(args, index + 2),
             "-k" | "--kill-after" | "-s" | "--signal" => {
                 if index + 1 >= args.len() {
                     return WrapperTarget::Unknown;
@@ -16257,6 +16511,41 @@ mod tests {
     fn a_program_named_at_run_time_with_an_unread_c_line_is_marked() {
         assert!(handed_shell_lines("X=$(which bash); $X -c \"$CMD\"").not_literal);
         assert!(!handed_shell_lines("$CC -c main.c -o main.o").not_literal);
+    }
+
+    /// A shell reads its options past `-c`, and `--` or `-` ends them: the
+    /// word after it is the line handed. Before `-c`, `--` makes `-c` a
+    /// script's name and no line is handed.
+    ///
+    /// FAILS ON REVERT of the `--` term in [`shell_c_operand`]: the line
+    /// handed was `--`, and the value of `C` was never read.
+    #[test]
+    fn a_double_dash_after_c_hands_the_word_after_it() {
+        for shell in [
+            "sh -c --",
+            "bash -c -x --",
+            "bash -xc -",
+            "bash -c -o errexit --",
+        ] {
+            let line = format!("C='rm -rf /'; {shell} \"$C\"");
+            let handed = handed_shell_lines(&line);
+            assert!(
+                handed.lines.iter().any(|handed| handed == "rm -rf /"),
+                "{line}: {handed:?}"
+            );
+            assert!(
+                !handed
+                    .lines
+                    .iter()
+                    .any(|handed| handed == "--" || handed == "-"),
+                "{line}: {handed:?}"
+            );
+        }
+        let handed = handed_shell_lines("C='rm -rf /'; bash -- -c \"$C\"");
+        assert!(
+            !handed.lines.iter().any(|handed| handed == "rm -rf /"),
+            "{handed:?}"
+        );
     }
 
     /// The dangerous fragment these cases carry, assembled rather than written
