@@ -1363,9 +1363,16 @@ pub(crate) struct TooLongCall {
     pub(crate) event: Option<String>,
     pub(crate) tool: Option<String>,
     pub(crate) session: Option<String>,
+    /// The folder the agent runs in (`cwd`), when it is in the head: a
+    /// relative path is judged from it, as in a call read whole.
+    pub(crate) cwd: Option<String>,
     /// The file the tool worked on (`file_path`, `notebook_path` or `path`
     /// of `tool_input`), when it is in the head.
     pub(crate) path: Option<String>,
+    /// Every such field whose value is whole in the head, as its key and
+    /// value, in the order read, the same key twice included: a file tool
+    /// past the cap is judged on each ([`large_file_write`]).
+    pub(crate) paths: Vec<(String, String)>,
 }
 
 impl TooLongCall {
@@ -1379,19 +1386,21 @@ impl TooLongCall {
                 }
                 ("tool_name" | "toolName", json_head::Value::Str(s)) => call.tool = Some(s),
                 ("session_id" | "sessionId", json_head::Value::Str(s)) => call.session = Some(s),
+                ("cwd", json_head::Value::Str(s)) => call.cwd = Some(s),
                 ("tool_input" | "toolInput", json_head::Value::Object) => {
-                    let mut path = None;
+                    let mut paths = Vec::new();
                     json_head::object(head, at, &mut |key, value, _, _| {
                         if let ("file_path" | "notebook_path" | "path", json_head::Value::Str(s)) =
                             (key.as_str(), value)
                         {
-                            path.get_or_insert(s);
+                            paths.push((key.to_string(), s));
                         }
                         true
                     });
-                    if path.is_some() {
-                        call.path = path;
+                    if let Some((_, first)) = paths.first() {
+                        call.path = Some(first.clone());
                     }
+                    call.paths.extend(paths);
                 }
                 _ => {}
             }
@@ -1602,6 +1611,9 @@ fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::E
         return std::process::ExitCode::SUCCESS;
     }
     if !call.already_ran() {
+        if let Some(exit) = large_file_write(&call, rest, monitor) {
+            return exit;
+        }
         return hook_unreadable("", rest, TOOL_CALL_TOO_LONG, monitor);
     }
     hook_net::already_ran(result_unread_to_agent(rest));
@@ -1620,6 +1632,148 @@ fn hook_too_long(head: &[u8], rest: &[String], monitor: bool) -> std::process::E
          read whole)."
     );
     std::process::ExitCode::SUCCESS
+}
+
+/// What the hook says of a file tool call past the cap whose path it judged:
+/// the path was read, the content was not.
+pub(crate) const LARGE_CONTENT_UNSCREENED: &str =
+    "content longer than the hook reads, not screened";
+
+/// What the agent is told when such a call is refused.
+const LARGE_WRITE_REMEDY: &str =
+    "  A change under 1 MiB is read whole and screened: write the file in parts, or ask the \
+     person supervising this agent to make the change.";
+
+/// A file tool call past the cap, about to run (`Write`, `Edit`,
+/// `MultiEdit`, `NotebookEdit`, and the `write_file` and `replace` of Gemini
+/// CLI and Hermes Agent). Such a call is given for a path, and the agent
+/// sends the path before the content: every path field whole in the head is
+/// judged as a call read whole is ([`screen_file_writes`]), so a privileged
+/// file, the guard's own configuration, a credential, or any file of a
+/// revoked agent is refused by name. Only the content goes unread, and that
+/// is never let through quietly: the person is asked where the agent can
+/// ask ([`review_answer`]), and the call is refused where it cannot, or
+/// where the line refuses every review (`--block-review`). Monitor never
+/// blocks, and says the content went unscreened.
+///
+/// `None`, so the call stays refused as one not read, for any other tool (a
+/// shell line, a patch whose files are named inside its text), for a head
+/// without the field the tool writes to ([`written_path_key`]: the content
+/// sent before the path, or another path field standing in front of it),
+/// and for the Cursor and Antigravity lines, which read calls in their own
+/// shapes. The path the person is asked about is the one the tool writes.
+fn large_file_write(
+    call: &TooLongCall,
+    rest: &[String],
+    monitor: bool,
+) -> Option<std::process::ExitCode> {
+    use innerwarden_agent_guard::{antigravity_hook, cursor_hook, file_tools};
+    let agent = agent_flag(rest);
+    if matches!(agent.as_deref(), Some(name) if name == cursor_hook::AGENT || name == antigravity_hook::AGENT)
+    {
+        return None;
+    }
+    let tool = call.tool.as_deref()?;
+    if !file_tools::FILE_TOOLS.contains(&tool) && !file_tools::GEMINI_FILE_TOOLS.contains(&tool) {
+        return None;
+    }
+    // The field the tool writes to must be in the head: a path in another
+    // field (`{"path": "a.txt", <content>, "file_path": "~/.ssh/..."}`)
+    // would be judged and named to the person in its place.
+    let written = written_path_key(tool, agent.as_deref());
+    let path = call
+        .paths
+        .iter()
+        .find(|(key, path)| key == written && !path.trim().is_empty())
+        .map(|(_, path)| path.trim().to_string())?;
+    let paths: Vec<String> = call
+        .paths
+        .iter()
+        .map(|(_, path)| path)
+        .filter(|path| !path.trim().is_empty())
+        .cloned()
+        .collect();
+    // What the head says of the call, for the file screen and the record:
+    // the folder a relative path is judged from, the session, the event.
+    let mut payload = serde_json::json!({ "tool_name": tool, "tool_input": {} });
+    for (key, value) in [
+        ("hook_event_name", &call.event),
+        ("session_id", &call.session),
+        ("cwd", &call.cwd),
+    ] {
+        if let Some(value) = value {
+            payload[key] = value.clone().into();
+        }
+    }
+    let buf = payload.to_string();
+    let screen = screen_file_writes(&buf, rest, monitor, false, tool, &paths);
+    if !matches!(screen, FileScreen::Pass) {
+        return file_screen_exit(&buf, rest, screen, monitor, false);
+    }
+    let command = format!("{tool} {path}");
+    let explanation = format!("{command}: {LARGE_CONTENT_UNSCREENED}");
+    let block_review = rest.iter().any(|a| a == "--block-review");
+    let answer = review_answer(agent.as_deref());
+    let asks = matches!(
+        answer,
+        ReviewAnswer::AskClaudeCode
+            | ReviewAnswer::AskHermes
+            | ReviewAnswer::AskCursor
+            | ReviewAnswer::AskAntigravity
+    );
+    let refused = block_review || !asks;
+    let verdict = serde_json::json!({
+        "command": command,
+        "risk_score": 40,
+        "severity": "medium",
+        "signals": [{
+            "signal": "content_unscreened",
+            "score": 40,
+            "detail": explanation,
+        }],
+        "recommendation": "review",
+        "explanation": explanation,
+    });
+    record_shell(
+        &buf, rest, &command, &verdict, monitor, refused, None, false,
+    );
+    if monitor {
+        eprintln!(
+            "InnerWarden hook: {explanation}; it was NOT screened (monitor mode never blocks)."
+        );
+        return Some(std::process::ExitCode::from(unreadable_exit_code(true)));
+    }
+    if !refused {
+        if let Some(line) = review_answer_line(answer, &explanation) {
+            println!("{line}");
+            HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
+            return Some(std::process::ExitCode::SUCCESS);
+        }
+    }
+    let said = if block_review {
+        format!(
+            "InnerWarden blocked this file change (recommendation=review): {explanation}; its \
+             hook line has --block-review, which refuses every review."
+        )
+    } else {
+        review_refusal_line(&explanation)
+    };
+    note_refusal(said.clone());
+    eprintln!("{said}");
+    eprintln!("{LARGE_WRITE_REMEDY}");
+    Some(std::process::ExitCode::from(2))
+}
+
+/// The field of `tool_input` a file tool writes to: `notebook_path` for
+/// `NotebookEdit`, `path` for Hermes Agent's `write_file`, `file_path` for
+/// every other (Claude Code's tools, Gemini CLI's `write_file` and
+/// `replace`).
+fn written_path_key(tool: &str, agent: Option<&str>) -> &'static str {
+    match (tool, agent) {
+        ("NotebookEdit", _) => "notebook_path",
+        ("write_file" | "replace", Some(innerwarden_agent_guard::hermes_hook::AGENT)) => "path",
+        _ => "file_path",
+    }
 }
 
 /// Whether the agent of this hook line reads a PostToolUse hook's
@@ -7612,5 +7766,61 @@ mod phase_timing_tests {
             .map(|(name, ms)| (name.to_string(), ((ms * 100.0).round() / 100.0).into()))
             .collect();
         println!("PHASES {}", serde_json::Value::Object(json));
+    }
+}
+
+#[cfg(test)]
+mod too_long_call_tests {
+    use super::{written_path_key, TooLongCall};
+
+    /// The field each file tool writes to, by agent.
+    ///
+    /// FAILS ON REVERT to any path field: Hermes's `write_file` and
+    /// `NotebookEdit` name theirs apart.
+    #[test]
+    fn each_file_tool_writes_to_its_own_field() {
+        for (tool, agent, key) in [
+            ("Write", None, "file_path"),
+            ("Edit", None, "file_path"),
+            ("MultiEdit", Some("claude-code"), "file_path"),
+            ("NotebookEdit", None, "notebook_path"),
+            ("write_file", Some("gemini"), "file_path"),
+            ("replace", Some("gemini"), "file_path"),
+            ("write_file", Some("hermes"), "path"),
+        ] {
+            assert_eq!(written_path_key(tool, agent), key, "{tool} {agent:?}");
+        }
+    }
+
+    /// The head of a file tool call past the cap: the folder and every path
+    /// field whole in it are read, in order, a key named twice included; a
+    /// path in the content, or one cut short by the end of the head, is
+    /// not.
+    ///
+    /// FAILS ON REVERT of `cwd` and `paths` in `TooLongCall::read`: the
+    /// folder is lost and only the first path is kept.
+    #[test]
+    fn the_head_of_a_long_file_write_gives_its_folder_and_every_path() {
+        let head = br#"{"session_id":"s","cwd":"/home/u/proj","hook_event_name":"PreToolUse","tool_name":"Write","tool_input":{"file_path":"src/a.rs","path":"/home/u/.ssh/authorized_keys","file_path":"b.rs","content":"\"file_path\":\"/etc/passwd\" and more"#;
+        let call = TooLongCall::read(head);
+        assert_eq!(call.cwd.as_deref(), Some("/home/u/proj"));
+        assert_eq!(call.tool.as_deref(), Some("Write"));
+        assert_eq!(call.path.as_deref(), Some("src/a.rs"));
+        assert_eq!(
+            call.paths,
+            [
+                ("file_path", "src/a.rs"),
+                ("path", "/home/u/.ssh/authorized_keys"),
+                ("file_path", "b.rs"),
+            ]
+            .map(|(key, path)| (key.to_string(), path.to_string()))
+        );
+
+        // The content before the path: no path is read.
+        let late = br#"{"tool_name":"Write","tool_input":{"content":"abc"#;
+        assert!(TooLongCall::read(late).paths.is_empty());
+        // A path cut short by the end of the head is not read either.
+        let cut = br#"{"tool_name":"Write","tool_input":{"file_path":"/home/u/.ss"#;
+        assert!(TooLongCall::read(cut).paths.is_empty());
     }
 }
