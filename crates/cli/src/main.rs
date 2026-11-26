@@ -2632,7 +2632,7 @@ fn antigravity_unknown_tool(
 }
 
 fn cmd_hook(rest: &[String]) -> std::process::ExitCode {
-    hook_limits::keep_writes_from_killing_the_hook();
+    hook_limits::keep_limits_from_killing_the_hook();
     let exit = cmd_hook_screen(rest);
     say_mcp_pending(agent_flag(rest).as_deref(), exit);
     let exit = match agent_flag(rest).as_deref() {

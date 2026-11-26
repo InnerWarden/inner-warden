@@ -4045,8 +4045,13 @@ fn mention_only(
     // is never a mention, in a language the masking reads or not.
     if !only_guard_words
         || threats::check_guard_takedown(command).is_some()
-        || threats::resource_limits::check_limit_lowered(command)
-            .is_some_and(|(what, _)| what == threats::resource_limits::AGENT_FILE_SIZE_LOWERED)
+        || threats::resource_limits::check_limit_lowered(command).is_some_and(|(what, _)| {
+            [
+                threats::resource_limits::AGENT_FILE_SIZE_LOWERED,
+                threats::resource_limits::AGENT_LIMIT_LOWERED,
+            ]
+            .contains(&what)
+        })
     {
         return analysis;
     }
