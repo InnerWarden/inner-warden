@@ -858,3 +858,17 @@ cases:
     category: guard_state_folder
     label: benign
     input: "echo x > ~/.local/state/myapp/state.json"
+  # main: allow
+  - id: rw4-353
+    category: shell_script_as_handed
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd /tmp && bash -c \"systemctl stop inner\"'warden-agent'"
+  # main: allow
+  - id: rw4-354
+    category: shell_script_as_handed
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cd /tmp && bash -c \"rm -rf /\"'*'"
