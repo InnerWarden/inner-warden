@@ -77,3 +77,23 @@ fn the_hook_refuses_the_notes_file_run() {
         assert_eq!(hook_exit(home.path(), &line), Some(2), "{line}");
     }
 }
+
+/// A journal entry as an agent writes one: the date and a commit taken by
+/// command substitution before notes appended by `cat` that quote a
+/// here-document handed to `python3`, then the file shown. Measured
+/// 2026-11-26 on the branch before this change: exit 2, with and without
+/// the last `cat`.
+///
+/// FAILS ON REVERT of the head reading in `text_written_by_cat_blanked`
+/// (`crates/agent-guard/src/shell.rs`).
+#[test]
+fn the_hook_lets_a_journal_entry_with_substitutions_run() {
+    let home = tempfile::tempdir().unwrap();
+    let entry = "mkdir -p ~/journal && D=$(date -u +%Y-%m-%dT%H:%MZ) && SHA=$(git -C ~/src/repo rev-parse --short HEAD) && cat >> ~/journal/T-1.md <<EOF\n$D PR ready (commit $SHA)\n$D OUT OF SCOPE: python3 - <<'EOF' + open('~/.claude/settings.json','w') -> allow on main\nEOF\n";
+    for then in ["", "cat ~/journal/T-1.md"] {
+        let line = format!("{entry}{then}");
+        assert_eq!(hook_exit(home.path(), &line), Some(0), "{line}");
+    }
+    let run = format!("{entry}bash ~/journal/T-1.md");
+    assert_eq!(hook_exit(home.path(), &run), Some(2), "{run}");
+}

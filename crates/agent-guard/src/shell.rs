@@ -3204,17 +3204,24 @@ fn shell_heredoc_data_blanked(source: &str) -> Vec<(String, String)> {
 /// settings, or to the terminal. A body the shell expands into commands (a
 /// substitution, `${...}`) and a line with any other command that may run
 /// what was written stay read whole ([`command_runs_nothing_written`]).
-/// `None` when no body is blanked.
+/// Before the first notes, a command that only sets variables and any
+/// substitution are read: they stay on the line judged again and run before
+/// the notes exist. After the notes, a substitution keeps the line read
+/// whole ([`command_substitutes`]), and so does one before them when a
+/// pipe, a `&` or a group may run it beside the notes. `None` when no
+/// body is blanked.
 ///
 /// Measured 2026-11-25 (a line of Pro's hook tests): notes written with
 /// `cat` that described how a settings file can be rewritten through
 /// `node -e` were refused as that rewrite, read from the text of the notes.
+/// Measured 2026-11-26 (another): a journal entry whose date and commit
+/// were taken by `$(...)` before the notes was refused the same way.
 pub(crate) fn text_written_by_cat_blanked(source: &str) -> Option<String> {
     if !source.contains("<<") || !source.contains("cat") {
         return None;
     }
     let line = crate::shell_words::read_line(source);
-    if !line.nested.is_empty() || !line.arrays.is_empty() {
+    if !line.arrays.is_empty() {
         return None;
     }
     let notes = |command: &crate::shell_words::Command| {
@@ -3228,6 +3235,7 @@ pub(crate) fn text_written_by_cat_blanked(source: &str) -> Option<String> {
         first.is_plain()
             && words[0] == "cat"
             && options_only
+            && !command_substitutes(command)
             && !command.piped
             && !command.inputs.is_empty()
             && command.reads.is_empty()
@@ -3235,11 +3243,30 @@ pub(crate) fn text_written_by_cat_blanked(source: &str) -> Option<String> {
                 target.is_plain() && (target.text == "/dev/null" || is_notes_file(&target.text))
             })
     };
+    // What runs before the first notes are written stays on the line judged
+    // again, and cannot run text not yet written: a substitution there
+    // (`D=$(date -u ...)`) is read, as long as each command ends before the
+    // next starts. A pipe, a `&` or a group may run it beside the notes.
+    let first_note = line.commands.iter().position(&notes)?;
+    let head = &line.commands[..first_note];
+    if head.iter().any(command_substitutes)
+        && (line.background || line.groups || head.iter().any(|command| command.piped))
+    {
+        return None;
+    }
     let mut out = source.to_owned();
     let mut changed = false;
-    for command in &line.commands {
+    for (at, command) in line.commands.iter().enumerate() {
         if !notes(command) {
-            if command_runs_nothing_written(command) || command_shows_files_only(command) {
+            // After the notes, a substitution may run what they hold, and
+            // its line would be judged with the notes blanked.
+            if at > first_note && command_substitutes(command) {
+                return None;
+            }
+            if command_runs_nothing_written(command)
+                || command_shows_files_only(command)
+                || (at < first_note && command_only_assigns(command))
+            {
                 continue;
             }
             return None;
@@ -3263,6 +3290,71 @@ pub(crate) fn text_written_by_cat_blanked(source: &str) -> Option<String> {
         }
     }
     changed.then_some(out)
+}
+
+/// Whether a command runs another command line when the shell expands it:
+/// a command or process substitution, or a `${...}`, in one of its words
+/// or redirection targets, or in a here-document or here-string it reads
+/// (`inputs_run`). `cat` writing notes whose body expands so is not
+/// writing notes: the body is read whole.
+fn command_substitutes(command: &crate::shell_words::Command) -> bool {
+    let runs = |word: &crate::shell_words::Word| {
+        !word.substitutions.is_empty()
+            || word.text.chars().zip(&word.marks).any(|(c, mark)| {
+                *mark == crate::shell_words::Mark::Expansion && matches!(c, '(' | '{' | '`')
+            })
+    };
+    command.inputs_run
+        || command.words.iter().any(runs)
+        || command.writes.iter().any(runs)
+        || command.reads.iter().any(runs)
+}
+
+/// Whether a command only sets shell variables (`D=$(date -u +%F)`):
+/// nothing runs but its substitutions, which stay on the line judged. A
+/// variable that changes how the shell finds or starts what runs next
+/// (`PATH`, `BASH_ENV`, `IFS`, a pager's) is not.
+fn command_only_assigns(command: &crate::shell_words::Command) -> bool {
+    !command.words.is_empty()
+        && command.writes.is_empty()
+        && command.reads.is_empty()
+        && command.inputs.is_empty()
+        && command.words.iter().all(|word| {
+            let Some((name, _)) = word.text.split_once('=') else {
+                return false;
+            };
+            let named = name
+                .chars()
+                .next()
+                .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+                && word.marks[..name.len()]
+                    .iter()
+                    .all(|mark| *mark == crate::shell_words::Mark::Plain);
+            named
+                && !matches!(
+                    name,
+                    "PATH"
+                        | "IFS"
+                        | "ENV"
+                        | "BASH_ENV"
+                        | "CDPATH"
+                        | "PROMPT_COMMAND"
+                        | "PS0"
+                        | "PS4"
+                        | "SHELLOPTS"
+                        | "BASHOPTS"
+                        | "GLOBIGNORE"
+                        | "HOME"
+                        | "SHELL"
+                        | "PAGER"
+                        | "LESSOPEN"
+                        | "LESSKEY"
+                        | "BAT_PAGER"
+                )
+                && !name.starts_with("LD_")
+                && !name.starts_with("BASH_FUNC")
+        })
 }
 
 /// Whether a command only shows files on the terminal: `cat`, `head`,

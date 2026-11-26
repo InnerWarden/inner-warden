@@ -117,6 +117,10 @@ pub(crate) struct Command {
     /// Text it reads on its input from the line itself: a here-document's
     /// body, a here-string's word.
     pub(crate) inputs: Vec<String>,
+    /// Some text it reads on its input runs a command when the shell
+    /// expands it: a command substitution or `${...}` in a here-document
+    /// whose delimiter is not quoted, an expansion in a here-string.
+    pub(crate) inputs_run: bool,
     /// The files it reads on its input: the targets of `<` and `<>`.
     pub(crate) reads: Vec<Word>,
     /// What ends the command in front of it. Two operators with no command
@@ -137,6 +141,13 @@ pub(crate) struct Line {
     /// The lists assigned to an array (`a=(...)`), as written: words a
     /// later command may run.
     pub(crate) arrays: Vec<String>,
+    /// A lone `&` sends a command to the background: what it runs goes on
+    /// beside the commands after it.
+    pub(crate) background: bool,
+    /// A subshell's parenthesis or a brace group's brace stands as an
+    /// operator: a command of the line may stand in a group whose pipe or
+    /// `&` the simple commands do not show.
+    pub(crate) groups: bool,
 }
 
 /// Read `text` as the shell reads a command line.
@@ -314,6 +325,7 @@ impl Lexer {
                         self.at += 2;
                     } else {
                         self.end_command(false, Joint::Loose);
+                        self.line.background = true;
                         self.at += 1;
                     }
                 }
@@ -330,6 +342,7 @@ impl Lexer {
                 '(' | ')' => {
                     let next = if c == '(' { Joint::Tight } else { Joint::Loose };
                     self.end_command(false, next);
+                    self.line.groups = true;
                     self.at += 1;
                 }
                 '<' | '>' if self.peek(1) == Some('(') => self.process_substitution(),
@@ -339,6 +352,7 @@ impl Lexer {
                 }
                 '{' | '}' if self.word.is_none() && self.reserved_brace(c) => {
                     self.end_command(false, Joint::Tight);
+                    self.line.groups = true;
                     self.at += 1;
                 }
                 // A `#` where a word starts opens a comment to the end of
@@ -675,7 +689,10 @@ impl Lexer {
                 strip_tabs: operator == "<<-",
                 expands: !target.quoted,
             }),
-            "<<<" => self.command.inputs.push(target.text),
+            "<<<" => {
+                self.command.inputs_run |= target.has(Mark::Expansion);
+                self.command.inputs.push(target.text);
+            }
             "<" => self.command.reads.push(target),
             "<>" => {
                 self.command.writes_file |= to_a_file;
@@ -739,13 +756,18 @@ impl Lexer {
                 body.push_str(&line);
                 body.push('\n');
             }
+            let mut runs = false;
             if heredoc.expands {
-                self.line.nested.extend(substitutions_in(&body));
+                let found = substitutions_in(&body);
+                runs = !found.is_empty();
+                self.line.nested.extend(found);
             }
-            match self.line.commands.get_mut(heredoc.command) {
-                Some(command) => command.inputs.push(body),
-                None => self.command.inputs.push(body),
-            }
+            let command = match self.line.commands.get_mut(heredoc.command) {
+                Some(command) => command,
+                None => &mut self.command,
+            };
+            command.inputs_run |= runs;
+            command.inputs.push(body);
         }
     }
 }
