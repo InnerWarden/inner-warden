@@ -795,6 +795,12 @@ pub(crate) fn check_child_agent_without_its_hook(content: &str) -> Option<(&'sta
 pub const CHILD_AGENT_UNHOOKED: &str =
     "starts an AI agent with the hook that screens it switched off or moved away";
 
+/// What [`child_agent_without_its_hook`] says when the line names the
+/// guard's own alerts or configuration elsewhere for the agent it starts.
+pub const CHILD_AGENT_GUARD_CONFIG: &str = "starts an AI agent with the guard's alerts or its \
+     configuration named elsewhere (IW_NOTIFY_CONFIG, IW_LLM_CONFIG or XDG_CONFIG_HOME): what the \
+     guard refuses in that agent would reach nobody";
+
 /// What [`child_agent_without_its_hook`] says when all the line moves is
 /// Claude Code's own folder: `CLAUDE_CONFIG_DIR` naming another one, which
 /// holds no hook of the guard's until one is installed there.
@@ -815,7 +821,12 @@ pub const CHILD_AGENT_OTHER_FOLDER: &str = "starts Claude Code with CLAUDE_CONFI
 /// `CLAUDE_CODE_RESTRICT_PERSONAL_CONFIG` and
 /// `CLAUDE_CODE_REMOTE_SESSION_ORIGIN` (read in Claude Code 2.1.323; the last
 /// one leaves the user's settings out with three other remote variables set
-/// beside it). Lowercase.
+/// beside it). And the guard's own: `IW_NOTIFY_CONFIG` and `IW_LLM_CONFIG`,
+/// which the hook of the child reads from the environment it is handed
+/// (a release build honours `/dev/null`, which switches the alerts or the
+/// second opinion off; measured 2026-11-26), and `XDG_CONFIG_HOME`, the
+/// folder of the configuration of the agents that read one there.
+/// Lowercase.
 const AGENT_HOOK_VARIABLES: &[&str] = &[
     "home",
     "codex_home",
@@ -834,6 +845,9 @@ const AGENT_HOOK_VARIABLES: &[&str] = &[
     "claude_code_personal_hooks_off",
     "claude_code_restrict_personal_config",
     "claude_code_remote_session_origin",
+    "xdg_config_home",
+    "iw_notify_config",
+    "iw_llm_config",
 ];
 
 /// The agent CLIs whose hook (or, for the Cursor CLI, whose MCP wiring) the
@@ -996,6 +1010,10 @@ const UNHOOKED: u8 = 1;
 /// A finding of [`child_agent_without_its_hook`]: Claude Code's own folder
 /// named elsewhere ([`CHILD_AGENT_OTHER_FOLDER`]).
 const OTHER_FOLDER: u8 = 2;
+
+/// A finding of [`child_agent_without_its_hook`]: the guard's alerts or its
+/// configuration named elsewhere ([`CHILD_AGENT_GUARD_CONFIG`]).
+const GUARD_CONFIG: u8 = 4;
 
 /// What a line has set by the time it reaches a command, as
 /// [`child_agent_without_its_hook`] reads it.
@@ -1164,6 +1182,7 @@ fn keeps_its_folder(name: &str, given: Given<'_>) -> bool {
     match name {
         "home" => rest.is_empty(),
         "claude_config_dir" => plain("/.claude"),
+        "xdg_config_home" => plain("/.config"),
         _ => false,
     }
 }
@@ -1201,6 +1220,8 @@ fn child_agent_without_its_hook(content: &str) -> Option<(&'static str, u32)> {
         Some((CHILD_AGENT_UNHOOKED, 60))
     } else if found & OTHER_FOLDER != 0 {
         Some((CHILD_AGENT_OTHER_FOLDER, 60))
+    } else if found & GUARD_CONFIG != 0 {
+        Some((CHILD_AGENT_GUARD_CONFIG, 60))
     } else {
         None
     }
@@ -1235,6 +1256,7 @@ fn variable_effect(name: &str, value: Given<'_>) -> u8 {
     }
     match name.as_str() {
         "claude_config_dir" => OTHER_FOLDER,
+        "xdg_config_home" | "iw_notify_config" | "iw_llm_config" => GUARD_CONFIG,
         _ => UNHOOKED,
     }
 }
@@ -3484,6 +3506,43 @@ const CARRIER_REWRITES: &[&str] = &[
     "removes or moves aside the plugin or hook that carries the guard in OpenClaw",
 ];
 
+/// Whether a verdict holds a write into the guard's own configuration
+/// (`~/.config/innerwarden`: its alerts, posture, mute and allow rules):
+/// what the hook refuses in every mode, monitor included, as lowering the
+/// guard is. The folder reached through a pattern of `command` counts; a
+/// line that takes a folder above it (the home, `~/.config`) stays
+/// observed in monitor, as the rest of monitor is.
+pub fn verdict_writes_guard_config(command: &str, verdict: &serde_json::Value) -> bool {
+    // The guard's folder reached through a pattern (`~/.config/inner*/x`) is
+    // said in the words of a folder above it taken: told apart by the path.
+    let through_pattern = || {
+        crate::shell_words::read_line(command)
+            .commands
+            .iter()
+            .flat_map(|line| line.words.iter())
+            .any(|word| above_guard_config(&word.text, &[]) == Some(AboveGuardConfig::Guard))
+    };
+    let says = |text: &str| {
+        text.contains(GUARD_CONFIG_WRITTEN)
+            || (text.contains(GUARD_CONFIG_ANCESTOR_TAKEN) && through_pattern())
+    };
+    verdict
+        .get("explanation")
+        .and_then(|explanation| explanation.as_str())
+        .is_some_and(says)
+        || verdict
+            .get("signals")
+            .and_then(|signals| signals.as_array())
+            .is_some_and(|signals| {
+                signals.iter().any(|signal| {
+                    signal
+                        .get("detail")
+                        .and_then(|detail| detail.as_str())
+                        .is_some_and(says)
+                })
+            })
+}
+
 /// What [`guard_self_disable_in`] says of a write into the guard's own
 /// configuration.
 const GUARD_CONFIG_WRITTEN: &str =
@@ -3572,6 +3631,10 @@ pub(crate) fn check_guard_takedown(content: &str) -> Option<(&'static str, u32)>
                 .or_else(|| check_security_tamper(line))
         })
         .map(|_| (SEARCH_RUNS_TAKEDOWN, 60))
+        .or_else(|| {
+            guard_file_targets::removal_may_reach_guard_file(content)
+                .then_some((guard_file_targets::GUARD_FILE_MAYBE_REACHED, 25))
+        })
 }
 
 /// What [`check_guard_takedown`] says of a search whose program takes the
@@ -13918,6 +13981,15 @@ pub fn check_command_except(content: &str, lifted: &[&str]) -> Option<(&'static 
             return Some(hit);
         }
     }
+    // A `PATH=` value is read as the shell hands it over: `PATH=\/tmp/x:...`
+    // sets the same PATH as `PATH=/tmp/x:...`.
+    if content.contains('\\') {
+        for assignment in path_assignments_as_read(content) {
+            if let Some(hit) = dangerous_command_in(&assignment) {
+                return Some(hit);
+            }
+        }
+    }
     if unfiltered_find_delete(content)
         || (normalized_differs && unfiltered_find_delete(&normalized))
     {
@@ -13930,6 +14002,23 @@ pub fn check_command_except(content: &str, lifted: &[&str]) -> Option<(&'static 
         return Some(("host shutdown or reboot", true));
     }
     None
+}
+
+/// Each `PATH=` assignment of the line written `PATH=<value>` with the
+/// value as the shell hands it over, its quotes and backslash escapes taken
+/// out (`export PATH=\/tmp/x:$PATH` is `PATH=/tmp/x:$PATH`): in front of a
+/// command, alone, or a word of `export`, `declare`, `typeset`,
+/// `readonly`, `local` or `env`. An expansion stays as written.
+fn path_assignments_as_read(content: &str) -> Vec<String> {
+    crate::shell_words::read_line(content)
+        .commands
+        .iter()
+        .flat_map(|command| command.words.iter())
+        .filter_map(|word| {
+            let value = word.text.strip_prefix("PATH=")?;
+            Some(format!("PATH={value}"))
+        })
+        .collect()
 }
 
 /// Whether a command of `content` powers the host off or restarts it:

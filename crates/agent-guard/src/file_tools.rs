@@ -1340,6 +1340,44 @@ fn judge(path: &Path, context: &WriteContext<'_>) -> Option<&'static str> {
     None
 }
 
+/// Whether a file tool's `path` is in the guard's own configuration folder
+/// (`~/.config/innerwarden`: its alerts, posture, mute and allow rules),
+/// or is that folder, as written or as its links resolve. A write there is
+/// refused in every mode, monitor included: it changes what the guard
+/// decides and who hears of it, the way lowering the guard does.
+pub fn writes_own_guard_config(path: &str, context: &WriteContext<'_>) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_PATH_BYTES {
+        return false;
+    }
+    let account_home;
+    let context = &if context.home.is_none() {
+        account_home = home_of_this_account();
+        WriteContext {
+            home: account_home.as_deref(),
+            ..*context
+        }
+    } else {
+        *context
+    };
+    let Some(absolute) = absolute_path(trimmed, context) else {
+        return false;
+    };
+    let written = lexical(&absolute);
+    let real = resolve_links(&absolute);
+    [Some(written), real].into_iter().flatten().any(|path| {
+        homes(context).iter().any(|home| {
+            home_relative(&path, home).is_some_and(|relative| {
+                relative == GUARD_CONFIG_FOLDER
+                    || relative.starts_with(&format!("{GUARD_CONFIG_FOLDER}/"))
+            })
+        })
+    })
+}
+
+/// The guard's own configuration folder, relative to the home.
+const GUARD_CONFIG_FOLDER: &str = ".config/innerwarden";
+
 /// The home as given and as its links resolve (a home under a linked
 /// directory is reached by either name).
 fn homes(context: &WriteContext<'_>) -> Vec<PathBuf> {

@@ -10,6 +10,7 @@ use std::ops::Range;
 
 mod git_editor;
 mod inline_calls;
+pub(crate) use inline_calls::lua_builtin_aliases_in_line;
 pub(crate) mod output_options;
 pub(crate) mod runners;
 mod sql_runner;
@@ -9786,18 +9787,103 @@ fn stands_in_an_argument(node: tree_sitter::Node<'_>) -> bool {
 
 /// The command lines `xargs` builds from the words a literal `echo` or
 /// `printf` hands it through a pipe: `echo / | xargs -I X rm -rf X` runs
-/// `rm -rf /`, which the line as written does not show. With a replace
-/// string (`-I R`, `-i`) one line per word, else one line with every
-/// word added. Words the text does not show whole, input from a file
-/// (`-a`) or options this reading does not know build nothing: the line is
-/// judged as written, as before.
+/// `rm -rf /`, which the line as written does not show. The names `ls`
+/// lists and the files `find` finds are handed on the same way, each as the
+/// pattern or the folder the line names (`ls ~/.config/systemd/user/inner*
+/// | xargs rm` is `rm ~/.config/systemd/user/inner*`, `find dir -name 'x*'
+/// | xargs rm` is `rm dir/x*`). With a replace string (`-I R`, `-i`) one
+/// line per word, else one line with every word added. Words the text does
+/// not show whole, input from a file (`-a`) or options this reading does
+/// not know build nothing: the line is judged as written, as before.
+/// The names `ls` given `words` lists, as the line names them: each
+/// operand (a pattern stays one). `None` for an `ls` of the folder it runs
+/// in, or with an option that prints more than names (`-l`).
+fn names_ls_lists(words: &[crate::shell_words::Word]) -> Option<Vec<String>> {
+    const NAME_ONLY: &[&str] = &["-1", "-d", "-a", "-A", "-t", "-r", "-S", "-U", "-v", "-X"];
+    let mut names = Vec::new();
+    let mut options = true;
+    for word in words {
+        if options && word.text == "--" {
+            options = false;
+        } else if options && word.text.starts_with('-') && word.text.len() > 1 {
+            let flags_known = word.text[1..]
+                .chars()
+                .all(|flag| NAME_ONLY.iter().any(|known| known[1..].starts_with(flag)));
+            if !flags_known {
+                return None;
+            }
+        } else {
+            names.push(word.text.clone());
+        }
+    }
+    (!names.is_empty()).then_some(names)
+}
+
+/// The files `find` given `words` prints, as the line names them: each
+/// starting folder joined to the pattern of its `-name` or `-iname`, the
+/// pattern of `-path` as it is, or the folder's contents (`dir/*`) with
+/// neither. `None` for a `find` that runs or prints something else
+/// (`-exec`, `-printf`, `-delete`), or with no starting folder.
+fn files_find_lists(words: &[crate::shell_words::Word]) -> Option<Vec<String>> {
+    let texts: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
+    let start = texts
+        .iter()
+        .position(|text| text.starts_with('-') || matches!(*text, "(" | "!" | ","))
+        .unwrap_or(texts.len());
+    let folders: Vec<&str> = texts[..start]
+        .iter()
+        .copied()
+        .filter(|text| !matches!(*text, "-H" | "-L" | "-P"))
+        .collect();
+    if folders.is_empty() {
+        return None;
+    }
+    let mut patterns: Vec<String> = Vec::new();
+    let mut paths: Vec<String> = Vec::new();
+    let mut at = start;
+    while at < texts.len() {
+        match texts[at] {
+            "-name" | "-iname" => {
+                patterns.push(texts.get(at + 1)?.to_string());
+                at += 2;
+            }
+            "-path" | "-ipath" | "-wholename" => {
+                paths.push(texts.get(at + 1)?.to_string());
+                at += 2;
+            }
+            "-type" | "-maxdepth" | "-mindepth" | "-newer" | "-mtime" | "-mmin" | "-size"
+            | "-user" | "-group" | "-perm" => at += 2,
+            "-print" | "-print0" | "-o" | "-or" | "-a" | "-and" | "-not" | "!" | "(" | ")"
+            | "-xdev" | "-mount" | "-follow" | "-depth" | "-empty" => at += 1,
+            _ => return None,
+        }
+    }
+    let mut files = paths;
+    for folder in &folders {
+        let folder = folder.trim_end_matches('/');
+        if patterns.is_empty() {
+            files.push(format!("{folder}/*"));
+        }
+        for pattern in &patterns {
+            files.push(format!("{folder}/{pattern}"));
+        }
+    }
+    Some(files)
+}
+
 pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
     use crate::shell_words::read_line;
     let line = read_line(source);
     let mut built = Vec::new();
     for pair in line.commands.windows(2) {
         let [feeder, runner] = pair else { continue };
-        if !feeder.piped || !feeder.words.iter().all(|word| word.is_plain()) {
+        // A pattern is kept: what it names is what is listed.
+        if !feeder.piped
+            || feeder
+                .words
+                .iter()
+                .any(|word| word.has(crate::shell_words::Mark::Expansion))
+        {
             continue;
         }
         let Some(program) = feeder.words.first() else {
@@ -9832,6 +9918,14 @@ pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
                     .map(str::to_string)
                     .collect(),
                 _ => continue,
+            },
+            Some("ls") => match names_ls_lists(&feeder.words[1..]) {
+                Some(names) => names,
+                None => continue,
+            },
+            Some("find") => match files_find_lists(&feeder.words[1..]) {
+                Some(files) => files,
+                None => continue,
             },
             _ => continue,
         };
@@ -9884,11 +9978,12 @@ pub(crate) fn lines_xargs_builds(source: &str) -> Vec<String> {
         if program_words.is_empty() {
             program_words.push("echo");
         }
-        // An item goes to the program as one word, never through a shell.
+        // An item goes to the program as one word, never through a shell; a
+        // pattern stays one, standing for the names it lists.
         let quoted = |item: &str| {
             if item
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_./~@%+=:,-".contains(c))
+                .all(|c| c.is_ascii_alphanumeric() || "_./~@%+=:,-*?[]".contains(c))
             {
                 item.to_string()
             } else {

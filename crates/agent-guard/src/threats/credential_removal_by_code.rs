@@ -75,7 +75,7 @@ static ASSIGNMENT: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// the module itself.
 static MODULE_BY_CALL: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
-        r#"\b(?:__import__|(?:[A-Za-z_]\w*\.)?import_module)\s*\(\s*\\?["']([\w.]+)\\?["']\s*\)|\brequire\s*\(?\s*\\?["']([\w.]+)\\?["']\s*\)?"#,
+        r#"\b(?:__import__|(?:[A-Za-z_]\w*\.)?import_module)\s*\(\s*\\?["']([\w.]+)\\?["']\s*\)|\brequire\s*\(?\s*\\?["'](?:node:)?([\w./-]+)\\?["']\s*\)?"#,
     )
     .expect("static module call regex")
 });
@@ -134,12 +134,14 @@ const ALIAS_ROUNDS: usize = 4;
 /// `os.remove(p)`, Lua's `local o = require("os"); o.remove(p)` as
 /// `os.remove(p)`.
 fn canonical_code(code: &str) -> String {
+    let code = crate::shell::lua_builtin_aliases_in_line(code);
     let mut text = MODULE_BY_CALL
-        .replace_all(code, |found: &regex::Captures| {
+        .replace_all(&code, |found: &regex::Captures| {
+            // Node's `require('fs/promises')` is `fs.promises`.
             found
                 .get(1)
                 .or_else(|| found.get(2))
-                .map_or(String::new(), |module| module.as_str().to_owned())
+                .map_or(String::new(), |module| module.as_str().replace('/', "."))
         })
         .into_owned();
     text = GETATTR.replace_all(&text, "${1}.${2}").into_owned();

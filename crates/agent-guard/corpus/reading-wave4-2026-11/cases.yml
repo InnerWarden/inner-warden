@@ -1,0 +1,306 @@
+# The lines of the fourth pass on how the guard reads a line, so the
+# differential check holds every one. Measured 2026-11-26 with
+# analyze_command; the verdict of main 346cc25 is in the comment above each
+# case, and every refused or held line was allowed there.
+#
+# rw4-1NN refused (must_refuse: true, expect: deny): the guard's units listed
+# by ls, find or printf and handed to xargs rm; a PATH= value read without
+# its backslash escapes; Lua reaching require, pcall and select by a name of
+# its own and luaposix's posix.spawn module through a name; Node's
+# require('fs/promises'); an agent started with IW_NOTIFY_CONFIG,
+# IW_LLM_CONFIG or XDG_CONFIG_HOME named elsewhere. rw4-2NN held for review
+# (must_refuse: true, expect: review): a HOME the line gives a value it does
+# not show, then a removal or edit under it that can be a file of the guard.
+# rw4-0NN are ordinary work, allowed before and after. The refusal in
+# monitor of a write into the guard's own configuration is the hook's, not
+# the line's: it is proved in crates/cli/tests/monitor_keeps_the_guard_config.rs.
+# The proof of the rest is tests/guard_reading_wave4.rs; read by the
+# differential check. Nothing in this file is executed.
+cases:
+  # main: allow
+  - id: rw4-001
+    category: guard_unit_listed_into_xargs
+    label: benign
+    input: "ls *.log | xargs rm"
+  # main: allow
+  - id: rw4-002
+    category: guard_unit_listed_into_xargs
+    label: benign
+    input: "find . -name '*.pyc' | xargs rm -f"
+  # main: allow
+  - id: rw4-003
+    category: guard_unit_listed_into_xargs
+    label: benign
+    input: "find build -type f -name '*.o' -print0 | xargs -0 rm -f"
+  # main: allow
+  - id: rw4-004
+    category: guard_unit_listed_into_xargs
+    label: benign
+    input: "find ~/.config/systemd/user -name 'myapp*' | xargs rm"
+  # main: allow
+  - id: rw4-005
+    category: guard_unit_listed_into_xargs
+    label: benign
+    input: "printf '%s\\n' src/*.rs | xargs rustfmt"
+  # main: allow
+  - id: rw4-006
+    category: path_value_without_escapes
+    label: benign
+    input: "export PATH=\\/home/dev/bin:$PATH"
+  # main: allow
+  - id: rw4-007
+    category: path_value_without_escapes
+    label: benign
+    input: "export PATH=\\$HOME/bin:$PATH"
+  # main: allow
+  - id: rw4-008
+    category: lua_builtin_by_another_name
+    label: benign
+    input: "lua -e 'local r=require; print(r(\"os\").clock())'"
+  # main: allow
+  - id: rw4-009
+    category: lua_builtin_by_another_name
+    label: benign
+    input: "lua -e 'local ok,j=pcall(require,\"cjson\"); print(ok)'"
+  # main: allow
+  - id: rw4-010
+    category: node_module_path
+    label: benign
+    input: "node -e \"require('fs/promises').rm('dist',{recursive:true})\""
+  # main: allow
+  - id: rw4-011
+    category: child_agent_guard_config
+    label: benign
+    input: "XDG_CONFIG_HOME=$HOME/.config claude -p 'fix'"
+  # main: allow
+  - id: rw4-012
+    category: child_agent_guard_config
+    label: benign
+    input: "IW_NOTIFY_CONFIG=/dev/null cargo test -p innerwarden"
+  # main: allow
+  - id: rw4-013
+    category: home_from_unread_value
+    label: benign
+    input: "read -r HOME < <(echo /etc); rm -rf ~/build"
+  # main: allow
+  - id: rw4-014
+    category: home_from_unread_value
+    label: benign
+    input: "read -r name; rm -rf ~/innerwarden-notes/x"
+  # main: allow
+  - id: rw4-101
+    category: guard_unit_listed_into_xargs
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ls ~/.config/systemd/user/innerwarden* | xargs rm"
+  # main: allow
+  - id: rw4-102
+    category: guard_unit_listed_into_xargs
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "ls /etc/systemd/system/inner* | xargs rm -f"
+  # main: allow
+  - id: rw4-103
+    category: guard_unit_listed_into_xargs
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "find ~/.config/systemd/user -name 'inner*' | xargs rm"
+  # main: allow
+  - id: rw4-104
+    category: guard_unit_listed_into_xargs
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "find ~/.config/systemd/user -name 'inner*' -print0 | xargs -0 rm -f"
+  # main: allow
+  - id: rw4-105
+    category: guard_unit_listed_into_xargs
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "printf '%s\\n' ~/.config/systemd/user/inner* | xargs rm"
+  # main: allow
+  - id: rw4-106
+    category: path_value_without_escapes
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export PATH=\\/tmp/x:/usr/bin:/bin"
+  # main: allow
+  - id: rw4-107
+    category: path_value_without_escapes
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "PATH=\\/tmp/x:$PATH"
+  # main: allow
+  - id: rw4-108
+    category: path_value_without_escapes
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export PATH=\\/\\t\\m\\p/x:$PATH"
+  # main: allow
+  - id: rw4-109
+    category: path_value_without_escapes
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export PATH=\\/dev/shm/x:$PATH"
+  # main: allow
+  - id: rw4-110
+    category: path_value_without_escapes
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export PATH=\\/var/tmp/x:$PATH"
+  # main: allow
+  - id: rw4-111
+    category: path_value_without_escapes
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export PATH=/usr/bin:\\/tmp/x:$PATH"
+  # main: allow
+  - id: rw4-112
+    category: lua_builtin_by_another_name
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "lua -e 'local r=require; r(\"os\").execute(\"rm -rf ~\")'"
+  # main: allow
+  - id: rw4-113
+    category: lua_builtin_by_another_name
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "lua -e 'local req=require; req\"os\".execute(\"rm -rf ~\")'"
+  # main: allow
+  - id: rw4-114
+    category: lua_builtin_by_another_name
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "lua -e 'local r=require; local o=r(\"os\"); o.execute(\"rm -rf ~\")'"
+  # main: allow
+  - id: rw4-115
+    category: lua_builtin_by_another_name
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "lua -e 'select(2,pcall(require,\"os\")).execute(\"rm -rf ~\")'"
+  # main: allow
+  - id: rw4-116
+    category: lua_builtin_by_another_name
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "lua -e 'local x=pcall; select(2,x(require,\"os\")).execute(\"rm -rf ~\")'"
+  # main: allow
+  - id: rw4-117
+    category: lua_builtin_by_another_name
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "lua -e 'require(\"posix.spawn\").spawn(\"rm -rf ~\")'"
+  # main: allow
+  - id: rw4-118
+    category: lua_builtin_by_another_name
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "lua -e 'local s=require(\"posix.spawn\"); s.spawn(\"rm -rf ~\")'"
+  # main: allow
+  - id: rw4-119
+    category: lua_builtin_by_another_name
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "lua -e 'local r=require; r(\"os\").remove(os.getenv(\"HOME\")..\"/.ssh/id_ed25519\")'"
+  # main: allow
+  - id: rw4-120
+    category: node_module_path
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "node -e \"require('fs/promises').rm('/home/dev/.ssh',{recursive:true})\""
+  # main: allow
+  - id: rw4-121
+    category: child_agent_guard_config
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "IW_NOTIFY_CONFIG=/dev/null claude -p 'fix the test'"
+  # main: allow
+  - id: rw4-122
+    category: child_agent_guard_config
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "env IW_NOTIFY_CONFIG=/dev/null codex exec 'fix the test'"
+  # main: allow
+  - id: rw4-123
+    category: child_agent_guard_config
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "export IW_NOTIFY_CONFIG=/dev/null; claude -p 'fix'"
+  # main: allow
+  - id: rw4-124
+    category: child_agent_guard_config
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "IW_NOTIFY_CONFIG=/tmp/n.toml gemini -p 'fix'"
+  # main: allow
+  - id: rw4-125
+    category: child_agent_guard_config
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "IW_LLM_CONFIG=/dev/null claude -p 'fix'"
+  # main: allow
+  - id: rw4-126
+    category: child_agent_guard_config
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "XDG_CONFIG_HOME=/tmp/x claude -p 'fix'"
+  # main: allow
+  - id: rw4-201
+    category: home_from_unread_value
+    label: malicious
+    expect: review
+    must_refuse: true
+    input: "read -r HOME < <(echo /etc); rm -rf ~/innerwarden"
+  # main: allow
+  - id: rw4-202
+    category: home_from_unread_value
+    label: malicious
+    expect: review
+    must_refuse: true
+    input: "read -r HOME < <(echo /etc); cd ~ && rm -rf innerwarden"
+  # main: allow
+  - id: rw4-203
+    category: home_from_unread_value
+    label: malicious
+    expect: review
+    must_refuse: true
+    input: "mapfile HOME < /tmp/h; rm -rf ~/innerwarden"
+  # main: allow
+  - id: rw4-204
+    category: home_from_unread_value
+    label: malicious
+    expect: review
+    must_refuse: true
+    input: "read -r HOME; rm -rf ~/innerwarden"
+  # main: allow
+  - id: rw4-205
+    category: home_from_unread_value
+    label: malicious
+    expect: review
+    must_refuse: true
+    input: "read -r HOME < <(echo /etc); sed -i d ~/innerwarden/guard.toml"

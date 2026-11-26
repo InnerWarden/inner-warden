@@ -2398,7 +2398,8 @@ fn antigravity_answer(exit: std::process::ExitCode, monitor: bool) -> std::proce
     if HOOK_ANSWERED.load(std::sync::atomic::Ordering::SeqCst) {
         return std::process::ExitCode::SUCCESS;
     }
-    if exit == std::process::ExitCode::SUCCESS || monitor {
+    let held = HELD_IN_MONITOR.load(std::sync::atomic::Ordering::SeqCst);
+    if exit == std::process::ExitCode::SUCCESS || (monitor && !held) {
         println!("{}", antigravity_hook::allow());
     } else {
         let reason = HOOK_REFUSAL
@@ -2410,6 +2411,10 @@ fn antigravity_answer(exit: std::process::ExitCode, monitor: bool) -> std::proce
     }
     std::process::ExitCode::SUCCESS
 }
+
+/// Set when monitor refuses a call all the same: a write into the guard's
+/// own configuration ([`innerwarden_agent_guard::threats::verdict_writes_guard_config`]).
+static HELD_IN_MONITOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// An Antigravity tool the guard does not read (`AgyCall::Unknown`): never
 /// let through as a call that names nothing. In enforce mode the person is
@@ -2715,7 +2720,13 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         HOOK_ANSWERED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    if !monitor && would_block_under_policy {
+    // Monitor only records, but for a write into the guard's own
+    // configuration: that is refused in every mode, as lowering the guard is.
+    let held_in_monitor = monitor
+        && would_block_under_policy
+        && innerwarden_agent_guard::threats::verdict_writes_guard_config(&command, &verdict);
+    if (!monitor || held_in_monitor) && would_block_under_policy {
+        HELD_IN_MONITOR.store(held_in_monitor, std::sync::atomic::Ordering::SeqCst);
         let rec = verdict
             .get("recommendation")
             .and_then(|r| r.as_str())
@@ -3229,12 +3240,19 @@ pub(crate) fn screen_shell(
         if warned {
             record_shell_warned(buf, rest, &command, &verdict, deciding_layer.clone(), demo);
         } else {
+            // A write into the guard's own configuration is refused in
+            // monitor too, and recorded as refused.
+            let held_in_monitor = monitor
+                && would_block_under_policy
+                && innerwarden_agent_guard::threats::verdict_writes_guard_config(
+                    &command, &verdict,
+                );
             record_shell(
                 buf,
                 rest,
                 &command,
                 &verdict,
-                monitor,
+                monitor && !held_in_monitor,
                 would_block_under_policy,
                 deciding_layer.clone(),
                 demo,
@@ -3894,16 +3912,20 @@ fn file_screen_exit(
     match screen {
         FileScreen::Pass => None,
         FileScreen::Unreadable(why) => Some(hook_unreadable(buf, rest, why, monitor)),
-        FileScreen::Refused { explanation } => {
+        FileScreen::Refused {
+            explanation,
+            held_in_monitor,
+        } => {
             if demo {
                 println!(
                     "{}",
                     demo::hook_report(Some("deny"), true, Some(&explanation))
                 );
             }
-            if monitor {
+            if monitor && !held_in_monitor {
                 return Some(std::process::ExitCode::SUCCESS);
             }
+            HELD_IN_MONITOR.store(held_in_monitor, std::sync::atomic::Ordering::SeqCst);
             eprintln!("InnerWarden blocked this file change (recommendation=deny): {explanation}");
             eprintln!("{}", FILE_BLOCK_REMEDY);
             Some(std::process::ExitCode::from(2))
@@ -3917,8 +3939,12 @@ pub(crate) enum FileScreen {
     /// nothing was recorded.
     Pass,
     /// Refused (in enforce; recorded as `would_block` in monitor), with the
-    /// person's words for why.
-    Refused { explanation: String },
+    /// person's words for why. `held_in_monitor`: refused in monitor too (a
+    /// write into the guard's own configuration), and recorded as refused.
+    Refused {
+        explanation: String,
+        held_in_monitor: bool,
+    },
     /// A path of the call could not be read, so what it changes is not
     /// known. Refused in enforce, said in monitor, and not recorded, as
     /// every call the hook cannot read.
@@ -3984,6 +4010,11 @@ pub(crate) fn screen_file_writes(
     };
     let verdict = file_tools::refusal_verdict(tool, path, what);
     let command = format!("{tool} {}", path.trim());
+    let held_in_monitor = monitor
+        && judged
+            .iter()
+            .any(|(path, _)| file_tools::writes_own_guard_config(path, &context));
+    let recorded_as_monitor = monitor && !held_in_monitor;
     // A change to a privileged file is a hard rule: no profile has a word
     // about it. Where profiles are in force the record says which layer.
     let deciding_layer = match agent_profiles_io::load() {
@@ -4004,7 +4035,7 @@ pub(crate) fn screen_file_writes(
         graph_io::record_hook(
             &command,
             &verdict,
-            monitor,
+            recorded_as_monitor,
             true,
             payload_session.as_deref(),
             hook_event_id(buf).as_deref(),
@@ -4017,6 +4048,7 @@ pub(crate) fn screen_file_writes(
     });
     FileScreen::Refused {
         explanation: file_tools::refusal_explanation(tool, path, what),
+        held_in_monitor,
     }
 }
 
@@ -4086,7 +4118,10 @@ fn screen_instruction_orders(
         return FileScreen::Pass;
     }
     record_shell(buf, rest, &command, &verdict, monitor, true, None, demo);
-    FileScreen::Refused { explanation }
+    FileScreen::Refused {
+        explanation,
+        held_in_monitor: false,
+    }
 }
 
 /// A file change that is not to a privileged file: refused (outside monitor)
@@ -4141,7 +4176,10 @@ fn file_tool_revoked(
             demo,
         );
     });
-    FileScreen::Refused { explanation }
+    FileScreen::Refused {
+        explanation,
+        held_in_monitor: false,
+    }
 }
 
 /// A profiles file that cannot be used, in enforce: the call is refused, as a

@@ -342,7 +342,7 @@ fn sink_of(lang: Lang, callee: &str) -> Option<Sink> {
             // `posix.spawn("prog", "arg", ...)`; `exec` and `execp` of
             // `posix` and `posix.unistd` take a program and the table of
             // its arguments (`exec` is also held by name, as every `exec(`).
-            "posix.spawn" => LineOrWords,
+            "posix.spawn" | "posix.spawn.spawn" => LineOrWords,
             "posix.exec" | "posix.execp" | "posix.unistd.exec" | "posix.unistd.execp" => PathList,
             "load" | "loadstring" => Code,
             "dofile" | "loadfile" | "require" => Load,
@@ -435,6 +435,7 @@ const SINK_HOLDERS: &[(Lang, &str)] = &[
     (Lang::Lua, "io"),
     (Lang::Lua, "posix"),
     (Lang::Lua, "posix.unistd"),
+    (Lang::Lua, "posix.spawn"),
     (Lang::Lua, "_G"),
     (Lang::Lua, "_ENV"),
 ];
@@ -1304,6 +1305,7 @@ fn normalized_code(lang: Lang, code: &str) -> String {
                         .then(|| format!("{object}.{name}"))
                 });
             }
+            text = lua_builtin_aliases(&text);
             text = lua_protected_requires(&text);
             text = lua_required_modules(&text);
             text = lua_literal_indexes(&text);
@@ -1514,6 +1516,136 @@ fn lua_required_modules(code: &str) -> String {
                 at = code.len() - after.len() + 1;
                 continue;
             }
+        }
+        let width = code[at..].chars().next().map_or(1, char::len_utf8);
+        out.push_str(&code[at..at + width]);
+        at += width;
+    }
+    out
+}
+
+/// The built-ins that load a module or call a function protected, which a
+/// Lua line may call through a name of its own.
+const LUA_LOADERS: &[&str] = &[
+    "require",
+    "pcall",
+    "xpcall",
+    "select",
+    "load",
+    "loadstring",
+    "dofile",
+];
+
+/// How many names given names [`lua_builtin_aliases`] follows.
+const LUA_ALIAS_ROUNDS: usize = 4;
+
+/// Lua's built-ins given another name (`local r = require`, `local p =
+/// pcall`, and a name given that name) written back as themselves wherever
+/// the name is used, outside strings; and the module a protected `require`
+/// hands back, picked by `select(2, ...)` or by `({...})[2]`, written as
+/// the `require` it is. `local r = require; r("os").execute(...)` is read
+/// as `require("os").execute(...)`, which is `os.execute(...)`.
+pub(crate) fn lua_builtin_aliases(code: &str) -> String {
+    lua_builtin_aliases_reading(code, true)
+}
+
+/// [`lua_builtin_aliases`] of a whole shell line that hands inline code to
+/// an interpreter: the code stands in the line's quotes, so a name is read
+/// inside strings too.
+pub(crate) fn lua_builtin_aliases_in_line(line: &str) -> String {
+    lua_builtin_aliases_reading(line, false)
+}
+
+/// [`lua_builtin_aliases`], reading names inside strings or not.
+fn lua_builtin_aliases_reading(code: &str, skip_strings: bool) -> String {
+    static GIVEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?:^|[^\w.:])(?:local\s+)?([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)")
+            .expect("static lua alias regex")
+    });
+    static PICKED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r#"\bselect\s*\(\s*(?:2|-1)\s*,\s*x?pcall\s*\(\s*require\s*,\s*("[\w./-]+"|'[\w./-]+')\s*\)\s*\)|\(\s*\{\s*x?pcall\s*\(\s*require\s*,\s*("[\w./-]+"|'[\w./-]+')\s*\)\s*\}\s*\)\s*\[\s*2\s*\]"#,
+        )
+        .expect("static lua select regex")
+    });
+    let mut aliases: Vec<(String, &'static str)> = Vec::new();
+    for _ in 0..LUA_ALIAS_ROUNDS {
+        let before = aliases.len();
+        for found in GIVEN.captures_iter(code) {
+            let (Some(name), Some(value)) = (found.get(1), found.get(2)) else {
+                continue;
+            };
+            // The built-in itself, not a call of it: nothing that calls,
+            // indexes or reads a field follows the name.
+            let next = code[value.end()..]
+                .trim_start_matches([' ', '\t'])
+                .chars()
+                .next();
+            if next.is_some_and(|c| matches!(c, '(' | '"' | '\'' | '[' | '{' | '.' | ':')) {
+                continue;
+            }
+            let builtin = LUA_LOADERS
+                .iter()
+                .copied()
+                .find(|builtin| *builtin == value.as_str())
+                .or_else(|| {
+                    aliases
+                        .iter()
+                        .find(|(alias, _)| alias == value.as_str())
+                        .map(|(_, builtin)| *builtin)
+                });
+            let Some(builtin) = builtin else {
+                continue;
+            };
+            if name.as_str() != builtin && !aliases.iter().any(|(alias, _)| alias == name.as_str())
+            {
+                aliases.push((name.as_str().to_owned(), builtin));
+            }
+        }
+        if aliases.len() == before {
+            break;
+        }
+    }
+    let mut text = code.to_owned();
+    for (alias, builtin) in &aliases {
+        text = lua_name_written_as(&text, alias, builtin, skip_strings);
+    }
+    PICKED
+        .replace_all(&text, |found: &regex::Captures| {
+            let module = found
+                .get(1)
+                .or_else(|| found.get(2))
+                .map_or("", |m| m.as_str());
+            format!("require({module})")
+        })
+        .into_owned()
+}
+
+/// `code` with each use of `name` as a name, outside strings, written as
+/// `target`; where the name is given a value (`name = ...`) it stays.
+fn lua_name_written_as(code: &str, name: &str, target: &str, skip_strings: bool) -> String {
+    let bytes = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if skip_strings && matches!(byte, b'\'' | b'"') {
+            let end = quoted_end(&code[at + 1..], byte as char, true)
+                .map_or(code.len(), |end| at + end + 2);
+            out.push_str(&code[at..end]);
+            at = end;
+            continue;
+        }
+        let end = at + name.len();
+        if code[at..].starts_with(name)
+            && (at == 0 || !(is_name_byte(bytes[at - 1]) || matches!(bytes[at - 1], b'.' | b':')))
+            && bytes.get(end).is_none_or(|&b| !is_name_byte(b))
+        {
+            let after = code[end..].trim_start();
+            let given = after.starts_with('=') && !after.starts_with("==");
+            out.push_str(if given { name } else { target });
+            at = end;
+            continue;
         }
         let width = code[at..].chars().next().map_or(1, char::len_utf8);
         out.push_str(&code[at..at + width]);

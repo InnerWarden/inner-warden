@@ -5,6 +5,16 @@ follows semantic versioning.
 
 ## Unreleased
 
+The hook in monitor refuses one thing: a write into the guard's own
+configuration (`~/.config/innerwarden`: `notify.toml`, `posture`,
+`suppress.toml`, `guard.toml` and the rest of the folder), by a shell line
+or by the agent's file tool, recorded as refused. It changes what the guard
+decides and who hears of it, as lowering the guard does. Everything else in
+monitor is still only recorded. Starting an AI agent with `IW_NOTIFY_CONFIG`,
+`IW_LLM_CONFIG` or `XDG_CONFIG_HOME` named elsewhere is refused as starting
+it with its hook moved: a release build honours `IW_NOTIFY_CONFIG=/dev/null`,
+which switched the child's alerts off.
+
 `innerwarden --version`, the hint that points `setup`, `dashboard`, `upgrade`
 and `uninstall` at the host layer, and `innerwarden openclaw status` name the
 host install on the machine by what it has: InnerWarden Pro only where a
