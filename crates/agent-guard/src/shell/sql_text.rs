@@ -332,7 +332,7 @@ mod tests {
     #[test]
     fn values_and_updates_are_data() {
         assert!(sql_text_is_data(
-            "INSERT INTO product.items (key, title) VALUES ('FP-1', 'innerwarden disable was refused');"
+            "INSERT INTO app.notes (key, title) VALUES ('FP-1', 'innerwarden disable was refused');"
         ));
         assert!(sql_text_is_data(
             "UPDATE t SET note = coalesce(note, '') || 'systemctl stop innerwarden-agent' WHERE id = 1"
@@ -368,7 +368,7 @@ mod tests {
     fn arguments_by_client() {
         let words = |list: &[&str]| list.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
         assert_eq!(
-            sql_arguments("psql", &words(&["-d", "crm", "-c", "select 1"])),
+            sql_arguments("psql", &words(&["-d", "app", "-c", "select 1"])),
             vec![(3, "select 1".to_owned())]
         );
         assert_eq!(

@@ -18,11 +18,11 @@ fn verdict(line: &str) -> String {
 #[test]
 fn sql_that_only_names_the_guard_is_data() {
     for line in [
-        "psql -d crm -c \"INSERT INTO product.items (key, title) VALUES ('FP-1', 'agent ran innerwarden disable and the guard refused it')\"",
-        "psql -d crm -v ON_ERROR_STOP=1 <<'SQL'\nINSERT INTO product.items (key, title) VALUES ('FP-1', 'innerwarden dry-run read as self disable');\nSQL",
-        "sudo psql -d crm <<'SQL'\nINSERT INTO t VALUES ('innerwarden allow * was quoted');\nSQL",
-        "psql -d crm <<< \"INSERT INTO t VALUES ('innerwarden disable')\"",
-        "echo \"INSERT INTO t VALUES ('innerwarden disable')\" | psql -d crm",
+        "psql -d app -c \"INSERT INTO app.notes (key, title) VALUES ('FP-1', 'agent ran innerwarden disable and the guard refused it')\"",
+        "psql -d app -v ON_ERROR_STOP=1 <<'SQL'\nINSERT INTO app.notes (key, title) VALUES ('FP-1', 'innerwarden dry-run read as self disable');\nSQL",
+        "sudo psql -d app <<'SQL'\nINSERT INTO t VALUES ('innerwarden allow * was quoted');\nSQL",
+        "psql -d app <<< \"INSERT INTO t VALUES ('innerwarden disable')\"",
+        "echo \"INSERT INTO t VALUES ('innerwarden disable')\" | psql -d app",
         "printf '%s\\n' \"INSERT INTO t VALUES ('innerwarden dry-run')\" | sqlite3 notes.db",
         "sqlite3 notes.db \"INSERT INTO notes VALUES ('innerwarden disable is refused')\"",
         "mysql -e \"INSERT INTO t VALUES ('systemctl stop innerwarden-agent was refused')\"",

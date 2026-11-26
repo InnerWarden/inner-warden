@@ -14574,7 +14574,51 @@ fn mask_data_heredoc(
             .is_some_and(|command| heredoc_writes_download_value(command, body, source))
     {
         mask_preserving_substitutions(body, source, masked, executable_inside_mask);
+        // The grammar does not always make a backtick substitution in the
+        // body a node of its own: an unquoted body runs it all the same.
+        if heredoc_body_expands(body, source) {
+            executable_inside_mask.extend(backtick_runs(body, source));
+        }
     }
+}
+
+/// Whether the shell expands the body of the here-document `body`: its
+/// delimiter is written with no quote and no backslash (`<<EOF`, not
+/// `<<'EOF'`, `<<"EOF"` or `<<\EOF`).
+fn heredoc_body_expands(body: tree_sitter::Node<'_>, source: &[u8]) -> bool {
+    let Some(redirect) = body.parent() else {
+        return true;
+    };
+    let mut cursor = redirect.walk();
+    let start = redirect
+        .children(&mut cursor)
+        .find(|child| child.kind() == "heredoc_start");
+    start.is_none_or(|start| !node_text(start, source).contains(['\'', '"', '\\']))
+}
+
+/// The byte ranges of the backtick substitutions in the text of `node`
+/// (an escaped backtick is a letter; one never closed runs to the end).
+fn backtick_runs(node: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Range<usize>> {
+    let range = node.byte_range();
+    let bytes = &source[range.clone()];
+    let mut runs = Vec::new();
+    let mut open: Option<usize> = None;
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b'\\' => at += 1,
+            b'`' => match open.take() {
+                Some(start) => runs.push(range.start + start..range.start + at + 1),
+                None => open = Some(at),
+            },
+            _ => {}
+        }
+        at += 1;
+    }
+    if let Some(start) = open {
+        runs.push(range.start + start..range.end);
+    }
+    runs
 }
 
 /// Whether the unquoted here-document `body` of `command` expands a value

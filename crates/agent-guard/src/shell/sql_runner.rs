@@ -402,10 +402,10 @@ mod tests {
     #[test]
     fn the_program_behind_a_container_runner_is_found() {
         for (line, client, at) in [
-            ("docker exec -i crm-postgres psql -U postgres", "psql", 4),
+            ("docker exec -i pg psql -U postgres", "psql", 4),
             ("sudo docker exec -it --user=postgres db psql", "psql", 6),
             ("podman container exec -u postgres db mysql -e", "mysql", 6),
-            ("kubectl -n db exec -i pg-0 -c pg -- psql -d crm", "psql", 9),
+            ("kubectl -n db exec -i pg-0 -c pg -- psql -d app", "psql", 9),
             ("docker exec db sudo -u postgres psql", "psql", 6),
         ] {
             assert_eq!(

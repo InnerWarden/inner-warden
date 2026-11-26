@@ -8,7 +8,7 @@
 //! - the pattern `'//'` or `'/'` of a `grep` whose output feeds a reader
 //!   was read as the root folder, and the search refused for reading the
 //!   home's credentials (`a_search_pattern_is_no_path`);
-//! - `cargo test -p innerwarden-killchain > ~/innerwarden-local/x.txt` was
+//! - `cargo test -p innerwarden-killchain > ~/innerwarden-notes/x.txt` was
 //!   refused as disabling the guard: the `kill` inside the package's name
 //!   was read as the verb and the redirection's file as its target
 //!   (`a_verb_is_a_word_and_a_redirection_is_no_target`);
@@ -127,12 +127,12 @@ fn a_search_pattern_is_no_path() {
 #[test]
 fn a_verb_is_a_word_and_a_redirection_is_no_target() {
     for line in [
-        "cargo test -p innerwarden-killchain > /home/u/innerwarden-local/x.txt",
-        "cargo build -p innerwarden-killchain >> /home/u/innerwarden-local/x.log 2>&1",
-        "cargo test -p skill-killer > /home/u/innerwarden-local/x.txt",
-        "cargo test --test kill_switch > /home/u/innerwarden-local/x.txt",
+        "cargo test -p innerwarden-killchain > /home/u/innerwarden-notes/x.txt",
+        "cargo build -p innerwarden-killchain >> /home/u/innerwarden-notes/x.log 2>&1",
+        "cargo test -p skill-killer > /home/u/innerwarden-notes/x.txt",
+        "cargo test --test kill_switch > /home/u/innerwarden-notes/x.txt",
         "cargo test --test kill_chain -p innerwarden-agent-guard 2>&1 | tail",
-        "systemctl stop nginx > /home/u/innerwarden-local/x.txt",
+        "systemctl stop nginx > /home/u/innerwarden-notes/x.txt",
     ] {
         assert_eq!(verdict(line), "allow", "{line}");
     }
@@ -140,7 +140,7 @@ fn a_verb_is_a_word_and_a_redirection_is_no_target() {
         "pkill -9 innerwarden-agent",
         "systemctl stop --no-block innerwarden-agent",
         "systemctl stop innerwarden-agent > /tmp/x.txt",
-        "pkill innerwarden > /home/u/innerwarden-local/x.txt",
+        "pkill innerwarden > /home/u/innerwarden-notes/x.txt",
         "xargs kill < /run/innerwarden/pids",
         "/usr/bin/pkill -f innerwarden",
         "systemctl 'stop' innerwarden-agent",
@@ -223,7 +223,7 @@ fn a_relative_name_is_read_from_the_folder_the_hook_gave() {
     for (line, cwd) in [
         ("rm -rf innerwarden/rules", "/home/dev/src/app"),
         ("rm -rf innerwarden/rules", "/home/dev"),
-        ("rm -rf innerwarden-local/x", "/home/dev"),
+        ("rm -rf innerwarden-notes/x", "/home/dev"),
         ("cd /tmp && rm -rf innerwarden/rules", "/etc"),
         ("rm -rf build", "/home/dev/src/app"),
         ("rm -rf crates/innerwarden-x/target", "/home/dev/src/app"),

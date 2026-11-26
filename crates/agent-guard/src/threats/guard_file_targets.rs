@@ -469,6 +469,7 @@ fn walk(content: &str, start: Option<Path>, follow_home: bool) -> bool {
         cwd: start,
         home: HomeAs::Account,
         follow_home,
+        input: None,
     };
     // A subshell's `cd` ends with it: the folder each open `(` restores
     // at its `)`, read from the segment's text as
@@ -507,6 +508,8 @@ fn walk(content: &str, start: Option<Path>, follow_home: bool) -> bool {
             if command.words != piece.words {
                 continue;
             }
+            let previous = next.checked_sub(1).and_then(|at| commands.get(at));
+            place.input = super::command_input(command, previous);
             next += 1;
             if command_reaches(command, &mut place) {
                 return true;
@@ -527,12 +530,19 @@ struct Place {
     cwd: Option<Path>,
     home: HomeAs,
     follow_home: bool,
+    /// The text the command reads on its input when the line shows it (a
+    /// here-string, a here-document, what an `echo` or `printf` in front
+    /// of it prints into the pipe).
+    input: Option<String>,
 }
 
 /// What a command that only sets variables, or `export`, `declare`,
-/// `typeset`, `readonly` or `local`, gives `HOME`; `read`, `printf -v`
-/// and `mapfile` naming it give a value the text does not hold. `None`
-/// when the command leaves `HOME` as it is. A `HOME=` in front of a
+/// `typeset`, `readonly` or `local`, gives `HOME`; `read` gives it the
+/// text the line hands it on its input and `printf -v` the text it prints
+/// ([`read_gives_home`], [`printf_gives_home`]), a value the line does not
+/// show when the text is not there (`mapfile`, `read` from a file). The
+/// name may be spelled by braces (`{HO,}ME`). `None` when the command
+/// leaves `HOME` as it is. A `HOME=` in front of a
 /// program sets it for that program alone, after the shell has read the
 /// program's words.
 fn home_given(command: &crate::shell_words::Command, place: &Place) -> Option<HomeAs> {
@@ -547,14 +557,23 @@ fn home_given(command: &crate::shell_words::Command, place: &Place) -> Option<Ho
     } else if words.iter().all(|word| is_assignment(&word.text)) {
         words
     } else {
-        if matches!(
-            first.text.as_str(),
-            "read" | "printf" | "mapfile" | "readarray"
-        ) && words[1..].iter().any(|word| word.text == "HOME")
-        {
-            return Some(HomeAs::Unknown);
+        let texts: Vec<String> = words.iter().map(|word| word.text.clone()).collect();
+        let at = effective_command_index(&texts)?;
+        let args = &words[at + 1..];
+        if !args.iter().any(names_home) {
+            return None;
         }
-        return None;
+        let given = match program_name(&texts[at]).as_str() {
+            "read" => read_gives_home(args, place.input.as_deref()),
+            "printf" => printf_gives_home(args),
+            "mapfile" | "readarray" => Some(None),
+            _ => None,
+        }?;
+        return Some(match given {
+            Some(value) => resolve_from(&value, place.cwd.as_ref(), &place.home)
+                .map_or(HomeAs::Unknown, HomeAs::Set),
+            None => HomeAs::Unknown,
+        });
     };
     let mut given = None;
     for word in assignments {
@@ -590,6 +609,159 @@ fn is_assignment(word: &str) -> bool {
         !name.is_empty()
             && !name.starts_with(|c: char| c.is_ascii_digit())
             && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric())
+    })
+}
+
+/// Whether a word names the variable `HOME`: written so, or spelled so
+/// once the shell has expanded its braces (`{HO,}ME`, `H{O,X}ME`).
+fn names_home(word: &Word) -> bool {
+    if word.text == "HOME" {
+        return true;
+    }
+    let chars: Vec<char> = word.text.chars().collect();
+    word.has(Mark::Pattern)
+        && !word.has(Mark::Expansion)
+        && chars.len() == word.marks.len()
+        && could_be(&chars, &word.marks, "HOME")
+}
+
+/// A word that hands its text to the program as it is: no `~`, nothing
+/// the shell changes.
+fn plain_word(text: &str) -> Word {
+    Word {
+        text: text.to_string(),
+        marks: vec![Mark::Plain; text.chars().count()],
+        ..Word::default()
+    }
+}
+
+/// What `read` gives `HOME` when one of its names is `HOME`: the field of
+/// the first line of `input` the name takes (the last name takes the rest
+/// of the line, a lone name the whole line, trimmed), or the first field
+/// for an array (`-a`). `Some(None)`: a value the line does not show (no
+/// input the line holds, a prompt read from the terminal). `None`: no name
+/// of the command is `HOME`.
+fn read_gives_home(args: &[Word], input: Option<&str>) -> Option<Option<Word>> {
+    let mut names: Vec<&Word> = Vec::new();
+    let mut array: Option<&Word> = None;
+    let mut raw = false;
+    let mut delimiter = '\n';
+    let mut options = true;
+    let mut at = 0;
+    while at < args.len() {
+        let word = &args[at];
+        at += 1;
+        if options && word.text == "--" {
+            options = false;
+            continue;
+        }
+        if options && word.text.len() > 1 && word.text.starts_with('-') {
+            let flags: Vec<char> = word.text.chars().skip(1).collect();
+            for (index, flag) in flags.iter().enumerate() {
+                if !"adinNptu".contains(*flag) {
+                    raw |= *flag == 'r';
+                    continue;
+                }
+                // The rest of the word, or the next word, is its value.
+                let glued: String = flags[index + 1..].iter().collect();
+                let value = if glued.is_empty() {
+                    at += 1;
+                    args.get(at - 1).map(|word| word.text.clone())
+                } else {
+                    Some(glued)
+                };
+                match flag {
+                    'a' => array = args.get(at - 1).filter(|_| index + 1 == flags.len()),
+                    'd' => delimiter = value.and_then(|v| v.chars().next()).unwrap_or('\0'),
+                    _ => {}
+                }
+                break;
+            }
+            continue;
+        }
+        options = false;
+        names.push(word);
+    }
+    let named = array.is_some_and(names_home) || names.iter().any(|word| names_home(word));
+    if !named {
+        return None;
+    }
+    let Some(input) = input else {
+        return Some(None);
+    };
+    let line = input.split(delimiter).next().unwrap_or_default();
+    let line = if raw {
+        line.to_string()
+    } else {
+        // Without `-r` a backslash keeps the character after it.
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            out.push(if c == '\\' {
+                chars.next().unwrap_or(c)
+            } else {
+                c
+            });
+        }
+        out
+    };
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    if array.is_some_and(names_home) {
+        return Some(fields.first().map(|field| plain_word(field)));
+    }
+    let index = names.iter().position(|word| names_home(word))?;
+    let value = if index + 1 == names.len() {
+        fields.get(index..).map(|rest| rest.join(" "))
+    } else {
+        fields.get(index).map(|field| (*field).to_string())
+    };
+    Some(value.map(|value| plain_word(&value)))
+}
+
+/// What `printf -v HOME` gives `HOME`: its format when the format holds
+/// no conversion and no escape, or the one argument of a `%s` format, as
+/// the word the line wrote (a `~` in it is the home the shell puts there).
+/// `Some(None)` for any other format. `None`: `-v` names no `HOME`.
+fn printf_gives_home(args: &[Word]) -> Option<Option<Word>> {
+    let (at, name) = args.iter().enumerate().find_map(|(at, word)| {
+        if word.text == "-v" {
+            args.get(at + 1).map(|name| (at + 2, name.clone()))
+        } else {
+            word.text.strip_prefix("-v").map(|glued| {
+                let skip = word.text.chars().count() - glued.chars().count();
+                let name = Word {
+                    text: glued.to_string(),
+                    marks: word
+                        .marks
+                        .get(skip..)
+                        .map(<[Mark]>::to_vec)
+                        .unwrap_or_default(),
+                    ..Word::default()
+                };
+                (at + 1, name)
+            })
+        }
+    })?;
+    if !names_home(&name) {
+        return None;
+    }
+    let rest = args.get(at..).unwrap_or_default();
+    let rest = match rest.first() {
+        Some(word) if word.text == "--" => &rest[1..],
+        _ => rest,
+    };
+    let Some(format) = rest.first() else {
+        return Some(None);
+    };
+    if format.has(Mark::Expansion) {
+        return Some(None);
+    }
+    if !format.text.contains(['%', '\\']) {
+        return Some(Some(format.clone()));
+    }
+    Some(match (format.text.as_str(), rest.get(1..)) {
+        ("%s", Some([value])) => Some(value.clone()),
+        _ => None,
     })
 }
 

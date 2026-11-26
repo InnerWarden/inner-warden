@@ -21254,7 +21254,7 @@ fn check_disable_verb_reaches_target(lower: &str) -> Option<&'static str> {
     for target in PROTECTED_TARGETS {
         for (target_at, _) in lower.match_indices(target) {
             // The file a command's output is sent to is not what the command
-            // acts on: `cargo test -p x > ~/innerwarden-local/out.txt`.
+            // acts on: `cargo test -p x > ~/innerwarden-notes/out.txt`.
             if in_output_redirect_target(lower, target_at) {
                 continue;
             }

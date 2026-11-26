@@ -9,9 +9,10 @@
 //! that did not load, and every call of every agent was refused under
 //! `AG-RULES-BROKEN`.
 
+use std::cell::RefCell;
 use std::fmt::Write as _;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Once;
 
 use innerwarden_agent_guard::mcp_proxy::enforce::{apply_layers, ProxyAction, ProxyMode};
 use innerwarden_agent_guard::mcp_proxy::jsonrpc::{parse_line, ParsedLine};
@@ -186,17 +187,46 @@ fn benign_matches(engine: &RuleEngine) -> Vec<String> {
     .collect()
 }
 
-/// The WARN events logged while `load` runs, each as its fields.
+thread_local! {
+    /// The WARN events of this thread, while a test of this thread collects
+    /// them ([`warnings_while`]).
+    static SEEN: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+/// Install [`Capture`] as the one subscriber of this test binary, before
+/// any test logs. A subscriber set for one thread only beside none at all
+/// let tracing decide a warning's interest once for every thread: a test
+/// running at the same time without it could leave the warning unseen by
+/// the one that collects it (measured on macOS CI, tracing-core 0.1.36).
+/// Every test calls it first.
+fn capture_installed() {
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        tracing::subscriber::set_global_default(Capture).expect("one subscriber per test binary");
+    });
+}
+
+/// The WARN events logged on this thread while `load` runs, each as its
+/// fields.
 fn warnings_while<T>(load: impl FnOnce() -> T) -> (T, Vec<String>) {
-    let seen = Arc::new(Mutex::new(Vec::new()));
-    let out = tracing::subscriber::with_default(Capture(seen.clone()), load);
-    let warnings = seen.lock().unwrap().clone();
+    capture_installed();
+    SEEN.with(|seen| *seen.borrow_mut() = Some(Vec::new()));
+    let out = load();
+    let warnings = SEEN.with(|seen| seen.borrow_mut().take().unwrap_or_default());
     (out, warnings)
 }
 
-struct Capture(Arc<Mutex<Vec<String>>>);
+/// Keeps each WARN event for the thread that logged it, when that thread
+/// collects them.
+struct Capture;
 
 impl tracing::Subscriber for Capture {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        tracing::subscriber::Interest::always()
+    }
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
     }
@@ -209,9 +239,13 @@ impl tracing::Subscriber for Capture {
         if *event.metadata().level() != tracing::Level::WARN {
             return;
         }
-        let mut text = String::new();
-        event.record(&mut Fields(&mut text));
-        self.0.lock().unwrap().push(text);
+        SEEN.with(|seen| {
+            if let Some(seen) = seen.borrow_mut().as_mut() {
+                let mut text = String::new();
+                event.record(&mut Fields(&mut text));
+                seen.push(text);
+            }
+        });
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
@@ -227,6 +261,7 @@ impl tracing::field::Visit for Fields<'_> {
 
 #[test]
 fn a_valid_sigma_rule_in_the_rules_folder_refuses_no_call() {
+    capture_installed();
     for (name, body) in SIGMA_FILES {
         let dir = rules_dir(&[(name, body)]);
         let (overlay, warnings) = warnings_while(|| RuleEngine::load_with_overlay(dir.path()));
@@ -273,6 +308,7 @@ fn a_valid_sigma_rule_in_the_rules_folder_refuses_no_call() {
 
 #[test]
 fn yaml_of_another_kind_is_ignored_and_named() {
+    capture_installed();
     let dir = rules_dir(&[("allow/jobs.yaml", OTHER_YAML_LIST)]);
     let (engine, warnings) = warnings_while(|| RuleEngine::load_with_overlay(dir.path()));
     assert!(
@@ -308,6 +344,7 @@ fn yaml_of_another_kind_is_ignored_and_named() {
 /// refuses the call it names, under its own id, and lets the rest through.
 #[test]
 fn an_atr_rule_beside_sigma_rules_still_runs() {
+    capture_installed();
     let mut files = vec![("operator.yaml", ATR_RULE)];
     files.extend(SIGMA_FILES.iter().map(|(name, body)| (*name, *body)));
     let dir = rules_dir(&files);
@@ -355,6 +392,7 @@ fn an_atr_rule_beside_sigma_rules_still_runs() {
 /// with an ATR document among several.
 #[test]
 fn a_broken_atr_rule_still_refuses_every_call() {
+    capture_installed();
     let atr_among_documents = format!("{SIGMA_REFERENCE_MAPS}---\n{ATR_RULE}");
     for (name, body) in [
         ("operator.yaml", ATR_RULE_CONDITION_LIST),
@@ -394,6 +432,7 @@ fn a_broken_atr_rule_still_refuses_every_call() {
 /// An engine of the embedded corpus alone ignores nothing.
 #[test]
 fn the_embedded_corpus_ignores_nothing() {
+    capture_installed();
     assert!(RuleEngine::load_embedded().ignored_files().is_empty());
     let missing = RuleEngine::load_with_overlay(Path::new("/nonexistent/rules/dir"));
     assert!(missing.ignored_files().is_empty());

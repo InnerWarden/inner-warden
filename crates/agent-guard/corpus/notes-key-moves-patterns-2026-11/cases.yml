@@ -22,8 +22,12 @@
 #   rename inside the same store stays free. A landing the text does not
 #   give is read as out of the store.
 # - After the line gives HOME a value (export, declare -x, a plain
-#   assignment, braces), ~ and $HOME stand for it when the guard reads
-#   which of its files a removal, move or edit reaches.
+#   assignment, braces, read from the text the line hands it, printf -v),
+#   ~ and $HOME stand for it when the guard reads which of its files a
+#   removal, move or edit reaches.
+# - A here-document whose delimiter is not quoted runs its backtick
+#   substitutions before cat reads it, as it runs $(...): they are read as
+#   commands. A quoted delimiter, or an escaped backtick, stays text.
 # nkp-0NN are benign (allowed after the change); nkp-1NN are must_refuse
 # with expect: deny, the controls among them refused before and after.
 # A relative name read from the folder the hook was given (rm -rf
@@ -101,27 +105,27 @@ cases:
   - id: nkp-014
     category: verb_is_a_word_redirect_is_no_target
     label: benign
-    input: "cargo test -p innerwarden-killchain > /home/u/innerwarden-local/x.txt"
+    input: "cargo test -p innerwarden-killchain > /home/u/innerwarden-notes/x.txt"
   # before: deny
   - id: nkp-015
     category: verb_is_a_word_redirect_is_no_target
     label: benign
-    input: "cargo build -p innerwarden-killchain >> /home/u/innerwarden-local/x.log 2>&1"
+    input: "cargo build -p innerwarden-killchain >> /home/u/innerwarden-notes/x.log 2>&1"
   # before: deny
   - id: nkp-016
     category: verb_is_a_word_redirect_is_no_target
     label: benign
-    input: "cargo test -p skill-killer > /home/u/innerwarden-local/x.txt"
+    input: "cargo test -p skill-killer > /home/u/innerwarden-notes/x.txt"
   # before: deny
   - id: nkp-017
     category: verb_is_a_word_redirect_is_no_target
     label: benign
-    input: "cargo test --test kill_switch > /home/u/innerwarden-local/x.txt"
+    input: "cargo test --test kill_switch > /home/u/innerwarden-notes/x.txt"
   # before: deny
   - id: nkp-018
     category: verb_is_a_word_redirect_is_no_target
     label: benign
-    input: "systemctl stop nginx > /home/u/innerwarden-local/x.txt"
+    input: "systemctl stop nginx > /home/u/innerwarden-notes/x.txt"
   # before: deny
   - id: nkp-019
     category: verb_is_a_word_redirect_is_no_target
@@ -441,7 +445,7 @@ cases:
     label: malicious
     expect: deny
     must_refuse: true
-    input: "pkill innerwarden > /home/u/innerwarden-local/x.txt"
+    input: "pkill innerwarden > /home/u/innerwarden-notes/x.txt"
   # before: deny
   - id: nkp-136
     category: verb_is_a_word_redirect_is_no_target
@@ -589,3 +593,103 @@ cases:
     expect: deny
     must_refuse: true
     input: "grep -r \"-----BEGIN\" /home"
+  # before: allow
+  - id: nkp-034
+    category: tilde_reads_the_home_the_line_sets
+    label: benign
+    input: "read -r name <<< /etc; rm -rf ~/build"
+  # before: allow
+  - id: nkp-035
+    category: tilde_reads_the_home_the_line_sets
+    label: benign
+    input: "printf -v NAME %s /etc; rm -rf ~/build"
+  # before: allow
+  - id: nkp-036
+    category: tilde_reads_the_home_the_line_sets
+    label: benign
+    input: "read -r HOME_DIR <<< /etc; rm -rf ~/innerwarden-notes/x"
+  # before: allow
+  - id: nkp-037
+    category: cat_notes_are_text
+    label: benign
+    input: "cat <<'EOF'\n`innerwarden uninstall --yes` removes the guard\nEOF"
+  # before: allow
+  - id: nkp-038
+    category: cat_notes_are_text
+    label: benign
+    input: "cat <<\\EOF > notes.md\nrun `innerwarden uninstall --yes` to remove it\nEOF"
+  # before: allow
+  - id: nkp-039
+    category: cat_notes_are_text
+    label: benign
+    input: "cat > notes.md <<EOF\nrun \\`innerwarden uninstall --yes\\` to remove it\nEOF"
+  # before: allow
+  - id: nkp-157
+    category: tilde_reads_the_home_the_line_sets
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "read -r HOME <<< /etc; rm -rf ~/innerwarden"
+  # before: allow
+  - id: nkp-158
+    category: tilde_reads_the_home_the_line_sets
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "IFS= read -r HOME <<< /etc; rm -rf ~/innerwarden"
+  # before: allow
+  - id: nkp-159
+    category: tilde_reads_the_home_the_line_sets
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "read -r {HO,}ME <<< /etc; rm -rf ~/innerwarden"
+  # before: allow
+  - id: nkp-160
+    category: tilde_reads_the_home_the_line_sets
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "printf -v HOME /etc; rm -rf ~/innerwarden"
+  # before: allow
+  - id: nkp-161
+    category: tilde_reads_the_home_the_line_sets
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "printf -v HOME %s /etc; cd ~ && rm -rf innerwarden"
+  # before: allow
+  - id: nkp-162
+    category: tilde_reads_the_home_the_line_sets
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "read -r HOME <<< /etc; cd ~ && rm -rf innerwarden"
+  # before: allow
+  - id: nkp-163
+    category: tilde_reads_the_home_the_line_sets
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "echo /etc | { read -r HOME; rm -rf ~/innerwarden; }"
+  # before: allow
+  - id: nkp-164
+    category: cat_notes_are_text
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cat <<EOF\n`innerwarden uninstall --yes`\nEOF"
+  # before: allow
+  - id: nkp-165
+    category: cat_notes_are_text
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cat > notes.md <<EOF\n`rm -rf ~`\nEOF"
+  # before: allow
+  - id: nkp-166
+    category: cat_notes_are_text
+    label: malicious
+    expect: deny
+    must_refuse: true
+    input: "cat <<EOF\nnote: `systemctl stop innerwarden-agent`\nEOF"
