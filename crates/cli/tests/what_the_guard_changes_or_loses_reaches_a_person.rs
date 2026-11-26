@@ -555,12 +555,18 @@ fn outages_of_one_fault_are_told_three_times_an_hour_at_most() {
 /// be written (`record_health::fallback_path`): in the account's home,
 /// named by a digest of the folder.
 fn kept_outside(home: &Home) -> PathBuf {
+    kept_outside_as(home, "record-health")
+}
+
+/// [`kept_outside`] for the record named `stem` (`guard-events-health`
+/// for the sink's).
+fn kept_outside_as(home: &Home, stem: &str) -> PathBuf {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(home.store().to_string_lossy().as_bytes());
     let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     home.path()
         .join(".local/state/innerwarden")
-        .join(format!("record-health-{hex}.json"))
+        .join(format!("{stem}-{hex}.json"))
 }
 
 /// REGRESSION ANCHOR (a record planted where an outage is kept when the
@@ -638,6 +644,90 @@ fn a_record_planted_outside_the_folder_neither_silences_nor_paints() {
         kept["lost"], 3,
         "the place planted is where the outage is kept: {kept}"
     );
+}
+
+/// REGRESSION ANCHOR (what is planted outside the folder after
+/// the folder fell, and outside a healthy sink's folder). On an install
+/// that keeps its records beside the graph and the sink:
+/// - the sink's record planted outside (`"lost":99999`, `"since_unix":1`)
+///   put that count into `guard-events.jsonl` as a `guard.events_lost`
+///   line, which InnerWarden's host install raises an incident from, and
+///   told the end of an outage that never was;
+/// - the graph's record planted outside AFTER the folder was made `0500`,
+///   and again before every call, held back the alert (3 failures, 0
+///   alerts), and `status` said "has not recorded for 498800 hours".
+///
+/// What lies outside the folder is read only when the record beside
+/// cannot be written: it never silences, paints or counts while it can.
+///
+/// FAILS ON REVERT: let `record_health::ending` read outside for the sink
+/// and the forged count reaches the file; let `record_health::note_in`
+/// take the episode from outside before it writes beside and the outage
+/// is not heard.
+#[cfg(unix)]
+#[test]
+fn a_record_planted_outside_neither_counts_nor_silences_nor_paints() {
+    use std::os::unix::fs::PermissionsExt;
+    let listener = Listener::start();
+    let home = Home::new(&listener, false);
+    home.wire_claude_code();
+    if !folder_modes_hold(&home.store()) {
+        return;
+    }
+    let out = home.hook(REFUSED);
+    assert_eq!(out.status.code(), Some(2), "{}", said(&out));
+    for kept in ["record-health.json", "guard-events-health.json"] {
+        assert!(home.store().join(kept).exists(), "{kept} is kept beside");
+    }
+
+    let sink_planted = kept_outside_as(&home, "guard-events-health");
+    std::fs::create_dir_all(sink_planted.parent().unwrap()).unwrap();
+    std::fs::write(
+        &sink_planted,
+        r#"{"code":"guard_events_not_written","since_unix":1,"lost":99999}"#,
+    )
+    .unwrap();
+    let _ = listener.take();
+    let out = home.hook(REFUSED);
+    assert_eq!(out.status.code(), Some(2), "{}", said(&out));
+    let forged: Vec<serde_json::Value> = home
+        .sink_lines()
+        .into_iter()
+        .filter(|l| l["kind"] == "guard.events_lost")
+        .collect();
+    assert!(
+        forged.is_empty(),
+        "a forged count reached the sink: {forged:?}"
+    );
+    let heard = listener.take();
+    assert_eq!(
+        holding(&heard, &["adding to guard-events.jsonl again"]),
+        0,
+        "the end of an outage that never was: {heard:#?}"
+    );
+
+    std::fs::set_permissions(home.store(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    let planted = kept_outside(&home);
+    for _ in 0..3 {
+        std::fs::write(
+            &planted,
+            r#"{"code":"graph_write_failed","since_unix":1,"lost":1}"#,
+        )
+        .unwrap();
+        let out = home.hook(REFUSED);
+        assert_eq!(out.status.code(), Some(2), "{}", said(&out));
+    }
+    let text = said(&home.run(&["status"]));
+    std::fs::set_permissions(home.store(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let heard = listener.take();
+    assert_eq!(
+        holding(&heard, &["has not recorded"]),
+        1,
+        "silenced: {heard:#?}"
+    );
+    assert!(text.contains("decisions are not being recorded"), "{text}");
+    assert!(!text.contains(" hours ("), "painted: {text}");
 }
 
 /// REGRESSION ANCHOR (the count of lines lost glued to a cut line). The

@@ -2056,10 +2056,11 @@ pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) -> bool
         if let Some(alert) = noted.alert() {
             crate::notify_io::fire_text(&alert);
         }
-    } else if pending.is_some() {
-        if let Some(ended) = crate::record_health::note_sink_success_in(dir, &before, counted) {
-            crate::notify_io::fire_text(&ended.summary());
-        }
+    } else if let Some(ended) = crate::record_health::note_sink_success_in(dir, &before, counted) {
+        // Every append that works, not only one with a count to write: it
+        // leaves the sink's record beside, so the next outage is kept
+        // where InnerWarden guards it, never outside the folder.
+        crate::notify_io::fire_text(&ended.summary());
     }
     refused.is_none()
 }
@@ -4000,6 +4001,60 @@ mod tests {
         assert_eq!(lines[1]["n"], 4);
         assert_eq!(lines[2]["n"], 5);
         assert!(crate::record_health::sink_outage_in(dir.path()).is_none());
+    }
+
+    /// The count of lines lost is written only from the sink's record
+    /// beside it, never from one kept outside the folder (one planted there
+    /// put its own count into the file). So a healthy append keeps that
+    /// record, `{}`, and a folder that then stops taking new files (`0500`)
+    /// still keeps the losses beside the sink, where the first append that
+    /// works reads the count.
+    ///
+    /// FAILS ON REVERT: keep the record only when there is a count to write
+    /// (`note_sink_success_in` under `pending.is_some()`) and the losses in
+    /// the `0500` folder are kept outside it, so no count reaches the sink.
+    #[cfg(unix)]
+    #[test]
+    fn a_sink_folder_that_stops_taking_files_still_counts_its_losses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let sink = dir.path().join("guard-events.jsonl");
+        assert!(append_guard_event_at(
+            dir.path(),
+            &json!({"kind": "guard.blocked", "n": 1})
+        ));
+        std::fs::remove_file(&sink).unwrap();
+        // A directory standing at the sink's name refuses every append.
+        std::fs::create_dir(&sink).unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let held = std::fs::write(dir.path().join(".probe"), b"").is_err();
+        if held {
+            for _ in 0..3 {
+                assert!(!append_guard_event_at(
+                    dir.path(),
+                    &json!({"kind": "guard.blocked"})
+                ));
+            }
+        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        if !held {
+            // Root writes any folder: nothing to prove here.
+            return;
+        }
+        std::fs::remove_dir(&sink).unwrap();
+        assert!(append_guard_event_at(
+            dir.path(),
+            &json!({"kind": "guard.blocked", "n": 2})
+        ));
+        let lines: Vec<Value> = std::fs::read_to_string(&sink)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(lines[0]["kind"], SINK_LOST_KIND, "{lines:?}");
+        assert_eq!(lines[0]["lost"], 3, "{lines:?}");
+        assert_eq!(lines[1]["n"], 2);
     }
 
     /// REGRESSION ANCHOR (the count of lines lost glued to a cut line). A
