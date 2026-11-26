@@ -10,6 +10,7 @@ pub(crate) use guard_lowering::lists_only_other_processes;
 mod credential_removal_by_code;
 mod guard_takedown;
 mod instruction_files;
+pub(crate) mod resource_limits;
 mod words_after;
 pub(crate) use credential_removal_by_code::interpreter_code_removes_credentials;
 
