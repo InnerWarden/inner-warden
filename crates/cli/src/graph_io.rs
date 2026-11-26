@@ -1666,6 +1666,10 @@ pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Dec
         event_hash,
     } = decision;
     let (mode, outcome) = (*mode, *outcome);
+    // How the record's folder and the graph stand before anything below
+    // writes there: what an outage kept outside the folder is checked
+    // against (`record_health::Before`).
+    let before = crate::record_health::Before::of(path);
     // A block or a would-block is told on the compact, append-only line
     // (`guard.blocked` in `guard-events.jsonl`) BEFORE the graph is
     // rewritten: the rewrite reads and writes the whole record, seconds on a
@@ -1708,21 +1712,23 @@ pub(crate) fn persist(path: &std::path::Path, decision: &crate::jail_record::Dec
         eprintln!("innerwarden: graph record skipped ({error})");
         // stderr alone hid a six-hour outage. Persist it where the CLI and the
         // dashboard can find it, and tell someone ONCE per episode.
-        let noted = crate::record_health::note_failure_at(path, &error.to_string());
-        if noted.first_of_episode {
-            crate::notify_io::fire_text(&noted.outage.summary());
+        let noted = crate::record_health::note_failures_after(path, &error.to_string(), 1, &before);
+        if let Some(alert) = noted.alert() {
+            crate::notify_io::fire_text(&alert);
         }
         false
     } else {
         // The end of an episode is told where its start was: a person who
         // heard the record stop has to hear it start again, or the channel
-        // reads as an outage that never ended.
-        if let Some(ended) = crate::record_health::note_success_at(path) {
+        // reads as an outage that never ended. Once writes have worked for
+        // the quiet window (`record_health::QUIET_SECS`), so a fault that
+        // comes and goes is one outage, not two alerts a turn.
+        if let Some(ended) = crate::record_health::note_success_at(path, &before) {
             eprintln!(
                 "innerwarden: recording recovered after {} lost action(s)",
-                ended.lost
+                ended.outage.lost
             );
-            crate::notify_io::fire_text(&ended.recovered_summary());
+            crate::notify_io::fire_text(&ended.summary());
         }
         true
     };
@@ -1987,13 +1993,15 @@ pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) -> bool
         return handed;
     }
     let path = dir.join("guard-events.jsonl");
+    let before = crate::record_health::sink_before(dir);
     create_sink_with_directory_ownership(&path);
     // Lines this sink lost earlier are counted in the same write, ahead of
-    // this one: the sink is what InnerWarden's host install reads, so the
-    // count goes where it reads ([`SINK_LOST_KIND`]).
-    let lost_before = crate::record_health::sink_outage_in(dir);
+    // this one, so the count stays in the file (`guard.events_lost`,
+    // [`SINK_LOST_KIND`]), the file InnerWarden's host install reads.
+    let pending = crate::record_health::sink_pending_in(dir, &before);
+    let counted = pending.as_ref().map_or(0, |lost| lost.lost);
     let mut record = String::new();
-    if let Some(lost) = &lost_before {
+    if let Some(lost) = pending.as_ref().filter(|lost| lost.lost > 0) {
         record.push_str(&sink_lost_line(lost).to_string());
         record.push('\n');
     }
@@ -2018,10 +2026,20 @@ pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) -> bool
         Ok(mut file) => match file.metadata() {
             Ok(metadata) => match crate::record_health::refusal(&metadata) {
                 Some(why) => Some(crate::record_health::refusal_words(why).to_string()),
-                None => file
-                    .write_all(record.as_bytes())
-                    .err()
-                    .map(|e| format!("could not be written ({})", e.kind())),
+                None => {
+                    // A write cut at the file size limit leaves part of a
+                    // line with no end: this record starts on a line of
+                    // its own, or the first of it (the count of lines
+                    // lost) was glued to that part and read as neither.
+                    let mut whole = String::with_capacity(record.len() + 1);
+                    if ends_mid_line(&path, metadata.len()) {
+                        whole.push('\n');
+                    }
+                    whole.push_str(&record);
+                    file.write_all(whole.as_bytes())
+                        .err()
+                        .map(|e| format!("could not be written ({})", e.kind()))
+                }
             },
             Err(error) => Some(format!("could not be read ({})", error.kind())),
         },
@@ -2034,16 +2052,33 @@ pub(crate) fn append_guard_event_at(dir: &std::path::Path, line: &Value) -> bool
         );
         // stderr alone lost the line in silence: counted, and told once per
         // episode, as a graph write that fails is.
-        let noted = crate::record_health::note_sink_failure_in(dir);
-        if noted.first_of_episode {
-            crate::notify_io::fire_text(&noted.outage.summary());
+        let noted = crate::record_health::note_sink_failure_in(dir, &before);
+        if let Some(alert) = noted.alert() {
+            crate::notify_io::fire_text(&alert);
         }
-    } else if lost_before.is_some() {
-        if let Some(ended) = crate::record_health::note_sink_success_in(dir) {
-            crate::notify_io::fire_text(&ended.recovered_summary());
+    } else if pending.is_some() {
+        if let Some(ended) = crate::record_health::note_sink_success_in(dir, &before, counted) {
+            crate::notify_io::fire_text(&ended.summary());
         }
     }
     refused.is_none()
+}
+
+/// Whether the file at `path`, `len` bytes long, ends inside a line: its
+/// last byte is there and is not a newline. Read without following a link;
+/// a file that cannot be read is taken to end a line.
+fn ends_mid_line(path: &std::path::Path, len: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    if len == 0 {
+        return false;
+    }
+    let Ok(mut file) = innerwarden_safe_io::open_no_follow(path) else {
+        return false;
+    };
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::Start(len - 1)).is_ok()
+        && file.read_exact(&mut last).is_ok()
+        && last[0] != b'\n'
 }
 
 /// The kind of the line that counts what `guard-events.jsonl` lost, written
@@ -3923,7 +3958,7 @@ mod tests {
     /// append that fails is counted in the sink's own outage record, told
     /// once per episode, and the count is written into the sink, where
     /// InnerWarden's host install reads, by the first append that works;
-    /// the episode then ends and a later append writes no count again.
+    /// the episode then closes and a later append writes no count again.
     ///
     /// FAILS ON REVERT: drop `note_sink_failure_in` from the failed append
     /// and nothing counts the loss; drop the count from the next write and
@@ -3965,6 +4000,39 @@ mod tests {
         assert_eq!(lines[1]["n"], 4);
         assert_eq!(lines[2]["n"], 5);
         assert!(crate::record_health::sink_outage_in(dir.path()).is_none());
+    }
+
+    /// REGRESSION ANCHOR (the count of lines lost glued to a cut line). A
+    /// write cut at the file size limit leaves part of a line with no end,
+    /// and the next append (the `guard.events_lost` line first) was glued
+    /// to it: `{"agent":"claude-code","detail":"curl ht{"code":...}` is
+    /// neither line, and the count was gone. The append starts on a line of
+    /// its own; a file that ends a line gets no empty one.
+    ///
+    /// FAILS ON REVERT: drop the leading newline (`ends_mid_line`) and the
+    /// line after the cut one does not parse.
+    #[test]
+    fn an_append_after_a_cut_line_starts_a_line_of_its_own() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let sink = dir.path().join("guard-events.jsonl");
+        let cut = "{\"agent\":\"claude-code\",\"detail\":\"curl ht";
+        std::fs::write(&sink, format!("{{\"kind\":\"guard.blocked\"}}\n{cut}")).unwrap();
+        assert!(append_guard_event_at(
+            dir.path(),
+            &json!({"kind": "guard.blocked", "n": 2})
+        ));
+        assert!(append_guard_event_at(
+            dir.path(),
+            &json!({"kind": "guard.blocked", "n": 3})
+        ));
+        let text = std::fs::read_to_string(&sink).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text}");
+        assert_eq!(lines[1], cut);
+        for (line, n) in [(lines[2], 2), (lines[3], 3)] {
+            let parsed: Value = serde_json::from_str(line).expect(line);
+            assert_eq!(parsed["n"], n, "{text}");
+        }
     }
 
     #[test]

@@ -295,8 +295,8 @@ fn sweep_removing(
         }
         _ => {
             let noted = crate::record_health::note_failures_at(graph, CUT_CODE, lost);
-            if noted.first_of_episode {
-                alert(&noted.outage.summary());
+            if let Some(line) = noted.alert() {
+                alert(&line);
             }
         }
     }
@@ -459,7 +459,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let graph = dir.path().join("graph.json");
         std::fs::write(&graph, "{}").unwrap();
-        crate::record_health::note_sink_failure_in(dir.path());
+        crate::record_health::note_sink_failure_in(
+            dir.path(),
+            &crate::record_health::sink_before(dir.path()),
+        );
         let gone = 4_194_304u32 + 31;
         std::fs::write(
             dir.path().join(format!("{MARK_PREFIX}{gone}")),

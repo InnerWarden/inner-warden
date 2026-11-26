@@ -880,8 +880,8 @@ impl Shared {
                 continue;
             }
             let noted = crate::record_health::note_failures_at(&self.graph, why.code(), n);
-            if noted.first_of_episode {
-                crate::notify_io::fire_text(&noted.outage.summary());
+            if let Some(alert) = noted.alert() {
+                crate::notify_io::fire_text(&alert);
             }
         }
     }

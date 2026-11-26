@@ -377,6 +377,12 @@ list, with every limit.
   different surface: the local check-command contract served by `innerwarden
   serve`.
 - Notifications: surfaces verdicts and events through your configured channels.
+  A record that stops (a folder it cannot write, writes that fail, lines of
+  `guard-events.jsonl` that cannot be added) is told once, and its end once
+  writes have worked for ten minutes: a fault that comes back inside those
+  ten minutes is the same outage, not a new alert. At most three outages of
+  one kind are told an hour; the next alert about it says how many more
+  there were.
 - Conversation attempts: records what an agent was ASKED to do when the ask is
   dangerous, including the asks a model refuses on its own. Those produce no
   command, so they reach nothing else in the product. An ask is dangerous when

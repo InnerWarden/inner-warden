@@ -1586,9 +1586,13 @@ fn recording_recovers_on_a_graph_that_is_already_over_the_old_limit() {
     );
 
     // And the outage state must be clear, so no surface claims a live failure.
+    let health: Value = std::fs::read_to_string(dir.path().join("record-health.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
     assert!(
-        !dir.path().join("record-health.json").exists(),
-        "a successful write must clear the outage marker"
+        health["code"].is_null(),
+        "a successful write must clear the outage marker: {health}"
     );
 }
 
