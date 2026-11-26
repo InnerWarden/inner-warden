@@ -2412,6 +2412,21 @@ fn antigravity_answer(exit: std::process::ExitCode, monitor: bool) -> std::proce
     std::process::ExitCode::SUCCESS
 }
 
+/// The exit of a refusal: 2, the refusal every agent reads, but for one
+/// that monitor holds on Gemini's line. That line turns every end other than
+/// 0 into 1, "warn, run the tool" (a guard that is gone must not hold Gemini
+/// up in a mode that never blocks), except
+/// [`innerwarden_agent_guard::hook::MONITOR_HELD_EXIT`], which it turns into
+/// 2. A write into the guard's own configuration is refused in every mode and
+/// for every agent.
+fn refusal_exit(rest: &[String], held_in_monitor: bool) -> std::process::ExitCode {
+    if held_in_monitor && agent_flag(rest).as_deref() == Some("gemini") {
+        std::process::ExitCode::from(innerwarden_agent_guard::hook::MONITOR_HELD_EXIT)
+    } else {
+        std::process::ExitCode::from(2)
+    }
+}
+
 /// Set when monitor refuses a call all the same: a write into the guard's
 /// own configuration ([`innerwarden_agent_guard::threats::verdict_writes_guard_config`]).
 static HELD_IN_MONITOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -2760,7 +2775,7 @@ fn cmd_hook_screen(rest: &[String]) -> std::process::ExitCode {
         // reaches the agent first, and a ready-to-run `innerwarden allow '<cmd>'`
         // here was an instruction the agent could follow to lift its own block.
         eprintln!("{}", hook_block_remedy(&verdict));
-        std::process::ExitCode::from(2)
+        refusal_exit(rest, held_in_monitor)
     } else if !monitor && runs_with_a_warning(warned, &verdict, posture) {
         // The default posture: a refusal outside the high-certainty class,
         // or a review outside it, runs. It is in the record, and the agent
@@ -3928,7 +3943,7 @@ fn file_screen_exit(
             HELD_IN_MONITOR.store(held_in_monitor, std::sync::atomic::Ordering::SeqCst);
             eprintln!("InnerWarden blocked this file change (recommendation=deny): {explanation}");
             eprintln!("{}", FILE_BLOCK_REMEDY);
-            Some(std::process::ExitCode::from(2))
+            Some(refusal_exit(rest, held_in_monitor))
         }
     }
 }

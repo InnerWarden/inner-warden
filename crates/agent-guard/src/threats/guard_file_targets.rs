@@ -458,7 +458,9 @@ pub(super) fn removal_reaches_guard_file_from(
 /// the guard anywhere (`~/build`) is not.
 pub(super) fn removal_may_reach_guard_file(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
-    if !lower.contains("home") && !content.contains(['{', '\\']) {
+    // `HOME` named, or spelled by braces, escapes or a pattern the shell
+    // matches against the folder's names (`read -r H*E` after `touch HOME`).
+    if !lower.contains("home") && !content.contains(['{', '\\', '*', '?', '[']) {
         return false;
     }
     let spelled = super::names_spelled_out(content);

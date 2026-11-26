@@ -713,6 +713,9 @@ struct Reader<'a> {
     functions: Vec<(String, Vec<String>)>,
     /// Where the name of each call the reader read stands, in bytes.
     read_names: Vec<(usize, usize)>,
+    /// The names bound to a value whose target is built at run time
+    /// ([`Self::bound_constructed_name`]).
+    built_targets: Vec<String>,
     /// Every call site that is not a definition, statement by statement:
     /// the callee, where its arguments start and where its statement ends.
     /// Listed once, the first time a helper's calls are looked for.
@@ -755,6 +758,7 @@ pub(crate) fn read_code(lang: Lang, code: &str, depth: u8) -> InlineReading {
         node_calls: Vec::new(),
         functions: Vec::new(),
         read_names: Vec::new(),
+        built_targets: Vec::new(),
         call_list: None,
         closures: Vec::new(),
         string_code_depth: 0,
@@ -1262,6 +1266,7 @@ fn normalized_code(lang: Lang, code: &str) -> String {
                 (is_chain(object) && rest.trim().is_empty() && is_chain(name))
                     .then(|| format!("{object}.{name}"))
             });
+            text = python_literal_dict_lookups(&text);
         }
         Lang::Ruby => {
             for opener in [
@@ -1315,6 +1320,48 @@ fn normalized_code(lang: Lang, code: &str) -> String {
     text
 }
 
+/// Python's `x.__dict__['name']` and `x.__dict__.get('name')`, a name
+/// written out, as the attribute they look up: `x.name`. A name that is not
+/// one plain string is left for [`constructed_lookup`].
+fn python_literal_dict_lookups(code: &str) -> String {
+    const DICT: &str = ".__dict__";
+    let mut out = String::with_capacity(code.len());
+    let mut rest = code;
+    while let Some(found) = rest.find(DICT) {
+        let after = &rest[found + DICT.len()..];
+        let (inner, tail) = if let Some(open) = after.strip_prefix('[') {
+            match closing(open) {
+                Some(close) => (&open[..close], &open[close + 1..]),
+                None => ("", ""),
+            }
+        } else if let Some(open) = after.strip_prefix(".get(") {
+            match closing(open) {
+                Some(close) => (&open[..close], &open[close + 1..]),
+                None => ("", ""),
+            }
+        } else {
+            ("", "")
+        };
+        let name = simple_quoted(inner.trim())
+            .filter(|(name, rest)| rest.trim().is_empty() && is_chain(name))
+            .map(|(name, _)| name);
+        match name {
+            Some(name) => {
+                out.push_str(&rest[..found]);
+                out.push('.');
+                out.push_str(name);
+                rest = tail;
+            }
+            None => {
+                out.push_str(&rest[..found + DICT.len()]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A way code reaches a function by a name it builds at run time, found
 /// where it starts ([`constructed_lookup`]).
 #[derive(Clone, Copy, Debug)]
@@ -1355,6 +1402,17 @@ fn constructed_lookup(lang: Lang, text: &str, call_start: bool) -> Option<Lookup
     };
     match lang {
         Lang::Python => {
+            // An object's own table of names, indexed by one it builds
+            // (`os.__dict__['sys'+'tem']`, `.get(...)`); one written out is
+            // the attribute ([`python_literal_dict_lookups`]).
+            if !call_start {
+                if text.starts_with("__dict__.get(") {
+                    return Some(lookup("__dict__.get", true, false, false));
+                }
+                if text.starts_with("__dict__[") {
+                    return Some(lookup("__dict__", false, false, false));
+                }
+            }
             for name in [
                 "operator.methodcaller",
                 "importlib.import_module",
@@ -2469,6 +2527,10 @@ impl Reader<'_> {
         }
         self.scan_code_in_strings(start, end);
         for (chain, at, arguments_at) in self.call_sites(start, end) {
+            if let Some(skip) = self.built_target_call(&chain) {
+                self.read_constructed_call(arguments_at, end, skip);
+                continue;
+            }
             let callee = if self.lang == Lang::Php && is_variable(&chain) {
                 self.called_php_variable(&chain)
             } else {
@@ -2546,7 +2608,13 @@ impl Reader<'_> {
                 if let Some(lookup) =
                     constructed_lookup(self.lang, &code[at..end], starts_a_call(code, at))
                 {
-                    for (arguments_at, skip) in self.constructed_calls(at, end, lookup) {
+                    let calls = self.constructed_calls(at, end, lookup);
+                    if calls.is_empty() {
+                        if let Some(name) = self.bound_constructed_name(start, at, end, lookup) {
+                            self.built_targets.push(name);
+                        }
+                    }
+                    for (arguments_at, skip) in calls {
                         self.read_constructed_call(arguments_at, end, skip);
                     }
                 }
@@ -2609,6 +2677,86 @@ impl Reader<'_> {
             }
         }
         calls
+    }
+
+    /// The name a value whose target is built at run time is bound to, when
+    /// it is not called where it is built: `f = getattr(os, 'sys'+'tem')`,
+    /// `s = os.__dict__[n]`, Node's `const f = require(m)[n]`, Ruby's `m =
+    /// Kernel.method(n)`. A later call of the name, or of its `.call`, is
+    /// read as the call itself ([`Self::built_target_call`]).
+    fn bound_constructed_name(
+        &self,
+        start: usize,
+        at: usize,
+        end: usize,
+        lookup: Lookup,
+    ) -> Option<String> {
+        let code = self.code;
+        let bytes = code.as_bytes();
+        // Whether the value's target is built: the walk of
+        // [`Self::constructed_calls`], up to the value's end.
+        let mut cursor = at + lookup.name_len;
+        let mut own = lookup.own_group;
+        let mut built = lookup.built;
+        while cursor < end {
+            let rest = &code[cursor..end];
+            match rest.as_bytes()[0] {
+                b'(' | b'[' | b'{' => {
+                    let close = closing(&rest[1..])?;
+                    let inner = &rest[1..1 + close];
+                    if own || rest.starts_with('[') {
+                        built |= !whole_literal(inner);
+                    }
+                    own = false;
+                    cursor += close + 2;
+                }
+                b'.' => {
+                    let name = rest[1..].bytes().take_while(|b| is_name_byte(*b)).count();
+                    if name == 0 {
+                        break;
+                    }
+                    cursor += 1 + name;
+                }
+                _ => break,
+            }
+        }
+        if !built {
+            return None;
+        }
+        // The chain the lookup stands in (`os.__dict__[...]`), then the
+        // name it is bound to: `name = `, `name=`, never `==`.
+        let mut chain = at;
+        while chain > start && (is_name_byte(bytes[chain - 1]) || bytes[chain - 1] == b'.') {
+            chain -= 1;
+        }
+        let before = code[start..chain].trim_end().strip_suffix('=')?;
+        if before.ends_with(['=', '!', '<', '>', ':']) {
+            return None;
+        }
+        let before = before.trim_end();
+        let name_len = before
+            .bytes()
+            .rev()
+            .take_while(|b| is_name_byte(*b))
+            .count();
+        let name = &before[before.len() - name_len..];
+        (!name.is_empty() && !name.as_bytes()[0].is_ascii_digit()).then(|| name.to_string())
+    }
+
+    /// For a call of a name bound to a value whose target is built at run
+    /// time ([`Self::bound_constructed_name`]), how many lead arguments are
+    /// not handed to the target: none for `f(x)` and Ruby's `m.call(x)`,
+    /// the `this` of Node's `f.call(this, x)`.
+    fn built_target_call(&self, chain: &str) -> Option<usize> {
+        self.built_targets.iter().find_map(|name| {
+            if chain == name {
+                Some(0)
+            } else if chain.strip_prefix(name.as_str()) == Some(".call") {
+                Some(usize::from(self.lang == Lang::Js))
+            } else {
+                None
+            }
+        })
     }
 
     /// A call whose target is built at run time: not read, and what it is

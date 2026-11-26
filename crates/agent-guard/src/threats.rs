@@ -25421,9 +25421,13 @@ fn download_output_targets(words: &[String]) -> Vec<String> {
         return Vec::new();
     }
     let mut targets = redirect_targets(&words[command_index + 1..]);
+    let redirected = targets.len();
     let args = &words[command_index + 1..];
     let mut index = 0usize;
     let mut remote_name = false;
+    // The folder curl's `--output-dir` (wget's `-P`, `--directory-prefix`)
+    // puts a file it names by `-o` or by the remote name in.
+    let mut folder: Option<String> = None;
     // BSD `fetch URL` saves under the URL's last path component, like wget.
     let fetch_default_name = command == "fetch"
         && !args.iter().any(|argument| {
@@ -25462,6 +25466,25 @@ fn download_output_targets(words: &[String]) -> Vec<String> {
                 }
             }
         }
+        let folder_word = match command.as_str() {
+            "curl" => ["--output-dir"].as_slice(),
+            "wget" => ["-P", "--directory-prefix"].as_slice(),
+            _ => [].as_slice(),
+        };
+        if folder_word.contains(&argument.as_str()) {
+            folder = args.get(index + 1).cloned();
+            index += 2;
+            continue;
+        }
+        if let Some(value) = folder_word
+            .iter()
+            .filter(|word| word.starts_with("--"))
+            .find_map(|word| argument.strip_prefix(&format!("{word}=")))
+        {
+            folder = Some(value.to_string());
+            index += 1;
+            continue;
+        }
         let takes_next = match command.as_str() {
             "curl" | "fetch" => matches!(argument.as_str(), "-o" | "--output"),
             "wget" => matches!(argument.as_str(), "-O" | "--output-document"),
@@ -25494,6 +25517,17 @@ fn download_output_targets(words: &[String]) -> Vec<String> {
     if command == "wget" || (command == "curl" && remote_name) || fetch_default_name {
         if let Some(name) = args.iter().find_map(|argument| remote_basename(argument)) {
             targets.push(name);
+        }
+    }
+    // A name of the downloader's own, not a path from `/` or `~`, lands in
+    // the folder it was given: `curl --output-dir ~/.ssh -O URL` writes
+    // `~/.ssh/<remote name>`.
+    if let Some(folder) = folder.filter(|folder| !folder.is_empty()) {
+        let folder = folder.trim_end_matches('/');
+        for target in &mut targets[redirected..] {
+            if !target.starts_with('/') && !target.starts_with('~') {
+                *target = format!("{folder}/{target}");
+            }
         }
     }
     targets

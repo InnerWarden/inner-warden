@@ -46,6 +46,13 @@ pub(crate) const INSTRUCTION_FOLDERS: &[&str] = &[
     ".github/instructions/",
 ];
 
+/// Folders whose Markdown files an agent reads as orders when it is asked
+/// to: Claude Code's custom commands (`/deploy` runs
+/// `.claude/commands/deploy.md` as the prompt) and subagents (the body of
+/// `.claude/agents/<name>.md` is that agent's instructions), in a project
+/// or in the home.
+pub(crate) const INSTRUCTION_MARKDOWN_FOLDERS: &[&str] = &[".claude/commands/", ".claude/agents/"];
+
 /// Whether `path` names a file an agent reads as its instructions.
 pub fn is_instruction_file(path: &str) -> bool {
     let lower = path
@@ -53,11 +60,12 @@ pub fn is_instruction_file(path: &str) -> bool {
         .to_ascii_lowercase()
         .replace('\\', "/");
     let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let in_folder =
+        |folder: &&str| lower.starts_with(folder) || lower.contains(&format!("/{folder}"));
     INSTRUCTION_NAMES.contains(&name)
         || name.ends_with(".instructions.md")
-        || INSTRUCTION_FOLDERS
-            .iter()
-            .any(|folder| lower.starts_with(folder) || lower.contains(&format!("/{folder}")))
+        || INSTRUCTION_FOLDERS.iter().any(in_folder)
+        || (name.ends_with(".md") && INSTRUCTION_MARKDOWN_FOLDERS.iter().any(in_folder))
 }
 
 /// The line a shell runs from its `-c` (`-lc`, `-ec`): the word after it.
@@ -259,6 +267,7 @@ pub(crate) fn mentions_one(content: &str) -> bool {
     INSTRUCTION_NAMES
         .iter()
         .chain(INSTRUCTION_FOLDERS)
+        .chain(INSTRUCTION_MARKDOWN_FOLDERS)
         .any(|name| lower.contains(name.trim_end_matches('/')))
         || lower.contains(".instructions.md")
 }

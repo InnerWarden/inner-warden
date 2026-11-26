@@ -15,6 +15,16 @@ monitor is still only recorded. Starting an AI agent with `IW_NOTIFY_CONFIG`,
 it with its hook moved: a release build honours `IW_NOTIFY_CONFIG=/dev/null`,
 which switched the child's alerts off.
 
+On Gemini CLI that monitor refusal is now a refusal too: the monitor line
+`agents connect gemini --monitor` writes turned every end of the guard but 0
+into 1, Gemini's "warn and run", so the write ran. The new line passes the
+refusal on and still lets the call run when the guard is gone or cannot
+start; run `innerwarden agents connect gemini --monitor` once to replace
+the line an earlier version wrote. An order written into Claude Code's
+custom commands or subagents (`.claude/commands/*.md`, `.claude/agents/*.md`)
+is read as one written into `CLAUDE.md`, and so is a file an instruction
+file imports with `@path`.
+
 `innerwarden --version`, the hint that points `setup`, `dashboard`, `upgrade`
 and `uninstall` at the host layer, and `innerwarden openclaw status` name the
 host install on the machine by what it has: InnerWarden Pro only where a
