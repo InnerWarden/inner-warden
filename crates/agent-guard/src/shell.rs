@@ -3239,7 +3239,7 @@ pub(crate) fn text_written_by_cat_blanked(source: &str) -> Option<String> {
     let mut changed = false;
     for command in &line.commands {
         if !notes(command) {
-            if command_runs_nothing_written(command) {
+            if command_runs_nothing_written(command) || command_shows_files_only(command) {
                 continue;
             }
             return None;
@@ -3263,6 +3263,44 @@ pub(crate) fn text_written_by_cat_blanked(source: &str) -> Option<String> {
         }
     }
     changed.then_some(out)
+}
+
+/// Whether a command only shows files on the terminal: `cat`, `head`,
+/// `tail`, `less`, `more` or `bat` with every word written as it runs,
+/// what it prints handed to no other command and written into no file but
+/// a notes file or `/dev/null`. Showing a file never runs it, so notes
+/// written by `cat` and then shown stay text. A pager takes no option and
+/// no command at all: its own commands (`less +!cmd`), a key file that sets
+/// its input filter (`less --lesskey-src`) or a pager it is told to start
+/// (`bat --pager`) may run what the notes hold, so the line stays read
+/// whole.
+///
+/// Measured 2026-11-26 (a line of Pro's hook tests): notes written with
+/// `cat` that quoted a here-document handed to `python3` were refused as
+/// that rewrite once a `cat` of the same file followed.
+fn command_shows_files_only(command: &crate::shell_words::Command) -> bool {
+    let Some(first) = command.words.first() else {
+        return false;
+    };
+    if !command.words.iter().all(crate::shell_words::Word::is_plain)
+        || command.piped
+        || !command.inputs.is_empty()
+        || !command.reads.is_empty()
+        || !command.writes.iter().all(|target| {
+            target.is_plain() && (target.text == "/dev/null" || is_notes_file(&target.text))
+        })
+    {
+        return false;
+    }
+    let pager = match first.text.as_str() {
+        "cat" | "head" | "tail" => false,
+        "less" | "more" | "bat" => true,
+        _ => return false,
+    };
+    !pager
+        || command.words[1..]
+            .iter()
+            .all(|word| !word.text.starts_with(['-', '+']))
 }
 
 /// Whether a file a line writes is a notes file: a document by its
