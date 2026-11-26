@@ -89,7 +89,7 @@ fn a_value_inside_the_taint_window_survives_expiry() {
     let mut s = PersistedSession::default();
     s.record_tool_result("Read", "the deploy target is deploy.example.com", now);
     assert_eq!(
-        s.tainted_values.len(),
+        s.destinations_kept(),
         1,
         "a value recorded just now must not be expired by the same call"
     );

@@ -112,7 +112,15 @@ impl Host {
     }
 
     /// Whether the store, or a change kept beside it, holds `value`.
+    /// Whether the store, or a change kept beside it, keeps `value` among
+    /// what tool results carried in: a network destination is kept as a
+    /// hash, so each session is asked for it by name.
     fn kept(&self, value: &str) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let command = format!("nc {value} 443");
         std::fs::read_dir(self.dir.path())
             .expect("scratch dir")
             .flatten()
@@ -121,8 +129,17 @@ impl Host {
                 let name = entry.file_name().to_string_lossy().into_owned();
                 name == "sessions.json" || name.ends_with(".pending")
             })
-            .any(|entry| {
-                std::fs::read_to_string(entry.path()).is_ok_and(|text| text.contains(value))
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .any(|store| {
+                store["sessions"].as_object().is_some_and(|sessions| {
+                    sessions.values().any(|session| {
+                        serde_json::from_value::<
+                            innerwarden_agent_guard::session::PersistedSession,
+                        >(session.clone())
+                        .is_ok_and(|state| state.tainted_argument(&command, now).is_some())
+                    })
+                })
             })
     }
 }
