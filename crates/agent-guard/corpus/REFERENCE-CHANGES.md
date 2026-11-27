@@ -581,3 +581,26 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   substitution before the notes stays read whole, so a journal entry whose
   date is taken by `$(date)` stays refused: a known false positive, kept on
   purpose. No other corpus line moved.
+- 2026-11-27: mcp-sessions grows by two whole sessions. mcps-015 is
+  must_refuse: a login, an answer that prints the issuer of its tokens,
+  then a call carrying a token forged with that issuer; refused on main and
+  here (`AG-TAINT`). mcps-104 is benign: a login returns a session token,
+  the agent sends it to `whoami`, whose answer prints the issuer it reads
+  out of the token, then sends the same token to `verify_token`. Main
+  refuses the last call (`AG-TAINT`): a call is read decoded
+  (`super::canon`), so the issuer inside the token's base64 claims matched
+  the issuer `whoami` printed, recorded as the server's. The answer to a
+  call no longer records a word that stands whole in what a value the call
+  sent holds decoded and that is not in that value as written
+  (`taint::SentValues::holds`, `taint::stands_whole_in`): the issuer was
+  the agent's own, inside the token it sent. The same issuer printed by the
+  answer to another call still taints (mcps-015). Held by
+  `taint::tests::the_claims_read_out_of_a_token_sent_are_the_calls_own`,
+  `a_decoded_value_holds_only_whole_words_not_written_ones` and
+  `a_decoded_value_is_looked_through_within_its_budget`, which fail on
+  revert, and by `the_session_corpus_holds` in
+  `tests/mcp/mcp_effect_and_provenance.rs`. No other corpus line moved.
+  harmless-proven:
+  mcp-sessions/mcps-104
+  goes from deny to allow for the reason above: a session token a login
+  returned, sent back to the server that issued it.

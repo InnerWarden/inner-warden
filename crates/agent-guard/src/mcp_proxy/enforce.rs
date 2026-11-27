@@ -1562,6 +1562,54 @@ mod tests {
         }
     }
 
+    /// AgentDojo's workspace tasks 35 and 38 (a delete of file `11`, refused
+    /// by ATR-2026-040 for the tool's name) on a server whose `initialize`
+    /// answer says protocol `2025-11-25` and version `1.30.0`: a warning in
+    /// the default posture, as for a file no server named. Each number of
+    /// the two versions was a value a server said, and kept the refusal.
+    ///
+    /// FAILS ON REVERT of the router keeping only the instructions of the
+    /// `initialize` answer.
+    #[test]
+    fn a_number_of_the_handshake_does_not_keep_a_refusal_by_name() {
+        use crate::mcp_proxy::taint::TaintTracker;
+        let handshake = serde_json::json!({
+            "jsonrpc": "2.0", "id": 0,
+            "result": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {"listChanged": false}},
+                "serverInfo": {"name": "workspace", "version": "1.30.0"}
+            }
+        })
+        .to_string();
+        for file_id in ["0", "1", "11", "25", "30", "2025"] {
+            let mut taint = TaintTracker::new();
+            let _ = route_message(
+                &env(&handshake),
+                Direction::ServerToClient,
+                Some(&PendingRequest {
+                    method: "initialize".into(),
+                    tool: None,
+                }),
+                None,
+                Some(&mut taint),
+            );
+            let (d, action) = posture(
+                "delete_file",
+                &format!(r#"{{"file_id":"{file_id}"}}"#),
+                ProxyMode::Guard,
+                &mut taint,
+            );
+            assert_eq!(
+                action,
+                ProxyAction::ForwardWithAlert,
+                "file {file_id}: {:?}",
+                d.verdict.alerts
+            );
+            assert!(d.verdict.alerts.iter().any(|a| a.rule == POSTURE_RULE));
+        }
+    }
+
     /// What is refused in every posture: a secret read, a privileged write, a
     /// shell line judged deny, a value that matches a rule by what it says,
     /// a delete of the root, a home or a key store, and a refusal beside the
