@@ -10659,6 +10659,39 @@ mod tests {
         }
     }
 
+    /// A temp folder the line runs from is charged once when a line it hands on
+    /// names the same folder, and charged again when the handed line names
+    /// another: the same signal name for another folder is its own finding.
+    #[test]
+    fn a_temp_folder_is_charged_once_and_another_folder_on_its_own() {
+        let charged = |command: &str| -> Vec<String> {
+            analyze_command(command, None)
+                .signals
+                .into_iter()
+                .filter(|s| s.signal == "tmp_execution" && s.score > 0)
+                .map(|s| s.detail)
+                .collect()
+        };
+
+        let same = charged("bash /tmp/iw-a.sh; sh -c 'bash /tmp/iw-b.sh'");
+        assert_eq!(same.len(), 1, "/tmp/ charged twice: {same:?}");
+
+        let other = charged("bash /tmp/iw-a.sh; sh -c 'bash /dev/shm/iw-b.sh'");
+        assert_eq!(other.len(), 2, "each folder charged once: {other:?}");
+        assert!(
+            other
+                .iter()
+                .any(|d| d == "references world-writable directory: /tmp/"),
+            "{other:?}"
+        );
+        assert!(
+            other
+                .iter()
+                .any(|d| d.ends_with("references world-writable directory: /dev/shm/")),
+            "{other:?}"
+        );
+    }
+
     /// One observation is charged once, and the displayed scores still add up.
     ///
     /// `curl … | sh` fired three rules for the single fact "remote content is fed

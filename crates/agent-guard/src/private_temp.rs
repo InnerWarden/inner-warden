@@ -406,4 +406,20 @@ mod tests {
             ]
         );
     }
+
+    /// A quote opened inside the word, after the path starts, is taken off and
+    /// holds its spaces as the shell reads it: the directory judged is the one
+    /// the line runs from, not the word cut at the quote.
+    #[test]
+    fn a_quote_opened_inside_a_path_is_taken_off_and_holds_its_spaces() {
+        assert_eq!(
+            temp_paths("bash /tmp/q/'a b'/c.sh; bash /tmp/q/\"d e\"/f.sh"),
+            vec![
+                Some("/tmp/q/a b/c.sh".to_string()),
+                Some("/tmp/q/d e/f.sh".to_string()),
+            ]
+        );
+        // Opened inside the word and never closed: the guard cannot read it.
+        assert_eq!(temp_paths("bash /tmp/q/'a b"), vec![None]);
+    }
 }
