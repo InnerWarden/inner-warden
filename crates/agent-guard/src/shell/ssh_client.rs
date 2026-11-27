@@ -55,36 +55,35 @@ const REMOTE_DEPTH: u8 = 4;
 /// first word after the destination that is not an option (`ssh` reads
 /// options again after the destination). A letter not known is `None`.
 pub(super) fn ssh_command_start(args: &[String]) -> Option<usize> {
-    let mut index = 0;
     let mut destination = false;
     let mut options_end = false;
-    loop {
-        let arg = args.get(index)?;
+    let mut indexed = args.iter().enumerate();
+    while let Some((index, arg)) = indexed.next() {
         if !options_end && arg == "--" {
             options_end = true;
-            index += 1;
             continue;
         }
         if !options_end && arg.len() > 1 && arg.starts_with('-') {
-            let mut takes_next = false;
             for (at, letter) in arg[1..].char_indices() {
                 if SSH_VALUED.contains(letter) {
-                    takes_next = at + letter.len_utf8() == arg.len() - 1;
+                    // The value is the next word when the letter ends this one.
+                    if at + letter.len_utf8() == arg.len() - 1 {
+                        indexed.next();
+                    }
                     break;
                 }
                 if !SSH_PLAIN.contains(letter) {
                     return None;
                 }
             }
-            index += if takes_next { 2 } else { 1 };
             continue;
         }
         if destination {
             return Some(index);
         }
         destination = true;
-        index += 1;
     }
+    None
 }
 
 /// `line` as the secret-read check reads it
@@ -118,10 +117,7 @@ pub(crate) fn client_reading(line: &str) -> Cow<'_, str> {
     if !line.contains("ssh") {
         return Cow::Borrowed(line);
     }
-    match reading_at(line, 0) {
-        Some(reading) if reading != line => Cow::Owned(reading),
-        _ => Cow::Borrowed(line),
-    }
+    reading_at(line, 0).map_or(Cow::Borrowed(line), Cow::Owned)
 }
 
 /// [`client_reading`] of `line`, `depth` remote lines in. `None` where the
@@ -481,10 +477,12 @@ pub(super) fn names_ssh_client_settings(word: &str) -> bool {
     }
 }
 
-/// The places of `-F` and its value in an `ssh`, `scp` or `sftp` command's
-/// arguments when the value is the ssh client's own settings
+/// The places of `-F` in an `ssh`, `scp` or `sftp` command's arguments
+/// when its value is the ssh client's own settings
 /// ([`names_ssh_client_settings`]): `-F ~/.ssh/config.d/work` hands the
-/// client a file of the person's settings, as no `-F` at all does.
+/// client a file of the person's settings, as no `-F` at all does. A value
+/// of its own word is blanked as any word naming the settings is
+/// ([`reading_at`]); `-F~/.ssh/config` is one word, blanked whole here.
 fn settings_options(arguments: &[tree_sitter::Node<'_>], source: &[u8]) -> Vec<Range<usize>> {
     let mut places = Vec::new();
     let texts: Vec<String> = arguments
@@ -502,11 +500,10 @@ fn settings_options(arguments: &[tree_sitter::Node<'_>], source: &[u8]) -> Vec<R
                 && stands_alone(arguments[at + 1], source)
             {
                 places.push(arguments[at].byte_range());
-                places.push(arguments[at + 1].byte_range());
             }
         } else if text
             .strip_prefix("-F")
-            .is_some_and(|value| !value.is_empty() && names_ssh_client_settings(value))
+            .is_some_and(names_ssh_client_settings)
             && stands_alone(arguments[at], source)
         {
             places.push(arguments[at].byte_range());
@@ -529,10 +526,10 @@ fn settings_options(arguments: &[tree_sitter::Node<'_>], source: &[u8]) -> Vec<R
 ///   `--include-from`): the key may be in it;
 /// - the transport holds a quote, an escape, a separator, a redirection, a
 ///   substitution, a pattern, or a variable written any way but `$NAME` or
-///   `${NAME}`;
+///   `${NAME}`, in any of its words;
 /// - an option of the transport is not known, hands the client a file of
-///   settings (`-F` but the person's own, `-o Include=`) or code (`-I`,
-///   `-o PKCS11Provider=`), or a command (`-o ProxyCommand=`);
+///   settings (`-F`, `-o Include=`) or code (`-I`, `-o PKCS11Provider=`),
+///   or a command (`-o ProxyCommand=`);
 /// - a variable of the key may be set by the line (or `IFS` may), so it
 ///   may hold a blank and a second word: `HOME='x ~/.ssh/id_rsa'` makes the
 ///   key a file `ssh` is handed as its destination;
@@ -575,7 +572,7 @@ fn transport_identities(
             continue;
         };
         if let Some(key) = transport_identity(&transport, line_sets) {
-            places.extend(map[key].iter().flatten().map(|&at| at..at + 1));
+            places.extend(map[key].iter().map(|&at| at..at + 1));
         }
     }
     places
@@ -604,9 +601,8 @@ fn transport_identity(transport: &str, line_sets: &HashSet<String>) -> Option<Ra
         return None;
     }
     let mut key: Option<Range<usize>> = None;
-    let mut index = 1;
-    while let Some(&(start, word)) = words.get(index) {
-        index += 1;
+    let mut options = words.iter().skip(1);
+    while let Some(&(start, word)) = options.next() {
         let Some(letters) = word.strip_prefix('-').filter(|letters| !letters.is_empty()) else {
             // An operand: rsync adds the host after the transport, and
             // whatever stands here is no option of the client.
@@ -621,15 +617,16 @@ fn transport_identity(transport: &str, line_sets: &HashSet<String>) -> Option<Ra
             }
             let left = &letters[offset + letter.len_utf8()..];
             let (value, value_start) = if left.is_empty() {
-                let &(next_start, next) = words.get(index)?;
-                index += 1;
+                let &(next_start, next) = options.next()?;
                 (next, next_start)
             } else {
-                (left, start + 1 + offset + letter.len_utf8())
+                (left, start + word.len() - left.len())
             };
             match letter {
-                'I' => return None,
-                'F' if !names_ssh_client_settings(value) => return None,
+                // Code, or a file of settings: the person's own names a
+                // path under `.ssh/`, a word every transport naming one
+                // is refused for below.
+                'I' | 'F' => return None,
                 'i' => {
                     if key.is_some() {
                         return None;
@@ -656,20 +653,23 @@ fn transport_identity(transport: &str, line_sets: &HashSet<String>) -> Option<Ra
         }
     }
     let key = key?;
-    let value = &transport[key.clone()];
-    let variables = variables_of_one_word(value)?;
-    if !variables.is_empty()
-        && (line_sets.contains("IFS") || variables.iter().any(|name| line_sets.contains(*name)))
+    // Every word holds only plain variables; every word but the one that
+    // holds the key and names a key or a credential is read as before.
+    let mut key_variables = Vec::new();
+    for &(start, word) in &words {
+        let variables = variables_of_one_word(word)?;
+        if start <= key.start && key.end <= start + word.len() {
+            key_variables = variables;
+        } else if crate::threats::check_sensitive_path(word).is_some() {
+            return None;
+        }
+    }
+    if !key_variables.is_empty()
+        && (line_sets.contains("IFS") || key_variables.iter().any(|name| line_sets.contains(*name)))
     {
         return None;
     }
-    // Every other word that names a key or a credential is read as before.
-    let elsewhere = words.iter().any(|&(start, word)| {
-        start != key.start
-            && !(start < key.start && key.end <= start + word.len())
-            && crate::threats::check_sensitive_path(word).is_some()
-    });
-    (!elsewhere).then_some(key)
+    Some(key)
 }
 
 /// The names of the variables `$NAME` and `${NAME}` in `word`, when they
@@ -701,74 +701,38 @@ fn variables_of_one_word(word: &str) -> Option<Vec<&str>> {
 }
 
 /// `written`, one shell word at byte `base` of its line, with its quotes
-/// taken off, and for each byte the byte of the line it came from. A
-/// `$NAME` or `${NAME}` is kept as written (its value is not known here);
-/// any other expansion, a substitution or an escaped line end is `None`.
-fn unquote_keeping_variables(written: &[u8], base: usize) -> Option<(String, Vec<Option<usize>>)> {
+/// taken off, and for each byte the byte of the line it came from. A `$`
+/// is kept as written (what follows it is judged by
+/// [`variables_of_one_word`]); an escaped line end, or a pattern, a brace
+/// or a `~` outside double quotes, is `None`.
+fn unquote_keeping_variables(written: &[u8], base: usize) -> Option<(String, Vec<usize>)> {
     let mut out = Vec::new();
     let mut map = Vec::new();
-    let mut at = 0;
     let mut double = false;
-    while let Some(&byte) = written.get(at) {
+    let mut bytes = (base..).zip(written.iter().copied());
+    while let Some((at, byte)) = bytes.next() {
         match byte {
-            b'\'' if !double => {
-                at += 1;
-                loop {
-                    let byte = *written.get(at)?;
-                    at += 1;
-                    if byte == b'\'' {
-                        break;
-                    }
-                    out.push(byte);
-                    map.push(Some(base + at - 1));
+            b'\'' if !double => loop {
+                let (at, byte) = bytes.next()?;
+                if byte == b'\'' {
+                    break;
                 }
-            }
-            b'"' => {
-                double = !double;
-                at += 1;
-            }
+                out.push(byte);
+                map.push(at);
+            },
+            b'"' => double = !double,
             b'\\' => {
-                let next = *written.get(at + 1)?;
+                let (at, next) = bytes.next()?;
                 if next == b'\n' || (double && !matches!(next, b'"' | b'\\' | b'$' | b'`')) {
                     return None;
                 }
                 out.push(next);
-                map.push(Some(base + at + 1));
-                at += 2;
+                map.push(at);
             }
-            b'`' => return None,
-            b'$' => {
-                let rest = &written[at + 1..];
-                let length = match rest.first() {
-                    Some(b'{') => {
-                        let close = rest.iter().position(|&b| b == b'}')?;
-                        let name = &rest[1..close];
-                        if name.is_empty()
-                            || !name.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'_')
-                        {
-                            return None;
-                        }
-                        close + 1
-                    }
-                    Some(first) if first.is_ascii_alphabetic() || *first == b'_' => rest
-                        .iter()
-                        .position(|b| !(b.is_ascii_alphanumeric() || *b == b'_'))
-                        .unwrap_or(rest.len()),
-                    _ => return None,
-                };
-                for offset in 0..=length {
-                    out.push(written[at + offset]);
-                    map.push(Some(base + at + offset));
-                }
-                at += length + 1;
-            }
+            b'*' | b'?' | b'[' | b'{' | b'~' if !double => return None,
             _ => {
-                if !double && matches!(byte, b'*' | b'?' | b'[' | b'{' | b'~') {
-                    return None;
-                }
                 out.push(byte);
-                map.push(Some(base + at));
-                at += 1;
+                map.push(at);
             }
         }
     }
@@ -839,9 +803,8 @@ pub(crate) fn private_key_opened(line: &str) -> Option<(&'static str, u32)> {
 fn keygen_opened_file(args: &[String]) -> Option<String> {
     let mut opens = false;
     let mut file = None;
-    let mut index = 0;
-    while let Some(arg) = args.get(index) {
-        index += 1;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         if arg == "--" {
             break;
         }
@@ -856,8 +819,7 @@ fn keygen_opened_file(args: &[String]) -> Option<String> {
             if KEYGEN_VALUED.contains(letter) {
                 let left = &letters[offset + letter.len_utf8()..];
                 let value = if left.is_empty() {
-                    index += 1;
-                    args.get(index - 1).cloned()
+                    args.next().cloned()
                 } else {
                     Some(left.to_owned())
                 };
@@ -871,17 +833,18 @@ fn keygen_opened_file(args: &[String]) -> Option<String> {
     file.filter(|_| opens)
 }
 
-/// The variable `word` is, alone: `$k`, `${k}`.
+/// The variable `word` is, alone: `$k`, `${k}`. A name no `for` loop can
+/// set (`$1`, `$`) is taken as one all the same: no loop holds it, and the
+/// word names no key either way.
 fn loop_variable(word: &str) -> Option<&str> {
     let name = word.strip_prefix('$')?;
     let name = name
         .strip_prefix('{')
         .and_then(|name| name.strip_suffix('}'))
         .unwrap_or(name);
-    (!name.is_empty()
-        && !name.starts_with(|c: char| c.is_ascii_digit())
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-    .then_some(name)
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        .then_some(name)
 }
 
 /// The words of every `for NAME in WORDS` loop that holds `command`.
@@ -924,6 +887,12 @@ mod tests {
         client_reading(line) == line
     }
 
+    /// Whether the reading of `line` is `line` with the bytes of `key` (its
+    /// first place) blanked, and nothing else. Compared, never printed.
+    fn reads_with_key_blanked(line: &str, key: &str) -> bool {
+        client_reading(line) == line.replacen(key, &" ".repeat(key.len()), 1)
+    }
+
     fn words(line: &str) -> Vec<String> {
         line.split(' ').map(str::to_owned).collect()
     }
@@ -934,7 +903,9 @@ mod tests {
             ("host psql", Some(1)),
             ("-p 22 host -t psql", Some(4)),
             ("-oBatchMode=yes host psql", Some(2)),
+            ("-qp 22 host psql", Some(3)),
             ("-- host psql", Some(2)),
+            ("- psql", Some(1)),
             ("host", None),
             ("-Z host psql", None),
         ] {
@@ -977,12 +948,58 @@ mod tests {
     }
 
     #[test]
+    fn a_public_ssh_file_is_named_only_plainly() {
+        for word in [
+            "~/.ssh/id_k.pub",
+            "$HOME/.ssh/known_hosts",
+            "${HOME}/.ssh/known_hosts.old",
+            "/home/u/.ssh/authorized_keys",
+            "authorized_keys2",
+            "k.pub",
+        ] {
+            assert!(names_public_ssh_file(word), "{word}");
+        }
+        for word in [
+            "",
+            "-x.pub",
+            "~/.ssh/.pub",
+            "~/.ssh/$K.pub",
+            "~/.ssh/*.pub",
+            "~/.ssh/id_k.pub(:r)",
+            "~/.ssh/../.ssh/id_k.pub",
+            "\"~/.ssh/id_k.pub\"",
+            "~/.ssh/id_k",
+            "~/.ssh/known_hosts/x",
+        ] {
+            assert!(!names_public_ssh_file(word), "{word}");
+        }
+    }
+
+    #[test]
     fn a_remote_line_is_read_on_a_line_of_its_own() {
         let reading = client_reading("ssh -i ~/.ssh/id_k h1 'tail -n 5 /var/log/syslog'");
         let (command, remote) = reading.split_once('\n').expect("two lines");
         assert!(
             command.trim_end() == "ssh -i ~/.ssh/id_k h1" && remote == "tail -n 5 /var/log/syslog",
             "the remote line is not read on a line of its own"
+        );
+    }
+
+    #[test]
+    fn a_remote_line_is_read_remote_depth_deep_and_no_deeper() {
+        // Four remote lines in: the fourth `ssh` is read, and its `-F` is
+        // the person's settings.
+        let reading = client_reading("ssh h1 ssh h2 ssh h3 ssh -F /home/u/.ssh/config h4 uptime");
+        assert!(
+            !reading.contains(".ssh"),
+            "a remote line REMOTE_DEPTH deep is not read"
+        );
+        // Five: the fifth is left as written.
+        let reading =
+            client_reading("ssh h1 ssh h2 ssh h3 ssh h4 ssh -F /home/u/.ssh/config h5 uptime");
+        assert!(
+            reading.lines().last() == Some("ssh -F /home/u/.ssh/config h5 uptime"),
+            "a remote line deeper than REMOTE_DEPTH is read"
         );
     }
 
@@ -1028,13 +1045,19 @@ mod tests {
     #[test]
     fn a_substitution_read_as_a_value_or_as_a_public_key() {
         // The whole value of a variable: the remote line is read alone.
-        let reading = client_reading("out=$(ssh -i ~/.ssh/id_k h1 'grep -c x log'); echo $out");
-        assert!(
-            reading.ends_with("\ngrep -c x log"),
-            "the remote line of a variable's value is not read alone"
-        );
-        // A word of a command: what it prints may be the path read.
         for line in [
+            "out=$(ssh -i ~/.ssh/id_k h1 'grep -c x log'); echo $out",
+            "out=\"$(ssh -i ~/.ssh/id_k h1 'grep -c x log')\"; echo \"$out\"",
+        ] {
+            assert!(
+                client_reading(line).ends_with("\ngrep -c x log"),
+                "the remote line of a variable's value is not read alone: {line}"
+            );
+        }
+        // A word of a command, or a part of a value: what it prints may be
+        // the path read.
+        for line in [
+            "out=\"n=$(ssh -i ~/.ssh/id_k h1 'grep -c x log')\"",
             "cat \"$(ssh h1 'echo /home/u/.ssh/id_rsa')\"",
             "cat <(ssh h1 'echo x') ~/.ssh/id_rsa",
             "x=$(cat \"$(ssh h1 'echo /home/u/.ssh/id_rsa')\")",
@@ -1068,6 +1091,11 @@ mod tests {
         ] {
             assert!(read_as_written(line), "{line}");
         }
+        // Its output sent to a file feeds it nothing: its remote line is
+        // read on its own.
+        for line in ["ssh h1 uptime > out", "ssh h1 uptime 2>> err"] {
+            assert!(!read_as_written(line), "{line}");
+        }
     }
 
     #[test]
@@ -1084,6 +1112,21 @@ mod tests {
                 .eq(["ssh", "-i", "~/.ssh/id_rsa", "h1"]),
             "-F with the person's settings is not blanked, or more is"
         );
+        let reading = client_reading("ssh -F~/.ssh/config.d/w -i ~/.ssh/id_rsa h1");
+        assert!(
+            reading
+                .split_whitespace()
+                .eq(["ssh", "-i", "~/.ssh/id_rsa", "h1"]),
+            "-F joined to the person's settings is not blanked, or more is"
+        );
+        for kept in [
+            "ssh -F ./cfg -i ~/.ssh/id_rsa h1",
+            "ssh -F~/.ssh/config.bak -i ~/.ssh/id_rsa h1",
+            // The settings are not a word alone: more follows them.
+            "ssh -F ~/.ssh/config>o -i ~/.ssh/id_rsa h1",
+        ] {
+            assert!(read_as_written(kept), "{kept}");
+        }
         for written in [
             "grep -q 'Host h1' ~/.ssh/config || printf 'Host h1\\n' >> ~/.ssh/config",
             "grep -n h1 ~/.ssh/config; echo k >> ~/.ssh/authorized_keys",
@@ -1128,6 +1171,57 @@ mod tests {
     }
 
     #[test]
+    fn the_key_of_a_transport_is_blanked_byte_for_byte() {
+        for (line, key) in [
+            (
+                "rsync -e \"ssh -i$HOME/.ssh/id_k\" d/ u@h1:x/",
+                "$HOME/.ssh/id_k",
+            ),
+            (
+                "rsync -e \"ssh -qi$HOME/.ssh/id_k\" d/ u@h1:x/",
+                "$HOME/.ssh/id_k",
+            ),
+            (
+                "rsync -e \"ssh -o IdentityFile=$HOME/.ssh/id_k\" d/ u@h1:x/",
+                "$HOME/.ssh/id_k",
+            ),
+            (
+                "rsync -e \"ssh -oIdentityFile=$HOME/.ssh/id_k\" d/ u@h1:x/",
+                "$HOME/.ssh/id_k",
+            ),
+            (
+                "rsync -a --rsh=\"ssh -i ${HOME}/.ssh/id_k\" d/ u@h1:x/",
+                "${HOME}/.ssh/id_k",
+            ),
+            // Quoted whole, single or double, and an escape.
+            ("rsync -e 'ssh -i ~/.ssh/id_k' d/ u@h1:x/", "~/.ssh/id_k"),
+            ("rsync -e \"ssh -i ~/.ssh/id_k\" d/ u@h1:x/", "~/.ssh/id_k"),
+            (
+                "rsync -e ssh\\ -i\\ \\~/.ssh/id_k d/ u@h1:x/",
+                "~/.ssh/id_k",
+            ),
+        ] {
+            assert!(reads_with_key_blanked(line, key), "{line}");
+        }
+        for kept in [
+            // Code the client loads.
+            "rsync -e \"ssh -I /usr/lib/p.so -i $HOME/.ssh/id_k\" d/ u@h1:x/",
+            // A key named before the key.
+            "rsync -e \"ssh -o UserKnownHostsFile=~/.ssh/id_rsa -i $HOME/.ssh/id_k\" d/ u@h1:x/",
+            // An expansion that is no plain variable, in any word.
+            "rsync -e \"ssh -p $1 -i $HOME/.ssh/id_k\" d/ u@h1:x/",
+            "rsync -e \"ssh -i ${1}/.ssh/id_k\" d/ u@h1:x/",
+            // A `~` the shell may expand, a backslash or a quote the
+            // shell keeps.
+            "rsync -e ssh\\ -i\\ ~/.ssh/id_k d/ u@h1:x/",
+            "rsync -e \"ssh -i \\~/.ssh/id_k\" d/ u@h1:x/",
+            "rsync -e \"ssh -i '~/.ssh/id_k'\" d/ u@h1:x/",
+        ] {
+            assert!(read_as_written(kept), "{kept}");
+        }
+    }
+
+    #[test]
     fn keygen_opens_a_private_key_named_or_walked_by_a_loop() {
         for line in [
             "ssh-keygen -y -f ~/.ssh/id_ed25519",
@@ -1135,7 +1229,9 @@ mod tests {
             "ssh-keygen -p -N '' -f ~/.ssh/id_rsa",
             "ssh-keygen -i -m PEM -f deploy.key",
             "for k in ~/.ssh/id_*; do ssh-keygen -y -f $k; done",
+            "for key_a in ~/.ssh/id_*; do ssh-keygen -y -f ${key_a}; done",
             "for k in ~/.ssh/id_*; do case $k in *.pub) ;; *) ssh-keygen -y -f \"$k\";; esac; done",
+            "ssh-keygen -y -f ${K:-~/.ssh/id_rsa}",
         ] {
             assert!(private_key_opened(line).is_some(), "{line}");
         }
@@ -1146,6 +1242,7 @@ mod tests {
             "ssh-keygen -R h1",
             "ssh-keygen -F h1 -f ~/.ssh/known_hosts",
             "for k in a b; do ssh-keygen -y -f $k; done",
+            "for d in ~/.ssh/id_*; do for k in a b; do ssh-keygen -y -f $k; done; done",
             "echo ssh-keygen -y -f ~/.ssh/id_rsa",
         ] {
             assert!(private_key_opened(line).is_none(), "{line}");

