@@ -59,7 +59,11 @@
 //!    session, as the JSON leaves it holds (strings, and the keys of maps
 //!    below the top), the text of a tool result's every block (text, an
 //!    embedded resource, a resource link's name and description), errors,
-//!    prompts, notifications, listings.
+//!    prompts, notifications, listings, and the instructions of the
+//!    `initialize` answer. The rest of that answer is the handshake (the
+//!    protocol version, the capabilities, the server's own name and
+//!    version): it describes the server program, not the world, and is not
+//!    kept.
 //! 3. **What the call carries** ([`carried`]): every string and number, at
 //!    any depth, every key below the top level, the address-, link- and
 //!    account-shaped words inside a longer string, and each argument's

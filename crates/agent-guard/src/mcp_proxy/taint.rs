@@ -233,6 +233,19 @@
 //! * the token is not kept already. A value another result brought in stays
 //!   tainted when the agent sends it on and the server repeats it.
 //!
+//! What such a value holds once decoded is what the call sent too. A token
+//! or a base64 blob is read decoded on both sides ([`super::canon`]), so a
+//! call that sends on the session token a login returned carries what the
+//! token holds (its issuer, its subject). A server that decodes it (a token
+//! verifier, a `whoami`) answers with those words, and, recorded as the
+//! server's, they refused the next call that sent the same token. So a word
+//! of the answer that stands whole in what a value the call sent holds
+//! decoded ([`stands_whole_in`]: `1.2.3.4` does not stand in `11.2.3.45`)
+//! is not recorded either, unless it is in that value as written (a word of
+//! a longer value as written is recorded, as above). The same word said in
+//! the answer to another call is recorded as before: a token forged with
+//! the issuer a configuration answer printed is refused.
+//!
 //! A value one call sent and the answer to another call names is recorded as
 //! before. What a call sent is kept until its answer arrives, for at most
 //! [`MAX_SENT_CALLS`] calls of [`SENT_CALL_COST`] each; past either, or for a
@@ -327,6 +340,11 @@ const SENT_CALL_COST: usize = 16 * 1024;
 /// The longest request id a call's sent values are kept under. A call with a
 /// longer id is not remembered, and its answer is recorded whole.
 const MAX_SENT_ID_BYTES: usize = 128;
+/// The most bytes of what a call's values hold decoded that the words of its
+/// answer are looked for in, for one answer (see "A value the agent sent").
+/// Past it, a word is recorded, the cautious side. A token of a few hundred
+/// bytes is looked through for thousands of words.
+const MAX_DECODED_LOOKUP_BYTES: usize = 4 * 1024 * 1024;
 
 /// The tools of the reference MCP filesystem server whose successful result is
 /// a list of names (entries, matches, allowed directories) rather than file
@@ -375,6 +393,58 @@ impl Provenance {
             _ => Provenance::Content,
         }
     }
+}
+
+/// What one call sent, kept until the answer to it is recorded (see "A value
+/// the agent sent").
+#[derive(Debug, Default)]
+struct SentValues {
+    /// Its whole argument values one token long, and the short destinations
+    /// it names, as written.
+    written: HashSet<Box<str>>,
+    /// Each whole value one token long that reads otherwise once decoded
+    /// ([`super::canon::canonical`]: a token, a base64 blob), as written
+    /// and decoded.
+    decoded: Vec<(Box<str>, Box<str>)>,
+}
+
+impl SentValues {
+    /// Whether `word` of the answer is what the call sent: one of its values
+    /// as written, or a value that stands whole in what one of them holds
+    /// decoded ([`stands_whole_in`]) and is not in it as written (a word of
+    /// a longer value as written is recorded, as for any argument). `budget`
+    /// is what is left of [`MAX_DECODED_LOOKUP_BYTES`]: past it the word is
+    /// not the call's.
+    fn holds(&self, word: &str, budget: &mut usize) -> bool {
+        if self.written.contains(word) {
+            return true;
+        }
+        self.decoded.iter().any(|(written, plain)| {
+            let cost = plain.len() + written.len();
+            if cost > *budget {
+                *budget = 0;
+                return false;
+            }
+            *budget -= cost;
+            stands_whole_in(plain, word) && !written.contains(word)
+        })
+    }
+}
+
+/// Whether `word` appears in `text` with nothing of a longer value on
+/// either side: at an end, or next to a space, a quote or the punctuation
+/// that separates values (`,;{}[]()<>|`). `1.2.3.4` does not stand whole in
+/// `11.2.3.45`, nor `evil.example` in `notevil.example`.
+fn stands_whole_in(text: &str, word: &str) -> bool {
+    if word.is_empty() {
+        return false;
+    }
+    let apart = |c: Option<char>| {
+        c.is_none_or(|c| c.is_whitespace() || QUOTES.contains(&c) || ",;{}[]()<>|".contains(c))
+    };
+    text.match_indices(word).any(|(at, _)| {
+        apart(text[..at].chars().next_back()) && apart(text[at + word.len()..].chars().next())
+    })
 }
 
 /// One recorded token, where it came from, and the result that holds it.
@@ -455,7 +525,7 @@ pub struct TaintTracker {
     /// The argument values each recent call sent, by request id, oldest
     /// first, until the answer to it is recorded (see "A value the agent
     /// sent").
-    sent: VecDeque<(Box<str>, HashSet<Box<str>>)>,
+    sent: VecDeque<(Box<str>, SentValues)>,
     /// The pins of this server's tool definitions ([`super::pins`]), when the
     /// proxy keeps them. Not taint either: kept here for the same reason as
     /// `declared`.
@@ -559,8 +629,9 @@ impl TaintTracker {
     }
 
     /// Remember the argument values a `tools/call` sent whole, each one token
-    /// long, under its request `id`, so that the answer to it does not record
-    /// them as the server's (see "A value the agent sent"). `reuses_result` is whether the call carries a
+    /// long, and what each holds decoded, under its request `id`, so that the
+    /// answer to it does not record them as the server's (see "A value the
+    /// agent sent"). `reuses_result` is whether the call carries a
     /// recorded token: such a call may have been steered, so nothing it sent
     /// is remembered, and an earlier call under the same id is forgotten too.
     /// A call with no id, or one longer than [`MAX_SENT_ID_BYTES`], is not
@@ -607,13 +678,44 @@ impl TaintTracker {
                 values.insert(dest.into());
             }
         });
-        if values.is_empty() {
+        // What a whole value holds once decoded (a token, a base64 blob),
+        // the spelling `arg_taint_alert` also reads it in: a server that
+        // decodes it (a token verifier, a `whoami`) answers with what it
+        // holds, and that is the value the call sent, read.
+        let mut decoded: Vec<(Box<str>, Box<str>)> = Vec::new();
+        walk_strings(args, &mut |value| {
+            // A decoded value costs at least what the value does, so one
+            // that cannot fit is not decoded at all.
+            if value.len() < MIN_TOKEN_LEN
+                || cost + value.len() + TOKEN_OVERHEAD > SENT_CALL_COST
+                || value.contains(char::is_whitespace)
+                || decoded.iter().any(|(kept, _)| **kept == *value)
+            {
+                return;
+            }
+            let Cow::Owned(plain) = super::canon::canonical(value) else {
+                return;
+            };
+            let added = value.len() + cost_of(&plain);
+            if cost + added > SENT_CALL_COST {
+                return;
+            }
+            cost += added;
+            decoded.push((value.into(), plain.into()));
+        });
+        if values.is_empty() && decoded.is_empty() {
             return;
         }
         if self.sent.len() >= MAX_SENT_CALLS {
             self.sent.pop_front();
         }
-        self.sent.push_back((key.into(), values));
+        self.sent.push_back((
+            key.into(),
+            SentValues {
+                written: values,
+                decoded,
+            },
+        ));
     }
 
     /// [`TaintTracker::record_result`] for the answer to request `id`: a
@@ -630,7 +732,7 @@ impl TaintTracker {
 
     /// Record one result's tokens, leaving out a token not yet kept that is
     /// one of `sent` (what the call it answers sent).
-    fn record(&mut self, text: &str, provenance: Provenance, sent: Option<&HashSet<Box<str>>>) {
+    fn record(&mut self, text: &str, provenance: Provenance, sent: Option<&SentValues>) {
         if text.len() > MAX_SCAN_BYTES {
             self.seen.note_unread();
         } else {
@@ -640,12 +742,7 @@ impl TaintTracker {
     }
 
     /// [`TaintTracker::record`] without keeping the text as said.
-    fn record_tokens_of(
-        &mut self,
-        text: &str,
-        provenance: Provenance,
-        sent: Option<&HashSet<Box<str>>>,
-    ) {
+    fn record_tokens_of(&mut self, text: &str, provenance: Provenance, sent: Option<&SentValues>) {
         self.results += 1;
         // Tokens an earlier result holds, and what this result costs with
         // them.
@@ -668,12 +765,13 @@ impl TaintTracker {
             }
             _ => None,
         };
+        let mut lookup = MAX_DECODED_LOOKUP_BYTES;
         for raw in tokenize(&canon) {
             let tok = kept_part(&raw, provenance);
-            // The call itself sent it: the agent's value, not one the server
-            // brought in.
-            let own = sent.is_some_and(|sent| sent.contains(&*raw))
-                && verbatim.as_ref().is_none_or(|said| said.contains(&*raw));
+            // The call itself sent it, as written or inside a value it sent
+            // encoded: the agent's value, not one the server brought in.
+            let own = verbatim.as_ref().is_none_or(|said| said.contains(&*raw))
+                && sent.is_some_and(|sent| sent.holds(&raw, &mut lookup));
             whole_cost += self.take(tok, provenance, &mut seen_again, own);
         }
         // Destinations shorter than a token (see "Short destinations"), every
@@ -684,7 +782,7 @@ impl TaintTracker {
         };
         let mut short_again: Vec<u64> = Vec::new();
         for dest in short_destinations(&canon) {
-            let own = sent.is_some_and(|sent| sent.contains(dest.as_str()))
+            let own = sent.is_some_and(|sent| sent.written.contains(dest.as_str()))
                 && said_short.as_ref().is_none_or(|said| said.contains(&dest));
             whole_cost += self.take_short(&dest, &mut short_again, own);
         }
@@ -4188,7 +4286,7 @@ mod tests {
         let names: Vec<String> = (0..400).map(|i| format!("package-name-{i:04}")).collect();
         let mut t = TaintTracker::new();
         t.note_call(Some(&json!(1)), &json!({"names": names}), false);
-        let kept = &t.sent.front().expect("the call is kept").1;
+        let kept = &t.sent.front().expect("the call is kept").1.written;
         assert!(kept.len() > 1 && kept.len() < names.len(), "{}", kept.len());
         assert!(kept.iter().map(|v| cost_of(v)).sum::<usize>() <= SENT_CALL_COST);
 
@@ -5007,6 +5105,116 @@ mod tests {
                 &json!({"url": "https://collector-host.example.net/other"})
             )
             .is_some());
+    }
+
+    /// A session token in the shape a login returns: header, claims and a
+    /// signature, each base64url. The claims carry `issuer`.
+    fn session_token(issuer: &str, role: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let claims = URL_SAFE_NO_PAD.encode(format!(
+            r#"{{"sub":"guest","role":"{role}","iss":"{issuer}","exp":1795786065}}"#
+        ));
+        format!("{header}.{claims}.j_T3g7_sXzAnfRMOZjpjHCEP3hePyEGgGEhezeZexMc")
+    }
+
+    /// The session token a login returned, sent to `whoami` and then to
+    /// `verify_token`: the issuer `whoami` reads out of the token is what the
+    /// call sent, decoded, and does not taint the token sent again. The
+    /// same issuer printed by another answer (a configuration page) still
+    /// refuses a token forged with it.
+    ///
+    /// FAILS ON REVERT of the decoded values in `note_call` (or of
+    /// `SentValues::holds` looking in them): the issuer `whoami` printed is
+    /// recorded, and `verify_token` with the token the login gave is refused.
+    #[test]
+    fn the_claims_read_out_of_a_token_sent_are_the_calls_own() {
+        let token = session_token("issuer-of-this-login", "user");
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(2)), &json!({ "token": token }), false);
+        t.record_answer(
+            Some(&json!(2)),
+            "=== Current Identity ===\n\n  User: guest\n  Role: user\n  Issuer: issuer-of-this-login\n",
+            Provenance::Content,
+        );
+        let alert = t.arg_taint_alert("verify_token", &json!({ "token": token }));
+        assert!(alert.is_none(), "{alert:?}");
+
+        // Printed by the answer to a call that did not send the token.
+        let mut t = TaintTracker::new();
+        t.note_call(Some(&json!(2)), &json!({}), false);
+        t.record_answer(
+            Some(&json!(2)),
+            "jwt_issuer: issuer-of-this-login\njwt_secret: [REDACTED]",
+            Provenance::Content,
+        );
+        let forged = session_token("issuer-of-this-login", "admin");
+        let alert = t
+            .arg_taint_alert("access_admin", &json!({ "token": forged }))
+            .expect("a token forged with the issuer a server printed");
+        assert!(alert.block, "{}", alert.detail);
+    }
+
+    /// What a value holds decoded counts only where nothing of a longer
+    /// value is next to the word, and not for a word of the value as
+    /// written, which is recorded as a word of any longer argument is.
+    ///
+    /// FAILS ON REVERT of `!written.contains(word)` in `SentValues::holds`
+    /// (the host written in the value sent is left out of the answer), or
+    /// of either side in `stands_whole_in`.
+    #[test]
+    fn a_decoded_value_holds_only_whole_words_not_written_ones() {
+        assert!(stands_whole_in(
+            r#"{"iss":"issuer-of-this-login"}"#,
+            "issuer-of-this-login"
+        ));
+        assert!(stands_whole_in(
+            "issuer-of-this-login",
+            "issuer-of-this-login"
+        ));
+        assert!(!stands_whole_in("send to 11.2.3.45 now", "1.2.3.4"));
+        assert!(!stands_whole_in(
+            "x@notevil.example.org",
+            "evil.example.org"
+        ));
+        assert!(!stands_whole_in("evil.example.orgs", "evil.example.org"));
+        assert!(!stands_whole_in("anything", ""));
+
+        let mut t = TaintTracker::new();
+        t.note_call(
+            Some(&json!(3)),
+            &json!({"q": "collector-host.example.net,%20inbox"}),
+            false,
+        );
+        t.record_answer(
+            Some(&json!(3)),
+            "Saved to collector-host.example.net",
+            Provenance::Content,
+        );
+        assert!(t
+            .arg_taint_alert(
+                "fetch",
+                &json!({"url": "https://collector-host.example.net/x"})
+            )
+            .is_some());
+    }
+
+    /// Looking in what values hold decoded stops at its budget: past it a
+    /// word is not the call's, and the rest of the answer is recorded.
+    #[test]
+    fn a_decoded_value_is_looked_through_within_its_budget() {
+        let sent = SentValues {
+            written: HashSet::new(),
+            decoded: vec![("aXNzdWVy".into(), "issuer-of-this-login".into())],
+        };
+        let cost = "aXNzdWVy".len() + "issuer-of-this-login".len();
+        let mut budget = cost;
+        assert!(sent.holds("issuer-of-this-login", &mut budget));
+        assert_eq!(budget, 0);
+        let mut budget = cost - 1;
+        assert!(!sent.holds("issuer-of-this-login", &mut budget));
+        assert_eq!(budget, 0);
     }
 
     #[test]
