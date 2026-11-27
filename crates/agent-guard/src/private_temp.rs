@@ -16,7 +16,10 @@
 
 use crate::threats::{effective_command_index, shell_command_segments, shell_tokens};
 
-/// The world-writable directories a temp path may sit in, as written.
+/// The world-writable directories a temp path may sit in, as written. Read
+/// only where a directory's owner and mode can be read (unix): elsewhere no
+/// temp path is private.
+#[cfg(unix)]
 const TEMP_ROOTS: [&str; 5] = ["/private/tmp", "/var/tmp", "/dev/shm", "/run/shm", "/tmp"];
 
 /// Whether every temp-directory path on each of `lines` (the line, and the
@@ -144,8 +147,15 @@ fn is_private(path: &str) -> bool {
 /// [`is_private`] for the user `user`.
 #[cfg(unix)]
 fn is_private_for(path: &str, user: u32) -> bool {
+    is_private_below(path, user, &TEMP_ROOTS)
+}
+
+/// [`is_private_for`] below the temp roots `roots` (each as written): a test
+/// names a root of its own, which the host's roots cannot be.
+#[cfg(unix)]
+fn is_private_below(path: &str, user: u32, roots: &[&str]) -> bool {
     use std::os::unix::fs::MetadataExt;
-    let Some(root) = TEMP_ROOTS
+    let Some(root) = roots
         .iter()
         .find(|root| path == **root || path.starts_with(&format!("{root}/")))
     else {
@@ -262,6 +272,13 @@ mod tests {
         assert!(!through_link);
         // A climb out, and a file others may write.
         assert!(!is_private(&format!("{}/../run.sh", own.0)));
+        // A name the system refuses to look up (longer than a name may be):
+        // what is there is not known, so it is not private.
+        assert!(!is_private(&format!(
+            "{}/{}/run.sh",
+            own.0,
+            "a".repeat(300)
+        )));
         let file = format!("{}/run.sh", own.0);
         std::fs::write(&file, "true\n").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
@@ -289,6 +306,8 @@ mod tests {
             format!("cd \"{dir}\" && bash 'run.sh' 2>&1 | tail -5"),
             format!("S={dir}; python3 $S/run.py"),
             format!("python3 {dir}/*.py"),
+            // `pushd` to the directory, a path and not a rotation.
+            format!("pushd {dir} && python3 run.py"),
         ] {
             let known = crate::shell::line_with_known_paths(&line);
             let mut lines = vec![line.as_str()];
@@ -308,6 +327,12 @@ mod tests {
             format!("cd {dir} && cd .. && ./run.sh"),
             format!("cd {dir} && python3 ../run.py"),
             format!("cd /tmp; cd {dir}; cd -; ./run.sh"),
+            // `cd -` back to wherever the line started, with no other temp
+            // path to judge: only the `cd` rule says no.
+            format!("cd {dir}; cd -; ./run.sh"),
+            format!("cd {dir} && cd - && ./build.sh"),
+            // `popd` back to wherever the line started, the same way.
+            format!("pushd {dir}; popd; ./run.sh"),
             format!("pushd /tmp; cd {dir}; popd; ./run.sh"),
             format!("pushd {dir}; pushd +1; ./run.sh"),
             // `$TMPDIR` is read as `/tmp`.
@@ -320,6 +345,50 @@ mod tests {
             lines.extend(known.as_deref());
             assert!(!every_temp_path_is_private(&lines), "not private: {line}");
         }
+    }
+
+    /// The temp root keeps others from renaming what they do not own only
+    /// with its sticky bit: below a root without it (here a root of the
+    /// test's own, since the host's are what they are), the user's closed
+    /// directory can be moved away and replaced, and is not private. The
+    /// same tree below a sticky root is. FAILS ON REVERT of the sticky check
+    /// (the guard dropped, or `&&` read as `||`).
+    #[test]
+    fn a_closed_directory_below_a_root_without_the_sticky_bit_is_not_private() {
+        use std::os::unix::fs::MetadataExt;
+        let root = TempDirectory::new("root", 0o777);
+        let inner = format!("{}/inner", root.0);
+        std::fs::create_dir(&inner).unwrap();
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let user = std::fs::metadata(&inner).expect("test directory").uid();
+        let run = format!("{inner}/run.sh");
+        let roots = [root.0.as_str()];
+        assert!(
+            !is_private_below(&run, user, &roots),
+            "a root anyone renames in"
+        );
+        std::fs::set_permissions(&root.0, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(is_private_below(&run, user, &roots), "a sticky root");
+        // A root that is not a directory.
+        let file = format!("{}/file", root.0);
+        std::fs::write(&file, "x").unwrap();
+        assert!(!is_private_below(
+            &format!("{file}/run.sh"),
+            user,
+            &[file.as_str()]
+        ));
+    }
+
+    /// The test directory is gone once the test is done with it: the tests
+    /// make their directories in the host's `/tmp`.
+    #[test]
+    fn a_test_directory_is_removed_when_dropped() {
+        let path = {
+            let gone = TempDirectory::new("gone", 0o700);
+            std::fs::write(format!("{}/file", gone.0), "x").unwrap();
+            gone.0.clone()
+        };
+        assert!(!std::path::Path::new(&path).exists(), "{path} left behind");
     }
 
     #[test]

@@ -741,6 +741,62 @@ mod tests {
         }
     }
 
+    /// Only a run by uv (`uvx`, `uv tool run`) reads `python` as
+    /// uv's own interpreter: an install by uv, a run by `pipx` and a run by
+    /// `npx` name a package, and their `python` is judged as one. FAILS ON
+    /// REVERT of either half of the rule (`||` for `&&`, or `!=` for `==` on
+    /// `uv`).
+    #[test]
+    fn only_a_run_by_uv_names_uvs_interpreter() {
+        let uv_run = |line: &str| {
+            let words = shell_tokens(line);
+            install_arguments(&words)
+                .map(|(_, _, uv_run, _)| uv_run)
+                .unwrap_or_else(|| panic!("{line}: an install or a run"))
+        };
+        for line in ["uvx python run.py", "uv tool run python3 x.py"] {
+            assert!(uv_run(line), "{line}");
+        }
+        for line in [
+            "uv pip install python",
+            "uv tool install python",
+            "uv add python",
+            "pipx run python",
+            "pipx install python",
+            "npx python",
+            "pip install python",
+        ] {
+            assert!(!uv_run(line), "{line}");
+        }
+    }
+
+    /// uv's interpreter is `python`, `python3`, or `python3.<digits>`, with
+    /// or without `@version`; any other tail is a name of its own. FAILS ON
+    /// REVERT of the minor version's two conditions (`||` for `&&`).
+    #[test]
+    fn uvs_interpreter_is_python_three_and_a_numeric_minor() {
+        for name in [
+            "python",
+            "python3",
+            "python3.12",
+            "Python3.9",
+            "python@3.12",
+            "'python3.13'",
+        ] {
+            assert!(names_uv_interpreter(name), "{name}");
+        }
+        for name in [
+            "python3.",
+            "python3.x",
+            "python3.12a",
+            "python2",
+            "pythonx",
+            "python-dateutil",
+        ] {
+            assert!(!names_uv_interpreter(name), "{name}");
+        }
+    }
+
     #[test]
     fn the_shipped_list_parses_and_holds_both_registries() {
         let lists = popular();
