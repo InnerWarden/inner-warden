@@ -13,9 +13,9 @@
 # H"O"ME, printf -v, read -r): denied by main, let through by the branch
 # before its second round. must_refuse: true with expect: deny on every
 # rw2-NNN; rw2-c.. are controls. The proof is
-# tests/guard_user_units.rs, tests/inline_code_deletes_credentials.rs,
-# tests/lua_sinks_through_require.rs and
-# tests/worktree_paths_that_leave_and_home_by_pieces.rs; read by the
+# tests/guard/guard_user_units.rs, tests/commands_a_l/inline_code_deletes_credentials.rs,
+# tests/commands_l_w/lua_sinks_through_require.rs and
+# tests/commands_l_w/worktree_paths_that_leave_and_home_by_pieces.rs; read by the
 # differential check. Nothing in this file is executed.
 cases:
   # main: allow

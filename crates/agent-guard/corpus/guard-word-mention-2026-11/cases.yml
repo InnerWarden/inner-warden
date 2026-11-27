@@ -10,7 +10,7 @@
 # writes and runs). Each was refused by main on 2026-11-21 and must stay
 # refused. gwm-c01.. are mentions, benign with `expect: review`: main
 # refused them, the mention reading holds them for review instead.
-# The proof is `tests/guard_word_mention_and_action.rs`; read by the
+# The proof is `tests/guard/guard_word_mention_and_action.rs`; read by the
 # differential check. Nothing in this file is executed.
 cases:
   - id: gwm-001

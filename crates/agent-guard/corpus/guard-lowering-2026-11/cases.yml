@@ -6,7 +6,7 @@
 # KeePass database; after the review of the change: a piece of the guard's
 # name through any launcher, pgrep, pidof or killall, a backslash before a
 # letter read in every regular expression dialect, a unit glob, and the secret
-# files in any case. The proof is tests/guard_lowering_forms_and_secret_files.rs.
+# files in any case. The proof is tests/guard/guard_lowering_forms_and_secret_files.rs.
 # Nothing in this file is executed.
 cases:
   - id: gl-01

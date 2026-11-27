@@ -14,7 +14,7 @@
 # From cg-48 (second review, 2026-11-21): global options before the starting
 # point, a starting point the line resolves to the root, a test that is not a
 # literal name or path, the program behind a launcher or in a shell's -c line.
-# The proof is tests/cd_then_glob_and_recursive_owner.rs.
+# The proof is tests/commands_a_l/cd_then_glob_and_recursive_owner.rs.
 # Nothing in this file is executed.
 cases:
   - id: cg-01

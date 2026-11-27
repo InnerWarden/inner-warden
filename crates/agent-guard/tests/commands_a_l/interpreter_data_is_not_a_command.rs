@@ -153,7 +153,7 @@ EOF"##,
     }
     // Code that only prints a stop of the guard names it: refused until
     // 2026-11-21, held for review since (decision of the operator; the
-    // print piped to a shell stays refused, `tests/guard_word_mention_and_action.rs`).
+    // print piped to a shell stays refused, `tests/guard/guard_word_mention_and_action.rs`).
     let printed = "python3 - <<'EOF'\nprint('pkill -f innerwarden')\nEOF";
     assert_eq!(verdict(printed), "review", "{printed}");
 }

@@ -141,7 +141,7 @@ fn pay(to: Value) -> Value {
 #[test]
 fn the_session_corpus_holds() {
     use innerwarden_agent_guard::benchmark::{run, Corpus, Label};
-    let corpus = Corpus::from_yaml(include_str!("../corpus/mcp-sessions/cases.yml"))
+    let corpus = Corpus::from_yaml(include_str!("../../corpus/mcp-sessions/cases.yml"))
         .expect("the session corpus parses");
     assert!(corpus.cases.len() >= 10);
     let engine = RuleEngine::load_embedded();

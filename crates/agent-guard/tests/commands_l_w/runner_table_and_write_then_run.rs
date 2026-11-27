@@ -63,7 +63,7 @@ fn a_file_the_line_writes_with_text_it_does_not_show_is_held() {
         "php -r \"file_put_contents('x.sh', $argv[1]);\" x && sh x.sh",
         // Decision of 2026-11-20 (they were allowed here before): what a
         // program prints into a file, or a copy, then run, is not shown by
-        // the line, and is held for review (tests/write_then_run_gaps.rs).
+        // the line, and is held for review (tests/commands_l_w/write_then_run_gaps.rs).
         "python3 gen.py > r.sh && bash r.sh",
         "cp template.sh run.sh && sh run.sh",
     ] {

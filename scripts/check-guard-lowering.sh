@@ -2,7 +2,7 @@
 # check-guard-lowering.sh: drive the installed PreToolUse hook with the
 # guard-lowering corpus and assert the verdict of every line.
 #
-# This is the host proof of what tests/guard_lowering_corpus.rs proves in the
+# This is the host proof of what tests/guard/guard_lowering_corpus.rs proves in the
 # unit suite: an AI agent cannot lower its own guard, in any name, wrapper or
 # command string the corpus holds. It runs the REAL hook (`innerwarden hook`),
 # the same program the agent's PreToolUse calls, under an agent shell's

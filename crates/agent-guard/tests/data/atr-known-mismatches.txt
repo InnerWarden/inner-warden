@@ -1,6 +1,6 @@
 # ATR rule test cases whose engine verdict differs from their `expected`.
 # One line per case: "<rule id> <section>[<index>] expected=<verdict>".
-# Enforced by tests/atr_test_cases.rs: the list must equal the current set.
+# Enforced by tests/mcp/atr_test_cases.rs: the list must equal the current set.
 ATR-2026-001 true_negatives[7] expected=not_triggered
 ATR-2026-00851 true_positives[2] expected=triggered
 ATR-2026-00851 true_positives[3] expected=triggered

@@ -129,7 +129,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   judged as if written where it is loaded, and one that sets a variable the
   guard reads in its own way (the home, the search path, `IFS`, `PS4`,
   `SHELLOPTS`, a setting that loads code) is held, since the rest of the
-  line is not read with it (`tests/write_then_run_gaps.rs`). No waiver.
+  line is not read with it (`tests/commands_l_w/write_then_run_gaps.rs`). No waiver.
 - 2026-11-21: line-variables-2026-11 and cd-glob-owner-2026-11 join the
   release safety suite (review of the pull request that reads a line's
   values where each name is used); nothing already in the reference moved.
@@ -444,7 +444,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   the folder it is given. must_refuse lines main 14509ae allows and this
   branch refuses: guard-config-ancestors-2026-11/gc-085, guard-config-ancestors-2026-11/gc-086, guard-config-ancestors-2026-11/gc-087, guard-config-ancestors-2026-11/gc-088, guard-config-ancestors-2026-11/gc-089, guard-config-ancestors-2026-11/gc-090, guard-config-ancestors-2026-11/gc-091, guard-config-ancestors-2026-11/gc-092, guard-config-ancestors-2026-11/gc-093, guard-config-ancestors-2026-11/gc-094, guard-config-ancestors-2026-11/gc-095, guard-config-ancestors-2026-11/gc-096, guard-config-ancestors-2026-11/gc-097, guard-config-ancestors-2026-11/gc-098, guard-config-ancestors-2026-11/gc-099. Controls allowed on main and here: guard-config-ancestors-2026-11/gc-c50, guard-config-ancestors-2026-11/gc-c51, guard-config-ancestors-2026-11/gc-c52, guard-config-ancestors-2026-11/gc-c53, guard-config-ancestors-2026-11/gc-c54, guard-config-ancestors-2026-11/gc-c55, guard-config-ancestors-2026-11/gc-c56, guard-config-ancestors-2026-11/gc-c57.
   Each new line is held by a test in
-  `tests/guard_config_commands_and_ancestors.rs` that fails when its part
+  `tests/guard/guard_config_commands_and_ancestors.rs` that fails when its part
   is reverted. A clone with no folder (`cd ~/.config && git clone
   .../innerwarden.git`) stays a review, as the repository's name is read
   as data.
@@ -469,7 +469,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   `${ }` inside a pattern or string; adv-p15b: a Ruby method taken by a
   `%s` symbol with `instance_method` and called with `bind`), and their
   generated variants. Each family is held by a test in
-  `tests/text_a_later_step_runs.rs` that fails when its part is
+  `tests/commands_l_w/text_a_later_step_runs.rs` that fails when its part is
   reverted. No other line of any corpus moved, from an empty home or a
   home with keys.
 - 2026-11-25: own-work/own-027 goes from deny to allow: SQL handed to a
@@ -483,7 +483,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   backtick, a dollar quote, `COPY`, `PROGRAM`, `LANGUAGE`, a file
   function, or a string inside a function that is not a plain value is
   read as before, every word of it as a shell line; held by
-  `tests/sql_text_is_data.rs`, whose allowed lines fail on revert. No
+  `tests/commands_l_w/sql_text_is_data.rs`, whose allowed lines fail on revert. No
   other line of any corpus moved. harmless-proven: own-work/own-027
   goes from deny to allow for the reason above: the client stores the
   string and nothing on the line runs it.
@@ -498,7 +498,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   on the remote line, an option of the runner that runs a program, and
   any other program behind the runner (`sh -c`, `bash`) are read as
   before; the 49 must_refuse lines of the corpus stay refused, held by
-  `tests/sql_through_container_and_ssh.rs`, whose allowed lines fail on
+  `tests/commands_l_w/sql_through_container_and_ssh.rs`, whose allowed lines fail on
   revert. A trigger or user function the database already holds is not
   on the line: a known limit, not read. Against the branch before the
   change no other line moved (every corpus line and generated variant);
@@ -526,7 +526,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   written plainly (`threats::names_spelled_out`, used by
   `with_home_named`, `home_kept` and the reading of the line's values).
   The wsh-1NN lines are must_refuse, held by
-  `tests/worktree_paths_and_spelled_home.rs`, whose lines fail on revert.
+  `tests/commands_l_w/worktree_paths_and_spelled_home.rs`, whose lines fail on revert.
   Against the branch before the change no other corpus line moved.
   harmless-proven:
   worktree-paths-spelled-home-2026-11/wsh-001 worktree-paths-spelled-home-2026-11/wsh-002 worktree-paths-spelled-home-2026-11/wsh-003 worktree-paths-spelled-home-2026-11/wsh-004 worktree-paths-spelled-home-2026-11/wsh-005
@@ -546,7 +546,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   the folder the hook was given and with `~` and `$HOME` standing for a
   `HOME` the line sets (`guard_file_targets::removal_reaches_guard_file_from`).
   The nkp-1NN lines are must_refuse, held by
-  `tests/notes_key_moves_patterns_and_home.rs`, whose lines fail on revert.
+  `tests/commands_l_w/notes_key_moves_patterns_and_home.rs`, whose lines fail on revert.
   harmless-proven:
   notes-key-moves-patterns-2026-11/nkp-002 notes-key-moves-patterns-2026-11/nkp-003 notes-key-moves-patterns-2026-11/nkp-006 notes-key-moves-patterns-2026-11/nkp-007 notes-key-moves-patterns-2026-11/nkp-008 notes-key-moves-patterns-2026-11/nkp-009 notes-key-moves-patterns-2026-11/nkp-010 notes-key-moves-patterns-2026-11/nkp-014 notes-key-moves-patterns-2026-11/nkp-015 notes-key-moves-patterns-2026-11/nkp-016 notes-key-moves-patterns-2026-11/nkp-017 notes-key-moves-patterns-2026-11/nkp-018 notes-key-moves-patterns-2026-11/nkp-019
   go from deny (or review) to allow for the reasons above: notes written by
@@ -562,7 +562,7 @@ harmless. A malicious or `must_refuse` line cannot be waived here.
   `/dev/null`. Showing a file never runs it. A line that runs, sources or
   pipes the file, or hands a pager a command, a key file or another pager,
   is read whole as before. The nsc-1NN lines are must_refuse, held by
-  `tests/notes_shown_after_cat_stay_text.rs`, whose shown lines fail on
+  `tests/commands_l_w/notes_shown_after_cat_stay_text.rs`, whose shown lines fail on
   revert. Against the branch before the change no other corpus line moved.
   harmless-proven:
   notes-shown-after-cat-2026-11/nsc-001 notes-shown-after-cat-2026-11/nsc-002 notes-shown-after-cat-2026-11/nsc-003 notes-shown-after-cat-2026-11/nsc-004 notes-shown-after-cat-2026-11/nsc-005 notes-shown-after-cat-2026-11/nsc-006 notes-shown-after-cat-2026-11/nsc-007 notes-shown-after-cat-2026-11/nsc-008 notes-shown-after-cat-2026-11/nsc-009 notes-shown-after-cat-2026-11/nsc-010 notes-shown-after-cat-2026-11/nsc-011 notes-shown-after-cat-2026-11/nsc-012 notes-shown-after-cat-2026-11/nsc-013 notes-shown-after-cat-2026-11/nsc-014 notes-shown-after-cat-2026-11/nsc-015

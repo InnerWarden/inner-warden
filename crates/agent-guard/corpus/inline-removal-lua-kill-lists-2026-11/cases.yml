@@ -10,7 +10,7 @@
 # comment above each case. must_refuse: true on every irl-NNN (expect:
 # deny, or review for a kill whose ids the line does not say, as main
 # holds such a kill); irl-c.. are controls. The proof is
-# tests/inline_removal_lua_calls_and_kill_lists.rs; read by the
+# tests/commands_a_l/inline_removal_lua_calls_and_kill_lists.rs; read by the
 # differential check. Nothing in this file is executed.
 cases:
   # before: allow

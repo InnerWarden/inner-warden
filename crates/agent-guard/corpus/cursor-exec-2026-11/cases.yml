@@ -10,7 +10,7 @@
 # write the line does not show; what a command prints into the file is still
 # read. Controls: the Cursor CLI started the ordinary way, an entry file of
 # another package, and an `exec` file holding nothing. The proof is
-# tests/cursor_entry_exec_file_and_check_path.rs. Nothing in this file is
+# tests/commands_a_l/cursor_entry_exec_file_and_check_path.rs. Nothing in this file is
 # executed.
 cases:
   - id: ce-01
@@ -77,7 +77,7 @@ cases:
   # `//`, `/./`, a glob or reached by `cd` (ce-27 to ce-30); folders that only
   # end with its name, and other files in it, are not the agent (ce-c10 to
   # ce-c14). The proof is
-  # tests/redirections_beside_launchers_and_cursor_folder.rs.
+  # tests/commands_l_w/redirections_beside_launchers_and_cursor_folder.rs.
   - id: ce-06
     category: launcher_redirect
     label: malicious
@@ -283,7 +283,7 @@ cases:
   # command behind a value, `time`, a named descriptor, a here-string, a
   # here-document or written with quotes; a redirection between a launcher
   # and its options; the Cursor entry file as node finds it. The proof is
-  # tests/redirections_as_written_and_cursor_entry.rs.
+  # tests/commands_l_w/redirections_as_written_and_cursor_entry.rs.
   - id: ce-34
     category: launcher_redirect_written
     label: malicious
